@@ -743,7 +743,7 @@
       },
       "title": "eth_getLogs window span",
       "type": "timeseries",
-      "description": "Block span of the shared chain-event poller's next eth_getLogs window, per node, and the rate of windows the RPC provider rejected for their range or result count. The span starts at blockchain.get_logs_max_block_span, drops to half a rejected window, and doubles back after 32 accepted windows, so a caught-up node climbs back to the ceiling after a transient rejection. Rejections that keep coming mean the provider caps eth_getLogs: set the ceiling to the lowest span reached while they come.",
+      "description": "Block span of the shared chain-event poller's next eth_getLogs window, per node, and the rate of windows the RPC provider rejected for their range or result count. The span starts at blockchain.get_logs_max_block_span, drops to half a rejected window, and doubles back after 32 accepted windows, so a caught-up node climbs back to the ceiling after a transient rejection. Rejections that keep coming mean the provider caps eth_getLogs: set the ceiling to the lowest span reached while they come. Retries/s counts windows the poller retried inside a tick after a transient provider error; a retry that succeeds is not watcher downtime, so a steady retry rate is where a flaky provider shows.",
       "targets": [
         {
           "datasource": {
@@ -762,6 +762,15 @@
           "expr": "rate(decdn_chain_get_logs_range_rejections_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])",
           "refId": "B",
           "legendFormat": "{{instance}} rejections/s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "rate(decdn_chain_get_logs_retries_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])",
+          "refId": "C",
+          "legendFormat": "{{instance}} retries/s"
         }
       ],
       "fieldConfig": {
@@ -819,6 +828,22 @@
             "matcher": {
               "id": "byFrameRefID",
               "options": "B"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "unit",
+                "value": "reqps"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
             },
             "properties": [
               {

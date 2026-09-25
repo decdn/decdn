@@ -798,7 +798,8 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
 
 /// The chain-event poller builder with its config-driven settings: the
 /// `eth_getLogs` block-span ceiling (`blockchain.get_logs_max_block_span`) and
-/// the span and range-rejection metrics. Routes are added by the caller.
+/// the span, range-rejection and window-retry metrics. Routes are added by the
+/// caller.
 fn chain_poller_builder(
     head: Arc<dyn HeadSource>,
     poll_interval: Duration,
@@ -812,6 +813,10 @@ fn chain_poller_builder(
         .on_range_rejection(metrics::metric_hook(
             node_metrics,
             metrics::Metrics::chain_get_logs_range_rejected,
+        ))
+        .on_window_retry(metrics::metric_hook(
+            node_metrics,
+            metrics::Metrics::chain_get_logs_retried,
         ))
 }
 
@@ -5012,11 +5017,12 @@ mod tests {
         assert_eq!(builder.span_ceiling(), 150);
 
         // The hooks land in the exported series: `run` reports the starting
-        // span, and a range rejection bumps the counter.
+        // span, and a range rejection and a window retry bump their counters.
         let built = builder.build();
         assert!(built.is_ok(), "an empty poller builds");
         let Ok(poller) = built else { return };
         poller.fire_range_rejection_for_test();
+        poller.fire_window_retry_for_test();
         let provider = alloy::providers::ProviderBuilder::new()
             .connect_mocked_client(alloy::providers::mock::Asserter::new());
         let shutdown = CancellationToken::new();
@@ -5032,6 +5038,12 @@ mod tests {
                 .lines()
                 .any(|l| l == "decdn_chain_get_logs_range_rejections_total 1"),
             "rejection counter not wired"
+        );
+        assert!(
+            scrape
+                .lines()
+                .any(|l| l == "decdn_chain_get_logs_retries_total 1"),
+            "window-retry counter not wired"
         );
     }
 }

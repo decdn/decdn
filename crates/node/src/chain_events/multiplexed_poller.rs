@@ -56,7 +56,22 @@
 //! and retries the same start block at once; no route hook fires. The span
 //! doubles back after a run of accepted windows ([`WindowSpan`]), so a
 //! transient rejection does not cost throughput until restart. Only a rejected one-block
-//! window, or any other `get_logs` failure, goes through [`fail_whole_tick`].
+//! window, or any other `get_logs` failure that survives the retries below, goes
+//! through [`fail_whole_tick`].
+//!
+//! # Transient window failures
+//!
+//! A tick that is behind head scans several windows, and it succeeds only if
+//! every window does. A provider that fails a fraction of its calls therefore
+//! fails most long ticks, and each failed tick adds a backoff sleep that makes
+//! the next tick longer still. So [`run_tick`] retries a failed window in place:
+//! a `get_logs` error that [`is_transient_window_error`] accepts is retried on
+//! the same block range up to [`GET_LOGS_WINDOW_RETRIES`] times, after
+//! [`GET_LOGS_WINDOW_RETRY_DELAY`] each. A retry that succeeds is a plain
+//! success: no route hook fires and no route is marked down. Each retry fires
+//! the `on_window_retry` hook (the `decdn_chain_get_logs_retries_total` counter),
+//! so provider flakiness stays visible although it no longer shows as watcher
+//! downtime. A permanent JSON-RPC error and a range rejection are not retried.
 //!
 //! The runtime registers each `eth_getLogs` watcher's [`Route`] on one
 //! poller in `build_chain_and_handlers` and spawns it once — one merged loop in
@@ -82,6 +97,7 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::transports::TransportError;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use decdn_client::provider::is_permanent_rpc_error;
 use decdn_common::config::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN;
 use decdn_common::redact::sanitize_err_chain;
 use tokio_util::sync::CancellationToken;
@@ -254,6 +270,9 @@ pub struct MultiplexedPoller {
     /// Called on every range rejection the poller recognises, including a
     /// rejected one-block window.
     on_range_rejection: Option<WatcherHook>,
+    /// Called on every in-tick retry of a transiently failed `get_logs`
+    /// window (see the module doc's "Transient window failures").
+    on_window_retry: Option<WatcherHook>,
     initial_backoff: Duration,
     /// Ceiling for the shared loop's backoff. One loop now serves every route,
     /// so a route that used to carry its own tighter cap (slash's 30s) no
@@ -287,6 +306,7 @@ pub struct MultiplexedPollerBuilder {
     max_backfill_span: u64,
     on_span_change: Option<SpanHook>,
     on_range_rejection: Option<WatcherHook>,
+    on_window_retry: Option<WatcherHook>,
     initial_backoff: Duration,
     max_backoff: Duration,
     rpc_call_timeout: Option<Duration>,
@@ -315,6 +335,7 @@ impl MultiplexedPollerBuilder {
             max_backfill_span: DEFAULT_GET_LOGS_MAX_BLOCK_SPAN,
             on_span_change: None,
             on_range_rejection: None,
+            on_window_retry: None,
             initial_backoff: WATCHER_INITIAL_BACKOFF,
             max_backoff: WATCHER_MAX_BACKOFF,
             rpc_call_timeout: None,
@@ -356,6 +377,13 @@ impl MultiplexedPollerBuilder {
     #[must_use]
     pub(crate) fn on_range_rejection(mut self, hook: WatcherHook) -> Self {
         self.on_range_rejection = Some(hook);
+        self
+    }
+
+    /// Observe every in-tick retry of a transiently failed `get_logs` window.
+    #[must_use]
+    pub(crate) fn on_window_retry(mut self, hook: WatcherHook) -> Self {
+        self.on_window_retry = Some(hook);
         self
     }
 
@@ -432,6 +460,7 @@ impl MultiplexedPollerBuilder {
             span: WindowSpan::new(span_ceiling),
             on_span_change: self.on_span_change,
             on_range_rejection: self.on_range_rejection,
+            on_window_retry: self.on_window_retry,
             initial_backoff: self.initial_backoff,
             max_backoff: self.max_backoff,
             rpc_call_timeout: self.rpc_call_timeout,
@@ -695,6 +724,31 @@ const LIMIT_WORDS: [&str; 10] = [
     "not supported",
 ];
 
+/// How many times [`run_tick`] retries a transiently failed `get_logs` window
+/// before it fails the tick. At a per-call failure rate of 20 %, two retries
+/// take the per-window failure rate below 1 %.
+const GET_LOGS_WINDOW_RETRIES: u32 = 2;
+
+/// The sleep before each in-tick retry of a failed `get_logs` window. A
+/// load-balanced provider whose backend lags head fails a window at the tip
+/// until the backend catches up, so an immediate retry often fails again.
+const GET_LOGS_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Whether a failed `get_logs` window is worth a retry on the same block
+/// range inside the tick. A range rejection is not: it takes the shrink path
+/// ([`shrink_on_range_rejection`]). A JSON-RPC error that
+/// [`is_permanent_rpc_error`] classifies as deterministic (invalid params, an
+/// unsupported method) is not either. Everything else is: a provider's
+/// "temporary internal error" or "request timeout" response, a transport
+/// failure, and a `timed` timeout, which carries no typed cause.
+fn is_transient_window_error(err: &anyhow::Error) -> bool {
+    !is_range_rejection(err)
+        && !err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<TransportError>())
+            .is_some_and(is_permanent_rpc_error)
+}
+
 /// Handle a failed `get_logs` for the window `[start, end]`. A range rejection
 /// the poller recognises shrinks the span to half the window and returns
 /// `None`: the caller retries the same start block at once. A provider that
@@ -754,6 +808,14 @@ impl MultiplexedPoller {
     pub(crate) fn fire_range_rejection_for_test(&self) {
         fire(self.on_range_rejection.as_ref());
     }
+
+    /// Fire the window-retry hook once, as [`run_tick`] does on each in-tick
+    /// retry. Lets the runtime test the hook's metric wiring without
+    /// scripting a provider.
+    #[cfg(test)]
+    pub(crate) fn fire_window_retry_for_test(&self) {
+        fire(self.on_window_retry.as_ref());
+    }
 }
 
 /// Hand the new window span to the `on_span_change` hook, if any.
@@ -763,12 +825,66 @@ fn report_span(poller: &MultiplexedPoller, span: u64) {
     }
 }
 
+/// Fetch the logs of the window `[start, end]`, retrying a transient failure
+/// on the same range (see the module doc's "Transient window failures").
+/// Returns `None` when `shutdown` is cancelled during a retry sleep, and
+/// otherwise the logs or the error the caller hands to the range-rejection
+/// and whole-tick paths.
+///
+/// Takes the poller's parts rather than `&MultiplexedPoller`: the poller is
+/// not `Sync`, so a shared borrow of it cannot live across the awaits here.
+async fn fetch_window_logs<P: Provider + Clone>(
+    provider: &P,
+    base_filter: &Filter,
+    rpc_call_timeout: Option<Duration>,
+    on_window_retry: Option<&WatcherHook>,
+    start: u64,
+    end: u64,
+    shutdown: &CancellationToken,
+) -> Option<Result<Vec<Log>>> {
+    let filter = base_filter.clone().from_block(start).to_block(end);
+    let mut retries = 0;
+    loop {
+        let err = match timed(rpc_call_timeout, "get_logs", provider.get_logs(&filter))
+            .await
+            .with_context(|| format!("multiplexed get_logs [{start}, {end}]"))
+        {
+            Ok(logs) => return Some(Ok(logs)),
+            Err(err) => err,
+        };
+        if !is_transient_window_error(&err) {
+            return Some(Err(err));
+        }
+        if retries == GET_LOGS_WINDOW_RETRIES {
+            return Some(Err(err.context(format!(
+                "gave up after {GET_LOGS_WINDOW_RETRIES} in-tick retries"
+            ))));
+        }
+        retries += 1;
+        fire(on_window_retry);
+        debug!(
+            error = %sanitize_err_chain(&err),
+            start,
+            end,
+            retry = retries,
+            "eth_getLogs window failed; retrying the same window"
+        );
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return None,
+            () = tokio::time::sleep(GET_LOGS_WINDOW_RETRY_DELAY) => {}
+        }
+    }
+}
+
 /// Run one poll tick: read head, resolve each route's floor, scan the merged
 /// `[min(floor), head]` range in windows (one `get_logs` per window), demux
 /// each log to its owning route, then reconcile and fire hooks. A recognised
 /// provider range rejection retries the window at half its length instead of
-/// failing (see the module doc's "Provider range caps"). Returns `Err`
-/// if the shared head/floor/`get_logs` reads fail, or if any route errored
+/// failing (see the module doc's "Provider range caps"), and a transient
+/// `get_logs` failure retries the same window (see "Transient window
+/// failures"). Returns `Err` if the shared head/floor reads fail, if a
+/// `get_logs` window still fails after its retries, or if any route errored
 /// applying a log or reconciling — either way the *loop* backs off, but a
 /// route that itself succeeded this tick has already advanced and persisted.
 async fn run_tick<P: Provider + Clone>(
@@ -797,15 +913,21 @@ async fn run_tick<P: Provider + Clone>(
             return Ok(());
         }
         let end = window_end(start, to, poller.span.current());
-        let filter = poller.base_filter.clone().from_block(start).to_block(end);
-        let logs = match timed(
+        let fetched = fetch_window_logs(
+            provider,
+            &poller.base_filter,
             poller.rpc_call_timeout,
-            "get_logs",
-            provider.get_logs(&filter),
+            poller.on_window_retry.as_ref(),
+            start,
+            end,
+            shutdown,
         )
-        .await
-        .with_context(|| format!("multiplexed get_logs [{start}, {end}]"))
-        {
+        .await;
+        let Some(fetched) = fetched else {
+            // Shutdown ends the tick as the per-window check above does.
+            return Ok(());
+        };
+        let logs = match fetched {
             Ok(logs) => logs,
             Err(err) => match shrink_on_range_rejection(poller, start, end, err) {
                 // Retry the same start block with the smaller window.
@@ -2705,7 +2827,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_rate_limit_backs_off_and_keeps_the_window() {
         let asserter = alloy::providers::mock::Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
@@ -2719,14 +2841,14 @@ mod tests {
         };
 
         asserter.push_success(&U64::from(20));
-        if let Some(payload) = error_payload(429, "Too Many Requests") {
-            asserter.push_failure(payload);
+        for _ in 0..=GET_LOGS_WINDOW_RETRIES {
+            push_rpc_failure(&asserter, 429, "Too Many Requests");
         }
 
         let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
         assert!(
             result.is_err(),
-            "a rate limit fails the tick into the backoff path"
+            "a rate limit that outlasts the retries fails the tick into the backoff path"
         );
         assert_eq!(poller.span.current(), DEFAULT_GET_LOGS_MAX_BLOCK_SPAN);
         assert_eq!(
@@ -2771,6 +2893,261 @@ mod tests {
             1,
             "a provider that rejects even one block is still counted"
         );
+    }
+
+    // --- Transient window failures: the window retries inside the tick -------
+
+    /// A poller over one checkpoint route resuming at block 1, with the route's
+    /// `on_backoff` and the poller's `on_window_retry` counted.
+    struct RetryPoller {
+        poller: MultiplexedPoller,
+        backoff: Arc<AtomicUsize>,
+        retries: Arc<AtomicUsize>,
+        store: Arc<MemoryCheckpointStore>,
+    }
+
+    fn retry_poller<P: Provider + Clone + 'static>(provider: P) -> Option<RetryPoller> {
+        let (mut route, _sink, store) = checkpoint_route(1);
+        let backoff = Arc::new(AtomicUsize::new(0));
+        let retries = Arc::new(AtomicUsize::new(0));
+        {
+            let counter = Arc::clone(&backoff);
+            route.on_backoff = Some(Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        let counter = Arc::clone(&retries);
+        let built = MultiplexedPollerBuilder::new(shared_head(provider), Duration::from_secs(1))
+            .on_window_retry(Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }))
+            .route(route)
+            .build();
+        assert_built(built).ok().map(|poller| RetryPoller {
+            poller,
+            backoff,
+            retries,
+            store,
+        })
+    }
+
+    fn push_rpc_failure(asserter: &alloy::providers::mock::Asserter, code: i64, message: &str) {
+        if let Some(payload) = error_payload(code, message) {
+            asserter.push_failure(payload);
+        }
+    }
+
+    #[test]
+    fn transient_window_errors_are_the_non_range_non_permanent_ones() {
+        // dRPC free plan: a lagging upstream at the tip, and a slow call.
+        assert!(is_transient_window_error(&rpc_error(
+            19,
+            "Temporary internal error. Please retry"
+        )));
+        assert!(is_transient_window_error(&rpc_error(
+            30,
+            "Request timeout on the free plan"
+        )));
+        assert!(is_transient_window_error(&rpc_error(
+            -32603,
+            "internal error"
+        )));
+        assert!(is_transient_window_error(&anyhow::Error::new(
+            alloy::transports::TransportErrorKind::custom_str("connection reset")
+        )));
+        assert!(is_transient_window_error(&anyhow::anyhow!(
+            "get_logs timed out after 10s"
+        )));
+        // A range rejection shrinks the window instead.
+        assert!(!is_transient_window_error(&rpc_error(
+            35,
+            "ranges over 10000 blocks are not supported on free plan"
+        )));
+        // A deterministic JSON-RPC error fails the same way on every retry.
+        assert!(!is_transient_window_error(&rpc_error(
+            -32602,
+            "invalid params"
+        )));
+        assert!(!is_transient_window_error(&rpc_error(
+            -32601,
+            "the method eth_getLogs does not exist"
+        )));
+    }
+
+    /// A window that fails once with a transient error and then succeeds
+    /// completes the tick: no route is marked down.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_window_error_retries_and_the_tick_succeeds() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let Some(RetryPoller {
+            mut poller,
+            backoff,
+            retries,
+            store,
+        }) = retry_poller(provider.clone())
+        else {
+            return;
+        };
+
+        asserter.push_success(&U64::from(20));
+        push_rpc_failure(&asserter, 19, "Temporary internal error. Please retry");
+        asserter.push_success(&Vec::<Log>::new());
+
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(
+            result.is_ok(),
+            "the retried window completes the tick: {result:?}"
+        );
+        assert_eq!(retries.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            backoff.load(Ordering::SeqCst),
+            0,
+            "a retried window is not downtime"
+        );
+        assert_eq!(poller.routes.first().and_then(|r| r.cursor), Some(21));
+        assert_eq!(
+            store
+                .load_checkpoint(CheckpointKey::PoolOpened)
+                .ok()
+                .flatten(),
+            Some(20)
+        );
+        assert!(
+            poller.routes.iter().all(|r| r.established && !r.recovering),
+            "a retried window leaves the route established"
+        );
+    }
+
+    /// A window that fails on every attempt fails the tick after
+    /// `GET_LOGS_WINDOW_RETRIES` retries, and the error says so.
+    #[tokio::test(start_paused = true)]
+    async fn a_window_that_keeps_failing_fails_the_tick_after_the_retries() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let Some(RetryPoller {
+            mut poller,
+            backoff,
+            retries,
+            ..
+        }) = retry_poller(provider.clone())
+        else {
+            return;
+        };
+
+        asserter.push_success(&U64::from(20));
+        for _ in 0..=GET_LOGS_WINDOW_RETRIES {
+            push_rpc_failure(&asserter, 30, "Request timeout on the free plan");
+        }
+
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        let err = result.err().map(|e| format!("{e:#}"));
+        assert!(
+            err.as_ref().is_some_and(|e| e.contains("in-tick retries")),
+            "the exhausted window fails the tick and names the retries: {err:?}"
+        );
+        assert_eq!(
+            retries.load(Ordering::SeqCst),
+            usize::try_from(GET_LOGS_WINDOW_RETRIES).unwrap_or(usize::MAX)
+        );
+        assert_eq!(backoff.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            poller.routes.first().and_then(|r| r.cursor),
+            Some(1),
+            "the cursor holds at the failed window's start"
+        );
+    }
+
+    /// A deterministic JSON-RPC error fails the tick at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_window_error_is_not_retried() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let Some(RetryPoller {
+            mut poller,
+            backoff,
+            retries,
+            ..
+        }) = retry_poller(provider.clone())
+        else {
+            return;
+        };
+
+        asserter.push_success(&U64::from(20));
+        push_rpc_failure(&asserter, -32602, "invalid params");
+
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(result.is_err(), "a permanent error fails the tick");
+        assert_eq!(retries.load(Ordering::SeqCst), 0);
+        assert_eq!(backoff.load(Ordering::SeqCst), 1);
+    }
+
+    /// A range rejection takes the shrink path, not the retry path.
+    #[tokio::test(start_paused = true)]
+    async fn a_range_rejection_is_not_retried() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let Some(RetryPoller {
+            mut poller,
+            retries,
+            ..
+        }) = retry_poller(provider.clone())
+        else {
+            return;
+        };
+
+        asserter.push_success(&U64::from(20));
+        push_rpc_failure(
+            &asserter,
+            35,
+            "ranges over 10000 blocks are not supported on free plan",
+        );
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&Vec::<Log>::new());
+
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(
+            result.is_ok(),
+            "the halved windows complete the tick: {result:?}"
+        );
+        assert_eq!(retries.load(Ordering::SeqCst), 0);
+        assert_eq!(poller.span.current(), 10);
+    }
+
+    /// Shutdown during the retry sleep ends the tick at once, with no backoff
+    /// edge and no further `get_logs`.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_a_retry_sleep_ends_the_tick() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let Some(RetryPoller {
+            mut poller,
+            backoff,
+            retries,
+            ..
+        }) = retry_poller(provider.clone())
+        else {
+            return;
+        };
+
+        asserter.push_success(&U64::from(20));
+        push_rpc_failure(&asserter, 19, "Temporary internal error. Please retry");
+
+        let shutdown = CancellationToken::new();
+        let cancel = async {
+            tokio::time::sleep(GET_LOGS_WINDOW_RETRY_DELAY / 2).await;
+            shutdown.cancel();
+        };
+        let started = tokio::time::Instant::now();
+        let (result, ()) = tokio::join!(run_tick(&provider, &mut poller, &shutdown), cancel);
+        assert!(result.is_ok(), "shutdown ends the tick cleanly: {result:?}");
+        assert!(
+            started.elapsed() < GET_LOGS_WINDOW_RETRY_DELAY,
+            "the retry sleep does not outlast shutdown"
+        );
+        assert_eq!(retries.load(Ordering::SeqCst), 1);
+        assert_eq!(backoff.load(Ordering::SeqCst), 0);
+        assert_eq!(poller.routes.first().and_then(|r| r.cursor), Some(1));
     }
 
     #[test]

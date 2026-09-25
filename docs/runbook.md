@@ -127,6 +127,13 @@ becomes scrapeable once boot completes.
   about 4 blocks per second, so about 30 blocks per 7 s tick) still works, but
   each tick then costs several `eth_getLogs` requests against the provider's
   quota.
+- `decdn_chain_get_logs_retries_total` counts `eth_getLogs` windows the poller
+  retried inside a tick after a transient provider error (dRPC
+  `Temporary internal error`, `Request timeout on the free plan`, a
+  timeout, a rate limit). Each window gets two retries, 2 s apart, before the
+  tick fails. A retry that succeeds is not watcher downtime, so a steady retry
+  rate with healthy watchers is a flaky provider that the poller absorbs. The
+  "eth_getLogs window span" panel plots it beside the rejections.
 - `multiplexed poller tick error` `warn!` lines on `get_logs` while
   `decdn_rpc_healthy` stays 1 mean the watchers cannot read events although
   the endpoint answers. `rejects even a one-block eth_getLogs window` means the
