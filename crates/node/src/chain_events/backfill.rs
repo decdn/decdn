@@ -5,10 +5,10 @@
 //! (rather than in any one watcher) so a new consumer picks up the shared windowing
 //! instead of forking a fresh one (#1092).
 //!
-//! This provides the live-tail windowing every watcher shares, plus the
-//! durable-cursor rewind that only the settlement watcher resumes from. The
-//! genesis-replay watchers (origin directory, blacklist, buyer-reconcile)
-//! enumerate their state from a contract view at a pinned block and use neither.
+//! Every watcher shares the live-tail windowing. Only the settlement watcher
+//! resumes a durable cursor, so only it uses the reorg rewind. The others seed
+//! their cursor at a pinned enumeration block (blacklist, slash, staker set) or
+//! at head (fee shares) and persist nothing.
 
 /// How many blocks the persisted scan checkpoint is rewound before the
 /// resume backfill (#751), absorbing a shallow reorg between the last scanned
@@ -24,9 +24,9 @@
 ///
 /// One live consumer: the settlement watcher ([`crate::payment_settlement`], #751),
 /// through [`super::resumable_watcher::CursorStart::FromCheckpoint`]'s `reorg_margin`.
-/// The origin directory seeds its tail at the enumeration block and persists
-/// nothing, so it has no cursor to rewind; a reorg below that block is corrected
-/// by the next boot's enumeration.
+/// The other watchers seed their tail at an enumeration block or at head and
+/// persist nothing, so they have no cursor to rewind; a reorg below that block
+/// is corrected by the next boot's enumeration.
 pub(crate) const REORG_MARGIN_BLOCKS: u64 = 128;
 
 /// The inclusive end of the `eth_getLogs` window that starts at `start`: at

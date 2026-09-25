@@ -3,9 +3,9 @@
 //!
 //! [`resumable_watcher`](super::resumable_watcher) gives every watcher its own
 //! cursor loop and its own `eth_getLogs` call each tick. That is right when a
-//! watcher's filter genuinely differs from its siblings', but six watchers on
-//! this node scan disjoint `(address, topic0)` slices of the *same* four
-//! contracts — so six independent loops cost six `eth_getLogs` calls per tick
+//! watcher's filter genuinely differs from its siblings', but five watchers on
+//! this node scan disjoint `(address, topic0)` slices of the same few
+//! contracts — so five independent loops cost five `eth_getLogs` calls per tick
 //! where one merged call, demuxed after the fact, would do. [`MultiplexedPoller`]
 //! is that merge: one filter, one `eth_getLogs` per window, fanned out by
 //! `(address, topic0)` into each watcher's own [`ErasedSink`].
@@ -40,7 +40,7 @@
 //! checkpoint-load floor derivation, or the merged `get_logs` call): those fail
 //! the *whole* tick before any route-specific step runs, so [`fail_whole_tick`]
 //! fires `on_backoff` for every route directly at the failure site — every route
-//! is equally down, just as six independent watchers all convoyed into backoff
+//! is equally down, just as five independent watchers all convoyed into backoff
 //! together when every one read the shared head through
 //! [`super::shared_head::SharedHead`].
 //!
@@ -49,9 +49,17 @@
 //! token must not flip a readiness gate open), while `on_tick_success` keeps
 //! stamping unconditionally.
 //!
+//! # Provider range caps
+//!
+//! A `get_logs` failure that [`is_range_rejection`] recognises does not fail the
+//! tick. [`run_tick`] sets the window span to half the rejected window's length
+//! and retries the same start block at once; no hook fires. The smaller span
+//! holds for the process lifetime. Only a rejected one-block window, or any
+//! other `get_logs` failure, goes through [`fail_whole_tick`].
+//!
 //! The runtime registers each `eth_getLogs` watcher's [`Route`] on one
 //! poller in `build_chain_and_handlers` and spawns it once — one merged loop in
-//! place of six independent per-watcher loops (five when the fee-shares
+//! place of five independent per-watcher loops (four when the fee-shares
 //! route is absent: it registers only when the startup `feeRouter()` read
 //! succeeds).
 //!
@@ -235,9 +243,9 @@ pub struct MultiplexedPoller {
     from_block: u64,
     poll_interval: Duration,
     /// Block span of the next `eth_getLogs` window. Starts at the configured
-    /// ceiling and only shrinks: [`run_tick`] halves it when the provider
-    /// rejects a window's range, and the smaller span holds for the rest of the
-    /// process lifetime. Always `>= 1` ([`MultiplexedPollerBuilder::build`]
+    /// ceiling and only shrinks: when the provider rejects a window's range,
+    /// [`run_tick`] sets it to half the rejected window's length, and the
+    /// smaller span holds for the rest of the process lifetime. Always `>= 1` ([`MultiplexedPollerBuilder::build`]
     /// rejects `0`).
     max_backfill_span: u64,
     initial_backoff: Duration,
@@ -614,12 +622,14 @@ fn fire_route_hooks(poller: &mut MultiplexedPoller, shutdown: &CancellationToken
 /// different codes for this: dRPC `35 "ranges over 10000 blocks are not
 /// supported"`, Alchemy `-32600 "… up to a 10 block range"`, Infura `-32005
 /// "query returned more than 10000 results"` (also its rate-limit code),
-/// Quicknode `-32614 "eth_getLogs is limited to a 10,000 range"`. The codes do
-/// not agree, so the test is the message: a JSON-RPC error response that names
-/// a range, or a result count together with a limit word ("more than",
-/// "exceed", "max", "limit", "too many"). "out of range" is excluded: a load-balanced
-/// provider whose backend lags head reports a `toBlock` past that backend's
-/// head that way, and the shrink is sticky. Any other error — a timeout, a
+/// Quicknode `-32614 "eth_getLogs is limited to a 10,000 range"`, Ankr
+/// `"block range is too wide"`. The codes do not agree, so the test is the
+/// message: a JSON-RPC error response that names a range or a result count
+/// *and* a limit ([`LIMIT_WORDS`]). Both parts are required because the shrink
+/// is sticky: a load-balanced provider whose backend lags head reports a
+/// `toBlock` past that backend's head with range wording but no limit ("block
+/// range extends beyond current head block", "block number is out of range"),
+/// and a smaller window is not the fix for that. Any other error — a timeout, a
 /// transport failure, a rate limit, an unknown block — takes the backoff path
 /// and leaves the window span alone, so a transient fault cannot shrink it.
 fn is_range_rejection(err: &anyhow::Error) -> bool {
@@ -628,17 +638,32 @@ fn is_range_rejection(err: &anyhow::Error) -> bool {
         .and_then(TransportError::as_error_resp)
         .is_some_and(|resp| {
             let message = resp.message.to_ascii_lowercase();
-            let result_limit = message.contains("results")
-                && ["more than", "exceed", "max", "limit", "too many"]
-                    .iter()
-                    .any(|word| message.contains(word));
-            (message.contains("range") && !message.contains("out of range")) || result_limit
+            (message.contains("range") || message.contains("results"))
+                && !message.contains("out of range")
+                && LIMIT_WORDS.iter().any(|word| message.contains(word))
         })
 }
 
+/// Words that mark a range or result-count message as a limit, not a
+/// head-lag or lookup error. See [`is_range_rejection`].
+const LIMIT_WORDS: [&str; 10] = [
+    "limit",
+    "max",
+    "exceed",
+    "up to",
+    " over ",
+    "more than",
+    "too many",
+    "too wide",
+    "too large",
+    "not supported",
+];
+
 /// Run one poll tick: read head, resolve each route's floor, scan the merged
 /// `[min(floor), head]` range in windows (one `get_logs` per window), demux
-/// each log to its owning route, then reconcile and fire hooks. Returns `Err`
+/// each log to its owning route, then reconcile and fire hooks. A recognised
+/// provider range rejection retries the window at half its length instead of
+/// failing (see the module doc's "Provider range caps"). Returns `Err`
 /// if the shared head/floor/`get_logs` reads fail, or if any route errored
 /// applying a log or reconciling — either way the *loop* backs off, but a
 /// route that itself succeeded this tick has already advanced and persisted.
@@ -684,18 +709,27 @@ async fn run_tick<P: Provider + Clone>(
                 // wider) range can never succeed. Halve the window and retry
                 // it at once. A one-block window cannot shrink, so its
                 // rejection takes the backoff path like any other failure.
-                if let Some(span) = halved_span(start, end).filter(|_| is_range_rejection(&err)) {
+                let range_rejected = is_range_rejection(&err);
+                if let Some(span) = halved_span(start, end).filter(|_| range_rejected) {
                     warn!(
                         error = %sanitize_err_chain(&err),
                         rejected_span = (end - start).saturating_add(1),
                         span,
                         "RPC provider rejected the eth_getLogs block range; \
                          shrinking the poll window (set blockchain.get_logs_max_block_span \
-                         to the provider's limit)"
+                         to the logged span to skip this after a restart)"
                     );
                     poller.max_backfill_span = span;
                     continue;
                 }
+                let err = if range_rejected {
+                    err.context(
+                        "the RPC provider rejects even a one-block eth_getLogs window; \
+                         it cannot serve the chain watchers — use another provider",
+                    )
+                } else {
+                    err
+                };
                 return Err(fail_whole_tick(poller, shutdown, err));
             }
         };
@@ -2266,7 +2300,7 @@ mod tests {
 
     #[test]
     fn range_rejection_matches_provider_range_and_result_caps() {
-        // dRPC free tier (the real cap was ~100-178 blocks, whatever the text says).
+        // dRPC's free tier rejects ranges above ~100-178 blocks, whatever the text says.
         assert!(is_range_rejection(&rpc_error(
             35,
             "ranges over 10000 blocks are not supported on free plan"
@@ -2281,6 +2315,15 @@ mod tests {
         assert!(is_range_rejection(&rpc_error(
             -32005,
             "query returned more than 10000 results"
+        )));
+        // Ankr and Chainstack.
+        assert!(is_range_rejection(&rpc_error(
+            -32600,
+            "block range is too wide"
+        )));
+        assert!(is_range_rejection(&rpc_error(
+            -32000,
+            "Block range limit exceeded"
         )));
         // geth / Erigon result cap.
         assert!(is_range_rejection(&rpc_error(
@@ -2310,6 +2353,15 @@ mod tests {
         )));
         assert!(!is_range_rejection(&rpc_error(-32000, "unknown block")));
         assert!(!is_range_rejection(&rpc_error(-32603, "internal error")));
+        // Head-lag range wording without a limit word.
+        assert!(!is_range_rejection(&rpc_error(
+            -32000,
+            "block range extends beyond current head block"
+        )));
+        assert!(!is_range_rejection(&rpc_error(
+            -32602,
+            "invalid block range params"
+        )));
         // "results" alone is not a result limit.
         assert!(!is_range_rejection(&rpc_error(
             -32000,
@@ -2395,6 +2447,63 @@ mod tests {
                 .ok()
                 .flatten(),
             Some(20)
+        );
+    }
+
+    /// A result cap that trips on a later, dense window after earlier windows
+    /// already applied and persisted: the retry resumes at the rejected
+    /// window's start, so no log is skipped or applied twice.
+    #[tokio::test]
+    async fn a_mid_backfill_rejection_retries_from_the_rejected_window() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let (route, sink, store) = checkpoint_route(1);
+        let built =
+            MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
+                .max_backfill_span(10)
+                .route(route)
+                .build();
+        let Ok(mut poller) = assert_built(built) else {
+            return;
+        };
+
+        // head=30, span 10: [1,10] ok, [11,20] rejected, then span 5:
+        // [11,15], [16,20], [21,25], [26,30].
+        asserter.push_success(&U64::from(30));
+        asserter.push_success(&vec![log_at(ADDR_A, TOPIC_A, 5)]);
+        if let Some(payload) = error_payload(-32005, "query returned more than 10000 results") {
+            asserter.push_failure(payload);
+        }
+        asserter.push_success(&vec![log_at(ADDR_A, TOPIC_A, 12)]);
+        asserter.push_success(&vec![log_at(ADDR_A, TOPIC_A, 18)]);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&Vec::<Log>::new());
+
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(
+            result.is_ok(),
+            "the retried windows must complete the tick: {result:?}"
+        );
+        assert_eq!(poller.max_backfill_span, 5);
+        let applied: Vec<Option<u64>> = sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .applied
+            .iter()
+            .map(|(_, _, block)| *block)
+            .collect();
+        assert_eq!(
+            applied,
+            vec![Some(5), Some(12), Some(18)],
+            "each log applied exactly once, in order"
+        );
+        assert_eq!(poller.routes.first().and_then(|r| r.cursor), Some(31));
+        assert_eq!(
+            store
+                .load_checkpoint(CheckpointKey::PoolOpened)
+                .ok()
+                .flatten(),
+            Some(30)
         );
     }
 
@@ -2522,8 +2631,8 @@ mod tests {
         }
     }
 
-    /// The production failure: a provider capping `eth_getLogs` at 150 blocks
-    /// and a 1 651-block gap behind head. The poller must shrink its window over
+    /// A provider capping `eth_getLogs` at 150 blocks and a 1 651-block gap
+    /// behind head. The poller must shrink its window over
     /// the real HTTP error path, finish the backfill in one tick, and keep the
     /// learned span so the next tick sends no rejected request.
     #[tokio::test]

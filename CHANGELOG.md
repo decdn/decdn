@@ -831,15 +831,17 @@ since project inception and will roll into the first tagged release.
   the error. A provider with a lower range cap (dRPC's free tier rejects about
   150 blocks, Alchemy's free tier 10) rejected every window, the cursor held,
   and each backoff retry asked for a wider range, so every watcher stayed
-  blind until restart. The poller now halves its window when the provider's
-  JSON-RPC error names a range or result limit, retries at once, and keeps the
-  smaller span for the process lifetime; timeouts, rate limits and other
-  errors keep the backoff path. The five `*WatcherStalled` alerts only read
-  the tick gauge behind a `> 0` guard, and a never-ticked watcher reads `0`,
-  so none fired. Each now also fires on
-  `decdn_<watcher>_watcher_down_seconds > 180`. The "Oldest watcher tick", "Watcher tick age" and "Settlement
-  watcher freshness" panels show a failing never-ticked watcher by its
-  down-seconds instead of dropping it.
+  blind. A restart did not help once the settlement checkpoint was more than
+  the cap behind head. The poller now sets its window to half the rejected
+  window when the provider's JSON-RPC error names a range or result limit,
+  retries at once, and keeps the smaller span for the process lifetime;
+  timeouts, rate limits, head-lag errors and other errors keep the backoff
+  path. The five `*WatcherStalled` alerts only read the tick gauge behind a
+  `> 0` guard, and a never-ticked watcher reads `0`, so none fired. Each now
+  also fires on `decdn_<watcher>_watcher_down_seconds > 180`. The "Oldest
+  watcher tick", "Watcher tick age" and "Settlement watcher freshness" panels
+  show a failing never-ticked watcher by its down-seconds instead of dropping
+  it.
 
 - **Tracing: dependency spans no longer export, and each run of a streaming
   miss has an `upstream_stream` span (#2048).** The OTLP export filter

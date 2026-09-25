@@ -148,8 +148,9 @@ pub struct ResolvedBlockchain {
     /// enforces a minimum (see `MIN_EVENT_POLL_INTERVAL_MS`).
     pub event_poll_interval_ms: u64,
     /// Starting ceiling on the block span of one chain-watcher `eth_getLogs`
-    /// request (the `MultiplexedPoller`'s window). The poller halves it for the
-    /// rest of the process lifetime when the provider rejects a range. Defaults
+    /// request (the `MultiplexedPoller`'s window). When the provider rejects a
+    /// range, the poller sets its span to half the rejected window's length for
+    /// the rest of the process lifetime. Defaults
     /// to [`super::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN`]; always `>= 1`.
     pub get_logs_max_block_span: u64,
     /// Seconds between authoritative `FeeRouter.getShares()` re-reads by the

@@ -82,10 +82,11 @@ const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
 /// Default ceiling on the block span of one chain-watcher `eth_getLogs`
 /// request. A node that resumes far behind head scans the gap in windows of at
 /// most this many blocks, because one unbounded request would exceed the range
-/// and result caps that RPC providers enforce. 10 000 clears the common paid
-/// and public caps. A provider with a lower cap (free tiers go down to 10
-/// blocks) rejects the request, and the poller then halves its window until the
-/// provider accepts it.
+/// and result caps that RPC providers enforce. 10 000 clears the common
+/// paid-tier range caps. It bounds the block span, not the result count, so a
+/// dense window can still trip a result cap. A provider with a lower cap (free
+/// tiers go down to 10 blocks) or a result cap rejects the request, and the
+/// poller then halves its window until the provider accepts it.
 pub const DEFAULT_GET_LOGS_MAX_BLOCK_SPAN: u64 = 10_000;
 
 /// Default accrued-claim redemption threshold: 1 USDC (`1_000_000` `µUSDC`).

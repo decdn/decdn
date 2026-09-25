@@ -228,9 +228,10 @@ pub struct BlockchainConfig {
     /// `MIN_EVENT_POLL_INTERVAL_MS` are rejected at config resolution.
     pub event_poll_interval_ms: Option<u64>,
     /// Maximum block span of one chain-watcher `eth_getLogs` request. Set it to
-    /// the RPC provider's documented `eth_getLogs` range limit. The poller also
-    /// halves its window on its own when the provider rejects a range, so this
-    /// is a starting ceiling, not a hard requirement. Absent =>
+    /// the RPC provider's actual `eth_getLogs` range limit: the `span` that the
+    /// poller's shrink `warn!` logs. A provider's documented or quoted limit can
+    /// be wrong. The poller also shrinks its window on its own when the provider
+    /// rejects a range, so this is a starting ceiling, not a hard requirement. Absent =>
     /// [`super::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN`] (10 000). Must not be `0`;
     /// rejected at config resolution.
     pub get_logs_max_block_span: Option<u64>,

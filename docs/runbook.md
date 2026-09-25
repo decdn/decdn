@@ -69,10 +69,11 @@ blacklist updates and stop being able to settle channels. Once
 **Detect:**
 
 - Existing alerts in `monitoring/prometheus-alerts.yml`: a dead endpoint stalls
-  every chain-event watcher at once, so expect the five stalled alerts to fire
-  together — `DecdnBlacklistWatcherStalled`, `DecdnSlashWatcherStalled`,
-  `DecdnStakerSetWatcherStalled`, `DecdnFeeSharesWatcherStalled`, and
-  `DecdnSettlementWatcherStalled`. Several firing together points at the RPC endpoint
+  every chain-event watcher at once, so expect up to five stalled alerts to
+  fire together — `DecdnBlacklistWatcherStalled`, `DecdnSlashWatcherStalled`,
+  `DecdnStakerSetWatcherStalled`, `DecdnFeeSharesWatcherStalled` (only where
+  the fee-shares watcher is registered), and `DecdnSettlementWatcherStalled`.
+  Several firing together points at the RPC endpoint
   rather than at any one watcher. Each fires on the *age* of that watcher's last
   successful tick (guarded against the pre-first-tick sentinel) **or** on
   `decdn_*_watcher_down_seconds`, which counts from the first failed poll tick —
@@ -95,18 +96,24 @@ blacklist updates and stop being able to settle channels. Once
 
 - Provider status page.
 
-- `multiplexed poller tick error` `warn!` lines whose error names a block range
-  or a result limit (dRPC `ranges over 10000 blocks are not supported`, Alchemy
-  `up to a 10 block range`, Infura `more than 10000 results`) mean the provider
-  caps `eth_getLogs`. The endpoint is up (`decdn_rpc_healthy` stays 1) but the
-  watchers cannot read events. The poller halves its window on each such
-  rejection and logs `RPC provider rejected the eth_getLogs block range;
-  shrinking the poll window` with the new `span`; the span holds until restart.
-  Set `blockchain.get_logs_max_block_span` to the provider's limit so a restart
-  does not re-learn it. A cap below one poll interval of blocks (Arbitrum makes
-  about 4 blocks per second, so about 30 blocks per 7 s tick) still works, but
-  each tick then costs several `eth_getLogs` requests against the provider's
-  quota.
+- `RPC provider rejected the eth_getLogs block range; shrinking the poll
+  window` `warn!` lines mean the provider caps `eth_getLogs` (dRPC
+  `ranges over 10000 blocks are not supported`, Alchemy
+  `up to a 10 block range`, Infura `more than 10000 results`). The poller sets
+  its window to half the rejected window and retries at once; the smaller span
+  holds until restart. Set `blockchain.get_logs_max_block_span` to the last
+  logged `span`, **not** to the number in the provider's message — dRPC's free
+  tier says 10 000 but rejects about 150. A cap below one poll interval of
+  blocks (Arbitrum makes about 4 blocks per second, so about 30 blocks per 7 s
+  tick) still works, but each tick then costs several `eth_getLogs` requests
+  against the provider's quota.
+- `multiplexed poller tick error` `warn!` lines on `get_logs` while
+  `decdn_rpc_healthy` stays 1 mean the watchers cannot read events although
+  the endpoint answers. `rejects even a one-block eth_getLogs window` means the
+  provider cannot serve the watchers at all: change provider. Repeated
+  `get_logs` timeouts, or a range or size error the poller does not recognise
+  (it logs no shrink line), mean the windows are too wide for this provider:
+  lower `blockchain.get_logs_max_block_span` and restart.
 
 - `decdn_staker_set_watcher_down_seconds` climbing (with
   `decdn_staker_set_watcher_restarts_total` advancing) is the chain-side
@@ -225,7 +232,8 @@ slashed by an external adversary.
   - `DecdnBlacklistWatcherStalled` (critical) — the blacklist watcher has
     not completed a poll tick for several intervals, so the node may be
     serving content blacklisted since the last successful tick. It fires on
-    the age of `decdn_blacklist_watcher_last_tick_timestamp_seconds`. See
+    the age of `decdn_blacklist_watcher_last_tick_timestamp_seconds`, or on
+    `decdn_blacklist_watcher_down_seconds` when every poll tick fails. See
     [ContentBlacklist compliance](#contentblacklist-compliance).
   - `DecdnBlacklistEnforcementFailing` (critical) — a re-scope could not
     re-verify or evict every known deny-set entry, so a blacklisted hash may
@@ -360,13 +368,15 @@ action is required.
 - Alerts in `monitoring/prometheus-alerts.yml` (verbatim names):
   - `DecdnBlacklistWatcherStalled` (critical) — no successful poll tick for
     several intervals; fires on the age of
-    `decdn_blacklist_watcher_last_tick_timestamp_seconds`.
+    `decdn_blacklist_watcher_last_tick_timestamp_seconds`, or on
+    `decdn_blacklist_watcher_down_seconds` when every poll tick fails.
   - `DecdnBlacklistEnforcementFailing` (critical) — a re-scope could not
     re-verify or evict every known entry, so a blacklisted hash may still be
     servable even while `decdn_blacklist_watcher_down_seconds` reads 0. The two
     answer different questions: deny-set enforced vs chain readable.
-- Grafana: the "Blacklist watcher tick age" panel in
-  `monitoring/grafana-dashboard.json`.
+- Grafana: the "Oldest watcher tick" panel in
+  `monitoring/grafana-dashboard.json`, and the per-watcher "Watcher tick age"
+  table in `monitoring/dashboard-chain.json`.
 - There is no sync-lag or version-delta coverage: the watcher rebuilds the
   deny-set by full enumeration and keeps no version cursor
   (`adr/011-content-takedown.md` § Node Behavior), so no such gauge exists. The

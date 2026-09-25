@@ -1622,7 +1622,7 @@ pub struct DecdnMetrics {
     // a watcher that panicked while healthy, wedged in an await, or exited
     // cleanly leaves `down_since == None` and reads a healthy `0` forever — a
     // dead watcher is byte-identical to a live one. These two families close
-    // that gap for all six chain-event watchers: `*_last_tick_timestamp_seconds`
+    // that gap for all five chain-event watchers: `*_last_tick_timestamp_seconds`
     // is a *positive* liveness signal a dead task cannot advance, and
     // `*_task_panicked_total` makes an otherwise-discarded task panic visible.
     /// `decdn_slash_watcher_last_tick_timestamp_seconds` (#1316): Unix time of
