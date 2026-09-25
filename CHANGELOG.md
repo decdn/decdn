@@ -825,6 +825,20 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **An own origin that declines `Range` degrades before the node signs
+  (#2069).** The own-origin serve-miss probe now reads the blob's first chunk
+  group as a ranged GET. An origin that publishes `{H}.obao4` but ignores
+  `Range` falls back to the buffered whole-blob pull instead of signing
+  `ok: true` and failing the stream on its first draw. A per-origin latch skips
+  the probe once the origin serves a clean range window. A panic in the range
+  encode now surfaces as a local store fault with its message, logged as an
+  internal fault, not as a local-origin fault. New series:
+  `decdn_cache_range_pull_permit_waits_total` (draws that waited on the full
+  range-pull pool, warning past 10 s) and
+  `decdn_node_pull_through_wait_seconds` (length of each pull pause, warning
+  past 30 s). `decdn_cache_fill_not_coalesced_total` now counts once per claim,
+  and only when the skipped fill overlaps the request.
+
 - **The cache footprint counts a partial blob's present bytes (#2157).**
   `size_snapshot` sized a partial blob from iroh-blobs' `status()`, which
   leaves the size unknown until the blob's last chunk arrives and then reports
