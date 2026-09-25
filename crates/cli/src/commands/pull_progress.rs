@@ -30,6 +30,13 @@
 //! (one that survives the include/exclude filters) declares a size, the total bar is
 //! omitted and only per-file bars render.
 //!
+//! In a terminal that supports the OSC 9;4 progress sequence (iTerm2, Ghostty,
+//! `WezTerm`, Windows Terminal, and others; detected by `anstyle-progress`, as Cargo
+//! does), the total bar's percent also drives the terminal's own progress
+//! indicator in the tab bar or dock. A run with no total bar shows it as
+//! indeterminate. The indicator is removed when the run finishes or the renderer
+//! drops.
+//!
 //! The whole renderer is silent — every bar a no-op, every file's delivery
 //! callback `None` — when stderr is not a terminal or the run is `--json`, so
 //! piped and scripted output is byte-for-byte what it was before per-file bars.
@@ -43,6 +50,7 @@ use std::time::{Duration, Instant};
 use decdn_client::ProgressCallback;
 
 use super::fetch;
+use super::tab_progress::TabProgress;
 
 /// The label for a pull's bar: its first destination path, plus a `(+k more)`
 /// tail when the same blob lands at more than one path (a fetch-once hash group).
@@ -65,6 +73,14 @@ pub(crate) fn file_label(paths: &[String]) -> String {
 /// overwritten. Nothing touches a bar before the container owns it.
 const TICK: Duration = Duration::from_millis(120);
 
+/// A bar of length `len` that clears its line when dropped unfinished, as the
+/// in-flight bars are when a Ctrl-C stops the run. Setting the finish mode draws
+/// nothing, so the bar is still untouched when the container takes it (see
+/// [`TICK`]).
+fn new_bar(len: u64) -> indicatif::ProgressBar {
+    indicatif::ProgressBar::new(len).with_finish(indicatif::ProgressFinish::AndClear)
+}
+
 /// The multi-bar renderer for one `bundle pull` run. Disabled variants (no inner
 /// state) make every method a no-op and every bar handle silent.
 pub(crate) struct PullProgress {
@@ -80,12 +96,26 @@ struct Inner {
     /// the run's rate/ETA; per-file bars insert before it. `None` when the manifest
     /// declares no sizes, in which case only per-file bars render.
     total: Option<TotalBar>,
+    /// The terminal's tab-bar indicator; `None` when the terminal lacks OSC 9;4.
+    tab: Option<Arc<TabProgress>>,
     /// How many of each file's download bytes the total bar already holds, by bar
     /// label. A retry round builds a new bar for a file whose earlier bar already
     /// folded its landed prefix into the total, and its first callback reports
     /// that same prefix again as it resumes; the new bar picks up the old
     /// high-water mark so those bytes are not counted twice.
     folded: Mutex<HashMap<String, Arc<AtomicU64>>>,
+}
+
+impl Drop for Inner {
+    /// Remove the tab-bar indicator when the renderer drops, even if a per-file
+    /// callback still holds a clone of it: an early return must not leave a
+    /// stale percent in the tab, and a late update after the clear writes
+    /// nothing.
+    fn drop(&mut self) {
+        if let Some(tab) = &self.tab {
+            tab.clear();
+        }
+    }
 }
 
 /// The bottom total bar plus the rate meter behind its `{msg}`. Every downloaded
@@ -98,6 +128,8 @@ pub(crate) struct TotalBar {
     bar: indicatif::ProgressBar,
     /// The whole-download rate estimate, sampled on every transferred increment.
     speed: Arc<Mutex<fetch::SpeedState>>,
+    /// The terminal's tab-bar indicator, fed the bar's percent on every increment.
+    tab: Option<Arc<TabProgress>>,
 }
 
 impl TotalBar {
@@ -112,19 +144,24 @@ impl TotalBar {
         .progress_chars("=>-")
     }
 
-    /// Wrap an existing bar with a fresh meter.
-    fn wrap(bar: indicatif::ProgressBar) -> Self {
+    /// Wrap an existing bar with a fresh meter, mirroring its percent into `tab`.
+    fn wrap(bar: indicatif::ProgressBar, tab: Option<Arc<TabProgress>>) -> Self {
         Self {
             bar,
             speed: Arc::new(Mutex::new(fetch::SpeedState::default())),
+            tab,
         }
     }
 
-    /// Advance the total by `bytes` of transferred content and refresh the
-    /// rate/ETA from the new position.
+    /// Advance the total by `bytes` of transferred content, refresh the
+    /// rate/ETA from the new position, and update the tab-bar percent.
     fn inc(&self, bytes: u64) {
         self.bar.inc(bytes);
         self.refresh_rate();
+        if let Some(tab) = &self.tab {
+            let position = self.bar.position();
+            tab.update(position, self.bar.length().unwrap_or(position));
+        }
     }
 
     /// Sample the meter at the bar's current position and rewrite the `{msg}` as
@@ -193,13 +230,14 @@ impl PullProgress {
             };
             let _ = mp.println(header);
         }
-        let total = download_total
-            .filter(|n| *n > 0)
-            .map(|len| Self::add_total_bar(&mp, len));
+        let download_total = download_total.filter(|n| *n > 0);
+        let tab = TabProgress::detect(download_total.is_some());
+        let total = download_total.map(|len| Self::add_total_bar(&mp, len, tab.clone()));
         Self {
             inner: Some(Inner {
                 mp,
                 total,
+                tab,
                 folded: Mutex::new(HashMap::new()),
             }),
         }
@@ -208,12 +246,16 @@ impl PullProgress {
     /// Build the bottom total bar with a fixed content-byte length inside the
     /// container, then style, label, and tick it (see [`TICK`] for why the add
     /// comes first).
-    fn add_total_bar(mp: &indicatif::MultiProgress, len: u64) -> TotalBar {
-        let bar = mp.add(indicatif::ProgressBar::new(len));
+    fn add_total_bar(
+        mp: &indicatif::MultiProgress,
+        len: u64,
+        tab: Option<Arc<TabProgress>>,
+    ) -> TotalBar {
+        let bar = mp.add(new_bar(len));
         bar.set_style(TotalBar::style());
         bar.set_prefix("total");
         bar.enable_steady_tick(TICK);
-        TotalBar::wrap(bar)
+        TotalBar::wrap(bar, tab)
     }
 
     /// A renderer that draws nothing and hands out silent bar handles.
@@ -240,10 +282,8 @@ impl PullProgress {
     /// owns it).
     fn insert_file_bar(i: &Inner, label: &str, download_total: u64) -> indicatif::ProgressBar {
         let bar = match &i.total {
-            Some(total) => {
-                i.mp.insert_before(&total.bar, indicatif::ProgressBar::new(download_total))
-            }
-            None => i.mp.add(indicatif::ProgressBar::new(download_total)),
+            Some(total) => i.mp.insert_before(&total.bar, new_bar(download_total)),
+            None => i.mp.add(new_bar(download_total)),
         };
         bar.set_style(Self::file_style());
         bar.set_prefix(label.to_string());
@@ -304,13 +344,17 @@ impl PullProgress {
         }
     }
 
-    /// Clear the total bar at the end of the run; the command then prints its own
-    /// summary line. A no-op when disabled or when there is no total bar.
+    /// Clear the total bar and remove the tab-bar indicator at the end of the run;
+    /// the command then prints its own summary line. A no-op when disabled.
     pub(crate) fn finish(&self) {
-        if let Some(i) = &self.inner
-            && let Some(total) = &i.total
-        {
+        let Some(i) = &self.inner else {
+            return;
+        };
+        if let Some(total) = &i.total {
             total.finish_and_clear();
+        }
+        if let Some(tab) = &i.tab {
+            tab.clear();
         }
     }
 }
@@ -495,10 +539,13 @@ mod tests {
 
     /// A hidden total bar of fixed content length `len`, with its own rate meter.
     fn hidden_total(len: u64) -> TotalBar {
-        TotalBar::wrap(indicatif::ProgressBar::with_draw_target(
-            Some(len),
-            indicatif::ProgressDrawTarget::hidden(),
-        ))
+        TotalBar::wrap(
+            indicatif::ProgressBar::with_draw_target(
+                Some(len),
+                indicatif::ProgressDrawTarget::hidden(),
+            ),
+            None,
+        )
     }
 
     #[test]
@@ -513,11 +560,12 @@ mod tests {
     fn hidden_pp(download_total: u64) -> (PullProgress, TotalBar) {
         let mp =
             indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
-        let total = TotalBar::wrap(mp.add(indicatif::ProgressBar::new(download_total)));
+        let total = TotalBar::wrap(mp.add(indicatif::ProgressBar::new(download_total)), None);
         let pp = PullProgress {
             inner: Some(Inner {
                 mp,
                 total: Some(total.clone()),
+                tab: None,
                 folded: Mutex::new(HashMap::new()),
             }),
         };
@@ -644,5 +692,38 @@ mod tests {
         let msg = total.bar.message();
         assert!(msg.starts_with('('), "{msg}");
         assert!(msg.contains("ETA"), "{msg}");
+    }
+
+    #[test]
+    fn dropping_the_renderer_clears_the_tab_while_a_callback_lives() {
+        let (tab, log) = TabProgress::recorded(true);
+        let (mut pp, _total) = hidden_pp(1000);
+        if let Some(i) = pp.inner.as_mut() {
+            i.tab = Some(Arc::clone(&tab));
+        }
+        // A per-file callback outlives the renderer, still holding the tab.
+        let late = Arc::clone(&tab);
+        drop(pp);
+        assert_eq!(log.lock().unwrap().last().unwrap(), "\x1b]9;4;0;\x1b\\");
+        late.update(500, 1000);
+        assert_eq!(
+            log.lock().unwrap().last().unwrap(),
+            "\x1b]9;4;0;\x1b\\",
+            "an update after the clear writes nothing"
+        );
+    }
+
+    #[test]
+    fn total_bar_inc_drives_the_tab_percent() {
+        let (tab, log) = TabProgress::recorded(true);
+        let total = TotalBar::wrap(
+            indicatif::ProgressBar::with_draw_target(
+                Some(1000),
+                indicatif::ProgressDrawTarget::hidden(),
+            ),
+            Some(tab),
+        );
+        total.inc(250);
+        assert_eq!(log.lock().unwrap().last().unwrap(), "\x1b]9;4;1;25\x1b\\");
     }
 }

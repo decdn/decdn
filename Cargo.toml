@@ -127,6 +127,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # `decdn fetch` delivery progress bar (#1118). TTY-aware by default (drawn to
 # stderr, hidden when piped/CI), so it never pollutes scripted output.
 indicatif = "0.18"
+# The terminal's own progress indicator (OSC 9;4: tab bar / dock badge) for
+# `decdn bundle pull`, with the per-terminal support detection Cargo uses.
+anstyle-progress = "0.1"
 
 # Observability
 tracing = "0.1"

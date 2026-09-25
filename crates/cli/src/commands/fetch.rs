@@ -72,6 +72,8 @@ use decdn_client::probe::probe_once;
 use decdn_client::provider;
 
 use super::buyer_store::{ChainAdoption, DataDirSource, open_client_store_for_buy};
+use super::interrupt::{Interrupt, Interrupted};
+use super::tab_progress::TabProgress;
 
 /// Per-candidate probe timeout during auto-discovery (#936). The K probes run
 /// concurrently, so this bounds selection latency rather than the overall fetch
@@ -129,7 +131,10 @@ fn new_progress_bar() -> indicatif::ProgressBar {
     // (returns the bar unchanged) on the default no-subscriber path. The bar is
     // attached before it is styled or ticked: either would draw a detached bar
     // straight to stderr, leaving an orphan line the container never clears.
-    let bar = crate::logging::attach_progress_bar(indicatif::ProgressBar::new(0));
+    // `AndClear`: a bar dropped unfinished (a Ctrl-C) clears its line too.
+    let bar = crate::logging::attach_progress_bar(
+        indicatif::ProgressBar::new(0).with_finish(indicatif::ProgressFinish::AndClear),
+    );
     bar.set_style(style);
     bar.enable_steady_tick(Duration::from_millis(120));
     bar
@@ -1285,6 +1290,40 @@ fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext) -> anyhow:
     }
 }
 
+/// Settles a drive that is dropped before it returns, as a Ctrl-C does.
+///
+/// A drive persists its lanes' voucher watermarks after it returns. A dropped
+/// drive never gets there, so this guard runs `settle` from its `Drop` instead:
+/// the lanes' paid bytes are recorded, at the armed (HIGH) settlement, and the
+/// next run's vouchers continue from them. A drive that returns calls
+/// [`Self::disarm`] and settles on its normal path.
+struct SettleOnDrop<F: FnOnce()> {
+    /// The settle to run on drop; `None` once disarmed.
+    settle: Option<F>,
+}
+
+impl<F: FnOnce()> SettleOnDrop<F> {
+    /// Arm `settle` for a drop before [`Self::disarm`].
+    const fn new(settle: F) -> Self {
+        Self {
+            settle: Some(settle),
+        }
+    }
+
+    /// The drive returned: its normal path settles, so the drop does nothing.
+    fn disarm(mut self) {
+        self.settle = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for SettleOnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(settle) = self.settle.take() {
+            settle();
+        }
+    }
+}
+
 /// Persist what the pool lane paid, warning rather than masking the fetch
 /// outcome.
 ///
@@ -1377,9 +1416,15 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // One discovery-enabled endpoint, reused for probing and the delivery dial.
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
     // The body runs in `fetch_over`, so the endpoint closes on every exit —
-    // success, an early return, or an error — and its open connections end
-    // cleanly instead of being aborted on drop.
-    let result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint).await;
+    // success, an early return, an error, or a Ctrl-C — and its open connections
+    // end cleanly instead of being aborted on drop. A Ctrl-C drops `fetch_over`
+    // mid-transfer: each drive's drop guard records what it paid, and the
+    // `.partial` is the next run's resume prefix.
+    let mut interrupt = Interrupt::watch();
+    let result = tokio::select! {
+        result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint) => result,
+        () = interrupt.wait() => Err(Interrupted.into()),
+    };
     endpoint.close().await;
     result
 }
@@ -2704,6 +2749,11 @@ where
         width: std::num::NonZeroUsize::MIN,
         takes_first: true,
     }];
+    // A dropped drive records the ranges it landed and the vouchers it signed.
+    let on_drop = SettleOnDrop::new(|| {
+        let _ = store.flush_present_record();
+        prelude.settle_lane(deps.store, lane, false, false);
+    });
     let driven = prelude
         .drive_watched(
             &store,
@@ -2716,6 +2766,7 @@ where
         )
         .await
         .into_result();
+    on_drop.disarm();
 
     // Finalize the progress bar (or run the caller's no-op, for `bundle pull`)
     // now that the transfer has settled, before persisting the watermark.
@@ -2876,6 +2927,14 @@ where
         })
         .collect();
     let pool = lead.prelude.pool_with(topups_used);
+    // A dropped drive records the ranges it landed and every lane's vouchers.
+    let on_drop = SettleOnDrop::new(|| {
+        let _ = store.flush_present_record();
+        for l in lanes {
+            let s = l.session;
+            s.prelude.settle_lane(s.store, s.lane, false, false);
+        }
+    });
     let outcome = lead
         .prelude
         .drive_watched(
@@ -2888,6 +2947,7 @@ where
             lead.deadlines,
         )
         .await;
+    on_drop.disarm();
     let succeeded = outcome.succeeded();
     // Only the floor is a failure every lane shares. A local fault of the
     // drive (a store query, a flush, a finalize) is no peer's.
@@ -3785,6 +3845,11 @@ where
     let scratch = tempfile::tempdir_in(&deps.chain.data_dir)
         .map_err(|e| anyhow::anyhow!("open stream scratch dir: {e}"))?;
 
+    // A dropped stream records every lane's vouchers (its scratch store is
+    // discarded either way).
+    let on_drop = SettleOnDrop::new(|| {
+        persist_face_watermarks(deps.store, deps.self_address, &handles);
+    });
     let streamer = Streamer::new(stream_candidates, funder, drive_config, scratch.path());
     let (mut reader, mut drive) = streamer
         .open(hash, total_bytes, &pull_config, Arc::new(NoCache))
@@ -3814,6 +3879,7 @@ where
     }
 
     // Persist every lane's watermark before surfacing a stream error.
+    on_drop.disarm();
     persist_face_watermarks(deps.store, deps.self_address, &handles);
 
     copy_result.map_err(|err| match first_ctx.as_ref().map(|c| c.lock()) {
@@ -4007,6 +4073,10 @@ where
         watch: &watch,
     };
     let downloader = Downloader::new(stream_candidates, funder, drive_config);
+    // A dropped download records every lane's vouchers.
+    let on_drop = SettleOnDrop::new(|| {
+        persist_face_watermarks(deps.store, deps.self_address, &handles);
+    });
     let result = Box::pin(downloader.fetch_to_paths_until(
         &[DownloadTarget {
             hash,
@@ -4022,6 +4092,7 @@ where
 
     // Persist every lane's watermark before surfacing an error: paid bytes are
     // paid whatever the fetch's outcome.
+    on_drop.disarm();
     persist_face_watermarks(deps.store, deps.self_address, &handles);
 
     match result {
@@ -4306,8 +4377,10 @@ impl DeliveryMeter {
 
 /// The `decdn fetch` delivery progress bar, the callback that drives it, and a
 /// [`DeliveryMeter`] the caller reads after `finish_and_clear` for the terminal
-/// summary (#1118). The callback both advances the bar and folds each update
-/// into the shared [`SpeedState`] so `{msg}` shows a steady rate/ETA.
+/// summary (#1118). The callback advances the bar, folds each update into the
+/// shared [`SpeedState`] so `{msg}` shows a steady rate/ETA, and mirrors the
+/// percent into the terminal's tab bar ([`TabProgress`]) where supported; the
+/// tab indicator is removed when the callback drops.
 fn delivery_progress() -> (
     indicatif::ProgressBar,
     impl Fn(u64, u64) + 'static,
@@ -4316,7 +4389,7 @@ fn delivery_progress() -> (
     let bar = new_progress_bar();
     // `ProgressBar` is `Arc`-backed, so the clone the callback owns drives the
     // same bar the caller clears.
-    let (on_progress, meter) = bar_callback(bar.clone());
+    let (on_progress, meter) = bar_callback(bar.clone(), TabProgress::detect(true));
     (bar, on_progress, meter)
 }
 
@@ -4324,13 +4397,17 @@ fn delivery_progress() -> (
 /// `total_bytes` once, advancing its position to the cumulative verified
 /// content-byte count, and folding each update into a [`SpeedState`] for the
 /// rate/ETA `{msg}` — and return it with the [`DeliveryMeter`] the caller reads
-/// after the bar finishes.
+/// after the bar finishes. `tab`, when set, shows the same percent in the
+/// terminal's tab bar.
 ///
 /// The callback's `received`/`expected` are content bytes, per
 /// [`decdn_client::ProgressCallback`]. Both the bar length and its position
 /// are therefore in the same unit, so the bar fills to exactly 100% and never
 /// overshoots.
-fn bar_callback(bar: indicatif::ProgressBar) -> (impl Fn(u64, u64) + 'static, DeliveryMeter) {
+fn bar_callback(
+    bar: indicatif::ProgressBar,
+    tab: Option<Arc<TabProgress>>,
+) -> (impl Fn(u64, u64) + 'static, DeliveryMeter) {
     // `expected` is constant across the pull, so set the bar length once (it
     // takes a write lock) rather than on every chunk in the hot receive loop.
     let length_set = std::sync::atomic::AtomicBool::new(false);
@@ -4341,6 +4418,9 @@ fn bar_callback(bar: indicatif::ProgressBar) -> (impl Fn(u64, u64) + 'static, De
             bar.set_length(expected);
         }
         bar.set_position(received);
+        if let Some(tab) = &tab {
+            tab.update(received, expected);
+        }
 
         // A poisoned lock only costs this one rate update; the bar still advances.
         if let Ok(mut s) = cb_state.lock() {
@@ -5976,6 +6056,15 @@ mod tests {
             .get_by_pool_id(pool_id)?
             .and_then(|s| s.lane_progress(lane))
             .ok_or_else(|| anyhow::anyhow!("lane record missing"))
+    }
+
+    #[test]
+    fn settle_on_drop_runs_only_when_dropped_armed() {
+        let settled = std::cell::Cell::new(0);
+        drop(SettleOnDrop::new(|| settled.set(settled.get() + 1)));
+        assert_eq!(settled.get(), 1, "a dropped drive settles");
+        SettleOnDrop::new(|| settled.set(settled.get() + 1)).disarm();
+        assert_eq!(settled.get(), 1, "a returned drive settles on its own path");
     }
 
     /// `persist_watermark` overwrites the lane record down to a rebase anchor and
