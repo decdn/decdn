@@ -142,6 +142,8 @@ Four boot reads must succeed before the node serves: the registry snapshot (Step
 - One boot deadline applies to all four reads. The deadline is 10 minutes from the start of the reads. When the next retry cannot start before the deadline, the node exits.
 - A deterministic failure stops the node at once. Examples are no contract at the configured address, an ABI mismatch, a revert, a JSON-RPC invalid request, method or params error, and an HTTP 4xx other than 408 and 429 that has no `Retry-After` header.
 - A retry delays readiness. It does not open the node to connections: Step 3.1 still gates them.
+- The registry, slash, and blacklist enumerations read at one snapshot block. The snapshot block is 256 blocks below the head that the RPC reports. A load-balanced RPC reports the head of its newest upstream. An upstream that is behind that head cannot serve it, but all upstreams can serve an older block. If the contract has no code at the snapshot block, the contract is newer than the margin, and the node reads at the head.
+- Each event tail starts at its snapshot block. The first poll applies the events between the snapshot block and the head again. Each watcher ignores an event that it already has.
 
 The fee-share reads (`PaymentPool.feeRouter()` and `FeeRouter.getShares()`) use the same retry. They retry for 1 minute at most, inside the same deadline. This limit keeps time for the four reads that come after them. When they fail, the node uses the floor fee share and does not stop.
 

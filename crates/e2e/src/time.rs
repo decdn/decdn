@@ -24,6 +24,15 @@ pub async fn mine<P: Provider>(provider: &P) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Mine `count` blocks in one `anvil_mine` call.
+pub async fn mine_blocks<P: Provider>(provider: &P, count: u64) -> anyhow::Result<()> {
+    let _: serde_json::Value = provider
+        .raw_request("anvil_mine".into(), (count,))
+        .await
+        .context("anvil_mine")?;
+    Ok(())
+}
+
 /// Advance the chain clock so `block.timestamp >= ready_at`, then mine. A
 /// no-op (still mines once) if the head is already past `ready_at`. Useful for
 /// timelock `readyAt` gates (namespace transfer, publisher vetting).

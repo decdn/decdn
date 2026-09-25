@@ -51,6 +51,7 @@ use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
@@ -62,7 +63,7 @@ use tracing::{debug, info, warn};
 use crate::chain_events::boot_retry::{BootFault, BootRetry};
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
-use crate::chain_events::shared_head::HeadSource;
+use crate::chain_events::shared_head::{HeadSource, snapshot_block};
 use crate::chain_events::timed;
 use crate::dht::chain_projection::{with_read, with_write};
 use crate::dht::chain_staker_set::{ChainStakerSet, StakerChange, apply_change};
@@ -129,7 +130,12 @@ pub(crate) trait RegistryChainReads: Send + Sync {
         operator: Address,
     ) -> impl Future<Output = Result<Option<(NodeId, bool)>>> + Send;
 
-    /// Re-enumerate both projections from chain state, as the bootstrap does.
+    /// The block an enumeration pins its pages to
+    /// (`shared_head::snapshot_block`): the lag margin below the head.
+    fn snapshot_block(&self) -> impl Future<Output = Result<u64>> + Send;
+
+    /// Re-enumerate the projections from chain state at block `at`, as the
+    /// bootstrap does.
     ///
     /// This is the self-healing leg. Every other input to these projections is
     /// an event, and an event can be missed — an orphaned log at the unstable
@@ -140,6 +146,7 @@ pub(crate) trait RegistryChainReads: Send + Sync {
     #[allow(clippy::type_complexity)] // (active set, bindings, reverse map, regions) — the four projections
     fn full_snapshot(
         &self,
+        at: u64,
     ) -> impl Future<
         Output = Result<(
             HashSet<NodeId>,
@@ -153,18 +160,30 @@ pub(crate) trait RegistryChainReads: Send + Sync {
 /// Production [`RegistryChainReads`] over the live contract.
 struct ContractReads<P: Provider + Clone> {
     registry: CapacityBond::CapacityBondInstance<P>,
+    /// The shared head source the snapshot block derives from.
+    head: Arc<dyn HeadSource>,
 }
 
 impl<P: Provider + Clone> RegistryChainReads for ContractReads<P> {
+    async fn snapshot_block(&self) -> Result<u64> {
+        snapshot_block(
+            self.registry.provider(),
+            &*self.head,
+            *self.registry.address(),
+        )
+        .await
+    }
+
     async fn full_snapshot(
         &self,
+        at: u64,
     ) -> Result<(
         HashSet<NodeId>,
         HashMap<NodeId, Address>,
         HashMap<Address, NodeId>,
         HashMap<NodeId, String>,
     )> {
-        bootstrap_registry(&self.registry).await
+        bootstrap_registry(&self.registry, BlockId::number(at)).await
     }
 
     async fn node_id_of(&self, operator: Address) -> Result<Option<(NodeId, bool)>> {
@@ -215,6 +234,10 @@ pub(crate) struct RegistrySink<R> {
     /// When the last re-enumeration ran. Seeded to "just ran" at bootstrap,
     /// since the bootstrap enumeration IS one.
     pub(crate) last_resync: Option<Instant>,
+    /// The block of the latest tail change to each `NodeId`. A resync keeps the
+    /// current projection entries of every node changed above its snapshot block
+    /// (see [`Self::overlay_tail_changes`]), then forgets the rest.
+    pub(crate) tail_changes: HashMap<NodeId, u64>,
 }
 
 impl<R: RegistryChainReads> RegistrySink<R> {
@@ -276,7 +299,13 @@ impl<R: RegistryChainReads> RegistrySink<R> {
     /// change. The canonical `nodeIdOf.active` wins over what the event implies
     /// (they can disagree if a later transition raced the event). Bindings are
     /// untouched: these events never change one.
-    async fn on_operator_change(&self, operator: Address, event_implies_active: bool) {
+    ///
+    /// Returns the node the change applied to, `None` when it applied nothing.
+    async fn on_operator_change(
+        &self,
+        operator: Address,
+        event_implies_active: bool,
+    ) -> Option<NodeId> {
         let resolved = match self.reads.node_id_of(operator).await {
             Ok(r) => r,
             Err(err) => {
@@ -296,12 +325,12 @@ impl<R: RegistryChainReads> RegistrySink<R> {
                     %operator,
                     "nodeIdOf RPC failed; cached active set may diverge from chain state for this operator"
                 );
-                return;
+                return None;
             }
         };
         let Some((node_id, now_active)) = resolved else {
             debug!(%operator, "operator-indexed event for unbound operator; ignoring");
-            return;
+            return None;
         };
         if now_active != event_implies_active {
             debug!(
@@ -317,29 +346,90 @@ impl<R: RegistryChainReads> RegistrySink<R> {
             StakerChange::Inactive(node_id)
         };
         apply_change(&self.active, &self.metrics, change);
+        Some(node_id)
+    }
+
+    /// Carry every node the tail changed above `at` from the current projections
+    /// into a snapshot pinned at `at`, then forget the changes at or below it.
+    ///
+    /// The snapshot reads the lagged block, so it misses any change the tail
+    /// already applied above it. Replacing the projections wholesale would roll
+    /// those back until the next resync. A node changed above `at` keeps its
+    /// current entry in every projection; every other node takes the snapshot's.
+    fn overlay_tail_changes(
+        &mut self,
+        at: u64,
+        active: &mut HashSet<NodeId>,
+        bindings: &mut HashMap<NodeId, Address>,
+        operator_to_node: &mut HashMap<Address, NodeId>,
+        regions: &mut HashMap<NodeId, String>,
+    ) {
+        self.tail_changes.retain(|_, block| *block > at);
+        for node_id in self.tail_changes.keys() {
+            if with_read(&self.active, "chain staker set", |set| {
+                set.contains(node_id)
+            }) {
+                active.insert(*node_id);
+            } else {
+                active.remove(node_id);
+            }
+            if let Some(current) = &self.bindings {
+                match with_read(current, "chain node-address directory", |m| {
+                    m.get(node_id).copied()
+                }) {
+                    Some(addr) => bindings.insert(*node_id, addr),
+                    None => bindings.remove(node_id),
+                };
+            }
+            match with_read(&self.regions, "chain region directory", |m| {
+                m.get(node_id).cloned()
+            }) {
+                Some(region) => regions.insert(*node_id, region),
+                None => regions.remove(node_id),
+            };
+            operator_to_node.retain(|_, nid| nid != node_id);
+            with_read(&self.operator_to_node, "chain operator reverse map", |m| {
+                for (addr, nid) in m {
+                    if nid == node_id {
+                        operator_to_node.insert(*addr, *nid);
+                    }
+                }
+            });
+        }
     }
 }
 
 impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
     #[allow(clippy::cognitive_complexity)]
     async fn apply(&mut self, log: Log) -> Result<()> {
-        match log.topic0().copied() {
+        // A log without a block number never comes back from `eth_getLogs`; one
+        // that did would count as the newest change, which a resync keeps.
+        let block = log.block_number.unwrap_or(u64::MAX);
+        let changed = match log.topic0().copied() {
             Some(sig) if sig == CapacityBond::NodeRegistered::SIGNATURE_HASH => {
                 match CapacityBond::NodeRegistered::decode_log_data(&log.inner.data) {
                     Ok(event) => {
-                        self.on_registered(
-                            NodeId::from_bytes(event.nodeId.0),
-                            event.ethAddress,
-                            &event.regionHint,
-                        );
+                        let node_id = NodeId::from_bytes(event.nodeId.0);
+                        self.on_registered(node_id, event.ethAddress, &event.regionHint);
+                        Some(node_id)
                     }
-                    Err(err) => warn!(error = %err, "skipping undecodable NodeRegistered log"),
+                    Err(err) => {
+                        warn!(error = %err, "skipping undecodable NodeRegistered log");
+                        None
+                    }
                 }
             }
             Some(sig) if sig == CapacityBond::NodeDeregistered::SIGNATURE_HASH => {
                 match CapacityBond::NodeDeregistered::decode_log_data(&log.inner.data) {
-                    Ok(event) => self.on_deregistered(NodeId::from_bytes(event.nodeId.0)),
-                    Err(err) => warn!(error = %err, "skipping undecodable NodeDeregistered log"),
+                    Ok(event) => {
+                        let node_id = NodeId::from_bytes(event.nodeId.0);
+                        self.on_deregistered(node_id);
+                        Some(node_id)
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "skipping undecodable NodeDeregistered log");
+                        None
+                    }
                 }
             }
             Some(sig) if sig == CapacityBond::NodeAutoEjected::SIGNATURE_HASH => {
@@ -348,25 +438,32 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
                     // `isActive` only, and the operator may still be owed payment
                     // on an open channel.
                     Ok(event) => {
-                        apply_change(
-                            &self.active,
-                            &self.metrics,
-                            StakerChange::Inactive(event.nodeId.0.into()),
-                        );
+                        let node_id = NodeId::from(event.nodeId.0);
+                        apply_change(&self.active, &self.metrics, StakerChange::Inactive(node_id));
+                        Some(node_id)
                     }
-                    Err(err) => warn!(error = %err, "skipping undecodable NodeAutoEjected log"),
+                    Err(err) => {
+                        warn!(error = %err, "skipping undecodable NodeAutoEjected log");
+                        None
+                    }
                 }
             }
             Some(sig) if sig == CapacityBond::Reinstated::SIGNATURE_HASH => {
                 match CapacityBond::Reinstated::decode_log_data(&log.inner.data) {
                     Ok(event) => self.on_operator_change(event.operator, true).await,
-                    Err(err) => warn!(error = %err, "skipping undecodable Reinstated log"),
+                    Err(err) => {
+                        warn!(error = %err, "skipping undecodable Reinstated log");
+                        None
+                    }
                 }
             }
             Some(sig) if sig == CapacityBond::UnbondingRequested::SIGNATURE_HASH => {
                 match CapacityBond::UnbondingRequested::decode_log_data(&log.inner.data) {
                     Ok(event) => self.on_operator_change(event.operator, false).await,
-                    Err(err) => warn!(error = %err, "skipping undecodable UnbondingRequested log"),
+                    Err(err) => {
+                        warn!(error = %err, "skipping undecodable UnbondingRequested log");
+                        None
+                    }
                 }
             }
             // The blacklist-ejection twin of `Reinstated` (#1030). `ejected` is a
@@ -378,23 +475,32 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
             Some(sig) if sig == CapacityBond::EjectedByBlacklist::SIGNATURE_HASH => {
                 match CapacityBond::EjectedByBlacklist::decode_log_data(&log.inner.data) {
                     Ok(event) => self.on_operator_change(event.operator, false).await,
-                    Err(err) => warn!(error = %err, "skipping undecodable EjectedByBlacklist log"),
+                    Err(err) => {
+                        warn!(error = %err, "skipping undecodable EjectedByBlacklist log");
+                        None
+                    }
                 }
             }
             Some(sig) if sig == CapacityBond::RegionUpdated::SIGNATURE_HASH => {
                 match CapacityBond::RegionUpdated::decode_log_data(&log.inner.data) {
                     Ok(event) => {
-                        self.on_region_updated(
-                            NodeId::from_bytes(event.nodeId.0),
-                            &event.newRegion,
-                        );
+                        let node_id = NodeId::from_bytes(event.nodeId.0);
+                        self.on_region_updated(node_id, &event.newRegion);
+                        Some(node_id)
                     }
-                    Err(err) => warn!(error = %err, "skipping undecodable RegionUpdated log"),
+                    Err(err) => {
+                        warn!(error = %err, "skipping undecodable RegionUpdated log");
+                        None
+                    }
                 }
             }
             _ => {
                 debug!(topic0 = ?log.topic0(), "unmatched CapacityBond event in subscribed OR-set");
+                None
             }
+        };
+        if let Some(node_id) = changed {
+            self.tail_changes.insert(node_id, block);
         }
         Ok(())
     }
@@ -417,8 +523,9 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
         clear_cadence_on_recovery(&mut self.last_resync, self.resync_interval);
     }
 
-    /// Cadence-gated re-enumeration: rebuild both projections from chain state
-    /// and swap them in.
+    /// Cadence-gated re-enumeration: rebuild the projections from chain state at
+    /// the lagged snapshot block, carry over every node the tail changed above it
+    /// ([`Self::overlay_tail_changes`]), and swap them in.
     ///
     /// Build-then-swap, never clear-then-fill: the new sets are fully
     /// materialized before either lock is taken for writing, so a failed read
@@ -450,8 +557,13 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
         // read retries on the resync cadence rather than on every watcher tick.
         self.last_resync = Some(now);
 
-        let (active, bindings, operator_to_node, regions) = match self.reads.full_snapshot().await {
-            Ok(snapshot) => snapshot,
+        let read = async {
+            let at = self.reads.snapshot_block().await?;
+            let snapshot = self.reads.full_snapshot(at).await?;
+            anyhow::Ok((at, snapshot))
+        };
+        let (at, (mut active, mut bindings, mut operator_to_node, mut regions)) = match read.await {
+            Ok(read) => read,
             Err(err) => {
                 // `Ok` upward, so the counter is the only thing that moves: an
                 // `Err` marks the route errored, which stalls event pickup and
@@ -462,6 +574,13 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
             }
         };
 
+        self.overlay_tail_changes(
+            at,
+            &mut active,
+            &mut bindings,
+            &mut operator_to_node,
+            &mut regions,
+        );
         let active_len = active.len();
         let binding_len = bindings.len();
         with_write(&self.active, "chain staker set", |set| *set = active);
@@ -508,8 +627,13 @@ const REGISTRY_RESYNC_INTERVAL: Duration = Duration::from_mins(15);
 /// round-trip. `operator_to_node` is the inverse of `bindings`, built from the
 /// same page with no chain call of its own; like `regions` it is unfiltered and
 /// always built.
+///
+/// Every page reads at `at`, the snapshot block, so the pages agree with each
+/// other: a load-balanced provider cannot answer one page from a lagging
+/// upstream and the next from a current one.
 async fn bootstrap_registry<P>(
     registry: &CapacityBond::CapacityBondInstance<P>,
+    at: BlockId,
 ) -> Result<(
     HashSet<NodeId>,
     HashMap<NodeId, Address>,
@@ -530,6 +654,7 @@ where
             "getRegisteredNodes",
             registry
                 .getRegisteredNodes(U256::from(offset), U256::from(PAGE_SIZE))
+                .block(at)
                 .call(),
         )
         .await
@@ -573,8 +698,9 @@ where
 /// Enumerate `CapacityBond` once, then spawn the single watcher that keeps both
 /// projections current.
 ///
-/// The head read and the enumeration retry transient failures on `boot`'s
-/// budget; a deterministic fault or an exhausted budget fails the bootstrap.
+/// The snapshot-block read and the enumeration retry transient failures on
+/// `boot`'s budget; a deterministic fault or an exhausted budget fails the
+/// bootstrap.
 ///
 /// `track_node_addresses` mirrors `cache.node_to_node_pull_through_enabled`.
 pub async fn bootstrap<P>(
@@ -589,23 +715,27 @@ where
     P: Provider + Clone + 'static,
 {
     let registry = CapacityBond::new(registry_addr, provider.clone());
+    let reads = ContractReads {
+        registry: registry.clone(),
+        head,
+    };
 
-    // Head BEFORE the enumeration, then seed the cursor there. The reverse order
-    // would lose any event landing between the enumeration and the head read: it
-    // would be neither in the snapshot nor above the cursor. Re-applying an event
-    // the snapshot already reflects is a no-op in every arm, so overlap is safe
-    // but a gap is not. (`SharedHead`'s TTL only ever makes this cursor *older*,
-    // which widens the overlap — it cannot open a gap.)
+    // Pin every page to one snapshot block and seed the tail cursor at that same
+    // block. An event at or below it is in the enumeration; one above it is on
+    // the tail, which scans from the block inclusive. Re-applying an event the
+    // snapshot already reflects is a no-op in every arm, so overlap is safe but a
+    // gap is not. The block sits `SNAPSHOT_LAG_MARGIN_BLOCKS` below the reported
+    // head so every upstream behind a load-balanced RPC can serve the pages.
     let (
         snapshot_block,
         (initial_active, initial_bindings, initial_operator_to_node, initial_regions),
     ) = boot
         .run("CapacityBond registry snapshot", || async {
-            let snapshot_block = head
-                .head()
+            let snapshot_block = reads
+                .snapshot_block()
                 .await
-                .context("read head block for CapacityBond registry snapshot")?;
-            let snapshot = bootstrap_registry(&registry).await.with_context(|| {
+                .context("read the CapacityBond registry snapshot block")?;
+            let snapshot = reads.full_snapshot(snapshot_block).await.with_context(|| {
                 format!("paginated getRegisteredNodes from CapacityBond at {registry_addr}")
             })?;
             Ok((snapshot_block, snapshot))
@@ -640,9 +770,7 @@ where
     metrics.capacity_bond_registry_resync();
 
     let sink = RegistrySink {
-        reads: ContractReads {
-            registry: registry.clone(),
-        },
+        reads,
         active: Arc::clone(&active),
         bindings: bindings.clone(),
         operator_to_node: Arc::clone(&operator_to_node),
@@ -652,6 +780,7 @@ where
         // The bootstrap enumeration just ran, so the first backstop resync is
         // due one interval from now rather than on the first tick.
         last_resync: Some(Instant::now()),
+        tail_changes: HashMap::new(),
     };
     let route = Route {
         addresses: vec![registry_addr],
@@ -758,7 +887,7 @@ fn registry_route_topic0s() -> Vec<B256> {
 }
 
 /// The registry route's cursor start: seed the live tail from the enumeration
-/// snapshot head. The staker set is rebuilt from that enumeration each boot, so
+/// snapshot block. The staker set is rebuilt from that enumeration each boot, so
 /// there is no durable cursor to persist. Split out from [`bootstrap`] so the
 /// cursor shape is unit-testable without a provider.
 const fn registry_cursor_start(snapshot_block: u64) -> CursorStart {
@@ -817,6 +946,9 @@ mod tests {
             None,
         ));
         let asserter = Asserter::new();
+        // The first read of an attempt is the snapshot block's code-presence
+        // `eth_getCode`, so the failure lands there; every boot read shares the
+        // retry path.
         asserter.push_failure(
             serde_json::from_value(serde_json::json!({
                 "code": 1,
@@ -824,6 +956,8 @@ mod tests {
             }))
             .unwrap(),
         );
+        // The retry: the code-presence `eth_getCode`, then one empty page.
+        asserter.push_success(&Bytes::from_static(&[0x60]));
         let empty: (Vec<CapacityBond::NodeInfo>, Vec<bool>) = (Vec::new(), Vec::new());
         asserter.push_success(&Bytes::from(
             CapacityBond::getRegisteredNodesCall::abi_encode_returns_tuple(&empty),
@@ -858,11 +992,14 @@ mod tests {
         use crate::chain_events::test_support::{bounded, hanging_provider};
 
         let registry = CapacityBond::new(Address::repeat_byte(0x11), hanging_provider());
-        let err = bounded("registry snapshot", bootstrap_registry(&registry))
-            .await
-            .err()
-            .map(|e| format!("{e:#}"))
-            .unwrap();
+        let err = bounded(
+            "registry snapshot",
+            bootstrap_registry(&registry, BlockId::latest()),
+        )
+        .await
+        .err()
+        .map(|e| format!("{e:#}"))
+        .unwrap();
 
         assert!(err.contains("getRegisteredNodes timed out after"), "{err}");
     }
@@ -888,9 +1025,12 @@ mod tests {
         ));
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let err = bootstrap_registry(&CapacityBond::new(Address::repeat_byte(0x11), provider))
-            .await
-            .unwrap_err();
+        let err = bootstrap_registry(
+            &CapacityBond::new(Address::repeat_byte(0x11), provider),
+            BlockId::latest(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("mismatched page/active"),
@@ -902,7 +1042,7 @@ mod tests {
         );
     }
 
-    /// The registry route seeds its cursor at the enumeration snapshot head,
+    /// The registry route seeds its cursor at the enumeration snapshot block,
     /// with no durable persistence (the staker set is rebuilt from enumeration
     /// each boot).
     #[test]
@@ -936,6 +1076,8 @@ mod tests {
         node_id: std::result::Result<Option<(NodeId, bool)>, &'static str>,
         /// What `full_snapshot` returns; `Err` models an unreadable chain.
         snapshot: std::result::Result<Snapshot, &'static str>,
+        /// What `snapshot_block` returns.
+        snapshot_block: u64,
     }
 
     impl StubReads {
@@ -948,6 +1090,7 @@ mod tests {
                     HashMap::new(),
                     HashMap::new(),
                 )),
+                snapshot_block: 0,
             }
         }
 
@@ -958,6 +1101,10 @@ mod tests {
     }
 
     impl RegistryChainReads for StubReads {
+        async fn snapshot_block(&self) -> Result<u64> {
+            Ok(self.snapshot_block)
+        }
+
         async fn node_id_of(&self, _operator: Address) -> Result<Option<(NodeId, bool)>> {
             match &self.node_id {
                 Ok(v) => Ok(*v),
@@ -967,6 +1114,7 @@ mod tests {
 
         async fn full_snapshot(
             &self,
+            _at: u64,
         ) -> Result<(
             HashSet<NodeId>,
             HashMap<NodeId, Address>,
@@ -1007,6 +1155,7 @@ mod tests {
             metrics: Arc::clone(&metrics),
             resync_interval: REGISTRY_RESYNC_INTERVAL,
             last_resync: Some(Instant::now()),
+            tail_changes: HashMap::new(),
         };
         (s, active, bindings, operator_to_node, regions, metrics)
     }
@@ -1575,6 +1724,131 @@ mod tests {
             2,
             "the reverse map is replaced too"
         );
+    }
+
+    /// A resync pinned below a tail change keeps it in every projection: a node
+    /// the tail registered above the snapshot block stays, one it deregistered
+    /// above the block stays gone, and a change at or below the block yields to
+    /// the authoritative snapshot.
+    #[tokio::test]
+    async fn resync_keeps_tail_changes_above_its_block() {
+        let mut reads = StubReads::new(Ok(None)).with_snapshot(Ok(snapshot_of(&[2], &[2])));
+        reads.snapshot_block = 800;
+        let (mut sink, active, bindings, operator_to_node, _regions, _m) = sink(reads, true);
+        let at = |mut log: Log, block: u64| {
+            log.block_number = Some(block);
+            log
+        };
+        sink.apply(at(registered_log(nid(2), addr(2)), 600))
+            .await
+            .unwrap();
+        sink.apply(at(registered_log(nid(6), addr(6)), 700))
+            .await
+            .unwrap();
+        sink.apply(at(registered_log(nid(5), addr(5)), 900))
+            .await
+            .unwrap();
+        sink.apply(at(deregistered_log(nid(2)), 950)).await.unwrap();
+        sink.last_resync = None;
+
+        sink.on_tick_complete().await.unwrap();
+
+        assert_eq!(*active.read().unwrap(), HashSet::from([nid(5)]));
+        let bindings = bindings.unwrap();
+        assert_eq!(
+            *bindings.read().unwrap(),
+            HashMap::from([(nid(5), addr(5))])
+        );
+        assert_eq!(
+            *operator_to_node.read().unwrap(),
+            HashMap::from([(addr(5), nid(5))])
+        );
+        assert_eq!(
+            sink.tail_changes.keys().copied().collect::<HashSet<_>>(),
+            HashSet::from([nid(2), nid(5)]),
+            "changes at or below the pin are dropped"
+        );
+    }
+
+    /// The boot enumeration pins its code check and every `getRegisteredNodes`
+    /// page to the snapshot block, and seeds the tail cursor at that same block.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_boot_enumeration_pins_its_pages_and_cursor_to_the_snapshot_block() {
+        use crate::chain_events::boot_retry::BootRetry;
+        use crate::chain_events::shared_head::{SNAPSHOT_LAG_MARGIN_BLOCKS, SharedHead};
+        use alloy::providers::ProviderBuilder;
+
+        let tags = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(RegistryRpc {
+                tags: Arc::clone(&tags),
+            })
+            .mount(&server)
+            .await;
+        let url: reqwest::Url = server.uri().parse().unwrap();
+        let provider = ProviderBuilder::new().connect_http(url);
+        let head: Arc<dyn HeadSource> = Arc::new(SharedHead::with_ttl(
+            provider.clone(),
+            Duration::from_hours(1),
+            None,
+        ));
+        let metrics = Arc::new(Metrics::new());
+
+        let handles = bootstrap(
+            provider,
+            Address::repeat_byte(0x11),
+            head,
+            false,
+            Arc::clone(&metrics),
+            &BootRetry::single_attempt(Arc::clone(&metrics)),
+        )
+        .await
+        .unwrap();
+
+        let pinned = 1_000 - SNAPSHOT_LAG_MARGIN_BLOCKS;
+        // The code check, then one empty `getRegisteredNodes` page.
+        let tags = tags.lock().unwrap().clone();
+        assert_eq!(tags, vec![serde_json::json!(format!("{pinned:#x}")); 2]);
+        assert_eq!(handles.route.start.seed(), Some(pinned));
+    }
+
+    /// A JSON-RPC responder for the registry boot: head 1000, contract code at
+    /// every block, and an empty `getRegisteredNodes` page, recording the block
+    /// tag of every call but `eth_blockNumber`.
+    struct RegistryRpc {
+        tags: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl wiremock::Respond for RegistryRpc {
+        fn respond(&self, req: &wiremock::Request) -> wiremock::ResponseTemplate {
+            use alloy::sol_types::SolCall;
+
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+            let method = body.get("method").and_then(serde_json::Value::as_str);
+            let result = if method == Some("eth_blockNumber") {
+                serde_json::json!("0x3e8")
+            } else {
+                let tag = body
+                    .pointer("/params/1")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                self.tags.lock().unwrap().push(tag);
+                if method == Some("eth_getCode") {
+                    serde_json::json!("0x60")
+                } else {
+                    let empty: (Vec<CapacityBond::NodeInfo>, Vec<bool>) = (Vec::new(), Vec::new());
+                    serde_json::json!(Bytes::from(
+                        CapacityBond::getRegisteredNodesCall::abi_encode_returns_tuple(&empty)
+                    ))
+                }
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "result": result,
+            }))
+        }
     }
 
     /// `full_snapshot` derives the reverse map as the inverse of `bindings` for

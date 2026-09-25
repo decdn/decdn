@@ -88,7 +88,7 @@
 //! (`SlashJudge.submitBlacklistChallenge`), so prompt eviction is the node's only
 //! local protection.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -114,7 +114,7 @@ use tracing::{debug, info, warn};
 use crate::chain_events::boot_retry::{BootFault, BootRetry};
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
-use crate::chain_events::shared_head::HeadSource;
+use crate::chain_events::shared_head::{HeadSource, snapshot_block};
 use crate::chain_events::timed;
 use crate::chain_freshness::ChainFreshness;
 use crate::content_deny::ContentDenylist;
@@ -160,9 +160,9 @@ impl InitialSyncGate {
 /// `Send`. Production monomorphizes to the alloy contract impl
 /// ([`ContractReads`]).
 trait BlacklistChainReads: Send + Sync {
-    /// Current head, the block every enumeration read is pinned to
-    /// (`get_block_number`).
-    fn block_number(&self) -> impl Future<Output = Result<u64>> + Send;
+    /// The block every enumeration read is pinned to
+    /// (`shared_head::snapshot_block`): the lag margin below the head.
+    fn snapshot_block(&self) -> impl Future<Output = Result<u64>> + Send;
     /// The one-to-three region keys in scope for `operator` right now
     /// (`getScopeRegions`, GLOBAL first).
     fn scope_regions(
@@ -222,8 +222,13 @@ struct ContractReads<P: Provider + Clone> {
 }
 
 impl<P: Provider + Clone> BlacklistChainReads for ContractReads<P> {
-    async fn block_number(&self) -> Result<u64> {
-        self.head.head().await
+    async fn snapshot_block(&self) -> Result<u64> {
+        snapshot_block(
+            self.contract.provider(),
+            &*self.head,
+            *self.contract.address(),
+        )
+        .await
     }
 
     async fn scope_regions(&self, operator: Address, at: u64) -> Result<Vec<B256>> {
@@ -333,16 +338,17 @@ struct BootstrapSnapshot {
     known: HashSet<(B256, Hash)>,
 }
 
-/// Enumerate the current on-chain deny-set at one pinned block: read head, then
-/// page the address union and the per-region hash sets against that height.
+/// Enumerate the on-chain deny-set at one pinned block, the lag margin below
+/// head: page the address union and the per-region hash sets against that
+/// height.
 async fn bootstrap_snapshot<R: BlacklistChainReads>(
     reads: &R,
     operator: Address,
 ) -> Result<BootstrapSnapshot> {
     let block = reads
-        .block_number()
+        .snapshot_block()
         .await
-        .context("get_block_number for the ContentBlacklist enumeration snapshot")?;
+        .context("read the ContentBlacklist enumeration snapshot block")?;
     let origins = enumerate_address_union(reads, operator, block).await?;
     let known = enumerate_known(reads, operator, block).await?;
     Ok(BootstrapSnapshot {
@@ -482,6 +488,14 @@ struct WatcherState {
     /// Event). Seeded from the enumerated address union on boot and fed by
     /// `OriginBlacklistUpdated` / `OperatorBlacklisted` on the tail.
     denylist: Arc<ContentDenylist>,
+    /// The latest tail change to each origin: its block and the blacklisted
+    /// state it set. A re-enumeration applies every change above its snapshot
+    /// block on top of the snapshot's origins, then forgets the rest.
+    origin_changes: HashMap<Address, (u64, bool)>,
+    /// The block of each `(region, hash)` entry the tail removed. A
+    /// re-enumeration skips a snapshot entry the tail removed above its snapshot
+    /// block, then forgets the rest.
+    removed_entries: HashMap<(B256, Hash), u64>,
 }
 
 impl WatcherState {
@@ -496,15 +510,41 @@ impl WatcherState {
     /// transition, which emits no event) is not dropped by an in-scope-only
     /// enumeration, while the chain origins are authoritative and REPLACED
     /// wholesale.
+    ///
+    /// The snapshot reads the lagged block, so it misses any change the tail
+    /// already applied above that block. Both halves keep those changes: every
+    /// origin change above the block is applied on top of the snapshot's origins,
+    /// and a snapshot entry the tail removed above the block is not re-added.
+    /// Without that, the fold would drop an origin the tail blacklisted inside the
+    /// margin.
     fn fold_reenumeration(&mut self, snapshot: BootstrapSnapshot) {
-        self.known.extend(snapshot.known);
-        self.denylist.set_chain_origins(snapshot.origins);
+        let at = snapshot.block;
+        self.origin_changes.retain(|_, (block, _)| *block > at);
+        self.removed_entries.retain(|_, block| *block > at);
+        let mut origins = snapshot.origins;
+        for (origin, (_, blacklisted)) in &self.origin_changes {
+            if *blacklisted {
+                origins.insert(*origin);
+            } else {
+                origins.remove(origin);
+            }
+        }
+        let removed = &self.removed_entries;
+        self.known.extend(
+            snapshot
+                .known
+                .into_iter()
+                .filter(|entry| !removed.contains_key(entry)),
+        );
+        self.denylist.set_chain_origins(origins);
     }
 
     /// Drop exactly the `(region, hash)` entry — same-hash entries under other
-    /// regions stay retained for re-scoping.
-    fn remove_entry(&mut self, region: B256, hash: Hash) {
+    /// regions stay retained for re-scoping — and note the block of the removal
+    /// for [`Self::fold_reenumeration`].
+    fn remove_entry(&mut self, region: B256, hash: Hash, block: u64) {
         self.known.remove(&(region, hash));
+        self.removed_entries.insert((region, hash), block);
     }
 
     /// Drop every entry for `hash` (once locally evicted, the sticky eviction
@@ -527,9 +567,11 @@ impl WatcherState {
     /// (`OriginBlacklistUpdated` and `OperatorBlacklisted`) feed this one set as a
     /// union `isOriginBlacklisted(op) || isOperatorBlacklisted(op)` — the node does
     /// not need to know which list an address came from, only that governance put
-    /// it on one.
-    fn set_origin(&self, origin: Address, blacklisted: bool) {
+    /// it on one. Notes the change and its block for
+    /// [`Self::fold_reenumeration`].
+    fn set_origin(&mut self, origin: Address, blacklisted: bool, block: u64) {
         self.denylist.apply_chain_origin(origin, blacklisted);
+        self.origin_changes.insert(origin, (block, blacklisted));
     }
 }
 
@@ -592,19 +634,24 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
             .is_none_or(|at| at.elapsed() >= self.rescan_interval);
 
         // The re-enumeration backstop. Rebuild the address union + in-scope hash set
-        // at a fresh pinned block and fold it into the projections: origins are
-        // authoritative (replace wholesale), the `known` worklist is UNIONed so an
-        // out-of-scope entry the tail learned (retained for future ripening) is not
-        // dropped by an in-scope-only enumeration. Build-then-fold; Ok-on-failure
-        // keeps the current set. The `rescan` below then re-scopes + evicts.
+        // at the lagged snapshot block and fold it into the projections: origins are
+        // authoritative (replace wholesale, with the tail's newer changes on top),
+        // the `known` worklist is UNIONed so an out-of-scope entry the tail learned
+        // (retained for future ripening) is not dropped by an in-scope-only
+        // enumeration. Build-then-fold; Ok-on-failure keeps the current set and
+        // counts `decdn_blacklist_reenumeration_failures_total`. The `rescan` below
+        // then re-scopes + evicts.
         if due {
             match bootstrap_snapshot(&self.reads, self.operator).await {
                 Ok(snapshot) => self.state.fold_reenumeration(snapshot),
-                Err(err) => warn!(
-                    error = %sanitize_err_chain(&err),
-                    "blacklist watcher: periodic re-enumeration failed; keeping the current \
-                     deny-set (the live tail is still the primary path)"
-                ),
+                Err(err) => {
+                    self.metrics.blacklist_reenumeration_failure();
+                    warn!(
+                        error = %sanitize_err_chain(&err),
+                        "blacklist watcher: periodic re-enumeration failed; keeping the current \
+                         deny-set (the live tail is still the primary path)"
+                    );
+                }
             }
         }
 
@@ -812,9 +859,16 @@ fn on_operator_log(state: &mut WatcherState, log: &Log, blacklisted: bool) -> Re
             }
         }
     };
-    state.set_origin(operator, blacklisted);
+    state.set_origin(operator, blacklisted, log_block(log));
     debug!(%operator, blacklisted, "blacklist watcher: operator blacklist updated");
     Ok(())
+}
+
+/// The block a tail log was mined in. A log without one never comes back from
+/// `eth_getLogs`; one that did would count as the newest change, which a
+/// re-enumeration keeps.
+fn log_block(log: &Log) -> u64 {
+    log.block_number.unwrap_or(u64::MAX)
 }
 
 /// An origin-class log we cannot decode is an ENFORCEMENT failure, not a parse
@@ -839,7 +893,7 @@ fn on_origin_log(state: &mut WatcherState, log: &Log) -> Result<()> {
         Ok(event) => event,
         Err(err) => return Err(undecodable_origin_log(&err, log, "OriginBlacklistUpdated")),
     };
-    state.set_origin(event.origin, event.blacklisted);
+    state.set_origin(event.origin, event.blacklisted, log_block(log));
     debug!(
         origin = %event.origin,
         blacklisted = event.blacklisted,
@@ -893,7 +947,7 @@ async fn on_removed_log<P: Provider + Clone>(
     match HashRemoved::decode_log_data(&log.inner.data) {
         Ok(event) => {
             let hash = Hash::from_bytes(event.hash.0);
-            state.remove_entry(event.region, hash);
+            state.remove_entry(event.region, hash, log_block(log));
             if cache.is_chain_denied(hash) {
                 lift_deny_if_out_of_scope(contract, operator, cache, hash).await;
             }
@@ -1111,6 +1165,8 @@ where
     let mut state = WatcherState {
         known: snapshot.known,
         denylist: Arc::clone(denylist),
+        origin_changes: HashMap::new(),
+        removed_entries: HashMap::new(),
     };
     let RescanOutcome {
         clean,
@@ -1158,9 +1214,14 @@ struct BootEnforced {
     state: WatcherState,
 }
 
-/// Enumerate the current on-chain deny-set at one pinned block, enforce it, then
-/// return the [`Route`] that follows the live tail seeded at that block on the
-/// shared multiplexed poller.
+/// Enumerate the on-chain deny-set at one pinned block, enforce it, then return
+/// the [`Route`] that follows the live tail seeded at that block on the shared
+/// multiplexed poller.
+///
+/// The pinned block sits `SNAPSHOT_LAG_MARGIN_BLOCKS` below head (or at head for
+/// a contract deployed inside the margin), so the readiness gate opens on the
+/// deny-set as of that block. A takedown inside the margin is enforced by the
+/// first tail tick, which replays the margin.
 ///
 /// One boot attempt is the enumeration plus the enforcement pass. An attempt that
 /// cannot read the chain (block or enumeration RPC error) or cannot enforce
@@ -1328,7 +1389,7 @@ fn blacklist_route_topic0s() -> Vec<B256> {
 }
 
 /// The blacklist route's cursor start: seed the tail at the enumeration
-/// snapshot head. No durable cursor and no historical replay — the boot
+/// snapshot block. No durable cursor and no historical replay — the boot
 /// enumeration rebuilt the whole deny-set, so the tail only follows forward
 /// from the snapshot. Split out from [`bootstrap`] so the cursor shape is
 /// unit-testable without a provider.
@@ -1369,7 +1430,7 @@ mod tests {
         );
     }
 
-    /// The blacklist route seeds its cursor at the enumeration snapshot head,
+    /// The blacklist route seeds its cursor at the enumeration snapshot block,
     /// with no durable persistence (the deny-set is rebuilt from enumeration
     /// each boot).
     #[test]
@@ -1399,6 +1460,8 @@ mod tests {
         WatcherState {
             known: HashSet::new(),
             denylist,
+            origin_changes: HashMap::new(),
+            removed_entries: HashMap::new(),
         }
     }
 
@@ -1455,7 +1518,7 @@ mod tests {
     }
 
     impl BlacklistChainReads for StubReads {
-        async fn block_number(&self) -> Result<u64> {
+        async fn snapshot_block(&self) -> Result<u64> {
             Ok(self.block)
         }
 
@@ -1622,14 +1685,15 @@ mod tests {
         assert!(format!("{err:#}").contains("read 1 of 3"), "{err:#}");
     }
 
-    /// `ContractReads::block_number` must route through the shared, TTL-cached
+    /// `ContractReads::snapshot_block` must route through the shared, TTL-cached
     /// [`SharedHead`] single-flight rather than issue its own `eth_blockNumber` —
-    /// two calls inside the TTL cost exactly one RPC. The unconsumed asserter
+    /// two calls inside the TTL cost exactly one head RPC — and pin the lag
+    /// margin below that head. The unconsumed asserter
     /// queue is the proof: a second direct read would have popped a response
     /// that was never pushed.
     #[tokio::test]
-    async fn contract_reads_block_number_routes_through_shared_head() -> Result<()> {
-        use crate::chain_events::shared_head::SharedHead;
+    async fn contract_reads_snapshot_block_routes_through_shared_head() -> Result<()> {
+        use crate::chain_events::shared_head::{SNAPSHOT_LAG_MARGIN_BLOCKS, SharedHead};
         use alloy::primitives::U64;
         use alloy::providers::ProviderBuilder;
         use alloy::providers::mock::Asserter;
@@ -1637,17 +1701,21 @@ mod tests {
         const TTL: Duration = Duration::from_secs(4);
 
         let asserter = Asserter::new();
-        asserter.push_success(&U64::from(100));
+        asserter.push_success(&U64::from(1_000));
+        // One code-presence `eth_getCode` per call.
+        asserter.push_success(&alloy::primitives::Bytes::from_static(&[0x60]));
+        asserter.push_success(&alloy::primitives::Bytes::from_static(&[0x60]));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         let head: Arc<dyn HeadSource> = Arc::new(SharedHead::with_ttl(provider.clone(), TTL, None));
+        let pinned = 1_000 - SNAPSHOT_LAG_MARGIN_BLOCKS;
 
         let contract = ContentBlacklist::new(Address::ZERO, provider);
         let reads = ContractReads { contract, head };
 
-        assert_eq!(reads.block_number().await?, 100);
+        assert_eq!(reads.snapshot_block().await?, pinned);
         assert_eq!(
-            reads.block_number().await?,
-            100,
+            reads.snapshot_block().await?,
+            pinned,
             "second call is TTL-cached via SharedHead"
         );
         assert_eq!(
@@ -1682,6 +1750,58 @@ mod tests {
         assert!(snapshot.known.contains(&(US, hash(0x22))));
         assert!(snapshot.known.contains(&(US, hash(0x33))));
         Ok(())
+    }
+
+    /// A re-enumeration pinned below a tail change keeps it: an origin the tail
+    /// blacklisted above the snapshot block stays denied, and one it cleared
+    /// above the block stays clear, whatever the lagged snapshot says.
+    #[test]
+    fn a_re_enumeration_keeps_origin_changes_above_its_block() {
+        let denylist = Arc::new(ContentDenylist::empty());
+        let mut state = state_with_denylist(Arc::clone(&denylist));
+        let (late_add, late_clear, early) = (addr(0xA1), addr(0xA2), addr(0xA3));
+        state.set_origin(late_add, true, 900);
+        state.set_origin(late_clear, false, 901);
+        state.set_origin(early, true, 700);
+
+        // The snapshot at 800 predates the two late changes, and its read of
+        // `early` (changed at 700, below the pin) is authoritative.
+        state.fold_reenumeration(BootstrapSnapshot {
+            block: 800,
+            origins: HashSet::from([late_clear]),
+            known: HashSet::new(),
+        });
+
+        assert!(denylist.is_origin_denied(&late_add));
+        assert!(!denylist.is_origin_denied(&late_clear));
+        assert!(!denylist.is_origin_denied(&early));
+        assert_eq!(
+            state.origin_changes.len(),
+            2,
+            "changes at or below the pin are dropped"
+        );
+    }
+
+    /// A re-enumeration pinned below a `HashRemoved` does not re-add the removed
+    /// entry, while an entry removed at or below the pin comes back from the
+    /// authoritative snapshot.
+    #[test]
+    fn a_re_enumeration_does_not_re_add_an_entry_removed_above_its_block() {
+        let mut state = state();
+        let (late, early) = (hash(0x51), hash(0x52));
+        state.add_entry(US, late);
+        state.add_entry(US, early);
+        state.remove_entry(US, late, 900);
+        state.remove_entry(US, early, 700);
+
+        state.fold_reenumeration(BootstrapSnapshot {
+            block: 800,
+            origins: HashSet::new(),
+            known: HashSet::from([(US, late), (US, early)]),
+        });
+
+        assert!(!state.known.contains(&(US, late)));
+        assert!(state.known.contains(&(US, early)));
     }
 
     /// Paging reads more than one page and stops when it has `count` entries.
@@ -1765,7 +1885,7 @@ mod tests {
         state.add_entry(US, h);
         state.add_entry(FR, h);
 
-        state.remove_entry(FR, h);
+        state.remove_entry(FR, h, 1);
 
         assert!(!state.known.contains(&(FR, h)));
         assert!(state.known.contains(&(US, h)), "US entry must survive");
@@ -1778,7 +1898,7 @@ mod tests {
         let mut state = state();
         state.add_entry(US, h);
 
-        state.remove_entry(US, h);
+        state.remove_entry(US, h, 1);
 
         assert!(state.known.is_empty());
         assert!(state.distinct_hashes().is_empty());
@@ -1899,10 +2019,12 @@ mod tests {
         serde_json::from_value(serde_json::json!({ "code": code, "message": message })).unwrap()
     }
 
-    /// Queue the reads of a clean enumeration: no blacklisted addresses, and
-    /// `hashes` under the one in-scope region `US`.
+    /// Queue the reads of a clean enumeration: the snapshot block's
+    /// code-presence `eth_getCode`, no blacklisted addresses, and `hashes` under the one
+    /// in-scope region `US`.
     fn push_enumeration(asserter: &alloy::providers::mock::Asserter, hashes: &[B256]) {
         use alloy::sol_types::SolValue;
+        asserter.push_success(&alloy::primitives::Bytes::from_static(&[0x60]));
         asserter.push_success(&alloy::primitives::Bytes::from(U256::ZERO.abi_encode()));
         if hashes.is_empty() {
             asserter.push_success(&alloy::primitives::Bytes::from(

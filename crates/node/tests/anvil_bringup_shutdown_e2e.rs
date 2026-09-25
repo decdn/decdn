@@ -570,7 +570,11 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
         Box::new(|_| Ok(decdn_node::runtime::LogLevelApply::Installed)) as LogLevelSetter,
     ));
 
-    // ---- 5. Boot the real runtime.
+    // ---- 5. Boot the real runtime. The head is far below
+    // `SNAPSHOT_LAG_MARGIN_BLOCKS` here, so the lagged snapshot block predates the
+    // deployment. The boot therefore runs the code-presence `eth_getCode`
+    // fallback that pins such a young contract at head. It mirrors a
+    // `contracts/dev-deploy.sh` local chain.
     let secret_key = decdn_common::identity::load_or_generate(&cfg.identity.data_dir)?;
     let handle = tokio::spawn(decdn_node::runtime::run(
         cfg,
