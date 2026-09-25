@@ -106,6 +106,18 @@ struct Inner {
     folded: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
+impl Drop for Inner {
+    /// Remove the tab-bar indicator when the renderer drops, even if a per-file
+    /// callback still holds a clone of it: an early return must not leave a
+    /// stale percent in the tab, and a late update after the clear writes
+    /// nothing.
+    fn drop(&mut self) {
+        if let Some(tab) = &self.tab {
+            tab.clear();
+        }
+    }
+}
+
 /// The bottom total bar plus the rate meter behind its `{msg}`. Every downloaded
 /// byte folded into the total passes through [`inc`](Self::inc), which samples the
 /// meter; bytes spliced from disk never reach it, so its rate is a transfer rate.
@@ -680,6 +692,25 @@ mod tests {
         let msg = total.bar.message();
         assert!(msg.starts_with('('), "{msg}");
         assert!(msg.contains("ETA"), "{msg}");
+    }
+
+    #[test]
+    fn dropping_the_renderer_clears_the_tab_while_a_callback_lives() {
+        let (tab, log) = TabProgress::recorded(true);
+        let (mut pp, _total) = hidden_pp(1000);
+        if let Some(i) = pp.inner.as_mut() {
+            i.tab = Some(Arc::clone(&tab));
+        }
+        // A per-file callback outlives the renderer, still holding the tab.
+        let late = Arc::clone(&tab);
+        drop(pp);
+        assert_eq!(log.lock().unwrap().last().unwrap(), "\x1b]9;4;0;\x1b\\");
+        late.update(500, 1000);
+        assert_eq!(
+            log.lock().unwrap().last().unwrap(),
+            "\x1b]9;4;0;\x1b\\",
+            "an update after the clear writes nothing"
+        );
     }
 
     #[test]
