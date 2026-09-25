@@ -45,6 +45,10 @@ export SPONSOR_TREASURY_KEYSTORE=/path/to/treasury-keystore.json
 export SPONSOR_TREASURY_PASSWORD=...
 export SPONSOR_TURNSTILE_SECRET=...
 export SPONSOR_TURNSTILE_SITEKEY=...
+export SPONSOR_DECDN_RELEASE=v0.1.0
+export SPONSOR_DECDN_SUMS_SHA256=...
+export SPONSOR_WRAPPER_RELEASE=v0.1.0
+export SPONSOR_WRAPPER_SUMS_SHA256=...
 cargo run -p sponsord
 ```
 
@@ -79,6 +83,10 @@ pool up from the treasury whenever its remaining balance falls below
 | `SPONSOR_TURNSTILE_SECRET` | **yes** | — | Cloudflare Turnstile server-side secret, used to verify captcha tokens |
 | `SPONSOR_TURNSTILE_SITEKEY` | **yes** | — | Cloudflare Turnstile sitekey, interpolated into the `/fund` widget page |
 | `SPONSOR_DATA_DIR` | no | `./data` | Directory for the redb store (issuance bookkeeping) |
+| `SPONSOR_DECDN_RELEASE` | **yes** | — | `decdn/decdn` release tag (`vMAJOR.MINOR.PATCH`, optionally `-pre`, e.g. `v1.0.0-rc.1`) the installers install `decdn` from |
+| `SPONSOR_DECDN_SUMS_SHA256` | **yes** | — | SHA-256 of that release's `SHA256SUMS` file |
+| `SPONSOR_WRAPPER_RELEASE` | **yes** | — | `decdn/sponsord` release tag (same shape) the installers install `decdn-sponsored` from |
+| `SPONSOR_WRAPPER_SUMS_SHA256` | **yes** | — | SHA-256 of that release's `SHA256SUMS` file (printed in the release notes) |
 
 ## The `decdn-sponsored` flow
 
@@ -97,8 +105,12 @@ irm https://up.decdn.org/decdn.ps1 | iex; decdn-sponsored pull b3:<hash>
 
 1. The installer served at `GET /decdn.sh` (`assets/decdn.sh`), or its
    PowerShell twin at `GET /decdn.ps1` (`assets/decdn.ps1`), installs the
-   `decdn` and `decdn-sponsored` binaries and writes `~/.decdn/sponsor.toml`
-   with the gateway's contract addresses and RPC URL filled in. Any
+   `decdn` and `decdn-sponsored` binaries straight from their pinned GitHub
+   Releases. It downloads each release's `SHA256SUMS`, checks it against the
+   pinned digest, then checks the platform's archive against `SHA256SUMS`;
+   nothing is installed unless both match. It then writes
+   `~/.decdn/sponsor.toml` with the gateway's contract addresses and RPC URL
+   filled in. Any
    arguments are passed on to `decdn-sponsored`. Running it again is
    harmless, and `decdn-sponsored pull ...` works on its own once installed.
 2. `decdn-sponsored pull <hash> [-o <dir>]` (output defaults to the current
@@ -126,28 +138,26 @@ names must match exactly. Current fields: `gateway_base`, `decdn_bin`,
 `data_dir`, `rpc_url`, `payment_pool`, `capacity_bond` (optional),
 `slash_judge` (optional), `chain_id`. Unknown fields are ignored.
 
-## Publish seam
+## Building against `decdn`
 
-This repo currently depends on its sibling `decdn` checkout via path
-dependencies in the root `Cargo.toml`:
+The workspace path-depends on its sibling `decdn` checkout
+(`../decdn/crates/*`), so a local build uses whatever that checkout holds.
+CI checks out `decdn/decdn` beside this repo: `main` by default, or any ref a
+manual run names (`decdn_ref`), so breakage from `decdn` changes shows up
+early. Releases build against the commit pinned in `decdn.ref` instead, so a
+tag always builds the same code.
 
-```toml
-decdn-client      = { path = "../decdn/crates/client" }
-decdn-incentive   = { path = "../decdn/crates/incentive", features = ["redb"] }
-decdn-common      = { path = "../decdn/crates/common" }
-```
+## Releasing
 
-Before this repo goes public, swap those to git dependencies pinned to a
-tagged `decdn` release:
-
-```toml
-decdn-client      = { git = "https://github.com/decdn/decdn.git", tag = "vX.Y.Z" }
-decdn-incentive   = { git = "https://github.com/decdn/decdn.git", tag = "vX.Y.Z", features = ["redb"] }
-decdn-common      = { git = "https://github.com/decdn/decdn.git", tag = "vX.Y.Z" }
-```
-
-Only flip this repo's visibility to public **after** `decdn` itself is
-public — a public repo with a path dependency into a private sibling
-doesn't build for anyone outside this workspace, and a public repo pointing
-at a private git dependency leaks the existence (and tag names) of a repo
-nobody can otherwise see.
+1. Point `decdn.ref` at the `decdn` commit (full SHA) or tag to build
+   against, and make sure `Cargo.lock` is consistent with it
+   (`cargo metadata --locked` with that commit checked out beside this repo).
+2. Push a `vMAJOR.MINOR.PATCH[-pre]` tag. `.github/workflows/release.yml`
+   builds `decdn-sponsored` for Linux, macOS and Windows (x86_64 and
+   aarch64 each) and `sponsord` for Linux, and publishes them with a
+   `SHA256SUMS` manifest as a GitHub Release.
+3. The release notes print the `SPONSOR_WRAPPER_RELEASE` and
+   `SPONSOR_WRAPPER_SUMS_SHA256` values that pin it. Set them on the gateway
+   to make the installers serve it. `decdn` releases are pinned the same way
+   (`SPONSOR_DECDN_RELEASE`, and `SPONSOR_DECDN_SUMS_SHA256` = the SHA-256 of
+   that release's `SHA256SUMS`).

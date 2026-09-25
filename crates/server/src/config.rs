@@ -18,6 +18,70 @@ fn env_u64(k: &str, default: u64) -> anyhow::Result<u64> {
     }
 }
 
+/// A GitHub Release the installers download binaries from, pinned by its tag
+/// and by the SHA-256 of its `SHA256SUMS` file. The installer checks the
+/// downloaded `SHA256SUMS` against `sums_sha256`, then each archive against
+/// `SHA256SUMS`, so a release asset replaced after pinning is rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasePin {
+    /// `vMAJOR.MINOR.PATCH`, optionally with a `-pre.release` suffix.
+    pub tag: String,
+    /// 64 lowercase hex characters.
+    pub sums_sha256: String,
+}
+
+impl ReleasePin {
+    /// Both values are interpolated into the POSIX and PowerShell installer
+    /// scripts, so they are held to a strict shape rather than escaped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `tag` is not a semver release tag or
+    /// `sums_sha256` is not 64 lowercase hex characters.
+    pub fn new(tag: &str, sums_sha256: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            is_release_tag(tag),
+            "release tag {tag:?} is not vMAJOR.MINOR.PATCH[-pre]"
+        );
+        anyhow::ensure!(
+            sums_sha256.len() == 64
+                && sums_sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "SHA256SUMS digest {sums_sha256:?} is not 64 lowercase hex characters"
+        );
+        Ok(Self {
+            tag: tag.to_owned(),
+            sums_sha256: sums_sha256.to_owned(),
+        })
+    }
+
+    fn from_env(tag_var: &str, sums_var: &str) -> anyhow::Result<Self> {
+        Self::new(&env(tag_var)?, &env(sums_var)?)
+            .map_err(|e| anyhow::anyhow!("{tag_var}/{sums_var}: {e}"))
+    }
+}
+
+fn is_release_tag(tag: &str) -> bool {
+    let Some(version) = tag.strip_prefix('v') else {
+        return false;
+    };
+    let (core, pre) = match version.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (version, None),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        && pre.is_none_or(|p| {
+            !p.is_empty()
+                && p.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        })
+}
+
 pub struct ServerConfig {
     pub bind: SocketAddr,
     pub public_url: String,
@@ -35,6 +99,11 @@ pub struct ServerConfig {
     pub turnstile_secret: String,
     pub turnstile_sitekey: String,
     pub data_dir: PathBuf,
+    /// The `decdn/decdn` release the installers install `decdn` from.
+    pub decdn_release: ReleasePin,
+    /// The `decdn/sponsord` release the installers install `decdn-sponsored`
+    /// from.
+    pub wrapper_release: ReleasePin,
 }
 
 impl ServerConfig {
@@ -61,6 +130,14 @@ impl ServerConfig {
             data_dir: PathBuf::from(
                 std::env::var("SPONSOR_DATA_DIR").unwrap_or_else(|_| "./data".into()),
             ),
+            decdn_release: ReleasePin::from_env(
+                "SPONSOR_DECDN_RELEASE",
+                "SPONSOR_DECDN_SUMS_SHA256",
+            )?,
+            wrapper_release: ReleasePin::from_env(
+                "SPONSOR_WRAPPER_RELEASE",
+                "SPONSOR_WRAPPER_SUMS_SHA256",
+            )?,
         })
     }
 
@@ -124,6 +201,10 @@ mod tests {
             std::env::set_var("SPONSOR_TREASURY_KEYSTORE", "/tmp/ks.json");
             std::env::set_var("SPONSOR_TURNSTILE_SECRET", "s");
             std::env::set_var("SPONSOR_TURNSTILE_SITEKEY", "k");
+            std::env::set_var("SPONSOR_DECDN_RELEASE", "v0.1.0");
+            std::env::set_var("SPONSOR_DECDN_SUMS_SHA256", "ab".repeat(32));
+            std::env::set_var("SPONSOR_WRAPPER_RELEASE", "v0.2.0-rc.1");
+            std::env::set_var("SPONSOR_WRAPPER_SUMS_SHA256", "cd".repeat(32));
             std::env::remove_var("SPONSOR_CHAIN_ID");
             std::env::remove_var("SPONSOR_CAPABILITY_CAP_MICRO_USDC");
             std::env::remove_var("SPONSOR_CAPABILITY_TTL_SECS");
@@ -133,5 +214,36 @@ mod tests {
         assert_eq!(cfg.capability_cap.0, 5_000_000);
         assert_eq!(cfg.capability_ttl_secs, 172_800);
         assert_eq!(cfg.pool_low_water.0, 20_000_000);
+        assert_eq!(cfg.decdn_release.tag, "v0.1.0");
+        assert_eq!(cfg.wrapper_release.tag, "v0.2.0-rc.1");
+    }
+
+    #[test]
+    fn release_pin_accepts_semver_tags_and_hex_digests() {
+        let digest = "0123456789abcdef".repeat(4);
+        for tag in ["v0.1.0", "v10.20.30", "v1.0.0-rc.1", "v1.0.0-beta-2"] {
+            assert!(ReleasePin::new(tag, &digest).is_ok(), "{tag}");
+        }
+    }
+
+    #[test]
+    fn release_pin_rejects_anything_a_script_could_misread() {
+        let digest = "ab".repeat(32);
+        for tag in [
+            "0.1.0",
+            "v0.1",
+            "v0.1.0.1",
+            "v0..0",
+            "v0.1.0-",
+            "v0.1.0 ",
+            "v0.1.0;rm",
+            "v0.1.0$(id)",
+            "v0.1.0'",
+        ] {
+            assert!(ReleasePin::new(tag, &digest).is_err(), "{tag:?}");
+        }
+        for bad in [&"AB".repeat(32), &"ab".repeat(31), &"zz".repeat(32)] {
+            assert!(ReleasePin::new("v0.1.0", bad).is_err(), "{bad}");
+        }
     }
 }

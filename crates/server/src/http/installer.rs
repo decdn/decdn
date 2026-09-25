@@ -18,9 +18,15 @@ const DECDN_SH_TEMPLATE: &str = include_str!("../../assets/decdn.sh");
 const DECDN_PS1_TEMPLATE: &str = include_str!("../../assets/decdn.ps1");
 
 /// Substitute `cfg`'s values for the `{{GATEWAY_BASE}}`, `{{RPC_URL}}`,
-/// `{{PAYMENT_POOL}}`, `{{CAPACITY_BOND}}`, and `{{CHAIN_ID}}` placeholders.
+/// `{{PAYMENT_POOL}}`, `{{CAPACITY_BOND}}`, `{{CHAIN_ID}}`, and the pinned
+/// release placeholders (`{{DECDN_RELEASE}}`, `{{DECDN_SUMS_SHA256}}`,
+/// `{{WRAPPER_RELEASE}}`, `{{WRAPPER_SUMS_SHA256}}`).
 fn render(template: &str, cfg: &ServerConfig) -> String {
     template
+        .replace("{{DECDN_RELEASE}}", &cfg.decdn_release.tag)
+        .replace("{{DECDN_SUMS_SHA256}}", &cfg.decdn_release.sums_sha256)
+        .replace("{{WRAPPER_RELEASE}}", &cfg.wrapper_release.tag)
+        .replace("{{WRAPPER_SUMS_SHA256}}", &cfg.wrapper_release.sums_sha256)
         .replace("{{GATEWAY_BASE}}", &cfg.public_url)
         .replace("{{RPC_URL}}", &cfg.rpc_url)
         .replace("{{PAYMENT_POOL}}", &cfg.payment_pool.to_string())

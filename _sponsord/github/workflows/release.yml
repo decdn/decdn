@@ -1,0 +1,168 @@
+name: Release
+
+# A `vMAJOR.MINOR.PATCH` tag builds `decdn-sponsored` for every platform the
+# installers support and the `sponsord` server for Linux, then publishes them
+# with a SHA256SUMS manifest as a GitHub Release. The gateway's installers pin
+# a release by its tag and by the SHA-256 of that SHA256SUMS file
+# (`SPONSOR_WRAPPER_RELEASE` / `SPONSOR_WRAPPER_SUMS_SHA256`); the release notes
+# print both.
+#
+# This workspace path-depends on `../decdn`. A release builds against the
+# commit pinned in `decdn.ref`, not against whatever `decdn` main is, so the
+# same tag always builds the same code.
+on:
+  push:
+    tags: ['v[0-9]*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      decdn_ref: ${{ steps.version.outputs.decdn_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # The tag flows into archive names and the release notes, and the glob
+      # above matches things like `v0$(id)`, so hold it to strict semver.
+      - id: version
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag $GITHUB_REF_NAME is not vMAJOR.MINOR.PATCH[-pre]"
+            exit 1
+          fi
+          DECDN_REF="$(tr -d '[:space:]' < decdn.ref)"
+          if ! [[ "$DECDN_REF" =~ ^([0-9a-f]{40}|v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
+            echo "::error::decdn.ref must be a full commit SHA or a vMAJOR.MINOR.PATCH tag"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "decdn_ref=$DECDN_REF" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build ${{ matrix.binary }} ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds run on Ubuntu 22.04 (glibc 2.35), so the binaries run
+          # on Debian 12, Ubuntu 22.04, and anything newer.
+          - { package: decdn-sponsored, binary: decdn-sponsored, target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
+          - { package: decdn-sponsored, binary: decdn-sponsored, target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
+          - { package: decdn-sponsored, binary: decdn-sponsored, target: x86_64-apple-darwin, runner: macos-latest }
+          - { package: decdn-sponsored, binary: decdn-sponsored, target: aarch64-apple-darwin, runner: macos-latest }
+          - { package: decdn-sponsored, binary: decdn-sponsored, target: x86_64-pc-windows-msvc, runner: windows-latest }
+          # Cross-compiled on the x64 runner with the MSVC ARM64 toolchain.
+          - { package: decdn-sponsored, binary: decdn-sponsored, target: aarch64-pc-windows-msvc, runner: windows-latest }
+          # The gateway itself, for devops to deploy.
+          - { package: sponsord, binary: sponsord, target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
+          - { package: sponsord, binary: sponsord, target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sponsord
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: decdn/decdn
+          ref: ${{ needs.version.outputs.decdn_ref }}
+          path: decdn
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.95
+      # From inside the checkout, so the target lands on the toolchain that
+      # `rust-toolchain.toml` pins rather than on the action's own.
+      - working-directory: sponsord
+        run: rustup target add ${{ matrix.target }}
+      - working-directory: sponsord
+        run: cargo build --release --locked -p ${{ matrix.package }} --target ${{ matrix.target }}
+
+      # The binary sits at the archive root, the layout decdn's own release
+      # archives use and the installers unpack.
+      - name: Archive (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          tar -czf "$BINARY-$VERSION-$TARGET.tar.gz" -C "sponsord/target/$TARGET/release" "$BINARY"
+        env:
+          BINARY: ${{ matrix.binary }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.version.outputs.version }}
+      - name: Archive (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "sponsord/target/$env:TARGET/release/$env:BINARY.exe" `
+            -DestinationPath "$env:BINARY-$env:VERSION-$env:TARGET.zip"
+        env:
+          BINARY: ${{ matrix.binary }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.version.outputs.version }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}-${{ matrix.target }}
+          path: ${{ matrix.binary }}-${{ needs.version.outputs.version }}-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      # The count check matters: `sha256sum` with no file arguments reads
+      # stdin instead of failing, so a missing leg would otherwise produce a
+      # plausible-looking manifest.
+      - name: Checksum manifest
+        working-directory: dist
+        env:
+          EXPECTED_ARCHIVES: "8"
+        run: |
+          shopt -s nullglob
+          archives=( *.tar.gz *.zip )
+          if [ "${#archives[@]}" -ne "$EXPECTED_ARCHIVES" ]; then
+            echo "::error::expected $EXPECTED_ARCHIVES archives, found ${#archives[@]}: ${archives[*]}"
+            exit 1
+          fi
+          sha256sum -- "${archives[@]}" > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          DECDN_REF: ${{ needs.version.outputs.decdn_ref }}
+        run: |
+          SUMS_SHA256="$(sha256sum dist/SHA256SUMS | cut -d' ' -f1)"
+          {
+            echo "Built against decdn/decdn@${DECDN_REF}."
+            echo
+            echo "Pin this release in the gateway's installers with:"
+            echo
+            echo '```'
+            echo "SPONSOR_WRAPPER_RELEASE=${TAG}"
+            echo "SPONSOR_WRAPPER_SUMS_SHA256=${SUMS_SHA256}"
+            echo '```'
+          } > notes.md
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" --notes-file notes.md

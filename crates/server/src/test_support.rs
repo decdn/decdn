@@ -16,7 +16,7 @@ use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 
 use sponsord::captcha::CaptchaVerifier;
-use sponsord::config::ServerConfig;
+use sponsord::config::{ReleasePin, ServerConfig};
 use sponsord::issuer::Issuer;
 use sponsord::money::MicroUsdc;
 use sponsord::state::AppState;
@@ -139,6 +139,14 @@ pub fn app_state_with_options(opts: FakeOptions) -> AppState {
         turnstile_secret: "secret".into(),
         turnstile_sitekey: "TEST_SITEKEY".into(),
         data_dir,
+        decdn_release: ReleasePin {
+            tag: "v0.1.0".into(),
+            sums_sha256: "ab".repeat(32),
+        },
+        wrapper_release: ReleasePin {
+            tag: "v0.2.0".into(),
+            sums_sha256: "cd".repeat(32),
+        },
     };
     AppState {
         store,

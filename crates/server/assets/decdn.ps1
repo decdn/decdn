@@ -28,6 +28,14 @@
     $CapacityBond = '{{CAPACITY_BOND}}'
     $ChainId = '{{CHAIN_ID}}'
 
+    # The binaries come from pinned GitHub Releases. Each release is pinned by
+    # tag and by the SHA-256 of its SHA256SUMS file.
+    $Releases = 'https://github.com/decdn'
+    $DecdnRelease = '{{DECDN_RELEASE}}'
+    $DecdnSumsSha256 = '{{DECDN_SUMS_SHA256}}'
+    $WrapperRelease = '{{WRAPPER_RELEASE}}'
+    $WrapperSumsSha256 = '{{WRAPPER_SUMS_SHA256}}'
+
     $BinDir = Join-Path $env:LOCALAPPDATA 'decdn\bin'
     $DecdnDir = Join-Path $HOME '.decdn'
     New-Item -ItemType Directory -Force -Path $BinDir, $DecdnDir | Out-Null
@@ -45,14 +53,50 @@
       default { throw "decdn: unsupported Windows architecture: $OsArch" }
     }
 
+    $Target = "$Arch-pc-windows-msvc"
+
+    # Downloads SHA256SUMS and checks it against the pinned digest, then
+    # downloads the archive for this platform and checks it against
+    # SHA256SUMS. Nothing lands in BinDir unless both checks pass.
+    $FetchBin = {
+      param($Repo, $Bin, $Tag, $SumsSha256)
+      $Base = "$Releases/$Repo/releases/download/$Tag"
+      $Archive = "$Bin-$($Tag.Substring(1))-$Target.zip"
+      $Dir = Join-Path $Work $Bin
+      New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+
+      Write-Host "Installing $Bin $Tag ($Target)..."
+      $Sums = Join-Path $Dir 'SHA256SUMS'
+      Invoke-WebRequest -UseBasicParsing -Uri "$Base/SHA256SUMS" -OutFile $Sums
+      if ((Get-FileHash -Algorithm SHA256 $Sums).Hash.ToLower() -ne $SumsSha256) {
+        throw "decdn: SHA256SUMS for $Repo $Tag does not match the pinned digest"
+      }
+
+      $Expected = Get-Content $Sums | ForEach-Object {
+        $Hash, $Name = $_ -split '\s+', 2
+        if ($Name -and $Name.TrimStart('*') -eq $Archive) { $Hash.ToLower() }
+      } | Select-Object -First 1
+      if (-not $Expected) {
+        throw "decdn: $Repo $Tag has no $Archive (unsupported platform?)"
+      }
+      $Zip = Join-Path $Dir $Archive
+      Invoke-WebRequest -UseBasicParsing -Uri "$Base/$Archive" -OutFile $Zip
+      if ((Get-FileHash -Algorithm SHA256 $Zip).Hash.ToLower() -ne $Expected) {
+        throw "decdn: $Archive does not match SHA256SUMS"
+      }
+
+      Expand-Archive -Path $Zip -DestinationPath $Dir -Force
+      Move-Item -Force -Path (Join-Path $Dir "$Bin.exe") -Destination (Join-Path $BinDir "$Bin.exe")
+    }
+
     # 1. Install the decdn and decdn-sponsored binaries.
-    #
-    # NOTE: release hosting (GET /dl/<bin>-<os>-<arch>) is not wired up on the
-    # gateway yet; until it is, this step fails with a 404.
-    foreach ($bin in 'decdn', 'decdn-sponsored') {
-      Write-Host "Installing $bin..."
-      Invoke-WebRequest -UseBasicParsing -Uri "$Gateway/dl/$bin-windows-$Arch.exe" `
-        -OutFile (Join-Path $BinDir "$bin.exe")
+    $Work = Join-Path ([IO.Path]::GetTempPath()) ("decdn-" + [Guid]::NewGuid())
+    New-Item -ItemType Directory -Force -Path $Work | Out-Null
+    try {
+      & $FetchBin 'decdn' 'decdn' $DecdnRelease $DecdnSumsSha256
+      & $FetchBin 'sponsord' 'decdn-sponsored' $WrapperRelease $WrapperSumsSha256
+    } finally {
+      Remove-Item -Recurse -Force -Path $Work -ErrorAction SilentlyContinue
     }
 
     # 2. Put the binaries on PATH: permanently for the user, and right away for

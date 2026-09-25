@@ -236,6 +236,22 @@ async fn decdn_sh_templated_with_payment_pool() {
         body.contains("payment_pool ="),
         "installer writes payment_pool"
     );
+    assert_pins_releases(&body);
+}
+
+/// Both installers download from the GitHub Releases pinned in config
+/// (`test_support`: decdn v0.1.0, sponsord v0.2.0), by tag and by the digest
+/// of each release's SHA256SUMS.
+fn assert_pins_releases(body: &str) {
+    assert!(body.contains("https://github.com/decdn"));
+    assert!(body.contains("'v0.1.0'") || body.contains("\"v0.1.0\""));
+    assert!(body.contains("'v0.2.0'") || body.contains("\"v0.2.0\""));
+    assert!(body.contains(&"ab".repeat(32)), "decdn SHA256SUMS digest");
+    assert!(
+        body.contains(&"cd".repeat(32)),
+        "sponsord SHA256SUMS digest"
+    );
+    assert!(!body.contains("/dl/"), "no gateway-hosted binaries");
 }
 
 #[tokio::test]
@@ -257,7 +273,8 @@ async fn decdn_ps1_templated_with_payment_pool() {
         "installer writes payment_pool"
     );
     assert!(
-        body.contains("-windows-$Arch.exe"),
-        "installer downloads the Windows binaries"
+        body.contains("-pc-windows-msvc"),
+        "installer downloads the Windows release archives"
     );
+    assert_pins_releases(&body);
 }
