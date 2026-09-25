@@ -143,6 +143,8 @@ Four boot reads must succeed before the node serves: the registry snapshot (Step
 - A deterministic failure stops the node at once. Examples are no contract at the configured address, an ABI mismatch, a revert, a JSON-RPC invalid request, method or params error, and an HTTP 4xx other than 408 and 429.
 - A retry delays readiness. It does not open the node to connections: Step 3.1 still gates them.
 
+The fee-share reads (`PaymentPool.feeRouter()` and `FeeRouter.getShares()`) use the same retry and the same deadline. When they fail, the node uses the floor fee share and does not stop.
+
 #### Step 3.3 — Configure local rate
 
 Set the node's `rate_per_mb`, satisfying `rate_per_mb ≤ MAX_RATE_PER_MB`. This rate is advertised verbatim in `ProbeResponse` messages; the node never raises it to the delivery floor. The floor is a redemption-time credit clamp, not a quote gate ([ADR 003 § Rate-floor enforcement](003-payments.md#rate-floor-enforcement)): a rate below the floor still sells and settles, and only its vote-weight byte credit is clamped. An operator that wants full vote-weight credit sets `rate_per_mb` at or above the current `deliveryFloor`, but this is a revenue choice, not a protocol requirement. Probes are the canonical rate-discovery channel; rate changes propagate through fresh probe responses ([ADR 005](005-protocol.md#adr-005-wire-protocol)).

@@ -900,7 +900,9 @@ async fn build_chain_and_handlers(
     // registry, slash, `usdc()` self-check and blacklist reads (#2159). Each
     // retries its reads on transient provider errors and fails only on a
     // deterministic fault or once the shared deadline passes. The best-effort
-    // fee-shares and binding reads do not use it. Startup stays fail-closed: a
+    // fee-shares reads share the deadline but fall back to the floor share
+    // instead of failing boot; the binding check does not use it. Startup
+    // stays fail-closed: a
     // retry delays readiness, and the ALPN router waits on the blacklist
     // enumeration and enforcement.
     let boot = BootRetry::new(BOOT_CHAIN_RETRY_BUDGET, Arc::clone(&infra.node_metrics));
@@ -1093,67 +1095,24 @@ async fn build_chain_and_handlers(
         "blockchain.payment_pool_address",
     )?;
 
-    // Live operator fee-share seed (ADR 041 / ADR 016 § Tunable Economics).
-    // A fail-fast on-chain self-check at startup — `PaymentPool.feeRouter()`
-    // resolves the router address, then `FeeRouter.getShares()` reads the current
-    // 3-way split, narrowed to the operator's bps. Unlike the rate-bounds read,
-    // NO leg of this chain is fatal to boot: an RPC failure or an unnarrowable
-    // split falls back to `FEE_ROUTER_OPERATOR_BPS_FLOOR` and the node still comes
-    // up, because the `margin` policy is an economic optimization, not a safety
-    // invariant. When the router address itself cannot be read, there is also
-    // nothing to watch, so the `SharesUpdated` route below is only registered on
-    // the success path; a re-read failure of `getShares()` alone still registers
-    // the route, since the watcher's own periodic re-read can recover from there.
-    let fee_router_addr = decdn_incentive::payment_pool::PaymentPool::new(
-        payment_pool_addr,
+    // Live operator fee-share seed (ADR 041 / ADR 016 § Tunable Economics):
+    // `PaymentPool.feeRouter()` resolves the router address, then
+    // `FeeRouter.getShares()` reads the current 3-way split, narrowed to the
+    // operator's bps. Unlike the fail-closed reads, NO leg of this chain is fatal
+    // to boot: a failure falls back to `FEE_ROUTER_OPERATOR_BPS_FLOOR` and the
+    // node still comes up. Both reads retry transient errors on the boot
+    // deadline, because `feeRouter` is immutable and a missed read would leave
+    // the `SharesUpdated` route below unregistered until restart.
+    let crate::fee_shares::FeeShareSeed {
+        router: fee_router_addr,
+        operator_bps: seed_operator_bps,
+    } = crate::fee_shares::seed_from_chain(
         ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
+        payment_pool_addr,
+        FEE_ROUTER_OPERATOR_BPS_FLOOR,
+        &boot,
     )
-    .feeRouter()
-    .call()
-    .await
-    .inspect_err(|err| {
-        tracing::warn!(
-            error = %err,
-            fallback_bps = FEE_ROUTER_OPERATOR_BPS_FLOOR,
-            "PaymentPool.feeRouter() startup read failed; operator fee share seeded to the \
-             FeeRouter OPERATOR_BPS_FLOOR and the fee-shares watcher is not registered"
-        );
-    })
-    .ok();
-    let seed_operator_bps = match fee_router_addr {
-        Some(addr) => {
-            let fee_router_contract = decdn_incentive::payment_pool::FeeRouter::new(
-                addr,
-                ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
-            );
-            match fee_router_contract.getShares().call().await {
-                Ok(shares) => {
-                    match crate::fee_shares::operator_bps_from_shares(shares, &addr.to_string()) {
-                        Ok(bps) => bps,
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                fallback_bps = FEE_ROUTER_OPERATOR_BPS_FLOOR,
-                                "FeeRouter.getShares() startup read could not be narrowed to \
-                                 operator bps; falling back to OPERATOR_BPS_FLOOR"
-                            );
-                            FEE_ROUTER_OPERATOR_BPS_FLOOR
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        fallback_bps = FEE_ROUTER_OPERATOR_BPS_FLOOR,
-                        "FeeRouter.getShares() startup read failed; falling back to \
-                         OPERATOR_BPS_FLOOR"
-                    );
-                    FEE_ROUTER_OPERATOR_BPS_FLOOR
-                }
-            }
-        }
-        None => FEE_ROUTER_OPERATOR_BPS_FLOOR,
-    };
+    .await;
     let operator_shares = crate::fee_shares::OperatorShares::new(seed_operator_bps);
     tracing::info!(
         bps = seed_operator_bps,

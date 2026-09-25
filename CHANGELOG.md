@@ -844,6 +844,12 @@ since project inception and will roll into the first tagged release.
   - The slash enumeration reads at its snapshot block, so a lagging
     load-balanced backend answers "header not found" (retried) instead of
     reverting on a slash index it has not seen (fatal).
+  - The best-effort fee-share reads (`PaymentPool.feeRouter()`,
+    `FeeRouter.getShares()`) retry on the same boot deadline and carry the
+    per-call timeout. They still fall back to the floor share rather than fail
+    boot, but a transient `feeRouter()` error no longer leaves the node on the
+    floor share with the fee-shares watcher unregistered until restart. Their
+    failure logs are sanitized, so an RPC URL key cannot leak into them.
   - The client's registry discovery shares the classifier
     (`decdn_client::provider::is_permanent_contract_error` /
     `is_permanent_rpc_error`): a provider outage answered as a JSON-RPC error
