@@ -263,6 +263,23 @@ pub struct PoolSettlementService<P: Provider + Clone + 'static> {
     redeemer: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Startup self-check: a cheap immutable view confirms the configured address
+/// actually hosts the `PaymentPool` contract. Transient errors retry on
+/// `boot`'s budget; no contract at the address decodes as `ZeroData`, which is
+/// permanent and fails at once.
+async fn usdc_self_check<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    boot: &BootRetry,
+) -> Result<Address> {
+    let payment_pool_addr = *contract.address();
+    boot.run("PaymentPool.usdc() self-check", || async {
+        timed(None, "PaymentPool.usdc()", contract.usdc().call())
+            .await
+            .with_context(|| format!("PaymentPool.usdc() self-check at {payment_pool_addr}"))
+    })
+    .await
+}
+
 impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
     /// Bootstrap the service: self-check the contract, spawn the redemption
     /// task, and return the service alongside the paid-watermark [`Route`] the
@@ -292,18 +309,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
     ) -> Result<(Self, Route)> {
         let contract = PaymentPool::new(payment_pool_addr, provider);
 
-        // Startup self-check: a cheap immutable view confirms the configured
-        // address actually hosts the contract. No contract there decodes as
-        // `ZeroData`, which the boot retry treats as permanent.
-        let usdc_token = boot
-            .run("PaymentPool.usdc() self-check", || async {
-                timed(None, "PaymentPool.usdc()", contract.usdc().call())
-                    .await
-                    .with_context(|| {
-                        format!("PaymentPool.usdc() self-check at {payment_pool_addr}")
-                    })
-            })
-            .await?;
+        let usdc_token = usdc_self_check(&contract, boot).await?;
         info!(
             %payment_pool_addr,
             %usdc_token,
@@ -2094,6 +2100,64 @@ fn is_oversize_send_err(msg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn boot_retries(metrics: &Metrics) -> u64 {
+        let text = metrics.encode().unwrap_or_default();
+        text.lines()
+            .find_map(|l| l.strip_prefix("decdn_chain_boot_read_retries_total "))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(u64::MAX)
+    }
+
+    /// A transient error on the `usdc()` self-check is retried, not fatal.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_usdc_self_check_error_is_retried() {
+        use crate::chain_events::boot_retry::BOOT_CHAIN_RETRY_BUDGET;
+        use alloy::providers::mock::Asserter;
+        use alloy::sol_types::SolValue;
+
+        let usdc = Address::repeat_byte(0x33);
+        let asserter = Asserter::new();
+        asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
+        asserter.push_success(&alloy::primitives::Bytes::from(usdc.abi_encode()));
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let metrics = Arc::new(Metrics::new());
+
+        let got = usdc_self_check(
+            &PaymentPool::new(Address::repeat_byte(0x11), provider),
+            &BootRetry::new(BOOT_CHAIN_RETRY_BUDGET, Arc::clone(&metrics)),
+        )
+        .await;
+
+        assert_eq!(got.ok(), Some(usdc));
+        assert_eq!(boot_retries(&metrics), 1);
+    }
+
+    /// No contract at the configured address fails the self-check at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_payment_pool_fails_the_self_check_at_once() {
+        use crate::chain_events::boot_retry::BOOT_CHAIN_RETRY_BUDGET;
+        use alloy::providers::mock::Asserter;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&alloy::primitives::Bytes::new());
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let metrics = Arc::new(Metrics::new());
+        let start = tokio::time::Instant::now();
+
+        let err = usdc_self_check(
+            &PaymentPool::new(Address::repeat_byte(0x11), provider),
+            &BootRetry::new(BOOT_CHAIN_RETRY_BUDGET, Arc::clone(&metrics)),
+        )
+        .await
+        .err()
+        .map(|e| format!("{e:#}"))
+        .unwrap_or_default();
+
+        assert!(err.contains("not retried"), "{err}");
+        assert_eq!(boot_retries(&metrics), 0);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
 
     fn status(remaining: u64, lifecycle: Lifecycle) -> PoolStatus {
         PoolStatus {

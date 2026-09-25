@@ -747,6 +747,8 @@ mod tests {
         paused_total: u64,
         /// slashIds whose record was point-read, for the early-stop assertion.
         reads: std::sync::Mutex<Vec<U256>>,
+        /// The block every read ran at, for the pinned-read assertion.
+        blocks: std::sync::Mutex<Vec<BlockId>>,
     }
 
     impl StubSlashReads {
@@ -756,7 +758,12 @@ mod tests {
                 slashes,
                 paused_total: 0,
                 reads: std::sync::Mutex::new(Vec::new()),
+                blocks: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn blocks_read(&self) -> Vec<BlockId> {
+            self.blocks.lock().unwrap().clone()
         }
 
         fn with_paused_total(mut self, paused_total: u64) -> Self {
@@ -770,7 +777,8 @@ mod tests {
     }
 
     impl SlashChainReads for StubSlashReads {
-        async fn operator_slash_count(&self, operator: Address, _at: BlockId) -> Result<U256> {
+        async fn operator_slash_count(&self, operator: Address, at: BlockId) -> Result<U256> {
+            self.blocks.lock().unwrap().push(at);
             assert_eq!(operator, self.operator, "unexpected operator");
             Ok(U256::from(self.slashes.len()))
         }
@@ -779,8 +787,9 @@ mod tests {
             &self,
             operator: Address,
             index: U256,
-            _at: BlockId,
+            at: BlockId,
         ) -> Result<U256> {
+            self.blocks.lock().unwrap().push(at);
             assert_eq!(operator, self.operator, "unexpected operator");
             let i: usize = index.to();
             self.slashes
@@ -789,7 +798,8 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("SlashIndexOutOfRange"))
         }
 
-        async fn get_slash_record(&self, slash_id: U256, _at: BlockId) -> Result<SlashRecordView> {
+        async fn get_slash_record(&self, slash_id: U256, at: BlockId) -> Result<SlashRecordView> {
+            self.blocks.lock().unwrap().push(at);
             self.reads.lock().unwrap().push(slash_id);
             self.slashes
                 .iter()
@@ -798,7 +808,8 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("no such slash"))
         }
 
-        async fn paused_total(&self, _at: BlockId) -> Result<u64> {
+        async fn paused_total(&self, at: BlockId) -> Result<u64> {
+            self.blocks.lock().unwrap().push(at);
             Ok(self.paused_total)
         }
     }
@@ -815,6 +826,182 @@ mod tests {
             evidence_hash: B256::repeat_byte(evidence),
             appeal_window_close,
         }
+    }
+
+    /// Every enumeration read runs at the block it is given: the count, the
+    /// pause offset, each index and each record.
+    #[tokio::test]
+    async fn every_enumeration_read_runs_at_the_given_block() {
+        let op = Address::repeat_byte(0xAB);
+        let now = 1_000;
+        let reads = StubSlashReads::new(
+            op,
+            vec![
+                (U256::from(20u64), record(1, 200, 0x22, now + 50)),
+                (U256::from(30u64), record(0, 300, 0x33, now + 99)),
+            ],
+        );
+
+        bootstrap_slashes(&reads, op, now, BlockId::number(100))
+            .await
+            .unwrap();
+
+        let blocks = reads.blocks_read();
+        // Count, pause offset, then an index and a record per slash.
+        assert_eq!(blocks.len(), 6);
+        assert!(
+            blocks.iter().all(|b| *b == BlockId::number(100)),
+            "{blocks:?}"
+        );
+    }
+
+    /// A JSON-RPC responder that answers `eth_blockNumber` with block 100 and
+    /// every `eth_call` with a zero word, recording each call's block tag.
+    struct BlockTagRpc {
+        tags: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl wiremock::Respond for BlockTagRpc {
+        fn respond(&self, req: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+            let result = if body.get("method").and_then(serde_json::Value::as_str)
+                == Some("eth_blockNumber")
+            {
+                serde_json::json!("0x64")
+            } else {
+                let tag = body
+                    .pointer("/params/1")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                self.tags.lock().unwrap().push(tag);
+                serde_json::json!(format!("0x{}", "00".repeat(32)))
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "result": result,
+            }))
+        }
+    }
+
+    /// The boot enumeration pins its reads to the snapshot head, so a lagging
+    /// load-balanced backend cannot answer the count and the records from
+    /// different blocks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_boot_enumeration_reads_at_the_snapshot_block() {
+        use crate::chain_events::boot_retry::BootRetry;
+        use crate::chain_events::shared_head::SharedHead;
+        use alloy::providers::ProviderBuilder;
+
+        let tags = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(BlockTagRpc {
+                tags: Arc::clone(&tags),
+            })
+            .mount(&server)
+            .await;
+        let url: reqwest::Url = server.uri().parse().unwrap();
+        let provider = ProviderBuilder::new().connect_http(url);
+        let head: Arc<dyn HeadSource> = Arc::new(SharedHead::with_ttl(
+            provider.clone(),
+            Duration::from_hours(1),
+            None,
+        ));
+        let metrics = Arc::new(Metrics::new());
+
+        bootstrap(
+            provider,
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            head,
+            Arc::clone(&metrics),
+            &BootRetry::single_attempt(Arc::clone(&metrics)),
+        )
+        .await
+        .unwrap();
+
+        // No slashes: the count and the pause offset.
+        let tags = tags.lock().unwrap().clone();
+        assert_eq!(tags, vec![serde_json::json!("0x64"); 2]);
+    }
+
+    /// A stalled provider cannot wedge boot: every read is bounded by the
+    /// per-call timeout, so the boot read fails into its budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_provider_fails_the_boot_enumeration() {
+        use crate::chain_events::boot_retry::BootRetry;
+        use crate::chain_events::shared_head::SharedHead;
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+        use alloy::providers::ProviderBuilder;
+        use alloy::providers::mock::Asserter;
+
+        let head_asserter = Asserter::new();
+        head_asserter.push_success(&alloy::primitives::U64::from(100));
+        let head: Arc<dyn HeadSource> = Arc::new(SharedHead::with_ttl(
+            ProviderBuilder::new().connect_mocked_client(head_asserter),
+            Duration::from_hours(1),
+            None,
+        ));
+        let metrics = Arc::new(Metrics::new());
+
+        let err = bounded(
+            "slash boot enumeration",
+            bootstrap(
+                hanging_provider(),
+                Address::repeat_byte(0x11),
+                Address::repeat_byte(0x22),
+                head,
+                Arc::clone(&metrics),
+                &BootRetry::single_attempt(Arc::clone(&metrics)),
+            ),
+        )
+        .await
+        .err()
+        .map(|e| format!("{e:#}"))
+        .unwrap();
+
+        assert!(err.contains("operatorSlashCount timed out after"), "{err}");
+    }
+
+    /// A deterministic head-read failure keeps its typed cause through the
+    /// `SharedHead` cache, so boot fails at once rather than retrying.
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_head_error_fails_the_boot_enumeration_at_once() {
+        use crate::chain_events::boot_retry::{BOOT_CHAIN_RETRY_BUDGET, BootRetry};
+        use crate::chain_events::shared_head::SharedHead;
+        use alloy::providers::ProviderBuilder;
+        use alloy::providers::mock::Asserter;
+
+        let head_asserter = Asserter::new();
+        head_asserter.push_failure(
+            serde_json::from_value(serde_json::json!({
+                "code": -32601,
+                "message": "method not found",
+            }))
+            .unwrap(),
+        );
+        let head: Arc<dyn HeadSource> = Arc::new(SharedHead::with_ttl(
+            ProviderBuilder::new().connect_mocked_client(head_asserter),
+            Duration::from_hours(1),
+            None,
+        ));
+        let metrics = Arc::new(Metrics::new());
+        let start = tokio::time::Instant::now();
+
+        let err = bootstrap(
+            ProviderBuilder::new().connect_mocked_client(Asserter::new()),
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            head,
+            Arc::clone(&metrics),
+            &BootRetry::new(BOOT_CHAIN_RETRY_BUDGET, Arc::clone(&metrics)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("not retried"), "{err:#}");
+        assert_eq!(start.elapsed(), Duration::ZERO);
     }
 
     /// Enumeration surfaces the still-appealable slashes newest-first, carrying

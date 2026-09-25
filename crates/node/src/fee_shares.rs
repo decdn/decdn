@@ -72,7 +72,8 @@ pub fn operator_bps_from_shares(shares: [U256; 3], addr: &str) -> anyhow::Result
 pub(crate) struct FeeShareSeed {
     /// `PaymentPool.feeRouter()`, or `None` when it cannot be read. With no
     /// router address there is nothing to watch, so the runtime registers the
-    /// fee-shares route only when this is `Some`.
+    /// fee-shares route only when this is `Some`. When `None`, `operator_bps` is
+    /// `floor_bps`.
     pub(crate) router: Option<Address>,
     /// The operator share, or `floor_bps` when it cannot be read or narrowed.
     pub(crate) operator_bps: u16,
@@ -262,6 +263,33 @@ mod tests {
         );
         assert_eq!(retries(&metrics), 0);
         assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// A stalled provider cannot wedge boot: the fee reads are bounded by the
+    /// per-call timeout and fall back to the floor share.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_provider_falls_back_to_the_floor() {
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+
+        let metrics = Arc::new(Metrics::new());
+        let seed = bounded(
+            "fee-share seed",
+            seed_from_chain(
+                hanging_provider(),
+                Address::repeat_byte(0x11),
+                FLOOR,
+                &BootRetry::single_attempt(Arc::clone(&metrics)),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            seed,
+            FeeShareSeed {
+                router: None,
+                operator_bps: FLOOR,
+            }
+        );
     }
 
     /// A `getShares()` read that never succeeds seeds the floor but keeps the

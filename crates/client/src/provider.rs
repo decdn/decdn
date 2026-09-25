@@ -78,7 +78,8 @@ pub fn is_permanent_contract_error(err: &alloy::contract::Error) -> bool {
 ///   names a revert, in any case), or an invalid request, unknown method or
 ///   invalid params (`-32600`, `-32601`, `-32602`);
 /// - an HTTP 4xx other than 408 and 429 — a wrong path, an unauthorized or
-///   expired API key;
+///   expired API key. An HTTP error whose body is a JSON-RPC error reaches
+///   here as an error response and is judged by its code, not its status;
 /// - a request that could not be serialized, or that the transport rejects
 ///   locally.
 ///

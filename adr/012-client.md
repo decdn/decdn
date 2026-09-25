@@ -56,8 +56,10 @@ Startup sequence from first launch to ready state:
        - an ABI mismatch
        - a revert
        - a JSON-RPC invalid request, method or params error
-       - an HTTP 4xx other than 408 and 429
-     The client retries every other JSON-RPC error response. Providers
+       - an HTTP 4xx other than 408 and 429, without a `Retry-After`
+         header
+     An HTTP error with a JSON-RPC error body counts as a JSON-RPC error
+     response. The client retries every other JSON-RPC error response. Providers
      report rate limits and upstream outages that way.
      The whole of step 3 is additionally bounded by the client's
      `--timeout-ms`, so the retry schedule can never be the reason a fetch

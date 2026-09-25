@@ -1,10 +1,10 @@
 //! One shared, TTL-cached `eth_blockNumber` read for every chain watcher.
 //!
-//! Each watcher runs its own poll loop against its own provider, so before this
-//! module every tick cost one `eth_blockNumber` *per watcher* — ~7 head reads per
-//! `event_poll_interval` against a single endpoint, on top of each watcher's
-//! `eth_getLogs`. [`SharedHead`] collapses them: the first caller within a TTL
-//! window issues the RPC, everyone else reads the cache.
+//! Without a shared read, every tick would cost one `eth_blockNumber` *per
+//! watcher* — ~7 head reads per `event_poll_interval` against a single endpoint,
+//! on top of each watcher's `eth_getLogs`. [`SharedHead`] collapses them: the
+//! first caller within a TTL window issues the RPC, everyone else reads the
+//! cache.
 //!
 //! Two properties matter:
 //!
@@ -27,8 +27,7 @@
 //!   `chain_events::DEFAULT_RPC_CALL_TIMEOUT` in turn, so the last one's tick — and
 //!   therefore its `*_backoff_started` gauge — would be delayed by N × 10s. With
 //!   it, one caller pays the timeout and the rest fail instantly, so every
-//!   watcher enters backoff at the same moment, exactly as it did when each read
-//!   its own head.
+//!   watcher enters backoff at the same moment.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,11 +48,14 @@ use super::timed;
 /// block X been reached yet?") rather than a scan upper bound would be delayed by
 /// up to the TTL; no watcher does that today.
 ///
-/// `Err` is retryable: the caller's tick fails into backoff.
+/// `Err` keeps the provider's typed cause in its chain. A watcher tick treats
+/// every `Err` as retryable and fails into backoff; a boot read classifies it
+/// (`boot_retry::is_permanent_boot_error`), so a deterministic failure such as a
+/// rejected API key fails boot at once.
 #[async_trait]
 pub trait HeadSource: Send + Sync {
     /// The current chain head, at or before the true head and never ahead
-    /// of it. `Err` is retryable.
+    /// of it. `Err` keeps its typed cause in its chain.
     async fn head(&self) -> Result<u64>;
 }
 
@@ -454,7 +456,7 @@ mod tests {
     }
 
     /// The cached failure replays the *original* message, not a placeholder —
-    /// the `Arc` round-trip and `{err:#}` re-wrap must not lose it, or the
+    /// the shared `Arc` behind `HeadReadFailed` must not lose it, or the
     /// second-through-Nth watcher would log a less diagnostic error than the
     /// first for the very same fault. (`timed` only attaches its `get_block_number`
     /// label on the timeout path; a transport error propagates raw and

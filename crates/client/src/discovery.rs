@@ -224,7 +224,8 @@ where
                 // likeliest first-run mistakes both land here: a typo'd
                 // `blockchain.capacity_bond_address` (the call returns `0x`,
                 // decoded as `ZeroData`) and an expired or wrong RPC API key
-                // (HTTP 401/403). Retrying either one would sit silently for
+                // (HTTP 401/403 with a plain body; a JSON-RPC error body is
+                // judged by its code instead). Retrying either one would sit silently for
                 // 36 s and then blame network connectivity.
                 Err(e) if is_permanent_contract_error(&e) => {
                     return Err(e).with_context(|| {

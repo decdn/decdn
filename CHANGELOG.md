@@ -834,8 +834,8 @@ since project inception and will roll into the first tagged release.
   One 10-minute boot deadline covers all of them, so a dead endpoint still
   exits. A deterministic fault still fails boot at once: no contract at the
   address, an ABI mismatch, a revert, an invalid request/method/params
-  response, an HTTP 4xx other than 408/429, or a local eviction error during
-  the blacklist enforcement pass. Startup stays fail-closed: the ALPN router
+  response, an HTTP 4xx other than 408/429, or a local eviction error that
+  decides a blacklist enforcement attempt. Startup stays fail-closed: the ALPN router
   still waits on the blacklist enumeration and enforcement. Supporting changes:
   - The registry, slash and `usdc()` reads carry the 10 s per-call RPC
     timeout, so a hung provider reaches the retry instead of wedging boot.
@@ -845,11 +845,17 @@ since project inception and will roll into the first tagged release.
     load-balanced backend answers "header not found" (retried) instead of
     reverting on a slash index it has not seen (fatal).
   - The best-effort fee-share reads (`PaymentPool.feeRouter()`,
-    `FeeRouter.getShares()`) retry on the same boot deadline and carry the
-    per-call timeout. They still fall back to the floor share rather than fail
-    boot, but a transient `feeRouter()` error no longer leaves the node on the
-    floor share with the fee-shares watcher unregistered until restart. Their
-    failure logs are sanitized, so an RPC URL key cannot leak into them.
+    `FeeRouter.getShares()`) retry on a 1-minute sub-budget of the boot
+    deadline and carry the per-call timeout. They still fall back to the floor
+    share rather than fail boot, but a transient `feeRouter()` error no longer
+    leaves the node on the floor share with the fee-shares watcher
+    unregistered until restart. When it does fall back, the new
+    `decdn_fee_shares_watcher_unregistered` gauge reads `1`. Their failure
+    logs are sanitized, so an RPC URL key cannot leak into them.
+  - The fee-shares watcher's periodic `getShares()` re-read carries the
+    per-call timeout and logs a sanitized error.
+  - The blacklist boot enforcement pass stops at its first failed scope read
+    instead of re-checking every remaining hash against a failing provider.
   - The client's registry discovery shares the classifier
     (`decdn_client::provider::is_permanent_contract_error` /
     `is_permanent_rpc_error`): a provider outage answered as a JSON-RPC error

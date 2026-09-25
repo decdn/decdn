@@ -138,12 +138,12 @@ If the read fails, the node retries it as [Boot-time chain reads](#boot-time-cha
 
 Four boot reads must succeed before the node serves: the registry snapshot (Step 3.2), the slash enumeration, the `PaymentPool.usdc()` self-check, and the blacklist enumeration with its enforcement pass (Step 3.1).
 
-- A transient RPC failure does not stop the node. The node retries the read with exponential backoff. The backoff starts at 1 s, doubles, and stops at 60 s.
-- One boot deadline applies to all four reads. The deadline is 10 minutes from the start of the reads. When a retry cannot end before the deadline, the node exits.
-- A deterministic failure stops the node at once. Examples are no contract at the configured address, an ABI mismatch, a revert, a JSON-RPC invalid request, method or params error, and an HTTP 4xx other than 408 and 429.
+- A transient RPC failure does not stop the node. The node retries the read with exponential backoff. The backoff starts at 1 s and doubles on each retry. It does not increase above 60 s.
+- One boot deadline applies to all four reads. The deadline is 10 minutes from the start of the reads. When the next retry cannot start before the deadline, the node exits.
+- A deterministic failure stops the node at once. Examples are no contract at the configured address, an ABI mismatch, a revert, a JSON-RPC invalid request, method or params error, and an HTTP 4xx other than 408 and 429 that has no `Retry-After` header.
 - A retry delays readiness. It does not open the node to connections: Step 3.1 still gates them.
 
-The fee-share reads (`PaymentPool.feeRouter()` and `FeeRouter.getShares()`) use the same retry and the same deadline. When they fail, the node uses the floor fee share and does not stop.
+The fee-share reads (`PaymentPool.feeRouter()` and `FeeRouter.getShares()`) use the same retry. They retry for 1 minute at most, inside the same deadline. This limit keeps time for the four reads that come after them. When they fail, the node uses the floor fee share and does not stop.
 
 #### Step 3.3 — Configure local rate
 

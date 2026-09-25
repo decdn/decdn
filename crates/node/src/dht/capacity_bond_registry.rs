@@ -799,6 +799,74 @@ mod tests {
         );
     }
 
+    /// A transient provider error on the registry snapshot is retried on the
+    /// boot budget, not fatal.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_boot_snapshot_error_is_retried() {
+        use crate::chain_events::boot_retry::{BOOT_CHAIN_RETRY_BUDGET, BootRetry};
+        use crate::chain_events::shared_head::SharedHead;
+        use alloy::providers::ProviderBuilder;
+        use alloy::providers::mock::Asserter;
+        use alloy::sol_types::SolCall;
+
+        let head_asserter = Asserter::new();
+        head_asserter.push_success(&alloy::primitives::U64::from(100));
+        let head: Arc<dyn HeadSource> = Arc::new(SharedHead::with_ttl(
+            ProviderBuilder::new().connect_mocked_client(head_asserter),
+            Duration::from_hours(1),
+            None,
+        ));
+        let asserter = Asserter::new();
+        asserter.push_failure(
+            serde_json::from_value(serde_json::json!({
+                "code": 1,
+                "message": "no available upstreams to process the request",
+            }))
+            .unwrap(),
+        );
+        let empty: (Vec<CapacityBond::NodeInfo>, Vec<bool>) = (Vec::new(), Vec::new());
+        asserter.push_success(&Bytes::from(
+            CapacityBond::getRegisteredNodesCall::abi_encode_returns_tuple(&empty),
+        ));
+        let metrics = Arc::new(Metrics::new());
+
+        let handles = bootstrap(
+            ProviderBuilder::new().connect_mocked_client(asserter.clone()),
+            Address::repeat_byte(0x11),
+            head,
+            false,
+            Arc::clone(&metrics),
+            &BootRetry::new(BOOT_CHAIN_RETRY_BUDGET, Arc::clone(&metrics)),
+        )
+        .await
+        .unwrap();
+
+        assert!(handles.operator_to_node.read().unwrap().is_empty());
+        assert!(asserter.read_q().is_empty(), "both attempts ran");
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_chain_boot_read_retries_total 1"),
+            "{text}"
+        );
+    }
+
+    /// A stalled provider cannot wedge the snapshot: each page read is bounded
+    /// by the per-call timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_provider_fails_the_snapshot_read() {
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+
+        let registry = CapacityBond::new(Address::repeat_byte(0x11), hanging_provider());
+        let err = bounded("registry snapshot", bootstrap_registry(&registry))
+            .await
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap();
+
+        assert!(err.contains("getRegisteredNodes timed out after"), "{err}");
+    }
+
     /// A page whose `active[]` length differs from its `page` length is a
     /// decoder fault, and a boot read must not retry it.
     #[tokio::test]

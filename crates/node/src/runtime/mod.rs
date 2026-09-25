@@ -140,6 +140,11 @@ const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 100;
 /// never a griefing surface.
 const FEE_ROUTER_OPERATOR_BPS_FLOOR: u16 = 4000;
 
+/// The most of the boot deadline the best-effort fee-share reads may spend on
+/// retries. It covers a short provider blip; a longer outage falls back to the
+/// floor share and leaves the rest of the deadline to the fail-closed reads.
+const FEE_SHARE_BOOT_BUDGET: Duration = Duration::from_mins(1);
+
 /// Apply an explicit client poll interval to a freshly built provider,
 /// overriding alloy's localhost-detected 250 ms default (#1011).
 ///
@@ -163,7 +168,7 @@ fn with_poll_interval<P: Provider>(provider: P, interval: Duration) -> P {
 }
 
 /// Keep every iroh ALPN listener closed until the blacklist watcher reports one
-/// clean full replay + operator-scope pass. The closure is the explicit seam
+/// clean boot enumeration + operator-scope enforcement pass. The closure is the explicit seam
 /// that makes it impossible to construct the `Router` on either pending or
 /// failed readiness.
 async fn gate_listener_on_blacklist_sync<T>(
@@ -673,18 +678,15 @@ async fn serve_until_shutdown(
         blacklist_ready_rx,
     } = serve_in;
 
-    // No Probe, Client, or DHT ALPN is registered before the mandatory
-    // first global + operator-region blacklist replay/scope pass succeeds. The
-    // gate sits here — after the metrics/admin listeners are bound and every
-    // background task is spawned — so a *slow* (still-pending) initial sync keeps
-    // the paid-delivery listeners closed while observability, the admin control
-    // surface, and the startup banner stay up. A *failed* initial sync is
-    // fail-closed the hard way: the gate returns `Err`, `run` propagates it, and
-    // the process exits (tearing those listeners down with it) rather than ever
-    // serving un-vetted content. The watcher was spawned earlier in bring-up
-    // so its initial replay runs
-    // concurrently and is often already complete by the time control reaches
-    // this gate.
+    // No Probe, Client, or DHT ALPN is registered before the mandatory first
+    // global + operator-region blacklist enumeration and enforcement pass
+    // succeeds. That pass runs inline in `build_chain_and_handlers`, before the
+    // metrics and admin listeners bind, and has always resolved by the time
+    // control reaches this gate; a boot that retries it has nothing listening
+    // yet. The gate is the structural seam: the `Router` cannot be built on a
+    // pending or failed sync. A *failed* initial sync is fail-closed the hard
+    // way: the gate returns `Err`, `run` propagates it, and the process exits
+    // rather than ever serving un-vetted content.
     let router = gate_listener_on_blacklist_sync(blacklist_ready_rx, || {
         Router::builder(ep.clone())
             .accept(ProbeHandler::ALPN, probe_handler)
@@ -838,8 +840,9 @@ async fn build_chain_and_handlers(
     let slash_domain =
         decdn_incentive::slash_judge_domain(cfg.blockchain.chain_id, slash_judge_addr);
 
-    // Chain-backed active-staker set. Bootstrap failure is fatal once its
-    // retries are exhausted (see the boot budget below): an
+    // Chain-backed active-staker set. Bootstrap failure is fatal on a
+    // deterministic fault or once its retries are exhausted (see the boot
+    // budget below): an
     // empty set silently rejects every inbound `Store`, and once the
     // iterative `FindValue` lookup filter exists it would drop every
     // responder. Built here (ahead of the probe handler) so the probe
@@ -900,11 +903,10 @@ async fn build_chain_and_handlers(
     // registry, slash, `usdc()` self-check and blacklist reads (#2159). Each
     // retries its reads on transient provider errors and fails only on a
     // deterministic fault or once the shared deadline passes. The best-effort
-    // fee-shares reads share the deadline but fall back to the floor share
-    // instead of failing boot; the binding check does not use it. Startup
-    // stays fail-closed: a
-    // retry delays readiness, and the ALPN router waits on the blacklist
-    // enumeration and enforcement.
+    // fee-share reads retry on a capped sub-budget of it and fall back to the
+    // floor share instead of failing boot; the binding check does not use it.
+    // Startup stays fail-closed: a retry delays readiness, and the ALPN router
+    // waits on the blacklist enumeration and enforcement.
     let boot = BootRetry::new(BOOT_CHAIN_RETRY_BUDGET, Arc::clone(&infra.node_metrics));
 
     // One CapacityBond enumeration + one route feeding both registry projections
@@ -1100,9 +1102,12 @@ async fn build_chain_and_handlers(
     // `FeeRouter.getShares()` reads the current 3-way split, narrowed to the
     // operator's bps. Unlike the fail-closed reads, NO leg of this chain is fatal
     // to boot: a failure falls back to `FEE_ROUTER_OPERATOR_BPS_FLOOR` and the
-    // node still comes up. Both reads retry transient errors on the boot
-    // deadline, because `feeRouter` is immutable and a missed read would leave
-    // the `SharesUpdated` route below unregistered until restart.
+    // node still comes up. Both reads retry transient errors; the `feeRouter()`
+    // retry matters most, because `feeRouter` is immutable and a missed read
+    // leaves the `SharesUpdated` route below unregistered until restart. They
+    // retry on a `FEE_SHARE_BOOT_BUDGET` sub-budget of the boot deadline, so a
+    // flapping provider cannot spend the time the later `usdc()` and blacklist
+    // reads need.
     let crate::fee_shares::FeeShareSeed {
         router: fee_router_addr,
         operator_bps: seed_operator_bps,
@@ -1110,9 +1115,12 @@ async fn build_chain_and_handlers(
         ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
         payment_pool_addr,
         FEE_ROUTER_OPERATOR_BPS_FLOOR,
-        &boot,
+        &boot.capped(FEE_SHARE_BOOT_BUDGET),
     )
     .await;
+    infra
+        .node_metrics
+        .fee_shares_watcher_unregistered(fee_router_addr.is_none());
     let operator_shares = crate::fee_shares::OperatorShares::new(seed_operator_bps);
     tracing::info!(
         bps = seed_operator_bps,
@@ -2509,14 +2517,13 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // flush by a poll — it just cannot report anything once cancelled.
     republish_stop.cancel();
     let _ = bucket_refresh_stop_tx.send(());
-    // The chain watchers are now one multiplexed poller with one shutdown
-    // token, so the previous staggered per-watcher stops collapse to a SINGLE
-    // `poller.shutdown()` at the LATE point below (after `router.shutdown`). The
-    // blacklist and rate-bounds routes, which used to stop here early, move to
-    // that late stop: it is harmless — neither carries a durable cursor to flush,
-    // and neither is consulted for a drain-time decision (unlike the
-    // capacity-bond route's staker set), so they only keep applying
-    // compliance/rate updates a little longer.
+    // The chain watchers are one multiplexed poller with one shutdown token, so
+    // they stop together in a SINGLE `poller.shutdown()` at the LATE point below
+    // (after `router.shutdown`). For the blacklist and rate-bounds routes the
+    // late stop is harmless — neither carries a durable cursor to flush, and
+    // neither is consulted for a drain-time decision (unlike the capacity-bond
+    // route's staker set), so they only keep applying compliance/rate updates a
+    // little longer.
     // Admin server shutdown is ordered per `admin_stop_order`:
     //
     //   - `Early` (the default, including SIGTERM/SIGINT and plain

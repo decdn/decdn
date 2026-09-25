@@ -9,14 +9,21 @@
 //! process: each bootstrap retries its read phase through `BootRetry::run` and
 //! fails only on a deterministic fault or once the shared boot deadline passes.
 //!
+//! The best-effort fee-share reads (`fee_shares::seed_from_chain`) run between
+//! the slash and `usdc()` reads. They retry the same way but fall back to the
+//! floor share instead of failing boot, and they run on a short sub-budget
+//! (`BootRetry::capped`) so a flapping provider cannot spend the deadline the
+//! later fail-closed reads need.
+//!
 //! Startup stays fail-closed. A retry delays readiness; it never opens the ALPN
 //! router before the deny-set is loaded and enforced.
 //!
 //! Three boot-time facts shape the loop:
 //!
 //! - No signal handler exists yet, so SIGTERM or SIGINT ends a retrying boot at
-//!   once. The only writes a boot attempt makes are sticky, idempotent cache
-//!   evictions, so an abrupt exit needs no teardown.
+//!   once. The only durable writes a boot attempt makes are sticky, idempotent
+//!   cache evictions; everything else it sets is in memory. An abrupt exit
+//!   therefore needs no teardown.
 //! - [`SharedHead`](super::shared_head::SharedHead) caches a failed head read
 //!   for half the poll interval. Retries inside that window replay the cached
 //!   error — the first two at the default 7 s poll interval — so the cost is at
@@ -39,10 +46,10 @@ use super::{WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF};
 use crate::metrics::Metrics;
 
 /// The boot deadline: a wall-clock window that starts at [`BootRetry::new`] and
-/// covers every fail-closed boot read, including its successful attempts and the
-/// other bring-up work between them. A provider that stays down this long is
-/// treated as dead: the daemon exits, and the supervisor (systemd, Kubernetes)
-/// surfaces it.
+/// covers every boot chain read, including its successful attempts and the
+/// other bring-up work between them. A provider that stays down for the rest of
+/// this window is treated as dead: the daemon exits, and the supervisor
+/// (systemd, Kubernetes) surfaces it.
 pub(crate) const BOOT_CHAIN_RETRY_BUDGET: Duration = Duration::from_mins(10);
 
 /// A deterministic fault the node detects itself, such as a decoder that
@@ -93,6 +100,23 @@ impl BootRetry {
     #[must_use]
     pub fn single_attempt(metrics: Arc<Metrics>) -> Self {
         Self::new(Duration::ZERO, metrics)
+    }
+
+    /// A sub-budget for a best-effort read: the earlier of this deadline and
+    /// `cap` from now. A best-effort read that retries on it cannot spend the
+    /// time the later fail-closed reads need.
+    #[must_use]
+    pub(crate) fn capped(&self, cap: Duration) -> Self {
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(cap)
+            .map_or(self.deadline, |d| d.min(self.deadline));
+        Self {
+            started: self.started,
+            deadline,
+            budget: deadline.saturating_duration_since(now),
+            metrics: Arc::clone(&self.metrics),
+        }
     }
 
     /// Run `attempt` until it succeeds, fails with a permanent error
@@ -158,11 +182,11 @@ impl BootRetry {
 ///   classifier the client's registry discovery shares
 ///   ([`is_permanent_contract_error`], [`is_permanent_rpc_error`]). The head
 ///   read keeps its typed cause through the `SharedHead` cache, so this covers
-///   the first read of every bootstrap too.
+///   the head read that opens the registry, slash and blacklist bootstraps.
 ///
 /// An error with no typed cause is transient. That covers a
 /// `chain_events::timed` timeout and the blacklist enumeration's count checks,
-/// which a mid-page removal or an inconsistent RPC view can trip. A response
+/// which an inconsistent RPC view of the pinned block can trip. A response
 /// that is not JSON-RPC at all (`DeserError`) is transient as well: a proxy
 /// under load can return one, and the budget bounds a URL that always does.
 fn is_permanent_boot_error(err: &anyhow::Error) -> bool {
@@ -371,6 +395,31 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("read b: gave up after 3 attempts"), "{msg}");
         assert!(msg.contains("budget of 10s is spent"), "{msg}");
+    }
+
+    /// A capped sub-budget ends at its cap, and never past the parent deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_capped_budget_ends_at_the_earlier_deadline() {
+        let metrics = Arc::new(Metrics::new());
+        let boot = BootRetry::new(Duration::from_secs(10), Arc::clone(&metrics));
+        let start = Instant::now();
+        let dead = || async { Err::<(), _>(anyhow::anyhow!("connection refused")) };
+
+        // A 3 s cap: sleeps of 1 s and 2 s fit, the next 4 s does not.
+        boot.capped(Duration::from_secs(3))
+            .run("capped", dead)
+            .await
+            .unwrap_err();
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+
+        // A cap past the parent deadline is clipped to it: 7 s are left, so
+        // sleeps of 1 s, 2 s and 4 s fit and the next 8 s does not.
+        boot.capped(Duration::from_mins(1))
+            .run("clipped", dead)
+            .await
+            .unwrap_err();
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+        assert_eq!(retries(&metrics), 5);
     }
 
     /// The production budget and the 60 s backoff cap together: a dead endpoint
