@@ -231,7 +231,8 @@ pub struct BlockchainConfig {
     /// the RPC provider's actual `eth_getLogs` range limit: the `span` that the
     /// poller's shrink `warn!` logs. A provider's documented or quoted limit can
     /// be wrong. The poller also shrinks its window on its own when the provider
-    /// rejects a range, so this is a starting ceiling, not a hard requirement. Absent =>
+    /// rejects a range, and grows it back toward this ceiling, so this is a
+    /// ceiling, not a hard requirement. Absent =>
     /// [`super::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN`] (10 000). Must not be `0`;
     /// rejected at config resolution.
     pub get_logs_max_block_span: Option<u64>,

@@ -61,7 +61,7 @@ pub mod shared_head;
 // it. Re-export it on a public path rather than widen the whole module.
 pub use resumable_watcher::WatcherHandle;
 
-pub(crate) use backfill::{REORG_MARGIN_BLOCKS, halved_span, window_end};
+pub(crate) use backfill::{REORG_MARGIN_BLOCKS, WindowSpan, window_end};
 
 use std::future::IntoFuture;
 use std::time::Duration;

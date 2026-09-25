@@ -100,13 +100,18 @@ blacklist updates and stop being able to settle channels. Once
   window` `warn!` lines mean the provider caps `eth_getLogs` (dRPC
   `ranges over 10000 blocks are not supported`, Alchemy
   `up to a 10 block range`, Infura `more than 10000 results`). The poller sets
-  its window to half the rejected window and retries at once; the smaller span
-  holds until restart. Set `blockchain.get_logs_max_block_span` to the last
-  logged `span`, **not** to the number in the provider's message — dRPC's free
-  tier says 10 000 but rejects about 150. A cap below one poll interval of
-  blocks (Arbitrum makes about 4 blocks per second, so about 30 blocks per 7 s
-  tick) still works, but each tick then costs several `eth_getLogs` requests
-  against the provider's quota.
+  its window to half the rejected window and retries at once, and doubles it
+  back after 32 accepted full windows in a row. `decdn_chain_get_logs_span`
+  shows the current span and `decdn_chain_get_logs_range_rejections_total` the
+  rejections; the "eth_getLogs window span" panel in
+  `monitoring/dashboard-chain.json` plots both. Set
+  `blockchain.get_logs_max_block_span` to the lowest logged `span`, **not** to
+  the number in the provider's message — dRPC's free tier says 10 000 but
+  rejects about 150. Until you do, the regrow probes the cap again every few
+  dozen windows at the cost of one rejected request. A cap below one poll
+  interval of blocks (Arbitrum makes about 4 blocks per second, so about 30
+  blocks per 7 s tick) still works, but each tick then costs several
+  `eth_getLogs` requests against the provider's quota.
 - `multiplexed poller tick error` `warn!` lines on `get_logs` while
   `decdn_rpc_healthy` stays 1 mean the watchers cannot read events although
   the endpoint answers. `rejects even a one-block eth_getLogs window` means the
@@ -114,6 +119,12 @@ blacklist updates and stop being able to settle channels. Once
   `get_logs` timeouts, or a range or size error the poller does not recognise
   (it logs no shrink line), mean the windows are too wide for this provider:
   lower `blockchain.get_logs_max_block_span` and restart.
+- `DecdnChainWatcherFlapping` means a watcher's poll ticks fail and recover
+  again and again (five or more failure windows in 30 minutes, for 15 minutes).
+  Each recovery resets the stalled alerts, so they stay quiet while the watcher
+  lags head. Treat it as an unreliable RPC provider: read the
+  `multiplexed poller tick error` lines for the cause, and check
+  `decdn_chain_get_logs_span` for an `eth_getLogs` cap.
 
 - `decdn_staker_set_watcher_down_seconds` climbing (with
   `decdn_staker_set_watcher_restarts_total` advancing) is the chain-side

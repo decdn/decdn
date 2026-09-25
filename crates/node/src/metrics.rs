@@ -1686,6 +1686,20 @@ pub struct DecdnMetrics {
     /// payment-settlement watcher task unwound on a panic.
     pub settlement_watcher_task_panicked: Counter,
 
+    // ---- Shared chain-event poller: eth_getLogs window span ----
+    /// `decdn_chain_get_logs_span`: block span of the chain-event poller's next
+    /// `eth_getLogs` window. It starts at `blockchain.get_logs_max_block_span`,
+    /// drops to half a window the RPC provider rejects for its range, and
+    /// doubles back after a streak of accepted windows. A value far below the
+    /// configured ceiling means the provider caps `eth_getLogs`; set the ceiling
+    /// to it.
+    pub chain_get_logs_span: Gauge,
+    /// `decdn_chain_get_logs_range_rejections_total`: `eth_getLogs` windows the
+    /// RPC provider rejected for their block range or result count. Each one
+    /// costs one wasted request. A steady rate is the regrow probing a known
+    /// cap; set `blockchain.get_logs_max_block_span` to the span gauge to stop it.
+    pub chain_get_logs_range_rejections: Counter,
+
     // ---- Down-family parity for the watchers that lacked it (#1283, #1316) ----
     /// `decdn_blacklist_watcher_restarts_total` (#1283): distinct drift windows
     /// the blacklist watcher entered, bumped once on the edge into the
@@ -1897,6 +1911,11 @@ impl Default for Metrics {
 /// keeps the workspace `unwrap_used` deny satisfied without pushing a
 /// `Result` onto every recorder signature.
 fn sat(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// Saturating `u64` → `i64` for gauge values; see [`sat`].
+fn sat_u64(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
 }
 
@@ -2972,6 +2991,10 @@ recorders! {
     /// with the current wall-clock time (#1316). The `on_tick_success` hook,
     /// fired on EVERY successful poll tick so a dead task's gauge goes stale.
     slash_watcher_tick => slash_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
+    /// Record the chain-event poller's current `eth_getLogs` window span.
+    chain_get_logs_span(span: u64) => chain_get_logs_span.set(sat_u64(span));
+    /// Count one `eth_getLogs` window the provider rejected for its range.
+    chain_get_logs_range_rejected => chain_get_logs_range_rejections.inc();
     /// Stamp the staker-set watcher's liveness gauge (#1316). See `slash_watcher_tick`.
     staker_set_watcher_tick => staker_set_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
     /// A capacity-bond registry re-enumeration failed and the previous

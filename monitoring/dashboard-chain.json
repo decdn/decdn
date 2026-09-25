@@ -737,12 +737,132 @@
       "id": 6
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "title": "eth_getLogs window span",
+      "type": "timeseries",
+      "description": "Block span of the shared chain-event poller's next eth_getLogs window, per node, and the rate of windows the RPC provider rejected for their range or result count. The span starts at blockchain.get_logs_max_block_span, drops to half a rejected window, and doubles back after 32 accepted full windows in a row. A span far below the ceiling means the provider caps eth_getLogs: set the ceiling to it. A steady rejection rate is the regrow probing that cap.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "decdn_chain_get_logs_span{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}} span"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "rate(decdn_chain_get_logs_range_rejections_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])",
+          "refId": "B",
+          "legendFormat": "{{instance}} rejections/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "unit",
+                "value": "reqps"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "sum"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "id": 32
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 17
+        "y": 24
       },
       "id": 7,
       "panels": [],
@@ -837,7 +957,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 18
+        "y": 25
       },
       "id": 8
     },
@@ -937,7 +1057,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 18
+        "y": 25
       },
       "id": 9
     },
@@ -1040,7 +1160,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 18
+        "y": 25
       },
       "id": 10
     },
@@ -1154,7 +1274,7 @@
         "h": 12,
         "w": 14,
         "x": 0,
-        "y": 25
+        "y": 32
       },
       "id": 27
     },
@@ -1238,7 +1358,7 @@
         "h": 12,
         "w": 5,
         "x": 14,
-        "y": 25
+        "y": 32
       },
       "id": 29
     },
@@ -1304,7 +1424,7 @@
         "h": 12,
         "w": 5,
         "x": 19,
-        "y": 25
+        "y": 32
       },
       "id": 28
     },
@@ -1314,7 +1434,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 37
+        "y": 44
       },
       "id": 11,
       "panels": [],
@@ -1408,7 +1528,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 38
+        "y": 45
       },
       "id": 12
     },
@@ -1500,7 +1620,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 38
+        "y": 45
       },
       "id": 13
     },
@@ -1597,7 +1717,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 38
+        "y": 45
       },
       "id": 14
     },
@@ -1607,7 +1727,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 45
+        "y": 52
       },
       "id": 15,
       "panels": [],
@@ -1702,7 +1822,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 46
+        "y": 53
       },
       "id": 16
     },
@@ -1794,7 +1914,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 46
+        "y": 53
       },
       "id": 17
     },
@@ -1885,7 +2005,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 46
+        "y": 53
       },
       "id": 18
     },
@@ -2015,7 +2135,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 53
+        "y": 60
       },
       "id": 19
     },
@@ -2136,7 +2256,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 53
+        "y": 60
       },
       "id": 20
     },
@@ -2236,7 +2356,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 53
+        "y": 60
       },
       "id": 21
     },
@@ -2366,7 +2486,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 60
+        "y": 67
       },
       "id": 30
     },
@@ -2478,7 +2598,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 60
+        "y": 67
       },
       "id": 31
     },
@@ -2488,7 +2608,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 68
+        "y": 75
       },
       "id": 22,
       "panels": [],
@@ -2593,7 +2713,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 69
+        "y": 76
       },
       "id": 23
     },
@@ -2705,7 +2825,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 69
+        "y": 76
       },
       "id": 24
     },
@@ -2808,7 +2928,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 69
+        "y": 76
       },
       "id": 25
     },
@@ -2850,7 +2970,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 76
+        "y": 83
       },
       "id": 26
     }

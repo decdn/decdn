@@ -53,9 +53,10 @@
 //!
 //! A `get_logs` failure that [`is_range_rejection`] recognises does not fail the
 //! tick. [`run_tick`] sets the window span to half the rejected window's length
-//! and retries the same start block at once; no hook fires. The smaller span
-//! holds for the process lifetime. Only a rejected one-block window, or any
-//! other `get_logs` failure, goes through [`fail_whole_tick`].
+//! and retries the same start block at once; no route hook fires. The span
+//! regrows after a streak of accepted windows ([`WindowSpan`]), so a transient
+//! rejection does not cost throughput until restart. Only a rejected one-block
+//! window, or any other `get_logs` failure, goes through [`fail_whole_tick`].
 //!
 //! The runtime registers each `eth_getLogs` watcher's [`Route`] on one
 //! poller in `build_chain_and_handlers` and spawns it once — one merged loop in
@@ -83,12 +84,12 @@ use async_trait::async_trait;
 use decdn_common::config::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN;
 use decdn_common::redact::sanitize_err_chain;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use super::resumable_watcher::{CursorStart, LogSink, WatcherHandle, WatcherHook, fire};
 use super::shared_head::HeadSource;
 use super::{AbortOnDrop, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF};
-use super::{halved_span, timed, window_end};
+use super::{WindowSpan, timed, window_end};
 
 /// Object-safe adapter over [`LogSink`], so routes with different concrete sink
 /// types live in one `Vec<Box<dyn ErasedSink>>`. `LogSink::apply` /
@@ -242,12 +243,16 @@ pub struct MultiplexedPoller {
     /// persisted resume that never predates deploy), retained as that floor.
     from_block: u64,
     poll_interval: Duration,
-    /// Block span of the next `eth_getLogs` window. Starts at the configured
-    /// ceiling and only shrinks: when the provider rejects a window's range,
-    /// [`run_tick`] sets it to half the rejected window's length, and the
-    /// smaller span holds for the rest of the process lifetime. Always `>= 1` ([`MultiplexedPollerBuilder::build`]
-    /// rejects `0`).
-    max_backfill_span: u64,
+    /// Block span of the next `eth_getLogs` window, learned from the provider:
+    /// it starts at the configured ceiling, shrinks on a range rejection and
+    /// regrows after a streak of accepted windows (see [`WindowSpan`]).
+    span: WindowSpan,
+    /// Called with the new span when it changes, and once with the starting
+    /// span when [`run`] starts (the `decdn_chain_get_logs_span` gauge).
+    on_span_change: Option<SpanHook>,
+    /// Called on every range rejection the poller recognises, including a
+    /// rejected one-block window.
+    on_range_rejection: Option<WatcherHook>,
     initial_backoff: Duration,
     /// Ceiling for the shared loop's backoff. One loop now serves every route,
     /// so a route that used to carry its own tighter cap (slash's 30s) no
@@ -268,6 +273,9 @@ impl std::fmt::Debug for MultiplexedPoller {
     }
 }
 
+/// Receives the poller's `eth_getLogs` window span each time it changes.
+pub(crate) type SpanHook = Box<dyn Fn(u64) + Send + Sync>;
+
 /// Accumulates [`Route`]s and builds a [`MultiplexedPoller`].
 pub struct MultiplexedPollerBuilder {
     head: Arc<dyn HeadSource>,
@@ -275,6 +283,8 @@ pub struct MultiplexedPollerBuilder {
     from_block: u64,
     poll_interval: Duration,
     max_backfill_span: u64,
+    on_span_change: Option<SpanHook>,
+    on_range_rejection: Option<WatcherHook>,
     initial_backoff: Duration,
     max_backoff: Duration,
     rpc_call_timeout: Option<Duration>,
@@ -301,6 +311,8 @@ impl MultiplexedPollerBuilder {
             from_block: 0,
             poll_interval,
             max_backfill_span: DEFAULT_GET_LOGS_MAX_BLOCK_SPAN,
+            on_span_change: None,
+            on_range_rejection: None,
             initial_backoff: WATCHER_INITIAL_BACKOFF,
             max_backoff: WATCHER_MAX_BACKOFF,
             rpc_call_timeout: None,
@@ -314,12 +326,34 @@ impl MultiplexedPollerBuilder {
         self
     }
 
-    /// Set the starting block span per `eth_getLogs` window
-    /// (`blockchain.get_logs_max_block_span`). The poller shrinks it on a
-    /// provider range rejection. [`Self::build`] rejects `0`.
+    /// Set the block-span ceiling per `eth_getLogs` window
+    /// (`blockchain.get_logs_max_block_span`). The poller starts there,
+    /// shrinks below it on a provider range rejection and regrows back to it.
+    /// [`Self::build`] rejects `0`.
     #[must_use]
     pub const fn max_backfill_span(mut self, span: u64) -> Self {
         self.max_backfill_span = span;
+        self
+    }
+
+    /// The configured block-span ceiling.
+    #[cfg(test)]
+    pub(crate) const fn span_ceiling(&self) -> u64 {
+        self.max_backfill_span
+    }
+
+    /// Observe the window span: called once when the poller starts and on
+    /// every shrink or regrow.
+    #[must_use]
+    pub(crate) fn on_span_change(mut self, hook: SpanHook) -> Self {
+        self.on_span_change = Some(hook);
+        self
+    }
+
+    /// Observe every provider range rejection the poller recognises.
+    #[must_use]
+    pub(crate) fn on_range_rejection(mut self, hook: WatcherHook) -> Self {
+        self.on_range_rejection = Some(hook);
         self
     }
 
@@ -395,7 +429,9 @@ impl MultiplexedPollerBuilder {
             base_filter,
             from_block: self.from_block,
             poll_interval: self.poll_interval,
-            max_backfill_span: self.max_backfill_span,
+            span: WindowSpan::new(self.max_backfill_span),
+            on_span_change: self.on_span_change,
+            on_range_rejection: self.on_range_rejection,
             initial_backoff: self.initial_backoff,
             max_backoff: self.max_backoff,
             rpc_call_timeout: self.rpc_call_timeout,
@@ -659,6 +695,60 @@ const LIMIT_WORDS: [&str; 10] = [
     "not supported",
 ];
 
+/// Handle a failed `get_logs` for the window `[start, end]`. A range rejection
+/// the poller recognises shrinks the span to half the window and returns
+/// `None`: the caller retries the same start block at once. A provider that
+/// caps the `eth_getLogs` range rejects the window outright, and retrying the
+/// same (or, as head moves, a wider) range can never succeed. Any other error
+/// — and a rejected one-block window, which cannot shrink — comes back for the
+/// backoff path.
+fn shrink_on_range_rejection(
+    poller: &mut MultiplexedPoller,
+    start: u64,
+    end: u64,
+    err: anyhow::Error,
+) -> Option<anyhow::Error> {
+    if !is_range_rejection(&err) {
+        return Some(err);
+    }
+    fire(poller.on_range_rejection.as_ref());
+    let Some((span, new_low)) = poller.span.shrink(start, end) else {
+        return Some(err.context(
+            "the RPC provider rejects even a one-block eth_getLogs window; \
+             it cannot serve the chain watchers — use another provider",
+        ));
+    };
+    let rejected_span = (end - start).saturating_add(1);
+    // A new low is news; returning to a span already seen is the regrow
+    // probing a known cap again.
+    if new_low {
+        warn!(
+            error = %sanitize_err_chain(&err),
+            rejected_span,
+            span,
+            "RPC provider rejected the eth_getLogs block range; \
+             shrinking the poll window (set blockchain.get_logs_max_block_span \
+             to the logged span to skip this after a restart)"
+        );
+    } else {
+        debug!(
+            error = %sanitize_err_chain(&err),
+            rejected_span,
+            span,
+            "RPC provider rejected a regrown eth_getLogs window; shrinking again"
+        );
+    }
+    report_span(poller, span);
+    None
+}
+
+/// Hand the new window span to the `on_span_change` hook, if any.
+fn report_span(poller: &MultiplexedPoller, span: u64) {
+    if let Some(hook) = poller.on_span_change.as_ref() {
+        hook(span);
+    }
+}
+
 /// Run one poll tick: read head, resolve each route's floor, scan the merged
 /// `[min(floor), head]` range in windows (one `get_logs` per window), demux
 /// each log to its owning route, then reconcile and fire hooks. A recognised
@@ -692,7 +782,7 @@ async fn run_tick<P: Provider + Clone>(
         if shutdown.is_cancelled() {
             return Ok(());
         }
-        let end = window_end(start, to, poller.max_backfill_span);
+        let end = window_end(start, to, poller.span.current());
         let filter = poller.base_filter.clone().from_block(start).to_block(end);
         let logs = match timed(
             poller.rpc_call_timeout,
@@ -703,38 +793,21 @@ async fn run_tick<P: Provider + Clone>(
         .with_context(|| format!("multiplexed get_logs [{start}, {end}]"))
         {
             Ok(logs) => logs,
-            Err(err) => {
-                // A provider that caps the `eth_getLogs` range rejects the
-                // window outright, and retrying the same (or, as head moves, a
-                // wider) range can never succeed. Halve the window and retry
-                // it at once. A one-block window cannot shrink, so its
-                // rejection takes the backoff path like any other failure.
-                let range_rejected = is_range_rejection(&err);
-                if let Some(span) = halved_span(start, end).filter(|_| range_rejected) {
-                    warn!(
-                        error = %sanitize_err_chain(&err),
-                        rejected_span = (end - start).saturating_add(1),
-                        span,
-                        "RPC provider rejected the eth_getLogs block range; \
-                         shrinking the poll window (set blockchain.get_logs_max_block_span \
-                         to the logged span to skip this after a restart)"
-                    );
-                    poller.max_backfill_span = span;
-                    continue;
-                }
-                let err = if range_rejected {
-                    err.context(
-                        "the RPC provider rejects even a one-block eth_getLogs window; \
-                         it cannot serve the chain watchers — use another provider",
-                    )
-                } else {
-                    err
-                };
-                return Err(fail_whole_tick(poller, shutdown, err));
-            }
+            Err(err) => match shrink_on_range_rejection(poller, start, end, err) {
+                // Retry the same start block with the smaller window.
+                None => continue,
+                Some(err) => return Err(fail_whole_tick(poller, shutdown, err)),
+            },
         };
         demux_window_logs(poller, logs).await;
         advance_routes(poller, end);
+        if let Some(span) = poller.span.record_success(start, end) {
+            debug!(
+                span,
+                "eth_getLogs windows accepted; growing the poll window"
+            );
+            report_span(poller, span);
+        }
         if end >= to {
             break;
         }
@@ -804,6 +877,7 @@ where
         hooks: &panic_hooks,
     };
 
+    report_span(&poller, poller.span.current());
     let mut backoff = poller.initial_backoff;
     let mut ticker = tokio::time::interval(poller.poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2437,7 +2511,8 @@ mod tests {
             "the halved windows must complete the tick: {result:?}"
         );
         assert_eq!(
-            poller.max_backfill_span, 10,
+            poller.span.current(),
+            10,
             "the span is halved from the 20-block window"
         );
         assert_eq!(poller.routes.first().and_then(|r| r.cursor), Some(21));
@@ -2484,7 +2559,7 @@ mod tests {
             result.is_ok(),
             "the retried windows must complete the tick: {result:?}"
         );
-        assert_eq!(poller.max_backfill_span, 5);
+        assert_eq!(poller.span.current(), 5);
         let applied: Vec<Option<u64>> = sink
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2505,6 +2580,62 @@ mod tests {
                 .flatten(),
             Some(30)
         );
+    }
+
+    /// The span hook sees every shrink and regrow and the rejection hook counts
+    /// every range rejection: they drive `decdn_chain_get_logs_span` and
+    /// `decdn_chain_get_logs_range_rejections_total`.
+    #[tokio::test]
+    async fn span_hooks_report_the_shrink_and_the_regrow() {
+        use crate::chain_events::backfill::SPAN_REGROW_AFTER_WINDOWS;
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let (route, _sink, _store) = checkpoint_route(1);
+        let spans = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rejections = Arc::new(AtomicUsize::new(0));
+        let spans_hook = Arc::clone(&spans);
+        let rejections_hook = Arc::clone(&rejections);
+        let built =
+            MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
+                .max_backfill_span(20)
+                .on_span_change(Box::new(move |span| {
+                    spans_hook
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(span);
+                }))
+                .on_range_rejection(Box::new(move || {
+                    rejections_hook.fetch_add(1, Ordering::SeqCst);
+                }))
+                .route(route)
+                .build();
+        let Ok(mut poller) = assert_built(built) else {
+            return;
+        };
+
+        // [1, 20] is rejected (span 10), then 32 full 10-block windows regrow it
+        // to the 20-block ceiling on the last one.
+        let windows = u64::from(SPAN_REGROW_AFTER_WINDOWS);
+        asserter.push_success(&U64::from(windows * 10));
+        if let Some(payload) = error_payload(35, "ranges over 10000 blocks are not supported") {
+            asserter.push_failure(payload);
+        }
+        for _ in 0..windows {
+            asserter.push_success(&Vec::<Log>::new());
+        }
+
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(result.is_ok(), "the tick must complete: {result:?}");
+        assert_eq!(rejections.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            spans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            vec![10, 20],
+            "one shrink to 10, then one regrow back to the ceiling"
+        );
+        assert_eq!(poller.span.current(), 20);
     }
 
     #[tokio::test]
@@ -2530,7 +2661,7 @@ mod tests {
             result.is_err(),
             "a rate limit fails the tick into the backoff path"
         );
-        assert_eq!(poller.max_backfill_span, DEFAULT_GET_LOGS_MAX_BLOCK_SPAN);
+        assert_eq!(poller.span.current(), DEFAULT_GET_LOGS_MAX_BLOCK_SPAN);
         assert_eq!(
             poller.routes.first().and_then(|r| r.cursor),
             Some(1),
@@ -2562,7 +2693,7 @@ mod tests {
             result.is_err(),
             "a one-block window cannot shrink: back off"
         );
-        assert_eq!(poller.max_backfill_span, 1);
+        assert_eq!(poller.span.current(), 1);
     }
 
     #[test]
@@ -2668,9 +2799,9 @@ mod tests {
             "the capped backfill must complete: {first:?}"
         );
         assert!(
-            poller.max_backfill_span <= CAP,
+            poller.span.current() <= CAP,
             "span {} over the cap",
-            poller.max_backfill_span
+            poller.span.current()
         );
         assert_eq!(poller.routes.first().and_then(|r| r.cursor), Some(2_001));
         assert_eq!(

@@ -793,6 +793,25 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     warming_creditor: StopHandle,
 }
 
+/// The chain-event poller builder with its config-driven settings: the
+/// `eth_getLogs` block-span ceiling (`blockchain.get_logs_max_block_span`) and
+/// the span and range-rejection metrics. Routes are added by the caller.
+fn chain_poller_builder(
+    head: Arc<dyn HeadSource>,
+    poll_interval: Duration,
+    blockchain: &decdn_common::config::ResolvedBlockchain,
+    node_metrics: &Arc<metrics::Metrics>,
+) -> crate::chain_events::multiplexed_poller::MultiplexedPollerBuilder {
+    let span_metrics = Arc::clone(node_metrics);
+    crate::chain_events::multiplexed_poller::MultiplexedPollerBuilder::new(head, poll_interval)
+        .max_backfill_span(blockchain.get_logs_max_block_span)
+        .on_span_change(Box::new(move |span| span_metrics.chain_get_logs_span(span)))
+        .on_range_rejection(metrics::metric_hook(
+            node_metrics,
+            metrics::Metrics::chain_get_logs_range_rejected,
+        ))
+}
+
 /// Middle phase of [`run`] (#1253): parse the chain contract addresses and
 /// EIP-712 domains, bootstrap the `CapacityBond` registry / slash / origin
 /// watchers, and construct the probe, client, and DHT handlers plus the
@@ -1425,11 +1444,12 @@ async fn build_chain_and_handlers(
     // runtime condition — surfacing it at boot. Up to four contract addresses
     // (payment_pool, capacity_bond, content_blacklist, fee_router) with
     // disjoint topic0s per (address, topic0).
-    let poller = crate::chain_events::multiplexed_poller::MultiplexedPollerBuilder::new(
+    let poller = chain_poller_builder(
         Arc::clone(&head),
         event_poll_interval,
-    )
-    .max_backfill_span(cfg.blockchain.get_logs_max_block_span);
+        &cfg.blockchain,
+        &infra.node_metrics,
+    );
     let poller = poller_routes
         .into_iter()
         .fold(
@@ -4989,5 +5009,27 @@ mod tests {
             .await
             .expect("discovery + custom relay endpoint binds");
         ep.close().await;
+    }
+
+    /// The runtime hands `blockchain.get_logs_max_block_span` to the poller:
+    /// dropping the setter would silently ignore the knob.
+    #[test]
+    fn chain_poller_builder_uses_the_configured_get_logs_span() {
+        struct NoHead;
+        #[async_trait::async_trait]
+        impl HeadSource for NoHead {
+            async fn head(&self) -> anyhow::Result<u64> {
+                Ok(0)
+            }
+        }
+        let (_tmp, mut cfg) = cfg_with_origin(None);
+        cfg.blockchain.get_logs_max_block_span = 150;
+        let builder = chain_poller_builder(
+            Arc::new(NoHead),
+            Duration::from_secs(7),
+            &cfg.blockchain,
+            &Arc::new(metrics::Metrics::new()),
+        );
+        assert_eq!(builder.span_ceiling(), 150);
     }
 }

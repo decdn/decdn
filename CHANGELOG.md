@@ -834,7 +834,7 @@ since project inception and will roll into the first tagged release.
   blind. A restart did not help once the settlement checkpoint was more than
   the cap behind head. The poller now sets its window to half the rejected
   window when the provider's JSON-RPC error names a range or result limit,
-  retries at once, and keeps the smaller span for the process lifetime;
+  retries at once, and doubles the span back after 32 accepted full windows;
   timeouts, rate limits, head-lag errors and other errors keep the backoff
   path. The five `*WatcherStalled` alerts only read the tick gauge behind a
   `> 0` guard, and a never-ticked watcher reads `0`, so none fired. Each now
@@ -2239,6 +2239,14 @@ since project inception and will roll into the first tagged release.
   chain-watcher `eth_getLogs` request** (default 10 000, must be > 0,
   restart-required). Set it to the RPC provider's range limit so the poller
   does not have to learn it from rejections after each restart.
+
+- **Chain-event poller span metrics and a flapping-watcher alert.**
+  `decdn_chain_get_logs_span` reports the poller's current `eth_getLogs`
+  window span and `decdn_chain_get_logs_range_rejections_total` counts the
+  windows the provider rejected; the chain dashboard plots both.
+  `DecdnChainWatcherFlapping` fires when a watcher enters five or more failure
+  windows in 30 minutes for 15 minutes: each recovery resets the stalled
+  alerts, so a watcher that fails on and off otherwise lags head unseen.
 
 - **Observability: the first latency histograms, so a latency SLO can be
   written in PromQL (#2047).** Before this change the exporter had no
