@@ -2018,7 +2018,7 @@
       },
       "title": "Redemption failures",
       "type": "timeseries",
-      "description": "Earned USDC that did not make it on chain. The On-chain transaction outcomes panel splits the revert, send, receipt and timeout cases.",
+      "description": "Redemption steps that failed: a redeemMany that reverted or was refused at send, or a lane the redeemer could not plan. An unconfirmed receipt does not count here; the On-chain transaction outcomes panel shows it as receipt failed or timeout.",
       "targets": [
         {
           "datasource": {
@@ -2369,7 +2369,7 @@
       },
       "title": "On-chain transaction outcomes",
       "type": "timeseries",
-      "description": "Every node transaction counts once by outcome. receipt failed and timeout were issued and can still mine — their tx hash is in the warn! line.",
+      "description": "Every node transaction counts once by outcome. A receipt wait that fails or times out falls back to fetching the receipt by hash, and a receipt found there counts as landed or reverted. receipt failed and timeout are the transactions still unconfirmed after that fetch; they can still mine, and their tx hash is in the warn! line. receipt recovered is not an outcome: it counts the waits the fetch by hash resolved, which points at a lagging RPC provider.",
       "targets": [
         {
           "datasource": {
@@ -2415,6 +2415,15 @@
           "expr": "sum(rate(decdn_onchain_tx_timeout_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "E",
           "legendFormat": "timeout"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_onchain_tx_receipt_recovered_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "F",
+          "legendFormat": "receipt recovered"
         }
       ],
       "fieldConfig": {

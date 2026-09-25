@@ -681,8 +681,10 @@ groups:
         annotations:
           summary: "Voucher redemptions failing on {{ $labels.instance }}"
           description: |
-            redeemMany keeps failing: reverted, refused at send, no receipt, a
-            timed-out receipt, or a lane-store read failure.
+            Redemption steps keep failing: a redeemMany that reverted or was
+            refused at send, or a lane the redeemer could not plan or load.
+            An unconfirmed receipt does not count here; DecdnOnchainTxUnconfirmed
+            covers it.
             The claims stay and retry, but unredeemed revenue accrues and a
             closing pool's grace window can run out. Read the redeemMany warn!
             lines (each carries the tx hash when one was issued) and check the
@@ -707,18 +709,26 @@ groups:
             against the read batch size, and read the stage="reconcile" warn!
             lines for the underlying error.
 
-      - alert: DecdnOnchainTxTimeouts
-        expr: increase(decdn_onchain_tx_timeout_total[1h]) > 0
+      - alert: DecdnOnchainTxUnconfirmed
+        expr: >-
+          increase(decdn_onchain_tx_timeout_total[1h])
+          + increase(decdn_onchain_tx_receipt_failed_total[1h]) > 0
         for: 0m
         labels:
           component: payments
           severity: warning
         annotations:
-          summary: "On-chain transaction receipts timing out on {{ $labels.instance }}"
+          summary: "On-chain transactions unconfirmed on {{ $labels.instance }}"
           description: |
-            A node transaction was issued but its receipt did not arrive in
-            time. It can still mine; look it up by the tx hash in the warn!
-            line. A repeat points at a congested chain or a low gas price.
+            A node transaction was issued, but its receipt wait failed or
+            timed out and three fetches by hash did not find it either. The
+            node leaves its claims for the next sweep, but it cannot record a
+            landed redemption it cannot see. The tx can still mine; look it up
+            by the tx hash in the warn! line. The line's last_lookup field
+            names the cause: "no receipt yet" points at a dropped or
+            underpriced tx (check gas price and the operator key's nonce); an
+            RPC error or "fetch timed out" points at the RPC provider, which
+            may not serve eth_getTransactionReceipt.
 
       # The next four are latent-bug reports, not degradations: each non-zero
       # increase is a node-side fault worth filing. increase(...[1h]) rather
@@ -798,8 +808,8 @@ groups:
             A pool owner started a close while this node held unredeemed
             vouchers on it. The redeemer must land them before the grace window
             ends or the revenue is lost. Check that redeemMany is landing
-            (decdn_onchain_tx_landed_total, DecdnRedemptionFailing) and that the
-            operator key has gas.
+            (decdn_onchain_tx_landed_total, DecdnRedemptionFailing,
+            DecdnOnchainTxUnconfirmed) and that the operator key has gas.
 
       - alert: DecdnBuyerWalletUnfunded
         # Scoped on `> 0`, not on the series existing: every metric is registered
