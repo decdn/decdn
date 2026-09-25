@@ -743,7 +743,7 @@
       },
       "title": "eth_getLogs window span",
       "type": "timeseries",
-      "description": "Block span of the shared chain-event poller's next eth_getLogs window, per node, and the rate of windows the RPC provider rejected for their range or result count. The span starts at blockchain.get_logs_max_block_span, drops to half a rejected window, and doubles back after 32 accepted full windows in a row. A span far below the ceiling means the provider caps eth_getLogs: set the ceiling to it. A steady rejection rate is the regrow probing that cap.",
+      "description": "Block span of the shared chain-event poller's next eth_getLogs window, per node, and the rate of windows the RPC provider rejected for their range or result count. The span starts at blockchain.get_logs_max_block_span, drops to half a rejected window, and doubles back after 32 accepted windows, so a caught-up node climbs back to the ceiling after a transient rejection. Rejections that keep coming mean the provider caps eth_getLogs: set the ceiling to the lowest span reached while they come.",
       "targets": [
         {
           "datasource": {
@@ -836,7 +836,9 @@
       "options": {
         "legend": {
           "calcs": [
-            "sum"
+            "lastNotNull",
+            "min",
+            "max"
           ],
           "displayMode": "table",
           "placement": "right",

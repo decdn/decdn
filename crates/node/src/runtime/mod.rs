@@ -5013,8 +5013,8 @@ mod tests {
 
     /// The runtime hands `blockchain.get_logs_max_block_span` to the poller:
     /// dropping the setter would silently ignore the knob.
-    #[test]
-    fn chain_poller_builder_uses_the_configured_get_logs_span() {
+    #[tokio::test]
+    async fn chain_poller_builder_uses_the_configured_get_logs_span() {
         struct NoHead;
         #[async_trait::async_trait]
         impl HeadSource for NoHead {
@@ -5024,12 +5024,36 @@ mod tests {
         }
         let (_tmp, mut cfg) = cfg_with_origin(None);
         cfg.blockchain.get_logs_max_block_span = 150;
+        let node_metrics = Arc::new(metrics::Metrics::new());
         let builder = chain_poller_builder(
             Arc::new(NoHead),
             Duration::from_secs(7),
             &cfg.blockchain,
-            &Arc::new(metrics::Metrics::new()),
+            &node_metrics,
         );
         assert_eq!(builder.span_ceiling(), 150);
+
+        // The hooks land in the exported series: `run` reports the starting
+        // span, and a range rejection bumps the counter.
+        let built = builder.build();
+        assert!(built.is_ok(), "an empty poller builds");
+        let Ok(poller) = built else { return };
+        poller.fire_range_rejection_for_test();
+        let provider = alloy::providers::ProviderBuilder::new()
+            .connect_mocked_client(alloy::providers::mock::Asserter::new());
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        crate::chain_events::multiplexed_poller::run(provider, poller, shutdown).await;
+        let scrape = node_metrics.encode().unwrap_or_default();
+        assert!(
+            scrape.lines().any(|l| l == "decdn_chain_get_logs_span 150"),
+            "span gauge not wired: {scrape}"
+        );
+        assert!(
+            scrape
+                .lines()
+                .any(|l| l == "decdn_chain_get_logs_range_rejections_total 1"),
+            "rejection counter not wired"
+        );
     }
 }

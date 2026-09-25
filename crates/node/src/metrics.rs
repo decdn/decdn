@@ -1690,14 +1690,17 @@ pub struct DecdnMetrics {
     /// `decdn_chain_get_logs_span`: block span of the chain-event poller's next
     /// `eth_getLogs` window. It starts at `blockchain.get_logs_max_block_span`,
     /// drops to half a window the RPC provider rejects for its range, and
-    /// doubles back after a streak of accepted windows. A value far below the
-    /// configured ceiling means the provider caps `eth_getLogs`; set the ceiling
-    /// to it.
+    /// doubles back after 32 accepted windows, up to the ceiling. A caught-up
+    /// node climbs back to the ceiling after a transient rejection, so a low
+    /// value is a recent rejection, not proof of a cap: read the rejection
+    /// counter for that. The lowest values over a range with rejections show
+    /// the provider's cap.
     pub chain_get_logs_span: Gauge,
     /// `decdn_chain_get_logs_range_rejections_total`: `eth_getLogs` windows the
     /// RPC provider rejected for their block range or result count. Each one
-    /// costs one wasted request. A steady rate is the regrow probing a known
-    /// cap; set `blockchain.get_logs_max_block_span` to the span gauge to stop it.
+    /// costs one wasted request. Rejections that keep coming mean the provider
+    /// caps `eth_getLogs`; set `blockchain.get_logs_max_block_span` to the
+    /// lowest span the gauge reaches while they come, and they stop.
     pub chain_get_logs_range_rejections: Counter,
 
     // ---- Down-family parity for the watchers that lacked it (#1283, #1316) ----
@@ -2390,7 +2393,9 @@ macro_rules! watcher_downtime_recorders {
                 // incremented and, because std poison is sticky, stays frozen for
                 // the process's life. The paired `*_down_seconds` gauge covers this
                 // — `refresh_watcher_down_seconds` reports `i64::MAX` on a poisoned
-                // lock — so alert on the gauge, never on `rate(*_restarts_total)`
+                // lock — so alert on the gauge for outages. The counter drives only
+                // the flapping rule, which a frozen counter silences while the
+                // stalled rule fires on the `i64::MAX` gauge
                 // (appendix-observability § Watcher Liveness, #1322).
                 pub fn $backoff(&self) {
                     if let Ok(mut down_since) = self.$down_since.lock()
@@ -3680,6 +3685,42 @@ mod tests {
     /// **What this does not prove.** A name that resolves may still sit at a
     /// permanent zero because nothing increments it; the gate is about the
     /// name, not the wiring. `docs/runbook.md § ContentBlacklist compliance` is the live example.
+    /// `DecdnChainWatcherFlapping` selects its counters by the name pattern
+    /// `decdn_.+_watcher_restarts_total`, which the literal-name gate above
+    /// cannot check. Pin what the pattern matches: exactly the five chain
+    /// watchers, so a renamed counter cannot drop out of the rule unseen.
+    #[test]
+    fn flapping_rule_pattern_matches_the_five_watcher_restart_counters() {
+        let mut matched: Vec<String> = exported_series(&full_scrape())
+            .into_iter()
+            .filter(|name| {
+                name.strip_prefix("decdn_")
+                    .and_then(|rest| rest.strip_suffix("_watcher_restarts_total"))
+                    .is_some_and(|watcher| !watcher.is_empty())
+            })
+            .collect();
+        matched.sort();
+        assert_eq!(
+            matched,
+            [
+                "decdn_blacklist_watcher_restarts_total",
+                "decdn_fee_shares_watcher_restarts_total",
+                "decdn_settlement_watcher_restarts_total",
+                "decdn_slash_watcher_restarts_total",
+                "decdn_staker_set_watcher_restarts_total",
+            ]
+        );
+        let rules = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../monitoring/prometheus-alerts.yml"
+        ))
+        .unwrap_or_default();
+        assert!(
+            rules.contains(r#"{__name__=~"decdn_.+_watcher_restarts_total"}"#),
+            "the flapping rule's selector changed; update this test with it"
+        );
+    }
+
     #[test]
     fn monitoring_selectors_are_exported() {
         // Names ending in `_` are filtered below: no exported series ends with

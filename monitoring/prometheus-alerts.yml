@@ -137,35 +137,44 @@ groups:
             naming the watcher and file a bug.
 
       - alert: DecdnChainWatcherFlapping
-        # Catches a watcher whose poll ticks fail on and off. Every successful
+        # Catches a node whose chain watchers fail on and off. Every successful
         # tick clears down-seconds and stamps the tick gauge, so a watcher that
         # recovers every few minutes never holds either *WatcherStalled arm for
         # 5m, yet it lags head and misses events for most of the time.
         # *_watcher_restarts_total counts once per drift window (the edge into
-        # failure), so its 30m increase measures the on/off pattern directly. A
-        # single sustained outage is one window and stays with *WatcherStalled;
-        # a process restart reads negative. Same offset-subtraction and
-        # label_replace shape as DecdnWatcherTaskPanicked, for the same reason
-        # (increase() drops __name__). Healthy nodes run 0-2 windows per 30m;
-        # `for: 15m` absorbs a one-off burst at boot.
+        # failure), so its increase measures the on/off pattern directly; a
+        # single sustained outage is one window and stays with *WatcherStalled.
+        #
+        # increase() handles a daemon restart (the counter resets to 0), which a
+        # plain `x - x offset 30m` does not: that form read negative after a
+        # restart and cleared a pending alert. It runs as a subquery over the
+        # label_replace so the per-watcher names survive (increase() on the raw
+        # regex selector drops __name__ and collides the five series), and
+        # `max without (watcher)` folds them back: the five watchers share one
+        # poller, so they flap together and this raises one alert per node.
+        #
+        # A burst steps the 30m increase up for exactly 30m, so `for: 45m`
+        # outlasts any single burst and fires only on repeated failure. Checked
+        # against 3 days of fleet data: 4+ windows held for 45m only on the one
+        # node that was flapping; a fleet-wide 4-minute RPC blip stayed silent.
         expr: >-
-          (label_replace({__name__=~"decdn_.+_watcher_restarts_total"}, "watcher", "$1",
-          "__name__", "decdn_(.+)_watcher_restarts_total") - label_replace({__name__=~"decdn_.+_watcher_restarts_total"}
-          offset 30m, "watcher", "$1", "__name__", "decdn_(.+)_watcher_restarts_total")) >= 5
-        for: 15m
+          max without (watcher) (increase(label_replace({__name__=~"decdn_.+_watcher_restarts_total"},
+          "watcher", "$1", "__name__", "decdn_(.+)_watcher_restarts_total")[30m:1m])) >= 4
+        for: 45m
         labels:
           component: watcher
           severity: warning
         annotations:
           runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#rpc-unreachable"
-          summary: "The {{ $labels.watcher }} watcher keeps failing and recovering on {{ $labels.instance }}"
+          summary: "Chain watchers keep failing and recovering on {{ $labels.instance }}"
           description: |
-            The {{ $labels.watcher }} watcher entered {{ $value }} failure windows
-            in the last 30 minutes. Its poll ticks fail on and off, so it lags
-            chain head and events reach the node late. Check the RPC provider:
-            the `multiplexed poller tick error` log lines name the cause, and a
-            decdn_chain_get_logs_span far below blockchain.get_logs_max_block_span
-            means the provider caps eth_getLogs.
+            The chain watchers entered about {{ $value | printf "%.0f" }} failure
+            windows in the last 30 minutes, and have kept doing so for 45
+            minutes. Their poll ticks fail on and off, so they lag chain head
+            and events reach the node late. Check the RPC provider: the
+            `multiplexed poller tick error` log lines name the cause, and a
+            rising decdn_chain_get_logs_range_rejections_total means the
+            provider caps eth_getLogs.
 
       # A latent-bug report, not a degradation (#1517). The engine recovers the
       # guard and clears the poison, so coalescing never stops and no restart is
