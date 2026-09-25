@@ -583,9 +583,10 @@ impl AdminRpcServer for AdminRpcImpl {
         // pre-evict state the response will carry. Any cache I/O
         // failure here is a genuine problem (the iroh-blobs store is
         // misbehaving), not a routine "blob is absent" path. Note that
-        // `inspect` reads `BlobStatus` directly so the size we report
-        // is the on-disk byte count, even when `already_evicted` is
-        // already true — operators want to see disk-reclaim potential.
+        // `inspect` reads `BlobStatus` directly, so a complete blob reports
+        // its size even when `already_evicted` is already true — operators
+        // want to see disk-reclaim potential. A partial reports its
+        // validated total, or `None` before its last chunk arrives.
         let preview = self
             .state
             .cache
