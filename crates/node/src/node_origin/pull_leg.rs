@@ -265,7 +265,7 @@ struct DownstreamWait {
     /// hit its ADR 037 window and is waiting for downstream payment to clear or a
     /// serve leg to park at its frontier — and `node_pull_through_min_draw_waits` on
     /// each pause for the minimum draw. Records each pause's length in
-    /// `node_pull_through_wait_seconds`.
+    /// `node_pull_through_wait_seconds`, a cancelled pause included.
     metrics: Arc<crate::metrics::Metrics>,
 }
 
@@ -310,7 +310,11 @@ impl PacingWait for DownstreamWait {
             WaitReason::MinDraw => self.metrics.node_pull_through_min_draw_waits(),
         }
         Box::pin(async move {
-            let started = tokio::time::Instant::now();
+            // Records on drop, so a pause its leg cancels is observed too.
+            let _timer = PauseTimer {
+                started: tokio::time::Instant::now(),
+                metrics: &self.metrics,
+            };
             let mut past =
                 std::pin::pin!(self.watch.past(observed.served_paid, observed.serve_demand));
             if tokio::time::timeout(PULL_WAIT_WARN_AFTER, &mut past)
@@ -328,20 +332,34 @@ impl PacingWait for DownstreamWait {
                 );
                 past.await;
             }
-            self.metrics.node_pull_through_wait(started.elapsed());
         })
     }
 }
 
-/// Whether an own-origin leg's terminal error is a local store fault
-/// ([`CacheError::Store`] anywhere in its chain) rather than an origin fault.
-/// The range wire reports an encode panic and a broken reader invariant this
-/// way.
+/// Records one pause's length in `node_pull_through_wait_seconds` when it drops:
+/// at the end of the wait, or when the leg cancels the wait.
+struct PauseTimer<'a> {
+    /// When the pause started.
+    started: tokio::time::Instant,
+    /// The histogram's home.
+    metrics: &'a crate::metrics::Metrics,
+}
+
+impl Drop for PauseTimer<'_> {
+    fn drop(&mut self) {
+        self.metrics.node_pull_through_wait(self.started.elapsed());
+    }
+}
+
+/// Whether an own-origin leg's terminal error is a code bug
+/// ([`CacheError::Internal`] anywhere in its chain): an encode panic or a broken
+/// reader invariant. A store fault ([`CacheError::Store`], such as a full disk)
+/// is not one.
 fn is_internal_fault(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<CacheError>(),
-            Some(CacheError::Store(_))
+            Some(CacheError::Internal(_))
         )
     })
 }
@@ -1539,8 +1557,8 @@ pub(crate) async fn run_local_pull_leg(
     // (our own origin is corrupt/misconfigured, or a transport fault reaching it):
     // meter it as a local fault and NEVER score a provider or a bao-corruption against
     // an upstream that does not exist. Skipped on cancel (nobody waits).
-    // A local store fault (an encode panic or a broken invariant) is a code bug,
-    // not the origin's: say so, so the operator does not audit a healthy origin.
+    // An internal fault (an encode panic or a broken invariant) is a code bug, not
+    // the origin's: say so, so the operator does not audit a healthy origin.
     if !cancelled && let Err(err) = &result {
         metrics.node_pull_local_fault();
         if is_internal_fault(err) {
@@ -1552,7 +1570,7 @@ pub(crate) async fn run_local_pull_leg(
         } else {
             tracing::warn!(
                 %hash,
-                error = %err,
+                error = %format_args!("{err:#}"),
                 "own-origin pull leg failed; local-origin fault (no upstream to score)"
             );
         }
@@ -1895,15 +1913,21 @@ mod local_pull_leg_tests {
         Ok(())
     }
 
-    /// A `Store` fault anywhere in the chain (the range wire's encode panic) reads
-    /// as internal; an origin fault does not.
+    /// An `Internal` fault anywhere in the chain (the range wire's encode panic)
+    /// reads as internal; an origin fault and a store fault do not.
     #[test]
-    fn a_store_fault_in_the_chain_is_internal() {
+    fn an_internal_fault_in_the_chain_is_internal() {
         use decdn_cache::CacheError;
 
-        let panic = anyhow::Error::from(CacheError::Store(anyhow::anyhow!("encode panicked")))
+        let panic = anyhow::Error::from(CacheError::Internal(anyhow::anyhow!("encode panicked")))
             .context("drive failed");
         assert!(super::is_internal_fault(&panic));
+        let disk = anyhow::Error::from(CacheError::Store(anyhow::anyhow!("no space left")))
+            .context("drive failed");
+        assert!(
+            !super::is_internal_fault(&disk),
+            "a store fault is not a code bug"
+        );
         let origin = anyhow::Error::from(CacheError::OriginError {
             hash: Hash::from([1; 32]),
             source: anyhow::anyhow!("origin stopped serving"),
@@ -1967,6 +1991,29 @@ mod downstream_wait_tests {
             count(&metrics, "decdn_node_pull_through_wait_seconds_count "),
             2,
             "each pause records its length once",
+        );
+    }
+
+    /// A pause the leg cancels still records its length.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_pause_records_its_length() {
+        let session = FillSession::new(bao_tree::blake3::Hash::from([7; 32]), 1 << 20);
+        let metrics = Arc::new(Metrics::new());
+        let hook = DownstreamWait::for_session(&session, Hash::from([7; 32]), Arc::clone(&metrics));
+        let cancelled = tokio::time::timeout(
+            Duration::from_secs(5),
+            hook.wait(DownstreamFrontier::default(), WaitReason::WindowFull),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "nothing advances, so the pause runs until cancelled"
+        );
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_node_pull_through_wait_seconds_count 1"),
+            "the cancelled pause records once:\n{text}"
         );
     }
 

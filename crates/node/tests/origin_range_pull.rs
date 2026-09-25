@@ -1074,7 +1074,8 @@ fn parse_byte_range(h: &str) -> Option<(u64, u64)> {
 
 /// A WHOLE-BLOB cold miss whose own origin publishes the `{H}.obao4` outboard is
 /// served through the own-origin two-leg path (`serve_via_backend_origin`):
-/// dispatch confirms serviceability (origin size + published outboard),
+/// dispatch confirms serviceability (origin size + published outboard + a
+/// ranged first-group read),
 /// signs `ok:true`, and runs the local pull leg (fill the cache from origin)
 /// beside the serve leg (stream the filling cache to the paying client). This
 /// asserts the dispatch selection reaches `serve_via_backend_origin` — the
@@ -1913,6 +1914,19 @@ async fn no_range_origin_degrades_to_buffered_before_signing() -> anyhow::Result
         counter_value(&metrics, "local_outboard_serves_total")? == 0,
         "the range probe must decline before the two-leg tier signs"
     );
+    // The degrade comes from the range half: the outboard was read once, and the
+    // probe's ranged read of the first chunk group reached the origin once.
+    let obao_gets = count_requests(&server, |r| r.url.path() == format!("/{hex}.obao4")).await?;
+    anyhow::ensure!(obao_gets == 1, "one outboard read, got {obao_gets}");
+    let probe = probe_range_val(blob.len());
+    let probe_gets = count_requests(&server, |r| {
+        r.url.path() == format!("/{hex}")
+            && r.headers
+                .get("range")
+                .is_some_and(|v| v.to_str().is_ok_and(|v| v == probe))
+    })
+    .await?;
+    anyhow::ensure!(probe_gets == 1, "one probe range read, got {probe_gets}");
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
@@ -2001,6 +2015,119 @@ async fn own_origin_size_probe_fault_refuses_internal_error_not_cache_miss() -> 
     anyhow::ensure!(
         counter_value(&metrics, "serve_stream_rejected_internal_error_total")? == 1,
         "a size-probe transport fault must refuse as InternalError (degraded node)"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "serve_stream_rejected_cache_miss_total")? == 0,
+        "a degraded node must not be reported as an empty one"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// #1129 through the range half of the serviceability probe: the size and the
+/// outboard answer, but the ranged read of the first chunk group times out. With no
+/// other fill tier configured, the miss must refuse as `InternalError` (a
+/// degraded node), never `NotFound` (an empty one), and nothing is signed.
+#[tokio::test(flavor = "multi_thread")]
+async fn own_origin_range_probe_fault_refuses_internal_error_not_cache_miss() -> anyhow::Result<()>
+{
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let server = MockServer::start().await;
+    // The size and the outboard answer, but the probe's ranged read of the first
+    // chunk group hangs past the origin read budget set below: a transport-class
+    // timeout fault, unlike a decline. Nothing else is mounted: no fill tier can
+    // serve.
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header("range", probe_range_val(blob.len()).as_str()))
+        .respond_with(ResponseTemplate::new(206).set_delay(Duration::from_secs(5)))
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x6C);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+    cache.set_origin_read_budget(Duration::from_millis(500), 1_000_000);
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // A bound whole-blob open, read the refusal, close.
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    let binding_hash =
+        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_signature = client_eth
+        .sign_hash_sync(&binding_hash)?
+        .as_bytes()
+        .to_vec();
+    let ext = StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: client_eth.address().into(),
+            binding_signature,
+        }),
+        capability: None,
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id.into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x9004,
+    };
+    let payload =
+        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
+    write_frame_to(&mut send, &payload).await?;
+    let (resp, _resp_ext) = read_stream_response(&mut recv).await?;
+    anyhow::ensure!(!resp.body.ok, "a faulted node must refuse");
+    conn.close(0u32.into(), b"done");
+
+    anyhow::ensure!(
+        counter_value(&metrics, "serve_stream_rejected_internal_error_total")? == 1,
+        "a range-probe transport fault must refuse as InternalError (degraded node)"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 0,
+        "the two-leg tier must not be entered after a faulted probe"
     );
     anyhow::ensure!(
         counter_value(&metrics, "serve_stream_rejected_cache_miss_total")? == 0,
@@ -2558,8 +2685,9 @@ async fn interior_hold_own_origin_miss_pulls_only_the_gaps() -> anyhow::Result<(
 }
 
 /// SERVE-LEVEL NO-HANG: an origin fetch failure on the own-origin serve-miss path
-/// must FAIL the serve, not hang it. Dispatch confirms serviceability (origin size +
-/// published outboard both succeed) and signs `ok:true`, but the ranged data GET the
+/// must FAIL the serve, not hang it. Dispatch confirms serviceability (origin size,
+/// published outboard and the ranged first-group probe succeed) and signs `ok:true`,
+/// but the ranged data GET the
 /// local pull leg draws returns `500` — so `origin_range_wire` errors, the pull
 /// leg records a terminal `pull_result`/`pull_ended`, and the serve leg races that
 /// terminal against its present-range watch and FAILS the gap it is waiting on. The
@@ -2585,8 +2713,9 @@ async fn own_origin_serve_fails_not_hangs_on_origin_fetch_error() -> anyhow::Res
         )
         .mount(&server)
         .await;
-    // (2) outboard GET SUCCEEDS (serviceability): dispatch proves the blob is
-    //     serviceable and signs `ok:true`, committing to the two-leg serve.
+    // (2) outboard GET SUCCEEDS: the outboard half of serviceability. With the
+    //     range probe below, dispatch signs `ok:true` and commits to the two-leg
+    //     serve.
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))

@@ -1032,7 +1032,7 @@ impl ClientHandler {
                                 // then fall through — another source may still serve.
                                 Err(e) => {
                                     self.metrics.node_pull_through_error();
-                                    tracing::warn!(%hash, error = %e, "own-origin range probe faulted; falling through");
+                                    tracing::warn!(%hash, error = %format_args!("{e:#}"), "own-origin range probe faulted; falling through");
                                     fault_seen = true;
                                 }
                             }

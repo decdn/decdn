@@ -1248,7 +1248,8 @@ pub struct DecdnMetrics {
     pub node_pull_through_min_draw_waits: Counter,
     /// `decdn_node_pull_through_wait_seconds`: how long one window-paced pause
     /// (window full or minimum draw) held the upstream pull before a downstream
-    /// payment or a parked serve leg released it. One observation per pause.
+    /// payment or a parked serve leg released it, or its leg cancelled it. One
+    /// observation per pause.
     /// Most pauses end within a voucher round trip; a tail near the top bucket
     /// means a payer that stalls or a pacing regression that parks the pull
     /// with no serve leg left to wake it. A pause past 30 s also logs a warning.

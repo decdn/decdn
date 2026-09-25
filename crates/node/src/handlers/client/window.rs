@@ -523,7 +523,8 @@ impl ClientHandler {
     /// `NodeFunder`, and no upstream counterparty.
     ///
     /// `total_bytes` is the origin-probe size the caller already confirmed
-    /// serviceable (`origin_size` + a published `{H}.obao4` outboard). The
+    /// serviceable (`origin_size`, a published `{H}.obao4` outboard, and a ranged
+    /// read of the first chunk group). The
     /// request may be whole-blob, bounded, or resumed: the serve leg clamps delivery
     /// to `[byte_offset, end)` and the local pull leg fills only that span's missing
     /// chunk groups, so a bounded request pulls exactly its aligned span from

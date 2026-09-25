@@ -73,6 +73,12 @@ pub enum CacheError {
     #[error("store error: {0}")]
     Store(#[source] anyhow::Error),
 
+    /// A code bug in the cache: a broken internal invariant or a caught panic.
+    /// Never an origin fault and never a store fault, so an operator reads it
+    /// as a bug to report, not as a backend to check.
+    #[error("internal fault: {0}")]
+    Internal(#[source] anyhow::Error),
+
     /// The local evicted-hash set is full. Hard cap on the number of
     /// distinct hashes the operator may evict in a single cache lifetime
     /// (issue #279) — protects the in-memory `HashSet` and the on-disk

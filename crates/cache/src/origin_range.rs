@@ -312,9 +312,9 @@ fn park_fault(slot: &FaultSlot, fault: CacheError) {
     }
 }
 
-/// Log a caught encode panic as the code bug it is and park it as a local
-/// [`CacheError::Store`] that carries the panic's message, so it never reads as
-/// an origin fault.
+/// Log a caught encode panic as the code bug it is and park it as a
+/// [`CacheError::Internal`] that carries the panic's message, so it never reads
+/// as an origin or store fault.
 fn park_panic(slot: &FaultSlot, hash: Hash, kind: OriginKind, payload: &(dyn Any + Send)) {
     let msg = payload
         .downcast_ref::<&str>()
@@ -329,7 +329,7 @@ fn park_panic(slot: &FaultSlot, hash: Hash, kind: OriginKind, payload: &(dyn Any
     );
     park_fault(
         slot,
-        CacheError::Store(anyhow::anyhow!(
+        CacheError::Internal(anyhow::anyhow!(
             "origin range encode for {hash} panicked: {msg}"
         )),
     );
@@ -339,7 +339,7 @@ fn park_panic(slot: &FaultSlot, hash: Hash, kind: OriginKind, payload: &(dyn Any
 /// and reported as a local fault so it never blames the operator's origin.
 fn internal_fault(hash: Hash, what: &str) -> CacheError {
     tracing::error!(%hash, what, "origin range reader invariant broken");
-    CacheError::Store(anyhow::anyhow!(
+    CacheError::Internal(anyhow::anyhow!(
         "origin range reader invariant broken for {hash}: {what}"
     ))
 }
@@ -513,9 +513,11 @@ impl AsyncStreamWriter for ChannelWriter {
 }
 
 /// Parks an `OriginError` if the encode task is cancelled before it reaches its
-/// verdict: an abort or a runtime shutdown drops it. A panic does not reach it,
-/// because the task catches the unwind and parks a [`CacheError::Store`]. So the
-/// channel never closes on an unfinished wire without a fault behind it.
+/// verdict: an abort or a runtime shutdown drops it. A panic inside the encode
+/// does not reach it, because the task catches the unwind and parks a
+/// [`CacheError::Internal`]; a panic after the encode (in the verdict
+/// classification) does. So the channel never closes on an unfinished wire
+/// without a fault behind it.
 struct UnfinishedGuard {
     slot: FaultSlot,
     hash: Hash,
@@ -538,7 +540,7 @@ impl Drop for UnfinishedGuard {
                 CacheError::OriginError {
                     hash: self.hash,
                     source: anyhow::anyhow!(
-                        "origin range encode for {} was cancelled before completing",
+                        "origin range encode for {} was cancelled, or panicked outside the encode, before completing",
                         self.hash
                     ),
                 },
@@ -557,7 +559,7 @@ impl Drop for UnfinishedGuard {
 /// - `Some(Err(_))` — the encode stopped: [`CacheError::VerifyFailed`] for a
 ///   window that fails verification against `H`, [`CacheError::OriginError`]
 ///   for an origin that stops serving or a task that is cancelled,
-///   [`CacheError::Store`] for a local fault: a reader invariant break, or a
+///   [`CacheError::Internal`] for a code bug: a reader invariant break, or a
 ///   panic in the encode, whose message the error carries. The wire is
 ///   incomplete.
 /// - `None` with no `Err` before it — the encode completed; the wire is whole.
@@ -579,13 +581,13 @@ impl std::fmt::Debug for OriginRangeWire {
 }
 
 impl OriginRangeWire {
-    /// Start the encode of `aligned` over `cursor`. Checks the outboard and
-    /// first-window lengths up front: either wrong length cannot verify, so it
-    /// is [`CacheError::VerifyFailed`] at once, before any wire. A wrong-length
-    /// outboard or a failed bao verification evicts the cursor's outboard from
-    /// `outboards`, so the next draw reads it from the origin again instead of
-    /// reusing a copy that may be the bad half. A wrong-length first window
-    /// blames the data and keeps the outboard.
+    /// Start the encode of `aligned` over `cursor`, whose first window has the
+    /// right length (the caller advances the origin chain past one that does
+    /// not). Checks the outboard length up front: a wrong length cannot verify,
+    /// so it is [`CacheError::VerifyFailed`] at once, before any wire. A
+    /// wrong-length outboard or a failed bao verification evicts the cursor's
+    /// outboard from `outboards`, so the next draw reads it from the origin
+    /// again instead of reusing a copy that may be the bad half.
     pub(crate) fn spawn(
         cursor: OriginRangeCursor,
         aligned: &AlignedRange,
@@ -608,15 +610,9 @@ impl OriginRangeWire {
             outboards.evict_if_same(hash, &outboard);
             return Err(CacheError::VerifyFailed { expected: hash });
         }
-        if cursor.first_is_wrong_length() {
-            tracing::warn!(
-                %hash,
-                ?kind,
-                "own origin served a wrong-length first range window; hard local-origin \
-                 fault (no degrade — committed to serving under H)",
-            );
-            return Err(CacheError::VerifyFailed { expected: hash });
-        }
+        // `open_range_cursor` never hands out a cursor whose first window has
+        // the wrong length: it advances the origin chain instead.
+        debug_assert!(!cursor.first_is_wrong_length());
         // A verify fault does not say whether the outboard or the data was bad,
         // so the encode task evicts the outboard copy it used.
         let used_outboard = outboard.clone();
@@ -860,7 +856,7 @@ mod tests {
 
         assert!(reader.read_at(0, 1).await.is_err(), "a backward read fails");
         assert!(
-            matches!(*fault.lock().unwrap(), Some(CacheError::Store(_))),
+            matches!(*fault.lock().unwrap(), Some(CacheError::Internal(_))),
             "a backward read is a local fault, not an origin fault",
         );
     }

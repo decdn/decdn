@@ -96,7 +96,11 @@ impl ClientHandler {
             // unreadable channel store) as `OriginPullError::Permanent`, and those recur
             // for every hash until an operator acts. Telling an operator to wait for a
             // permanent defect to pass is worse than saying nothing.
-            Ok(Err(e @ (CacheError::OriginError { .. } | CacheError::Store(_)))) => {
+            Ok(Err(
+                e @ (CacheError::OriginError { .. }
+                | CacheError::Store(_)
+                | CacheError::Internal(_)),
+            )) => {
                 self.metrics.node_pull_through_error();
                 tracing::warn!(%hash, error = %e, "node-to-node pull-through hit a backend fault");
                 FillOutcome::HardFault
@@ -150,7 +154,11 @@ impl ClientHandler {
             // Transient — the operator's own origin is down. See
             // [`Self::try_pull_through`] for why the split is exactly these two
             // variants and not a catch-all.
-            Ok(Err(e @ (CacheError::OriginError { .. } | CacheError::Store(_)))) => {
+            Ok(Err(
+                e @ (CacheError::OriginError { .. }
+                | CacheError::Store(_)
+                | CacheError::Internal(_)),
+            )) => {
                 self.metrics.node_pull_through_error();
                 tracing::warn!(%hash, error = %e, "reactive local-origin pull-through hit a transient backend fault");
                 FillOutcome::HardFault
