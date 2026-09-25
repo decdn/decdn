@@ -1710,7 +1710,7 @@ pub struct DecdnMetrics {
     /// chain-event poller retried inside a tick after a transient provider
     /// error. A retry that succeeds is not watcher downtime, so this counter is
     /// where a flaky RPC provider shows once the watchers stay up. A window
-    /// that still fails after its retries fails the tick as before.
+    /// that still fails after its retries fails the tick.
     pub chain_get_logs_retries: Counter,
     /// `decdn_chain_boot_read_retries_total` (#2159): retries of a boot-time
     /// chain read (the registry, slash, `usdc()` self-check and blacklist
