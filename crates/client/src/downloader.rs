@@ -314,7 +314,9 @@ where
                 max_sources: self.candidates.len().max(1),
                 unit_deadline: config.download_unit_deadline,
             };
-            multi_source_fetch_until(
+            // A dropped download still records the ranges that landed.
+            let flush_on_drop = store.flush_on_drop();
+            let fetched = multi_source_fetch_until(
                 &store,
                 &lanes,
                 &pacer,
@@ -330,7 +332,9 @@ where
                 None,
                 stop.as_mut(),
             )
-            .await?;
+            .await;
+            flush_on_drop.disarm();
+            fetched?;
             // `multi_source_fetch` flushes the present record but does not promote;
             // a download keeps the file, so finalize (verify + promote `.partial`).
             store.finalize().await?;
@@ -819,6 +823,58 @@ mod tests {
         };
         anyhow::ensure!(format!("{err:#}") == "stopped by the floor", "{err:#}");
         anyhow::ensure!(!dest.exists(), "a stopped target is not promoted");
+
+        let partial = ClientRangedStore::open(dir.path(), "model.bin", root, total)?;
+        let recorded = crate::driver::ranges_content_len(
+            &decdn_bao_range::RangedStore::present_ranges(&partial).await?,
+            total,
+        );
+        anyhow::ensure!(
+            recorded >= 4 * 1024 * 1024 && recorded < total,
+            "the landed prefix is recorded for a resume: {recorded}"
+        );
+        Ok(())
+    }
+
+    /// A download dropped mid-fetch (a caller's Ctrl-C) before any periodic
+    /// flush still records the bytes that landed, so a resume does not fetch
+    /// and pay for them again.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_download_records_the_landed_prefix() -> anyhow::Result<()> {
+        let blob = payload(12 * 1024 * 1024);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(blob.clone())?
+            .stall_after(6 * 1024 * 1024, Duration::from_hours(1))
+            .paying(Arc::clone(&ledger));
+        let root = source.root();
+        let total = u64::try_from(blob.len())?;
+
+        let downloader = Downloader::new(
+            vec![candidate(source, ledger, 0xA1)],
+            funder(),
+            drive_config(),
+        );
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("model.bin");
+        let config = PullConfig {
+            download_unit_deadline: Duration::ZERO,
+            ..PullConfig::default()
+        };
+        let targets = [DownloadTarget {
+            hash: root,
+            total_bytes: total,
+            dest: &dest,
+        }];
+        // Well inside the first periodic flush, so only the drop can record.
+        let dropped = tokio::time::timeout(
+            crate::driver::PRESENT_RECORD_FLUSH_INTERVAL / 5,
+            downloader.fetch_to_paths(&targets, &config, None, None),
+        )
+        .await;
+        anyhow::ensure!(
+            dropped.is_err(),
+            "the stalled download must still be running"
+        );
 
         let partial = ClientRangedStore::open(dir.path(), "model.bin", root, total)?;
         let recorded = crate::driver::ranges_content_len(

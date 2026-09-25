@@ -721,6 +721,51 @@ impl ClientRangedStore {
     }
 }
 
+impl ClientRangedStore {
+    /// A guard that persists the present-range record if it drops before
+    /// [`FlushOnDrop::disarm`].
+    ///
+    /// A fetch flushes the record when it returns, on success and on failure. A
+    /// fetch future that is dropped instead (a caller's Ctrl-C) never gets there,
+    /// so the ranges that landed since the last periodic flush would be fetched
+    /// and paid for again on resume. Arm this before awaiting the fetch and
+    /// disarm it once the fetch returns.
+    pub(crate) const fn flush_on_drop(&self) -> FlushOnDrop<'_> {
+        FlushOnDrop { store: Some(self) }
+    }
+}
+
+/// See [`ClientRangedStore::flush_on_drop`].
+pub(crate) struct FlushOnDrop<'a> {
+    /// The store to flush on drop; `None` once disarmed.
+    store: Option<&'a ClientRangedStore>,
+}
+
+impl FlushOnDrop<'_> {
+    /// The fetch returned and flushed on its own path: dropping does nothing.
+    pub(crate) fn disarm(mut self) {
+        self.store = None;
+    }
+}
+
+impl Drop for FlushOnDrop<'_> {
+    /// A synchronous write on the dropping thread. A periodic flush still
+    /// running on a blocking thread cannot corrupt it: each write renames its
+    /// own temp file into place, and `present` only grows, so the worst case is
+    /// an older snapshot landing last, which under-claims.
+    fn drop(&mut self) {
+        if let Some(store) = self.store.take()
+            && let Err(error) = store.flush_present_record()
+        {
+            tracing::warn!(
+                %error,
+                "could not persist the present-range record of a dropped fetch; its \
+                 unrecorded ranges are fetched again on resume"
+            );
+        }
+    }
+}
+
 /// The open `.partial` data file and `.obao4` outboard of one
 /// [`ClientRangedStore::ingest_stream`] call, held by its [`IngestPipeline`].
 struct IngestFiles {
