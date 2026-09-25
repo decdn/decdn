@@ -1706,6 +1706,13 @@ pub struct DecdnMetrics {
     /// caps `eth_getLogs`; set `blockchain.get_logs_max_block_span` to the
     /// lowest span the gauge reaches while they come, and they stop.
     pub chain_get_logs_range_rejections: Counter,
+    /// `decdn_chain_boot_read_retries_total` (#2159): retries of a boot-time
+    /// chain read (the registry, slash, `usdc()` self-check and blacklist
+    /// bootstraps, and the best-effort fee-share reads) after a transient
+    /// error; one read can retry many times. The metrics
+    /// listener binds after these reads, so the value becomes visible once boot
+    /// completes. A rise after a restart points at the RPC provider.
+    pub chain_boot_read_retries: Counter,
 
     // ---- Down-family parity for the watchers that lacked it (#1283, #1316) ----
     /// `decdn_blacklist_watcher_restarts_total` (#1283): distinct drift windows
@@ -1728,11 +1735,13 @@ pub struct DecdnMetrics {
 
     /// `decdn_blacklist_enforcement_failures_total` (#1319): distinct hashes a
     /// batched re-scope could NOT re-verify or evict this pass (`Recheck::Failed`
-    /// — a disk error or a scope `eth_call` failure). Non-zero means the deny-set
-    /// is not fully enforced and a blacklisted blob may still be servable and
-    /// slashable, even while `blacklist_watcher_down_seconds` reads `0`. Answers
-    /// a different question than the down-family, which tracks chain-read outages
-    /// only. Pairs with the aggregate `warn!` in `rescan`.
+    /// — a disk error or a scope `eth_call` failure). An increase means a pass
+    /// did not fully enforce the deny-set, so a blacklisted blob may still be
+    /// servable and slashable, even while `blacklist_watcher_down_seconds` reads
+    /// `0`. Answers a different question than the down-family, which tracks
+    /// chain-read outages only. A boot that retries its enforcement pass also
+    /// adds to it; the node serves only after a clean pass, so that increase does
+    /// not mean a served blob. Pairs with the aggregate `warn!` in `rescan`.
     pub blacklist_enforcement_failures: Counter,
 
     // ---- Stream outcomes and volume ----
@@ -1828,6 +1837,12 @@ pub struct DecdnMetrics {
     pub dht_bootstrap_find_node_failures: Counter,
 
     // ---- Fee-shares watcher parity ----
+    /// `decdn_fee_shares_watcher_unregistered`: `1` when the startup
+    /// `PaymentPool.feeRouter()` read failed, so the fee-shares watcher is not
+    /// running and the operator share stays at the floor for the life of the
+    /// process; `0` otherwise. The watcher's own down gauges read healthy in
+    /// that state, since it never started.
+    pub fee_shares_watcher_unregistered: Gauge,
     /// `decdn_fee_shares_watcher_poll_failures_total`: authoritative
     /// `getShares()` re-reads that failed. The watcher keeps the current share and
     /// its tick still succeeds, so this is the only signal that the safety-net
@@ -3016,6 +3031,8 @@ recorders! {
     chain_get_logs_span(span: u64) => chain_get_logs_span.set(sat_u64(span));
     /// Count one `eth_getLogs` window the provider rejected for its range.
     chain_get_logs_range_rejected => chain_get_logs_range_rejections.inc();
+    /// Count one boot-time chain read retried after a transient error.
+    chain_boot_read_retried => chain_boot_read_retries.inc();
     /// Stamp the staker-set watcher's liveness gauge (#1316). See `slash_watcher_tick`.
     staker_set_watcher_tick => staker_set_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
     /// A capacity-bond registry re-enumeration failed and the previous
@@ -3096,6 +3113,9 @@ recorders! {
 
     /// The fee-shares watcher's authoritative `getShares()` re-read failed.
     fee_shares_watcher_poll_failure => fee_shares_watcher_poll_failures.inc();
+    /// Record whether the fee-shares watcher is unregistered because the startup
+    /// `feeRouter()` read failed.
+    fee_shares_watcher_unregistered(unregistered: bool) => fee_shares_watcher_unregistered.set(i64::from(unregistered));
 
     /// A config reload failed and kept the previous values.
     config_reload_failure => config_reload_failures.inc();
@@ -4438,6 +4458,7 @@ mod tests {
             "decdn_onchain_tx_receipt_failed_total",
             "decdn_onchain_tx_timeout_total",
             "decdn_onchain_tx_receipt_recovered_total",
+            "decdn_chain_boot_read_retries_total",
             "decdn_dht_findvalue_queries_total",
             "decdn_dht_lookup_round_timeouts_total",
             "decdn_dht_store_published_total",
@@ -4447,6 +4468,7 @@ mod tests {
             "decdn_fee_shares_watcher_poll_failures_total",
             "decdn_fee_shares_watcher_restarts_total",
             "decdn_fee_shares_watcher_down_seconds",
+            "decdn_fee_shares_watcher_unregistered",
             "decdn_config_reload_failures_total",
             "decdn_receipt_write_failures_total",
             "decdn_serve_stream_midstream_pool_exhausted_total",

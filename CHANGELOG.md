@@ -825,6 +825,43 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **A transient RPC error during a boot-time chain read no longer exits the
+  daemon (#2159).** The CapacityBond registry snapshot, the slash enumeration,
+  the PaymentPool `usdc()` self-check and the ContentBlacklist boot enumeration
+  plus its enforcement pass now retry in process on the chain watchers' backoff
+  (1 s doubling to 60 s), with a `WARN` (`boot chain read failed; retrying
+  after backoff`) and a `decdn_chain_boot_read_retries_total` bump per retry.
+  One 10-minute boot deadline covers all of them, so a dead endpoint still
+  exits. A deterministic fault still fails boot at once: no contract at the
+  address, an ABI mismatch, a revert, an invalid request/method/params
+  response, an HTTP 4xx other than 408/429, or a local eviction error that
+  decides a blacklist enforcement attempt. Startup stays fail-closed: the ALPN router
+  still waits on the blacklist enumeration and enforcement. Supporting changes:
+  - The registry, slash and `usdc()` reads carry the 10 s per-call RPC
+    timeout, so a hung provider reaches the retry instead of wedging boot.
+  - A failed head read keeps its typed provider error through the
+    `SharedHead` cache, so the first read of each bootstrap is classified too.
+  - The slash enumeration reads at its snapshot block, so a lagging
+    load-balanced backend answers "header not found" (retried) instead of
+    reverting on a slash index it has not seen (fatal).
+  - The best-effort fee-share reads (`PaymentPool.feeRouter()`,
+    `FeeRouter.getShares()`) retry on a 1-minute sub-budget of the boot
+    deadline and carry the per-call timeout. They still fall back to the floor
+    share rather than fail boot, but a transient `feeRouter()` error no longer
+    leaves the node on the floor share with the fee-shares watcher
+    unregistered until restart. When it does fall back, the new
+    `decdn_fee_shares_watcher_unregistered` gauge reads `1`. Their failure
+    logs are sanitized, so an RPC URL key cannot leak into them.
+  - The fee-shares watcher's periodic `getShares()` re-read carries the
+    per-call timeout and logs a sanitized error.
+  - The blacklist boot enforcement pass stops at its first failed scope read
+    instead of re-checking every remaining hash against a failing provider.
+  - The client's registry discovery shares the classifier
+    (`decdn_client::provider::is_permanent_contract_error` /
+    `is_permanent_rpc_error`): a provider outage answered as a JSON-RPC error
+    response (for example code `1` "no available upstreams" or `19` "Temporary
+    internal error") is now retried on the ADR 012 schedule instead of failing
+    the read at once.
 - **The cache footprint counts a partial blob's present bytes (#2157).**
   `size_snapshot` sized a partial blob from iroh-blobs' `status()`, which
   leaves the size unknown until the blob's last chunk arrives and then reports

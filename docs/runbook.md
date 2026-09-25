@@ -66,6 +66,19 @@ blacklist updates and stop being able to settle channels. Once
 [#283](https://github.com/decdn/decdn/issues/283) lands, the
 `decdn_rpc_healthy` gauge drops to 0.
 
+A provider that passes the preflight but fails intermittently delays boot
+rather than ending it: each boot-time chain read logs `boot chain read failed;
+retrying after backoff` at `WARN` and retries. The daemon exits when the next
+retry could not start before a shared 10-minute boot deadline (`gave up after
+N attempts`), or at once on a deterministic fault (`deterministic failure, not
+retried`: a wrong contract address, an ABI mismatch, a revert, a disk error
+that decides a blacklist enforcement attempt). A best-effort fee-share read
+that gives up logs the same text but falls back to the floor share instead of
+exiting; `decdn_fee_shares_watcher_unregistered` then reads `1`. The node
+serves nothing until the blacklist enumeration and enforcement complete. The
+`decdn_chain_boot_read_retries_total` counter counts the boot retries; it
+becomes scrapeable once boot completes.
+
 **Detect:**
 
 - Existing alerts in `monitoring/prometheus-alerts.yml`: a dead endpoint stalls

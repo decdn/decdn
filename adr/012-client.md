@@ -50,9 +50,17 @@ Startup sequence from first launch to ready state:
      twice leaves one retry for every page after it. Per-page budgets would
      make the worst case 36 s × page-count, which scales with the size of
      the registry — something the caller cannot see or bound.
-     Deterministic failures (no contract at the configured address, an ABI
-     mismatch, an HTTP 4xx other than 429) are reported at once rather than
-     retried — repeating them only spends the schedule.
+     Some failures are deterministic. The client reports them at once and
+     does not retry them, because a repeat only spends the schedule:
+       - no contract at the configured address
+       - an ABI mismatch
+       - a revert
+       - a JSON-RPC invalid request, method or params error
+       - an HTTP 4xx other than 408 and 429, without a `Retry-After`
+         header
+     An HTTP error with a JSON-RPC error body counts as a JSON-RPC error
+     response. The client retries every other JSON-RPC error response. Providers
+     report rate limits and upstream outages that way.
      The whole of step 3 is additionally bounded by the client's
      `--timeout-ms`, so the retry schedule can never be the reason a fetch
      appears to hang past the deadline the user set.

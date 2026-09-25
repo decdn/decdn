@@ -85,6 +85,7 @@ use decdn_incentive::{
     bind_node_id_domain, register_node_signing_hash, slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_channel::BuyerPoolService;
+use decdn_node::chain_events::boot_retry::BootRetry;
 use decdn_node::chain_events::shared_head::{HeadSource, SharedHead};
 use decdn_node::channel_store::PersistentPoolStateStore;
 use decdn_node::metrics::Metrics;
@@ -731,6 +732,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         300,
         Duration::from_secs(300),
         Arc::clone(&metrics),
+        &BootRetry::single_attempt(Arc::clone(&metrics)),
         pool_view.clone(),
         redeem_tx,
         redeem_rx,

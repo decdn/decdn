@@ -1,10 +1,10 @@
 //! One shared, TTL-cached `eth_blockNumber` read for every chain watcher.
 //!
-//! Each watcher runs its own poll loop against its own provider, so before this
-//! module every tick cost one `eth_blockNumber` *per watcher* — ~7 head reads per
-//! `event_poll_interval` against a single endpoint, on top of each watcher's
-//! `eth_getLogs`. [`SharedHead`] collapses them: the first caller within a TTL
-//! window issues the RPC, everyone else reads the cache.
+//! Without a shared read, every tick would cost one `eth_blockNumber` *per
+//! watcher* — ~7 head reads per `event_poll_interval` against a single endpoint,
+//! on top of each watcher's `eth_getLogs`. [`SharedHead`] collapses them: the
+//! first caller within a TTL window issues the RPC, everyone else reads the
+//! cache.
 //!
 //! Two properties matter:
 //!
@@ -27,8 +27,7 @@
 //!   `chain_events::DEFAULT_RPC_CALL_TIMEOUT` in turn, so the last one's tick — and
 //!   therefore its `*_backoff_started` gauge — would be delayed by N × 10s. With
 //!   it, one caller pays the timeout and the rest fail instantly, so every
-//!   watcher enters backoff at the same moment, exactly as it did when each read
-//!   its own head.
+//!   watcher enters backoff at the same moment.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,11 +48,14 @@ use super::timed;
 /// block X been reached yet?") rather than a scan upper bound would be delayed by
 /// up to the TTL; no watcher does that today.
 ///
-/// `Err` is retryable: the caller's tick fails into backoff.
+/// `Err` keeps the provider's typed cause in its chain. A watcher tick treats
+/// every `Err` as retryable and fails into backoff; a boot read classifies it
+/// (`boot_retry::is_permanent_boot_error`), so a deterministic failure such as a
+/// rejected API key fails boot at once.
 #[async_trait]
 pub trait HeadSource: Send + Sync {
     /// The current chain head, at or before the true head and never ahead
-    /// of it. `Err` is retryable.
+    /// of it. `Err` keeps its typed cause in its chain.
     async fn head(&self) -> Result<u64>;
 }
 
@@ -63,6 +65,27 @@ struct CachedHead {
     /// `Arc` because `anyhow::Error` is not `Clone` and one failed read is
     /// replayed to every caller that arrives within the TTL.
     result: std::result::Result<u64, Arc<anyhow::Error>>,
+}
+
+/// A failed head read, shared by every caller inside the TTL.
+///
+/// The failure is kept whole behind an `Arc` (`anyhow::Error` is not `Clone`)
+/// and exposed as this error's [`source`](std::error::Error::source), so a
+/// caller's `err.chain()` still reaches the typed cause — the provider's
+/// `TransportError` — and can classify it.
+#[derive(Debug)]
+struct HeadReadFailed(Arc<anyhow::Error>);
+
+impl std::fmt::Display for HeadReadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("chain head read failed")
+    }
+}
+
+impl std::error::Error for HeadReadFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&**self.0)
+    }
 }
 
 /// TTL-cached, single-flight [`HeadSource`] over one provider.
@@ -124,11 +147,9 @@ impl<P: Provider> HeadSource for SharedHead<P> {
         {
             return match &entry.result {
                 Ok(head) => Ok(*head),
-                // Re-wrap rather than clone (`anyhow::Error` is not `Clone`).
-                // `{err:#}` flattens the whole chain into the new message, so a
-                // caller rendering this with `sanitize_err_chain` sees the same
-                // text the first caller did — the cause is folded in, not lost.
-                Err(err) => Err(anyhow::anyhow!("{err:#}")),
+                // Every caller inside the TTL gets the same failure, typed
+                // cause included, and renders the same text the first did.
+                Err(err) => Err(HeadReadFailed(Arc::clone(err)).into()),
             };
         }
         let result = timed(
@@ -151,7 +172,7 @@ impl<P: Provider> HeadSource for SharedHead<P> {
                     at: Instant::now(),
                     result: Err(Arc::clone(&shared)),
                 });
-                Err(anyhow::anyhow!("{shared:#}"))
+                Err(HeadReadFailed(shared).into())
             }
         }
     }
@@ -248,6 +269,28 @@ mod tests {
         assert!(a.is_err(), "first caller sees the failure");
         assert!(b.is_err(), "second caller replays the cached failure");
         assert_eq!(asserter.read_q().len(), 0, "one RPC, not two");
+    }
+
+    /// The typed provider error survives into the caller's error chain, for the
+    /// first caller and for every caller the cache replays it to, so a boot read
+    /// can tell a deterministic head failure from a transient one.
+    #[tokio::test]
+    async fn a_failure_keeps_its_typed_cause_and_text() {
+        let (asserter, provider) = mocked();
+        asserter.push_failure_msg("boom");
+        let head = SharedHead::with_ttl(provider, TTL, None);
+
+        for caller in ["first", "cached"] {
+            let err = head.head().await.unwrap_err();
+            assert!(
+                err.chain()
+                    .any(<dyn std::error::Error>::is::<alloy::transports::TransportError>),
+                "{caller} caller lost the typed cause: {err:#}"
+            );
+            let text = format!("{err:#}");
+            assert!(text.starts_with("chain head read failed: "), "{text}");
+            assert!(text.contains("boom"), "{text}");
+        }
     }
 
     /// A cached failure must not outlive its TTL — the watcher has to recover.
@@ -413,7 +456,7 @@ mod tests {
     }
 
     /// The cached failure replays the *original* message, not a placeholder —
-    /// the `Arc` round-trip and `{err:#}` re-wrap must not lose it, or the
+    /// the shared `Arc` behind `HeadReadFailed` must not lose it, or the
     /// second-through-Nth watcher would log a less diagnostic error than the
     /// first for the very same fault. (`timed` only attaches its `get_block_number`
     /// label on the timeout path; a transport error propagates raw and

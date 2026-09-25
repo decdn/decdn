@@ -594,9 +594,10 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// # Errors
     ///
     /// Returns an error if the `usdc()` self-check call fails (a bad
-    /// `payment_pool_address` or unreachable RPC is fatal at bring-up), if the
-    /// persisted buyer pools cannot be loaded, or if the one-time approval
-    /// transaction fails.
+    /// `payment_pool_address` or an unreachable RPC), if the persisted buyer
+    /// pools cannot be loaded, or if the one-time approval transaction fails.
+    /// The runtime treats the error as non-fatal: the node serves, and only its
+    /// paid node-to-node cache-miss leg is off.
     #[allow(clippy::too_many_arguments)]
     pub async fn bootstrap(
         provider: P,

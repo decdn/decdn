@@ -122,6 +122,8 @@ The node process MUST complete all of the following steps before opening any QUI
 
 Enumerate the full current deny-set from the `ContentBlacklist` contract at a single pinned block — the blacklisted address union (`blacklistedAddresses`, kept to the live members of `isOriginBlacklisted || isOperatorBlacklisted`) and the node's in-scope hashes (`getScopeRegions` then `blacklistedHashes` per region, liveness-filtered by `isHashBlacklistedForOperator`). The node MUST NOT accept connections until this enumeration completes successfully ([ADR 011](011-content-takedown.md#enumerating-the-deny-set)).
 
+The enumeration and its enforcement pass retry on a transient RPC failure. See [Boot-time chain reads](#boot-time-chain-reads) below.
+
 After the initial enumeration, the node follows the contract's blacklist events for live updates and periodically re-enumerates as the backstop. There is no version checkpoint to record: every boot rebuilds the complete deny-set, so a node returning from any downtime is immediately current.
 
 #### Step 3.2 — Build initial node view from on-chain registry
@@ -130,7 +132,18 @@ Query `CapacityBond.getRegisteredNodes(offset=0, limit=100)` to bootstrap the lo
 
 This registry snapshot is the initial node view. The node subscribes to `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events to keep the view fresh ([ADR 001 § Node Discovery (Registry)](001-network.md#node-discovery-registry)).
 
-If the RPC endpoint is unavailable, retry with exponential backoff (3 attempts at 1s, 5s, 30s). If all retries fail, the node cannot start (no node view = cannot participate in DHT lookups or probing).
+If the read fails, the node retries it as [Boot-time chain reads](#boot-time-chain-reads) describes. If the retries do not succeed, the node cannot start: without a node view it cannot take part in DHT lookups or probing.
+
+#### Boot-time chain reads
+
+Four boot reads must succeed before the node serves: the registry snapshot (Step 3.2), the slash enumeration, the `PaymentPool.usdc()` self-check, and the blacklist enumeration with its enforcement pass (Step 3.1).
+
+- A transient RPC failure does not stop the node. The node retries the read with exponential backoff. The backoff starts at 1 s and doubles on each retry. It does not increase above 60 s.
+- One boot deadline applies to all four reads. The deadline is 10 minutes from the start of the reads. When the next retry cannot start before the deadline, the node exits.
+- A deterministic failure stops the node at once. Examples are no contract at the configured address, an ABI mismatch, a revert, a JSON-RPC invalid request, method or params error, and an HTTP 4xx other than 408 and 429 that has no `Retry-After` header.
+- A retry delays readiness. It does not open the node to connections: Step 3.1 still gates them.
+
+The fee-share reads (`PaymentPool.feeRouter()` and `FeeRouter.getShares()`) use the same retry. They retry for 1 minute at most, inside the same deadline. This limit keeps time for the four reads that come after them. When they fail, the node uses the floor fee share and does not stop.
 
 #### Step 3.3 — Configure local rate
 
