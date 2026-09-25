@@ -697,10 +697,12 @@ impl ServeAudit {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EvictionPreview {
     /// Bytes the iroh-blobs store reports for this hash. `None` when the
-    /// blob isn't in the store; matches `BlobStatus::NotFound`. Partial
-    /// blobs (`BlobStatus::Partial { size }`) report whatever size the
-    /// store has so far — the operator sees how much disk a partial
-    /// pull is occupying.
+    /// blob isn't in the store; matches `BlobStatus::NotFound`. A partial
+    /// blob reports `BlobStatus::Partial { size }` as is: the whole blob's
+    /// size once its last chunk validates, `None` before. That is the blob's
+    /// total, not the bytes it holds on disk — the delivery and probe paths
+    /// sign and advertise it as the total, and
+    /// [`CacheEngine::size_snapshot`] is the on-disk measure.
     pub size_bytes: Option<u64>,
     /// Microseconds elapsed since the blob was last served via
     /// [`CacheEngine::get`]. `None` when no access has been recorded —
@@ -786,6 +788,39 @@ impl PresentRanges {
     pub const fn size(&self) -> u64 {
         self.size
     }
+}
+
+/// Bytes of a `size`-byte blob that `ranges` marks present.
+///
+/// `ranges` counts 1 KiB chunks ([`bao_tree::ChunkNum`]). When a bitfield
+/// holds the blob's last chunk, iroh-blobs extends its ranges to an open end
+/// ([`ChunkRanges::all`] once complete), so every span ends at `size` at the
+/// latest. The same clamp counts a short last chunk at its true length.
+fn present_byte_count(ranges: &ChunkRanges, size: u64) -> u64 {
+    const CHUNK_BYTES: u64 = 1024;
+    let byte = |chunk: &bao_tree::ChunkNum| chunk.0.saturating_mul(CHUNK_BYTES).min(size);
+    ranges.boundaries().chunks(2).fold(0u64, |acc, span| {
+        let start = span.first().map_or(size, byte);
+        let end = span.get(1).map_or(size, byte);
+        acc.saturating_add(end.saturating_sub(start))
+    })
+}
+
+/// Bytes of `hash` present on disk, from its `observe()` bitfield.
+///
+/// Sizes a `Partial` blob. `status()` does not: iroh-blobs leaves a partial's
+/// size unknown until its last chunk validates, then reports the whole blob's
+/// size. The first `observe` item is the current bitfield and arrives at once,
+/// so a hash that GC removes after its `status()` reads as 0 bytes.
+async fn observed_present_bytes(
+    blobs: &iroh_blobs::api::blobs::Blobs,
+    hash: Hash,
+) -> CacheResult<u64> {
+    let bitfield = blobs
+        .observe(hash)
+        .await
+        .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+    Ok(present_byte_count(&bitfield.ranges, bitfield.size()))
 }
 
 /// Snapshot of access times for blobs that are eligible for LRU
@@ -1101,8 +1136,8 @@ async fn gc_protect_inner(
 /// `status`) report `BlobStatus::NotFound` and are dropped — they
 /// cannot have contributed bytes either way.
 ///
-/// `Partial` blobs report whatever size iroh-blobs has on disk so far
-/// (`None` when the store can't tell us, treated as zero). Including
+/// A `Partial` blob reports the bytes its bitfield marks present
+/// ([`observed_present_bytes`]), not `status()`'s size. Including
 /// partials matters: the threat model that motivated #518 is exactly
 /// the partial-import case (`add_stream` errored mid-flight, the
 /// `TempTag` was dropped, but the bytes already on disk are what we
@@ -1123,7 +1158,9 @@ async fn snapshot_blob_sizes(store: &FsStore) -> CacheResult<HashMap<Hash, u64>>
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
         let size = match status {
             iroh_blobs::api::blobs::BlobStatus::NotFound => continue,
-            iroh_blobs::api::blobs::BlobStatus::Partial { size } => size.unwrap_or(0),
+            iroh_blobs::api::blobs::BlobStatus::Partial { .. } => {
+                observed_present_bytes(blobs, hash).await?
+            }
             iroh_blobs::api::blobs::BlobStatus::Complete { size } => size,
         };
         out.insert(hash, size);
@@ -4102,7 +4139,8 @@ impl CacheEngine {
     }
 
     /// Snapshot every on-disk blob keyed by hash with its byte size
-    /// (`Complete` and `Partial` alike), the public form of the internal
+    /// (`Complete` and `Partial` alike; a partial counts only its present
+    /// bytes), the public form of the internal
     /// `snapshot_blob_sizes` helper. This is the authoritative disk-usage
     /// input for the capacity-eviction driver (#1173): unlike
     /// [`Self::eviction_candidates`] — which sees only hashes *touched since
@@ -10384,15 +10422,124 @@ mod tests {
         );
     }
 
+    /// A middle-range partial (no front, no tail) leaves `status()`'s size
+    /// unknown, yet its bytes sit on disk. `size_snapshot` — the eviction
+    /// footprint and the `decdn_cache_bytes` gauge — must count them (#2157).
+    #[tokio::test]
+    async fn size_snapshot_counts_middle_range_partial_by_present_bytes() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await?;
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = decdn_protocol::DISCOVERY_BLOCK_BYTES + 3 * group;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?);
+
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 2 * group, 2 * group, total);
+        engine.admit_bao(hash, ranges, bao).await?;
+
+        let status = engine.inner.store.blobs().status(hash).await?;
+        anyhow::ensure!(
+            matches!(
+                status,
+                iroh_blobs::api::blobs::BlobStatus::Partial { size: None }
+            ),
+            "a middle-range partial must leave status()'s size unknown, got {status:?}"
+        );
+
+        let sizes = engine.size_snapshot().await?;
+        anyhow::ensure!(
+            sizes.get(&hash).copied() == Some(2 * group),
+            "size_snapshot must count the middle partial's present bytes, got {:?}",
+            sizes.get(&hash)
+        );
+        anyhow::ensure!(
+            engine.total_bytes().await? == 2 * group,
+            "total_bytes must agree with size_snapshot"
+        );
+        Ok(())
+    }
+
+    /// A partial that holds its tail has a validated `status()` size equal to
+    /// the whole blob, but only some of those bytes are on disk. The footprint
+    /// counts the present bytes, including the short last chunk (#2157).
+    #[tokio::test]
+    async fn size_snapshot_counts_tail_bearing_partial_by_present_bytes_not_total()
+    -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await?;
+        let block = decdn_protocol::DISCOVERY_BLOCK_BYTES;
+        let tail_start = block + 3 * crate::CHUNK_GROUP_BYTES;
+        let tail_len = 123;
+        let total = tail_start + tail_len;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?);
+
+        let (hash, head_ranges, head_bao) =
+            bao_for(root, &plaintext, outboard.clone(), 0, block, total);
+        engine.admit_bao(hash, head_ranges, head_bao).await?;
+        let (_, tail_ranges, tail_bao) =
+            bao_for(root, &plaintext, outboard, tail_start, tail_len, total);
+        engine.admit_bao(hash, tail_ranges, tail_bao).await?;
+
+        let status = engine.inner.store.blobs().status(hash).await?;
+        anyhow::ensure!(
+            matches!(
+                status,
+                iroh_blobs::api::blobs::BlobStatus::Partial { size: Some(s) } if s == total
+            ),
+            "the tail validates the size, got {status:?}"
+        );
+
+        let sizes = engine.size_snapshot().await?;
+        anyhow::ensure!(
+            sizes.get(&hash).copied() == Some(block + tail_len),
+            "size_snapshot must count present bytes, not the declared total {total}, got {:?}",
+            sizes.get(&hash)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn present_byte_count_clamps_to_size() {
+        use bao_tree::ChunkNum;
+        assert_eq!(present_byte_count(&ChunkRanges::empty(), 5000), 0);
+        assert_eq!(
+            present_byte_count(&ChunkRanges::all(), 5000),
+            5000,
+            "a complete bitfield counts the whole blob, short last chunk included"
+        );
+        assert_eq!(
+            present_byte_count(&ChunkRanges::from(ChunkNum(1)..ChunkNum(3)), 5000),
+            2048,
+            "a closed span counts 1 KiB per chunk"
+        );
+        assert_eq!(
+            present_byte_count(&ChunkRanges::from(ChunkNum(4)..), 5000),
+            5000 - 4096,
+            "an open tail ends at the blob size"
+        );
+        assert_eq!(
+            present_byte_count(
+                &(ChunkRanges::from(ChunkNum(0)..ChunkNum(1)) | ChunkRanges::from(ChunkNum(4)..)),
+                5000
+            ),
+            1024 + 904,
+            "disjoint spans sum"
+        );
+        assert_eq!(
+            present_byte_count(&ChunkRanges::from(ChunkNum(1)..), 0),
+            0,
+            "an unknown size contributes nothing past it"
+        );
+    }
+
     /// Advertise (`coverage`) and serve (`partial_hit_size`, mirrored here via
     /// `present_ranges` + `missing_ranges` — the exact sequence it now runs)
     /// must AGREE on a front-prefix partial (#1506).
     ///
-    /// Both size the blob from the `observe()` bitfield. `inspect`'s
-    /// `status()`-derived `size_bytes` is not usable here: iroh-blobs leaves it
-    /// `None` for a `Partial` blob until its FINAL chunk validates, so on a
-    /// front-prefix partial (block 0 present, no tail) a `status()`-sized serve
-    /// gate declines a block that `coverage` already advertises as covered.
+    /// Both size the blob from the `observe()` bitfield. `status()`'s size is
+    /// not usable here: iroh-blobs leaves it `None` for a `Partial` blob until
+    /// its FINAL chunk validates, so on a front-prefix partial (block 0
+    /// present, no tail) a `status()`-sized serve gate declines a block that
+    /// `coverage` already advertises as covered.
     #[tokio::test]
     async fn partial_hit_size_source_agrees_with_coverage_on_front_partial() {
         let tmp = tempfile::tempdir().unwrap();
