@@ -80,7 +80,7 @@ use tracing::{error, warn};
 use super::resumable_watcher::{CursorStart, LogSink, WatcherHandle, WatcherHook, fire};
 use super::shared_head::HeadSource;
 use super::{AbortOnDrop, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF};
-use super::{timed, window_end};
+use super::{halved_span, timed, window_end};
 
 /// Object-safe adapter over [`LogSink`], so routes with different concrete sink
 /// types live in one `Vec<Box<dyn ErasedSink>>`. `LogSink::apply` /
@@ -616,7 +616,8 @@ fn fire_route_hooks(poller: &mut MultiplexedPoller, shutdown: &CancellationToken
 /// "query returned more than 10000 results"` (also its rate-limit code),
 /// Quicknode `-32614 "eth_getLogs is limited to a 10,000 range"`. The codes do
 /// not agree, so the test is the message: a JSON-RPC error response that names
-/// a range or a result limit. "out of range" is excluded: a load-balanced
+/// a range, or a result count together with a limit word ("more than",
+/// "exceed", "max", "limit", "too many"). "out of range" is excluded: a load-balanced
 /// provider whose backend lags head reports a `toBlock` past that backend's
 /// head that way, and the shrink is sticky. Any other error — a timeout, a
 /// transport failure, a rate limit, an unknown block — takes the backoff path
@@ -627,8 +628,11 @@ fn is_range_rejection(err: &anyhow::Error) -> bool {
         .and_then(TransportError::as_error_resp)
         .is_some_and(|resp| {
             let message = resp.message.to_ascii_lowercase();
-            (message.contains("range") && !message.contains("out of range"))
-                || message.contains("results")
+            let result_limit = message.contains("results")
+                && ["more than", "exceed", "max", "limit", "too many"]
+                    .iter()
+                    .any(|word| message.contains(word));
+            (message.contains("range") && !message.contains("out of range")) || result_limit
         })
 }
 
@@ -680,12 +684,10 @@ async fn run_tick<P: Provider + Clone>(
                 // wider) range can never succeed. Halve the window and retry
                 // it at once. A one-block window cannot shrink, so its
                 // rejection takes the backoff path like any other failure.
-                let window = end - start + 1;
-                if window > 1 && is_range_rejection(&err) {
-                    let span = window / 2;
+                if let Some(span) = halved_span(start, end).filter(|_| is_range_rejection(&err)) {
                     warn!(
                         error = %sanitize_err_chain(&err),
-                        rejected_span = window,
+                        rejected_span = (end - start).saturating_add(1),
                         span,
                         "RPC provider rejected the eth_getLogs block range; \
                          shrinking the poll window (set blockchain.get_logs_max_block_span \
@@ -2280,6 +2282,11 @@ mod tests {
             -32005,
             "query returned more than 10000 results"
         )));
+        // geth / Erigon result cap.
+        assert!(is_range_rejection(&rpc_error(
+            -32000,
+            "query exceeds max results 20000"
+        )));
         // QuickNode.
         assert!(is_range_rejection(&rpc_error(
             -32614,
@@ -2303,6 +2310,11 @@ mod tests {
         )));
         assert!(!is_range_rejection(&rpc_error(-32000, "unknown block")));
         assert!(!is_range_rejection(&rpc_error(-32603, "internal error")));
+        // "results" alone is not a result limit.
+        assert!(!is_range_rejection(&rpc_error(
+            -32000,
+            "failed to marshal results"
+        )));
         // Not a JSON-RPC error response at all.
         assert!(!is_range_rejection(&anyhow::Error::new(
             alloy::transports::TransportErrorKind::custom_str("connection reset")

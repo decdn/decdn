@@ -69,11 +69,10 @@ blacklist updates and stop being able to settle channels. Once
 **Detect:**
 
 - Existing alerts in `monitoring/prometheus-alerts.yml`: a dead endpoint stalls
-  every chain-event watcher at once, so expect the five that have stalled alerts
-  to fire together — `DecdnBlacklistWatcherStalled`, `DecdnSlashWatcherStalled`,
-  `DecdnStakerSetWatcherStalled`, `DecdnOriginDirectoryWatcherStalled`, and
-  `DecdnSettlementWatcherStalled`. (The sixth, `rate_bounds`, exports a tick
-  gauge but has no rule.) Several firing together points at the RPC endpoint
+  every chain-event watcher at once, so expect the five stalled alerts to fire
+  together — `DecdnBlacklistWatcherStalled`, `DecdnSlashWatcherStalled`,
+  `DecdnStakerSetWatcherStalled`, `DecdnFeeSharesWatcherStalled`, and
+  `DecdnSettlementWatcherStalled`. Several firing together points at the RPC endpoint
   rather than at any one watcher. Each fires on the *age* of that watcher's last
   successful tick (guarded against the pre-first-tick sentinel) **or** on
   `decdn_*_watcher_down_seconds`, which counts from the first failed poll tick —

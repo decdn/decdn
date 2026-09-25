@@ -38,6 +38,19 @@ pub(crate) fn window_end(start: u64, to: u64, span: u64) -> u64 {
     start.saturating_add(span.max(1) - 1).min(to)
 }
 
+/// The span to retry with after the provider rejects the inclusive window
+/// `[start, end]`: half its length, rounded down. `None` for a one-block window,
+/// which cannot shrink. Computed from `end - start`, so a window that spans all
+/// of `u64` cannot overflow.
+pub(crate) const fn halved_span(start: u64, end: u64) -> Option<u64> {
+    let last = end.saturating_sub(start);
+    if last == 0 {
+        return None;
+    }
+    // (last + 1) / 2 without the `+ 1` overflow.
+    Some(last / 2 + last % 2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,6 +82,20 @@ mod tests {
         assert_eq!(window_end(7, 100, 0), 7);
         // A span near u64::MAX saturates instead of overflowing.
         assert_eq!(window_end(5, 9, u64::MAX), 9);
+    }
+
+    #[test]
+    fn halved_span_halves_the_window_length() {
+        assert_eq!(halved_span(1, 20), Some(10), "20 blocks -> 10");
+        assert_eq!(halved_span(0, 20), Some(10), "21 blocks -> 10");
+        assert_eq!(halved_span(5, 7), Some(1), "3 blocks -> 1");
+        assert_eq!(halved_span(5, 6), Some(1), "2 blocks -> 1");
+        assert_eq!(halved_span(9, 9), None, "a one-block window cannot shrink");
+        assert_eq!(
+            halved_span(0, u64::MAX),
+            Some(1 << 63),
+            "the full u64 range does not overflow"
+        );
     }
 
     #[test]
