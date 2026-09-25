@@ -825,6 +825,22 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Chain watchers survive an RPC that caps `eth_getLogs` ranges, and the
+  stalled-watcher alerts catch a watcher that never ticked.** The chain-event
+  poller scanned `[cursor, head]` in fixed 10 000-block windows and never read
+  the error. A provider with a lower range cap (dRPC's free tier rejects about
+  150 blocks, Alchemy's free tier 10) rejected every window, the cursor held,
+  and each backoff retry asked for a wider range, so every watcher stayed
+  blind until restart. The poller now halves its window when the provider's
+  JSON-RPC error names a range or result limit, retries at once, and keeps the
+  smaller span for the process lifetime; timeouts, rate limits and other
+  errors keep the backoff path. The five `*WatcherStalled` alerts only read
+  the tick gauge behind a `> 0` guard, and a never-ticked watcher reads `0`,
+  so none fired. Each now also fires on
+  `decdn_<watcher>_watcher_down_seconds > 180`. The "Oldest watcher tick", "Watcher tick age" and "Settlement
+  watcher freshness" panels show a failing never-ticked watcher by its
+  down-seconds instead of dropping it.
+
 - **Tracing: dependency spans no longer export, and each run of a streaming
   miss has an `upstream_stream` span (#2048).** The OTLP export filter
   admitted any span at `WARN` from a non-deCDN crate. iroh opens its periodic
@@ -2216,6 +2232,11 @@ since project inception and will roll into the first tagged release.
   ownership only; no steady-state behavior change.
 
 ### Added
+
+- **`blockchain.get_logs_max_block_span` sets the starting block span of one
+  chain-watcher `eth_getLogs` request** (default 10 000, must be > 0,
+  restart-required). Set it to the RPC provider's range limit so the poller
+  does not have to learn it from rejections after each restart.
 
 - **Observability: the first latency histograms, so a latency SLO can be
   written in PromQL (#2047).** Before this change the exporter had no

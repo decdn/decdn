@@ -103,14 +103,14 @@
       },
       "title": "Watcher tick age",
       "type": "table",
-      "description": "Age of each watcher's last successful poll tick, stamped every tick including idle ones, so this is a positive liveness signal rather than an absence of errors. Built with label_replace on the raw selector because `time() - x` drops __name__. Red at 180s matches the stalled-watcher alerts. A watcher that has never ticked reads 0 and is filtered out by the `> 0` guard rather than showing as infinitely stale.",
+      "description": "Age of each watcher's last successful poll tick, stamped every tick including idle ones, so this is a positive liveness signal rather than an absence of errors. Built with label_replace on the raw selector because `time() - x` drops __name__. Red at 180s matches the stalled-watcher alerts. A watcher that has never ticked reads 0, so the `> 0` guard drops its tick age; if its poll keeps failing, the row shows its down-seconds (time since the first failed tick) instead, matching the stalled-watcher alerts' second arm. A watcher that is simply not wired on this node shows no row.",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "time() - label_replace({__name__=~\"decdn_.+_watcher_last_tick_timestamp_seconds\",deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"} > 0, \"watcher\", \"$1\", \"__name__\", \"decdn_(.+)_watcher_last_tick_timestamp_seconds\")",
+          "expr": "(time() - label_replace({__name__=~\"decdn_.+_watcher_last_tick_timestamp_seconds\",deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"} > 0, \"watcher\", \"$1\", \"__name__\", \"decdn_(.+)_watcher_last_tick_timestamp_seconds\")) or (label_replace({__name__=~\"decdn_.+_watcher_down_seconds\",deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"} > 0, \"watcher\", \"$1\", \"__name__\", \"decdn_(.+)_watcher_down_seconds\") * 1)",
           "refId": "A",
           "instant": true,
           "range": false,
@@ -2153,7 +2153,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "time() - (decdn_settlement_watcher_last_tick_timestamp_seconds{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"} > 0)",
+          "expr": "(time() - (decdn_settlement_watcher_last_tick_timestamp_seconds{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"} > 0)) or ((decdn_settlement_watcher_down_seconds{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"} > 0) * 1)",
           "refId": "A",
           "legendFormat": "{{instance}}"
         }

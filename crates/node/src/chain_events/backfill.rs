@@ -2,7 +2,7 @@
 //!
 //! The `multiplexed_poller` loop walks each route's `[cursor, head]` gap in
 //! bounded `eth_getLogs` windows and rewinds a shallow reorg margin on resume. Kept here
-//! (rather than in any one watcher) so a new consumer picks up the shared span
+//! (rather than in any one watcher) so a new consumer picks up the shared windowing
 //! instead of forking a fresh one (#1092).
 //!
 //! This provides the live-tail windowing every watcher shares, plus the
@@ -29,86 +29,57 @@
 /// by the next boot's enumeration.
 pub(crate) const REORG_MARGIN_BLOCKS: u64 = 128;
 
-/// Maximum block span scanned per `eth_getLogs` during the resume backfill
-/// (#751). A node down for a long time resumes from a checkpoint many thousands
-/// of blocks behind head; a single unbounded `eth_getLogs` over that gap would
-/// exceed the range/result caps most RPC providers enforce. The backfill walks
-/// the gap in windows of this size instead.
-///
-/// This bounds the *block span* per request, not the *result count* — some
-/// providers cap `eth_getLogs` by number of matched logs (or a lower block span)
-/// rather than range, so a dense 10k-block window could still trip a result-count
-/// limit. 10k is a conservative default that clears the common range caps; tie it
-/// to the deployment provider's documented `eth_getLogs` limit (and make it
-/// configurable) if a target RPC enforces a tighter or result-count-based cap.
-///
-/// Shared so the buyer-side bootstrap reconciliation scan
-/// ([`crate::buyer_channel`], #763) uses the same window cap.
-pub(crate) const MAX_BACKFILL_BLOCK_SPAN: u64 = 10_000;
-
-/// Split an inclusive `[from, to]` block range into successive inclusive windows
-/// of at most `span` blocks (#751), so a long resume backfill issues bounded
-/// `eth_getLogs` calls. Pure and allocation-light (one entry per window); a
-/// `from > to` range yields no windows (the caller validates that separately).
-/// Unit-tested for the window math.
-///
-/// Shared so the buyer-side bootstrap reconciliation scan
-/// ([`crate::buyer_channel`], #763) reuses the same windowing rather than forking it.
-pub(crate) fn backfill_windows(from: u64, to: u64, span: u64) -> Vec<(u64, u64)> {
-    let mut windows = Vec::new();
-    if from > to || span == 0 {
-        return windows;
-    }
-    let mut start = from;
-    loop {
-        let end = start.saturating_add(span - 1).min(to);
-        windows.push((start, end));
-        if end >= to {
-            return windows;
-        }
-        start = end.saturating_add(1);
-    }
+/// The inclusive end of the `eth_getLogs` window that starts at `start`: at
+/// most `span` blocks, clamped to `to`. The poller walks `[from, to]` with it
+/// one window at a time, because the span can shrink between windows when the
+/// provider rejects a range (see `multiplexed_poller::run_tick`). A `span` of
+/// `0` is treated as `1`; the poller never passes it.
+pub(crate) fn window_end(start: u64, to: u64, span: u64) -> u64 {
+    start.saturating_add(span.max(1) - 1).min(to)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn backfill_windows_split_the_range() {
-        // Exact multiple: two full windows.
-        assert_eq!(
-            backfill_windows(0, 19, 10),
-            vec![(0, 9), (10, 19)],
-            "two contiguous inclusive windows"
-        );
-        // Remainder: a short final window.
-        assert_eq!(
-            backfill_windows(0, 25, 10),
-            vec![(0, 9), (10, 19), (20, 25)]
-        );
-        // Single block and single-window-fits cases.
-        assert_eq!(backfill_windows(1_000, 1_000, 10), vec![(1_000, 1_000)]);
-        assert_eq!(backfill_windows(1_000, 1_005, 10), vec![(1_000, 1_005)]);
-        // Non-zero start offset: windows stay aligned to `from`, not to 0.
-        assert_eq!(backfill_windows(100, 119, 10), vec![(100, 109), (110, 119)]);
-        // Degenerate inputs yield no windows (caller validates separately).
-        assert!(backfill_windows(10, 5, 10).is_empty());
-        assert!(backfill_windows(0, 10, 0).is_empty());
+    /// Walk `[from, to]` the way the poller does with a fixed span.
+    fn windows(from: u64, to: u64, span: u64) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        let mut start = from;
+        while start <= to {
+            let end = window_end(start, to, span);
+            out.push((start, end));
+            start = end + 1;
+        }
+        out
     }
 
     #[test]
-    fn backfill_windows_cover_a_large_gap_without_overlap_or_gap() {
-        // A long downtime gap: every block in [from, to] is covered exactly once
-        // and no window exceeds the span.
-        let (from, to, span) = (1_000u64, 55_321u64, MAX_BACKFILL_BLOCK_SPAN);
-        let windows = backfill_windows(from, to, span);
+    fn window_end_splits_the_range() {
+        // Exact multiple: two full windows.
+        assert_eq!(windows(0, 19, 10), vec![(0, 9), (10, 19)]);
+        // Remainder: a short final window.
+        assert_eq!(windows(0, 25, 10), vec![(0, 9), (10, 19), (20, 25)]);
+        // Single block and single-window-fits cases.
+        assert_eq!(windows(1_000, 1_000, 10), vec![(1_000, 1_000)]);
+        assert_eq!(windows(1_000, 1_005, 10), vec![(1_000, 1_005)]);
+        // Non-zero start offset: windows stay aligned to `from`, not to 0.
+        assert_eq!(windows(100, 119, 10), vec![(100, 109), (110, 119)]);
+        // A zero span is a one-block window, never an empty scan.
+        assert_eq!(window_end(7, 100, 0), 7);
+        // A span near u64::MAX saturates instead of overflowing.
+        assert_eq!(window_end(5, 9, u64::MAX), 9);
+    }
+
+    #[test]
+    fn windows_cover_a_large_gap_without_overlap_or_gap() {
+        let (from, to, span) = (1_000u64, 55_321u64, 10_000u64);
+        let windows = windows(from, to, span);
         let mut expected_next = from;
         for (start, end) in &windows {
             assert_eq!(*start, expected_next, "windows must be contiguous");
             assert!(end >= start, "window end >= start");
-            // Window length (end - start + 1) must not exceed the span cap;
-            // written as `< span` to avoid clippy's int_plus_one.
+            // Written as `< span` to avoid clippy's int_plus_one.
             assert!(
                 end - start < span,
                 "window span {} exceeds cap {span}",

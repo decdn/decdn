@@ -79,6 +79,14 @@ const DEFAULT_EVENT_POLL_INTERVAL_MS: u64 = 7000;
 /// 250 ms is kept as the floor because it is alloy's own localhost cadence: a dev
 /// anvil can still be driven at the fastest interval alloy itself considers sane.
 const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
+/// Default ceiling on the block span of one chain-watcher `eth_getLogs`
+/// request. A node that resumes far behind head scans the gap in windows of at
+/// most this many blocks, because one unbounded request would exceed the range
+/// and result caps that RPC providers enforce. 10 000 clears the common paid
+/// and public caps. A provider with a lower cap (free tiers go down to 10
+/// blocks) rejects the request, and the poller then halves its window until the
+/// provider accepts it.
+pub const DEFAULT_GET_LOGS_MAX_BLOCK_SPAN: u64 = 10_000;
 
 /// Default accrued-claim redemption threshold: 1 USDC (`1_000_000` `µUSDC`).
 /// At this size the ~$0.10 redeem gas is a few percent of the redeemed
@@ -1533,6 +1541,19 @@ fn resolve_blockchain_into(
         },
     );
 
+    let get_logs_max_block_span = file
+        .and_then(|b| b.get_logs_max_block_span)
+        .unwrap_or(DEFAULT_GET_LOGS_MAX_BLOCK_SPAN);
+    bag.check_with(
+        get_logs_max_block_span > 0,
+        "blockchain.get_logs_max_block_span",
+        || {
+            "blockchain.get_logs_max_block_span=0 would scan no blocks; use at least 1 \
+             (the provider's eth_getLogs range limit)"
+                .to_owned()
+        },
+    );
+
     let redeem_threshold_micro_usdc = file
         .and_then(|b| b.redeem_threshold_micro_usdc)
         .unwrap_or(DEFAULT_REDEEM_THRESHOLD_MICRO_USDC);
@@ -1657,6 +1678,7 @@ fn resolve_blockchain_into(
         chain_id,
         rpc_watchdog_interval_sec,
         event_poll_interval_ms,
+        get_logs_max_block_span,
         fee_shares_poll_interval_sec,
         redeem_threshold_micro_usdc,
         redeem_max_vouchers_per_tx,
@@ -9929,6 +9951,68 @@ usdc_address = \"0xUsdc\"
         };
         let resolved = resolve_blockchain(&cli, Some(&in_range), dir.path())?;
         assert_eq!(resolved.event_poll_interval_ms, 1000);
+        Ok(())
+    }
+
+    fn get_logs_span_cli() -> BlockchainArgs {
+        BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        }
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_zero_get_logs_max_block_span() -> anyhow::Result<()> {
+        // A zero span would scan no blocks: every chain watcher would go blind.
+        let dir = data_dir_with_keystore()?;
+        let file = types::BlockchainConfig {
+            get_logs_max_block_span: Some(0),
+            ..Default::default()
+        };
+        let Err(err) = resolve_blockchain(&get_logs_span_cli(), Some(&file), dir.path()) else {
+            anyhow::bail!("expected an error for get_logs_max_block_span = 0");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("get_logs_max_block_span"),
+            "error should name the field: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_applies_default_get_logs_max_block_span_when_absent() -> anyhow::Result<()>
+    {
+        let dir = data_dir_with_keystore()?;
+        let resolved = resolve_blockchain(&get_logs_span_cli(), None, dir.path())?;
+        assert_eq!(
+            resolved.get_logs_max_block_span,
+            DEFAULT_GET_LOGS_MAX_BLOCK_SPAN
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_accepts_a_provider_sized_get_logs_max_block_span() -> anyhow::Result<()> {
+        // One block is the smallest span that still scans; 10 is Alchemy's
+        // free-tier cap.
+        let dir = data_dir_with_keystore()?;
+        for span in [1, 10] {
+            let file = types::BlockchainConfig {
+                get_logs_max_block_span: Some(span),
+                ..Default::default()
+            };
+            let resolved = resolve_blockchain(&get_logs_span_cli(), Some(&file), dir.path())?;
+            assert_eq!(resolved.get_logs_max_block_span, span);
+        }
         Ok(())
     }
 

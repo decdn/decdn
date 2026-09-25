@@ -69,16 +69,18 @@ use std::time::Duration;
 use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
+use alloy::transports::TransportError;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use decdn_common::config::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN;
 use decdn_common::redact::sanitize_err_chain;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
 use super::resumable_watcher::{CursorStart, LogSink, WatcherHandle, WatcherHook, fire};
 use super::shared_head::HeadSource;
-use super::{AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF};
-use super::{backfill_windows, timed};
+use super::{AbortOnDrop, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF};
+use super::{timed, window_end};
 
 /// Object-safe adapter over [`LogSink`], so routes with different concrete sink
 /// types live in one `Vec<Box<dyn ErasedSink>>`. `LogSink::apply` /
@@ -232,6 +234,11 @@ pub struct MultiplexedPoller {
     /// persisted resume that never predates deploy), retained as that floor.
     from_block: u64,
     poll_interval: Duration,
+    /// Block span of the next `eth_getLogs` window. Starts at the configured
+    /// ceiling and only shrinks: [`run_tick`] halves it when the provider
+    /// rejects a window's range, and the smaller span holds for the rest of the
+    /// process lifetime. Always `>= 1` ([`MultiplexedPollerBuilder::build`]
+    /// rejects `0`).
     max_backfill_span: u64,
     initial_backoff: Duration,
     /// Ceiling for the shared loop's backoff. One loop now serves every route,
@@ -276,7 +283,8 @@ impl std::fmt::Debug for MultiplexedPollerBuilder {
 
 impl MultiplexedPollerBuilder {
     /// Construct with the defaults every route shares: the deploy floor (`0`),
-    /// [`MAX_BACKFILL_BLOCK_SPAN`], and the default watcher backoff schedule.
+    /// [`DEFAULT_GET_LOGS_MAX_BLOCK_SPAN`], and the default watcher backoff
+    /// schedule.
     #[must_use]
     pub fn new(head: Arc<dyn HeadSource>, poll_interval: Duration) -> Self {
         Self {
@@ -284,7 +292,7 @@ impl MultiplexedPollerBuilder {
             routes: Vec::new(),
             from_block: 0,
             poll_interval,
-            max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
+            max_backfill_span: DEFAULT_GET_LOGS_MAX_BLOCK_SPAN,
             initial_backoff: WATCHER_INITIAL_BACKOFF,
             max_backoff: WATCHER_MAX_BACKOFF,
             rpc_call_timeout: None,
@@ -298,10 +306,11 @@ impl MultiplexedPollerBuilder {
         self
     }
 
-    /// Override the max block span per `eth_getLogs` window (tests use a small
-    /// span to exercise multi-window backfills without huge fixtures).
-    #[cfg(test)]
-    pub(crate) const fn max_backfill_span(mut self, span: u64) -> Self {
+    /// Set the starting block span per `eth_getLogs` window
+    /// (`blockchain.get_logs_max_block_span`). The poller shrinks it on a
+    /// provider range rejection. [`Self::build`] rejects `0`.
+    #[must_use]
+    pub const fn max_backfill_span(mut self, span: u64) -> Self {
         self.max_backfill_span = span;
         self
     }
@@ -313,6 +322,10 @@ impl MultiplexedPollerBuilder {
     /// startup rather than silently routing every such log to whichever route
     /// happened to register first.
     pub fn build(self) -> Result<MultiplexedPoller> {
+        anyhow::ensure!(
+            self.max_backfill_span > 0,
+            "multiplexed poller max_backfill_span must be at least 1 block"
+        );
         let mut key_index = HashMap::new();
         let mut all_addresses = Vec::new();
         let mut all_topic0s = Vec::new();
@@ -596,6 +609,29 @@ fn fire_route_hooks(poller: &mut MultiplexedPoller, shutdown: &CancellationToken
     any_errored
 }
 
+/// Whether a failed `eth_getLogs` is the provider refusing the window's block
+/// range (or its result count), so a smaller window can succeed. Providers use
+/// different codes for this: dRPC `35 "ranges over 10000 blocks are not
+/// supported"`, Alchemy `-32600 "… up to a 10 block range"`, Infura `-32005
+/// "query returned more than 10000 results"` (also its rate-limit code),
+/// Quicknode `-32614 "eth_getLogs is limited to a 10,000 range"`. The codes do
+/// not agree, so the test is the message: a JSON-RPC error response that names
+/// a range or a result limit. "out of range" is excluded: a load-balanced
+/// provider whose backend lags head reports a `toBlock` past that backend's
+/// head that way, and the shrink is sticky. Any other error — a timeout, a
+/// transport failure, a rate limit, an unknown block — takes the backoff path
+/// and leaves the window span alone, so a transient fault cannot shrink it.
+fn is_range_rejection(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<TransportError>())
+        .and_then(TransportError::as_error_resp)
+        .is_some_and(|resp| {
+            let message = resp.message.to_ascii_lowercase();
+            (message.contains("range") && !message.contains("out of range"))
+                || message.contains("results")
+        })
+}
+
 /// Run one poll tick: read head, resolve each route's floor, scan the merged
 /// `[min(floor), head]` range in windows (one `get_logs` per window), demux
 /// each log to its owning route, then reconcile and fire hooks. Returns `Err`
@@ -620,28 +656,53 @@ async fn run_tick<P: Provider + Clone>(
     // If every route is already at/above head this is an idle tick: no
     // `get_logs`, but the reconcile below still runs every route's
     // `on_tick_complete`.
-    if from <= to {
-        for (start, end) in backfill_windows(from, to, poller.max_backfill_span) {
-            // Yield between windows so a large merged backfill does not block
-            // graceful shutdown (mirrors the per-window shutdown check).
-            if shutdown.is_cancelled() {
-                return Ok(());
-            }
-            let filter = poller.base_filter.clone().from_block(start).to_block(end);
-            let logs = match timed(
-                poller.rpc_call_timeout,
-                "get_logs",
-                provider.get_logs(&filter),
-            )
-            .await
-            .with_context(|| format!("multiplexed get_logs [{start}, {end}]"))
-            {
-                Ok(logs) => logs,
-                Err(err) => return Err(fail_whole_tick(poller, shutdown, err)),
-            };
-            demux_window_logs(poller, logs).await;
-            advance_routes(poller, end);
+    let mut start = from;
+    while start <= to {
+        // Yield between windows so a large merged backfill does not block
+        // graceful shutdown (mirrors the per-window shutdown check).
+        if shutdown.is_cancelled() {
+            return Ok(());
         }
+        let end = window_end(start, to, poller.max_backfill_span);
+        let filter = poller.base_filter.clone().from_block(start).to_block(end);
+        let logs = match timed(
+            poller.rpc_call_timeout,
+            "get_logs",
+            provider.get_logs(&filter),
+        )
+        .await
+        .with_context(|| format!("multiplexed get_logs [{start}, {end}]"))
+        {
+            Ok(logs) => logs,
+            Err(err) => {
+                // A provider that caps the `eth_getLogs` range rejects the
+                // window outright, and retrying the same (or, as head moves, a
+                // wider) range can never succeed. Halve the window and retry
+                // it at once. A one-block window cannot shrink, so its
+                // rejection takes the backoff path like any other failure.
+                let window = end - start + 1;
+                if window > 1 && is_range_rejection(&err) {
+                    let span = window / 2;
+                    warn!(
+                        error = %sanitize_err_chain(&err),
+                        rejected_span = window,
+                        span,
+                        "RPC provider rejected the eth_getLogs block range; \
+                         shrinking the poll window (set blockchain.get_logs_max_block_span \
+                         to the provider's limit)"
+                    );
+                    poller.max_backfill_span = span;
+                    continue;
+                }
+                return Err(fail_whole_tick(poller, shutdown, err));
+            }
+        };
+        demux_window_logs(poller, logs).await;
+        advance_routes(poller, end);
+        if end >= to {
+            break;
+        }
+        start = end + 1;
     }
 
     notify_recovered_routes(poller, shutdown);
@@ -2183,5 +2244,355 @@ mod tests {
             applied, 1,
             "only window [1,1]'s log applied; the failed and un-scanned windows did not"
         );
+    }
+
+    // --- Provider range caps: the window shrinks on a range rejection ------------
+
+    fn error_payload(code: i64, message: &str) -> Option<alloy_json_rpc::ErrorPayload> {
+        serde_json::from_value(serde_json::json!({ "code": code, "message": message })).ok()
+    }
+
+    fn rpc_error(code: i64, message: &str) -> anyhow::Error {
+        error_payload(code, message).map_or_else(
+            || anyhow::anyhow!("unbuildable error payload"),
+            |payload| {
+                anyhow::Error::new(TransportError::ErrorResp(payload))
+                    .context("multiplexed get_logs [1, 20]")
+            },
+        )
+    }
+
+    #[test]
+    fn range_rejection_matches_provider_range_and_result_caps() {
+        // dRPC free tier (the real cap was ~100-178 blocks, whatever the text says).
+        assert!(is_range_rejection(&rpc_error(
+            35,
+            "ranges over 10000 blocks are not supported on free plan"
+        )));
+        // Alchemy free tier.
+        assert!(is_range_rejection(&rpc_error(
+            -32600,
+            "Under the Free tier plan, you can make eth_getLogs requests with up to a 10 \
+             block range."
+        )));
+        // Infura result cap: -32005 is also its rate-limit code.
+        assert!(is_range_rejection(&rpc_error(
+            -32005,
+            "query returned more than 10000 results"
+        )));
+        // QuickNode.
+        assert!(is_range_rejection(&rpc_error(
+            -32614,
+            "eth_getLogs is limited to a 10,000 range"
+        )));
+    }
+
+    #[test]
+    fn range_rejection_ignores_every_other_failure() {
+        // Rate limits back off; they never shrink the window.
+        assert!(!is_range_rejection(&rpc_error(429, "Too Many Requests")));
+        assert!(!is_range_rejection(&rpc_error(
+            -32005,
+            "project ID request rate exceeded"
+        )));
+        // A lagging load-balanced backend: a smaller window is not the fix, and
+        // the shrink is sticky.
+        assert!(!is_range_rejection(&rpc_error(
+            -32000,
+            "block number is out of range"
+        )));
+        assert!(!is_range_rejection(&rpc_error(-32000, "unknown block")));
+        assert!(!is_range_rejection(&rpc_error(-32603, "internal error")));
+        // Not a JSON-RPC error response at all.
+        assert!(!is_range_rejection(&anyhow::Error::new(
+            alloy::transports::TransportErrorKind::custom_str("connection reset")
+        )));
+        assert!(!is_range_rejection(&anyhow::anyhow!(
+            "get_logs timed out after 10s"
+        )));
+    }
+
+    /// A route resuming from a checkpoint at `from`, so the first tick backfills
+    /// `[from, head]`.
+    fn checkpoint_route(
+        from: u64,
+    ) -> (
+        Route,
+        Arc<std::sync::Mutex<ScriptedSink>>,
+        Arc<MemoryCheckpointStore>,
+    ) {
+        let store = Arc::new(MemoryCheckpointStore::default());
+        assert!(
+            store
+                .record_checkpoint(CheckpointKey::PoolOpened, from)
+                .is_ok()
+        );
+        let (route, sink) = seeded_route(
+            "a",
+            ADDR_A,
+            TOPIC_A,
+            CursorStart::FromCheckpoint {
+                checkpoint: Checkpoint {
+                    store: Arc::clone(&store) as Arc<dyn KeyedCheckpointStore>,
+                    key: CheckpointKey::PoolOpened,
+                },
+                reorg_margin: 0,
+                cold_start: ColdStart::Head,
+            },
+        );
+        (route, sink, store)
+    }
+
+    #[tokio::test]
+    async fn a_range_rejection_halves_the_window_and_the_tick_completes() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let (route, _sink, store) = checkpoint_route(1);
+        let built =
+            MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
+                .route(route)
+                .build();
+        let Ok(mut poller) = assert_built(built) else {
+            return;
+        };
+
+        // head=20, default span: [1, 20] is rejected, then [1, 10] and [11, 20].
+        asserter.push_success(&U64::from(20));
+        if let Some(payload) = error_payload(
+            -32600,
+            "you can make eth_getLogs requests with up to a 10 block range",
+        ) {
+            asserter.push_failure(payload);
+        }
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&Vec::<Log>::new());
+
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(
+            result.is_ok(),
+            "the halved windows must complete the tick: {result:?}"
+        );
+        assert_eq!(
+            poller.max_backfill_span, 10,
+            "the span is halved from the 20-block window"
+        );
+        assert_eq!(poller.routes.first().and_then(|r| r.cursor), Some(21));
+        assert_eq!(
+            store
+                .load_checkpoint(CheckpointKey::PoolOpened)
+                .ok()
+                .flatten(),
+            Some(20)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_backs_off_and_keeps_the_window() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let (route, _sink, _store) = checkpoint_route(1);
+        let built =
+            MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
+                .route(route)
+                .build();
+        let Ok(mut poller) = assert_built(built) else {
+            return;
+        };
+
+        asserter.push_success(&U64::from(20));
+        if let Some(payload) = error_payload(429, "Too Many Requests") {
+            asserter.push_failure(payload);
+        }
+
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(
+            result.is_err(),
+            "a rate limit fails the tick into the backoff path"
+        );
+        assert_eq!(poller.max_backfill_span, DEFAULT_GET_LOGS_MAX_BLOCK_SPAN);
+        assert_eq!(
+            poller.routes.first().and_then(|r| r.cursor),
+            Some(1),
+            "cursor held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_one_block_window_fails_the_tick_instead_of_looping() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let (route, _sink, _store) = checkpoint_route(1);
+        let built =
+            MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
+                .max_backfill_span(1)
+                .route(route)
+                .build();
+        let Ok(mut poller) = assert_built(built) else {
+            return;
+        };
+
+        asserter.push_success(&U64::from(1));
+        if let Some(payload) = error_payload(35, "ranges over 10000 blocks are not supported") {
+            asserter.push_failure(payload);
+        }
+
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(
+            result.is_err(),
+            "a one-block window cannot shrink: back off"
+        );
+        assert_eq!(poller.max_backfill_span, 1);
+    }
+
+    #[test]
+    fn a_zero_span_is_a_build_error() {
+        let head: Arc<dyn HeadSource> = Arc::new(StaticHead(0));
+        let built = MultiplexedPollerBuilder::new(head, Duration::from_secs(1))
+            .max_backfill_span(0)
+            .build();
+        assert!(built.is_err(), "a zero span would scan no blocks");
+    }
+
+    /// A head the test moves between ticks.
+    struct MovingHead(Arc<std::sync::atomic::AtomicU64>);
+
+    #[async_trait]
+    impl HeadSource for MovingHead {
+        async fn head(&self) -> Result<u64> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    /// A JSON-RPC mock with a provider-side `eth_getLogs` range cap. It answers
+    /// dRPC's free-tier error for any window wider than `cap` blocks and records
+    /// every requested window as `(from, to, accepted)`.
+    struct CappedGetLogsRpc {
+        cap: u64,
+        windows: Arc<std::sync::Mutex<Vec<(u64, u64, bool)>>>,
+    }
+
+    fn hex_block(value: Option<&serde_json::Value>) -> Option<u64> {
+        let text = value?.as_str()?.strip_prefix("0x")?;
+        u64::from_str_radix(text, 16).ok()
+    }
+
+    impl wiremock::Respond for CappedGetLogsRpc {
+        fn respond(&self, req: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            let id = body.get("id").cloned().unwrap_or(serde_json::json!(0));
+            let filter = body.get("params").and_then(|p| p.get(0));
+            let from = hex_block(filter.and_then(|f| f.get("fromBlock")));
+            let to = hex_block(filter.and_then(|f| f.get("toBlock")));
+            let (Some(from), Some(to)) = (from, to) else {
+                return wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32602, "message": "missing block bounds" },
+                }));
+            };
+            let accepted = to - from < self.cap;
+            self.windows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((from, to, accepted));
+            let payload = if accepted {
+                serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": [] })
+            } else {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {
+                        "code": 35,
+                        "message": "ranges over 10000 blocks are not supported on free plan",
+                    },
+                })
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(payload)
+        }
+    }
+
+    /// The production failure: a provider capping `eth_getLogs` at 150 blocks
+    /// and a 1 651-block gap behind head. The poller must shrink its window over
+    /// the real HTTP error path, finish the backfill in one tick, and keep the
+    /// learned span so the next tick sends no rejected request.
+    #[tokio::test]
+    async fn a_capped_provider_backfill_recovers_and_the_span_sticks() {
+        const CAP: u64 = 150;
+        let windows = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(CappedGetLogsRpc {
+                cap: CAP,
+                windows: Arc::clone(&windows),
+            })
+            .mount(&server)
+            .await;
+        let parsed_url = server.uri().parse();
+        assert!(parsed_url.is_ok(), "mock server uri must parse");
+        let Ok(url) = parsed_url else { return };
+        let provider = ProviderBuilder::new().connect_http(url);
+
+        let head_block = Arc::new(std::sync::atomic::AtomicU64::new(2_000));
+        let head: Arc<dyn HeadSource> = Arc::new(MovingHead(Arc::clone(&head_block)));
+        let (route, _sink, store) = checkpoint_route(350);
+        let built = MultiplexedPollerBuilder::new(head, Duration::from_secs(1))
+            .route(route)
+            .build();
+        let Ok(mut poller) = assert_built(built) else {
+            return;
+        };
+
+        let first = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(
+            first.is_ok(),
+            "the capped backfill must complete: {first:?}"
+        );
+        assert!(
+            poller.max_backfill_span <= CAP,
+            "span {} over the cap",
+            poller.max_backfill_span
+        );
+        assert_eq!(poller.routes.first().and_then(|r| r.cursor), Some(2_001));
+        assert_eq!(
+            store
+                .load_checkpoint(CheckpointKey::PoolOpened)
+                .ok()
+                .flatten(),
+            Some(2_000)
+        );
+        let recorded = windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let accepted: Vec<(u64, u64)> = recorded
+            .iter()
+            .filter(|w| w.2)
+            .map(|w| (w.0, w.1))
+            .collect();
+        let mut next = 350;
+        for (from, to) in &accepted {
+            assert_eq!(
+                *from, next,
+                "accepted windows must be contiguous: {accepted:?}"
+            );
+            next = to + 1;
+        }
+        assert_eq!(next, 2_001, "accepted windows must cover the whole gap");
+
+        // Tick 2: 100 new blocks fit the learned span, so nothing is rejected.
+        head_block.store(2_100, Ordering::SeqCst);
+        let rejected_before = recorded.iter().filter(|w| !w.2).count();
+        let second = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(second.is_ok(), "the live tail must complete: {second:?}");
+        let rejected_after = windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|w| !w.2)
+            .count();
+        assert_eq!(
+            rejected_after, rejected_before,
+            "the learned span must stick"
+        );
+        assert_eq!(poller.routes.first().and_then(|r| r.cursor), Some(2_101));
     }
 }

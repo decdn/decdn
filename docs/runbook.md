@@ -75,9 +75,9 @@ blacklist updates and stop being able to settle channels. Once
   `DecdnSettlementWatcherStalled`. (The sixth, `rate_bounds`, exports a tick
   gauge but has no rule.) Several firing together points at the RPC endpoint
   rather than at any one watcher. Each fires on the *age* of that watcher's last
-  successful tick and is guarded against the pre-first-tick sentinel, so a
-  watcher that never established at all is caught by `decdn_*_watcher_down_seconds`
-  and by the blacklist readiness gate, not here.
+  successful tick (guarded against the pre-first-tick sentinel) **or** on
+  `decdn_*_watcher_down_seconds`, which counts from the first failed poll tick —
+  so a watcher that never established at all fires too.
   `DecdnBlacklistWatcherStalled` is the one carrying slash risk; see
   [ContentBlacklist compliance](#contentblacklist-compliance).
 - Direct probe:
@@ -95,6 +95,19 @@ blacklist updates and stop being able to settle channels. Once
   down.
 
 - Provider status page.
+
+- `multiplexed poller tick error` `warn!` lines whose error names a block range
+  or a result limit (dRPC `ranges over 10000 blocks are not supported`, Alchemy
+  `up to a 10 block range`, Infura `more than 10000 results`) mean the provider
+  caps `eth_getLogs`. The endpoint is up (`decdn_rpc_healthy` stays 1) but the
+  watchers cannot read events. The poller halves its window on each such
+  rejection and logs `RPC provider rejected the eth_getLogs block range;
+  shrinking the poll window` with the new `span`; the span holds until restart.
+  Set `blockchain.get_logs_max_block_span` to the provider's limit so a restart
+  does not re-learn it. A cap below one poll interval of blocks (Arbitrum makes
+  about 4 blocks per second, so about 30 blocks per 7 s tick) still works, but
+  each tick then costs several `eth_getLogs` requests against the provider's
+  quota.
 
 - `decdn_staker_set_watcher_down_seconds` climbing (with
   `decdn_staker_set_watcher_restarts_total` advancing) is the chain-side

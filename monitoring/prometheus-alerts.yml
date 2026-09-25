@@ -57,13 +57,16 @@ groups:
       # alert on. DecdnBlacklistWatcherStalled below is the coverage: it fires on
       # staleness of the watcher's last successful tick, which IS exported.
       - alert: DecdnBlacklistWatcherStalled
-        # Positive liveness: the gauge is stamped every successful poll tick, so
-        # staleness catches a panicked, wedged, or exited watcher that the
-        # error-triggered down-seconds gauge reads as a healthy 0 (#1316/#1320).
-        # 180s ≈ several poll intervals; tune to content_blacklist_poll_interval_sec.
-        # The `> 0` guard skips the pre-first-tick sentinel (the gauge reads 0
-        # until the first successful tick), so a fresh boot doesn't self-fire.
-        expr: (decdn_blacklist_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_blacklist_watcher_last_tick_timestamp_seconds > 180)
+        # Two arms. Positive liveness: the tick gauge is stamped every
+        # successful poll tick, so its staleness catches a panicked, wedged, or
+        # exited watcher that the error-triggered down-seconds gauge reads as a
+        # healthy 0 (#1316/#1320). The `> 0` guard skips the pre-first-tick
+        # sentinel (the gauge reads 0 until the first successful tick), so a
+        # fresh boot doesn't self-fire. Failing ticks: down-seconds counts from
+        # the first failed poll tick, so it also catches a watcher that never
+        # ticked because every eth_getLogs fails (an RPC that rejects the range),
+        # which the guarded tick arm cannot see. 180s ≈ several poll intervals.
+        expr: ((decdn_blacklist_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_blacklist_watcher_last_tick_timestamp_seconds > 180)) or (decdn_blacklist_watcher_down_seconds > 180)
         for: 5m
         labels:
           component: blacklist
@@ -234,17 +237,20 @@ groups:
             accepting connections. The sum-without(direction) aggregation
             avoids false alerts when only one direction is idle.
 
-      # Chain-event watcher liveness (#1316): the *_last_tick_timestamp_seconds
-      # gauge advances only while the watcher actually completes ticks, so
-      # staleness catches a panicked/wedged/exited task the error-triggered
-      # down-seconds gauge reads as a healthy 0. 180s ≈ several poll intervals;
-      # tune to your event_poll_interval. The `> 0` guard skips the pre-first-tick
-      # sentinel (gauge reads 0 until the first success), so a fresh boot — and a
-      # node that never enables a conditionally-spawned watcher — doesn't
-      # self-fire. Blacklist has its own (slash-risk) rule in decdn-slash-safety;
-      # settlement is in decdn-delivery.
+      # Chain-event watcher liveness (#1316), two arms. The
+      # *_last_tick_timestamp_seconds gauge advances only while the watcher
+      # actually completes ticks, so staleness catches a panicked/wedged/exited
+      # task the error-triggered down-seconds gauge reads as a healthy 0. The
+      # `> 0` guard skips the pre-first-tick sentinel (gauge reads 0 until the
+      # first success), so a fresh boot — and a node that never enables a
+      # conditionally-spawned watcher — doesn't self-fire. The *_down_seconds arm
+      # counts from the first failed poll tick, so it catches a watcher that
+      # never ticked because every eth_getLogs fails; an unregistered watcher
+      # never fails a tick, so it stays 0. 180s ≈ several poll intervals; tune to
+      # your event_poll_interval. Blacklist has its own (slash-risk) rule in
+      # decdn-slash-safety; settlement is in decdn-delivery.
       - alert: DecdnSlashWatcherStalled
-        expr: (decdn_slash_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_slash_watcher_last_tick_timestamp_seconds > 180)
+        expr: ((decdn_slash_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_slash_watcher_last_tick_timestamp_seconds > 180)) or (decdn_slash_watcher_down_seconds > 180)
         for: 5m
         labels:
           component: watcher
@@ -258,7 +264,7 @@ groups:
             operator could go undetected. Restart and check the RPC provider.
 
       - alert: DecdnStakerSetWatcherStalled
-        expr: (decdn_staker_set_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_staker_set_watcher_last_tick_timestamp_seconds > 180)
+        expr: ((decdn_staker_set_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_staker_set_watcher_last_tick_timestamp_seconds > 180)) or (decdn_staker_set_watcher_down_seconds > 180)
         for: 5m
         labels:
           component: watcher
@@ -357,7 +363,7 @@ groups:
             BatchSpanProcessor.SpanDroppingStarted warning.
 
       - alert: DecdnFeeSharesWatcherStalled
-        expr: (decdn_fee_shares_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_fee_shares_watcher_last_tick_timestamp_seconds > 180)
+        expr: ((decdn_fee_shares_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_fee_shares_watcher_last_tick_timestamp_seconds > 180)) or (decdn_fee_shares_watcher_down_seconds > 180)
         for: 5m
         labels:
           component: watcher
@@ -561,11 +567,12 @@ groups:
             default up instead. max_probe_holds is restart-required.
 
       # Chain-event watcher liveness (#1316) for the payment-settlement watcher
-      # — staleness of its last successful poll tick. 180s ≈ several poll
-      # intervals; tune to your event_poll_interval. The `> 0` guard skips the
-      # pre-first-tick sentinel (gauge reads 0 until the first success).
+      # — staleness of its last successful poll tick, or a failing poll that
+      # never ticked (down-seconds). 180s ≈ several poll intervals; tune to your
+      # event_poll_interval. The `> 0` guard skips the pre-first-tick sentinel
+      # (gauge reads 0 until the first success).
       - alert: DecdnSettlementWatcherStalled
-        expr: (decdn_settlement_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_settlement_watcher_last_tick_timestamp_seconds > 180)
+        expr: ((decdn_settlement_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_settlement_watcher_last_tick_timestamp_seconds > 180)) or (decdn_settlement_watcher_down_seconds > 180)
         for: 5m
         labels:
           component: settlement

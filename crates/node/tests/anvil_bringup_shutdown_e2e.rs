@@ -344,6 +344,7 @@ fn build_config(
             capacity_bond_address: addrs.capacity_bond.to_string(),
             rpc_watchdog_interval_sec: 30,
             event_poll_interval_ms: 250,
+            get_logs_max_block_span: decdn_common::config::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN,
             fee_shares_poll_interval_sec: 3600,
             redeem_threshold_micro_usdc: 1_000_000,
             redeem_max_vouchers_per_tx: 300,

@@ -1428,7 +1428,8 @@ async fn build_chain_and_handlers(
     let poller = crate::chain_events::multiplexed_poller::MultiplexedPollerBuilder::new(
         Arc::clone(&head),
         event_poll_interval,
-    );
+    )
+    .max_backfill_span(cfg.blockchain.get_logs_max_block_span);
     let poller = poller_routes
         .into_iter()
         .fold(
@@ -3998,6 +3999,7 @@ mod tests {
                 capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
                 rpc_watchdog_interval_sec: 30,
                 event_poll_interval_ms: 7000,
+                get_logs_max_block_span: decdn_common::config::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN,
                 fee_shares_poll_interval_sec: 3600,
                 redeem_threshold_micro_usdc: 1_000_000,
                 redeem_max_vouchers_per_tx: 300,

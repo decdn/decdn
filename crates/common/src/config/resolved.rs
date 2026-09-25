@@ -147,6 +147,11 @@ pub struct ResolvedBlockchain {
     /// Defaults to 7000 ms (`DEFAULT_EVENT_POLL_INTERVAL_MS`); the resolver
     /// enforces a minimum (see `MIN_EVENT_POLL_INTERVAL_MS`).
     pub event_poll_interval_ms: u64,
+    /// Starting ceiling on the block span of one chain-watcher `eth_getLogs`
+    /// request (the `MultiplexedPoller`'s window). The poller halves it for the
+    /// rest of the process lifetime when the provider rejects a range. Defaults
+    /// to [`super::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN`]; always `>= 1`.
+    pub get_logs_max_block_span: u64,
     /// Seconds between authoritative `FeeRouter.getShares()` re-reads by the
     /// fee-shares watcher (ADR 041 / ADR 016 § Tunable Economics). Safety-net
     /// cadence alongside the `SharesUpdated` event subscription. Defaults to
