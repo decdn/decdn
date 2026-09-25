@@ -47,6 +47,9 @@
 //! rather than the wiring.
 
 pub(crate) mod backfill;
+// Public because `BootRetry` appears in the `pub` bootstrap signatures that
+// external integration tests (`tests/anvil_settlement_e2e.rs`) call.
+pub mod boot_retry;
 // Public because `Route` appears in the `pub` watcher `bootstrap` signatures and
 // the builder/`spawn` are driven by external integration tests
 // (`tests/anvil_settlement_e2e.rs`) to run the settlement route.

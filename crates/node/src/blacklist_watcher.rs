@@ -111,6 +111,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::chain_events::boot_retry::{BootFault, BootRetry};
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
 use crate::chain_events::shared_head::HeadSource;
@@ -608,7 +609,7 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
         }
 
         if due {
-            let RescanOutcome { clean, failed } = rescan(
+            let RescanOutcome { clean, failed, .. } = rescan(
                 &self.contract,
                 self.operator,
                 &self.cache,
@@ -656,6 +657,9 @@ struct RescanOutcome {
     /// own. A shutdown-cancelled pass reports the failures observed **before** the
     /// cancel (not `0`).
     failed: u64,
+    /// The first failure's cause, so a boot attempt can report why enforcement
+    /// is incomplete and tell a deterministic fault from a transient one.
+    first_failure: Option<RecheckFailure>,
 }
 
 /// Re-scope every distinct hash in `known` (one scope `eth_call` per hash, not per
@@ -675,20 +679,23 @@ where
     let snapshot = state.distinct_hashes();
     let mut evicted = 0usize;
     let mut failed = 0u64;
+    let mut first_failure = None;
     let mut clean = true;
     for hash in snapshot {
         if shutdown.is_cancelled() {
             return RescanOutcome {
                 clean: false,
                 failed,
+                first_failure,
             };
         }
         match recheck(contract, operator, cache, warming, state, hash).await {
             Recheck::Evicted => evicted = evicted.saturating_add(1),
             Recheck::NoAction => {}
-            Recheck::Failed => {
+            Recheck::Failed(cause) => {
                 clean = false;
                 failed = failed.saturating_add(1);
+                first_failure.get_or_insert(cause);
             }
         }
     }
@@ -703,7 +710,11 @@ where
             "blacklist re-scope could not enforce every entry"
         );
     }
-    RescanOutcome { clean, failed }
+    RescanOutcome {
+        clean,
+        failed,
+        first_failure,
+    }
 }
 
 /// Handle one live log: `HashBlacklisted` records the `(region, hash)` entry and
@@ -733,7 +744,7 @@ where
             contract, operator, cache, warming, state, &log,
         )
         .await
-            == Recheck::Failed),
+        .is_failed()),
         Some(topic) if *topic == HashRemoved::SIGNATURE_HASH => {
             on_removed_log(contract, operator, cache, state, &log).await;
             Ok(false)
@@ -857,7 +868,7 @@ async fn on_removed_log<P: Provider + Clone>(
             let hash = Hash::from_bytes(event.hash.0);
             state.remove_entry(event.region, hash);
             if cache.is_chain_denied(hash)
-                && scope_check(contract, operator, hash).await == Some(false)
+                && matches!(scope_check(contract, operator, hash).await, Ok(false))
             {
                 undeny_hash(cache, hash);
             }
@@ -874,15 +885,30 @@ async fn on_removed_log<P: Provider + Clone>(
 /// Outcome of one scope re-check, so callers can distinguish an enforcement
 /// *failure* (retry promptly — the entry may be live and slashable) from a
 /// legitimately out-of-scope entry (the periodic re-scope keeps watching it).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum Recheck {
     /// The hash was in scope and its eviction succeeded.
     Evicted,
     /// Nothing to do: already evicted, or currently out of scope.
     NoAction,
-    /// The scope read or the eviction failed (RPC error/timeout, cache error) — the
-    /// entry is retained and must be re-checked promptly.
-    Failed,
+    /// The scope read or the eviction failed — the entry is retained and must be
+    /// re-checked promptly.
+    Failed(RecheckFailure),
+}
+
+impl Recheck {
+    const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+}
+
+/// Why a re-check failed.
+#[derive(Debug)]
+enum RecheckFailure {
+    /// The `isHashBlacklistedForOperator` read failed (RPC error or timeout).
+    Scope(anyhow::Error),
+    /// The local cache could not evict the hash (a disk error).
+    Evict(anyhow::Error),
 }
 
 /// Record that `hash` is refused because *governance* blacklisted it, and publish
@@ -900,7 +926,7 @@ fn undeny_hash(cache: &CacheEngine, hash: Hash) {
     cache.set_chain_denied_one(hash, false);
 }
 
-/// Evict `hash` if in scope. Out-of-scope (`Some(false)`) and RPC-error (`None`)
+/// Evict `hash` if in scope. Out-of-scope (`Ok(false)`) and RPC-error (`Err`)
 /// hashes keep their `known` entries for the next re-scope (callers insert before
 /// calling); evicted hashes drop *all* their regional entries — eviction is sticky
 /// and region-independent.
@@ -920,7 +946,8 @@ where
         // not yet recorded as governance-denied: `evicted.log` records no cause, so
         // takedowns discharged by an older build (or a prior boot's eviction) would
         // otherwise keep answering `EvictedSinceProbe` forever.
-        if !cache.is_chain_denied(hash) && scope_check(contract, operator, hash).await == Some(true)
+        if !cache.is_chain_denied(hash)
+            && matches!(scope_check(contract, operator, hash).await, Ok(true))
         {
             deny_hash(cache, hash);
         }
@@ -928,40 +955,40 @@ where
         return Recheck::NoAction;
     }
     match scope_check(contract, operator, hash).await {
-        Some(true) => {
+        Ok(true) => {
             // Deny before evicting: eviction is what retires the hash from `known`,
             // and `known` is the retry backstop. Denying first also means an
             // eviction that fails on a disk error still stops the serving, since
             // `CacheEngine::refuses` honors this set too.
             deny_hash(cache, hash);
-            if evict(cache, warming, hash).await {
-                state.drop_hash(hash);
-                Recheck::Evicted
-            } else {
-                Recheck::Failed
+            match evict(cache, warming, hash).await {
+                Ok(()) => {
+                    state.drop_hash(hash);
+                    Recheck::Evicted
+                }
+                Err(err) => Recheck::Failed(RecheckFailure::Evict(err)),
             }
         }
-        Some(false) => Recheck::NoAction,
-        None => Recheck::Failed,
+        Ok(false) => Recheck::NoAction,
+        Err(err) => Recheck::Failed(RecheckFailure::Scope(err)),
     }
 }
 
 /// `isHashBlacklistedForOperator` bounded by the shared
-/// [`chain_events::DEFAULT_RPC_CALL_TIMEOUT`]. `None` on timeout or RPC error
-/// (caller keeps the hash in `known` for the next re-scope), `Some(bool)`
-/// otherwise.
+/// [`chain_events::DEFAULT_RPC_CALL_TIMEOUT`]. `Err` on timeout or RPC error,
+/// logged here (caller keeps the hash in `known` for the next re-scope).
 ///
 /// [`chain_events::DEFAULT_RPC_CALL_TIMEOUT`]: crate::chain_events::DEFAULT_RPC_CALL_TIMEOUT
 async fn scope_check<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     hash: Hash,
-) -> Option<bool>
+) -> Result<bool>
 where
     P: Provider + Clone,
 {
     let hash_key = B256::from(*hash.as_bytes());
-    match timed(
+    timed(
         None,
         "isHashBlacklistedForOperator",
         contract
@@ -969,46 +996,99 @@ where
             .call(),
     )
     .await
-    {
-        Ok(flag) => Some(flag),
-        Err(err) => {
-            warn!(
-                %hash,
-                error = %sanitize_err_chain(&err),
-                "blacklist watcher: isHashBlacklistedForOperator failed; keeping for re-scope"
-            );
-            None
-        }
-    }
+    .inspect_err(|err| {
+        warn!(
+            %hash,
+            error = %sanitize_err_chain(err),
+            "blacklist watcher: isHashBlacklistedForOperator failed; keeping for re-scope"
+        );
+    })
+    .with_context(|| format!("isHashBlacklistedForOperator({hash})"))
 }
 
-/// Evict `hash` from the cache (durable + sticky). Returns `true` on success.
-async fn evict(cache: &CacheEngine, warming: &Arc<WarmingAllowance>, hash: Hash) -> bool {
+/// Evict `hash` from the cache (durable + sticky). A failure is logged here and
+/// returned.
+async fn evict(cache: &CacheEngine, warming: &Arc<WarmingAllowance>, hash: Hash) -> Result<()> {
     match cache.evict(hash).await {
         Ok(()) => {
             info!(%hash, "evicted blacklisted blob (ADR 011 compliance)");
             // ADR 041: drop the warming tag for the evicted hash, so a later
             // reuse of this slot can never credit a stale source's allowance.
             warming.forget(hash);
-            true
+            Ok(())
         }
         Err(err) => {
             warn!(%hash, error = %err, "blacklist watcher: evict failed; will retry");
-            false
+            Err(anyhow::Error::new(err).context(format!("evict {hash}")))
         }
     }
+}
+
+/// One boot attempt: enumerate the current on-chain deny-set at one pinned
+/// block, seed the live origin deny-set the delivery path reads, then enforce —
+/// deny + evict every enumerated hash that is in scope right now, decided by the
+/// same `isHashBlacklistedForOperator` liveness the tail uses (so a lapsed
+/// emergency entry is not enforced). Returns the snapshot block, the origin
+/// count and the enforced state.
+///
+/// An unclean pass fails the attempt with its first failure as the cause: a
+/// scope read keeps its typed RPC error for the retry classifier, and a local
+/// eviction error is a [`BootFault`], since a retry does not repair a disk. The
+/// inline pass is not shutdown-interruptible; the periodic re-scope on the sink
+/// is.
+#[allow(clippy::too_many_arguments)]
+async fn enumerate_and_enforce<P>(
+    reads: &ContractReads<P>,
+    contract: &ContentBlacklist::ContentBlacklistInstance<P>,
+    operator: Address,
+    cache: &CacheEngine,
+    warming: &Arc<WarmingAllowance>,
+    denylist: &Arc<ContentDenylist>,
+    metrics: &Arc<Metrics>,
+    shutdown: &CancellationToken,
+) -> Result<(u64, usize, WatcherState)>
+where
+    P: Provider + Clone,
+{
+    let snapshot = bootstrap_snapshot(reads, operator).await?;
+    denylist.set_chain_origins(snapshot.origins.clone());
+    let mut state = WatcherState {
+        known: snapshot.known,
+        denylist: Arc::clone(denylist),
+    };
+    let RescanOutcome {
+        clean,
+        failed,
+        first_failure,
+    } = rescan(contract, operator, cache, warming, &mut state, shutdown).await;
+    if failed > 0 {
+        metrics.blacklist_enforcement_failure(failed);
+    }
+    if !clean {
+        let cause = match first_failure {
+            Some(RecheckFailure::Scope(err)) => err,
+            Some(RecheckFailure::Evict(err)) => BootFault(format!("{err:#}")).into(),
+            None => anyhow::anyhow!("enforcement pass did not complete"),
+        };
+        return Err(cause.context(format!(
+            "initial ContentBlacklist enforcement could not enforce every entry ({failed} failed)"
+        )));
+    }
+    Ok((snapshot.block, snapshot.origins.len(), state))
 }
 
 /// Enumerate the current on-chain deny-set at one pinned block, enforce it, then
 /// return the [`Route`] that follows the live tail seeded at that block on the
 /// shared multiplexed poller.
 ///
-/// `initial_sync_tx` fires once the boot enumeration + enforcement pass either
-/// completes cleanly (`Ok`) or cannot enforce every entry (`Err`), so the runtime
-/// can gate the ALPN router on blacklist enforcement being live. A failure to
-/// READ the chain at boot (block or enumeration RPC error) is fatal — it signals
-/// `Err` and returns `Err`, so the router never opens on an un-vetted deny-set.
-/// `rescan_interval` is the batched re-enumeration + re-scope cadence.
+/// One boot attempt is the enumeration plus the enforcement pass. An attempt that
+/// cannot read the chain (block or enumeration RPC error) or cannot enforce
+/// every entry retries on `boot`'s budget. `initial_sync_tx` fires once, when
+/// the attempts resolve: `Ok` after a clean pass, so the runtime can gate the
+/// ALPN router on blacklist enforcement being live, or `Err` on a deterministic
+/// fault or an exhausted budget. That failure also returns `Err`, so the router
+/// never opens on an un-vetted deny-set. `rescan_interval` is the batched
+/// re-enumeration + re-scope cadence.
 ///
 /// The returned route carries a [`SinkSource::Factory`]: the blacklist sink must
 /// observe the poller's own shutdown token (its re-scope polls it between per-hash
@@ -1027,6 +1107,7 @@ pub(crate) async fn bootstrap<P>(
     metrics: &Arc<Metrics>,
     denylist: Arc<ContentDenylist>,
     chain_freshness: ChainFreshness,
+    boot: &BootRetry,
 ) -> Result<Route>
 where
     P: Provider + Clone + 'static,
@@ -1038,61 +1119,42 @@ where
     };
     let initial_sync = InitialSyncGate::new(initial_sync_tx);
 
-    // Enumerate the current on-chain deny-set at one pinned block.
-    let snapshot = match bootstrap_snapshot(&reads, operator).await {
-        Ok(snapshot) => snapshot,
+    // An attempt that cannot enforce every entry is retried whole, unless its
+    // first failure is deterministic; re-seeding and re-enforcing are
+    // idempotent.
+    let boot_shutdown = CancellationToken::new();
+    let attempt = boot
+        .run("ContentBlacklist boot snapshot", || {
+            enumerate_and_enforce(
+                &reads,
+                &contract,
+                operator,
+                &cache,
+                &warming,
+                &denylist,
+                metrics,
+                &boot_shutdown,
+            )
+        })
+        .await;
+    let (snapshot_block, origin_count, state) = match attempt {
+        Ok(done) => done,
         Err(err) => {
             // Fail CLOSED: signal the readiness gate so the runtime keeps every ALPN
-            // listener shut, then abort startup — a node that cannot read the
+            // listener shut, then abort startup — a node that cannot vet the
             // takedown set must not serve.
             initial_sync.signal(Err(format!(
                 "initial ContentBlacklist sync failed: {}",
                 sanitize_err_chain(&err)
             )));
-            return Err(err).context("enumerate ContentBlacklist state for the boot snapshot");
+            return Err(err).context("enumerate and enforce the ContentBlacklist boot snapshot");
         }
     };
-    let snapshot_block = snapshot.block;
-    let origin_count = snapshot.origins.len();
-
-    // Seed the live origin deny-set the delivery path reads.
-    denylist.set_chain_origins(snapshot.origins.clone());
-
-    let mut state = WatcherState {
-        known: snapshot.known,
-        denylist,
-    };
-
-    // Initial enforcement pass: deny + evict every enumerated hash that is in scope
-    // right now, decided by the same `isHashBlacklistedForOperator` liveness the
-    // tail uses (so a lapsed emergency entry is not enforced). A pass that cannot
-    // enforce every entry is fail-CLOSED — the router never opens on an un-vetted
-    // deny-set. This inline pass is not shutdown-interruptible, matching the boot
-    // replay it replaces; the periodic re-scope on the sink IS.
-    let boot_shutdown = CancellationToken::new();
-    let RescanOutcome { clean, failed } = rescan(
-        &contract,
-        operator,
-        &cache,
-        &warming,
-        &mut state,
-        &boot_shutdown,
-    )
-    .await;
-    if failed > 0 {
-        metrics.blacklist_enforcement_failure(failed);
-    }
-    if clean {
-        // The boot enumeration + enforcement read the chain successfully, so seed
-        // the freshness clock: a node that has just vetted its deny-set must not
-        // read as stale in the window before the first poll tick stamps it.
-        chain_freshness.stamp();
-        initial_sync.signal(Ok(()));
-    } else {
-        initial_sync.signal(Err(
-            "initial ContentBlacklist enumeration could not enforce every entry".to_string(),
-        ));
-    }
+    // The boot enumeration + enforcement read the chain successfully, so seed the
+    // freshness clock: a node that has just vetted its deny-set must not read as
+    // stale in the window before the first poll tick stamps it.
+    chain_freshness.stamp();
+    initial_sync.signal(Ok(()));
 
     info!(
         %contract_addr,
@@ -1100,7 +1162,6 @@ where
         snapshot_block,
         known_hashes = state.known.len(),
         origins = origin_count,
-        enforcement_clean = clean,
         "blacklist compliance watcher enumerated its boot snapshot"
     );
 
@@ -1679,6 +1740,202 @@ mod tests {
         alloy::primitives::Bytes::from(word.to_vec())
     }
 
+    /// What one boot-bootstrap run leaves behind, for the fail-closed assertions.
+    struct BootRun {
+        result: Result<Route>,
+        gate: InitialSyncResult,
+        metrics: Arc<Metrics>,
+        cache: CacheEngine,
+        _tmp: tempfile::TempDir,
+    }
+
+    /// Run [`bootstrap`] against a mocked contract whose `eth_call`s answer from
+    /// `asserter` in order. The head read answers once; its long TTL serves every
+    /// retry from cache, so the queue holds only contract reads.
+    async fn run_boot(
+        asserter: &alloy::providers::mock::Asserter,
+        boot: impl FnOnce(Arc<Metrics>) -> crate::chain_events::boot_retry::BootRetry,
+    ) -> Result<BootRun> {
+        use crate::chain_events::shared_head::SharedHead;
+        use alloy::providers::mock::Asserter;
+
+        let head_asserter = Asserter::new();
+        head_asserter.push_success(&alloy::primitives::U64::from(100));
+        let head: Arc<dyn HeadSource> = Arc::new(SharedHead::with_ttl(
+            alloy::providers::ProviderBuilder::new()
+                .connect_mocked_client(head_asserter)
+                .erased(),
+            Duration::from_hours(1),
+            None,
+        ));
+        let provider = alloy::providers::ProviderBuilder::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let tmp = tempfile::tempdir()?;
+        let cache = CacheEngine::open(tmp.path(), Vec::new(), 1).await?;
+        let metrics = Arc::new(Metrics::new());
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let result = bootstrap(
+            provider,
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            cache.clone(),
+            Arc::new(crate::warming_allowance::WarmingAllowance::new(1000, 0)),
+            head,
+            Duration::from_mins(10),
+            ready_tx,
+            &metrics,
+            Arc::new(ContentDenylist::empty()),
+            ChainFreshness::new(Duration::from_mins(30)),
+            &boot(Arc::clone(&metrics)),
+        )
+        .await;
+        Ok(BootRun {
+            result,
+            gate: ready_rx.await?,
+            metrics,
+            cache,
+            _tmp: tmp,
+        })
+    }
+
+    fn rpc_error(code: i64, message: &str) -> alloy_json_rpc::ErrorPayload {
+        serde_json::from_value(serde_json::json!({ "code": code, "message": message })).unwrap()
+    }
+
+    /// Queue the reads of a clean enumeration: no blacklisted addresses, and
+    /// `hashes` under the one in-scope region `US`.
+    fn push_enumeration(asserter: &alloy::providers::mock::Asserter, hashes: &[B256]) {
+        use alloy::sol_types::SolValue;
+        asserter.push_success(&alloy::primitives::Bytes::from(U256::ZERO.abi_encode()));
+        if hashes.is_empty() {
+            asserter.push_success(&alloy::primitives::Bytes::from(
+                Vec::<B256>::new().abi_encode(),
+            ));
+            return;
+        }
+        asserter.push_success(&alloy::primitives::Bytes::from(vec![US].abi_encode()));
+        asserter.push_success(&alloy::primitives::Bytes::from(
+            U256::from(hashes.len()).abi_encode(),
+        ));
+        asserter.push_success(&alloy::primitives::Bytes::from(
+            hashes.to_vec().abi_encode(),
+        ));
+    }
+
+    fn counter(metrics: &Metrics, name: &str) -> u64 {
+        let text = metrics.encode().unwrap();
+        text.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(' '))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("{name} not exported:\n{text}"))
+    }
+
+    /// A transient provider error during the boot enumeration is retried in
+    /// process, and the readiness gate opens on the clean retry.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_boot_enumeration_error_is_retried_not_fatal() -> Result<()> {
+        use crate::chain_events::boot_retry::{BOOT_CHAIN_RETRY_BUDGET, BootRetry};
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_failure(rpc_error(
+            1,
+            "no available upstreams to process the request",
+        ));
+        push_enumeration(&asserter, &[]);
+
+        let run = run_boot(&asserter, |m| BootRetry::new(BOOT_CHAIN_RETRY_BUDGET, m)).await?;
+
+        run.result?;
+        assert_eq!(run.gate, Ok(()), "the gate opens on the clean retry");
+        assert!(asserter.read_q().is_empty(), "both attempts ran");
+        assert_eq!(
+            counter(&run.metrics, "decdn_chain_boot_read_retries_total"),
+            1
+        );
+        Ok(())
+    }
+
+    /// A deterministic enumeration fault fails boot at once and keeps the gate
+    /// shut. The zero retry count is the proof: an exhausted mock queue answers
+    /// with a transient error, so a misclassified fault would retry.
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_boot_enumeration_error_keeps_the_gate_shut() -> Result<()> {
+        use crate::chain_events::boot_retry::{BOOT_CHAIN_RETRY_BUDGET, BootRetry};
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_failure(rpc_error(-32601, "method not found"));
+        let start = tokio::time::Instant::now();
+
+        let run = run_boot(&asserter, |m| BootRetry::new(BOOT_CHAIN_RETRY_BUDGET, m)).await?;
+
+        let err = run.result.expect_err("boot fails");
+        assert!(format!("{err:#}").contains("not retried"), "{err:#}");
+        let gate = run.gate.expect_err("the gate stays shut");
+        assert!(
+            gate.starts_with("initial ContentBlacklist sync failed"),
+            "{gate}"
+        );
+        assert_eq!(
+            counter(&run.metrics, "decdn_chain_boot_read_retries_total"),
+            0
+        );
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        Ok(())
+    }
+
+    /// An enforcement pass that cannot re-check every hash is retried whole, and
+    /// the gate opens only once the retry denies and evicts the hash.
+    #[tokio::test(start_paused = true)]
+    async fn an_unclean_boot_enforcement_is_retried_before_the_gate_opens() -> Result<()> {
+        use crate::chain_events::boot_retry::{BOOT_CHAIN_RETRY_BUDGET, BootRetry};
+
+        let h = b256(0x42);
+        let asserter = alloy::providers::mock::Asserter::new();
+        push_enumeration(&asserter, &[h]);
+        asserter.push_failure(rpc_error(19, "Temporary internal error. Please retry"));
+        push_enumeration(&asserter, &[h]);
+        asserter.push_success(&abi_bool(true));
+
+        let run = run_boot(&asserter, |m| BootRetry::new(BOOT_CHAIN_RETRY_BUDGET, m)).await?;
+
+        run.result?;
+        assert_eq!(run.gate, Ok(()));
+        assert!(asserter.read_q().is_empty(), "both attempts ran");
+        let hash = Hash::from_bytes(h.0);
+        assert!(run.cache.is_chain_denied(hash));
+        assert!(run.cache.is_evicted(hash));
+        assert_eq!(
+            counter(&run.metrics, "decdn_chain_boot_read_retries_total"),
+            1
+        );
+        assert_eq!(
+            counter(&run.metrics, "decdn_blacklist_enforcement_failures_total"),
+            1
+        );
+        Ok(())
+    }
+
+    /// An exhausted budget fails boot and keeps the gate shut.
+    #[tokio::test(start_paused = true)]
+    async fn an_exhausted_boot_budget_keeps_the_gate_shut() -> Result<()> {
+        use crate::chain_events::boot_retry::BootRetry;
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_failure(rpc_error(19, "Temporary internal error. Please retry"));
+
+        let run = run_boot(&asserter, BootRetry::single_attempt).await?;
+
+        let err = run.result.expect_err("boot fails");
+        assert!(
+            format!("{err:#}").contains("gave up after 1 attempts"),
+            "{err:#}"
+        );
+        let gate = run.gate.expect_err("the gate stays shut");
+        assert!(gate.contains("gave up after 1 attempts"), "{gate}");
+        Ok(())
+    }
+
     /// A sink whose `isHashBlacklistedForOperator` calls answer `scope_results` in
     /// order, so a test can drive the enforcing path. Its `reads` provider is a
     /// separate empty mock (the enforcement tests call `recheck`/`on_removed_log`
@@ -1772,7 +2029,7 @@ mod tests {
         )
         .await;
 
-        assert!(outcome == Recheck::Evicted);
+        assert!(matches!(outcome, Recheck::Evicted), "{outcome:?}");
         assert!(
             sink.cache.is_chain_denied(h),
             "the live deny-set the delivery path reads must carry the reason"
@@ -1815,7 +2072,7 @@ mod tests {
             h,
         )
         .await;
-        assert!(outcome == Recheck::Evicted);
+        assert!(matches!(outcome, Recheck::Evicted), "{outcome:?}");
 
         // If the tag survived the takedown, this credit would refill `source`.
         // With the tag forgotten, `credit_serve` is a documented no-op.
@@ -1850,7 +2107,7 @@ mod tests {
         .await;
 
         assert!(
-            outcome == Recheck::NoAction,
+            matches!(outcome, Recheck::NoAction),
             "already evicted, nothing to evict"
         );
         assert!(
@@ -1881,7 +2138,7 @@ mod tests {
                 h,
             )
             .await;
-            assert!(outcome == Recheck::NoAction);
+            assert!(matches!(outcome, Recheck::NoAction), "{outcome:?}");
         }
         Ok(())
     }

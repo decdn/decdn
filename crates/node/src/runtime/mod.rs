@@ -6,6 +6,7 @@ pub mod reload;
 pub(crate) use reload::emit_config_notices;
 pub use reload::{LogLevelApply, LogLevelSetter, ReloadSnapshot, RuntimeReloadState};
 
+use crate::chain_events::boot_retry::{BOOT_CHAIN_RETRY_BUDGET, BootRetry};
 use crate::chain_events::shared_head::{HeadSource, SharedHead};
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -837,7 +838,8 @@ async fn build_chain_and_handlers(
     let slash_domain =
         decdn_incentive::slash_judge_domain(cfg.blockchain.chain_id, slash_judge_addr);
 
-    // Chain-backed active-staker set. Bootstrap failure is fatal: an
+    // Chain-backed active-staker set. Bootstrap failure is fatal once its
+    // retries are exhausted (see the boot budget below): an
     // empty set silently rejects every inbound `Store`, and once the
     // iterative `FindValue` lookup filter exists it would drop every
     // responder. Built here (ahead of the probe handler) so the probe
@@ -894,18 +896,25 @@ async fn build_chain_and_handlers(
     // holds its own contract instance for its follow-up reads/writes).
     let poller_provider = ProviderFactory::read_only(rpc_url.clone(), event_poll_interval);
 
+    // One boot deadline for the four fail-closed chain bootstraps below — the
+    // registry, slash, `usdc()` self-check and blacklist reads (#2159). Each
+    // retries its reads on transient provider errors and fails only on a
+    // deterministic fault or once the shared deadline passes. The best-effort
+    // fee-shares and binding reads do not use it. Startup stays fail-closed: a
+    // retry delays readiness, and the ALPN router waits on the blacklist
+    // enumeration and enforcement.
+    let boot = BootRetry::new(BOOT_CHAIN_RETRY_BUDGET, Arc::clone(&infra.node_metrics));
+
     // One CapacityBond enumeration + one route feeding both registry projections
     // (#1110). The bindings half is built only when pull-through is on; it derives
-    // from page data already read here, so — unlike when it had its own bootstrap
-    // — it has no RPC that can fail on its own. `getRegisteredNodes` failure was
-    // already fatal via this same (unconditional, first-to-run) call, so nothing
-    // that boots today loses pull-through.
+    // from page data already read here, so it has no RPC that can fail on its own.
     let registry = crate::dht::capacity_bond_registry::bootstrap(
         chain_provider,
         capacity_bond_addr,
         Arc::clone(&head),
         cfg.cache.node_to_node_pull_through_enabled,
         Arc::clone(&infra.node_metrics),
+        &boot,
     )
     .await
     .with_context(|| format!("CapacityBond registry bootstrap at {capacity_bond_addr}"))?;
@@ -924,16 +933,17 @@ async fn build_chain_and_handlers(
     // a slash surfaces over `admin_v1_slashes` (+ the `decdn_slashes_detected_total`
     // metric) and the operator can file `decdn appeal slash` in time. Read-only;
     // held to `run()`'s end so its background task lives as long as the daemon.
-    // The boot enumeration is fatal, like the CapacityBond registry bootstrap
-    // above on the same contract that already gates startup — so it adds no new
-    // failure mode; thereafter a tail blip retries and the periodic resync heals
-    // drift, so detection is never disabled for the daemon's lifetime.
+    // The boot enumeration retries on the shared boot budget, like the
+    // CapacityBond registry bootstrap above; thereafter a tail blip retries and
+    // the periodic resync heals drift, so detection is never disabled for the
+    // daemon's lifetime.
     let (slash_store, slash_route) = crate::slash_watcher::bootstrap(
         ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
         capacity_bond_addr,
         infra.eth_signer.address(),
         Arc::clone(&head),
         Arc::clone(&infra.node_metrics),
+        &boot,
     )
     .await
     .context("bootstrap the slash-detection watcher")?;
@@ -1383,6 +1393,7 @@ async fn build_chain_and_handlers(
         usize::try_from(cfg.blockchain.redeem_max_vouchers_per_tx).unwrap_or(usize::MAX),
         Duration::from_secs(cfg.blockchain.redeem_interval_secs),
         Arc::clone(&infra.node_metrics),
+        &boot,
         pool_view,
         redeem_tx,
         redeem_rx,
@@ -1416,6 +1427,7 @@ async fn build_chain_and_handlers(
         &infra.node_metrics,
         Arc::clone(&content_denylist),
         chain_freshness,
+        &boot,
     )
     .await
     .context("blacklist compliance watcher boot enumeration")?;

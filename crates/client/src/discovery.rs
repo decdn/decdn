@@ -39,6 +39,8 @@ use iroh::PublicKey;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
+use crate::provider::is_permanent_contract_error;
+
 /// Page size for the paginated `getRegisteredNodes` read (ADR 019 § Step 3.3's
 /// worked-example limit). At `PoC` scale (tens of nodes) one page suffices; the
 /// loop preserves the pattern for production scale.
@@ -182,58 +184,6 @@ fn candidate_from(info: &CapacityBond::NodeInfo, is_active: bool) -> Option<Node
     })
 }
 
-/// Whether a `getRegisteredNodes` failure is deterministic — the same call will
-/// fail the same way however often it is repeated, so retrying it only burns
-/// the 36 s backoff schedule before reporting the error it was always going to
-/// report.
-///
-/// This matters because the two likeliest first-run mistakes both land here: a
-/// typo'd `blockchain.capacity_bond_address` (the call returns `0x`, decoded as
-/// [`ZeroData`](alloy::contract::Error::ZeroData)) and an expired or wrong RPC
-/// API key (HTTP 401/403). Without this check either one makes `decdn fetch`
-/// sit silently for 36 s and then blame network connectivity.
-///
-/// Note `TransportErrorKind::is_retry_err` is deliberately *not* used at the
-/// transport layer: it is an allowlist of 429/503/missing-batch, so it would
-/// classify an ordinary connection refusal as non-retryable and defeat the
-/// ADR's retry entirely. This is the complementary denylist — retry unless we
-/// know better. `ErrorPayload::is_retry_err` *is* used, because there the
-/// allowlist is the right shape: see below.
-fn is_permanent(err: &alloy::contract::Error) -> bool {
-    use alloy::contract::Error as ContractError;
-    use alloy::transports::{RpcError, TransportErrorKind};
-
-    match err {
-        ContractError::TransportError(e) => match e {
-            // A JSON-RPC error response is usually deterministic — an unknown
-            // method, a revert, a rejected key. But providers also signal rate
-            // limiting this way, over HTTP 200 with an error body, so the HTTP
-            // check below never sees it: Infura's -32005, Alchemy's -32016,
-            // QuickNode's -32007/-32012, and a plain 429 in the JSON `code`.
-            // Those are exactly what the backoff schedule is for, so defer to
-            // alloy's list of them.
-            RpcError::ErrorResp(resp) => !resp.is_retry_err(),
-            RpcError::UnsupportedFeature(_)
-            | RpcError::LocalUsageError(_)
-            | RpcError::SerError(_) => true,
-            // 4xx other than 429 is a client-side fault — a wrong path, an
-            // unauthorized or expired API key. 429 stays retryable.
-            RpcError::Transport(TransportErrorKind::HttpError(h)) => {
-                (400..500).contains(&h.status) && !h.is_rate_limit_err()
-            }
-            // Everything else is transport-shaped: refused connections, resets,
-            // timeouts, truncated bodies. Exactly what the schedule is for.
-            _ => false,
-        },
-        // Only a transport failure can be transient. Every other variant is a
-        // contract-level fault that repeats identically: no contract at the
-        // configured address (`ZeroData` — the typo'd-address case), an ABI
-        // that does not match our binding, an unknown function or selector, a
-        // failed deployment.
-        _ => true,
-    }
-}
-
 /// Drive `fetch_page` across the paginated `getRegisteredNodes` read, retrying on
 /// the ADR 012 § Bootstrap step 3 schedule ([`REGISTRY_RETRY_BACKOFF`]) and
 /// distilling every entry through [`candidate_from`].
@@ -256,7 +206,7 @@ fn is_permanent(err: &alloy::contract::Error) -> bool {
 /// # Errors
 ///
 /// Fails when the read's retries are exhausted, or immediately when the failure
-/// is [`is_permanent`].
+/// is [`is_permanent_contract_error`].
 async fn paginate_with_retry<F, Fut>(fetch_page: F) -> anyhow::Result<Vec<NodeCandidate>>
 where
     F: Fn(u64) -> Fut,
@@ -270,7 +220,13 @@ where
         let (page, active) = loop {
             match fetch_page(offset).await {
                 Ok(page) => break page,
-                Err(e) if is_permanent(&e) => {
+                // A deterministic failure short-circuits the schedule. The two
+                // likeliest first-run mistakes both land here: a typo'd
+                // `blockchain.capacity_bond_address` (the call returns `0x`,
+                // decoded as `ZeroData`) and an expired or wrong RPC API key
+                // (HTTP 401/403). Retrying either one would sit silently for
+                // 36 s and then blame network connectivity.
+                Err(e) if is_permanent_contract_error(&e) => {
                     return Err(e).with_context(|| {
                         format!(
                             "CapacityBond.getRegisteredNodes(offset={offset}) failed and will not \
@@ -1375,27 +1331,6 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "code": code, "message": message }))
                 .unwrap(),
         ))
-    }
-
-    #[test]
-    fn provider_rate_limits_stay_retryable() {
-        // Providers signal rate limiting as a JSON-RPC error response over HTTP
-        // 200, so treating every `ErrorResp` as deterministic would skip the
-        // ADR's retry for one of the most common transient failures there is.
-        for (code, message) in [
-            (429, "Too Many Requests"),
-            (-32005, "exceeded project rate limit"),
-            (-32016, "Your app has exceeded its rate limit"),
-            (-32007, "100/second request limit reached"),
-        ] {
-            assert!(
-                !is_permanent(&error_resp(code, message)),
-                "JSON-RPC {code} ({message}) is a rate limit and must be retried"
-            );
-        }
-        // A genuinely deterministic response still short-circuits.
-        assert!(is_permanent(&error_resp(-32601, "method not found")));
-        assert!(is_permanent(&error_resp(3, "execution reverted")));
     }
 
     #[tokio::test(start_paused = true)]

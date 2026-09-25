@@ -79,6 +79,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{Instrument as _, debug, error, info, warn};
 
+use crate::chain_events::boot_retry::BootRetry;
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{Checkpoint, ColdStart, CursorStart, LogSink};
 use crate::chain_events::{REORG_MARGIN_BLOCKS, timed};
@@ -269,8 +270,9 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the `usdc()` self-check call fails — a bad
-    /// `payment_pool_address` or an unreachable RPC is fatal at bring-up.
+    /// Returns an error if the `usdc()` self-check fails deterministically — a
+    /// bad `payment_pool_address` is fatal at bring-up — or if `boot`'s budget
+    /// runs out on transient RPC failures.
     #[allow(clippy::too_many_arguments)]
     pub async fn bootstrap(
         provider: P,
@@ -283,6 +285,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         redeem_max_vouchers_per_tx: usize,
         redeem_interval: Duration,
         metrics: Arc<Metrics>,
+        boot: &BootRetry,
         pool_view: PoolProjection,
         redeem_tx: mpsc::Sender<LaneKey>,
         redeem_rx: mpsc::Receiver<LaneKey>,
@@ -290,12 +293,17 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         let contract = PaymentPool::new(payment_pool_addr, provider);
 
         // Startup self-check: a cheap immutable view confirms the configured
-        // address actually hosts the contract.
-        let usdc_token = contract
-            .usdc()
-            .call()
-            .await
-            .with_context(|| format!("PaymentPool.usdc() self-check at {payment_pool_addr}"))?;
+        // address actually hosts the contract. No contract there decodes as
+        // `ZeroData`, which the boot retry treats as permanent.
+        let usdc_token = boot
+            .run("PaymentPool.usdc() self-check", || async {
+                timed(None, "PaymentPool.usdc()", contract.usdc().call())
+                    .await
+                    .with_context(|| {
+                        format!("PaymentPool.usdc() self-check at {payment_pool_addr}")
+                    })
+            })
+            .await?;
         info!(
             %payment_pool_addr,
             %usdc_token,

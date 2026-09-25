@@ -1706,6 +1706,12 @@ pub struct DecdnMetrics {
     /// caps `eth_getLogs`; set `blockchain.get_logs_max_block_span` to the
     /// lowest span the gauge reaches while they come, and they stop.
     pub chain_get_logs_range_rejections: Counter,
+    /// `decdn_chain_boot_read_retries_total` (#2159): retries of a boot-time
+    /// chain read (the registry, slash, settlement and blacklist bootstraps)
+    /// after a transient error; one read can retry many times. The metrics
+    /// listener binds after these reads, so the value becomes visible once boot
+    /// completes. A rise after a restart points at the RPC provider.
+    pub chain_boot_read_retries: Counter,
 
     // ---- Down-family parity for the watchers that lacked it (#1283, #1316) ----
     /// `decdn_blacklist_watcher_restarts_total` (#1283): distinct drift windows
@@ -3016,6 +3022,8 @@ recorders! {
     chain_get_logs_span(span: u64) => chain_get_logs_span.set(sat_u64(span));
     /// Count one `eth_getLogs` window the provider rejected for its range.
     chain_get_logs_range_rejected => chain_get_logs_range_rejections.inc();
+    /// Count one boot-time chain read retried after a transient error.
+    chain_boot_read_retried => chain_boot_read_retries.inc();
     /// Stamp the staker-set watcher's liveness gauge (#1316). See `slash_watcher_tick`.
     staker_set_watcher_tick => staker_set_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
     /// A capacity-bond registry re-enumeration failed and the previous
@@ -4438,6 +4446,7 @@ mod tests {
             "decdn_onchain_tx_receipt_failed_total",
             "decdn_onchain_tx_timeout_total",
             "decdn_onchain_tx_receipt_recovered_total",
+            "decdn_chain_boot_read_retries_total",
             "decdn_dht_findvalue_queries_total",
             "decdn_dht_lookup_round_timeouts_total",
             "decdn_dht_store_published_total",

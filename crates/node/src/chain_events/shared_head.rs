@@ -65,6 +65,27 @@ struct CachedHead {
     result: std::result::Result<u64, Arc<anyhow::Error>>,
 }
 
+/// A failed head read, shared by every caller inside the TTL.
+///
+/// The failure is kept whole behind an `Arc` (`anyhow::Error` is not `Clone`)
+/// and exposed as this error's [`source`](std::error::Error::source), so a
+/// caller's `err.chain()` still reaches the typed cause — the provider's
+/// `TransportError` — and can classify it.
+#[derive(Debug)]
+struct HeadReadFailed(Arc<anyhow::Error>);
+
+impl std::fmt::Display for HeadReadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("chain head read failed")
+    }
+}
+
+impl std::error::Error for HeadReadFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&**self.0)
+    }
+}
+
 /// TTL-cached, single-flight [`HeadSource`] over one provider.
 pub struct SharedHead<P> {
     provider: P,
@@ -124,11 +145,9 @@ impl<P: Provider> HeadSource for SharedHead<P> {
         {
             return match &entry.result {
                 Ok(head) => Ok(*head),
-                // Re-wrap rather than clone (`anyhow::Error` is not `Clone`).
-                // `{err:#}` flattens the whole chain into the new message, so a
-                // caller rendering this with `sanitize_err_chain` sees the same
-                // text the first caller did — the cause is folded in, not lost.
-                Err(err) => Err(anyhow::anyhow!("{err:#}")),
+                // Every caller inside the TTL gets the same failure, typed
+                // cause included, and renders the same text the first did.
+                Err(err) => Err(HeadReadFailed(Arc::clone(err)).into()),
             };
         }
         let result = timed(
@@ -151,7 +170,7 @@ impl<P: Provider> HeadSource for SharedHead<P> {
                     at: Instant::now(),
                     result: Err(Arc::clone(&shared)),
                 });
-                Err(anyhow::anyhow!("{shared:#}"))
+                Err(HeadReadFailed(shared).into())
             }
         }
     }
@@ -248,6 +267,28 @@ mod tests {
         assert!(a.is_err(), "first caller sees the failure");
         assert!(b.is_err(), "second caller replays the cached failure");
         assert_eq!(asserter.read_q().len(), 0, "one RPC, not two");
+    }
+
+    /// The typed provider error survives into the caller's error chain, for the
+    /// first caller and for every caller the cache replays it to, so a boot read
+    /// can tell a deterministic head failure from a transient one.
+    #[tokio::test]
+    async fn a_failure_keeps_its_typed_cause_and_text() {
+        let (asserter, provider) = mocked();
+        asserter.push_failure_msg("boom");
+        let head = SharedHead::with_ttl(provider, TTL, None);
+
+        for caller in ["first", "cached"] {
+            let err = head.head().await.unwrap_err();
+            assert!(
+                err.chain()
+                    .any(<dyn std::error::Error>::is::<alloy::transports::TransportError>),
+                "{caller} caller lost the typed cause: {err:#}"
+            );
+            let text = format!("{err:#}");
+            assert!(text.starts_with("chain head read failed: "), "{text}");
+            assert!(text.contains("boom"), "{text}");
+        }
     }
 
     /// A cached failure must not outlive its TTL — the watcher has to recover.

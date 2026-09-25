@@ -15,9 +15,10 @@
 //!   the append-only index backwards and stopping at the first closed record
 //!   reads only the still-appealable tail. Offense and evidence come straight off
 //!   the record; the enforced deadline is the record's base `appealWindowClose`
-//!   plus the global `pausedTotal`, both read at the same snapshot. Fatal on
-//!   failure, like the registry bootstrap on the same contract that already gates
-//!   startup: an RPC that fails here fails there first.
+//!   plus the global `pausedTotal`, all read at the snapshot block. A transient
+//!   RPC failure retries on the shared boot budget, like the registry bootstrap
+//!   on the same contract; a deterministic fault or an exhausted budget fails
+//!   startup.
 //! - **Follow `SlashRecorded` at head.** The route follows `SlashRecorded` on the
 //!   shared multiplexed poller, seeded at the enumeration snapshot head, so there
 //!   is no historical scan on any boot. `SlashRecorded` indexes `operator` as
@@ -36,6 +37,7 @@ use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
@@ -46,9 +48,11 @@ use tracing::{debug, info, warn};
 
 use decdn_common::redact::sanitize_err_chain;
 
+use crate::chain_events::boot_retry::BootRetry;
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
 use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
 use crate::chain_events::shared_head::HeadSource;
+use crate::chain_events::timed;
 use crate::metrics::{Metrics, metric_hook};
 
 /// How often the store is re-enumerated from `CapacityBond` as a drift backstop.
@@ -115,22 +119,28 @@ struct SlashRecordView {
 trait SlashChainReads: Send + Sync {
     /// How many slashes have ever been minted against `operator`
     /// (`operatorSlashCount`).
-    fn operator_slash_count(&self, operator: Address) -> impl Future<Output = Result<U256>> + Send;
+    fn operator_slash_count(
+        &self,
+        operator: Address,
+        at: BlockId,
+    ) -> impl Future<Output = Result<U256>> + Send;
     /// The `slashId` at `index` in `operator`'s append-only slash list
-    /// (`operatorSlashIdAt`); indices are stable, so no pinned block is needed.
+    /// (`operatorSlashIdAt`).
     fn operator_slash_id_at(
         &self,
         operator: Address,
         index: U256,
+        at: BlockId,
     ) -> impl Future<Output = Result<U256>> + Send;
     /// The authoritative record for `slashId` (`getSlashRecord`).
     fn get_slash_record(
         &self,
         slash_id: U256,
+        at: BlockId,
     ) -> impl Future<Output = Result<SlashRecordView>> + Send;
     /// The global `pausedTotal` offset added to every record's base
     /// `appealWindowClose` to get the deadline the contract enforces.
-    fn paused_total(&self) -> impl Future<Output = Result<u64>> + Send;
+    fn paused_total(&self, at: BlockId) -> impl Future<Output = Result<u64>> + Send;
 }
 
 /// Enumerate this operator's still-appealable slashes from the authoritative
@@ -141,26 +151,34 @@ trait SlashChainReads: Send + Sync {
 /// record whose appeal window has already closed against `now_secs`: earlier
 /// records were minted earlier (`slashedAt` order), so their windows closed too.
 /// The list is append-only with stable indices, so — unlike the swap-and-pop
-/// enumeration views — no pinned-block read or count re-check is required; a
-/// slash minted mid-scan lands at an index past the old count (unseen here) and
-/// is picked up by the live `SlashRecorded` tail instead.
+/// enumeration views — no count re-check is required; a slash minted mid-scan
+/// lands at an index past the old count (unseen here) and is picked up by the
+/// live `SlashRecorded` tail instead.
+///
+/// Every read runs at `at`. The boot enumeration pins it to the snapshot block,
+/// so a load-balanced provider cannot answer the count from one backend and the
+/// index or record from a lagging one: a backend behind `at` answers "header not
+/// found", which retries, rather than reverting on an index it has not seen,
+/// which is deterministic and fails boot. The periodic resync reads `latest`; a
+/// failed resync keeps the current set.
 async fn bootstrap_slashes<R: SlashChainReads>(
     reads: &R,
     operator: Address,
     now_secs: u64,
+    at: BlockId,
 ) -> Result<Vec<DetectedSlash>> {
-    let count = reads.operator_slash_count(operator).await?;
+    let count = reads.operator_slash_count(operator, at).await?;
     // The enforced deadline is the record's base `appealWindowClose` plus this
     // global offset; read once at the same snapshot. It only ever grows and
     // applies uniformly, so base-close ordering equals effective-close ordering
     // and the backward-walk early-stop below stays valid.
-    let paused_total = reads.paused_total().await?;
+    let paused_total = reads.paused_total(at).await?;
     let mut out = Vec::new();
     let mut index = count;
     while index > U256::ZERO {
         index -= U256::from(1u8);
-        let slash_id = reads.operator_slash_id_at(operator, index).await?;
-        let record = reads.get_slash_record(slash_id).await?;
+        let slash_id = reads.operator_slash_id_at(operator, index, at).await?;
+        let record = reads.get_slash_record(slash_id, at).await?;
         // The deadline the contract enforces (`SlashEscrowLib`): base + pause.
         let effective_close = record.appeal_window_close.saturating_add(paused_total);
         if effective_close <= now_secs {
@@ -188,29 +206,42 @@ struct ContractReads<P: Provider + Clone> {
 }
 
 impl<P: Provider + Clone> SlashChainReads for ContractReads<P> {
-    async fn operator_slash_count(&self, operator: Address) -> Result<U256> {
-        self.bond
-            .operatorSlashCount(operator)
-            .call()
-            .await
-            .with_context(|| format!("operatorSlashCount({operator})"))
+    async fn operator_slash_count(&self, operator: Address, at: BlockId) -> Result<U256> {
+        timed(
+            None,
+            "operatorSlashCount",
+            self.bond.operatorSlashCount(operator).block(at).call(),
+        )
+        .await
+        .with_context(|| format!("operatorSlashCount({operator})"))
     }
 
-    async fn operator_slash_id_at(&self, operator: Address, index: U256) -> Result<U256> {
-        self.bond
-            .operatorSlashIdAt(operator, index)
-            .call()
-            .await
-            .with_context(|| format!("operatorSlashIdAt({operator}, {index})"))
+    async fn operator_slash_id_at(
+        &self,
+        operator: Address,
+        index: U256,
+        at: BlockId,
+    ) -> Result<U256> {
+        timed(
+            None,
+            "operatorSlashIdAt",
+            self.bond
+                .operatorSlashIdAt(operator, index)
+                .block(at)
+                .call(),
+        )
+        .await
+        .with_context(|| format!("operatorSlashIdAt({operator}, {index})"))
     }
 
-    async fn get_slash_record(&self, slash_id: U256) -> Result<SlashRecordView> {
-        let record = self
-            .bond
-            .getSlashRecord(slash_id)
-            .call()
-            .await
-            .with_context(|| format!("getSlashRecord({slash_id})"))?;
+    async fn get_slash_record(&self, slash_id: U256, at: BlockId) -> Result<SlashRecordView> {
+        let record = timed(
+            None,
+            "getSlashRecord",
+            self.bond.getSlashRecord(slash_id).block(at).call(),
+        )
+        .await
+        .with_context(|| format!("getSlashRecord({slash_id})"))?;
         Ok(SlashRecordView {
             offense_type: record.offenseType,
             amount: record.slashAmount,
@@ -219,8 +250,14 @@ impl<P: Provider + Clone> SlashChainReads for ContractReads<P> {
         })
     }
 
-    async fn paused_total(&self) -> Result<u64> {
-        self.bond.pausedTotal().call().await.context("pausedTotal")
+    async fn paused_total(&self, at: BlockId) -> Result<u64> {
+        timed(
+            None,
+            "pausedTotal",
+            self.bond.pausedTotal().block(at).call(),
+        )
+        .await
+        .context("pausedTotal")
     }
 }
 
@@ -239,18 +276,19 @@ fn unix_now() -> u64 {
 /// return the shared detected-slash store (for the admin surface) and the
 /// `SlashRecorded` [`Route`] the shared poller drives to keep it current.
 ///
-/// Fatal on an enumeration failure, matching the `CapacityBond` registry
-/// bootstrap that runs on the same contract immediately before this one and
-/// already gates node startup: an RPC that fails here fails there first, so this
-/// adds no new startup-failure mode. Once running, a transient tail RPC blip
-/// retries with the shared poller's backoff, and the periodic resync repairs any
-/// drift — so detection is never disabled for the daemon's lifetime.
+/// The enumeration retries transient failures on `boot`'s budget, like the
+/// `CapacityBond` registry bootstrap that runs on the same contract immediately
+/// before this one; a deterministic fault or an exhausted budget fails the
+/// bootstrap. Once running, a transient tail RPC blip retries with the shared
+/// poller's backoff, and the periodic resync repairs any drift — so detection is
+/// never disabled for the daemon's lifetime.
 pub async fn bootstrap<P: Provider + Clone + 'static>(
     provider: P,
     capacity_bond_addr: Address,
     self_address: Address,
     head: Arc<dyn HeadSource>,
     metrics: Arc<Metrics>,
+    boot: &BootRetry,
 ) -> Result<(SlashStore, Route)> {
     info!(%capacity_bond_addr, %self_address, "slash-detection watcher started");
     let reads = ContractReads {
@@ -261,15 +299,25 @@ pub async fn bootstrap<P: Provider + Clone + 'static>(
     // order would lose a `SlashRecorded` landing between enumeration and the head
     // read — neither in the snapshot nor above the cursor. Re-applying a snapshot
     // event is a deduped no-op, so overlap is safe but a gap is not.
-    let snapshot_block = head
-        .head()
-        .await
-        .context("read head block for the slash enumeration snapshot")?;
-    let initial = bootstrap_slashes(&reads, self_address, unix_now())
-        .await
-        .with_context(|| {
-            format!("enumerate operator slashes from CapacityBond at {capacity_bond_addr}")
-        })?;
+    let (snapshot_block, initial) = boot
+        .run("slash enumeration snapshot", || async {
+            let snapshot_block = head
+                .head()
+                .await
+                .context("read head block for the slash enumeration snapshot")?;
+            let initial = bootstrap_slashes(
+                &reads,
+                self_address,
+                unix_now(),
+                BlockId::number(snapshot_block),
+            )
+            .await
+            .with_context(|| {
+                format!("enumerate operator slashes from CapacityBond at {capacity_bond_addr}")
+            })?;
+            Ok((snapshot_block, initial))
+        })
+        .await?;
     info!(
         slash_count = initial.len(),
         snapshot_block, %self_address, "slash enumeration complete"
@@ -378,7 +426,14 @@ impl<R: SlashChainReads> LogSink for SlashSink<R> {
         // read retries on the resync cadence rather than on every watcher tick.
         self.last_resync = Some(now);
 
-        let fresh = match bootstrap_slashes(&self.reads, self.self_address, unix_now()).await {
+        let fresh = match bootstrap_slashes(
+            &self.reads,
+            self.self_address,
+            unix_now(),
+            BlockId::latest(),
+        )
+        .await
+        {
             Ok(fresh) => fresh,
             Err(err) => {
                 warn!(
@@ -457,7 +512,7 @@ async fn record_recorded_log<R: SlashChainReads>(
     };
     // Read the record and the global pause offset together; a failure on either
     // soft-skips (the resync recovers it) rather than recording a wrong deadline.
-    let record = match reads.get_slash_record(slash_id).await {
+    let record = match reads.get_slash_record(slash_id, BlockId::latest()).await {
         Ok(record) => record,
         Err(err) => {
             warn!(
@@ -468,7 +523,7 @@ async fn record_recorded_log<R: SlashChainReads>(
             return;
         }
     };
-    let paused_total = match reads.paused_total().await {
+    let paused_total = match reads.paused_total(BlockId::latest()).await {
         Ok(paused_total) => paused_total,
         Err(err) => {
             warn!(
@@ -526,6 +581,58 @@ fn record_slash(store: &SlashStore, metrics: &Arc<Metrics>, slash: DetectedSlash
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    /// A transient provider error during the boot enumeration is retried on the
+    /// boot budget, not fatal.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_boot_enumeration_error_is_retried() {
+        use crate::chain_events::boot_retry::{BOOT_CHAIN_RETRY_BUDGET, BootRetry};
+        use crate::chain_events::shared_head::SharedHead;
+        use alloy::providers::ProviderBuilder;
+        use alloy::providers::mock::Asserter;
+        use alloy::sol_types::SolValue;
+
+        let head_asserter = Asserter::new();
+        head_asserter.push_success(&alloy::primitives::U64::from(100));
+        let head: Arc<dyn HeadSource> = Arc::new(SharedHead::with_ttl(
+            ProviderBuilder::new().connect_mocked_client(head_asserter),
+            Duration::from_hours(1),
+            None,
+        ));
+        let asserter = Asserter::new();
+        asserter.push_failure(
+            serde_json::from_value(serde_json::json!({
+                "code": 19,
+                "message": "Temporary internal error. Please retry",
+            }))
+            .unwrap(),
+        );
+        // The retry: no slashes, then the pause offset.
+        for _ in 0..2 {
+            asserter.push_success(&alloy::primitives::Bytes::from(U256::ZERO.abi_encode()));
+        }
+        let metrics = Arc::new(Metrics::new());
+
+        let (store, _route) = bootstrap(
+            ProviderBuilder::new().connect_mocked_client(asserter.clone()),
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            head,
+            Arc::clone(&metrics),
+            &BootRetry::new(BOOT_CHAIN_RETRY_BUDGET, Arc::clone(&metrics)),
+        )
+        .await
+        .unwrap();
+
+        assert!(store.read().unwrap().is_empty());
+        assert!(asserter.read_q().is_empty(), "both attempts ran");
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_chain_boot_read_retries_total 1"),
+            "{text}"
+        );
+    }
 
     /// The slash route watches exactly `SlashRecorded` — no more, no fewer —
     /// and there is deliberately no `topic2` (operator) constraint on the route
@@ -663,12 +770,17 @@ mod tests {
     }
 
     impl SlashChainReads for StubSlashReads {
-        async fn operator_slash_count(&self, operator: Address) -> Result<U256> {
+        async fn operator_slash_count(&self, operator: Address, _at: BlockId) -> Result<U256> {
             assert_eq!(operator, self.operator, "unexpected operator");
             Ok(U256::from(self.slashes.len()))
         }
 
-        async fn operator_slash_id_at(&self, operator: Address, index: U256) -> Result<U256> {
+        async fn operator_slash_id_at(
+            &self,
+            operator: Address,
+            index: U256,
+            _at: BlockId,
+        ) -> Result<U256> {
             assert_eq!(operator, self.operator, "unexpected operator");
             let i: usize = index.to();
             self.slashes
@@ -677,7 +789,7 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("SlashIndexOutOfRange"))
         }
 
-        async fn get_slash_record(&self, slash_id: U256) -> Result<SlashRecordView> {
+        async fn get_slash_record(&self, slash_id: U256, _at: BlockId) -> Result<SlashRecordView> {
             self.reads.lock().unwrap().push(slash_id);
             self.slashes
                 .iter()
@@ -686,7 +798,7 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("no such slash"))
         }
 
-        async fn paused_total(&self) -> Result<u64> {
+        async fn paused_total(&self, _at: BlockId) -> Result<u64> {
             Ok(self.paused_total)
         }
     }
@@ -721,7 +833,9 @@ mod tests {
             ],
         );
 
-        let slashes = bootstrap_slashes(&reads, op, now).await.unwrap();
+        let slashes = bootstrap_slashes(&reads, op, now, BlockId::latest())
+            .await
+            .unwrap();
 
         assert_eq!(slashes.len(), 2, "closed slash 10 must be excluded");
         // Newest-first backward walk: 30 then 20.
@@ -750,7 +864,9 @@ mod tests {
             ],
         );
 
-        let slashes = bootstrap_slashes(&reads, op, now).await.unwrap();
+        let slashes = bootstrap_slashes(&reads, op, now, BlockId::latest())
+            .await
+            .unwrap();
 
         assert_eq!(slashes.len(), 1);
         assert_eq!(slashes[0].slash_id, U256::from(3u64));
@@ -782,7 +898,9 @@ mod tests {
         // …but a 100s protocol pause moves every effective deadline past `now`.
         .with_paused_total(100);
 
-        let slashes = bootstrap_slashes(&reads, op, now).await.unwrap();
+        let slashes = bootstrap_slashes(&reads, op, now, BlockId::latest())
+            .await
+            .unwrap();
 
         assert_eq!(
             slashes.len(),
@@ -801,7 +919,7 @@ mod tests {
         let op = Address::repeat_byte(0xEF);
         let reads = StubSlashReads::new(op, vec![]);
         assert!(
-            bootstrap_slashes(&reads, op, 1_000)
+            bootstrap_slashes(&reads, op, 1_000, BlockId::latest())
                 .await
                 .unwrap()
                 .is_empty()
