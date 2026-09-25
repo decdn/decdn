@@ -3,9 +3,9 @@
 //! This module owns the cursor + sink vocabulary every on-chain watcher shares;
 //! the loop that drives it lives in
 //! [`multiplexed_poller`](super::multiplexed_poller), which reads head once per
-//! tick, scans each route's `[cursor, head]` gap in `MAX_BACKFILL_BLOCK_SPAN`
-//! windows via one merged `eth_getLogs`, hands each log to the owning
-//! [`LogSink`], then advances — and, for a route whose [`CursorStart`] owns a
+//! tick, scans each route's `[cursor, head]` gap in bounded windows
+//! (`blockchain.get_logs_max_block_span`) via one merged `eth_getLogs`, hands
+//! each log to the owning [`LogSink`], then advances — and, for a route whose [`CursorStart`] owns a
 //! [`Checkpoint`], durably records — the cursor per window. The **first tick's**
 //! large range *is* the historical backfill; later ticks are the live tail. The
 //! poller uses `eth_getLogs` rather than alloy's `watch_logs` (`eth_newFilter` +

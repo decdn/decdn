@@ -251,14 +251,14 @@
       },
       "title": "Oldest watcher tick",
       "type": "stat",
-      "description": "Age of the least recently ticked chain-event watcher, across all five watchers and every node. Red at 180s matches DecdnBlacklistWatcherStalled \u2014 a stalled blacklist watcher is a slash risk, not a cosmetic lag.",
+      "description": "Age of the least recently ticked chain-event watcher, across all five watchers and every node. A watcher that has never ticked because its poll keeps failing counts by its down-seconds (time since the first failed tick) instead of dropping out. Red at 180s matches DecdnBlacklistWatcherStalled \u2014 a stalled blacklist watcher is a slash risk, not a cosmetic lag.",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "max(time() - label_replace({__name__=~\"decdn_.+_watcher_last_tick_timestamp_seconds\",deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"} > 0, \"watcher\", \"$1\", \"__name__\", \"decdn_(.+)_watcher_last_tick_timestamp_seconds\"))",
+          "expr": "max((time() - label_replace({__name__=~\"decdn_.+_watcher_last_tick_timestamp_seconds\",deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"} > 0, \"watcher\", \"$1\", \"__name__\", \"decdn_(.+)_watcher_last_tick_timestamp_seconds\")) or (label_replace({__name__=~\"decdn_.+_watcher_down_seconds\",deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"} > 0, \"watcher\", \"$1\", \"__name__\", \"decdn_(.+)_watcher_down_seconds\") * 1))",
           "refId": "A"
         }
       ],

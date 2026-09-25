@@ -1622,7 +1622,7 @@ pub struct DecdnMetrics {
     // a watcher that panicked while healthy, wedged in an await, or exited
     // cleanly leaves `down_since == None` and reads a healthy `0` forever — a
     // dead watcher is byte-identical to a live one. These two families close
-    // that gap for all six chain-event watchers: `*_last_tick_timestamp_seconds`
+    // that gap for all five chain-event watchers: `*_last_tick_timestamp_seconds`
     // is a *positive* liveness signal a dead task cannot advance, and
     // `*_task_panicked_total` makes an otherwise-discarded task panic visible.
     /// `decdn_slash_watcher_last_tick_timestamp_seconds` (#1316): Unix time of
@@ -1685,6 +1685,23 @@ pub struct DecdnMetrics {
     /// `decdn_settlement_watcher_task_panicked_total` (#1316): the
     /// payment-settlement watcher task unwound on a panic.
     pub settlement_watcher_task_panicked: Counter,
+
+    // ---- Shared chain-event poller: eth_getLogs window span ----
+    /// `decdn_chain_get_logs_span`: block span of the chain-event poller's next
+    /// `eth_getLogs` window. It starts at `blockchain.get_logs_max_block_span`,
+    /// drops to half a window the RPC provider rejects for its range, and
+    /// doubles back after 32 accepted windows, up to the ceiling. A caught-up
+    /// node climbs back to the ceiling after a transient rejection, so a low
+    /// value is a recent rejection, not proof of a cap: read the rejection
+    /// counter for that. The lowest values over a range with rejections show
+    /// the provider's cap.
+    pub chain_get_logs_span: Gauge,
+    /// `decdn_chain_get_logs_range_rejections_total`: `eth_getLogs` windows the
+    /// RPC provider rejected for their block range or result count. Each one
+    /// costs one wasted request. Rejections that keep coming mean the provider
+    /// caps `eth_getLogs`; set `blockchain.get_logs_max_block_span` to the
+    /// lowest span the gauge reaches while they come, and they stop.
+    pub chain_get_logs_range_rejections: Counter,
 
     // ---- Down-family parity for the watchers that lacked it (#1283, #1316) ----
     /// `decdn_blacklist_watcher_restarts_total` (#1283): distinct drift windows
@@ -1897,6 +1914,11 @@ impl Default for Metrics {
 /// keeps the workspace `unwrap_used` deny satisfied without pushing a
 /// `Result` onto every recorder signature.
 fn sat(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// Saturating `u64` → `i64` for gauge values; see [`sat`].
+fn sat_u64(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
 }
 
@@ -2371,7 +2393,9 @@ macro_rules! watcher_downtime_recorders {
                 // incremented and, because std poison is sticky, stays frozen for
                 // the process's life. The paired `*_down_seconds` gauge covers this
                 // — `refresh_watcher_down_seconds` reports `i64::MAX` on a poisoned
-                // lock — so alert on the gauge, never on `rate(*_restarts_total)`
+                // lock — so alert on the gauge for outages. The counter drives only
+                // the flapping rule, which a frozen counter silences while the
+                // stalled rule fires on the `i64::MAX` gauge
                 // (appendix-observability § Watcher Liveness, #1322).
                 pub fn $backoff(&self) {
                     if let Ok(mut down_since) = self.$down_since.lock()
@@ -2972,6 +2996,10 @@ recorders! {
     /// with the current wall-clock time (#1316). The `on_tick_success` hook,
     /// fired on EVERY successful poll tick so a dead task's gauge goes stale.
     slash_watcher_tick => slash_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
+    /// Record the chain-event poller's current `eth_getLogs` window span.
+    chain_get_logs_span(span: u64) => chain_get_logs_span.set(sat_u64(span));
+    /// Count one `eth_getLogs` window the provider rejected for its range.
+    chain_get_logs_range_rejected => chain_get_logs_range_rejections.inc();
     /// Stamp the staker-set watcher's liveness gauge (#1316). See `slash_watcher_tick`.
     staker_set_watcher_tick => staker_set_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
     /// A capacity-bond registry re-enumeration failed and the previous
@@ -3657,6 +3685,42 @@ mod tests {
     /// **What this does not prove.** A name that resolves may still sit at a
     /// permanent zero because nothing increments it; the gate is about the
     /// name, not the wiring. `docs/runbook.md § ContentBlacklist compliance` is the live example.
+    /// `DecdnChainWatcherFlapping` selects its counters by the name pattern
+    /// `decdn_.+_watcher_restarts_total`, which the literal-name gate above
+    /// cannot check. Pin what the pattern matches: exactly the five chain
+    /// watchers, so a renamed counter cannot drop out of the rule unseen.
+    #[test]
+    fn flapping_rule_pattern_matches_the_five_watcher_restart_counters() {
+        let mut matched: Vec<String> = exported_series(&full_scrape())
+            .into_iter()
+            .filter(|name| {
+                name.strip_prefix("decdn_")
+                    .and_then(|rest| rest.strip_suffix("_watcher_restarts_total"))
+                    .is_some_and(|watcher| !watcher.is_empty())
+            })
+            .collect();
+        matched.sort();
+        assert_eq!(
+            matched,
+            [
+                "decdn_blacklist_watcher_restarts_total",
+                "decdn_fee_shares_watcher_restarts_total",
+                "decdn_settlement_watcher_restarts_total",
+                "decdn_slash_watcher_restarts_total",
+                "decdn_staker_set_watcher_restarts_total",
+            ]
+        );
+        let rules = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../monitoring/prometheus-alerts.yml"
+        ))
+        .unwrap_or_default();
+        assert!(
+            rules.contains(r#"{__name__=~"decdn_.+_watcher_restarts_total"}"#),
+            "the flapping rule's selector changed; update this test with it"
+        );
+    }
+
     #[test]
     fn monitoring_selectors_are_exported() {
         // Names ending in `_` are filtered below: no exported series ends with

@@ -194,6 +194,11 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
+        "  get_logs_max_block_span: {}",
+        resolved.blockchain.get_logs_max_block_span
+    )?;
+    writeln!(
+        w,
         "  fee_shares_poll_interval_sec: {}",
         resolved.blockchain.fee_shares_poll_interval_sec
     )?;
@@ -941,6 +946,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
 # event_poll_interval_ms = 7000      # eth_getLogs tick cadence for chain watchers + pending-tx receipt polling (#1011/#1106); default 7000ms, min 250ms (lower for a local anvil)
+# get_logs_max_block_span = 10000    # max blocks per chain-watcher eth_getLogs request; set to your RPC provider's range limit (the poller also shrinks the window when the provider rejects a range; set it to the lowest span the poller reaches while rejections keep coming); default 10000, must be > 0
 # fee_shares_poll_interval_sec = 3600  # authoritative getShares() re-read cadence, safety net beside the SharesUpdated subscription (ADR 041); default 3600s, must be > 0
 # redeem_threshold_micro_usdc = 1000000          # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 1 USDC
 # redeem_max_vouchers_per_tx = 300  # max vouchers per redeemMany tx; the redeemer chunks a sweep to stay under the block gas limit (default 300)
@@ -1205,6 +1211,7 @@ mod tests {
             chain_id,
             rpc_watchdog_interval_sec,
             event_poll_interval_ms,
+            get_logs_max_block_span,
             fee_shares_poll_interval_sec,
             redeem_threshold_micro_usdc,
             redeem_max_vouchers_per_tx,
@@ -1260,6 +1267,10 @@ mod tests {
                 rpc_watchdog_interval_sec.is_none(),
             ),
             ("event_poll_interval_ms =", event_poll_interval_ms.is_none()),
+            (
+                "get_logs_max_block_span =",
+                get_logs_max_block_span.is_none(),
+            ),
             (
                 "fee_shares_poll_interval_sec =",
                 fee_shares_poll_interval_sec.is_none(),

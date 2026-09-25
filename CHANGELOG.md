@@ -825,6 +825,24 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Chain watchers survive an RPC that caps `eth_getLogs` ranges, and the
+  stalled-watcher alerts catch a watcher that never ticked.** The chain-event
+  poller scanned `[cursor, head]` in fixed 10 000-block windows and never read
+  the error. A provider with a lower range cap (dRPC's free tier rejects about
+  150 blocks, Alchemy's free tier 10) rejected every window, the cursor held,
+  and each backoff retry asked for a wider range, so every watcher stayed
+  blind. A restart did not help once the settlement checkpoint was more than
+  the cap behind head. The poller now sets its window to half the rejected
+  window when the provider's JSON-RPC error names a range or result limit,
+  retries at once, and doubles the span back after 32 accepted windows;
+  timeouts, rate limits, head-lag errors and other errors keep the backoff
+  path. The five `*WatcherStalled` alerts only read the tick gauge behind a
+  `> 0` guard, and a never-ticked watcher reads `0`, so none fired. Each now
+  also fires on `decdn_<watcher>_watcher_down_seconds > 180`. The "Oldest
+  watcher tick", "Watcher tick age" and "Settlement watcher freshness" panels
+  show a failing never-ticked watcher by its down-seconds instead of dropping
+  it.
+
 - **Tracing: dependency spans no longer export, and each run of a streaming
   miss has an `upstream_stream` span (#2048).** The OTLP export filter
   admitted any span at `WARN` from a non-deCDN crate. iroh opens its periodic
@@ -2216,6 +2234,22 @@ since project inception and will roll into the first tagged release.
   ownership only; no steady-state behavior change.
 
 ### Added
+
+- **`blockchain.get_logs_max_block_span` sets the ceiling on the block span of
+  one chain-watcher `eth_getLogs` request** (default 10 000, must be > 0,
+  restart-required). Set it to the RPC provider's range limit so the poller
+  neither learns it from rejections after each restart nor probes it again
+  each time the span doubles back.
+
+- **Chain-event poller span metrics and a flapping-watcher alert.**
+  `decdn_chain_get_logs_span` reports the poller's current `eth_getLogs`
+  window span and `decdn_chain_get_logs_range_rejections_total` counts the
+  windows the provider rejected; the chain dashboard plots both.
+  `DecdnChainWatcherFlapping` fires, once per node, when the chain watchers
+  enter four or more failure windows in 30 minutes and keep doing so for 45
+  minutes: each recovery resets the stalled alerts, so watchers that fail on
+  and off otherwise lag head unseen. It uses `increase()`, so a daemon restart
+  does not clear it, and a single burst does not fire it.
 
 - **Observability: the first latency histograms, so a latency SLO can be
   written in PromQL (#2047).** Before this change the exporter had no

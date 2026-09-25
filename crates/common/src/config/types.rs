@@ -227,6 +227,16 @@ pub struct BlockchainConfig {
     /// cadence so live-RPC load is unchanged). Values below
     /// `MIN_EVENT_POLL_INTERVAL_MS` are rejected at config resolution.
     pub event_poll_interval_ms: Option<u64>,
+    /// Maximum block span of one chain-watcher `eth_getLogs` request. Set it to
+    /// the RPC provider's actual `eth_getLogs` range limit: the lowest `span`
+    /// the poller reaches while rejections keep coming (the shrink `warn!` and
+    /// the `decdn_chain_get_logs_span` gauge show it). A provider's documented
+    /// or quoted limit can be wrong. The poller also shrinks its window on its own when the provider
+    /// rejects a range, and grows it back toward this ceiling, so this is a
+    /// ceiling, not a hard requirement. Absent =>
+    /// [`super::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN`] (10 000). Must not be `0`;
+    /// rejected at config resolution.
+    pub get_logs_max_block_span: Option<u64>,
     /// Seconds between authoritative `FeeRouter.getShares()` re-reads by the
     /// fee-shares watcher (ADR 041 / ADR 016 § Tunable Economics). This is the
     /// safety-net cadence *in addition to* the `SharesUpdated` event

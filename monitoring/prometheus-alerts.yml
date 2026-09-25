@@ -57,13 +57,17 @@ groups:
       # alert on. DecdnBlacklistWatcherStalled below is the coverage: it fires on
       # staleness of the watcher's last successful tick, which IS exported.
       - alert: DecdnBlacklistWatcherStalled
-        # Positive liveness: the gauge is stamped every successful poll tick, so
-        # staleness catches a panicked, wedged, or exited watcher that the
-        # error-triggered down-seconds gauge reads as a healthy 0 (#1316/#1320).
-        # 180s ≈ several poll intervals; tune to content_blacklist_poll_interval_sec.
-        # The `> 0` guard skips the pre-first-tick sentinel (the gauge reads 0
-        # until the first successful tick), so a fresh boot doesn't self-fire.
-        expr: (decdn_blacklist_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_blacklist_watcher_last_tick_timestamp_seconds > 180)
+        # Two arms. Positive liveness: the tick gauge is stamped every
+        # successful poll tick, so its staleness catches a panicked, wedged, or
+        # exited watcher that the error-triggered down-seconds gauge reads as a
+        # healthy 0 (#1316/#1320). The `> 0` guard skips the pre-first-tick
+        # sentinel (the gauge reads 0 until the first successful tick), so a
+        # fresh boot doesn't self-fire. Failing ticks: down-seconds counts from
+        # the first failed poll tick, so it also catches a watcher that never
+        # ticked because every poll tick fails (a dead or rate-limiting RPC, or one
+        # that rejects even a one-block eth_getLogs window),
+        # which the guarded tick arm cannot see. 180s ≈ several poll intervals.
+        expr: ((decdn_blacklist_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_blacklist_watcher_last_tick_timestamp_seconds > 180)) or (decdn_blacklist_watcher_down_seconds > 180)
         for: 5m
         labels:
           component: blacklist
@@ -74,9 +78,11 @@ groups:
           summary: "Blacklist watcher not ticking on {{ $labels.instance }}"
           description: |
             No successful blacklist poll tick for several intervals — the
-            watcher has panicked, wedged, or exited. The node may be serving
-            content blacklisted after the failure, which is slashable. Restart
-            the daemon and check the RPC provider. See adr/011-content-takedown.md.
+            watcher has panicked, wedged, or exited, or every poll tick is
+            failing. The node may be serving content blacklisted after the
+            failure, which is slashable. Check the RPC provider first (the
+            `multiplexed poller tick error` log lines name the cause), then
+            restart the daemon. See adr/011-content-takedown.md.
 
       - alert: DecdnBlacklistEnforcementFailing
         expr: rate(decdn_blacklist_enforcement_failures_total[10m]) > 0
@@ -129,6 +135,46 @@ groups:
             The {{ $labels.watcher }} watcher task unwound on a panic. Never
             expected under the anti-panic policy. Capture the error! log line
             naming the watcher and file a bug.
+
+      - alert: DecdnChainWatcherFlapping
+        # Catches a node whose chain watchers fail on and off. Every successful
+        # tick clears down-seconds and stamps the tick gauge, so a watcher that
+        # recovers every few minutes never holds either *WatcherStalled arm for
+        # 5m, yet it lags head and misses events for most of the time.
+        # *_watcher_restarts_total counts once per drift window (the edge into
+        # failure), so its increase measures the on/off pattern directly; a
+        # single sustained outage is one window and stays with *WatcherStalled.
+        #
+        # increase() handles a daemon restart (the counter resets to 0), which a
+        # plain `x - x offset 30m` does not: that form read negative after a
+        # restart and cleared a pending alert. It runs as a subquery over the
+        # label_replace so the per-watcher names survive (increase() on the raw
+        # regex selector drops __name__ and collides the five series), and
+        # `max without (watcher)` folds them back: the five watchers share one
+        # poller, so they flap together and this raises one alert per node.
+        #
+        # A burst steps the 30m increase up for exactly 30m, so `for: 45m`
+        # outlasts any single burst and fires only on repeated failure. Checked
+        # against 3 days of fleet data: 4+ windows held for 45m only on the one
+        # node that was flapping; a fleet-wide 4-minute RPC blip stayed silent.
+        expr: >-
+          max without (watcher) (increase(label_replace({__name__=~"decdn_.+_watcher_restarts_total"},
+          "watcher", "$1", "__name__", "decdn_(.+)_watcher_restarts_total")[30m:1m])) >= 4
+        for: 45m
+        labels:
+          component: watcher
+          severity: warning
+        annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#rpc-unreachable"
+          summary: "Chain watchers keep failing and recovering on {{ $labels.instance }}"
+          description: |
+            The chain watchers entered about {{ $value | printf "%.0f" }} failure
+            windows in the last 30 minutes, and have kept doing so for 45
+            minutes. Their poll ticks fail on and off, so they lag chain head
+            and events reach the node late. Check the RPC provider: the
+            `multiplexed poller tick error` log lines name the cause, and a
+            rising decdn_chain_get_logs_range_rejections_total means the
+            provider caps eth_getLogs.
 
       # A latent-bug report, not a degradation (#1517). The engine recovers the
       # guard and clears the poison, so coalescing never stops and no restart is
@@ -234,17 +280,20 @@ groups:
             accepting connections. The sum-without(direction) aggregation
             avoids false alerts when only one direction is idle.
 
-      # Chain-event watcher liveness (#1316): the *_last_tick_timestamp_seconds
-      # gauge advances only while the watcher actually completes ticks, so
-      # staleness catches a panicked/wedged/exited task the error-triggered
-      # down-seconds gauge reads as a healthy 0. 180s ≈ several poll intervals;
-      # tune to your event_poll_interval. The `> 0` guard skips the pre-first-tick
-      # sentinel (gauge reads 0 until the first success), so a fresh boot — and a
-      # node that never enables a conditionally-spawned watcher — doesn't
-      # self-fire. Blacklist has its own (slash-risk) rule in decdn-slash-safety;
-      # settlement is in decdn-delivery.
+      # Chain-event watcher liveness (#1316), two arms. The
+      # *_last_tick_timestamp_seconds gauge advances only while the watcher
+      # actually completes ticks, so staleness catches a panicked/wedged/exited
+      # task the error-triggered down-seconds gauge reads as a healthy 0. The
+      # `> 0` guard skips the pre-first-tick sentinel (gauge reads 0 until the
+      # first success), so a fresh boot — and a node that never enables a
+      # conditionally-spawned watcher — doesn't self-fire. The *_down_seconds arm
+      # counts from the first failed poll tick, so it catches a watcher that
+      # never ticked because every eth_getLogs fails; an unregistered watcher
+      # never fails a tick, so it stays 0. 180s ≈ several poll intervals; tune to
+      # your event_poll_interval. Blacklist has its own (slash-risk) rule in
+      # decdn-slash-safety; settlement is in decdn-delivery.
       - alert: DecdnSlashWatcherStalled
-        expr: (decdn_slash_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_slash_watcher_last_tick_timestamp_seconds > 180)
+        expr: ((decdn_slash_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_slash_watcher_last_tick_timestamp_seconds > 180)) or (decdn_slash_watcher_down_seconds > 180)
         for: 5m
         labels:
           component: watcher
@@ -254,11 +303,12 @@ groups:
           summary: "Slash watcher not ticking on {{ $labels.instance }}"
           description: |
             No successful slash-detection poll tick for several intervals — the
-            watcher may have panicked, wedged, or exited, so a slash against this
-            operator could go undetected. Restart and check the RPC provider.
+            watcher may have panicked, wedged, or exited, or every poll tick is
+            failing, so a slash against this operator could go undetected.
+            Check the RPC provider, then restart.
 
       - alert: DecdnStakerSetWatcherStalled
-        expr: (decdn_staker_set_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_staker_set_watcher_last_tick_timestamp_seconds > 180)
+        expr: ((decdn_staker_set_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_staker_set_watcher_last_tick_timestamp_seconds > 180)) or (decdn_staker_set_watcher_down_seconds > 180)
         for: 5m
         labels:
           component: watcher
@@ -357,7 +407,7 @@ groups:
             BatchSpanProcessor.SpanDroppingStarted warning.
 
       - alert: DecdnFeeSharesWatcherStalled
-        expr: (decdn_fee_shares_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_fee_shares_watcher_last_tick_timestamp_seconds > 180)
+        expr: ((decdn_fee_shares_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_fee_shares_watcher_last_tick_timestamp_seconds > 180)) or (decdn_fee_shares_watcher_down_seconds > 180)
         for: 5m
         labels:
           component: watcher
@@ -366,9 +416,10 @@ groups:
           summary: "Fee-shares watcher not ticking on {{ $labels.instance }}"
           description: |
             No successful fee-shares poll tick for several intervals — the
-            watcher may have panicked, wedged, or exited. The node keeps
-            pricing its settlement share off the last split it read, which the
-            chain may have moved. Restart and check the RPC provider.
+            watcher may have panicked, wedged, or exited, or every poll tick is
+            failing. The node keeps pricing its settlement share off the last
+            split it read, which the chain may have moved. Check the RPC
+            provider, then restart.
 
       # getShares() is the safety-net re-read behind the SharesUpdated event
       # tail. Its failure keeps the current share and the tick still succeeds,
@@ -561,11 +612,12 @@ groups:
             default up instead. max_probe_holds is restart-required.
 
       # Chain-event watcher liveness (#1316) for the payment-settlement watcher
-      # — staleness of its last successful poll tick. 180s ≈ several poll
-      # intervals; tune to your event_poll_interval. The `> 0` guard skips the
-      # pre-first-tick sentinel (gauge reads 0 until the first success).
+      # — staleness of its last successful poll tick, or a failing poll that
+      # never ticked (down-seconds). 180s ≈ several poll intervals; tune to your
+      # event_poll_interval. The `> 0` guard skips the pre-first-tick sentinel
+      # (gauge reads 0 until the first success).
       - alert: DecdnSettlementWatcherStalled
-        expr: (decdn_settlement_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_settlement_watcher_last_tick_timestamp_seconds > 180)
+        expr: ((decdn_settlement_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_settlement_watcher_last_tick_timestamp_seconds > 180)) or (decdn_settlement_watcher_down_seconds > 180)
         for: 5m
         labels:
           component: settlement
@@ -576,8 +628,8 @@ groups:
           description: |
             No successful payment-settlement poll tick for several intervals —
             channel open/settle/close events are not being ingested, so
-            voucher redemption and reconciliation stall. Restart and check the
-            RPC provider.
+            voucher redemption and reconciliation stall. Check the RPC
+            provider, then restart.
 
       # #1520. Three deposit guards route through this one counter (the miss floor,
       # the window ceiling, the direct-serve ceiling), so it cannot say WHICH — the

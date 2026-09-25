@@ -793,6 +793,25 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     warming_creditor: StopHandle,
 }
 
+/// The chain-event poller builder with its config-driven settings: the
+/// `eth_getLogs` block-span ceiling (`blockchain.get_logs_max_block_span`) and
+/// the span and range-rejection metrics. Routes are added by the caller.
+fn chain_poller_builder(
+    head: Arc<dyn HeadSource>,
+    poll_interval: Duration,
+    blockchain: &decdn_common::config::ResolvedBlockchain,
+    node_metrics: &Arc<metrics::Metrics>,
+) -> crate::chain_events::multiplexed_poller::MultiplexedPollerBuilder {
+    let span_metrics = Arc::clone(node_metrics);
+    crate::chain_events::multiplexed_poller::MultiplexedPollerBuilder::new(head, poll_interval)
+        .max_backfill_span(blockchain.get_logs_max_block_span)
+        .on_span_change(Box::new(move |span| span_metrics.chain_get_logs_span(span)))
+        .on_range_rejection(metrics::metric_hook(
+            node_metrics,
+            metrics::Metrics::chain_get_logs_range_rejected,
+        ))
+}
+
 /// Middle phase of [`run`] (#1253): parse the chain contract addresses and
 /// EIP-712 domains, bootstrap the `CapacityBond` registry / slash / origin
 /// watchers, and construct the probe, client, and DHT handlers plus the
@@ -1425,9 +1444,11 @@ async fn build_chain_and_handlers(
     // runtime condition — surfacing it at boot. Up to four contract addresses
     // (payment_pool, capacity_bond, content_blacklist, fee_router) with
     // disjoint topic0s per (address, topic0).
-    let poller = crate::chain_events::multiplexed_poller::MultiplexedPollerBuilder::new(
+    let poller = chain_poller_builder(
         Arc::clone(&head),
         event_poll_interval,
+        &cfg.blockchain,
+        &infra.node_metrics,
     );
     let poller = poller_routes
         .into_iter()
@@ -3998,6 +4019,7 @@ mod tests {
                 capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
                 rpc_watchdog_interval_sec: 30,
                 event_poll_interval_ms: 7000,
+                get_logs_max_block_span: decdn_common::config::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN,
                 fee_shares_poll_interval_sec: 3600,
                 redeem_threshold_micro_usdc: 1_000_000,
                 redeem_max_vouchers_per_tx: 300,
@@ -4987,5 +5009,51 @@ mod tests {
             .await
             .expect("discovery + custom relay endpoint binds");
         ep.close().await;
+    }
+
+    /// The runtime hands `blockchain.get_logs_max_block_span` to the poller:
+    /// dropping the setter would silently ignore the knob.
+    #[tokio::test]
+    async fn chain_poller_builder_uses_the_configured_get_logs_span() {
+        struct NoHead;
+        #[async_trait::async_trait]
+        impl HeadSource for NoHead {
+            async fn head(&self) -> anyhow::Result<u64> {
+                Ok(0)
+            }
+        }
+        let (_tmp, mut cfg) = cfg_with_origin(None);
+        cfg.blockchain.get_logs_max_block_span = 150;
+        let node_metrics = Arc::new(metrics::Metrics::new());
+        let builder = chain_poller_builder(
+            Arc::new(NoHead),
+            Duration::from_secs(7),
+            &cfg.blockchain,
+            &node_metrics,
+        );
+        assert_eq!(builder.span_ceiling(), 150);
+
+        // The hooks land in the exported series: `run` reports the starting
+        // span, and a range rejection bumps the counter.
+        let built = builder.build();
+        assert!(built.is_ok(), "an empty poller builds");
+        let Ok(poller) = built else { return };
+        poller.fire_range_rejection_for_test();
+        let provider = alloy::providers::ProviderBuilder::new()
+            .connect_mocked_client(alloy::providers::mock::Asserter::new());
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        crate::chain_events::multiplexed_poller::run(provider, poller, shutdown).await;
+        let scrape = node_metrics.encode().unwrap_or_default();
+        assert!(
+            scrape.lines().any(|l| l == "decdn_chain_get_logs_span 150"),
+            "span gauge not wired: {scrape}"
+        );
+        assert!(
+            scrape
+                .lines()
+                .any(|l| l == "decdn_chain_get_logs_range_rejections_total 1"),
+            "rejection counter not wired"
+        );
     }
 }
