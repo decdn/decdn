@@ -1109,8 +1109,8 @@ pub enum StreamError {
         /// The specific validation failure.
         reason: VoucherRejectReason,
         /// The node's true watermark plus the client's own last-accepted
-        /// signature, attached ONLY on the regression/exhaustion reasons
-        /// (`AmountRegression`, `BytesRegression`, `SpendingCapExhausted`) and ONLY
+        /// signature, attached ONLY on the watermark-gated reasons
+        /// ([`VoucherRejectReason::is_watermark_gated`]) and ONLY
         /// when the rejected voucher's signature recovers to the
         /// capability's pinned `voucher_signer` (issue #1481 §5 security
         /// property — otherwise anyone who guessed the chain-derivable
@@ -1207,9 +1207,7 @@ pub enum VoucherRejectReason {
     /// a capability voucher scoped to one node redeemed against another.
     /// `PoolError::WrongProvider`.
     WrongProvider,
-    /// Cumulative amount does not cover what the lane holds: at or below the
-    /// signed watermark (`PoolError::AmountRegression`), or a rollover that
-    /// folds less than the live chain proved (`PoolError::UnderFold`).
+    /// Cumulative amount regressed. `PoolError::AmountRegression`.
     AmountRegression,
     /// Cumulative bytes delivered regressed. `PoolError::BytesRegression`.
     BytesRegression,
@@ -1294,15 +1292,29 @@ pub enum VoucherRejectReason {
     /// against its own key, rebases its lane to it once, and retries (ADR 005
     /// §`VoucherRejected` semantics).
     Underpaid,
+    /// The voucher opens a new `chain_root`, which retires the lane's live
+    /// chain, but its `amount` or `bytes_delivered` does not fold the frontier
+    /// that chain proved: the signed anchor plus `verified_index` chunks (ADR
+    /// 003 §Chain length and rollover). Accepting it would discard chunks the
+    /// node holds preimages for, so the node adopts nothing.
+    ///
+    /// A payer reaches this when it resumes from a watermark that trails the
+    /// node's verified frontier. The reject carries the node's
+    /// [`WatermarkBundle`]. Recovery: the payer verifies the bundle against its
+    /// own key, reseeds to it with the chain frontier folded in, and retries.
+    /// `PoolError::UnderFold`.
+    UnderFold,
 }
 
 impl VoucherRejectReason {
     /// Whether a [`StreamError::VoucherRejected`] carrying this reason is
-    /// eligible for a [`WatermarkBundle`] (issue #1481 §5): exactly four
+    /// eligible for a [`WatermarkBundle`] (issue #1481 §5): exactly five
     /// reasons. The three regression/exhaustion reasons are ones a wallet-less
     /// client cannot distinguish from chain, since its local watermark is the
-    /// only thing that could be wrong. [`Self::Underpaid`] is the fourth: an
-    /// honest payer reaches it only through that same watermark divergence.
+    /// only thing that could be wrong. [`Self::Underpaid`] and
+    /// [`Self::UnderFold`] are the other two: a payer reaches them only through
+    /// that same watermark divergence, and the bundle states the watermark it
+    /// has to rebase or fold to.
     /// Every other handler-direct reason (`CapabilityExpired`, `PoolExhausted`,
     /// `SignerCapExhausted`, the chain reasons) and the signer/pool/provider
     /// mismatches are never eligible — a bundle would not help there, since the
@@ -1321,6 +1333,7 @@ impl VoucherRejectReason {
                 | Self::AmountRegression
                 | Self::BytesRegression
                 | Self::Underpaid
+                | Self::UnderFold
         )
     }
 }
@@ -1715,6 +1728,7 @@ mod tests {
             VoucherRejectReason::UnanchoredPreimage,
             VoucherRejectReason::ChunkPriceMismatch,
             VoucherRejectReason::Underpaid,
+            VoucherRejectReason::UnderFold,
         ]
         .into_iter()
         .enumerate()
@@ -1741,6 +1755,7 @@ mod tests {
             R::BytesRegression,
             R::SpendingCapExhausted,
             R::Underpaid,
+            R::UnderFold,
         ] {
             assert!(r.is_watermark_gated(), "{r:?} must be watermark-gated");
         }

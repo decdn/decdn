@@ -831,11 +831,15 @@ since project inception and will roll into the first tagged release.
   claim, the node credited it 0 bytes. It then waited for a proof that never
   came, until the 10 s voucher read timeout. The client failed over to another
   provider, so every small bundle entry routed to that node took about 11 s.
-  The node now rejects the voucher `AmountRegression` with the resume bundle.
-  The client folds the proved frontier, reseeds, and resumes on the same
-  provider (ADR 003 §Chain length and rollover). The wire format does not
-  change. `decdn_serve_stream_client_declined_total` stops rising for this
-  case.
+  The node now rejects the voucher with the new reason `UnderFold` and the
+  resume bundle. The client folds the proved frontier, reseeds, and resumes on
+  the same provider (ADR 003 §Chain length and rollover).
+  `decdn_serve_stream_client_declined_total` stops rising for this case.
+  - The fold check now binds `bytes_delivered` as well as `amount`. A rollover
+    that pays the whole claim but signs fewer bytes than the chain proved is
+    also refused `UnderFold`.
+  - **Wire-breaking:** `VoucherRejectReason::UnderFold` is a new variant,
+    appended at the end. A peer built before it cannot decode the reason.
 
 - **Every failed inbound stream now has a reason counter (#2073).** About 91 %
   of `decdn_streams_failed_total{direction="inbound"}` had none, so the

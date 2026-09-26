@@ -118,12 +118,8 @@ pub const fn voucher_reject_reason(err: &PoolError) -> Result<VoucherRejectReaso
     match err {
         PoolError::WrongPool { .. } => Ok(VoucherRejectReason::WrongPool),
         PoolError::WrongProvider { .. } => Ok(VoucherRejectReason::WrongProvider),
-        // An under-fold shares the wire reason: both are watermark-gated, and the
-        // bundle that heals a stale payer is the same one that states the fold an
-        // under-folding payer owes.
-        PoolError::AmountRegression { .. } | PoolError::UnderFold { .. } => {
-            Ok(VoucherRejectReason::AmountRegression)
-        }
+        PoolError::AmountRegression { .. } => Ok(VoucherRejectReason::AmountRegression),
+        PoolError::UnderFold { .. } => Ok(VoucherRejectReason::UnderFold),
         PoolError::BytesRegression { .. } => Ok(VoucherRejectReason::BytesRegression),
         PoolError::CapExceeded { .. } => Ok(VoucherRejectReason::SpendingCapExhausted),
         PoolError::BadPreimage { .. } => Ok(VoucherRejectReason::BadPreimage),
@@ -317,10 +313,11 @@ mod tests {
             ),
             (
                 PoolError::UnderFold {
+                    axis: crate::FoldAxis::Amount,
                     owed: U256::ZERO,
                     got: U256::ZERO,
                 },
-                Ok(VoucherRejectReason::AmountRegression),
+                Ok(VoucherRejectReason::UnderFold),
             ),
             (
                 PoolError::BytesRegression {

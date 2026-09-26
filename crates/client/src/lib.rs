@@ -906,7 +906,7 @@ impl std::error::Error for PullTimeout {}
 /// only for the gated regression/exhaustion reasons, and only when the node
 /// verified the rejected voucher recovered to the pool capability.s pinned
 /// `signer` before attaching it. A caller that sees `Some` alongside
-/// `AmountRegression`/`BytesRegression`/`SpendingCapExhausted` can self-heal —
+/// `AmountRegression`/`BytesRegression`/`UnderFold`/`SpendingCapExhausted` can self-heal —
 /// re-seed its ledger to the bundle's watermark
 /// ([`crate::ledger::Cumulative::from`]) and resume from `bytes_delivered` —
 /// rather than treating the rejection as terminal. `SpendingCapExhausted`
@@ -1918,7 +1918,7 @@ async fn open_stream(
 
 /// Wallet-less resume (issue #1481 §5): the maximum number of times a fetch
 /// will reopen a fresh stream after a gated, bundled
-/// `AmountRegression`/`BytesRegression`/`SpendingCapExhausted`
+/// `AmountRegression`/`BytesRegression`/`UnderFold`/`SpendingCapExhausted`
 /// rejection. Bounds a node that keeps rejecting (a buggy or adversarial
 /// peer echoing a bundle that never lets the client catch up) to a handful
 /// of round trips rather than looping forever; a healthy self-heal needs

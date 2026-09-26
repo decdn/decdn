@@ -813,13 +813,24 @@ impl LaneState {
             // this node's quote, so adopting it keeps the two in step.
             next.chain.chunk_price = signed.voucher.chunk_price;
         } else {
-            if let Some(live) = self.live_claim()
-                && live.value() > signed.voucher.amount
-            {
-                return Err(PoolError::UnderFold {
-                    owed: live.value(),
-                    got: signed.voucher.amount,
-                });
+            // The fold binds both axes (ADR 003 §Rollover): a voucher that pays
+            // the whole claim but signs fewer bytes than the frontier proved
+            // would still retire those chunks from the lane's byte claim.
+            if let Some(live) = self.live_claim() {
+                if live.value() > signed.voucher.amount {
+                    return Err(PoolError::UnderFold {
+                        axis: FoldAxis::Amount,
+                        owed: live.value(),
+                        got: signed.voucher.amount,
+                    });
+                }
+                if live.bytes_value() > signed.voucher.bytes_delivered {
+                    return Err(PoolError::UnderFold {
+                        axis: FoldAxis::Bytes,
+                        owed: live.bytes_value(),
+                        got: signed.voucher.bytes_delivered,
+                    });
+                }
             }
             next.chain = LaneChain::opened(signed.voucher.chain_root, signed.voucher.chunk_price);
         }
@@ -913,6 +924,25 @@ impl PreimageApplied {
     }
 }
 
+/// The axis of a lane claim a rollover voucher has to fold
+/// ([`PoolError::UnderFold`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldAxis {
+    /// The cumulative `amount`.
+    Amount,
+    /// The cumulative `bytes_delivered`.
+    Bytes,
+}
+
+impl std::fmt::Display for FoldAxis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Amount => "amount",
+            Self::Bytes => "bytes_delivered",
+        })
+    }
+}
+
 /// Failure modes for [`LaneState::apply_voucher`].
 ///
 /// Each in-memory variant maps to an on-chain `PaymentPool.redeem` revert;
@@ -953,17 +983,21 @@ pub enum PoolError {
         /// The cumulative amount it carried.
         got: U256,
     },
-    /// A voucher under a different `chain_root` retires the live epoch but its
-    /// `amount` does not cover the lane's live claim: the signed anchor plus
-    /// the frontier the live chain proved (ADR 003 §Chain length and rollover).
-    /// It is above the signed watermark, so no sibling settled it; the payer
-    /// under-signs chunks the node holds preimages for. The node refuses it and
-    /// sends the resume bundle that states the fold the payer owes.
-    #[error("voucher amount {got} does not fold the live claim {owed}")]
+    /// A voucher under a different `chain_root` retires the live epoch but
+    /// does not fold the frontier the live chain proved: its `amount` or its
+    /// `bytes_delivered` falls short of the signed anchor plus `verified_index`
+    /// chunks (ADR 003 §Chain length and rollover). It is above the signed
+    /// watermark, so no sibling settled it; the payer under-signs chunks the
+    /// node holds preimages for. The node refuses it and sends the resume
+    /// bundle that states the fold the payer owes.
+    #[error("voucher {axis} {got} does not fold the live claim {owed}")]
     UnderFold {
-        /// The lane's live claim: signed anchor plus the proved frontier.
+        /// The axis that falls short. The amount is checked first.
+        axis: FoldAxis,
+        /// The lane's live claim on `axis`: signed anchor plus the proved
+        /// frontier.
         owed: U256,
-        /// The cumulative amount the voucher carried.
+        /// The cumulative figure the voucher carried on `axis`.
         got: U256,
     },
     /// Cumulative bytes delivered went down.
@@ -1818,7 +1852,7 @@ mod tests {
         anyhow::ensure!(
             matches!(
                 state_at_9.advance_presigned(&stingy),
-                Err(PoolError::UnderFold { owed, got })
+                Err(PoolError::UnderFold { axis: FoldAxis::Amount, owed, got })
                     if owed == owed_before && got == U256::from(1_000 + 2 * PRICE)
             ),
             "an under-folding rollover must be refused, naming the fold it owed"
@@ -1832,21 +1866,60 @@ mod tests {
         Ok(())
     }
 
+    /// The fold binds the byte axis too. A rollover that pays the whole claim
+    /// but signs fewer bytes than the frontier proved is refused the same way:
+    /// adopting it would retire proved chunks from the lane's byte claim.
+    #[test]
+    fn a_rollover_folding_short_on_bytes_is_refused() -> anyhow::Result<()> {
+        let (signer, mut state, domain, store) = fixture();
+        state.apply_voucher(
+            &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
+            &domain,
+            &store,
+        )?;
+        let (state_at_9, _) = state.advance_preimage(root(), 9, reveal(9))?;
+        let bytes_before = state_at_9.owed_bytes();
+
+        // Folds all 9 chunks on the money axis, only 2 on the byte axis.
+        let next_root = crate::chain::root_from_seed(B256::repeat_byte(0x6E));
+        let short_bytes = build_metering(
+            signer.address(),
+            1_000 + 9 * PRICE,
+            2 * crate::chain::CHUNK_BYTES,
+            next_root,
+            PRICE,
+        )
+        .sign(&signer, &domain)?;
+
+        anyhow::ensure!(
+            matches!(
+                state_at_9.advance_presigned(&short_bytes),
+                Err(PoolError::UnderFold { axis: FoldAxis::Bytes, owed, got })
+                    if owed == bytes_before && got == U256::from(2 * crate::chain::CHUNK_BYTES)
+            ),
+            "a rollover short on bytes must be refused, naming the bytes it owed"
+        );
+        anyhow::ensure!(state_at_9.owed_bytes() == bytes_before);
+        anyhow::ensure!(state_at_9.chain().chain_root == root());
+        Ok(())
+    }
+
     /// The refusal is watermark-gated, which is what makes it recoverable: the
     /// wire reason a rejected under-fold maps to is the one the node attaches a
     /// resume bundle to, so the payer learns the frontier it has to fold.
     #[test]
     fn the_under_fold_refusal_carries_a_resume_bundle() {
         let reason = crate::client_bridge::voucher_reject_reason(&PoolError::UnderFold {
+            axis: FoldAxis::Amount,
             owed: U256::from(1_090u64),
             got: U256::from(1_020u64),
         });
         assert_eq!(
             reason,
-            Ok(decdn_protocol::client::VoucherRejectReason::AmountRegression)
+            Ok(decdn_protocol::client::VoucherRejectReason::UnderFold)
         );
         assert!(
-            decdn_protocol::client::VoucherRejectReason::AmountRegression.is_watermark_gated(),
+            decdn_protocol::client::VoucherRejectReason::UnderFold.is_watermark_gated(),
             "the payer cannot fold correctly without the bundle that states the frontier"
         );
     }
@@ -1864,8 +1937,14 @@ mod tests {
         let (state_at_3, _) = state.advance_preimage(root(), 3, reveal(3))?;
         let next_root = crate::chain::root_from_seed(B256::repeat_byte(0x6E));
         let (rolled, _) = state_at_3.advance_presigned(
-            &build_metering(signer.address(), 1_000 + 3 * PRICE, 0, next_root, PRICE)
-                .sign(&signer, &domain)?,
+            &build_metering(
+                signer.address(),
+                1_000 + 3 * PRICE,
+                3 * crate::chain::CHUNK_BYTES,
+                next_root,
+                PRICE,
+            )
+            .sign(&signer, &domain)?,
         )?;
         let (after, applied) = rolled.advance_preimage(root(), 4, reveal(4))?;
         anyhow::ensure!(!applied.advanced());

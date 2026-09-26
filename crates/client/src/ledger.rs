@@ -919,8 +919,8 @@ impl PoolLedger {
 
     /// Wallet-less self-heal (issue #1481): overwrite the committed watermark to
     /// `cum` — typically [`Cumulative::from`] a [`WatermarkBundle`] the node
-    /// attached to a gated `AmountRegression` / `BytesRegression` / `SpendingCapExhausted`
-    /// rejection — and clear the rewind + armed state, since the node has just
+    /// attached to a gated `AmountRegression` / `BytesRegression` / `UnderFold` /
+    /// `SpendingCapExhausted` rejection — and clear the rewind + armed state, since the node has just
     /// told us its authoritative watermark. The next [`Self::issue`] builds on
     /// `cum`, matching what the node will accept next.
     ///

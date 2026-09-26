@@ -2439,8 +2439,8 @@ const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 ///   the `warn!` about a node that cannot pay anyone.
 /// - **This lane to this provider is finished, but the pool's DEPOSIT is not gone.** The
 ///   signer's spending cap is exhausted (`SpendingCapExhausted`) or its capability expired
-///   (`CapabilityExpired`), our accounting drifted (`AmountRegression`/`BytesRegression`),
-///   or the voucher was addressed to the wrong pool or a different provider
+///   (`CapabilityExpired`), our accounting drifted (`AmountRegression`/`BytesRegression`/
+///   `UnderFold`), or the voucher was addressed to the wrong pool or a different provider
 ///   (`WrongPool`/`WrongProvider`). No further voucher on this lane is accepted, but the
 ///   pool row still holds a deposit worth keeping — so the provider is suppressed for a
 ///   bounded window and the pool row is KEPT rather than deleted.
@@ -2450,8 +2450,8 @@ const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 ///   retry rather than suppress a healthy peer.
 ///
 /// Wallet-less resume: this classifier does NOT special-case a bundled
-/// `SpendingCapExhausted`/`AmountRegression`/`BytesRegression`/`Underpaid`, and it does not
-/// need to.
+/// `SpendingCapExhausted`/`AmountRegression`/`BytesRegression`/`UnderFold`/`Underpaid`, and it
+/// does not need to.
 /// The gap-driven `decdn_client::drive` loop (this node's own cache-miss buyer leg)
 /// already retries a resumable rejection in its own loop before it can ever surface here: it
 /// reseeds the pool's ledger and reopens the pull, transparently, and this classifier sees
@@ -2503,8 +2503,8 @@ const fn voucher_verdict(reason: VoucherRejectReason, has_bundle: bool) -> PullV
         // (`SpendingCapExhausted`) or its mid-stream cross-provider cap-headroom
         // re-check (`SignerCapExhausted`) — or its capability expired
         // (`CapabilityExpired`), our accounting drifted and the resync budget ran out
-        // (`AmountRegression`/`BytesRegression`/a bundled `Underpaid`), or the voucher named the wrong pool or a
-        // different provider (`WrongPool`/`WrongProvider`). None of these has surrendered
+        // (`AmountRegression`/`BytesRegression`/`UnderFold`/a bundled `Underpaid`), or the voucher
+        // named the wrong pool or a different provider (`WrongPool`/`WrongProvider`). None of these has surrendered
         // the pool row's value outright — a mis-addressed or drifted voucher spends
         // nothing, and an exhausted cap or expired capability means too little for THIS
         // signer right now — so the provider is suppressed and the pool row is KEPT.
@@ -2512,6 +2512,7 @@ const fn voucher_verdict(reason: VoucherRejectReason, has_bundle: bool) -> PullV
         | VoucherRejectReason::WrongProvider
         | VoucherRejectReason::AmountRegression
         | VoucherRejectReason::BytesRegression
+        | VoucherRejectReason::UnderFold
         | VoucherRejectReason::Underpaid
         | VoucherRejectReason::SpendingCapExhausted
         | VoucherRejectReason::SignerCapExhausted
