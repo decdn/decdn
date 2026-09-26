@@ -4092,8 +4092,7 @@ async fn client_under_folding_a_live_chain_reseeds_and_resumes() -> anyhow::Resu
 /// voucher repeats the anchor amount under a fresh root. No sibling settled it
 /// under that root, so it is an under-fold, not an already-satisfied voucher.
 #[tokio::test(flavor = "multi_thread")]
-async fn client_resuming_at_the_anchor_under_a_live_chain_reseeds_and_resumes() -> anyhow::Result<()>
-{
+async fn client_resuming_at_the_anchor_under_a_live_chain_heals() -> anyhow::Result<()> {
     resume_under_a_live_chain(0).await
 }
 
@@ -7463,6 +7462,79 @@ async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
         "persisted bytes_delivered: {} (expected {})",
         only.last_bytes_delivered(),
         total_bytes
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// Honest concurrent pulls that roll hash chains draw no voucher rejection. Two
+/// multi-chunk fetches share one ledger, so their reveals, re-anchors, rolls and
+/// closing vouchers all land on one lane and fold one another's frontiers. A
+/// second round runs over the lane the first left behind. Every voucher folds
+/// what the lane proved on both axes, so the node rejects none. A false
+/// `UnderFold` can heal through the bundle and still pass the fetch, so the
+/// test checks the reject counter as well as the bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn honest_concurrent_rollovers_draw_no_voucher_rejection() -> anyhow::Result<()> {
+    let payload_a: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let payload_b: Vec<u8> = (0..5 * 1024 * 1024 / 2u32)
+        .map(|i| (i % 241) as u8)
+        .collect();
+    let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let server_addr = server_eth.address();
+    let sd = slash_domain();
+    for round in 0..2u64 {
+        let (ra, rb) = tokio::join!(
+            stream_fetch_shared(
+                &client_ep,
+                target.clone(),
+                &ctx,
+                &ledger,
+                &sd,
+                server_addr,
+                *hash_a.as_bytes(),
+                0,
+                0x0a00 + round,
+                PullDeadlines::whole_transfer(Duration::from_secs(20)),
+                0,
+                0,
+            ),
+            stream_fetch_shared(
+                &client_ep,
+                target.clone(),
+                &ctx,
+                &ledger,
+                &sd,
+                server_addr,
+                *hash_b.as_bytes(),
+                0,
+                0x0b00 + round,
+                PullDeadlines::whole_transfer(Duration::from_secs(20)),
+                0,
+                0,
+            ),
+        );
+        let bytes_a = ra.map_err(|e| anyhow::anyhow!("round {round} pull A failed: {e:?}"))?;
+        let bytes_b = rb.map_err(|e| anyhow::anyhow!("round {round} pull B failed: {e:?}"))?;
+        anyhow::ensure!(bytes_a.as_ref() == payload_a.as_slice(), "blob A mismatch");
+        anyhow::ensure!(bytes_b.as_ref() == payload_b.as_slice(), "blob B mismatch");
+    }
+
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_voucher_rejected_total")? == 0,
+        "an honest payer's vouchers must all fold the lane"
+    );
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_client_declined_total")? == 0,
+        "no stream may stall on a proof the client never sends"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;

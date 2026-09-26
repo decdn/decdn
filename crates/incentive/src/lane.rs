@@ -766,15 +766,21 @@ impl LaneState {
             "advance_presigned: voucher provider must match the lane's"
         );
         if signed.voucher.amount <= self.last_amount {
-            // At exactly the signed anchor, a voucher under another root has
-            // not been settled by any sibling: a sibling that re-sends the
+            // At exactly the signed anchor, a voucher that opens another chain
+            // has not been settled by any sibling: a sibling that re-sends the
             // anchor names the live root. With reveals proved on top of the
             // anchor, it is a rollover that folds none of them. A payer whose
             // last reveal reached the node but whose own send failed restarts
             // here, so it gets the rejection that carries the fold it owes.
             // With nothing proved, the live claim is the anchor, and the node
             // may adopt the new root (see `adopt_chain`).
+            //
+            // A sealed voucher opens no chain. At the anchor it is a sibling's
+            // closing voucher, signed before a sibling opened the live chain at
+            // the same amount and delivered after it, so it stays an ordering
+            // regression.
             if signed.voucher.amount == self.last_amount
+                && !signed.voucher.chain_root.is_zero()
                 && signed.voucher.chain_root != self.chain.chain_root
                 && let Some(live) = self.live_claim()
                 && live.value() > signed.voucher.amount
@@ -1010,7 +1016,8 @@ pub enum PoolError {
     /// does not fold the frontier the live chain proved: its `amount` or its
     /// `bytes_delivered` falls short of the signed anchor plus `verified_index`
     /// chunks (ADR 003 §Chain length and rollover). It is at or above the
-    /// signed watermark under a root no sibling names, so no sibling settled
+    /// signed watermark under a root no sibling names — at exactly the anchor,
+    /// a root that opens a chain, never a sealed one — so no sibling settled
     /// it; the payer under-signs chunks the node holds preimages for. The node
     /// refuses it and sends the resume bundle that states the fold the payer
     /// owes. A payer short only on `bytes_delivered` cannot fold from the
@@ -1894,7 +1901,8 @@ mod tests {
     /// A rollover at EXACTLY the signed anchor folds none of the proved
     /// frontier. No sibling settled it under that root, so it is an under-fold,
     /// not an ordering regression that the node would treat as already
-    /// satisfied. A restarted payer that lost only its last reveal opens here.
+    /// satisfied. A payer whose last reveal reached the node but whose own send
+    /// failed restarts here.
     #[test]
     fn a_rollover_at_the_anchor_over_a_proved_frontier_is_an_under_fold() -> anyhow::Result<()> {
         let (signer, mut state, domain, store) = fixture();
@@ -1930,6 +1938,34 @@ mod tests {
             "with nothing proved, the anchor voucher stays an ordering regression"
         );
         anyhow::ensure!(state.adopt_chain(&at_zero).is_some());
+        Ok(())
+    }
+
+    /// A sealed voucher at the anchor is a sibling's closing voucher, not a
+    /// restart. One payer signs a sealed close at amount C, then a sibling opens
+    /// a chain at the same C and reveals on it. When the open and the reveal
+    /// reach the node first, the late sealed close sits at the anchor under a
+    /// root the lane does not meter. The payer already covered it, so it stays
+    /// an ordering regression, which the node treats as already satisfied.
+    #[test]
+    fn a_late_sealed_close_at_the_anchor_is_not_an_under_fold() -> anyhow::Result<()> {
+        let (signer, mut state, domain, store) = fixture();
+        let sealed_close =
+            build_metering(signer.address(), 1_000, 0, B256::ZERO, 0).sign(&signer, &domain)?;
+        state.apply_voucher(
+            &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
+            &domain,
+            &store,
+        )?;
+        let (state_at_1, _) = state.advance_preimage(root(), 1, reveal(1))?;
+
+        anyhow::ensure!(
+            matches!(
+                state_at_1.advance_presigned(&sealed_close),
+                Err(PoolError::AmountRegression { .. })
+            ),
+            "a late sealed close at the anchor must stay an ordering regression"
+        );
         Ok(())
     }
 

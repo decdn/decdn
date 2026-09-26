@@ -1478,25 +1478,37 @@ mod tests {
     }
 
     /// At EXACTLY the signed anchor, the root decides. A re-send under the live
-    /// root is what a sibling sends before its reveals: already satisfied, and
-    /// the lane is untouched. The same amount under another root folds none of
-    /// the proved frontier: a payer that restarted after losing its last reveal
-    /// sends it, and it is rejected `UnderFold` with the bundle.
+    /// root is what a sibling sends before its reveals, and a sealed voucher is
+    /// a sibling's late closing voucher: both are already satisfied, and the
+    /// lane is untouched. The same amount under a fresh root folds none of the
+    /// proved frontier: a payer whose last reveal reached the node but whose own
+    /// send failed restarts with it, and it is rejected `UnderFold` with the
+    /// bundle.
     #[test]
-    fn a_voucher_at_the_anchor_is_benign_only_under_the_live_root() {
+    fn a_voucher_at_the_anchor_is_an_under_fold_only_under_a_fresh_root() {
         let lane = LiveChainLane::new();
         let live_root = lane.state.chain().chain_root;
 
-        let verified = lane
-            .verify(live_root, lane.price, lane.anchor_amount, lane.anchor_bytes)
-            .expect("a re-send of the live root voucher is benign");
-        assert_eq!(
-            verified.next_state, lane.state,
-            "a benign voucher leaves the lane untouched"
-        );
-        assert_eq!(verified.new_bytes, lane.state.owed_bytes());
+        for (root, price, what) in [
+            (live_root, lane.price, "a re-send of the live root voucher"),
+            (B256::ZERO, U256::ZERO, "a late sealed close"),
+        ] {
+            let verified = lane
+                .verify(root, price, lane.anchor_amount, lane.anchor_bytes)
+                .unwrap_or_else(|_| panic!("{what} at the anchor is benign"));
+            assert_eq!(
+                verified.next_state, lane.state,
+                "{what} leaves the lane untouched"
+            );
+            assert_eq!(verified.new_bytes, lane.state.owed_bytes());
+        }
 
-        let bundle = expect_under_fold(lane.verify_sealed(lane.anchor_amount, lane.anchor_bytes));
+        let bundle = expect_under_fold(lane.verify(
+            B256::repeat_byte(0x6E),
+            lane.price,
+            lane.anchor_amount,
+            lane.anchor_bytes,
+        ));
         assert_eq!(bundle.verified_index, LiveChainLane::VERIFIED_INDEX);
     }
 

@@ -917,12 +917,11 @@ impl PoolLedger {
         Ok(Metered::Released(released))
     }
 
-    /// Wallet-less self-heal (issue #1481): overwrite the committed watermark to
-    /// `cum` — typically [`Cumulative::from`] a [`WatermarkBundle`] the node
-    /// attached to a gated `AmountRegression` / `BytesRegression` / `UnderFold` /
-    /// `SpendingCapExhausted` rejection — and clear the rewind + armed state, since the node has just
-    /// told us its authoritative watermark. The next [`Self::issue`] builds on
-    /// `cum`, matching what the node will accept next.
+    /// Wallet-less self-heal (issue #1481): overwrite the committed watermark to `cum` — typically
+    /// [`Cumulative::from`] a [`WatermarkBundle`] the node attached to a watermark-gated rejection
+    /// — and clear the rewind + armed state, since the node has just told us its authoritative
+    /// watermark. The next [`Self::issue`] builds on `cum`, matching what the node will accept
+    /// next.
     ///
     /// This is a hard overwrite, not a monotonic bump: the caller's prior local
     /// state was wrong (a wallet-less client has no reliable on-chain source for
@@ -931,12 +930,12 @@ impl PoolLedger {
     /// `resumable_watermark` before it reaches here — is authoritative. Callers
     /// MUST only pass a cumulative sourced from such a bundle.
     ///
-    /// Returns `false` — leaving the ledger untouched — if `cum` does not ADVANCE
-    /// past the committed watermark's `amount`. Reseeding heals a watermark that
-    /// has fallen BEHIND what the node holds; a bundle at or behind `committed`
-    /// proves nothing, and applying it would REGRESS the watermark and re-sign a
-    /// spent amount. Guarded here rather than only at the call sites because
-    /// monotonicity is the ledger's invariant to keep.
+    /// Returns `false` — leaving the ledger untouched — if `cum` does not ADVANCE past
+    /// [`Self::committed`]'s `amount` (the anchor plus the accrual). Reseeding heals a watermark
+    /// that has fallen BEHIND what the node holds; a bundle at or behind `committed` proves
+    /// nothing, and applying it would REGRESS the watermark and re-sign a spent amount. Guarded
+    /// here rather than only at the call sites because monotonicity is the ledger's invariant to
+    /// keep.
     #[must_use]
     pub fn reseed(&self, cum: Cumulative) -> bool {
         {

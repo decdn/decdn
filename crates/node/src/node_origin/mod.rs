@@ -2450,20 +2450,18 @@ const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 ///   retry rather than suppress a healthy peer.
 ///
 /// Wallet-less resume: this classifier does NOT special-case a bundled
-/// `SpendingCapExhausted`/`AmountRegression`/`BytesRegression`/`UnderFold`/`Underpaid`, and it
-/// does not need to.
-/// The gap-driven `decdn_client::drive` loop (this node's own cache-miss buyer leg)
+/// `SpendingCapExhausted`/`AmountRegression`/`BytesRegression`/`UnderFold`/`Underpaid`, and it does
+/// not need to. The gap-driven `decdn_client::drive` loop (this node's own cache-miss buyer leg)
 /// already retries a resumable rejection in its own loop before it can ever surface here: it
-/// reseeds the pool's ledger and reopens the pull, transparently, and this classifier sees
-/// only the FINAL outcome. The loop also answers a genuine `SpendingCapExhausted` with an
-/// on-chain top-up (via [`NodeFunder`]) rather than a terminal error. So by the time
-/// `pull_verdict` downcasts an error to `UpstreamVoucherRejected` and
-/// reaches this function, the rejection is genuinely terminal: either the reason was never
-/// gated, it carried no bundle, the bundle failed shape validation or authentication, the
-/// bundle did not advance our ledger (an echo, or a bytes-only `UnderFold`), or the bounded
-/// resume attempts were exhausted. `OurDeadLane` remains the correct verdict for every lane-terminal
-/// reason in that case — the lane really is unusable, and the deposit worth keeping the pool
-/// row for is not what needs reclaiming.
+/// reseeds the pool's ledger and reopens the pull, transparently, and this classifier sees only the
+/// FINAL outcome. The loop also answers a genuine `SpendingCapExhausted` with an on-chain top-up
+/// (via [`NodeFunder`]) rather than a terminal error. So by the time `pull_verdict` downcasts an
+/// error to `UpstreamVoucherRejected` and reaches this function, the rejection is genuinely
+/// terminal: either the reason was never gated, it carried no bundle, the bundle failed shape
+/// validation or authentication, the bundle did not advance our ledger (an echo, or a bytes-only
+/// `UnderFold`), or the bounded resume attempts were exhausted. `OurDeadLane` remains the correct
+/// verdict for every lane-terminal reason in that case — the lane really is unusable, and the
+/// deposit worth keeping the pool row for is not what needs reclaiming.
 const fn voucher_verdict(reason: VoucherRejectReason, has_bundle: bool) -> PullVerdict {
     match reason {
         // An `Underpaid` with no watermark comes from a lane that has accepted no
@@ -3263,10 +3261,10 @@ mod tests {
         );
     }
 
-    /// An `UnderFold` that reaches the classifier survived the drive loop's
-    /// reseed: its bundle failed authentication, did not advance our ledger, or
-    /// ran out the resume budget. Our lane to this peer is dead; the peer and the
-    /// pool row are kept, as for the other drifted-accounting reasons.
+    /// An `UnderFold` that reaches the classifier survived the drive loop's heal: it carried no
+    /// bundle, its bundle failed authentication or did not advance our ledger, or it ran out the
+    /// resume budget. Our lane to this peer is dead; the peer and the pool row are kept, as for the
+    /// other drifted-accounting reasons.
     #[test]
     fn an_under_fold_rejection_is_a_dead_lane() {
         for has_bundle in [true, false] {

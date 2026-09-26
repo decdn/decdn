@@ -1291,20 +1291,24 @@ pub enum VoucherRejectReason {
     /// against its own key, rebases its lane to it once, and retries (ADR 005
     /// §`VoucherRejected` semantics).
     Underpaid,
-    /// The voucher names a `chain_root` other than the live one (a sealed
-    /// voucher included), which retires the lane's live chain, but its
+    /// The voucher is at or above the signed anchor and names a `chain_root`
+    /// other than the live one, which retires the lane's live chain, but its
     /// `amount` or `bytes_delivered` does not fold the frontier that chain
     /// proved: the signed anchor plus `verified_index` chunks (ADR 003 §Chain
-    /// length and rollover). Accepting it would discard chunks the node holds
-    /// preimages for, so the node adopts nothing.
+    /// length and rollover). At exactly the anchor, only a voucher that opens a
+    /// chain qualifies; a sealed one there is [`Self::AmountRegression`].
+    /// Accepting it would discard chunks the node holds preimages for, so the
+    /// node adopts nothing.
     ///
     /// A payer reaches this when it resumes from a watermark that trails the
-    /// node's verified frontier, at or above the signed anchor. The reject
-    /// carries the node's [`WatermarkBundle`]. Recovery: the payer verifies the
-    /// bundle against its own key, reseeds to it with the chain frontier folded
-    /// in, and retries. A voucher that already covers the claim's `amount` but
-    /// falls short on `bytes_delivered` cannot heal this way — the bundle does
-    /// not advance the payer's amount — so the payer surfaces it as terminal.
+    /// node's verified frontier. The reject carries the node's
+    /// [`WatermarkBundle`]. Recovery: the payer verifies the bundle against its
+    /// own key, reseeds to it with the chain frontier folded in, and retries.
+    /// Concurrent streams on the lane get the same bundle; one that finds its
+    /// ledger already at the bundle retries without a reseed. A voucher that
+    /// already covers the claim's `amount` but falls short on
+    /// `bytes_delivered` cannot heal this way — the bundle does not advance the
+    /// payer's amount — so the payer surfaces it as terminal.
     /// `PoolError::UnderFold`.
     UnderFold,
 }
