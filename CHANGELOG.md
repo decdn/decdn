@@ -827,8 +827,8 @@ since project inception and will roll into the first tagged release.
 
 - **An under-folding voucher no longer stalls the stream for 10 s (#2167).**
   A lane can hold a live hash chain from an earlier payer process. When a new
-  process sent a voucher above the signed anchor but short of that chain's
-  claim, the node credited it 0 bytes. It then waited for a proof that never
+  process sent a voucher at or above the signed anchor, under a new root, but
+  short of that chain's claim, the node credited it 0 bytes. It then waited for a proof that never
   came, until the 10 s voucher read timeout. The client failed over to another
   provider, so every small bundle entry routed to that node took about 11 s.
   The node now rejects the voucher with the new reason `UnderFold` and the
@@ -837,7 +837,10 @@ since project inception and will roll into the first tagged release.
   `decdn_serve_stream_client_declined_total` stops rising for this case.
   - The fold check now binds `bytes_delivered` as well as `amount`. A rollover
     that pays the whole claim but signs fewer bytes than the chain proved is
-    also refused `UnderFold`.
+    also refused `UnderFold`. That one does not heal: the bundle does not
+    advance the client's amount, so the client stops and logs a `warn!`.
+  - The node logs the fold shortfall (axis, owed, got) at `debug!` when it
+    rejects a voucher on lane validation.
   - **Wire-breaking:** `VoucherRejectReason::UnderFold` is a new variant,
     appended at the end. A peer built before it cannot decode the reason.
 

@@ -4081,48 +4081,56 @@ async fn client_ahead_of_the_node_rebases_and_resumes() -> anyhow::Result<()> {
 /// process resumes from a persisted watermark ABOVE the signed anchor but SHORT
 /// of the live claim. Its first voucher opens a fresh root, so it retires the
 /// live chain without folding all of it.
-///
-/// The node must reject it with the bundle stating the fold owed; the client
-/// folds, reseeds, and completes. Crediting it zero instead leaves the node
-/// waiting on a proof the client never sends, and the stream only dies at the
-/// 10s `VOUCHER_READ_TIMEOUT`. The 8s budget sits below that backstop, so the
-/// heal must fire on the rejection itself.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_under_folding_a_live_chain_reseeds_and_resumes() -> anyhow::Result<()> {
+    resume_under_a_live_chain(1).await
+}
+
+/// The same heal when the new process resumes from EXACTLY the signed anchor: a
+/// reveal whose send failed locally still reached the node, so the persisted
+/// watermark is the anchor and the node's frontier is past it. The opening
+/// voucher repeats the anchor amount under a fresh root. No sibling settled it
+/// under that root, so it is an under-fold, not an already-satisfied voucher.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_resuming_at_the_anchor_under_a_live_chain_reseeds_and_resumes() -> anyhow::Result<()>
+{
+    resume_under_a_live_chain(0).await
+}
+
+/// The earlier process's lane: an anchor `signer` signed under root `R` at
+/// three chunks, plus one reveal the node proved on top of it. One chunk of
+/// proved frontier leaves the reloaded lane one chunk of credit headroom, well
+/// under a 3 MiB blob, so a stream whose reveals fold nothing cannot finish on
+/// that headroom.
+fn lane_with_one_proved_reveal(
+    signer: &PrivateKeySigner,
+    deposit: U256,
+) -> anyhow::Result<LaneState> {
     use decdn_incentive::chain::{CHUNK_BYTES, preimage_at, root_from_seed};
 
-    let payload: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-
-    let client_signer = Arc::new(PrivateKeySigner::random());
-    let deposit = U256::from(1_000_000_000u64);
-
-    // The earlier process's lane: an anchor it signed under root `R`, plus five
-    // reveals the node proved on top of it.
     let price = decdn_incentive::min_payment(CHUNK_BYTES, RATE_PER_MB);
     let anchor_amount = price * U256::from(3u64);
     let anchor_bytes = U256::from(3 * CHUNK_BYTES);
     let chain_seed = B256::repeat_byte(0x5E);
-    let verified_index = 5u8;
     let chain = decdn_incentive::LaneChain {
         chain_root: root_from_seed(chain_seed),
         chunk_price: price,
-        verified_index,
-        tip: preimage_at(chain_seed, verified_index),
+        verified_index: 1,
+        tip: preimage_at(chain_seed, 1),
     };
     let anchor = decdn_incentive::Voucher {
         pool_id: pool_id(),
-        signer: client_signer.address(),
+        signer: signer.address(),
         provider: operator_addr(),
         amount: anchor_amount,
         bytes_delivered: anchor_bytes,
         chain_root: chain.chain_root,
         chunk_price: price,
     }
-    .sign(&client_signer, &payment_domain())?;
-    let lane = LaneState::hydrate(
+    .sign(signer, &payment_domain())?;
+    Ok(LaneState::hydrate(
         pool_id(),
-        client_signer.address(),
+        signer.address(),
         operator_addr(),
         deposit,
         0,
@@ -4130,7 +4138,27 @@ async fn client_under_folding_a_live_chain_reseeds_and_resumes() -> anyhow::Resu
         anchor_bytes,
         Some(anchor.signature.as_bytes()),
         chain,
-    );
+    ))
+}
+
+/// Seed a lane holding a live chain ([`lane_with_one_proved_reveal`]), then
+/// fetch from a new process whose persisted amount sits `above_anchor` base
+/// units over the anchor, short of the live claim.
+///
+/// The node must reject the first voucher `UnderFold` with the bundle stating
+/// the fold owed; the client folds, reseeds, and completes. Crediting it zero
+/// instead leaves the node waiting on a proof the client never sends, and the
+/// stream only dies at the 10s `VOUCHER_READ_TIMEOUT`. The 8s budget sits below
+/// that backstop, so the heal must fire on the rejection itself.
+async fn resume_under_a_live_chain(above_anchor: u64) -> anyhow::Result<()> {
+    let payload: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(1_000_000_000u64);
+    let lane = lane_with_one_proved_reveal(&client_signer, deposit)?;
+    let anchor_amount = lane.last_amount();
+    let anchor_bytes = lane.last_bytes_delivered();
     let store = Arc::new(MemoryPoolStateStore::new());
     store.record(&lane)?;
 
@@ -4155,10 +4183,10 @@ async fn client_under_folding_a_live_chain_reseeds_and_resumes() -> anyhow::Resu
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
-    // The new process: one base unit above the signed anchor — past what any
-    // sibling settled, short of the chain the node proved.
+    // The new process: at or just above the signed anchor, short of the chain
+    // the node proved.
     let mut ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
-    ctx.prior_amount = anchor_amount + U256::from(1u64);
+    ctx.prior_amount = anchor_amount + U256::from(above_anchor);
     ctx.prior_bytes_delivered = anchor_bytes;
     let got = stream_fetch(
         &client_ep,

@@ -2459,8 +2459,9 @@ const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 /// on-chain top-up (via [`NodeFunder`]) rather than a terminal error. So by the time
 /// `pull_verdict` downcasts an error to `UpstreamVoucherRejected` and
 /// reaches this function, the rejection is genuinely terminal: either the reason was never
-/// gated, it carried no bundle, the bundle failed shape validation, or the bounded resume
-/// attempts were exhausted. `OurDeadLane` remains the correct verdict for every lane-terminal
+/// gated, it carried no bundle, the bundle failed shape validation or authentication, the
+/// bundle did not advance our ledger (an echo, or a bytes-only `UnderFold`), or the bounded
+/// resume attempts were exhausted. `OurDeadLane` remains the correct verdict for every lane-terminal
 /// reason in that case — the lane really is unusable, and the deposit worth keeping the pool
 /// row for is not what needs reclaiming.
 const fn voucher_verdict(reason: VoucherRejectReason, has_bundle: bool) -> PullVerdict {
@@ -2502,9 +2503,10 @@ const fn voucher_verdict(reason: VoucherRejectReason, has_bundle: bool) -> PullV
         // cap is spent — either the upstream's voucher-amount check
         // (`SpendingCapExhausted`) or its mid-stream cross-provider cap-headroom
         // re-check (`SignerCapExhausted`) — or its capability expired
-        // (`CapabilityExpired`), our accounting drifted and the resync budget ran out
-        // (`AmountRegression`/`BytesRegression`/`UnderFold`/a bundled `Underpaid`), or the voucher
-        // named the wrong pool or a different provider (`WrongPool`/`WrongProvider`). None of these has surrendered
+        // (`CapabilityExpired`), our accounting drifted and no resync healed it
+        // (`AmountRegression`/`BytesRegression`/`UnderFold`/a bundled `Underpaid`), or
+        // the voucher named the wrong pool or a different provider
+        // (`WrongPool`/`WrongProvider`). None of these has surrendered
         // the pool row's value outright — a mis-addressed or drifted voucher spends
         // nothing, and an exhausted cap or expired capability means too little for THIS
         // signer right now — so the provider is suppressed and the pool row is KEPT.
@@ -3259,6 +3261,20 @@ mod tests {
             voucher_verdict(VoucherRejectReason::Underpaid, false),
             PullVerdict::OurLocalFault
         );
+    }
+
+    /// An `UnderFold` that reaches the classifier survived the drive loop's
+    /// reseed: its bundle failed authentication, did not advance our ledger, or
+    /// ran out the resume budget. Our lane to this peer is dead; the peer and the
+    /// pool row are kept, as for the other drifted-accounting reasons.
+    #[test]
+    fn an_under_fold_rejection_is_a_dead_lane() {
+        for has_bundle in [true, false] {
+            assert_eq!(
+                voucher_verdict(VoucherRejectReason::UnderFold, has_bundle),
+                PullVerdict::OurDeadLane(VoucherRejectReason::UnderFold)
+            );
+        }
     }
 
     /// A `PoolExhausted` rejection is a statement about OUR buyer pool, not the peer:

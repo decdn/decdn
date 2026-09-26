@@ -769,12 +769,11 @@ impl ClientHandler {
                 // claiming MORE bytes — same money, more bytes — which is a
                 // single-signer fault (#1699 rule 4).
                 //
-                // A voucher ABOVE the signed watermark that still falls short of the
-                // live chain's claim is not this arm: the lane returns `UnderFold`,
-                // and the catch-all below rejects it with the bundle stating the
-                // fold owed.
-                // Crediting it zero here would leave the node waiting on a proof
-                // the payer never sends.
+                // A rollover that falls short of the live chain's claim is not this
+                // arm, even at exactly the signed watermark: the lane returns
+                // `UnderFold`, and the catch-all below rejects it with the bundle
+                // stating the fold owed. Crediting it zero here would leave the
+                // node waiting on a proof the payer never sends.
                 let amount = U256::from(wire.amount);
                 if amount == last && new_bytes > state.last_bytes_delivered() {
                     return Err(VerifyStop::Reject(
@@ -810,10 +809,13 @@ impl ClientHandler {
                         )));
                     }
                 };
-                // Wallet-less resume (#1481 §5): for a gated regression/exhaustion
-                // reason, attach the node's true watermark so an authorized funder
-                // can re-seed and resume. The pinned-signer gate is already
-                // enforced by the caller's lock-free `verify_signer` (#1735).
+                // The wire reason drops the lane's detail (for an `UnderFold`, the
+                // axis and the shortfall), so record it here.
+                tracing::debug!(error = %e, ?reason, "voucher fails lane validation");
+                // Wallet-less resume (#1481 §5): for a watermark-gated reason,
+                // attach the node's true watermark so an authorized funder can
+                // reseed and resume. The pinned-signer gate is already enforced
+                // by the caller's lock-free `verify_signer` (#1735).
                 let bundle = Self::watermark_bundle_for_reject(reason, state);
                 Err(VerifyStop::Reject(reason, bundle))
             }
@@ -1337,7 +1339,6 @@ mod tests {
         price: U256,
         anchor_amount: U256,
         anchor_bytes: u64,
-        chain: decdn_incentive::LaneChain,
         state: LaneState,
     }
 
@@ -1353,12 +1354,6 @@ mod tests {
             let anchor_amount = price * U256::from(5u64);
             let anchor_bytes = 5 * CHUNK_BYTES;
             let chain_seed = B256::repeat_byte(0x5E);
-            let chain = decdn_incentive::LaneChain {
-                chain_root: root_from_seed(chain_seed),
-                chunk_price: price,
-                verified_index: Self::VERIFIED_INDEX,
-                tip: preimage_at(chain_seed, Self::VERIFIED_INDEX),
-            };
             let state = LaneState::hydrate(
                 B256::repeat_byte(0x21),
                 signer_key.address(),
@@ -1368,7 +1363,12 @@ mod tests {
                 anchor_amount,
                 U256::from(anchor_bytes),
                 Some([9u8; 65]),
-                chain,
+                decdn_incentive::LaneChain {
+                    chain_root: root_from_seed(chain_seed),
+                    chunk_price: price,
+                    verified_index: Self::VERIFIED_INDEX,
+                    tip: preimage_at(chain_seed, Self::VERIFIED_INDEX),
+                },
             );
             Self {
                 signer_key,
@@ -1377,15 +1377,16 @@ mod tests {
                 price,
                 anchor_amount,
                 anchor_bytes,
-                chain,
                 state,
             }
         }
 
-        /// Verify a sealed voucher (`chain_root = 0`, so a rollover against the
-        /// live root) at `amount` / `bytes` against this lane.
-        fn verify_sealed(
+        /// Verify a voucher at `amount` / `bytes` under `chain_root`, priced at
+        /// `chunk_price`, against this lane.
+        fn verify(
             &self,
+            chain_root: B256,
+            chunk_price: U256,
             amount: U256,
             bytes: u64,
         ) -> Result<super::VerifiedVoucher, super::VerifyStop> {
@@ -1396,17 +1397,17 @@ mod tests {
                 provider: key.provider,
                 amount,
                 bytes_delivered: U256::from(bytes),
-                chain_root: B256::ZERO,
-                chunk_price: U256::ZERO,
+                chain_root,
+                chunk_price,
             }
             .sign(&self.signer_key, &self.domain)
-            .expect("sign sealed voucher");
+            .expect("sign voucher");
             let wire = decdn_protocol::client::Voucher {
                 signature: voucher.signature.as_bytes().to_vec(),
                 amount: u64::try_from(amount).expect("amount fits u64 in this test"),
                 bytes_delivered: bytes,
-                chain_root: [0u8; 32],
-                chunk_price: 0,
+                chain_root: chain_root.into(),
+                chunk_price: u64::try_from(chunk_price).expect("price fits u64 in this test"),
             };
             super::ClientHandler::verify_voucher(
                 &self.state,
@@ -1415,6 +1416,16 @@ mod tests {
                 &wire,
                 self.rate_per_mb,
             )
+        }
+
+        /// Verify a sealed voucher (`chain_root = 0`, so a rollover against the
+        /// live root) at `amount` / `bytes`.
+        fn verify_sealed(
+            &self,
+            amount: U256,
+            bytes: u64,
+        ) -> Result<super::VerifiedVoucher, super::VerifyStop> {
+            self.verify(B256::ZERO, U256::ZERO, amount, bytes)
         }
     }
 
@@ -1437,13 +1448,13 @@ mod tests {
     /// No sibling settled it, so it is not the benign already-satisfied case:
     /// crediting it zero would leave the node waiting on a proof the payer never
     /// sends. It is rejected `UnderFold` with the bundle naming the frontier the
-    /// payer has to fold. A voucher at or below the signed watermark on the same
-    /// lane stays benign.
+    /// payer has to fold.
     #[test]
     fn an_under_folding_voucher_is_rejected_with_the_resume_bundle() {
         use decdn_incentive::chain::CHUNK_BYTES;
 
         let lane = LiveChainLane::new();
+        let chain = lane.state.chain();
 
         // Folds 2 of the 9 proved chunks: above the anchor, short of the claim.
         let bundle = expect_under_fold(lane.verify_sealed(
@@ -1455,23 +1466,38 @@ mod tests {
             lane.anchor_amount,
             "the bundle echoes the signed anchor"
         );
+        assert_eq!(bundle.bytes_delivered, lane.anchor_bytes);
         assert_eq!(
             bundle.verified_index,
             LiveChainLane::VERIFIED_INDEX,
             "the bundle names the frontier the payer has to fold"
         );
-        assert_eq!(B256::from(bundle.chain_root), lane.chain.chain_root);
-        assert_eq!(B256::from(bundle.tip), lane.chain.tip);
+        assert_eq!(U256::from(bundle.chunk_price), lane.price);
+        assert_eq!(B256::from(bundle.chain_root), chain.chain_root);
+        assert_eq!(B256::from(bundle.tip), chain.tip);
+    }
 
-        // At the signed anchor: a sibling already settled it, so it stays benign.
+    /// At EXACTLY the signed anchor, the root decides. A re-send under the live
+    /// root is what a sibling sends before its reveals: already satisfied, and
+    /// the lane is untouched. The same amount under another root folds none of
+    /// the proved frontier: a payer that restarted after losing its last reveal
+    /// sends it, and it is rejected `UnderFold` with the bundle.
+    #[test]
+    fn a_voucher_at_the_anchor_is_benign_only_under_the_live_root() {
+        let lane = LiveChainLane::new();
+        let live_root = lane.state.chain().chain_root;
+
         let verified = lane
-            .verify_sealed(lane.anchor_amount, lane.anchor_bytes)
-            .expect("a voucher at the signed watermark is benign");
+            .verify(live_root, lane.price, lane.anchor_amount, lane.anchor_bytes)
+            .expect("a re-send of the live root voucher is benign");
         assert_eq!(
             verified.next_state, lane.state,
             "a benign voucher leaves the lane untouched"
         );
         assert_eq!(verified.new_bytes, lane.state.owed_bytes());
+
+        let bundle = expect_under_fold(lane.verify_sealed(lane.anchor_amount, lane.anchor_bytes));
+        assert_eq!(bundle.verified_index, LiveChainLane::VERIFIED_INDEX);
     }
 
     /// The fold binds the byte axis too: a rollover that pays the whole live

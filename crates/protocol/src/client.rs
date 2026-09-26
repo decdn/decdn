@@ -1119,9 +1119,8 @@ pub enum StreamError {
         /// is `0` until settlement), so this lets it self-heal: re-seed the
         /// ledger's PAYMENT BASELINE to `bytes_delivered` (a pool-cumulative
         /// counter, NOT a blob `byte_offset`) and re-sign from the new
-        /// baseline. `None` for every handler-direct reason (`CapabilityExpired`,
-        /// `PoolExhausted`) and whenever the signer does not recover to
-        /// `voucher_signer`.
+        /// baseline. `None` for every reason that is not watermark-gated and
+        /// whenever the signer does not recover to `voucher_signer`.
         bundle: Option<WatermarkBundle>,
     },
     /// The pool funding this request is owned by a blacklisted origin
@@ -1179,11 +1178,11 @@ impl StreamError {
 
 /// Why a [`Voucher`] was rejected (ADR 005 §`VoucherRejected` semantics).
 ///
-/// The first seven variants mirror `decdn_incentive::PoolError` ∪
-/// `VoucherError` one-to-one; the handler-side conversion `voucher_reject_reason`
-/// matches those exhaustively so a new `PoolError` variant fails to compile
-/// until this enum is extended (ADR 005 §Mirror obligation). The remaining
-/// variants have no validation-enum counterpart and are emitted directly by the
+/// The first seven variants and [`Self::UnderFold`] mirror
+/// `decdn_incentive::PoolError` ∪ `VoucherError` one-to-one; the handler-side
+/// conversion `voucher_reject_reason` matches those exhaustively so a new
+/// `PoolError` variant fails to compile until this enum is extended (ADR 005
+/// §Mirror obligation). The other variants are emitted directly by the
 /// `cdn/client/v1` handler: [`Self::CapabilityExpired`] fires when the signer's
 /// capability has passed its expiry; [`Self::PoolExhausted`] fires when the
 /// pool's remaining deposit can no longer fund further credit; and the four
@@ -1192,7 +1191,7 @@ impl StreamError {
 /// the handler holds the per-stream chain anchor a validation enum cannot see;
 /// [`Self::Underpaid`] fires when the span a voucher adds over the lane's
 /// accepted watermark pays below the quoted `rate_per_mb`.
-/// Variant order is frozen — new handler-direct reasons append at the end.
+/// Variant order is frozen — new reasons append at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoucherRejectReason {
     /// Signature malformed (corrupted bytes, non-canonical `s`, invalid
@@ -1292,16 +1291,20 @@ pub enum VoucherRejectReason {
     /// against its own key, rebases its lane to it once, and retries (ADR 005
     /// §`VoucherRejected` semantics).
     Underpaid,
-    /// The voucher opens a new `chain_root`, which retires the lane's live
-    /// chain, but its `amount` or `bytes_delivered` does not fold the frontier
-    /// that chain proved: the signed anchor plus `verified_index` chunks (ADR
-    /// 003 §Chain length and rollover). Accepting it would discard chunks the
-    /// node holds preimages for, so the node adopts nothing.
+    /// The voucher names a `chain_root` other than the live one (a sealed
+    /// voucher included), which retires the lane's live chain, but its
+    /// `amount` or `bytes_delivered` does not fold the frontier that chain
+    /// proved: the signed anchor plus `verified_index` chunks (ADR 003 §Chain
+    /// length and rollover). Accepting it would discard chunks the node holds
+    /// preimages for, so the node adopts nothing.
     ///
     /// A payer reaches this when it resumes from a watermark that trails the
-    /// node's verified frontier. The reject carries the node's
-    /// [`WatermarkBundle`]. Recovery: the payer verifies the bundle against its
-    /// own key, reseeds to it with the chain frontier folded in, and retries.
+    /// node's verified frontier, at or above the signed anchor. The reject
+    /// carries the node's [`WatermarkBundle`]. Recovery: the payer verifies the
+    /// bundle against its own key, reseeds to it with the chain frontier folded
+    /// in, and retries. A voucher that already covers the claim's `amount` but
+    /// falls short on `bytes_delivered` cannot heal this way — the bundle does
+    /// not advance the payer's amount — so the payer surfaces it as terminal.
     /// `PoolError::UnderFold`.
     UnderFold,
 }
@@ -1315,7 +1318,7 @@ impl VoucherRejectReason {
     /// [`Self::UnderFold`] are the other two: a payer reaches them only through
     /// that same watermark divergence, and the bundle states the watermark it
     /// has to rebase or fold to.
-    /// Every other handler-direct reason (`CapabilityExpired`, `PoolExhausted`,
+    /// Every other reason (`CapabilityExpired`, `PoolExhausted`,
     /// `SignerCapExhausted`, the chain reasons) and the signer/pool/provider
     /// mismatches are never eligible — a bundle would not help there, since the
     /// fix is not "resync the watermark".
