@@ -17,7 +17,7 @@ use tokio::task::{JoinError, JoinSet};
 use futures_util::FutureExt as _;
 use tracing::Instrument as _;
 
-use super::outcome::{ResetCause, ServeEnd};
+use super::outcome::{ErrEnd, ResetCause, ServeEnd};
 use crate::load_shed::RequestClass;
 use crate::metrics::FirstByteClock;
 
@@ -160,24 +160,26 @@ impl ClientHandler {
                                 let ended = AssertUnwindSafe(serve).catch_unwind().await;
                                 unended.0 = None;
                                 match ended {
+                                    // Reason first, then the completed / failed
+                                    // count, on every end: a scrape between the
+                                    // two never shows an unclaimed failure.
                                     Ok(Ok(end)) => {
                                         end.record(&span);
-                                        this.metrics.inbound_stream_ended(matches!(
-                                            end,
-                                            ServeEnd::Completed { .. }
-                                        ));
+                                        let completed = end.meter(&this.metrics);
+                                        this.metrics.inbound_stream_ended(completed);
                                     }
                                     Ok(Err(e)) => {
                                         span.record("outcome", "failed");
-                                        this.metrics.inbound_stream_ended(false);
                                         span.record(
                                             "error",
                                             tracing::field::display(format_args!("{e:#}")),
                                         );
                                         this.log_stream_end(&e, &span);
+                                        this.metrics.inbound_stream_ended(false);
                                     }
                                     Err(panic) => {
                                         span.record("outcome", "panicked");
+                                        this.metrics.serve_stream_node_fault();
                                         this.metrics.inbound_stream_ended(false);
                                         span.record("otel.status_code", "ERROR");
                                         std::panic::resume_unwind(panic);
@@ -209,13 +211,13 @@ impl ClientHandler {
                     break;
                 }
                 Some(joined) = inflight.join_next(), if !inflight.is_empty() => {
-                    self.note_joined_stream(joined);
+                    Self::note_joined_stream(joined);
                 }
             }
         }
         // Drain any streams still finishing after the connection closed.
         while let Some(joined) = inflight.join_next().await {
-            self.note_joined_stream(joined);
+            Self::note_joined_stream(joined);
         }
         Ok(())
     }
@@ -226,16 +228,16 @@ impl ClientHandler {
     /// so only a [`JoinError`] reaches here. It means the task did not return a
     /// value — the `JoinSet`
     /// isolates that from the connection, which keeps serving its other streams —
-    /// and splits two ways: a PANIC is a node-side bug, metered on
-    /// `decdn_serve_stream_node_fault_total` and logged at `error!` so its rate is
-    /// alertable; a CANCELLATION is a benign teardown artifact (the drain path
+    /// and splits two ways: a PANIC is a node-side bug, logged at `error!` (the
+    /// task's own panic arm already metered it on
+    /// `decdn_serve_stream_node_fault_total`, before the failed count, so its rate
+    /// is alertable); a CANCELLATION is a benign teardown artifact (the drain path
     /// never aborts, so this only arises on runtime shutdown), logged at `debug!`
     /// and not counted.
-    fn note_joined_stream(&self, joined: Result<(), JoinError>) {
+    fn note_joined_stream(joined: Result<(), JoinError>) {
         match joined {
             Ok(()) => {}
             Err(join_err) if join_err.is_panic() => {
-                self.metrics.serve_stream_node_fault();
                 tracing::error!(error = %join_err, "client stream task panicked");
             }
             Err(join_err) => {
@@ -244,30 +246,36 @@ impl ClientHandler {
         }
     }
 
-    /// File one finished serve stream's error by who caused it.
+    /// File one finished serve stream's error by who caused it, and count it on
+    /// exactly one reason counter.
     ///
     /// A node-side fault — an encode fault, an alignment error, a store fault, a
     /// framing fault — is the operator's only signal that a delivery was
     /// abandoned, since the client only ever sees a short stream. It logs at
     /// `error!` and bumps `decdn_serve_stream_node_fault_total`, so the rate is
-    /// alertable rather than only greppable. A peer-attributable error
-    /// ([`PeerFault`](super::wire::PeerFault)) or a client payment fault
-    /// ([`ClientPaymentFault`](super::wire::ClientPaymentFault)) is routine and
-    /// logs at `debug!`.
+    /// alertable rather than only greppable. A client payment fault
+    /// ([`ClientPaymentFault`](super::wire::ClientPaymentFault)) is a rejected
+    /// voucher and bumps `decdn_serve_stream_voucher_rejected_total`. A
+    /// peer-attributable error ([`PeerFault`](super::wire::PeerFault)) is a peer
+    /// that left or broke the protocol: `decdn_serve_stream_client_abandoned_total`
+    /// when the serve loop tagged it [`PaidProgress`](super::wire::PaidProgress),
+    /// otherwise `decdn_serve_stream_client_declined_total`. All three log at
+    /// `debug!`. [`ErrEnd::of`] holds the classification.
     ///
     /// `{e:#}` rather than `{e}`: the marker sits in the chain, so the alternate
     /// form is what prints the cause beside it. A node-side fault also marks the
     /// stream's `span` as an error for the trace backend.
     fn log_stream_end(&self, e: &anyhow::Error, span: &tracing::Span) {
-        if super::wire::is_peer_attributable(e) {
-            tracing::debug!(error = %format_args!("{e:#}"), "client stream ended with error");
-        } else {
+        let end = ErrEnd::of(e);
+        end.meter(&self.metrics);
+        if end == ErrEnd::NodeFault {
             span.record("otel.status_code", "ERROR");
-            self.metrics.serve_stream_node_fault();
             tracing::error!(
                 error = %format_args!("{e:#}"),
                 "client stream ended with a node-side fault"
             );
+        } else {
+            tracing::debug!(error = %format_args!("{e:#}"), "client stream ended with error");
         }
     }
 
@@ -293,10 +301,11 @@ impl ClientHandler {
             Err(StreamReadError { err, app_code }) => {
                 reset_stream(&mut send, &mut recv, app_code);
                 // A request-read failure is peer-side (a timeout, a malformed
-                // frame, a decode fault), not a node-side bug — mark it so the
-                // dispatch sink logs it at `debug!` rather than `error!`. The
-                // marker rides as context so `err` keeps its own chain.
-                return Err(err.context(super::wire::PeerFault));
+                // frame, a decode fault), not a node-side bug, so it logs at
+                // `debug!` and ends as a reset rather than an error.
+                super::wire::record_stream_error(format_args!("{err:#}"));
+                tracing::debug!(error = %format_args!("{err:#}"), "client request unreadable");
+                return Ok(ServeEnd::Reset(ResetCause::RequestUnreadable));
             }
         };
         // The time-to-first-byte window opens on the decoded request: the accept
@@ -343,7 +352,6 @@ impl ClientHandler {
                             "client binding signature recovered a different address"
                         );
                     }
-                    self.metrics.serve_stream_rejected_bad_binding();
                     reset_stream(&mut send, &mut recv, APP_ERR_MALFORMED_MESSAGE);
                     return Ok(ServeEnd::Reset(ResetCause::BadBinding));
                 }
@@ -357,7 +365,6 @@ impl ClientHandler {
                             "client binding signature invalid"
                         );
                     }
-                    self.metrics.serve_stream_rejected_bad_binding();
                     reset_stream(&mut send, &mut recv, APP_ERR_MALFORMED_MESSAGE);
                     return Ok(ServeEnd::Reset(ResetCause::BadBinding));
                 }

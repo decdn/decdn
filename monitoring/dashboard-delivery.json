@@ -406,7 +406,7 @@
       },
       "title": "Serve refusals by reason",
       "type": "timeseries",
-      "description": "All of these collapse to one NotFound wire code on the client side. insufficient deposit is fed by three separate guards (the pre-spend miss floor, the window tier's ceiling and the direct-serve ceiling) and cannot attribute a spike to one \u2014 the node's throttled warn! line does. Sustained insufficient deposit means either clients running dry, or this node's chain watcher lagging an on-chain top-up and turning funded clients away.",
+      "description": "Most signed refusals here collapse to one NotFound wire code on the client side; insufficient deposit, evicted since probe, internal error and the three takedown refusals (hash denied, chain hash denied, origin denied) keep their own codes. stream cap full and bad binding are resets with no signed response (RATE_LIMITED and MALFORMED_MESSAGE). insufficient deposit is fed by three separate guards (the pre-spend miss floor, the window tier's ceiling and the direct-serve ceiling) and cannot attribute a spike to one — the node's throttled warn! line does. Sustained insufficient deposit means either clients running dry, or this node's chain watcher lagging an on-chain top-up and turning funded clients away.",
       "targets": [
         {
           "datasource": {
@@ -569,6 +569,15 @@
           "expr": "sum(rate(decdn_serve_stream_rejected_bad_binding_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "R",
           "legendFormat": "bad binding"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_serve_stream_rejected_stream_cap_full_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "S",
+          "legendFormat": "stream cap full"
         }
       ],
       "fieldConfig": {
@@ -653,7 +662,7 @@
       },
       "title": "Stream outcomes by direction",
       "type": "timeseries",
-      "description": "Every ended paid stream counts once as completed or failed. inbound is this node serving; outbound is a stream this node opened to an upstream candidate, or one assembled range on the streaming miss path. failed includes routine outcomes \u2014 a cache-miss refusal, a client that closes early, and the free header handshake a downstream node opens and closes \u2014 so read the refusal and pull-outcome panels for health. Mid-stream stops name the cause: the pool or the signer cap can no longer fund the stream, or the payer sent its whole per-chunk proof budget for one chunk and none of the proofs settled it.",
+      "description": "Every ended paid stream counts once as completed or failed. inbound is this node serving; outbound is a stream this node opened to an upstream candidate, or one assembled range on the streaming miss path. failed includes routine outcomes, so read the reason series: client declined before paying is a requester that read the quote and left, which includes the header handshake a downstream miss pull opens and does not adopt; client left mid-stream is a paying requester that gave up. request unreadable is a first request the node could not read: a timeout, a peer reset, or a frame that does not decode. Refusals are on the Serve refusals by reason panel, and the Unattributed stream failures panel shows the inbound failures no reason claims. Mid-stream stops name the cause: the pool or the signer cap can no longer fund the stream, the node rejected a voucher, or the payer sent its whole per-chunk proof budget for one chunk and none of the proofs settled it.",
       "targets": [
         {
           "datasource": {
@@ -699,6 +708,42 @@
           "expr": "sum(rate(decdn_serve_stream_proof_budget_exhausted_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "E",
           "legendFormat": "stopped mid-stream: proof budget exhausted"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_serve_stream_voucher_rejected_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "F",
+          "legendFormat": "stopped mid-stream: voucher rejected"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_serve_stream_client_abandoned_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "G",
+          "legendFormat": "client left mid-stream"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_serve_stream_client_declined_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "H",
+          "legendFormat": "client declined before paying"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_serve_stream_request_unreadable_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "I",
+          "legendFormat": "request unreadable"
         }
       ],
       "fieldConfig": {
@@ -3187,14 +3232,14 @@
       },
       "title": "Unattributed stream failures",
       "type": "timeseries",
-      "description": "Seller-leg stream failures that no reason counter claims: rate(decdn_streams_failed_total{direction=\"inbound\"}) minus the 23 siblings that each end exactly one inbound stream \u2014 every serve_stream_rejected_* reason, the two midstream exhaustion stops, the node fault, the spent proof budget and the takedown termination. decdn_serve_economics_refused_total is deliberately NOT subtracted: it is a buyer-leg gate that declines to buy from a candidate upstream, and ends no inbound stream. A standing positive floor is expected and healthy \u2014 a client that closes early, a peer-attributable stream error, and the free header handshake a downstream node's miss pull opens and closes after the response all count as failures by design and have no reason counter. Read the SHAPE, not the level: a step change means a failure mode arrived that no counter names, and the refusal breakdown will not show it. Goes negative only if a reason counter fires without ending a stream.",
+      "description": "Seller-leg stream failures that no reason counter claims: rate(decdn_streams_failed_total{direction=\"inbound\"}) minus the 28 siblings that each end exactly one inbound stream — every serve_stream_rejected_* reason (the stream-cap reset included), the unreadable request, the two midstream exhaustion stops, the takedown termination, the rejected voucher, the spent proof budget, the declined quote (a requester that leaves before any voucher credits a byte, which includes the header handshake a downstream miss pull does not adopt), the mid-stream client abandon, and the node fault. decdn_serve_economics_refused_total is deliberately NOT subtracted: it is a buyer-leg gate that declines to buy from a candidate upstream, and ends no inbound stream. Expected 0. Any positive rate is a failure no reason claims, which is a bug: file it. The node crate's INBOUND_FAILURE_REASONS list and a test hold this expression to the code.",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(rate(decdn_streams_failed_total{direction=\"inbound\",deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_bad_binding_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_cache_miss_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_chain_hash_denied_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_chain_stale_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_evicted_since_probe_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_foreign_declined_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_hash_denied_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_insufficient_deposit_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_internal_error_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_load_shed_hit_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_load_shed_miss_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_origin_denied_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_owner_mismatch_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_pool_unconfirmed_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_range_not_satisfiable_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_signer_cap_exhausted_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_signer_floor_at_cap_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_unknown_lane_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_midstream_pool_exhausted_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_midstream_signer_cap_exhausted_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_node_fault_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_proof_budget_exhausted_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_terminated_takedown_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum(rate(decdn_streams_failed_total{direction=\"inbound\",deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_bad_binding_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_cache_miss_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_chain_hash_denied_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_chain_stale_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_evicted_since_probe_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_foreign_declined_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_hash_denied_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_insufficient_deposit_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_internal_error_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_load_shed_hit_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_load_shed_miss_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_origin_denied_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_owner_mismatch_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_pool_unconfirmed_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_range_not_satisfiable_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_signer_cap_exhausted_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_signer_floor_at_cap_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_stream_cap_full_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_rejected_unknown_lane_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_request_unreadable_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_midstream_pool_exhausted_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_midstream_signer_cap_exhausted_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_terminated_takedown_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_voucher_rejected_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_proof_budget_exhausted_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_client_declined_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_client_abandoned_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n  - sum(rate(decdn_serve_stream_node_fault_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "A",
           "legendFormat": "no reason counter"
         }

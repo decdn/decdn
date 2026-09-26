@@ -825,6 +825,36 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Every failed inbound stream now has a reason counter (#2073).** About 91 %
+  of `decdn_streams_failed_total{direction="inbound"}` had none, so the
+  "Unattributed stream failures" panel showed a baseline no operator could
+  read. Five new counters close the gap:
+  `decdn_serve_stream_rejected_stream_cap_full_total`,
+  `decdn_serve_stream_request_unreadable_total`,
+  `decdn_serve_stream_voucher_rejected_total`,
+  `decdn_serve_stream_client_declined_total` (the requester left before a
+  voucher credited a byte, which includes the header handshake a downstream
+  miss pull does not adopt) and `decdn_serve_stream_client_abandoned_total`
+  (the requester left after paying). The serve handler now counts every end in
+  one place, so each inbound failure counts on exactly one reason and the panel
+  reads 0; any positive rate is a bug.
+  - A refusal whose signing fails counts only as a node fault; it used to count
+    as the refusal reason too.
+  - A refusal, a voucher reject, or a mid-stream pool or signer-cap stop whose
+    frame the peer never reads (it already left) keeps its own reason instead of
+    counting as the peer leaving.
+  - A write to a stream the node already closed is a node fault on every write
+    path; the framed writes used to file it as the peer's fault.
+  - A panicked stream counts its node fault before its failure.
+  - The `serve_stream` span records `outcome = "stopped"`,
+    `reason = "proof_budget_exhausted"` for a spent proof budget and
+    `outcome = "reset"`, `reason = "request_unreadable"` for an unreadable
+    request, where both used to record `outcome = "failed"`. Both keep the cause
+    in the span's `error` field, as does a refusal or stop whose write failed.
+  - Both Unattributed panels subtract the node crate's `INBOUND_FAILURE_REASONS`
+    list, and tests hold the panels, the list, and every exported
+    `decdn_serve_stream_*` counter to one another.
+
 - **A transient `eth_getLogs` failure no longer takes every chain watcher down
   (#2161).** The shared chain-event poller retries a failed window on the same
   block range up to two times, 2 s apart, before it fails the tick. A retry

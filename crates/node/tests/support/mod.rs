@@ -701,6 +701,52 @@ pub(crate) fn build_handler_full_configured(
     Ok(Arc::new(ClientHandler::new(deps)?))
 }
 
+/// The value of the sample line `name` (a bare name or one with labels) in the
+/// node's metrics, or `0` when the line is absent.
+fn sample_value(encoded: &str, name: &str) -> u64 {
+    encoded
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(name)?
+                .strip_prefix(' ')?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .unwrap_or(0)
+}
+
+/// Wait until the node has recorded `failed` inbound stream failures and the
+/// reason counters in [`INBOUND_FAILURE_REASONS`] claim each of them exactly
+/// once. The serve task records a stream's end after the client sees it, so both
+/// counts are polled up to a deadline.
+///
+/// [`INBOUND_FAILURE_REASONS`]: decdn_node::metrics::INBOUND_FAILURE_REASONS
+pub(crate) async fn assert_inbound_failures_attributed(
+    metrics: &Metrics,
+    failed: u64,
+) -> anyhow::Result<()> {
+    const FAILED: &str = "decdn_streams_failed_total{direction=\"inbound\"}";
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let encoded = metrics.encode()?;
+        let recorded = sample_value(&encoded, FAILED);
+        let claimed: u64 = decdn_node::metrics::INBOUND_FAILURE_REASONS
+            .iter()
+            .map(|name| sample_value(&encoded, name))
+            .sum();
+        if recorded == failed && claimed == failed {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "expected {failed} inbound failed streams each claimed once; got {recorded} \
+             failed and {claimed} claimed:\n{encoded}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Read one length-framed [`ClientMessage`] from `recv`. Mirrors the requester's
 /// private `decdn_client::read_client_message`, exposed for the raw fake
 /// clients/servers the `cdn/client/v1` integration binaries hand-roll.

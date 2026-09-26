@@ -51,6 +51,43 @@ const FIRST_BYTE_BUCKETS: [f64; 15] = [
 /// tasks.
 const MAX_METRICS_CONNECTIONS: usize = 32;
 
+/// Every counter that names why an inbound `cdn/client/v1` stream failed. Each
+/// failed inbound stream counts on exactly one of them, so
+/// `decdn_streams_failed_total{direction="inbound"}` minus their sum is zero. The
+/// "Unattributed stream failures" dashboard panels subtract exactly this list, and
+/// a test holds them to it. The serve handler counts every end in one place, so a
+/// scrape never sees a failure before its reason.
+pub const INBOUND_FAILURE_REASONS: &[&str] = &[
+    "decdn_serve_stream_rejected_bad_binding_total",
+    "decdn_serve_stream_rejected_cache_miss_total",
+    "decdn_serve_stream_rejected_chain_hash_denied_total",
+    "decdn_serve_stream_rejected_chain_stale_total",
+    "decdn_serve_stream_rejected_evicted_since_probe_total",
+    "decdn_serve_stream_rejected_foreign_declined_total",
+    "decdn_serve_stream_rejected_hash_denied_total",
+    "decdn_serve_stream_rejected_insufficient_deposit_total",
+    "decdn_serve_stream_rejected_internal_error_total",
+    "decdn_serve_stream_rejected_load_shed_hit_total",
+    "decdn_serve_stream_rejected_load_shed_miss_total",
+    "decdn_serve_stream_rejected_origin_denied_total",
+    "decdn_serve_stream_rejected_owner_mismatch_total",
+    "decdn_serve_stream_rejected_pool_unconfirmed_total",
+    "decdn_serve_stream_rejected_range_not_satisfiable_total",
+    "decdn_serve_stream_rejected_signer_cap_exhausted_total",
+    "decdn_serve_stream_rejected_signer_floor_at_cap_total",
+    "decdn_serve_stream_rejected_stream_cap_full_total",
+    "decdn_serve_stream_rejected_unknown_lane_total",
+    "decdn_serve_stream_request_unreadable_total",
+    "decdn_serve_stream_midstream_pool_exhausted_total",
+    "decdn_serve_stream_midstream_signer_cap_exhausted_total",
+    "decdn_serve_stream_terminated_takedown_total",
+    "decdn_serve_stream_voucher_rejected_total",
+    "decdn_serve_stream_proof_budget_exhausted_total",
+    "decdn_serve_stream_client_declined_total",
+    "decdn_serve_stream_client_abandoned_total",
+    "decdn_serve_stream_node_fault_total",
+];
+
 #[derive(
     Debug,
     Clone,
@@ -1267,8 +1304,12 @@ pub struct DecdnMetrics {
     /// aborted the upstream pull and abandoned the partial fill. The per-request
     /// loss is bounded to the ramped credit window; a sustained rate flags a leech.
     /// A node-side fault on the serve leg is not an abandon: it counts on
-    /// `decdn_serve_stream_node_fault_total` only. A spent per-chunk proof budget
-    /// counts here and on `decdn_serve_stream_proof_budget_exhausted_total`.
+    /// `decdn_serve_stream_node_fault_total` only. Every abandon here also ends the
+    /// inbound stream on one serve reason counter: a spent per-chunk proof budget
+    /// on `decdn_serve_stream_proof_budget_exhausted_total`, a rejected voucher on
+    /// `decdn_serve_stream_voucher_rejected_total`, and a client that drops on
+    /// `decdn_serve_stream_client_declined_total` before it pays or
+    /// `decdn_serve_stream_client_abandoned_total` after.
     pub node_pull_through_client_abandoned: Counter,
     /// `decdn_node_pull_through_upstream_verify_failed_total` (#856/#915): a
     /// serve-miss pull ingested upstream bytes that failed bao verification against
@@ -1578,17 +1619,54 @@ pub struct DecdnMetrics {
     pub serve_stream_node_fault: Counter,
     /// `decdn_serve_stream_proof_budget_exhausted_total`: a `cdn/client/v1`
     /// delivery ended because the payer sent `MAX_PROOFS_PER_CHUNK` proofs for one
-    /// chunk and none of them settled it. Bumped on both the cache-hit and the
+    /// chunk and none of them settled it. Counted for both the cache-hit and the
     /// miss serve loop; on the miss loop the same exit also counts on
     /// `decdn_node_pull_through_client_abandoned_total`.
     ///
     /// Each such proof credits part of the chunk or nothing, so a payer that
     /// answers one chunk with zero-credit vouchers or partial payments ends here.
     /// This budget is what stops such a payer from holding a stream open (#2132).
-    /// It is a client payment fault, not a node fault, so dispatch logs it only
-    /// at `debug!`; this counter is what makes the rate visible at the default log
-    /// level. Each bump ends exactly one inbound stream as failed.
+    /// It is the payer's fault, not a node fault, so the serve loop logs it only
+    /// at `debug!` and ends the stream as a stop; this counter is what makes the
+    /// rate visible at the default log level. Each bump ends exactly one inbound
+    /// stream as failed.
     pub serve_stream_proof_budget_exhausted: Counter,
+    /// `decdn_serve_stream_rejected_stream_cap_full_total`: `cdn/client/v1`
+    /// streams reset with `RATE_LIMITED` because the connection already had
+    /// `max_concurrent_streams` streams in flight. No signed response is sent.
+    /// A client that opens more concurrent streams than the cap drives it.
+    pub serve_stream_rejected_stream_cap_full: Counter,
+    /// `decdn_serve_stream_request_unreadable_total`: `cdn/client/v1` streams
+    /// reset because the node could not read the first request: the read timed
+    /// out, the peer reset the stream or dropped the connection, or the frame or
+    /// its extensions failed to decode. Peer-side, logged at `debug!`.
+    pub serve_stream_request_unreadable: Counter,
+    /// `decdn_serve_stream_voucher_rejected_total`: paying `cdn/client/v1`
+    /// streams the node stopped because it rejected a voucher or a chunk
+    /// preimage: for example a wrong pool or signer, a bad signature, an
+    /// underpayment, a regression, an expired capability, or a voucher that fails
+    /// the rate check. Counted for both the cache-hit and the miss serve loop; on
+    /// the miss loop the same exit also counts on
+    /// `decdn_node_pull_through_client_abandoned_total`. A rejection counts here
+    /// even when the peer leaves before it reads the reject frame.
+    pub serve_stream_voucher_rejected: Counter,
+    /// `decdn_serve_stream_client_declined_total`: `cdn/client/v1` streams the
+    /// requester left before any voucher credited a byte. The routine shapes are a
+    /// requester that reads the signed `StreamResponse` and does not take the
+    /// quote, and the header handshake a downstream node's miss pull opens and
+    /// closes without adopting. A peer that sends a malformed proof before paying
+    /// counts here too. The reference requester closes every stream with code `0`,
+    /// and the node does not read the code, so it sees only that the peer left,
+    /// not why. Peer-side, logged at `debug!`.
+    pub serve_stream_client_declined: Counter,
+    /// `decdn_serve_stream_client_abandoned_total`: paying `cdn/client/v1`
+    /// streams the requester left or broke the protocol on after at least one
+    /// voucher credited bytes: it stopped reading, reset the stream, dropped the
+    /// connection, stopped sending proofs, or sent a malformed proof. A fully paid
+    /// stream whose `StreamEnd` write fails counts here too. Peer-side, logged at `debug!`. A sustained rise against
+    /// `decdn_streams_completed_total{direction="inbound"}` flags clients that
+    /// give up mid-delivery.
+    pub serve_stream_client_abandoned: Counter,
     /// `decdn_load_shed_egress_bps`: current measured egress EWMA, bytes/sec.
     pub load_shed_egress_bps: Gauge,
     /// `decdn_load_shed_pressure_active`: 1 while the load-shed policy considers
@@ -1788,11 +1866,14 @@ pub struct DecdnMetrics {
     /// `decdn_streams_failed_total{direction}`: paid streams that ended without
     /// delivering the whole request — refused, stopped mid-stream, reset,
     /// panicked, or ended on an error. Routine outcomes count here too: a cache
-    /// miss refusal, a client that closes early, and a header-handshake pull a
-    /// downstream node's miss pull closes without adopting: the whole-blob open
-    /// it makes when it has no size hint, or a first-leg pull its pull leg does
-    /// not adopt. So read
-    /// the reason siblings, not a raw ratio, for health. See `streams_completed`.
+    /// miss refusal, a requester that declines the quote — including the header
+    /// handshake a downstream node's miss pull opens and does not adopt — and a
+    /// client that leaves mid-stream. So read the reason siblings, not a raw
+    /// ratio, for health. See `streams_completed`.
+    ///
+    /// Every `inbound` failure counts on exactly one sibling in
+    /// [`INBOUND_FAILURE_REASONS`], so `inbound` minus their sum is zero. A
+    /// positive residual is a failure no reason claims, which is a bug.
     streams_failed: Family<StreamLabels, Counter>,
     /// `decdn_bytes_served_total`: payload bytes this node wrote to clients and
     /// downstream nodes on `cdn/client/v1`, counted per frame as it is written.
@@ -2790,8 +2871,28 @@ recorders! {
     serve_stream_node_fault => serve_stream_node_fault.inc();
 
     /// Record a `cdn/client/v1` delivery that ended because the payer spent its
-    /// per-chunk proof budget without settling the chunk. Client payment fault.
+    /// per-chunk proof budget without settling the chunk. The payer's fault, not a
+    /// node fault.
     serve_stream_proof_budget_exhausted => serve_stream_proof_budget_exhausted.inc();
+
+    /// Record a `cdn/client/v1` stream reset because the connection's stream cap
+    /// was full.
+    serve_stream_rejected_stream_cap_full => serve_stream_rejected_stream_cap_full.inc();
+
+    /// Record a `cdn/client/v1` stream reset because its first request could not
+    /// be read. Peer-side.
+    serve_stream_request_unreadable => serve_stream_request_unreadable.inc();
+
+    /// Record a paying `cdn/client/v1` stream stopped on a rejected voucher.
+    serve_stream_voucher_rejected => serve_stream_voucher_rejected.inc();
+
+    /// Record a `cdn/client/v1` stream the requester left before any voucher
+    /// credited a byte. Peer-side.
+    serve_stream_client_declined => serve_stream_client_declined.inc();
+
+    /// Record a paying `cdn/client/v1` stream the requester left after a voucher
+    /// credited bytes. Peer-side.
+    serve_stream_client_abandoned => serve_stream_client_abandoned.inc();
 
     /// Record the current measured egress EWMA, bytes/sec.
     load_shed_egress_bps(bps: i64) => load_shed_egress_bps.set(bps);
@@ -4522,6 +4623,110 @@ mod tests {
             assert!(
                 has_metric_line(&text, name, 0),
                 "{name} should export at zero on a fresh registry:\n{text}"
+            );
+        }
+    }
+
+    /// Every inbound failure reason exports at zero, so the residual the
+    /// dashboards plot is never computed against an absent series.
+    #[test]
+    fn inbound_failure_reasons_export_at_zero() {
+        let text = Metrics::new().encode().unwrap();
+        for name in INBOUND_FAILURE_REASONS {
+            assert!(
+                has_metric_line(&text, name, 0),
+                "{name} should export at zero on a fresh registry:\n{text}"
+            );
+        }
+    }
+
+    /// Every exported `decdn_serve_stream_*_total` counter is an inbound failure
+    /// reason. A new serve-stream counter lands in [`INBOUND_FAILURE_REASONS`], and
+    /// through it on the dashboards, or this test names it.
+    #[test]
+    fn every_serve_stream_counter_is_an_inbound_failure_reason() {
+        let exported = exported_series(&Metrics::new().encode().unwrap());
+        let missing: Vec<&String> = exported
+            .iter()
+            .filter(|n| n.starts_with("decdn_serve_stream_") && n.ends_with("_total"))
+            .filter(|n| !INBOUND_FAILURE_REASONS.contains(&n.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "serve-stream counters missing from INBOUND_FAILURE_REASONS: {missing:?}"
+        );
+    }
+
+    /// Both "Unattributed stream failures" panels subtract exactly
+    /// [`INBOUND_FAILURE_REASONS`] from the inbound failed count, so a reason
+    /// added to that list cannot be missed on the dashboard, and the reverse.
+    #[test]
+    fn unattributed_panels_subtract_every_inbound_failure_reason() {
+        fn find_exprs(panel: &serde_json::Value, out: &mut Vec<String>) {
+            if panel.get("title").and_then(serde_json::Value::as_str)
+                == Some("Unattributed stream failures")
+            {
+                for target in panel
+                    .get("targets")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(expr) = target.get("expr").and_then(serde_json::Value::as_str) {
+                        out.push(expr.to_owned());
+                    }
+                }
+            }
+            for child in panel
+                .get("panels")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                find_exprs(child, out);
+            }
+        }
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut want: std::collections::BTreeSet<String> = INBOUND_FAILURE_REASONS
+            .iter()
+            .map(|n| (*n).to_owned())
+            .collect();
+        want.insert("decdn_streams_failed_total".to_owned());
+        for file in [
+            "monitoring/grafana-dashboard.json",
+            "monitoring/dashboard-delivery.json",
+        ] {
+            let dashboard: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(root.join(file)).unwrap()).unwrap();
+            let mut exprs = Vec::new();
+            for panel in dashboard
+                .get("panels")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                find_exprs(panel, &mut exprs);
+            }
+            assert_eq!(
+                exprs.len(),
+                1,
+                "{file}: expected one Unattributed panel target"
+            );
+            let expr = exprs.first().unwrap();
+            assert!(
+                expr.starts_with("sum(rate(decdn_streams_failed_total{direction=\"inbound\","),
+                "{file}: the residual must start from the inbound failed count"
+            );
+            assert_eq!(
+                decdn_names_in(expr),
+                want,
+                "{file}: the Unattributed panel must subtract exactly INBOUND_FAILURE_REASONS"
+            );
+            assert_eq!(
+                expr.matches("\n  - sum(rate(").count(),
+                INBOUND_FAILURE_REASONS.len(),
+                "{file}: each reason is subtracted once"
             );
         }
     }

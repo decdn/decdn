@@ -5246,7 +5246,12 @@ async fn spawn_handler_server_with_draining_pool(
     low: U256,
     drained: Arc<std::sync::atomic::AtomicBool>,
     recheck_interval: Duration,
-) -> anyhow::Result<(EndpointAddr, Endpoint, tokio::task::JoinHandle<()>)> {
+) -> anyhow::Result<(
+    EndpointAddr,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<Metrics>,
+)> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = operator_signer();
@@ -5274,7 +5279,7 @@ async fn spawn_handler_server_with_draining_pool(
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    Ok((target, server_ep, server_task))
+    Ok((target, server_ep, server_task, metrics))
 }
 
 /// Mid-stream `PoolExhausted`: a live stream stops IN-BAND at a voucher boundary
@@ -5325,7 +5330,7 @@ async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()>
     // so once A's floor is the pool's only committed credit
     // `remaining − M < HARNESS_FLOOR_COST` and B's re-check trips. M = 0 here.
     let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (target, server_ep, server_task) = spawn_handler_server_with_draining_pool(
+    let (target, server_ep, server_task, metrics) = spawn_handler_server_with_draining_pool(
         cache,
         store_dyn,
         U256::from(10_000u64),
@@ -5397,8 +5402,22 @@ async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()>
             .is_err(),
         "after PoolExhausted the server finishes the stream; no further frame is sent"
     );
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
+    anyhow::ensure!(
+        counter(
+            &metrics,
+            "decdn_serve_stream_midstream_pool_exhausted_total"
+        )? == 1,
+        "the mid-stream stop must be counted"
+    );
 
+    // Closing the connection ends the parked holder A unpaid: a decline.
     conn.close(0u32.into(), b"done");
+    support::assert_inbound_failures_attributed(&metrics, 2).await?;
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_client_declined_total")? == 1,
+        "the parked holder ends unpaid"
+    );
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
@@ -5452,7 +5471,7 @@ async fn setup_recheck_holder_and_driven(
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
 
     let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (target, server_ep, server_task) = spawn_handler_server_with_draining_pool(
+    let (target, server_ep, server_task, _metrics) = spawn_handler_server_with_draining_pool(
         cache,
         store_dyn,
         U256::from(10_000u64),
@@ -6435,6 +6454,7 @@ async fn denylisted_hash_is_refused_even_when_held() -> anyhow::Result<()> {
         err.to_string().contains("HashBlacklisted") || err.to_string().contains("refused"),
         "error should surface HashBlacklisted: {err}"
     );
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
@@ -6587,6 +6607,9 @@ async fn takedown_mid_stream_terminates_the_delivery() -> anyhow::Result<()> {
         .await?
         .err()
         .ok_or_else(|| anyhow::anyhow!("delivery must not complete through a takedown"))?;
+    // The dispatch sink counts the stop once the serve task returns, which can
+    // trail the client seeing the reset.
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
@@ -7145,6 +7168,9 @@ async fn blacklisting_the_funder_mid_stream_cuts_off_a_delegated_delivery() -> a
              re-check has been re-keyed onto the voucher signer"
         )
     })?;
+    // The dispatch sink counts the stop once the serve task returns, which can
+    // trail the client seeing the reset.
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
@@ -10275,8 +10301,151 @@ async fn bad_signature_after_an_accepted_voucher_is_rejected() -> anyhow::Result
         lane.last_bytes_delivered()
     );
 
+    // The stop counts once, as a rejected voucher.
+    support::assert_inbound_failures_attributed(&fx.metrics, 1).await?;
+    anyhow::ensure!(
+        counter(&fx.metrics, "decdn_serve_stream_voucher_rejected_total")? == 1,
+        "a rejected voucher must be counted"
+    );
+
     fx.conn.close(0u32.into(), b"done");
     shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
+    Ok(())
+}
+
+/// A voucher that raises the amount but adds no bytes fails the rate check
+/// (`ZeroBytes`): a client payment fault, which ends the stream and counts once
+/// as a rejected voucher even though a voucher already paid (#2073).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_zero_byte_voucher_after_paying_counts_as_rejected() -> anyhow::Result<()> {
+    let mut fx = drive_to_second_interval_awaiting_voucher().await?;
+
+    // Interval 1 is paid. Re-sign its byte count at a higher amount.
+    let amount = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB) + U256::from(1u64);
+    send_signed_voucher(&mut fx.send, &fx.signer, HARNESS_INTERVAL_BYTES, amount).await?;
+
+    // A rate-check bail drops the stream with no in-band reject frame, which is
+    // what tells it apart from a `VoucherRejected` stop.
+    match tokio::time::timeout(Duration::from_secs(10), read_client_msg(&mut fx.recv)).await {
+        Err(_elapsed) => anyhow::bail!("the node kept the stream open after a zero-byte voucher"),
+        Ok(Ok(other)) => anyhow::bail!("expected the stream to drop, got {other:?}"),
+        Ok(Err(_)) => {}
+    }
+    support::assert_inbound_failures_attributed(&fx.metrics, 1).await?;
+    anyhow::ensure!(
+        counter(&fx.metrics, "decdn_serve_stream_voucher_rejected_total")? == 1,
+        "a rate-check bail is a rejected voucher"
+    );
+    anyhow::ensure!(
+        counter(&fx.metrics, "decdn_serve_stream_client_abandoned_total")? == 0,
+        "a rate-check bail after payment is not an abandon"
+    );
+
+    fx.conn.close(0u32.into(), b"done");
+    shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
+    Ok(())
+}
+
+/// A client that leaves after a voucher credited bytes counts as an abandon,
+/// not a decline and not a node fault (#2073).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_leaves_after_paying_counts_as_abandoned() -> anyhow::Result<()> {
+    let fx = drive_to_second_interval_awaiting_voucher().await?;
+
+    // Interval 1 is paid; interval 2 is on the wire. The client walks away.
+    fx.conn.close(0u32.into(), b"client-abandoned");
+
+    support::assert_inbound_failures_attributed(&fx.metrics, 1).await?;
+    anyhow::ensure!(
+        counter(&fx.metrics, "decdn_serve_stream_client_abandoned_total")? == 1,
+        "a client that leaves after paying must count as abandoned"
+    );
+    anyhow::ensure!(
+        counter(&fx.metrics, "decdn_serve_stream_client_declined_total")? == 0,
+        "a client that paid did not decline"
+    );
+
+    shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
+    Ok(())
+}
+
+/// A requester that reads the signed `StreamResponse` and the opening credit,
+/// then leaves without paying, counts as a decline (#2073). This is the shape of
+/// the header handshake a downstream miss pull opens and does not adopt.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_requester_that_leaves_before_paying_counts_as_declined() -> anyhow::Result<()> {
+    let payload = vec![0x3Du8; 4 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_pipelined_server_with_metrics(cache, store, 64 * 1024 * 1024, 2).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+    let (_send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+
+    // The quote and the free opening interval are in hand; the requester leaves.
+    conn.close(0u32.into(), b"upstream-pull-dropped");
+
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_client_declined_total")? == 1,
+        "a requester that leaves before paying must count as declined"
+    );
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_node_fault_total")? == 0,
+        "a requester that leaves is not a node fault"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// A first frame that does not decode as a request resets the stream, and the
+/// reset counts once as an unreadable request (#2073).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_request_is_reset_and_counted() -> anyhow::Result<()> {
+    let payload = vec![0x3Eu8; 64 * 1024];
+    let (cache, _hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, _signer, _deposit) = seeded_store()?;
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_pipelined_server_with_metrics(cache, store, 64 * 1024 * 1024, 2).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    write_frame(&mut send, &[0xFF; 16])
+        .await
+        .map_err(|e| anyhow::anyhow!("write garbage frame: {e}"))?;
+    anyhow::ensure!(
+        read_frame(&mut recv).await.is_err(),
+        "the node must not answer an undecodable request"
+    );
+
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_request_unreadable_total")? == 1,
+        "an undecodable request must be counted"
+    );
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_node_fault_total")? == 0,
+        "an undecodable request is the peer's fault"
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -10530,6 +10699,7 @@ async fn sliver_vouchers_exhaust_the_per_chunk_proof_budget() -> anyhow::Result<
         )? == 1,
         "a spent proof budget must be counted"
     );
+    support::assert_inbound_failures_attributed(&fx.metrics, 1).await?;
 
     fx.conn.close(0u32.into(), b"done");
     shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
@@ -10642,8 +10812,22 @@ async fn over_cap_stream_is_reset_without_signing_a_response() -> anyhow::Result
         .await
         .map_err(|e| anyhow::anyhow!("write second request: {e}"))?;
     assert_stream_reset(&mut recv2, decdn_protocol::APP_ERR_RATE_LIMITED).await?;
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
+    anyhow::ensure!(
+        counter(
+            &metrics,
+            "decdn_serve_stream_rejected_stream_cap_full_total"
+        )? == 1,
+        "an over-cap stream must be counted"
+    );
 
+    // Closing the connection ends the parked stream unpaid: a decline.
     conn.close(0u32.into(), b"done");
+    support::assert_inbound_failures_attributed(&metrics, 2).await?;
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_client_declined_total")? == 1,
+        "the parked stream ends unpaid"
+    );
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
