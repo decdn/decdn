@@ -825,6 +825,18 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **An under-folding voucher no longer stalls the stream for 10 s (#2167).**
+  A lane can hold a live hash chain from an earlier payer process. When a new
+  process sent a voucher above the signed anchor but short of that chain's
+  claim, the node credited it 0 bytes. It then waited for a proof that never
+  came, until the 10 s voucher read timeout. The client failed over to another
+  provider, so every small bundle entry routed to that node took about 11 s.
+  The node now rejects the voucher `AmountRegression` with the resume bundle.
+  The client folds the proved frontier, reseeds, and resumes on the same
+  provider (ADR 003 §Chain length and rollover). The wire format does not
+  change. `decdn_serve_stream_client_declined_total` stops rising for this
+  case.
+
 - **Every failed inbound stream now has a reason counter (#2073).** About 91 %
   of `decdn_streams_failed_total{direction="inbound"}` had none, so the
   "Unattributed stream failures" panel showed a baseline no operator could

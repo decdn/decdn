@@ -762,12 +762,18 @@ impl ClientHandler {
                 })
             }
             Err(PoolError::AmountRegression { last, .. }) => {
-                // A voucher at-or-below the lane watermark: a concurrent same-lane
-                // sibling already settled this cumulative. Benign — treat as
-                // ALREADY-SATISFIED: do not advance the watermark, do not reject.
+                // A voucher at-or-below the lane's SIGNED watermark: a concurrent
+                // same-lane sibling already settled this cumulative. Benign — treat
+                // as ALREADY-SATISFIED: do not advance the watermark, do not reject.
                 // The one exception is a DIVERGENT voucher at the SAME amount
                 // claiming MORE bytes — same money, more bytes — which is a
                 // single-signer fault (#1699 rule 4).
+                //
+                // A voucher ABOVE the signed watermark that still falls short of the
+                // live chain's claim is not this arm: it is `UnderFold`, which the
+                // catch-all below rejects with the bundle stating the fold owed.
+                // Crediting it zero here would leave the node waiting on a proof
+                // the payer never sends.
                 let amount = U256::from(wire.amount);
                 if amount == last && new_bytes > state.last_bytes_delivered() {
                     return Err(VerifyStop::Reject(
@@ -1319,6 +1325,113 @@ mod tests {
             ),
             super::VerifyStop::Bail(e) => panic!("expected a Reject, got Bail({e})"),
         }
+    }
+
+    /// #2167: a voucher under a different root whose amount sits ABOVE the
+    /// signed watermark but BELOW the live chain's claim under-folds the chain.
+    /// No sibling settled it, so it is not the benign already-satisfied case:
+    /// crediting it zero would leave the node waiting on a proof the payer never
+    /// sends. It is rejected `AmountRegression` with the bundle naming the
+    /// frontier the payer has to fold. A voucher at or below the signed watermark
+    /// on the same lane stays benign.
+    #[test]
+    fn an_under_folding_voucher_is_rejected_with_the_resume_bundle() {
+        use alloy::primitives::B256;
+        use alloy::signers::local::PrivateKeySigner;
+        use decdn_incentive::chain::{CHUNK_BYTES, preimage_at, root_from_seed};
+
+        let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+        let signer_key = PrivateKeySigner::random();
+        let signer = signer_key.address();
+        let pool_id = B256::repeat_byte(0x21);
+        let provider = Address::repeat_byte(0x55);
+
+        let rate_per_mb = 1_000_000u64;
+        let price = decdn_incentive::min_payment(CHUNK_BYTES, rate_per_mb);
+        let anchor_amount = price * U256::from(5u64);
+        let anchor_bytes = 5 * CHUNK_BYTES;
+        // The live chain has proved 9 chunks on top of the signed anchor.
+        let seed_bytes = B256::repeat_byte(0x5E);
+        let verified_index = 9u8;
+        let chain = decdn_incentive::LaneChain {
+            chain_root: root_from_seed(seed_bytes),
+            chunk_price: price,
+            verified_index,
+            tip: preimage_at(seed_bytes, verified_index),
+        };
+        let seed = LaneState::hydrate(
+            pool_id,
+            signer,
+            provider,
+            U256::MAX,
+            0,
+            anchor_amount,
+            U256::from(anchor_bytes),
+            Some([9u8; 65]),
+            chain,
+        );
+        let live_bytes = seed.owed_bytes();
+
+        let sealed = |amount: U256, bytes: u64| {
+            let voucher = decdn_incentive::Voucher {
+                pool_id,
+                signer,
+                provider,
+                amount,
+                bytes_delivered: U256::from(bytes),
+                chain_root: B256::ZERO,
+                chunk_price: U256::ZERO,
+            }
+            .sign(&signer_key, &domain)
+            .expect("sign sealed voucher");
+            let wire = decdn_protocol::client::Voucher {
+                signature: voucher.signature.as_bytes().to_vec(),
+                amount: u64::try_from(amount).expect("amount fits u64 in this test"),
+                bytes_delivered: bytes,
+                chain_root: [0u8; 32],
+                chunk_price: 0,
+            };
+            (voucher, wire)
+        };
+
+        // Folds 2 of the 9 proved chunks: above the anchor, short of the claim.
+        let (voucher, wire) = sealed(
+            anchor_amount + price * U256::from(2u64),
+            anchor_bytes + 2 * CHUNK_BYTES,
+        );
+        let err =
+            super::ClientHandler::verify_voucher(&seed, live_bytes, &voucher, &wire, rate_per_mb)
+                .expect_err("an under-folding voucher must not verify");
+        let super::VerifyStop::Reject(reason, bundle) = err else {
+            panic!("expected a Reject, got a Bail");
+        };
+        assert_eq!(
+            reason,
+            decdn_protocol::client::VoucherRejectReason::AmountRegression
+        );
+        let bundle = bundle.expect("the rejection carries the resume bundle");
+        assert_eq!(
+            U256::from(bundle.amount),
+            anchor_amount,
+            "the bundle echoes the signed anchor"
+        );
+        assert_eq!(
+            bundle.verified_index, verified_index,
+            "the bundle names the frontier the payer has to fold"
+        );
+        assert_eq!(B256::from(bundle.chain_root), chain.chain_root);
+        assert_eq!(B256::from(bundle.tip), chain.tip);
+
+        // At the signed anchor: a sibling already settled it, so it stays benign.
+        let (voucher, wire) = sealed(anchor_amount, anchor_bytes);
+        let verified =
+            super::ClientHandler::verify_voucher(&seed, live_bytes, &voucher, &wire, rate_per_mb)
+                .expect("a voucher at the signed watermark is benign");
+        assert_eq!(
+            verified.next_state, seed,
+            "a benign voucher leaves the lane untouched"
+        );
+        assert_eq!(verified.new_bytes, live_bytes);
     }
 
     /// #1735: signature validity is hoisted OUT of the per-lane lock. A voucher

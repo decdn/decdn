@@ -1207,7 +1207,9 @@ pub enum VoucherRejectReason {
     /// a capability voucher scoped to one node redeemed against another.
     /// `PoolError::WrongProvider`.
     WrongProvider,
-    /// Cumulative amount regressed. `PoolError::AmountRegression`.
+    /// Cumulative amount does not cover what the lane holds: at or below the
+    /// signed watermark (`PoolError::AmountRegression`), or a rollover that
+    /// folds less than the live chain proved (`PoolError::UnderFold`).
     AmountRegression,
     /// Cumulative bytes delivered regressed. `PoolError::BytesRegression`.
     BytesRegression,

@@ -745,9 +745,10 @@ impl LaneState {
     ///
     /// # Errors
     ///
-    /// [`PoolError::AmountRegression`], [`PoolError::BytesRegression`], or
-    /// [`PoolError::CapExceeded`] — the same watermark-dependent taxonomy as
-    /// [`Self::stage_voucher`], minus the signature and pool/provider checks.
+    /// [`PoolError::AmountRegression`], [`PoolError::BytesRegression`],
+    /// [`PoolError::CapExceeded`], or [`PoolError::UnderFold`] — the same
+    /// watermark-dependent taxonomy as [`Self::stage_voucher`], minus the
+    /// signature and pool/provider checks.
     pub fn advance_presigned(
         &self,
         signed: &SignedVoucher,
@@ -815,8 +816,8 @@ impl LaneState {
             if let Some(live) = self.live_claim()
                 && live.value() > signed.voucher.amount
             {
-                return Err(PoolError::AmountRegression {
-                    last: live.value(),
+                return Err(PoolError::UnderFold {
+                    owed: live.value(),
                     got: signed.voucher.amount,
                 });
             }
@@ -942,17 +943,27 @@ pub enum PoolError {
         /// The provider the voucher named.
         got: Address,
     },
-    /// Cumulative amount did not cover what the lane already holds — a stale or
-    /// replayed voucher, or a rollover that folded less than the frontier its
-    /// retiring chain proved. `amount` is the sole ordering key (there is no
-    /// nonce), and `last` is what the amount had to beat: the signed watermark
-    /// on the ordering check, and the lane's full claim (anchor plus proved
-    /// frontier) on the fold check.
+    /// Cumulative amount is at or below the lane's signed watermark — a stale
+    /// or replayed voucher, or one a concurrent same-lane sibling already
+    /// settled. `amount` is the sole ordering key (there is no nonce).
     #[error("voucher amount {got} not greater than last accepted {last}")]
     AmountRegression {
-        /// What the voucher's cumulative amount had to beat.
+        /// The signed watermark the voucher's cumulative amount had to beat.
         last: U256,
         /// The cumulative amount it carried.
+        got: U256,
+    },
+    /// A voucher under a different `chain_root` retires the live epoch but its
+    /// `amount` does not cover the lane's live claim: the signed anchor plus
+    /// the frontier the live chain proved (ADR 003 §Chain length and rollover).
+    /// It is above the signed watermark, so no sibling settled it; the payer
+    /// under-signs chunks the node holds preimages for. The node refuses it and
+    /// sends the resume bundle that states the fold the payer owes.
+    #[error("voucher amount {got} does not fold the live claim {owed}")]
+    UnderFold {
+        /// The lane's live claim: signed anchor plus the proved frontier.
+        owed: U256,
+        /// The cumulative amount the voucher carried.
         got: U256,
     },
     /// Cumulative bytes delivered went down.
@@ -1807,8 +1818,8 @@ mod tests {
         anyhow::ensure!(
             matches!(
                 state_at_9.advance_presigned(&stingy),
-                Err(PoolError::AmountRegression { last, got })
-                    if last == owed_before && got == U256::from(1_000 + 2 * PRICE)
+                Err(PoolError::UnderFold { owed, got })
+                    if owed == owed_before && got == U256::from(1_000 + 2 * PRICE)
             ),
             "an under-folding rollover must be refused, naming the fold it owed"
         );
@@ -1826,8 +1837,8 @@ mod tests {
     /// resume bundle to, so the payer learns the frontier it has to fold.
     #[test]
     fn the_under_fold_refusal_carries_a_resume_bundle() {
-        let reason = crate::client_bridge::voucher_reject_reason(&PoolError::AmountRegression {
-            last: U256::from(1_090u64),
+        let reason = crate::client_bridge::voucher_reject_reason(&PoolError::UnderFold {
+            owed: U256::from(1_090u64),
             got: U256::from(1_020u64),
         });
         assert_eq!(

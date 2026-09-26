@@ -4076,6 +4076,131 @@ async fn client_ahead_of_the_node_rebases_and_resumes() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Under-fold heal (#2167): the node's lane holds a LIVE chain from an earlier
+/// payer process — a signed anchor plus reveals proved on top of it — and a new
+/// process resumes from a persisted watermark ABOVE the signed anchor but SHORT
+/// of the live claim. Its first voucher opens a fresh root, so it retires the
+/// live chain without folding all of it.
+///
+/// The node must reject it with the bundle stating the fold owed; the client
+/// folds, reseeds, and completes. Crediting it zero instead leaves the node
+/// waiting on a proof the client never sends, and the stream only dies at the
+/// 10s `VOUCHER_READ_TIMEOUT`. The 8s budget sits below that backstop, so the
+/// heal must fire on the rejection itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_under_folding_a_live_chain_reseeds_and_resumes() -> anyhow::Result<()> {
+    use decdn_incentive::chain::{CHUNK_BYTES, preimage_at, root_from_seed};
+
+    let payload: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(1_000_000_000u64);
+
+    // The earlier process's lane: an anchor it signed under root `R`, plus five
+    // reveals the node proved on top of it.
+    let price = decdn_incentive::min_payment(CHUNK_BYTES, RATE_PER_MB);
+    let anchor_amount = price * U256::from(3u64);
+    let anchor_bytes = U256::from(3 * CHUNK_BYTES);
+    let chain_seed = B256::repeat_byte(0x5E);
+    let verified_index = 5u8;
+    let chain = decdn_incentive::LaneChain {
+        chain_root: root_from_seed(chain_seed),
+        chunk_price: price,
+        verified_index,
+        tip: preimage_at(chain_seed, verified_index),
+    };
+    let anchor = decdn_incentive::Voucher {
+        pool_id: pool_id(),
+        signer: client_signer.address(),
+        provider: operator_addr(),
+        amount: anchor_amount,
+        bytes_delivered: anchor_bytes,
+        chain_root: chain.chain_root,
+        chunk_price: price,
+    }
+    .sign(&client_signer, &payment_domain())?;
+    let lane = LaneState::hydrate(
+        pool_id(),
+        client_signer.address(),
+        operator_addr(),
+        deposit,
+        0,
+        anchor_amount,
+        anchor_bytes,
+        Some(anchor.signature.as_bytes()),
+        chain,
+    );
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&lane)?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // The new process: one base unit above the signed anchor — past what any
+    // sibling settled, short of the chain the node proved.
+    let mut ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    ctx.prior_amount = anchor_amount + U256::from(1u64);
+    ctx.prior_bytes_delivered = anchor_bytes;
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x5555,
+        Duration::from_secs(8),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "the under-folding client must reseed and recover the full blob, got {} of {} bytes",
+        got.len(),
+        payload.len()
+    );
+    let healed = store
+        .load_all()?
+        .first()
+        .map(LaneState::owed)
+        .ok_or_else(|| anyhow::anyhow!("no persisted lane"))?;
+    anyhow::ensure!(
+        healed > lane.owed(),
+        "the healed stream must pay past the live claim: {} -> {healed}",
+        lane.owed()
+    );
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_client_declined_total")? == 0,
+        "no stream may stall on a proof the client never sends"
+    );
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_voucher_rejected_total")? == 1,
+        "the heal costs exactly one rejected voucher"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// Resume with a NON-EMPTY proof spine (#1060): a ~200 KiB blob spans many 16 KiB
 /// chunk groups, so the offset resume exercises the production
 /// `export_bao_range` ↔ verifying-decoder pair over real proof PARENT
