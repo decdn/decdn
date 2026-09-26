@@ -119,6 +119,7 @@ pub const fn voucher_reject_reason(err: &PoolError) -> Result<VoucherRejectReaso
         PoolError::WrongPool { .. } => Ok(VoucherRejectReason::WrongPool),
         PoolError::WrongProvider { .. } => Ok(VoucherRejectReason::WrongProvider),
         PoolError::AmountRegression { .. } => Ok(VoucherRejectReason::AmountRegression),
+        PoolError::UnderFold { .. } => Ok(VoucherRejectReason::UnderFold),
         PoolError::BytesRegression { .. } => Ok(VoucherRejectReason::BytesRegression),
         PoolError::CapExceeded { .. } => Ok(VoucherRejectReason::SpendingCapExhausted),
         PoolError::BadPreimage { .. } => Ok(VoucherRejectReason::BadPreimage),
@@ -309,6 +310,14 @@ mod tests {
                     got: U256::ZERO,
                 },
                 Ok(VoucherRejectReason::AmountRegression),
+            ),
+            (
+                PoolError::UnderFold {
+                    axis: crate::FoldAxis::Amount,
+                    owed: U256::ZERO,
+                    got: U256::ZERO,
+                },
+                Ok(VoucherRejectReason::UnderFold),
             ),
             (
                 PoolError::BytesRegression {

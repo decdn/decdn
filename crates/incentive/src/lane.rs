@@ -745,9 +745,10 @@ impl LaneState {
     ///
     /// # Errors
     ///
-    /// [`PoolError::AmountRegression`], [`PoolError::BytesRegression`], or
-    /// [`PoolError::CapExceeded`] — the same watermark-dependent taxonomy as
-    /// [`Self::stage_voucher`], minus the signature and pool/provider checks.
+    /// [`PoolError::AmountRegression`], [`PoolError::BytesRegression`],
+    /// [`PoolError::CapExceeded`], or [`PoolError::UnderFold`] — the same
+    /// watermark-dependent taxonomy as [`Self::stage_voucher`], minus the
+    /// signature and pool/provider checks.
     pub fn advance_presigned(
         &self,
         signed: &SignedVoucher,
@@ -765,6 +766,31 @@ impl LaneState {
             "advance_presigned: voucher provider must match the lane's"
         );
         if signed.voucher.amount <= self.last_amount {
+            // At exactly the signed anchor, a voucher that opens another chain
+            // has not been settled by any sibling: a sibling that re-sends the
+            // anchor names the live root. With reveals proved on top of the
+            // anchor, it is a rollover that folds none of them. A payer whose
+            // last reveal reached the node but whose own send failed restarts
+            // here, so it gets the rejection that carries the fold it owes.
+            // With nothing proved, the live claim is the anchor, and the node
+            // may adopt the new root (see `adopt_chain`).
+            //
+            // A sealed voucher opens no chain. At the anchor it is a sibling's
+            // closing voucher, signed before a sibling opened the live chain at
+            // the same amount and delivered after it, so it stays an ordering
+            // regression.
+            if signed.voucher.amount == self.last_amount
+                && !signed.voucher.chain_root.is_zero()
+                && signed.voucher.chain_root != self.chain.chain_root
+                && let Some(live) = self.live_claim()
+                && live.value() > signed.voucher.amount
+            {
+                return Err(PoolError::UnderFold {
+                    axis: FoldAxis::Amount,
+                    owed: live.value(),
+                    got: signed.voucher.amount,
+                });
+            }
             return Err(PoolError::AmountRegression {
                 last: self.last_amount,
                 got: signed.voucher.amount,
@@ -788,18 +814,20 @@ impl LaneState {
         let bytes_delta = signed.voucher.bytes_delivered - self.last_bytes_delivered;
 
         // A voucher carrying a DIFFERENT root retires the live epoch, and the
-        // rule that makes that safe is that its `amount` must FOLD the frontier
-        // the retired chain proved. One that folds less is refused here, before
-        // anything is adopted: it would sign for fewer chunks than the node holds
-        // preimages for, and adopting the new root would discard the difference.
+        // rule that makes that safe is that its `amount` and `bytes_delivered`
+        // must FOLD the frontier the retired chain proved. One that folds less
+        // is refused here, before anything is adopted: it would sign for fewer
+        // chunks than the node holds preimages for, and adopting the new root
+        // would discard the difference.
         //
-        // Refusing rather than salvaging is deliberate. No honest payer can reach
-        // this: issuance is serialized under the payer's own lock, and a voucher
-        // that folds must also roll, so the folded amount covers the frontier by
-        // construction. What is left is a buggy or malicious payer, and for those
-        // the loud answer is the useful one — the reason is watermark-gated, so
-        // the rejection carries the bundle that states the fold the payer owes,
-        // and nothing is accepted, nothing displaced, and the lane's claim is
+        // Refusing rather than salvaging is deliberate. Within one payer process
+        // it cannot happen: issuance is serialized under the payer's own lock,
+        // and a voucher that folds must also roll, so the folded amount covers
+        // the frontier by construction. A payer reaches it by resuming from a
+        // watermark that trails the node's frontier — a restart after a reveal
+        // whose send failed locally but still reached the node. The reason is
+        // watermark-gated, so the rejection carries the bundle that states the
+        // fold owed, the payer folds it and resumes, and the lane's claim is
         // exactly as strong afterwards as before.
         //
         // A voucher that repeats the SAME root is not a rollover at all (a
@@ -812,13 +840,24 @@ impl LaneState {
             // this node's quote, so adopting it keeps the two in step.
             next.chain.chunk_price = signed.voucher.chunk_price;
         } else {
-            if let Some(live) = self.live_claim()
-                && live.value() > signed.voucher.amount
-            {
-                return Err(PoolError::AmountRegression {
-                    last: live.value(),
-                    got: signed.voucher.amount,
-                });
+            // The fold binds both axes (ADR 003 §Rollover): a voucher that pays
+            // the whole claim but signs fewer bytes than the frontier proved
+            // would still retire those chunks from the lane's byte claim.
+            if let Some(live) = self.live_claim() {
+                if live.value() > signed.voucher.amount {
+                    return Err(PoolError::UnderFold {
+                        axis: FoldAxis::Amount,
+                        owed: live.value(),
+                        got: signed.voucher.amount,
+                    });
+                }
+                if live.bytes_value() > signed.voucher.bytes_delivered {
+                    return Err(PoolError::UnderFold {
+                        axis: FoldAxis::Bytes,
+                        owed: live.bytes_value(),
+                        got: signed.voucher.bytes_delivered,
+                    });
+                }
             }
             next.chain = LaneChain::opened(signed.voucher.chain_root, signed.voucher.chunk_price);
         }
@@ -912,12 +951,33 @@ impl PreimageApplied {
     }
 }
 
+/// The axis of a lane claim a rollover voucher has to fold
+/// ([`PoolError::UnderFold`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldAxis {
+    /// The cumulative `amount`.
+    Amount,
+    /// The cumulative `bytes_delivered`.
+    Bytes,
+}
+
+impl std::fmt::Display for FoldAxis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Amount => "amount",
+            Self::Bytes => "bytes_delivered",
+        })
+    }
+}
+
 /// Failure modes for [`LaneState::apply_voucher`].
 ///
-/// Each in-memory variant maps to an on-chain `PaymentPool.redeem` revert;
-/// off-chain we surface them before they cost gas. [`PoolError::Store`] is the
-/// additional off-chain-only variant for persistent-store failures (issue
-/// #527).
+/// Most in-memory variants map to an on-chain `PaymentPool.redeem` revert;
+/// off-chain we surface them before they cost gas. The ordering and fold
+/// guards ([`PoolError::AmountRegression`], [`PoolError::BytesRegression`],
+/// [`PoolError::UnderFold`]) have no revert — redemption is cumulative — and
+/// keep the node's own ledger consistent. [`PoolError::Store`] is the
+/// off-chain-only variant for persistent-store failures (issue #527).
 ///
 /// `PartialEq`/`Eq` are intentionally not derived: [`StoreError::Io`] wraps
 /// `std::io::Error`, which is not `PartialEq`. Tests pattern-match on variants
@@ -942,17 +1002,34 @@ pub enum PoolError {
         /// The provider the voucher named.
         got: Address,
     },
-    /// Cumulative amount did not cover what the lane already holds — a stale or
-    /// replayed voucher, or a rollover that folded less than the frontier its
-    /// retiring chain proved. `amount` is the sole ordering key (there is no
-    /// nonce), and `last` is what the amount had to beat: the signed watermark
-    /// on the ordering check, and the lane's full claim (anchor plus proved
-    /// frontier) on the fold check.
+    /// Cumulative amount is at or below the lane's signed watermark — a stale
+    /// or replayed voucher, or one a concurrent same-lane sibling already
+    /// settled. `amount` is the sole ordering key (there is no nonce).
     #[error("voucher amount {got} not greater than last accepted {last}")]
     AmountRegression {
-        /// What the voucher's cumulative amount had to beat.
+        /// The signed watermark the voucher's cumulative amount had to beat.
         last: U256,
         /// The cumulative amount it carried.
+        got: U256,
+    },
+    /// A voucher under a different `chain_root` retires the live epoch but
+    /// does not fold the frontier the live chain proved: its `amount` or its
+    /// `bytes_delivered` falls short of the signed anchor plus `verified_index`
+    /// chunks (ADR 003 §Chain length and rollover). It is at or above the
+    /// signed watermark under a root no sibling names — at exactly the anchor,
+    /// a root that opens a chain, never a sealed one — so no sibling settled
+    /// it; the payer under-signs chunks the node holds preimages for. The node
+    /// refuses it and sends the resume bundle that states the fold the payer
+    /// owes. A payer short only on `bytes_delivered` cannot fold from the
+    /// bundle, because the bundle does not advance its amount.
+    #[error("voucher {axis} {got} does not fold the live claim {owed}")]
+    UnderFold {
+        /// The axis that falls short. The amount is checked first.
+        axis: FoldAxis,
+        /// The lane's live claim on `axis`: signed anchor plus the proved
+        /// frontier.
+        owed: U256,
+        /// The cumulative figure the voucher carried on `axis`.
         got: U256,
     },
     /// Cumulative bytes delivered went down.
@@ -1780,8 +1857,8 @@ mod tests {
     /// adopted and the lane's claim is exactly as strong afterwards as before.
     ///
     /// The reason is watermark-gated, so the rejection carries the bundle that
-    /// tells the payer the fold it owes — a rejection with its own recovery
-    /// route, on a path no honest payer can reach.
+    /// tells the payer the fold it owes. A payer that resumes from a watermark
+    /// behind the node's frontier reaches it, and folds the bundle to recover.
     #[test]
     fn an_under_folded_rollover_is_refused() -> anyhow::Result<()> {
         let (signer, mut state, domain, store) = fixture();
@@ -1807,8 +1884,8 @@ mod tests {
         anyhow::ensure!(
             matches!(
                 state_at_9.advance_presigned(&stingy),
-                Err(PoolError::AmountRegression { last, got })
-                    if last == owed_before && got == U256::from(1_000 + 2 * PRICE)
+                Err(PoolError::UnderFold { axis: FoldAxis::Amount, owed, got })
+                    if owed == owed_before && got == U256::from(1_000 + 2 * PRICE)
             ),
             "an under-folding rollover must be refused, naming the fold it owed"
         );
@@ -1821,21 +1898,131 @@ mod tests {
         Ok(())
     }
 
+    /// A rollover at EXACTLY the signed anchor folds none of the proved
+    /// frontier. No sibling settled it under that root, so it is an under-fold,
+    /// not an ordering regression that the node would treat as already
+    /// satisfied. A payer whose last reveal reached the node but whose own send
+    /// failed restarts here.
+    #[test]
+    fn a_rollover_at_the_anchor_over_a_proved_frontier_is_an_under_fold() -> anyhow::Result<()> {
+        let (signer, mut state, domain, store) = fixture();
+        state.apply_voucher(
+            &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
+            &domain,
+            &store,
+        )?;
+        let (state_at_1, _) = state.advance_preimage(root(), 1, reveal(1))?;
+
+        let next_root = crate::chain::root_from_seed(B256::repeat_byte(0x6E));
+        let at_anchor =
+            build_metering(signer.address(), 1_000, 0, next_root, PRICE).sign(&signer, &domain)?;
+        anyhow::ensure!(
+            matches!(
+                state_at_1.advance_presigned(&at_anchor),
+                Err(PoolError::UnderFold { axis: FoldAxis::Amount, owed, got })
+                    if owed == state_at_1.owed() && got == U256::from(1_000u64)
+            ),
+            "a rollover at the anchor over a proved frontier must be an under-fold"
+        );
+
+        // The same voucher over a frontier with nothing proved is an ordinary
+        // ordering regression: the live claim is the anchor, and the node may
+        // adopt the new root.
+        let at_zero =
+            build_metering(signer.address(), 1_000, 0, next_root, PRICE).sign(&signer, &domain)?;
+        anyhow::ensure!(
+            matches!(
+                state.advance_presigned(&at_zero),
+                Err(PoolError::AmountRegression { .. })
+            ),
+            "with nothing proved, the anchor voucher stays an ordering regression"
+        );
+        anyhow::ensure!(state.adopt_chain(&at_zero).is_some());
+        Ok(())
+    }
+
+    /// A sealed voucher at the anchor is a sibling's closing voucher, not a
+    /// restart. One payer signs a sealed close at amount C, then a sibling opens
+    /// a chain at the same C and reveals on it. When the open and the reveal
+    /// reach the node first, the late sealed close sits at the anchor under a
+    /// root the lane does not meter. The payer already covered it, so it stays
+    /// an ordering regression, which the node treats as already satisfied.
+    #[test]
+    fn a_late_sealed_close_at_the_anchor_is_not_an_under_fold() -> anyhow::Result<()> {
+        let (signer, mut state, domain, store) = fixture();
+        let sealed_close =
+            build_metering(signer.address(), 1_000, 0, B256::ZERO, 0).sign(&signer, &domain)?;
+        state.apply_voucher(
+            &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
+            &domain,
+            &store,
+        )?;
+        let (state_at_1, _) = state.advance_preimage(root(), 1, reveal(1))?;
+
+        anyhow::ensure!(
+            matches!(
+                state_at_1.advance_presigned(&sealed_close),
+                Err(PoolError::AmountRegression { .. })
+            ),
+            "a late sealed close at the anchor must stay an ordering regression"
+        );
+        Ok(())
+    }
+
+    /// The fold binds the byte axis too. A rollover that pays the whole claim
+    /// but signs fewer bytes than the frontier proved is refused the same way:
+    /// adopting it would retire proved chunks from the lane's byte claim.
+    #[test]
+    fn a_rollover_folding_short_on_bytes_is_refused() -> anyhow::Result<()> {
+        let (signer, mut state, domain, store) = fixture();
+        state.apply_voucher(
+            &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
+            &domain,
+            &store,
+        )?;
+        let (state_at_9, _) = state.advance_preimage(root(), 9, reveal(9))?;
+        let bytes_before = state_at_9.owed_bytes();
+
+        // Folds all 9 chunks on the money axis, only 2 on the byte axis.
+        let next_root = crate::chain::root_from_seed(B256::repeat_byte(0x6E));
+        let short_bytes = build_metering(
+            signer.address(),
+            1_000 + 9 * PRICE,
+            2 * crate::chain::CHUNK_BYTES,
+            next_root,
+            PRICE,
+        )
+        .sign(&signer, &domain)?;
+
+        anyhow::ensure!(
+            matches!(
+                state_at_9.advance_presigned(&short_bytes),
+                Err(PoolError::UnderFold { axis: FoldAxis::Bytes, owed, got })
+                    if owed == bytes_before && got == U256::from(2 * crate::chain::CHUNK_BYTES)
+            ),
+            "a rollover short on bytes must be refused, naming the bytes it owed"
+        );
+        anyhow::ensure!(state_at_9.owed_bytes() == bytes_before);
+        anyhow::ensure!(state_at_9.chain().chain_root == root());
+        Ok(())
+    }
+
     /// The refusal is watermark-gated, which is what makes it recoverable: the
     /// wire reason a rejected under-fold maps to is the one the node attaches a
     /// resume bundle to, so the payer learns the frontier it has to fold.
     #[test]
     fn the_under_fold_refusal_carries_a_resume_bundle() {
-        let reason = crate::client_bridge::voucher_reject_reason(&PoolError::AmountRegression {
-            last: U256::from(1_090u64),
+        let reason = crate::client_bridge::voucher_reject_reason(&PoolError::UnderFold {
+            axis: FoldAxis::Amount,
+            owed: U256::from(1_090u64),
             got: U256::from(1_020u64),
         });
         assert_eq!(
             reason,
-            Ok(decdn_protocol::client::VoucherRejectReason::AmountRegression)
+            Ok(decdn_protocol::client::VoucherRejectReason::UnderFold)
         );
         assert!(
-            decdn_protocol::client::VoucherRejectReason::AmountRegression.is_watermark_gated(),
+            decdn_protocol::client::VoucherRejectReason::UnderFold.is_watermark_gated(),
             "the payer cannot fold correctly without the bundle that states the frontier"
         );
     }
@@ -1853,8 +2040,14 @@ mod tests {
         let (state_at_3, _) = state.advance_preimage(root(), 3, reveal(3))?;
         let next_root = crate::chain::root_from_seed(B256::repeat_byte(0x6E));
         let (rolled, _) = state_at_3.advance_presigned(
-            &build_metering(signer.address(), 1_000 + 3 * PRICE, 0, next_root, PRICE)
-                .sign(&signer, &domain)?,
+            &build_metering(
+                signer.address(),
+                1_000 + 3 * PRICE,
+                3 * crate::chain::CHUNK_BYTES,
+                next_root,
+                PRICE,
+            )
+            .sign(&signer, &domain)?,
         )?;
         let (after, applied) = rolled.advance_preimage(root(), 4, reveal(4))?;
         anyhow::ensure!(!applied.advanced());

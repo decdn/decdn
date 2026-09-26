@@ -4076,6 +4076,158 @@ async fn client_ahead_of_the_node_rebases_and_resumes() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Under-fold heal (#2167): the node's lane holds a LIVE chain from an earlier
+/// payer process — a signed anchor plus reveals proved on top of it — and a new
+/// process resumes from a persisted watermark ABOVE the signed anchor but SHORT
+/// of the live claim. Its first voucher opens a fresh root, so it retires the
+/// live chain without folding all of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_under_folding_a_live_chain_reseeds_and_resumes() -> anyhow::Result<()> {
+    resume_under_a_live_chain(1).await
+}
+
+/// The same heal when the new process resumes from EXACTLY the signed anchor: a
+/// reveal whose send failed locally still reached the node, so the persisted
+/// watermark is the anchor and the node's frontier is past it. The opening
+/// voucher repeats the anchor amount under a fresh root. No sibling settled it
+/// under that root, so it is an under-fold, not an already-satisfied voucher.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_resuming_at_the_anchor_under_a_live_chain_heals() -> anyhow::Result<()> {
+    resume_under_a_live_chain(0).await
+}
+
+/// The earlier process's lane: an anchor `signer` signed under root `R` at
+/// three chunks, plus one reveal the node proved on top of it. One chunk of
+/// proved frontier leaves the reloaded lane one chunk of credit headroom, well
+/// under a 3 MiB blob, so a stream whose reveals fold nothing cannot finish on
+/// that headroom.
+fn lane_with_one_proved_reveal(
+    signer: &PrivateKeySigner,
+    deposit: U256,
+) -> anyhow::Result<LaneState> {
+    use decdn_incentive::chain::{CHUNK_BYTES, preimage_at, root_from_seed};
+
+    let price = decdn_incentive::min_payment(CHUNK_BYTES, RATE_PER_MB);
+    let anchor_amount = price * U256::from(3u64);
+    let anchor_bytes = U256::from(3 * CHUNK_BYTES);
+    let chain_seed = B256::repeat_byte(0x5E);
+    let chain = decdn_incentive::LaneChain {
+        chain_root: root_from_seed(chain_seed),
+        chunk_price: price,
+        verified_index: 1,
+        tip: preimage_at(chain_seed, 1),
+    };
+    let anchor = decdn_incentive::Voucher {
+        pool_id: pool_id(),
+        signer: signer.address(),
+        provider: operator_addr(),
+        amount: anchor_amount,
+        bytes_delivered: anchor_bytes,
+        chain_root: chain.chain_root,
+        chunk_price: price,
+    }
+    .sign(signer, &payment_domain())?;
+    Ok(LaneState::hydrate(
+        pool_id(),
+        signer.address(),
+        operator_addr(),
+        deposit,
+        0,
+        anchor_amount,
+        anchor_bytes,
+        Some(anchor.signature.as_bytes()),
+        chain,
+    ))
+}
+
+/// Seed a lane holding a live chain ([`lane_with_one_proved_reveal`]), then
+/// fetch from a new process whose persisted amount sits `above_anchor` base
+/// units over the anchor, short of the live claim.
+///
+/// The node must reject the first voucher `UnderFold` with the bundle stating
+/// the fold owed; the client folds, reseeds, and completes. Crediting it zero
+/// instead leaves the node waiting on a proof the client never sends, and the
+/// stream only dies at the 10s `VOUCHER_READ_TIMEOUT`. The 8s budget sits below
+/// that backstop, so the heal must fire on the rejection itself.
+async fn resume_under_a_live_chain(above_anchor: u64) -> anyhow::Result<()> {
+    let payload: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(1_000_000_000u64);
+    let lane = lane_with_one_proved_reveal(&client_signer, deposit)?;
+    let anchor_amount = lane.last_amount();
+    let anchor_bytes = lane.last_bytes_delivered();
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&lane)?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // The new process: at or just above the signed anchor, short of the chain
+    // the node proved.
+    let mut ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    ctx.prior_amount = anchor_amount + U256::from(above_anchor);
+    ctx.prior_bytes_delivered = anchor_bytes;
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x5555,
+        Duration::from_secs(8),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "the under-folding client must reseed and recover the full blob, got {} of {} bytes",
+        got.len(),
+        payload.len()
+    );
+    let healed = store
+        .load_all()?
+        .first()
+        .map(LaneState::owed)
+        .ok_or_else(|| anyhow::anyhow!("no persisted lane"))?;
+    anyhow::ensure!(
+        healed > lane.owed(),
+        "the healed stream must pay past the live claim: {} -> {healed}",
+        lane.owed()
+    );
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_client_declined_total")? == 0,
+        "no stream may stall on a proof the client never sends"
+    );
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_voucher_rejected_total")? == 1,
+        "the heal costs exactly one rejected voucher"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// Resume with a NON-EMPTY proof spine (#1060): a ~200 KiB blob spans many 16 KiB
 /// chunk groups, so the offset resume exercises the production
 /// `export_bao_range` ↔ verifying-decoder pair over real proof PARENT
@@ -7310,6 +7462,79 @@ async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
         "persisted bytes_delivered: {} (expected {})",
         only.last_bytes_delivered(),
         total_bytes
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// Honest concurrent pulls that roll hash chains draw no voucher rejection. Two
+/// multi-chunk fetches share one ledger, so their reveals, re-anchors, rolls and
+/// closing vouchers all land on one lane and fold one another's frontiers. A
+/// second round runs over the lane the first left behind. Every voucher folds
+/// what the lane proved on both axes, so the node rejects none. A false
+/// `UnderFold` can heal through the bundle and still pass the fetch, so the
+/// test checks the reject counter as well as the bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn honest_concurrent_rollovers_draw_no_voucher_rejection() -> anyhow::Result<()> {
+    let payload_a: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let payload_b: Vec<u8> = (0..5 * 1024 * 1024 / 2u32)
+        .map(|i| (i % 241) as u8)
+        .collect();
+    let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let server_addr = server_eth.address();
+    let sd = slash_domain();
+    for round in 0..2u64 {
+        let (ra, rb) = tokio::join!(
+            stream_fetch_shared(
+                &client_ep,
+                target.clone(),
+                &ctx,
+                &ledger,
+                &sd,
+                server_addr,
+                *hash_a.as_bytes(),
+                0,
+                0x0a00 + round,
+                PullDeadlines::whole_transfer(Duration::from_secs(20)),
+                0,
+                0,
+            ),
+            stream_fetch_shared(
+                &client_ep,
+                target.clone(),
+                &ctx,
+                &ledger,
+                &sd,
+                server_addr,
+                *hash_b.as_bytes(),
+                0,
+                0x0b00 + round,
+                PullDeadlines::whole_transfer(Duration::from_secs(20)),
+                0,
+                0,
+            ),
+        );
+        let bytes_a = ra.map_err(|e| anyhow::anyhow!("round {round} pull A failed: {e:?}"))?;
+        let bytes_b = rb.map_err(|e| anyhow::anyhow!("round {round} pull B failed: {e:?}"))?;
+        anyhow::ensure!(bytes_a.as_ref() == payload_a.as_slice(), "blob A mismatch");
+        anyhow::ensure!(bytes_b.as_ref() == payload_b.as_slice(), "blob B mismatch");
+    }
+
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_voucher_rejected_total")? == 0,
+        "an honest payer's vouchers must all fold the lane"
+    );
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_client_declined_total")? == 0,
+        "no stream may stall on a proof the client never sends"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;

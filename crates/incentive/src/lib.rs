@@ -80,7 +80,8 @@ pub use client_bridge::{
 pub use credit::ramped_credit_window;
 pub use erc20::Erc20;
 pub use lane::{
-    LaneChain, LaneKey, LaneState, PoolError, PoolId, PreimageApplied, RedeemClaim, VoucherApplied,
+    FoldAxis, LaneChain, LaneKey, LaneState, PoolError, PoolId, PreimageApplied, RedeemClaim,
+    VoucherApplied,
 };
 pub use pool_open_error::{PoolOpenFailureReason, is_erc20_allowance_shortfall};
 pub use probe_sig::{

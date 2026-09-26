@@ -825,6 +825,29 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **An under-folding voucher no longer stalls the stream for 10 s (#2167).**
+  A lane can hold a live hash chain from an earlier payer process. When a new
+  process sent a voucher at or above the signed anchor, under a new root, but
+  short of that chain's claim, the node credited it 0 bytes. It then waited
+  for a proof that never came, until the 10 s voucher read timeout. The client failed over to another
+  provider, so every small bundle entry routed to that node took about 11 s.
+  The node now rejects the voucher with the new reason `UnderFold` and the
+  resume bundle. The client folds the proved frontier, reseeds, and resumes on
+  the same provider (ADR 003 §Chain length and rollover).
+  `decdn_serve_stream_client_declined_total` stops rising for this case.
+  - The fold check now binds `bytes_delivered` as well as `amount`. A rollover
+    that pays the whole claim but signs fewer bytes than the chain proved is
+    also refused `UnderFold`. That one does not heal: the bundle does not
+    advance the client's amount, so the client stops and logs a `warn!`.
+  - Concurrent streams on one lane get the same rejection. The first one
+    reseeds; the others find the ledger already healed and retry.
+  - A sealed closing voucher that reaches the node at the anchor after a
+    sibling opened the live chain stays already-satisfied, as before.
+  - The node logs the fold shortfall (axis, owed, got) at `debug!` when it
+    rejects a voucher on lane validation.
+  - **Wire-breaking:** `VoucherRejectReason::UnderFold` is a new variant,
+    appended at the end. A peer built before it cannot decode the reason.
+
 - **Every failed inbound stream now has a reason counter (#2073).** About 91 %
   of `decdn_streams_failed_total{direction="inbound"}` had none, so the
   "Unattributed stream failures" panel showed a baseline no operator could

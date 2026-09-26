@@ -133,9 +133,9 @@ impl ClientHandler {
     /// Write a mid-stream `StreamError { VoucherRejected }` and finish the
     /// stream **cleanly** — no QUIC reset — so the client can read the reason
     /// (ADR 005 §`VoucherRejected` semantics). `bundle` is the wallet-less
-    /// resume watermark (issue #1481): callers pass `Some` only for the three
-    /// watermark-gated regression/exhaustion reasons (`AmountRegression`,
-    /// `BytesRegression`, `SpendingCapExhausted`), and only after verifying the rejected
+    /// resume watermark (issue #1481): callers pass `Some` only for a
+    /// watermark-gated reason (`VoucherRejectReason::is_watermark_gated`), and
+    /// only after verifying the rejected
     /// voucher's signature recovered to the lane's pinned `signer` — this method
     /// does not re-derive or re-check that gate, it trusts the caller.
     ///
