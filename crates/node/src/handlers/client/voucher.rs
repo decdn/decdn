@@ -574,8 +574,8 @@ impl ClientHandler {
         // So credit this stream from that lane headroom rather than throttling it
         // to a `MAX_PROOFS_PER_CHUNK` stall. Without it, cross-stream reveal
         // reordering starves the slower stream: its reveals keep landing below the
-        // frontier, credit nothing, and its unpaid frontier is throttled into a
-        // `ClientPaymentFault` (the concurrent same-lane voucher-starvation bug).
+        // frontier, credit nothing, and its unpaid frontier is stopped as
+        // `ProofBudgetExhausted` (the concurrent same-lane voucher-starvation bug).
         //
         // The headroom is this reveal's to take because no metering voucher takes
         // a whole chunk from it (`voucher_credit_delta`). A sibling's rollover

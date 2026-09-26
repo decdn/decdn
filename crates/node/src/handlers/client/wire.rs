@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 
+use anyhow::Context as _;
 use bytes::Bytes;
 
 use iroh::endpoint::WriteError;
@@ -87,12 +88,15 @@ impl ClientHandler {
 
     /// Send a signed `StreamResponse { ok: false, error }` (delivery-side
     /// failure), then finish the stream. `reason` is the single source of truth:
-    /// it both selects the per-reason metric (finer-grained than the wire for the
-    /// reasons that collapse to `NotFound`, which share one code to avoid leaking
-    /// channel existence) and derives the wire `StreamError` via `wire_error()` (#876).
-    /// The metric
-    /// is bumped before the network write so a refusal is counted even if the
-    /// client has already gone and the write fails.
+    /// the returned `Refused(reason)` selects the per-reason metric in the
+    /// dispatch sink (finer-grained than the wire for the reasons that collapse to
+    /// `NotFound`, which share one code to avoid leaking channel existence), and
+    /// `wire_error()` derives the wire `StreamError` (#876).
+    ///
+    /// A signing or encoding fault is this node's own: it returns the error, and
+    /// the dispatch sink counts it as a node fault. A write that fails because the
+    /// peer already left still ends as `Refused`: the refusal is the stream's
+    /// outcome whether or not the peer reads it.
     ///
     /// `rate_per_mb` is the node's quoted price, echoed into the signed refusal
     /// so a requester sees the same rate whether it is admitted or declined. It
@@ -106,45 +110,6 @@ impl ClientHandler {
         reason: ServeRejectReason,
         rate_per_mb: u64,
     ) -> anyhow::Result<super::outcome::ServeEnd> {
-        match reason {
-            ServeRejectReason::EvictedSinceProbe => {
-                self.metrics.serve_stream_rejected_evicted_since_probe();
-            }
-            ServeRejectReason::CacheMiss => self.metrics.serve_stream_rejected_cache_miss(),
-            ServeRejectReason::InternalError => self.metrics.serve_stream_rejected_internal_error(),
-            ServeRejectReason::UnknownChannel => {
-                self.metrics.serve_stream_rejected_unknown_lane();
-            }
-            ServeRejectReason::OwnerMismatch => self.metrics.serve_stream_rejected_owner_mismatch(),
-            ServeRejectReason::InsufficientDeposit => {
-                self.metrics.serve_stream_rejected_insufficient_deposit();
-            }
-            ServeRejectReason::PoolUnconfirmed => {
-                self.metrics.serve_stream_rejected_pool_unconfirmed();
-            }
-            ServeRejectReason::SignerCapExhausted => {
-                self.metrics.serve_stream_rejected_signer_cap_exhausted();
-            }
-            ServeRejectReason::SignerFloorAtCap => {
-                self.metrics.serve_stream_rejected_signer_floor_at_cap();
-            }
-            ServeRejectReason::LoadShedHit => self.metrics.serve_stream_rejected_load_shed_hit(),
-            ServeRejectReason::LoadShedMiss => self.metrics.serve_stream_rejected_load_shed_miss(),
-            ServeRejectReason::RangeNotSatisfiable => {
-                self.metrics.serve_stream_rejected_range_not_satisfiable();
-            }
-            ServeRejectReason::HashDenied => self.metrics.serve_stream_rejected_hash_denied(),
-            ServeRejectReason::ChainHashDenied => {
-                self.metrics.serve_stream_rejected_chain_hash_denied();
-            }
-            ServeRejectReason::OriginDenied => self.metrics.serve_stream_rejected_origin_denied(),
-            ServeRejectReason::ForeignNamespaceDeclined => {
-                self.metrics.serve_stream_rejected_foreign_declined();
-            }
-            ServeRejectReason::ChainStale => {
-                self.metrics.serve_stream_rejected_chain_stale();
-            }
-        }
         let error = reason.wire_error();
         let body = StreamResponseBody {
             hash: req.hash,
@@ -154,8 +119,13 @@ impl ClientHandler {
             pool_id: req.pool_id,
             timestamp_us: req.timestamp_us,
         };
-        let (resp, resp_ext) = self.sign_response(body, Some(error))?;
-        self.write_stream_response(send, &resp, &resp_ext).await?;
+        let (resp, resp_ext) = self
+            .sign_response(body, Some(error))
+            .with_context(|| format!("sign the {reason:?} refusal"))?;
+        tolerate_departed_peer(
+            self.write_stream_response(send, &resp, &resp_ext).await,
+            "refusal",
+        )?;
         let _ = send.finish();
         Ok(super::outcome::ServeEnd::Refused(reason))
     }
@@ -168,17 +138,25 @@ impl ClientHandler {
     /// `BytesRegression`, `SpendingCapExhausted`), and only after verifying the rejected
     /// voucher's signature recovered to the lane's pinned `signer` — this method
     /// does not re-derive or re-check that gate, it trusts the caller.
+    ///
+    /// Every caller ends the stream with the stop this frame names, whether or not
+    /// the peer is still there to read it, so a write that fails because the peer
+    /// left returns `Ok`. An encoding fault or a write to a stream this node
+    /// already closed is this node's own and returns the error.
     pub(super) async fn write_reject(
         &self,
         send: &mut SendStream,
         reason: VoucherRejectReason,
         bundle: Option<WatermarkBundle>,
     ) -> anyhow::Result<()> {
-        self.write_message(
-            send,
-            &ClientMessage::StreamError(StreamError::VoucherRejected { reason, bundle }),
-        )
-        .await?;
+        tolerate_departed_peer(
+            self.write_message(
+                send,
+                &ClientMessage::StreamError(StreamError::VoucherRejected { reason, bundle }),
+            )
+            .await,
+            "voucher reject",
+        )?;
         let _ = send.finish();
         Ok(())
     }
@@ -303,20 +281,60 @@ pub(super) fn chunk_frame_bufs(frame: &FrameChunks) -> anyhow::Result<Vec<Bytes>
 /// Whether a finished serve stream's error is the peer's doing rather than this
 /// node's — a [`PeerFault`] or a [`ClientPaymentFault`].
 ///
-/// The dispatch sink's sole classifier: a `false` here is what routes an error to
-/// `error!` and the node-fault counter.
+/// The dispatch sink's node-fault classifier: a `false` here is what routes an
+/// error to `error!` and the node-fault counter.
 pub(super) fn is_peer_attributable(e: &anyhow::Error) -> bool {
     e.is::<PeerFault>() || e.is::<ClientPaymentFault>()
+}
+
+/// Record `detail` as the `error` field of the current `serve_stream` span.
+///
+/// An end that returns `Ok(ServeEnd)` never reaches the dispatch sink's `error`
+/// record, so a site that ends the stream on a peer-side failure records the
+/// cause here. The trace backend then keeps the detail that the default
+/// `RUST_LOG=info` filters out of the `debug!` line.
+pub(super) fn record_stream_error(detail: impl std::fmt::Display) {
+    tracing::Span::current().record("error", tracing::field::display(detail));
+}
+
+/// Absorb a write that fails because the peer already left.
+///
+/// The caller has already decided how the stream ends — a refusal or a stop —
+/// and that outcome stands whether or not the peer reads the frame. A
+/// peer-attributable failure logs at `debug!`, rides the span, and returns `Ok`.
+/// Any other failure is this node's own and returns unchanged.
+fn tolerate_departed_peer(result: anyhow::Result<()>, what: &str) -> anyhow::Result<()> {
+    match result {
+        Err(e) if is_peer_attributable(&e) => {
+            record_stream_error(format_args!("{what} write failed: {e:#}"));
+            tracing::debug!(error = %format_args!("{e:#}"), "{what} write failed");
+            Ok(())
+        }
+        other => other,
+    }
 }
 
 /// Attribute a framed-write failure.
 ///
 /// An oversized frame is this node's own encoding bug — it never reached the
-/// wire — so it carries no marker. Everything else is the transport under a peer
-/// that went away.
+/// wire — so it carries no marker. So does a write to a stream this node already
+/// finished or reset, and a 0-RTT rejection on a stream this node opened: both
+/// are faults in its own stream state machine, as in [`write_chunk_error`]. The
+/// transport wraps the stream's [`WriteError`] inside the `io::Error`, so it is
+/// recovered by downcast. Everything else is the transport under a peer that
+/// went away.
 fn write_frame_error(e: FrameError) -> anyhow::Error {
     match e {
         FrameError::TooLarge(len) => anyhow::anyhow!("refusing to write a {len}-byte frame"),
+        FrameError::Io(io)
+            if matches!(
+                io.get_ref()
+                    .and_then(|inner| inner.downcast_ref::<WriteError>()),
+                Some(WriteError::ClosedStream | WriteError::ZeroRttRejected)
+            ) =>
+        {
+            anyhow::anyhow!("write failed: {io}")
+        }
         e => anyhow::Error::new(PeerFault).context(format!("write failed: {e}")),
     }
 }
@@ -356,7 +374,8 @@ impl std::fmt::Display for FrameAccountingFault {
 impl std::error::Error for FrameAccountingFault {}
 
 /// Marker for a serve-stream error attributable to the peer rather than to this
-/// node: a hang-up, a stream reset, a read timeout, or a malformed request.
+/// node: a hang-up, a stream reset, a read timeout, or a malformed message — a
+/// peer that left or broke the protocol.
 ///
 /// The dispatch sink logs every `serve_stream` error at one of two levels. A node
 /// bug — an encode fault, an alignment error, a store fault, a framing fault —
@@ -369,9 +388,10 @@ impl std::error::Error for FrameAccountingFault {}
 /// The attach sites are the peer-attributable arms of the wire writes
 /// ([`ClientHandler::write_payload`], [`ClientHandler::write_chunk_bufs`]), the
 /// proof reads ([`BufferedProofReader::read`](super::BufferedProofReader::read)
-/// and its gather timeout), and the opening request read. A write or read fault
-/// this node caused — an oversized frame it encoded, a write after its own
-/// `finish`/`reset` — stays unmarked and reaches `error!`.
+/// and its gather timeout), and the voucher read timeout in
+/// [`ClientHandler::commit_one_proof`]. A write or read fault this node caused —
+/// an oversized frame it encoded, a write after its own `finish`/`reset` — stays
+/// unmarked and reaches `error!`.
 #[derive(Debug)]
 pub(super) struct PeerFault;
 
@@ -384,9 +404,9 @@ impl std::fmt::Display for PeerFault {
 impl std::error::Error for PeerFault {}
 
 /// Marker for a serve-stream error that is a client-attributable payment fault:
-/// a voucher that fails the advertised-rate check with zero bytes or an overflow,
-/// or a payer that spends its per-chunk proof budget without settling the chunk.
-/// An underpaying voucher is not here: it is a clean `Underpaid` wire reject.
+/// a voucher that fails the advertised-rate check with zero bytes or an overflow.
+/// An underpaying voucher is not here: it is a clean `Underpaid` wire reject. The
+/// dispatch sink counts it as a rejected voucher.
 ///
 /// The dispatch sink files an unmarked error under "node-side fault" at
 /// `error!`. A client's payment fault is neither a node bug nor a disconnect, and
@@ -407,6 +427,36 @@ impl std::fmt::Display for ClientPaymentFault {
 }
 
 impl std::error::Error for ClientPaymentFault {}
+
+/// Marker for a serve-stream error that ended after at least one voucher
+/// credited bytes on the stream.
+///
+/// The reference requester closes every stream with code `0`, and the node does
+/// not read the code, so it cannot see why a peer left. It can see how far the
+/// stream got. A peer that leaves before paying declined the quote — the routine
+/// shape of a header handshake — and a peer that leaves after paying abandoned a
+/// delivery. Both serve loops attach
+/// this marker at their outer boundary when their paid-byte count is nonzero,
+/// and the dispatch sink reads it to split a peer-attributable end between
+/// `decdn_serve_stream_client_declined_total` and
+/// `decdn_serve_stream_client_abandoned_total`. Attach it with
+/// [`anyhow::Error::context`] and recover it with `anyhow::Error::is`.
+#[derive(Debug)]
+pub(super) struct PaidProgress;
+
+impl std::fmt::Display for PaidProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("after payment")
+    }
+}
+
+impl std::error::Error for PaidProgress {}
+
+/// Tag a serve loop's error with [`PaidProgress`] when `paid` — the bytes that
+/// accepted vouchers credited on the stream — is nonzero.
+pub(super) fn tag_paid_progress(e: anyhow::Error, paid: u64) -> anyhow::Error {
+    if paid > 0 { e.context(PaidProgress) } else { e }
+}
 
 /// A queue of not-yet-framed export bytes plus its running byte count, holding the
 /// two in step so a frame is cut from a count that always matches the bytes present.
@@ -556,8 +606,9 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        ClientPaymentFault, FrameError, FrameQueue, PeerFault, WriteError, chunk_frame_bufs,
-        is_peer_attributable, write_chunk_error, write_frame_error,
+        ClientPaymentFault, FrameError, FrameQueue, PaidProgress, PeerFault, WriteError,
+        chunk_frame_bufs, is_peer_attributable, tag_paid_progress, tolerate_departed_peer,
+        write_chunk_error, write_frame_error,
     };
 
     /// The whole classification rests on a marker staying recoverable under the
@@ -617,6 +668,74 @@ mod tests {
         assert!(
             is_peer_attributable(&stopped),
             "a peer stop is the peer: {stopped}"
+        );
+    }
+
+    /// The framed writes attribute a stream-state fault the way the vectored
+    /// `ChunkData` write does. The transport wraps the stream's `WriteError`
+    /// inside the `io::Error`, so a write after this node's own close stays a node
+    /// fault, while a peer stop or a lost connection is the peer.
+    #[test]
+    fn a_framed_write_after_close_is_a_node_fault_but_a_peer_stop_is_not() {
+        let framed = |e: WriteError| write_frame_error(FrameError::Io(std::io::Error::from(e)));
+
+        for own in [WriteError::ClosedStream, WriteError::ZeroRttRejected] {
+            let err = framed(own);
+            assert!(
+                !is_peer_attributable(&err),
+                "a framed write fault in this node's own stream state must reach error!: {err}"
+            );
+        }
+        let stopped = framed(WriteError::Stopped(iroh::endpoint::VarInt::from_u32(0)));
+        assert!(
+            is_peer_attributable(&stopped),
+            "a peer stop is the peer: {stopped}"
+        );
+        let lost = write_frame_error(FrameError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "connection lost",
+        )));
+        assert!(
+            is_peer_attributable(&lost),
+            "a transport error with no stream-state cause is the peer: {lost}"
+        );
+    }
+
+    /// A refusal or stop whose frame the departed peer never reads keeps its
+    /// outcome; a write fault this node caused still fails the stream.
+    #[test]
+    fn a_departed_peer_does_not_fail_a_decided_end() {
+        assert!(tolerate_departed_peer(Ok(()), "stop").is_ok());
+        let gone = anyhow::Error::new(PeerFault).context("write failed");
+        assert!(tolerate_departed_peer(Err(gone), "stop").is_ok());
+        let own = write_frame_error(FrameError::Io(std::io::Error::from(
+            WriteError::ClosedStream,
+        )));
+        let err = tolerate_departed_peer(Err(own), "stop").unwrap_err();
+        assert!(
+            !is_peer_attributable(&err),
+            "a node fault still fails the stream"
+        );
+    }
+
+    /// `PaidProgress` rides only an error from a stream that a voucher paid, keeps
+    /// the peer marker under it, and never turns a node fault peer-side.
+    #[test]
+    fn paid_progress_tags_only_a_paid_stream() {
+        let unpaid = tag_paid_progress(anyhow::Error::new(PeerFault).context("gone"), 0);
+        assert!(
+            !unpaid.is::<PaidProgress>(),
+            "an unpaid stream is not tagged"
+        );
+
+        let paid = tag_paid_progress(anyhow::Error::new(PeerFault).context("gone"), 1);
+        assert!(paid.is::<PaidProgress>(), "a paid stream is tagged");
+        assert!(paid.is::<PeerFault>(), "the peer marker survives the tag");
+
+        let node = tag_paid_progress(anyhow::anyhow!("store fault"), 1);
+        assert!(
+            !is_peer_attributable(&node),
+            "a node fault after payment stays a node fault"
         );
     }
 

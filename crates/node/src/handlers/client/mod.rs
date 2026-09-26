@@ -1581,7 +1581,8 @@ impl ClientHandler {
     /// already-exhausted signer authoritatively, so this only catches drain SINCE
     /// admit, and the on-chain `redeemMany` `min(desired, cap − spent)` is the
     /// backstop; this re-check only BOUNDS over-delivery, it is not a correctness
-    /// gate. Bumps the mid-stream metric when it returns `true`.
+    /// gate. The caller ends the stream as `Stopped { SignerCapExhausted }`, which
+    /// the dispatch sink counts on the mid-stream metric.
     pub(super) async fn signer_cap_drained_midstream(
         &self,
         pool_id: B256,
@@ -1597,11 +1598,7 @@ impl ClientHandler {
             self.credit_window(CHUNK_BYTES, 0),
             rate_per_mb,
         ));
-        if headroom < floor_micro {
-            self.metrics.serve_stream_midstream_signer_cap_exhausted();
-            return true;
-        }
-        false
+        headroom < floor_micro
     }
 
     /// The pool's funder (`getPool.owner`) for the ADR 011 mid-stream takedown
@@ -2273,14 +2270,10 @@ impl ClientHandler {
     /// `0x03` for peers that misbehaved; coding it as a fault would have the
     /// client penalise this node's reputation for discharging a takedown. A
     /// client that re-requests the hash gets the signed `HashBlacklisted`
-    /// refusal from the open-time gate, which is where the reason belongs.
-    pub(super) fn terminate_for_takedown(
-        &self,
-        send: &mut SendStream,
-        recv: &mut RecvStream,
-        hash: Hash,
-    ) {
-        self.metrics.serve_stream_terminated_takedown();
+    /// refusal from the open-time gate, which is where the reason belongs. The
+    /// caller returns `Stopped { Takedown }`, which the dispatch sink counts on
+    /// `decdn_serve_stream_terminated_takedown_total`.
+    pub(super) fn terminate_for_takedown(send: &mut SendStream, recv: &mut RecvStream, hash: Hash) {
         tracing::warn!(
             %hash,
             "terminating an in-flight delivery: a takedown landed after the stream opened"

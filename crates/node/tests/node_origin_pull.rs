@@ -7825,6 +7825,9 @@ async fn window_pull_through_funder_blacklisted_mid_stream_cuts_off_a_delegated_
         "delivery completed for a blacklisted funder — the window loop's mid-stream \
          re-check has been re-keyed onto the voucher signer: {outcome:?}"
     );
+    // The dispatch sink counts the stop once the serve task returns, which can
+    // trail the leaf seeing the reset.
+    support::assert_inbound_failures_attributed(&b_metrics, 1).await?;
     assert_counter(&b_metrics, "serve_stream_terminated_takedown_total", 1)?;
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
@@ -9666,6 +9669,8 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
     );
     assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
     assert_counter(&b_metrics, "serve_stream_proof_budget_exhausted_total", 0)?;
+    support::assert_inbound_failures_attributed(&b_metrics, 1).await?;
+    assert_counter(&b_metrics, "serve_stream_voucher_rejected_total", 1)?;
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
     Ok(())
@@ -9871,6 +9876,7 @@ async fn window_pull_through_sliver_vouchers_exhaust_the_proof_budget() -> Resul
     }
     assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
     assert_counter(&b_metrics, "serve_stream_proof_budget_exhausted_total", 1)?;
+    support::assert_inbound_failures_attributed(&b_metrics, 1).await?;
 
     leaf.conn.close(0u32.into(), b"done");
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
@@ -9958,17 +9964,20 @@ async fn window_pull_through_store_record_failure_is_a_node_fault_not_an_abandon
     assert_counter(&b_metrics, "serve_stream_node_fault_total", 1)?;
     assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 0)?;
     assert_counter(&b_metrics, "serve_stream_proof_budget_exhausted_total", 0)?;
+    support::assert_inbound_failures_attributed(&b_metrics, 1).await?;
 
     leaf.conn.close(0u32.into(), b"done");
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
     Ok(())
 }
 
-/// A leaf that drops while B waits for its proof is a client abandon (#2134).
-/// The proof read fails on a peer-attributable transport error, so B meters the
-/// abandon. It is neither a node fault nor a spent proof budget.
+/// A leaf that drops while B waits for its first proof is a pull-through abandon
+/// (#2134) and a serve-stream decline (#2073). The proof read fails on a
+/// peer-attributable transport error, so B meters the pull-through abandon. The
+/// leaf never paid, so the inbound stream counts as a decline. It is neither a
+/// node fault nor a spent proof budget.
 #[tokio::test(flavor = "multi_thread")]
-async fn window_pull_through_leaf_drop_in_recoup_is_an_abandon() -> Result<()> {
+async fn window_pull_through_leaf_drop_before_paying_is_an_abandon_and_a_decline() -> Result<()> {
     let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3)).unwrap_or(usize::MAX);
     let payload = vec![0x5Eu8; payload_len];
     let hash = Hash::new(&payload);
@@ -10023,6 +10032,72 @@ async fn window_pull_through_leaf_drop_in_recoup_is_an_abandon() -> Result<()> {
     assert_counter(&b_metrics, "streams_failed_total{direction=\"inbound\"}", 1)?;
     assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
     assert_counter(&b_metrics, "serve_stream_proof_budget_exhausted_total", 0)?;
+    assert_counter(&b_metrics, "serve_stream_node_fault_total", 0)?;
+    // The leaf left before paying the first interval: a decline on the serve leg.
+    assert_counter(&b_metrics, "serve_stream_client_declined_total", 1)?;
+    support::assert_inbound_failures_attributed(&b_metrics, 1).await?;
+
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    Ok(())
+}
+
+/// A leaf that drops after B credited a voucher is a serve-stream abandon, not a
+/// decline (#2073). The serve leg tags its error `PaidProgress` at its outer
+/// boundary. The leaf drops right after its second voucher; B only put the
+/// second interval on the wire after it credited the first, so the drop comes
+/// after payment whether or not B reads the second voucher.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_leaf_drop_after_paying_is_a_serve_abandon() -> Result<()> {
+    let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(4)).unwrap_or(usize::MAX);
+    let payload = vec![0x6Au8; payload_len];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xAB);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x6B);
+    let (handler_b, b_target, ep_b, _recorded, _cache_b, b_metrics, _local_rep, b_operator) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let outcome = leaf_paced_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        b_operator,
+        leaf_channel_id,
+        hash,
+        RATE,
+        Some(2),
+    )
+    .await?;
+    anyhow::ensure!(
+        !outcome.completed && outcome.acks == 2,
+        "the leaf must drop after its second voucher"
+    );
+
+    support::assert_inbound_failures_attributed(&b_metrics, 1).await?;
+    assert_counter(&b_metrics, "serve_stream_client_abandoned_total", 1)?;
+    assert_counter(&b_metrics, "serve_stream_client_declined_total", 0)?;
     assert_counter(&b_metrics, "serve_stream_node_fault_total", 0)?;
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;

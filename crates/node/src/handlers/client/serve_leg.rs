@@ -87,21 +87,15 @@ impl ClientHandler {
     /// # Errors
     ///
     /// A client disconnect (the write / voucher-collect surfaces it), a rate-check
-    /// bail, a spent per-chunk proof budget, a lane-store `record` failure, an
-    /// `encode_range` fault, an offset at or past the blob end, or a gap the pull
-    /// leg could not fill. On any error the caller drops the
-    /// pull leg, which stops the upstream spend and persists the buyer watermark.
-    /// The peer-attributable errors carry
+    /// bail, a lane-store `record` failure, an `encode_range` fault, an offset at
+    /// or past the blob end, or a gap the pull leg could not fill. On any error the
+    /// caller drops the pull leg, which stops the upstream spend and persists the
+    /// buyer watermark. The peer-attributable errors carry
     /// [`PeerFault`](super::wire::PeerFault) or
     /// [`ClientPaymentFault`](super::wire::ClientPaymentFault); the rest reach the
-    /// dispatch sink's `error!` as node faults.
-    // One linear, ADR-ordered miss-leg serve loop; splitting it would scatter the
-    // ordering invariants across helpers (same rationale as `deliver`).
-    #[allow(
-        clippy::too_many_arguments,
-        clippy::too_many_lines,
-        clippy::cognitive_complexity
-    )]
+    /// dispatch sink's `error!` as node faults. An error after a voucher credited
+    /// bytes also carries [`PaidProgress`](super::wire::PaidProgress).
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn serve_leg(
         &self,
         send: &mut SendStream,
@@ -119,6 +113,60 @@ impl ClientHandler {
         total_bytes: u64,
         floor_reservation: Option<&FloorReservation>,
         first_byte: FirstByteClock,
+    ) -> anyhow::Result<ServeEnd> {
+        // Bytes an accepted voucher credited. Owned here so every exit of the loop,
+        // `?` included, passes through the one `PaidProgress` tag: the dispatch
+        // sink splits a peer that left into declined or abandoned by it.
+        let mut paid: u64 = 0;
+        self.serve_leg_loop(
+            send,
+            recv,
+            store,
+            session,
+            also_pace,
+            lane,
+            hash,
+            lane_key,
+            client_node_id,
+            rate_per_mb,
+            offset,
+            len,
+            total_bytes,
+            floor_reservation,
+            first_byte,
+            &mut paid,
+        )
+        .await
+        .map_err(|e| super::wire::tag_paid_progress(e, paid))
+    }
+
+    /// The body of [`Self::serve_leg`]. `paid` counts the bytes accepted vouchers
+    /// credited; the caller reads it when the loop ends.
+    // One linear, ADR-ordered miss-leg serve loop; splitting it would scatter the
+    // ordering invariants across helpers (same rationale as `deliver`).
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::cognitive_complexity
+    )]
+    async fn serve_leg_loop(
+        &self,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+        store: NodeRangedStore,
+        session: Arc<FillSession>,
+        also_pace: &[Arc<FillSession>],
+        lane: &Arc<Mutex<LaneDeliveryState>>,
+        hash: Hash,
+        lane_key: LaneKey,
+        client_node_id: B256,
+        rate_per_mb: u64,
+        offset: u64,
+        len: u64,
+        total_bytes: u64,
+        floor_reservation: Option<&FloorReservation>,
+        first_byte: FirstByteClock,
+        paid: &mut u64,
     ) -> anyhow::Result<ServeEnd> {
         // An offset at or past the blob end has no bytes to deliver, and the
         // clamp below would fold it into the legitimate `end == offset` empty
@@ -158,7 +206,6 @@ impl ClientHandler {
         // WIRE quantities (bao content + proof, ADR 038). Their gap
         // `delivered − paid` is the unrecouped credit the window caps.
         let mut delivered: u64 = 0;
-        let mut paid: u64 = 0;
         let mut first_byte = Some(first_byte);
         // Bytes forwarded since the last COMPLETED interval (the sub-interval
         // remainder), and the completed intervals whose payment is still owed —
@@ -218,13 +265,13 @@ impl ClientHandler {
             // window), recomputed each iteration exactly as the cache-hit twin in
             // `deliver` does. Floored at one chunk so the loop can always make
             // progress: deliver a full chunk, then recoup the proof that pays it.
-            let window = self.credit_window(chunk_bytes, paid);
+            let window = self.credit_window(chunk_bytes, *paid);
 
             // --- deliver phase: stream frames while the window has room. Checked
             // BEFORE each send, so `delivered − paid` overshoots by at most the one
             // frame that crosses the threshold. ---
             while next_chunk.is_some() {
-                if delivered.saturating_sub(paid) >= window {
+                if delivered.saturating_sub(*paid) >= window {
                     break;
                 }
                 let Some(frame) = next_chunk.take() else {
@@ -261,7 +308,7 @@ impl ClientHandler {
                 // remains after this send (see the twin in `deliver`). The room cap is
                 // what keeps this from parking on upstream bytes that this loop must
                 // exit to recoup before they can be pulled.
-                let room = window.saturating_sub(delivered.saturating_sub(paid));
+                let room = window.saturating_sub(delivered.saturating_sub(*paid));
                 next_chunk = producer
                     .next_frame_chunks(self.frame_target(unvouchered, chunk_bytes, room))
                     .await
@@ -339,7 +386,7 @@ impl ClientHandler {
                                 // has not settled.
                                 credited_this_iter =
                                     credited_this_iter.saturating_add(credited_bytes);
-                                paid = paid.saturating_add(credited_bytes);
+                                *paid = paid.saturating_add(credited_bytes);
                                 // Publish the PAID CONTENT frontier for the pull leg's
                                 // `WindowPacer`, mapping paid WIRE back into content
                                 // space (the largest chunk-group boundary provably
@@ -347,7 +394,7 @@ impl ClientHandler {
                                 // pull never overshoots its window). One contiguous
                                 // delivery from `fetch_start`, so it is the single
                                 // fetch-start.
-                                let served = content_paid_frontier(fetch_start, total_bytes, paid);
+                                let served = content_paid_frontier(fetch_start, total_bytes, *paid);
                                 // Forward-only, and guarded on THIS leg's start: an
                                 // owning session's frontier starts at the raw
                                 // `byte_offset`, at or above its group floor
@@ -373,17 +420,25 @@ impl ClientHandler {
                             }
                             if attempts >= MAX_PROOFS_PER_CHUNK {
                                 self.metrics.node_pull_through_client_abandoned();
-                                self.metrics.serve_stream_proof_budget_exhausted();
                                 // A payer that spends its per-chunk proof budget
-                                // without settling the chunk is a client payment
-                                // fault, not a node bug.
-                                return Err(anyhow::Error::new(super::wire::ClientPaymentFault)
-                                    .context(format!(
-                                        "payer sent {attempts} proofs without settling one \
-                                         {}-byte chunk ({} bytes still owed)",
-                                        owed.len(),
-                                        owed.remaining()
-                                    )));
+                                // without settling the chunk is at fault, not this
+                                // node, so the stream ends as a stop, not an error.
+                                super::wire::record_stream_error(format_args!(
+                                    "payer sent {attempts} proofs without settling one \
+                                     {}-byte chunk ({} bytes still owed)",
+                                    owed.len(),
+                                    owed.remaining()
+                                ));
+                                tracing::debug!(
+                                    attempts,
+                                    chunk_bytes = owed.len(),
+                                    owed_bytes = owed.remaining(),
+                                    "payer spent its proof budget without settling a chunk"
+                                );
+                                return Ok(ServeEnd::Stopped {
+                                    stop: ServeStop::ProofBudgetExhausted,
+                                    bytes: delivered,
+                                });
                             }
                         }
                         VoucherStop::Rejected => {
@@ -396,7 +451,7 @@ impl ClientHandler {
                     }
                 }
             }
-            ensure_unpaid_bytes_tracked(delivered, paid, unvouchered)?;
+            ensure_unpaid_bytes_tracked(delivered, *paid, unvouchered)?;
 
             // Reconcile the floor reservation against this stream's live balance now
             // that `paid` has advanced (mirrors `deliver`). `paid`/`delivered` are BYTE
@@ -408,7 +463,7 @@ impl ClientHandler {
                 // release to the reserved µUSDC keeps it correct at any
                 // `credit_ramp_divisor` — with the ramp disabled the reservation is the
                 // full `credit_max`, so release waits for that much paid, not one chunk.
-                res.release_if_repaid(decdn_incentive::min_payment(paid, rate_per_mb));
+                res.release_if_repaid(decdn_incentive::min_payment(*paid, rate_per_mb));
             }
 
             // Done when the whole range is on the wire and every interval — closing
@@ -455,7 +510,6 @@ impl ClientHandler {
                 {
                     self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
                         .await?;
-                    self.metrics.serve_stream_midstream_pool_exhausted();
                     // Observable stop (symmetric with the takedown re-check below): this
                     // terminates a paying miss-leg delivery.
                     tracing::warn!(
@@ -508,7 +562,7 @@ impl ClientHandler {
             // taken-down blob is the pull leg's own takedown handling, reached when
             // this return drops it.
             if collected_any && !done && self.takedown_landed(hash, funder) {
-                self.terminate_for_takedown(send, recv, hash);
+                Self::terminate_for_takedown(send, recv, hash);
                 return Ok(ServeEnd::Stopped {
                     stop: ServeStop::Takedown,
                     bytes: delivered,
