@@ -284,8 +284,8 @@ impl ClientHandler {
         // pull (no double spend, #305) while each keeps its own per-channel voucher
         // stream; a request AHEAD of that frontier owns its own pull instead
         // (#2062 — attaching would starve it behind the other client's payments),
-        // at the cost of fetching the overlap twice (`fill_not_coalesced`,
-        // decdn#2069 §4). `make_session` builds the shared `FillSession` only on an
+        // at the cost of fetching the overlap not yet in the store twice
+        // (`fill_not_coalesced`). `make_session` builds the shared `FillSession` only on an
         // owning branch (`Owner` or `Mixed`), with its PAID content frontier at the
         // request's ABSOLUTE content start (`req.byte_offset`), so a non-zero-offset
         // request does not show a window of phantom lead and immediately `Wait`.
@@ -523,7 +523,8 @@ impl ClientHandler {
     /// `NodeFunder`, and no upstream counterparty.
     ///
     /// `total_bytes` is the origin-probe size the caller already confirmed
-    /// serviceable (`origin_size` + a published `{H}.obao4` outboard). The
+    /// serviceable (`origin_size`, a published `{H}.obao4` outboard, and a ranged
+    /// read of the first chunk group). The
     /// request may be whole-blob, bounded, or resumed: the serve leg clamps delivery
     /// to `[byte_offset, end)` and the local pull leg fills only that span's missing
     /// chunk groups, so a bounded request pulls exactly its aligned span from

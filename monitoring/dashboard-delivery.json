@@ -1882,7 +1882,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "title": "Pull time to first byte",
+      "title": "Pull time to first byte and pause length",
       "type": "timeseries",
       "description": "Fleet p50, p95 and p99 time to first byte of one paid node-to-node pull leg, from the start of its open to the first bao bytes read. The window includes a dial when the node holds no warm connection to the peer. An adopted header-handshake pull is timed from the start of the handshake open. A rising p95 with a flat serve-hit p95 points at the upstream peers or the path to them, not at the serving nodes\u2019 own stores.",
       "targets": [
@@ -1912,6 +1912,15 @@
           "expr": "histogram_quantile(0.99, sum by (le) (rate(decdn_node_pull_first_byte_seconds_bucket{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])))",
           "refId": "C",
           "legendFormat": "pull leg p99"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(decdn_node_pull_through_wait_seconds_bucket{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval])))",
+          "refId": "D",
+          "legendFormat": "pull pause p95"
         }
       ],
       "fieldConfig": {
@@ -2932,6 +2941,15 @@
           "expr": "sum(rate(decdn_warming_credits_dropped_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "C",
           "legendFormat": "warming credits dropped"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_cache_range_pull_permit_waits_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "D",
+          "legendFormat": "range-pull permit waits"
         }
       ],
       "fieldConfig": {

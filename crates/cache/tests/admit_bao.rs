@@ -31,8 +31,7 @@ async fn admit_bao_imports_verified_range() -> anyhow::Result<()> {
 /// Two live fills whose covered ranges overlap (the #2062 non-coalesced shape:
 /// a whole-blob fill plus a tail fill the registry refused to attach) admit the
 /// SAME chunk groups concurrently. The store must accept both idempotently and
-/// end byte-exact — the safety half of the duplicate-egress trade
-/// (decdn#2069 §4).
+/// end byte-exact — the safety half of the duplicate-egress trade.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_same_group_admits_are_idempotent() -> anyhow::Result<()> {
     let payload = util::make_blob(200 * 1024);

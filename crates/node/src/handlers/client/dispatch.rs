@@ -972,19 +972,17 @@ impl ClientHandler {
                 // chunk groups, so a bounded request costs exactly its aligned span
                 // in origin egress.
                 //
-                // Serviceability is confirmed by `origin_size` (a live probe of the
-                // data object) + `origin_fetch_outboard_bytes` (an origin publishes the
-                // outboard; a cached copy answers without an origin read, and a draw
-                // that the origin then declines fails the signed stream) — NOT by
-                // proving a Range/206 `fetch_range_data` works. All three shipped
-                // adapters (fs/http/s3) support Range whenever they publish an
-                // outboard, so this holds in practice; a custom Origin that publishes
-                // an outboard but refuses Range would sign `ok:true` then fail the
-                // stream. Acceptable for the shipped backends within this path's scope.
+                // Serviceability is confirmed before the response is signed, by
+                // `origin_size` (a live probe of the data object) and
+                // `origin_range_serviceable` (an origin publishes the outboard AND
+                // serves ranged reads of the data). The range half reads one chunk
+                // group until the origin has served a clean range window once, then
+                // reads nothing. So an origin that publishes an outboard but declines
+                // `Range` degrades here instead of failing a signed stream.
                 //
                 // Best-effort degrade (ADR 037 §"Fallback is always correct"): no
-                // published outboard / no origin size / no origins => fall through to
-                // `try_local_populate` below.
+                // published outboard / no ranged reads / no origin size / no origins
+                // => fall through to `try_local_populate` below.
                 // Once serviceable, `serve_via_backend_origin` claims the fill itself
                 // (`CacheEngine::claim_fill`): the first same-hash miss OWNS
                 // the local origin pull; a concurrent one ATTACHES as an observer and
@@ -994,12 +992,13 @@ impl ClientHandler {
                 if self.pull_authorized(&req, verified_client) {
                     match self.cache.origin_size(hash).await {
                         Ok(Some(total)) => {
-                            match self.cache.origin_fetch_outboard_bytes(hash, total).await {
+                            match self.cache.origin_range_serviceable(hash, total).await {
                                 // Serviceable: size known and an origin publishes the
-                                // outboard. Enter the orchestration directly — it claims
-                                // the fill (owner-or-attach) internally after signing the
-                                // response, so no coalescing decision happens here.
-                                Ok(Some(_)) => {
+                                // outboard and serves ranges. Enter the orchestration
+                                // directly — it claims the fill (owner-or-attach)
+                                // internally after signing the response, so no
+                                // coalescing decision happens here.
+                                Ok(true) => {
                                     // Boxed: the serve future is large
                                     // (clippy::large_futures). `pull_authorized`
                                     // (checked in the `if` above) guarantees a
@@ -1022,17 +1021,18 @@ impl ClientHandler {
                                         .await;
                                     }
                                 }
-                                // Size known but no published outboard — not
-                                // serviceable via the range encoder. Degrade to the
-                                // buffered local populate below.
-                                Ok(None) => {}
-                                // A genuine origin transport fault while fetching the
-                                // outboard. Latch it (#1129) so a later-tier miss
-                                // reports InternalError not NotFound, then fall
-                                // through — another source may still serve.
+                                // Size known but no origin publishes the outboard
+                                // and serves ranges — not serviceable via the range
+                                // encoder. Degrade to the buffered local populate
+                                // below.
+                                Ok(false) => {}
+                                // A genuine origin fault while probing the outboard
+                                // or the first range window. Latch it (#1129) so a
+                                // later-tier miss reports InternalError not NotFound,
+                                // then fall through — another source may still serve.
                                 Err(e) => {
                                     self.metrics.node_pull_through_error();
-                                    tracing::warn!(%hash, error = %e, "own-origin outboard probe faulted; falling through");
+                                    tracing::warn!(%hash, error = %format_args!("{e:#}"), "own-origin range probe faulted; falling through");
                                     fault_seen = true;
                                 }
                             }

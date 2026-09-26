@@ -878,6 +878,22 @@ since project inception and will roll into the first tagged release.
     response (for example code `1` "no available upstreams" or `19` "Temporary
     internal error") is now retried on the ADR 012 schedule instead of failing
     the read at once.
+- **An own origin that declines `Range` degrades before the node signs
+  (#2069).** The own-origin serve-miss probe now reads the blob's first chunk
+  group as a ranged GET. An origin that publishes `{H}.obao4` but ignores
+  `Range` falls back to the buffered whole-blob pull instead of signing
+  `ok: true` and failing the stream on its first draw. A per-origin latch skips
+  the probe's range read once the origin serves a clean range window, and an
+  origin that serves a wrong-length first window no longer shadows a healthy
+  later origin. A panic in the range encode now surfaces as the new
+  `CacheError::Internal` with its message, logged as a code bug, not as a
+  local-origin fault; a store fault such as a full disk is not. New series:
+  `decdn_cache_range_pull_permit_waits_total` (draws that waited on the full
+  range-pull pool, warning past 10 s) and
+  `decdn_node_pull_through_wait_seconds` (length of each pull pause, warning
+  past 30 s). `decdn_cache_fill_not_coalesced_total` now counts once per claim,
+  and only when the skipped fill overlaps the request.
+
 - **The cache footprint counts a partial blob's present bytes (#2157).**
   `size_snapshot` sized a partial blob from iroh-blobs' `status()`, which
   leaves the size unknown until the blob's last chunk arrives and then reports

@@ -449,6 +449,23 @@ async fn partial_serve_mixed_range_pulls_only_the_missing_group() -> anyhow::Res
         .respond_with(ResponseTemplate::new(206).set_body_bytes(gap_bytes))
         .mount(&server)
         .await;
+    // The serviceability probe reads group 0 once, before the node signs, to
+    // confirm the origin serves ranges. It is no draw: the count below leaves it
+    // out.
+    let probe_val = format!("bytes=0-{}", group - 1);
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(wiremock::matchers::header("range", probe_val.as_str()))
+        .respond_with(
+            ResponseTemplate::new(206).set_body_bytes(
+                plaintext
+                    .get(..usize::try_from(group)?)
+                    .unwrap_or_default()
+                    .to_vec(),
+            ),
+        )
+        .mount(&server)
+        .await;
 
     let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
     let cache = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
@@ -523,11 +540,14 @@ async fn partial_serve_mixed_range_pulls_only_the_missing_group() -> anyhow::Res
     );
 
     // The mixed request neither short-circuited as a cache hit nor re-fetched the
-    // held group: exactly one ranged GET, and it is the gap (group 1) alone.
+    // held group: beside the probe, exactly one ranged GET, and it is the gap
+    // (group 1) alone.
     let ranged_gets = count_requests(&server, |r| {
         r.method.as_str() == "GET"
             && r.url.path() == format!("/{hex}")
-            && r.headers.contains_key("range")
+            && r.headers
+                .get("range")
+                .is_some_and(|v| v.to_str().is_ok_and(|v| v != probe_val))
     })
     .await?;
     anyhow::ensure!(

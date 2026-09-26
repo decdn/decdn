@@ -27,6 +27,7 @@ use tokio::sync::{Notify, broadcast};
 
 use decdn_config_types::{CircuitBreakerPolicy, DeniedHashes, PinDiff, PinnedHashes, RetryPolicy};
 
+use crate::CHUNK_GROUP_BYTES;
 use crate::circuit_breaker::{
     Admission, Clock, OriginBreaker, OriginOutcome, SystemClock, TrialGuard,
 };
@@ -37,7 +38,7 @@ use crate::origin::{Origin, OriginKind, OutboardFetch};
 use crate::origin_probe::{OriginProbeMemo, OriginProbePolicy, Presence};
 use crate::origin_range::{
     MAX_CONCURRENT_RANGE_PULLS, OriginRangeCursor, OriginRangeWire, OriginReadBudget,
-    within_origin_timeout,
+    RANGE_PULL_PERMIT_WARN_AFTER, within_origin_timeout,
 };
 use crate::outboard_cache::{OUTBOARD_CACHE_BYTES, OUTBOARD_CACHE_ENTRIES, OutboardCache};
 use crate::probe_hold::ProbeHoldOutcome;
@@ -484,9 +485,16 @@ struct Inner {
     /// (#2065); each holds a permit for its whole span and `O(window + outboard)`
     /// bytes, so the bound caps their sum.
     own_origin_range_pulls: Arc<tokio::sync::Semaphore>,
+    /// Per configured origin (same index as `origins`): whether the origin has
+    /// served a clean first range window. Set on the first such window, by the
+    /// serviceability probe ([`CacheEngine::origin_range_serviceable`]) or a
+    /// draw, and never cleared, so the probe's range half reads nothing for a
+    /// confirmed origin. An origin that later stops serving ranges fails its
+    /// draw like any other mid-life origin fault.
+    origin_range_confirmed: Box<[AtomicBool]>,
     /// Origin `{H}.obao4` outboards already read, keyed by hash, tagged with
-    /// the serving origin, and bounded by bytes. The serviceability probe
-    /// ([`CacheEngine::origin_fetch_outboard_bytes`]) and every
+    /// the serving origin, and bounded by bytes. The serviceability probe's
+    /// outboard half ([`CacheEngine::origin_fetch_outboard_bytes`]) and every
     /// [`CacheEngine::origin_range_wire`] draw read it and fill it. Each
     /// [`OriginRangeWire`] holds a handle and evicts the copy it used when the
     /// range fails bao verification.
@@ -1485,6 +1493,7 @@ impl CacheEngine {
             .iter()
             .map(|_| OriginBreaker::new(circuit_breaker, Arc::clone(&clock), metrics.clone()))
             .collect::<Vec<_>>();
+        let origin_range_confirmed = origins.iter().map(|_| AtomicBool::new(false)).collect();
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -1533,6 +1542,7 @@ impl CacheEngine {
                 own_origin_range_pulls: Arc::new(tokio::sync::Semaphore::new(
                     MAX_CONCURRENT_RANGE_PULLS,
                 )),
+                origin_range_confirmed,
                 outboards: OutboardCache::new(OUTBOARD_CACHE_BYTES, OUTBOARD_CACHE_ENTRIES),
                 outboard_flights: Mutex::new(HashMap::new()),
                 origin_read_head_start_ms: AtomicU64::new(0),
@@ -3590,22 +3600,35 @@ impl CacheEngine {
         Ok(())
     }
 
-    /// A permit from the own-origin draw pool ([`MAX_CONCURRENT_RANGE_PULLS`]);
-    /// waits (with a debug line) when the pool is full rather than degrading,
-    /// because the degrade is a whole-blob origin pull — more egress, not less.
-    async fn range_pull_permit(
-        pool: &Arc<tokio::sync::Semaphore>,
-    ) -> CacheResult<tokio::sync::OwnedSemaphorePermit> {
+    /// A permit from the own-origin draw pool ([`MAX_CONCURRENT_RANGE_PULLS`]).
+    /// A full pool bumps `range_pull_permit_waits` and waits rather than
+    /// degrading, because the degrade is a whole-blob origin pull — more egress,
+    /// not less. A wait past [`RANGE_PULL_PERMIT_WARN_AFTER`] logs one warning.
+    async fn range_pull_permit(&self) -> CacheResult<tokio::sync::OwnedSemaphorePermit> {
+        let pool = &self.inner.own_origin_range_pulls;
         if let Ok(permit) = Arc::clone(pool).try_acquire_owned() {
             return Ok(permit);
+        }
+        if let Some(m) = &self.inner.metrics {
+            m.range_pull_permit_waits.inc();
         }
         tracing::debug!(
             bound = MAX_CONCURRENT_RANGE_PULLS,
             "origin range-pull pool is full; waiting for a permit",
         );
-        Arc::clone(pool).acquire_owned().await.map_err(|e| {
-            CacheError::Store(anyhow::Error::new(e).context("range-pull bound closed"))
-        })
+        let closed =
+            |e| CacheError::Internal(anyhow::Error::new(e).context("range-pull bound closed"));
+        let mut acquire = std::pin::pin!(Arc::clone(pool).acquire_owned());
+        if let Ok(permit) = tokio::time::timeout(RANGE_PULL_PERMIT_WARN_AFTER, &mut acquire).await {
+            return permit.map_err(closed);
+        }
+        tracing::warn!(
+            bound = MAX_CONCURRENT_RANGE_PULLS,
+            waited_secs = RANGE_PULL_PERMIT_WARN_AFTER.as_secs(),
+            "origin range-pull pool still full; a slow or hung origin may be holding \
+             permits for whole draws, stalling this fill",
+        );
+        acquire.await.map_err(closed)
     }
 
     /// The `{H}.obao4` outboard for `hash` (a `total_bytes`-byte blob): the
@@ -3617,12 +3640,11 @@ impl CacheEngine {
     /// [`Self::set_origin_read_budget`]'s budget. A per-origin decline, wrong
     /// length, transport fault or timeout advances the chain.
     ///
-    /// This is the own-origin serviceability probe: the node's own-origin serve-miss
-    /// path confirms an origin can furnish the outboard for `H` before it signs a
-    /// `StreamResponse` and spins up the two-leg driver, so a blob no origin can
-    /// prove is never advertised as serviceable. A cached copy answers without an
-    /// origin read. The caller's live `origin_size` probe still confirms the data
-    /// object, and a draw that the origin then declines fails the signed stream.
+    /// This is the outboard half of the own-origin serviceability probe
+    /// ([`Self::origin_range_serviceable`]), which the serve-miss path runs
+    /// before it signs a `StreamResponse`, so a blob no origin can prove is
+    /// never advertised as serviceable. A cached copy answers without an origin
+    /// read.
     /// The returned outboard is UNTRUSTED until it verifies against the root `H`
     /// (the range encode in [`Self::origin_range_wire`] is where that happens).
     ///
@@ -3635,16 +3657,29 @@ impl CacheEngine {
         hash: Hash,
         total_bytes: u64,
     ) -> CacheResult<Option<Bytes>> {
+        Ok(self
+            .outboard_with_origin(hash, total_bytes)
+            .await?
+            .map(|(ob, _)| ob))
+    }
+
+    /// [`Self::origin_fetch_outboard_bytes`], with the index of the origin whose
+    /// copy it is — the cached entry's origin, or the origin that served it.
+    async fn outboard_with_origin(
+        &self,
+        hash: Hash,
+        total_bytes: u64,
+    ) -> CacheResult<Option<(Bytes, usize)>> {
         let expected_len = expected_outboard_len(total_bytes);
         if let Some(cached) = self.inner.outboards.get(hash, expected_len) {
-            return Ok(Some(cached.bytes));
+            return Ok(Some((cached.bytes, cached.origin_ix)));
         }
         // A concurrent cold miss of this hash may be reading the outboard now:
         // wait for it, then take its cached copy.
         let flight = self.outboard_flight(hash);
         let _reading = flight.lock().await;
         if let Some(cached) = self.inner.outboards.get(hash, expected_len) {
-            return Ok(Some(cached.bytes));
+            return Ok(Some((cached.bytes, cached.origin_ix)));
         }
         // A genuine transport fault on an origin (as opposed to a clean
         // `NotFound`/`Unsupported` decline) is remembered so it can be surfaced when
@@ -3659,7 +3694,7 @@ impl CacheEngine {
                 .fetch_gated_outboard(ix, origin, hash, expected_len)
                 .await
             {
-                Ok(GatedOutboard::Found(ob)) => return Ok(Some(ob)),
+                Ok(GatedOutboard::Found(ob)) => return Ok(Some((ob, ix))),
                 Ok(GatedOutboard::Declined | GatedOutboard::WrongLength) => {}
                 Err(e) => last_err = Some(e),
             }
@@ -3715,10 +3750,95 @@ impl CacheEngine {
         hash: Hash,
         aligned: &AlignedRange,
     ) -> CacheResult<Option<OriginRangeWire>> {
-        let permit = Self::range_pull_permit(&self.inner.own_origin_range_pulls).await?;
+        let permit = self.range_pull_permit().await?;
+        let Some(cursor) = self.open_range_cursor(hash, aligned, None).await? else {
+            return Ok(None);
+        };
+        OriginRangeWire::spawn(cursor, aligned, permit, self.inner.outboards.clone()).map(Some)
+    }
+
+    /// The own-origin serviceability probe the serve-miss path runs before it
+    /// signs a `StreamResponse`: whether an origin furnishes both the `{H}.obao4`
+    /// outboard for `hash` (a `total_bytes`-byte blob) and ranged reads of its
+    /// data. `false` sends the caller to the buffered whole-blob degrade
+    /// (ADR 037 §"Fallback is always correct"), so an origin that publishes an
+    /// outboard but declines `Range` does not have a signed stream fail on its
+    /// first draw. The exception is an origin that served ranges earlier and
+    /// has stopped since: it fails its draw like any other mid-life origin
+    /// fault.
+    ///
+    /// The range half reads the first chunk group through the same origin
+    /// chain a draw walks, starting at the origin that served the outboard. It
+    /// reads nothing when that origin has already served a clean range window.
+    /// The 0-byte blob has no data to range, so its outboard alone answers.
+    ///
+    /// # Errors
+    ///
+    /// - [`CacheError::OriginError`] — no origin serves both halves, and at
+    ///   least one failed with a transport fault or a timeout.
+    /// - [`CacheError::VerifyFailed`] — no origin serves both halves, and an
+    ///   origin served a wrong-length outboard or first window, which cannot
+    ///   verify.
+    pub async fn origin_range_serviceable(
+        &self,
+        hash: Hash,
+        total_bytes: u64,
+    ) -> CacheResult<bool> {
+        let Some((outboard, ix)) = self.outboard_with_origin(hash, total_bytes).await? else {
+            return Ok(false);
+        };
+        if total_bytes == 0 || self.range_confirmed(ix) {
+            return Ok(true);
+        }
+        let first_group =
+            align_range(0, CHUNK_GROUP_BYTES.min(total_bytes), total_bytes).map_err(|e| {
+                CacheError::Internal(anyhow::Error::from(e).context("range probe alignment"))
+            })?;
+        let opened = self
+            .open_range_cursor(hash, &first_group, Some((ix, outboard)))
+            .await?
+            .is_some();
+        if !opened {
+            tracing::debug!(
+                %hash,
+                "no own origin serves ranged reads of this blob; the miss degrades to a \
+                 whole-blob origin pull",
+            );
+        }
+        Ok(opened)
+    }
+
+    /// Whether the origin at `ix` has served a clean first range window.
+    fn range_confirmed(&self, ix: usize) -> bool {
+        self.inner
+            .origin_range_confirmed
+            .get(ix)
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+
+    /// Open a cursor on the first origin that serves both the outboard and a
+    /// first window of `aligned` of the right length. `preferred` (an origin
+    /// index and the outboard it served) goes first and reuses that copy; with
+    /// `None`, the origin whose outboard is cached goes first and reuses the
+    /// cached copy. Every other origin, in chain order, reads its own outboard
+    /// through the exact-length gate. A per-origin decline, transport fault,
+    /// wrong-length outboard or wrong-length first window advances the chain,
+    /// so a broken origin never shadows a healthy later one. The opened origin
+    /// is marked range-confirmed. Errors as [`Self::origin_range_wire`].
+    async fn open_range_cursor(
+        &self,
+        hash: Hash,
+        aligned: &AlignedRange,
+        preferred: Option<(usize, Bytes)>,
+    ) -> CacheResult<Option<OriginRangeCursor>> {
         let expected_len = expected_outboard_len(aligned.blob_size());
-        let cached = self.inner.outboards.get(hash, expected_len);
-        let first = cached.as_ref().map(|c| c.origin_ix);
+        let cached = preferred.or_else(|| {
+            self.inner
+                .outboards
+                .get(hash, expected_len)
+                .map(|c| (c.origin_ix, c.bytes))
+        });
+        let first = cached.as_ref().map(|(ix, _)| *ix);
         let order = first
             .into_iter()
             .chain((0..self.inner.origins.len()).filter(|ix| Some(*ix) != first));
@@ -3730,7 +3850,7 @@ impl CacheEngine {
                 continue;
             };
             let outboard = match &cached {
-                Some(c) if c.origin_ix == ix => c.bytes.clone(),
+                Some((cached_ix, bytes)) if *cached_ix == ix => bytes.clone(),
                 _ => match self.flighted_outboard(ix, origin, hash, expected_len).await {
                     Ok(GatedOutboard::Found(ob)) => ob,
                     Ok(GatedOutboard::Declined) => continue,
@@ -3754,14 +3874,20 @@ impl CacheEngine {
             )
             .await;
             match opened {
+                Ok(Some(cursor)) if cursor.first_is_wrong_length() => {
+                    tracing::warn!(
+                        %hash,
+                        kind = ?origin.kind(),
+                        "own origin served a wrong-length first range window; it cannot \
+                         verify against H, trying next origin",
+                    );
+                    wrong_length = true;
+                }
                 Ok(Some(cursor)) => {
-                    return OriginRangeWire::spawn(
-                        cursor,
-                        aligned,
-                        permit,
-                        self.inner.outboards.clone(),
-                    )
-                    .map(Some);
+                    if let Some(confirmed) = self.inner.origin_range_confirmed.get(ix) {
+                        confirmed.store(true, Ordering::Relaxed);
+                    }
+                    return Ok(Some(cursor));
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -9209,6 +9335,9 @@ mod tests {
         outboard_fetches: AtomicUsize,
         /// When true, [`Origin::fetch_outboard`] waits on `gate`.
         gate_outboard: bool,
+        /// Calls to [`Origin::fetch_range_data`] so far, shared so a test can
+        /// read it after the engine takes the origin.
+        range_fetches: Arc<AtomicUsize>,
     }
 
     impl RangeStubOrigin {
@@ -9230,6 +9359,7 @@ mod tests {
                 fault_outboard: false,
                 outboard_fetches: AtomicUsize::new(0),
                 gate_outboard: false,
+                range_fetches: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -9252,6 +9382,7 @@ mod tests {
                 fault_outboard: true,
                 outboard_fetches: AtomicUsize::new(0),
                 gate_outboard: false,
+                range_fetches: Arc::new(AtomicUsize::new(0)),
             }
         }
     }
@@ -9323,6 +9454,7 @@ mod tests {
             >,
         > {
             self.max_req.fetch_max(req.len(), Ordering::SeqCst);
+            self.range_fetches.fetch_add(1, Ordering::SeqCst);
             assert!(
                 req.fetch_start < self.panic_from,
                 "stub origin panics on request"
@@ -9409,6 +9541,166 @@ mod tests {
         Ok((engine, tmp))
     }
 
+    /// The serviceability probe confirms an origin that serves the outboard and
+    /// ranges with one chunk-group read, then answers the next probe from the
+    /// latch without a read.
+    #[tokio::test]
+    async fn origin_range_serviceable_probes_one_group_then_latches() -> anyhow::Result<()> {
+        let (data, hash, origin, _) = multi_window_stub();
+        let total = u64::try_from(data.len())?;
+        let fetches = Arc::clone(&origin.range_fetches);
+        let (engine, _tmp) = stub_engine(vec![origin]).await?;
+        anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
+        anyhow::ensure!(
+            fetches.load(Ordering::SeqCst) == 1,
+            "the first probe reads one window"
+        );
+        anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
+        anyhow::ensure!(
+            fetches.load(Ordering::SeqCst) == 1,
+            "a confirmed origin is not probed again"
+        );
+        Ok(())
+    }
+
+    /// An origin that publishes the outboard but declines ranges is not
+    /// serviceable, so the caller degrades before it signs.
+    #[tokio::test]
+    async fn origin_range_serviceable_is_false_without_range_support() -> anyhow::Result<()> {
+        let (data, hash, mut origin, _) = multi_window_stub();
+        let total = u64::try_from(data.len())?;
+        origin.support_range = false;
+        let (engine, _tmp) = stub_engine(vec![origin]).await?;
+        anyhow::ensure!(!engine.origin_range_serviceable(hash, total).await?);
+        Ok(())
+    }
+
+    /// A wrong-length first window cannot verify: the probe reports it as a hard
+    /// fault, not as serviceable.
+    #[tokio::test]
+    async fn origin_range_serviceable_faults_on_a_short_first_window() -> anyhow::Result<()> {
+        let (data, hash, mut origin, _) = multi_window_stub();
+        let total = u64::try_from(data.len())?;
+        origin.short_from = 0;
+        let (engine, _tmp) = stub_engine(vec![origin]).await?;
+        let probed = engine.origin_range_serviceable(hash, total).await;
+        anyhow::ensure!(
+            matches!(probed, Err(CacheError::VerifyFailed { .. })),
+            "a short first window must fault, got {probed:?}"
+        );
+        Ok(())
+    }
+
+    /// A blob of one chunk group has an empty outboard, which the outboard cache
+    /// never holds. The latch still keys on the origin that served it, so the
+    /// second probe reads no range.
+    #[tokio::test]
+    async fn origin_range_serviceable_latches_a_small_blob() -> anyhow::Result<()> {
+        use bao_tree::io::outboard::PreOrderMemOutboard;
+
+        let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let ob = PreOrderMemOutboard::create(&data, crate::range_pull::IROH_BLOCK_SIZE);
+        anyhow::ensure!(ob.data.is_empty(), "one chunk group has an empty outboard");
+        let hash = Hash::from(*ob.root.as_bytes());
+        let origin = RangeStubOrigin::serving(hash, &data, Bytes::from(ob.data));
+        let fetches = Arc::clone(&origin.range_fetches);
+        let (engine, _tmp) = stub_engine(vec![origin]).await?;
+        let total = u64::try_from(data.len())?;
+        anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
+        anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
+        anyhow::ensure!(
+            fetches.load(Ordering::SeqCst) == 1,
+            "a confirmed origin is probed once, got {}",
+            fetches.load(Ordering::SeqCst)
+        );
+        Ok(())
+    }
+
+    /// A first origin that publishes the outboard but declines ranges does not
+    /// shadow a second origin that serves both; the probe confirms the second.
+    #[tokio::test]
+    async fn origin_range_serviceable_walks_past_a_range_declining_origin() -> anyhow::Result<()> {
+        let (data, hash, mut declining, _) = multi_window_stub();
+        let total = u64::try_from(data.len())?;
+        declining.support_range = false;
+        let (_, _, serving, _) = multi_window_stub();
+        let declined = Arc::clone(&declining.range_fetches);
+        let served = Arc::clone(&serving.range_fetches);
+        let (engine, _tmp) = stub_engine(vec![declining, serving]).await?;
+        anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
+        anyhow::ensure!(
+            served.load(Ordering::SeqCst) == 1,
+            "the second origin serves the probe"
+        );
+        let before = declined.load(Ordering::SeqCst);
+        anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
+        anyhow::ensure!(
+            declined.load(Ordering::SeqCst) == before && served.load(Ordering::SeqCst) == 1,
+            "a second probe reads no range from either origin"
+        );
+        Ok(())
+    }
+
+    /// A first origin that serves a wrong-length first window does not shadow a
+    /// healthy second origin: the probe confirms the second, and a draw opens
+    /// on it and completes.
+    #[tokio::test]
+    async fn a_short_first_window_advances_to_a_healthy_origin() -> anyhow::Result<()> {
+        let (data, hash, mut short, aligned) = multi_window_stub();
+        let total = u64::try_from(data.len())?;
+        short.short_from = 0;
+        let (_, _, healthy, _) = multi_window_stub();
+        let (engine, _tmp) = stub_engine(vec![short, healthy]).await?;
+        anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
+        let wire = engine
+            .origin_range_wire(hash, &aligned)
+            .await?
+            .expect("opens on the healthy origin");
+        let (_, fault) = drain_wire(wire).await;
+        anyhow::ensure!(
+            fault.is_none(),
+            "the healthy origin's wire is whole: {fault:?}"
+        );
+        Ok(())
+    }
+
+    /// A draw that waits on a full pool past the warning threshold keeps its
+    /// place and opens once a permit frees.
+    #[tokio::test]
+    async fn a_permit_wait_past_the_warning_keeps_waiting() -> anyhow::Result<()> {
+        use std::time::Duration;
+
+        let (_, hash, mut origin, aligned) = multi_window_stub();
+        origin.gate_from = crate::RANGE_PULL_WINDOW_BYTES;
+        let (engine, _tmp) = stub_engine(vec![origin]).await?;
+        let mut wires = Vec::new();
+        for _ in 0..crate::MAX_CONCURRENT_RANGE_PULLS {
+            let mut wire = engine
+                .origin_range_wire(hash, &aligned)
+                .await?
+                .expect("opens");
+            anyhow::ensure!(matches!(wire.next_chunk().await, Some(Ok(_))));
+            wires.push(wire);
+        }
+        tokio::time::pause();
+        let waiting = engine.origin_range_wire(hash, &aligned);
+        tokio::pin!(waiting);
+        anyhow::ensure!(
+            tokio::time::timeout(RANGE_PULL_PERMIT_WARN_AFTER * 2, &mut waiting)
+                .await
+                .is_err(),
+            "the warning must not end the wait"
+        );
+        tokio::time::resume();
+        drop(wires.pop());
+        let opened = tokio::time::timeout(Duration::from_secs(10), waiting).await??;
+        anyhow::ensure!(
+            opened.is_some(),
+            "the waiting draw opens once a permit frees"
+        );
+        Ok(())
+    }
+
     /// An origin that stops serving (declines) a later window ends the wire on
     /// an `OriginError`, not a `VerifyFailed` and not a clean end.
     #[tokio::test]
@@ -9446,28 +9738,39 @@ mod tests {
         Ok(())
     }
 
-    /// A panic inside the encode task never reads as a clean end: the wire ends
-    /// on an `OriginError`.
+    /// A panic inside the encode task never reads as a clean end, and never as
+    /// an origin or store fault: the wire ends on an `Internal` fault that
+    /// carries the panic's message, and the task still releases its permit.
     #[tokio::test]
-    async fn origin_range_wire_panicking_encode_ends_on_a_fault() -> anyhow::Result<()> {
+    async fn origin_range_wire_panicking_encode_ends_on_an_internal_fault() -> anyhow::Result<()> {
+        use std::time::Duration;
+
         let (_, hash, mut origin, aligned) = multi_window_stub();
         origin.panic_from = crate::RANGE_PULL_WINDOW_BYTES;
         let (engine, _tmp) = stub_engine(vec![origin]).await?;
-        let wire = engine
-            .origin_range_wire(hash, &aligned)
-            .await?
+        for _ in 0..=crate::MAX_CONCURRENT_RANGE_PULLS {
+            let wire = tokio::time::timeout(
+                Duration::from_secs(10),
+                engine.origin_range_wire(hash, &aligned),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("a panicked encode must release its permit"))??
             .expect("opens");
-        let (_, fault) = drain_wire(wire).await;
-        anyhow::ensure!(
-            matches!(fault, Some(CacheError::OriginError { .. })),
-            "a panicked encode must end on an OriginError, got {fault:?}"
-        );
+            let (_, fault) = drain_wire(wire).await;
+            let Some(CacheError::Internal(source)) = &fault else {
+                anyhow::bail!("a panicked encode must end on an Internal fault, got {fault:?}");
+            };
+            anyhow::ensure!(
+                format!("{source:#}").contains("stub origin panics on request"),
+                "the fault must carry the panic message, got {source:#}"
+            );
+        }
         Ok(())
     }
 
     /// Dropping a wire releases its permit, and the own-origin pool is separate
     /// from the range-pull pool: a full own-origin pool does not stall a range
-    /// pull.
+    /// pull. A draw that finds the pool full is counted as a permit wait.
     #[tokio::test]
     async fn origin_range_wire_releases_its_permit_on_drop() -> anyhow::Result<()> {
         use std::time::Duration;
@@ -9475,7 +9778,19 @@ mod tests {
         let (_, hash, mut origin, aligned) = multi_window_stub();
         // Every wire stalls in its second window, holding its permit.
         origin.gate_from = crate::RANGE_PULL_WINDOW_BYTES;
-        let (engine, _tmp) = stub_engine(vec![origin]).await?;
+        let tmp = tempfile::tempdir()?;
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            vec![Arc::new(origin) as Arc<dyn Origin>],
+            64,
+            PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
+            Some(Arc::clone(&cm)),
+            Duration::ZERO,
+        )
+        .await?;
 
         let mut wires = Vec::new();
         for _ in 0..crate::MAX_CONCURRENT_RANGE_PULLS {
@@ -9494,6 +9809,11 @@ mod tests {
             .await
             .is_err(),
             "a full own-origin pool must make the next open wait",
+        );
+        anyhow::ensure!(
+            cm.range_pull_permit_waits.get() == 1,
+            "the waiting draw is counted once, got {}",
+            cm.range_pull_permit_waits.get()
         );
         drop(wires);
         let reopened = tokio::time::timeout(

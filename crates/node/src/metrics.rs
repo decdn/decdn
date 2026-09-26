@@ -1253,6 +1253,15 @@ pub struct DecdnMetrics {
     /// upstream request, so the pause batches the room into fewer, larger draws.
     /// A high rate is benign; it grows with the number of vouchers per draw.
     pub node_pull_through_min_draw_waits: Counter,
+    /// `decdn_node_pull_through_wait_seconds`: how long one window-paced pause
+    /// (window full or minimum draw) held the upstream pull before a downstream
+    /// payment or a parked serve leg released it, or its leg cancelled it. One
+    /// observation per pause.
+    /// Most pauses end within a voucher round trip; a tail near the top bucket
+    /// means a payer that stalls or a pacing regression that parks the pull
+    /// with no serve leg left to wake it. A pause past 30 s also logs a warning.
+    #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
+    pub node_pull_through_wait_seconds: Histogram,
     /// `decdn_node_pull_through_client_abandoned_total` (#856): window-paced
     /// serves the requesting client dropped or underpaid mid-pull, so the node
     /// aborted the upstream pull and abandoned the partial fill. The per-request
@@ -2810,6 +2819,10 @@ recorders! {
     /// window opened to the minimum draw (#2061).
     node_pull_through_min_draw_waits => node_pull_through_min_draw_waits.inc();
 
+    /// A window-paced pause of the upstream pull ended after `elapsed`.
+    node_pull_through_wait(elapsed: Duration) =>
+        node_pull_through_wait_seconds.observe(elapsed.as_secs_f64());
+
     /// A window-paced serve was abandoned because the requesting client dropped
     /// or underpaid mid-pull (#856).
     node_pull_through_client_abandoned => node_pull_through_client_abandoned.inc();
@@ -3489,11 +3502,12 @@ mod tests {
     /// the base name that a registry row names.
     #[test]
     fn latency_histograms_export_buckets_sum_and_count() {
-        const HISTOGRAMS: [&str; 4] = [
+        const HISTOGRAMS: [&str; 5] = [
             "decdn_probe_collection_latency_seconds",
             "decdn_serve_first_byte_hit_seconds",
             "decdn_serve_first_byte_miss_seconds",
             "decdn_node_pull_first_byte_seconds",
+            "decdn_node_pull_through_wait_seconds",
         ];
         let metrics = Metrics::new();
         let text = metrics.encode().unwrap();
