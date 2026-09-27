@@ -40,8 +40,8 @@ use decdn_node::chain_events::shared_head::SNAPSHOT_LAG_MARGIN_BLOCKS;
 
 use crate::bindings::{
     AccessControl, CapacityBond, ContentBlacklist, ContentBlacklistOrigin, DecdnGovernor, Erc20,
-    ManualVettingPolicy, OriginAssignment, PublisherRegistry, SlashAppeal, SlashJudge,
-    TimelockController,
+    FeeRouterParams, ManualVettingPolicy, OriginAssignment, PaymentPoolParams, PublisherRegistry,
+    SlashAppeal, SlashJudge, TimelockController,
 };
 
 /// The single chain id every anvil-e2e chain runs on: the one-time protocol
@@ -84,20 +84,6 @@ const MIN_BOND_WEI: &str = "50000000000000000000000";
 
 /// `FeeRouter`/`CapacityBond` epoch length, for the served-bytes read.
 const EPOCH_LENGTH_SECS: u64 = 7 * 24 * 60 * 60;
-
-/// `DeployProtocol`'s default `FeeRouter` trailing window, in epochs. Mirrored by
-/// [`ChainFixture::redeploy_payment_pool`]'s fresh router.
-const FEE_ROUTER_WINDOW_EPOCHS: u64 = 13;
-
-/// `DeployProtocol`'s launch-mode `FeeRouter` split, operator / buyback /
-/// treasury in bps: the buyback bucket stays dormant behind a zero burner.
-const FEE_ROUTER_LAUNCH_SHARES: [u64; 3] = [9_000, 0, 1_000];
-
-/// `DeployProtocol`'s `PaymentPool` dispute window (48 hours).
-const PAYMENT_DISPUTE_WINDOW_SECS: u64 = 48 * 60 * 60;
-
-/// `DeployProtocol`'s `PaymentPool` delivery floor.
-const PAYMENT_DELIVERY_FLOOR: u64 = 1;
 
 // A cold compile of the full contracts suite can be slow; a single 180s cap with
 // no retry made an over-budget-but-progressing build a hard failure. Give it
@@ -220,8 +206,9 @@ pub struct ContractAddrs {
     /// `DecdnGovernor` — the on-chain governor that proposes through the
     /// timelock below.
     pub governor: Address,
-    /// `TimelockController` — holds `GOVERNANCE_ROLE` + `DEFAULT_ADMIN_ROLE` on
-    /// the governed contracts after the `DeployProtocol` handoff. The blacklist
+    /// `TimelockController` — holds `GOVERNANCE_ROLE` on the governed contracts
+    /// after the `DeployProtocol` handoff, which renounces `DEFAULT_ADMIN_ROLE`
+    /// to no one (#2028). The blacklist
     /// journeys drive governance actions by impersonating it (anvil), since the
     /// deployer keeps no privileged roles; the G-NODE-05 grant executes through
     /// it via a real Governor proposal.
@@ -444,19 +431,38 @@ impl ChainFixture {
     /// Deploy a second `PaymentPool` beside the snapshot's — the chain an
     /// operator sees after a `PaymentPool` redeploy — and return its address.
     ///
-    /// The new pool shares the snapshot's USDC and `CapacityBond` and takes
-    /// `DeployProtocol`'s parameters, so a node bonded on the snapshot serves and
-    /// redeems against it unchanged. It settles through a fresh `FeeRouter`: the
-    /// snapshot router renounced `DEFAULT_ADMIN_ROLE` at deploy, which freezes
-    /// its `ROUTER_CALLER_ROLE` membership on the snapshot pool. The fixture
-    /// admin EOA holds both new contracts' admin roles; nothing moves to the
-    /// Timelock.
+    /// The new pool shares the snapshot's USDC and `CapacityBond`, and copies
+    /// the snapshot pool's dispute window, delivery floor, and minimum deposit,
+    /// so a node bonded on the snapshot serves and redeems against it unchanged.
+    /// It settles through a fresh `FeeRouter` that copies the snapshot router's
+    /// window and split: the deployer renounced its `DEFAULT_ADMIN_ROLE` on the
+    /// snapshot router, which pins `ROUTER_CALLER_ROLE` to the snapshot pool
+    /// alone. The fixture admin EOA holds both new contracts' admin roles; no
+    /// role moves to the Timelock. [`Self::served_bytes`] reads the snapshot
+    /// router, so it does not see bytes settled through the new pool.
     ///
     /// `ownerPoolNonce` starts at zero on the new pool, so every owner's Nth pool
     /// here has the same id as its Nth pool on [`ContractAddrs::payment_pool`].
     pub async fn redeploy_payment_pool(&self) -> anyhow::Result<Address> {
         let contracts = contracts_dir()?;
-        let [operator_share, buyback_share, treasury_share] = FEE_ROUTER_LAUNCH_SHARES;
+        let snapshot_router = FeeRouterParams::new(self.addrs.fee_router, &self.admin);
+        let window_epochs = snapshot_router
+            .windowEpochs()
+            .call()
+            .await
+            .context("snapshot FeeRouter.windowEpochs")?;
+        let shares = snapshot_router
+            .getShares()
+            .call()
+            .await
+            .context("snapshot FeeRouter.getShares")?;
+        // The fresh router takes no burner, which `_setShares` accepts only while
+        // the buyback bucket is dormant.
+        anyhow::ensure!(
+            shares.get(1).is_some_and(U256::is_zero),
+            "the snapshot FeeRouter has an active buyback share {shares:?}; the redeployed \
+             router has no burner to route it to"
+        );
         // FeeRouter(usdc, capacityBond, treasury, epochLength, windowEpochs,
         //           admin, initialShares, buybackBurner)
         let router_args = (
@@ -464,26 +470,38 @@ impl ChainFixture {
             self.addrs.capacity_bond,
             self.addrs.timelock,
             EPOCH_LENGTH_SECS,
-            FEE_ROUTER_WINDOW_EPOCHS,
+            window_epochs,
             self.admin_addr,
-            [
-                U256::from(operator_share),
-                U256::from(buyback_share),
-                U256::from(treasury_share),
-            ],
+            shares,
             Address::ZERO,
         )
             .abi_encode_params();
         let router = deploy_artifact(&self.admin, &contracts, "FeeRouter", &router_args).await?;
+        let snapshot_pool = PaymentPoolParams::new(self.addrs.payment_pool, &self.admin);
+        let dispute_window = snapshot_pool
+            .disputeWindow()
+            .call()
+            .await
+            .context("snapshot PaymentPool.disputeWindow")?;
+        let delivery_floor = snapshot_pool
+            .getRateBounds()
+            .call()
+            .await
+            .context("snapshot PaymentPool.getRateBounds")?;
+        let min_deposit = snapshot_pool
+            .minDeposit()
+            .call()
+            .await
+            .context("snapshot PaymentPool.minDeposit")?;
         // PaymentPool(usdc, capacityBond, feeRouter, disputeWindow,
         //             deliveryFloor, minDeposit, admin)
         let pool_args = (
             self.usdc,
             self.addrs.capacity_bond,
             router,
-            U256::from(PAYMENT_DISPUTE_WINDOW_SECS),
-            U256::from(PAYMENT_DELIVERY_FLOOR),
-            0u64,
+            dispute_window,
+            delivery_floor,
+            min_deposit,
             self.admin_addr,
         )
             .abi_encode_params();
@@ -508,17 +526,37 @@ impl ChainFixture {
                 .context("FeeRouter.hasRole")?,
             "the redeployed PaymentPool {pool} does not hold ROUTER_CALLER_ROLE on {router}"
         );
+        self.ensure_redeploy_wiring(pool, router).await?;
+        Ok(pool)
+    }
+
+    /// Read the redeployed pool's wiring back: it settles in the fixture USDC,
+    /// routes through `router`, and gates on the snapshot `CapacityBond`.
+    async fn ensure_redeploy_wiring(&self, pool: Address, router: Address) -> anyhow::Result<()> {
         let settles_in = crate::bindings::PaymentPool::new(pool, &self.admin)
             .usdc()
             .call()
             .await
             .context("redeployed PaymentPool.usdc")?;
+        let redeployed = PaymentPoolParams::new(pool, &self.admin);
+        let routes_to = redeployed
+            .feeRouter()
+            .call()
+            .await
+            .context("redeployed PaymentPool.feeRouter")?;
+        let bonded_by = redeployed
+            .capacityBond()
+            .call()
+            .await
+            .context("redeployed PaymentPool.capacityBond")?;
         anyhow::ensure!(
-            settles_in == self.usdc,
-            "the redeployed PaymentPool settles in {settles_in}, not the fixture USDC {}",
-            self.usdc
+            settles_in == self.usdc && routes_to == router && bonded_by == self.addrs.capacity_bond,
+            "the redeployed PaymentPool is miswired: usdc {settles_in} (want {}), feeRouter \
+             {routes_to} (want {router}), capacityBond {bonded_by} (want {})",
+            self.usdc,
+            self.addrs.capacity_bond
         );
-        Ok(pool)
+        Ok(())
     }
 
     /// Build a wallet-filled provider for `signer` (simple nonce management

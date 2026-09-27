@@ -17,23 +17,29 @@
 //! with `pool_id`, `foreign_payment_pool` and `configured_payment_pool` fields.
 //! The unit tests in `crates/node/src/buyer_channel.rs` cover that decision
 //! against a mocked transport. This file runs it against two real deployments of
-//! the same contract, which is the only place the hand-written `sol!` bindings
-//! meet two same-shaped contracts that differ by address alone:
+//! the same contract, so the `sol!` bindings, the config repoint, and the
+//! on-chain enumeration all take part:
 //!
 //!   1. **An empty redeploy.** The node drops the #1 row, opens nothing at boot,
-//!      and its first cache-miss pull opens a fresh pool on #2. That pool has the
-//!      #1 id, but its lane starts at zero.
+//!      and its first cache-miss pull opens a fresh pool on #2 at the #1 id. The
+//!      store holds that pool at the fresh #2 deposit, not the #1 row.
 //!   2. **A redeploy that reissued the tracked id.** The node's key already owns
 //!      an open pool on #2 at the tracked id. The node adopts it with the #2
-//!      deposit and no lanes, and the next pull pays #2 only for the bytes it
-//!      delivers — not the #1 cumulative on top.
+//!      deposit and no lanes; the #1 row, with the #1 deposit and its lane to
+//!      SEEDER #1, is gone.
+//!
+//! In both journeys the store assertions are what pin the guard. The #2 pull
+//! then proves the repointed node buys and settles on #2 at the leg-2 price.
+//! That pull pays a different provider than leg 1, so it cannot show a #1
+//! cumulative carried onto a #2 lane; a same-provider check needs #2181.
 //!
 //! Topology: a pull-through SERVER that holds nothing buys each client miss from
 //! a SEEDER. Leg 1 runs on #1 through SEEDER #1. Leg 2 runs on #2 through a
 //! fresh SEEDER #2 that has only ever known #2. The fresh seeder is deliberate:
 //! the seller-side lane store is keyed without the deployment too (#2181), and
 //! a repointed SEEDER #1 would reject the SERVER's first #2 voucher against its
-//! #1 frontier. Each leg's blob lives in its own namespace, seated on its own
+//! #1 frontier. When #2181 lands, its acceptance variant repoints SEEDER #1
+//! instead. Each leg's blob lives in its own namespace, seated on its own
 //! seeder, so the directory never routes a leg-2 miss to SEEDER #1.
 //!
 //! The drop assertion reads the SERVER's captured log, so `DECDN_NODE_LOG` must
@@ -82,8 +88,8 @@ const REDEPLOY_WORKING_DEPOSIT: u64 = 1_500_000;
 
 /// The deposit of the pool the test opens on #2 under the SERVER's key. Distinct
 /// from both working deposits so the adopted row's deposit names its source.
-/// Above [`REDEPLOY_WORKING_DEPOSIT`], so reusing it never triggers a refill that
-/// would move the figure.
+/// Above [`REDEPLOY_WORKING_DEPOSIT`], so it never falls below the refill
+/// low-water mark (a fraction of the working deposit) and the figure holds.
 const PREOPENED_DEPOSIT: u64 = 2_000_000;
 
 /// The refundable floor `M`, set on every node so the seller-side pre-serve gate
@@ -102,7 +108,8 @@ const FOREIGN_ROW_DROPPED: &str =
     "the tracked buyer pool belongs to a different PaymentPool deployment";
 
 /// The WARN the SERVER logs when a pull meets a foreign row that bootstrap
-/// failed to drop. Never expected here: bootstrap's drop is the whole guard.
+/// failed to drop. Never expected here: bootstrap's drop removes the row before
+/// any pull runs.
 const FOREIGN_ROW_IGNORED: &str =
     "ignoring a tracked buyer pool from another PaymentPool deployment";
 
@@ -129,12 +136,11 @@ fn wire_bytes(blob: &[u8]) -> anyhow::Result<u64> {
     ))
 }
 
-/// The price of `wire` bytes at [`RATE_PER_MB`], rounded up the way the contract
-/// and the ledger both round: a partial megabyte is charged.
-fn price_micro_usdc(wire: u64) -> u64 {
-    const MB: u128 = 1024 * 1024;
-    let cost = (u128::from(wire) * u128::from(RATE_PER_MB)).div_ceil(MB);
-    u64::try_from(cost).unwrap_or(u64::MAX)
+/// The price of `wire` bytes at [`RATE_PER_MB`] as the voucher signer prices
+/// it: pro rata, with a fractional micro-USDC rounded up.
+fn price_micro_usdc(wire: u64) -> anyhow::Result<u64> {
+    u64::try_from(decdn_incentive::rate::min_payment(wire, RATE_PER_MB))
+        .context("price overflows u64")
 }
 
 /// A node repointed at an empty redeploy drops its #1 row, opens nothing at
@@ -150,8 +156,8 @@ async fn a_node_repointed_at_an_empty_redeploy_drops_its_stale_row_and_opens_fre
 }
 
 /// A node repointed at a redeploy on which its key already owns the tracked id
-/// adopts that pool with the #2 deposit and no lanes, and pays #2 only for the
-/// bytes #2 sees.
+/// adopts that pool with the #2 deposit and no lanes, and buys on it without
+/// opening another.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_repointed_at_a_redeploy_that_reissued_its_pool_id_adopts_it_without_its_lanes()
 -> anyhow::Result<()> {
@@ -170,19 +176,16 @@ async fn run_empty_redeploy() -> anyhow::Result<()> {
         .repoint_payment_pool(r.pool2, &[&r.seeder2])
         .await?;
     r.assert_foreign_row_dropped().await?;
+    wait_buyer_bootstrap(&r.server).await?;
 
     // The drop deletes the row outright, so the store reads empty — not merely
     // filtered — once bootstrap is through.
     let admin = r.server.admin_client()?;
-    decdn_e2e::poll(SETTLE, || async {
-        Ok(admin
-            .pools()
-            .await
-            .ok()
-            .filter(|p| p.pools.is_empty() && p.skipped.is_empty()))
-    })
-    .await?
-    .context("the SERVER's buyer store never emptied after the foreign row was dropped")?;
+    let store = admin.pools().await.context("admin pools")?;
+    anyhow::ensure!(
+        store.pools.is_empty() && store.skipped.is_empty(),
+        "the SERVER's buyer store must be empty after the foreign row is dropped, got {store:?}"
+    );
 
     // The node opens lazily on a miss, so #2 has nothing for this owner yet.
     anyhow::ensure!(
@@ -248,9 +251,9 @@ async fn run_reissued_id() -> anyhow::Result<()> {
     let r = stale_row_from_first_deployment().await?;
     let pool2 = r.pool_on(r.pool2);
 
-    // Walk the owner's #2 nonce up to the tracked one, under the SERVER's own key
-    // while its daemon is down. Only `msg.sender` opens a pool for itself, so
-    // this is the one way a pool at the tracked id exists on #2.
+    // Open pools on #2 under the SERVER's own key, while its daemon is down,
+    // until one lands at the tracked nonce. Only `msg.sender` opens a pool for
+    // itself, so this is the one way a pool at the tracked id exists on #2.
     let tracked_nonce = owner_pool_nonce(&r.pool_on(r.pool1), r.owner)
         .await?
         .checked_sub(1)
@@ -303,18 +306,19 @@ async fn run_reissued_id() -> anyhow::Result<()> {
         .repoint_payment_pool(r.pool2, &[&r.seeder2])
         .await?;
     r.assert_foreign_row_dropped().await?;
+    wait_buyer_bootstrap(&r.server).await?;
 
     // The node adopts the #2 pool at the tracked id as a fresh row: the #2
-    // deposit, no lanes. Keeping the #1 row would show the #1 deposit and the #1
-    // lane — the production bug.
+    // deposit, no lanes. Keeping the #1 row would show `FIRST_WORKING_DEPOSIT`
+    // and the lane to SEEDER #1 — the stale-row resume this journey guards
+    // against.
     let adopted = r.sole_pool_on_redeploy().await?;
     anyhow::ensure!(
         adopted.deposit_micro_usdc == PREOPENED_DEPOSIT && adopted.lanes.is_empty(),
         "the adopted row must carry the #2 deposit {PREOPENED_DEPOSIT} and no lanes, got \
-         deposit {} and lanes {:?} (carried #1 cumulative was {})",
+         deposit {} and lanes {:?}",
         adopted.deposit_micro_usdc,
-        adopted.lanes,
-        r.carried
+        adopted.lanes
     );
     anyhow::ensure!(
         owner_pool_nonce(&pool2, r.owner).await? == nonce_before_repoint,
@@ -337,7 +341,8 @@ struct Redeploy {
     chain: ChainFixture,
     pool1: Address,
     pool2: Address,
-    // Kept alive so it can finish redeeming leg 1.
+    // Kept running so a leg-2 miss could reach it; the journey proves the
+    // directory never routes one there.
     _seeder1: NodeFixture,
     seeder2: NodeFixture,
     server: NodeFixture,
@@ -347,8 +352,6 @@ struct Redeploy {
     owner: Address,
     // The SERVER's pool id on #1, which #2 reissues.
     tracked: B256,
-    // The #1 lane's cumulative the SERVER's row carried into the repoint.
-    carried: u64,
 }
 
 /// Run leg 1 on #1 and stop the SERVER, leaving its buyer row as a node carries
@@ -435,69 +438,30 @@ async fn stale_row_from_first_deployment() -> anyhow::Result<Redeploy> {
     // The row the SERVER carries into the repoint: tagged #1, with a lane to
     // SEEDER #1 at the leg-1 cumulative.
     let first_wire = wire_bytes(&first)?;
-    let expected_carried = price_micro_usdc(first_wire);
+    let first_price = price_micro_usdc(first_wire)?;
     let seeder1_addr = seeder1.operator_addr();
-    let admin = server.admin_client()?;
-    let last_seen = std::sync::Mutex::new(Vec::new());
-    let row = decdn_e2e::poll(SETTLE, || async {
-        let rows = admin.pools().await.context("admin pools")?.pools;
-        last_seen
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone_from(&rows);
-        Ok(match rows.as_slice() {
-            [row]
-                if lane_to(row, seeder1_addr).is_some_and(|l| {
-                    l.last_amount_micro_usdc == expected_carried
-                        && l.last_bytes_delivered == first_wire
-                }) =>
-            {
-                Some(row.clone())
-            }
-            _ => None,
-        })
-    })
-    .await?
-    .with_context(|| {
-        format!(
-            "the SERVER's buyer store never recorded one pool with a lane to SEEDER #1 at \
-             {expected_carried} micro-USDC for {first_wire} bytes; last saw {:?}",
-            last_seen
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        )
-    })?;
+    let row = wait_lane(&server, pool1, seeder1_addr, first_wire).await?;
+    let lane = lane_to(&row, seeder1_addr)?.context("leg-1 lane to SEEDER #1")?;
     anyhow::ensure!(
-        parse_b256(&row.pool_id)? == tracked && parse_address(&row.payment_pool)? == pool1,
-        "the leg-1 row must be the tracked pool on #1, got {} on {}",
-        row.pool_id,
-        row.payment_pool
+        parse_b256(&row.pool_id)? == tracked
+            && lane.last_amount_micro_usdc == first_price
+            && lane.last_bytes_delivered == first_wire,
+        "the leg-1 row must be the tracked pool with a lane to SEEDER #1 at {first_price} for \
+         {first_wire} bytes, got {row:?}"
     );
 
     // Real, redeemed progress: SEEDER #1 cashed the leg-1 voucher on #1.
-    let redeemed = decdn_e2e::poll(SETTLE, || async {
-        let w = on_1
-            .getWatermark(tracked, owner, seeder1_addr)
-            .call()
-            .await
-            .context("read the #1 lane watermark")?;
-        Ok((w.amount > 0).then_some(w))
-    })
-    .await?
-    .context("SEEDER #1 never redeemed the SERVER's leg-1 voucher")?;
-    anyhow::ensure!(
-        redeemed.amount == expected_carried && redeemed.bytesDelivered == first_wire,
-        "SEEDER #1 must redeem the leg-1 price {expected_carried} for {first_wire} bytes, got \
-         {} for {}",
-        redeemed.amount,
-        redeemed.bytesDelivered
-    );
+    wait_redeemed(&on_1, tracked, owner, seeder1_addr, first_price, first_wire)
+        .await
+        .context("SEEDER #1 redeeming the SERVER's leg-1 voucher")?;
 
-    // The deposit a fresh #2 open escrows. The restart runs against #1, where
-    // the row is on the configured deployment and is kept.
+    // The deposit a fresh #2 open escrows. This call restarts the SERVER while it
+    // still points at #1, where the row is on the configured deployment and is
+    // kept; the bootstrap wait makes that a checked outcome, not a race.
     server
         .set_buyer_working_deposit(REDEPLOY_WORKING_DEPOSIT)
         .await?;
+    wait_buyer_bootstrap(&server).await?;
     anyhow::ensure!(
         server.log_line(&[FOREIGN_ROW_DROPPED]).is_none(),
         "a node still on #1 must not drop its #1 row"
@@ -516,7 +480,6 @@ async fn stale_row_from_first_deployment() -> anyhow::Result<Redeploy> {
         second_hash,
         owner,
         tracked,
-        carried: expected_carried,
     })
 }
 
@@ -542,28 +505,28 @@ impl Redeploy {
         Ok(())
     }
 
-    /// Wait until the SERVER's buyer store holds exactly one row, and that row
-    /// is the tracked id on #2.
+    /// The SERVER's buyer store holds exactly one row, and that row is the
+    /// tracked id on #2. Read once bootstrap is through
+    /// ([`wait_buyer_bootstrap`]), so a single read is the settled state.
     async fn sole_pool_on_redeploy(&self) -> anyhow::Result<BuyerPoolSnapshot> {
-        let admin = self.server.admin_client()?;
-        let row = decdn_e2e::poll(SETTLE, || async {
-            let Ok(response) = admin.pools().await else {
-                return Ok(None);
-            };
-            Ok(match response.pools.as_slice() {
-                [row] if parse_address(&row.payment_pool)? == self.pool2 => Some(row.clone()),
-                _ => None,
-            })
-        })
-        .await?
-        .context("the SERVER never tracked a single pool on #2")?;
+        let pools = self
+            .server
+            .admin_client()?
+            .pools()
+            .await
+            .context("admin pools")?
+            .pools;
+        let [row] = pools.as_slice() else {
+            anyhow::bail!("the SERVER must track exactly one pool, got {pools:?}");
+        };
         anyhow::ensure!(
-            parse_b256(&row.pool_id)? == self.tracked,
-            "the #2 row must be the tracked id {}, got {}",
+            parse_address(&row.payment_pool)? == self.pool2
+                && parse_b256(&row.pool_id)? == self.tracked,
+            "the SERVER's row must be the tracked id {} on #2 {}, got {row:?}",
             self.tracked,
-            row.pool_id
+            self.pool2
         );
-        Ok(row)
+        Ok(row.clone())
     }
 
     /// Leg 2: a fresh client on #2 fetches `second` through the SERVER, whose
@@ -578,55 +541,32 @@ impl Redeploy {
         Ok(())
     }
 
-    /// The SERVER's #2 lane — in its own store and on chain — covers the leg-2
-    /// bytes alone. A resumed #1 row signs and redeems `carried + price`.
+    /// The repointed SERVER buys and settles on #2: its lane to SEEDER #2 — in
+    /// its own store and on chain — is metered at exactly the leg-2 wire price.
     async fn assert_paid_for_second_only(&self) -> anyhow::Result<()> {
         let bytes = wire_bytes(&self.second)?;
-        let price = price_micro_usdc(bytes);
+        let price = price_micro_usdc(bytes)?;
         let seeder2 = self.seeder2.operator_addr();
 
-        let row = self.sole_pool_on_redeploy().await?;
-        let admin = self.server.admin_client()?;
-        let lane = decdn_e2e::poll(SETTLE, || async {
-            let pools = admin.pools().await.context("admin pools")?.pools;
-            Ok(pools
-                .iter()
-                .find(|p| p.pool_id == row.pool_id)
-                .and_then(|p| lane_to(p, seeder2))
-                .filter(|l| l.last_amount_micro_usdc > 0)
-                .cloned())
-        })
-        .await?
-        .context("the SERVER never recorded a lane to SEEDER #2")?;
+        let row = wait_lane(&self.server, self.pool2, seeder2, bytes).await?;
+        let lane = lane_to(&row, seeder2)?.context("leg-2 lane to SEEDER #2")?;
         anyhow::ensure!(
-            lane.last_amount_micro_usdc == price && lane.last_bytes_delivered == bytes,
-            "the #2 lane must cover the leg-2 bytes alone ({price} for {bytes}), got {} for {} \
-             ({} would be the #1 cumulative carried over)",
-            lane.last_amount_micro_usdc,
-            lane.last_bytes_delivered,
-            self.carried.saturating_add(price)
+            parse_b256(&row.pool_id)? == self.tracked
+                && lane.last_amount_micro_usdc == price
+                && lane.last_bytes_delivered == bytes,
+            "the #2 lane must be the tracked pool at {price} for {bytes} bytes, got {row:?}"
         );
 
-        let pool2 = self.pool_on(self.pool2);
-        let redeemed = decdn_e2e::poll(SETTLE, || async {
-            let w = pool2
-                .getWatermark(self.tracked, self.owner, seeder2)
-                .call()
-                .await
-                .context("read the #2 lane watermark")?;
-            Ok((w.amount > 0).then_some(w))
-        })
-        .await?
-        .context("SEEDER #2 never redeemed the SERVER's leg-2 voucher")?;
-        anyhow::ensure!(
-            redeemed.amount == price && redeemed.bytesDelivered == bytes,
-            "#2 must be paid {price} for {bytes} bytes, got {} for {} ({} would be the #1 \
-             cumulative carried over)",
-            redeemed.amount,
-            redeemed.bytesDelivered,
-            self.carried.saturating_add(price)
-        );
-        Ok(())
+        wait_redeemed(
+            &self.pool_on(self.pool2),
+            self.tracked,
+            self.owner,
+            seeder2,
+            price,
+            bytes,
+        )
+        .await
+        .context("SEEDER #2 redeeming the SERVER's leg-2 voucher")
     }
 
     /// The pull path never met the #1 row: bootstrap's drop is what removed it,
@@ -658,14 +598,101 @@ const fn is_open(pool: &PaymentPool::Pool) -> bool {
     matches!(pool.status, PaymentPool::Status::Open)
 }
 
+/// Wait until `node`'s buyer leg has finished bootstrap in its current process.
+///
+/// `restart` returns once the admin RPC answers, but the buyer bootstrap —
+/// the foreign-row drop, the on-chain enumeration, and adoption — runs later on
+/// its own task. It publishes `decdn_buyer_wallet_usdc` last, and the gauge is
+/// per process, so a non-zero read means this spawn's bootstrap is through. The
+/// SERVER holds [`SERVER_BUYER_USDC`], so the wallet is never empty.
+async fn wait_buyer_bootstrap(node: &NodeFixture) -> anyhow::Result<()> {
+    decdn_e2e::poll(SETTLE, || async {
+        Ok((node.scrape_metric("decdn_buyer_wallet_usdc").await? > 0).then_some(()))
+    })
+    .await?
+    .context("the node's buyer bootstrap never published its wallet balance")
+}
+
+/// Wait until `node`'s buyer store holds exactly one row, on `payment_pool`,
+/// whose lane to `provider` has metered at least `bytes`, and return that row.
+/// Waiting on the byte count rather than the first non-zero voucher keeps the
+/// exact-amount checks after it free of a mid-pull read.
+async fn wait_lane(
+    node: &NodeFixture,
+    payment_pool: Address,
+    provider: Address,
+    bytes: u64,
+) -> anyhow::Result<BuyerPoolSnapshot> {
+    let admin = node.admin_client()?;
+    let last_seen = std::sync::Mutex::new(Vec::new());
+    decdn_e2e::poll(SETTLE, || async {
+        let rows = admin.pools().await.context("admin pools")?.pools;
+        last_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone_from(&rows);
+        let [row] = rows.as_slice() else {
+            return Ok(None);
+        };
+        if parse_address(&row.payment_pool)? != payment_pool {
+            return Ok(None);
+        }
+        Ok(lane_to(row, provider)?
+            .is_some_and(|l| l.last_bytes_delivered >= bytes)
+            .then(|| row.clone()))
+    })
+    .await?
+    .with_context(|| {
+        format!(
+            "the buyer store never held one pool on {payment_pool} with {bytes} bytes metered \
+             to {provider}; last saw {:?}",
+            last_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        )
+    })
+}
+
+/// Wait until the on-chain watermark of `(pool_id, signer, provider)` reaches
+/// `amount`, then require exactly `amount` for exactly `bytes`.
+async fn wait_redeemed(
+    pool: &PaymentPool::PaymentPoolInstance<DynProvider>,
+    pool_id: B256,
+    signer: Address,
+    provider: Address,
+    amount: u64,
+    bytes: u64,
+) -> anyhow::Result<()> {
+    let redeemed = decdn_e2e::poll(SETTLE, || async {
+        let w = pool
+            .getWatermark(pool_id, signer, provider)
+            .call()
+            .await
+            .context("getWatermark")?;
+        Ok((w.amount >= amount).then_some(w))
+    })
+    .await?
+    .with_context(|| format!("the watermark never reached {amount}"))?;
+    anyhow::ensure!(
+        redeemed.amount == amount && redeemed.bytesDelivered == bytes,
+        "the lane must be paid {amount} for {bytes} bytes, got {} for {}",
+        redeemed.amount,
+        redeemed.bytesDelivered
+    );
+    Ok(())
+}
+
 /// `row`'s lane paying `provider`, if it has one.
 fn lane_to(
     row: &BuyerPoolSnapshot,
     provider: Address,
-) -> Option<&decdn_common::admin::BuyerLaneSnapshot> {
-    row.lanes
-        .iter()
-        .find(|l| parse_address(&l.provider).is_ok_and(|p| p == provider))
+) -> anyhow::Result<Option<&decdn_common::admin::BuyerLaneSnapshot>> {
+    for lane in &row.lanes {
+        if parse_address(&lane.provider)? == provider {
+            return Ok(Some(lane));
+        }
+    }
+    Ok(None)
 }
 
 fn parse_address(s: &str) -> anyhow::Result<Address> {

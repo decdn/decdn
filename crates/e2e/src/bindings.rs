@@ -272,6 +272,26 @@ alloy::sol! {
         function hasRole(bytes32 role, address account) external view returns (bool);
     }
 
+    /// `PaymentPool` construction parameters and wiring, read back so a
+    /// redeployed pool copies the snapshot pool's economics and its own wiring
+    /// can be checked (see `ChainFixture::redeploy_payment_pool`).
+    #[sol(rpc)]
+    contract PaymentPoolParams {
+        function disputeWindow() external view returns (uint256);
+        function minDeposit() external view returns (uint64);
+        function getRateBounds() external view returns (uint256 floor);
+        function feeRouter() external view returns (address);
+        function capacityBond() external view returns (address);
+    }
+
+    /// `FeeRouter` construction parameters, read back so a redeployed router
+    /// copies the snapshot router's window and split.
+    #[sol(rpc)]
+    contract FeeRouterParams {
+        function windowEpochs() external view returns (uint64);
+        function getShares() external view returns (uint256[3] memory);
+    }
+
     /// `SlashAppeal` full lifecycle surface (ADR 028) the G-NODE-05 journey
     /// drives: the operator files via `openSlashAppeal` (also exercised through
     /// the `decdn appeal slash` CLI), the emergency multisig `fastTrackAppeal`s,

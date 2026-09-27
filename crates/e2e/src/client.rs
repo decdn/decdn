@@ -145,7 +145,8 @@ pub struct ClientFixture {
 
 impl ClientFixture {
     /// Create a funded client: fresh eth key with gas, a mock-USDC balance, and
-    /// a max approval for the `PaymentPool`, plus a loopback iroh endpoint.
+    /// an approval for 100 deposits on the snapshot `PaymentPool`, plus a
+    /// loopback iroh endpoint.
     pub async fn new(chain: &ChainFixture) -> anyhow::Result<Self> {
         Self::new_on_payment_pool(chain, chain.addrs().payment_pool).await
     }

@@ -645,7 +645,9 @@ impl NodeFixture {
     /// the daemon's own nonce.
     pub fn stop(&self) -> anyhow::Result<()> {
         let mut child = self.child.0.lock().unwrap_or_else(PoisonError::into_inner);
-        let _ = child.kill();
+        // `kill` answers `Ok` for a child that already exited, so an error here is
+        // a live process `wait` would block on.
+        child.kill().context("kill decdn-node")?;
         child.wait().context("reap stopped decdn-node")?;
         Ok(())
     }
@@ -699,7 +701,9 @@ impl NodeFixture {
             anyhow::ensure!(
                 tokio::time::Instant::now() < deadline,
                 "decdn-node logged no line holding all of {needles:?} within {timeout:?} \
-                 (only events at or above $DECDN_NODE_LOG, default `warn`, are captured)"
+                 (only events at or above $DECDN_NODE_LOG, default `warn`, are captured); \
+                 its last {LOG_TAIL_LINES} lines:\n{}",
+                self.log.tail(LOG_TAIL_LINES)
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
@@ -1068,25 +1072,35 @@ fn rewrite_payment_pool(
     toml::to_string(&doc).context("render node config")
 }
 
-/// Everything every spawn of one daemon has written to stdout and stderr, one
-/// line per event, with ANSI styling removed. The daemon's pretty log format
-/// styles field names even when its output is a pipe, so a raw line never
-/// contains `name=value` verbatim.
+/// How many trailing log lines a [`NodeFixture::wait_for_log_line`] timeout
+/// reports.
+const LOG_TAIL_LINES: usize = 20;
+
+/// Everything every spawn of one daemon has written to stdout and stderr, line
+/// by line, with ANSI styling removed. The daemon's log format styles field
+/// names whenever colour is on (unless `NO_COLOR` is set), even when its output
+/// is a pipe, so a raw line does not contain `name=value` verbatim.
 #[derive(Debug, Clone, Default)]
 struct DaemonLog(Arc<Mutex<String>>);
 
 impl DaemonLog {
     /// Copy `pipe` to `echo` byte for byte, and append each line to the log,
     /// on a background thread that ends when the daemon closes the pipe. The
-    /// echo keeps the daemon's output in the test's own stream, where the
-    /// harness captures it as before.
+    /// echo keeps the daemon's output in the test process's own stdout or
+    /// stderr, which nextest captures per test.
+    ///
+    /// A line cut short by a killed daemon gains a newline in the log, so it
+    /// never runs into the next spawn's first line. A read failure ends the
+    /// thread and leaves a line saying so, so a dead capture shows up in
+    /// [`Self::tail`] rather than as silence.
     fn tee(
         &self,
         pipe: impl std::io::Read + Send + 'static,
         mut echo: impl std::io::Write + Send + 'static,
         name: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<std::thread::JoinHandle<()>> {
         let log = self.clone();
+        let stream = name.to_owned();
         std::thread::Builder::new()
             .name(format!("decdn-node-{name}-tee"))
             .spawn(move || {
@@ -1095,40 +1109,64 @@ impl DaemonLog {
                 loop {
                     line.clear();
                     match reader.read_until(b'\n', &mut line) {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => break,
                         Ok(_) => {
                             let _ = echo.write_all(&line);
                             let _ = echo.flush();
-                            log.0
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .push_str(&strip_ansi(&line));
+                            let mut plain = strip_ansi(&line);
+                            if !plain.ends_with('\n') {
+                                plain.push('\n');
+                            }
+                            log.append(&plain);
+                        }
+                        Err(err) => {
+                            log.append(&format!(
+                                "[e2e] decdn-node {stream} log capture failed: {err}\n"
+                            ));
+                            break;
                         }
                     }
                 }
             })
-            .with_context(|| format!("spawn decdn-node {name} tee thread"))?;
-        Ok(())
+            .with_context(|| format!("spawn decdn-node {name} tee thread"))
+    }
+
+    fn append(&self, text: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_str(text);
+    }
+
+    /// The last `lines` lines of the log.
+    fn tail(&self, lines: usize) -> String {
+        let log = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let all: Vec<&str> = log.lines().collect();
+        all.get(all.len().saturating_sub(lines)..)
+            .unwrap_or_default()
+            .join("\n")
     }
 }
 
-/// `bytes` as text with every ANSI CSI escape sequence (`ESC [` … final byte in
-/// `0x40..=0x7E`) removed.
+/// `bytes` as text with every ANSI CSI sequence (`ESC [` … final byte in
+/// `0x40..=0x7E`) removed. Any other ESC is removed on its own, and a CSI left
+/// unterminated at a newline ends there, keeping the newline.
 fn strip_ansi(bytes: &[u8]) -> String {
     let mut plain = Vec::with_capacity(bytes.len());
-    let mut rest = bytes.iter().copied();
+    let mut rest = bytes.iter().copied().peekable();
     while let Some(byte) = rest.next() {
-        if byte == 0x1b {
-            if rest.next() == Some(b'[') {
-                for escaped in rest.by_ref() {
-                    if (0x40..=0x7e).contains(&escaped) {
-                        break;
-                    }
-                }
-            }
+        if byte != 0x1b {
+            plain.push(byte);
             continue;
         }
-        plain.push(byte);
+        if rest.next_if_eq(&b'[').is_none() {
+            continue;
+        }
+        while let Some(escaped) = rest.next_if(|&b| b != b'\n') {
+            if (0x40..=0x7e).contains(&escaped) {
+                break;
+            }
+        }
     }
     String::from_utf8_lossy(&plain).into_owned()
 }
@@ -1240,10 +1278,12 @@ fn spawn_daemon(
         .stderr(Stdio::piped())
         .spawn()
         .context("spawn decdn-node")?;
+    // The tee threads are detached: each ends when this child's pipe closes.
     let teed = match (child.stdout.take(), child.stderr.take()) {
         (Some(stdout), Some(stderr)) => log
             .tee(stdout, std::io::stdout(), "stdout")
-            .and_then(|()| log.tee(stderr, std::io::stderr(), "stderr")),
+            .and_then(|_| log.tee(stderr, std::io::stderr(), "stderr"))
+            .map(drop),
         _ => Err(anyhow::anyhow!("decdn-node spawned without piped stdio")),
     };
     if let Err(err) = teed {
@@ -1565,6 +1605,58 @@ mod tests {
             " WARN pool_id=0xab\n"
         );
         assert_eq!(strip_ansi(b"plain = text"), "plain = text");
+    }
+
+    /// Only a CSI sequence is consumed past its ESC: a lone ESC goes alone,
+    /// and a CSI cut off at a newline keeps the newline.
+    #[test]
+    fn strip_ansi_removes_a_lone_esc_alone_and_stops_a_cut_csi_at_newline() {
+        assert_eq!(strip_ansi(b"a\x1bcb"), "acb");
+        assert_eq!(strip_ansi(b"a\x1b"), "a");
+        assert_eq!(strip_ansi(b"a\x1b[3\nb"), "a\nb");
+    }
+
+    /// A `Write` whose bytes the test reads back after the tee thread ends.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The tee echoes the daemon's bytes unchanged, logs them without styling,
+    /// and ends a line the daemon never finished, so the next spawn's first
+    /// line starts on its own.
+    #[test]
+    fn tee_echoes_verbatim_and_logs_whole_plain_lines() {
+        let raw: &[u8] = b"\x1b[3mpool_id\x1b[0m=1\ncut off";
+        let log = DaemonLog::default();
+        let echo = SharedBuf::default();
+        log.tee(std::io::Cursor::new(raw.to_vec()), echo.clone(), "test")
+            .expect("spawn tee")
+            .join()
+            .expect("tee thread");
+        log.append("next spawn\n");
+
+        assert_eq!(
+            echo.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_slice(),
+            raw
+        );
+        assert_eq!(log.tail(3), "pool_id=1\ncut off\nnext spawn");
+        assert_eq!(log.tail(1), "next spawn");
     }
 
     /// A match needs every needle on the same line, so two fields logged by
