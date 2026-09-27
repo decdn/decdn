@@ -48,8 +48,10 @@
 //!   standard tier. Today those are:
 //!   `origin_blacklist_compliance` (repeated 180s catch-up polls), `slash_appeal`
 //!   (120+30+30s), the `g_node_04` removal-reversal journey (60s evict + 30s
-//!   blacklist + 180s removal convergence), and the `g_node_07` Ethereum leg
-//!   (five sequential CLI invocations across the unbonding window).
+//!   blacklist + 180s removal convergence), the `g_node_07` Ethereum leg
+//!   (five sequential CLI invocations across the unbonding window), and both
+//!   `node_pull_pool_redeploy` journeys (60s bootstrap, log, and store waits
+//!   around two 60s redemption waits).
 //!
 //! When you add a journey, pick a tier by the rule above. Do not copy `STANDARD`
 //! because a neighbouring test uses it — confirm its poll ladder stays under

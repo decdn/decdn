@@ -12,9 +12,10 @@
 //! to the test executable and errors clearly if absent.
 
 use std::fmt::Write as _;
+use std::io::BufRead as _;
 use std::path::PathBuf;
-use std::process::Child;
-use std::sync::Arc;
+use std::process::{Child, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use alloy::primitives::Address;
@@ -82,6 +83,8 @@ pub struct NodeFixture {
     // state; `config_path()` lets a journey point the `decdn` CLI at the same
     // `[blockchain]` coordinates + keystore the daemon uses (#1032).
     config_path: PathBuf,
+    // Everything every spawn of this daemon has logged, for `log_line`.
+    log: DaemonLog,
 }
 
 impl NodeFixture {
@@ -299,7 +302,29 @@ impl NodeFixture {
         region: &str,
         serve_blobs: &[&[u8]],
     ) -> anyhow::Result<(Self, Vec<Hash>)> {
-        Self::launch_configured(chain, region, serve_blobs, false, &[], true).await
+        Self::launch_configured(
+            chain,
+            region,
+            serve_blobs,
+            false,
+            &[],
+            true,
+            chain.addrs().payment_pool,
+        )
+        .await
+    }
+
+    /// Like [`Self::launch_with_blobs`], but bound to the `PaymentPool` at
+    /// `payment_pool` instead of the snapshot's — a node that joins after a
+    /// `PaymentPool` redeploy (see [`ChainFixture::redeploy_payment_pool`]). It
+    /// serves, meters, and redeems against that deployment only.
+    pub async fn launch_with_blobs_on_payment_pool(
+        chain: &ChainFixture,
+        payment_pool: Address,
+        region: &str,
+        serve_blobs: &[&[u8]],
+    ) -> anyhow::Result<(Self, Vec<Hash>)> {
+        Self::launch_configured(chain, region, serve_blobs, false, &[], true, payment_pool).await
     }
 
     /// Provision and launch a node that is **not** onboarded on-chain: no bond,
@@ -326,8 +351,16 @@ impl NodeFixture {
         region: &str,
         serve_blob: &[u8],
     ) -> anyhow::Result<(Self, Hash)> {
-        let (node, mut hashes) =
-            Self::launch_configured(chain, region, &[serve_blob], false, &[], false).await?;
+        let (node, mut hashes) = Self::launch_configured(
+            chain,
+            region,
+            &[serve_blob],
+            false,
+            &[],
+            false,
+            chain.addrs().payment_pool,
+        )
+        .await?;
         let hash = hashes
             .pop()
             .ok_or_else(|| anyhow::anyhow!("launch_bare returned no hash"))?;
@@ -341,8 +374,16 @@ impl NodeFixture {
         region: &str,
         discovery_peers: &[&NodeFixture],
     ) -> anyhow::Result<Self> {
-        let (node, hashes) =
-            Self::launch_configured(chain, region, &[], true, discovery_peers, true).await?;
+        let (node, hashes) = Self::launch_configured(
+            chain,
+            region,
+            &[],
+            true,
+            discovery_peers,
+            true,
+            chain.addrs().payment_pool,
+        )
+        .await?;
         anyhow::ensure!(
             hashes.is_empty(),
             "empty cache launch returned seeded hashes"
@@ -442,6 +483,7 @@ impl NodeFixture {
         node_to_node_pull_through: bool,
         discovery_peers: &[&NodeFixture],
         onboard: bool,
+        payment_pool: Address,
     ) -> anyhow::Result<(Self, Vec<Hash>)> {
         let data_dir = tempfile::tempdir().context("create node data dir")?;
         // `identity::ensure_data_dir` (and the keystore/identity writers) require
@@ -508,7 +550,10 @@ impl NodeFixture {
             cache_dir: &cache_dir,
             origin_dir: origin_dir.path(),
             chain_id: chain.chain_id(),
-            addrs: chain.addrs(),
+            addrs: ContractAddrs {
+                payment_pool,
+                ..chain.addrs()
+            },
             node_to_node_pull_through,
             discovery_peers: &discovery_peers,
         });
@@ -541,7 +586,8 @@ impl NodeFixture {
             warm.shutdown().await.context("flush warm cache")?;
         }
 
-        let child = spawn_daemon(&config_path, data_dir.path())?;
+        let log = DaemonLog::default();
+        let child = spawn_daemon(&config_path, data_dir.path(), &log)?;
 
         let fixture = Self {
             child: NodeGuard(std::sync::Mutex::new(child)),
@@ -554,6 +600,7 @@ impl NodeFixture {
             metrics_port,
             admin_url: format!("http://127.0.0.1:{admin_port}"),
             config_path,
+            log,
         };
         fixture
             .wait_healthy(Duration::from_secs(30))
@@ -569,7 +616,8 @@ impl NodeFixture {
     /// restart, and exercises the across-restart slash re-scan (#1032): the new
     /// process rebuilds its in-memory slash store by re-enumerating on chain and
     /// seeding the watcher tail. Uses `&self`: the child handle lives behind a
-    /// `Mutex`, so the swap needs no exclusive borrow.
+    /// `Mutex`, so the swap needs no exclusive borrow. A daemon halted by
+    /// [`Self::stop`] is respawned.
     pub async fn restart(&self) -> anyhow::Result<()> {
         // Kill the old process and swap in the new one, holding the guard lock
         // only briefly (never across an await). `wait()` reaps the old process
@@ -582,11 +630,83 @@ impl NodeFixture {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ = child.kill();
             let _ = child.wait();
-            *child = spawn_daemon(&self.config_path, self.data_dir.path())?;
+            *child = spawn_daemon(&self.config_path, self.data_dir.path(), &self.log)?;
         }
         self.wait_healthy(Duration::from_secs(30))
             .await
             .context("node never became healthy after restart")
+    }
+
+    /// Kill the daemon and reap it, leaving the config and data dir in place for
+    /// a later [`Self::restart`].
+    ///
+    /// While stopped, the admin RPC is down and the operator key sends nothing,
+    /// so a journey can send transactions from [`Self::operator`] without racing
+    /// the daemon's own nonce.
+    pub fn stop(&self) -> anyhow::Result<()> {
+        let mut child = self.child.0.lock().unwrap_or_else(PoisonError::into_inner);
+        // `kill` answers `Ok` for a child that already exited, so an error here is
+        // a live process `wait` would block on.
+        child.kill().context("kill decdn-node")?;
+        child.wait().context("reap stopped decdn-node")?;
+        Ok(())
+    }
+
+    /// Point the daemon at the `PaymentPool` at `payment_pool` and at
+    /// `discovery_peers` alone, then restart it: the operator's side of a
+    /// `PaymentPool` redeploy. The config changes; the data dir — the buyer pool
+    /// store, the seller lane store, and the cache — stays.
+    pub async fn repoint_payment_pool(
+        &self,
+        payment_pool: Address,
+        discovery_peers: &[&NodeFixture],
+    ) -> anyhow::Result<()> {
+        let peers: Vec<_> = discovery_peers
+            .iter()
+            .map(|peer| (peer.node_id(), peer.bind_port()))
+            .collect();
+        let config = std::fs::read_to_string(&self.config_path).context("read node config")?;
+        let rewritten = rewrite_payment_pool(&config, payment_pool, &peers)?;
+        std::fs::write(&self.config_path, rewritten).context("write node config")?;
+
+        self.restart()
+            .await
+            .context("restart after PaymentPool repoint")
+    }
+
+    /// The first line this daemon logged — across every spawn — that contains
+    /// every one of `needles`, with ANSI styling removed. Requiring all needles
+    /// on one line ties each field to the same event.
+    ///
+    /// Only events at or above the daemon's `RUST_LOG` filter are logged; the
+    /// fixture sets it from `$DECDN_NODE_LOG`, else `warn`.
+    #[must_use]
+    pub fn log_line(&self, needles: &[&str]) -> Option<String> {
+        let log = self.log.0.lock().unwrap_or_else(PoisonError::into_inner);
+        line_with_all(&log, needles).map(str::to_owned)
+    }
+
+    /// Poll [`Self::log_line`] until a line with every one of `needles` appears,
+    /// or `timeout` elapses.
+    pub async fn wait_for_log_line(
+        &self,
+        needles: &[&str],
+        timeout: Duration,
+    ) -> anyhow::Result<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(line) = self.log_line(needles) {
+                return Ok(line);
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "decdn-node logged no line holding all of {needles:?} within {timeout:?} \
+                 (only events at or above $DECDN_NODE_LOG, default `warn`, are captured); \
+                 its last {LOG_TAIL_LINES} lines:\n{}",
+                self.log.tail(LOG_TAIL_LINES)
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     /// Scrape the daemon's Prometheus endpoint and return the current value of a
@@ -908,6 +1028,155 @@ fn rewrite_pool_min_remaining_deposit(config: &str, micro_usdc: u64) -> anyhow::
     toml::to_string(&doc).context("render node config")
 }
 
+/// Rewrite `blockchain.payment_pool_address` and replace
+/// `[network.discovery.peers]` with `discovery_peers` in a node TOML config,
+/// preserving every other key. Separate from [`NodeFixture::repoint_payment_pool`]
+/// so its parse → mutate → `toml::to_string` round-trip is testable without a
+/// live daemon, mirroring [`rewrite_rate_per_mb`]. Peers take the
+/// `addrs = ["127.0.0.1:{port}"]` shape [`render_config`] writes.
+fn rewrite_payment_pool(
+    config: &str,
+    payment_pool: Address,
+    discovery_peers: &[(iroh::PublicKey, u16)],
+) -> anyhow::Result<String> {
+    let mut doc: toml::Table = config.parse().context("parse node config")?;
+    let blockchain = doc
+        .get_mut("blockchain")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| anyhow::anyhow!("node config has no [blockchain] table"))?;
+    blockchain.insert(
+        "payment_pool_address".to_string(),
+        toml::Value::String(payment_pool.to_string()),
+    );
+    let network = doc
+        .get_mut("network")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| anyhow::anyhow!("node config has no [network] table"))?;
+    let peers: toml::Table = discovery_peers
+        .iter()
+        .map(|(node_id, port)| {
+            let mut peer = toml::Table::new();
+            peer.insert(
+                "addrs".to_string(),
+                toml::Value::Array(vec![toml::Value::String(format!("127.0.0.1:{port}"))]),
+            );
+            (node_id.to_string(), toml::Value::Table(peer))
+        })
+        .collect();
+    let discovery = network
+        .entry("discovery")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("node config [network.discovery] is not a table"))?;
+    discovery.insert("peers".to_string(), toml::Value::Table(peers));
+    toml::to_string(&doc).context("render node config")
+}
+
+/// How many trailing log lines a [`NodeFixture::wait_for_log_line`] timeout
+/// reports.
+const LOG_TAIL_LINES: usize = 20;
+
+/// Everything every spawn of one daemon has written to stdout and stderr, line
+/// by line, with ANSI styling removed. The daemon's log format styles field
+/// names whenever colour is on (unless `NO_COLOR` is set), even when its output
+/// is a pipe, so a raw line does not contain `name=value` verbatim.
+#[derive(Debug, Clone, Default)]
+struct DaemonLog(Arc<Mutex<String>>);
+
+impl DaemonLog {
+    /// Copy `pipe` to `echo` byte for byte, and append each line to the log,
+    /// on a background thread that ends when the daemon closes the pipe. The
+    /// echo keeps the daemon's output in the test process's own stdout or
+    /// stderr, which nextest captures per test.
+    ///
+    /// A line cut short by a killed daemon gains a newline in the log, so it
+    /// never runs into the next spawn's first line. A read failure ends the
+    /// thread and leaves a line saying so, so a dead capture shows up in
+    /// [`Self::tail`] rather than as silence.
+    fn tee(
+        &self,
+        pipe: impl std::io::Read + Send + 'static,
+        mut echo: impl std::io::Write + Send + 'static,
+        name: &str,
+    ) -> anyhow::Result<std::thread::JoinHandle<()>> {
+        let log = self.clone();
+        let stream = name.to_owned();
+        std::thread::Builder::new()
+            .name(format!("decdn-node-{name}-tee"))
+            .spawn(move || {
+                let mut reader = std::io::BufReader::new(pipe);
+                let mut line = Vec::new();
+                loop {
+                    line.clear();
+                    match reader.read_until(b'\n', &mut line) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let _ = echo.write_all(&line);
+                            let _ = echo.flush();
+                            let mut plain = strip_ansi(&line);
+                            if !plain.ends_with('\n') {
+                                plain.push('\n');
+                            }
+                            log.append(&plain);
+                        }
+                        Err(err) => {
+                            log.append(&format!(
+                                "[e2e] decdn-node {stream} log capture failed: {err}\n"
+                            ));
+                            break;
+                        }
+                    }
+                }
+            })
+            .with_context(|| format!("spawn decdn-node {name} tee thread"))
+    }
+
+    fn append(&self, text: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_str(text);
+    }
+
+    /// The last `lines` lines of the log.
+    fn tail(&self, lines: usize) -> String {
+        let log = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let all: Vec<&str> = log.lines().collect();
+        all.get(all.len().saturating_sub(lines)..)
+            .unwrap_or_default()
+            .join("\n")
+    }
+}
+
+/// `bytes` as text with every ANSI CSI sequence (`ESC [` … final byte in
+/// `0x40..=0x7E`) removed. Any other ESC is removed on its own, and a CSI left
+/// unterminated at a newline ends there, keeping the newline.
+fn strip_ansi(bytes: &[u8]) -> String {
+    let mut plain = Vec::with_capacity(bytes.len());
+    let mut rest = bytes.iter().copied().peekable();
+    while let Some(byte) = rest.next() {
+        if byte != 0x1b {
+            plain.push(byte);
+            continue;
+        }
+        if rest.next_if_eq(&b'[').is_none() {
+            continue;
+        }
+        while let Some(escaped) = rest.next_if(|&b| b != b'\n') {
+            if (0x40..=0x7e).contains(&escaped) {
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&plain).into_owned()
+}
+
+/// The first line of `log` that contains every one of `needles`.
+fn line_with_all<'a>(log: &'a str, needles: &[&str]) -> Option<&'a str> {
+    log.lines()
+        .find(|line| needles.iter().all(|needle| line.contains(needle)))
+}
+
 /// Write `blob` into a filesystem-origin shard layout (`{root}/{hex[..2]}/{hex}`).
 fn write_fs_origin_blob(root: &std::path::Path, hash: &Hash, blob: &[u8]) -> anyhow::Result<()> {
     let hex = hash.to_hex();
@@ -982,8 +1251,8 @@ fn decdn_node_bin() -> anyhow::Result<PathBuf> {
 }
 
 /// Spawn `decdn-node run --config <config_path>` with the fixture's test
-/// keystore password and log level, hermetically. Shared by
-/// [`NodeFixture::launch`] and [`NodeFixture::restart`].
+/// keystore password and log level, hermetically, teeing its stdout and stderr
+/// into `log`. Shared by [`NodeFixture::launch`] and [`NodeFixture::restart`].
 ///
 /// `home` is taken explicitly rather than derived from `config_path`'s parent:
 /// the two coincide today only because the config is written *inside* the data
@@ -992,17 +1261,38 @@ fn decdn_node_bin() -> anyhow::Result<PathBuf> {
 /// explicit `--config` already keeps it off `~/.decdn/node.toml`; the isolation
 /// here covers the `DECDN_*` env namespace (which outranks the config) and any
 /// path the config leaves to a `$HOME`-derived default (#1332).
-fn spawn_daemon(config_path: &std::path::Path, home: &std::path::Path) -> anyhow::Result<Child> {
+fn spawn_daemon(
+    config_path: &std::path::Path,
+    home: &std::path::Path,
+    log: &DaemonLog,
+) -> anyhow::Result<Child> {
     let decoy = write_password_decoy(home)?;
-    crate::cli::hermetic_command(decdn_node_bin()?, home, KEYSTORE_PASSWORD)?
+    let mut child = crate::cli::hermetic_command(decdn_node_bin()?, home, KEYSTORE_PASSWORD)?
         // Set after `hermetic_command`, which strips the whole `DECDN_*`
         // namespace before seeding its own entries.
         .env("DECDN_KEYSTORE_PASSWORD_FILE", &decoy)
         .arg("--config")
         .arg(config_path)
         .arg("run")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
-        .context("spawn decdn-node")
+        .context("spawn decdn-node")?;
+    // The tee threads are detached: each ends when this child's pipe closes.
+    let teed = match (child.stdout.take(), child.stderr.take()) {
+        (Some(stdout), Some(stderr)) => log
+            .tee(stdout, std::io::stdout(), "stdout")
+            .and_then(|_| log.tee(stderr, std::io::stderr(), "stderr"))
+            .map(drop),
+        _ => Err(anyhow::anyhow!("decdn-node spawned without piped stdio")),
+    };
+    if let Err(err) = teed {
+        // No caller holds the child yet, so nothing else would reap it.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+    Ok(child)
 }
 
 /// Write a password file holding the WRONG password, for the daemon to reach
@@ -1258,5 +1548,127 @@ mod tests {
             Some(true)
         );
         assert_eq!(doc["payment"]["rate_per_mb"].as_integer(), Some(10));
+    }
+
+    /// `repoint_payment_pool`'s parse → mutate → serialize step
+    /// (`rewrite_payment_pool`) must round-trip: the new `PaymentPool` lands, the
+    /// discovery peers are replaced rather than merged, and every other section —
+    /// notably the `[cache]` scalar-after-subtable that trips the serializer
+    /// hazard — survives.
+    #[test]
+    fn repoint_payment_pool_round_trips_through_toml() {
+        let old_peer = iroh::SecretKey::from_bytes(&[0xCC; 32]).public();
+        let new_peer = iroh::SecretKey::from_bytes(&[0xDD; 32]).public();
+        let redeployed = Address::from([0x23; 20]);
+        // The sample renders no peers, so the first rewrite also creates
+        // `[network.discovery]`; the second replaces what the first wrote.
+        let with_old = rewrite_payment_pool(
+            &sample_rendered_config(),
+            Address::from([0x22; 20]),
+            &[(old_peer, 4434)],
+        )
+        .expect("first rewrite_payment_pool must succeed");
+        let rewritten = rewrite_payment_pool(&with_old, redeployed, &[(new_peer, 4435)])
+            .expect("second rewrite_payment_pool must succeed");
+        let doc: toml::Value =
+            toml::from_str(&rewritten).expect("rewritten config must be valid TOML");
+
+        assert_eq!(
+            doc["blockchain"]["payment_pool_address"].as_str(),
+            Some(redeployed.to_string().as_str())
+        );
+        let peers = doc["network"]["discovery"]["peers"]
+            .as_table()
+            .expect("discovery peers must be a table");
+        assert_eq!(peers.len(), 1, "peers are replaced, not merged: {peers:?}");
+        assert_eq!(
+            peers[&new_peer.to_string()]["addrs"][0].as_str(),
+            Some("127.0.0.1:4435")
+        );
+        // Everything around the mutation is intact.
+        assert_eq!(doc["network"]["bind_port"].as_integer(), Some(4433));
+        assert_eq!(doc["blockchain"]["chain_id"].as_integer(), Some(31_337));
+        assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
+        assert_eq!(
+            doc["cache"]["node_to_node_pull_through_enabled"].as_bool(),
+            Some(true)
+        );
+    }
+
+    /// The daemon's pretty log format styles a field as italic name, dimmed
+    /// `=`, plain value. Stripping must leave the bare `name=value` a needle
+    /// matches, and keep text outside the escapes byte for byte.
+    #[test]
+    fn strip_ansi_removes_sgr_styling() {
+        assert_eq!(
+            strip_ansi(b"\x1b[33m WARN\x1b[0m \x1b[3mpool_id\x1b[0m\x1b[2m=\x1b[0m0xab\n"),
+            " WARN pool_id=0xab\n"
+        );
+        assert_eq!(strip_ansi(b"plain = text"), "plain = text");
+    }
+
+    /// Only a CSI sequence is consumed past its ESC: a lone ESC goes alone,
+    /// and a CSI cut off at a newline keeps the newline.
+    #[test]
+    fn strip_ansi_removes_a_lone_esc_alone_and_stops_a_cut_csi_at_newline() {
+        assert_eq!(strip_ansi(b"a\x1bcb"), "acb");
+        assert_eq!(strip_ansi(b"a\x1b"), "a");
+        assert_eq!(strip_ansi(b"a\x1b[3\nb"), "a\nb");
+    }
+
+    /// A `Write` whose bytes the test reads back after the tee thread ends.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The tee echoes the daemon's bytes unchanged, logs them without styling,
+    /// and ends a line the daemon never finished, so the next spawn's first
+    /// line starts on its own.
+    #[test]
+    fn tee_echoes_verbatim_and_logs_whole_plain_lines() {
+        let raw: &[u8] = b"\x1b[3mpool_id\x1b[0m=1\ncut off";
+        let log = DaemonLog::default();
+        let echo = SharedBuf::default();
+        log.tee(std::io::Cursor::new(raw.to_vec()), echo.clone(), "test")
+            .expect("spawn tee")
+            .join()
+            .expect("tee thread");
+        log.append("next spawn\n");
+
+        assert_eq!(
+            echo.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_slice(),
+            raw
+        );
+        assert_eq!(log.tail(3), "pool_id=1\ncut off\nnext spawn");
+        assert_eq!(log.tail(1), "next spawn");
+    }
+
+    /// A match needs every needle on the same line, so two fields logged by
+    /// different events never combine into a false hit.
+    #[test]
+    fn line_with_all_needs_every_needle_on_one_line() {
+        let log =
+            "a pool_id=1\nforeign_payment_pool=2 other\nboth pool_id=1 foreign_payment_pool=2\n";
+        assert_eq!(
+            line_with_all(log, &["pool_id=1", "foreign_payment_pool=2"]),
+            Some("both pool_id=1 foreign_payment_pool=2")
+        );
+        assert_eq!(line_with_all(log, &["pool_id=1", "absent"]), None);
     }
 }

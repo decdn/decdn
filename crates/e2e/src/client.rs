@@ -138,12 +138,26 @@ pub struct FetchOutcome {
 pub struct ClientFixture {
     signer: Arc<PrivateKeySigner>,
     endpoint: Endpoint,
+    // The `PaymentPool` this client approves, opens pools on, and signs
+    // vouchers for.
+    payment_pool: Address,
 }
 
 impl ClientFixture {
     /// Create a funded client: fresh eth key with gas, a mock-USDC balance, and
-    /// a max approval for the `PaymentPool`, plus a loopback iroh endpoint.
+    /// an approval for 100 deposits on the snapshot `PaymentPool`, plus a
+    /// loopback iroh endpoint.
     pub async fn new(chain: &ChainFixture) -> anyhow::Result<Self> {
+        Self::new_on_payment_pool(chain, chain.addrs().payment_pool).await
+    }
+
+    /// Like [`Self::new`], but paying through the `PaymentPool` at
+    /// `payment_pool` instead of the snapshot's — a client of a node repointed
+    /// at a redeployed pool (see [`ChainFixture::redeploy_payment_pool`]).
+    pub async fn new_on_payment_pool(
+        chain: &ChainFixture,
+        payment_pool: Address,
+    ) -> anyhow::Result<Self> {
         let signer = Arc::new(PrivateKeySigner::random());
         let addr = signer.address();
         chain.fund_eth(addr, 100).await?;
@@ -156,7 +170,7 @@ impl ClientFixture {
         let provider = chain.provider_for(&signer);
         let approve_receipt = Erc20::new(chain.usdc(), &provider)
             .approve(
-                chain.addrs().payment_pool,
+                payment_pool,
                 U256::from(DEPOSIT_MICRO_USDC) * U256::from(100u64),
             )
             .send()
@@ -168,7 +182,11 @@ impl ClientFixture {
         crate::ensure_mined(&approve_receipt, "client approve")?;
 
         let endpoint = loopback_endpoint().await?;
-        Ok(Self { signer, endpoint })
+        Ok(Self {
+            signer,
+            endpoint,
+            payment_pool,
+        })
     }
 
     /// The buyer's Ethereum address (pool owner / voucher signer), for journeys
@@ -592,8 +610,8 @@ impl ClientFixture {
         node: &NodeFixture,
     ) -> anyhow::Result<PoolSession> {
         let provider = chain.provider_for(&self.signer);
-        let contract = PaymentPool::new(chain.addrs().payment_pool, provider);
-        let voucher_dom = voucher_domain(chain.chain_id(), chain.addrs().payment_pool);
+        let contract = PaymentPool::new(self.payment_pool, provider);
+        let voucher_dom = voucher_domain(chain.chain_id(), self.payment_pool);
         let deposit = U256::from(DEPOSIT_MICRO_USDC);
 
         // The shared open kernel escrows the deposit, decodes the authoritative
@@ -822,10 +840,10 @@ impl ClientFixture {
         node: &NodeFixture,
         pool_id: B256,
     ) -> anyhow::Result<PoolContext> {
-        let voucher_dom = voucher_domain(chain.chain_id(), chain.addrs().payment_pool);
+        let voucher_dom = voucher_domain(chain.chain_id(), self.payment_pool);
         let state = BuyerPoolState::new(
             pool_id,
-            chain.addrs().payment_pool,
+            self.payment_pool,
             self.signer.address(),
             chain.usdc(),
             U256::from(DEPOSIT_MICRO_USDC),
