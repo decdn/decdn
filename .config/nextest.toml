@@ -57,10 +57,10 @@ retries = 2
 # deadline plus instrumentation and a loaded runner while naming a wedge 120s
 # sooner than the global `300s` (60s×5) backstop, with the first `SLOW` line at 60s.
 #
-# `success-output` is what makes a teardown breach visible: `shutdown` warns rather
-# than failing (the stranded-driver half is a known open defect no test can fix),
-# and nextest's default of `never` would capture and discard that line for a test
-# that still passes.
+# `success-output` keeps a teardown breach line visible for a test that still
+# passes: `shutdown` fails the test on a breach, but `shutdown_within` — the
+# helpers' own suite, which produces breaches on purpose — only reports one, and
+# nextest's default of `never` would capture and discard that line.
 [[profile.default.overrides]]
 filter = 'package(decdn-node) - binary(anvil_settlement_e2e) - binary(anvil_bringup_shutdown_e2e)'
 slow-timeout = { period = "60s", terminate-after = 3 }

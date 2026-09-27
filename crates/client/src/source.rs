@@ -38,8 +38,7 @@ use iroh::{Endpoint, EndpointAddr};
 use crate::connection::WarmConnection;
 use crate::sink::{PullReader, StashedFault};
 use crate::{
-    DialObserver, PoolContext, PoolLedger, PullDeadlines, UpstreamPull, UpstreamPullHeader,
-    VoucherProgress,
+    PoolContext, PoolLedger, PullDeadlines, UpstreamPull, UpstreamPullHeader, VoucherProgress,
 };
 
 /// A boxed, `Send` future returned by the async trait methods in this module —
@@ -255,15 +254,11 @@ pub struct PeerSource<'a> {
     max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
     deadlines: PullDeadlines,
-    /// Notified with a weak handle to every connection this source dials, set by a
-    /// caller that must observe those connections reach drained before it drops the
-    /// runtime their QUIC drivers live on (`decdn-node`'s per-serve pull legs).
-    ///
-    /// It sits HERE rather than in the caller because a dial that fails its
-    /// handshake never yields a reader — and those are exactly the opens whose
-    /// connection is left live on the pull runtime, so a caller-side wrapper around
-    /// the returned reader cannot see them.
-    on_connect: Option<&'a DialObserver<'a>>,
+    /// The runtime every dial of this source runs on, so each connection's QUIC
+    /// driver lives there rather than on the runtime the pull runs on. `None`
+    /// dials on the caller's runtime. See
+    /// [`with_dial_runtime`](Self::with_dial_runtime).
+    dial_runtime: Option<tokio::runtime::Handle>,
     /// The one connection every open reuses, when the source keeps one warm.
     /// `None` dials per open. The inner `None` is a warm source that has not
     /// dialled yet, or whose connection closed and is dialled again on the next
@@ -320,18 +315,25 @@ impl<'a> PeerSource<'a> {
             max_blob_size_bytes,
             max_rate_per_mb,
             deadlines,
-            on_connect: None,
+            dial_runtime: None,
             warm: None,
         }
     }
 
-    /// Observe every connection this source dials.
+    /// Run every dial of this source on `runtime`.
     ///
-    /// For a caller that drops the runtime the pull ran on: see [`DialObserver`].
-    /// A source without one behaves identically and costs nothing.
+    /// A dial spawns the connection's QUIC driver on the runtime that runs it, and
+    /// the driver is what carries the connection through its close to QUIC's
+    /// draining state. A caller that runs a pull on a runtime it drops afterwards
+    /// (`decdn-node`'s per-serve pull legs) passes a runtime that outlives its
+    /// endpoint here. Otherwise a connection the pull dialled that has not reached
+    /// draining when the pull's runtime drops loses its driver, stays in the
+    /// endpoint's active set, and `Endpoint::close` waits for it forever.
+    /// The dial and the connection's driver move to `runtime`; the pull still
+    /// opens and polls its streams from the caller's runtime.
     #[must_use]
-    pub const fn with_dial_observer(mut self, on_connect: &'a DialObserver<'a>) -> Self {
-        self.on_connect = Some(on_connect);
+    pub fn with_dial_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {
+        self.dial_runtime = Some(runtime);
         self
     }
 
@@ -346,16 +348,8 @@ impl<'a> PeerSource<'a> {
     /// fails because the connection closed under it is retried once on a fresh
     /// one; an open sends no voucher, so the retry pays nothing. The connection
     /// closes when the source drops.
-    ///
-    /// Dials through a warm connection are not reported to a
-    /// [`with_dial_observer`](Self::with_dial_observer) observer; a caller that
-    /// needs one keeps the per-open dial.
     #[must_use]
     pub fn with_warm_connection(mut self) -> Self {
-        debug_assert!(
-            self.on_connect.is_none(),
-            "a warm connection is not reported to a dial observer"
-        );
         self.warm = Some(tokio::sync::Mutex::new(None));
         self
     }
@@ -410,7 +404,7 @@ impl<'a> PeerSource<'a> {
                 self.max_rate_per_mb,
                 self.deadlines,
                 byte_len,
-                self.on_connect,
+                self.dial_runtime.as_ref(),
             )
             .await;
         };
@@ -442,8 +436,13 @@ impl<'a> PeerSource<'a> {
             return Ok(Arc::clone(conn));
         }
         let conn = Arc::new(
-            WarmConnection::connect(self.endpoint, self.target.clone(), self.deadlines.open())
-                .await?,
+            WarmConnection::connect(
+                self.endpoint,
+                self.target.clone(),
+                self.deadlines.open(),
+                self.dial_runtime.as_ref(),
+            )
+            .await?,
         );
         *held = Some(Arc::clone(&conn));
         Ok(conn)
@@ -472,7 +471,6 @@ impl<'a> PeerSource<'a> {
             self.max_rate_per_mb,
             self.deadlines,
             byte_len,
-            None,
         )
         .await
     }

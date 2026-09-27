@@ -28,6 +28,13 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`decdn-client` dials on a caller-chosen runtime (#2185).**
+  `PeerSource::with_dial_runtime(Handle)` replaces `with_dial_observer`, and
+  `DialObserver` is removed. `open_progressive_pull` and
+  `WarmConnection::connect` each take a new `dial_runtime: Option<&Handle>`
+  argument; `None` dials on the caller's runtime as before. A caller that pulls
+  on a runtime it drops afterwards passes a long-lived runtime, so every
+  connection's QUIC driver outlives the pull.
 - **An underpaying voucher gets an `Underpaid` rejection carrying the node's
   watermark, and a diverged payer lane heals itself.** Wire-breaking:
   `VoucherRejectReason::Underpaid` is appended as discriminant 14 and is
@@ -825,6 +832,21 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **`decdn-node` no longer hangs until systemd's stop timeout after
+  node-to-node pulls (#2185).** A serve-miss pull leg runs on its own
+  current-thread runtime, which drops when the leg returns. An upstream dial
+  made there put the connection's QUIC driver on that runtime, so the driver
+  died with it and the connection never reached QUIC's draining state. On
+  SIGTERM, `router.shutdown()` then waited in `Endpoint::close` until systemd
+  killed the process, which skipped the final redeem sweep, the lane-store
+  flush, the receipt tail and `cache.shutdown`. Every upstream dial the node
+  makes now runs on its main runtime, so each driver outlives the pull leg. The
+  per-leg drain wait is gone, and so is its counter
+  `decdn_node_pull_abandon_drain_timeout_total` and its dashboard series. The
+  router close is also bounded by the 15 s shutdown deadline and logs an error
+  when it gives up, so a stuck endpoint close can no longer cost settlement
+  state. A dial task that panics or is cancelled by its runtime shutting down
+  is this node's fault, and no longer scores the provider unreachable.
 - **Steady-state DHT republishes batch again (#2179).** The republish
   scheduler ticked every second and sent only the records already due. The
   per-record `uniform(30, 50 min)` jitter spread due times so thinly that each

@@ -803,6 +803,7 @@ async fn build_origin_with_probe_caches(
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
+        dial_runtime: tokio::runtime::Handle::current(),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
         staker_set: Arc::new(stakers) as Arc<dyn StakerSet>,
         origin_directory: Arc::new(StaticOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,
@@ -961,6 +962,7 @@ async fn build_origin_multi_hash(
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
+        dial_runtime: tokio::runtime::Handle::current(),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
         // Providers are active stakers, matching production (a probe-cache HIT
         // re-checks `is_active`, so an empty set would make every cached provider
@@ -1570,6 +1572,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
     dir.insert(U256::ZERO, providers.clone());
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
+        dial_runtime: tokio::runtime::Handle::current(),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(DhtNodeId::from_bytes(
             *b_id.as_bytes(),
         )))),
@@ -4102,16 +4105,6 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
          advancing after cancel; got {:?}",
         progress_log(&recorded)?
     );
-
-    // The abandoned upstream reached drained inside the cap, so nothing was stranded.
-    // A tick here means this node dropped a per-serve runtime with a live QUIC driver
-    // on it, which is what makes an endpoint close hang — the failure mode the whole
-    // cancel path exists to avoid.
-    //
-    // This reads as "drained", not "not finished yet", only because the poll above
-    // waited for the SETTLE, and the settle guard drops after the drain returns. Move
-    // those two apart and this assertion goes vacuous with nothing to flag it.
-    assert_counter(&b_metrics, "node_pull_abandon_drain_timeout_total", 0)?;
 
     shutdown([task_a], [&ep_b, &ep_a]).await?;
     Ok(())
@@ -7580,7 +7573,7 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
 /// its paced pull draws) instead of a whole-blob open it would drop, and the pull
 /// leg adopts it. A therefore serves exactly the two paid legs, `[0, window)`
 /// and `[window, end)`, and no throwaway open.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_handshake_is_the_first_pull_leg() -> Result<()> {
     let window = decdn_client::PULL_WINDOW_FLOOR;
     let payload_len = usize::try_from(window.saturating_mul(3) / 2).unwrap_or(usize::MAX);
@@ -10430,6 +10423,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
+        dial_runtime: tokio::runtime::Handle::current(),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(DhtNodeId::from_bytes(
             *b_id.as_bytes(),
         )))),
@@ -12152,6 +12146,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
+        dial_runtime: tokio::runtime::Handle::current(),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
         staker_set: Arc::clone(&mutable_staker) as Arc<dyn StakerSet>,
         origin_directory: Arc::clone(&mutable_dir) as Arc<dyn OriginDirectory>,
@@ -13536,6 +13531,7 @@ async fn build_origin_economics(
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
+        dial_runtime: tokio::runtime::Handle::current(),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
         staker_set: Arc::new(stakers) as Arc<dyn StakerSet>,
         origin_directory: Arc::new(StaticOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,

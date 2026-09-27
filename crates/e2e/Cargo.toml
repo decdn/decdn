@@ -66,6 +66,10 @@ tempfile = { workspace = true }
 reqwest = { workspace = true }
 jsonrpsee = { workspace = true }
 tracing = { workspace = true }
+# `NodeFixture::terminate` sends the daemon a real SIGTERM, the signal
+# `systemctl stop` sends, through `kill(2)`'s safe wrapper: the workspace forbids
+# `unsafe_code`, which rules out calling `libc::kill` directly.
+nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

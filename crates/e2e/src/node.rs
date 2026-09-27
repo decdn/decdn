@@ -652,6 +652,53 @@ impl NodeFixture {
         Ok(())
     }
 
+    /// Send the daemon SIGTERM — the signal `systemctl stop` sends — and wait up
+    /// to `timeout` for it to exit, returning its exit status and how long it
+    /// took.
+    ///
+    /// Unlike [`Self::stop`], this runs the daemon's graceful shutdown: the
+    /// router close, the final redeem sweep, the lane-store and receipt flushes,
+    /// and the cache close. A daemon still running at `timeout` is killed and
+    /// reaped, and the call fails with the daemon's last log lines, so a hung
+    /// shutdown fails the journey instead of leaking the process. A daemon
+    /// stopped here is respawned by [`Self::restart`].
+    pub async fn terminate(
+        &self,
+        timeout: Duration,
+    ) -> anyhow::Result<(std::process::ExitStatus, Duration)> {
+        let pid = {
+            let child = self.child.0.lock().unwrap_or_else(PoisonError::into_inner);
+            i32::try_from(child.id()).context("decdn-node pid does not fit a pid_t")?
+        };
+        let started = tokio::time::Instant::now();
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .context("send SIGTERM to decdn-node")?;
+        loop {
+            // The guard lock is held only for the non-blocking `try_wait`, never
+            // across the sleep.
+            let exited = {
+                let mut child = self.child.0.lock().unwrap_or_else(PoisonError::into_inner);
+                child.try_wait().context("poll decdn-node for exit")?
+            };
+            if let Some(status) = exited {
+                return Ok((status, started.elapsed()));
+            }
+            if started.elapsed() >= timeout {
+                self.stop()
+                    .context("kill decdn-node after its SIGTERM timed out")?;
+                anyhow::bail!(
+                    "decdn-node did not exit within {timeout:?} of SIGTERM; its last \
+                     {LOG_TAIL_LINES} lines:\n{}",
+                    self.log.tail(LOG_TAIL_LINES)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Point the daemon at the `PaymentPool` at `payment_pool` and at
     /// `discovery_peers` alone, then restart it: the operator's side of a
     /// `PaymentPool` redeploy. The config changes; the data dir — the buyer pool

@@ -820,6 +820,9 @@ async fn probe_read_timeout_resets_stream_with_zero_code() -> anyhow::Result<()>
     // observation form.
     assert_reset_with_code(&mut recv, 0x00).await?;
     let _ = send.finish();
+    // Teardown's deadline must run on the real clock: a paused one auto-advances
+    // past it whenever the runtime idles on socket I/O, a spurious breach.
+    tokio::time::resume();
     tear_down(h).await
 }
 
@@ -850,7 +853,8 @@ async fn probe_accept_bi_timeout_errors_handler() -> anyhow::Result<()> {
     );
 
     // Manual teardown — `h.accept_task` was consumed above, so the shared
-    // `tear_down` helper can't run as-is.
+    // `tear_down` helper can't run as-is. Real clock, as above.
+    tokio::time::resume();
     h.client_conn.close(0u32.into(), b"bye");
     shutdown([], [&h.client_ep, &h.server_ep]).await?;
     Ok(())

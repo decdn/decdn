@@ -40,7 +40,6 @@
 //! buyer bootstrap failed — `fetch` returns [`OriginFetch::NotFound`], a clean
 //! miss that leaves the handler behaving exactly as it did before pull-through.
 
-mod abandon_drain;
 mod admit_store;
 mod backend_source;
 mod funder;
@@ -48,11 +47,6 @@ mod pull_leg;
 mod ranged_pull;
 mod timed_source;
 
-use abandon_drain::{ConnDrain, as_observer, drain_abandoned};
-// Public only so the integration-test teardown helper can pin its own deadline
-// above this cap. Not part of the crate's surface.
-#[doc(hidden)]
-pub use abandon_drain::ABANDON_DRAIN_CAP;
 pub(crate) use admit_store::NodeAdmitStore;
 pub(crate) use backend_source::BackendSource;
 pub(crate) use funder::NodeFunder;
@@ -471,6 +465,17 @@ impl NodeOriginConfig {
 pub struct NodeOriginDeps {
     /// The node's shared iroh endpoint (dials probes + pulls).
     pub endpoint: Endpoint,
+    /// The runtime every upstream dial of a pull leg runs on: the node's main
+    /// runtime, which outlives `endpoint`'s close.
+    ///
+    /// A pull leg runs on its own current-thread runtime, which drops when the leg
+    /// returns. A connection dialled there would lose its QUIC driver with that
+    /// runtime, never reach QUIC's draining state, and hang `Endpoint::close` at
+    /// shutdown. Every upstream dial this node makes, on a pull thread or not, goes
+    /// through
+    /// [`PeerSource::with_dial_runtime`](decdn_client::source::PeerSource::with_dial_runtime)
+    /// with this handle, so every driver lives here.
+    pub dial_runtime: tokio::runtime::Handle,
     /// DHT routing table handle for `find_providers`.
     pub routing_table: Arc<Mutex<RoutingTable>>,
     /// Active-staker set (lookup integrity filter).
@@ -1814,8 +1819,8 @@ async fn pull_from_candidate_in_span(
     // than the upstream serving a throwaway open and then the same range again.
     // `NO_NAMESPACE`, as this hash-only populate path carries no served-client
     // namespace. `rate_ceiling` folds the ADR 041 buy cap in (computed above with
-    // the skip decision). It opens on the outer runtime: nothing to strand, so no
-    // dial observer.
+    // the skip decision). Its dial runs on the node's main runtime, so its
+    // connection's driver lives there and outlives the pull thread that adopts it.
     let handshake_source = PeerSource::new(
         &deps.endpoint,
         EndpointAddr::new(pk),
@@ -1827,7 +1832,8 @@ async fn pull_from_candidate_in_span(
         deps.config.max_blob_size_bytes,
         rate_ceiling,
         deadlines,
-    );
+    )
+    .with_dial_runtime(deps.dial_runtime.clone());
     let handshake = timed_open(
         handshake_source.open_whole(hash_bytes),
         Arc::clone(&deps.metrics),
@@ -1857,7 +1863,7 @@ async fn pull_from_candidate_in_span(
     // window/leech pacer (this tier has no downstream paid frontier to pace against, so
     // it pulls the whole blob under a plain [`BudgetPacer`]).
     //
-    // Cancellation + settle + drain mirror `run_pull_leg`, and each half is
+    // Cancellation, settle and the dial runtime mirror `run_pull_leg`, and each is
     // load-bearing:
     //
     // - CANCELLATION. `spawn_blocking` tasks are never aborted when their `JoinHandle`
@@ -1871,14 +1877,14 @@ async fn pull_from_candidate_in_span(
     //   `Arc`, and persists the FINAL watermark (#852) only after `drive` has fully
     //   stopped advancing it. Settling from the outer future would race the still-running
     //   thread and persist a STALE cumulative, wedging the lane.
-    // - ABANDON DRAIN. A cancelled or errored `drive` returns without a graceful
-    //   cooperative close, stranding the upstream iroh connection whose QUIC driver
-    //   lives on this pull-thread runtime; dropping the runtime with no drain hangs the
-    //   node's `Endpoint::close()`. Wait on those paths for the connection to actually
-    //   reach drained (see the `abandon_drain` module), under its own ceiling. The
-    //   clean `Ok` path skips the wait and carries the same residual as #1675.
+    // - DIALS ON THE MAIN RUNTIME. The pull thread's runtime drops when the thread
+    //   returns, so every upstream dial runs on `deps.dial_runtime` instead. Each
+    //   connection's QUIC driver lives there and carries a clean finish, a cancel or
+    //   an error through its close to draining, so the node's `Endpoint::close()`
+    //   never waits on a connection whose driver died with this runtime.
     let hash = Hash::from(hash_bytes);
     let endpoint = deps.endpoint.clone();
+    let dial_runtime = deps.dial_runtime.clone();
     let slash_domain = deps.slash_domain.clone();
     let engine = deps.engine.clone();
     let buyer = Arc::clone(&deps.buyer);
@@ -1930,8 +1936,6 @@ async fn pull_from_candidate_in_span(
                 prior_amount,
                 ledger: Arc::clone(&ledger_for_drive),
             };
-            let abandoned = ConnDrain::default();
-            let observer = abandoned.observer();
             let source = PeerSource::new(
                 &endpoint,
                 EndpointAddr::new(pk),
@@ -1944,7 +1948,7 @@ async fn pull_from_candidate_in_span(
                 rate_ceiling,
                 deadlines,
             )
-            .with_dial_observer(as_observer(&observer));
+            .with_dial_runtime(dial_runtime);
             let source = PrimedSource::new(TimedSource::new(source, Arc::clone(&metrics)));
             // The handshake's pull is the drive's first leg only when that leg is
             // the whole blob: this node holds none of it.
@@ -2001,13 +2005,6 @@ async fn pull_from_candidate_in_span(
             };
             // A primed pull the drive never opened closes now.
             source.clear();
-            // Wait out a stranded upstream connection on the cancel/`Err` paths only,
-            // so `Endpoint::close()` cannot hang on the runtime this thread is about
-            // to drop. The `_settle` guard drops AFTER this, persisting the final
-            // watermark.
-            if cancelled || result.is_err() {
-                drain_abandoned(&abandoned, provider_addr, &metrics).await;
-            }
             (result, pool_id, cancelled)
         }))
     })

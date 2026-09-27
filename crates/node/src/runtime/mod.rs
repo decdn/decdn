@@ -50,12 +50,14 @@ use decdn_common::redact::{redact_userinfo, sanitize_rpc_display};
 use decdn_incentive::PoolStateStore;
 use decdn_incentive::eth_identity;
 
-/// Ceiling on how long we wait for spawned tasks to drain after the endpoint
-/// and metrics server have been signalled to stop. Sized comfortably larger
-/// than the sum of the probe handler's accept + close timeouts (see
+/// Ceiling on each bounded shutdown stage: the router close ([`close_router`]),
+/// the final redeem sweep, and the drain of spawned tasks after the endpoint and
+/// metrics server have been signalled to stop. Sized comfortably larger than the
+/// sum of the probe handler's accept + close timeouts (see
 /// `handlers::probe::ACCEPT_BI_TIMEOUT` + `PROBE_READ_TIMEOUT` +
-/// `PROBE_CLOSE_TIMEOUT`) so in-flight handlers finish naturally; the
-/// `abort_all` branch only fires as a safety net.
+/// `PROBE_CLOSE_TIMEOUT`) so in-flight handlers finish naturally, and than an
+/// endpoint close's `3 * PTO` wait; each stage's give-up branch only fires as a
+/// safety net.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Period between dispatch per-source rate-limiter GC sweeps (#440).
@@ -2105,6 +2107,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             if let Some(resolver) = resolver_opt.as_ref() {
                 origin.provision(crate::node_origin::NodeOriginDeps {
                     endpoint: ep_for_buyer.clone(),
+                    dial_runtime: tokio::runtime::Handle::current(),
                     routing_table: dht_routing_c,
                     staker_set: staker_set_c,
                     // FIND_VALUE last-resort fallback when the DHT returns no
@@ -2432,6 +2435,45 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     tasks: JoinSet<()>,
 }
 
+/// Shut `router` down, giving up after `deadline`. Returns whether the router
+/// task ran to completion.
+///
+/// The router's shutdown cancels its handlers, then calls
+/// [`iroh::Endpoint::close`], which waits for every open connection to reach
+/// QUIC's draining state. A connection whose QUIC driver died with the runtime
+/// that dialled it never does, and the close then waits forever. The teardown
+/// after this call redeems lanes, flushes the lane store and the receipt tail,
+/// and closes the cache, so a stuck close must not cost that settlement state.
+///
+/// Past `deadline` this drops the shutdown future, which aborts the router's
+/// task, and logs an error: every upstream dial runs on the main runtime, so a
+/// close that does not finish is a defect, not load. The handlers are already
+/// cancelled by then, so no serve outlives the give-up. The endpoint is left
+/// closing rather than closed, so nothing after this call may wait on
+/// [`iroh::Endpoint::closed`]. A router task that panicked also counts as not
+/// finished: its endpoint close may never have run.
+async fn close_router(router: &Router, deadline: Duration) -> bool {
+    match tokio::time::timeout(deadline, router.shutdown()).await {
+        Ok(Ok(())) => true,
+        Ok(Err(err)) => {
+            tracing::error!(
+                error = %err,
+                "router shutdown task failed; the endpoint may not have closed"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::error!(
+                ?deadline,
+                "router shutdown did not finish within the deadline, most likely because the \
+                 endpoint close waits on a connection whose QUIC driver is gone; continuing \
+                 with redeem and flush"
+            );
+            false
+        }
+    }
+}
+
 /// Graceful teardown of [`run`] (#1253). Consumes every field of
 /// [`ShutdownHandles`] via an exhaustive destructure — see that type's docs for
 /// why the `..`-free binding is load-bearing. The teardown ordering here is
@@ -2470,11 +2512,10 @@ async fn shutdown<P: Provider + Clone + 'static>(
         mut tasks,
     } = handles;
 
-    // Signal the HTTP accept loops to stop *before* awaiting
-    // `router.shutdown()`. Router shutdown can block indefinitely if a
-    // protocol handler is slow, and while it's blocked the metrics/admin
-    // servers would otherwise keep accepting fresh loopback connections —
-    // wasting the outer `SHUTDOWN_DEADLINE` budget and emitting misleading
+    // Signal the HTTP accept loops to stop *before* closing the router.
+    // The router close can take up to `SHUTDOWN_DEADLINE`, and while it runs
+    // the metrics/admin servers would otherwise keep accepting fresh loopback
+    // connections — wasting that budget and emitting misleading
     // "still serving" signals. The accept loops are cheap to unwind, so
     // stopping them first is strictly cleaner.
     if metrics_stop_tx.send(()).is_err() {
@@ -2568,10 +2609,8 @@ async fn shutdown<P: Provider + Clone + 'static>(
     };
 
     // Router::shutdown waits for ProtocolHandler::shutdown on each handler,
-    // then closes the endpoint.
-    if let Err(err) = router.shutdown().await {
-        tracing::warn!(error = %err, "router shutdown reported an error");
-    }
+    // then closes the endpoint. Bounded, so every step below still runs.
+    close_router(&router, SHUTDOWN_DEADLINE).await;
     // The ONE multiplexed poller driving all registered watcher routes stops here,
     // once. It exits cooperatively — cancelling its loop at the next await
     // boundary and flushing every persisting route's checkpoint (settlement's
@@ -2648,6 +2687,10 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // have misread the ECONNREFUSED as drain completion while
     // in-flight streams were still draining. Log at `error!`
     // accordingly so post-mortems surface it.
+    //
+    // A router close that gave up at its deadline still reaches here: its
+    // handlers were cancelled first, so no stream is in flight, and
+    // `close_router` has already logged the stuck endpoint close.
     if matches!(stop_order, AdminStopOrder::AfterRouter)
         && let Some(tx) = admin_stop_tx.take()
         && tx.send(()).is_err()
@@ -5044,6 +5087,102 @@ mod tests {
                 .lines()
                 .any(|l| l == "decdn_chain_get_logs_retries_total 1"),
             "window-retry counter not wired"
+        );
+    }
+
+    /// Bind a loopback endpoint with relays off, returning it and a dialable
+    /// address.
+    async fn loopback_endpoint(alpns: Vec<Vec<u8>>) -> (Endpoint, iroh::EndpointAddr) {
+        let ep = Endpoint::builder(presets::Minimal)
+            .alpns(alpns)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind_addr(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::LOCALHOST,
+                0,
+            ))
+            .expect("loopback bind address")
+            .bind()
+            .await
+            .expect("bind loopback endpoint");
+        let socket = *ep
+            .bound_sockets()
+            .iter()
+            .find(|a| a.is_ipv4())
+            .expect("an IPv4 bound socket");
+        let addr = iroh::EndpointAddr::new(ep.id()).with_ip_addr(socket);
+        (ep, addr)
+    }
+
+    /// A router whose endpoint holds one connection to a peer that keeps it open.
+    /// With `strand`, the connection is dialled on a throwaway runtime that is then
+    /// dropped, taking the connection's QUIC driver with it: the shape a pull leg
+    /// that dials on its own runtime leaves behind (#2185).
+    async fn router_holding_a_connection(
+        strand: bool,
+    ) -> (Router, iroh::endpoint::Connection, Endpoint) {
+        const ALPN: &[u8] = b"cdn/close-router-test/v1";
+        let (peer, peer_addr) = loopback_endpoint(vec![ALPN.to_vec()]).await;
+        let accept_peer = peer.clone();
+        tokio::spawn(async move {
+            if let Some(incoming) = accept_peer.accept().await
+                && let Ok(connecting) = incoming.accept()
+            {
+                let _held = connecting.await;
+                std::future::pending::<()>().await;
+            }
+        });
+        let (ep, _) = loopback_endpoint(Vec::new()).await;
+        let conn = if strand {
+            let dialer = ep.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build throwaway runtime");
+                let conn = rt
+                    .block_on(dialer.connect(peer_addr, ALPN))
+                    .expect("dial on the throwaway runtime");
+                drop(rt);
+                conn
+            })
+            .join()
+            .expect("dialling thread")
+        } else {
+            ep.connect(peer_addr, ALPN)
+                .await
+                .expect("dial on the test runtime")
+        };
+        (Router::builder(ep).spawn(), conn, peer)
+    }
+
+    /// A router whose endpoint holds a connection with no driver never finishes
+    /// its shutdown on its own; `close_router` gives up at the deadline and
+    /// reports it, so node teardown goes on to redeem and flush.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_router_gives_up_on_a_stranded_connection_at_its_deadline() {
+        let (router, _conn, _peer) = router_holding_a_connection(true).await;
+        let deadline = Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        assert!(
+            !close_router(&router, deadline).await,
+            "a close stuck on a stranded connection must be reported as unfinished"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the close must return near its deadline, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The control: the same router with the connection's driver still running
+    /// finishes inside a generous deadline. Without it, the test above would pass
+    /// for any setup that stalls the close, stranded driver or not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_router_finishes_when_every_connection_drains() {
+        let (router, _conn, _peer) = router_holding_a_connection(false).await;
+        assert!(
+            close_router(&router, Duration::from_secs(10)).await,
+            "a close with a driven connection must finish inside the deadline"
         );
     }
 }

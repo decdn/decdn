@@ -261,8 +261,7 @@ use decdn_protocol::client::{
     StreamResponseExt, VoucherRejectReason, WatermarkBundle, WireCapability,
 };
 use decdn_protocol::{
-    ALPN_CLIENT, CHUNK_BYTES, ChunkPreimage, decode_message, encode_message, read_frame,
-    write_frame,
+    CHUNK_BYTES, ChunkPreimage, decode_message, encode_message, read_frame, write_frame,
 };
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
@@ -1784,17 +1783,6 @@ pub async fn stream_fetch_shared(
     .await
 }
 
-/// Notified with a weak handle to each upstream connection at the moment it is
-/// dialled, before any handshake step that could fail with the connection already
-/// live on the caller's runtime.
-///
-/// For a caller that runs a pull on a runtime it is about to drop — `decdn-node`'s
-/// per-serve pull-leg runtimes — and must first observe every connection it dialled
-/// reach its drained state. The handle is weak by construction, so observing can
-/// never delay the close it watches, and a caller with no such hazard (the
-/// publisher CLI, one long-lived runtime) passes `None` and pays nothing.
-pub type DialObserver<'a> = dyn Fn(iroh::endpoint::WeakConnectionHandle) + Send + Sync + 'a;
-
 /// Where an [`open_stream`] gets its QUIC connection.
 enum ConnSource<'a> {
     /// Dial a fresh one-shot connection to `target`. The pull owns it and closes
@@ -1802,6 +1790,9 @@ enum ConnSource<'a> {
     Dial {
         endpoint: &'a Endpoint,
         target: EndpointAddr,
+        /// The runtime the dial and the connection's driver run on; `None` runs
+        /// them on the caller's (see [`connection::dial`]).
+        runtime: Option<&'a tokio::runtime::Handle>,
     },
     /// Reuse a caller-owned [`WarmConnection`]'s connection. The pull borrows it
     /// and leaves it open for the next hash; the [`WarmConnection`] closes it once.
@@ -1842,7 +1833,6 @@ async fn open_stream(
     byte_len: u64,
     timestamp_us: u64,
     open: Duration,
-    on_connect: Option<&DialObserver<'_>>,
 ) -> anyhow::Result<(
     iroh::endpoint::Connection,
     SendStream,
@@ -1852,20 +1842,15 @@ async fn open_stream(
 )> {
     tokio::time::timeout(open, async move {
         let conn = match source {
-            ConnSource::Dial { endpoint, target } => endpoint
-                .connect(target, ALPN_CLIENT)
-                .await
-                .map_err(|e| rate_limited::transport_error("connect failed", e))?,
+            ConnSource::Dial {
+                endpoint,
+                target,
+                runtime,
+            } => connection::dial(endpoint, target, runtime, "connect failed").await?,
             // Already dialled and warm — reuse the handle. A fresh `open_bi` below
             // gives this hash its own stream.
             ConnSource::Reuse(conn) => conn.clone(),
         };
-        // Hand the caller its handle HERE, before the handshake — every step below
-        // can fail with the connection already dialled and its driver already on
-        // this runtime, and a caller that must observe the drain needs those too.
-        if let Some(observe) = on_connect {
-            observe(conn.weak_handle());
-        }
         let (mut send, mut recv) = conn
             .open_bi()
             .await
@@ -2103,7 +2088,7 @@ async fn fetch_in_memory_once(
         deadlines,
         // Whole tail: the in-memory wrapper has no store to compute gaps against.
         0,
-        // One long-lived test runtime: nothing to strand, so no dial observer.
+        // One long-lived test runtime: the dial runs on it.
         None,
     )
     .await?;
@@ -2176,8 +2161,6 @@ async fn fetch_in_memory_once_on(
         deadlines,
         // Whole tail: the in-memory wrapper has no store to compute gaps against.
         0,
-        // One long-lived test runtime: nothing to strand, so no dial observer.
-        None,
     )
     .await?;
     let total_bytes = header.total_bytes;
@@ -2852,6 +2835,11 @@ impl std::fmt::Debug for UpstreamPull {
 /// (`AmountRegression`, #1145 review). The caller reads what to
 /// persist from it — including after a drop — via [`PoolLedger::settlement`].
 ///
+/// `dial_runtime` is the runtime the dial and the connection's QUIC driver run
+/// on; `None` runs them on the caller's. A caller that drops the runtime it pulls
+/// on passes a long-lived one — see
+/// [`PeerSource::with_dial_runtime`](crate::source::PeerSource::with_dial_runtime).
+///
 /// Runs inside an `open_progressive_pull` span that covers the dial and the
 /// signed-response handshake — the time to first byte. Its `hash`, `pool_id`,
 /// `byte_offset`, `peer` and `local_node_id` fields match the serving node's
@@ -2887,10 +2875,14 @@ pub async fn open_progressive_pull(
     max_rate_per_mb: u64,
     deadlines: PullDeadlines,
     byte_len: u64,
-    on_connect: Option<&DialObserver<'_>>,
+    dial_runtime: Option<&tokio::runtime::Handle>,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
     open_progressive_pull_impl(
-        ConnSource::Dial { endpoint, target },
+        ConnSource::Dial {
+            endpoint,
+            target,
+            runtime: dial_runtime,
+        },
         // One-shot dial: the pull owns this connection and closes it on teardown.
         true,
         ctx,
@@ -2905,7 +2897,6 @@ pub async fn open_progressive_pull(
         max_rate_per_mb,
         deadlines,
         byte_len,
-        on_connect,
     )
     .await
 }
@@ -2949,7 +2940,6 @@ pub(crate) async fn open_progressive_pull_on(
     max_rate_per_mb: u64,
     deadlines: PullDeadlines,
     byte_len: u64,
-    on_connect: Option<&DialObserver<'_>>,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
     open_progressive_pull_impl(
         ConnSource::Reuse(warm.connection()),
@@ -2967,7 +2957,6 @@ pub(crate) async fn open_progressive_pull_on(
         max_rate_per_mb,
         deadlines,
         byte_len,
-        on_connect,
     )
     .await
 }
@@ -2998,11 +2987,6 @@ async fn open_progressive_pull_impl(
     // the exact gap length so the server scopes both the serve and the payment
     // to it, rather than streaming the whole remainder.
     byte_len: u64,
-    // Notified with a weak handle to the connection the instant it is dialled, so a
-    // caller on a runtime it is about to drop can wait for that connection to reach
-    // drained — including on the handshake failures below, which return with the
-    // connection already live. `None` for a caller with no such hazard.
-    on_connect: Option<&DialObserver<'_>>,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
     let result: anyhow::Result<(UpstreamPullHeader, UpstreamPull)> = async {
         let window = deadlines.window;
@@ -3031,7 +3015,6 @@ async fn open_progressive_pull_impl(
             byte_len,
             timestamp_us,
             deadlines.open,
-            on_connect,
         )
         .await?;
         if !resp.body.ok {
