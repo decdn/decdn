@@ -832,16 +832,17 @@ since project inception and will roll into the first tagged release.
   first exposed a third issue in the client:
   - Every new `cdn/client/v1` stream restarted the node's credit window at the
     one-chunk floor, on the serve loop and on the pull leg's `RampPacer`. A
-    lane now keeps an in-memory ramp-credit pool. A stream takes the whole
-    pool when it starts. When it ends fully paid, it returns its carried
-    credit plus its own confirmed payment, so the next request on the lane
-    opens at the window the last one earned. A stream that ends any other way
-    forfeits the credit, so a payer that abandons stream after stream gets no
-    more unpaid bytes than `paid / credit_ramp_divisor` plus one floor for
-    each stream. The pool holds at most `credit_max × credit_ramp_divisor`. A
-    restart or a forgotten lane starts at the floor again. The deposit guard
-    and floor reservations still price the floor (ADR 003 §Credit window,
-    ADR 037).
+    lane now keeps an in-memory ramp-credit pool of paid content bytes. A
+    stream takes the whole pool when it starts. When it ends fully paid, it
+    returns its carried credit plus the content of its request, so the next
+    request on the lane opens at the window the last one earned. A stream the
+    node refuses before its first byte returns its credit unchanged. A stream
+    that ends any other way forfeits the credit, so a payer that abandons
+    stream after stream gets no more unpaid bytes than
+    `paid / credit_ramp_divisor` plus one floor for each stream. The pool
+    holds at most `credit_max × credit_ramp_divisor`. A restart or a forgotten
+    lane starts at the floor again (ADR 003 §Credit window). The deposit guard
+    and floor reservations still price the floor (ADR 037).
   - `bundle pull` sized each provider lane once, from the permits free when
     the drive started, so a lane that started at width 1 while sibling entries
     held the provider's permits ran its runs one at a time. The lane now takes
@@ -850,7 +851,11 @@ since project inception and will roll into the first tagged release.
   - After a proof write fails, the client now reads past the `ChunkData`
     frames the node sent ahead of its `StreamError`, so an opening window wider
     than one frame no longer turns an `UnderFold` rejection into a transport
-    error. This also applies at `credit_ramp_divisor = 0`.
+    error. This also applies at `credit_ramp_divisor = 0`. The skipped frames
+    stay under the request's promised wire length and the received-byte
+    ceiling, and a `StreamEnd` behind skipped frames fails the leg.
+  - `decdn_client::LaneGrowth` hooks receive the number of waiting gaps and
+    never add more workers than that.
 
 - **The `UnderFold` heal documents the path that reaches it (#2169).** A
   reveal that fails to send locally never reaches the node: the client counts

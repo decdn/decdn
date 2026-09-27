@@ -742,14 +742,14 @@ pub struct RangeLane<'a, S> {
 /// A lane's growth hook in a [`drive_range_lanes`] drive.
 ///
 /// Each time a gap worker of the lane takes a gap and more gaps still wait,
-/// the drive calls the hook, and it adds one worker to the lane for each unit
-/// the hook returns. The hook must not wait: it grants only what it can grant
+/// the drive calls the hook with the number of gaps that wait, and it adds one
+/// worker to the lane for each unit the hook returns, up to that number. The hook must not wait: it grants only what it can grant
 /// now, such as stream permits that another fetch has released since the
 /// drive started, and the caller holds what it grants until the drive
 /// returns. A lane that starts narrow because a sibling fetch holds its
 /// provider's streams thus widens when that sibling finishes.
 #[derive(Clone, Copy)]
-pub struct LaneGrowth<'a>(pub &'a (dyn Fn() -> usize + Send + Sync + 'a));
+pub struct LaneGrowth<'a>(pub &'a (dyn Fn(usize) -> usize + Send + Sync + 'a));
 
 impl std::fmt::Debug for LaneGrowth<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1031,18 +1031,20 @@ where
                         match next {
                             Some(gap) => {
                                 q.in_flight = q.in_flight.saturating_add(1);
-                                Some((gap, !q.waiting.is_empty()))
+                                Some((gap, q.waiting.len()))
                             }
                             None if q.in_flight == 0 && q.first.is_none() => return Ok(()),
                             None => None,
                         }
                     };
-                    let Some(((gap_start, gap_len), more_waiting)) = taken else {
+                    let Some(((gap_start, gap_len), waiting)) = taken else {
                         notified.await;
                         continue;
                     };
-                    if more_waiting && let Some(LaneGrowth(grow)) = lane.grow {
-                        let extra = grow();
+                    if waiting > 0
+                        && let Some(LaneGrowth(grow)) = lane.grow
+                    {
+                        let extra = grow(waiting).min(waiting);
                         if extra > 0 {
                             grown
                                 .lock()
@@ -2369,16 +2371,17 @@ mod tests {
         let total = 64 * GROUP;
         let ranges = scattered(total);
         let granted: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
-        let hook: &'static (dyn Fn() -> usize + Send + Sync) = Box::leak(Box::new(move || {
-            // Two extra workers in all, one per call.
-            usize::from(
-                granted
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                        (n < 2).then_some(n + 1)
-                    })
-                    .is_ok(),
-            )
-        }));
+        let hook: &'static (dyn Fn(usize) -> usize + Send + Sync) =
+            Box::leak(Box::new(move |_| {
+                // Two extra workers in all, one per call.
+                usize::from(
+                    granted
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                            (n < 2).then_some(n + 1)
+                        })
+                        .is_ok(),
+                )
+            }));
         let spec = LaneSpec {
             grow: Some(LaneGrowth(hook)),
             ..LaneSpec::healthy(1)

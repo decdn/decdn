@@ -160,7 +160,7 @@ impl ClientHandler {
         session: Arc<FillSession>,
         also_pace: &[Arc<FillSession>],
         lane: &Arc<Mutex<LaneDeliveryState>>,
-        carry: RampCarry,
+        mut carry: RampCarry,
         hash: Hash,
         lane_key: LaneKey,
         client_node_id: B256,
@@ -241,6 +241,9 @@ impl ClientHandler {
 
         // The first frame — awaiting the pull leg if `R` opens on a gap. A pull
         // that ends `Err` here fails the serve rather than hanging.
+        // The first byte is about to go out: from here a stream that ends unpaid
+        // forfeits its ramp credit (ADR 003 §Credit window).
+        carry.start_delivery();
         let opening_window = self.credit_window(chunk_bytes, carry.ramp_paid(0));
         let mut next_chunk = producer
             .next_frame_chunks(self.frame_target(0, chunk_bytes, opening_window))
@@ -599,9 +602,9 @@ impl ClientHandler {
         // floor; the guard drops as this leg returns.
         // The stream is fully paid: return its ramp credit to the lane before
         // `StreamEnd`, so the payer's next request on this lane opens at the
-        // window this one earned (ADR 003 §Credit window). Every other exit
-        // drops the carry and forfeits it.
-        carry.return_paid(*paid);
+        // window this one earned (ADR 003 §Credit window). Any other exit after
+        // the first byte drops the carry and forfeits it.
+        carry.return_paid(super::dispatch::aligned_span(offset, len, total_bytes));
         self.write_message(send, &ClientMessage::StreamEnd).await?;
         let _ = send.finish();
         // Drain the client's send half to its FIN before `recv` drops, so the

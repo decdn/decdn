@@ -3373,9 +3373,9 @@ impl UpstreamPull {
         // cause still downcasts through the added context); what the recovery saw
         // rides along so the log can tell a silent peer from a chatty one.
         // The frames it passes over stay under the same ceilings as the ones it
-        // takes in: an honest node sends no byte past the request's promised wire
-        // length or the received-byte ceiling, so a peer that does is not draining
-        // an in-flight window, and the recovery read fails.
+        // takes in (`next_chunk`): an honest node sends no byte past the
+        // request's promised wire length, and our own received-byte ceiling
+        // stops the pull as it would on any read.
         let mut skipped: u64 = 0;
         let terminal = tokio::time::timeout(TERMINAL_AFTER_WRITE_TIMEOUT, async {
             loop {
@@ -3383,13 +3383,17 @@ impl UpstreamPull {
                     Ok(ClientMessage::ChunkData(chunk)) => {
                         skipped = skipped.saturating_add(chunk.bytes().len() as u64);
                         let seen = self.cumulative.saturating_add(skipped);
-                        if seen > self.expected_wire_bytes
-                            || (self.max_received_wire > 0 && seen > self.max_received_wire)
-                        {
+                        if seen > self.expected_wire_bytes {
                             anyhow::bail!(
                                 "server sent {seen} bytes, more than the {} promised",
                                 self.expected_wire_bytes
                             );
+                        }
+                        if self.max_received_wire > 0 && seen > self.max_received_wire {
+                            return Err(anyhow::Error::new(BlobTooLarge {
+                                received: seen,
+                                ceiling: self.max_received_wire,
+                            }));
                         }
                     }
                     other => return other,
@@ -3440,6 +3444,8 @@ impl UpstreamPull {
                 "no terminal signal after the voucher write failed; peer sent {}",
                 variant_name(&other)
             ))),
+            // The ceiling stays typed: it is terminal, not a peer to fail over from.
+            Ok(Err(read_err)) if read_err.is::<BlobTooLarge>() => Err(read_err),
             Ok(Err(read_err)) => Err(write_err.context(format!(
                 "no terminal signal after the voucher write failed; recovery read failed: \
                  {read_err:#}"

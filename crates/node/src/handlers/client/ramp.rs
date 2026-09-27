@@ -2,29 +2,33 @@
 //!
 //! A stream's credit window ramps with `paid / credit_ramp_divisor`. The `paid`
 //! input is the stream's own confirmed payment plus the credit it carries from
-//! its lane. Each lane keeps one [`RampPool`] of paid wire bytes. A new stream
-//! takes the whole pool as a [`RampCarry`], so a payer that pulls many ranges
-//! back to back keeps its ramp instead of starting each request at the
-//! one-chunk floor.
+//! its lane. Each lane keeps one [`RampPool`] of paid content bytes: the content
+//! of the requests its fully paid streams served. Content is never more than the
+//! wire bytes that paid for it, so the pool never overstates the lane's revenue,
+//! and the pull leg's `RampPacer` uses it directly against its content
+//! frontiers. A new stream takes the whole pool as a [`RampCarry`], so a payer
+//! that pulls many ranges back to back keeps its ramp instead of starting each
+//! request at the one-chunk floor.
 //!
-//! Only a stream that ends fully paid returns credit: its carry plus its own
-//! confirmed payment, just before its `StreamEnd`. A stream that ends any other
-//! way (abandoned, rejected, faulted) forfeits its carry and its own payment.
-//! Each paid byte therefore opens credit on at most one stream that leaves bytes
-//! unpaid, so the lane's unpaid exposure over its whole life stays at
-//! `paid / credit_ramp_divisor` plus one floor for each stream. Two live streams
-//! never hold the same paid bytes, because a take empties the pool. The pool
-//! holds at most `credit_max × credit_ramp_divisor`, which is the credit that
-//! opens one window at the ceiling. The pool lives in memory only: a restart, or
-//! a forgotten lane, starts the lane at the floor again.
+//! Only a stream that ends fully paid returns credit: its carry plus the content
+//! of its request, just before its `StreamEnd`. A stream that ends any other
+//! way after its first byte (abandoned, rejected, faulted) forfeits its carry
+//! and its own payment. A stream refused before its first byte returns its
+//! carry whole. Each paid byte therefore opens credit on at most one stream that
+//! leaves bytes unpaid, so the lane's unpaid exposure over its whole life stays
+//! at `paid / credit_ramp_divisor` plus one floor for each stream. Two live
+//! streams never hold the same paid bytes, because a take empties the pool. The
+//! pool holds at most `credit_max × credit_ramp_divisor`, which is the credit
+//! that opens one window at the ceiling. The pool lives in memory only: a
+//! restart, or a forgotten lane, starts the lane at the floor again.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// One lane's banked ramp credit, in wire bytes the lane's streams paid.
+/// One lane's banked ramp credit, in content bytes the lane's streams paid for.
 ///
-/// Atomic, not guarded by the lane's `tokio` mutex, so taking and returning
-/// credit never waits on the lane lock.
+/// Atomic, not guarded by the lane's `tokio` mutex, so a carry can return its
+/// credit from a synchronous `Drop`.
 #[derive(Debug, Default)]
 pub(crate) struct RampPool {
     credit: AtomicU64,
@@ -61,16 +65,19 @@ impl RampPool {
     }
 }
 
-/// The ramp credit one stream took from its lane.
+/// The ramp credit one stream took from its lane, in paid content bytes.
 ///
-/// The stream returns it, with its own confirmed payment, through
-/// [`Self::return_paid`] when it ends fully paid. A carry dropped without that
-/// call forfeits its credit.
+/// The stream returns it, with the content it paid for itself, through
+/// [`Self::return_paid`] when it ends fully paid. A carry dropped before
+/// [`Self::start_delivery`] returns its credit untouched: the stream sent no
+/// byte, so it left nothing unpaid. A carry dropped after that forfeits its
+/// credit.
 #[derive(Debug)]
 pub(crate) struct RampCarry {
     pool: Arc<RampPool>,
     cap: u64,
     carried: u64,
+    delivering: bool,
 }
 
 impl RampCarry {
@@ -79,7 +86,12 @@ impl RampCarry {
     /// returns nothing.
     pub(crate) fn take(pool: Arc<RampPool>, cap: u64) -> Self {
         let carried = pool.take(cap);
-        Self { pool, cap, carried }
+        Self {
+            pool,
+            cap,
+            carried,
+            delivering: false,
+        }
     }
 
     /// A carry with no lane behind it: it carries nothing and returns nowhere.
@@ -87,31 +99,39 @@ impl RampCarry {
         Self::take(Arc::new(RampPool::default()), 0)
     }
 
-    /// The paid wire bytes this stream carries from its lane.
-    #[cfg(test)]
+    /// The paid content bytes this stream carries from its lane.
     pub(crate) const fn carried(&self) -> u64 {
         self.carried
     }
 
-    /// A lower bound on the content bytes inside the carried wire bytes, for a
-    /// ramp that paces on content (the pull leg's `RampPacer`). The bao
-    /// interleave adds at most one 64-byte parent node per 16 KiB chunk group,
-    /// under 1/128 of the content even for a blob whose last group holds one
-    /// byte, so taking 1/128 off never overstates the paid content.
-    pub(crate) const fn carried_content(&self) -> u64 {
-        self.carried.saturating_sub(self.carried.div_ceil(128))
-    }
-
     /// The ramp input for a stream that confirmed `own_paid` bytes itself.
+    /// The serve loops pass wire bytes, which are at least the content they
+    /// carry, so the sum never overstates what the lane paid.
     pub(crate) const fn ramp_paid(&self, own_paid: u64) -> u64 {
         self.carried.saturating_add(own_paid)
     }
 
-    /// Return `carried + own_paid` to the lane's pool. Call it only when the
-    /// stream has delivered and been paid for every byte of its request.
-    pub(crate) fn return_paid(self, own_paid: u64) {
+    /// Mark the first byte of the stream as about to go out. From here on, a
+    /// dropped carry forfeits its credit.
+    pub(crate) const fn start_delivery(&mut self) {
+        self.delivering = true;
+    }
+
+    /// Return `carried + paid_content` to the lane's pool. Call it only when the
+    /// stream has delivered, and been paid for, all `paid_content` bytes of its
+    /// request.
+    pub(crate) fn return_paid(mut self, paid_content: u64) {
         self.pool
-            .bank(self.carried.saturating_add(own_paid), self.cap);
+            .bank(self.carried.saturating_add(paid_content), self.cap);
+        self.carried = 0;
+    }
+}
+
+impl Drop for RampCarry {
+    fn drop(&mut self) {
+        if !self.delivering {
+            self.pool.bank(self.carried, self.cap);
+        }
     }
 }
 
@@ -158,16 +178,6 @@ mod tests {
     }
 
     #[test]
-    fn the_carried_content_never_exceeds_the_carried_wire() {
-        let pool = pool_with(128 << 20);
-        let carry = RampCarry::take(Arc::clone(&pool), CAP);
-        assert_eq!(carry.carried_content(), (128 << 20) - (1 << 20));
-        assert_eq!(RampCarry::detached().carried_content(), 0);
-        let one = RampCarry::take(pool_with(1), CAP);
-        assert_eq!(one.carried_content(), 0);
-    }
-
-    #[test]
     fn a_fully_paid_stream_returns_its_carry_plus_its_payment() {
         let pool = pool_with(3 << 20);
         let carry = RampCarry::take(Arc::clone(&pool), CAP);
@@ -181,11 +191,21 @@ mod tests {
     #[test]
     fn an_abandoned_stream_forfeits_its_carry() {
         let pool = pool_with(CAP);
-        let carry = RampCarry::take(Arc::clone(&pool), CAP);
+        let mut carry = RampCarry::take(Arc::clone(&pool), CAP);
         assert_eq!(carry.carried(), CAP);
+        carry.start_delivery();
         drop(carry);
         assert_eq!(pool.credit(), 0);
         assert_eq!(RampCarry::take(Arc::clone(&pool), CAP).carried(), 0);
+    }
+
+    /// A stream refused before its first byte left nothing unpaid, so its carry
+    /// goes back to the lane whole.
+    #[test]
+    fn a_stream_refused_before_delivery_returns_its_carry() {
+        let pool = pool_with(6 << 20);
+        drop(RampCarry::take(Arc::clone(&pool), CAP));
+        assert_eq!(pool.credit(), 6 << 20);
     }
 
     #[test]
@@ -194,7 +214,8 @@ mod tests {
         let mut paid_total: u64 = 0;
         let mut live: Vec<(RampCarry, u64)> = Vec::new();
         for round in 0..64_u64 {
-            let carry = RampCarry::take(Arc::clone(&pool), CAP);
+            let mut carry = RampCarry::take(Arc::clone(&pool), CAP);
+            carry.start_delivery();
             let own = (round % 7 + 1) << 20;
             paid_total = paid_total.saturating_add(own);
             live.push((carry, own));

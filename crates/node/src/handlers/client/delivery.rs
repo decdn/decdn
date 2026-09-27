@@ -260,7 +260,7 @@ impl ClientHandler {
         total_bytes: u64,
         lane_key: LaneKey,
         lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
-        carry: RampCarry,
+        mut carry: RampCarry,
         client_node_id: B256,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
@@ -347,6 +347,9 @@ impl ClientHandler {
         let mut chunks = ChunkFramer::new(data, hash);
         // Nothing is delivered, paid, or vouchered yet, so the opening frame may run
         // a whole interval against the whole opening window.
+        // The first byte is about to go out: from here a stream that ends unpaid
+        // forfeits its ramp credit (ADR 003 §Credit window).
+        carry.start_delivery();
         let opening_window = self.credit_window(chunk_bytes, carry.ramp_paid(0));
         let mut next_chunk = chunks
             .next_frame_chunks(self.frame_target(0, chunk_bytes, opening_window))
@@ -677,9 +680,13 @@ impl ClientHandler {
         // floor; the guard drops as this function returns.
         // The stream is fully paid: return its ramp credit to the lane before
         // `StreamEnd`, so the payer's next request on this lane opens at the
-        // window this one earned (ADR 003 §Credit window). Every other exit
-        // drops the carry and forfeits it.
-        carry.return_paid(*paid);
+        // window this one earned (ADR 003 §Credit window). Any other exit after
+        // the first byte drops the carry and forfeits it.
+        carry.return_paid(super::dispatch::aligned_span(
+            byte_offset,
+            byte_len,
+            total_bytes,
+        ));
         self.write_message(send, &ClientMessage::StreamEnd).await?;
         let _ = send.finish();
         // Drain the client's send half to its FIN before `recv` drops, so the

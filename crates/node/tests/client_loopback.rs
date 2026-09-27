@@ -1690,45 +1690,26 @@ async fn paying_grows_the_window_to_paid_over_divisor() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// #2168: a stream's paid bytes return to its lane's ramp-credit pool when it
-/// ends, so the payer's next request on the lane opens at the window the first
-/// one earned instead of at the one-interval floor (ADR 003 §Credit window).
-/// Stream 1 pays for a 4 MiB range to its `StreamEnd`. Stream 2 then asks for
-/// the whole blob and pays nothing: at divisor 1 it still receives about 4 MiB
-/// before it parks, where a fresh lane receives one interval
-/// (`unpaid_stream_is_served_only_the_floor_then_pauses`).
-#[tokio::test(flavor = "multi_thread")]
-async fn a_back_to_back_stream_opens_at_the_lanes_banked_ramp() -> anyhow::Result<()> {
-    const CREDIT_MAX: u64 = 64 * 1024 * 1024;
-    const FIRST_RANGE: u64 = 4 * HARNESS_INTERVAL_BYTES;
-    let payload = vec![0x5Au8; 16 * 1024 * 1024];
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let (store, signer, _deposit) = seeded_store()?;
-
-    let (target, _server_eth, server_ep, server_task) =
-        spawn_pipelined_server(cache, Arc::clone(&store), CREDIT_MAX, 1).await?;
-
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let client_node_id = B256::from(*client_ep.id().as_bytes());
-    let ext = binding_ext(&signer, client_node_id)?;
-
-    // Stream 1: pay each interval as it lands, and the remainder when the node
-    // parks, through to `StreamEnd`.
-    let (mut send, mut recv) =
-        open_paid_range_stream(&conn, *hash.as_bytes(), Some(&ext), 0, FIRST_RANGE).await?;
-    let mut received: u64 = 0;
-    let mut paid: u64 = 0;
+/// Pay a `[0, +range)` stream on `conn` to its `StreamEnd`: each interval as
+/// it lands, and the remainder when the node parks. `paid` is the lane's
+/// cumulative wire bytes before the stream; returns it after.
+async fn pay_range_to_end(
+    conn: &Connection,
+    hash: [u8; 32],
+    ext: &StreamRequestExt,
+    signer: &PrivateKeySigner,
+    range: u64,
+    mut paid: u64,
+) -> anyhow::Result<u64> {
+    let (mut send, mut recv) = open_paid_range_stream(conn, hash, Some(ext), 0, range).await?;
+    let mut received = paid;
     loop {
         match tokio::time::timeout(Duration::from_secs(5), read_client_msg(&mut recv)).await {
             Ok(msg) => match msg? {
                 ClientMessage::ChunkData(chunk) => {
                     received = received.saturating_add(chunk.bytes().len() as u64);
                     if received.saturating_sub(paid) >= HARNESS_INTERVAL_BYTES {
-                        pay_cumulative(&mut send, &signer, received).await?;
+                        pay_cumulative(&mut send, signer, received).await?;
                         paid = received;
                     }
                 }
@@ -1736,20 +1717,24 @@ async fn a_back_to_back_stream_opens_at_the_lanes_banked_ramp() -> anyhow::Resul
                 other => anyhow::bail!("expected ChunkData or StreamEnd, got {other:?}"),
             },
             Err(_elapsed) => {
-                anyhow::ensure!(received > paid, "stream 1 stalled with nothing owed");
-                pay_cumulative(&mut send, &signer, received).await?;
+                anyhow::ensure!(received > paid, "the stream stalled with nothing owed");
+                pay_cumulative(&mut send, signer, received).await?;
                 paid = received;
             }
         }
     }
-    anyhow::ensure!(paid >= FIRST_RANGE, "stream 1 paid {paid} wire bytes");
     let _ = send.finish();
-    drop(recv);
+    Ok(paid)
+}
 
-    // Stream 2: the same lane, no voucher. It opens at the banked window (`paid`
-    // at divisor 1), so it receives well past one interval before it parks, and
-    // never more than that window plus the one frame that crosses it.
-    let (_send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+/// Read what an unpaid whole-blob stream on `conn` receives before the node
+/// parks it for a voucher. Returns the stream so the caller controls its end.
+async fn read_unpaid_opening(
+    conn: &Connection,
+    hash: [u8; 32],
+    ext: &StreamRequestExt,
+) -> anyhow::Result<(u64, SendStream, RecvStream)> {
+    let (send, mut recv) = open_paid_stream(conn, hash, Some(ext)).await?;
     let mut unpaid: u64 = 0;
     while let Ok(msg) =
         tokio::time::timeout(Duration::from_secs(2), read_client_msg(&mut recv)).await
@@ -1761,13 +1746,104 @@ async fn a_back_to_back_stream_opens_at_the_lanes_banked_ramp() -> anyhow::Resul
             other => anyhow::bail!("expected ChunkData, got {other:?}"),
         }
     }
+    Ok((unpaid, send, recv))
+}
+
+/// #2168: a stream that ends fully paid returns its paid content to its lane's
+/// ramp-credit pool, so the payer's next request on the lane opens at the
+/// window the first one earned instead of at the one-interval floor (ADR 003
+/// §Credit window). Stream 1 pays for a 4 MiB range to its `StreamEnd`.
+/// Stream 2 then asks for the whole blob and pays nothing: at divisor 1 it
+/// still receives about 4 MiB before it parks, where a fresh lane receives one
+/// interval (`unpaid_stream_is_served_only_the_floor_then_pauses`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_back_to_back_stream_opens_at_the_lanes_banked_ramp() -> anyhow::Result<()> {
+    const CREDIT_MAX: u64 = 64 * 1024 * 1024;
+    const FIRST_RANGE: u64 = 4 * HARNESS_INTERVAL_BYTES;
+    let payload = vec![0x5Au8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_pipelined_server(cache, Arc::clone(&store), CREDIT_MAX, 1).await?;
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    let paid = pay_range_to_end(&conn, *hash.as_bytes(), &ext, &signer, FIRST_RANGE, 0).await?;
+    anyhow::ensure!(paid >= FIRST_RANGE, "stream 1 paid {paid} wire bytes");
+
+    // Stream 2: the same lane, no voucher. It opens at the banked window, so it
+    // receives the first range's content before it parks, and never more than
+    // that window plus the one frame that crosses it.
+    let (unpaid, _send, _recv) = read_unpaid_opening(&conn, *hash.as_bytes(), &ext).await?;
     anyhow::ensure!(
         unpaid >= FIRST_RANGE,
-        "stream 2 received {unpaid} unpaid wire bytes; the banked ramp opens {paid}"
+        "stream 2 received {unpaid} unpaid wire bytes; the banked ramp opens {FIRST_RANGE}"
     );
     anyhow::ensure!(
         unpaid <= paid.saturating_add(HARNESS_INTERVAL_BYTES),
         "stream 2 received {unpaid} unpaid wire bytes past its {paid}-byte window"
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// #2168: a stream that ends unpaid forfeits the ramp credit it carried, so a
+/// payer that paid once cannot open a wide window on stream after stream it
+/// abandons. Stream 2 opens at the banked window and walks away unpaid; stream 3
+/// then opens at the one-interval floor.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_stream_forfeits_its_lanes_ramp() -> anyhow::Result<()> {
+    const CREDIT_MAX: u64 = 64 * 1024 * 1024;
+    const FIRST_RANGE: u64 = 4 * HARNESS_INTERVAL_BYTES;
+    let payload = vec![0x5Cu8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_pipelined_server_with_metrics(cache, Arc::clone(&store), CREDIT_MAX, 1).await?;
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    pay_range_to_end(&conn, *hash.as_bytes(), &ext, &signer, FIRST_RANGE, 0).await?;
+    let (unpaid, mut send, mut recv) = read_unpaid_opening(&conn, *hash.as_bytes(), &ext).await?;
+    anyhow::ensure!(
+        unpaid >= FIRST_RANGE,
+        "stream 2 opened at {unpaid} wire bytes"
+    );
+
+    // Walk away from stream 2, then wait for the node to end it.
+    let ended = || -> anyhow::Result<u64> {
+        Ok(
+            counter(&metrics, "decdn_serve_stream_client_declined_total")?
+                + counter(&metrics, "decdn_serve_stream_client_abandoned_total")?,
+        )
+    };
+    let before = ended()?;
+    let _ = send.reset(0u32.into());
+    let _ = recv.stop(0u32.into());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while ended()? == before {
+        anyhow::ensure!(Instant::now() < deadline, "the node never ended stream 2");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let (unpaid, _send, _recv) = read_unpaid_opening(&conn, *hash.as_bytes(), &ext).await?;
+    anyhow::ensure!(
+        unpaid == HARNESS_INTERVAL_BYTES,
+        "stream 3 received {unpaid} unpaid wire bytes; the forfeited lane opens at one interval"
     );
 
     conn.close(0u32.into(), b"done");
@@ -12435,9 +12511,9 @@ async fn client_completes_when_its_send_is_stopped_before_the_closing_voucher() 
 /// the typed reason as "write failed", and the exhaustion / reactive-top-up path
 /// keys on [`UpstreamVoucherRejected`]. Under one chunk, so the only voucher is the
 /// closing one — the same end-of-stream write the sibling test covers, with a
-/// rejection terminal in place of a clean `StreamEnd`. (The recovery reads exactly
-/// one terminal message, so the failing write must be the one the terminal follows;
-/// a true mid-delivery reveal failure exercises the identical recovery path.)
+/// rejection terminal in place of a clean `StreamEnd`. A write that fails mid-
+/// delivery, with frames still in flight ahead of the terminal, is
+/// `client_reads_past_in_flight_frames_to_a_typed_rejection`.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_surfaces_typed_rejection_when_its_send_is_stopped_before_the_closing_voucher()
 -> anyhow::Result<()> {
@@ -12483,6 +12559,80 @@ async fn client_surfaces_typed_rejection_when_its_send_is_stopped_before_the_clo
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// Fetch a 3 MiB blob from a [`spawn_stop_send_server`] that stops the buyer's
+/// send half before any data, then sends the whole wire and `signal`. The
+/// buyer's first proof write fails with most of the blob still in flight
+/// ahead of the terminal message.
+async fn fetch_with_frames_in_flight(signal: StopThenSignal) -> anyhow::Result<anyhow::Error> {
+    let payload: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 239) as u8).collect();
+    let hash = Hash::new(&payload);
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_stop_send_server(
+        server_ep.clone(),
+        Arc::clone(&server_eth),
+        slash_domain(),
+        payload,
+        signal,
+    );
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(
+        &client_ep,
+        Arc::new(PrivateKeySigner::random()),
+        U256::from(10_000_000u64),
+    );
+    let err = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffef,
+        Duration::from_secs(20),
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("a fetch whose proof write fails mid-blob must fail"))?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(err)
+}
+
+/// A node delivers ahead of payment within its credit window, so the frames it
+/// sent before it rejected sit in front of its `StreamError`. The buyer whose
+/// proof write fails reads past them to the typed rejection, which the reactive
+/// top-up and the `UnderFold` heal key on (#2168).
+#[tokio::test(flavor = "multi_thread")]
+async fn client_reads_past_in_flight_frames_to_a_typed_rejection() -> anyhow::Result<()> {
+    let err = fetch_with_frames_in_flight(StopThenSignal::Reject(
+        VoucherRejectReason::SpendingCapExhausted,
+    ))
+    .await?;
+    anyhow::ensure!(
+        err.downcast_ref::<UpstreamVoucherRejected>().is_some(),
+        "the fetch must surface the typed UpstreamVoucherRejected, got: {err:#}"
+    );
+    Ok(())
+}
+
+/// A `StreamEnd` behind frames the buyer passed over confirms nothing: the leg
+/// did not take in those bytes, so it must not read as paid through its end.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_end_behind_skipped_frames_fails_the_leg() -> anyhow::Result<()> {
+    let err = fetch_with_frames_in_flight(StopThenSignal::End).await?;
+    anyhow::ensure!(
+        format!("{err:#}").contains("did not take in"),
+        "the fetch must fail on the skipped frames, got: {err:#}"
+    );
     Ok(())
 }
 

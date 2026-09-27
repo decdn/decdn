@@ -1841,8 +1841,9 @@ impl LaneStreamCap {
 ///
 /// [`Self::grant`] takes only the permits free right now and never waits, so a
 /// lane cannot deadlock against a sibling entry that holds one permit set and
-/// waits for another. The drive calls it once at the start and again whenever
-/// the lane takes a gap and more gaps wait ([`decdn_client::LaneGrowth`]), so a
+/// waits for another. The caller calls it once to size the lane, and the drive
+/// calls it again whenever the lane takes a gap and more gaps wait
+/// ([`decdn_client::LaneGrowth`]), so a
 /// lane that started narrow widens when a sibling entry frees its permits. The
 /// permits return when the grant drops at the end of the drive.
 struct LaneGrant {
@@ -1864,15 +1865,15 @@ impl LaneGrant {
         }
     }
 
-    /// Take the free permits the lane still has room for, and return how many
-    /// it took.
-    fn grant(&self) -> usize {
+    /// Take up to `most` of the free permits the lane still has room for, and
+    /// return how many it took.
+    fn grant(&self, most: usize) -> usize {
         let mut held = self
             .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = held.len();
-        let want = self.room.saturating_sub(before);
+        let want = self.room.saturating_sub(before).min(most);
         held.extend(
             std::iter::from_fn(|| Arc::clone(&self.semaphore).try_acquire_owned().ok()).take(want),
         );
@@ -3431,7 +3432,7 @@ impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
                 self.ctx.lane_cap.n.saturating_sub(1),
             ));
         }
-        let hooks: Vec<_> = grants.iter().map(|g| move || g.grant()).collect();
+        let hooks: Vec<_> = grants.iter().map(|g| move |most| g.grant(most)).collect();
         let lanes: Vec<_> = open
             .iter()
             .zip(&grants)
@@ -3439,7 +3440,7 @@ impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
             .map(
                 |((&(_, session, takes_first), grant), hook)| fetch::StripeLane {
                     session,
-                    width: std::num::NonZeroUsize::MIN.saturating_add(grant.grant()),
+                    width: std::num::NonZeroUsize::MIN.saturating_add(grant.grant(usize::MAX)),
                     takes_first,
                     grow: Some(decdn_client::LaneGrowth(hook)),
                 },
@@ -8588,9 +8589,10 @@ mod tests {
         assert_eq!(off.args.entry_retries, 0);
     }
 
-    /// A lane grant takes only the permits free right now and never more than
-    /// its room. A later call picks up the permits a sibling entry freed since
-    /// (#2168), and every permit returns to the cap when the grant drops.
+    /// A lane grant takes only the permits free right now, never more than
+    /// asked and never more than its room. A later call picks up the permits a
+    /// sibling entry freed since (#2168), and every permit returns to the cap
+    /// when the grant drops.
     #[tokio::test]
     async fn a_lane_grant_takes_free_permits_now_and_later() {
         let p1 = Address::repeat_byte(1);
@@ -8598,16 +8600,17 @@ mod tests {
         let held = cap.permit(p1).await.unwrap();
         let sibling = cap.permit(p1).await.unwrap();
         let grant = LaneGrant::new(cap.semaphore(p1).await, cap.n - 1);
-        assert_eq!(grant.grant(), 2, "the two free permits");
-        assert_eq!(grant.grant(), 0, "the cap is reached");
+        assert_eq!(grant.grant(usize::MAX), 2, "the two free permits");
+        assert_eq!(grant.grant(usize::MAX), 0, "the cap is reached");
         drop(sibling);
-        assert_eq!(grant.grant(), 1, "the permit the sibling freed");
-        assert_eq!(grant.grant(), 0, "the grant is at its room");
+        assert_eq!(grant.grant(0), 0, "no more than asked");
+        assert_eq!(grant.grant(usize::MAX), 1, "the permit the sibling freed");
+        assert_eq!(grant.grant(usize::MAX), 0, "the grant is at its room");
         drop(grant);
         drop(held);
         let all = LaneGrant::new(cap.semaphore(p1).await, 10);
         assert_eq!(
-            all.grant(),
+            all.grant(usize::MAX),
             4,
             "every permit came back, and never past the cap"
         );

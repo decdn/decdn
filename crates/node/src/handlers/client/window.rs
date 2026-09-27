@@ -197,7 +197,7 @@ impl ClientHandler {
         // §Credit window). An owned pull leg paces on it too. The serve leg
         // returns it only when the stream ends fully paid.
         let carry = self.take_ramp_carry(Some(lane)).await;
-        let paid_carried = carry.carried_content();
+        let paid_carried = carry.carried();
         // The first leg a pull of `[offset, +len)` opens, so the handshake can
         // open that leg instead of a whole-blob open it drops (#2063).
         let prime_for = |offset: u64, len: u64| {
@@ -744,7 +744,7 @@ impl ClientHandler {
             let cancel = serve_session.cancel_token().clone();
             let credit_ramp_divisor = self.credit_ramp_divisor;
             let credit_max = self.credit_max;
-            let paid_carried = carry.carried_content();
+            let paid_carried = carry.carried();
             // The unpaid local-origin leg: a throwaway ledger that never signs
             // and never meters, because `BackendSource` quotes rate 0.
             let ledger = Arc::new(decdn_client::PoolLedger::new(
