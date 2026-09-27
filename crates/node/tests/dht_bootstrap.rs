@@ -407,8 +407,9 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
 /// missed hashes end up scheduled.
 ///
 /// No server, and no peers in the routing table: the sweep's contract is what
-/// reaches the *scheduler*. Publishing to peers is the tick path, covered by
-/// `run_republish_publishes_immediately_on_cache_insert` above.
+/// reaches the *scheduler*. Publishing to peers is the tick path's job;
+/// `run_republish_publishes_immediately_on_cache_insert` above covers the
+/// eager per-insert publish.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_republish_lag_sweeps_the_cache_back_into_the_scheduler() -> anyhow::Result<()> {
     use decdn_node::dht::{RepublishScheduler, publish::run_republish};

@@ -832,9 +832,10 @@ since project inception and will roll into the first tagged release.
   connection, most of them on the relay path. A tick with a due record now
   also takes the records due within the next 5 minutes, in due order, while
   each receiver's set stays at or below 32 hashes (below the 40-token per-peer
-  burst). A record goes at most 5 minutes early, so its refresh gap stays at or
-  below 50 minutes, inside the receiver-anchored 1 h TTL (ADR 022 §STORE Flow
-  "Drain cycle").
+  burst). A cycle less than 2 s after the previous one takes due records only,
+  so a receiver's bucket refills between look-ahead batches. Sending early only
+  shortens a record's refresh gap, which stays between 25 and 50 minutes,
+  inside the receiver-anchored 1 h TTL (ADR 022 §STORE Flow "Drain cycle").
 
 - **A backpressure refusal from the only holder of a range no longer fails
   paid serve streams (#2178).** A node pays every upstream leg from one buyer
