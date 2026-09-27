@@ -9053,9 +9053,14 @@ impl ScriptedLane {
     /// (`stream_root`), as the wire contract requires. A reveal on a stream whose
     /// root the lane has already rolled past is stale: the roll voucher folded its
     /// chunk in, so it does not move the claim.
+    ///
+    /// A voucher below the anchor is stale and changes no lane state. A sibling's
+    /// later voucher already folded it in, and adopting its root would reset the
+    /// frontier to a chain the lane has rolled past.
     fn apply(&mut self, proof: &ClientMessage, stream_root: Option<B256>) -> bool {
         let before = self.claim();
         match proof {
+            ClientMessage::Voucher(v) if U256::from(v.amount) < self.anchor => {}
             ClientMessage::Voucher(v) => {
                 let root = B256::from(v.chain_root);
                 if root != self.root {
@@ -9078,18 +9083,18 @@ impl ScriptedLane {
     }
 
     /// Credit one served chunk of `served` wire bytes, after `proof` was applied
-    /// (`advanced` is what [`Self::apply`] returned). Returns whether the chunk is
-    /// paid.
+    /// (`advanced` is what [`Self::apply`] returned).
     ///
     /// Mirrors the real node's `credit_advance` / `credit_stale`. A proof that
     /// advanced the claim credits the chunk up to the claim. A proof that did not
     /// is stale — the lane already holds its payment, because a sibling stream's
     /// later proof folded it in first — and pays the whole chunk from headroom, or
-    /// nothing. Without the stale arm, a proof overtaken on a sibling connection
-    /// leaves the stream waiting on a proof the payer never sends.
+    /// is [`Credit::Refused`], which the node answers with `AmountRegression`.
+    /// Without the stale arm, a proof overtaken on a sibling connection leaves the
+    /// stream waiting on a proof the payer never sends.
     ///
-    /// A metering voucher (non-zero root) on a whole chunk pays nothing, advanced
-    /// or stale, as in `voucher_credit_delta`: it anchors the stream, and the
+    /// A metering voucher (non-zero root) on a whole chunk is accepted and pays
+    /// nothing, advanced or stale, as in `voucher_credit_delta`: it anchors the stream, and the
     /// reveal after it settles the chunk. A reveal, a sealed voucher, or a voucher
     /// closing a partial chunk is the chunk's payment.
     ///
@@ -9099,24 +9104,35 @@ impl ScriptedLane {
     /// `due` would turn a rounding difference into a wait on a proof the payer
     /// never sends. The deposit cap, not this credit, is what the top-up tests
     /// measure.
-    fn credit(&mut self, proof: &ClientMessage, advanced: bool, served: u64) -> bool {
+    fn credit(&mut self, proof: &ClientMessage, advanced: bool, served: u64) -> Credit {
         if matches!(proof, ClientMessage::Voucher(v) if v.chain_root != [0u8; 32])
             && served >= CHUNK_BYTES
         {
-            return false;
+            return Credit::Unpaid;
         }
         let due = chunk_due(self.price, served);
         let headroom = self.claim().saturating_sub(self.credited);
         if advanced {
             self.credited = self.credited.saturating_add(due.min(headroom));
-            true
+            Credit::Paid
         } else if headroom >= due {
             self.credited = self.credited.saturating_add(due);
-            true
+            Credit::Paid
         } else {
-            false
+            Credit::Refused
         }
     }
+}
+
+/// What one proof did for the chunk being settled ([`ScriptedLane::credit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Credit {
+    /// Accepted, and the chunk is paid.
+    Paid,
+    /// Accepted, but the chunk still waits for its paying proof.
+    Unpaid,
+    /// A stale proof that lane headroom cannot pay: refused, and no state changes.
+    Refused,
 }
 
 /// Read one payment proof — a `Voucher` or a `ChunkPreimage`, the whole
@@ -12549,19 +12565,10 @@ async fn settle_voucher(
     // rollover), and neither advances the claim.
     for _ in 0..4u8 {
         let proof = read_proof(recv).await?;
-        match &proof {
-            // A sealed voucher (`chain_root == 0`) meters nothing, so it clears the
-            // anchor, as `StreamAnchor::adopt` does.
-            ClientMessage::Voucher(v) => {
-                let root = B256::from(v.chain_root);
-                *stream_root = (!root.is_zero()).then_some(root);
-            }
-            // A reveal on an unanchored stream has no chain to belong to.
-            ClientMessage::ChunkPreimage(_) if stream_root.is_none() => {
-                write_rejection(send, VoucherRejectReason::UnanchoredPreimage).await?;
-                return Ok(false);
-            }
-            _ => {}
+        // A reveal on an unanchored stream has no chain to belong to.
+        if matches!(proof, ClientMessage::ChunkPreimage(_)) && stream_root.is_none() {
+            write_rejection(send, VoucherRejectReason::UnanchoredPreimage).await?;
+            return Ok(false);
         }
         // Evaluate against a COPY first. A rejected proof must leave the lane
         // exactly as it found it — the real node stages a candidate and discards it
@@ -12570,7 +12577,7 @@ async fn settle_voucher(
         // the payer with money the upstream declined to be paid. One lock spans the
         // evaluation and the store, so a sibling stream's proof cannot land in
         // between and be overwritten.
-        let (advanced, paid, claim, dep) = {
+        let (advanced, credit, claim, dep) = {
             let mut lane = lane
                 .lock()
                 .map_err(|_| anyhow::anyhow!("scripted lane lock poisoned"))?;
@@ -12580,15 +12587,14 @@ async fn settle_voucher(
             let dep = read_deposit(deposit)?;
             // The deposit has to cover the CHAIN-EXTENDED claim, not just the signed
             // anchor — a reveal spends real money without a signature.
-            let paid = claim <= dep && {
-                let paid = candidate.credit(&proof, advanced, served);
+            let credit = (claim <= dep).then(|| candidate.credit(&proof, advanced, served));
+            if matches!(credit, Some(Credit::Paid | Credit::Unpaid)) {
                 *lane = candidate;
-                paid
-            };
-            (advanced, paid, claim, dep)
+            }
+            (advanced, credit, claim, dep)
         };
         eprintln!(
-            "DIAG proof={} adv={advanced} paid={paid} claim={claim} dep={dep}",
+            "DIAG proof={} adv={advanced} credit={credit:?} claim={claim} dep={dep}",
             match &proof {
                 ClientMessage::Voucher(v) =>
                     format!("V(amt={},root={:02x})", v.amount, v.chain_root[0]),
@@ -12596,12 +12602,27 @@ async fn settle_voucher(
                 _ => "?".to_string(),
             },
         );
-        if claim > dep {
-            write_rejection(send, VoucherRejectReason::SpendingCapExhausted).await?;
-            return Ok(false);
-        }
-        if paid {
-            return Ok(true);
+        match credit {
+            None => {
+                write_rejection(send, VoucherRejectReason::SpendingCapExhausted).await?;
+                return Ok(false);
+            }
+            Some(Credit::Refused) => {
+                write_rejection(send, VoucherRejectReason::AmountRegression).await?;
+                return Ok(false);
+            }
+            Some(accepted) => {
+                // Only an accepted voucher re-anchors the stream, as in the node. A
+                // sealed voucher (`chain_root == 0`) meters nothing, so it clears the
+                // anchor, as `StreamAnchor::adopt` does.
+                if let ClientMessage::Voucher(v) = &proof {
+                    let root = B256::from(v.chain_root);
+                    *stream_root = (!root.is_zero()).then_some(root);
+                }
+                if accepted == Credit::Paid {
+                    return Ok(true);
+                }
+            }
         }
     }
     anyhow::bail!("deposit-capped upstream: four proofs in a row credited nothing")
