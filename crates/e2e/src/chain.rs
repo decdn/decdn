@@ -85,6 +85,20 @@ const MIN_BOND_WEI: &str = "50000000000000000000000";
 /// `FeeRouter`/`CapacityBond` epoch length, for the served-bytes read.
 const EPOCH_LENGTH_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// `DeployProtocol`'s default `FeeRouter` trailing window, in epochs. Mirrored by
+/// [`ChainFixture::redeploy_payment_pool`]'s fresh router.
+const FEE_ROUTER_WINDOW_EPOCHS: u64 = 13;
+
+/// `DeployProtocol`'s launch-mode `FeeRouter` split, operator / buyback /
+/// treasury in bps: the buyback bucket stays dormant behind a zero burner.
+const FEE_ROUTER_LAUNCH_SHARES: [u64; 3] = [9_000, 0, 1_000];
+
+/// `DeployProtocol`'s `PaymentPool` dispute window (48 hours).
+const PAYMENT_DISPUTE_WINDOW_SECS: u64 = 48 * 60 * 60;
+
+/// `DeployProtocol`'s `PaymentPool` delivery floor.
+const PAYMENT_DELIVERY_FLOOR: u64 = 1;
+
 // A cold compile of the full contracts suite can be slow; a single 180s cap with
 // no retry made an over-budget-but-progressing build a hard failure. Give it
 // headroom plus a bounded retry for a transient stall (mirrors the deploy retry).
@@ -425,6 +439,86 @@ impl ChainFixture {
     #[must_use]
     pub const fn admin_addr(&self) -> Address {
         self.admin_addr
+    }
+
+    /// Deploy a second `PaymentPool` beside the snapshot's — the chain an
+    /// operator sees after a `PaymentPool` redeploy — and return its address.
+    ///
+    /// The new pool shares the snapshot's USDC and `CapacityBond` and takes
+    /// `DeployProtocol`'s parameters, so a node bonded on the snapshot serves and
+    /// redeems against it unchanged. It settles through a fresh `FeeRouter`: the
+    /// snapshot router renounced `DEFAULT_ADMIN_ROLE` at deploy, which freezes
+    /// its `ROUTER_CALLER_ROLE` membership on the snapshot pool. The fixture
+    /// admin EOA holds both new contracts' admin roles; nothing moves to the
+    /// Timelock.
+    ///
+    /// `ownerPoolNonce` starts at zero on the new pool, so every owner's Nth pool
+    /// here has the same id as its Nth pool on [`ContractAddrs::payment_pool`].
+    pub async fn redeploy_payment_pool(&self) -> anyhow::Result<Address> {
+        let contracts = contracts_dir()?;
+        let [operator_share, buyback_share, treasury_share] = FEE_ROUTER_LAUNCH_SHARES;
+        // FeeRouter(usdc, capacityBond, treasury, epochLength, windowEpochs,
+        //           admin, initialShares, buybackBurner)
+        let router_args = (
+            self.usdc,
+            self.addrs.capacity_bond,
+            self.addrs.timelock,
+            EPOCH_LENGTH_SECS,
+            FEE_ROUTER_WINDOW_EPOCHS,
+            self.admin_addr,
+            [
+                U256::from(operator_share),
+                U256::from(buyback_share),
+                U256::from(treasury_share),
+            ],
+            Address::ZERO,
+        )
+            .abi_encode_params();
+        let router = deploy_artifact(&self.admin, &contracts, "FeeRouter", &router_args).await?;
+        // PaymentPool(usdc, capacityBond, feeRouter, disputeWindow,
+        //             deliveryFloor, minDeposit, admin)
+        let pool_args = (
+            self.usdc,
+            self.addrs.capacity_bond,
+            router,
+            U256::from(PAYMENT_DISPUTE_WINDOW_SECS),
+            U256::from(PAYMENT_DELIVERY_FLOOR),
+            0u64,
+            self.admin_addr,
+        )
+            .abi_encode_params();
+        let pool = deploy_artifact(&self.admin, &contracts, "PaymentPool", &pool_args).await?;
+
+        let caller_role = keccak256("ROUTER_CALLER_ROLE");
+        let router_roles = AccessControl::new(router, &self.admin);
+        let receipt = router_roles
+            .grantRole(caller_role, pool)
+            .send()
+            .await
+            .context("FeeRouter.grantRole(ROUTER_CALLER_ROLE) send")?
+            .get_receipt()
+            .await
+            .context("FeeRouter.grantRole(ROUTER_CALLER_ROLE) receipt")?;
+        crate::ensure_mined(&receipt, "FeeRouter.grantRole(ROUTER_CALLER_ROLE)")?;
+        anyhow::ensure!(
+            router_roles
+                .hasRole(caller_role, pool)
+                .call()
+                .await
+                .context("FeeRouter.hasRole")?,
+            "the redeployed PaymentPool {pool} does not hold ROUTER_CALLER_ROLE on {router}"
+        );
+        let settles_in = crate::bindings::PaymentPool::new(pool, &self.admin)
+            .usdc()
+            .call()
+            .await
+            .context("redeployed PaymentPool.usdc")?;
+        anyhow::ensure!(
+            settles_in == self.usdc,
+            "the redeployed PaymentPool settles in {settles_in}, not the fixture USDC {}",
+            self.usdc
+        );
+        Ok(pool)
     }
 
     /// Build a wallet-filled provider for `signer` (simple nonce management
@@ -1981,18 +2075,35 @@ fn artifact_bytecode(artifact: &Path) -> anyhow::Result<String> {
 
 /// Deploy the mintable mock USDC from its compiled artifact bytecode.
 async fn deploy_mock_usdc<P: Provider>(provider: &P, contracts: &Path) -> anyhow::Result<Address> {
-    let code_hex = artifact_bytecode(&contracts.join("out/MintableUSDC.sol/MintableUSDC.json"))?;
-    let code: Bytes = code_hex.parse().context("parse MintableUSDC bytecode")?;
+    deploy_artifact(provider, contracts, "MintableUSDC", &[]).await
+}
+
+/// Deploy contract `name` from its compiled artifact (`out/{name}.sol/{name}.json`)
+/// with `ctor_args` — the ABI-encoded constructor parameters — appended to its
+/// creation code, and return the new contract's address.
+async fn deploy_artifact<P: Provider>(
+    provider: &P,
+    contracts: &Path,
+    name: &str,
+    ctor_args: &[u8],
+) -> anyhow::Result<Address> {
+    let code_hex = artifact_bytecode(&contracts.join(format!("out/{name}.sol/{name}.json")))?;
+    let code: Bytes = code_hex
+        .parse()
+        .with_context(|| format!("parse {name} bytecode"))?;
     let receipt = provider
-        .send_transaction(TransactionRequest::default().with_deploy_code(code))
+        .send_transaction(
+            TransactionRequest::default().with_deploy_code([code.as_ref(), ctor_args].concat()),
+        )
         .await
-        .context("MintableUSDC deploy send")?
+        .with_context(|| format!("{name} deploy send"))?
         .get_receipt()
         .await
-        .context("MintableUSDC deploy receipt")?;
+        .with_context(|| format!("{name} deploy receipt"))?;
+    crate::ensure_mined(&receipt, &format!("{name} deploy"))?;
     receipt
         .contract_address
-        .ok_or_else(|| anyhow::anyhow!("MintableUSDC deploy produced no contract address"))
+        .ok_or_else(|| anyhow::anyhow!("{name} deploy produced no contract address"))
 }
 
 /// A one-time protocol deployment shared by every journey in a test run: the
