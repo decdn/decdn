@@ -9088,22 +9088,29 @@ impl ScriptedLane {
     /// nothing. Without the stale arm, a proof overtaken on a sibling connection
     /// leaves the stream waiting on a proof the payer never sends.
     ///
-    /// A metering voucher (non-zero root) on a whole chunk pays nothing when stale,
-    /// as in `voucher_credit_delta`: it is the stream's re-anchor, and the reveal
-    /// after it settles the chunk. A stale reveal, a sealed voucher, or a voucher
+    /// A metering voucher (non-zero root) on a whole chunk pays nothing, advanced
+    /// or stale, as in `voucher_credit_delta`: it anchors the stream, and the
+    /// reveal after it settles the chunk. A reveal, a sealed voucher, or a voucher
     /// closing a partial chunk is the chunk's payment.
+    ///
+    /// One deliberate difference: an advancing proof pays the chunk even when
+    /// headroom covers only part of `due`. The node credits exact wire bytes; this
+    /// fixture prices in money through `chunk_due`'s rounding, so demanding all of
+    /// `due` would turn a rounding difference into a wait on a proof the payer
+    /// never sends. The deposit cap, not this credit, is what the top-up tests
+    /// measure.
     fn credit(&mut self, proof: &ClientMessage, advanced: bool, served: u64) -> bool {
+        if matches!(proof, ClientMessage::Voucher(v) if v.chain_root != [0u8; 32])
+            && served >= CHUNK_BYTES
+        {
+            return false;
+        }
         let due = chunk_due(self.price, served);
         let headroom = self.claim().saturating_sub(self.credited);
-        let stale_pays = match proof {
-            ClientMessage::ChunkPreimage(_) => true,
-            ClientMessage::Voucher(v) => v.chain_root == [0u8; 32] || served < CHUNK_BYTES,
-            _ => false,
-        };
         if advanced {
             self.credited = self.credited.saturating_add(due.min(headroom));
             true
-        } else if stale_pays && headroom >= due {
+        } else if headroom >= due {
             self.credited = self.credited.saturating_add(due);
             true
         } else {
@@ -12542,8 +12549,19 @@ async fn settle_voucher(
     // rollover), and neither advances the claim.
     for _ in 0..4u8 {
         let proof = read_proof(recv).await?;
-        if let ClientMessage::Voucher(v) = &proof {
-            *stream_root = Some(B256::from(v.chain_root));
+        match &proof {
+            // A sealed voucher (`chain_root == 0`) meters nothing, so it clears the
+            // anchor, as `StreamAnchor::adopt` does.
+            ClientMessage::Voucher(v) => {
+                let root = B256::from(v.chain_root);
+                *stream_root = (!root.is_zero()).then_some(root);
+            }
+            // A reveal on an unanchored stream has no chain to belong to.
+            ClientMessage::ChunkPreimage(_) if stream_root.is_none() => {
+                write_rejection(send, VoucherRejectReason::UnanchoredPreimage).await?;
+                return Ok(false);
+            }
+            _ => {}
         }
         // Evaluate against a COPY first. A rejected proof must leave the lane
         // exactly as it found it — the real node stages a candidate and discards it
@@ -12579,15 +12597,7 @@ async fn settle_voucher(
             },
         );
         if claim > dep {
-            write_frame(
-                send,
-                &encode_message(&ClientMessage::StreamError(StreamError::VoucherRejected {
-                    reason: VoucherRejectReason::SpendingCapExhausted,
-                    bundle: None,
-                }))?,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("write rejection: {e}"))?;
+            write_rejection(send, VoucherRejectReason::SpendingCapExhausted).await?;
             return Ok(false);
         }
         if paid {
@@ -12595,6 +12605,22 @@ async fn settle_voucher(
         }
     }
     anyhow::bail!("deposit-capped upstream: four proofs in a row credited nothing")
+}
+
+/// Refuse the stream's last proof with `reason` and no watermark bundle.
+async fn write_rejection(
+    send: &mut iroh::endpoint::SendStream,
+    reason: VoucherRejectReason,
+) -> Result<()> {
+    write_frame(
+        send,
+        &encode_message(&ClientMessage::StreamError(StreamError::VoucherRejected {
+            reason,
+            bundle: None,
+        }))?,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("write rejection: {e}"))
 }
 
 /// What `served` wire bytes cost at `chunk_price` per `CHUNK_BYTES`, rounded up as
