@@ -895,6 +895,9 @@ impl ClientHandler {
                     // for a bounded request. `release_live_repaid` frees it once
                     // cumulative payment REACHES this reserved amount (see the serve
                     // loop), so release stays matched to what was reserved at any divisor.
+                    // Ramp credit the stream carries from its lane widens its window past
+                    // this floor without a reservation: that credit is revenue the lane
+                    // already paid, and a stream that ends unpaid forfeits it.
                     let window = self.credit_window(CHUNK_BYTES, 0);
                     let reserved_bytes = if req.byte_len > 0 {
                         aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(window)

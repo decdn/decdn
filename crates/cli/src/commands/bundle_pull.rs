@@ -1816,21 +1816,6 @@ impl LaneStreamCap {
             .map_err(|_| anyhow!("bundle pull lane-stream cap closed"))
     }
 
-    /// Up to `max` more stream permits for `provider`, taking only those free
-    /// right now. Never waits, so it cannot deadlock against a caller that holds
-    /// one permit set and waits for another; an entry that gets none drives with
-    /// the one permit it already holds.
-    async fn try_extra(
-        &self,
-        provider: Address,
-        max: usize,
-    ) -> Vec<tokio::sync::OwnedSemaphorePermit> {
-        let sem = self.semaphore(provider).await;
-        std::iter::from_fn(|| Arc::clone(&sem).try_acquire_owned().ok())
-            .take(max)
-            .collect()
-    }
-
     /// Acquire one stream permit for every distinct provider in `providers`, in
     /// one global order (sorted, deduped `Address`), and return them held for the
     /// caller's whole fetch. Acquiring every multi-provider set in the same order
@@ -1848,6 +1833,51 @@ impl LaneStreamCap {
             permits.push(self.permit(provider).await?);
         }
         Ok(permits)
+    }
+}
+
+/// The extra stream permits one lane of a range drive holds for its provider,
+/// beyond the one its entry holds for the whole fetch.
+///
+/// [`Self::grant`] takes only the permits free right now and never waits, so a
+/// lane cannot deadlock against a sibling entry that holds one permit set and
+/// waits for another. The caller calls it once to size the lane, and the drive
+/// calls it again whenever the lane takes a gap and more gaps wait
+/// ([`decdn_client::LaneGrowth`]), so a
+/// lane that started narrow widens when a sibling entry frees its permits. The
+/// permits return when the grant drops at the end of the drive.
+struct LaneGrant {
+    /// The provider's per-lane stream semaphore ([`LaneStreamCap`]).
+    semaphore: Arc<tokio::sync::Semaphore>,
+    /// The most extra permits the lane may hold.
+    room: usize,
+    /// The extra permits the lane holds now.
+    held: std::sync::Mutex<Vec<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+impl LaneGrant {
+    /// A grant holding no permit yet, for at most `room` extra permits.
+    const fn new(semaphore: Arc<tokio::sync::Semaphore>, room: usize) -> Self {
+        Self {
+            semaphore,
+            room,
+            held: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Take up to `most` of the free permits the lane still has room for, and
+    /// return how many it took.
+    fn grant(&self, most: usize) -> usize {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = held.len();
+        let want = self.room.saturating_sub(before).min(most);
+        held.extend(
+            std::iter::from_fn(|| Arc::clone(&self.semaphore).try_acquire_owned().ok()).take(want),
+        );
+        held.len().saturating_sub(before)
     }
 }
 
@@ -2971,10 +3001,11 @@ trait RangeDriver {
 /// a discovered provider that failed it (a pinned `--node-id` is its only
 /// candidate); a retry round (`--entry-retries`) starts a new driver over a
 /// fresh probe. Each lane fills up to `--max-lane-streams` gaps at once, using
-/// the permits for its provider that are free when the drive starts beyond
-/// the one the entry already holds. It returns those extra permits when the
-/// drive ends: the entry keeps waiting on siblings between drives, and a
-/// sibling it waits on may need them.
+/// the permits for its provider beyond the one the entry already holds: those
+/// free when the drive starts, and those a sibling entry frees while the drive
+/// runs ([`LaneGrant`]). It returns those extra permits when the drive ends:
+/// the entry keeps waiting on siblings between drives, and a sibling it waits
+/// on may need them.
 struct CtxRangeDriver<'a, P: Provider + Clone> {
     hash: [u8; 32],
     staging: &'a Path,
@@ -3390,25 +3421,31 @@ impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
         // Held for this drive only, never across the entry's waits on a sibling
         // (`reconcile_deferred`): a donor this entry waits on may be blocked on
         // the same providers' permits.
-        let mut extras = Vec::with_capacity(open.len());
-        let mut lanes = Vec::with_capacity(open.len());
-        for &(index, session, takes_first) in open {
+        let mut grants = Vec::with_capacity(open.len());
+        for &(index, _, _) in open {
             let provider = match self.target(index) {
                 Ok(((_, provider), _)) => *provider,
                 Err(err) => return unfaulted(Err(err)),
             };
-            let extra = self
-                .ctx
-                .lane_cap
-                .try_extra(provider, self.ctx.lane_cap.n.saturating_sub(1))
-                .await;
-            lanes.push(fetch::StripeLane {
-                session,
-                width: std::num::NonZeroUsize::MIN.saturating_add(extra.len()),
-                takes_first,
-            });
-            extras.push(extra);
+            grants.push(LaneGrant::new(
+                self.ctx.lane_cap.semaphore(provider).await,
+                self.ctx.lane_cap.n.saturating_sub(1),
+            ));
         }
+        let hooks: Vec<_> = grants.iter().map(|g| move |most| g.grant(most)).collect();
+        let lanes: Vec<_> = open
+            .iter()
+            .zip(&grants)
+            .zip(&hooks)
+            .map(
+                |((&(_, session, takes_first), grant), hook)| fetch::StripeLane {
+                    session,
+                    width: std::num::NonZeroUsize::MIN.saturating_add(grant.grant(usize::MAX)),
+                    takes_first,
+                    grow: Some(decdn_client::LaneGrowth(hook)),
+                },
+            )
+            .collect();
         let driven = Box::pin(fetch::drive_stripe(
             store,
             &lanes,
@@ -3417,7 +3454,8 @@ impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
             &self.topups_used,
         ))
         .await;
-        drop(extras);
+        drop(lanes);
+        drop(grants);
         LanesDriven {
             faulted: driven.faulted,
             result: driven.result.map_err(|err| self.annotate(err)),
@@ -8551,20 +8589,31 @@ mod tests {
         assert_eq!(off.args.entry_retries, 0);
     }
 
-    /// `try_extra` takes only the permits free right now, never more than asked
-    /// and never past the cap, and they return to the pool when dropped.
+    /// A lane grant takes only the permits free right now, never more than
+    /// asked and never more than its room. A later call picks up the permits a
+    /// sibling entry freed since (#2168), and every permit returns to the cap
+    /// when the grant drops.
     #[tokio::test]
-    async fn lane_stream_cap_try_extra_takes_only_free_permits() {
+    async fn a_lane_grant_takes_free_permits_now_and_later() {
         let p1 = Address::repeat_byte(1);
         let cap = LaneStreamCap::new(4);
         let held = cap.permit(p1).await.unwrap();
-        let extra = cap.try_extra(p1, 3).await;
-        assert_eq!(extra.len(), 3, "the three free permits");
-        assert!(cap.try_extra(p1, 3).await.is_empty(), "the cap is reached");
-        drop(extra);
-        assert_eq!(cap.try_extra(p1, 2).await.len(), 2, "no more than asked");
+        let sibling = cap.permit(p1).await.unwrap();
+        let grant = LaneGrant::new(cap.semaphore(p1).await, cap.n - 1);
+        assert_eq!(grant.grant(usize::MAX), 2, "the two free permits");
+        assert_eq!(grant.grant(usize::MAX), 0, "the cap is reached");
+        drop(sibling);
+        assert_eq!(grant.grant(0), 0, "no more than asked");
+        assert_eq!(grant.grant(usize::MAX), 1, "the permit the sibling freed");
+        assert_eq!(grant.grant(usize::MAX), 0, "the grant is at its room");
+        drop(grant);
         drop(held);
-        assert_eq!(cap.try_extra(p1, 10).await.len(), 4, "never past the cap");
+        let all = LaneGrant::new(cap.semaphore(p1).await, 10);
+        assert_eq!(
+            all.grant(usize::MAX),
+            4,
+            "every permit came back, and never past the cap"
+        );
     }
 
     #[tokio::test]

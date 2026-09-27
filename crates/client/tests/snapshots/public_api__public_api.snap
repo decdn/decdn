@@ -116,6 +116,9 @@ pub decdn_client::driver::DriveConfig::settle_backoff: core::time::Duration
 pub decdn_client::driver::DriveConfig::working_deposit: alloy_primitives::aliases::U256
 impl decdn_client::driver::DriveConfig
 pub const fn decdn_client::driver::DriveConfig::cli(alloy_primitives::aliases::U256) -> Self
+pub struct decdn_client::driver::LaneGrowth<'a>(pub &'a (dyn core::ops::function::Fn(usize) -> usize + core::marker::Send + core::marker::Sync + 'a))
+impl core::fmt::Debug for decdn_client::driver::LaneGrowth<'_>
+pub fn decdn_client::driver::LaneGrowth<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::driver::PoolExhausted
 pub decdn_client::driver::PoolExhausted::gap_len: u64
 pub decdn_client::driver::PoolExhausted::gap_start: u64
@@ -124,6 +127,7 @@ impl core::fmt::Display for decdn_client::driver::PoolExhausted
 pub fn decdn_client::driver::PoolExhausted::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::driver::RangeLane<'a, S>
 pub decdn_client::driver::RangeLane::ctx: &'a alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>
+pub decdn_client::driver::RangeLane::grow: core::option::Option<decdn_client::driver::LaneGrowth<'a>>
 pub decdn_client::driver::RangeLane::ledger: &'a alloc::sync::Arc<decdn_client::PoolLedger>
 pub decdn_client::driver::RangeLane::source: &'a S
 pub decdn_client::driver::RangeLane::takes_first: bool
@@ -198,6 +202,7 @@ pub decdn_client::pacer::RampPacer::credit_max: u64
 pub decdn_client::pacer::RampPacer::divisor: u64
 pub decdn_client::pacer::RampPacer::floor: u64
 pub decdn_client::pacer::RampPacer::paid_base: u64
+pub decdn_client::pacer::RampPacer::paid_carried: u64
 impl decdn_client::pacer::Pacer for decdn_client::pacer::RampPacer
 pub fn decdn_client::pacer::RampPacer::decide(&self, &decdn_client::pacer::PaceState) -> decdn_client::pacer::PaceDecision
 pub struct decdn_client::pacer::WindowPacer
@@ -534,6 +539,9 @@ pub struct decdn_client::HashMismatch
 impl core::error::Error for decdn_client::HashMismatch
 impl core::fmt::Display for decdn_client::HashMismatch
 pub fn decdn_client::HashMismatch::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::LaneGrowth<'a>(pub &'a (dyn core::ops::function::Fn(usize) -> usize + core::marker::Send + core::marker::Sync + 'a))
+impl core::fmt::Debug for decdn_client::driver::LaneGrowth<'_>
+pub fn decdn_client::driver::LaneGrowth<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::LaneHandle
 pub decdn_client::LaneHandle::ctx: alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>
 pub decdn_client::LaneHandle::ledger: alloc::sync::Arc<decdn_client::PoolLedger>
@@ -692,10 +700,12 @@ pub decdn_client::RampPacer::credit_max: u64
 pub decdn_client::RampPacer::divisor: u64
 pub decdn_client::RampPacer::floor: u64
 pub decdn_client::RampPacer::paid_base: u64
+pub decdn_client::RampPacer::paid_carried: u64
 impl decdn_client::pacer::Pacer for decdn_client::pacer::RampPacer
 pub fn decdn_client::pacer::RampPacer::decide(&self, &decdn_client::pacer::PaceState) -> decdn_client::pacer::PaceDecision
 pub struct decdn_client::RangeLane<'a, S>
 pub decdn_client::RangeLane::ctx: &'a alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>
+pub decdn_client::RangeLane::grow: core::option::Option<decdn_client::driver::LaneGrowth<'a>>
 pub decdn_client::RangeLane::ledger: &'a alloc::sync::Arc<decdn_client::PoolLedger>
 pub decdn_client::RangeLane::source: &'a S
 pub decdn_client::RangeLane::takes_first: bool

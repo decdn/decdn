@@ -51,6 +51,7 @@ use crate::metrics::FirstByteClock;
 
 use super::MAX_PROOFS_PER_CHUNK;
 use super::outcome::{ServeEnd, ServeStop};
+use super::ramp::RampCarry;
 use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked};
 use super::wire::chunk_frame_bufs;
 use super::{
@@ -104,6 +105,7 @@ impl ClientHandler {
         session: Arc<FillSession>,
         also_pace: &[Arc<FillSession>],
         lane: &Arc<Mutex<LaneDeliveryState>>,
+        carry: RampCarry,
         hash: Hash,
         lane_key: LaneKey,
         client_node_id: B256,
@@ -125,6 +127,7 @@ impl ClientHandler {
             session,
             also_pace,
             lane,
+            carry,
             hash,
             lane_key,
             client_node_id,
@@ -157,6 +160,7 @@ impl ClientHandler {
         session: Arc<FillSession>,
         also_pace: &[Arc<FillSession>],
         lane: &Arc<Mutex<LaneDeliveryState>>,
+        mut carry: RampCarry,
         hash: Hash,
         lane_key: LaneKey,
         client_node_id: B256,
@@ -237,7 +241,10 @@ impl ClientHandler {
 
         // The first frame — awaiting the pull leg if `R` opens on a gap. A pull
         // that ends `Err` here fails the serve rather than hanging.
-        let opening_window = self.credit_window(chunk_bytes, 0);
+        // The first byte is about to go out: from here a stream that ends unpaid
+        // forfeits its ramp credit (ADR 003 §Credit window).
+        carry.start_delivery();
+        let opening_window = self.credit_window(chunk_bytes, carry.ramp_paid(0));
         let mut next_chunk = producer
             .next_frame_chunks(self.frame_target(0, chunk_bytes, opening_window))
             .await
@@ -261,11 +268,12 @@ impl ClientHandler {
             let delivered_at_iter_start = delivered;
             let mut credited_this_iter = 0u64;
 
-            // The ramped window for the payment confirmed so far (ADR 003 §Credit
-            // window), recomputed each iteration exactly as the cache-hit twin in
-            // `deliver` does. Floored at one chunk so the loop can always make
-            // progress: deliver a full chunk, then recoup the proof that pays it.
-            let window = self.credit_window(chunk_bytes, *paid);
+            // The ramped window for the payment confirmed so far plus the lane's
+            // carried credit (ADR 003 §Credit window), recomputed each iteration
+            // exactly as the cache-hit twin in `deliver` does. Floored at one chunk
+            // so the loop can always make progress: deliver a full chunk, then
+            // recoup the proof that pays it.
+            let window = self.credit_window(chunk_bytes, carry.ramp_paid(*paid));
 
             // --- deliver phase: stream frames while the window has room. Checked
             // BEFORE each send, so `delivered − paid` overshoots by at most the one
@@ -592,6 +600,11 @@ impl ClientHandler {
         // the pull leg's admit before this leg read it, so the served bytes are sound.
         // The floor reservation was already released once payment reached the reserved
         // floor; the guard drops as this leg returns.
+        // The stream is fully paid: return its ramp credit to the lane before
+        // `StreamEnd`, so the payer's next request on this lane opens at the
+        // window this one earned (ADR 003 §Credit window). Any other exit after
+        // the first byte drops the carry and forfeits it.
+        carry.return_paid(super::dispatch::aligned_span(offset, len, total_bytes));
         self.write_message(send, &ClientMessage::StreamEnd).await?;
         let _ = send.finish();
         // Drain the client's send half to its FIN before `recv` drops, so the

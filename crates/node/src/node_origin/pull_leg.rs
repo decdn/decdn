@@ -139,17 +139,25 @@ pub(crate) struct PrimeLeg {
     pub(crate) offset: u64,
     /// The pull's content length; `0` is to the blob's end.
     pub(crate) len: u64,
-    /// The first draw [`RampPacer`] allows: the ramped credit window at a paid
-    /// frontier of zero, floored to whole chunk groups as the window pacer
-    /// floors it.
+    /// The first draw [`RampPacer`] allows: the ramped credit window at the
+    /// ramp credit the owning stream carries and no payment of its own yet,
+    /// floored to whole chunk groups as the window pacer floors it.
     pub(crate) window: u64,
 }
 
 impl PrimeLeg {
     /// The prime for a pull of `[offset, +len)` paced by a [`RampPacer`] built
-    /// from `divisor`, `floor`, and `credit_max`.
-    pub(crate) fn new(offset: u64, len: u64, divisor: u64, floor: u64, credit_max: u64) -> Self {
-        let window = decdn_incentive::ramped_credit_window(divisor, floor, credit_max, 0);
+    /// from `divisor`, `floor`, `credit_max`, and `paid_carried`.
+    pub(crate) fn new(
+        offset: u64,
+        len: u64,
+        divisor: u64,
+        floor: u64,
+        credit_max: u64,
+        paid_carried: u64,
+    ) -> Self {
+        let window =
+            decdn_incentive::ramped_credit_window(divisor, floor, credit_max, paid_carried);
         Self {
             offset,
             len,
@@ -766,7 +774,8 @@ impl NodeOrigin {
 /// Assemble `[offset, offset + len)` of `hash` into `engine`'s cache across the
 /// ranked partial holders in `target` via the ranged-drive loop (#1506, ADR 039),
 /// paying only for the missing ranges and pacing each lane with a [`RampPacer`]
-/// built from `credit_ramp_divisor`, `credit_floor`, and `credit_max` — the same
+/// built from `credit_ramp_divisor`, `credit_floor`, `credit_max`, and the ramp
+/// credit `paid_carried` the owning stream carries from its lane — the same
 /// ramped credit window the serve leg computes from its own paid frontier (ADR 003
 /// §Credit window / ADR 037), so the pull never runs further ahead of the
 /// downstream serve leg's paid frontier than that window allows, plus the one
@@ -831,6 +840,7 @@ pub(crate) async fn run_pull_leg(
     credit_ramp_divisor: u64,
     credit_floor: u64,
     credit_max: u64,
+    paid_carried: u64,
     session: Arc<FillSession>,
     cancel: CancellationToken,
 ) {
@@ -872,6 +882,7 @@ pub(crate) async fn run_pull_leg(
         floor: credit_floor,
         credit_max,
         paid_base: session.served_start(),
+        paid_carried,
     };
     let config = DriveConfig {
         working_deposit: deps.config.working_deposit,
@@ -1420,8 +1431,8 @@ fn local_bookkeeping_ctx() -> PoolContext {
 /// Run the range-minimized OWN-ORIGIN pull for `[offset, offset + len)` of `hash`
 /// into `engine`'s cache via [`drive`] over an UNPAID [`BackendSource`], pacing the
 /// pull with the same [`RampPacer`] the paid leg uses, built from
-/// `credit_ramp_divisor`, `credit_floor`, and `credit_max` (ADR 003 §Credit window
-/// / ADR 037). Records the terminal outcome via the shared [`FillSession::mark_ended`]. The
+/// `credit_ramp_divisor`, `credit_floor`, `credit_max`, and `paid_carried` (ADR
+/// 003 §Credit window / ADR 037). Records the terminal outcome via the shared [`FillSession::mark_ended`]. The
 /// local twin of [`run_pull_leg`].
 ///
 /// # What drops out relative to the paid [`run_pull_leg`]
@@ -1479,6 +1490,7 @@ pub(crate) async fn run_local_pull_leg(
     credit_ramp_divisor: u64,
     credit_floor: u64,
     credit_max: u64,
+    paid_carried: u64,
     total_bytes: u64,
     session: Arc<FillSession>,
     cancel: CancellationToken,
@@ -1504,6 +1516,7 @@ pub(crate) async fn run_local_pull_leg(
         floor: credit_floor,
         credit_max,
         paid_base: session.served_start(),
+        paid_carried,
     };
     // `working_deposit == ZERO` disables the pacer's reactive top-up arm entirely, so
     // the settle-wait budget is inert here; keep the smallest sane values.
@@ -1828,6 +1841,7 @@ mod local_pull_leg_tests {
                 2,
                 credit_floor,
                 credit_floor,
+                0,
                 total,
                 Arc::clone(&session),
                 cancel,
@@ -2156,13 +2170,16 @@ mod prime_tests {
 
     const MIB: u64 = 1024 * 1024;
 
-    /// A nonzero ramp divisor opens at the floor; a zero one opens at the
-    /// ceiling. Either way the window is whole chunk groups.
+    /// A nonzero ramp divisor opens at the ramp of the carried credit, which is
+    /// the floor for a lane with none; a zero one opens at the ceiling. Either
+    /// way the window is whole chunk groups.
     #[test]
-    fn the_prime_window_is_the_ramp_at_zero_paid() {
-        let ramped = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB);
+    fn the_prime_window_is_the_ramp_at_the_carried_credit() {
+        let ramped = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 0);
         assert_eq!(ramped.window, PULL_WINDOW_FLOOR);
-        let open = PrimeLeg::new(0, 0, 0, PULL_WINDOW_FLOOR, 64 * MIB + 1);
+        let carried = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 32 * MIB + 5);
+        assert_eq!(carried.window, 16 * MIB);
+        let open = PrimeLeg::new(0, 0, 0, PULL_WINDOW_FLOOR, 64 * MIB + 1, 0);
         assert_eq!(open.window, 64 * MIB);
         assert_eq!(open.window % CHUNK_GROUP_BYTES, 0);
     }
@@ -2174,7 +2191,7 @@ mod prime_tests {
     fn the_predicted_leg_cuts_the_request_like_the_first_drive_leg() {
         let total = 3 * DISCOVERY_BLOCK_BYTES;
         let full = Coverage::full(num_blocks(total));
-        let prime = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB);
+        let prime = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 0);
 
         // A whole-blob pull draws one window from offset 0.
         assert_eq!(
@@ -2189,6 +2206,7 @@ mod prime_tests {
             2,
             PULL_WINDOW_FLOOR,
             64 * MIB,
+            0,
         );
         assert_eq!(
             short.predicted_leg(total, &full, 0),
@@ -2200,7 +2218,7 @@ mod prime_tests {
             align_range(0, 2 * CHUNK_GROUP_BYTES, total).ok()
         );
         // An open ramp is cut to the source's covered span.
-        let open = PrimeLeg::new(0, 0, 0, PULL_WINDOW_FLOOR, 4 * DISCOVERY_BLOCK_BYTES);
+        let open = PrimeLeg::new(0, 0, 0, PULL_WINDOW_FLOOR, 4 * DISCOVERY_BLOCK_BYTES, 0);
         let first_block = Coverage::from_block_indices(num_blocks(total), [0, 2].into_iter());
         assert_eq!(
             open.predicted_leg(total, &first_block, 0),
@@ -2210,7 +2228,7 @@ mod prime_tests {
         let later = Coverage::from_block_indices(num_blocks(total), [1].into_iter());
         assert_eq!(prime.predicted_leg(total, &later, 0), None);
         // A request past the hinted end has no leg.
-        let past = PrimeLeg::new(total, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB);
+        let past = PrimeLeg::new(total, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 0);
         assert_eq!(past.predicted_leg(total, &full, 0), None);
     }
 
@@ -2257,10 +2275,15 @@ mod prime_tests {
                 vec![head, tail],
             ),
         ];
-        for (offset, len, divisor, credit_max, ceiling, coverages) in cases {
+        // Each case runs with no carried credit and with a carry that ramps the
+        // window past a block.
+        let cases = cases
+            .into_iter()
+            .flat_map(|case| [(case.clone(), 0), (case, 3 * DISCOVERY_BLOCK_BYTES)]);
+        for ((offset, len, divisor, credit_max, ceiling, coverages), carried) in cases {
             let dir = tempfile::tempdir().unwrap();
             let store = ClientRangedStore::create(dir.path(), "b", [7; 32], total).unwrap();
-            let prime = PrimeLeg::new(offset, len, divisor, floor, credit_max);
+            let prime = PrimeLeg::new(offset, len, divisor, floor, credit_max, carried);
             let gap = store.missing_ranges(offset, len).await.unwrap();
             let sources: Vec<SourceCoverage> = coverages
                 .iter()
@@ -2279,7 +2302,8 @@ mod prime_tests {
             let got = prime.predicted_leg(total, coverages.get(run.source_ix).unwrap(), ceiling);
             assert_eq!(
                 got, want,
-                "offset {offset}, len {len}, divisor {divisor}, ceiling {ceiling}"
+                "offset {offset}, len {len}, divisor {divisor}, ceiling {ceiling}, \
+                 carried {carried}"
             );
         }
     }

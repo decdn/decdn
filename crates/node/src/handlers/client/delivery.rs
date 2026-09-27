@@ -9,6 +9,7 @@ use futures_util::{Stream, StreamExt};
 
 use super::MAX_PROOFS_PER_CHUNK;
 use super::outcome::{ServeEnd, ServeStop};
+use super::ramp::RampCarry;
 use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked};
 use super::wire::{FrameAccountingFault, FrameChunks, FrameQueue};
 use super::{
@@ -216,6 +217,10 @@ impl ClientHandler {
         // `?` included, passes through the one `PaidProgress` tag: the dispatch
         // sink splits a peer that left into declined or abandoned by it.
         let mut paid: u64 = 0;
+        // The lane's banked ramp credit, taken once for this stream (ADR 003
+        // §Credit window). The loop returns it only when the stream ends fully
+        // paid.
+        let carry = self.take_ramp_carry(lane).await;
         self.deliver_loop(
             send,
             recv,
@@ -225,6 +230,7 @@ impl ClientHandler {
             total_bytes,
             lane_key,
             lane,
+            carry,
             client_node_id,
             rate_per_mb,
             floor_reservation,
@@ -254,6 +260,7 @@ impl ClientHandler {
         total_bytes: u64,
         lane_key: LaneKey,
         lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
+        mut carry: RampCarry,
         client_node_id: B256,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
@@ -340,7 +347,10 @@ impl ClientHandler {
         let mut chunks = ChunkFramer::new(data, hash);
         // Nothing is delivered, paid, or vouchered yet, so the opening frame may run
         // a whole interval against the whole opening window.
-        let opening_window = self.credit_window(chunk_bytes, 0);
+        // The first byte is about to go out: from here a stream that ends unpaid
+        // forfeits its ramp credit (ADR 003 §Credit window).
+        carry.start_delivery();
+        let opening_window = self.credit_window(chunk_bytes, carry.ramp_paid(0));
         let mut next_chunk = chunks
             .next_frame_chunks(self.frame_target(0, chunk_bytes, opening_window))
             .await
@@ -368,11 +378,12 @@ impl ClientHandler {
             let delivered_at_iter_start = delivered;
             let paid_at_iter_start = *paid;
 
-            // The ramped window for the payment confirmed so far (ADR 003 §Credit
-            // window). Recomputed each iteration: as `paid` advances in the recoup
-            // phase the window widens, so a paying stream ramps toward `credit_max`
-            // while a non-payer stays pinned at the one-interval floor.
-            let window = self.credit_window(chunk_bytes, *paid);
+            // The ramped window for the payment confirmed so far plus the lane's
+            // carried credit (ADR 003 §Credit window). Recomputed each iteration:
+            // as `paid` advances in the recoup phase the window widens, so a paying
+            // stream ramps toward `credit_max` while a non-payer on a lane with no
+            // credit stays pinned at the one-interval floor.
+            let window = self.credit_window(chunk_bytes, carry.ramp_paid(*paid));
 
             // --- deliver phase: stream chunks while the window has room. The
             // window is checked BEFORE each send, so the frontier
@@ -667,6 +678,15 @@ impl ClientHandler {
         // Clean completion: the whole request delivered and every interval paid. The
         // floor reservation was already released once payment reached the reserved
         // floor; the guard drops as this function returns.
+        // The stream is fully paid: return its ramp credit to the lane before
+        // `StreamEnd`, so the payer's next request on this lane opens at the
+        // window this one earned (ADR 003 §Credit window). Any other exit after
+        // the first byte drops the carry and forfeits it.
+        carry.return_paid(super::dispatch::aligned_span(
+            byte_offset,
+            byte_len,
+            total_bytes,
+        ));
         self.write_message(send, &ClientMessage::StreamEnd).await?;
         let _ = send.finish();
         // Drain the client's send half to its FIN before `recv` drops, so the

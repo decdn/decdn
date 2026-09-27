@@ -71,6 +71,7 @@ mod delivery;
 mod dispatch;
 mod fill;
 mod outcome;
+mod ramp;
 mod serve_encoder;
 mod serve_leg;
 mod voucher;
@@ -142,6 +143,10 @@ struct LaneDeliveryState {
     /// it gates nothing, and the stamp lifecycle follows the lane row (a
     /// forgotten lane drops it automatically).
     last_voucher_at: AtomicU64,
+    /// Paid wire bytes that finished streams on this lane returned for the next
+    /// stream's credit ramp (ADR 003 §Credit window). In memory only: a lane this
+    /// process loads or registers starts with an empty pool.
+    ramp_pool: Arc<ramp::RampPool>,
 }
 
 impl LaneDeliveryState {
@@ -163,6 +168,7 @@ impl LaneDeliveryState {
             bytes_delivered_cumulative: owed_bytes,
             paid_credited: owed_bytes,
             last_voucher_at: AtomicU64::new(0),
+            ramp_pool: Arc::default(),
         }
     }
 }
@@ -249,6 +255,7 @@ impl LaneActivityClock {
                     bytes_delivered_cumulative: U256::ZERO,
                     paid_credited: U256::ZERO,
                     last_voucher_at: AtomicU64::new(now),
+                    ramp_pool: Arc::default(),
                 })),
             );
         }
@@ -1993,14 +2000,14 @@ impl ClientHandler {
     }
 
     /// The effective downstream credit window in bytes for a stream whose voucher
-    /// interval is `interval_bytes` and whose cumulative confirmed payment is
-    /// `paid` (ADR 003 §Credit window). The window ramps from one interval toward
-    /// `credit_max` as `paid` grows, so the serve loop's bounded credit exposure —
-    /// `delivered − paid` — is exactly the window: `paid / credit_ramp_divisor`
-    /// once that clears the one-interval floor, the floor itself below that point
-    /// (including at `paid == 0`), and the full `credit_max` when
-    /// `credit_ramp_divisor` is `0`. Floored at one interval so the loop always
-    /// makes progress.
+    /// interval is `interval_bytes` and whose ramp input is `paid` (ADR 003
+    /// §Credit window): the stream's own confirmed payment plus the credit it
+    /// carries from its lane ([`RampCarry::ramp_paid`](ramp::RampCarry::ramp_paid)).
+    /// The window ramps from one interval toward `credit_max` as `paid` grows:
+    /// `paid / credit_ramp_divisor` once that clears the one-interval floor, the
+    /// floor itself below that point (including at `paid == 0`), and the full
+    /// `credit_max` when `credit_ramp_divisor` is `0`. Floored at one interval so
+    /// the loop always makes progress.
     pub(super) fn credit_window(&self, interval_bytes: u64, paid: u64) -> u64 {
         decdn_incentive::ramped_credit_window(
             self.credit_ramp_divisor,
@@ -2008,6 +2015,26 @@ impl ClientHandler {
             self.credit_max,
             paid,
         )
+    }
+
+    /// The most ramp credit a lane banks: the paid bytes that open one window at
+    /// `credit_max`. `0` when the ramp is disabled, because the window then starts
+    /// at the ceiling.
+    const fn ramp_credit_cap(&self) -> u64 {
+        self.credit_max.saturating_mul(self.credit_ramp_divisor)
+    }
+
+    /// Take `lane`'s banked ramp credit for one new stream (ADR 003 §Credit
+    /// window). A stream with no tracked lane carries nothing.
+    async fn take_ramp_carry(
+        &self,
+        lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
+    ) -> ramp::RampCarry {
+        let Some(lane) = lane else {
+            return ramp::RampCarry::detached();
+        };
+        let pool = Arc::clone(&lane.lock().await.ramp_pool);
+        ramp::RampCarry::take(pool, self.ramp_credit_cap())
     }
 
     /// The refundable floor-`M` serving guard (shared-payment-pool model): the
@@ -4410,6 +4437,43 @@ mod tests {
         Ok(())
     }
 
+    /// A lane this process loads starts with an empty ramp-credit pool, so a
+    /// restart carries no credit into the next stream. A stream that ends fully
+    /// paid returns its credit, and the next stream on the lane opens above the
+    /// floor (ADR 003 §Credit window).
+    #[tokio::test]
+    async fn a_loaded_lane_starts_empty_and_banks_for_the_next_stream() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests(&metrics).await;
+        let state = LaneState::hydrate(
+            B256::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            Address::repeat_byte(0x33),
+            U256::MAX,
+            0,
+            U256::from(9_000_000u64),
+            U256::from(9u64 << 20),
+            None,
+            decdn_incentive::LaneChain::NONE,
+        );
+        let lane = Arc::new(Mutex::new(LaneDeliveryState::hydrated(state)));
+
+        let first = handler.take_ramp_carry(Some(&lane)).await;
+        assert_eq!(first.carried(), 0, "a loaded lane carries no credit");
+        assert_eq!(
+            handler.credit_window(CHUNK_BYTES, first.ramp_paid(0)),
+            CHUNK_BYTES
+        );
+        first.return_paid(8 << 20);
+
+        let second = handler.take_ramp_carry(Some(&lane)).await;
+        assert_eq!(second.carried(), 8 << 20);
+        assert_eq!(
+            handler.credit_window(CHUNK_BYTES, second.ramp_paid(0)),
+            (8 << 20) / handler.credit_ramp_divisor
+        );
+    }
+
     /// `LaneActivityClock::ages` reports a near-zero whole-seconds age for a
     /// stamped lane and OMITS an unstamped (`last_voucher_at == 0`) one, so the
     /// admin surface reads the latter back as "never" rather than a bogus `0`
@@ -4442,6 +4506,7 @@ mod tests {
                 bytes_delivered_cumulative: U256::ZERO,
                 paid_credited: U256::ZERO,
                 last_voucher_at: AtomicU64::new(stamp),
+                ramp_pool: Arc::default(),
             }))
         };
         let map = DashMap::new();

@@ -1028,6 +1028,7 @@ mod tests {
             bytes_delivered_cumulative: U256::ZERO,
             paid_credited: U256::ZERO,
             last_voucher_at: AtomicU64::new(0),
+            ramp_pool: Arc::default(),
         }));
         handler.lanes.insert(lane_key, Arc::clone(&lane));
 
@@ -1599,8 +1600,8 @@ mod tests {
     /// root is what a sibling sends before its reveals, and a sealed voucher is
     /// a sibling's late closing voucher: both are already satisfied, and the
     /// lane is untouched. The same amount under a fresh root folds none of the
-    /// proved frontier: a payer whose last reveal reached the node but whose own
-    /// send failed restarts with it, and it is rejected `UnderFold` with the
+    /// proved frontier: a payer process that sent reveals and exited before it
+    /// persisted them resumes with it, and it is rejected `UnderFold` with the
     /// bundle.
     #[test]
     fn a_voucher_at_the_anchor_is_an_under_fold_only_under_a_fresh_root() {

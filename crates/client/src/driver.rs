@@ -697,6 +697,7 @@ where
         ledger,
         width: concurrency,
         takes_first: true,
+        grow: None,
     };
     drive_range_lanes(
         store,
@@ -733,6 +734,27 @@ pub struct RangeLane<'a, S> {
     /// with the drive's [`first_leg`] sets it on that lane only, so the primed
     /// pull is the leg that fills the gap and no other lane opens it again.
     pub takes_first: bool,
+    /// How the lane grows past `width` while the drive runs, or `None` to stay
+    /// at `width`.
+    pub grow: Option<LaneGrowth<'a>>,
+}
+
+/// A lane's growth hook in a [`drive_range_lanes`] drive.
+///
+/// Each time a gap worker of the lane takes a gap and more gaps still wait,
+/// the drive calls the hook with the number of gaps that wait, and it adds one
+/// worker to the lane for each unit the hook returns, up to that number. The hook must not wait: it grants only what it can grant
+/// now, such as stream permits that another fetch has released since the
+/// drive started, and the caller holds what it grants until the drive
+/// returns. A lane that starts narrow because a sibling fetch holds its
+/// provider's streams thus widens when that sibling finishes.
+#[derive(Clone, Copy)]
+pub struct LaneGrowth<'a>(pub &'a (dyn Fn(usize) -> usize + Send + Sync + 'a));
+
+impl std::fmt::Debug for LaneGrowth<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LaneGrowth")
+    }
 }
 
 /// How a [`drive_range_lanes`] drive ended: each lane's fault, if it had one,
@@ -971,10 +993,15 @@ where
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         };
+        // Workers a lane's growth hook granted, by lane index, for the join loop
+        // below to start. `notify_one` keeps a wake that lands before the loop
+        // waits.
+        let grown: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        let grow_wake = tokio::sync::Notify::new();
 
         let worker = |index: usize| {
             let (delivered, halted, retired, wake) = (&delivered, &halted, &retired, &wake);
-            let (faults, lock) = (&faults, &lock);
+            let (faults, lock, grown, grow_wake) = (&faults, &lock, &grown, &grow_wake);
             async move {
                 let Some(lane) = lanes.get(index) else {
                     return Ok(());
@@ -1004,16 +1031,28 @@ where
                         match next {
                             Some(gap) => {
                                 q.in_flight = q.in_flight.saturating_add(1);
-                                Some(gap)
+                                Some((gap, q.waiting.len()))
                             }
                             None if q.in_flight == 0 && q.first.is_none() => return Ok(()),
                             None => None,
                         }
                     };
-                    let Some((gap_start, gap_len)) = taken else {
+                    let Some(((gap_start, gap_len), waiting)) = taken else {
                         notified.await;
                         continue;
                     };
+                    if waiting > 0
+                        && let Some(LaneGrowth(grow)) = lane.grow
+                    {
+                        let extra = grow(waiting).min(waiting);
+                        if extra > 0 {
+                            grown
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .extend(std::iter::repeat_n(index, extra));
+                            grow_wake.notify_one();
+                        }
+                    }
                     let mut counters = DriveCounters::new();
                     let filled = fill_gap(
                         store,
@@ -1076,11 +1115,28 @@ where
                 }
             }
         };
-        let workers = lanes
+        let mut running: futures_util::stream::FuturesUnordered<_> = lanes
             .iter()
             .enumerate()
-            .flat_map(|(index, lane)| (0..lane.width.get()).map(move |_| worker(index)));
-        let joined = futures_util::future::join_all(workers).await;
+            .flat_map(|(index, lane)| (0..lane.width.get()).map(move |_| worker(index)))
+            .collect();
+        let mut joined = Vec::new();
+        loop {
+            let granted = std::mem::take(
+                &mut *grown
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            running.extend(granted.into_iter().map(worker));
+            // Only a polled worker grants, so an empty set has no grant pending.
+            tokio::select! {
+                next = futures_util::StreamExt::next(&mut running) => match next {
+                    Some(ended) => joined.push(ended),
+                    None => break,
+                },
+                () = grow_wake.notified() => {}
+            }
+        }
         let left = lock();
         let every_lane_faulted = faults.iter().all(|f| {
             f.lock()
@@ -1632,6 +1688,7 @@ where
     clippy::cast_possible_truncation
 )] // tests
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     use alloy::primitives::{Address, B256, U256};
@@ -1646,8 +1703,9 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use super::{
-        DriveConfig, PoolExhausted, RangeLane, RangeSetOutcome, SharedPool, contiguous_byte_ranges,
-        drive, drive_range_lanes, drive_range_set, first_leg, ranges_content_len,
+        DriveConfig, LaneGrowth, PoolExhausted, RangeLane, RangeSetOutcome, SharedPool,
+        contiguous_byte_ranges, drive, drive_range_lanes, drive_range_set, first_leg,
+        ranges_content_len,
     };
     use crate::ProgressCallback;
     use crate::pacer::{BudgetPacer, PaceDecision, PaceState};
@@ -2292,6 +2350,7 @@ mod tests {
         width: usize,
         takes_first: bool,
         tweak: fn(ScriptedSource) -> ScriptedSource,
+        grow: Option<LaneGrowth<'static>>,
     }
 
     impl LaneSpec {
@@ -2300,8 +2359,61 @@ mod tests {
                 width,
                 takes_first: false,
                 tweak: |s| s,
+                grow: None,
             }
         }
+    }
+
+    /// A lane that starts at width 1 widens while gaps still wait, by what its
+    /// growth hook grants, and still opens each gap once (#2168).
+    #[tokio::test]
+    async fn a_lane_grows_past_its_width_by_what_its_hook_grants() {
+        let total = 64 * GROUP;
+        let ranges = scattered(total);
+        let granted: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
+        let hook: &'static (dyn Fn(usize) -> usize + Send + Sync) =
+            Box::leak(Box::new(move |_| {
+                // Two extra workers in all, one per call.
+                usize::from(
+                    granted
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                            (n < 2).then_some(n + 1)
+                        })
+                        .is_ok(),
+                )
+            }));
+        let spec = LaneSpec {
+            grow: Some(LaneGrowth(hook)),
+            ..LaneSpec::healthy(1)
+        };
+        let (outcome, sources, store, plaintext) = lanes_drive(total, &ranges, &[spec]).await;
+        outcome.into_result().expect("drive the range set");
+
+        let source = sources.first().expect("one lane");
+        let mut opened = source.opened_ranges();
+        opened.sort_unstable();
+        assert_eq!(opened, ranges, "each range opened once, nothing else");
+        assert_eq!(granted.load(Ordering::Relaxed), 2);
+        let peak = source.peak_in_flight();
+        assert!(
+            peak > 1 && peak <= 3,
+            "the lane widened to its grants: {peak}"
+        );
+        for &(off, len) in &ranges {
+            let got = store.read(off, len).await.expect("read range");
+            assert_eq!(got.as_ref(), &plaintext[off as usize..(off + len) as usize]);
+        }
+    }
+
+    /// With no growth hook a width-1 lane runs its gaps one at a time.
+    #[tokio::test]
+    async fn a_lane_without_a_hook_stays_at_its_width() {
+        let total = 64 * GROUP;
+        let ranges = scattered(total);
+        let (outcome, sources, _store, _plaintext) =
+            lanes_drive(total, &ranges, &[LaneSpec::healthy(1)]).await;
+        outcome.into_result().expect("drive the range set");
+        assert_eq!(sources.first().expect("one lane").peak_in_flight(), 1);
     }
 
     /// Drive `ranges` of a fresh `total`-byte blob across one scripted lane per
@@ -2350,6 +2462,7 @@ mod tests {
                 ledger: &ledgers[i],
                 width: NonZeroUsize::new(spec.width).expect("non-zero"),
                 takes_first: spec.takes_first,
+                grow: spec.grow,
             })
             .collect();
         let spent_ledgers = ledgers.clone();
@@ -2433,6 +2546,7 @@ mod tests {
         let specs = [
             LaneSpec {
                 width: 1,
+                grow: None,
                 takes_first: true,
                 tweak: |s| s.with_fault_after(512, || anyhow::anyhow!("stream reset")),
             },
@@ -2463,6 +2577,7 @@ mod tests {
         let specs = [
             LaneSpec {
                 width: 1,
+                grow: None,
                 takes_first: true,
                 tweak: |s| {
                     s.with_fault_after(512, || {
@@ -2476,6 +2591,7 @@ mod tests {
             },
             LaneSpec {
                 width: 1,
+                grow: None,
                 takes_first: false,
                 tweak: |s| s.slow_finish(std::time::Duration::from_millis(200)),
             },
@@ -2506,11 +2622,13 @@ mod tests {
         let specs = [
             LaneSpec {
                 width: 1,
+                grow: None,
                 takes_first: true,
                 tweak: reset,
             },
             LaneSpec {
                 width: 1,
+                grow: None,
                 takes_first: false,
                 tweak: reset,
             },
@@ -2536,6 +2654,7 @@ mod tests {
             LaneSpec::healthy(2),
             LaneSpec {
                 width: 1,
+                grow: None,
                 takes_first: true,
                 tweak: |s| s.slow_to_start(std::time::Duration::from_millis(20)),
             },
@@ -2661,6 +2780,7 @@ mod tests {
         let specs = [
             LaneSpec {
                 width: 1,
+                grow: None,
                 takes_first: true,
                 tweak: |s| {
                     s.slow_to_start(std::time::Duration::from_millis(300))
@@ -2748,6 +2868,7 @@ mod tests {
             ledger: &ledger,
             width: NonZeroUsize::MIN,
             takes_first: false,
+            grow: None,
         };
         let err = drive_range_lanes(
             &store,
@@ -4343,6 +4464,7 @@ mod tests {
                 floor: PULL_WINDOW_FLOOR,
                 credit_max: window,
                 paid_base: 0,
+                paid_carried: 0,
             };
             let served_paid = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let serve_demand = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -4512,6 +4634,7 @@ mod tests {
             floor: FLOOR,
             credit_max: window,
             paid_base: 0,
+            paid_carried: 0,
         };
         // The serve leg is parked on the first byte past the closed window: one
         // byte ahead of the pull once the window fills, and so in band.
