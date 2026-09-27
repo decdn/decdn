@@ -871,6 +871,18 @@ async fn open_paid_stream(
     hash: [u8; 32],
     ext: Option<&StreamRequestExt>,
 ) -> anyhow::Result<(SendStream, RecvStream)> {
+    open_paid_range_stream(conn, hash, ext, 0, 0).await
+}
+
+/// As [`open_paid_stream`], for the range `[byte_offset, +byte_len)` (`byte_len
+/// == 0` is to the blob's end).
+async fn open_paid_range_stream(
+    conn: &Connection,
+    hash: [u8; 32],
+    ext: Option<&StreamRequestExt>,
+    byte_offset: u64,
+    byte_len: u64,
+) -> anyhow::Result<(SendStream, RecvStream)> {
     let (mut send, mut recv) = conn
         .open_bi()
         .await
@@ -879,8 +891,8 @@ async fn open_paid_stream(
         hash,
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
         pool_id: pool_id().into(),
-        byte_offset: 0,
-        byte_len: 0,
+        byte_offset,
+        byte_len,
         timestamp_us: 0x0012_61a0,
     };
     let payload =
@@ -1672,6 +1684,91 @@ async fn paying_grows_the_window_to_paid_over_divisor() -> anyhow::Result<()> {
     // before parking again, the widened window.
     read_exact_chunks(&mut recv, 2 * HARNESS_INTERVAL_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv).await?;
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// #2168: a stream's paid bytes return to its lane's ramp-credit pool when it
+/// ends, so the payer's next request on the lane opens at the window the first
+/// one earned instead of at the one-interval floor (ADR 003 §Credit window).
+/// Stream 1 pays for a 4 MiB range to its `StreamEnd`. Stream 2 then asks for
+/// the whole blob and pays nothing: at divisor 1 it still receives about 4 MiB
+/// before it parks, where a fresh lane receives one interval
+/// (`unpaid_stream_is_served_only_the_floor_then_pauses`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_back_to_back_stream_opens_at_the_lanes_banked_ramp() -> anyhow::Result<()> {
+    const CREDIT_MAX: u64 = 64 * 1024 * 1024;
+    const FIRST_RANGE: u64 = 4 * HARNESS_INTERVAL_BYTES;
+    let payload = vec![0x5Au8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_pipelined_server(cache, Arc::clone(&store), CREDIT_MAX, 1).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    // Stream 1: pay each interval as it lands, and the remainder when the node
+    // parks, through to `StreamEnd`.
+    let (mut send, mut recv) =
+        open_paid_range_stream(&conn, *hash.as_bytes(), Some(&ext), 0, FIRST_RANGE).await?;
+    let mut received: u64 = 0;
+    let mut paid: u64 = 0;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), read_client_msg(&mut recv)).await {
+            Ok(msg) => match msg? {
+                ClientMessage::ChunkData(chunk) => {
+                    received = received.saturating_add(chunk.bytes().len() as u64);
+                    if received.saturating_sub(paid) >= HARNESS_INTERVAL_BYTES {
+                        pay_cumulative(&mut send, &signer, received).await?;
+                        paid = received;
+                    }
+                }
+                ClientMessage::StreamEnd => break,
+                other => anyhow::bail!("expected ChunkData or StreamEnd, got {other:?}"),
+            },
+            Err(_elapsed) => {
+                anyhow::ensure!(received > paid, "stream 1 stalled with nothing owed");
+                pay_cumulative(&mut send, &signer, received).await?;
+                paid = received;
+            }
+        }
+    }
+    anyhow::ensure!(paid >= FIRST_RANGE, "stream 1 paid {paid} wire bytes");
+    let _ = send.finish();
+    drop(recv);
+
+    // Stream 2: the same lane, no voucher. It opens at the banked window (`paid`
+    // at divisor 1), so it receives well past one interval before it parks, and
+    // never more than that window plus the one frame that crosses it.
+    let (_send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    let mut unpaid: u64 = 0;
+    while let Ok(msg) =
+        tokio::time::timeout(Duration::from_secs(2), read_client_msg(&mut recv)).await
+    {
+        match msg? {
+            ClientMessage::ChunkData(chunk) => {
+                unpaid = unpaid.saturating_add(chunk.bytes().len() as u64);
+            }
+            other => anyhow::bail!("expected ChunkData, got {other:?}"),
+        }
+    }
+    anyhow::ensure!(
+        unpaid >= FIRST_RANGE,
+        "stream 2 received {unpaid} unpaid wire bytes; the banked ramp opens {paid}"
+    );
+    anyhow::ensure!(
+        unpaid <= paid.saturating_add(HARNESS_INTERVAL_BYTES),
+        "stream 2 received {unpaid} unpaid wire bytes past its {paid}-byte window"
+    );
 
     conn.close(0u32.into(), b"done");
     shutdown([server_task], [&client_ep, &server_ep]).await?;
@@ -4186,9 +4283,9 @@ async fn client_under_folding_a_live_chain_reseeds_and_resumes() -> anyhow::Resu
     resume_under_a_live_chain(1).await
 }
 
-/// The same heal when the new process resumes from EXACTLY the signed anchor: a
-/// reveal whose send failed locally still reached the node, so the persisted
-/// watermark is the anchor and the node's frontier is past it. The opening
+/// The same heal when the new process resumes from EXACTLY the signed anchor: the
+/// earlier process sent reveals and exited before it persisted them, so the
+/// persisted watermark is the anchor and the node's frontier is past it. The opening
 /// voucher repeats the anchor amount under a fresh root. No sibling settled it
 /// under that root, so it is an under-fold, not an already-satisfied voucher.
 #[tokio::test(flavor = "multi_thread")]
@@ -4434,6 +4531,104 @@ async fn resume_under_a_live_chain(above_anchor: u64) -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         counter(&metrics, "decdn_serve_stream_voucher_rejected_total")? == 1,
+        "the heal costs exactly one rejected voucher"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// #2169: the path that leaves a persisted watermark behind the node's chain.
+/// One process pulls two blobs over one lane ledger, the way a bundle pull
+/// drives its entries, and persists after the first only: it exits before the
+/// second entry's persist. The node proved the second entry's reveals, so the
+/// next process resumes from a watermark that trails the node's frontier. Its
+/// first voucher under-folds, the node rejects it once with the bundle, and the
+/// client folds the bundle and completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_process_that_exits_before_its_last_persist_heals_in_one_rejection() -> anyhow::Result<()>
+{
+    let payload_a: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let payload_b: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 241) as u8).collect();
+    let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 16).await?;
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let sd = slash_domain();
+    let deadlines = PullDeadlines::whole_transfer(Duration::from_secs(15));
+
+    // The first process: one ledger across both entries. It persists after
+    // the first entry, then exits before the second entry's persist.
+    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let fetch_shared = |hash: decdn_cache::Hash, ts: u64| {
+        stream_fetch_shared(
+            &client_ep,
+            target.clone(),
+            &ctx,
+            &ledger,
+            &sd,
+            server_eth.address(),
+            *hash.as_bytes(),
+            0,
+            ts,
+            deadlines,
+            0,
+            0,
+        )
+    };
+    fetch_shared(hash_a, 0x2169_0001)
+        .await
+        .map_err(|e| anyhow::anyhow!("entry A: {e:#}"))?;
+    let persisted = ledger.committed();
+    fetch_shared(hash_b, 0x2169_0002)
+        .await
+        .map_err(|e| anyhow::anyhow!("entry B: {e:#}"))?;
+    let node_claim = store
+        .load_all()?
+        .first()
+        .map(LaneState::owed)
+        .ok_or_else(|| anyhow::anyhow!("no persisted lane"))?;
+    anyhow::ensure!(
+        node_claim > persisted.amount,
+        "the node proved past the persisted watermark: {node_claim} vs {}",
+        persisted.amount
+    );
+    let rejected_before = counter(&metrics, "decdn_serve_stream_voucher_rejected_total")?;
+
+    // The next process resumes from the persisted watermark.
+    let mut next = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    next.prior_amount = persisted.amount;
+    next.prior_bytes_delivered = persisted.bytes;
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &next,
+        &sd,
+        server_eth.address(),
+        *hash_a.as_bytes(),
+        0,
+        0x2169_0003,
+        Duration::from_secs(8),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("resumed fetch: {e:#}"))?;
+    anyhow::ensure!(
+        got.as_ref() == payload_a.as_slice(),
+        "the resumed fetch recovers blob A"
+    );
+    let healed = store
+        .load_all()?
+        .first()
+        .map(LaneState::owed)
+        .ok_or_else(|| anyhow::anyhow!("no persisted lane"))?;
+    anyhow::ensure!(
+        healed > node_claim,
+        "the healed stream pays past the node's claim: {node_claim} -> {healed}"
+    );
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_voucher_rejected_total")? == rejected_before + 1,
         "the heal costs exactly one rejected voucher"
     );
 

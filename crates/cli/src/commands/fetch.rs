@@ -2275,6 +2275,7 @@ struct WatchedLane<'p, 'a, P> {
     prelude: &'p FetchPrelude<'a, P>,
     width: std::num::NonZeroUsize,
     takes_first: bool,
+    grow: Option<decdn_client::LaneGrowth<'p>>,
 }
 
 /// Whether a failed drive counts against the peer in the peer store. Our own
@@ -2327,6 +2328,7 @@ where
                 ledger: &l.prelude.ledger,
                 width: l.width,
                 takes_first: l.takes_first,
+                grow: l.grow,
             })
             .collect();
         let driven = Box::pin(drive_range_lanes(
@@ -2748,6 +2750,7 @@ where
         prelude: &prelude,
         width: std::num::NonZeroUsize::MIN,
         takes_first: true,
+        grow: None,
     }];
     // A dropped drive records the ranges it landed and the vouchers it signed.
     let on_drop = SettleOnDrop::new(|| {
@@ -2862,6 +2865,9 @@ pub(crate) struct StripeLane<'s, 'a, P> {
     pub(crate) session: &'s RangeSession<'a, P>,
     pub(crate) width: std::num::NonZeroUsize,
     pub(crate) takes_first: bool,
+    /// How the lane widens past `width` while the drive runs
+    /// ([`decdn_client::LaneGrowth`]).
+    pub(crate) grow: Option<decdn_client::LaneGrowth<'s>>,
 }
 
 /// Whether a lane of a striped drive settles at its committed cumulative: it
@@ -2924,6 +2930,7 @@ where
             prelude: &l.session.prelude,
             width: l.width,
             takes_first: l.takes_first,
+            grow: l.grow,
         })
         .collect();
     let pool = lead.prelude.pool_with(topups_used);

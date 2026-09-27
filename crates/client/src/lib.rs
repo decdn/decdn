@@ -204,8 +204,8 @@ pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
 pub use decdn_bao_range::RangedStore;
 pub use downloader::{DownloadTarget, Downloader, download_first_unit};
 pub use driver::{
-    PacingWait, PoolExhausted, RangeLane, RangeSetOutcome, SharedPool, WaitReason, drive,
-    drive_range_lanes, drive_range_set, first_leg,
+    LaneGrowth, PacingWait, PoolExhausted, RangeLane, RangeSetOutcome, SharedPool, WaitReason,
+    drive, drive_range_lanes, drive_range_set, first_leg,
 };
 pub use ledger::{ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released};
 pub use ledgers::{LaneHandle, LaneLedgers};
@@ -3349,9 +3349,14 @@ impl UpstreamPull {
     /// end and does not re-pull and re-bill the tail. Confirming costs nothing
     /// extra, because [`PoolLedger::settlement`] already reports the armed voucher.
     ///
-    /// A `StreamError` surfaces as the typed rejection. A write we caused ourselves
-    /// (a [`LocalPullFault`]) is never masked, nor is a stream that yields no
-    /// terminal signal before the bound.
+    /// A `StreamError` surfaces as the typed rejection. The node delivers ahead of
+    /// payment within its credit window, so `ChunkData` it sent before it rejected
+    /// can sit in front of the `StreamError`: the read passes over those frames,
+    /// unread, to reach the terminal message. The rejected leg pays for none of
+    /// them, and a caller that resumes pulls them again. A `StreamEnd` behind
+    /// skipped `ChunkData` confirms nothing, because this leg did not take in those
+    /// bytes. A write we caused ourselves (a [`LocalPullFault`]) is never masked,
+    /// nor is a stream that yields no terminal signal before the bound.
     ///
     /// Returns whether a voucher was confirmed. A `StreamEnd` after a failed reveal
     /// or re-anchor write, or after a sibling's voucher replaced this stream's
@@ -3367,7 +3372,23 @@ impl UpstreamPull {
         // waiting, so the write failure stands as the honest outcome (its typed
         // cause still downcasts through the added context); what the recovery saw
         // rides along so the log can tell a silent peer from a chatty one.
-        match tokio::time::timeout(TERMINAL_AFTER_WRITE_TIMEOUT, self.read_under_floor()).await {
+        let mut skipped: u64 = 0;
+        let terminal = tokio::time::timeout(TERMINAL_AFTER_WRITE_TIMEOUT, async {
+            loop {
+                match self.read_under_floor().await {
+                    Ok(ClientMessage::ChunkData(chunk)) => {
+                        skipped = skipped.saturating_add(chunk.bytes().len() as u64);
+                    }
+                    other => return other,
+                }
+            }
+        })
+        .await;
+        match terminal {
+            Ok(Ok(ClientMessage::StreamEnd)) if skipped > 0 => Err(write_err.context(format!(
+                "the peer ended the stream after {skipped} bytes of ChunkData this leg did not \
+                 take in once the voucher write failed"
+            ))),
             Ok(Ok(ClientMessage::StreamEnd)) => {
                 self.ended = true;
                 let attempted = write_err

@@ -381,7 +381,8 @@ pub struct FillSession {
     served_paid: Frontier,
     /// The ABSOLUTE content offset the owning request starts at — the value
     /// `served_paid` is seeded with. A pull leg's `RampPacer` ramps on
-    /// `served_paid − served_start`, so a resumed request ramps from the floor.
+    /// `served_paid − served_start` plus the owning stream's carried lane credit,
+    /// so a resumed request ramps from that credit, not from its blob offset.
     served_start: u64,
     /// The content end of the furthest span a serve leg has been stuck on (a
     /// high-water mark, never lowered): the serve leg's frame consumer raises it

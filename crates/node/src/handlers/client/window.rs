@@ -193,6 +193,11 @@ impl ClientHandler {
         // `uint256` shape.
         let deadline = self.pull_through.unwrap_or(WINDOW_PULL_FALLBACK_DEADLINE);
         let namespace_id = U256::from_be_bytes(req.namespace_id);
+        // The lane's banked ramp credit, taken once for this stream (ADR 003
+        // §Credit window). An owned pull leg paces on it too. The serve leg
+        // returns it only when the stream ends fully paid.
+        let carry = self.take_ramp_carry(Some(lane)).await;
+        let paid_carried = carry.carried();
         // The first leg a pull of `[offset, +len)` opens, so the handshake can
         // open that leg instead of a whole-blob open it drops (#2063).
         let prime_for = |offset: u64, len: u64| {
@@ -202,6 +207,7 @@ impl ClientHandler {
                 self.credit_ramp_divisor,
                 pacing_floor,
                 self.credit_max,
+                paid_carried,
             )
         };
         let mut target: Option<PullLegTarget> = None;
@@ -400,9 +406,9 @@ impl ClientHandler {
             let session = Arc::clone(&serve_session);
             let cancel = serve_session.cancel_token().clone();
             // The pull leg's `RampPacer` (#1669): the same ramp the serve loop
-            // computes from its own paid frontier, so the pull never runs further
-            // ahead of the downstream served-paid frontier than the ramped credit
-            // window allows.
+            // computes from its own paid frontier and its carried lane credit, so
+            // the pull never runs further ahead of the downstream served-paid
+            // frontier than the ramped credit window allows.
             let credit_ramp_divisor = self.credit_ramp_divisor;
             let credit_max = self.credit_max;
             // The pull runs on its own thread and runtime, which starts with no
@@ -427,6 +433,7 @@ impl ClientHandler {
                             credit_ramp_divisor,
                             pacing_floor,
                             credit_max,
+                            paid_carried,
                             Arc::clone(&session),
                             cancel,
                         )),
@@ -477,6 +484,7 @@ impl ClientHandler {
                 Arc::clone(&serve_session),
                 &also_pace,
                 lane,
+                carry,
                 hash,
                 lane_key,
                 client_node_id,
@@ -725,6 +733,10 @@ impl ClientHandler {
         // that `run_local_pull_leg` reads back via `source.ledger()` and hands to
         // `drive` as the completion frontier (THE CRUX — a completion counter, never
         // payment).
+        // The lane's banked ramp credit, taken once for this stream (ADR 003
+        // §Credit window). An owned pull leg paces on it too. The serve leg
+        // returns it only when the stream ends fully paid.
+        let carry = self.take_ramp_carry(Some(lane)).await;
         if let Some((pull_offset, pull_len)) = pull_range {
             let engine = self.cache.clone();
             let metrics = Arc::clone(&self.metrics);
@@ -732,6 +744,7 @@ impl ClientHandler {
             let cancel = serve_session.cancel_token().clone();
             let credit_ramp_divisor = self.credit_ramp_divisor;
             let credit_max = self.credit_max;
+            let paid_carried = carry.carried();
             // The unpaid local-origin leg: a throwaway ledger that never signs
             // and never meters, because `BackendSource` quotes rate 0.
             let ledger = Arc::new(decdn_client::PoolLedger::new(
@@ -765,6 +778,7 @@ impl ClientHandler {
                             credit_ramp_divisor,
                             pacing_floor,
                             credit_max,
+                            paid_carried,
                             total_bytes,
                             Arc::clone(&session),
                             cancel,
@@ -816,6 +830,7 @@ impl ClientHandler {
                 Arc::clone(&serve_session),
                 &also_pace,
                 lane,
+                carry,
                 hash,
                 lane_key,
                 client_node_id,

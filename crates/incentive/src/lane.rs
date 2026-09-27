@@ -769,8 +769,8 @@ impl LaneState {
             // At exactly the signed anchor, a voucher that opens another chain
             // has not been settled by any sibling: a sibling that re-sends the
             // anchor names the live root. With reveals proved on top of the
-            // anchor, it is a rollover that folds none of them. A payer whose
-            // last reveal reached the node but whose own send failed restarts
+            // anchor, it is a rollover that folds none of them. A payer process
+            // that sent reveals and exited before it persisted them resumes
             // here, so it gets the rejection that carries the fold it owes.
             // With nothing proved, the live claim is the anchor, and the node
             // may adopt the new root (see `adopt_chain`).
@@ -824,8 +824,8 @@ impl LaneState {
         // it cannot happen: issuance is serialized under the payer's own lock,
         // and a voucher that folds must also roll, so the folded amount covers
         // the frontier by construction. A payer reaches it by resuming from a
-        // watermark that trails the node's frontier — a restart after a reveal
-        // whose send failed locally but still reached the node. The reason is
+        // watermark that trails the node's frontier — a new process after one
+        // that sent reveals and exited before it persisted them. The reason is
         // watermark-gated, so the rejection carries the bundle that states the
         // fold owed, the payer folds it and resumes, and the lane's claim is
         // exactly as strong afterwards as before.
@@ -1901,8 +1901,8 @@ mod tests {
     /// A rollover at EXACTLY the signed anchor folds none of the proved
     /// frontier. No sibling settled it under that root, so it is an under-fold,
     /// not an ordering regression that the node would treat as already
-    /// satisfied. A payer whose last reveal reached the node but whose own send
-    /// failed restarts here.
+    /// satisfied. A payer process that sent reveals and exited before it
+    /// persisted them resumes here.
     #[test]
     fn a_rollover_at_the_anchor_over_a_proved_frontier_is_an_under_fold() -> anyhow::Result<()> {
         let (signer, mut state, domain, store) = fixture();
