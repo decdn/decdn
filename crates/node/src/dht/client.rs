@@ -66,8 +66,8 @@ pub async fn find_node(
 
 /// Send a single `Store` request to `target` and return the ack.
 ///
-/// Used by the republish scheduler — one call per K+3 closest peer per
-/// cached blob, per ADR 022 §STORE Flow steps 1-2.
+/// Used by the republish scheduler's eager publish of a newly cached blob —
+/// one call per K+3 closest peer, per ADR 022 §STORE Flow steps 1-2.
 pub async fn store(
     endpoint: &Endpoint,
     target: EndpointAddr,
@@ -99,7 +99,8 @@ pub async fn store(
 /// Send a single `BatchStore` request to `target` and return the ack
 /// (ADR 022 §STORE Flow Batched STORE). One `bool` per request hash comes
 /// back in request order. Used by the re-publish scheduler, which groups
-/// due hashes by receiver and sends each receiver its set via this. Every
+/// a drain cycle's hashes by receiver and sends each receiver its set via
+/// this. Every
 /// DHT node implements `BatchStore`, so there is no per-hash fallback.
 ///
 /// `entries` MUST be ≤ [`decdn_protocol::dht::MAX_BATCH_STORE_HASHES`];

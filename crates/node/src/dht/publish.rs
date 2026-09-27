@@ -7,20 +7,26 @@
 //!
 //! On a periodic per-record jittered timer the scheduler:
 //!
-//!  1. Drains every record whose republish window has come due and
-//!     keeps those still held in the cache.
-//!  2. Groups the due hashes by receiver — each hash's K+3 closest
+//!  1. Drains every record whose republish window has come due. On a
+//!     tick where one has, it also drains the records due within
+//!     [`REPUBLISH_LOOKAHEAD`], in due order, while no receiver's set
+//!     passes [`LOOKAHEAD_RECEIVER_CAP`] (ADR 022 §STORE Flow "Drain
+//!     cycle"). It keeps those still held in the cache. Per-record jitter spreads due times so thinly that a
+//!     1 s tick alone holds about one hash; the look-ahead is what gives
+//!     a steady-state batch more than one.
+//!  2. Groups the drained hashes by receiver — each hash's K+3 closest
 //!     peers — so all hashes bound for one receiver ride a single
 //!     `BatchStoreRequest { hashes, holder: self }`, split at the
-//!     [`MAX_BATCH_STORE_HASHES`] wire cap. This collapses the
-//!     concentration of overlapping republish windows into one RPC per
-//!     publisher-receiver pair (ADR 022 §STORE Flow Batched STORE &
-//!     §DHT Bandwidth Analysis). Every DHT node implements `BatchStore`,
-//!     so there is no per-hash fallback.
+//!     [`MAX_BATCH_STORE_HASHES`] wire cap. This is one RPC per
+//!     publisher-receiver pair per cycle (ADR 022 §STORE Flow Batched
+//!     STORE & §DHT Bandwidth Analysis). Every DHT node implements
+//!     `BatchStore`, so there is no per-hash fallback.
 //!  3. Schedules the next republish at `now + uniform(30 min, 50 min)`
 //!     per ADR 022 §STORE Flow step 3. Jitter is drawn independently
 //!     per record so the next republish window for a given hash is
-//!     not predictable from outside the publisher.
+//!     not predictable from outside the publisher. Taking a record early
+//!     only shortens its refresh gap: the draw keeps it at or below
+//!     50 min, and [`REPUBLISH_LOOKAHEAD`] keeps it at or above 25 min.
 //!
 //! Cold-start (ADR 022 §Bootstrap "Cold-start re-publish scheduling"):
 //! a node booting with C cached blobs draws the first republish offset
@@ -42,11 +48,10 @@
 //! reason it is at boot.
 //!
 //! Implementation: a single tokio task drives all records via a
-//! `BinaryHeap<(due_at, hash)>`. The heap is small (one entry per
-//! cached blob, capped by the cache's blob count) and the next
-//! `due_at` drives the task's sleep duration. Sending a `Store` does
-//! not hold the heap mutex; the K+3 fan-out happens in spawned tasks
-//! so a slow receiver doesn't stall the rest of the schedule.
+//! `BinaryHeap<(due_at, hash)>` and a 1 s ticker. The heap is small (one
+//! entry per cached blob, capped by the cache's blob count). Sending does
+//! not hold the heap mutex; a drain cycle's batches go out in a spawned
+//! task so a slow receiver doesn't stall the rest of the schedule.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -81,6 +86,34 @@ pub const STEADY_STATE_MAX: Duration = Duration::from_mins(50);
 /// start re-publish scheduling"). The lower bound is 0 — a record
 /// drawn at 0 fires on the next tick.
 pub const COLD_START_MAX: Duration = Duration::from_mins(40);
+
+/// How far ahead a drain cycle reaches for records not yet due (ADR 022
+/// §STORE Flow "Drain cycle"). Sending early only shortens a record's refresh
+/// gap, which the [`STEADY_STATE_MAX`] draw bound keeps inside the
+/// receiver-anchored 1 h TTL. This bound keeps the gap at or above 25 min,
+/// which caps the extra refresh load the look-ahead adds.
+pub const REPUBLISH_LOOKAHEAD: Duration = Duration::from_mins(5);
+
+/// The most hashes one receiver's set holds once the look-ahead has pulled
+/// records forward (ADR 022 §STORE Flow "Drain cycle"). A full batch fits the
+/// 40-token per-peer burst of ADR 022 §DHT Rate Limiting with 8 tokens to
+/// spare for the same publisher's lookups and eager `Store`s. Records already
+/// due are not held to it.
+pub const LOOKAHEAD_RECEIVER_CAP: usize = 32;
+
+/// The shortest time between a drain cycle and a later cycle that pulls
+/// records forward (ADR 022 §STORE Flow "Drain cycle"). The per-receiver cap
+/// bounds one cycle, not two a second apart: after a backlog empties a
+/// receiver's per-peer bucket, a look-ahead batch on the next tick would find
+/// about 20 tokens and have its tail refused. At the 20-token/s per-peer
+/// refill, 2 s refill the whole 40-token burst.
+pub const LOOKAHEAD_MIN_SPACING: Duration = Duration::from_secs(2);
+
+// A record rescheduled at `now + STEADY_STATE_MIN` must fall outside the
+// look-ahead, or every cycle would pull it forward again.
+const _: () = assert!(REPUBLISH_LOOKAHEAD.as_secs() < STEADY_STATE_MIN.as_secs());
+// A look-ahead set fits in one `BatchStore`.
+const _: () = assert!(LOOKAHEAD_RECEIVER_CAP <= MAX_BATCH_STORE_HASHES);
 
 /// Per-record scheduler entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,7 +177,7 @@ fn jitter_us(lo: Duration, hi: Duration) -> u64 {
 /// A `BinaryHeap` cannot remove or reschedule an interior entry, so any
 /// rescheduling leaves the old entry behind as a tombstone. `scheduled` is
 /// therefore the authority: it maps each live hash to the ONE `due_us` that
-/// counts, and `drain_due` discards a popped entry whose `due_us`
+/// counts, and `drain_cycle` discards a popped entry whose `due_us`
 /// disagrees. Without that check a tombstone is resurrected the moment its
 /// hash is scheduled again — it pops already-overdue, passes a
 /// membership-only test, and buys a spurious republish. Three call patterns
@@ -189,7 +222,7 @@ impl RepublishScheduler {
     ///
     /// A fresh draw per cycle is ADR 022 §STORE Flow step 3. Superseding is
     /// safe because the displaced heap entry no longer matches the
-    /// authoritative due time and `drain_due` discards it.
+    /// authoritative due time and `drain_cycle` discards it.
     pub fn schedule_steady(&self, hash: ContentHash) {
         let offset = jitter_us(STEADY_STATE_MIN, STEADY_STATE_MAX);
         self.schedule_with_offset(hash, offset);
@@ -256,8 +289,8 @@ impl RepublishScheduler {
     /// Run `f` under both locks with a freshly computed due time.
     ///
     /// Both guards are held across the read-and-push so a concurrent
-    /// `drain_due` cannot act on a half-applied change. Acquired
-    /// heap-then-scheduled to match `drain_due`'s order — the reverse would
+    /// `drain_cycle` cannot act on a half-applied change. Acquired
+    /// heap-then-scheduled to match `drain_cycle`'s order — the reverse would
     /// risk deadlocking against it, which is why the [`with_lock`] calls nest
     /// in that order rather than running side by side.
     fn with_slots<F>(&self, offset_us: u64, f: F) -> bool
@@ -274,12 +307,27 @@ impl RepublishScheduler {
         })
     }
 
-    /// Drain every hash whose authoritative due time has passed.
+    /// Drain one republish cycle: every hash whose authoritative due time has
+    /// passed, then — only if at least one has — the hashes due by
+    /// `horizon_us`, in due order, while `admit` accepts them.
+    ///
+    /// `admit(hash, mandatory)` sees every live hash the cycle takes, plus the
+    /// one look-ahead hash it refuses. Every due hash reaches `admit` before
+    /// any look-ahead hash. `mandatory` is `true` for a hash already due: it
+    /// always drains, so `admit` must record it, and its answer is ignored.
+    /// For a look-ahead hash `admit` decides, and the first refusal ends the
+    /// cycle with that hash and every later one still scheduled. The
+    /// look-ahead never runs on its own: pulling hashes forward on a tick with
+    /// nothing due would only shift the whole schedule earlier and batch
+    /// nothing. A `horizon_us` at or below `now_us` turns it off.
     ///
     /// A popped entry counts only if `scheduled` still names that hash at
     /// exactly that `due_us`. Anything else is a tombstone left by a
-    /// supersede or an unschedule, and is dropped.
-    fn drain_due(&self, now_us: u64) -> Vec<ContentHash> {
+    /// supersede or an unschedule, and is dropped without reaching `admit`.
+    fn drain_cycle<F>(&self, now_us: u64, horizon_us: u64, mut admit: F) -> Vec<ContentHash>
+    where
+        F: FnMut(&ContentHash, bool) -> bool,
+    {
         let mut out = Vec::new();
         with_lock(&self.heap, "dht republish heap", |heap| {
             with_lock(
@@ -287,13 +335,20 @@ impl RepublishScheduler {
                 "dht republish scheduled set",
                 |scheduled| {
                     while let Some(Reverse(Entry { due_us, hash })) = heap.peek().copied() {
-                        if due_us > now_us {
+                        if due_us > now_us.max(horizon_us) {
+                            break;
+                        }
+                        if scheduled.get(&hash) != Some(&due_us) {
+                            heap.pop();
+                            continue;
+                        }
+                        let mandatory = due_us <= now_us;
+                        if mandatory {
+                            admit(&hash, true);
+                        } else if out.is_empty() || !admit(&hash, false) {
                             break;
                         }
                         heap.pop();
-                        if scheduled.get(&hash) != Some(&due_us) {
-                            continue;
-                        }
                         out.push(hash);
                         // Drop the live entry so the next `schedule_*` for this hash
                         // re-adds it. The caller re-schedules after publishing.
@@ -305,12 +360,19 @@ impl RepublishScheduler {
         out
     }
 
+    /// Drain every hash whose authoritative due time has passed, with no
+    /// look-ahead.
+    #[cfg(test)]
+    fn drain_due(&self, now_us: u64) -> Vec<ContentHash> {
+        self.drain_cycle(now_us, now_us, |_, _| true)
+    }
+
     /// Unschedule `hash` — used when the cache evicts the blob.
     pub fn unschedule(&self, hash: &ContentHash) {
         with_lock(&self.scheduled, "dht republish scheduled set", |s| {
             s.remove(hash);
         });
-        // The heap entry is left in place; `drain_due` discards it, and a
+        // The heap entry is left in place; `drain_cycle` discards it, and a
         // later re-schedule cannot resurrect it because its `due_us` will no
         // longer match the authoritative one.
     }
@@ -763,8 +825,9 @@ async fn run_sweep_worker(
 }
 
 /// Long-running task: consumes a [`broadcast::Receiver<Hash>`] from
-/// the cache, drives the scheduler heap, and fans out `Store` requests
-/// to the K+3 closest peers per due hash. Exits on `stop`, or on a
+/// the cache, drives the scheduler heap, and publishes each new hash with a
+/// `Store` to its K+3 closest peers and each drain cycle with one
+/// `BatchStore` per receiver. Exits on `stop`, or on a
 /// closed cache subscribe channel — which this task's own `CacheEngine`
 /// clone makes unreachable in practice.
 ///
@@ -801,6 +864,7 @@ pub async fn run_republish(
     // shutdown signal. A 1-second poll keeps the worst-case latency
     // between "hash became due" and "Store sent" bounded.
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    let mut last_cycle_us = None;
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await; // burn first tick
 
@@ -867,8 +931,9 @@ pub async fn run_republish(
                 }
             }
             _ = ticker.tick() => {
-                let due = scheduler.drain_due(now_us());
-                // ADR 022 §Content Records and TTL line 122: "A node
+                let (due, budget) =
+                    plan_cycle(&scheduler, &routing, now_us(), &mut last_cycle_us);
+                // ADR 022 §Content Records and TTL: "A node
                 // stops re-publishing when it evicts the blob." Keep only
                 // the still-held hashes; drop evicted ones from the
                 // scheduler instead of re-adding them.
@@ -899,7 +964,7 @@ pub async fn run_republish(
                 }
                 if !held.is_empty() {
                     // Re-schedule with the steady-state jitter window first
-                    // (ADR 022 line 130 — fresh jitter draw per record per
+                    // (ADR 022 §STORE Flow step 3 — fresh jitter draw per record per
                     // cycle). The reschedule is independent of publish
                     // outcome, so doing it before the publish lets the
                     // publish run detached below.
@@ -908,27 +973,67 @@ pub async fn run_republish(
                     }
                     // One BatchStore per receiver (ADR 022 §STORE Flow
                     // Batched STORE) rather than a per-hash fan-out — the
-                    // overlapping republish windows concentrate on shared
-                    // receiver sets, which is exactly what batching folds
-                    // into a single RPC. Fire it off the select loop: a slow
+                    // cycle's hashes share receiver sets, which is exactly
+                    // what batching folds into a single RPC. The sets are the
+                    // ones the drain admitted, so each look-ahead batch stays
+                    // within the cap. Fire it off the select loop: a slow
                     // or unreachable receiver would otherwise hold the loop
                     // for up to (chunks × DHT_CLIENT_TIMEOUT), delaying the
                     // shutdown signal and eager cache-insert publishes. The
                     // sweep is best-effort — abandoned on shutdown, retried
                     // next cycle.
+                    let groups = budget.into_groups(&held.into_iter().collect());
                     let ep = endpoint.clone();
-                    let routing = Arc::clone(&routing);
                     let cache_cloned = cache.clone();
                     let metrics = Arc::clone(&metrics);
                     tokio::spawn(async move {
                         let accepted =
-                            publish_batch(&ep, self_node_id, &routing, &cache_cloned, &held).await;
+                            publish_batch(&ep, self_node_id, &cache_cloned, groups).await;
                         metrics.dht_store_published(accepted);
                     });
                 }
             }
         }
     }
+}
+
+/// Plan one drain cycle at `now_us`: drain it from `scheduler` and group it by
+/// receiver (ADR 022 §STORE Flow "Drain cycle").
+///
+/// The cycle takes the records due now and, while no receiver's set passes
+/// [`LOOKAHEAD_RECEIVER_CAP`], the ones due within [`REPUBLISH_LOOKAHEAD`].
+/// Per-record jitter spreads due times so thinly that a tick alone holds about
+/// one hash per receiver. The look-ahead is off when the previous non-empty
+/// cycle, recorded in `last_cycle_us`, is less than [`LOOKAHEAD_MIN_SPACING`]
+/// old.
+///
+/// Lock order is heap → scheduled → routing: nothing takes a scheduler lock
+/// while it holds the routing table.
+fn plan_cycle(
+    scheduler: &RepublishScheduler,
+    routing: &Mutex<RoutingTable>,
+    now_us: u64,
+    last_cycle_us: &mut Option<u64>,
+) -> (Vec<ContentHash>, ReceiverBudget) {
+    let micros = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+    let spaced = last_cycle_us
+        .is_none_or(|last| now_us.saturating_sub(last) >= micros(LOOKAHEAD_MIN_SPACING));
+    let horizon_us = if spaced {
+        now_us.saturating_add(micros(REPUBLISH_LOOKAHEAD))
+    } else {
+        now_us
+    };
+    let mut budget = ReceiverBudget::default();
+    let drained = scheduler.drain_cycle(now_us, horizon_us, |hash, mandatory| {
+        let receivers = with_lock(routing, "dht routing table", |table| {
+            table.closest_unbounded(hash.as_bytes(), REPUBLISH_FANOUT)
+        });
+        budget.admit(*hash, &receivers, mandatory)
+    });
+    if !drained.is_empty() {
+        *last_cycle_us = Some(now_us);
+    }
+    (drained, budget)
 }
 
 /// Whether this node would still advertise `hash` — `Some(true)` when it
@@ -1002,7 +1107,7 @@ async fn publish_hash(
 ) -> u64 {
     let coverage = fetch_coverage(cache, hash).await;
     let targets: Vec<NodeId> = with_lock(routing, "dht routing table", |table| {
-        // ADR 022 §STORE Flow line 128 specifies K+3 (= 23) closest
+        // ADR 022 §STORE Flow step 1 specifies K+3 (= 23) closest
         // nodes — the three positions beyond K are overflow targets
         // so an attacker suppressing receivers has to take down K+3
         // hosts rather than K. The default `closest` caps at K (=
@@ -1082,28 +1187,61 @@ async fn fetch_coverage(cache: &decdn_cache::CacheEngine, hash: ContentHash) -> 
     }
 }
 
-/// Group `hashes` by receiver: for each hash, its K+3 closest peers
-/// (ADR 022 §STORE Flow line 128), inverted into `receiver → hashes`.
-/// A pure function over a locked snapshot of the routing table so the
-/// receiver-grouping logic is unit-testable without a network. Returns
-/// an empty map when the table has no peers (e.g. boot before
-/// bootstrap) — the caller then publishes nothing this cycle.
-fn group_by_receiver(
-    table: &RoutingTable,
-    hashes: &[ContentHash],
-) -> HashMap<NodeId, Vec<ContentHash>> {
-    let mut groups: HashMap<NodeId, Vec<ContentHash>> = HashMap::new();
-    for &hash in hashes {
-        for peer in table.closest_unbounded(hash.as_bytes(), REPUBLISH_FANOUT) {
-            groups.entry(peer).or_default().push(hash);
-        }
-    }
-    groups
+/// One republish cycle's `receiver → hashes` grouping, which is also the
+/// admission rule behind the look-ahead in
+/// [`RepublishScheduler::drain_cycle`].
+///
+/// The grouping that admits a hash is the grouping that publishes it:
+/// [`publish_batch`] sends exactly these sets rather than asking the routing
+/// table again. A peer that joins the table between the two steps cannot then
+/// collect uncharged hashes and push its batch past the cap.
+///
+/// A set holds at most `max(cap, due hashes)` because `drain_cycle` presents
+/// every due hash before any look-ahead hash; the type itself does not track
+/// the order.
+#[derive(Debug, Default)]
+struct ReceiverBudget {
+    groups: HashMap<NodeId, Vec<ContentHash>>,
 }
 
-/// Publish a set of due hashes as one `BatchStore` per receiver, split
-/// at the [`MAX_BATCH_STORE_HASHES`] wire cap (ADR 022 §STORE Flow
-/// Batched STORE). Each receiver's batches run in their own task so a
+impl ReceiverBudget {
+    /// Add `hash` to the set of each of `receivers` — its K+3 closest peers
+    /// (ADR 022 §STORE Flow step 1). A `mandatory` hash is always added. A
+    /// look-ahead hash is added only if it has a receiver and no receiver's
+    /// set is already at [`LOOKAHEAD_RECEIVER_CAP`]; otherwise nothing is
+    /// added and the answer is `false`. With no receivers (boot before
+    /// bootstrap) the cycle publishes nothing, so pulling a record forward
+    /// would only spend its refresh.
+    fn admit(&mut self, hash: ContentHash, receivers: &[NodeId], mandatory: bool) -> bool {
+        let full =
+            |peer: &NodeId| self.groups.get(peer).map_or(0, Vec::len) >= LOOKAHEAD_RECEIVER_CAP;
+        if !mandatory && (receivers.is_empty() || receivers.iter().any(full)) {
+            return false;
+        }
+        for peer in receivers {
+            self.groups.entry(*peer).or_default().push(hash);
+        }
+        true
+    }
+
+    /// The per-receiver sets, keeping only the hashes in `held`. A hash the
+    /// due-time gate dropped (evicted, or a store fault) leaves every set, and
+    /// a receiver left with nothing gets no batch.
+    fn into_groups(self, held: &HashSet<ContentHash>) -> HashMap<NodeId, Vec<ContentHash>> {
+        self.groups
+            .into_iter()
+            .filter_map(|(peer, mut hashes)| {
+                hashes.retain(|h| held.contains(h));
+                (!hashes.is_empty()).then_some((peer, hashes))
+            })
+            .collect()
+    }
+}
+
+/// Publish a cycle's `receiver → hashes` sets ([`ReceiverBudget::into_groups`])
+/// as one `BatchStore` per receiver, split at the [`MAX_BATCH_STORE_HASHES`]
+/// wire cap (ADR 022 §STORE Flow Batched STORE). Each receiver's batches run
+/// in their own task so a
 /// slow peer doesn't stall the rest of the sweep. A rejected hash (peer
 /// not staked, over quota) or a failed exchange is logged at debug — the
 /// record retries on the next cycle. Every DHT node implements
@@ -1113,13 +1251,9 @@ fn group_by_receiver(
 async fn publish_batch(
     endpoint: &Endpoint,
     self_node_id: NodeId,
-    routing: &Arc<Mutex<RoutingTable>>,
     cache: &decdn_cache::CacheEngine,
-    hashes: &[ContentHash],
+    groups: HashMap<NodeId, Vec<ContentHash>>,
 ) -> u64 {
-    let groups = with_lock(routing, "dht routing table", |table| {
-        group_by_receiver(table, hashes)
-    });
     if groups.is_empty() {
         // No routing-table entries yet (e.g. boot before bootstrap).
         // Nothing to do this cycle; the scheduler will retry.
@@ -1129,8 +1263,9 @@ async fn publish_batch(
     // receiver's batch — the same rationale as `publish_hash`'s single
     // snapshot: every receiver of a given hash this cycle sees the same
     // coverage rather than a per-batch re-derivation that could drift.
+    let hashes: HashSet<ContentHash> = groups.values().flatten().copied().collect();
     let mut coverage_by_hash = HashMap::with_capacity(hashes.len());
-    for &hash in hashes {
+    for hash in hashes {
         coverage_by_hash.insert(hash, fetch_coverage(cache, hash).await);
     }
     let coverage_by_hash = Arc::new(coverage_by_hash);
@@ -1214,40 +1349,131 @@ mod tests {
         NodeId::from_bytes([b; 32])
     }
 
-    #[test]
-    fn group_by_receiver_sends_every_due_hash_to_each_of_its_closest_peers() {
-        // A table with fewer than REPUBLISH_FANOUT (23) peers means every
-        // peer is within the K+3 closest set of every hash, so each peer's
-        // batch must carry all due hashes exactly once.
+    /// A routing table holding `peers`, behind the lock `plan_cycle` takes.
+    fn table_of(peers: &[u8]) -> Mutex<RoutingTable> {
         let mut table = RoutingTable::new(nid(0x01));
-        for b in [0x10, 0x20, 0x30] {
+        for &b in peers {
             table.insert(nid(b));
         }
-        let hashes = [h(0xA0), h(0xB0)];
-        let groups = group_by_receiver(&table, &hashes);
+        Mutex::new(table)
+    }
+
+    fn micros(d: Duration) -> u64 {
+        u64::try_from(d.as_micros()).unwrap()
+    }
+
+    #[test]
+    fn a_planned_cycle_groups_every_hash_under_each_of_its_closest_peers() {
+        // A table with fewer than REPUBLISH_FANOUT (23) peers means every
+        // peer is within the K+3 closest set of every hash, so each peer's
+        // set must carry every drained hash exactly once — the grouping the
+        // tick path hands to `publish_batch`.
+        let routing = table_of(&[0x10, 0x20, 0x30]);
+        let s = RepublishScheduler::new();
+        let now: u64 = 1_000_000_000;
+        place(&s, h(0xA0), now);
+        place(&s, h(0xB0), now + 1);
+        let (drained, budget) = plan_cycle(&s, &routing, now, &mut None);
+        assert_eq!(drained, vec![h(0xA0), h(0xB0)]);
+        let groups = budget.into_groups(&drained.iter().copied().collect());
         assert_eq!(
             groups.len(),
             3,
             "all three peers are closest to both hashes"
         );
         for b in [0x10, 0x20, 0x30] {
-            let mut got = groups
-                .get(&nid(b))
-                .cloned()
-                .unwrap_or_else(|| panic!("peer {b:#x} missing a batch"));
-            got.sort();
-            let mut want = hashes.to_vec();
-            want.sort();
-            assert_eq!(got, want, "peer {b:#x} must receive every due hash once");
+            assert_eq!(
+                groups.get(&nid(b)),
+                Some(&drained),
+                "peer {b:#x} must receive every drained hash once"
+            );
         }
     }
 
     #[test]
-    fn group_by_receiver_empty_table_yields_no_batches() {
-        // No routing-table peers (e.g. boot before bootstrap): nothing to
-        // publish, so the grouping is empty rather than a panic.
-        let table = RoutingTable::new(nid(0x01));
-        assert!(group_by_receiver(&table, &[h(0xA0)]).is_empty());
+    fn a_planned_cycle_on_an_empty_table_groups_nothing() {
+        // No routing-table peers (e.g. boot before bootstrap): the due record
+        // drains, nothing is pulled forward, and there is no batch to send.
+        let routing = table_of(&[]);
+        let s = RepublishScheduler::new();
+        let now: u64 = 1_000_000_000;
+        place(&s, h(0xA0), now);
+        place(&s, h(0xB0), now + 1);
+        let (drained, budget) = plan_cycle(&s, &routing, now, &mut None);
+        assert_eq!(drained, vec![h(0xA0)]);
+        assert!(
+            budget
+                .into_groups(&drained.into_iter().collect())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_planned_cycle_reaches_exactly_the_lookahead_window() {
+        let routing = table_of(&[0x10]);
+        let s = RepublishScheduler::new();
+        let now: u64 = 1_000_000_000;
+        let window = micros(REPUBLISH_LOOKAHEAD);
+        place(&s, h(1), now);
+        place(&s, h(2), now + window - 1);
+        place(&s, h(3), now + window + 1);
+        let (drained, _) = plan_cycle(&s, &routing, now, &mut None);
+        assert_eq!(drained, vec![h(1), h(2)]);
+        assert_eq!(s.len(), 1, "the record past the window stays scheduled");
+    }
+
+    #[test]
+    fn a_planned_cycle_takes_no_lookahead_right_after_another_cycle() {
+        // The cap bounds one cycle, not two a second apart: a look-ahead
+        // batch right behind a cycle that emptied a receiver's bucket would
+        // have its tail refused.
+        let routing = table_of(&[0x10]);
+        let s = RepublishScheduler::new();
+        let t0: u64 = 1_000_000_000;
+        let spacing = micros(LOOKAHEAD_MIN_SPACING);
+        place(&s, h(1), t0);
+        place(&s, h(2), t0 + 1_000_000);
+        place(&s, h(3), t0 + 1_000_001);
+        // Due only after the third cycle, so only the look-ahead takes them.
+        let t3 = t0 + 1_000_000 + spacing;
+        place(&s, h(4), t3 + 10);
+        place(&s, h(5), t3 + 11);
+        let mut last = Some(t0 - 1);
+        assert_eq!(
+            plan_cycle(&s, &routing, t0, &mut last).0,
+            vec![h(1)],
+            "a cycle 1 µs after the last one takes only its due record"
+        );
+        assert_eq!(last, Some(t0), "a non-empty cycle moves the mark");
+        assert_eq!(
+            plan_cycle(&s, &routing, t0 + 1_000_000, &mut last).0,
+            vec![h(2)],
+            "1 s later: still too close, due records only"
+        );
+        assert_eq!(
+            plan_cycle(&s, &routing, t3, &mut last).0,
+            vec![h(3), h(4), h(5)],
+            "a full spacing later the look-ahead runs again"
+        );
+    }
+
+    #[test]
+    fn a_due_set_of_only_tombstones_does_not_unlock_the_lookahead() {
+        let s = RepublishScheduler::new();
+        let now: u64 = 1_000_000_000;
+        place(&s, h(1), now);
+        s.unschedule(&h(1));
+        place(&s, h(2), now + 1);
+        assert!(s.drain_cycle(now, now + 10, |_, _| true).is_empty());
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn the_receiver_cap_fits_the_default_per_peer_burst() {
+        // A full look-ahead batch must fit the burst a receiver on the
+        // ADR 022 defaults grants one publisher.
+        let burst = crate::dht::rate_limit::DhtRateLimitConfig::default().per_peer_burst;
+        assert!(LOOKAHEAD_RECEIVER_CAP < usize::try_from(burst).unwrap());
     }
 
     #[test]
@@ -1289,6 +1515,160 @@ mod tests {
         s.unschedule(&h(1));
         let drained = s.drain_due(now_us());
         assert!(drained.is_empty());
+    }
+
+    /// Place `hash` at an exact `due_us`, so a look-ahead test controls the
+    /// order and spacing of due times rather than drawing them from jitter.
+    fn place(s: &RepublishScheduler, hash: ContentHash, due_us: u64) {
+        let (mut heap, mut scheduled) = (s.heap.lock().unwrap(), s.scheduled.lock().unwrap());
+        scheduled.insert(hash, due_us);
+        schedule_at(&mut heap, hash, due_us);
+    }
+
+    /// A budget where every hash has the one receiver `nid(0x99)` — the
+    /// N ≤ K+3 shape, where every hash goes to every peer.
+    fn one_receiver(budget: &mut ReceiverBudget) -> impl FnMut(&ContentHash, bool) -> bool + '_ {
+        |hash, mandatory| budget.admit(*hash, &[nid(0x99)], mandatory)
+    }
+
+    #[test]
+    fn lookahead_does_not_run_on_a_tick_with_nothing_due() {
+        // Pulling records forward on an idle tick would only shift the whole
+        // schedule earlier and batch nothing.
+        let s = RepublishScheduler::new();
+        let now: u64 = 1_000_000_000;
+        place(&s, h(1), now + 1);
+        place(&s, h(2), now + 2);
+        let mut budget = ReceiverBudget::default();
+        assert!(
+            s.drain_cycle(now, now + 10, one_receiver(&mut budget))
+                .is_empty()
+        );
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn lookahead_takes_records_due_by_the_horizon_in_due_order() {
+        let s = RepublishScheduler::new();
+        let now: u64 = 1_000_000_000;
+        place(&s, h(3), now + 5);
+        place(&s, h(1), now);
+        place(&s, h(2), now + 3);
+        place(&s, h(4), now + 11); // past the horizon
+        let mut budget = ReceiverBudget::default();
+        assert_eq!(
+            s.drain_cycle(now, now + 10, one_receiver(&mut budget)),
+            vec![h(1), h(2), h(3)]
+        );
+        assert_eq!(s.len(), 1, "the record past the horizon stays scheduled");
+    }
+
+    #[test]
+    fn lookahead_stops_at_the_receiver_cap_and_leaves_the_rest_scheduled() {
+        let s = RepublishScheduler::new();
+        let now: u64 = 1_000_000_000;
+        place(&s, h(0), now);
+        for b in 1u8..=40 {
+            place(&s, h(b), now + u64::from(b));
+        }
+        let mut budget = ReceiverBudget::default();
+        let drained = s.drain_cycle(now, now + 100, one_receiver(&mut budget));
+        let want: Vec<ContentHash> = (0u8..32).map(h).collect();
+        assert_eq!(drained, want, "the due record plus 31 pulled forward");
+        assert_eq!(s.len(), 9, "the refused record and every later one stay");
+
+        // They still drain at their own due times.
+        let mut budget = ReceiverBudget::default();
+        assert_eq!(
+            s.drain_cycle(now + 40, now + 40, one_receiver(&mut budget)),
+            (32u8..=40).map(h).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn due_records_past_the_cap_still_drain_but_take_no_lookahead() {
+        let s = RepublishScheduler::new();
+        let now: u64 = 1_000_000_000;
+        for b in 0u8..40 {
+            place(&s, h(b), now.saturating_sub(u64::from(b)));
+        }
+        place(&s, h(200), now + 1);
+        let mut budget = ReceiverBudget::default();
+        assert_eq!(
+            s.drain_cycle(now, now + 10, one_receiver(&mut budget))
+                .len(),
+            40
+        );
+        assert_eq!(s.len(), 1, "the look-ahead record waits for its due time");
+    }
+
+    #[test]
+    fn a_tombstone_in_the_lookahead_window_is_skipped_and_not_charged() {
+        let s = RepublishScheduler::new();
+        let now: u64 = 1_000_000_000;
+        place(&s, h(1), now);
+        place(&s, h(2), now + 1);
+        s.unschedule(&h(2));
+        place(&s, h(3), now + 2);
+        let mut charged = Vec::new();
+        let drained = s.drain_cycle(now, now + 10, |hash, _| {
+            charged.push(*hash);
+            true
+        });
+        assert_eq!(drained, vec![h(1), h(3)]);
+        assert_eq!(charged, vec![h(1), h(3)]);
+    }
+
+    #[test]
+    fn receiver_budget_caps_each_receiver_independently() {
+        let mut budget = ReceiverBudget::default();
+        for b in 0..LOOKAHEAD_RECEIVER_CAP {
+            assert!(budget.admit(h(u8::try_from(b).unwrap()), &[nid(0xA)], false));
+        }
+        assert!(!budget.admit(h(0xE0), &[nid(0xA)], false), "A is full");
+        assert!(
+            !budget.admit(h(0xE1), &[nid(0xA), nid(0xB)], false),
+            "one full receiver refuses the hash"
+        );
+        assert!(
+            budget.admit(h(0xE2), &[nid(0xB)], false),
+            "B still has room"
+        );
+        assert!(
+            budget.admit(h(0xE3), &[nid(0xA)], true),
+            "a due record ignores the cap"
+        );
+        let groups = budget.into_groups(&(0u8..=0xFF).map(h).collect());
+        assert_eq!(groups[&nid(0xA)].len(), LOOKAHEAD_RECEIVER_CAP + 1);
+        assert_eq!(
+            groups[&nid(0xB)],
+            vec![h(0xE2)],
+            "a refused hash joins no set, not even a receiver with room"
+        );
+    }
+
+    #[test]
+    fn receiver_budget_refuses_lookahead_with_no_receivers() {
+        let mut budget = ReceiverBudget::default();
+        assert!(!budget.admit(h(1), &[], false));
+        assert!(budget.admit(h(2), &[], true));
+        assert!(
+            budget
+                .into_groups(&[h(1), h(2)].into_iter().collect())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn receiver_budget_groups_drop_hashes_the_due_time_gate_removed() {
+        // An evicted or faulted hash leaves every set, and a receiver whose
+        // set empties gets no batch.
+        let mut budget = ReceiverBudget::default();
+        assert!(budget.admit(h(1), &[nid(0xA), nid(0xB)], true));
+        assert!(budget.admit(h(2), &[nid(0xB)], true));
+        let groups = budget.into_groups(&std::iter::once(h(2)).collect());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[&nid(0xB)], vec![h(2)]);
     }
 
     #[test]
