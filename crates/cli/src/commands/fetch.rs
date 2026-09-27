@@ -4758,10 +4758,9 @@ where
 ///
 /// It reflects redeemed vouchers only, so a provider still holding one it has
 /// not redeemed is ahead of it. That gap repairs itself inside the fetch: the
-/// provider answers the first voucher below its own watermark with that
-/// watermark (the wallet-less resume, #1946), and the driver reseeds from it —
-/// unless the provider is serving more than one stream on the lane, or the
-/// resume budget is spent, where the fetch fails. Resuming below the chain
+/// provider answers the first stale proof that its lane headroom cannot pay
+/// with that watermark (the wallet-less resume, #1946), and the driver reseeds
+/// from it — unless the resume budget is spent, where the fetch fails. Resuming below the chain
 /// watermark has no such repair: every voucher at or below it redeems nothing
 /// on chain, whatever the provider does.
 async fn lane_watermark<P>(

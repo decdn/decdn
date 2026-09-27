@@ -431,6 +431,7 @@ pub decdn_client::EpochAction::Open
 pub decdn_client::EpochAction::Roll
 pub enum decdn_client::Metered
 pub decdn_client::Metered::Exhausted
+pub decdn_client::Metered::Moved
 pub decdn_client::Metered::Released(decdn_client::Released)
 pub enum decdn_client::PaceDecision
 pub decdn_client::PaceDecision::Done
@@ -641,7 +642,7 @@ pub fn decdn_client::PoolLedger::chain_root(&self) -> core::option::Option<alloy
 pub fn decdn_client::PoolLedger::committed(&self) -> decdn_client::Cumulative
 pub fn decdn_client::PoolLedger::generation(&self) -> u64
 pub async fn decdn_client::PoolLedger::issue<F, Fut>(&self, u64, u64, decdn_client::EpochAction, F) -> anyhow::Result<decdn_client::Cumulative> where F: core::ops::function::FnOnce(decdn_client::Cumulative, decdn_client::ChainCommit) -> Fut, Fut: core::future::future::Future<Output = anyhow::Result<()>>
-pub async fn decdn_client::PoolLedger::meter<F, Fut>(&self, F) -> anyhow::Result<decdn_client::Metered> where F: core::ops::function::FnOnce(decdn_client::Released) -> Fut, Fut: core::future::future::Future<Output = anyhow::Result<()>>
+pub async fn decdn_client::PoolLedger::meter<F, Fut>(&self, core::option::Option<alloy_primitives::aliases::B256>, F) -> anyhow::Result<decdn_client::Metered> where F: core::ops::function::FnOnce(decdn_client::Released) -> Fut, Fut: core::future::future::Future<Output = anyhow::Result<()>>
 pub fn decdn_client::PoolLedger::new(decdn_client::Cumulative) -> Self
 pub async fn decdn_client::PoolLedger::rebase(&self, decdn_client::Cumulative, core::option::Option<u64>) -> decdn_client::Rebase
 pub fn decdn_client::PoolLedger::reseed(&self, decdn_client::Cumulative) -> bool

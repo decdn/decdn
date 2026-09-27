@@ -4,14 +4,13 @@
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
-    FirstMessage, FloorRefusal, FloorRefusalSite, FloorReservation, Hash, LaneKey, LaneSlot,
+    FirstMessage, FloorRefusal, FloorRefusalSite, FloorReservation, Hash, LaneKey,
     OwnedSemaphorePermit, PublicKey, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore,
     SendStream, ServeRejectReason, StreamReadError, StreamRequest, StreamResponseBody, U256,
     VarInt, read_first_message, reset_stream, verify_binding,
 };
 use arc_swap::ArcSwapOption;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::Ordering;
 use tokio::task::{JoinError, JoinSet};
 
 use futures_util::FutureExt as _;
@@ -611,29 +610,6 @@ impl ClientHandler {
             None => None,
         };
 
-        // Per-lane active-stream counter. Runs ONCE here, before any serve-path branch,
-        // so every delivered stream — cache hit, backend-origin miss, window
-        // pull-through miss, or buffered miss — is counted. The count is not a solvency
-        // gate: the per-pool ceiling and the per-signer live cap (both in
-        // `try_reserve_floor`, ADR 003 §Pool solvency) bound un-vouchered floor across
-        // and within lanes. The count exists for the wallet-less-resume heal
-        // (`commit_one_proof`), which reads `active_streams` to tell a lone wedged
-        // stream from a concurrent-sibling out-of-order voucher without depending on
-        // chain data.
-        //
-        // Incremented under the lane lock so concurrent first-streams on a fresh lane
-        // share one counter. `LaneSlot`'s drop releases the slot on every exit (success,
-        // `?`, disconnect, panic).
-        let mut lane_slot: Option<LaneSlot> = None;
-        if let Some(lane) = known_lane.as_ref() {
-            let guard = lane.lock().await;
-            let active = guard.active_streams.clone();
-            active.fetch_add(1, Ordering::Relaxed);
-            drop(guard);
-            lane_slot = Some(LaneSlot::new(active));
-        }
-        let _lane_slot = lane_slot;
-
         // Per-pool cumulative floor-credit admission reservation (ADR 003 §Pool
         // solvency, stateful-B). It sums floor credit across ALL distinct lanes on
         // the pool and bounds it to `remaining − M`, closing the fan-out hole where
@@ -702,8 +678,7 @@ impl ClientHandler {
         // The initial `None` is unread on every live path (both branches below
         // either shed and return or overwrite it, and the audit `Err` returns
         // too) — kept anyway so the slot's declared type and its
-        // `Drop`-at-fn-scope binding below read the same as the `lane_slot`
-        // admission guard above.
+        // `Drop`-at-fn-scope binding stay explicit.
         #[allow(unused_assignments)]
         let mut shed_slot: Option<crate::load_shed::ShedSlot> = None;
         // The gate's class. The shed gate admits under it and the first-byte clock

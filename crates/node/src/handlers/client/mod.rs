@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -124,19 +124,15 @@ const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
 #[derive(Debug)]
 struct LaneDeliveryState {
     state: LaneState,
-    /// Lane-wide cumulative bytes delivered as of the last accepted voucher.
+    /// Lane-wide cumulative bytes the lane's claim covers: the signed bytes
+    /// extended by the chunks the chain has proved.
     bytes_delivered_cumulative: U256,
     /// Cumulative wire bytes CREDITED to streams' paid headroom on this lane
-    /// (design rule #1). Monotone and never exceeds `bytes_delivered_cumulative`
-    /// (the settled watermark), so a benign already-satisfied voucher — which
-    /// does not raise the watermark — can only advance a stream's window for
-    /// bytes the lane has actually settled, never for unpaid delivered bytes.
+    /// (design rule #1). Monotone and never exceeds the chain-extended watermark
+    /// the lane has settled, so a benign already-satisfied proof — which does
+    /// not raise the watermark — can only advance a stream's window for bytes
+    /// the lane has actually settled, never for unpaid delivered bytes.
     paid_credited: U256,
-    /// Count of same-lane streams currently admitted and delivering. The serve-path
-    /// admission gate charges each already-active stream one credit-window floor of
-    /// pool headroom; a [`LaneSlot`] decrements this on every serve exit path. Shared
-    /// as an `Arc` so the guard releases lock-free without re-taking the lane mutex.
-    active_streams: Arc<AtomicU32>,
     /// Wall-clock (Unix milliseconds) of the last accepted voucher on this lane,
     /// or `0` when this process has accepted none since it hydrated the lane
     /// (issue #1733). Stamped by [`ClientHandler::commit_one_proof`] under the
@@ -146,6 +142,29 @@ struct LaneDeliveryState {
     /// it gates nothing, and the stamp lifecycle follows the lane row (a
     /// forgotten lane drops it automatically).
     last_voucher_at: AtomicU64,
+}
+
+impl LaneDeliveryState {
+    /// The delivery state for a lane this process loads or registers, with its
+    /// whole claim — signed bytes and proved chain frontier — already credited.
+    ///
+    /// Every byte the lane's claim covers was delivered before this entry
+    /// existed — by an earlier process, or before the lane was last forgotten —
+    /// to a stream that either took the credit or ended with it unclaimed. No
+    /// stream outlives the entry it drew on. A new stream delivers
+    /// only new bytes, so none of that claim is headroom it may draw on.
+    /// Crediting only the signed half would hand each restart the proved
+    /// frontier — up to a whole chain — as free credit for proofs that pay
+    /// nothing.
+    fn hydrated(state: LaneState) -> Self {
+        let owed_bytes = state.owed_bytes();
+        Self {
+            state,
+            bytes_delivered_cumulative: owed_bytes,
+            paid_credited: owed_bytes,
+            last_voucher_at: AtomicU64::new(0),
+        }
+    }
 }
 
 /// Read handle over the client handler's live lane registry, exposing each
@@ -229,7 +248,6 @@ impl LaneActivityClock {
                     state,
                     bytes_delivered_cumulative: U256::ZERO,
                     paid_credited: U256::ZERO,
-                    active_streams: Arc::new(AtomicU32::new(0)),
                     last_voucher_at: AtomicU64::new(now),
                 })),
             );
@@ -263,36 +281,6 @@ impl ClientHandler {
         LaneActivityClock {
             lanes: Arc::clone(&self.lanes),
         }
-    }
-}
-
-/// RAII slot for one admitted same-lane stream. Created under the lane lock after
-/// the admission gate increments [`LaneDeliveryState::active_streams`]; its `Drop`
-/// decrements the same counter on every serve exit — success, error, `?`-return,
-/// client disconnect, panic — so a finished stream always frees its slot. A leaked
-/// slot would make the lane refuse new streams forever, so the count is owned by
-/// this guard, never decremented by hand.
-struct LaneSlot {
-    counter: Arc<AtomicU32>,
-}
-
-impl LaneSlot {
-    const fn new(counter: Arc<AtomicU32>) -> Self {
-        Self { counter }
-    }
-}
-
-impl Drop for LaneSlot {
-    fn drop(&mut self) {
-        // Saturating decrement. A slot exists only paired with a prior increment,
-        // so the counter is never 0 here today; the saturating floor keeps a future
-        // unpaired slot from underflowing `u32::MAX` and wedging the lane (every
-        // admission then refused) rather than failing safe.
-        let _ = self
-            .counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(1))
-            });
     }
 }
 
@@ -396,9 +384,8 @@ impl PoolFloorState {
 /// once THIS stream's cumulative payment reaches the reserved floor. On drop (every
 /// exit path — success, `?`, disconnect, panic) the guard releases the live
 /// reservation if it was not already repaid, so an abandoned stream never holds a
-/// pool's floor headroom past its own lifetime. Mirrors [`LaneSlot`]: the
-/// reservation is owned by the guard and never adjusted by hand, and every counter
-/// update saturates.
+/// pool's floor headroom past its own lifetime. The reservation is owned by the
+/// guard and never adjusted by hand, and every counter update saturates.
 #[must_use = "dropping the guard at once releases its live reservation"]
 pub(super) struct FloorReservation {
     map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
@@ -1420,16 +1407,9 @@ impl ClientHandler {
     pub fn new(deps: ClientHandlerDeps) -> anyhow::Result<Self> {
         let map: DashMap<LaneKey, Arc<Mutex<LaneDeliveryState>>> = DashMap::new();
         for state in deps.channel_state_store.load_all()? {
-            let bytes = state.last_bytes_delivered();
             map.insert(
                 state.key(),
-                Arc::new(Mutex::new(LaneDeliveryState {
-                    state,
-                    bytes_delivered_cumulative: bytes,
-                    paid_credited: bytes,
-                    active_streams: Arc::new(AtomicU32::new(0)),
-                    last_voucher_at: AtomicU64::new(0),
-                })),
+                Arc::new(Mutex::new(LaneDeliveryState::hydrated(state))),
             );
         }
         // Seed the atomic lane counter once at hydrate; `register_lane` /
@@ -1804,18 +1784,11 @@ impl ClientHandler {
         // periodic lane flush doing the disk work.
         self.channel_state_store.record(&state)?;
 
-        let bytes = state.last_bytes_delivered();
         // Only a REAL insertion (a vacant slot) tunes the lane gauge — the
         // entry guard is atomic, so racing first-streams on one lane still
         // count it once.
         if let dashmap::mapref::entry::Entry::Vacant(entry) = self.lanes.entry(key) {
-            entry.insert(Arc::new(Mutex::new(LaneDeliveryState {
-                state,
-                bytes_delivered_cumulative: bytes,
-                paid_credited: bytes,
-                active_streams: Arc::new(AtomicU32::new(0)),
-                last_voucher_at: AtomicU64::new(0),
-            })));
+            entry.insert(Arc::new(Mutex::new(LaneDeliveryState::hydrated(state))));
             self.tune_lane_gauge(1);
         }
         Ok(())
@@ -2680,6 +2653,52 @@ pub(super) async fn handler_over_store(
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// #2171: a lane loaded from the store counts its whole claim — the signed
+    /// bytes AND the chunks its chain proved — as already credited. Crediting
+    /// only the signed half would reopen the proved frontier as headroom for any
+    /// stream whose proofs pay nothing.
+    #[tokio::test]
+    async fn a_loaded_lane_counts_its_proved_frontier_as_credited() {
+        use decdn_incentive::chain::{CHUNK_BYTES, preimage_at, root_from_seed};
+
+        let seed = B256::repeat_byte(0x5E);
+        let lane = LaneState::hydrate(
+            B256::repeat_byte(0x21),
+            Address::repeat_byte(0x33),
+            Address::repeat_byte(0x55),
+            U256::MAX,
+            0,
+            U256::from(3_000u64),
+            U256::from(3 * CHUNK_BYTES),
+            Some([9u8; 65]),
+            decdn_incentive::LaneChain {
+                chain_root: root_from_seed(seed),
+                chunk_price: U256::from(1_000u64),
+                verified_index: 5,
+                tip: preimage_at(seed, 5),
+            },
+        );
+        let owed_bytes = lane.owed_bytes();
+        assert_eq!(owed_bytes, U256::from(8 * CHUNK_BYTES));
+
+        let store = Arc::new(decdn_incentive::store::MemoryPoolStateStore::new());
+        store.record(&lane).expect("record the seeded lane");
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_over_store(&metrics, store).await;
+
+        let loaded = handler
+            .lanes
+            .get(&lane.key())
+            .map(|e| Arc::clone(e.value()))
+            .expect("the handler loads the stored lane");
+        let guard = loaded.lock().await;
+        assert_eq!(
+            guard.paid_credited, owed_bytes,
+            "the whole claim is credited"
+        );
+        assert_eq!(guard.bytes_delivered_cumulative, owed_bytes);
+    }
 
     /// A client that sends garbage on the proof stream is a peer fault, not a node
     /// bug: it must reach `debug!`, not the node-fault counter. The `ProbeRequest`
@@ -3732,22 +3751,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lane_slot_decrements_counter_on_drop() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        let counter = Arc::new(AtomicU32::new(0));
-        counter.fetch_add(1, Ordering::Relaxed); // caller increments under lock
-        {
-            let _slot = LaneSlot::new(counter.clone());
-            assert_eq!(counter.load(Ordering::Relaxed), 1);
-        }
-        assert_eq!(
-            counter.load(Ordering::Relaxed),
-            0,
-            "slot must release on drop"
-        );
-    }
-
     /// Lock the floor map for a test assertion, surfacing a poisoned lock as an
     /// `anyhow` error rather than panicking (the anti-panic policy holds in tests).
     /// The capability signer every floor-accumulator unit test reserves under.
@@ -4438,7 +4441,6 @@ mod tests {
                 ),
                 bytes_delivered_cumulative: U256::ZERO,
                 paid_credited: U256::ZERO,
-                active_streams: Arc::new(AtomicU32::new(0)),
                 last_voucher_at: AtomicU64::new(stamp),
             }))
         };

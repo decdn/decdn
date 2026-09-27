@@ -353,8 +353,9 @@ pub enum EpochAction {
     /// root, or a **sealed** section if it holds none. Opens nothing.
     ///
     /// This is what a per-stream re-anchor and a closing residual voucher both
-    /// use. Re-asserting a root the node already holds is free, because an
-    /// at-or-below-watermark voucher is already-satisfied rather than rejected,
+    /// use. Re-asserting a root the node already holds is free, because a
+    /// metering voucher at or below the watermark is already-satisfied and pays
+    /// no whole chunk, so the node never rejects it,
     /// and settling a partial trailing chunk this way leaves the chain live for
     /// every sibling stream on the lane — which sealing would not.
     Keep,
@@ -410,6 +411,10 @@ pub enum Metered {
     /// The epoch has no index left (or the lane holds no chain). Nothing was
     /// sent; the caller signs a rollover voucher and meters again.
     Exhausted,
+    /// The lane meters a chain other than the one the stream is anchored to: a
+    /// sibling rolled the lane after the stream anchored. Nothing was sent; the
+    /// caller re-anchors the stream and meters again.
+    Moved,
 }
 
 /// One lane's live voucher ledger, shared by every concurrent stream that draws
@@ -852,6 +857,13 @@ impl PoolLedger {
     /// does, so concurrent streams on one lane release strictly deepening
     /// indices and never two values at the same depth.
     ///
+    /// `anchored` is the root the calling stream last carried a voucher for.
+    /// The node places a reveal against that root, so a reveal from any other
+    /// chain folds nothing there. The check runs under the issuance lock, which
+    /// is the only place the live root cannot move: a sibling can roll the lane
+    /// between the stream's anchor and this tick. Returns [`Metered::Moved`]
+    /// **without sending anything** when the live root differs.
+    ///
     /// Returns [`Metered::Exhausted`] **without sending anything** when the
     /// epoch has no index left. The caller then signs a rollover voucher
     /// ([`EpochAction::Roll`]) — whose amount already folds this chain's
@@ -863,7 +875,11 @@ impl PoolLedger {
     /// Propagates an `exchange` failure. The index is NOT consumed on a failed
     /// send: an unreleased preimage proves nothing, so re-releasing the same
     /// index later is both safe and correct.
-    pub async fn meter<F, Fut>(&self, exchange: F) -> anyhow::Result<Metered>
+    pub async fn meter<F, Fut>(
+        &self,
+        anchored: Option<B256>,
+        exchange: F,
+    ) -> anyhow::Result<Metered>
     where
         F: FnOnce(Released) -> Fut,
         Fut: Future<Output = anyhow::Result<()>>,
@@ -874,6 +890,9 @@ impl PoolLedger {
             let Some(live) = slot.as_ref() else {
                 return Ok(Metered::Exhausted);
             };
+            if anchored != Some(live.root()) {
+                return Ok(Metered::Moved);
+            }
             let Some(index) = live.next_index() else {
                 return Ok(Metered::Exhausted);
             };
@@ -1301,7 +1320,9 @@ mod tests {
             .issue(0, 10, EpochAction::Open, |_n, _c| async { Ok(()) })
             .await?;
         let anchor = ledger.committed();
-        ledger.meter(|_r| async { Ok(()) }).await?;
+        ledger
+            .meter(ledger.chain_root(), |_r| async { Ok(()) })
+            .await?;
         let chunk = ledger.committed().minus(anchor);
         assert!(!chunk.amount.is_zero(), "a reveal accrues one chunk");
 
@@ -1317,7 +1338,9 @@ mod tests {
         let armed = sent.ok_or_else(|| anyhow::anyhow!("issue never reached the send"))?;
 
         // A sibling releases a reveal on the rolled chain before the confirm.
-        ledger.meter(|_r| async { Ok(()) }).await?;
+        ledger
+            .meter(ledger.chain_root(), |_r| async { Ok(()) })
+            .await?;
         let owed_before_confirm = ledger.committed();
 
         assert_eq!(ledger.confirm_armed(armed.amount).await, Some(armed));
@@ -1485,6 +1508,9 @@ mod tests {
                 index: released.index,
             }),
             Metered::Exhausted => anyhow::bail!("the epoch was exhausted; nothing was released"),
+            Metered::Moved => {
+                anyhow::bail!("the lane moved to another chain; nothing was released")
+            }
         }
     }
 
@@ -1504,8 +1530,12 @@ mod tests {
             .issue(1_000, 10, EpochAction::Open, |_n, _c| async { Ok(()) })
             .await?;
         let anchor = ledger.committed();
-        ledger.meter(|_r| async { Ok(()) }).await?;
-        let second = ledger.meter(|_r| async { Ok(()) }).await?;
+        ledger
+            .meter(ledger.chain_root(), |_r| async { Ok(()) })
+            .await?;
+        let second = ledger
+            .meter(ledger.chain_root(), |_r| async { Ok(()) })
+            .await?;
         let two_reveals = ledger.committed();
         assert!(two_reveals.amount > anchor.amount);
 
@@ -1552,14 +1582,18 @@ mod tests {
             .await?;
         let mut last = None;
         for _ in 0..3u8 {
-            last = Some(ledger.meter(|_r| async { Ok(()) }).await?);
+            last = Some(
+                ledger
+                    .meter(ledger.chain_root(), |_r| async { Ok(()) })
+                    .await?,
+            );
         }
         let third = last.ok_or_else(|| anyhow::anyhow!("no reveal was released"))?;
         assert!(ledger.resolve_reject(reveal_proof(third)?));
 
         let next = std::sync::Mutex::new(None);
         ledger
-            .meter(|r| {
+            .meter(ledger.chain_root(), |r| {
                 *next
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(r.index);
@@ -1571,6 +1605,49 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             Some(3),
             "the refused depth is released again, not skipped"
+        );
+        Ok(())
+    }
+
+    /// A stream anchored to a chain a sibling has since rolled away from gets
+    /// `Moved` from `meter`: the node would place its reveal against the old
+    /// root and fold nothing. Nothing goes on the wire and nothing accrues, so
+    /// the stream re-anchors and meters again.
+    #[tokio::test]
+    async fn a_reveal_under_a_moved_root_is_not_released() -> anyhow::Result<()> {
+        let ledger = metered_ledger(Cumulative::default());
+        ledger
+            .issue(0, 10, EpochAction::Open, |_n, _c| async { Ok(()) })
+            .await?;
+        let anchored = ledger.chain_root();
+        ledger.meter(anchored, |_r| async { Ok(()) }).await?;
+        // A sibling rolls the lane.
+        ledger
+            .issue(0, 10, EpochAction::Roll, |_n, _c| async { Ok(()) })
+            .await?;
+        anyhow::ensure!(
+            ledger.chain_root() != anchored,
+            "the roll opens a new chain"
+        );
+        let before = ledger.settlement();
+
+        let mut sent = false;
+        let metered = ledger
+            .meter(anchored, |_r| {
+                sent = true;
+                async { Ok(()) }
+            })
+            .await?;
+        assert_eq!(metered, Metered::Moved);
+        assert!(!sent, "no reveal goes on the wire");
+        assert_eq!(ledger.settlement(), before, "nothing accrues");
+
+        let live = ledger
+            .meter(ledger.chain_root(), |_r| async { Ok(()) })
+            .await?;
+        assert!(
+            matches!(live, Metered::Released(_)),
+            "the re-anchored stream meters the live chain: {live:?}"
         );
         Ok(())
     }
@@ -1593,7 +1670,9 @@ mod tests {
             .issue(0, 10, EpochAction::Open, |_n, _c| async { Ok(()) })
             .await?;
         // Stream A releases a reveal.
-        let a_reveal = ledger.meter(|_r| async { Ok(()) }).await?;
+        let a_reveal = ledger
+            .meter(ledger.chain_root(), |_r| async { Ok(()) })
+            .await?;
         // Stream B rolls; the node accepts the rollover (continued delivery IS
         // acceptance), so the lane's anchor is now B's.
         ledger
@@ -1634,7 +1713,9 @@ mod tests {
             .issue(0, 10, EpochAction::Open, |_n, _c| async { Ok(()) })
             .await?;
         let live = ledger.chain_root();
-        ledger.meter(|_r| async { Ok(()) }).await?;
+        ledger
+            .meter(ledger.chain_root(), |_r| async { Ok(()) })
+            .await?;
 
         let rolled = ledger
             .issue(0, 10, EpochAction::Roll, |_n, _c| async { Ok(()) })

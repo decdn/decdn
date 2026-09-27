@@ -2367,9 +2367,9 @@ pub(crate) enum Healed {
     /// the node never accepted. [`PoolLedger::rebase`] moved us down to it.
     Rebased,
     /// The ledger has already healed past this rejection: an `Underpaid` for a
-    /// voucher signed before the latest rebase, or an `UnderFold` whose bundle a
-    /// sibling stream already reseeded to. Nothing moved, and the pull retries
-    /// from the healed anchor.
+    /// voucher signed before the latest rebase, or an `UnderFold` or
+    /// `AmountRegression` whose bundle a sibling stream already reseeded to.
+    /// Nothing moved, and the pull retries from the healed anchor.
     Stale,
 }
 
@@ -2385,19 +2385,22 @@ pub(crate) fn rejection_watermark(err: &anyhow::Error, ctx: &PoolContext) -> Opt
 /// `None` when it proves no desync and the caller must surface the real error.
 ///
 /// A bundle ahead of our committed watermark reseeds, whatever the reason. A
-/// bundle behind it heals only on [`VoucherRejectReason::Underpaid`], and only
-/// for a voucher signed under the ledger's current generation; see
-/// [`PoolLedger::rebase`]. A bundle that merely echoes our own watermark proves
-/// no desync: the node attaches one to every watermark-gated rejection once a
-/// voucher is accepted, so an exhausted lane echoes it straight back.
+/// bundle at or behind it rebases only on [`VoucherRejectReason::Underpaid`],
+/// and only for a voucher signed under the ledger's current generation; see
+/// [`PoolLedger::rebase`]. On [`VoucherRejectReason::UnderFold`] or
+/// [`VoucherRejectReason::AmountRegression`] it retries without moving the
+/// ledger (below). On every other reason it proves no desync: the node attaches
+/// a bundle to every watermark-gated rejection once a voucher is accepted, so an
+/// exhausted lane echoes our own watermark straight back.
 ///
-/// An [`VoucherRejectReason::UnderFold`] whose folded bundle does not advance
-/// our amount splits two ways. When our ledger already covers the bundle on
-/// both axes, a sibling stream took the same rejection and reseeded first, so
-/// the stream retries ([`Healed::Stale`]). When it covers the amount but not
-/// the bytes, the voucher paid the node's whole claim but signed fewer bytes
-/// than the chain proved. No bundle can heal that; it is terminal and logged
-/// at `warn!`.
+/// An `UnderFold` or `AmountRegression` whose folded bundle does not advance our
+/// amount splits two ways. Both reasons say a proof trailed the node's
+/// watermark. When our ledger already covers the bundle on both axes, the ledger
+/// moved past the rejected proof after it went out — usually a sibling stream
+/// took the same rejection and reseeded first — so the stream retries
+/// ([`Healed::Stale`]). When it covers the amount but not the bytes, the ledger
+/// paid the node's whole claim but signed fewer bytes than the node holds. No
+/// bundle can heal that; it is terminal and logged at `warn!`.
 pub(crate) async fn heal_watermark_desync(
     err: &anyhow::Error,
     watermark: Cumulative,
@@ -2412,8 +2415,11 @@ pub(crate) async fn heal_watermark_desync(
         return Some(Healed::Reseeded);
     }
     let rejected = err.downcast_ref::<UpstreamVoucherRejected>()?;
-    if rejected.reason == VoucherRejectReason::UnderFold {
-        return under_fold_already_covered(watermark, ledger);
+    if matches!(
+        rejected.reason,
+        VoucherRejectReason::UnderFold | VoucherRejectReason::AmountRegression
+    ) {
+        return already_covered(watermark, ledger);
     }
     if rejected.reason != VoucherRejectReason::Underpaid {
         return None;
@@ -2422,18 +2428,33 @@ pub(crate) async fn heal_watermark_desync(
     rebase_outcome(outcome, watermark, rejected.proof_generation)
 }
 
-/// Resolve an `UnderFold` whose folded bundle does not advance our amount. When
-/// our ledger covers its bytes too, a sibling stream reseeded to the same bundle
-/// first, and the stream retries. Otherwise the voucher folded the amount but not
+/// Resolve a trailing-proof rejection (`UnderFold` or `AmountRegression`) whose
+/// folded bundle does not advance our amount. When our ledger covers its bytes
+/// too, the ledger moved past the rejected proof, and the stream retries. A
+/// ledger exactly at the bundle is the common case: a sibling stream reseeded
+/// to the same bundle first. A ledger past it has advanced since, or holds
+/// vouchers the node never accepted; the retry then either proceeds or draws
+/// the reason that says which. Otherwise the ledger covers the amount but not
 /// the bytes, which no bundle can heal.
-fn under_fold_already_covered(watermark: Cumulative, ledger: &PoolLedger) -> Option<Healed> {
+fn already_covered(watermark: Cumulative, ledger: &PoolLedger) -> Option<Healed> {
     let committed = ledger.committed();
     if committed.bytes >= watermark.bytes {
-        tracing::debug!(
-            amount = %watermark.amount,
-            bytes = %watermark.bytes,
-            "under-fold rejection already healed by a sibling stream; retrying"
-        );
+        if committed == watermark {
+            tracing::debug!(
+                amount = %watermark.amount,
+                bytes = %watermark.bytes,
+                "trailing-proof rejection already healed by a sibling stream; retrying"
+            );
+        } else {
+            tracing::debug!(
+                bundle_amount = %watermark.amount,
+                bundle_bytes = %watermark.bytes,
+                committed_amount = %committed.amount,
+                committed_bytes = %committed.bytes,
+                "trailing-proof rejection carried a watermark our ledger is already past; \
+                 retrying from the ledger"
+            );
+        }
         return Some(Healed::Stale);
     }
     tracing::warn!(
@@ -2441,8 +2462,8 @@ fn under_fold_already_covered(watermark: Cumulative, ledger: &PoolLedger) -> Opt
         bundle_bytes = %watermark.bytes,
         committed_amount = %committed.amount,
         committed_bytes = %committed.bytes,
-        "under-fold rejection carried a watermark our amount covers but our bytes \
-         do not; the voucher folded the amount but not the bytes"
+        "trailing-proof rejection carried a watermark our amount covers but our bytes \
+         do not; the ledger paid the amount but not the bytes"
     );
     None
 }
@@ -3367,7 +3388,6 @@ impl UpstreamPull {
                         amount: confirmed.amount,
                         generation,
                     });
-                    self.meter.anchored_root = self.ledger.chain_root();
                     Ok(true)
                 } else {
                     tracing::warn!(
@@ -3521,7 +3541,11 @@ impl Drop for UpstreamPull {
 /// are cumulative over delivered bytes).
 ///
 /// Returns the sent voucher as the [`StreamProof`] the stream records, stamped
-/// with the ledger generation it was signed under.
+/// with the ledger generation it was signed under, and the chain root the
+/// voucher anchors this stream to (`None` for a sealed voucher, which clears the
+/// node's anchor). The root is the one the voucher signed, read under the
+/// issuance lock: a read of the ledger after the send can already name a
+/// sibling's newer chain.
 async fn send_voucher(
     send: &mut SendStream,
     ctx: &PoolContext,
@@ -3529,7 +3553,7 @@ async fn send_voucher(
     rate_per_mb: u64,
     delta_bytes: u64,
     epoch: EpochAction,
-) -> anyhow::Result<StreamProof> {
+) -> anyhow::Result<(StreamProof, Option<B256>)> {
     if ctx.provider.is_zero() {
         return Err(anyhow::anyhow!(
             "voucher provider is not pinned (Address::ZERO) — call PoolContext::with_provider \
@@ -3538,16 +3562,23 @@ async fn send_voucher(
         .context(LocalPullFault));
     }
     let mut attempted = None;
+    let mut signed_root = B256::ZERO;
     let issued = ledger
         .issue_stamped(delta_bytes, rate_per_mb, epoch, |next, chain| {
             attempted = Some(next.amount);
+            signed_root = chain.chain_root;
             sign_and_write_voucher(send, ctx, next, chain)
         })
         .await;
     issued
-        .map(|(next, generation)| StreamProof::Voucher {
-            amount: next.amount,
-            generation,
+        .map(|(next, generation)| {
+            (
+                StreamProof::Voucher {
+                    amount: next.amount,
+                    generation,
+                },
+                (!signed_root.is_zero()).then_some(signed_root),
+            )
         })
         .map_err(|err| match attempted {
             Some(amount) => err.context(UnconfirmedVoucher { amount }),
@@ -3648,11 +3679,12 @@ impl StreamMeter {
         rate_per_mb: u64,
     ) -> anyhow::Result<()> {
         if ledger.chain_root().is_none() {
-            self.last_proof =
-                Some(send_voucher(send, ctx, ledger, rate_per_mb, 0, EpochAction::Open).await?);
-            // Re-read rather than reuse the pre-send `None`: the send is what
-            // opened the chain, so only the ledger knows which one.
-            self.anchored_root = ledger.chain_root();
+            let (proof, root) =
+                send_voucher(send, ctx, ledger, rate_per_mb, 0, EpochAction::Open).await?;
+            self.last_proof = Some(proof);
+            // The root the voucher signed: the send is what opened the chain,
+            // and a sibling may have rolled it again since.
+            self.anchored_root = root;
             return Ok(());
         }
         if ledger.chain_root().is_some() && self.anchored_root != ledger.chain_root() {
@@ -3693,16 +3725,19 @@ impl StreamMeter {
         ledger: &PoolLedger,
         rate_per_mb: u64,
     ) -> anyhow::Result<()> {
-        // Two attempts, never more: the first can find the epoch spent, and the
-        // roll that follows opens a chain with index 1 available by
-        // construction. A third pass would mean the ledger contradicted itself.
-        for attempt in 0..2u8 {
+        // One rollover, never more: the first meter can find the epoch spent,
+        // and the roll that follows opens a chain with index 1 available by
+        // construction. A second exhaustion would mean the ledger contradicted
+        // itself. A `Moved` tick re-anchors and meters again; each one means a
+        // sibling rolled the lane, so the lane progresses every time it repeats.
+        let mut rolled = false;
+        loop {
             self.anchor(&mut *send, ctx, ledger, rate_per_mb).await?;
             // Reborrow per iteration: the closure takes the stream by unique
             // reference for the duration of the send, and the loop needs it back.
             let wire = &mut *send;
             match ledger
-                .meter(|released: Released| async move {
+                .meter(self.anchored_root, |released: Released| async move {
                     write_message(
                         wire,
                         &ClientMessage::ChunkPreimage(ChunkPreimage {
@@ -3721,16 +3756,18 @@ impl StreamMeter {
                     });
                     return Ok(());
                 }
-                Metered::Exhausted if attempt == 0 => {
+                Metered::Moved => {}
+                Metered::Exhausted if !rolled => {
                     // Roll. The new voucher's `amount` already folds this
                     // chain's frontier — every reveal advanced the committed
                     // cumulative as it went — so the fold is the frontier
                     // actually reached, never a flat 255 (ADR 003 §Rollover).
-                    self.last_proof = Some(
+                    let (proof, root) =
                         send_voucher(&mut *send, ctx, ledger, rate_per_mb, 0, EpochAction::Roll)
-                            .await?,
-                    );
-                    self.anchored_root = ledger.chain_root();
+                            .await?;
+                    self.last_proof = Some(proof);
+                    self.anchored_root = root;
+                    rolled = true;
                 }
                 Metered::Exhausted => {
                     // A ledger self-contradiction, not a peer fault: marked as OURS so
@@ -3743,7 +3780,6 @@ impl StreamMeter {
                 }
             }
         }
-        Ok(())
     }
 
     /// Settle a residual smaller than one chunk with a signed voucher.
@@ -3770,18 +3806,17 @@ impl StreamMeter {
         rate_per_mb: u64,
         residual_bytes: u64,
     ) -> anyhow::Result<()> {
-        self.last_proof = Some(
-            send_voucher(
-                send,
-                ctx,
-                ledger,
-                rate_per_mb,
-                residual_bytes,
-                EpochAction::Keep,
-            )
-            .await?,
-        );
-        self.anchored_root = ledger.chain_root();
+        let (proof, root) = send_voucher(
+            send,
+            ctx,
+            ledger,
+            rate_per_mb,
+            residual_bytes,
+            EpochAction::Keep,
+        )
+        .await?;
+        self.last_proof = Some(proof);
+        self.anchored_root = root;
         Ok(())
     }
 
@@ -4602,10 +4637,12 @@ mod tests {
         Ok(())
     }
 
-    /// Only `Underpaid` rebases down. An `AmountRegression` echo behind the ledger
-    /// proves no desync, so the caller surfaces the real error.
+    /// Only `Underpaid` rebases down. An `AmountRegression` bundle behind the
+    /// ledger means the ledger already moved past the proof the node refused:
+    /// the pull retries and the ledger stays where it is.
     #[tokio::test]
-    async fn heal_does_not_rebase_on_other_reasons() -> anyhow::Result<()> {
+    async fn an_amount_regression_behind_the_ledger_retries_without_a_rebase() -> anyhow::Result<()>
+    {
         let (ctx, signer) = heal_test_ctx();
         let seed = Cumulative {
             bytes: U256::from(9_000u64),
@@ -4619,7 +4656,7 @@ mod tests {
             (60, 5_000),
             Some(0),
         )?;
-        assert_eq!(heal(&err, &ctx, &ledger).await, None);
+        assert_eq!(heal(&err, &ctx, &ledger).await, Some(Healed::Stale));
         assert_eq!(ledger.generation(), 0);
         assert_eq!(ledger.committed(), seed);
         Ok(())
@@ -4672,6 +4709,38 @@ mod tests {
         )?;
         assert_eq!(heal(&first, &ctx, &ledger).await, Some(Healed::Reseeded));
         assert_eq!(heal(&second, &ctx, &ledger).await, Some(Healed::Stale));
+        assert_eq!(
+            ledger.committed(),
+            Cumulative {
+                bytes: U256::from(9_000u64),
+                amount: U256::from(90u64),
+            }
+        );
+        Ok(())
+    }
+
+    /// A restarted payer's concurrent streams each carry a stale proof, and the
+    /// node rejects each `AmountRegression` with the same bundle. The first heal
+    /// reseeds; the second finds the ledger already at the bundle and retries
+    /// rather than failing the stream (#2173).
+    #[tokio::test]
+    async fn a_sibling_amount_regression_after_the_reseed_is_stale() -> anyhow::Result<()> {
+        let (ctx, signer) = heal_test_ctx();
+        let ledger = PoolLedger::new(Cumulative::default());
+        let rejected = || {
+            rejected_with_bundle(
+                VoucherRejectReason::AmountRegression,
+                &ctx,
+                &signer,
+                (90, 9_000),
+                None,
+            )
+        };
+        assert_eq!(
+            heal(&rejected()?, &ctx, &ledger).await,
+            Some(Healed::Reseeded)
+        );
+        assert_eq!(heal(&rejected()?, &ctx, &ledger).await, Some(Healed::Stale));
         assert_eq!(
             ledger.committed(),
             Cumulative {

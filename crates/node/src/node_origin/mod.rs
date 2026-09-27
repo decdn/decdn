@@ -2492,8 +2492,8 @@ const fn voucher_verdict(reason: VoucherRejectReason, has_bundle: bool) -> PullV
         // Not fatal, and not the peer's fault: this stream had not carried the
         // current epoch's `chain_root` voucher before its first reveal. The fix
         // is to re-anchor and resend, which is what a retry does — and the
-        // resend costs nothing, because an at-or-below-watermark voucher is
-        // already-satisfied rather than rejected.
+        // resend costs nothing, because a metering voucher at or below the
+        // watermark is already-satisfied and pays no whole chunk.
         VoucherRejectReason::PoolExhausted | VoucherRejectReason::UnanchoredPreimage => {
             PullVerdict::OurVoucherRetryable(reason)
         }
