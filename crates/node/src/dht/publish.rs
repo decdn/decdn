@@ -929,7 +929,7 @@ pub async fn run_republish(
                     let receivers = with_lock(&routing, "dht routing table", |table| {
                         table.closest_unbounded(hash.as_bytes(), REPUBLISH_FANOUT)
                     });
-                    budget.admit(&receivers, mandatory)
+                    budget.admit(*hash, &receivers, mandatory)
                 });
                 // ADR 022 §Content Records and TTL line 122: "A node
                 // stops re-publishing when it evicts the blob." Keep only
@@ -972,20 +972,21 @@ pub async fn run_republish(
                     // One BatchStore per receiver (ADR 022 §STORE Flow
                     // Batched STORE) rather than a per-hash fan-out — the
                     // cycle's hashes share receiver sets, which is exactly
-                    // what batching folds into a single RPC. Fire it off the
-                    // select loop: a slow
+                    // what batching folds into a single RPC. The sets are the
+                    // ones the drain admitted, so each look-ahead batch stays
+                    // within the cap. Fire it off the select loop: a slow
                     // or unreachable receiver would otherwise hold the loop
                     // for up to (chunks × DHT_CLIENT_TIMEOUT), delaying the
                     // shutdown signal and eager cache-insert publishes. The
                     // sweep is best-effort — abandoned on shutdown, retried
                     // next cycle.
+                    let groups = budget.into_groups(&held.iter().copied().collect());
                     let ep = endpoint.clone();
-                    let routing = Arc::clone(&routing);
                     let cache_cloned = cache.clone();
                     let metrics = Arc::clone(&metrics);
                     tokio::spawn(async move {
                         let accepted =
-                            publish_batch(&ep, self_node_id, &routing, &cache_cloned, &held).await;
+                            publish_batch(&ep, self_node_id, &cache_cloned, &held, groups).await;
                         metrics.dht_store_published(accepted);
                     });
                 }
@@ -1145,56 +1146,57 @@ async fn fetch_coverage(cache: &decdn_cache::CacheEngine, hash: ContentHash) -> 
     }
 }
 
-/// Group `hashes` by receiver: for each hash, its K+3 closest peers
-/// (ADR 022 §STORE Flow line 128), inverted into `receiver → hashes`.
-/// A pure function over a locked snapshot of the routing table so the
-/// receiver-grouping logic is unit-testable without a network. Returns
-/// an empty map when the table has no peers (e.g. boot before
-/// bootstrap) — the caller then publishes nothing this cycle.
-fn group_by_receiver(
-    table: &RoutingTable,
-    hashes: &[ContentHash],
-) -> HashMap<NodeId, Vec<ContentHash>> {
-    let mut groups: HashMap<NodeId, Vec<ContentHash>> = HashMap::new();
-    for &hash in hashes {
-        for peer in table.closest_unbounded(hash.as_bytes(), REPUBLISH_FANOUT) {
-            groups.entry(peer).or_default().push(hash);
-        }
-    }
-    groups
-}
-
-/// Per-receiver hash counts for one republish cycle — the admission rule
-/// behind the look-ahead in [`RepublishScheduler::drain_cycle`].
+/// One republish cycle's `receiver → hashes` grouping, which is also the
+/// admission rule behind the look-ahead in
+/// [`RepublishScheduler::drain_cycle`].
+///
+/// The grouping that admits a hash is the grouping that publishes it:
+/// [`publish_batch`] sends exactly these sets rather than asking the routing
+/// table again. A peer that joins the table between the two steps cannot then
+/// collect uncharged hashes and push its batch past the cap.
 #[derive(Debug, Default)]
 struct ReceiverBudget {
-    counts: HashMap<NodeId, usize>,
+    groups: HashMap<NodeId, Vec<ContentHash>>,
 }
 
 impl ReceiverBudget {
-    /// Charge one hash to each of `receivers`. A `mandatory` hash is always
-    /// charged. A look-ahead hash is charged only if it has a receiver and no
-    /// receiver is already at [`LOOKAHEAD_RECEIVER_CAP`]; otherwise nothing is
-    /// charged and the answer is `false`. With no receivers (boot before
+    /// Add `hash` to the set of each of `receivers` — its K+3 closest peers
+    /// (ADR 022 §STORE Flow step 1). A `mandatory` hash is always added. A
+    /// look-ahead hash is added only if it has a receiver and no receiver's
+    /// set is already at [`LOOKAHEAD_RECEIVER_CAP`]; otherwise nothing is
+    /// added and the answer is `false`. With no receivers (boot before
     /// bootstrap) the cycle publishes nothing, so pulling a record forward
     /// would only spend its refresh.
-    fn admit(&mut self, receivers: &[NodeId], mandatory: bool) -> bool {
+    fn admit(&mut self, hash: ContentHash, receivers: &[NodeId], mandatory: bool) -> bool {
         let full =
-            |peer: &NodeId| self.counts.get(peer).copied().unwrap_or(0) >= LOOKAHEAD_RECEIVER_CAP;
+            |peer: &NodeId| self.groups.get(peer).map_or(0, Vec::len) >= LOOKAHEAD_RECEIVER_CAP;
         if !mandatory && (receivers.is_empty() || receivers.iter().any(full)) {
             return false;
         }
         for peer in receivers {
-            let count = self.counts.entry(*peer).or_default();
-            *count = count.saturating_add(1);
+            self.groups.entry(*peer).or_default().push(hash);
         }
         true
     }
+
+    /// The per-receiver sets, keeping only the hashes in `held`. A hash the
+    /// due-time gate dropped (evicted, or a store fault) leaves every set, and
+    /// a receiver left with nothing gets no batch.
+    fn into_groups(self, held: &HashSet<ContentHash>) -> HashMap<NodeId, Vec<ContentHash>> {
+        self.groups
+            .into_iter()
+            .filter_map(|(peer, mut hashes)| {
+                hashes.retain(|h| held.contains(h));
+                (!hashes.is_empty()).then_some((peer, hashes))
+            })
+            .collect()
+    }
 }
 
-/// Publish a set of due hashes as one `BatchStore` per receiver, split
-/// at the [`MAX_BATCH_STORE_HASHES`] wire cap (ADR 022 §STORE Flow
-/// Batched STORE). Each receiver's batches run in their own task so a
+/// Publish a cycle's `receiver → hashes` sets ([`ReceiverBudget::into_groups`])
+/// as one `BatchStore` per receiver, split at the [`MAX_BATCH_STORE_HASHES`]
+/// wire cap (ADR 022 §STORE Flow Batched STORE). `hashes` is every hash in
+/// `groups`. Each receiver's batches run in their own task so a
 /// slow peer doesn't stall the rest of the sweep. A rejected hash (peer
 /// not staked, over quota) or a failed exchange is logged at debug — the
 /// record retries on the next cycle. Every DHT node implements
@@ -1204,13 +1206,10 @@ impl ReceiverBudget {
 async fn publish_batch(
     endpoint: &Endpoint,
     self_node_id: NodeId,
-    routing: &Arc<Mutex<RoutingTable>>,
     cache: &decdn_cache::CacheEngine,
     hashes: &[ContentHash],
+    groups: HashMap<NodeId, Vec<ContentHash>>,
 ) -> u64 {
-    let groups = with_lock(routing, "dht routing table", |table| {
-        group_by_receiver(table, hashes)
-    });
     if groups.is_empty() {
         // No routing-table entries yet (e.g. boot before bootstrap).
         // Nothing to do this cycle; the scheduler will retry.
@@ -1306,39 +1305,60 @@ mod tests {
     }
 
     #[test]
-    fn group_by_receiver_sends_every_due_hash_to_each_of_its_closest_peers() {
+    fn a_drain_cycle_groups_every_hash_under_each_of_its_closest_peers() {
         // A table with fewer than REPUBLISH_FANOUT (23) peers means every
         // peer is within the K+3 closest set of every hash, so each peer's
-        // batch must carry all due hashes exactly once.
+        // set must carry every drained hash exactly once — the grouping the
+        // tick path hands to `publish_batch`.
         let mut table = RoutingTable::new(nid(0x01));
         for b in [0x10, 0x20, 0x30] {
             table.insert(nid(b));
         }
-        let hashes = [h(0xA0), h(0xB0)];
-        let groups = group_by_receiver(&table, &hashes);
+        let s = RepublishScheduler::new();
+        let now: u64 = 1_000_000_000;
+        place(&s, h(0xA0), now);
+        place(&s, h(0xB0), now + 1);
+        let mut budget = ReceiverBudget::default();
+        let drained = s.drain_cycle(now, now + 10, |hash, mandatory| {
+            let receivers = table.closest_unbounded(hash.as_bytes(), REPUBLISH_FANOUT);
+            budget.admit(*hash, &receivers, mandatory)
+        });
+        assert_eq!(drained, vec![h(0xA0), h(0xB0)]);
+        let groups = budget.into_groups(&drained.iter().copied().collect());
         assert_eq!(
             groups.len(),
             3,
             "all three peers are closest to both hashes"
         );
         for b in [0x10, 0x20, 0x30] {
-            let mut got = groups
-                .get(&nid(b))
-                .cloned()
-                .unwrap_or_else(|| panic!("peer {b:#x} missing a batch"));
-            got.sort();
-            let mut want = hashes.to_vec();
-            want.sort();
-            assert_eq!(got, want, "peer {b:#x} must receive every due hash once");
+            assert_eq!(
+                groups.get(&nid(b)),
+                Some(&drained),
+                "peer {b:#x} must receive every drained hash once"
+            );
         }
     }
 
     #[test]
-    fn group_by_receiver_empty_table_yields_no_batches() {
-        // No routing-table peers (e.g. boot before bootstrap): nothing to
-        // publish, so the grouping is empty rather than a panic.
+    fn a_drain_cycle_on_an_empty_table_groups_nothing() {
+        // No routing-table peers (e.g. boot before bootstrap): the due record
+        // drains, nothing is pulled forward, and there is no batch to send.
         let table = RoutingTable::new(nid(0x01));
-        assert!(group_by_receiver(&table, &[h(0xA0)]).is_empty());
+        let s = RepublishScheduler::new();
+        let now: u64 = 1_000_000_000;
+        place(&s, h(0xA0), now);
+        place(&s, h(0xB0), now + 1);
+        let mut budget = ReceiverBudget::default();
+        let drained = s.drain_cycle(now, now + 10, |hash, mandatory| {
+            let receivers = table.closest_unbounded(hash.as_bytes(), REPUBLISH_FANOUT);
+            budget.admit(*hash, &receivers, mandatory)
+        });
+        assert_eq!(drained, vec![h(0xA0)]);
+        assert!(
+            budget
+                .into_groups(&drained.into_iter().collect())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1393,7 +1413,7 @@ mod tests {
     /// A budget where every hash has the one receiver `nid(0x99)` — the
     /// N ≤ K+3 shape, where every hash goes to every peer.
     fn one_receiver(budget: &mut ReceiverBudget) -> impl FnMut(&ContentHash, bool) -> bool + '_ {
-        |_, mandatory| budget.admit(&[nid(0x99)], mandatory)
+        |hash, mandatory| budget.admit(*hash, &[nid(0x99)], mandatory)
     }
 
     #[test]
@@ -1487,26 +1507,53 @@ mod tests {
     #[test]
     fn receiver_budget_caps_each_receiver_independently() {
         let mut budget = ReceiverBudget::default();
-        for _ in 0..LOOKAHEAD_RECEIVER_CAP {
-            assert!(budget.admit(&[nid(0xA)], false));
+        for b in 0..LOOKAHEAD_RECEIVER_CAP {
+            assert!(budget.admit(h(u8::try_from(b).unwrap()), &[nid(0xA)], false));
         }
-        assert!(!budget.admit(&[nid(0xA)], false), "A is full");
+        assert!(!budget.admit(h(0xE0), &[nid(0xA)], false), "A is full");
         assert!(
-            !budget.admit(&[nid(0xA), nid(0xB)], false),
+            !budget.admit(h(0xE1), &[nid(0xA), nid(0xB)], false),
             "one full receiver refuses the hash"
         );
-        assert!(budget.admit(&[nid(0xB)], false), "B still has room");
         assert!(
-            budget.admit(&[nid(0xA)], true),
+            budget.admit(h(0xE2), &[nid(0xB)], false),
+            "B still has room"
+        );
+        assert!(
+            budget.admit(h(0xE3), &[nid(0xA)], true),
             "a due record ignores the cap"
+        );
+        let groups = budget.into_groups(&(0u8..=0xFF).map(h).collect());
+        assert_eq!(groups[&nid(0xA)].len(), LOOKAHEAD_RECEIVER_CAP + 1);
+        assert_eq!(
+            groups[&nid(0xB)],
+            vec![h(0xE2)],
+            "a refused hash joins no set, not even a receiver with room"
         );
     }
 
     #[test]
     fn receiver_budget_refuses_lookahead_with_no_receivers() {
         let mut budget = ReceiverBudget::default();
-        assert!(!budget.admit(&[], false));
-        assert!(budget.admit(&[], true));
+        assert!(!budget.admit(h(1), &[], false));
+        assert!(budget.admit(h(2), &[], true));
+        assert!(
+            budget
+                .into_groups(&[h(1), h(2)].into_iter().collect())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn receiver_budget_groups_drop_hashes_the_due_time_gate_removed() {
+        // An evicted or faulted hash leaves every set, and a receiver whose
+        // set empties gets no batch.
+        let mut budget = ReceiverBudget::default();
+        assert!(budget.admit(h(1), &[nid(0xA), nid(0xB)], true));
+        assert!(budget.admit(h(2), &[nid(0xB)], true));
+        let groups = budget.into_groups(&std::iter::once(h(2)).collect());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[&nid(0xB)], vec![h(2)]);
     }
 
     #[test]
