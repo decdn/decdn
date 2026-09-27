@@ -825,6 +825,17 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Steady-state DHT republishes batch again (#2179).** The republish
+  scheduler ticked every second and sent only the records already due. The
+  per-record `uniform(30, 50 min)` jitter spread due times so thinly that each
+  `BatchStoreRequest` carried about 1.2 hashes, and each paid a fresh QUIC
+  connection, most of them on the relay path. A tick with a due record now
+  also takes the records due within the next 5 minutes, in due order, while
+  each receiver's set stays at or below 32 hashes (below the 40-token per-peer
+  burst). A record goes at most 5 minutes early, so its refresh gap stays at or
+  below 50 minutes, inside the receiver-anchored 1 h TTL (ADR 022 §STORE Flow
+  "Drain cycle").
+
 - **A backpressure refusal from the only holder of a range no longer fails
   paid serve streams (#2178).** A node pays every upstream leg from one buyer
   signer, so its own concurrent pulls can fill a seller's per-signer live cap,

@@ -7,20 +7,26 @@
 //!
 //! On a periodic per-record jittered timer the scheduler:
 //!
-//!  1. Drains every record whose republish window has come due and
-//!     keeps those still held in the cache.
-//!  2. Groups the due hashes by receiver — each hash's K+3 closest
+//!  1. Drains every record whose republish window has come due. On a
+//!     tick where one has, it also drains the records due within
+//!     [`REPUBLISH_LOOKAHEAD`], in due order, while no receiver's set
+//!     passes [`LOOKAHEAD_RECEIVER_CAP`]. It keeps those still held in
+//!     the cache. Per-record jitter spreads due times so thinly that a
+//!     1 s tick alone holds about one hash; the look-ahead is what gives
+//!     a steady-state batch more than one.
+//!  2. Groups the drained hashes by receiver — each hash's K+3 closest
 //!     peers — so all hashes bound for one receiver ride a single
 //!     `BatchStoreRequest { hashes, holder: self }`, split at the
-//!     [`MAX_BATCH_STORE_HASHES`] wire cap. This collapses the
-//!     concentration of overlapping republish windows into one RPC per
-//!     publisher-receiver pair (ADR 022 §STORE Flow Batched STORE &
-//!     §DHT Bandwidth Analysis). Every DHT node implements `BatchStore`,
-//!     so there is no per-hash fallback.
+//!     [`MAX_BATCH_STORE_HASHES`] wire cap. This is one RPC per
+//!     publisher-receiver pair per cycle (ADR 022 §STORE Flow Batched
+//!     STORE & §DHT Bandwidth Analysis). Every DHT node implements
+//!     `BatchStore`, so there is no per-hash fallback.
 //!  3. Schedules the next republish at `now + uniform(30 min, 50 min)`
 //!     per ADR 022 §STORE Flow step 3. Jitter is drawn independently
 //!     per record so the next republish window for a given hash is
-//!     not predictable from outside the publisher.
+//!     not predictable from outside the publisher. A record the
+//!     look-ahead takes early goes at most [`REPUBLISH_LOOKAHEAD`]
+//!     ahead of its draw, so its refresh gap stays at or below 50 min.
 //!
 //! Cold-start (ADR 022 §Bootstrap "Cold-start re-publish scheduling"):
 //! a node booting with C cached blobs draws the first republish offset
@@ -81,6 +87,20 @@ pub const STEADY_STATE_MAX: Duration = Duration::from_mins(50);
 /// start re-publish scheduling"). The lower bound is 0 — a record
 /// drawn at 0 fires on the next tick.
 pub const COLD_START_MAX: Duration = Duration::from_mins(40);
+
+/// How far ahead a republish cycle reaches for records not yet due (ADR 022
+/// §STORE Flow "Batched STORE"). A record goes at most this early, so the gap
+/// between two refreshes of one record stays at or below
+/// [`STEADY_STATE_MAX`], well inside the receiver-anchored 1 h TTL.
+pub const REPUBLISH_LOOKAHEAD: Duration = Duration::from_mins(5);
+
+/// The most hashes one receiver's batch holds once the look-ahead has pulled
+/// records forward (ADR 022 §STORE Flow "Batched STORE"). Below the 40-token
+/// per-peer burst of ADR 022 §DHT Rate Limiting, with room left for the same
+/// peer's lookups and eager `Store`s, so a pulled-forward record never comes
+/// back `accepted: false` for lack of tokens. Records already due are not
+/// held to it.
+pub const LOOKAHEAD_RECEIVER_CAP: usize = 32;
 
 /// Per-record scheduler entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,12 +294,25 @@ impl RepublishScheduler {
         })
     }
 
-    /// Drain every hash whose authoritative due time has passed.
+    /// Drain one republish cycle: every hash whose authoritative due time has
+    /// passed, then — only if at least one has — the hashes due by
+    /// `horizon_us`, in due order, while `admit` accepts them.
+    ///
+    /// `admit(hash, mandatory)` sees every live hash the cycle takes.
+    /// `mandatory` is `true` for a hash already due: it always drains, and
+    /// `admit`'s answer is ignored. For a look-ahead hash `admit` decides, and
+    /// the first refusal ends the cycle with that hash and every later one
+    /// still scheduled. The look-ahead never runs on its own: pulling hashes
+    /// forward on a tick with nothing due would only shift the whole schedule
+    /// earlier and batch nothing.
     ///
     /// A popped entry counts only if `scheduled` still names that hash at
     /// exactly that `due_us`. Anything else is a tombstone left by a
-    /// supersede or an unschedule, and is dropped.
-    fn drain_due(&self, now_us: u64) -> Vec<ContentHash> {
+    /// supersede or an unschedule, and is dropped without reaching `admit`.
+    fn drain_cycle<F>(&self, now_us: u64, horizon_us: u64, mut admit: F) -> Vec<ContentHash>
+    where
+        F: FnMut(&ContentHash, bool) -> bool,
+    {
         let mut out = Vec::new();
         with_lock(&self.heap, "dht republish heap", |heap| {
             with_lock(
@@ -287,13 +320,20 @@ impl RepublishScheduler {
                 "dht republish scheduled set",
                 |scheduled| {
                     while let Some(Reverse(Entry { due_us, hash })) = heap.peek().copied() {
-                        if due_us > now_us {
+                        if due_us > now_us.max(horizon_us) {
+                            break;
+                        }
+                        if scheduled.get(&hash) != Some(&due_us) {
+                            heap.pop();
+                            continue;
+                        }
+                        let mandatory = due_us <= now_us;
+                        if mandatory {
+                            admit(&hash, true);
+                        } else if out.is_empty() || !admit(&hash, false) {
                             break;
                         }
                         heap.pop();
-                        if scheduled.get(&hash) != Some(&due_us) {
-                            continue;
-                        }
                         out.push(hash);
                         // Drop the live entry so the next `schedule_*` for this hash
                         // re-adds it. The caller re-schedules after publishing.
@@ -303,6 +343,13 @@ impl RepublishScheduler {
             );
         });
         out
+    }
+
+    /// Drain every hash whose authoritative due time has passed, with no
+    /// look-ahead.
+    #[cfg(test)]
+    fn drain_due(&self, now_us: u64) -> Vec<ContentHash> {
+        self.drain_cycle(now_us, now_us, |_, _| true)
     }
 
     /// Unschedule `hash` — used when the cache evicts the blob.
@@ -867,7 +914,23 @@ pub async fn run_republish(
                 }
             }
             _ = ticker.tick() => {
-                let due = scheduler.drain_due(now_us());
+                // Records due now, plus the ones due within the look-ahead
+                // while no receiver's batch passes the cap (ADR 022 §STORE
+                // Flow Batched STORE). Per-record jitter spreads due times so
+                // thinly that a tick alone holds about one hash per receiver.
+                // Lock order is heap → scheduled → routing: nothing takes a
+                // scheduler lock while it holds the routing table.
+                let now = now_us();
+                let horizon = now.saturating_add(
+                    u64::try_from(REPUBLISH_LOOKAHEAD.as_micros()).unwrap_or(u64::MAX),
+                );
+                let mut budget = ReceiverBudget::default();
+                let due = scheduler.drain_cycle(now, horizon, |hash, mandatory| {
+                    let receivers = with_lock(&routing, "dht routing table", |table| {
+                        table.closest_unbounded(hash.as_bytes(), REPUBLISH_FANOUT)
+                    });
+                    budget.admit(&receivers, mandatory)
+                });
                 // ADR 022 §Content Records and TTL line 122: "A node
                 // stops re-publishing when it evicts the blob." Keep only
                 // the still-held hashes; drop evicted ones from the
@@ -908,9 +971,9 @@ pub async fn run_republish(
                     }
                     // One BatchStore per receiver (ADR 022 §STORE Flow
                     // Batched STORE) rather than a per-hash fan-out — the
-                    // overlapping republish windows concentrate on shared
-                    // receiver sets, which is exactly what batching folds
-                    // into a single RPC. Fire it off the select loop: a slow
+                    // cycle's hashes share receiver sets, which is exactly
+                    // what batching folds into a single RPC. Fire it off the
+                    // select loop: a slow
                     // or unreachable receiver would otherwise hold the loop
                     // for up to (chunks × DHT_CLIENT_TIMEOUT), delaying the
                     // shutdown signal and eager cache-insert publishes. The
@@ -1101,6 +1164,34 @@ fn group_by_receiver(
     groups
 }
 
+/// Per-receiver hash counts for one republish cycle — the admission rule
+/// behind the look-ahead in [`RepublishScheduler::drain_cycle`].
+#[derive(Debug, Default)]
+struct ReceiverBudget {
+    counts: HashMap<NodeId, usize>,
+}
+
+impl ReceiverBudget {
+    /// Charge one hash to each of `receivers`. A `mandatory` hash is always
+    /// charged. A look-ahead hash is charged only if it has a receiver and no
+    /// receiver is already at [`LOOKAHEAD_RECEIVER_CAP`]; otherwise nothing is
+    /// charged and the answer is `false`. With no receivers (boot before
+    /// bootstrap) the cycle publishes nothing, so pulling a record forward
+    /// would only spend its refresh.
+    fn admit(&mut self, receivers: &[NodeId], mandatory: bool) -> bool {
+        let full =
+            |peer: &NodeId| self.counts.get(peer).copied().unwrap_or(0) >= LOOKAHEAD_RECEIVER_CAP;
+        if !mandatory && (receivers.is_empty() || receivers.iter().any(full)) {
+            return false;
+        }
+        for peer in receivers {
+            let count = self.counts.entry(*peer).or_default();
+            *count = count.saturating_add(1);
+        }
+        true
+    }
+}
+
 /// Publish a set of due hashes as one `BatchStore` per receiver, split
 /// at the [`MAX_BATCH_STORE_HASHES`] wire cap (ADR 022 §STORE Flow
 /// Batched STORE). Each receiver's batches run in their own task so a
@@ -1289,6 +1380,133 @@ mod tests {
         s.unschedule(&h(1));
         let drained = s.drain_due(now_us());
         assert!(drained.is_empty());
+    }
+
+    /// Place `hash` at an exact `due_us`, so a look-ahead test controls the
+    /// order and spacing of due times rather than drawing them from jitter.
+    fn place(s: &RepublishScheduler, hash: ContentHash, due_us: u64) {
+        let (mut heap, mut scheduled) = (s.heap.lock().unwrap(), s.scheduled.lock().unwrap());
+        scheduled.insert(hash, due_us);
+        schedule_at(&mut heap, hash, due_us);
+    }
+
+    /// A budget where every hash has the one receiver `nid(0x99)` — the
+    /// N ≤ K+3 shape, where every hash goes to every peer.
+    fn one_receiver(budget: &mut ReceiverBudget) -> impl FnMut(&ContentHash, bool) -> bool + '_ {
+        |_, mandatory| budget.admit(&[nid(0x99)], mandatory)
+    }
+
+    #[test]
+    fn lookahead_does_not_run_on_a_tick_with_nothing_due() {
+        // Pulling records forward on an idle tick would only shift the whole
+        // schedule earlier and batch nothing.
+        let s = RepublishScheduler::new();
+        let now: u64 = 1_000_000_000;
+        place(&s, h(1), now + 1);
+        place(&s, h(2), now + 2);
+        let mut budget = ReceiverBudget::default();
+        assert!(
+            s.drain_cycle(now, now + 10, one_receiver(&mut budget))
+                .is_empty()
+        );
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn lookahead_takes_records_due_by_the_horizon_in_due_order() {
+        let s = RepublishScheduler::new();
+        let now: u64 = 1_000_000_000;
+        place(&s, h(3), now + 5);
+        place(&s, h(1), now);
+        place(&s, h(2), now + 3);
+        place(&s, h(4), now + 11); // past the horizon
+        let mut budget = ReceiverBudget::default();
+        assert_eq!(
+            s.drain_cycle(now, now + 10, one_receiver(&mut budget)),
+            vec![h(1), h(2), h(3)]
+        );
+        assert_eq!(s.len(), 1, "the record past the horizon stays scheduled");
+    }
+
+    #[test]
+    fn lookahead_stops_at_the_receiver_cap_and_leaves_the_rest_scheduled() {
+        let s = RepublishScheduler::new();
+        let now: u64 = 1_000_000_000;
+        place(&s, h(0), now);
+        for b in 1u8..=40 {
+            place(&s, h(b), now + u64::from(b));
+        }
+        let mut budget = ReceiverBudget::default();
+        let drained = s.drain_cycle(now, now + 100, one_receiver(&mut budget));
+        let want: Vec<ContentHash> = (0u8..32).map(h).collect();
+        assert_eq!(drained, want, "the due record plus 31 pulled forward");
+        assert_eq!(s.len(), 9, "the refused record and every later one stay");
+
+        // They still drain at their own due times.
+        let mut budget = ReceiverBudget::default();
+        assert_eq!(
+            s.drain_cycle(now + 40, now + 40, one_receiver(&mut budget)),
+            (32u8..=40).map(h).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn due_records_past_the_cap_still_drain_but_take_no_lookahead() {
+        let s = RepublishScheduler::new();
+        let now: u64 = 1_000_000_000;
+        for b in 0u8..40 {
+            place(&s, h(b), now.saturating_sub(u64::from(b)));
+        }
+        place(&s, h(200), now + 1);
+        let mut budget = ReceiverBudget::default();
+        assert_eq!(
+            s.drain_cycle(now, now + 10, one_receiver(&mut budget))
+                .len(),
+            40
+        );
+        assert_eq!(s.len(), 1, "the look-ahead record waits for its due time");
+    }
+
+    #[test]
+    fn a_tombstone_in_the_lookahead_window_is_skipped_and_not_charged() {
+        let s = RepublishScheduler::new();
+        let now: u64 = 1_000_000_000;
+        place(&s, h(1), now);
+        place(&s, h(2), now + 1);
+        s.unschedule(&h(2));
+        place(&s, h(3), now + 2);
+        let mut charged = Vec::new();
+        let drained = s.drain_cycle(now, now + 10, |hash, _| {
+            charged.push(*hash);
+            true
+        });
+        assert_eq!(drained, vec![h(1), h(3)]);
+        assert_eq!(charged, vec![h(1), h(3)]);
+    }
+
+    #[test]
+    fn receiver_budget_caps_each_receiver_independently() {
+        let mut budget = ReceiverBudget::default();
+        for _ in 0..LOOKAHEAD_RECEIVER_CAP {
+            assert!(budget.admit(&[nid(0xA)], false));
+        }
+        assert!(!budget.admit(&[nid(0xA)], false), "A is full");
+        assert!(
+            !budget.admit(&[nid(0xA), nid(0xB)], false),
+            "one full receiver refuses the hash"
+        );
+        assert!(budget.admit(&[nid(0xB)], false), "B still has room");
+        assert!(
+            budget.admit(&[nid(0xA)], true),
+            "a due record ignores the cap"
+        );
+    }
+
+    #[test]
+    fn receiver_budget_refuses_lookahead_with_no_receivers() {
+        let mut budget = ReceiverBudget::default();
+        assert!(!budget.admit(&[], false));
+        assert!(budget.admit(&[], true));
     }
 
     #[test]
