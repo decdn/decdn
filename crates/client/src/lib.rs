@@ -3388,7 +3388,6 @@ impl UpstreamPull {
                         amount: confirmed.amount,
                         generation,
                     });
-                    self.meter.anchored_root = self.ledger.chain_root();
                     Ok(true)
                 } else {
                     tracing::warn!(
