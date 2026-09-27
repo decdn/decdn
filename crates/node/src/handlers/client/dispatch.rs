@@ -678,8 +678,7 @@ impl ClientHandler {
         // The initial `None` is unread on every live path (both branches below
         // either shed and return or overwrite it, and the audit `Err` returns
         // too) — kept anyway so the slot's declared type and its
-        // `Drop`-at-fn-scope binding below read the same as the `lane_slot`
-        // admission guard above.
+        // `Drop`-at-fn-scope binding stay explicit.
         #[allow(unused_assignments)]
         let mut shed_slot: Option<crate::load_shed::ShedSlot> = None;
         // The gate's class. The shed gate admits under it and the first-byte clock

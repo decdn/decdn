@@ -261,7 +261,7 @@ impl ClientHandler {
         paid: &mut u64,
     ) -> anyhow::Result<ServeEnd> {
         // Owned here so the pool floor reservation reconciles at every exit —
-        // success, `?`, disconnect, panic — exactly like `LaneSlot`. The serve loop
+        // success, `?`, disconnect, panic. The serve loop
         // below releases it once the stream repays a floor; on any other exit the
         // guard's `Drop` frees the pool's live floor headroom.
         let floor_reservation = floor_reservation;

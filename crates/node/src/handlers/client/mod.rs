@@ -148,9 +148,10 @@ impl LaneDeliveryState {
     /// The delivery state for a lane this process loads or registers, with its
     /// whole claim — signed bytes and proved chain frontier — already credited.
     ///
-    /// No stream outlives the process that served it. Every byte the lane's
-    /// claim covers was delivered to a stream of an earlier process, which
-    /// either took the credit or ended with it unclaimed. A new stream delivers
+    /// Every byte the lane's claim covers was delivered before this entry
+    /// existed — by an earlier process, or before the lane was last forgotten —
+    /// to a stream that either took the credit or ended with it unclaimed. No
+    /// stream outlives the entry it drew on. A new stream delivers
     /// only new bytes, so none of that claim is headroom it may draw on.
     /// Crediting only the signed half would hand each restart the proved
     /// frontier — up to a whole chain — as free credit for proofs that pay
