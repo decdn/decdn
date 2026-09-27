@@ -87,9 +87,19 @@ impl RampCarry {
         Self::take(Arc::new(RampPool::default()), 0)
     }
 
-    /// The paid bytes this stream carries from its lane.
+    /// The paid wire bytes this stream carries from its lane.
+    #[cfg(test)]
     pub(crate) const fn carried(&self) -> u64 {
         self.carried
+    }
+
+    /// A lower bound on the content bytes inside the carried wire bytes, for a
+    /// ramp that paces on content (the pull leg's `RampPacer`). The bao
+    /// interleave adds at most one 64-byte parent node per 16 KiB chunk group,
+    /// under 1/128 of the content even for a blob whose last group holds one
+    /// byte, so taking 1/128 off never overstates the paid content.
+    pub(crate) const fn carried_content(&self) -> u64 {
+        self.carried.saturating_sub(self.carried.div_ceil(128))
     }
 
     /// The ramp input for a stream that confirmed `own_paid` bytes itself.
@@ -145,6 +155,16 @@ mod tests {
         let pool = pool_with(CAP);
         RampCarry::take(Arc::clone(&pool), CAP).return_paid(64 << 20);
         assert_eq!(pool.credit(), CAP);
+    }
+
+    #[test]
+    fn the_carried_content_never_exceeds_the_carried_wire() {
+        let pool = pool_with(128 << 20);
+        let carry = RampCarry::take(Arc::clone(&pool), CAP);
+        assert_eq!(carry.carried_content(), (128 << 20) - (1 << 20));
+        assert_eq!(RampCarry::detached().carried_content(), 0);
+        let one = RampCarry::take(pool_with(1), CAP);
+        assert_eq!(one.carried_content(), 0);
     }
 
     #[test]

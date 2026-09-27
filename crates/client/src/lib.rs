@@ -3372,12 +3372,25 @@ impl UpstreamPull {
         // waiting, so the write failure stands as the honest outcome (its typed
         // cause still downcasts through the added context); what the recovery saw
         // rides along so the log can tell a silent peer from a chatty one.
+        // The frames it passes over stay under the same ceilings as the ones it
+        // takes in: an honest node sends no byte past the request's promised wire
+        // length or the received-byte ceiling, so a peer that does is not draining
+        // an in-flight window, and the recovery read fails.
         let mut skipped: u64 = 0;
         let terminal = tokio::time::timeout(TERMINAL_AFTER_WRITE_TIMEOUT, async {
             loop {
                 match self.read_under_floor().await {
                     Ok(ClientMessage::ChunkData(chunk)) => {
                         skipped = skipped.saturating_add(chunk.bytes().len() as u64);
+                        let seen = self.cumulative.saturating_add(skipped);
+                        if seen > self.expected_wire_bytes
+                            || (self.max_received_wire > 0 && seen > self.max_received_wire)
+                        {
+                            anyhow::bail!(
+                                "server sent {seen} bytes, more than the {} promised",
+                                self.expected_wire_bytes
+                            );
+                        }
                     }
                     other => return other,
                 }

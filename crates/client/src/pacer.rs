@@ -380,8 +380,9 @@ pub struct RampPacer {
     /// so the stream's own payment is `served_paid − paid_base`: what THIS
     /// stream has paid, not where in the blob it happens to sit.
     pub paid_base: u64,
-    /// Paid bytes the owning downstream stream carries from earlier streams on
-    /// its lane (ADR 003 §Credit window). Added to the stream's own payment, so
+    /// Paid content bytes the owning downstream stream carries from earlier
+    /// streams on its lane (ADR 003 §Credit window), in the same content units
+    /// as `served_paid`. Added to the stream's own payment, so
     /// the ramp input is `served_paid − paid_base + paid_carried`: a request
     /// resuming at a multi-GiB offset ramps from its lane's credit, not from its
     /// position in the blob.
