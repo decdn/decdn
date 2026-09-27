@@ -87,7 +87,7 @@ use decdn_incentive::{
 use decdn_node::buyer_channel::BuyerPoolService;
 use decdn_node::chain_events::boot_retry::BootRetry;
 use decdn_node::chain_events::shared_head::{HeadSource, SharedHead};
-use decdn_node::channel_store::PersistentPoolStateStore;
+use decdn_node::channel_store::{Deployment, PersistentPoolStateStore};
 use decdn_node::metrics::Metrics;
 use decdn_node::payment_settlement::PoolSettlementService;
 use decdn_protocol::ALPN_CLIENT;
@@ -678,7 +678,13 @@ async fn run_e2e() -> anyhow::Result<()> {
     // One concrete redb-backed store backs the lane-state trait (the handler +
     // #527 replay guard), the capability sink/source (first-redemption
     // registration), and the watcher checkpoint — mirrors the runtime wiring.
-    let concrete_store = Arc::new(PersistentPoolStateStore::open(store_tmp.path())?);
+    let concrete_store = Arc::new(PersistentPoolStateStore::open(
+        store_tmp.path(),
+        Deployment {
+            chain_id: CHAIN_ID,
+            payment_pool,
+        },
+    )?);
     let store: Arc<dyn PoolStateStore> = concrete_store.clone();
     let checkpoint_store: Arc<dyn KeyedCheckpointStore> = concrete_store.clone();
 

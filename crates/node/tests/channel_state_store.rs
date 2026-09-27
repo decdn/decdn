@@ -21,12 +21,17 @@ use decdn_incentive::{
     LaneKey, LaneState, PoolError, PoolStateStore, SignedVoucher, StoreError, Voucher,
     voucher_domain,
 };
-use decdn_node::channel_store::PersistentPoolStateStore;
+use decdn_node::channel_store::{Deployment, PersistentPoolStateStore};
 use tempfile::TempDir;
 
 const CHAIN_ID: u64 = 421_614; // Arbitrum Sepolia
 const VERIFYING: Address = address!("0000000000000000000000000000000000001234");
 const PROVIDER: Address = address!("00000000000000000000000000000000000000b2");
+/// The deployment every store in this file binds to: the voucher domain's.
+const DEPLOYMENT: Deployment = Deployment {
+    chain_id: CHAIN_ID,
+    payment_pool: VERIFYING,
+};
 const POOL_ID: B256 = b256!("11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff");
 
 fn data_dir() -> anyhow::Result<TempDir> {
@@ -106,7 +111,7 @@ fn replay_after_restart_is_rejected() -> anyhow::Result<()> {
     // Phase 1: open the store, apply amount=5000, drop. Mirrors a node that
     // accepted a few vouchers and then was shut down.
     {
-        let store = PersistentPoolStateStore::open(dir.path())?;
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
         let mut state = make_state(POOL_ID, &signer);
         let v5 = signed_voucher(&signer, &domain, POOL_ID, 5_000, 5_000_000)?;
         state.apply_voucher(&v5, &domain, &store)?;
@@ -120,7 +125,7 @@ fn replay_after_restart_is_rejected() -> anyhow::Result<()> {
     // the persisted lane (which is what the runtime does at bring-up), then
     // attempt a replay of amount=3000. Pre-#527 this would be accepted because
     // the fresh in-memory state had `last_amount = 0`.
-    let store = PersistentPoolStateStore::open(dir.path())?;
+    let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
     let mut state = hydrate(&store, POOL_ID, &signer)?;
     anyhow::ensure!(
         state.last_amount() == U256::from(5_000u64),
@@ -153,7 +158,7 @@ fn replay_same_nonce_after_restart_is_rejected() -> anyhow::Result<()> {
     let domain = voucher_domain(CHAIN_ID, VERIFYING);
 
     {
-        let store = PersistentPoolStateStore::open(dir.path())?;
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
         let mut state = make_state(POOL_ID, &signer);
         let v5 = signed_voucher(&signer, &domain, POOL_ID, 5_000, 5_000_000)?;
         state.apply_voucher(&v5, &domain, &store)?;
@@ -162,7 +167,7 @@ fn replay_same_nonce_after_restart_is_rejected() -> anyhow::Result<()> {
         store.flush()?;
     }
 
-    let store = PersistentPoolStateStore::open(dir.path())?;
+    let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
     let mut state = hydrate(&store, POOL_ID, &signer)?;
     let v5_replay = signed_voucher(&signer, &domain, POOL_ID, 5_000, 5_000_000)?;
     let err = state
@@ -186,7 +191,7 @@ fn forward_progress_after_restart_is_accepted() -> anyhow::Result<()> {
     let domain = voucher_domain(CHAIN_ID, VERIFYING);
 
     {
-        let store = PersistentPoolStateStore::open(dir.path())?;
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
         let mut state = make_state(POOL_ID, &signer);
         let v5 = signed_voucher(&signer, &domain, POOL_ID, 5_000, 5_000_000)?;
         state.apply_voucher(&v5, &domain, &store)?;
@@ -195,7 +200,7 @@ fn forward_progress_after_restart_is_accepted() -> anyhow::Result<()> {
         store.flush()?;
     }
 
-    let store = PersistentPoolStateStore::open(dir.path())?;
+    let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
     let mut state = hydrate(&store, POOL_ID, &signer)?;
     let v6 = signed_voucher(&signer, &domain, POOL_ID, 6_000, 6_000_000)?;
     state.apply_voucher(&v6, &domain, &store)?;
@@ -213,14 +218,14 @@ fn registered_until_round_trips_across_restart() -> anyhow::Result<()> {
     let signer = PrivateKeySigner::random();
 
     {
-        let store = PersistentPoolStateStore::open(dir.path())?;
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
         let mut state = make_state(POOL_ID, &signer);
         state.registered_until = 1_800_000_000;
         store.record(&state)?;
         store.flush()?;
     }
 
-    let store = PersistentPoolStateStore::open(dir.path())?;
+    let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
     let key = LaneKey {
         pool_id: POOL_ID,
         signer: signer.address(),
@@ -249,7 +254,7 @@ fn set_registered_until_survives_restart_and_resists_regression() -> anyhow::Res
     let signer = PrivateKeySigner::random();
 
     {
-        let store = PersistentPoolStateStore::open(dir.path())?;
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
         let state = make_state(POOL_ID, &signer);
         store.record(&state)?;
         store.set_registered_until(state.key(), 1_800_000_000)?;
@@ -263,7 +268,7 @@ fn set_registered_until_survives_restart_and_resists_regression() -> anyhow::Res
     };
 
     {
-        let store = PersistentPoolStateStore::open(dir.path())?;
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
         let found = store
             .get(key)?
             .ok_or_else(|| anyhow::anyhow!("lane not found after reopen"))?;
@@ -281,7 +286,7 @@ fn set_registered_until_survives_restart_and_resists_regression() -> anyhow::Res
         store.flush()?;
     }
 
-    let store = PersistentPoolStateStore::open(dir.path())?;
+    let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
     let found = store
         .get(key)?
         .ok_or_else(|| anyhow::anyhow!("lane not found after second reopen"))?;
@@ -305,7 +310,7 @@ fn set_paid_cumulative_survives_restart_and_resists_regression() -> anyhow::Resu
     let signer = PrivateKeySigner::random();
 
     {
-        let store = PersistentPoolStateStore::open(dir.path())?;
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
         let state = make_state(POOL_ID, &signer);
         store.record(&state)?;
         store.set_paid_cumulative(state.key(), U256::from(6_307u64))?;
@@ -319,7 +324,7 @@ fn set_paid_cumulative_survives_restart_and_resists_regression() -> anyhow::Resu
     };
 
     {
-        let store = PersistentPoolStateStore::open(dir.path())?;
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
         let found = store
             .get(key)?
             .ok_or_else(|| anyhow::anyhow!("lane not found after reopen"))?;
@@ -336,7 +341,7 @@ fn set_paid_cumulative_survives_restart_and_resists_regression() -> anyhow::Resu
         store.flush()?;
     }
 
-    let store = PersistentPoolStateStore::open(dir.path())?;
+    let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
     let found = store
         .get(key)?
         .ok_or_else(|| anyhow::anyhow!("lane not found after second reopen"))?;
@@ -372,7 +377,7 @@ fn set_paid_cumulative_survives_restart_and_resists_regression() -> anyhow::Resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_vouchers_across_distinct_channels() -> anyhow::Result<()> {
     let dir = data_dir()?;
-    let store = Arc::new(PersistentPoolStateStore::open(dir.path())?);
+    let store = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
     let domain = voucher_domain(CHAIN_ID, VERIFYING);
 
     let signer_a = PrivateKeySigner::random();
@@ -497,7 +502,7 @@ fn corrupt_file_refuses_to_start() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
-    let err = PersistentPoolStateStore::open(dir.path())
+    let err = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)
         .err()
         .ok_or_else(|| anyhow::anyhow!("open() should reject corrupt file"))?;
     anyhow::ensure!(
@@ -513,7 +518,7 @@ fn corrupt_file_refuses_to_start() -> anyhow::Result<()> {
 fn truncated_file_refuses_to_start() -> anyhow::Result<()> {
     let dir = data_dir()?;
     {
-        let store = PersistentPoolStateStore::open(dir.path())?;
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
         // Force one commit so the file has real redb structure.
         store.record(&LaneState::hydrate(
             b256!("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
@@ -533,7 +538,7 @@ fn truncated_file_refuses_to_start() -> anyhow::Result<()> {
     // non-zero so the empty-file guard isn't the rejecter.
     f.set_len(32)?;
     drop(f);
-    let err = PersistentPoolStateStore::open(dir.path())
+    let err = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)
         .err()
         .ok_or_else(|| anyhow::anyhow!("open() should reject truncated file"))?;
     anyhow::ensure!(
@@ -559,7 +564,7 @@ fn zero_length_file_refuses_to_start() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
-    let err = PersistentPoolStateStore::open(dir.path())
+    let err = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)
         .err()
         .ok_or_else(|| anyhow::anyhow!("open() should reject zero-length file"))?;
     anyhow::ensure!(
@@ -582,7 +587,7 @@ fn bad_permissions_rejected() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     // Group-readable — explicitly insecure.
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))?;
-    let res = PersistentPoolStateStore::open(dir.path());
+    let res = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT);
     anyhow::ensure!(
         res.is_err(),
         "open() must reject a data_dir that is not 0700"
@@ -594,7 +599,7 @@ fn bad_permissions_rejected() -> anyhow::Result<()> {
 #[test]
 fn channels_db_lives_in_data_dir() -> anyhow::Result<()> {
     let dir = data_dir()?;
-    let store = PersistentPoolStateStore::open(dir.path())?;
+    let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
     let parent = store
         .path()
         .parent()
@@ -624,7 +629,7 @@ fn buyer_and_seller_pending_settle_sets_are_isolated() -> anyhow::Result<()> {
     let buyer_pool = b256!("bb00000000000000000000000000000000000000000000000000000000000000");
 
     {
-        let concrete = Arc::new(PersistentPoolStateStore::open(dir.path())?);
+        let concrete = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
         let seller: Arc<dyn PendingSettleStore> = concrete.clone();
         let buyer: Arc<dyn PendingSettleStore> =
             Arc::new(BuyerPendingSettleStoreHandle::new(Arc::clone(&concrete)));
@@ -664,7 +669,7 @@ fn buyer_and_seller_pending_settle_sets_are_isolated() -> anyhow::Result<()> {
     }
 
     // Reopen: durability + isolation both survive a restart.
-    let concrete = Arc::new(PersistentPoolStateStore::open(dir.path())?);
+    let concrete = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
     let seller: Arc<dyn PendingSettleStore> = concrete.clone();
     let buyer: Arc<dyn PendingSettleStore> =
         Arc::new(BuyerPendingSettleStoreHandle::new(Arc::clone(&concrete)));

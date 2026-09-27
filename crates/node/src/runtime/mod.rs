@@ -427,6 +427,16 @@ async fn build_infra(
     // Failure here MUST abort startup: continuing with a fresh in-memory
     // map silently reopens the replay window the store exists to close.
     let channel_store_data_dir = cfg.identity.data_dir.clone();
+    // The store binds to the configured `PaymentPool` deployment and drops the
+    // seller-side rows another deployment wrote: pool ids repeat across
+    // deployments, so a stale row would shadow a returning buyer's new pool.
+    let channel_store_deployment = crate::channel_store::Deployment {
+        chain_id: cfg.blockchain.chain_id,
+        payment_pool: parse_nonzero_address(
+            &cfg.blockchain.payment_pool_address,
+            "blockchain.payment_pool_address",
+        )?,
+    };
     // Keep the concrete store `Arc` so it can back the seller
     // `ChannelStateStore` (channel_state_v1 table), the pending-settle store
     // (pending_settle_v1 table, PR #743 review), and the buyer
@@ -434,7 +444,7 @@ async fn build_infra(
     // second `Database` handle to the same file, so one shared store owns all.
     let concrete_channel_store: Arc<PersistentPoolStateStore> = Arc::new(
         tokio::task::spawn_blocking(move || {
-            PersistentPoolStateStore::open(&channel_store_data_dir)
+            PersistentPoolStateStore::open(&channel_store_data_dir, channel_store_deployment)
         })
         .await
         .context("channel state store open task panicked")?
