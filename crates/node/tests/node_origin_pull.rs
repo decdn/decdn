@@ -14296,11 +14296,16 @@ fn two_providers(
 /// seller lane on the SHARED `ab_pool_id` keyed by the buyer's signer and this
 /// holder's own operator address, so a test can read back exactly what this
 /// holder was paid.
+///
+/// The holder answers its first `refuse_client_conns` `cdn/client/v1`
+/// connections with a signed `NotFound` instead of serving — the wire shape of a
+/// seller's collapsed per-signer cap refusal (#2178).
 async fn spawn_partial_holder(
     payload: &[u8],
     ab_pool_id: B256,
     s_buyer_addr: Address,
     coverage: Coverage,
+    refuse_client_conns: usize,
 ) -> Result<(
     iroh::PublicKey,
     std::net::SocketAddr,
@@ -14358,11 +14363,32 @@ async fn spawn_partial_holder(
         let eth = Arc::clone(&eth);
         let slash = slash_domain();
         tokio::spawn(async move {
+            let mut client_conns = 0usize;
             while let Some(incoming) = ep.accept().await {
                 let Ok(connecting) = incoming.accept() else {
                     continue;
                 };
                 let Ok(conn) = connecting.await else { continue };
+                if conn.alpn() == ALPN_CLIENT {
+                    let nth = client_conns;
+                    client_conns += 1;
+                    if nth < refuse_client_conns {
+                        let eth = Arc::clone(&eth);
+                        let dom = slash.clone();
+                        tokio::spawn(async move {
+                            let _ = serve_refusal(
+                                conn,
+                                &eth,
+                                &dom,
+                                total_bytes,
+                                RATE,
+                                StreamError::NotFound,
+                            )
+                            .await;
+                        });
+                        continue;
+                    }
+                }
                 if conn.alpn() == ALPN_PROBE {
                     let eth = Arc::clone(&eth);
                     let dom = slash.clone();
@@ -14393,8 +14419,8 @@ async fn spawn_partial_holder(
 }
 
 /// Build serving node S: an empty-cache window-paced `ClientHandler` whose
-/// `NodeOrigin` discovers the two partial holders, plus the leaf's own lane in
-/// S's seller store. A focused twin of [`build_node_b_with_leaves`] for the
+/// `NodeOrigin` discovers the two partial holders, plus each leaf's own lane in
+/// S's seller store (`leaves` is `(channel_id, owner)` per leaf). A focused twin of [`build_node_b_with_leaves`] for the
 /// two-holder ranged pull (that helper hardwires a single provider).
 #[allow(clippy::too_many_arguments)]
 async fn build_serving_node(
@@ -14404,8 +14430,7 @@ async fn build_serving_node(
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
     holder_dials: &[(iroh::PublicKey, std::net::SocketAddr)],
-    leaf_channel_id: B256,
-    leaf_eth_addr: Address,
+    leaves: &[(B256, Address)],
     leaf_deposit: U256,
 ) -> Result<(
     Arc<decdn_node::handlers::client::ClientHandler>,
@@ -14414,6 +14439,8 @@ async fn build_serving_node(
     Arc<Mutex<Vec<ProgressEntry>>>,
     decdn_cache::CacheEngine,
     Address,
+    Arc<Metrics>,
+    Arc<NodeOrigin>,
 )> {
     let s_sk = fresh_key();
     let s_id = s_sk.public();
@@ -14448,32 +14475,35 @@ async fn build_serving_node(
         0, // max_blob_size_bytes: 0 = unlimited; this test does not exercise the size ceiling
     )
     .await;
+    let origin_s = Arc::new(origin);
 
     let cache_tmp = tempfile::tempdir()?;
     let cache_s = decdn_cache::CacheEngine::open(cache_tmp.path(), vec![], 64).await?;
     let cache_handle = cache_s.clone();
     std::mem::forget(cache_tmp);
     let store_s = Arc::new(MemoryPoolStateStore::new());
-    store_s.record(&LaneState::hydrate(
-        leaf_channel_id,
-        leaf_eth_addr,
-        s_eth.address(),
-        leaf_deposit,
-        0,
-        U256::ZERO,
-        U256::ZERO,
-        None,
-        decdn_incentive::LaneChain::NONE,
-    ))?;
     let mut pool_status_map: HashMap<B256, decdn_node::pool_view::PoolStatus> = HashMap::new();
-    pool_status_map.insert(
-        leaf_channel_id,
-        decdn_node::pool_view::PoolStatus {
-            owner: leaf_eth_addr,
-            remaining: leaf_deposit,
-            lifecycle: decdn_node::pool_view::Lifecycle::Open,
-        },
-    );
+    for &(leaf_channel_id, leaf_eth_addr) in leaves {
+        store_s.record(&LaneState::hydrate(
+            leaf_channel_id,
+            leaf_eth_addr,
+            s_eth.address(),
+            leaf_deposit,
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+            decdn_incentive::LaneChain::NONE,
+        ))?;
+        pool_status_map.insert(
+            leaf_channel_id,
+            decdn_node::pool_view::PoolStatus {
+                owner: leaf_eth_addr,
+                remaining: leaf_deposit,
+                lifecycle: decdn_node::pool_view::Lifecycle::Open,
+            },
+        );
+    }
     let pool_view = Arc::new(StubPoolView {
         status: pool_status_map,
     }) as Arc<dyn decdn_node::pool_view::PoolView>;
@@ -14495,7 +14525,7 @@ async fn build_serving_node(
         16,
         |deps| {
             deps.pull_through = Some(Duration::from_secs(20));
-            deps.pull_through_origin = Some(Arc::new(origin));
+            deps.pull_through_origin = Some(Arc::clone(&origin_s));
             deps.pool_view = Some(pool_view);
         },
     )?;
@@ -14507,6 +14537,8 @@ async fn build_serving_node(
         recorded,
         cache_handle,
         s_eth.address(),
+        s_metrics,
+        origin_s,
     ))
 }
 
@@ -14549,6 +14581,7 @@ async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
         ab_pool_id,
         s_buyer.address(),
         Coverage::from_block_indices(2, [0].into_iter()),
+        0,
     )
     .await?;
     let (b_id, b_addr, b_eth, ep_b, task_b, store_b) = spawn_partial_holder(
@@ -14556,6 +14589,7 @@ async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
         ab_pool_id,
         s_buyer.address(),
         Coverage::from_block_indices(2, [1].into_iter()),
+        0,
     )
     .await?;
 
@@ -14568,15 +14602,14 @@ async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x1F);
-    let (handler_s, s_target, ep_s, recorded, cache_s, s_operator) = build_serving_node(
+    let (handler_s, s_target, ep_s, recorded, cache_s, s_operator, _, _) = build_serving_node(
         hash,
         ab_pool_id,
         &s_buyer,
         providers,
         addr_map,
         &[(a_id, a_addr), (b_id, b_addr)],
-        leaf_channel_id,
-        leaf_eth.address(),
+        &[(leaf_channel_id, leaf_eth.address())],
         U256::from(DEPOSIT_MICRO_USDC),
     )
     .await?;
@@ -14671,4 +14704,174 @@ async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
 
     shutdown([task_s, task_a, task_b], [&leaf_ep, &ep_s, &ep_a, &ep_b]).await?;
     Ok(())
+}
+
+/// #2178: a holder that refuses a leg with a signed `NotFound` — the wire shape
+/// of a seller's per-signer live-cap refusal — is waited on and asked again when
+/// no other candidate covers its range, and is not suppressed for the hash. Every
+/// leaf stream on the hash completes; none ends short after payment.
+///
+/// Holder A covers block 0 only and holder B block 1 only, so B is the sole
+/// coverer of its run. B refuses its first TWO `cdn/client/v1` connections. The
+/// live-probe ranking decides whether S's handshake goes to A or to B, so B's
+/// first connection is either its run or the handshake; with two refusals, B's
+/// run is refused at least once on either order. Dropping B on that refusal
+/// would end the assembly `Unavailable` with block 1 unfetched, and suppressing
+/// B would take it out of every other stream's candidate walk on the hash.
+#[allow(clippy::too_many_lines)]
+async fn sole_coverer_refusal_is_retried(leaves: usize) -> Result<()> {
+    let block: u64 = 16 * 1024;
+    let _block_guard = decdn_protocol::override_discovery_block_bytes_for_test(block);
+    anyhow::ensure!(
+        decdn_protocol::discovery_block_bytes() == block,
+        "override did not take"
+    );
+    let payload_len = usize::try_from(2 * block).unwrap_or(usize::MAX);
+    let payload: Vec<u8> = (0..payload_len)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let hash = Hash::new(&payload);
+    let total_bytes = 2 * block;
+
+    let ab_pool_id = B256::repeat_byte(0xA2);
+    let s_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a, _store_a) = spawn_partial_holder(
+        &payload,
+        ab_pool_id,
+        s_buyer.address(),
+        Coverage::from_block_indices(2, [0].into_iter()),
+        0,
+    )
+    .await?;
+    let (b_id, b_addr, b_eth, ep_b, task_b, store_b) = spawn_partial_holder(
+        &payload,
+        ab_pool_id,
+        s_buyer.address(),
+        Coverage::from_block_indices(2, [1].into_iter()),
+        2,
+    )
+    .await?;
+    let (providers, addr_map) = two_providers(
+        DhtNodeId::from_bytes(*a_id.as_bytes()),
+        a_eth,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        b_eth,
+    );
+
+    let leaf_eths: Vec<Arc<PrivateKeySigner>> = (0..leaves)
+        .map(|_| Arc::new(PrivateKeySigner::random()))
+        .collect();
+    let leaf_lanes: Vec<(B256, Address)> = leaf_eths
+        .iter()
+        .zip(0x2Fu8..)
+        .map(|(eth, byte)| (B256::repeat_byte(byte), eth.address()))
+        .collect();
+    let (handler_s, s_target, ep_s, _recorded, cache_s, s_operator, s_metrics, origin_s) =
+        build_serving_node(
+            hash,
+            ab_pool_id,
+            &s_buyer,
+            providers,
+            addr_map,
+            &[(a_id, a_addr), (b_id, b_addr)],
+            &leaf_lanes,
+            U256::from(DEPOSIT_MICRO_USDC),
+        )
+        .await?;
+    let task_s = spawn_server(ep_s.clone(), handler_s);
+
+    // Every leaf pulls the whole blob from S at once: the sibling streams the
+    // issue names, sharing S's one fill on the hash or opening their own.
+    let mut leaf_eps = Vec::new();
+    let mut pulls = Vec::new();
+    for (eth, &(channel_id, _)) in leaf_eths.iter().zip(&leaf_lanes) {
+        let leaf_sk = fresh_key();
+        let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+        let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+        leaf_eps.push(leaf_ep.clone());
+        let eth = Arc::clone(eth);
+        let target = s_target.clone();
+        pulls.push(tokio::spawn(async move {
+            leaf_paced_pull(
+                &leaf_ep,
+                target,
+                leaf_node_id,
+                &eth,
+                s_operator,
+                channel_id,
+                hash,
+                RATE,
+                None,
+            )
+            .await
+        }));
+    }
+    for (ix, pull) in pulls.into_iter().enumerate() {
+        let outcome = pull.await??;
+        anyhow::ensure!(
+            outcome.completed,
+            "leaf {ix}'s paid delivery must not end short on a refused leg"
+        );
+        anyhow::ensure!(outcome.hash_ok, "leaf {ix}'s bytes failed the hash check");
+        anyhow::ensure!(
+            outcome.received == total_bytes,
+            "leaf {ix} received {} of {total_bytes} bytes",
+            outcome.received
+        );
+    }
+    anyhow::ensure!(
+        cache_s.has(hash).await?,
+        "S must promote the assembled blob on a complete delivery"
+    );
+    // B's refused run was waited on, not dropped, and B served block 1 on the
+    // retry. The refusals are still metered, but none suppressed B.
+    anyhow::ensure!(
+        counter_value(&s_metrics, "node_pull_backpressure_backoffs_total")? >= 1,
+        "the refused run must have been waited on, not dropped"
+    );
+    anyhow::ensure!(
+        counter_value(&s_metrics, "node_pull_backpressure_exhausted_total")? == 0,
+        "the refusal cleared inside the wait budget"
+    );
+    anyhow::ensure!(
+        counter_value(&s_metrics, "node_pull_refused_total")? >= 1
+            && counter_value(&s_metrics, "node_pull_refused_unattributable_total")? >= 1,
+        "the refusal is still metered"
+    );
+    anyhow::ensure!(
+        !origin_s.is_suppressed(b_id, hash),
+        "a backpressure refusal must not suppress the holder for the hash"
+    );
+    let lane_b = LaneKey {
+        pool_id: ab_pool_id,
+        signer: s_buyer.address(),
+        provider: b_eth,
+    };
+    let b_delivered = store_b
+        .get(lane_b)?
+        .ok_or_else(|| anyhow::anyhow!("holder B lane vanished"))?
+        .last_bytes_delivered();
+    anyhow::ensure!(
+        b_delivered > U256::ZERO,
+        "B must have served block 1 on the retry"
+    );
+
+    shutdown([task_s, task_a, task_b], [&ep_s, &ep_a, &ep_b]).await?;
+    for leaf_ep in leaf_eps {
+        leaf_ep.close().await;
+    }
+    Ok(())
+}
+
+/// #2178, one leaf stream: see [`sole_coverer_refusal_is_retried`].
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sole_coverer_backpressure_refusal_is_retried_not_dropped() -> Result<()> {
+    sole_coverer_refusal_is_retried(1).await
+}
+
+/// #2178, sibling leaf streams on one hash: a refused leg on the sole coverer
+/// fails none of them. See [`sole_coverer_refusal_is_retried`].
+#[tokio::test(flavor = "multi_thread")]
+async fn sibling_streams_survive_a_sole_coverer_backpressure_refusal() -> Result<()> {
+    sole_coverer_refusal_is_retried(2).await
 }

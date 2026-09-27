@@ -1119,7 +1119,9 @@ pub struct DecdnMetrics {
     /// `decdn_node_pull_refused_unattributable_total` (#1520): the subset of
     /// [`Self::node_pull_refused`] whose wire code this node cannot pin on the
     /// upstream — `NotFound` and `Overloaded`, i.e. `RefusalVerdict::Transient`.
-    /// Those briefly suppress the `(peer, hash)` pair without touching reputation.
+    /// Those briefly suppress the `(peer, hash)` pair without touching reputation,
+    /// except an open-stage refusal on a node-origin leg, which is backpressure
+    /// and suppresses nothing unless it outlasts the wait budget (#2178).
     ///
     /// Split out because it is the shape a *buyer-side* misconfiguration takes:
     /// `NotFound` is what a seller signs when it refuses OUR channel for
@@ -1143,15 +1145,40 @@ pub struct DecdnMetrics {
     /// ADR 013 §Application Error Codes) — the upstream's connection limiter,
     /// probe limiter, or per-connection stream cap refused the work before any
     /// signed message existed. The transport-level twin of an `Overloaded`
-    /// refusal, treated the same way: the `(peer, hash)` pair is suppressed for
-    /// the short refusal TTL and NO reputation outcome is recorded, so this is
-    /// the only trace the event leaves at the default `RUST_LOG=info`.
+    /// refusal, treated the same way: NO reputation outcome is recorded, and the
+    /// `(peer, hash)` pair is suppressed for the short refusal TTL except on a
+    /// node-origin leg, where the shed is backpressure (#2178). So this is the
+    /// only trace the event leaves at the default `RUST_LOG=info`.
     ///
     /// A sustained rate is peer-side load, not a local fault — but a rate that
     /// tracks `node_pull_unreachable` is worth a look: a `global-full` shed skips
     /// the upstream's close ack-wait and can still arrive as a bare drop, which
     /// lands in the unreachable counter instead of here.
     pub node_upstream_rate_limited: Counter,
+    /// `decdn_node_pull_backpressure_backoffs_total` (#2178): a ranged run's
+    /// upstream refused the stream open for backpressure (`NotFound`,
+    /// `Overloaded`, or a transport rate-limit), no other candidate covered the
+    /// still-missing gap, and the assembly waited to ask the same upstream again
+    /// instead of dropping it. The common cause is this node's own other pulls
+    /// filling the upstream's per-signer live cap: the refusal clears as those
+    /// pulls pay.
+    ///
+    /// Each tick is one completed wait, and each wait follows one refusal already
+    /// counted in `node_pull_refused_unattributable` or
+    /// `node_upstream_rate_limited`. A sustained rate most often means an
+    /// upstream's cap is too small for the concurrency this node's clients drive
+    /// through it.
+    pub node_pull_backpressure_backoffs: Counter,
+    /// `decdn_node_pull_backpressure_exhausted_total` (#2178): the only holder of
+    /// a still-missing range kept refusing for backpressure through the whole
+    /// wait budget, so the assembly ended short and every serve stream attached
+    /// to it was truncated. The holder is then suppressed for the hash for the
+    /// short refusal TTL, and a `warn!` names it.
+    ///
+    /// Zero is the expected value. A non-zero rate means a refusal that waiting
+    /// does not clear: a holder whose cap never releases, or one of the refusals
+    /// the seller collapses onto `NotFound` that is not a cap at all.
+    pub node_pull_backpressure_exhausted: Counter,
     /// `decdn_node_pull_stalled_total` (#1797): an upstream's throughput fell below the
     /// floor mid-stream — the bytes across `node_pull_stall_window_sec` dropped under
     /// `node_pull_min_throughput_bps` — so the pull was abandoned after at least one byte had
@@ -2978,6 +3005,15 @@ recorders! {
     /// An upstream shed a probe or pull at the transport with `APP_ERR_RATE_LIMITED`
     /// (#1986). Suppressed briefly, never scored — see the counter's docs.
     node_upstream_rate_limited => node_upstream_rate_limited.inc();
+
+    /// A ranged run completed one wait on an upstream's backpressure refusal
+    /// instead of dropping the sole covering source (#2178) — see the counter's
+    /// docs.
+    node_pull_backpressure_backoffs => node_pull_backpressure_backoffs.inc();
+
+    /// The sole covering source outlasted the backpressure wait budget and the
+    /// assembly ended short (#2178) — see the counter's docs.
+    node_pull_backpressure_exhausted => node_pull_backpressure_exhausted.inc();
 
     /// An upstream went silent mid-stream (#1134); the pull was abandoned and the
     /// provider scored `Unreachable`.
