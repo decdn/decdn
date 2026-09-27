@@ -642,6 +642,20 @@ impl NodeOrigin {
     pub(crate) fn deps_arc(&self) -> Arc<OnceLock<NodeOriginDeps>> {
         Arc::clone(&self.deps)
     }
+
+    /// Whether the negative cache currently suppresses `peer` for `hash`. `false`
+    /// on an unprovisioned origin. Test-only: it lets a loopback test read the
+    /// suppression a pull left behind.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn is_suppressed(&self, peer: PublicKey, hash: Hash) -> bool {
+        self.deps.get().is_some_and(|deps| {
+            deps.negative_cache.contains_active(
+                &DhtNodeId::from_bytes(*peer.as_bytes()),
+                &DhtHash::from_bytes(*hash.as_bytes()),
+            )
+        })
+    }
 }
 
 impl Default for NodeOrigin {
@@ -2226,6 +2240,14 @@ enum DurableMissCause {
 /// So the refusal is suppressed on the assumption it may be *us*. At the full TTL, a
 /// pool that ran dry for one pull — or the pre-observation window right after we open
 /// a pool — blackholed a perfectly healthy upstream for five minutes.
+///
+/// A node-origin leg does not suppress for a backpressure refusal
+/// ([`record_backpressure_refusal`]). The refusal is usually the peer's per-signer
+/// cap, filled by this node's own other pulls, and a suppression would take the
+/// peer out of every other pull's candidate walk on the hash before that cap
+/// clears. The assembly may wait and ask the same peer again. It suppresses the
+/// pair only when the peer refuses past the wait budget
+/// ([`record_backpressure_exhausted`]).
 const REFUSAL_SUPPRESSION_TTL: Duration = Duration::from_secs(30);
 
 // `match_same_arms`: `VoucherRejected` and `OriginBlacklisted` both map to
@@ -2588,6 +2610,92 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
         return PullVerdict::Corruption;
     }
     PullVerdict::Unreachable
+}
+
+/// Meter a backpressure refusal on a node-origin leg — a first-leg or header
+/// handshake, or a ranged run — and return its verdict, or `None` when `err` is
+/// not backpressure (#2178).
+///
+/// Backpressure is an open-stage refusal that usually clears with time: a
+/// transport rate-limit ([`PullVerdict::RateLimited`]), or a signed `NotFound` or
+/// `Overloaded` answer to the stream open. The leg goes only to a source whose
+/// probe advertised the blob, so a `NotFound` from it is rarely an honest miss. It
+/// is one of the refusals the seller's `ServeRejectReason::wire_error` collapses
+/// onto `NotFound`, and the common one is the per-signer live cap: this node pays
+/// every upstream leg from one buyer signer, so its other concurrent pulls on the
+/// same hash can fill that cap. The collapse also carries refusals that do not
+/// clear by waiting (a spent capability, an unconfirmed pool, a chain-stale
+/// seller); the assembly's wait budget bounds what those cost.
+///
+/// Two refusals stay out. `InsufficientDeposit`: another provider may reserve a
+/// smaller floor and admit the pool, so the caller moves on. A mid-stream
+/// `NotFound` or `Overloaded`: the per-signer cap refuses only at admission, and a
+/// source that serves some bytes and then refuses must not reset the wait budget
+/// on every round.
+///
+/// On `Some`, this meters the refusal exactly as [`classify_pull_failure`] does but
+/// records no `(peer, hash)` suppression (see [`REFUSAL_SUPPRESSION_TTL`]). On
+/// `None`, it does nothing, and the caller classifies the failure as usual.
+fn record_backpressure_refusal(
+    deps: &NodeOriginDeps,
+    provider_addr: Address,
+    err: &anyhow::Error,
+) -> Option<PullVerdict> {
+    let verdict = backpressure_verdict(err)?;
+    if verdict == PullVerdict::RateLimited {
+        deps.metrics.node_upstream_rate_limited();
+    } else {
+        deps.metrics.node_pull_refused();
+        deps.metrics.node_pull_refused_unattributable();
+    }
+    debug!(%provider_addr, error = %err, "node-origin: upstream refused a leg for backpressure; not suppressing it, as the refusal usually clears with time");
+    Some(verdict)
+}
+
+/// The pure half of [`record_backpressure_refusal`]: the backpressure verdict
+/// `err` carries, or `None` when it is not backpressure.
+fn backpressure_verdict(err: &anyhow::Error) -> Option<PullVerdict> {
+    let verdict = pull_verdict(err);
+    match verdict {
+        PullVerdict::RateLimited => Some(verdict),
+        PullVerdict::Refused(RefusalVerdict::Transient) => {
+            let at_open = err.downcast_ref::<UpstreamRefused>().is_some_and(|r| {
+                r.evidence().is_some() && !matches!(r.error(), StreamError::InsufficientDeposit)
+            });
+            at_open.then_some(verdict)
+        }
+        _ => None,
+    }
+}
+
+/// Record that a ranged assembly dropped `pk`, the only holder of a
+/// still-missing range, after it refused `waits` backpressure waits in a row with
+/// no gap progress (#2178).
+///
+/// By this point the refusal has outlasted the time this node's own other pulls
+/// need to pay and release the holder's per-signer cap, so it is probably not
+/// ours. Suppress the `(peer, hash)` pair for [`REFUSAL_SUPPRESSION_TTL`], so the
+/// next miss on the hash does not spend the whole wait budget on it again. Score
+/// nothing: a refusal is still an answer.
+fn record_backpressure_exhausted(
+    deps: &NodeOriginDeps,
+    pk: PublicKey,
+    hash_bytes: [u8; 32],
+    waits: u32,
+) {
+    deps.metrics.node_pull_backpressure_exhausted();
+    deps.negative_cache.record_failure_with_ttl(
+        DhtNodeId::from_bytes(*pk.as_bytes()),
+        DhtHash::from_bytes(hash_bytes),
+        REFUSAL_SUPPRESSION_TTL,
+    );
+    warn!(
+        peer = %pk,
+        hash = %Hash::from(hash_bytes),
+        waits,
+        "node-origin: the only holder of a still-missing range kept refusing for \
+         backpressure; dropping it and ending the assembly short"
+    );
 }
 
 /// Classify a failed pull and fold the appropriate (or no) reputation outcome,
@@ -3242,6 +3350,42 @@ mod tests {
         assert_eq!(
             classify_refusal(&StreamError::InternalError),
             RefusalVerdict::NodeFault
+        );
+    }
+
+    /// #2178: backpressure is a transport shed or an OPEN-stage refusal. A bare
+    /// mid-stream `NotFound` or `Overloaded` is not: the per-signer cap refuses
+    /// only at admission, and a source that serves some bytes and then refuses
+    /// must not reset the wait budget on every round. The open-stage `NotFound`
+    /// case needs a signed refusal, which only the client crate can build; the
+    /// `a_sole_coverer_backpressure_refusal_is_retried_not_dropped` integration
+    /// test drives it through a real signed `StreamResponse`.
+    #[test]
+    fn backpressure_is_a_transport_shed_or_an_open_stage_refusal() {
+        assert_eq!(
+            backpressure_verdict(&anyhow::Error::new(UpstreamRateLimited { label: None })),
+            Some(PullVerdict::RateLimited)
+        );
+        for error in [
+            StreamError::NotFound,
+            StreamError::Overloaded,
+            StreamError::InsufficientDeposit,
+            StreamError::InternalError,
+            StreamError::EvictedSinceProbe,
+            StreamError::BlobTooLarge,
+            StreamError::HashBlacklisted,
+            StreamError::OriginBlacklisted,
+        ] {
+            let mid_stream = anyhow::Error::new(UpstreamRefused::mid_stream(error.clone()));
+            assert_eq!(
+                backpressure_verdict(&mid_stream),
+                None,
+                "a mid-stream {error:?} is not backpressure"
+            );
+        }
+        assert_eq!(
+            backpressure_verdict(&anyhow::anyhow!("connection lost")),
+            None
         );
     }
 

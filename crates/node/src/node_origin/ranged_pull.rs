@@ -23,6 +23,20 @@
 //! [`RunSink::missing`] excludes them — the replacement lane resumes at the gap
 //! and never re-fetches (or re-pays for) a byte the faulted lane already
 //! delivered.
+//!
+//! # Backpressure — wait, don't drop
+//!
+//! A source that refuses a run for backpressure ([`RunOutcome::Backpressure`])
+//! has not shown that it cannot serve. The common cause is the source's
+//! per-signer live cap: this node pays every upstream leg from one buyer signer,
+//! so its OTHER pulls on the same source (other serve-misses, each with its own
+//! assembly) can fill that cap, and the refusal clears as those pulls pay. When
+//! another survivor covers the still-missing gap, the loop reassigns as for any
+//! other fault. When no survivor does, dropping the source would end the assembly
+//! and fail every serve stream attached to it, so the loop keeps the source, waits
+//! ([`RunSink::backoff`]), and drives it again. A source that still refuses after
+//! [`MAX_BACKPRESSURE_RETRIES`] waits without gap progress ends the assembly
+//! [`AssembleOutcome::Backpressured`], after [`RunSink::backpressure_exhausted`].
 
 use bao_tree::ChunkRanges;
 use decdn_cache::FillError;
@@ -42,6 +56,17 @@ use crate::selection::MAX_PROVIDER_ATTEMPTS;
 /// failover loop and [`super::pull_leg`]'s header handshake spend.
 const MAX_REASSIGN_ATTEMPTS: usize = MAX_PROVIDER_ATTEMPTS;
 
+/// Upper bound on consecutive backpressure waits without gap progress (#2178).
+///
+/// A source that no survivor can replace is kept through a backpressure refusal
+/// and driven again after [`RunSink::backoff`]. The count is kept across the
+/// assembly and resets whenever a round shrinks the gap, so a long pull survives
+/// separate cap events. A source that refuses again after this many waits ends
+/// the assembly [`AssembleOutcome::Backpressured`]: the refusal has outlasted
+/// the time this node's other pulls need to pay and release the cap, so it is
+/// probably not one that clears by waiting.
+pub(crate) const MAX_BACKPRESSURE_RETRIES: u32 = 6;
+
 /// One run's terminal disposition, as the driving sink saw it.
 pub(crate) enum RunOutcome {
     /// The run's `[offset, offset+len)` is fully present in the store now.
@@ -50,6 +75,12 @@ pub(crate) enum RunOutcome {
     /// run's source and re-plan its still-missing remainder against the
     /// surviving candidates. The reassign-only tail.
     Reassign,
+    /// The source refused to open this run for a reason that usually clears with
+    /// time — most often a per-signer live cap, or a load shed (#2178). It says
+    /// nothing about whether the source can serve the range. The loop reassigns
+    /// when another survivor covers the gap, and otherwise keeps the source and
+    /// drives it again after a [`RunSink::backoff`].
+    Backpressure,
     /// The whole assembly is over — a terminal fault (`retry_disposition ==
     /// Terminal`) that another lane cannot fix (a shared-pool voucher rejection,
     /// an origin blacklist, an over-cap blob). Propagate it.
@@ -65,6 +96,7 @@ impl RunOutcome {
         match self {
             Self::Filled => "filled",
             Self::Reassign => "reassigned",
+            Self::Backpressure => "backpressure",
             Self::Terminal(_) => "terminal",
             Self::Cancelled => "cancelled",
         }
@@ -87,6 +119,11 @@ pub(crate) enum AssembleOutcome {
     /// coverage-union probe gather (#1506) narrows how often the gap is uncoverable
     /// in the first place rather than adding one.
     Unavailable,
+    /// The only source for a still-missing range kept refusing for backpressure
+    /// past [`MAX_BACKPRESSURE_RETRIES`] waits. Surfaces to the client the same
+    /// way as [`Self::Unavailable`] — a truncated stream — but names a different
+    /// cause for the operator: the holder was reachable and refused, not absent.
+    Backpressured,
     /// A run faulted terminally; propagate the fault to the serve leg.
     Terminal(FillError),
     /// The pull was cancelled mid-assembly.
@@ -114,6 +151,16 @@ pub(crate) trait RunSink {
     /// run.len)` of the blob into the store, reusing the shared demand-window
     /// axes so the pull never runs ahead of the downstream paid frontier.
     async fn drive_run(&self, run: CoveredRun) -> RunOutcome;
+
+    /// Wait before the `attempt`-th (1-based) re-drive of a source that refused
+    /// with [`RunOutcome::Backpressure`]. Returns `false` when the pull was
+    /// cancelled during the wait.
+    async fn backoff(&self, attempt: u32) -> bool;
+
+    /// The source at `source_ix` refused again after `waits` backpressure waits
+    /// without gap progress, and the assembly ends
+    /// [`AssembleOutcome::Backpressured`]. The sink records it for the operator.
+    fn backpressure_exhausted(&self, source_ix: usize, waits: u32);
 }
 
 /// Assemble `[offset, offset+len)` of a `total_bytes` blob across the ranked
@@ -121,18 +168,22 @@ pub(crate) trait RunSink {
 ///
 /// Loops: derive the gap, plan it into runs by coverage, drive each run in
 /// offset order, and on a non-terminal run fault drop that source and re-plan
-/// the remainder. Terminates on a fully-present gap ([`AssembleOutcome::Complete`]),
-/// an uncovered range ([`AssembleOutcome::Unavailable`]), a terminal fault, or
-/// cancellation.
+/// the remainder. A backpressure refusal from a source no survivor can replace
+/// waits and re-drives that source instead (see the module's `# Backpressure`).
+/// Terminates on a fully-present gap ([`AssembleOutcome::Complete`]),
+/// an uncovered range ([`AssembleOutcome::Unavailable`]), a sole source that
+/// outlasts the wait budget ([`AssembleOutcome::Backpressured`]), a terminal
+/// fault, or cancellation.
 ///
 /// Two guards keep the loop finite even under a driver that violates the
 /// reassign-only completion contract:
 ///
 /// - **No-progress guard.** `surviving` shrinks only on a reassign, so a round
 ///   that reports every run [`RunOutcome::Filled`] yet does NOT shrink the gap
-///   would re-plan an identical round forever. When a round drops no source and
-///   the gap does not shrink, the assembly ends [`AssembleOutcome::Unavailable`]
-///   rather than spin.
+///   would re-plan an identical round forever. When a round neither drops a
+///   source nor waits out a backpressure refusal, and the gap does not shrink,
+///   the assembly ends [`AssembleOutcome::Unavailable`] rather than spin. The
+///   waits themselves are bounded by [`MAX_BACKPRESSURE_RETRIES`].
 /// - **Reassign budget.** At most [`MAX_REASSIGN_ATTEMPTS`] sources are dropped
 ///   and re-planned before the assembly ends `Unavailable`, so a pathological set
 ///   cannot churn one lane open per survivor.
@@ -146,12 +197,15 @@ pub(crate) async fn assemble<S: RunSink>(
     // Surviving candidate indices, best-first. A source that faults
     // non-terminally is dropped from here and never re-planned.
     let mut surviving: Vec<usize> = (0..coverage.len()).collect();
-    // The prior round's gap measure and whether it dropped a source — the two
-    // inputs the no-progress guard reads.
+    // The prior round's gap measure and whether it dropped a source or waited
+    // out a backpressure refusal — the two inputs the no-progress guard reads.
     let mut prev_gap_chunks: Option<u64> = None;
-    let mut dropped_last_round = false;
+    let mut repaired_last_round = false;
     // Sources dropped so far, bounded by `MAX_REASSIGN_ATTEMPTS`.
     let mut reassigns = 0usize;
+    // Backpressure waits since the gap last shrank, bounded by
+    // `MAX_BACKPRESSURE_RETRIES`.
+    let mut backoffs = 0u32;
     loop {
         let gap = sink.missing(offset, len).await;
         if gap.is_empty() {
@@ -163,63 +217,106 @@ pub(crate) async fn assemble<S: RunSink>(
             return AssembleOutcome::Unavailable;
         }
         let gap_chunks = chunk_count(&gap);
-        // No-progress guard: a round that dropped no source and did not shrink the
-        // gap will re-plan identically next round. End rather than spin.
-        if let Some(prev) = prev_gap_chunks
-            && !dropped_last_round
-            && gap_chunks >= prev
-        {
-            return AssembleOutcome::Unavailable;
+        if let Some(prev) = prev_gap_chunks {
+            // Progress restores the whole backpressure budget: the budget bounds
+            // a source that refuses every retry, not a long pull that meets
+            // several separate cap events.
+            if gap_chunks < prev {
+                backoffs = 0;
+            }
+            // No-progress guard: a round that dropped no source, waited on none,
+            // and did not shrink the gap will re-plan identically next round. End
+            // rather than spin.
+            if !repaired_last_round && gap_chunks >= prev {
+                return AssembleOutcome::Unavailable;
+            }
         }
         prev_gap_chunks = Some(gap_chunks);
-        let sources: Vec<SourceCoverage> = surviving
-            .iter()
-            .filter_map(|&ix| {
-                coverage.get(ix).map(|c| SourceCoverage {
-                    source_ix: ix,
-                    coverage: c.clone(),
-                })
-            })
-            .collect();
         // `surviving` is already in ranked order and IS the rank the concentrate
         // planner ties-breaks on.
-        let (runs, uncovered) = plan_covered_runs(&gap, total_bytes, &sources, &surviving);
+        let (runs, uncovered) = plan_over(&gap, total_bytes, coverage, &surviving);
         if !uncovered.is_empty() {
             return AssembleOutcome::Unavailable;
         }
-        let mut faulted: Option<usize> = None;
+        let mut faulted: Option<(usize, bool)> = None;
         for run in &runs {
             match sink.drive_run(*run).await {
                 RunOutcome::Filled => {}
+                // Stop this round at the first fault: the faulted source may also
+                // own later planned runs, so re-plan the whole remainder rather
+                // than press on with a plan built around a dead source.
                 RunOutcome::Reassign => {
-                    // Stop this round at the first fault: the faulted source may
-                    // also own later planned runs, so re-plan the whole remainder
-                    // rather than press on with a plan built around a dead source.
-                    faulted = Some(run.source_ix);
+                    faulted = Some((run.source_ix, false));
+                    break;
+                }
+                RunOutcome::Backpressure => {
+                    faulted = Some((run.source_ix, true));
                     break;
                 }
                 RunOutcome::Terminal(err) => return AssembleOutcome::Terminal(err),
                 RunOutcome::Cancelled => return AssembleOutcome::Cancelled,
             }
         }
-        match faulted {
+        let Some((ix, backpressure)) = faulted else {
             // Every planned run filled its range; the runs partition the gap, so
             // the next `missing` is empty and the loop returns `Complete`.
-            None => dropped_last_round = false,
-            // Drop the faulted source and re-plan. The store keeps the verified
-            // bytes, so `missing` next round excludes them: no re-fetch, no
-            // re-pay. Bounded by the reassign budget so a pathological set cannot
-            // churn one lane open per survivor.
-            Some(ix) => {
-                reassigns += 1;
-                if reassigns >= MAX_REASSIGN_ATTEMPTS {
-                    return AssembleOutcome::Unavailable;
+            repaired_last_round = false;
+            continue;
+        };
+        repaired_last_round = true;
+        // A backpressure refusal keeps its source when no survivor can take over
+        // the still-missing gap: dropping it would end the assembly over a cap
+        // that usually clears with time. Past the wait budget the assembly ends
+        // and names the refusal as its cause.
+        if backpressure {
+            let remaining = sink.missing(offset, len).await;
+            if remaining.is_empty() {
+                continue;
+            }
+            let others: Vec<usize> = surviving.iter().copied().filter(|&s| s != ix).collect();
+            let (_, uncovered) = plan_over(&remaining, total_bytes, coverage, &others);
+            if !uncovered.is_empty() {
+                if backoffs >= MAX_BACKPRESSURE_RETRIES {
+                    sink.backpressure_exhausted(ix, backoffs);
+                    return AssembleOutcome::Backpressured;
                 }
-                surviving.retain(|&s| s != ix);
-                dropped_last_round = true;
+                backoffs += 1;
+                if !sink.backoff(backoffs).await {
+                    return AssembleOutcome::Cancelled;
+                }
+                continue;
             }
         }
+        // Drop the faulted source and re-plan. The store keeps the verified bytes,
+        // so `missing` next round excludes them: no re-fetch, no re-pay. Bounded
+        // by the reassign budget so a pathological set cannot churn one lane open
+        // per survivor.
+        reassigns += 1;
+        if reassigns >= MAX_REASSIGN_ATTEMPTS {
+            return AssembleOutcome::Unavailable;
+        }
+        surviving.retain(|&s| s != ix);
     }
+}
+
+/// Plan `gap` into covered runs over the `ranked` candidate indices, returning
+/// the runs and the part of the gap none of them covers.
+fn plan_over(
+    gap: &ChunkRanges,
+    total_bytes: u64,
+    coverage: &[Coverage],
+    ranked: &[usize],
+) -> (Vec<CoveredRun>, ChunkRanges) {
+    let sources: Vec<SourceCoverage> = ranked
+        .iter()
+        .filter_map(|&ix| {
+            coverage.get(ix).map(|c| SourceCoverage {
+                source_ix: ix,
+                coverage: c.clone(),
+            })
+        })
+        .collect();
+    plan_covered_runs(gap, total_bytes, &sources, ranked)
 }
 
 /// Total chunks a bounded [`ChunkRanges`] gap covers — the monotone measure the
@@ -247,7 +344,10 @@ mod tests {
     use decdn_client::CoveredRun;
     use decdn_protocol::{Coverage, DISCOVERY_BLOCK_BYTES, num_blocks};
 
-    use super::{AssembleOutcome, MAX_REASSIGN_ATTEMPTS, RunOutcome, RunSink, assemble};
+    use super::{
+        AssembleOutcome, MAX_BACKPRESSURE_RETRIES, MAX_REASSIGN_ATTEMPTS, RunOutcome, RunSink,
+        assemble,
+    };
 
     const BAO_CHUNK_BYTES: u64 = 1024;
 
@@ -282,6 +382,12 @@ mod tests {
         script: RefCell<std::collections::HashMap<usize, Vec<Disposition>>>,
         /// Every `(source_ix, offset, len)` driven, in order.
         driven: RefCell<Vec<(usize, u64, u64)>>,
+        /// Every `attempt` passed to `backoff`, in order.
+        backoffs: RefCell<Vec<u32>>,
+        /// Whether `backoff` reports the wait completed (`false` = cancelled).
+        backoff_completes: bool,
+        /// Every `(source_ix, waits)` passed to `backpressure_exhausted`.
+        exhausted: RefCell<Vec<(usize, u32)>>,
     }
 
     #[derive(Clone, Copy)]
@@ -293,6 +399,12 @@ mod tests {
         PartialThenReassign,
         /// Report `Reassign` having admitted nothing.
         Reassign,
+        /// Report `Backpressure` having admitted nothing.
+        Backpressure,
+        /// Fill only the run's FIRST block, then report `Backpressure`.
+        PartialThenBackpressure,
+        /// Fill the whole run, then report `Backpressure`.
+        FillThenBackpressure,
         /// Report `Terminal`.
         Terminal,
         /// Report `Filled` having admitted NOTHING — a driver that violates the
@@ -309,6 +421,9 @@ mod tests {
                 present: RefCell::new(Vec::new()),
                 script: RefCell::new(std::collections::HashMap::new()),
                 driven: RefCell::new(Vec::new()),
+                backoffs: RefCell::new(Vec::new()),
+                backoff_completes: true,
+                exhausted: RefCell::new(Vec::new()),
             }
         }
 
@@ -374,12 +489,32 @@ mod tests {
                     RunOutcome::Reassign
                 }
                 Disposition::Reassign => RunOutcome::Reassign,
+                Disposition::Backpressure => RunOutcome::Backpressure,
+                Disposition::PartialThenBackpressure => {
+                    if let Some(&first) = blocks.first() {
+                        self.present.borrow_mut().push(first);
+                    }
+                    RunOutcome::Backpressure
+                }
+                Disposition::FillThenBackpressure => {
+                    self.present.borrow_mut().extend(blocks);
+                    RunOutcome::Backpressure
+                }
                 Disposition::Terminal => {
                     RunOutcome::Terminal(decdn_cache::FillError::new("scripted terminal"))
                 }
                 // Reports Filled while admitting nothing: the gap does not shrink.
                 Disposition::FilledNothing => RunOutcome::Filled,
             }
+        }
+
+        async fn backoff(&self, attempt: u32) -> bool {
+            self.backoffs.borrow_mut().push(attempt);
+            self.backoff_completes
+        }
+
+        fn backpressure_exhausted(&self, source_ix: usize, waits: u32) {
+            self.exhausted.borrow_mut().push((source_ix, waits));
         }
     }
 
@@ -531,5 +666,128 @@ mod tests {
             offsets,
             vec![0, DISCOVERY_BLOCK_BYTES, 2 * DISCOVERY_BLOCK_BYTES]
         );
+    }
+
+    /// #2178: a sole source that refuses for backpressure is kept, waited on, and
+    /// driven again — not dropped, which would end the assembly `Unavailable`.
+    #[tokio::test]
+    async fn sole_source_backpressure_waits_and_retries() {
+        let total = DISCOVERY_BLOCK_BYTES;
+        let sink =
+            FakeSink::new(total).script(0, &[Disposition::Backpressure, Disposition::Backpressure]);
+        let coverage = vec![cov(1, &[0])];
+
+        let outcome = assemble(&sink, &coverage, 0, total, total).await;
+        assert!(matches!(outcome, AssembleOutcome::Complete));
+        let driven = sink.driven.borrow();
+        assert_eq!(driven.len(), 3, "two refusals, then the fill: {driven:?}");
+        assert!(driven.iter().all(|(ix, _, _)| *ix == 0));
+        assert_eq!(*sink.backoffs.borrow(), vec![1, 2]);
+    }
+
+    /// A backpressure refusal reassigns without waiting when another survivor
+    /// covers the still-missing gap.
+    #[tokio::test]
+    async fn backpressure_reassigns_when_a_survivor_covers_the_gap() {
+        let total = DISCOVERY_BLOCK_BYTES;
+        let sink = FakeSink::new(total).script(0, &[Disposition::Backpressure]);
+        let coverage = vec![cov(1, &[0]), cov(1, &[0])];
+
+        let outcome = assemble(&sink, &coverage, 0, total, total).await;
+        assert!(matches!(outcome, AssembleOutcome::Complete));
+        let driven = sink.driven.borrow();
+        assert_eq!(driven.len(), 2);
+        assert_eq!(driven[1].0, 1, "the survivor took over");
+        assert!(sink.backoffs.borrow().is_empty(), "no wait was needed");
+    }
+
+    /// A partial holder does not count as a replacement: when the survivor covers
+    /// only part of the gap, the refusing source is kept and waited on.
+    #[tokio::test]
+    async fn backpressure_waits_when_the_survivor_covers_only_part_of_the_gap() {
+        let total = 2 * DISCOVERY_BLOCK_BYTES;
+        let sink = FakeSink::new(total).script(0, &[Disposition::Backpressure]);
+        // A (ix 0) holds both blocks; B (ix 1) holds block 1 only.
+        let coverage = vec![cov(2, &[0, 1]), cov(2, &[1])];
+
+        let outcome = assemble(&sink, &coverage, 0, total, total).await;
+        assert!(matches!(outcome, AssembleOutcome::Complete));
+        assert_eq!(*sink.backoffs.borrow(), vec![1]);
+    }
+
+    /// A sole source that refuses every retry ends the assembly `Backpressured`
+    /// once the wait budget is spent, rather than wait forever, and the sink is
+    /// told which source outlasted it.
+    #[tokio::test]
+    async fn backpressure_budget_bounds_the_waits() {
+        let total = DISCOVERY_BLOCK_BYTES;
+        let refusals = vec![Disposition::Backpressure; 32];
+        let sink = FakeSink::new(total).script(0, &refusals);
+        let coverage = vec![cov(1, &[0])];
+
+        let outcome = assemble(&sink, &coverage, 0, total, total).await;
+        assert!(matches!(outcome, AssembleOutcome::Backpressured));
+        let budget = usize::try_from(MAX_BACKPRESSURE_RETRIES).unwrap();
+        assert_eq!(sink.backoffs.borrow().len(), budget);
+        assert_eq!(sink.driven.borrow().len(), budget + 1);
+        assert_eq!(
+            *sink.exhausted.borrow(),
+            vec![(0, MAX_BACKPRESSURE_RETRIES)]
+        );
+    }
+
+    /// A refusal that arrives after its run already admitted the whole gap needs
+    /// no wait: the next round finds the gap empty and completes.
+    #[tokio::test]
+    async fn backpressure_after_a_full_fill_completes_without_a_wait() {
+        let total = DISCOVERY_BLOCK_BYTES;
+        let sink = FakeSink::new(total).script(0, &[Disposition::FillThenBackpressure]);
+        let coverage = vec![cov(1, &[0])];
+
+        let outcome = assemble(&sink, &coverage, 0, total, total).await;
+        assert!(matches!(outcome, AssembleOutcome::Complete));
+        assert!(sink.backoffs.borrow().is_empty());
+        assert!(sink.exhausted.borrow().is_empty());
+    }
+
+    /// Gap progress restores the wait budget: a long pull that meets more
+    /// refusals in total than the budget still completes while each round admits
+    /// bytes before its refusal. (A real source cannot drip bytes this way to
+    /// keep itself waited on: a refusal counts as backpressure only at the stream
+    /// open, before any byte of the run arrives. This fake folds a prior run's
+    /// progress and the next run's refusal into one drive.)
+    #[tokio::test]
+    async fn backpressure_budget_resets_on_progress() {
+        let blocks = MAX_BACKPRESSURE_RETRIES + 2;
+        let total = u64::from(blocks) * DISCOVERY_BLOCK_BYTES;
+        let refusals = vec![Disposition::PartialThenBackpressure; usize::try_from(blocks).unwrap()];
+        let sink = FakeSink::new(total).script(0, &refusals);
+        let all: Vec<u32> = (0..blocks).collect();
+        let coverage = vec![cov(blocks, &all)];
+
+        let outcome = assemble(&sink, &coverage, 0, total, total).await;
+        assert!(matches!(outcome, AssembleOutcome::Complete));
+        let backoffs = sink.backoffs.borrow();
+        assert!(
+            backoffs.len() > usize::try_from(MAX_BACKPRESSURE_RETRIES).unwrap(),
+            "more total waits than the budget: {backoffs:?}"
+        );
+        assert!(
+            backoffs.iter().all(|&a| a == 1),
+            "each wait followed progress"
+        );
+    }
+
+    /// A pull cancelled during a backpressure wait ends `Cancelled`.
+    #[tokio::test]
+    async fn backpressure_wait_observes_cancellation() {
+        let total = DISCOVERY_BLOCK_BYTES;
+        let mut sink = FakeSink::new(total).script(0, &[Disposition::Backpressure]);
+        sink.backoff_completes = false;
+        let coverage = vec![cov(1, &[0])];
+
+        let outcome = assemble(&sink, &coverage, 0, total, total).await;
+        assert!(matches!(outcome, AssembleOutcome::Cancelled));
+        assert_eq!(sink.driven.borrow().len(), 1);
     }
 }

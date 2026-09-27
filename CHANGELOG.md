@@ -825,6 +825,25 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **A backpressure refusal from the only holder of a range no longer fails
+  paid serve streams (#2178).** A node pays every upstream leg from one buyer
+  signer, so its own concurrent pulls can fill a seller's per-signer live cap,
+  and the seller sends that refusal as `NotFound`. The node's ranged assembly
+  dropped the refusing source on the first refusal. When that source was the
+  only holder of a still-missing range, the assembly ended short and every
+  serve stream attached to it failed after payment. The 30 s `(peer, hash)`
+  suppression then took the holder out of every other pull on the hash.
+  - An open-stage `NotFound` or `Overloaded`, or a transport rate-limit, on a
+    ranged run is now backpressure. When no other holder covers the range, the
+    node waits (250 ms, doubling to 4 s) and asks the same holder again. After
+    six waits with no new verified bytes, the node ends the pull, logs a
+    `warn!`, and suppresses the pair (ADR 039 §Failure handling).
+  - Ranged runs and the first-leg and header handshakes meter a backpressure
+    refusal but do not suppress the pair for it.
+  - New counters: `decdn_node_pull_backpressure_backoffs_total` (one per
+    completed wait) and `decdn_node_pull_backpressure_exhausted_total` (a
+    holder outlasted the wait budget; zero is the expected value).
+
 - **Back-to-back range pulls keep their credit ramp, and a bundle lane widens
   as sibling entries finish (#2168).** A range-deduped bundle entry served
   through a cold two-leg miss pulled its complement (147 runs, median

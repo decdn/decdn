@@ -71,9 +71,10 @@ use super::funder::{SETTLE_POLL_STEP, settle_wait_budget};
 use super::ranged_pull::{AssembleOutcome, RunOutcome, RunSink, assemble};
 use super::timed_source::{TimedReader, TimedSource, timed_open};
 use super::{
-    EconGate, NodeOrigin, NodeOriginDeps, ProbeGather, PullMiss, PullOutcome, SettleOnDrop,
-    bind_upstream_ctx, cached_candidates, classify_pull_failure, discover, economic_ceiling,
-    heat_of, lane_ledger, mb_of, now_micros, probe_and_rank, record_outcome,
+    EconGate, NodeOrigin, NodeOriginDeps, ProbeGather, PullMiss, PullOutcome, PullVerdict,
+    SettleOnDrop, bind_upstream_ctx, cached_candidates, classify_pull_failure, discover,
+    economic_ceiling, heat_of, lane_ledger, mb_of, now_micros, probe_and_rank,
+    record_backpressure_exhausted, record_backpressure_refusal, record_outcome,
     record_pool_open_failure,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
@@ -711,14 +712,8 @@ impl NodeOrigin {
                 // whole-blob open's would be.
                 Err(err) => {
                     drop(stream_guard);
-                    let verdict = classify_pull_failure(
-                        deps,
-                        pk,
-                        provider_addr,
-                        hash_bytes,
-                        Some(ctx.pool_id),
-                        &err,
-                    );
+                    let verdict =
+                        handshake_verdict(deps, pk, provider_addr, hash_bytes, ctx.pool_id, &err);
                     return Err(PullMiss::for_verdict(verdict));
                 }
             }
@@ -753,14 +748,8 @@ impl NodeOrigin {
             Ok(pair) => pair,
             Err(err) => {
                 drop(stream_guard);
-                let verdict = classify_pull_failure(
-                    deps,
-                    pk,
-                    provider_addr,
-                    hash_bytes,
-                    Some(ctx.pool_id),
-                    &err,
-                );
+                let verdict =
+                    handshake_verdict(deps, pk, provider_addr, hash_bytes, ctx.pool_id, &err);
                 return Err(PullMiss::for_verdict(verdict));
             }
         };
@@ -769,6 +758,25 @@ impl NodeOrigin {
         drop(stream_guard);
         Ok((total_bytes, None))
     }
+}
+
+/// The verdict for a failed first-leg or header handshake. A backpressure
+/// refusal is metered without the `(peer, hash)` suppression (#2178): the
+/// handshake is a real admission at the seller, so this node's other pulls on
+/// the hash can fill the seller's per-signer cap and refuse it, and suppressing
+/// the peer would take it out of those pulls' candidate walks while the cap
+/// clears. Every other failure is classified as usual.
+fn handshake_verdict(
+    deps: &NodeOriginDeps,
+    pk: PublicKey,
+    provider_addr: Address,
+    hash_bytes: [u8; 32],
+    pool_id: B256,
+    err: &anyhow::Error,
+) -> PullVerdict {
+    record_backpressure_refusal(deps, provider_addr, err).unwrap_or_else(|| {
+        classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(pool_id), err)
+    })
 }
 
 /// Assemble `[offset, offset + len)` of `hash` into `engine`'s cache across the
@@ -921,7 +929,9 @@ pub(crate) async fn run_pull_leg(
     // leg finished first) is neither.
     match &outcome {
         AssembleOutcome::Complete => deps.metrics.outbound_stream_ended(true),
-        AssembleOutcome::Unavailable | AssembleOutcome::Terminal(_) => {
+        AssembleOutcome::Unavailable
+        | AssembleOutcome::Backpressured
+        | AssembleOutcome::Terminal(_) => {
             deps.metrics.outbound_stream_ended(false);
         }
         AssembleOutcome::Cancelled => {}
@@ -934,6 +944,10 @@ pub(crate) async fn run_pull_leg(
         AssembleOutcome::Complete | AssembleOutcome::Cancelled => Ok(()),
         AssembleOutcome::Unavailable => Err(FillError::new(
             "node-origin ranged pull: a still-missing range is held by no reachable provider",
+        )),
+        AssembleOutcome::Backpressured => Err(FillError::new(
+            "node-origin ranged pull: the only holder of a still-missing range kept refusing \
+             for backpressure",
         )),
         AssembleOutcome::Terminal(err) => Err(err),
     };
@@ -1043,7 +1057,47 @@ impl PeerRunSink<'_> {
     }
 }
 
+/// The first backpressure wait (#2178). Each later wait doubles, up to
+/// [`BACKPRESSURE_BACKOFF_MAX`].
+const BACKPRESSURE_BACKOFF_BASE: Duration = Duration::from_millis(250);
+
+/// The longest single backpressure wait (#2178). With the base and
+/// `MAX_BACKPRESSURE_RETRIES`, a source that refuses every retry holds the
+/// assembly for 11.75 s before the assembly gives up on it — long enough for
+/// this node's other pulls on that source to pay their first window and release
+/// its per-signer cap.
+const BACKPRESSURE_BACKOFF_MAX: Duration = Duration::from_secs(4);
+
+/// The wait before the `attempt`-th (1-based) backpressure re-drive.
+fn backpressure_backoff(attempt: u32) -> Duration {
+    let doublings = attempt.saturating_sub(1).min(8);
+    BACKPRESSURE_BACKOFF_BASE
+        .saturating_mul(1 << doublings)
+        .min(BACKPRESSURE_BACKOFF_MAX)
+}
+
 impl RunSink for PeerRunSink<'_> {
+    async fn backoff(&self, attempt: u32) -> bool {
+        tokio::select! {
+            () = self.cancel.cancelled() => false,
+            () = tokio::time::sleep(backpressure_backoff(attempt)) => {
+                self.deps.metrics.node_pull_backpressure_backoffs();
+                true
+            }
+        }
+    }
+
+    fn backpressure_exhausted(&self, source_ix: usize, waits: u32) {
+        let Some(pk) = self
+            .candidates
+            .get(source_ix)
+            .and_then(|c| PublicKey::from_bytes(&c.node_id).ok())
+        else {
+            return;
+        };
+        record_backpressure_exhausted(self.deps, pk, self.hash_bytes, waits);
+    }
+
     async fn missing(&self, offset: u64, len: u64) -> ChunkRanges {
         // A store read fault is OUR fault; surface it by reporting the whole range
         // as still-missing so a run is attempted and `drive`'s own read raises and
@@ -1336,6 +1390,10 @@ impl PeerRunSink<'_> {
                     );
                     record_outcome(self.deps, pk, &Outcome::Corruption);
                     self.deps.metrics.node_pull_through_upstream_verify_failed();
+                } else if record_backpressure_refusal(self.deps, provider_addr, &err).is_some() {
+                    // A refusal that usually clears with time (#2178): `assemble`
+                    // decides whether to wait on this source or reassign.
+                    return RunOutcome::Backpressure;
                 } else {
                     let _ = classify_pull_failure(
                         self.deps,
@@ -2341,5 +2399,35 @@ mod prime_tests {
         let other = align_range(0, CHUNK_GROUP_BYTES, total).unwrap();
         assert!(!key.answers(1, pool, &ledger, Some(&other)), "another leg");
         assert!(!key.answers(1, pool, &ledger, None), "nothing to open");
+    }
+}
+
+#[cfg(test)]
+mod backpressure_backoff_tests {
+    use std::time::Duration;
+
+    use super::{BACKPRESSURE_BACKOFF_MAX, backpressure_backoff};
+    use crate::node_origin::ranged_pull::MAX_BACKPRESSURE_RETRIES;
+
+    /// The schedule ADR 039 states: 250 ms, doubling, to a 4 s limit.
+    #[test]
+    fn backoff_doubles_from_250_ms_to_a_4_s_limit() {
+        let schedule: Vec<Duration> = (1..=7).map(backpressure_backoff).collect();
+        let expected: Vec<Duration> = [250, 500, 1000, 2000, 4000, 4000, 4000]
+            .into_iter()
+            .map(Duration::from_millis)
+            .collect();
+        assert_eq!(schedule, expected);
+        assert_eq!(backpressure_backoff(0), Duration::from_millis(250));
+        assert_eq!(backpressure_backoff(u32::MAX), BACKPRESSURE_BACKOFF_MAX);
+    }
+
+    /// The whole budget is the 11.75 s the constant docs name.
+    #[test]
+    fn the_wait_budget_totals_11_75_s() {
+        let total: Duration = (1..=MAX_BACKPRESSURE_RETRIES)
+            .map(backpressure_backoff)
+            .sum();
+        assert_eq!(total, Duration::from_millis(11_750));
     }
 }
