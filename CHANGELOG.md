@@ -838,6 +838,16 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Partial holders no longer pull a blob from each other in a loop (#2227).**
+  A serve-miss read the blob size by opening the whole blob at its
+  top-ranked candidate, even a partial holder that lacked the first block.
+  That holder treated the open as a miss and started its own pull, often
+  from another partial holder or from the node that asked it. On the
+  testnet, fra1, hel1, nbg1 and lon1 asked each other for a Mistral shard
+  none of them fully held, at up to 166 failed streams per node per 5
+  minutes. The size open now asks for one chunk group of a block the
+  candidate advertises, and the requesting node is never a candidate.
+
 - **A serve-miss pull draws for its parked serve leg while a sibling stream
   of the same blob waits further down (#2219).** Every serve leg's demand went to
   every live fill of the hash as one high-water mark, so a sibling stream's

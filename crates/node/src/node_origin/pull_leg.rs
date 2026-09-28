@@ -224,6 +224,19 @@ impl PrimeLeg {
     }
 }
 
+/// The header handshake's range for a candidate advertising `coverage` of a
+/// `total_bytes` blob: the first chunk group of the first discovery block it
+/// covers, as `(offset, len)`, or `None` when it covers none of the blob.
+fn covered_handshake_range(
+    coverage: &decdn_protocol::Coverage,
+    total_bytes: u64,
+) -> Option<(u64, u64)> {
+    let blocks = decdn_protocol::num_blocks(total_bytes);
+    let first = coverage.covered_blocks().find(|&block| block < blocks)?;
+    let start = u64::from(first).checked_mul(decdn_protocol::discovery_block_bytes())?;
+    (start < total_bytes).then(|| (start, CHUNK_GROUP_BYTES.min(total_bytes - start)))
+}
+
 /// Which run may adopt a primed pull, apart from the pull itself: the facts a
 /// run checks before it hands the pull to its drive.
 #[derive(Debug, Clone)]
@@ -459,8 +472,10 @@ async fn spanning_cached_candidates(
     deps: &NodeOriginDeps,
     target: DhtHash,
     hash: Hash,
+    requester: [u8; 32],
 ) -> Option<Vec<Candidate>> {
-    let cached = cached_candidates(deps, target).await?;
+    let mut cached = cached_candidates(deps, target).await?;
+    cached.retain(|candidate| candidate.node_id != requester);
     if coverage_spans(&cached) {
         return Some(cached);
     }
@@ -481,9 +496,13 @@ impl NodeOrigin {
     /// signs, claims a fill, and on a miss starts its own origin draw. With a
     /// `prime` and a candidate that reported its size on the probe, the handshake
     /// therefore opens the pull leg's own first leg and parks the pull in the
-    /// target for that leg to adopt (#2063). Without a prime or a size hint, or
-    /// when that range runs past the blob's end, it opens the whole blob, reads
-    /// the header, and drops the pull.
+    /// target for that leg to adopt (#2063). Otherwise it opens one chunk group
+    /// of a block the candidate advertised, reads the header, and drops the pull;
+    /// only without a size hint it can trust does it open the whole blob.
+    ///
+    /// `requester` is the node the serve answers. It is never a candidate: pulling
+    /// from it would hand it back its own bytes, and two nodes that each lack part
+    /// of the blob would pull from each other in a loop.
     ///
     /// Shares the buffered [`decdn_cache::Origin::fetch`] path's cached-first discover → probe →
     /// rank pipeline and its open-time candidate fallback, but stops at channel-open +
@@ -499,6 +518,7 @@ impl NodeOrigin {
         hash: Hash,
         namespace_id: U256,
         prime: Option<PrimeLeg>,
+        requester: [u8; 32],
     ) -> Result<PullLegTarget, PullMiss> {
         let deps = self.deps.get().ok_or(PullMiss::Clean)?;
         let hash_bytes = *hash.as_bytes();
@@ -508,7 +528,7 @@ impl NodeOrigin {
         let mut attempt_metered = false;
         let mut miss = PullMiss::Clean;
 
-        if let Some(cached) = spanning_cached_candidates(deps, target, hash).await {
+        if let Some(cached) = spanning_cached_candidates(deps, target, hash, requester).await {
             deps.metrics.probe_cache_hit();
             deps.metrics.node_pull_attempt();
             attempt_metered = true;
@@ -536,7 +556,9 @@ impl NodeOrigin {
             deps.metrics.probe_cache_miss();
         }
 
-        let providers = discover(deps, hash_bytes, namespace_id).await;
+        let mut providers = discover(deps, hash_bytes, namespace_id).await;
+        let requester_id = DhtNodeId::from_bytes(requester);
+        providers.retain(|provider| *provider != requester_id);
         if providers.is_empty() {
             if !attempt_metered {
                 deps.metrics.node_pull_no_providers();
@@ -552,7 +574,9 @@ impl NodeOrigin {
         // the blob — not stop at a fixed count that could miss the holders of the
         // still-uncovered blocks — and adds the origin-directory candidates when the
         // discovered holders cannot span it (#2195).
-        let ranked = probe_and_rank(
+        // The origin-directory supplement inside the probe round can list the
+        // requester too.
+        let mut ranked = probe_and_rank(
             deps,
             providers,
             hash_bytes,
@@ -560,6 +584,7 @@ impl NodeOrigin {
             namespace_id,
         )
         .await;
+        ranked.retain(|candidate| candidate.node_id != requester);
         let outcome = self
             .handshake_from_candidates(deps, &ranked, hash_bytes, namespace_id, budget, prime)
             .await;
@@ -695,6 +720,9 @@ impl NodeOrigin {
         // from. Its dial runs on the node's main runtime, so its connection's
         // driver lives there and outlives the pull thread that adopts it.
         let hint = candidate.total_bytes_hint;
+        // Set when the primed open runs past the blob's end: the probed size is
+        // wrong, so no range cut from it can be trusted.
+        let mut hint_wrong = false;
         let predicted = prime.zip(hint).and_then(|(prime, total)| {
             prime
                 .predicted_leg(total, &candidate.coverage, deps.config.max_blob_size_bytes)
@@ -749,12 +777,15 @@ impl NodeOrigin {
                 }
                 // A range past the blob's end means the probed size was wrong, not
                 // the provider: ask it for the whole blob instead.
-                Err(err) if decdn_client::is_range_past_end(&err) => debug!(
-                    peer = %pk,
-                    hash = %Hash::from(hash_bytes),
-                    "node-origin: the first-leg handshake runs past the blob's end ({err:#}); \
-                     opening the whole blob, as the probed size is wrong"
-                ),
+                Err(err) if decdn_client::is_range_past_end(&err) => {
+                    hint_wrong = true;
+                    debug!(
+                        peer = %pk,
+                        hash = %Hash::from(hash_bytes),
+                        "node-origin: the first-leg handshake runs past the blob's end ({err:#}); \
+                         opening the whole blob, as the probed size is wrong"
+                    );
+                }
                 // Any other failure is the handshake's own outcome, classified as the
                 // whole-blob open's would be.
                 Err(err) => {
@@ -766,11 +797,19 @@ impl NodeOrigin {
             }
         }
 
-        // The whole-blob header handshake: whole-tail open (`byte_offset == 0`,
-        // `byte_len == 0`) to read the committed `total_bytes`, then abort — no
-        // `next_chunk`, so no bytes are pulled and no voucher is paid, and the ledger
-        // watermark is unchanged. The actual range-minimized pull re-opens per gap via
-        // `PeerSource` on this same (now cached) channel.
+        // The header handshake: open a range to read the committed `total_bytes`,
+        // then abort — no `next_chunk`, so no bytes are pulled and no voucher is
+        // paid, and the ledger watermark is unchanged. The actual range-minimized
+        // pull re-opens per gap via `PeerSource` on this same (now cached) channel.
+        // The range lies in a block the candidate advertised, so a partial holder
+        // answers from what it holds; asked for bytes it lacks, a holder that pulls
+        // through starts its own pull for them, and partial holders asking each
+        // other form a loop. Only without a size to cut that range from is the
+        // whole blob (`byte_offset == 0`, `byte_len == 0`) the range asked for.
+        let (byte_offset, byte_len) = hint
+            .filter(|_| !hint_wrong)
+            .and_then(|total| covered_handshake_range(&candidate.coverage, total))
+            .unwrap_or((0, 0));
         let (header, probe) = match open_progressive_upstream(
             &deps.endpoint,
             EndpointAddr::new(pk),
@@ -780,12 +819,12 @@ impl NodeOrigin {
             provider_addr,
             hash_bytes,
             namespace_bytes,
-            0,
+            byte_offset,
             now_micros(),
             deps.config.max_blob_size_bytes,
             rate_ceiling,
             deadlines,
-            0,
+            byte_len,
             // Every dial this node makes runs on its main runtime, wherever the
             // caller runs.
             Some(&deps.dial_runtime),
