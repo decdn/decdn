@@ -14693,7 +14693,10 @@ async fn spawn_block_holder(
     let cache = CacheEngine::open(cache_tmp.path(), vec![], 16).await?;
     std::mem::forget(cache_tmp);
     for &b in blocks {
-        let start = u64::from(b) * block;
+        let start = u64::from(b)
+            .checked_mul(block)
+            .filter(|&start| start < total)
+            .ok_or_else(|| anyhow::anyhow!("block {b} lies past the {total}-byte blob"))?;
         let aligned = decdn_cache::range_pull::align_range(start, block.min(total - start), total)?;
         let data = payload
             .get(usize::try_from(aligned.fetch_start())?..usize::try_from(aligned.fetch_end())?)
