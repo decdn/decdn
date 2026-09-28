@@ -125,7 +125,7 @@ pub struct GaveUp {
 impl std::fmt::Display for GaveUp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let secs = self.idle.as_secs();
-        if secs >= 60 {
+        if secs >= 60 && secs.is_multiple_of(60) {
             write!(f, "no progress for {}m; rerun to resume", secs / 60)
         } else {
             write!(f, "no progress for {secs}s; rerun to resume")
@@ -209,5 +209,19 @@ mod tests {
             idle: Duration::from_secs(45),
         };
         assert_eq!(short.to_string(), "no progress for 45s; rerun to resume");
+    }
+
+    /// A limit that is not a whole number of minutes prints in seconds, so
+    /// 90 s never reads as "1m".
+    #[test]
+    fn a_limit_between_whole_minutes_prints_in_seconds() {
+        let odd = super::GaveUp {
+            idle: Duration::from_secs(90),
+        };
+        assert_eq!(odd.to_string(), "no progress for 90s; rerun to resume");
+        let whole = super::GaveUp {
+            idle: Duration::from_mins(2),
+        };
+        assert_eq!(whole.to_string(), "no progress for 2m; rerun to resume");
     }
 }

@@ -97,9 +97,16 @@ use crate::{Pacer, PoolContext, PoolLedger};
 
 /// How long a lane may go without a verified byte, with bytes of its range
 /// still missing, before its range moves to other lanes and its source cools.
+/// A leg's first byte gets a 30 s grace before this window applies.
 /// Off under consumption pacing, where a lane parked on the consumer's cursor
 /// is waiting, not stalled.
 pub const LANE_WATCHDOG: Duration = Duration::from_secs(10);
+
+/// How long a leg may wait for its first verified byte before the lane
+/// watchdog applies. A cold miss makes the node pull from its own upstream
+/// first, so its first byte can take longer than [`LANE_WATCHDOG`]. It equals
+/// the per-stream idle window a paid leg allows before its first byte.
+const FIRST_BYTE_GRACE: Duration = Duration::from_secs(30);
 
 /// What one [`acquire`] fills: byte ranges of one blob, in one store.
 pub struct AcquireTarget<'a, St> {
@@ -283,9 +290,11 @@ where
 /// to `fill_gap`'s own completion, never tripped. A zero deadline disables the
 /// watchdog.
 ///
-/// A gap between verified bytes shorter than the deadline, time to first byte
-/// on any open included, thus never trips it; a source that stops trips it
-/// within one to two deadlines.
+/// Before the unit's first verified byte the window is [`FIRST_BYTE_GRACE`]
+/// (or `deadline`, if longer), so a cold miss whose first byte waits on the
+/// node's own upstream is not a stall. After it, a gap between verified bytes
+/// shorter than the deadline never trips; a source that stops trips it within
+/// one to two deadlines.
 async fn watchdog<St>(store: &St, start: u64, len: u64, deadline: Duration, verified: &AtomicU64)
 where
     St: IngestStore,
@@ -294,8 +303,14 @@ where
         std::future::pending::<()>().await;
     }
     let mut prev = verified.load(Ordering::Relaxed);
+    let mut window = if prev == 0 {
+        deadline.max(FIRST_BYTE_GRACE)
+    } else {
+        deadline
+    };
     loop {
-        tokio::time::sleep(deadline).await;
+        tokio::time::sleep(window).await;
+        window = deadline;
         let now = verified.load(Ordering::Relaxed);
         if now != prev {
             prev = now;
@@ -1366,6 +1381,20 @@ where
     err
 }
 
+/// The pool deposit as the loop sees it: the larger of the deposit watch and
+/// every started lane's context. A bundle entry's lanes share their contexts
+/// with sibling entries through the run's `LaneLedgers`, so a top-up a
+/// sibling credits reaches this loop through them.
+fn pool_deposit<S>(
+    watch: &tokio::sync::watch::Receiver<U256>,
+    lanes: &[Arc<StreamCandidate<S>>],
+) -> U256 {
+    lanes
+        .iter()
+        .filter_map(|lane| lane.ctx.lock().ok().map(|ctx| ctx.deposit))
+        .fold(*watch.borrow(), U256::max)
+}
+
 /// Seed the deposit watch from `lane`'s pool context while it still holds zero:
 /// the first lane that builds names the pool's deposit.
 fn seed_deposit<S>(deposit: &tokio::sync::watch::Sender<U256>, lane: &StreamCandidate<S>) {
@@ -1582,7 +1611,7 @@ where
                 return Ok(());
             }
             let now = Instant::now();
-            let deposit = *deposit_rx.borrow();
+            let deposit = pool_deposit(&deposit_rx, &started.0);
 
             // Start lanes up to the cap, nearest first, for sources that cover work
             // still to do: cached lanes at once, the rest through `connect`.
@@ -1635,7 +1664,7 @@ where
                         slot
                     };
                     if !started.0.iter().any(|l| Arc::ptr_eq(l, &lane)) {
-                        join_pool(&lane, *deposit_rx.borrow(), &pool_lanes);
+                        join_pool(&lane, deposit, &pool_lanes);
                         started.0.push(Arc::clone(&lane));
                     }
                     running.insert(provider);
@@ -1676,7 +1705,7 @@ where
                         let err = err.unwrap_or_else(|| {
                             anyhow::anyhow!("no verified progress for {watchdog:?}")
                         });
-                        let deposit = *deposit_rx.borrow();
+                        let deposit = pool_deposit(&deposit_rx, &started.0);
                         if let Fault::Fatal(_) =
                             sources.record_fault(provider, &err, Instant::now(), deposit)
                         {
@@ -1705,7 +1734,8 @@ where
                 }
                 found = poll_opt(&mut discovering), if discovering.is_some() => {
                     discovering = None;
-                    sources.discovery_done(found, Instant::now(), *deposit_rx.borrow());
+                    let deposit = pool_deposit(&deposit_rx, &started.0);
+                    sources.discovery_done(found, Instant::now(), deposit);
                 }
                 () = sleep_until_opt(wake) => {}
                 Ok(()) = deposit_rx.changed() => {}
@@ -3646,6 +3676,66 @@ mod tests {
         );
     }
 
+    /// A leg's first byte gets the first-byte grace, not the lane watchdog: a
+    /// cold miss whose first byte takes 20 s is not a stall.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_gives_the_first_byte_its_grace() {
+        let store = ScriptedMissing::new(64 * 1024 * 1024, &[8192]);
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let start = tokio::time::Instant::now();
+        let feed = async {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            for k in 1u64.. {
+                counter.store(k * 1024, std::sync::atomic::Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        };
+        let tripped = tokio::time::timeout(Duration::from_mins(2), async {
+            tokio::select! {
+                () = super::watchdog(&store, 0, 64 * 1024 * 1024, LANE_WATCHDOG, &counter) => true,
+                () = feed => false,
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(!tripped, "tripped after {:?}", start.elapsed());
+
+        // With no first byte at all, it trips once the grace ends.
+        let silent = std::sync::atomic::AtomicU64::new(0);
+        let start = tokio::time::Instant::now();
+        super::watchdog(&store, 0, 64 * 1024 * 1024, LANE_WATCHDOG, &silent).await;
+        assert_eq!(start.elapsed(), super::FIRST_BYTE_GRACE);
+    }
+
+    /// End-to-end: a source whose first byte takes 20 s serves the whole
+    /// blob on its first open; the lane watchdog never reassigns it.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_first_byte_is_not_a_stall() -> anyhow::Result<()> {
+        let data = blob(1024 * 1024);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let a = ScriptedSource::new(data.clone())?
+            .paying(Arc::clone(&la))
+            .slow_to_start(Duration::from_secs(20));
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, dir) = fresh_store(root, total);
+        let provider = StaticSources::new(vec![candidate(a.clone(), la, 0xA1, None)])?;
+        run_acquire(
+            &store,
+            &provider,
+            root,
+            total,
+            &BudgetPacer::new(),
+            &no_topups(),
+            1,
+            Some(Duration::from_mins(5)),
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        assert_eq!(a.opened_ranges().len(), 1, "{:?}", a.opened_ranges());
+        Ok(())
+    }
+
     /// A zero window turns the watchdog off, as consumption pacing does.
     #[tokio::test(start_paused = true)]
     async fn watchdog_zero_deadline_never_trips() {
@@ -4229,6 +4319,90 @@ mod tests {
             provider.built.load(std::sync::atomic::Ordering::SeqCst),
             "the slow build ran to its end before acquire returned"
         );
+        Ok(())
+    }
+
+    /// A top-up another fetch of the run credits to a shared lane context
+    /// reaches this acquire: a source priced out below the new deposit is
+    /// usable again, so the acquire completes instead of stopping.
+    #[tokio::test(start_paused = true)]
+    async fn a_sibling_top_up_on_a_shared_lane_revives_a_priced_out_source() -> anyhow::Result<()> {
+        /// Static lanes whose discovery stands in for a sibling entry: from
+        /// its second call on, it tops up the shared lane context before it
+        /// answers. The first call runs as the fetch starts, before any lane
+        /// has run dry.
+        struct SiblingTopUp {
+            lanes: StaticSources<ScriptedSource>,
+            ctx: Arc<Mutex<PoolContext>>,
+            calls: std::sync::atomic::AtomicU32,
+        }
+
+        impl crate::SourceProvider for SiblingTopUp {
+            type Source = ScriptedSource;
+
+            fn discover(&self, hash: [u8; 32]) -> crate::SourceFuture<'_, Vec<crate::Holder>> {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                    self.ctx.lock().unwrap().deposit = U256::from(200u32);
+                }
+                self.lanes.discover(hash)
+            }
+
+            /// The build takes a second, so the first discovery ends before
+            /// any lane names the deposit.
+            fn connect<'a>(
+                &'a self,
+                holder: &'a crate::Holder,
+            ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    self.lanes.connect(holder).await
+                })
+            }
+        }
+
+        let data = blob(1024 * 1024);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ctx = Arc::new(Mutex::new(ctx_with(0xA1, U256::from(100u32))));
+        let a = ScriptedSource::new(data.clone())?
+            .paying(Arc::clone(&la))
+            .fault_once_after(0, || {
+                anyhow::Error::new(PoolExhausted {
+                    gap_start: 0,
+                    gap_len: 1,
+                })
+            });
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, dir) = fresh_store(root, total);
+        let provider = SiblingTopUp {
+            lanes: StaticSources::new(vec![candidate_ctx(a, la, Arc::clone(&ctx), None)])?,
+            ctx,
+            calls: std::sync::atomic::AtomicU32::new(0),
+        };
+        let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
+        let stop = StopPolicy::new(false, Some(Duration::from_mins(5)), Arc::default());
+        let drive = drive_config();
+        acquire(
+            AcquireTarget {
+                store: &store,
+                hash: root,
+                total_bytes: total,
+                ranges: &[(0, total)],
+            },
+            &mut set,
+            &AcquireEnv {
+                pacer: &BudgetPacer::new(),
+                funder: &no_topups(),
+                drive: &drive,
+                max_lanes: 1,
+                stop: &stop,
+                on_progress: None,
+                ledgers: None,
+                pacing: None,
+            },
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
         Ok(())
     }
 
