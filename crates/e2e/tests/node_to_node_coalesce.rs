@@ -36,6 +36,8 @@
 //!      buyer lane — funded by the server's operator — with a non-zero settled
 //!      claim. A single such lane (not two) is the upstream face of the
 //!      coalescing: one pull, one lane, paid once.
+//!   5. The server, having made node-to-node pulls, stops cleanly on SIGTERM:
+//!      it exits successfully and its router close never gives up (#2185).
 //!
 //! Gated behind `anvil-e2e` (off by default). Requires `anvil` + `forge` on
 //! `PATH` and a prior build of the `decdn-node` binary:
@@ -116,6 +118,12 @@ async fn settled_outstanding(node: &NodeFixture, pool_id: B256) -> anyhow::Resul
     .with_context(|| format!("node never reported a non-zero settled claim for pool {wanted}"))?;
     Ok(snapshot.outstanding_micro_usdc)
 }
+
+/// How long the server gets to exit after SIGTERM. Far below systemd's 5-minute
+/// stop timeout that a stuck shutdown used to run into, and generous enough for
+/// the bounded stages a healthy stop runs through (the final redeem sweep against
+/// anvil, the lane and receipt flushes, the cache close) on a loaded runner.
+const SERVER_STOP_BUDGET: Duration = Duration::from_secs(60);
 
 /// Time to keep observing the provider's lane store AFTER the first paid lane
 /// appears, so a second one lagging through the persisted-store fsync window is
@@ -343,5 +351,29 @@ async fn run_node_to_node_coalesce() -> anyhow::Result<()> {
         "the provider must have been PAID for the upstream pull (settled claim was {upstream_paid})"
     );
 
+    // (5) The server made node-to-node pulls, and still stops cleanly.
+    assert_stops_cleanly_on_sigterm(&server).await
+}
+
+/// SIGTERM `node` and require a successful exit whose router close never gave
+/// up.
+///
+/// A node that has made node-to-node pulls is where an upstream connection's
+/// QUIC driver could die with its pull leg's runtime and park the router close
+/// until systemd killed the node (#2185). The router close logs its give-up as
+/// an `error!`, so the daemon's default `warn` filter captures it.
+async fn assert_stops_cleanly_on_sigterm(node: &NodeFixture) -> anyhow::Result<()> {
+    let (status, took) = node.terminate(SERVER_STOP_BUDGET).await?;
+    anyhow::ensure!(
+        status.success(),
+        "the node must exit successfully on SIGTERM, got {status} after {took:?}"
+    );
+    let gave_up = node.log_line(&["router shutdown"]);
+    anyhow::ensure!(
+        gave_up.is_none(),
+        "the node's router close must finish on its own after node-to-node pulls, got: \
+         {gave_up:?}"
+    );
+    tracing::info!(?took, "node stopped on SIGTERM");
     Ok(())
 }

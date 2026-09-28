@@ -202,30 +202,16 @@ pub(crate) async fn local_endpoint(
 
 /// How long teardown has, in total, to reap every task and drain every endpoint.
 ///
-/// It must CLEAR `node_origin::ABANDON_DRAIN_CAP` (10s), not match it — 1.5×
-/// that cap, which is the sole derivation of the number. An abandoned
-/// pull leg runs its drain on its own runtime thread, waiting up to that cap for
-/// its upstream connections to reach their drained state, and [`Endpoint::close`]
-/// blocks on the same event. So the first close IS attempted under an equal
-/// budget; it simply sits inside the drain until both expire together, and the
-/// breach line then reports `0/M endpoints closed` for a run in which nothing was
-/// wedged. That is a false stranded-driver report on the one channel that keeps
-/// #1675 visible. The margin is what keeps a ceilinged drain from consuming the
-/// whole budget, so the two readings stay distinguishable; it still sits far below
-/// the `.config/nextest.toml` backstop.
+/// [`Endpoint::close`] waits for each open connection to reach QUIC's draining
+/// state: on a peer's close, or at the latest once its own close timer, `3 * PTO`,
+/// runs out. That timer is about 75 ms on loopback and a few seconds when CI
+/// CPU starvation inflates the RTT samples. The budget sits well above that, so a
+/// breach means a connection that is never going to drain, and well below the
+/// `.config/nextest.toml` backstop, so a breach still ends the test.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The 1.5× margin above is the whole point of the constant, so it is pinned
-/// here rather than left to the prose. A `SHUTDOWN_TIMEOUT` that merely CLEARS
-/// the drain cap still lets a ceilinged drain consume nearly the whole budget,
-/// collapsing the two readings the margin exists to keep distinguishable.
-/// Nanoseconds, so a sub-second change to either side still counts.
-const _: () = assert!(
-    SHUTDOWN_TIMEOUT.as_nanos() >= decdn_node::node_origin::ABANDON_DRAIN_CAP.as_nanos() * 3 / 2
-);
-
-/// What [`shutdown`] actually did, so a caller can assert on a breach rather
-/// than only see the warning line.
+/// What [`shutdown_within`] actually did, so a caller can assert on a breach
+/// rather than only see the warning line.
 ///
 /// The counts carry their own denominators. A bare `closed` says nothing on its
 /// own — `1` is clean for one endpoint and a breach for two — so the totals ride
@@ -274,14 +260,13 @@ impl ShutdownReport {
 /// guarantee and can still park until the `.config/nextest.toml` backstop; route
 /// teardown through this function, or [`reap`] for a one-shot task.
 ///
-/// A breach warns rather than fails, and names the stage it stalled in:
-/// `tasks reaped` short of `N` is a task outliving its own abort;
-/// `endpoints closed` short of `M` is a stranded upstream QUIC driver in the code
-/// under test (#1675). The second is a KNOWN open defect that no test here can
-/// fix, so failing on it would redden CI for something already tracked; the named
-/// line plus `decdn_node_pull_abandon_drain_timeout_total` are how it stays visible. A
-/// panicking server task is different — that is this test's own verdict, and it
-/// is returned.
+/// A breach fails the test, and names the stage it stalled in: `tasks reaped`
+/// short of `N` is a task outliving its own abort; `endpoints closed` short of
+/// `M` is a connection whose QUIC driver died with the runtime that dialled it,
+/// so it never reaches QUIC's draining state. The second is the node shutdown
+/// hang of #2185, which every teardown in this package therefore fails on, so a
+/// regression cannot pass silently. A test that must PRODUCE a breach calls
+/// [`shutdown_within`], which reports one instead.
 ///
 /// A caller that joins its own task must do so BEFORE this, and only for a
 /// one-shot task that ends on its own — an accept loop ends only once its
@@ -302,28 +287,63 @@ impl ShutdownReport {
 ///
 /// # Returns
 ///
-/// The [`ShutdownReport`] — the reaped/closed counts against their totals, so a
-/// caller can assert on a breach with [`ShutdownReport::is_clean`]. A breach (a
-/// deadline exceeded) is still `Ok`: it is a warning, not a failure, and the
-/// report carries the shortfall. A breach that also caught a panicking task
-/// returns the panic instead, and the counts are dropped with it.
+/// The [`ShutdownReport`], which on `Ok` is always clean.
 ///
 /// # Errors
 ///
-/// A server task that panicked.
+/// A server task that panicked, or a breach of [`SHUTDOWN_TIMEOUT`]. A breach
+/// that also caught a panicking task returns the panic.
 pub(crate) async fn shutdown<const N: usize, const M: usize>(
     tasks: [tokio::task::JoinHandle<()>; N],
     endpoints: [&Endpoint; M],
 ) -> anyhow::Result<ShutdownReport> {
-    shutdown_within(SHUTDOWN_TIMEOUT, tasks, endpoints).await
+    shutdown_strictly_within(SHUTDOWN_TIMEOUT, tasks, endpoints).await
 }
 
-/// [`shutdown`] under a caller-chosen deadline.
+/// [`shutdown`] under a caller-chosen deadline: fails on a breach, naming the
+/// stage and the index of the first task or endpoint that stalled.
+///
+/// Only the teardown helpers' own suite calls this directly, to pin that a
+/// breach fails without waiting out [`SHUTDOWN_TIMEOUT`].
+///
+/// # Errors
+///
+/// A server task that panicked, or a breach of `deadline`.
+pub(crate) async fn shutdown_strictly_within<const N: usize, const M: usize>(
+    deadline: Duration,
+    tasks: [tokio::task::JoinHandle<()>; N],
+    endpoints: [&Endpoint; M],
+) -> anyhow::Result<ShutdownReport> {
+    let report = shutdown_within(deadline, tasks, endpoints).await?;
+    anyhow::ensure!(
+        report.reaped == report.of_tasks,
+        "teardown exceeded {deadline:?}: task #{} outlived its abort ({report:?})",
+        report.reaped
+    );
+    anyhow::ensure!(
+        report.closed == report.of_endpoints,
+        "teardown exceeded {deadline:?}: endpoint #{} did not close, most likely a \
+         connection whose QUIC driver died with the runtime that dialled it (#2185) \
+         ({report:?})",
+        report.closed
+    );
+    Ok(report)
+}
+
+/// [`shutdown`] under a caller-chosen deadline, reporting a breach rather than
+/// failing on it.
 ///
 /// Only the teardown helpers' own suite needs this: a test that PROVES the
 /// breach path must wait the deadline out in real time, and [`SHUTDOWN_TIMEOUT`]
-/// is sized for the drain cap rather than for being waited on. Every other
+/// is sized for a starved close timer rather than for being waited on. Every other
 /// caller wants [`shutdown`].
+///
+/// # Returns
+///
+/// The [`ShutdownReport`] — the reaped/closed counts against their totals. A
+/// breach is still `Ok`, and the report carries the shortfall; assert on it with
+/// [`ShutdownReport::is_clean`]. A breach that also caught a panicking task
+/// returns the panic instead, and the counts are dropped with it.
 ///
 /// # Errors
 ///

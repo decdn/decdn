@@ -63,7 +63,6 @@ use iroh::{EndpointAddr, PublicKey};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument as _, debug, warn};
 
-use super::abandon_drain::{ConnDrain, as_observer, drain_abandoned};
 use super::admit_store::NodeAdmitStore;
 use super::backend_source::BackendSource;
 use super::funder::NodeFunder;
@@ -646,8 +645,8 @@ impl NodeOrigin {
         let stream_guard = deps.metrics.outbound_stream_guard();
 
         // The pull leg's own first leg, when the probe reported the size to cut it
-        // from. It opens on the outer runtime, which keeps living, so the pull
-        // needs no dial observer when the pull thread adopts it.
+        // from. Its dial runs on the node's main runtime, so its connection's
+        // driver lives there and outlives the pull thread that adopts it.
         let hint = candidate.total_bytes_hint;
         let predicted = prime.zip(hint).and_then(|(prime, total)| {
             prime
@@ -666,7 +665,8 @@ impl NodeOrigin {
                 deps.config.max_blob_size_bytes,
                 rate_ceiling,
                 deadlines,
-            );
+            )
+            .with_dial_runtime(deps.dial_runtime.clone());
             let handshake = timed_open(
                 source.open(hash_bytes, range.clone()),
                 Arc::clone(&deps.metrics),
@@ -739,9 +739,9 @@ impl NodeOrigin {
             rate_ceiling,
             deadlines,
             0,
-            // The pre-flight handshake runs on the OUTER runtime, which keeps
-            // living, so its driver is never stranded and needs no observer.
-            None,
+            // Every dial this node makes runs on its main runtime, wherever the
+            // caller runs.
+            Some(&deps.dial_runtime),
         )
         .await
         {
@@ -835,8 +835,10 @@ fn handshake_verdict(
 /// `&deps.slash_domain` are borrowed only within this runtime's scope. The shared
 /// coordination state (the shared [`FillSession`]'s [`DownstreamWatch`]) crosses
 /// runtimes safely — atomics and `Notify` wakers are runtime-agnostic — and the
-/// [`CacheEngine`] store actor and iroh [`Endpoint`](iroh::Endpoint) are reached
-/// through their own channels, so a second runtime talking to them is fine.
+/// [`CacheEngine`] store actor is reached through its own channel. Upstream dials
+/// are the exception: a connection's QUIC driver runs on the runtime that dials
+/// it, and this runtime drops when the leg returns, so every dial goes through
+/// [`NodeOriginDeps::dial_runtime`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_pull_leg(
     deps_lock: Arc<OnceLock<NodeOriginDeps>>,
@@ -1248,8 +1250,6 @@ impl PeerRunSink<'_> {
             prior_amount,
             ledger: Arc::clone(&ledger),
         };
-        let abandoned = ConnDrain::default();
-        let observer = abandoned.observer();
         let peer_source = PeerSource::new(
             &self.deps.endpoint,
             EndpointAddr::new(pk),
@@ -1262,7 +1262,7 @@ impl PeerRunSink<'_> {
             rate_ceiling,
             self.deadlines,
         )
-        .with_dial_observer(as_observer(&observer));
+        .with_dial_runtime(self.deps.dial_runtime.clone());
         let peer_source = PrimedSource::new(TimedSource::new(
             peer_source,
             Arc::clone(&self.deps.metrics),
@@ -1348,14 +1348,6 @@ impl PeerRunSink<'_> {
         let elapsed = started.elapsed();
         // A primed pull the drive never opened closes now, not when the run ends.
         peer_source.clear();
-
-        // Abandon drain on the cancel/`Err` paths — a dropped or errored `drive`
-        // strands its upstream connection on this pull-thread runtime, which the
-        // caller drops the instant this leg returns (see the single-source leg and
-        // `abandon_drain` for why the wait is on the transition, not a fixed span).
-        if cancelled || result.is_err() {
-            drain_abandoned(&abandoned, provider_addr, &self.deps.metrics).await;
-        }
         if cancelled {
             return RunOutcome::Cancelled;
         }
@@ -1618,11 +1610,6 @@ pub(crate) async fn run_local_pull_leg(
             Ok(())
         }
     };
-
-    // No abandon drain here, unlike the paid twin. This leg fetches from the node's
-    // OWN origin — an HTTP/S3/fs call inside the cache engine — so a cancelled or
-    // errored `drive` strands no QUIC driver on this pull-thread runtime, and there
-    // is nothing for the orchestration's immediate drop of that runtime to break.
 
     // Classify a terminal error. There is no upstream, so a fault is ALWAYS local
     // (our own origin is corrupt/misconfigured, or a transport fault reaching it):

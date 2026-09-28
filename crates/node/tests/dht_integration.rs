@@ -165,20 +165,15 @@ impl TestServer {
         (self.accept_task, self.endpoint)
     }
 
-    /// Reap the accept loop, close the endpoint under
-    /// [`support::shutdown`]'s deadline, and VERIFY the close landed — so the
-    /// peer is genuinely unreachable by the time this returns.
+    /// Reap the accept loop and close the endpoint under
+    /// [`support::shutdown`]'s deadline, so the peer is genuinely unreachable
+    /// by the time this returns.
     ///
-    /// The check is the point. [`support::shutdown`] warns rather than fails
-    /// when its deadline is breached, because the stranded-driver half of that
-    /// breach is a known open defect (#1675) no test here can fix. For teardown
-    /// that is the right trade. This is not teardown: the "handler dropped
-    /// mid-lookup" simulation in `find_providers_tolerates_unreachable_peer`
-    /// reads "this peer is down" as its PRECONDITION, and a breach would leave
-    /// the peer answering while the scenario passed having exercised nothing.
-    /// Asserting the postcondition keeps that failure loud, and the deadline
-    /// still stops a stalled close from parking the test until the
-    /// `.config/nextest.toml` backstop.
+    /// The "handler dropped mid-lookup" simulation in
+    /// `find_providers_tolerates_unreachable_peer` reads "this peer is down" as
+    /// its PRECONDITION. [`support::shutdown`] fails on a close that does not
+    /// land, so a peer still answering fails the test rather than letting the
+    /// scenario pass having exercised nothing.
     ///
     /// # Errors
     ///
@@ -186,11 +181,6 @@ impl TestServer {
     async fn shutdown(self) -> anyhow::Result<()> {
         let (task, endpoint) = self.into_teardown_parts();
         support::shutdown([task], [&endpoint]).await?;
-        anyhow::ensure!(
-            endpoint.is_closed(),
-            "the peer must be unreachable before the scenario runs, but its endpoint \
-             did not close within the teardown deadline"
-        );
         Ok(())
     }
 }

@@ -464,7 +464,7 @@ async fn two_hashes_reuse_one_warm_connection() -> anyhow::Result<()> {
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
     let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
 
-    let warm = WarmConnection::connect(&client_ep, target, Duration::from_secs(20)).await?;
+    let warm = WarmConnection::connect(&client_ep, target, Duration::from_secs(20), None).await?;
 
     let got_a = stream_fetch_on(
         &warm,

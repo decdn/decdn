@@ -25,11 +25,13 @@ use std::time::Duration;
 
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
-use support::{fresh_key, local_endpoint, reap, shutdown, shutdown_within};
+use support::{
+    fresh_key, local_endpoint, reap, shutdown, shutdown_strictly_within, shutdown_within,
+};
 
 /// How long the close tests give teardown. Real wall clock, so it is sized to
 /// be waited out: orders of magnitude above a healthy loopback close, and far
-/// below `support::SHUTDOWN_TIMEOUT`, which is sized against the drain cap
+/// below `support::SHUTDOWN_TIMEOUT`, which is sized for a starved close timer
 /// rather than for being sat through.
 const CLOSE_DEADLINE: Duration = Duration::from_secs(2);
 
@@ -144,7 +146,7 @@ async fn shutdown_reports_clean_counts() -> anyhow::Result<()> {
 
 /// A task that outlives its own abort yields `Ok` with the report short of its
 /// TASK total — the other half of the breach line, and the half that reads as
-/// this fixture's own defect rather than as #1675.
+/// this fixture's own defect rather than as a stranded connection driver.
 ///
 /// An abort only drops a task's future at its next poll, so a task that never
 /// yields never takes it. `spawn_blocking` is the honest way to park one: it
@@ -183,8 +185,8 @@ async fn shutdown_reports_a_task_that_outlives_its_abort() -> anyhow::Result<()>
 /// strands the driver task quinn spawned on it. `Endpoint::close` normally
 /// bounds itself on the connection's own close timer, but that timer is driven
 /// by the same stranded task, so the connection reaches neither drained nor
-/// timed out and the close waits indefinitely. That is the shape
-/// `node_origin::abandon_drain` exists to wait out (#1675).
+/// timed out and the close waits indefinitely. That is the shape a pull leg
+/// avoids by dialling on the node's main runtime (#2185).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_reports_a_stalled_close() -> anyhow::Result<()> {
     let (ep, _conn) = connected_endpoint(ConnDriver::Stranded).await?;
@@ -197,6 +199,45 @@ async fn shutdown_reports_a_stalled_close() -> anyhow::Result<()> {
         report.closed, 0,
         "the stalled endpoint must not count as closed"
     );
+    Ok(())
+}
+
+/// The strict teardown every other test uses FAILS on the same stalled close,
+/// and names the endpoint that stalled. If it only reported, every teardown in
+/// the package would stop guarding against a stranded QUIC driver (#2185).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn strict_shutdown_fails_on_a_stalled_close() -> anyhow::Result<()> {
+    let (ep, _conn) = connected_endpoint(ConnDriver::Stranded).await?;
+    let err = shutdown_strictly_within(CLOSE_DEADLINE, [], [&ep])
+        .await
+        .expect_err("a stalled close must fail the strict teardown");
+    assert!(
+        err.to_string().contains("endpoint #0 did not close"),
+        "the error must name the stalled endpoint, got: {err}"
+    );
+    Ok(())
+}
+
+/// A task that outlives its abort fails the strict teardown too, naming the
+/// task rather than an endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn strict_shutdown_fails_on_a_task_that_outlives_its_abort() -> anyhow::Result<()> {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let task = tokio::task::spawn_blocking(move || {
+        let _ = started_tx.send(());
+        let _ = release_rx.recv();
+    });
+    started_rx.await?;
+
+    let err = shutdown_strictly_within(REAP_DEADLINE, [task], [])
+        .await
+        .expect_err("an unabortable task must fail the strict teardown");
+    assert!(
+        err.to_string().contains("task #0 outlived its abort"),
+        "the error must name the stuck task, got: {err}"
+    );
+    drop(release_tx);
     Ok(())
 }
 

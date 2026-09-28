@@ -652,6 +652,62 @@ impl NodeFixture {
         Ok(())
     }
 
+    /// Send the daemon SIGTERM — the signal `systemctl stop` sends — and wait up
+    /// to `timeout` for it to exit, returning its exit status and how long it
+    /// took.
+    ///
+    /// Unlike [`Self::stop`], this runs the daemon's graceful shutdown: the
+    /// router close, the final redeem sweep, the lane-store and receipt flushes,
+    /// and the cache close. A daemon still running at `timeout` is killed and
+    /// reaped, and the call fails with the daemon's last log lines, so a hung
+    /// shutdown fails the journey instead of leaking the process. A daemon
+    /// stopped here is respawned by [`Self::restart`].
+    ///
+    /// It returns only once the log capture has read both pipes to EOF, so a
+    /// [`Self::log_line`] after it sees every line the shutdown wrote.
+    pub async fn terminate(
+        &self,
+        timeout: Duration,
+    ) -> anyhow::Result<(std::process::ExitStatus, Duration)> {
+        let pid = {
+            let child = self.child.0.lock().unwrap_or_else(PoisonError::into_inner);
+            i32::try_from(child.id()).context("decdn-node pid does not fit a pid_t")?
+        };
+        let started = tokio::time::Instant::now();
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .context("send SIGTERM to decdn-node")?;
+        loop {
+            // The guard lock is held only for the non-blocking `try_wait`, never
+            // across the sleep.
+            let exited = {
+                let mut child = self.child.0.lock().unwrap_or_else(PoisonError::into_inner);
+                child.try_wait().context("poll decdn-node for exit")?
+            };
+            if let Some(status) = exited {
+                let took = started.elapsed();
+                anyhow::ensure!(
+                    self.log.drained(LOG_DRAIN_TIMEOUT).await,
+                    "decdn-node exited ({status}) but its log capture did not reach EOF \
+                     within {LOG_DRAIN_TIMEOUT:?}, so its last lines may be missing"
+                );
+                return Ok((status, took));
+            }
+            if started.elapsed() >= timeout {
+                self.stop()
+                    .context("kill decdn-node after its SIGTERM timed out")?;
+                anyhow::bail!(
+                    "decdn-node did not exit within {timeout:?} of SIGTERM; its last \
+                     {LOG_TAIL_LINES} lines:\n{}",
+                    self.log.tail(LOG_TAIL_LINES)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Point the daemon at the `PaymentPool` at `payment_pool` and at
     /// `discovery_peers` alone, then restart it: the operator's side of a
     /// `PaymentPool` redeploy. The config changes; the data dir — the buyer pool
@@ -682,7 +738,7 @@ impl NodeFixture {
     /// fixture sets it from `$DECDN_NODE_LOG`, else `warn`.
     #[must_use]
     pub fn log_line(&self, needles: &[&str]) -> Option<String> {
-        let log = self.log.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let log = self.log.text.lock().unwrap_or_else(PoisonError::into_inner);
         line_with_all(&log, needles).map(str::to_owned)
     }
 
@@ -1076,12 +1132,23 @@ fn rewrite_payment_pool(
 /// reports.
 const LOG_TAIL_LINES: usize = 20;
 
+/// How long [`NodeFixture::terminate`] waits, after the daemon exits, for its log
+/// capture to read both pipes to EOF. A pipe closes the moment the process that
+/// holds it exits, so this only bounds the reader threads' last few reads.
+const LOG_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Everything every spawn of one daemon has written to stdout and stderr, line
 /// by line, with ANSI styling removed. The daemon's log format styles field
 /// names whenever colour is on (unless `NO_COLOR` is set), even when its output
 /// is a pipe, so a raw line does not contain `name=value` verbatim.
 #[derive(Debug, Clone, Default)]
-struct DaemonLog(Arc<Mutex<String>>);
+struct DaemonLog {
+    /// The captured lines.
+    text: Arc<Mutex<String>>,
+    /// The reader threads of the current spawn's pipes, kept so
+    /// [`Self::drained`] can wait for them to reach EOF.
+    readers: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+}
 
 impl DaemonLog {
     /// Copy `pipe` to `echo` byte for byte, and append each line to the log,
@@ -1131,8 +1198,41 @@ impl DaemonLog {
             .with_context(|| format!("spawn decdn-node {name} tee thread"))
     }
 
+    /// Keep a reader thread from [`Self::tee`], so [`Self::drained`] waits for
+    /// its pipe to close.
+    fn track(&self, reader: std::thread::JoinHandle<()>) {
+        self.readers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(reader);
+    }
+
+    /// Wait until every tracked reader has read its pipe to EOF, so the log holds
+    /// every line the daemon wrote before it exited, or until `timeout` elapses.
+    /// Returns whether every reader finished.
+    ///
+    /// A daemon's exit does not order its last lines into the log: the readers
+    /// run on their own threads and may still hold them. Only a closed pipe does.
+    async fn drained(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let all_done = {
+                let mut readers = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
+                readers.retain(|reader| !reader.is_finished());
+                readers.is_empty()
+            };
+            if all_done {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     fn append(&self, text: &str) {
-        self.0
+        self.text
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push_str(text);
@@ -1140,7 +1240,7 @@ impl DaemonLog {
 
     /// The last `lines` lines of the log.
     fn tail(&self, lines: usize) -> String {
-        let log = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let log = self.text.lock().unwrap_or_else(PoisonError::into_inner);
         let all: Vec<&str> = log.lines().collect();
         all.get(all.len().saturating_sub(lines)..)
             .unwrap_or_default()
@@ -1282,8 +1382,11 @@ fn spawn_daemon(
     let teed = match (child.stdout.take(), child.stderr.take()) {
         (Some(stdout), Some(stderr)) => log
             .tee(stdout, std::io::stdout(), "stdout")
-            .and_then(|_| log.tee(stderr, std::io::stderr(), "stderr"))
-            .map(drop),
+            .and_then(|out| {
+                log.track(out);
+                log.tee(stderr, std::io::stderr(), "stderr")
+            })
+            .map(|err| log.track(err)),
         _ => Err(anyhow::anyhow!("decdn-node spawned without piped stdio")),
     };
     if let Err(err) = teed {
