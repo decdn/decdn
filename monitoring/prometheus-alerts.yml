@@ -465,9 +465,10 @@ groups:
       # tail. Its failure keeps the current share and the tick still succeeds,
       # so the stall alert above cannot see it. The re-read runs once per
       # fee_shares_poll_interval_sec (default 1 h) and retries a failed one
-      # on the next interval. One transient RPC error
-      # is therefore healed by the next re-read; two failures inside 3 h
-      # mean consecutive re-reads are not landing.
+      # on the next interval, so the next re-read heals one transient RPC
+      # error. The alert fires when two re-reads fail inside 3 h: at the
+      # default cadence, two of the last three. An interval of 3 h or more
+      # fits fewer than two re-reads in the window, so the alert cannot fire.
       - alert: DecdnFeeSharesPollFailing
         expr: increase(decdn_fee_shares_watcher_poll_failures_total[3h]) >= 2
         for: 0m
