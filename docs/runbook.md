@@ -909,10 +909,20 @@ forfeit after the drop.
 
 **Before repointing:**
 
-1. Let the node redeem its open lanes and finish any pending settles on the
-   old deployment (`decdn_unredeemed_usdc` reaches 0 / the redeemer logs go
-   quiet), then stop the node.
-2. Update the config and restart. The boot logs one WARN per dropped lane
+1. While the node still points at the old deployment, set
+   `blockchain.redeem_threshold_micro_usdc = 1` and restart it. The redeemer
+   submits a chunk only when its unredeemed total clears this per-chunk
+   floor, and every redeem path uses it, graceful shutdown included. At the
+   default (1 USDC), sub-floor lanes stay unredeemed indefinitely, so
+   `decdn_unredeemed_usdc` may never reach 0. With the floor at 1 µUSDC, the
+   next self-tick (`blockchain.redeem_interval_secs`) redeems every lane that
+   owes anything.
+2. Wait until `decdn_unredeemed_usdc` reads 0, then stop the node gracefully.
+   Shutdown runs one final redeem sweep. Confirm the log has no
+   `shutdown redeem deadline elapsed` warning; if it does, start the node on
+   the old config and stop it again.
+3. Update the config (new deployment, and restore
+   `redeem_threshold_micro_usdc`) and restart. The boot logs one WARN per dropped lane
    with its `pool_id`, `signer`, `provider`, and unredeemed value — the last
    record of each claim — plus a summary WARN with `dropped_lanes` and
    `forfeited_micro_usdc`. Capture these lines if you need an audit trail.
