@@ -838,6 +838,17 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **A serve-miss pull draws for its parked serve leg while a sibling stream
+  of the same blob waits further down (#PR).** Every serve leg's demand went to
+  every live fill of the hash as one high-water mark, so a sibling stream's
+  demand hid a leg parked at its own pull's frontier. That pull paced to
+  `Wait` and neither leg moved until the client gave up. On the testnet, lon1
+  proxying a 13.5 GiB entry went silent for 31 s and the client failed over.
+  Each serve leg now stands its own demand through a `DemandSlot`, routed only
+  to the fill that produces the awaited byte and withdrawn once the leg moves
+  again, and a pull reads the nearest standing demand. `decdn-cache` exports
+  `Demand` and `DemandSlot`; `FillSession::demand_up_to` is removed and
+  `FillSession::serve_demand` returns a `Demand`.
 - **`bundle pull` holds a lane-stream permit only while that stream runs
   (#2208).** A range-dedup entry held a permit on every candidate, reserve
   and proxies included, for the whole entry, and a fan-out held one per

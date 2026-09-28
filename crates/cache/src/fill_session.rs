@@ -304,6 +304,118 @@ impl Frontier {
     }
 }
 
+/// A fill's serve demand: one standing demand per serve leg that has run out of
+/// encoded bytes while its encode waits on content this fill produces.
+///
+/// A leg stands its demand through its [`DemandSlot`] and withdraws it once its
+/// encode moves again or the leg ends. [`Self::get`] reads the NEAREST standing
+/// demand, so a leg parked far down the blob never hides a leg parked at the pull's
+/// frontier. Every change to the nearest demand wakes a pull parked in
+/// [`DownstreamWatch::past`].
+#[derive(Debug, Clone)]
+pub struct Demand {
+    /// The content end each starved serve leg awaits, keyed by its slot id.
+    legs: Arc<StdMutex<HashMap<u64, u64>>>,
+    /// The session's downstream wakeup, shared with its paid frontier.
+    advanced: Arc<Notify>,
+}
+
+impl Demand {
+    /// An empty demand that notifies `advanced` when its nearest value changes.
+    fn new(advanced: Arc<Notify>) -> Self {
+        Self {
+            legs: Arc::new(StdMutex::new(HashMap::new())),
+            advanced,
+        }
+    }
+
+    /// The nearest content end a starved serve leg awaits, or `0` when none waits.
+    #[must_use]
+    pub fn get(&self) -> u64 {
+        nearest(&self.legs.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Record that leg `leg` awaits content up to `end`.
+    fn stand(&self, leg: u64, end: u64) {
+        self.update(|legs| {
+            legs.insert(leg, end);
+        });
+    }
+
+    /// Drop leg `leg`'s standing demand, if any.
+    fn withdraw(&self, leg: u64) {
+        self.update(|legs| {
+            legs.remove(&leg);
+        });
+    }
+
+    /// Apply `change` and wake the parked pull when the nearest demand moved.
+    fn update(&self, change: impl FnOnce(&mut HashMap<u64, u64>)) {
+        let moved = {
+            let mut legs = self.legs.lock().unwrap_or_else(PoisonError::into_inner);
+            let before = nearest(&legs);
+            change(&mut legs);
+            nearest(&legs) != before
+        };
+        if moved {
+            self.advanced.notify_waiters();
+        }
+    }
+}
+
+/// The smallest standing demand in `legs`, or `0` when it is empty.
+fn nearest(legs: &HashMap<u64, u64>) -> u64 {
+    legs.values().copied().min().unwrap_or(0)
+}
+
+/// Source of [`DemandSlot`] ids, unique across every fill in the process.
+static NEXT_DEMAND_SLOT: AtomicU64 = AtomicU64::new(1);
+
+/// One serve leg's handle on the serve demand of its blob's live fills. Minted by
+/// [`FillSession::demand_slot`].
+///
+/// [`Self::stand`] routes the leg's demand to the live fill whose covered range
+/// holds the awaited byte, and withdraws it from every other fill of the hash:
+/// only that fill's pull can produce the byte. Dropping the slot withdraws the
+/// demand, so a finished or abandoned leg leaves nothing standing.
+#[derive(Debug)]
+pub struct DemandSlot {
+    /// The serve leg's own session, the route to the hash's registry.
+    session: Arc<FillSession>,
+    /// This slot's key in every [`Demand`] it stands in.
+    id: u64,
+}
+
+impl DemandSlot {
+    /// Stand this leg's demand for content up to `end`, clamped to the blob size.
+    /// It replaces the leg's previous demand. An `end` of `0` withdraws it.
+    pub fn stand(&self, end: u64) {
+        let end = end.min(self.session.total_bytes());
+        let Some(byte) = end.checked_sub(1) else {
+            self.withdraw();
+            return;
+        };
+        match self.session.registry_and_hash() {
+            Some((registry, hash)) => registry.route_demand(hash, self.id, byte, end),
+            None => self.session.route_own_demand(self.id, byte, end),
+        }
+    }
+
+    /// Withdraw this leg's demand from every fill of the hash.
+    pub fn withdraw(&self) {
+        match self.session.registry_and_hash() {
+            Some((registry, hash)) => registry.withdraw_demand(hash, self.id),
+            None => self.session.serve_demand.withdraw(self.id),
+        }
+    }
+}
+
+impl Drop for DemandSlot {
+    fn drop(&mut self) {
+        self.withdraw();
+    }
+}
+
 /// A pull leg's view of its session's two downstream frontiers: the paid frontier
 /// ([`FillSession::served_frontier`]) and the serve demand
 /// ([`FillSession::serve_demand`]). Read-only and cheap to clone, so a pull on its
@@ -312,8 +424,8 @@ impl Frontier {
 pub struct DownstreamWatch {
     /// The session's paid content frontier.
     served_paid: Frontier,
-    /// The session's serve-demand frontier. Shares its wakeup with `served_paid`.
-    serve_demand: Frontier,
+    /// The session's serve demand. Shares its wakeup with `served_paid`.
+    serve_demand: Demand,
 }
 
 impl DownstreamWatch {
@@ -323,15 +435,16 @@ impl DownstreamWatch {
         self.served_paid.get()
     }
 
-    /// The current serve-demand frontier.
+    /// The nearest content end a starved serve leg awaits, or `0` when none waits.
     #[must_use]
     pub fn serve_demand(&self) -> u64 {
         self.serve_demand.get()
     }
 
-    /// Resolve once either frontier lies past the observed value: `served_paid`
-    /// past `observed_paid`, or `serve_demand` past `observed_demand`. Returns at
-    /// once when one already does.
+    /// Resolve once `served_paid` lies past `observed_paid` or the serve demand
+    /// differs from `observed_demand`. Returns at once when either already holds.
+    /// The demand counts any change: a nearer leg parking lowers it, and the pull
+    /// must re-decide for that leg as much as for a farther one.
     ///
     /// Registers the wakeup BEFORE it re-reads the frontiers. `notify_waiters` wakes
     /// only waiters registered when it fires and stores no permit, so an advance
@@ -342,7 +455,7 @@ impl DownstreamWatch {
         tokio::pin!(notified);
         loop {
             notified.as_mut().enable();
-            if self.served_paid() > observed_paid || self.serve_demand() > observed_demand {
+            if self.served_paid() > observed_paid || self.serve_demand() != observed_demand {
                 return;
             }
             notified.as_mut().await;
@@ -384,17 +497,18 @@ pub struct FillSession {
     /// `served_paid − served_start` plus the owning stream's carried lane credit,
     /// so a resumed request ramps from that credit, not from its blob offset.
     served_start: u64,
-    /// The content end of the furthest span a serve leg has been stuck on (a
-    /// high-water mark, never lowered): the serve leg's frame consumer raises it
-    /// when it has no encoded bytes left and its encode is parked on a leaf or a
-    /// proof node no pull has produced ([`SessionOutboardReader::parked_on`]). A park
-    /// with encoded bytes still buffered is look-ahead and raises nothing, so a
-    /// client that stops paying cannot drag a pull past its window. When it lies
-    /// within one chunk group past a pull's frontier, that pull's pacer draws one
-    /// window floor even with its window full. Without it, a pull window that closes
-    /// before the serve leg's credit window leaves both legs waiting on each other.
-    /// Shares one wakeup with `served_paid`, so a parked pull wakes on either.
-    serve_demand: Frontier,
+    /// Where the starved serve legs reading this fill's content wait. A serve leg's
+    /// frame consumer stands a demand through its [`DemandSlot`] when it has no
+    /// encoded bytes left and its encode is parked on a leaf or a proof node no pull
+    /// has produced ([`SessionOutboardReader::parked_on`]), and withdraws it once
+    /// the encode moves again. A park with encoded bytes still buffered is
+    /// look-ahead and stands nothing, so a client that stops paying cannot drag a
+    /// pull past its window. When the nearest demand lies within one chunk group
+    /// past a pull's frontier, that pull's pacer draws one window floor even with
+    /// its window full. Without it, a pull window that closes before the serve leg's
+    /// credit window leaves both legs waiting on each other. Shares one wakeup with
+    /// `served_paid`, so a parked pull wakes on either.
+    serve_demand: Demand,
     /// The chunk ranges THIS fill will produce — exactly the bytes this pull
     /// fetches (its `missing_ranges ∩ R`). [`FillRegistry::range_still_live`]
     /// intersects a reader's node range against the union of all live sessions'
@@ -449,7 +563,7 @@ impl FillSession {
             ended: StdMutex::new(None),
             served_paid: Frontier::new(served_start, Arc::clone(&downstream_advanced)),
             served_start,
-            serve_demand: Frontier::new(0, downstream_advanced),
+            serve_demand: Demand::new(downstream_advanced),
             covered: StdMutex::new(ChunkRanges::all()),
             observers: AtomicUsize::new(0),
             cancel: CancellationToken::new(),
@@ -629,36 +743,46 @@ impl FillSession {
         }
     }
 
-    /// The content end of the furthest span a serve leg awaits. When it lies within
-    /// one chunk group past a pull's frontier, that pull's pacer draws one window
-    /// floor even with its window full; a demand further out is ignored.
+    /// The serve demand of this fill. When its nearest value lies within one chunk
+    /// group past a pull's frontier, that pull's pacer draws one window floor even
+    /// with its window full; a demand further out is ignored.
     #[must_use]
-    pub const fn serve_demand(&self) -> &Frontier {
+    pub const fn serve_demand(&self) -> &Demand {
         &self.serve_demand
     }
 
-    /// Record that a serve leg awaits content up to `end`, and wake each parked pull
-    /// whose demand frontier this raises. `end` is clamped to the blob's
-    /// [`Self::total_bytes`]. The demand goes to every live fill of the
-    /// hash, not only this one: under coalescing a sibling pull may be the one that
-    /// produces the awaited span. A pull acts on it only when `end` lies within one
-    /// chunk group past its own frontier, so a demand far from a pull costs nothing.
-    pub fn demand_up_to(&self, end: u64) {
-        let end = end.min(self.total_bytes());
-        let registry = self
-            .registry
-            .get()
-            .and_then(|(weak, hash)| weak.upgrade().map(|registry| (registry, *hash)));
-        match registry {
-            Some((registry, hash)) => registry.raise_demand(hash, end),
-            None => self.raise_own_demand(end),
+    /// Mint the [`DemandSlot`] one serve leg reading this fill stands its demand
+    /// through. Under coalescing the awaited byte may belong to a sibling fill of
+    /// the hash, so the slot routes each demand through the registry.
+    #[must_use]
+    pub fn demand_slot(self: &Arc<Self>) -> DemandSlot {
+        DemandSlot {
+            session: Arc::clone(self),
+            id: NEXT_DEMAND_SLOT.fetch_add(1, Ordering::Relaxed),
         }
     }
 
-    /// Raise this session's own demand frontier to `end`, waking its parked pull if
-    /// the frontier moved.
-    fn raise_own_demand(&self, end: u64) {
-        self.serve_demand.raise(end);
+    /// The owning registry and this session's hash, when registered and the
+    /// registry is still alive.
+    fn registry_and_hash(&self) -> Option<(Arc<FillRegistry>, Hash)> {
+        self.registry
+            .get()
+            .and_then(|(weak, hash)| weak.upgrade().map(|registry| (registry, *hash)))
+    }
+
+    /// Stand slot `slot`'s demand for content up to `end` here when this live fill
+    /// produces `byte`, and withdraw it otherwise.
+    fn route_own_demand(&self, slot: u64, byte: u64, end: u64) {
+        let chunk = bao_tree::ChunkNum::full_chunks(byte);
+        let produces = !self.is_dead() && {
+            let covered = self.covered.lock().unwrap_or_else(PoisonError::into_inner);
+            !(&*covered & &ChunkRanges::from(chunk..chunk + 1)).is_empty()
+        };
+        if produces {
+            self.serve_demand.stand(slot, end);
+        } else {
+            self.serve_demand.withdraw(slot);
+        }
     }
 
     /// The per-hash liveness signal, notified whenever any session for this hash
@@ -746,15 +870,15 @@ pub struct SessionOutboardReader {
     /// into the node whose pair no pull has captured. The reader does NOT raise
     /// serve demand itself — an encoder reads ahead of what its consumer needs, so
     /// a park here alone does not mean the serve leg is stuck. The frame consumer
-    /// publishes this value via [`FillSession::demand_up_to`] only once it is
+    /// stands this value via its [`DemandSlot`] only once it is
     /// starved of encoded bytes ([`Self::parked_on`]).
     parked_on: Arc<AtomicU64>,
 }
 
 impl SessionOutboardReader {
     /// The cell this reader writes the content end it waits on into. A frame
-    /// consumer shares it with its data reader and publishes it as serve demand
-    /// once it has no encoded bytes left to take.
+    /// consumer shares it with its data reader and stands it as serve demand
+    /// while it has no encoded bytes left to take.
     #[must_use]
     pub fn parked_on(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.parked_on)
@@ -1118,13 +1242,24 @@ impl FillRegistry {
             .map(|session| session.total_bytes())
     }
 
-    /// Raise the serve-demand frontier of every live fill of `hash` to `end`
-    /// ([`FillSession::demand_up_to`]).
-    fn raise_demand(&self, hash: Hash, end: u64) {
+    /// Route slot `slot`'s demand for content up to `end` to the live fill of `hash`
+    /// that produces `byte`, and withdraw it from every other fill of the hash
+    /// ([`DemandSlot::stand`]).
+    fn route_demand(&self, hash: Hash, slot: u64, byte: u64, end: u64) {
         let map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = map.get(&hash) {
-            for session in entry.sessions.iter().filter(|s| !s.is_dead()) {
-                session.raise_own_demand(end);
+            for session in &entry.sessions {
+                session.route_own_demand(slot, byte, end);
+            }
+        }
+    }
+
+    /// Withdraw slot `slot`'s demand from every fill of `hash`.
+    fn withdraw_demand(&self, hash: Hash, slot: u64) {
+        let map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = map.get(&hash) {
+            for session in &entry.sessions {
+                session.serve_demand.withdraw(slot);
             }
         }
     }
@@ -1610,50 +1745,109 @@ mod fill_registry_tests {
         assert_eq!(load.await.unwrap().unwrap(), Some(pair));
     }
 
-    /// Serve demand reaches every LIVE fill of the hash, never regresses, and skips a
-    /// dead fill: under coalescing the pull that produces the awaited span may be a
-    /// sibling of the reader's own session.
+    /// A serve leg's demand reaches the live fill that produces the awaited byte and
+    /// no other: under coalescing that fill may be a sibling of the leg's own
+    /// session. A dead fill produces nothing, so it never holds a demand.
     #[test]
-    fn demand_reaches_every_live_fill_and_never_regresses() {
+    fn demand_reaches_the_live_fill_that_produces_the_byte() {
         let total = 8 * G;
         let reg = Arc::new(FillRegistry::new());
         let hash = store_hash(0x4B);
         let (a, _al) = register(&reg, hash, hb(0x4B), total, ranges(0, 4 * G, total));
         let (b, _bl) = register(&reg, hash, hb(0x4B), total, ranges(4 * G, 4 * G, total));
-        let (dead, _dl) = register(&reg, hash, hb(0x4B), total, ranges(2 * G, 2 * G, total));
+        let (dead, _dl) = register(&reg, hash, hb(0x4B), total, ranges(4 * G, 2 * G, total));
         dead.mark_ended(Err(FillError::new("ended before the demand")));
 
-        a.demand_up_to(5 * G);
-        assert_eq!(a.serve_demand().get(), 5 * G);
+        let leg = a.demand_slot();
+        leg.stand(5 * G);
         assert_eq!(
             b.serve_demand().get(),
             5 * G,
-            "a live sibling receives the demand"
+            "the sibling produces the byte"
         );
+        assert_eq!(a.serve_demand().get(), 0, "the leg's own fill does not");
         assert_eq!(dead.serve_demand().get(), 0, "a dead fill is skipped");
 
-        b.demand_up_to(3 * G);
+        leg.stand(3 * G);
+        assert_eq!(a.serve_demand().get(), 3 * G, "the demand follows the leg");
         assert_eq!(
-            a.serve_demand().get(),
-            5 * G,
-            "a lower demand never regresses the frontier"
+            b.serve_demand().get(),
+            0,
+            "and leaves the fill it no longer awaits"
         );
     }
 
-    /// Serve demand never exceeds the blob: `demand_up_to` clamps `end` to the
-    /// session's total bytes, so a producer that reports a span past the end cannot
-    /// raise a pull's demand frontier beyond the content it can fetch.
+    /// A serve leg parked in a sibling fill's range, further down the blob, does
+    /// not hide a nearer parked leg from the fill that produces its bytes. On the
+    /// testnet a 30 s stall came from exactly this: a sibling stream's demand
+    /// masked the demand of a stream parked at its own pull's frontier, so that
+    /// pull waited on a payment its parked serve leg could not collect.
+    #[test]
+    fn a_sibling_fills_far_demand_does_not_hide_a_near_one() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x4E);
+        let (near, _nl) = register(&reg, hash, hb(0x4E), total, ranges(0, 4 * G, total));
+        let (far, _fl) = register(&reg, hash, hb(0x4E), total, ranges(4 * G, 4 * G, total));
+
+        let far_leg = far.demand_slot();
+        far_leg.stand(6 * G);
+        let near_leg = near.demand_slot();
+        near_leg.stand(G);
+
+        assert_eq!(
+            near.serve_demand().get(),
+            G,
+            "the near fill's pull sees the leg parked in its own range"
+        );
+        assert_eq!(
+            far.serve_demand().get(),
+            6 * G,
+            "the far fill's pull sees only the leg parked in its range"
+        );
+    }
+
+    /// Within one fill, the pull reads the NEAREST standing demand: a leg attached
+    /// further down the fill's range does not hide a leg parked at the pull's
+    /// frontier. A withdrawn or dropped slot leaves nothing standing.
+    #[test]
+    fn a_fill_reads_its_nearest_standing_demand() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x4F);
+        let (fill, _l) = register(&reg, hash, hb(0x4F), total, ranges(0, total, total));
+
+        let far = fill.demand_slot();
+        far.stand(6 * G);
+        let near = fill.demand_slot();
+        near.stand(G);
+        assert_eq!(fill.serve_demand().get(), G, "the nearer leg wins");
+
+        near.withdraw();
+        assert_eq!(fill.serve_demand().get(), 6 * G, "a moving leg withdraws");
+
+        drop(far);
+        assert_eq!(fill.serve_demand().get(), 0, "a dropped slot withdraws");
+    }
+
+    /// Serve demand never exceeds the blob: `stand` clamps `end` to the session's
+    /// total bytes, so a producer that reports a span past the end cannot place a
+    /// pull's demand beyond the content it can fetch. An `end` of `0` withdraws.
     #[test]
     fn demand_is_clamped_to_the_blob_size() {
         let total = 8 * G;
         let reg = Arc::new(FillRegistry::new());
         let hash = store_hash(0x4C);
-        let (a, _al) = register(&reg, hash, hb(0x4C), total, ranges(0, 0, total));
-        a.demand_up_to(total + 5 * G);
+        let (a, _al) = register(&reg, hash, hb(0x4C), total, ranges(0, total, total));
+        let leg = a.demand_slot();
+        leg.stand(total + 5 * G);
         assert_eq!(a.serve_demand().get(), total);
+        leg.stand(0);
+        assert_eq!(a.serve_demand().get(), 0);
 
         let standalone = FillSession::new(hb(0x4D), total);
-        standalone.demand_up_to(u64::MAX);
+        let leg = standalone.demand_slot();
+        leg.stand(u64::MAX);
         assert_eq!(standalone.serve_demand().get(), total);
     }
 
@@ -1729,8 +1923,8 @@ mod fill_registry_tests {
         assert_eq!(ahead.served_frontier().get(), 7 * G, "never regresses");
     }
 
-    /// A watch wakes on either frontier: a demand raise with no payment resolves a
-    /// watch parked on the paid frontier.
+    /// A watch wakes on either frontier: a standing demand with no payment resolves
+    /// a watch parked on the paid frontier, and so does its withdrawal.
     #[test]
     fn a_watch_wakes_on_a_demand_raise() {
         use futures_util::FutureExt;
@@ -1741,10 +1935,20 @@ mod fill_registry_tests {
         futures_util::pin_mut!(past);
         assert!(past.as_mut().now_or_never().is_none());
 
-        session.demand_up_to(G);
+        let leg = session.demand_slot();
+        leg.stand(G);
         assert!(
             past.now_or_never().is_some(),
-            "a demand raise wakes the watch"
+            "a standing demand wakes the watch"
+        );
+
+        let past = watch.past(0, G);
+        futures_util::pin_mut!(past);
+        assert!(past.as_mut().now_or_never().is_none());
+        leg.withdraw();
+        assert!(
+            past.now_or_never().is_some(),
+            "a withdrawn demand wakes the watch"
         );
     }
 

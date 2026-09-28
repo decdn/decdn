@@ -34,7 +34,7 @@ use bao_tree::ChunkRanges;
 use bao_tree::io::fsm::encode_ranges_validated;
 use bytes::Bytes;
 use decdn_bao_range::{RangedStore, align_range};
-use decdn_cache::{FillSession, NodeRangedStore, PresentRangeWatch, ServeStore};
+use decdn_cache::{DemandSlot, FillSession, NodeRangedStore, PresentRangeWatch, ServeStore};
 use futures_util::StreamExt;
 use iroh_io::{AsyncSliceReader, AsyncStreamWriter};
 use tokio::sync::{Notify, mpsc};
@@ -77,7 +77,7 @@ struct AwaitingDataReader {
     present: ChunkRanges,
     /// The content end this reader waits on, written before each park into the cell
     /// it shares with the encode's outboard reader. [`CoherentFrameProducer`]
-    /// publishes it as serve demand only once its consumer is starved.
+    /// stands it as serve demand only while its consumer is starved.
     parked_on: Arc<AtomicU64>,
 }
 
@@ -308,14 +308,15 @@ pub(super) struct CoherentFrameProducer {
     /// operator's only signal — the cache-hit framer carries the same field for the
     /// same reason.
     hash: decdn_cache::Hash,
-    /// The fill session whose pulls this encode reads from, for publishing serve
-    /// demand.
-    session: Arc<FillSession>,
+    /// This serve leg's demand on the live fills of its blob. It stands while the
+    /// consumer is starved on a park, and is withdrawn once encoded bytes flow again
+    /// or the producer drops.
+    demand: DemandSlot,
     /// The content end the encode's data or outboard reader last parked on, shared
     /// with both readers.
     parked_on: Arc<AtomicU64>,
-    /// The highest `parked_on` value already published as serve demand, so a
-    /// starved consumer that wakes again without progress does not re-publish it.
+    /// The demand this leg has standing, `0` when none, so a starved consumer that
+    /// wakes again without progress does not stand it again.
     published: u64,
 }
 
@@ -385,9 +386,9 @@ impl CoherentFrameProducer {
 
         let outboard = session.outboard_reader();
         let parked_on = outboard.parked_on();
+        let demand = session.demand_slot();
         let hash = store.hash();
-        let data =
-            AwaitingDataReader::new(store, total, Arc::clone(&session), Arc::clone(&parked_on));
+        let data = AwaitingDataReader::new(store, total, session, Arc::clone(&parked_on));
         let (tx, rx) = mpsc::channel(ENCODE_CHANNEL_CAP);
         let writer = ChannelWriter { tx };
 
@@ -413,7 +414,7 @@ impl CoherentFrameProducer {
             queue: FrameQueue::new(),
             faulted: false,
             hash,
-            session,
+            demand,
             parked_on,
             published: 0,
         })
@@ -507,7 +508,7 @@ impl CoherentFrameProducer {
                     let step = {
                         let rx = &mut self.rx;
                         let parked_on = &self.parked_on;
-                        let session = &self.session;
+                        let demand = &self.demand;
                         let published = &mut self.published;
                         std::future::poll_fn(|cx| {
                             if let Poll::Ready(res) = fut.as_mut().poll(cx) {
@@ -525,9 +526,9 @@ impl CoherentFrameProducer {
                             // A park that still has encoded bytes behind it is look-ahead,
                             // not a stall, and publishes nothing.
                             let end = parked_on.load(std::sync::atomic::Ordering::Relaxed);
-                            if end > *published {
+                            if end != *published {
                                 *published = end;
-                                session.demand_up_to(end);
+                                demand.stand(end);
                             }
                             Poll::Pending
                         })
@@ -542,6 +543,7 @@ impl CoherentFrameProducer {
                             // "range complete" and answer `None` — which `serve_leg`
                             // turns into `StreamEnd` over a truncation. Poison on the
                             // way out so the terminal state cannot be forgotten.
+                            self.withdraw_demand();
                             if let Err(e) = res {
                                 self.poison(&e);
                                 return Err(e);
@@ -549,6 +551,9 @@ impl CoherentFrameProducer {
                         }
                         PumpStep::Item(recv) => {
                             self.enc = Some(fut); // still encoding — keep the future
+                            // Encoded bytes flow again, so this leg no longer waits on
+                            // a pull.
+                            self.withdraw_demand();
                             // The encode future owns the only sender, so while it is
                             // live the channel cannot close. If it ever did, `None`
                             // here would read as end-of-range rather than as the
@@ -564,6 +569,14 @@ impl CoherentFrameProducer {
                 }
                 None => return Ok(self.rx.recv().await),
             }
+        }
+    }
+
+    /// Withdraw this leg's standing demand, if any.
+    fn withdraw_demand(&mut self) {
+        if self.published != 0 {
+            self.published = 0;
+            self.demand.withdraw();
         }
     }
 

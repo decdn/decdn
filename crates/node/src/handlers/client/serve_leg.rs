@@ -23,14 +23,17 @@
 //!   through [`content_paid_frontier`]); the pull leg's `WindowPacer` reads it to
 //!   bound `pulled − served_paid ≤ window`, plus one floor to serve `serve_demand`.
 //! - **`serve_demand`** — the content end of the span this leg's encoder waits
-//!   on, for a leaf or a proof node the store does not hold yet, published only
-//!   when this leg's frame producer has no encoded bytes left. The serve window
+//!   on, for a leaf or a proof node the store does not hold yet, stood through the
+//!   leg's `DemandSlot` only while its frame producer has no encoded bytes left,
+//!   and withdrawn once bytes flow again. It reaches only the fill whose pull
+//!   fetches the awaited byte, and that pull reads the nearest standing demand, so
+//!   another leg waiting further down the blob never hides this one. The serve window
 //!   meters wire and the pull window meters content, so the pull window can close
 //!   while this leg still has credit room and waits on bytes. This leg waits on
 //!   the first byte the pull has not fetched, so `serve_demand` lands within one
 //!   group past the pull's frontier, and the pull fetches one window floor past its
 //!   window, so neither leg waits on the other forever.
-//! - **Downstream wakeup** — every move of `served_paid` or `serve_demand` wakes
+//! - **Downstream wakeup** — every move of `served_paid` or the nearest `serve_demand` wakes
 //!   a pull leg parked in `PaceDecision::Wait` (`DownstreamWatch::past`), so it
 //!   re-decides exactly when the paid frontier advances or this leg starts
 //!   waiting. A voucher batch that stays inside one chunk group moves nothing and
