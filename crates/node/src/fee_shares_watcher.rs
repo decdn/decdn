@@ -55,8 +55,17 @@ impl<P: Provider + Clone> FeeSharesSink<P> {
     fn store_shares(&self, raw_shares: [U256; 3], source: &str) {
         match operator_bps_from_shares(raw_shares, source) {
             Ok(bps) => {
-                self.shares.store(bps);
-                tracing::info!(bps, source, "operator fee share updated from chain");
+                let previous = self.shares.store(bps);
+                if previous == bps {
+                    tracing::debug!(bps, source, "operator fee share unchanged on chain");
+                } else {
+                    tracing::info!(
+                        bps,
+                        previous,
+                        source,
+                        "operator fee share updated from chain"
+                    );
+                }
             }
             Err(err) => {
                 tracing::error!(

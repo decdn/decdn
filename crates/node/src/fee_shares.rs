@@ -40,10 +40,11 @@ impl OperatorShares {
         self.bps.load(Ordering::Relaxed)
     }
 
-    /// Publish a new operator share — called by the fee-shares watcher on a
-    /// `SharesUpdated` event and by the periodic authoritative re-read.
-    pub fn store(&self, bps: u16) {
-        self.bps.store(bps, Ordering::Relaxed);
+    /// Publish a new operator share and return the one it replaces — called by
+    /// the fee-shares watcher on a `SharesUpdated` event and by the periodic
+    /// authoritative re-read.
+    pub fn store(&self, bps: u16) -> u16 {
+        self.bps.swap(bps, Ordering::Relaxed)
     }
 }
 
@@ -180,6 +181,16 @@ mod tests {
     use crate::metrics::Metrics;
 
     const FLOOR: u16 = 4000;
+
+    /// `store` hands back the share it replaced, so the watcher can tell a real
+    /// change from a re-read of the same value.
+    #[test]
+    fn store_returns_the_replaced_share() {
+        let shares = OperatorShares::new(6000);
+        assert_eq!(shares.store(6000), 6000);
+        assert_eq!(shares.store(4000), 6000);
+        assert_eq!(shares.bps(), 4000);
+    }
 
     fn retries(metrics: &Metrics) -> u64 {
         let text = metrics.encode().unwrap();
