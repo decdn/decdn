@@ -5787,7 +5787,7 @@ where
     )
 }
 
-/// Record the end of an `origin_pull` / `origin_range_pull` span once. A
+/// Record the end of an `origin_pull` span once. A
 /// clean miss (`NotFound` / `NoOrigin`) is `not_found` with no error status,
 /// since walking a chain that lacks the blob is normal; every other failure
 /// is `failed` with its error text and an error status.

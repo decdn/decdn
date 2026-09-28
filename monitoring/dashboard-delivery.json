@@ -201,15 +201,6 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(rate(decdn_cache_bytes_returned_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
-          "refId": "A",
-          "legendFormat": "served to callers"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
           "expr": "sum(rate(decdn_cache_pull_through_bytes_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "B",
           "legendFormat": "pulled from origin"
@@ -305,7 +296,7 @@
         "y": 1
       },
       "id": 3,
-      "description": "served on the wire and received from peers count cdn/client/v1 payload bytes; served to callers and pulled from origin are the cache engine's own view."
+      "description": "served on the wire and received from peers count cdn/client/v1 payload bytes; pulled from origin is the cache engine's own view."
     },
     {
       "datasource": {
@@ -1238,6 +1229,7 @@
       },
       "title": "Attempts vs success",
       "type": "timeseries",
+      "description": "Node-to-node cache-miss pulls, where this node is the paying client. Both lines step only when a pull starts or ends, so they read zero while one long pull is in flight; its time to first byte and window pauses show its progress.",
       "targets": [
         {
           "datasource": {

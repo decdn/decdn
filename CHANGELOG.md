@@ -832,6 +832,24 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Monitoring: four dashboard panels show live data (#2197).** Each panel
+  showed zero, NaN or a dead series by construction.
+  - The delivery dashboard's "Bytes served, received and pulled through" panel
+    does not plot `decdn_cache_bytes_returned_total` ("served to callers"). That
+    counter is scoped to `CacheEngine::get`, and the serve path never calls
+    `get`, so the line held at zero. "served on the wire"
+    (`decdn_bytes_served_total`) is the delivered-bytes series.
+  - The overview's "Pull success rate" reads over a trailing `[1h]` window.
+    `decdn_node_pull_{attempts,success}_total` step only when a pull starts or
+    ends, so a `$__rate_interval` window read NaN during one long pull. "Pull
+    funnel" and the delivery dashboard's "Attempts vs success" say this in
+    their descriptions.
+  - The node dashboard's "File descriptors" panel does not plot
+    `node_filefd_maximum`. A host with no limit reports 2^63−1, and that value
+    flattened the allocated line to zero.
+  - The Tempo latency query, the span-rate panel description and the
+    `adr/appendix-observability.md` span table do not name `origin_range_pull`.
+    No code emits that span.
 - **A node that fills its cache through ranged pulls announces it to the DHT
   (#2186).** The DHT republisher learned about cached content only from
   whole-blob pull-through commits and from a boot-time walk of `Complete`

@@ -1120,7 +1120,7 @@
       },
       "title": "Pull funnel",
       "type": "timeseries",
-      "description": "Node-to-node cache-miss pulls, where this fleet is the paying client. The gap between the two lines is the failure budget broken out beside.",
+      "description": "Node-to-node cache-miss pulls, where this fleet is the paying client. The gap between the two lines is the failure budget broken out beside. Both lines step only when a pull starts or ends, so they read zero while one long pull is in flight; its time to first byte and window pauses show its progress.",
       "targets": [
         {
           "datasource": {
@@ -2182,14 +2182,14 @@
       },
       "title": "Pull success rate",
       "type": "timeseries",
-      "description": "Node-to-node cache-miss pulls that completed, over pulls attempted. This fleet is the paying client on this leg, so a collapse here means misses are not being backfilled and every subsequent request for the same blob pays origin again. A ratio carries that where the raw funnel counts do not: zero successes against a low attempt rate reads as light traffic in the counts and as a floored ratio here. Unguarded division: no attempts renders a gap.",
+      "description": "Node-to-node cache-miss pulls that completed, over pulls attempted. This fleet is the paying client on this leg, so a collapse here means misses are not being backfilled and every subsequent request for the same blob pays origin again. A ratio carries that where the raw funnel counts do not: zero successes against a low attempt rate reads as light traffic in the counts and as a floored ratio here. Both counters step only when a pull starts or ends, so the ratio reads over a trailing 1 h window: a short window holds neither step during one long pull. Unguarded division: no attempt in the last hour renders a gap.",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(rate(decdn_node_pull_success_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))\n/ sum(rate(decdn_node_pull_attempts_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum(rate(decdn_node_pull_success_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[1h]))\n/ sum(rate(decdn_node_pull_attempts_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[1h]))",
           "refId": "A",
           "legendFormat": "success rate"
         }
