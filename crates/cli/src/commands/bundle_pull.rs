@@ -1179,9 +1179,10 @@ async fn discover_candidates(
     Ok(all)
 }
 
-/// One entry's probe candidates: a fresh region-nearest sample of `registry`.
-/// A sample per entry costs no extra probe, because each entry probes its own
-/// candidates, and it lets every registered holder reach some entry.
+/// One entry's probe candidates: a fresh sample of `registry`, same-region
+/// nodes first ([`discovery::select_candidates`]). A sample per entry costs no
+/// extra probe, because each entry probes its own candidates, and a node that
+/// one draw leaves out can still reach other entries.
 fn entry_candidates(registry: &[NodeCandidate], region: Option<&str>) -> Vec<NodeCandidate> {
     discovery::select_candidates(registry.to_vec(), region, discovery::SELECT_K)
 }
@@ -1225,8 +1226,8 @@ async fn resolve_selection(
     common: &ClientFetchArgs,
     chain: &fetch::ResolvedChain,
 ) -> anyhow::Result<Selection> {
-    // Explicit single node for every entry, or a per-entry discovery candidate list
-    // read from `CapacityBond` once.
+    // Explicit single node for every entry, or the registry read from
+    // `CapacityBond` once, which each entry samples.
     let explicit = explicit_target(common)?;
     let registry = match explicit {
         Some(_) => None,
@@ -1675,12 +1676,28 @@ where
 /// fix.
 fn entry_retryable(err: &anyhow::Error) -> bool {
     shared_pool_disposition(err) == RetryDisposition::RetryElsewhere
+        && err.downcast_ref::<LanePermitFault>().is_none()
         && err.downcast_ref::<fetch::ManifestSizeMismatch>().is_none()
         && err
             .downcast_ref::<decdn_client::SignedSizeMismatch>()
             .is_none()
         && !is_local_disk_fault(err)
 }
+
+/// A range walk's lane permits disagree with its sessions: a fault of this
+/// client, not of any provider. It ends the walk and the entry at once rather
+/// than failing over, so the report names it instead of blaming each provider
+/// in turn.
+#[derive(Debug)]
+struct LanePermitFault(String);
+
+impl std::fmt::Display for LanePermitFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "internal lane-permit fault: {}", self.0)
+    }
+}
+
+impl std::error::Error for LanePermitFault {}
 
 /// Whether `err`'s chain holds an I/O error only this machine can fix.
 fn is_local_disk_fault(err: &anyhow::Error) -> bool {
@@ -1859,13 +1876,23 @@ impl LaneGrant {
     fn new(
         semaphore: Arc<tokio::sync::Semaphore>,
         room: usize,
-        base: Option<tokio::sync::OwnedSemaphorePermit>,
+        base: tokio::sync::OwnedSemaphorePermit,
     ) -> Self {
         Self {
             semaphore,
             room,
-            held: std::sync::Mutex::new(base.into_iter().collect()),
+            held: std::sync::Mutex::new(vec![base]),
         }
+    }
+
+    /// The lane's width: one gap worker for each permit it holds now.
+    fn width(&self) -> std::num::NonZeroUsize {
+        let held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        std::num::NonZeroUsize::new(held).unwrap_or(std::num::NonZeroUsize::MIN)
     }
 
     /// Give back one held permit, for a worker that stopped.
@@ -2746,9 +2773,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // re-drive) — the happy path (complement only) still probes exactly once.
         let targets = self.resolve_range_targets(hash, total).await?;
         // No lane-stream permit is held here: each drive pass reserves one for
-        // each session it drives, and its lanes give them back as they stop
-        // (`LiveSessions::drive`), so the entry holds none across the splice or
-        // its waits on a sibling.
+        // each session it drives (`SessionWalk::fill`), and its lanes give them
+        // back as their workers stop (`LiveSessions::drive`), so the entry holds
+        // none across the splice or its waits on a sibling.
         let driver = CtxRangeDriver::new(self, &targets, hash, staging, total, progress);
 
         // On any dedup-path success, true up the file + total progress bars to
@@ -3077,9 +3104,10 @@ trait RangeDriver {
 /// permit for its provider per gap worker: the base permit its drive pass
 /// reserved, then the permits free when the drive starts, and those a sibling
 /// entry frees while the drive runs ([`LaneGrant`]). Each worker gives its
-/// permit back as it stops, so a lane that faults frees its provider at once,
-/// and a lane that runs out of gaps keeps one permit for its one idle worker. The entry holds no permit between drives: it waits on
-/// siblings there, and a sibling it waits on may need them.
+/// permit back as it stops: a lane that faults frees each permit as each of its
+/// workers finishes its gap, and a lane that runs out of gaps keeps one permit
+/// for its one idle worker. The entry holds no permit between drives: it waits
+/// on siblings there, and a sibling it waits on may need them.
 struct CtxRangeDriver<'a, P: Provider + Clone> {
     hash: [u8; 32],
     staging: &'a Path,
@@ -3315,7 +3343,10 @@ impl<S: RangeSessions> SessionWalk<S> {
             };
             // No provider can fix a terminal fault or a local disk fault, so
             // neither fails over.
-            if retry_disposition(&err) == RetryDisposition::Terminal || is_local_disk_fault(&err) {
+            if retry_disposition(&err) == RetryDisposition::Terminal
+                || is_local_disk_fault(&err)
+                || err.downcast_ref::<LanePermitFault>().is_some()
+            {
                 return Err(err);
             }
             let failed = if failed.is_empty() {
@@ -3516,6 +3547,17 @@ impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
         }
         // One global order, the same as `LaneStreamCap::permit_set`.
         by_provider.sort_unstable();
+        // A second wait on one provider while holding its first permit could
+        // wait on itself for good.
+        let shared = by_provider
+            .iter()
+            .zip(by_provider.iter().skip(1))
+            .find(|(a, b)| a.0 == b.0);
+        if let Some(((provider, first), (_, second))) = shared {
+            return Err(anyhow::Error::new(LanePermitFault(format!(
+                "candidates {first} and {second} of one drive pass share provider {provider}"
+            ))));
+        }
         let mut permits = Vec::with_capacity(by_provider.len());
         for (provider, index) in by_provider {
             permits.push((index, self.ctx.lane_cap.permit(provider).await?));
@@ -3548,15 +3590,15 @@ impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
                 Err(err) => return unfaulted(Err(err)),
             };
             let Some(at) = permits.iter().position(|&(held, _)| held == index) else {
-                return unfaulted(Err(anyhow!(
+                return unfaulted(Err(anyhow::Error::new(LanePermitFault(format!(
                     "no stream permit reserved for provider {provider}"
-                )));
+                )))));
             };
             let (_, base) = permits.swap_remove(at);
             grants.push(LaneGrant::new(
                 self.ctx.lane_cap.semaphore(provider).await,
                 self.ctx.lane_cap.n,
-                Some(base),
+                base,
             ));
         }
         let hooks: Vec<_> = grants.iter().map(|g| move |most| g.grant(most)).collect();
@@ -3565,15 +3607,16 @@ impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
             .iter()
             .zip(&grants)
             .zip(hooks.iter().zip(&releases))
-            .map(
-                |((&(_, session, takes_first), grant), (hook, release))| fetch::StripeLane {
+            .map(|((&(_, session, takes_first), grant), (hook, release))| {
+                grant.grant(usize::MAX);
+                fetch::StripeLane {
                     session,
-                    width: std::num::NonZeroUsize::MIN.saturating_add(grant.grant(usize::MAX)),
+                    width: grant.width(),
                     takes_first,
                     grow: Some(decdn_client::LaneGrowth(hook)),
                     release: Some(decdn_client::LaneRelease(release)),
-                },
-            )
+                }
+            })
             .collect();
         let driven = Box::pin(fetch::drive_stripe(
             store,
@@ -5306,7 +5349,6 @@ mod tests {
         })
     }
 
-    /// The walk stops at the first success and never tries the rest.
     /// Every entry draws its own sample of the registry, so a node that one
     /// draw leaves out still reaches other entries.
     #[test]
@@ -5326,6 +5368,7 @@ mod tests {
         assert!(draws.len() > 1, "entries draw different samples");
     }
 
+    /// The walk stops at the first success and never tries the rest.
     #[tokio::test]
     async fn walk_candidates_stops_at_the_first_success() {
         let tried = std::sync::Mutex::new(Vec::new());
@@ -8746,6 +8789,22 @@ mod tests {
         assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 1]);
     }
 
+    /// A lane-permit fault is this client's own, so it ends the walk rather
+    /// than failing over and blaming each provider in turn, and no retry
+    /// round repeats it.
+    #[tokio::test]
+    async fn session_walk_stops_on_a_lane_permit_fault() {
+        let mut fake = FakeSessions::new(4);
+        fake.lane_error = vec![(1, || {
+            anyhow::Error::new(LanePermitFault("no stream permit reserved".into()))
+        })];
+        let walk = SessionWalk::new(fake);
+        let err = walk.drive(&[(0, 1)]).await.unwrap_err();
+        assert!(err.downcast_ref::<LanePermitFault>().is_some(), "{err:#}");
+        assert!(!entry_retryable(&err));
+        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0]);
+    }
+
     /// A local disk fault ends the walk too: every provider would meet it.
     #[tokio::test]
     async fn session_walk_stops_on_a_local_disk_fault() {
@@ -8916,19 +8975,23 @@ mod tests {
         let cap = LaneStreamCap::new(4);
         let held = cap.permit(p1).await.unwrap();
         let sibling = cap.permit(p1).await.unwrap();
-        let grant = LaneGrant::new(cap.semaphore(p1).await, cap.n - 1, None);
-        assert_eq!(grant.grant(usize::MAX), 2, "the two free permits");
+        let base = cap.permit(p1).await.unwrap();
+        let grant = LaneGrant::new(cap.semaphore(p1).await, cap.n, base);
+        assert_eq!(grant.width().get(), 1, "the base permit alone");
+        assert_eq!(grant.grant(usize::MAX), 1, "the one free permit");
         assert_eq!(grant.grant(usize::MAX), 0, "the cap is reached");
         drop(sibling);
         assert_eq!(grant.grant(0), 0, "no more than asked");
         assert_eq!(grant.grant(usize::MAX), 1, "the permit the sibling freed");
         assert_eq!(grant.grant(usize::MAX), 0, "the grant is at its room");
+        assert_eq!(grant.width().get(), 3, "one worker per permit held");
         drop(grant);
         drop(held);
-        let all = LaneGrant::new(cap.semaphore(p1).await, 10, None);
+        let base = cap.permit(p1).await.unwrap();
+        let all = LaneGrant::new(cap.semaphore(p1).await, 10, base);
         assert_eq!(
             all.grant(usize::MAX),
-            4,
+            3,
             "every permit came back, and never past the cap"
         );
     }
@@ -8941,7 +9004,7 @@ mod tests {
         let cap = LaneStreamCap::new(4);
         let semaphore = cap.semaphore(p1).await;
         let base = cap.permit(p1).await.unwrap();
-        let grant = LaneGrant::new(Arc::clone(&semaphore), cap.n, Some(base));
+        let grant = LaneGrant::new(Arc::clone(&semaphore), cap.n, base);
         assert_eq!(
             grant.grant(usize::MAX),
             3,

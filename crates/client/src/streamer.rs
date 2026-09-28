@@ -822,6 +822,26 @@ mod tests {
     }
 
     #[test]
+    fn a_candidates_lease_reaches_its_lane() {
+        // The scheduler releases a lane's lease when the lane stops, so the
+        // lease the caller put on a candidate must be the one its lane holds.
+        let led = Arc::new(PoolLedger::new(Cumulative::default()));
+        let candidates = vec![
+            candidate((), Arc::clone(&led), 1),
+            candidate((), Arc::clone(&led), 2),
+        ];
+        let built = super::source_lanes(&candidates, 1024);
+        assert_eq!(built.len(), candidates.len());
+        for (lane, cand) in built.iter().zip(&candidates) {
+            assert!(
+                lane.lease
+                    .is_some_and(|lease| std::ptr::eq(lease, &raw const cand.lease)),
+                "each lane holds its own candidate's lease"
+            );
+        }
+    }
+
+    #[test]
     fn a_candidates_measured_coverage_reaches_its_lane() {
         // A partial holder's measured coverage (#1506) must reach its SourceLane
         // so the scheduler never assigns it a range it does not hold; a candidate

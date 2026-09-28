@@ -844,7 +844,8 @@ since project inception and will roll into the first tagged release.
   provider after its lane died. A proxy lane that needed width then ran one
   stream at a time. Each drive pass now reserves a permit only for the
   sessions it drives, and each lane gives a permit back as each of its
-  streams stops.
+  streams stops. A lane with no range left keeps one permit for one idle
+  stream.
 - **The multi-source unit watchdog counts verified bytes, not durable
   checkpoints (#2209).** It judged progress by the store's missing-byte
   count, which moves only per 4 MiB checkpoint, so a proxy warming a cold
@@ -852,7 +853,8 @@ since project inception and will roll into the first tagged release.
   `--unit-deadline-ms` is now the longest gap between verified bytes.
 - **`bundle pull` samples probe candidates per entry (#2204).** One
   `SELECT_K` sample served the whole run, so with more registered nodes than
-  `SELECT_K` some nodes reached no entry, even as its only nearby holders.
+  `SELECT_K` some nodes reached no entry, even when they were an entry's only
+  nearby holders.
 - **`bundle pull` no longer counts re-fetched bytes as spliced (#2193).** A
   failed donor's group-wide re-fetch can cover part of a neighbour that
   spliced, and the summary's downloaded bytes read low by that overlap.

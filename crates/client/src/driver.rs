@@ -875,7 +875,7 @@ pub struct RangeLane<'a, S> {
 /// permits that another fetch has released since the drive started. The
 /// caller holds one unit for each worker until that worker stops
 /// ([`LaneRelease`]), or until the drive returns when the lane has no release
-/// hook. A lane that starts narrow because a sibling fetch holds its
+/// hook or a `stop` ends the drive. A lane that starts narrow because a sibling fetch holds its
 /// provider's streams thus widens when that sibling finishes.
 #[derive(Clone, Copy)]
 pub struct LaneGrowth<'a>(pub &'a (dyn Fn(usize) -> usize + Send + Sync + 'a));
@@ -890,9 +890,11 @@ impl std::fmt::Debug for LaneGrowth<'_> {
 ///
 /// The drive calls it once as each gap worker of the lane stops: when its lane
 /// retires on a fault, when the drive halts or drains, or when no gap is left
-/// for it while other gaps still run. In that last case the lane keeps one
-/// idle worker for gaps a faulted lane puts back, and grows again through its
-/// [`LaneGrowth`] hook when it takes one while more wait.
+/// for it while other gaps still run. The last case applies only to a lane
+/// that also has a [`LaneGrowth`] hook: it keeps one idle worker for gaps a
+/// faulted lane puts back, and grows again through that hook when it takes one
+/// while more wait. A worker that a `stop` drops unfinished is not released;
+/// the caller reclaims its unit when the drive returns.
 /// A lane runs `width` workers plus one for each unit its [`LaneGrowth`]
 /// grants, so a caller that holds one stream permit per worker gives one back
 /// on each call, and a lane that dies holds nothing for the rest of the drive.
@@ -1147,9 +1149,10 @@ where
         // waits.
         let grown: Mutex<Vec<usize>> = Mutex::new(Vec::new());
         let grow_wake = tokio::sync::Notify::new();
-        // Each lane's running gap workers. A lane with a release hook keeps one
-        // idle worker for gaps a faulted lane puts back, and lets the others
-        // stop and give their permits back.
+        // Each lane's running gap workers. A lane with release and growth
+        // hooks keeps one idle worker for gaps a faulted lane puts back, lets
+        // the others stop and give their permits back, and grows again when
+        // gaps come back.
         let live: Vec<AtomicUsize> = lanes.iter().map(|_| AtomicUsize::new(0)).collect();
 
         let worker = |index: usize| {
@@ -1199,6 +1202,7 @@ where
                                 // Under the queue lock, so two idle workers of
                                 // one lane cannot both leave it.
                                 None if lane.release.is_some()
+                                    && lane.grow.is_some()
                                     && live.load(Ordering::Acquire) > 1 =>
                                 {
                                     live.fetch_sub(1, Ordering::AcqRel);
@@ -2806,9 +2810,9 @@ mod tests {
         );
     }
 
-    /// A lane with a release hook that runs out of gaps while another lane
-    /// still fills one keeps a single idle worker and lets the others stop, so
-    /// their permits come back before the drive ends.
+    /// A lane with release and growth hooks that runs out of gaps while
+    /// another lane still fills one keeps a single idle worker and lets the
+    /// others stop, so their permits come back before the drive ends.
     #[tokio::test]
     async fn an_idle_lane_releases_its_surplus_workers_before_the_drive_ends() {
         let total = 64 * GROUP;
@@ -2821,8 +2825,10 @@ mod tests {
                 .expect("stamps lock")
                 .push(std::time::Instant::now());
         }));
+        let no_growth: &'static (dyn Fn(usize) -> usize + Send + Sync) = &|_| 0;
         let specs = [
             LaneSpec {
+                grow: Some(LaneGrowth(no_growth)),
                 release: Some(LaneRelease(release)),
                 ..LaneSpec::healthy(3)
             },

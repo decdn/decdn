@@ -281,15 +281,16 @@ where
 /// window passes with `verified` unchanged while the store still misses bytes
 /// of `[start, len)` — i.e. no verified progress and not yet done. `verified`
 /// is the unit's verified-byte counter, which every bao-verified leaf advances
-/// as it lands, before the store's 4 MiB checkpoint makes it durable. A source
-/// that keeps delivering verified bytes, however slowly or in however small
-/// paced draws, resets the window each sample and never trips; a range the
-/// store holds in full (missing == 0) is left to `fill_gap`'s own completion,
-/// never tripped. A zero deadline disables the watchdog.
+/// as it lands, before the store's 4 MiB checkpoint makes it durable. The
+/// watchdog samples the counter once per window, so a source that verifies at
+/// least one byte in every window, however slowly or in however small paced
+/// draws, never trips; a range the store holds in full (missing == 0) is left
+/// to `fill_gap`'s own completion, never tripped. A zero deadline disables the
+/// watchdog.
 ///
-/// `unit_deadline` is thus the longest gap between two verified leaves that a
-/// source may leave, including its time to first byte on the unit's first
-/// open.
+/// A gap between verified bytes shorter than `unit_deadline`, time to first
+/// byte on any open included, thus never trips it; a source that stops trips
+/// it within one to two deadlines.
 async fn watchdog<St>(store: &St, start: u64, len: u64, deadline: Duration, verified: &AtomicU64)
 where
     St: IngestStore,
@@ -2443,6 +2444,55 @@ mod tests {
             "verified bytes must not be refetched: delivered {total_delivered} for a \
              {total}-byte blob"
         );
+        Ok(())
+    }
+
+    /// A lane whose paced draws leave gaps shorter than the unit deadline, and
+    /// that reports no progress callback, is never reassigned: the watchdog
+    /// judges the verified bytes `fill_gap` counts as each leaf lands, not the
+    /// store's 4 MiB checkpoints (#2209). Each wait here (the first read, then a
+    /// pause after 1 MiB) is half the deadline, and the first watchdog sample
+    /// falls while bytes are still missing.
+    #[tokio::test]
+    async fn a_lane_pausing_under_the_deadline_is_not_reassigned() -> anyhow::Result<()> {
+        let deadline = Duration::from_millis(500);
+        let data = blob(16 * 1024 * 1024);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src = ScriptedSource::new(data.clone())?
+            .slow_to_start(deadline / 2)
+            .stall_after(1024 * 1024, deadline / 2)
+            .paying(Arc::clone(&ledger));
+        let root = src.root();
+        let total = src.total_bytes();
+        let (store, dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+        let lanes = vec![lane(&src, Arc::clone(&ledger), 0xA1)];
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: deadline,
+            },
+            None,
+            None,
+            None,
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
         Ok(())
     }
 

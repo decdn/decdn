@@ -269,8 +269,9 @@ as `decdn fetch`):
   proxy-warming non-holder do not join the stripe. Each lane takes ranges
   from one shared queue and fills up to `--max-lane-streams` of them at once,
   within the lane permits that are free. A lane holds one permit for each
-  stream it runs, and gives the permit back when that stream stops. An entry
-  holds no permit while it waits on a sibling entry. A lane of a fan-out holds
+  stream it runs, and gives the permit back when that stream stops. A lane
+  that has no range left keeps one permit for one idle stream slot until the
+  drive ends. An entry holds no permit while it waits on a sibling entry. A lane of a fan-out holds
   one permit until the lane stops. A lane that faults leaves the stripe,
   and the other lanes fill the ranges it left. A drive stall is a fault of
   every lane, so all striped lanes leave the stripe. When no striped lane is

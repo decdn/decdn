@@ -205,10 +205,11 @@ pub struct ClientFetchArgs {
     pub multi_source_min_bytes: u64,
 
     /// No-verified-progress deadline before a multi-source worker's remaining
-    /// range is reassigned to another source (ADR 039), in milliseconds. Any
-    /// bao-verified byte resets it, so it is the longest gap a source may leave
-    /// between verified bytes, including its time to first byte. `0` disables
-    /// it. Defaults to 10 s.
+    /// range is reassigned to another source (ADR 039), in milliseconds. A
+    /// source that sends no bao-verified byte for a whole deadline window is
+    /// reassigned, so a gap between verified bytes shorter than the deadline,
+    /// time to first byte included, never trips it. `0` disables it. Defaults
+    /// to 10 s.
     #[arg(long, value_name = "MS", default_value_t = 10_000)]
     pub unit_deadline_ms: u64,
 
