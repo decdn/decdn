@@ -384,7 +384,6 @@ The node sets `service.name = "decdn"` and `service.version` on the OTLP resourc
 | `pull_through` | One buffered cache-fill tier for a serve miss | `tier`, `hash`, `outcome` |
 | `serve_miss_pull` | The streaming pull thread for a serve miss | `tier`, `hash` |
 | `origin_pull` | One walk of the origin chain | `hash`, `local_only`, `outcome`, `error` |
-| `origin_range_pull` | One ranged pull from the origin chain | `hash`, `byte_offset`, `byte_len`, `outcome`, `error` |
 | `node_pull` | One node-to-node pull, over every candidate | `hash`, `outcome` |
 | `upstream_stream` | One paid pull from one candidate: the whole blob on a buffered miss, one run of the range on a streaming miss | `peer`, `local_node_id`, `hash`, `pool_id`, `direction`, `outcome` |
 | `open_progressive_pull` | The dial and handshake of one pulled range | `peer`, `local_node_id`, `hash`, `pool_id`, `byte_offset`, `byte_len`, `error` |
