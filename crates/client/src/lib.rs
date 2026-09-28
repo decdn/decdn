@@ -153,6 +153,9 @@ pub mod endpoint;
 /// What a failed lane, lane build, or discovery means for the acquire loop
 /// (spec § Fault classes): a pure classifier over `anyhow::Error`.
 pub mod fault;
+/// Command-wide health of each provider (spec § Unit 1): cooling backoff on a
+/// delivery fault, parking on an unaffordable price.
+pub mod health;
 mod ledger;
 /// Run-scoped registry of live per-lane voucher ledgers:
 /// [`ledgers::LaneLedgers`] maps each `(pool_id, signer, provider)` lane to
@@ -211,6 +214,7 @@ pub use driver::{
     SharedPool, WaitReason, drive, drive_range_lanes, drive_range_set, first_leg, range_set_reach,
 };
 pub use fault::{FatalScope, Fault, LaneBuildFault, classify};
+pub use health::{Health, PeerHealth};
 pub use ledger::{ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released};
 pub use ledgers::{LaneHandle, LaneLedgers};
 pub use pacer::{
