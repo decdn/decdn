@@ -5,8 +5,9 @@
 //! delivery fault cools it (in the command-wide [`PeerHealth`]), a price
 //! refusal parks it until the deposit rises, and a lane-build or discovery
 //! error backs off and retries. It ends a fetch only on a unanimous verdict:
-//! every known source is priced out, or every one signs a different size, and
-//! a fresh discovery found nothing new.
+//! every known source is priced out, every one signs a different size, or
+//! every one says it does not hold the blob, and a fresh discovery found
+//! nothing new.
 //!
 //! The state is synchronous. The acquire loop runs the `connect` and `discover`
 //! futures itself, so lanes keep streaming while a lane builds or discovery
@@ -143,6 +144,10 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// The deposit and mark epoch of the last successful discovery. A
     /// unanimous stop needs a discovery at the current pair.
     discovered_at: Option<(U256, u64)>,
+    /// The deposit and mark epoch of the last discovery attempt, success or
+    /// failure. Gates the unanimous-stop bypass in [`Self::wants_discovery`]
+    /// so a failing discovery still backs off instead of spinning.
+    looked_at: Option<(U256, u64)>,
 }
 
 impl<P: SourceProvider> std::fmt::Debug for SourceSet<'_, P> {
@@ -175,6 +180,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             discovery: None,
             mark_epoch: 0,
             discovered_at: None,
+            looked_at: None,
         };
         set.merge(holders);
         set
@@ -300,10 +306,18 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         self.health.record_progress(provider);
     }
 
-    /// Whether a discovery should run now: no source is running and none can
-    /// start, or a missing range has no usable holder, and the backoff allows it.
-    /// A deposit the set has not discovered at yet skips the backoff once, so a
-    /// priced-out set always gets one fresh look before it stops.
+    /// Whether a discovery should run now.
+    ///
+    /// A unanimous set (every known source excluded or item-marked) is driven
+    /// by the deposit/mark-epoch pair it last looked at and the discovery
+    /// backoff alone, regardless of `running`/`uncovered`: a source that becomes startable
+    /// again only because its delivery cooldown expired must not stop a
+    /// unanimously-stuck set from looking for a better one. A deposit and mark
+    /// epoch the set has not looked at yet skips the backoff once, so a
+    /// unanimous set always gets one fresh look before it stops; once looked
+    /// at, the normal backoff applies. Otherwise (not unanimous), a discovery
+    /// runs when no source is running and none can start, or a missing range
+    /// has no usable holder, and the backoff allows it.
     #[must_use]
     pub fn wants_discovery(
         &self,
@@ -312,37 +326,62 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         running: usize,
         uncovered: bool,
     ) -> bool {
+        let unanimous = self.all_excluded(deposit) || self.all_item_marked();
+        if unanimous {
+            if self.looked_at != Some((deposit, self.mark_epoch)) {
+                return true;
+            }
+            return self.discovery.is_none_or(|b| now >= b.next_at);
+        }
         let starved = running == 0 && self.next_to_start(now, deposit, &HashSet::new()).is_none();
         if !(starved || uncovered) {
             return false;
-        }
-        let unanimous = self.all_excluded(now, deposit) || self.all_item_marked();
-        if unanimous && self.discovered_at != Some((deposit, self.mark_epoch)) {
-            return true;
         }
         self.discovery.is_none_or(|b| now >= b.next_at)
     }
 
     /// Record a discovery's result. New holders join; known ones update their
     /// coverage and RTT. An error keeps every known holder and backs off.
+    /// Bringing in at least one genuinely new provider resets the backoff, so
+    /// the set looks again soon rather than waiting out the doubled wait; any
+    /// other outcome (an error, or a discovery that found nothing new) doubles
+    /// it as usual.
     pub fn discovery_done(
         &mut self,
         found: anyhow::Result<Vec<Holder>>,
         now: Instant,
         deposit: U256,
     ) {
+        match found {
+            Ok(holders) => {
+                let brought_new = holders.iter().any(|h| {
+                    self.holders
+                        .iter()
+                        .all(|known| known.provider != h.provider)
+                });
+                self.merge(holders);
+                self.discovered_at = Some((deposit, self.mark_epoch));
+                self.discovery = if brought_new {
+                    None
+                } else {
+                    Some(self.next_discovery_backoff(now))
+                };
+            }
+            Err(err) => {
+                tracing::debug!("discovery failed: {err:#}");
+                self.discovery = Some(self.next_discovery_backoff(now));
+            }
+        }
+        self.looked_at = Some((deposit, self.mark_epoch));
+    }
+
+    /// The next discovery backoff after an attempt at `now`.
+    fn next_discovery_backoff(&self, now: Instant) -> Backoff {
         let prior = self.discovery.unwrap_or(Backoff {
             next_at: now,
             attempts: 0,
         });
-        self.discovery = Some(prior.fail(now, DISCOVERY_BASE, DISCOVERY_CAP));
-        match found {
-            Ok(holders) => {
-                self.merge(holders);
-                self.discovered_at = Some((deposit, self.mark_epoch));
-            }
-            Err(err) => tracing::debug!("discovery failed: {err:#}"),
-        }
+        prior.fail(now, DISCOVERY_BASE, DISCOVERY_CAP)
     }
 
     /// The next instant a source may start or a retry may run.
@@ -363,8 +402,9 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
 
     /// The unanimous stop, if a discovery ran at this deposit and mark epoch and:
     /// every known source says the blob is absent or signs the wrong size (the
-    /// item ends), or every known source is priced out and the top-up budget
-    /// cannot change that (the command ends).
+    /// item ends), or every known source is priced out, disagrees on size, or
+    /// says the blob is absent, with at least one priced out, and the top-up
+    /// budget cannot change that (the command ends).
     #[must_use]
     pub fn exhausted(&self, deposit: U256, topups_left: bool) -> Option<anyhow::Error> {
         if self.holders.is_empty() || self.discovered_at != Some((deposit, self.mark_epoch)) {
@@ -377,8 +417,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 anyhow::Error::new(NoSourceHasBlob)
             });
         }
-        let now = Instant::now();
-        if !self.all_excluded(now, deposit) {
+        if !self.all_excluded(deposit) {
             return None;
         }
         (!topups_left).then(|| anyhow::Error::new(NoAffordableSource { deposit }))
@@ -393,17 +432,30 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 .all(|h| self.absent.contains(&h.provider) || self.wrong_size.contains(&h.provider))
     }
 
-    /// Whether every known source is priced out at `deposit` or disagrees on size.
-    fn all_excluded(&self, now: Instant, deposit: U256) -> bool {
+    /// Whether every known source is priced out at `deposit`, disagrees on
+    /// size, or says the blob is absent, with at least one actually priced
+    /// out. A set that is unanimous only on size or absence is handled by
+    /// [`Self::all_item_marked`] instead, so this is the affordability verdict
+    /// even when it is mixed with size or absence marks.
+    fn all_excluded(&self, deposit: U256) -> bool {
         !self.holders.is_empty()
+            && self
+                .holders
+                .iter()
+                .any(|h| self.is_unaffordable(h.provider, deposit))
             && self.holders.iter().all(|h| {
                 self.wrong_size.contains(&h.provider)
-                    || matches!(
-                        self.health.health(h.provider),
-                        crate::health::Health::Unaffordable { at_deposit } if deposit <= at_deposit
-                    )
+                    || self.absent.contains(&h.provider)
+                    || self.is_unaffordable(h.provider, deposit)
             })
-            && self.next_to_start(now, deposit, &HashSet::new()).is_none()
+    }
+
+    /// Whether `provider`'s health says it is priced out at `deposit`.
+    fn is_unaffordable(&self, provider: Address, deposit: U256) -> bool {
+        matches!(
+            self.health.health(provider),
+            crate::health::Health::Unaffordable { at_deposit } if deposit <= at_deposit
+        )
     }
 
     fn merge(&mut self, holders: Vec<Holder>) {
@@ -441,7 +493,7 @@ impl<S> StaticSources<S> {
     ///
     /// # Errors
     ///
-    /// Two candidates naming the same provider, or a poisoned context lock.
+    /// Two candidates naming the same provider.
     pub fn new(candidates: Vec<StreamCandidate<S>>) -> anyhow::Result<Self> {
         let mut holders = Vec::with_capacity(candidates.len());
         let mut lanes = HashMap::with_capacity(candidates.len());
@@ -449,7 +501,7 @@ impl<S> StaticSources<S> {
             let provider = candidate
                 .ctx
                 .lock()
-                .map_err(|_| anyhow::anyhow!("candidate context lock poisoned"))?
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .provider;
             let rtt_ms = f64::from(u32::try_from(rank).unwrap_or(u32::MAX));
             holders.push(Holder {
@@ -487,12 +539,9 @@ impl<S: BlobSource> SourceProvider for StaticSources<S> {
         let taken = self
             .lanes
             .lock()
-            .map_err(|_| anyhow::anyhow!("static lanes lock poisoned"))
-            .and_then(|mut lanes| {
-                lanes
-                    .remove(&holder.provider)
-                    .ok_or_else(|| anyhow::anyhow!("no static lane for {}", holder.provider))
-            });
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&holder.provider)
+            .ok_or_else(|| anyhow::anyhow!("no static lane for {}", holder.provider));
         Box::pin(async move { taken })
     }
 }
@@ -510,7 +559,7 @@ mod tests {
     use alloy::primitives::{Address, U256};
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
-    use tokio::time::Instant;
+    use tokio::time::{Duration, Instant};
 
     const A: Address = Address::repeat_byte(0xA1);
     const B: Address = Address::repeat_byte(0xB2);
@@ -783,5 +832,99 @@ mod tests {
         set.record_progress(A);
         set.discovery_done(Ok(vec![]), now, U256::ZERO);
         assert!(set.exhausted(U256::ZERO, true).is_none());
+    }
+
+    /// A discovery that fails while the set is unanimous must still back off:
+    /// it must not spin every tick just because every source is marked absent.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_discovery_backs_off_even_while_unanimous() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(
+            &p,
+            [0; 32],
+            Arc::default(),
+            vec![holder(A, 10.0), holder(B, 20.0)],
+        );
+        let now = Instant::now();
+        set.record_fault(A, &not_found(), now, U256::ZERO);
+        set.record_fault(B, &not_found(), now, U256::ZERO);
+        set.discovery_done(Err(anyhow::anyhow!("registry rpc down")), now, U256::ZERO);
+        assert!(!set.wants_discovery(now, U256::ZERO, 0, false));
+        assert!(!set.wants_discovery(
+            now + DISCOVERY_BASE - Duration::from_millis(1),
+            U256::ZERO,
+            0,
+            false
+        ));
+        assert!(set.wants_discovery(now + DISCOVERY_BASE, U256::ZERO, 0, false));
+    }
+
+    /// A unanimously stuck set keeps wanting a fresh discovery even once an
+    /// individual source's delivery cooldown clears and it looks startable
+    /// again: the `starved` gate must not mask the unanimous verdict.
+    #[tokio::test(start_paused = true)]
+    async fn a_unanimous_absent_set_still_wants_discovery_once_cooldowns_clear() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
+        let now = Instant::now();
+        set.record_fault(A, &not_found(), now, U256::ZERO);
+        set.discovery_done(Err(anyhow::anyhow!("registry rpc down")), now, U256::ZERO);
+        let later = now + DISCOVERY_BASE;
+        // A's delivery cooldown (2 s) is long over by `later` (5 s), so it is
+        // startable again and `running == 0` no longer implies "starved".
+        assert!(
+            set.next_to_start(later, U256::ZERO, &HashSet::new())
+                .is_some(),
+            "the source itself is startable again"
+        );
+        assert!(
+            set.wants_discovery(later, U256::ZERO, 1, false),
+            "but the set is still unanimously absent, so discovery must still be wanted"
+        );
+    }
+
+    /// A mixed set — one source priced out, another saying it does not hold
+    /// the blob — still ends the command once the top-up budget is spent: an
+    /// absent source is excluded from the affordability verdict too, and at
+    /// least one source being priced out is what makes it a command-ending
+    /// `NoAffordableSource` rather than the pure "nobody has it" case.
+    #[tokio::test(start_paused = true)]
+    async fn a_mixed_unaffordable_and_absent_set_stops_once_topups_are_spent() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(
+            &p,
+            [0; 32],
+            Arc::default(),
+            vec![holder(A, 10.0), holder(B, 20.0)],
+        );
+        let now = Instant::now();
+        let dep = U256::from(100u64);
+        let dry = anyhow::Error::new(crate::driver::PoolExhausted {
+            gap_start: 0,
+            gap_len: 1,
+        });
+        set.record_fault(A, &dry, now, dep);
+        set.record_fault(B, &not_found(), now, dep);
+        set.discovery_done(Ok(vec![]), now, dep);
+        assert!(set.exhausted(dep, true).is_none(), "top-ups left");
+        let err = set.exhausted(dep, false);
+        assert!(err.is_some_and(|e| e.downcast_ref::<NoAffordableSource>().is_some()));
+    }
+
+    /// A discovery that brings in a genuinely new provider resets the backoff,
+    /// so the set looks again soon rather than waiting out the doubled wait.
+    #[tokio::test(start_paused = true)]
+    async fn discovering_a_new_holder_resets_the_backoff() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
+        let now = Instant::now();
+        set.discovery_done(Err(anyhow::anyhow!("registry rpc down")), now, U256::ZERO);
+        assert_eq!(set.next_wake(now), Some(now + DISCOVERY_BASE));
+        set.discovery_done(Ok(vec![holder(B, 5.0)]), now, U256::ZERO);
+        assert_eq!(
+            set.next_wake(now),
+            None,
+            "a fresh holder resets the discovery timer"
+        );
     }
 }

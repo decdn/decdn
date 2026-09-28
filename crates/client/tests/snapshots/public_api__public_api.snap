@@ -754,6 +754,10 @@ pub struct decdn_client::NoSourceAgreesOnSize
 impl core::error::Error for decdn_client::source_set::NoSourceAgreesOnSize
 impl core::fmt::Display for decdn_client::source_set::NoSourceAgreesOnSize
 pub fn decdn_client::source_set::NoSourceAgreesOnSize::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::NoSourceHasBlob
+impl core::error::Error for decdn_client::source_set::NoSourceHasBlob
+impl core::fmt::Display for decdn_client::source_set::NoSourceHasBlob
+pub fn decdn_client::source_set::NoSourceHasBlob::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::PaceState
 pub decdn_client::PaceState::cleared_bytes: u64
 pub decdn_client::PaceState::downstream: decdn_client::pacer::DownstreamFrontier

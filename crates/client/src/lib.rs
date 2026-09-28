@@ -243,7 +243,8 @@ pub use source::{
     SourceFuture,
 };
 pub use source_set::{
-    Holder, NoAffordableSource, NoSourceAgreesOnSize, SourceProvider, SourceSet, StaticSources,
+    Holder, NoAffordableSource, NoSourceAgreesOnSize, NoSourceHasBlob, SourceProvider, SourceSet,
+    StaticSources,
 };
 pub use stop::{GaveUp, ProgressClock, SCRIPT_GIVE_UP, StopPolicy};
 pub use streamer::{
