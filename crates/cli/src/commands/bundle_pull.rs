@@ -1850,18 +1850,15 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                         .await?
                 }
             };
-            // `--max-sources` caps the holders the entry stripes across;
-            // rediscovery can bring in more once they cool.
-            let holders = holders
-                .into_iter()
-                .take(self.common.max_sources.max(1))
-                .collect();
+            // `--max-sources` caps the lanes the entry stripes across at
+            // once; every other holder waits as a reserve.
             let downloader = Downloader::new(
                 &sources,
                 holders,
                 Arc::clone(&self.health),
                 sources.funder(),
                 DriveConfig::cli(self.chain.working_deposit),
+                self.common.max_sources,
             );
             Box::pin(downloader.fetch_to_paths_until(
                 &[DownloadTarget {
@@ -7613,6 +7610,7 @@ mod tests {
             Arc::default(),
             no_topups(),
             drive_config(),
+            2,
         );
         let stop = StopPolicy::new(
             false,

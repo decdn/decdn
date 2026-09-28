@@ -370,7 +370,10 @@ where
 /// was not probed. A candidate with measured coverage, and a pinned
 /// `--node-id`, is a probed holder ([`Holder::probed_holder`]); a
 /// pull-through or proxy-warming target and a peer-store fast-path candidate
-/// are not. Each holder's node goes into `nodes`, keyed by provider.
+/// are not. Each holder's node goes into `nodes`, keyed by provider, and
+/// replaces the node a rediscovery found for that operator before, so the next
+/// lane build dials the node the latest probe ranked. A lane already built
+/// keeps its node.
 pub(crate) fn holders_from(
     targets: &ResolvedTargets,
     nodes: &mut HashMap<Address, NodeCandidate>,
@@ -396,9 +399,7 @@ pub(crate) fn holders_from(
             coverage,
             rtt_ms,
         });
-        nodes
-            .entry(candidate.eth_address)
-            .or_insert_with(|| candidate.clone());
+        nodes.insert(candidate.eth_address, candidate.clone());
     }
     holders
 }
@@ -537,6 +538,32 @@ mod tests {
             "a probed holder carries its measured coverage"
         );
         assert!(holders.iter().all(|h| h.probed_holder));
+    }
+
+    /// A rediscovery that ranks another node of an operator first replaces
+    /// the node the operator's next lane build dials.
+    #[test]
+    fn a_rediscovery_refreshes_an_operators_node() {
+        let node = |seed: u8| decdn_client::discovery::NodeCandidate {
+            node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+            eth_address: Address::repeat_byte(0xAA),
+            region_hint: None,
+            multiaddrs: alloy::primitives::Bytes::new(),
+        };
+        let targets =
+            |n: decdn_client::discovery::NodeCandidate| crate::commands::fetch::ResolvedTargets {
+                candidates: vec![n],
+                coverage_by_node: std::collections::HashMap::new(),
+                probed_samples: Vec::new(),
+                pinned: false,
+            };
+        let mut nodes = std::collections::HashMap::new();
+        holders_from(&targets(node(1)), &mut nodes);
+        holders_from(&targets(node(2)), &mut nodes);
+        assert_eq!(
+            nodes.get(&Address::repeat_byte(0xAA)).map(|n| n.node_id),
+            Some(node(2).node_id)
+        );
     }
 
     /// A pinned `--node-id` counts as a holder: its `NotFound` never marks it

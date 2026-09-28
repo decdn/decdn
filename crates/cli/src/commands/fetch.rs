@@ -1607,12 +1607,6 @@ async fn fetch_over(
             )
             .await
         } else {
-            // `--max-sources` caps the holders the download stripes across;
-            // rediscovery can bring in more once they cool.
-            let holders = holders
-                .into_iter()
-                .take(common.max_sources.max(1))
-                .collect();
             download_to_file(
                 &deps,
                 &sources,
@@ -1622,6 +1616,7 @@ async fn fetch_over(
                 total_bytes,
                 &args.output,
                 &stop,
+                common.max_sources,
             )
             .await
         }
@@ -2052,9 +2047,11 @@ fn stream_error(read_err: anyhow::Error, fetch_err: Option<anyhow::Error>) -> an
 }
 
 /// Fetch `hash` to `output` via the [`Downloader`] consumption face (#1848 4c),
-/// striping across `holders`, and print the summary line. The `.partial`
-/// beside `output` stays in place on a failure for a later resume. The caller
-/// persists each lane's voucher watermark after the fetch.
+/// striping across `holders` with at most `max_sources` lanes at once (a
+/// holder discovery adds later can take a free lane), and print the summary
+/// line. The `.partial` beside `output` stays in place on a failure for a
+/// later resume. The caller persists each lane's voucher watermark after the
+/// fetch.
 #[allow(clippy::too_many_arguments)]
 async fn download_to_file<P>(
     deps: &DriveFetchDeps<'_, P>,
@@ -2065,6 +2062,7 @@ async fn download_to_file<P>(
     total_bytes: u64,
     output: &Path,
     stop: &StopPolicy,
+    max_sources: usize,
 ) -> anyhow::Result<()>
 where
     P: alloy::providers::Provider + Clone,
@@ -2076,6 +2074,7 @@ where
         health,
         sources.funder(),
         DriveConfig::cli(deps.chain.working_deposit),
+        max_sources,
     );
     let result = Box::pin(downloader.fetch_to_paths_until(
         &[DownloadTarget {

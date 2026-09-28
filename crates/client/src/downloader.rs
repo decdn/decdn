@@ -61,8 +61,9 @@ pub struct DownloadTarget<'a> {
 ///
 /// A `Downloader` is the download face over the same loop the
 /// [`crate::Streamer`] uses: it fetches across a [`SourceSet`] of the injected
-/// `holders`, built through the [`SourceProvider`], with one lane per holder
-/// and no consumption pacing, then promotes each finished blob to its file. A
+/// `holders`, built through the [`SourceProvider`], with up to `max_lanes`
+/// lanes and no consumption pacing, then promotes each finished blob to its
+/// file. A
 /// source that faults cools (in the command-wide [`PeerHealth`]) and returns;
 /// its ranges move to the other sources meanwhile. A resumed download (an
 /// existing `.partial`, e.g. a bundle layer's chunk-hint dedup) re-pulls only
@@ -92,8 +93,10 @@ pub struct DownloadTarget<'a> {
 /// ) -> anyhow::Result<()> {
 ///     let sources = StaticSources::new(candidates)?;
 ///     let holders = sources.holders();
+///     let lanes = holders.len();
 ///     let drive = DriveConfig::cli(Default::default());
-///     let downloader = Downloader::new(sources, holders, Default::default(), funder, drive);
+///     let downloader =
+///         Downloader::new(sources, holders, Default::default(), funder, drive, lanes);
 ///     let target = DownloadTarget { hash, total_bytes, dest, ranges: None };
 ///     downloader
 ///         .fetch_to_paths(&[target], None, None)
@@ -112,6 +115,10 @@ pub struct Downloader<P, F> {
     funder: F,
     /// The driver's funding/settle policy.
     drive_config: DriveConfig,
+    /// The most lanes that stream at once, for every target. Holders past it
+    /// wait as reserves, and a holder discovery adds later can use a free
+    /// lane.
+    max_lanes: usize,
 }
 
 impl<P, F> std::fmt::Debug for Downloader<P, F> {
@@ -127,7 +134,8 @@ impl<P, F> Downloader<P, F> {
     /// Build a downloader over `holders`, whose lanes `provider` builds. The
     /// same holders start every target a later `fetch_to_dir` fetches, and
     /// `health` is shared across all of them. With no holder, each target
-    /// starts by discovering them.
+    /// starts by discovering them. At most `max_lanes` holders (at least one)
+    /// stream at once.
     #[must_use]
     pub const fn new(
         provider: P,
@@ -135,6 +143,7 @@ impl<P, F> Downloader<P, F> {
         health: Arc<PeerHealth>,
         funder: F,
         drive_config: DriveConfig,
+        max_lanes: usize,
     ) -> Self {
         Self {
             provider,
@@ -142,6 +151,7 @@ impl<P, F> Downloader<P, F> {
             health,
             funder,
             drive_config,
+            max_lanes,
         }
     }
 }
@@ -275,8 +285,7 @@ where
                 pacer: &pacer,
                 funder: &self.funder,
                 drive: &self.drive_config,
-                // One lane per holder: a download wants every holder striping.
-                max_lanes: self.holders.len().max(1),
+                max_lanes: self.max_lanes.max(1),
                 stop,
                 on_progress,
                 ledgers,
@@ -392,13 +401,53 @@ mod tests {
     ) -> anyhow::Result<Downloader<StaticSources<S>, FakeFunder>> {
         let sources = StaticSources::new(candidates)?;
         let holders = sources.holders();
+        let lanes = holders.len();
         Ok(Downloader::new(
             sources,
             holders,
             Arc::default(),
             funder(),
             drive_config(),
+            lanes,
         ))
+    }
+
+    /// The lane cap is the caller's, not the holder count: two holders under
+    /// a cap of one stream through one lane, and the other waits as a
+    /// reserve.
+    #[tokio::test]
+    async fn a_downloader_streams_at_most_max_lanes() -> anyhow::Result<()> {
+        let blob = payload(4 * 1024 * 1024);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger_b));
+        let (root, total) = (src_a.root(), src_a.total_bytes());
+        let (probe_a, probe_b) = (src_a.clone(), src_b.clone());
+        let sources = StaticSources::new(vec![
+            candidate(src_a, ledger_a, 0xA1),
+            candidate(src_b, ledger_b, 0xB2),
+        ])?;
+        let holders = sources.holders();
+        let downloader = Downloader::new(
+            sources,
+            holders,
+            Arc::default(),
+            funder(),
+            drive_config(),
+            1,
+        );
+        let dir = tempfile::tempdir()?;
+        downloader
+            .fetch_to_dir(&[(root, total)], dir.path(), None)
+            .await?;
+        anyhow::ensure!(
+            (probe_a.delivered_bytes() > 0) != (probe_b.delivered_bytes() > 0),
+            "exactly one lane streamed (a={}, b={})",
+            probe_a.delivered_bytes(),
+            probe_b.delivered_bytes()
+        );
+        Ok(())
     }
 
     /// A deterministic payload spanning several chunk groups and one voucher
@@ -865,6 +914,7 @@ mod tests {
             Arc::default(),
             funder(),
             drive_config(),
+            1,
         );
         let dir = tempfile::tempdir()?;
         let paths = downloader

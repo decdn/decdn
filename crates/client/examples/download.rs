@@ -38,12 +38,14 @@ async fn main() -> Result<()> {
     // matches the `NoTopUp` funder.
     let sources = StaticSources::new(candidates)?;
     let holders = sources.holders();
+    let max_lanes = holders.len();
     let downloader = Downloader::new(
         sources,
         holders,
         std::sync::Arc::default(),
         NoTopUp,
         DriveConfig::cli(U256::ZERO),
+        max_lanes,
     );
     let result = downloader
         .fetch_to_paths(
