@@ -3614,15 +3614,17 @@ async fn reassemble_dedup(
     // whose chunk no longer hashes to its hint (a lying donor hint, or a short read)
     // is re-fetched normally rather than trusted.
     // Each re-fetched donor is a dropped hint.
-    let (mut spliced_bytes, refetch) = splice_off_runtime(&partial, plan.donor.clone()).await?;
+    let mut ledger = SpliceLedger::default();
+    let refetch = splice_off_runtime(&partial, plan.donor.clone(), &mut ledger).await?;
     let mut hints_ignored = u64::try_from(refetch.len()).unwrap_or(u64::MAX);
     if !refetch.is_empty() {
         driver.drive(&refetch).await?;
+        ledger.driven.extend_from_slice(&refetch);
         if staging.try_exists()? {
             finish_progress();
             index.register(hints, staging);
             return Ok(DedupOutcome {
-                spliced_bytes,
+                spliced_bytes: ledger.spliced_bytes(total),
                 hints_ignored,
             });
         }
@@ -3632,10 +3634,18 @@ async fn reassemble_dedup(
     // registers it, waiting on the index's progress signal. A deferred chunk whose
     // assigned fetcher finishes WITHOUT producing it (a failed fetcher) is driven
     // and paid here instead, so the run never hangs.
-    let (tail_spliced, tail_ignored) =
-        reconcile_deferred(driver, &partial, &plan.deferred, index, fetch_plan, file).await?;
-    spliced_bytes = spliced_bytes.saturating_add(tail_spliced);
+    let tail_ignored = reconcile_deferred(
+        driver,
+        &partial,
+        &plan.deferred,
+        index,
+        fetch_plan,
+        file,
+        &mut ledger,
+    )
+    .await?;
     hints_ignored = hints_ignored.saturating_add(tail_ignored);
+    let mut spliced_bytes = ledger.spliced_bytes(total);
     if staging.try_exists()? {
         finish_progress();
         index.register(hints, staging);
@@ -3718,9 +3728,9 @@ async fn reassemble_dedup(
 /// assigned fetcher FINISHES without registering it (a failed fetcher, or one with
 /// no recorded assignee) — or one registered under a length that disagrees with the
 /// hint — is driven and paid here instead, over the whole groups its span touches,
-/// so the entry always completes and the run never hangs. Returns `(spliced_bytes,
-/// hints_ignored)`: bytes served from a splice, and deferred chunks that fell back to
-/// a paid drive.
+/// so the entry always completes and the run never hangs. Records each splice and
+/// each driven span in `ledger`, and returns the count of deferred chunks that fell
+/// back to a paid drive.
 async fn reconcile_deferred(
     driver: &dyn RangeDriver,
     partial: &Path,
@@ -3728,12 +3738,12 @@ async fn reconcile_deferred(
     index: &ChunkIndex,
     fetch_plan: &FetchPlan,
     file: Option<&pull_progress::FileBar>,
-) -> anyhow::Result<(u64, u64)> {
+    ledger: &mut SpliceLedger,
+) -> anyhow::Result<u64> {
     let mut waiting: Vec<DeferredChunk> = deferred.to_vec();
-    let mut spliced_bytes = 0u64;
     let mut ignored = 0u64;
     if waiting.is_empty() {
-        return Ok((0, 0));
+        return Ok(0);
     }
     let notified = index.progress.notified();
     tokio::pin!(notified);
@@ -3776,24 +3786,24 @@ async fn reconcile_deferred(
         }
 
         if !ready.is_empty() {
-            let (spliced, refetch) = splice_off_runtime(partial, ready).await?;
-            spliced_bytes = spliced_bytes.saturating_add(spliced);
+            let refetch = splice_off_runtime(partial, ready, ledger).await?;
             ignored = ignored.saturating_add(u64::try_from(refetch.len()).unwrap_or(u64::MAX));
             fallback.extend(refetch);
         }
 
         if !fallback.is_empty() {
             driver.drive(&fallback).await?;
+            ledger.driven.extend_from_slice(&fallback);
             // A fallback drive may complete the store (`drive` renames
             // `.partial` -> `<hex>`); no more splicing is then possible or needed.
             if driver.staging().try_exists()? {
-                return Ok((spliced_bytes, ignored));
+                return Ok(ignored);
             }
         }
 
         waiting = still;
         if waiting.is_empty() {
-            return Ok((spliced_bytes, ignored));
+            return Ok(ignored);
         }
 
         // Nothing to do this pass but wait on a sibling — surface it on the file row
@@ -4390,20 +4400,75 @@ fn splice_donors(partial: &Path, donors: &[DonorRange]) -> anyhow::Result<Vec<Do
     Ok(refetch)
 }
 
-/// [`splice_donors`] on the blocking pool. Returns the bytes spliced — the
-/// donors' `dst` spans less those of the donors that could not be trusted — and
-/// the [`DonorRange::refetch`] span of each untrusted donor, which the caller
-/// drives and pays for.
+/// [`splice_donors`] on the blocking pool. Records the `dst` span of each donor
+/// it spliced in `ledger`, and returns the [`DonorRange::refetch`] span of each
+/// untrusted donor, which the caller drives and pays for.
 async fn splice_off_runtime(
     partial: &Path,
     donors: Vec<DonorRange>,
-) -> anyhow::Result<(u64, Vec<(u64, u64)>)> {
-    let span_total = |ds: &[DonorRange]| ds.iter().map(|d| d.dst.1).fold(0u64, u64::saturating_add);
-    let planned = span_total(&donors);
+    ledger: &mut SpliceLedger,
+) -> anyhow::Result<Vec<(u64, u64)>> {
     let partial = partial.to_path_buf();
+    let planned: Vec<((u64, u64), (u64, u64))> =
+        donors.iter().map(|d| (d.dst, d.refetch)).collect();
     let failed = off_runtime("donor splice", move || splice_donors(&partial, &donors)).await?;
-    let spliced = planned.saturating_sub(span_total(&failed));
-    Ok((spliced, failed.iter().map(|d| d.refetch).collect()))
+    let failed_dst: HashSet<(u64, u64)> = failed.iter().map(|d| d.dst).collect();
+    ledger.spliced.extend(
+        planned
+            .iter()
+            .filter(|(dst, _)| !failed_dst.contains(dst))
+            .map(|&(dst, _)| dst),
+    );
+    Ok(failed.iter().map(|d| d.refetch).collect())
+}
+
+/// The byte spans one entry's reassembly spliced from disk and the spans it
+/// drove to replace an untrusted or missing donor. A driven span is widened to
+/// whole chunk groups, so it can cover part of a neighbour's spliced span, and
+/// the drive then writes and pays for those bytes.
+#[derive(Debug, Default)]
+struct SpliceLedger {
+    /// The `dst` span of each donor that spliced cleanly.
+    spliced: Vec<(u64, u64)>,
+    /// Each re-fetch or fallback span that a drive covered.
+    driven: Vec<(u64, u64)>,
+}
+
+impl SpliceLedger {
+    /// Bytes served from a splice: the spliced spans less every driven span.
+    fn spliced_bytes(&self, total: u64) -> u64 {
+        net_spliced(&self.spliced, &self.driven, total)
+    }
+}
+
+/// The bytes of `spliced` that no `driven` span covers, over `[0, total)`. Both
+/// are `(offset, len)` spans, in any order, and may overlap.
+fn net_spliced(spliced: &[(u64, u64)], driven: &[(u64, u64)], total: u64) -> u64 {
+    let kept = complement_runs(driven, total);
+    let mut kept = kept
+        .iter()
+        .map(|&(offset, len)| (offset, offset.saturating_add(len)));
+    let mut current = kept.next();
+    let mut bytes = 0u64;
+    for (start, end) in coalesce_runs(spliced, total) {
+        while let Some((k_start, k_end)) = current {
+            if k_end <= start {
+                current = kept.next();
+                continue;
+            }
+            if k_start >= end {
+                break;
+            }
+            let overlap = end.min(k_end).saturating_sub(start.max(k_start));
+            bytes = bytes.saturating_add(overlap);
+            if k_end <= end {
+                current = kept.next();
+            } else {
+                break;
+            }
+        }
+    }
+    bytes
 }
 
 /// Whether the `len` bytes at `offset` in `src` hash to `expected`. Any read
@@ -6630,7 +6695,8 @@ mod tests {
             vec![(GROUP, total - GROUP)],
             "the failed donor's whole groups are driven, boundary group included"
         );
-        assert_eq!(outcome.spliced_bytes, cut);
+        // The drive wrote and paid for donor A's share of the boundary group.
+        assert_eq!(outcome.spliced_bytes, GROUP);
         assert_eq!(outcome.hints_ignored, 1);
     }
 
@@ -6683,7 +6749,86 @@ mod tests {
             driver.driven.lock().expect("driven lock").clone(),
             vec![(GROUP, total - GROUP)]
         );
-        assert_eq!(outcome.spliced_bytes, cut);
+        // The fallback drive wrote and paid for donor A's share of the boundary group.
+        assert_eq!(outcome.spliced_bytes, GROUP);
+    }
+
+    /// A re-fetch of a failed donor at the first splice can cover part of a
+    /// deferred chunk that the tail splices later. The overlap is paid, so it
+    /// does not count as spliced.
+    #[tokio::test]
+    async fn spliced_bytes_exclude_a_first_splice_refetch_under_a_tail_splice() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let total = 4 * GROUP;
+        let content: Vec<u8> = (0..total)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        let whole = *blake3::hash(&content).as_bytes();
+        let cut = GROUP + 5000;
+        let (hints, mut map) = two_donor_fixture(tmp.path(), &content, cut);
+        // Chunk a is deferred to a sibling that has already registered it.
+        let a_hash = hints[0].hash;
+        map.remove(&a_hash);
+        let mut fetch_plan = FetchPlan::default();
+        fetch_plan.assigned.insert(a_hash, [0xaa; 32]);
+        let plan = plan_reassembly(&hints, &map, &fetch_plan, whole, total);
+        assert_eq!(plan.deferred.len(), 1);
+        assert_eq!(plan.donor.len(), 1);
+        let index = ChunkIndex::default();
+        index.register(Some(&hints[..1]), &tmp.path().join("a"));
+        // Donor b fails its re-hash, so the first splice re-fetches its groups.
+        std::fs::write(tmp.path().join("b"), vec![0u8; 16]).expect("corrupt donor b");
+        let staging = tmp.path().join("blob");
+        let driver = RecordingDriver {
+            hash: whole,
+            staging: staging.clone(),
+            content: content.clone(),
+            driven: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let outcome = reassemble_dedup(
+            &driver,
+            &plan,
+            total,
+            None,
+            &index,
+            &fetch_plan,
+            None,
+            &|| {},
+        )
+        .await
+        .expect("reassembly must succeed");
+
+        assert_eq!(std::fs::read(&staging).expect("read staging"), content);
+        assert_eq!(
+            driver.driven.lock().expect("driven lock").clone(),
+            vec![(GROUP, total - GROUP)]
+        );
+        assert_eq!(outcome.spliced_bytes, GROUP);
+        assert_eq!(outcome.hints_ignored, 1);
+    }
+
+    #[test]
+    fn net_spliced_subtracts_only_the_driven_overlap() {
+        // Disjoint: nothing driven under the splice.
+        assert_eq!(net_spliced(&[(0, 100)], &[(200, 50)], 1000), 100);
+        // Nested: the drive sits inside the splice.
+        assert_eq!(net_spliced(&[(0, 100)], &[(20, 30)], 1000), 70);
+        // The drive covers the whole splice.
+        assert_eq!(net_spliced(&[(10, 20)], &[(0, 100)], 1000), 0);
+        // Touching spans share no byte.
+        assert_eq!(net_spliced(&[(0, 100)], &[(100, 100)], 1000), 100);
+        // Overlapping drives count once, across several splices, in any order.
+        assert_eq!(
+            net_spliced(
+                &[(300, 100), (0, 100)],
+                &[(50, 100), (60, 10), (350, 100)],
+                1000
+            ),
+            100
+        );
+        assert_eq!(net_spliced(&[], &[(0, 10)], 1000), 0);
+        assert_eq!(net_spliced(&[(0, 10)], &[], 1000), 10);
     }
 
     /// A deferred chunk whose assigned fetcher registers its donor only AFTER the
