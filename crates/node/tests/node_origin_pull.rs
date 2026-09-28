@@ -8655,6 +8655,135 @@ async fn window_pull_through_bounded_unaligned_range_pulls_only_the_span() -> Re
     Ok(())
 }
 
+/// A BOUNDED peer serve-miss (leaf→B→A) over a B that already holds ranges both
+/// inside and outside the request (#2205). B seeds the shared outboard only from
+/// the held part of its own aligned range. The held groups 4-7 form one whole
+/// subtree, so that subtree's inner proof nodes lie on no path to a pulled group:
+/// only the seed supplies them, and without them the encoder parks and the serve
+/// fails when the pull ends. The held head and tail groups lie outside the request
+/// and need no seed. The leaf still gets its range byte-exact, and B buys less than
+/// the whole aligned span from A, since it never re-buys the held groups.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn window_pull_through_bounded_miss_seeds_only_the_held_ranges_inside_it() -> Result<()> {
+    const G: u64 = 16 * 1024;
+    let payload: Vec<u8> = (0..PAYLOAD_LEN)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let hash = Hash::new(&payload);
+    let total = u64::try_from(PAYLOAD_LEN)?;
+    let outboard = bao_tree::io::outboard::PreOrderMemOutboard::create(
+        &payload,
+        decdn_cache::range_pull::IROH_BLOCK_SIZE,
+    );
+    let outboard = bytes::Bytes::from(outboard.data);
+
+    let ab_channel_id = B256::repeat_byte(0xAA);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x90);
+    let (handler_b, b_target, ep_b, recorded, cache_b, _b_metrics, _local_rep, b_operator) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+        )
+        .await?;
+
+    // The 1.5 MiB payload spans groups 0-95. B holds the head group, groups 4-7
+    // and the tail group before the leaf asks.
+    for (off, len) in [(0, G), (4 * G, 4 * G), (total - G, G)] {
+        let aligned = decdn_cache::range_pull::align_range(off, len, total)?;
+        let data = payload
+            .get(usize::try_from(aligned.fetch_start())?..usize::try_from(aligned.fetch_end())?)
+            .ok_or_else(|| anyhow::anyhow!("held span out of bounds"))?;
+        let bao = decdn_cache::range_pull::encode_verified_range(
+            *hash.as_bytes(),
+            &aligned,
+            data,
+            outboard.clone(),
+        )?;
+        cache_b
+            .admit_bao(hash, aligned.chunk_ranges().clone(), bao)
+            .await?;
+    }
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+
+    // [3G + 100, 10G - 50) aligns to groups 3-9: held 4-7 inside, gaps 3, 8, 9.
+    let (req_off, req_len) = (3 * G + 100, 7 * G - 150);
+    let aligned = decdn_cache::range_pull::align_range(req_off, req_len, total)
+        .map_err(|e| anyhow::anyhow!("align: {e}"))?;
+    let got = tokio::time::timeout(
+        Duration::from_secs(30),
+        leaf_ranged_paid_pull(
+            &leaf_ep,
+            b_target,
+            leaf_node_id,
+            &leaf_eth,
+            b_operator,
+            leaf_channel_id,
+            hash,
+            req_off,
+            req_len,
+            RATE,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the bounded miss over held ranges hung"))??;
+    let want = payload
+        .get(usize::try_from(req_off)?..usize::try_from(req_off + req_len)?)
+        .ok_or_else(|| anyhow::anyhow!("requested range out of bounds"))?;
+    anyhow::ensure!(
+        got.as_slice() == want,
+        "bounded peer miss over held ranges must be byte-exact"
+    );
+
+    // B paid A for less than the whole aligned span: the held groups were never
+    // bought again. The pull settles on its own thread as it exits, which can land
+    // after the leaf's `StreamEnd`, so wait for the entry.
+    let span_wire = decdn_cache::range_pull::bao_encoded_size(total, aligned.chunk_ranges());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let last = loop {
+        if let Some(last) = progress_log(&recorded)?.last().copied() {
+            break last;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "B must have pulled the gaps upstream"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    anyhow::ensure!(
+        last.1 < U256::from(span_wire),
+        "B's upstream wire ({}) must stay below the aligned span's bao size ({span_wire})",
+        last.1
+    );
+    anyhow::ensure!(
+        cache_b
+            .missing_ranges(hash, req_off, req_len, total)
+            .await?
+            .is_empty(),
+        "the requested span must be present in B's cache"
+    );
+
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    Ok(())
+}
+
 /// A resumed cache-miss request (`byte_offset > 0`) IS served by the fused window
 /// path: the serve leg clamps delivery to `[offset, end)`, the pull leg fills only
 /// `missing_ranges(offset, 0)`, and every chunk group verifies against the root

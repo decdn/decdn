@@ -4858,11 +4858,13 @@ impl CacheEngine {
     /// hash mismatch returns `Err` and [quarantines](Self::is_quarantined) the
     /// hash.
     ///
-    /// The serve leg's shared outboard (ADR 038) is fed
-    /// from these so it can drive a coherent whole-range bao encode while the pull
-    /// fills the cache incrementally. Call it for each range as it is admitted (and
-    /// for the already-held ranges at serve start): `export_bao` emits every proof
-    /// `Parent` on the path to the range PLUS the right-siblings covering
+    /// The serve leg's shared outboard (ADR 038) is fed from these so it can drive
+    /// a coherent whole-range bao encode while the pull fills the cache
+    /// incrementally. Call it for each range as it is admitted (and for the held
+    /// part of the serve's range at serve start). It reads and verifies every leaf
+    /// of `chunk_ranges`, so its cost grows with the held bytes it is given.
+    /// `export_bao` emits every proof `Parent` on the path to the range PLUS the
+    /// right-siblings covering
     /// still-absent content, so the union over a front-to-back admit sequence is the
     /// whole tree's internal nodes. Leaf data and the size header are skipped.
     ///

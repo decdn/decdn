@@ -1,8 +1,10 @@
 //! Window-paced pull-through serve path (#856, ADR 037).
 
 use alloy::primitives::U256;
+use bao_tree::ChunkRanges;
 
 use super::dispatch::{aligned_span, range_out_of_bounds};
+use super::serve_encoder::{encoded_ranges, serve_end};
 
 use crate::metrics::FirstByteClock;
 use crate::node_origin::{PrimeLeg, PullLegTarget};
@@ -26,17 +28,37 @@ fn release_reservation_unspent(reservation: Option<&FloorReservation>) {
     }
 }
 
+/// The held chunk ranges whose proof a serve-miss for `[offset, +len)` seeds:
+/// `present` clipped to the chunk-group-aligned ranges the serve leg encodes.
+///
+/// The coherent encoder loads only the proof nodes whose spans meet those
+/// ranges. A held range outside them needs no seed, and `outboard_pairs` reads
+/// and verifies every leaf it exports, so an unclipped seed re-hashes every byte
+/// the node holds of the blob at each stream start. The ranges come from the
+/// same [`serve_end`] and [`encoded_ranges`] the serve leg and its encoder use,
+/// so the seed and the encode cannot disagree about the span. A span with no
+/// bytes (an offset at or past the end) seeds nothing.
+fn held_seed_ranges(present: &ChunkRanges, offset: u64, len: u64, total_bytes: u64) -> ChunkRanges {
+    let end = serve_end(offset, len, total_bytes);
+    match encoded_ranges(offset, end, total_bytes) {
+        Ok(ranges) => present & &ranges,
+        // The encoder fails this same span with the same error before it loads
+        // any proof, so a seed for it would go unread.
+        Err(_) => ChunkRanges::empty(),
+    }
+}
+
 /// End an owning serve-miss for a hash the engine refuses once its held-range
 /// seeding is done.
 ///
-/// `seed_held_outboard` validates the held ranges. When they fail, the engine
-/// quarantines the hash. A takedown can also land between dispatch and this
-/// point. Either way the serve leg can never deliver the hash
-/// (`covers_locally` refuses it). Spawning the pull would pay
-/// upstream or origin egress for bytes that never go on the wire, so the owner
-/// skips it. It fails the session so attached observers stop, releases every
-/// lease, and frees the floor reservation, because no byte was delivered. The
-/// response is already sent, so the serve fails mid-stream.
+/// `seed_held_outboard` validates the held ranges inside the request. When they
+/// fail, the engine quarantines the hash. A takedown can also land between
+/// dispatch and this point. Either way the serve leg can never deliver the hash
+/// (`covers_locally` refuses it). Spawning the pull would pay upstream or origin
+/// egress for bytes that never go on the wire, so the owner skips it. It fails
+/// the session so attached observers stop, releases every lease, and frees the
+/// floor reservation, because no byte was delivered. The response is already
+/// sent, so the serve fails mid-stream.
 fn abort_withdrawn_fill(
     hash: Hash,
     serve_session: &decdn_cache::FillSession,
@@ -388,11 +410,13 @@ impl ClientHandler {
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
 
-        // Seed the shared per-hash outboard with proof for held ranges no pull admits
-        // (`seed_held_outboard`; idempotent). OUTSIDE the claim lock, so awaits are
-        // safe. Every serve leg seeds, so its encoder is self-sufficient regardless of
-        // owner/attach ordering.
-        self.seed_held_outboard(hash, &serve_session).await;
+        // Seed the shared per-hash outboard with proof for the held ranges inside
+        // this serve's range, which no pull admits (`seed_held_outboard`;
+        // idempotent). OUTSIDE the claim lock, so awaits are safe. Every serve leg
+        // seeds, so its encoder is self-sufficient regardless of owner/attach
+        // ordering.
+        self.seed_held_outboard(hash, &serve_session, req, total_bytes)
+            .await;
         if pull_range.is_some() && self.cache.refuses(hash) {
             return Err(abort_withdrawn_fill(
                 hash,
@@ -737,9 +761,11 @@ impl ClientHandler {
         // the owner fills.
         let (serve_session, pull_range, also_pace, leases) = plan_serve(claim, req);
 
-        // Seed the shared per-hash outboard with proof for held ranges no pull admits.
-        // OUTSIDE the claim lock; idempotent, so every serve leg is self-sufficient.
-        self.seed_held_outboard(hash, &serve_session).await;
+        // Seed the shared per-hash outboard with proof for the held ranges inside
+        // this serve's range, which no pull admits. OUTSIDE the claim lock;
+        // idempotent, so every serve leg is self-sufficient.
+        self.seed_held_outboard(hash, &serve_session, req, total_bytes)
+            .await;
         if pull_range.is_some() && self.cache.refuses(hash) {
             return Err(abort_withdrawn_fill(
                 hash,
@@ -980,21 +1006,55 @@ impl ClientHandler {
     /// range-minimized serve-miss can start with held ranges (ADR 037 §held ranges
     /// read locally); their proof nodes are never admitted, so a coherent encoder
     /// that `load`s a held span's node would otherwise park until the pull ends and
-    /// then fail "outboard node never captured". `outboard_pairs` over the present
-    /// ranges emits exactly those nodes (plus the right-spine). Idempotent (capture
-    /// overwrites the same bytes), so EVERY serve leg — the owner AND each attached
-    /// observer — seeds the held-range proof its own encoder reads, rather than an
-    /// observer depending on the owner's seed-before-spawn ordering. Best-effort.
-    async fn seed_held_outboard(&self, hash: Hash, session: &Arc<decdn_cache::FillSession>) {
-        if let Ok(present) = self.cache.present_ranges(hash).await
-            && !present.chunk_ranges().is_empty()
-            && let Ok(pairs) = self
-                .cache
-                .outboard_pairs(hash, present.chunk_ranges())
-                .await
-        {
+    /// then fail "outboard node never captured". `outboard_pairs` over the held
+    /// part of this serve's range ([`held_seed_ranges`]) emits exactly the proof
+    /// nodes the encoder loads for those spans, and its cost is bounded by the held
+    /// part of the request, not by everything the node holds of the blob.
+    /// Idempotent (capture overwrites the same bytes), so EVERY serve leg — the
+    /// owner AND each attached observer — seeds the held-range proof its own
+    /// encoder reads, rather than an observer depending on the owner's
+    /// seed-before-spawn ordering.
+    ///
+    /// Best-effort: a store fault skips the seed and logs it, because the encoder
+    /// then fails later on a proof node it cannot load, and that error names
+    /// neither the seed nor its cause.
+    async fn seed_held_outboard(
+        &self,
+        hash: Hash,
+        session: &Arc<decdn_cache::FillSession>,
+        req: &StreamRequest,
+        total_bytes: u64,
+    ) {
+        let present = match self.cache.present_ranges(hash).await {
+            Ok(present) => present,
+            Err(err) => {
+                tracing::warn!(
+                    %hash,
+                    error = %err,
+                    "serve-miss: cannot read the held ranges; the serve may park on \
+                     held-span proof"
+                );
+                return;
+            }
+        };
+        let held = held_seed_ranges(
+            present.chunk_ranges(),
+            req.byte_offset,
+            req.byte_len,
+            total_bytes,
+        );
+        if held.is_empty() {
+            return;
+        }
+        match self.cache.outboard_pairs(hash, &held).await {
             // Seed the whole held-range proof under one wake, not one per node.
-            session.capture_many(pairs);
+            Ok(pairs) => session.capture_many(pairs),
+            Err(err) => tracing::warn!(
+                %hash,
+                error = %err,
+                "serve-miss: held-range outboard seed failed; the serve may park on \
+                 held-span proof"
+            ),
         }
     }
 }
@@ -1045,6 +1105,88 @@ fn plan_serve(claim: decdn_cache::FillClaim, req: &StreamRequest) -> ServePlan {
         ),
         decdn_cache::FillClaim::Attach { session, lease } => {
             (session, None, Vec::new(), vec![lease])
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
+mod tests {
+    use super::held_seed_ranges;
+    use bao_tree::{ChunkNum, ChunkRanges};
+    use decdn_bao_range::CHUNK_GROUP_BYTES;
+
+    /// Chunk-group `g`'s chunk range (16 KiB groups of 1 KiB chunks).
+    fn group(g: u64) -> ChunkRanges {
+        let per = CHUNK_GROUP_BYTES / 1024;
+        ChunkRanges::from(ChunkNum(g * per)..ChunkNum((g + 1) * per))
+    }
+
+    #[test]
+    fn a_held_range_outside_the_request_is_not_seeded() {
+        let total = 8 * CHUNK_GROUP_BYTES;
+        let present = &group(0) | &group(6);
+        // The request covers groups 2-3 only; neither held group is in it.
+        let seeded = held_seed_ranges(
+            &present,
+            2 * CHUNK_GROUP_BYTES,
+            2 * CHUNK_GROUP_BYTES,
+            total,
+        );
+        assert!(seeded.is_empty(), "seeded {seeded:?}");
+    }
+
+    #[test]
+    fn only_the_held_part_of_the_request_is_seeded() {
+        let total = 8 * CHUNK_GROUP_BYTES;
+        let present = &(&group(0) | &group(3)) | &group(6);
+        // An unaligned request inside groups 2-4 widens to those whole groups.
+        let seeded = held_seed_ranges(
+            &present,
+            2 * CHUNK_GROUP_BYTES + 100,
+            2 * CHUNK_GROUP_BYTES,
+            total,
+        );
+        assert_eq!(seeded, group(3));
+    }
+
+    #[test]
+    fn a_to_end_request_seeds_every_held_range_from_its_start() {
+        let total = 8 * CHUNK_GROUP_BYTES;
+        let present = &(&group(0) | &group(3)) | &group(6);
+        let seeded = held_seed_ranges(&present, 2 * CHUNK_GROUP_BYTES, 0, total);
+        assert_eq!(seeded, &group(3) | &group(6));
+    }
+
+    #[test]
+    fn a_to_end_request_seeds_a_held_partial_tail_group() {
+        // The blob ends 100 bytes into group 5, so its last chunk is chunk 80.
+        let total = 5 * CHUNK_GROUP_BYTES + 100;
+        let tail = ChunkRanges::from(ChunkNum(80)..ChunkNum(81));
+        let present = &group(0) | &tail;
+        let seeded = held_seed_ranges(&present, 2 * CHUNK_GROUP_BYTES, 0, total);
+        assert_eq!(seeded, tail);
+    }
+
+    #[test]
+    fn a_length_past_the_blob_end_clamps_to_it() {
+        let total = 8 * CHUNK_GROUP_BYTES;
+        let present = &group(0) | &group(7);
+        let seeded = held_seed_ranges(
+            &present,
+            6 * CHUNK_GROUP_BYTES,
+            10 * CHUNK_GROUP_BYTES,
+            total,
+        );
+        assert_eq!(seeded, group(7));
+    }
+
+    #[test]
+    fn a_request_at_or_past_the_blob_end_seeds_nothing() {
+        let total = 8 * CHUNK_GROUP_BYTES;
+        for offset in [total, total + CHUNK_GROUP_BYTES] {
+            let seeded = held_seed_ranges(&group(7), offset, 0, total);
+            assert!(seeded.is_empty(), "offset {offset} seeded {seeded:?}");
         }
     }
 }
