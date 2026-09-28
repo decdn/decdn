@@ -71,6 +71,8 @@ The scheduler keeps each dropped source's reason. A fetch that runs out of sourc
 
 **A holder that faults and recovers finishes the fetch.** The client runs one acquire loop over every admitted holder. There is no separate single-source path to fall back to. A holder that stalls, drops, or errors cools and rejoins the loop once its cooldown ends or a verified byte resets it. The `.partial` store resumes, so recovery re-pays for nothing already delivered.
 
+An item is one blob that the command fetches. In a bundle pull, each entry is one item, and an item that ends does not stop the other entries. In `decdn fetch`, the item is the whole fetch.
+
 Five faults end the fetch, because only the user can fix them:
 
 - a voucher rejection,
