@@ -832,6 +832,20 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **A node that fills its cache through ranged pulls announces it to the DHT
+  (#2186).** The DHT republisher learned about cached content only from
+  whole-blob pull-through commits and from a boot-time walk of `Complete`
+  blobs. A node that filled only through ranged serve-miss pulls therefore
+  published no provider records. A blob that completed through ranged fills
+  was announced only after the next restart. Now a ranged admit
+  (`admit_bao`, `admit_bao_stream`) that completes a 64 MiB discovery block
+  announces the hash on `subscribe_inserts`, as ADR 022 §STORE Flow requires.
+  It does this even when the admit fails partway, because the store keeps the
+  blocks it verified. The cold-start seed and the lag sweep also walk partial
+  blobs, and the due-time gate drops any partial that covers no block. The
+  eager `Store` on a cache event now goes out only for a hash that has not
+  announced yet, and never with empty coverage. Later blocks widen the
+  advertised coverage on the next republish cycle.
 - **`decdn-node` no longer hangs until systemd's stop timeout after
   node-to-node pulls (#2185).** A serve-miss pull leg runs on its own
   current-thread runtime, which drops when the leg returns. An upstream dial

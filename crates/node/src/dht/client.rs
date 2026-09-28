@@ -66,8 +66,8 @@ pub async fn find_node(
 
 /// Send a single `Store` request to `target` and return the ack.
 ///
-/// Used by the republish scheduler's eager publish of a newly cached blob —
-/// one call per K+3 closest peer, per ADR 022 §STORE Flow steps 1-2.
+/// Used by the republish scheduler's eager publish of a newly advertisable
+/// hash — one call per K+3 closest peer, per ADR 022 §STORE Flow steps 1-2.
 pub async fn store(
     endpoint: &Endpoint,
     target: EndpointAddr,

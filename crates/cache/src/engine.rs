@@ -824,6 +824,31 @@ fn present_byte_count(ranges: &ChunkRanges, size: u64) -> u64 {
     })
 }
 
+/// The chunk span of discovery block `index` of a `size`-byte blob.
+///
+/// One bao leaf chunk is 1024 bytes ([`bao_tree::ChunkNum`]'s unit), so one
+/// 64 MiB [`decdn_protocol::discovery_block_bytes`] block is 65536 chunks. The
+/// last block ends at the blob's last chunk. The block size is the same
+/// accessor [`decdn_protocol::num_blocks`] reads, so the two agree when a test
+/// overrides it.
+fn discovery_block_span(index: u32, size: u64) -> ChunkRanges {
+    const BAO_CHUNK_BYTES: u64 = 1024;
+    let chunks_per_block = decdn_protocol::discovery_block_bytes() / BAO_CHUNK_BYTES;
+    let total_chunks = size.div_ceil(BAO_CHUNK_BYTES);
+    let start = u64::from(index) * chunks_per_block;
+    let end = (start + chunks_per_block).min(total_chunks);
+    ChunkRanges::from(bao_tree::ChunkNum(start)..bao_tree::ChunkNum(end))
+}
+
+/// Indices of the discovery blocks of a `size`-byte blob that `present` fully
+/// covers. A block with any missing chunk is not covered.
+fn covered_blocks(size: u64, present: &ChunkRanges) -> impl Iterator<Item = u32> + '_ {
+    // `span - present` is empty iff `present` fully contains `span`, i.e.
+    // every chunk in this block is on disk.
+    (0..decdn_protocol::num_blocks(size))
+        .filter(move |&i| (discovery_block_span(i, size) - present).is_empty())
+}
+
 /// Bytes of `hash` present on disk, from its `observe()` bitfield.
 ///
 /// `status()` cannot size a partial blob: iroh-blobs leaves the size unknown
@@ -1583,13 +1608,16 @@ impl CacheEngine {
             .claim(hash, offset, len, total, make_session)
     }
 
-    /// Subscribe to a stream of `Hash`es announcing every blob that
-    /// successfully landed in the local store via the cache's
-    /// pull-through path (the private `pull_through` is the single
-    /// convergence point).
-    /// Used by the DHT republish scheduler (ADR 022 §STORE Flow line
-    /// 126 — "When a node caches blob H ...") to schedule the first
-    /// publish-set to the K+3 closest peers.
+    /// Subscribe to a stream of `Hash`es announcing hashes as they become
+    /// advertisable in the local store: a whole blob that the private
+    /// `pull_through` committed, or a ranged admit ([`Self::admit_bao`],
+    /// [`Self::admit_bao_stream`]) that touched a fully present discovery
+    /// block, whether the admit succeeded or failed partway. Used by the DHT republish scheduler (ADR
+    /// 022 §STORE Flow — "When a node verifies its first 64 MiB block of blob
+    /// H") to send the first publish-set to the K+3 closest peers.
+    ///
+    /// One hash can arrive more than once — a ranged fill announces once per
+    /// block it completes — so a consumer dedupes against its own state.
     ///
     /// The channel is bounded and best-effort: lagged receivers see a
     /// [`broadcast::error::RecvError::Lagged`] on the next recv and
@@ -2423,11 +2451,6 @@ impl CacheEngine {
     /// blocks (where `status()` would leave the size unknown until the last
     /// chunk). A `NotFound`, evicted, or refused hash reports no blocks.
     pub async fn coverage(&self, hash: Hash) -> CacheResult<decdn_protocol::Coverage> {
-        // One bao leaf chunk is 1024 bytes (`bao_tree::ChunkNum`'s unit); one
-        // discovery block is 65536 chunks (64 MiB).
-        const BAO_CHUNK_BYTES: u64 = 1024;
-        const CHUNKS_PER_BLOCK: u64 = decdn_protocol::DISCOVERY_BLOCK_BYTES / BAO_CHUNK_BYTES;
-
         if self.refuses(hash) {
             return Ok(decdn_protocol::Coverage::empty());
         }
@@ -2439,22 +2462,51 @@ impl CacheEngine {
         // already handles the absent/evicted guards (size 0 there too).
         let present = self.present_ranges(hash).await?;
         let size = present.size();
-        let present = present.chunk_ranges();
-        let total_chunks = size.div_ceil(BAO_CHUNK_BYTES);
-        let total_blocks = decdn_protocol::num_blocks(size);
-
-        let covered = (0..total_blocks).filter(|&i| {
-            let start = u64::from(i) * CHUNKS_PER_BLOCK;
-            let end = (start + CHUNKS_PER_BLOCK).min(total_chunks);
-            let span = ChunkRanges::from(bao_tree::ChunkNum(start)..bao_tree::ChunkNum(end));
-            // `span - present` is empty iff `present` fully contains `span`,
-            // i.e. every chunk in this block is on disk.
-            (span - present).is_empty()
-        });
         Ok(decdn_protocol::Coverage::from_block_indices(
-            total_blocks,
-            covered,
+            decdn_protocol::num_blocks(size),
+            covered_blocks(size, present.chunk_ranges()),
         ))
+    }
+
+    /// Announce `hash` on [`Self::subscribe_inserts`] when the admit of
+    /// `admitted` completed at least one discovery block — a block that
+    /// `admitted` touches and that is now fully present (ADR 022 §STORE Flow:
+    /// a partial holder publishes once it verifies a 64 MiB block).
+    ///
+    /// One admit fills a window, not a block, so most admits touch no fully
+    /// present block and announce nothing. A front-to-back fill announces about
+    /// once per block, and the republisher publishes eagerly only once.
+    ///
+    /// Fails open: when the coverage query faults, it announces anyway. No
+    /// later event may name this hash — a blob under 64 MiB has one block, and
+    /// a finished fill admits nothing more — so a dropped announcement would
+    /// last until the next lag sweep or restart. The consumer reads coverage
+    /// itself and publishes nothing for a hash that covers no block. With no
+    /// subscriber (no DHT task) it skips the store query entirely.
+    async fn announce_completed_blocks(&self, hash: Hash, admitted: &ChunkRanges) {
+        if self.inner.inserts_tx.receiver_count() == 0 {
+            return;
+        }
+        let present = match self.present_ranges(hash).await {
+            Ok(present) => present,
+            Err(err) => {
+                tracing::warn!(
+                    %hash,
+                    error = %err,
+                    "admit: coverage query failed; announcing the hash so the republisher \
+                     decides from its own coverage read"
+                );
+                let _ = self.inner.inserts_tx.send(hash);
+                return;
+            }
+        };
+        let size = present.size();
+        let completed = covered_blocks(size, present.chunk_ranges())
+            .any(|i| !discovery_block_span(i, size).is_disjoint(admitted));
+        if completed {
+            // `Err` only means no subscriber is left; nothing to announce to.
+            let _ = self.inner.inserts_tx.send(hash);
+        }
     }
 
     /// The chunk-aligned sub-ranges of `[byte_offset, byte_offset + byte_len)`
@@ -3912,24 +3964,35 @@ impl CacheEngine {
     /// against the root on import (iroh-blobs `import_bao_bytes`). Thin
     /// wrapper over the store call, exposed so `NodeRangedStore::admit` need
     /// not reach into the private store handle. Records recency, like every
-    /// fill path, so the partial it leaves is an eviction candidate.
+    /// fill path, so the partial it leaves is an eviction candidate. An admit
+    /// that completes a discovery block announces the hash on
+    /// [`Self::subscribe_inserts`].
     pub async fn admit_bao(
         &self,
         hash: Hash,
         chunk_ranges: bao_tree::ChunkRanges,
         bao_bytes: bytes::Bytes,
     ) -> CacheResult<()> {
-        self.inner
+        let imported = self
+            .inner
             .store
             .blobs()
-            .import_bao_bytes(hash, chunk_ranges, bao_bytes)
+            .import_bao_bytes(hash, chunk_ranges.clone(), bao_bytes)
             .await
             .map_err(|e| {
                 CacheError::Store(anyhow::Error::from(e).context("admit_bao: import_bao_bytes"))
-            })?;
-        self.protect_partial(hash).await?;
-        self.record_access(hash);
-        Ok(())
+            });
+        let finished = match imported {
+            Ok(()) => self
+                .protect_partial(hash)
+                .await
+                .map(|()| self.record_access(hash)),
+            Err(e) => Err(e),
+        };
+        // On success and failure alike, as in `admit_bao_stream`: items the store
+        // verified before a fault stay on disk.
+        self.announce_completed_blocks(hash, &chunk_ranges).await;
+        finished
     }
 
     /// Stream the header-less bao for `chunk_ranges` of `hash` (a `total_bytes`
@@ -3997,6 +4060,7 @@ impl CacheEngine {
         };
         let tree = bao_tree::BaoTree::new(total_bytes, crate::range_pull::IROH_BLOCK_SIZE);
         let capture = session.is_some();
+        let admitted = chunk_ranges.clone();
 
         let handle = match self
             .inner
@@ -4057,60 +4121,64 @@ impl CacheEngine {
         // bounded, so the store must drain it while the driver fills it.
         let ((reader, decode_res), store_res) = tokio::join!(driver, rx);
 
-        // A decode/verify fault names the real cause (corrupt upstream vs truncated
-        // feed) and wins over the store side.
-        let pairs = match decode_res {
-            Ok(pairs) => pairs,
-            Err(io_err) => return Err((reader, classify_admit_decode_error(hash, io_err))),
-        };
-        // Then the store's own result, or a dropped receiver (the store task died).
-        match store_res {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                return Err((
-                    reader,
-                    CacheError::Store(
+        let finished: CacheResult<()> = 'finish: {
+            // A decode/verify fault names the real cause (corrupt upstream vs
+            // truncated feed) and wins over the store side.
+            let pairs = match decode_res {
+                Ok(pairs) => pairs,
+                Err(io_err) => break 'finish Err(classify_admit_decode_error(hash, io_err)),
+            };
+            // Then the store's own result, or a dropped receiver (the store task died).
+            match store_res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    break 'finish Err(CacheError::Store(
                         anyhow::Error::from(e).context("admit_bao_stream: store import"),
-                    ),
-                ));
-            }
-            Err(_recv) => {
-                return Err((
-                    reader,
-                    CacheError::Store(anyhow::anyhow!(
+                    ));
+                }
+                Err(_recv) => {
+                    break 'finish Err(CacheError::Store(anyhow::anyhow!(
                         "admit_bao_stream: import result channel dropped"
-                    )),
-                ));
+                    )));
+                }
             }
-        }
 
-        // ADR 040: consult the admission policy, then label the segment only after
-        // `protect_partial` succeeds, so a failed protect leaves no stale membership
-        // entry for an unprotected blob. Under the default `AlwaysAdmit` the segment
-        // is `Main`, so `set_segment` is a no-op — membership is pure in-memory
-        // metadata, no tag I/O.
-        let admission_ctx = crate::policy::AdmissionContext {
-            hash,
-            known_size: Some(total_bytes),
+            // ADR 040: consult the admission policy, then label the segment only
+            // after `protect_partial` succeeds, so a failed protect leaves no stale
+            // membership entry for an unprotected blob. Under the default
+            // `AlwaysAdmit` the segment is `Main`, so `set_segment` is a no-op —
+            // membership is pure in-memory metadata, no tag I/O.
+            let admission_ctx = crate::policy::AdmissionContext {
+                hash,
+                known_size: Some(total_bytes),
+            };
+            let segment = self.admission_segment(&admission_ctx);
+            if let Err(e) = self.protect_partial(hash).await {
+                break 'finish Err(e);
+            }
+            self.set_segment(hash, segment);
+            // Recency only, like every fill path: the partial becomes an eviction
+            // candidate even when no serve follows (an aborted or unpaid serve leg
+            // never reaches `observe_hit`), so the bytes `size_snapshot` counts can
+            // be released.
+            self.record_access(hash);
+            // Wake parked serve legs once for the whole admit, not per node: a
+            // large range carries many proof nodes, and a per-node notify storm
+            // scales the wakeups with proof-node count for no gain. `pairs` is
+            // empty when no serve leg shares this fill.
+            if let Some(session) = session {
+                session.capture_many(pairs);
+            }
+            Ok(())
         };
-        let segment = self.admission_segment(&admission_ctx);
-        if let Err(e) = self.protect_partial(hash).await {
-            return Err((reader, e));
+        // On success and failure alike: the store keeps every item it verified
+        // before a fault, and a gap-fill retry admits only the missing ranges, so
+        // a block this admit completed is announced here or not at all.
+        self.announce_completed_blocks(hash, &admitted).await;
+        match finished {
+            Ok(()) => Ok(reader),
+            Err(e) => Err((reader, e)),
         }
-        self.set_segment(hash, segment);
-        // Recency only, like every fill path: the partial becomes an eviction
-        // candidate even when no serve follows (an aborted or unpaid serve leg
-        // never reaches `observe_hit`), so the bytes `size_snapshot` counts can
-        // be released.
-        self.record_access(hash);
-        // Wake parked serve legs once for the whole admit, not per node: a large
-        // range carries many proof nodes, and a per-node notify storm scales the
-        // wakeups with proof-node count for no gain. `pairs` is empty when no serve
-        // leg shares this fill.
-        if let Some(session) = session {
-            session.capture_many(pairs);
-        }
-        Ok(reader)
     }
 
     /// Best-effort total byte size of `hash` from the configured origins, for
@@ -4210,15 +4278,24 @@ impl CacheEngine {
             .collect()
     }
 
-    /// Walk every committed blob in the local iroh-blobs store and return its
-    /// hash, excluding operator-evicted blobs ([ADR 011](../../../adr/011-content-takedown.md))
-    /// and partial-import bytes (`BlobStatus != Complete`). Consumed by the
-    /// DHT republish scheduler at startup (ADR 022 §Bootstrap AC 16): every
-    /// cached blob's first re-publish time is drawn from `uniform(0, 40 min)`
-    /// per record, so the bootstrap `Store` rate matches steady-state by
-    /// construction. The complementary [`Self::subscribe_inserts`] stream
-    /// handles fresh pull-through commits during steady state; the two
-    /// together cover every blob the node holds.
+    /// Walk every blob in the local iroh-blobs store, complete or partial, and
+    /// return its hash, excluding operator-evicted blobs
+    /// ([ADR 011](../../../adr/011-content-takedown.md)). Consumed by the DHT
+    /// republish scheduler at startup and by its lag sweep (ADR 022 §Bootstrap;
+    /// AC 15 cold start, AC 20 lag re-seed): every held blob's first re-publish time is drawn from
+    /// `uniform(0, 40 min)` per record, so the bootstrap `Store` rate matches
+    /// steady-state by construction. The complementary
+    /// [`Self::subscribe_inserts`] stream handles fresh commits and completed
+    /// discovery blocks during steady state; the two together cover every blob
+    /// the node may advertise.
+    ///
+    /// A partial is listed whether or not it covers a whole discovery block
+    /// (ADR 022 §STORE Flow: a partial holder publishes once it verifies one).
+    /// The walk reads only `status()`: deciding coverage here would `observe()`
+    /// every partial at boot, and each `observe()` of an idle partial costs an
+    /// fsync on the entry's idle shutdown. The republisher's due-time gate reads
+    /// coverage instead, one hash at a time across the jittered window, and
+    /// drops a partial that covers no block.
     ///
     /// Unlike [`Self::access_times_snapshot`], this accessor reflects on-disk
     /// state and is non-empty on cold start. `access_times` maps `Hash →
@@ -4263,12 +4340,12 @@ impl CacheEngine {
                     tracing::warn!(
                         hash = %hash,
                         error = %err,
-                        "iter_hashes: blob status() failed; skipping (cold-start seed continues with remaining blobs)"
+                        "iter_hashes: blob status() failed; skipping (seed continues with remaining blobs)"
                     );
                     continue;
                 }
             };
-            if matches!(status, iroh_blobs::api::blobs::BlobStatus::Complete { .. }) {
+            if !matches!(status, iroh_blobs::api::blobs::BlobStatus::NotFound) {
                 out.push(hash);
             }
         }
@@ -4991,12 +5068,9 @@ impl CacheEngine {
                         // Flow). `broadcast::send` returns `Err(SendError)`
                         // only when there are no active subscribers, which
                         // is the normal state when no DHT republish task
-                        // exists — ignore. We deliberately do NOT emit on
-                        // the local-store hit short-circuit at line ~1090:
-                        // the consumer cares about *fresh* commits (which
-                        // start a new TTL cycle), and a get-from-local
-                        // doesn't change the holder's relationship with the
-                        // blob.
+                        // exists — ignore. A local-store hit in `get` does
+                        // not emit: a hit changes nothing the republisher
+                        // advertises; commits and completed blocks do.
                         let _ = self.inner.inserts_tx.send(hash);
                         return Ok(Some(bytes));
                     }
@@ -10865,6 +10939,218 @@ mod tests {
             cov.covers(0),
             "block 0 is fully present; coverage must not depend on status()'s size"
         );
+    }
+
+    // -- #2186: a ranged admit that completes a discovery block announces it --
+
+    /// The next `subscribe_inserts` emission, if one is queued. The admit sends
+    /// before it returns, so an emission it makes is already queued here.
+    fn next_insert(rx: &mut broadcast::Receiver<Hash>) -> Option<Hash> {
+        rx.try_recv().ok()
+    }
+
+    /// ADR 022 §STORE Flow: a node publishes H once it verifies its first
+    /// 64 MiB block, on any verified partial. The ranged `admit_bao` path must
+    /// therefore announce the hash when an admit completes a discovery block.
+    #[tokio::test]
+    async fn subscribe_inserts_emits_when_admit_bao_completes_a_discovery_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let mut rx = engine.subscribe_inserts();
+        let total = decdn_protocol::DISCOVERY_BLOCK_BYTES + 3 * crate::CHUNK_GROUP_BYTES;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let (hash, ranges, bao) = bao_for(
+            root,
+            &plaintext,
+            outboard,
+            0,
+            decdn_protocol::DISCOVERY_BLOCK_BYTES,
+            total,
+        );
+
+        engine.admit_bao(hash, ranges, bao).await.unwrap();
+
+        assert_eq!(
+            next_insert(&mut rx),
+            Some(hash),
+            "an admit that completes block 0 must announce the hash"
+        );
+    }
+
+    /// The serve leg and the node-origin pull leg fill through
+    /// `admit_bao_stream`, so it must announce a completed block too.
+    #[tokio::test]
+    async fn subscribe_inserts_emits_when_admit_bao_stream_completes_a_discovery_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let mut rx = engine.subscribe_inserts();
+        let total = decdn_protocol::DISCOVERY_BLOCK_BYTES + 3 * crate::CHUNK_GROUP_BYTES;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let (hash, ranges, bao) = bao_for(
+            root,
+            &plaintext,
+            outboard,
+            0,
+            decdn_protocol::DISCOVERY_BLOCK_BYTES,
+            total,
+        );
+
+        engine
+            .admit_bao_stream(hash, ranges, total, bao.slice(8..), None)
+            .await
+            .map_err(|(_reader, e)| e)
+            .unwrap();
+
+        assert_eq!(
+            next_insert(&mut rx),
+            Some(hash),
+            "a streamed admit that completes block 0 must announce the hash"
+        );
+    }
+
+    /// An admit that leaves every block it touches incomplete announces
+    /// nothing: the hash has no coverage to advertise yet.
+    #[tokio::test]
+    async fn subscribe_inserts_silent_for_an_admit_that_completes_no_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let mut rx = engine.subscribe_inserts();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = decdn_protocol::DISCOVERY_BLOCK_BYTES + 3 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, group, group, total);
+
+        engine.admit_bao(hash, ranges, bao).await.unwrap();
+
+        assert_eq!(
+            next_insert(&mut rx),
+            None,
+            "one interior group completes no discovery block"
+        );
+    }
+
+    /// A blob under 64 MiB is one discovery block, so it announces exactly
+    /// when the admit that completes the blob lands.
+    #[tokio::test]
+    async fn subscribe_inserts_emits_for_a_small_blob_only_once_it_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let mut rx = engine.subscribe_inserts();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        let (hash, front, front_bao) =
+            bao_for(root, &plaintext, outboard.clone(), 0, 2 * group, total);
+        engine.admit_bao(hash, front, front_bao).await.unwrap();
+        assert_eq!(
+            next_insert(&mut rx),
+            None,
+            "half a single-block blob completes nothing"
+        );
+
+        let (_, back, back_bao) = bao_for(root, &plaintext, outboard, 2 * group, 2 * group, total);
+        engine.admit_bao(hash, back, back_bao).await.unwrap();
+        assert_eq!(
+            next_insert(&mut rx),
+            Some(hash),
+            "the admit that completes the only block must announce the hash"
+        );
+    }
+
+    /// The short last block announces like any other: its span ends at the
+    /// blob's last chunk, not a full 64 MiB past its start.
+    #[tokio::test]
+    async fn subscribe_inserts_emits_when_an_admit_completes_the_short_last_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let mut rx = engine.subscribe_inserts();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let block = decdn_protocol::DISCOVERY_BLOCK_BYTES;
+        let total = block + 3 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        let (hash, tail, tail_bao) = bao_for(root, &plaintext, outboard, block, 3 * group, total);
+        engine.admit_bao(hash, tail, tail_bao).await.unwrap();
+
+        assert_eq!(
+            next_insert(&mut rx),
+            Some(hash),
+            "the admit that completes block 1 must announce the hash"
+        );
+    }
+
+    /// A middle-of-file fill — no front chunk, no tail chunk — still knows the
+    /// blob's size from the admit, so completing an interior block announces.
+    #[tokio::test]
+    async fn subscribe_inserts_emits_when_an_admit_completes_an_interior_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let mut rx = engine.subscribe_inserts();
+        let block = decdn_protocol::DISCOVERY_BLOCK_BYTES;
+        let total = 2 * block + crate::CHUNK_GROUP_BYTES;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        let (hash, middle, middle_bao) = bao_for(root, &plaintext, outboard, block, block, total);
+        engine.admit_bao(hash, middle, middle_bao).await.unwrap();
+
+        assert_eq!(
+            next_insert(&mut rx),
+            Some(hash),
+            "the admit that completes interior block 1 must announce the hash"
+        );
+    }
+
+    /// A streamed admit that fails after the store already took a whole block
+    /// still announces it. The store keeps the verified items, and a gap-fill
+    /// retry admits only the missing ranges, so no later admit touches that
+    /// block again.
+    #[tokio::test]
+    async fn admit_bao_stream_announces_a_block_it_completed_before_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let mut rx = engine.subscribe_inserts();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let block = decdn_protocol::DISCOVERY_BLOCK_BYTES;
+        let total = block + 3 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
+
+        // The pre-order wire carries block 0's subtree first, so cutting the
+        // last group off truncates the feed inside block 1.
+        let wire = bao.slice(8..);
+        let truncated = wire.slice(..wire.len() - usize::try_from(group).unwrap());
+        let failed = engine
+            .admit_bao_stream(hash, ranges, total, truncated, None)
+            .await;
+        assert!(failed.is_err(), "a truncated feed must fail the admit");
+        assert!(
+            engine.coverage(hash).await.unwrap().covers(0),
+            "fixture precondition: block 0 landed before the feed ended"
+        );
+
+        assert_eq!(
+            next_insert(&mut rx),
+            Some(hash),
+            "a block that landed before the failure must still be announced"
+        );
+    }
+
+    /// The cold-start seed and the lag sweep walk `iter_hashes`, so a partial
+    /// that ranged fills left behind must appear there.
+    #[tokio::test]
+    async fn iter_hashes_includes_partial_blobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, group, group, total);
+        engine.admit_bao(hash, ranges, bao).await.unwrap();
+        assert!(!engine.present_ranges(hash).await.unwrap().is_complete());
+
+        let hashes = engine.iter_hashes().await.unwrap();
+        assert_eq!(hashes, vec![hash], "a held partial is a held blob");
     }
 
     /// A middle-range partial (no front, no tail) leaves `status()`'s size

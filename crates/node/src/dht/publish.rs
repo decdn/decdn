@@ -1,9 +1,12 @@
 //! DHT republish scheduler (ADR 022 §STORE Flow & §Bootstrap).
 //!
-//! On every successful blob commit ([`decdn_cache::CacheEngine::subscribe_inserts`])
-//! the scheduler eagerly publishes the single new hash to its K+3
-//! closest peers with per-hash `StoreRequest`s (a size-1 batch buys
-//! nothing), then schedules its next republish.
+//! When a hash becomes advertisable — a whole-blob commit, or a ranged
+//! admit that completes a discovery block
+//! ([`decdn_cache::CacheEngine::subscribe_inserts`]) — and has not announced
+//! yet, the scheduler eagerly publishes it to its K+3 closest peers with
+//! per-hash `StoreRequest`s (a size-1 batch buys nothing) and schedules its
+//! next republish. A hash that has announced waits for its cycle, which
+//! carries its widened coverage.
 //!
 //! On a periodic per-record jittered timer the scheduler:
 //!
@@ -180,17 +183,23 @@ fn jitter_us(lo: Duration, hi: Duration) -> u64 {
 /// counts, and `drain_cycle` discards a popped entry whose `due_us`
 /// disagrees. Without that check a tombstone is resurrected the moment its
 /// hash is scheduled again — it pops already-overdue, passes a
-/// membership-only test, and buys a spurious republish. Three call patterns
-/// hit that: a re-seed racing the eager per-insert publish, a re-seed racing
-/// the tick path's drain-then-reschedule, and [`Self::unschedule`] followed by
-/// a later re-seed.
+/// membership-only test, and buys a spurious republish. Two call patterns hit
+/// that: a re-seed racing the tick path's drain-then-reschedule, and
+/// [`Self::unschedule`] followed by a later re-seed.
 #[allow(missing_debug_implementations)]
 pub struct RepublishScheduler {
     heap: Arc<Mutex<BinaryHeap<Reverse<Entry>>>>,
-    /// Live hash -> its authoritative `due_us`. Also gives `O(1)` dedupe on
-    /// cache-insert events without walking the heap. A hash absent here has no
+    /// Live hash -> its authoritative `due_us`. A hash absent here has no
     /// live entry, whatever the heap still holds.
     scheduled: Arc<Mutex<HashMap<ContentHash, u64>>>,
+    /// Hashes a `Store` with non-empty coverage went out for: an eager publish
+    /// that a peer accepted, or a drain cycle that took the hash. This, not
+    /// `scheduled`, is what dedupes the eager publish on cache events. A bulk
+    /// seed schedules hashes that have published nothing yet — a partial that
+    /// covered no block when the seed walked it — and the block it completes
+    /// before its due time must still publish at once. [`Self::unschedule`]
+    /// clears the mark.
+    announced: Arc<Mutex<HashSet<ContentHash>>>,
 }
 
 impl RepublishScheduler {
@@ -200,6 +209,7 @@ impl RepublishScheduler {
         Self {
             heap: Arc::new(Mutex::new(BinaryHeap::new())),
             scheduled: Arc::new(Mutex::new(HashMap::new())),
+            announced: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -226,6 +236,33 @@ impl RepublishScheduler {
     pub fn schedule_steady(&self, hash: ContentHash) {
         let offset = jitter_us(STEADY_STATE_MIN, STEADY_STATE_MAX);
         self.schedule_with_offset(hash, offset);
+    }
+
+    /// Schedule `hash` with the steady-state jitter window (30–50 min) only if
+    /// it has no live entry. Returns whether it was added.
+    ///
+    /// The cache-event path uses this so that a repeated event (a ranged fill
+    /// announces once per completed block) keeps the due time the hash already
+    /// has rather than pushing it back.
+    pub fn schedule_steady_if_absent(&self, hash: ContentHash) -> bool {
+        let offset = jitter_us(STEADY_STATE_MIN, STEADY_STATE_MAX);
+        self.schedule_if_absent(hash, offset)
+    }
+
+    /// Record that a `Store` with non-empty coverage went out for `hash`.
+    pub fn mark_announced(&self, hash: ContentHash) {
+        with_lock(&self.announced, "dht republish announced set", |a| {
+            a.insert(hash);
+        });
+    }
+
+    /// Whether a `Store` with non-empty coverage went out for `hash` since it
+    /// was last unscheduled.
+    #[must_use]
+    pub fn is_announced(&self, hash: &ContentHash) -> bool {
+        with_lock(&self.announced, "dht republish announced set", |a| {
+            a.contains(hash)
+        })
     }
 
     /// Batch-schedule every hash in `iter` with an independent
@@ -367,10 +404,15 @@ impl RepublishScheduler {
         self.drain_cycle(now_us, now_us, |_, _| true)
     }
 
-    /// Unschedule `hash` — used when the cache evicts the blob.
+    /// Unschedule `hash` — used when the cache evicts the blob, or holds no
+    /// whole block of it. Clears its announced mark, so the next cache event
+    /// for it publishes eagerly again.
     pub fn unschedule(&self, hash: &ContentHash) {
         with_lock(&self.scheduled, "dht republish scheduled set", |s| {
             s.remove(hash);
+        });
+        with_lock(&self.announced, "dht republish announced set", |a| {
+            a.remove(hash);
         });
         // The heap entry is left in place; `drain_cycle` discards it, and a
         // later re-schedule cannot resurrect it because its `due_us` will no
@@ -387,8 +429,10 @@ impl Default for RepublishScheduler {
 /// Every hash this node holds and may advertise, as one snapshot.
 ///
 /// The union of the origin-held index and — when the node relays foreign
-/// namespaces — the committed blobs in the local store. This is the input to
-/// both *full* seeds of the republish scheduler: bring-up cold start and the
+/// namespaces — the blobs in the local store, complete or partial. The set is
+/// a superset of what gets announced: the due-time gate ([`cache_still_holds`])
+/// drops a partial that covers no discovery block. This is the input to both
+/// *full* seeds of the republish scheduler: bring-up cold start and the
 /// lag sweep in [`run_republish`] need the same set, and computing it in one
 /// place is what keeps them from drifting apart. The periodic origin rescan is
 /// not one of them — it seeds the origin-held half alone and deliberately does
@@ -480,6 +524,10 @@ impl HolderSnapshot {
 
 /// Collect the [`HolderSnapshot`] for `cache`.
 ///
+/// The store half is every blob the store holds, complete or partial
+/// ([`decdn_cache::CacheEngine::iter_hashes`]); the due-time gate
+/// ([`cache_still_holds`]) later drops a partial that covers no discovery block.
+///
 /// Under the origin-only policy (`relay_foreign_namespaces == false`) the store
 /// half is not taken wholesale — the store may hold leftover foreign content
 /// from before the toggle was set, and announcing it would advertise blobs the
@@ -505,9 +553,10 @@ impl HolderSnapshot {
 /// Never fails: a store-walk error degrades to the origin-held half rather than
 /// yielding nothing, because a partial announce strictly beats none. Every way
 /// the set can come up short reports itself: `store_error` when the walk failed
-/// outright, `origin_probe_faults` for questions the origin would not answer —
-/// the last rescan's and this walk's own ownership tests both — and
-/// `origin_enumerate_failures` for an origin that could not be listed at all.
+/// outright, `rescan_probe_faults` and `ownership_probe_faults` for questions
+/// the origin would not answer — the last rescan's and this walk's own
+/// ownership tests — and `rescan_enumerate_failures` for an origin that could
+/// not be listed at all.
 pub(crate) async fn holder_snapshot(
     cache: &decdn_cache::CacheEngine,
     relay_foreign_namespaces: bool,
@@ -825,10 +874,10 @@ async fn run_sweep_worker(
 }
 
 /// Long-running task: consumes a [`broadcast::Receiver<Hash>`] from
-/// the cache, drives the scheduler heap, and publishes each new hash with a
-/// `Store` to its K+3 closest peers and each drain cycle with one
-/// `BatchStore` per receiver. Exits on `stop`, or on a
-/// closed cache subscribe channel — which this task's own `CacheEngine`
+/// the cache, drives the scheduler heap, and publishes each hash that has not
+/// announced yet with a `Store` to its K+3 closest peers and each drain cycle
+/// with one `BatchStore` per receiver. Exits on `stop`, or on a closed cache
+/// subscribe channel — which this task's own `CacheEngine`
 /// clone makes unreachable in practice.
 ///
 /// `stop` is owned by the runtime, which cancels it before flushing the cache
@@ -880,26 +929,35 @@ pub async fn run_republish(
                     Ok(hash) => {
                         let hash_bytes = ContentHash::from_bytes(*hash.as_bytes());
                         // ADR 022 §STORE Flow steps 2–3: publish
-                        // *immediately* on cache insertion (step 2),
-                        // then schedule the next republish at `T +
-                        // uniform(30, 50) min` where T is the local
-                        // wall-clock at step 2. Without the initial
-                        // publish a freshly-cached blob isn't
-                        // discoverable for up to 50 minutes — the
-                        // exact failure mode the eager publish
-                        // closes.
-                        let accepted =
-                            publish_hash(&endpoint, self_node_id, &routing, &cache, hash_bytes)
-                                .await;
-                        metrics.dht_store_published(accepted);
-                        scheduler.schedule_steady(hash_bytes);
+                        // *immediately* once the hash becomes advertisable
+                        // (step 2), with the next republish at `T +
+                        // uniform(30, 50) min` (step 3). Without the eager
+                        // publish a freshly-cached blob isn't discoverable
+                        // for up to 50 minutes.
+                        //
+                        // Only a hash that has not announced yet publishes: a
+                        // ranged fill announces once per completed block, and
+                        // an announced hash's coverage widens on its next
+                        // cycle (ADR 022 §Content Records and TTL). A hash
+                        // whose publish reached no peer stays unannounced, so
+                        // its next event retries.
+                        scheduler.schedule_steady_if_absent(hash_bytes);
+                        if !scheduler.is_announced(&hash_bytes) {
+                            let accepted =
+                                publish_hash(&endpoint, self_node_id, &routing, &cache, hash_bytes)
+                                    .await;
+                            metrics.dht_store_published(accepted);
+                            if accepted > 0 {
+                                scheduler.mark_announced(hash_bytes);
+                            }
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // ADR 022 §STORE Flow & the `subscribe_inserts`
                         // contract: the cache does not retain the missed
                         // hashes, so a lagged consumer MUST re-derive the
                         // held set rather than try to backfill. Without the
-                        // sweep a blob committed inside the lag window stays
+                        // sweep a hash announced inside the lag window stays
                         // undiscoverable until an operator restarts.
                         tracing::warn!(
                             missed = n,
@@ -968,8 +1026,12 @@ pub async fn run_republish(
                     // cycle). The reschedule is independent of publish
                     // outcome, so doing it before the publish lets the
                     // publish run detached below.
+                    // The gate passed, so each held hash covers a block and
+                    // this cycle's `Store` counts as its announcement. A
+                    // publish that reaches no peer retries on the next cycle.
                     for hash in &held {
                         scheduler.schedule_steady(*hash);
+                        scheduler.mark_announced(*hash);
                     }
                     // One BatchStore per receiver (ADR 022 §STORE Flow
                     // Batched STORE) rather than a per-hash fan-out — the
@@ -1061,10 +1123,10 @@ fn plan_cycle(
 /// Both reads are in-memory or local; the live origin probe is deliberately not
 /// used, because this runs per hash per republish cycle.
 ///
-/// Known limitation: a non-origin front-prefix partial with unknown size
-/// derives to an empty `Coverage` (see [`decdn_cache::CacheEngine::coverage`]),
-/// so it reports `Some(false)` here and never publishes a `Store` until a
-/// later size-persistence follow-up fixes the derivation.
+/// This gate is also what drops a partial the bulk seeds scheduled without
+/// reading its coverage ([`decdn_cache::CacheEngine::iter_hashes`]): one that
+/// covers no discovery block answers `Some(false)` and leaves the schedule
+/// until a later completed block announces it or a later seed re-adds it.
 async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash) -> Option<bool> {
     let h = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
     if cache.refuses(h) {
@@ -1095,7 +1157,10 @@ async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash)
 ///
 /// `coverage` is derived once, up front — every receiver gets the same
 /// snapshot of what this node can currently serve for `hash` rather than a
-/// per-RPC re-derivation that could drift mid-fan-out.
+/// per-RPC re-derivation that could drift mid-fan-out. An empty coverage sends
+/// nothing: the record would advertise no block a requester can fetch. That
+/// covers a cache event for a hash the store no longer holds, a partial with no
+/// whole block, and a coverage query that faulted.
 ///
 /// Returns how many peers accepted the record.
 async fn publish_hash(
@@ -1106,6 +1171,9 @@ async fn publish_hash(
     hash: ContentHash,
 ) -> u64 {
     let coverage = fetch_coverage(cache, hash).await;
+    if coverage.is_empty() {
+        return 0;
+    }
     let targets: Vec<NodeId> = with_lock(routing, "dht routing table", |table| {
         // ADR 022 §STORE Flow step 1 specifies K+3 (= 23) closest
         // nodes — the three positions beyond K are overflow targets
@@ -2180,10 +2248,8 @@ mod tests {
 
         // Two discovery blocks: block 0 is admitted whole, block 1's middle
         // group is left missing — a genuine partial, not a rounding
-        // artifact. iroh-blobs only reports a `Partial` blob's size once its
-        // FINAL chunk is present (see the sibling `decdn-cache` coverage
-        // test this mirrors), so the trailing group is admitted separately
-        // to establish the validated size while block 1 stays uncovered.
+        // artifact. The trailing group is admitted too, so block 1's middle
+        // group is its only gap.
         let group = decdn_bao_range::CHUNK_GROUP_BYTES;
         let total = decdn_protocol::DISCOVERY_BLOCK_BYTES + 3 * group;
         let (root, plaintext, outboard) =
@@ -2231,6 +2297,76 @@ mod tests {
         Ok(())
     }
 
+    /// A front-only partial — block 0 admitted, no tail, so `status()` does not
+    /// know the size yet — still counts as held. `CacheEngine::coverage` reads
+    /// the size from the `observe()` bitfield, so the due-time gate keeps a
+    /// front-to-back fill from its first block.
+    #[tokio::test]
+    async fn cache_still_holds_accepts_a_front_only_partial() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let cache = decdn_cache::CacheEngine::open(tmp.path(), vec![], 16).await?;
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+        let total = decdn_protocol::DISCOVERY_BLOCK_BYTES + 3 * group;
+        let (root, plaintext, outboard) =
+            synth_blob(usize::try_from(total).expect("test blob size fits usize"));
+        let (hash, block0_ranges, block0_bao) = bao_for(
+            root,
+            &plaintext,
+            outboard,
+            0,
+            decdn_protocol::DISCOVERY_BLOCK_BYTES,
+            total,
+        );
+        cache.admit_bao(hash, block0_ranges, block0_bao).await?;
+        assert!(
+            !cache.present_ranges(hash).await?.is_complete(),
+            "fixture precondition: the tail was never admitted"
+        );
+
+        let content_hash = ContentHash::from_bytes(*hash.as_bytes());
+        assert_eq!(cache_still_holds(&cache, &content_hash).await, Some(true));
+        Ok(())
+    }
+
+    /// A partial with no whole discovery block is not held for announcing. The
+    /// bulk seeds schedule such partials without reading their coverage, and
+    /// this answer is what drops them at their due time.
+    #[tokio::test]
+    async fn cache_still_holds_rejects_a_partial_with_no_whole_block() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let cache = decdn_cache::CacheEngine::open(tmp.path(), vec![], 16).await?;
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) =
+            synth_blob(usize::try_from(total).expect("test blob size fits usize"));
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, group, group, total);
+        cache.admit_bao(hash, ranges, bao).await?;
+
+        let content_hash = ContentHash::from_bytes(*hash.as_bytes());
+        assert_eq!(cache_still_holds(&cache, &content_hash).await, Some(false));
+        Ok(())
+    }
+
+    /// The cold-start seed and the lag sweep must reach a partial that ranged
+    /// fills left behind: without it, a node that fills only through ranged
+    /// pulls seeds nothing at boot (#2186).
+    #[tokio::test]
+    async fn holder_snapshot_includes_a_partial_blob() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let cache = decdn_cache::CacheEngine::open(tmp.path(), vec![], 16).await?;
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) =
+            synth_blob(usize::try_from(total).expect("test blob size fits usize"));
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 0, 2 * group, total);
+        cache.admit_bao(hash, ranges, bao).await?;
+
+        let snap = holder_snapshot(&cache, true).await;
+
+        assert!(snap.hashes.contains(&hash), "{snap:?}");
+        Ok(())
+    }
+
     /// A store fault at the due-time gate answers neither way (#1815): folding
     /// it into `Some(false)` would have the tick path `unschedule` the hash —
     /// dropping it from the announce set for the process lifetime on a
@@ -2270,6 +2406,52 @@ mod tests {
         assert!(snap.hashes.is_empty(), "{snap:?}");
         assert!(snap.store_error.is_none());
         Ok(())
+    }
+
+    /// A repeated cache event keeps the due time the hash already has: a
+    /// ranged fill announces once per block it completes, and each must not
+    /// push the next republish back.
+    #[test]
+    fn schedule_steady_if_absent_schedules_a_hash_once() {
+        let s = RepublishScheduler::new();
+        assert!(s.schedule_steady_if_absent(h(1)), "a new hash is scheduled");
+        assert!(
+            !s.schedule_steady_if_absent(h(1)),
+            "a scheduled hash is left alone"
+        );
+        assert_eq!(s.heap.lock().map_or(usize::MAX, |h| h.len()), 1);
+
+        let deadline_us = now_us()
+            .saturating_add(u64::try_from(STEADY_STATE_MAX.as_micros()).unwrap())
+            .saturating_add(1_000);
+        let early_us = now_us()
+            .saturating_add(u64::try_from(STEADY_STATE_MIN.as_micros()).unwrap())
+            .saturating_sub(1_000_000);
+        assert!(
+            s.drain_due(early_us).is_empty(),
+            "the draw is the steady-state window, not the cold-start one"
+        );
+        assert_eq!(s.drain_due(deadline_us), vec![h(1)]);
+        assert!(
+            s.schedule_steady_if_absent(h(1)),
+            "a drained hash is absent again"
+        );
+    }
+
+    /// A seed schedules without announcing, so the eager publish on the hash's
+    /// first completed block still fires. `unschedule` clears the mark, so a
+    /// hash that is dropped and later refilled announces again.
+    #[test]
+    fn announced_mark_is_independent_of_scheduling() {
+        let s = RepublishScheduler::new();
+        assert_eq!(s.seed_cold_start([h(1)]), 1);
+        assert!(!s.is_announced(&h(1)), "a seed announces nothing");
+
+        s.mark_announced(h(1));
+        assert!(s.is_announced(&h(1)));
+
+        s.unschedule(&h(1));
+        assert!(!s.is_announced(&h(1)), "unschedule clears the mark");
     }
 
     #[test]
