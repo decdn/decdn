@@ -212,7 +212,6 @@ mod tests {
             ctx: Arc::new(Mutex::new(ctx_with(provider, U256::from(1_000u32)))),
             ledger: Arc::new(PoolLedger::new(Cumulative::default())),
             coverage: None,
-            first_unit: None,
             lease: LaneLease::new(()),
         }
     }

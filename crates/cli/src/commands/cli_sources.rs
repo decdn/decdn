@@ -273,7 +273,6 @@ where
             ctx: lane.ctx,
             ledger: lane.ledger,
             coverage: holder.coverage.clone(),
-            first_unit: None,
             lease: LaneLease::default(),
         })
     }

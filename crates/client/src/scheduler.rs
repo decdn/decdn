@@ -359,11 +359,6 @@ struct Work {
     /// past any entry it cannot serve rather than dequeuing it, so an entry
     /// stays here until a covering lane is free to take it.
     pending: VecDeque<AlignedRange>,
-    /// Per-lane range reserved as that lane's first unit
-    /// ([`StreamCandidate::first_unit`]), taken on its first [`Work::pick`]
-    /// before anything in `pending`. No other worker picks or steals it until
-    /// then.
-    first: Vec<Option<AlignedRange>>,
     /// Per-lane current range, `None` when the lane holds nothing.
     in_flight: Vec<Option<(u64, u64)>>,
     /// Per-lane interrupt handles. [`Work::cancel_victim`] signals
@@ -393,7 +388,6 @@ impl Work {
     const fn new(pending: VecDeque<AlignedRange>, front_first: bool) -> Self {
         Self {
             pending,
-            first: Vec::new(),
             in_flight: Vec::new(),
             cancel: Vec::new(),
             units: Vec::new(),
@@ -403,10 +397,9 @@ impl Work {
         }
     }
 
-    /// Give a new lane a stable slot, alive, holding nothing but its reserved
-    /// `first` unit. Returns the slot.
-    fn add_lane(&mut self, coverage: Coverage, first: Option<AlignedRange>) -> usize {
-        self.first.push(first);
+    /// Give a new lane a stable slot, alive and holding nothing. Returns the
+    /// slot.
+    fn add_lane(&mut self, coverage: Coverage) -> usize {
         self.in_flight.push(None);
         self.cancel.push(Arc::new(CancelHandle::new()));
         self.units.push(0);
@@ -415,15 +408,12 @@ impl Work {
         self.in_flight.len() - 1
     }
 
-    /// Mark lane `i`'s worker ended. A first unit it never took goes back to
-    /// `pending`. Every `pending` entry stays: a cooling lane may return, and a
-    /// rediscovered holder may cover what no live lane does.
+    /// Mark lane `i`'s worker ended. Every `pending` entry stays: a cooling
+    /// lane may return, and a rediscovered holder may cover what no live lane
+    /// does.
     fn park(&mut self, i: usize) {
         if let Some(alive) = self.alive.get_mut(i) {
             *alive = false;
-        }
-        if let Some(unit) = self.first.get_mut(i).and_then(Option::take) {
-            self.pending.push_back(unit);
         }
     }
 
@@ -434,11 +424,11 @@ impl Work {
         }
     }
 
-    /// Whether some lane holds work: an untaken first unit or a range in
-    /// flight. A worker with nothing to pick parks while this holds, since a
-    /// peer's range may yet be re-queued or become splittable.
+    /// Whether some lane holds a range in flight. A worker with nothing to
+    /// pick parks while this holds, since a peer's range may yet be re-queued
+    /// or become splittable.
     fn busy(&self) -> bool {
-        self.first.iter().any(Option::is_some) || self.in_flight.iter().any(Option::is_some)
+        self.in_flight.iter().any(Option::is_some)
     }
 
     /// Whether a lane over `coverage` has anything to take: a pending entry it
@@ -470,26 +460,23 @@ impl Work {
         })
     }
 
-    /// Plan the first batch of lanes: reserve each lane's honoured first unit,
-    /// give every lane a slot, and replace `pending` with `missing` spread
-    /// across the lanes' coverage. Returns the lanes' slots, in order.
+    /// Plan the first batch of lanes: give every lane a slot, and replace
+    /// `pending` with `missing` spread across the lanes' `coverages`. Returns
+    /// the lanes' slots, in order.
     ///
     /// # Errors
     ///
     /// A segmentation alignment error.
     fn seed(
         &mut self,
-        mut missing: ChunkRanges,
+        missing: &ChunkRanges,
         total_bytes: u64,
-        lanes: &[(Coverage, Option<AlignedRange>)],
+        coverages: &[Coverage],
     ) -> anyhow::Result<Vec<usize>> {
-        let first = reserve_first_units(lanes, &mut missing, total_bytes);
-        let coverages: Vec<Coverage> = lanes.iter().map(|(c, _)| c.clone()).collect();
-        self.pending = plan_pending(&missing, total_bytes, &coverages)?;
-        Ok(lanes
+        self.pending = plan_pending(missing, total_bytes, coverages)?;
+        Ok(coverages
             .iter()
-            .zip(first)
-            .map(|((coverage, _), unit)| self.add_lane(coverage.clone(), unit))
+            .map(|coverage| self.add_lane(coverage.clone()))
             .collect())
     }
 
@@ -536,13 +523,6 @@ impl Work {
         match self.units.get_mut(i) {
             Some(unit) => *unit = unit.wrapping_add(1),
             None => anyhow::bail!("worker index {i} out of range for unit counters"),
-        }
-        if let Some(unit) = self.first.get_mut(i).and_then(Option::take) {
-            *self.slot_mut(i)? = Some((unit.fetch_start(), unit.fetch_len()));
-            return Ok(Some(Picked {
-                range: unit,
-                victim: None,
-            }));
         }
         let covered = |seg: &AlignedRange| {
             covers_byte_range(coverage, seg.fetch_start(), seg.fetch_len(), total_bytes)
@@ -1194,51 +1174,6 @@ impl std::fmt::Debug for ConsumptionPacing<'_> {
     }
 }
 
-/// Whether `unit` can be reserved as a lane's first unit: it aligns against
-/// this `total_bytes`-byte blob, every chunk of it is still `missing` (so it
-/// lies inside the request and overlaps no unit reserved before it), and the
-/// lane's `coverage` includes it.
-fn honours_first_unit(
-    unit: &AlignedRange,
-    missing: &ChunkRanges,
-    coverage: &Coverage,
-    total_bytes: u64,
-) -> bool {
-    unit.blob_size() == total_bytes
-        && !unit.chunk_ranges().is_empty()
-        && (unit.chunk_ranges().clone() - missing).is_empty()
-        && covers_byte_range(coverage, unit.fetch_start(), unit.fetch_len(), total_bytes)
-}
-
-/// Reserve each lane's honoured first unit, in lane order, and take it out of
-/// `missing` so the planner never hands it to another lane. Returns the
-/// reservations indexed like `lanes`; a unit that is not honoured
-/// ([`honours_first_unit`]) stays in `missing` and is planned like any range.
-fn reserve_first_units(
-    lanes: &[(Coverage, Option<AlignedRange>)],
-    missing: &mut ChunkRanges,
-    total_bytes: u64,
-) -> Vec<Option<AlignedRange>> {
-    lanes
-        .iter()
-        .map(|(coverage, first_unit)| {
-            let unit = first_unit.as_ref()?;
-            if honours_first_unit(unit, missing, coverage, total_bytes) {
-                *missing = missing.clone() - unit.chunk_ranges();
-                Some(unit.clone())
-            } else {
-                tracing::debug!(
-                    fetch_start = unit.fetch_start(),
-                    fetch_len = unit.fetch_len(),
-                    "a lane's first unit is not wholly missing and coverable; \
-                     planning it like any range"
-                );
-                None
-            }
-        })
-        .collect()
-}
-
 /// A lane's coverage, or the whole blob for a full holder.
 fn lane_coverage<S>(lane: &StreamCandidate<S>, total_bytes: u64) -> Coverage {
     lane.coverage
@@ -1641,15 +1576,13 @@ where
                 let mut w = work.lock().await;
                 if !seeded {
                     seeded = true;
-                    let lanes: Vec<(Coverage, Option<AlignedRange>)> = batch
+                    let coverages: Vec<Coverage> = batch
                         .iter()
-                        .map(|(_, lane)| {
-                            (lane_coverage(lane, total_bytes), lane.first_unit.clone())
-                        })
+                        .map(|(_, lane)| lane_coverage(lane, total_bytes))
                         .collect();
                     let missing = missing_chunks(store, ranges).await?;
                     for ((provider, _), slot) in
-                        batch.iter().zip(w.seed(missing, total_bytes, &lanes)?)
+                        batch.iter().zip(w.seed(&missing, total_bytes, &coverages)?)
                     {
                         slots.insert(*provider, slot);
                     }
@@ -1659,7 +1592,7 @@ where
                         w.revive(slot);
                         slot
                     } else {
-                        let slot = w.add_lane(lane_coverage(&lane, total_bytes), None);
+                        let slot = w.add_lane(lane_coverage(&lane, total_bytes));
                         slots.insert(provider, slot);
                         slot
                     };
@@ -1853,7 +1786,6 @@ mod tests {
             ctx,
             ledger,
             coverage,
-            first_unit: None,
             lease: LaneLease::new(()),
         }
     }
@@ -1965,108 +1897,6 @@ mod tests {
             },
         )
         .await
-    }
-
-    /// A lane's first unit goes to that lane, whose parked pull is adopted: the
-    /// only open of the unit is the priming one, no other lane touches it, and
-    /// the blob assembles byte-identical (#2063).
-    #[tokio::test]
-    async fn a_lanes_first_unit_is_adopted_from_its_primed_pull() -> anyhow::Result<()> {
-        use crate::PrimedSource;
-
-        let data = blob(8 * 1024 * 1024);
-        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
-        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
-        let inner_a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_a));
-        let inner_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
-        let src_a = PrimedSource::new(inner_a.clone());
-        let src_b = PrimedSource::new(inner_b.clone());
-        let root = inner_a.root();
-        let total = inner_a.total_bytes();
-        let (store, dir) = fresh_store(root, total);
-
-        // The SECOND lane holds the primed pull, so the unit is not simply what
-        // lane 0 would have been planned anyway.
-        let unit = decdn_bao_range::align_range(0, total / 2, total)?;
-        let (header, reader) = inner_b.open(root, unit.clone()).await?;
-        src_b.prime(
-            root,
-            unit.clone(),
-            header,
-            reader,
-            tokio::time::Instant::now(),
-        );
-
-        let mut lane_b = candidate(src_b, ledger_b, 0xB2, None);
-        lane_b.first_unit = Some(unit.clone());
-        let provider = StaticSources::new(vec![candidate(src_a, ledger_a, 0xA1, None), lane_b])?;
-        run_acquire_with(
-            &store,
-            &provider,
-            root,
-            &BudgetPacer::new(),
-            &no_topups(),
-            Knobs::lanes(2),
-        )
-        .await?;
-        store.finalize().await?;
-        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
-
-        // A later steal may take the unit's second half, but only the priming
-        // open ever starts at the unit's start.
-        let opens: Vec<(u64, u64)> = inner_a
-            .opened_ranges()
-            .into_iter()
-            .chain(inner_b.opened_ranges())
-            .collect();
-        assert_eq!(
-            opens
-                .iter()
-                .filter(|&&(start, _)| start == unit.fetch_start())
-                .count(),
-            1,
-            "the unit is opened once, by the priming open: {opens:?}"
-        );
-        assert_eq!(
-            inner_b.opened_ranges().first().copied(),
-            Some((unit.fetch_start(), unit.fetch_len()))
-        );
-        Ok(())
-    }
-
-    /// Only a unit that aligns against this blob, is wholly missing, and sits
-    /// inside the lane's coverage is reserved; anything else is planned like any
-    /// range.
-    #[test]
-    fn a_first_unit_is_honoured_only_when_wholly_missing_and_coverable() -> anyhow::Result<()> {
-        use bao_tree::ChunkRanges;
-        use decdn_bao_range::align_range;
-
-        use super::honours_first_unit;
-
-        let total = 2 * DISCOVERY_BLOCK_BYTES;
-        let unit = align_range(0, 64 * 1024, total)?;
-        let all = align_range(0, 0, total)?.chunk_ranges().clone();
-        let full = cov(2, &[0, 1]);
-
-        assert!(honours_first_unit(&unit, &all, &full, total));
-        // Aligned against another size.
-        let other_size = align_range(0, 64 * 1024, total - 1)?;
-        assert!(!honours_first_unit(&other_size, &all, &full, total));
-        // Partly present already.
-        let held = align_range(0, 16 * 1024, total)?;
-        let missing = all.clone() - held.chunk_ranges();
-        assert!(!honours_first_unit(&unit, &missing, &full, total));
-        // Outside the lane's coverage.
-        assert!(!honours_first_unit(&unit, &all, &cov(2, &[1]), total));
-        // Nothing missing at all.
-        assert!(!honours_first_unit(
-            &unit,
-            &ChunkRanges::empty(),
-            &full,
-            total
-        ));
-        Ok(())
     }
 
     #[tokio::test]
@@ -2774,9 +2604,8 @@ mod tests {
         Ok(())
     }
 
-    /// A parked lane keeps every `pending` entry and gives an untaken first
-    /// unit back to the queue: a cooling lane may return, and a rediscovered
-    /// holder may cover what no live lane does.
+    /// A parked lane keeps every `pending` entry: a cooling lane may return,
+    /// and a rediscovered holder may cover what no live lane does.
     #[test]
     fn park_keeps_every_pending_entry() -> anyhow::Result<()> {
         use std::collections::VecDeque;
@@ -2788,10 +2617,9 @@ mod tests {
         let total = 2 * DISCOVERY_BLOCK_BYTES;
         let in_block0 = align_range(0, 1, total)?;
         let in_block1 = align_range(DISCOVERY_BLOCK_BYTES, 1, total)?;
-        let first = align_range(DISCOVERY_BLOCK_BYTES + 64 * 1024, 1, total)?;
         let mut work = Work::new(VecDeque::from(vec![in_block0, in_block1]), false);
-        let a = work.add_lane(cov(2, &[0]), None);
-        let b = work.add_lane(cov(2, &[1]), Some(first.clone()));
+        let a = work.add_lane(cov(2, &[0]));
+        let b = work.add_lane(cov(2, &[1]));
 
         work.park(a);
         work.park(b);
@@ -2802,8 +2630,8 @@ mod tests {
             .collect();
         assert_eq!(
             starts,
-            vec![0, DISCOVERY_BLOCK_BYTES, first.fetch_start()],
-            "every entry stays queued, and b's untaken first unit joins them"
+            vec![0, DISCOVERY_BLOCK_BYTES],
+            "every entry stays queued"
         );
         assert!(work.uncovered(total), "no running lane covers the queue");
         work.revive(a);
@@ -2829,7 +2657,6 @@ mod tests {
         let coverage = cov(1, &[0]);
         let fresh_work = || Work {
             pending: VecDeque::new(),
-            first: vec![None, None, None],
             in_flight: vec![Some((0, total)), None, None],
             cancel: (0..3).map(|_| Arc::new(CancelHandle::new())).collect(),
             alive: vec![true, true, true],
@@ -4167,8 +3994,8 @@ mod tests {
         let total = 2 * DISCOVERY_BLOCK_BYTES;
         let both_blocks = align_range(0, total, total)?;
         let mut work = Work::new(VecDeque::from(vec![both_blocks]), false);
-        let a = work.add_lane(cov(2, &[0]), None);
-        let b = work.add_lane(cov(2, &[1]), None);
+        let a = work.add_lane(cov(2, &[0]));
+        let b = work.add_lane(cov(2, &[1]));
         assert!(!work.uncovered(total), "a and b cover it between them");
         work.park(b);
         assert!(work.uncovered(total), "block 1 has no running lane");

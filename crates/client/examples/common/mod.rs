@@ -255,7 +255,6 @@ impl Buyer {
                 ctx,
                 ledger,
                 coverage: Some(holder.coverage),
-                first_unit: None,
                 lease: decdn_client::LaneLease::default(),
             });
         }

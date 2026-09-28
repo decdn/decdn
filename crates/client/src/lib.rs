@@ -245,9 +245,7 @@ pub use source_set::{
     StaticSources,
 };
 pub use stop::{ClockHold, GaveUp, ProgressClock, SCRIPT_GIVE_UP, StopPolicy};
-pub use streamer::{
-    LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader, stream_first_unit,
-};
+pub use streamer::{LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader};
 
 pub(crate) use ledger::StreamProof;
 

@@ -513,7 +513,6 @@ pub fn decdn_client::streamer::LiveReader::fmt(&self, &mut core::fmt::Formatter<
 pub struct decdn_client::streamer::StreamCandidate<S>
 pub decdn_client::streamer::StreamCandidate::coverage: core::option::Option<decdn_protocol::coverage::Coverage>
 pub decdn_client::streamer::StreamCandidate::ctx: alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>
-pub decdn_client::streamer::StreamCandidate::first_unit: core::option::Option<decdn_bao_range::AlignedRange>
 pub decdn_client::streamer::StreamCandidate::lease: decdn_client::LaneLease
 pub decdn_client::streamer::StreamCandidate::ledger: alloc::sync::Arc<decdn_client::PoolLedger>
 pub decdn_client::streamer::StreamCandidate::source: S
@@ -537,7 +536,6 @@ impl<P, F> decdn_client::streamer::Streamer<'_, P, F> where P: decdn_client::sou
 pub async fn decdn_client::streamer::Streamer<'_, P, F>::open<'a>(self, [u8; 32], u64, &decdn_client::config::PullConfig, alloc::sync::Arc<dyn decdn_client::sink::BlobCache>, decdn_client::stop::StopPolicy) -> anyhow::Result<(decdn_client::streamer::VerifiedReader, decdn_client::streamer::StreamDrive<'a>)> where P: 'a, F: 'a
 impl<P, F> core::fmt::Debug for decdn_client::streamer::Streamer<'_, P, F>
 pub fn decdn_client::streamer::Streamer<'_, P, F>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub fn decdn_client::streamer::stream_first_unit(u64, &decdn_client::config::PullConfig) -> anyhow::Result<decdn_bao_range::AlignedRange>
 pub enum decdn_client::DeadlineError
 pub decdn_client::DeadlineError::CapCannotOutlastItsStages
 pub decdn_client::DeadlineError::CapCannotOutlastItsStages::hard_cap: core::time::Duration
@@ -995,7 +993,6 @@ pub fn decdn_client::peer_store::StoreConfig::default() -> Self
 pub struct decdn_client::StreamCandidate<S>
 pub decdn_client::StreamCandidate::coverage: core::option::Option<decdn_protocol::coverage::Coverage>
 pub decdn_client::StreamCandidate::ctx: alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>
-pub decdn_client::StreamCandidate::first_unit: core::option::Option<decdn_bao_range::AlignedRange>
 pub decdn_client::StreamCandidate::lease: decdn_client::LaneLease
 pub decdn_client::StreamCandidate::ledger: alloc::sync::Arc<decdn_client::PoolLedger>
 pub decdn_client::StreamCandidate::source: S
@@ -1153,7 +1150,6 @@ pub async fn decdn_client::open_progressive_pull(&iroh::endpoint::Endpoint, iroh
 pub fn decdn_client::plan_covered_runs(&bao_tree::ChunkRanges, u64, &[decdn_client::SourceCoverage], &[usize]) -> (alloc::vec::Vec<decdn_client::CoveredRun>, bao_tree::ChunkRanges)
 pub fn decdn_client::resume_may_be_stale(&anyhow::Error) -> bool
 pub fn decdn_client::sign_client_binding(&alloy_signer_local::PrivateKeySigner, alloy_primitives::aliases::B256, &alloy_sol_types::eip712::Eip712Domain) -> anyhow::Result<decdn_protocol::client::ClientBinding>
-pub fn decdn_client::stream_first_unit(u64, &decdn_client::config::PullConfig) -> anyhow::Result<decdn_bao_range::AlignedRange>
 pub type decdn_client::ProgressCallback = (dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync)
 pub type decdn_client::SinkFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>
 pub type decdn_client::SourceFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>

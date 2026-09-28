@@ -388,7 +388,6 @@ mod tests {
             ctx: Arc::new(Mutex::new(ctx_for(provider))),
             ledger,
             coverage: None,
-            first_unit: None,
             lease: crate::LaneLease::default(),
         }
     }

@@ -4369,7 +4369,6 @@ mod rekey_tests {
                     })),
                     ledger,
                     coverage: None,
-                    first_unit: None,
                     lease: LaneLease::default(),
                 })
             })

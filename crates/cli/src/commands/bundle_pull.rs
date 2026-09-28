@@ -7540,7 +7540,6 @@ mod tests {
             })),
             ledger,
             coverage: None,
-            first_unit: None,
             lease: decdn_client::LaneLease::default(),
         })
     }
