@@ -2684,6 +2684,161 @@ async fn interior_hold_own_origin_miss_pulls_only_the_gaps() -> anyhow::Result<(
     Ok(())
 }
 
+/// A BOUNDED own-origin serve-miss over a node that holds ranges both inside and
+/// outside the request (#2205). The serve seeds the shared outboard only from the
+/// held part of its own aligned range. The held groups 4-7 form one whole subtree,
+/// so that subtree's inner proof nodes lie on no path to a pulled group: only the
+/// seed supplies them. Without them the encoder parks and the serve fails when the
+/// pull ends. The held head and tail groups lie outside the request and need no
+/// seed. The client still gets its range byte-exact, and the origin serves only the
+/// request's two gap groups.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn a_bounded_miss_seeds_only_the_held_ranges_inside_it() -> anyhow::Result<()> {
+    const G: u64 = 16 * 1024;
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+    let blob_for_resp = blob.clone();
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header_exists("range"))
+        .respond_with(move |req: &Request| {
+            let span = req
+                .headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_byte_range)
+                .and_then(|(s, e)| Some((usize::try_from(s).ok()?, usize::try_from(e).ok()?)))
+                .and_then(|(s, e)| blob_for_resp.get(s..=e));
+            match span {
+                Some(body) => ResponseTemplate::new(206).set_body_bytes(body.to_vec()),
+                None => ResponseTemplate::new(416),
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x53);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
+    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    // The 200 KiB blob spans groups 0-12 (group 12 is a half group). Hold the head
+    // group, groups 4-7 and the tail group.
+    let held = [(0, G), (4 * G, 4 * G), (12 * G, blob_size - 12 * G)];
+    for (off, len) in held {
+        let aligned = align_range(off, len, blob_size)?;
+        let data = blob
+            .get(usize::try_from(aligned.fetch_start())?..usize::try_from(aligned.fetch_end())?)
+            .ok_or_else(|| anyhow::anyhow!("held span out of bounds"))?
+            .to_vec();
+        let bao = encode_verified_range(
+            *hash.as_bytes(),
+            &aligned,
+            &data,
+            bytes::Bytes::from(outboard.clone()),
+        )
+        .map_err(|e| anyhow::anyhow!("encode held range: {e:?}"))?;
+        cache
+            .admit_bao(hash, aligned.chunk_ranges().clone(), bao)
+            .await?;
+    }
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // [3G + 100, 9G - 50) aligns to groups 3-8: held 4-7 inside, gaps 3 and 8.
+    let (req_off, req_len) = (3 * G + 100, 6 * G - 150);
+    let got = tokio::time::timeout(
+        Duration::from_secs(30),
+        ranged_paid_pull(
+            &client_ep,
+            target,
+            client_node_id,
+            &client_eth,
+            pool_id,
+            provider,
+            hash,
+            req_off,
+            req_len,
+            RATE_PER_MB,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the bounded miss over held ranges hung"))??;
+    let want = blob
+        .get(usize::try_from(req_off)?..usize::try_from(req_off + req_len)?)
+        .ok_or_else(|| anyhow::anyhow!("requested range out of bounds"))?;
+    anyhow::ensure!(
+        got.as_slice() == want,
+        "bounded miss over held ranges must be byte-exact"
+    );
+
+    // The origin served the two gap groups and nothing the node held.
+    let ranged_gets: Vec<(u64, u64)> = server
+        .received_requests()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("wiremock request recording disabled"))?
+        .iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path() == format!("/{hex}"))
+        .filter_map(|r| {
+            r.headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_byte_range)
+        })
+        .collect();
+    for (s, e) in &ranged_gets {
+        anyhow::ensure!(
+            !(*s < 8 * G && *e >= 4 * G),
+            "the origin must never re-fetch held groups 4-7, saw bytes={s}-{e}"
+        );
+    }
+    for gap in [3 * G, 8 * G] {
+        anyhow::ensure!(
+            ranged_gets.iter().any(|(s, e)| *s <= gap && *e >= gap),
+            "gap group at {gap} must be pulled from origin, saw {ranged_gets:?}"
+        );
+    }
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "the own-origin two-leg serve tier must fire once"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// SERVE-LEVEL NO-HANG: an origin fetch failure on the own-origin serve-miss path
 /// must FAIL the serve, not hang it. Dispatch confirms serviceability (origin size,
 /// published outboard and the ranged first-group probe succeed) and signs `ok:true`,

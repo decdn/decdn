@@ -832,6 +832,21 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **A serve-miss starts its upstream pull without re-hashing held ranges
+  outside the stream's own range (#2205).** Before it spawned the pull, every
+  serve-miss stream seeded the shared outboard from all of the blob's held
+  ranges, and `outboard_pairs` reads and verifies every leaf it exports. On the
+  testnet, lon1 proxied a 13.5 GiB entry: the dead time before each stream's
+  pull grew from 2.4 s to 8.2 s as the node cached more of it, and the stream
+  sent no data frame in that time. The upstream leg itself moved ~50 MB in 6 s.
+  The primed handshake pull also idled past its 2 s adoption limit, so the node
+  opened the same range a second time and forfeited its carried ramp credit at
+  the holder. The seed now covers only the held part of the stream's own
+  chunk-group-aligned range, the only span whose proof nodes its encoder loads.
+  A corrupt held range outside that span no longer fails the stream; the first
+  stream that covers it quarantines the hash. A failed seed is now logged at
+  `WARN`.
+
 - **`DecdnFeeSharesPollFailing` fires on repeated re-read failures, not on
   one transient RPC error.** The rule fired for 6 h on any single failed
   `getShares()` re-read, although the next hourly re-read heals it. On the

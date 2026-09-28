@@ -319,6 +319,34 @@ pub(super) struct CoherentFrameProducer {
     published: u64,
 }
 
+/// The content end of a serve for `[offset, +len)` of a `total`-byte blob:
+/// `len == 0` reads to the blob end, and a longer `len` clamps to it.
+pub(super) fn serve_end(offset: u64, len: u64, total: u64) -> u64 {
+    if len == 0 {
+        total
+    } else {
+        offset.saturating_add(len).min(total)
+    }
+}
+
+/// The chunk-group-aligned ranges the coherent encoder walks for the content span
+/// `[offset, end)` of a `total`-byte blob (ADR 038): the ranges the client's
+/// verified stream covers. A span with no bytes (`end <= offset`) has empty
+/// ranges.
+///
+/// # Errors
+///
+/// A non-empty span that does not align: `offset` at or past the blob end, or an
+/// `end` that overflows or exceeds `total`.
+pub(super) fn encoded_ranges(offset: u64, end: u64, total: u64) -> anyhow::Result<ChunkRanges> {
+    if end <= offset {
+        return Ok(ChunkRanges::empty());
+    }
+    align_range(offset, end - offset, total)
+        .map(|a| a.chunk_ranges().clone())
+        .map_err(|e| anyhow::anyhow!("serve range [{offset}, {end}) does not align: {e}"))
+}
+
 /// One step of [`CoherentFrameProducer::pump`]: the encode finished (or faulted), or
 /// the channel yielded an encoded chunk (`None` if it closed).
 enum PumpStep {
@@ -351,16 +379,9 @@ impl CoherentFrameProducer {
         end: u64,
         total: u64,
     ) -> anyhow::Result<Self> {
-        // The chunk-group-aligned ranges the client's verified stream covers (ADR
-        // 038). `end == offset` (empty request) yields empty ranges — an empty
-        // stream: the encode future below skips the encoder and ends at once.
-        let ranges = if end > offset {
-            align_range(offset, end - offset, total)
-                .map(|a| a.chunk_ranges().clone())
-                .map_err(|e| anyhow::anyhow!("serve range [{offset}, {end}) does not align: {e}"))?
-        } else {
-            ChunkRanges::empty()
-        };
+        // `end == offset` (empty request) yields empty ranges — an empty stream:
+        // the encode future below skips the encoder and ends at once.
+        let ranges = encoded_ranges(offset, end, total)?;
 
         let outboard = session.outboard_reader();
         let parked_on = outboard.parked_on();

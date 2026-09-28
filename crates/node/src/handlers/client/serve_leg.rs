@@ -214,11 +214,7 @@ impl ClientHandler {
 
         // Resolve the request end. `len == 0` ⇒ to the blob end (driver
         // convention); otherwise clamp to the tree size.
-        let end = if len == 0 {
-            total_bytes
-        } else {
-            offset.saturating_add(len).min(total_bytes)
-        };
+        let end = super::serve_encoder::serve_end(offset, len, total_bytes);
         let offset = offset.min(end);
         // The wire this leg delivers starts at the chunk-group floor of `offset`
         // (`align_range` snaps the fetch start down), so paid wire maps back to
