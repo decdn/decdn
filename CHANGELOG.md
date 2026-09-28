@@ -832,6 +832,14 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **`DecdnFeeSharesPollFailing` fires on repeated re-read failures, not on
+  one transient RPC error.** The rule fired for 6 h on any single failed
+  `getShares()` re-read, although the next hourly re-read heals it. On the
+  testnet it fired 18–40 h per node over 7 days from 6–11 failures each. It
+  now fires on `increase(decdn_fee_shares_watcher_poll_failures_total[3h]) >= 2`,
+  so it fires only when consecutive re-reads fail. The same 7 days would
+  have fired it for 2–9 h per node.
+
 - **The client peer store no longer ranks a nearby node behind the origin
   after a cold miss (#2196).** The store's `latency_ms` folded each stream
   open's time to first byte alongside the probe RTT. On a cache miss that time
