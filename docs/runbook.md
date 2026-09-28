@@ -897,6 +897,31 @@ identity rotation, host clock skew breaking TLS.
    `timedatectl status`). Skew greater than the QUIC handshake tolerance
    breaks every connection silently.
 
+## Repointing at a redeployed PaymentPool
+
+**Changing `blockchain.payment_pool_address` or `blockchain.chain_id` drops
+seller payment state.** The lane store binds to one `PaymentPool` deployment
+(ADR 003 § Off-chain voucher state persistence): on the first boot against a
+different deployment the node deletes its seller lane frontiers, both
+pending-settle sets, and the event-scan checkpoints, because their pool ids
+repeat on the new deployment. Unredeemed vouchers on the old deployment are
+forfeit after the drop.
+
+**Before repointing:**
+
+1. Let the node redeem its open lanes and finish any pending settles on the
+   old deployment (`decdn_unredeemed_usdc` reaches 0 / the redeemer logs go
+   quiet), then stop the node.
+2. Update the config and restart. The boot logs one WARN per dropped lane
+   with its `pool_id`, `signer`, `provider`, and unredeemed value — the last
+   record of each claim — plus a summary WARN with `dropped_lanes` and
+   `forfeited_micro_usdc`. Capture these lines if you need an audit trail.
+
+Startup also verifies the configured deployment before touching the store:
+`eth_chainId` must match `blockchain.chain_id` and the `PaymentPool` address
+must have code on that chain, so a typo aborts boot instead of triggering the
+drop. Buyer pool rows are scoped per row and are not dropped by this path.
+
 ## Testnet faucet
 
 **⚠️ Testnet only.** `contracts/testnet/TestnetFaucet.sol` is **not** part of

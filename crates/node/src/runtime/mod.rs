@@ -360,6 +360,10 @@ struct Infra {
     node_metrics: Arc<metrics::Metrics>,
     secret_key: SecretKey,
     eth_signer: Arc<PrivateKeySigner>,
+    /// The `PaymentPool` deployment the lane store is stamped with. The voucher
+    /// EIP-712 domain is derived from this same value, so the stamp and the
+    /// signature domain can never disagree.
+    payment_pool_deployment: crate::channel_store::Deployment,
     concrete_channel_store: Arc<PersistentPoolStateStore>,
     channel_state_store: Arc<dyn PoolStateStore>,
     watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore>,
@@ -437,6 +441,23 @@ async fn build_infra(
             "blockchain.payment_pool_address",
         )?,
     };
+    // Verify the configured deployment against the live chain BEFORE the store
+    // opens: `bind_deployment` drops the seller lane state when the stamp
+    // differs, so a typo'd chain id or contract address must abort bring-up
+    // here, while the store is untouched, rather than trigger an irreversible
+    // drop on a WARN.
+    check_deployment_preflight(
+        cfg.blockchain.rpc_url.parse().with_context(|| {
+            format!(
+                "blockchain.rpc_url {:?} is not a valid URL",
+                cfg.blockchain.rpc_url
+            )
+        })?,
+        channel_store_deployment,
+        &BootRetry::new(BOOT_CHAIN_RETRY_BUDGET, Arc::clone(&node_metrics))
+            .capped(DEPLOYMENT_PREFLIGHT_BUDGET),
+    )
+    .await?;
     // Keep the concrete store `Arc` so it can back the seller
     // `ChannelStateStore` (channel_state_v1 table), the pending-settle store
     // (pending_settle_v1 table, PR #743 review), and the buyer
@@ -641,6 +662,7 @@ async fn build_infra(
         node_metrics,
         secret_key,
         eth_signer,
+        payment_pool_deployment: channel_store_deployment,
         concrete_channel_store,
         channel_state_store,
         watcher_checkpoint_store,
@@ -1105,15 +1127,13 @@ async fn build_chain_and_handlers(
     let dht_routing = dht_handler.routing_table();
 
     // `cdn/client/v1` paid-delivery handler (#317). The voucher EIP-712 domain
-    // binds to the `PaymentPool` deployment; the ephemeral-binding
-    // domain to the `CapacityBond` deployment (== `capacity_bond_addr`,
-    // which holds the NodeId↔address mappings). The handler hydrates per-channel
-    // voucher state from `channel_state_store` so a restart cannot replay an
-    // already-accepted voucher (#527).
-    let payment_pool_addr = parse_nonzero_address(
-        &cfg.blockchain.payment_pool_address,
-        "blockchain.payment_pool_address",
-    )?;
+    // binds to the `PaymentPool` deployment the lane store is stamped with
+    // (`infra.payment_pool_deployment` — one parse, one source of truth); the
+    // ephemeral-binding domain to the `CapacityBond` deployment
+    // (== `capacity_bond_addr`, which holds the NodeId↔address mappings). The
+    // handler hydrates per-channel voucher state from `channel_state_store` so
+    // a restart cannot replay an already-accepted voucher (#527).
+    let payment_pool_addr = infra.payment_pool_deployment.payment_pool;
 
     // Live operator fee-share seed (ADR 041 / ADR 016 § Tunable Economics):
     // `PaymentPool.feeRouter()` resolves the router address, then
@@ -1174,7 +1194,7 @@ async fn build_chain_and_handlers(
     .await;
 
     let voucher_domain =
-        decdn_incentive::voucher_domain(cfg.blockchain.chain_id, payment_pool_addr);
+        decdn_incentive::voucher_domain(infra.payment_pool_deployment.chain_id, payment_pool_addr);
     let bind_domain =
         decdn_incentive::bind_node_id_domain(cfg.blockchain.chain_id, capacity_bond_addr);
 
@@ -3661,6 +3681,59 @@ const RPC_PREFLIGHT_MAX_ATTEMPTS: u32 = 5;
 /// not crash-loop the node at startup. A fatal (other 4xx) response, or an
 /// exhausted retry budget, aborts bring-up so operators still catch typos and
 /// dead endpoints before the node binds ports and starts serving.
+/// Retry budget for [`check_deployment_preflight`]'s two chain reads. A capped
+/// sub-budget of [`BOOT_CHAIN_RETRY_BUDGET`]: the RPC endpoint has just passed
+/// [`check_rpc_reachability`], so a transient hiccup clears fast, and a real
+/// outage should not hold the lane store hostage for the whole boot budget.
+const DEPLOYMENT_PREFLIGHT_BUDGET: Duration = Duration::from_mins(1);
+
+/// Verify the configured `PaymentPool` deployment against the live chain:
+/// the RPC's `eth_chainId` must equal `blockchain.chain_id`, and the contract
+/// must have code. Runs BEFORE the lane store opens, because the store's
+/// deployment binding ([`crate::channel_store::Deployment`]) drops the seller
+/// lane state when the stamp differs — a typo in either field must abort
+/// bring-up while the store is untouched, not destroy unredeemed lane state
+/// on a WARN. The reads retry transient RPC errors on `retry`; the mismatch
+/// verdicts themselves are deterministic and fail at once.
+async fn check_deployment_preflight(
+    rpc_url: HttpUrl,
+    deployment: crate::channel_store::Deployment,
+    retry: &BootRetry,
+) -> anyhow::Result<()> {
+    let provider = ProviderFactory::shared_head(rpc_url);
+    let (rpc_chain_id, code_len) = retry
+        .run(
+            "deployment preflight (eth_chainId + PaymentPool code)",
+            || {
+                let provider = provider.clone();
+                async move {
+                    let chain_id = provider.get_chain_id().await.context("eth_chainId")?;
+                    let code = provider
+                        .get_code_at(deployment.payment_pool)
+                        .await
+                        .context("eth_getCode(payment_pool)")?;
+                    Ok((chain_id, code.len()))
+                }
+            },
+        )
+        .await?;
+    anyhow::ensure!(
+        rpc_chain_id == deployment.chain_id,
+        "blockchain.chain_id is {} but the RPC endpoint serves chain {rpc_chain_id}; a \
+         mismatched chain id would rebind the lane store and drop its seller state — fix \
+         blockchain.chain_id or blockchain.rpc_url",
+        deployment.chain_id,
+    );
+    anyhow::ensure!(
+        code_len > 0,
+        "blockchain.payment_pool_address {} has no code on chain {rpc_chain_id}; a wrong \
+         address would rebind the lane store and drop its seller state — fix \
+         blockchain.payment_pool_address",
+        deployment.payment_pool,
+    );
+    Ok(())
+}
+
 async fn check_rpc_reachability(rpc_url: &str) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))

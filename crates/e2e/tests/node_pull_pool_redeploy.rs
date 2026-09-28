@@ -52,7 +52,8 @@
 //! a leg-2 miss to SEEDER #1. In journey 3, SEEDER #1 holds both blobs and seats
 //! both namespaces, and there is no SEEDER #2.
 //!
-//! The drop assertion reads the SERVER's captured log, so `DECDN_NODE_LOG` must
+//! The drop assertions read the SERVER's — and, in journey 3, SEEDER #1's —
+//! captured logs, so `DECDN_NODE_LOG` must
 //! keep `decdn_node` at `warn` or more verbose. Run with
 //! `DECDN_NODE_LOG="warn,decdn_node=debug"` to see the daemons' debug logs
 //! through the harness.
@@ -452,6 +453,12 @@ async fn stale_row_from_first_deployment(leg_two: LegTwoSeeder) -> anyhow::Resul
     let pool2 = chain.redeploy_payment_pool().await?;
     anyhow::ensure!(pool2 != pool1, "the redeploy must land at a new address");
 
+    // `second` MUST price below `first`: journey 3's mutation detection rests
+    // on it. A seeder that wrongly kept its #1 lane holds a frontier at the
+    // leg-1 price, so the SERVER's first #2 voucher (the smaller leg-2
+    // cumulative) lands below it and fails as AmountRegression. A `second`
+    // priced above `first` would be accepted by the stale lane and only the
+    // weaker exact-watermark checks would catch the bug.
     let first = make_blob(6 * CHUNK_GROUP + 37);
     let second = make_blob(2 * CHUNK_GROUP + 11);
 

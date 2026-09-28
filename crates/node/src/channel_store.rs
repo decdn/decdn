@@ -25,7 +25,8 @@
 //! ([`Deployment`]). Pool ids repeat across deployments, so `open()` drops the
 //! lane rows, pending settles and watcher checkpoints a different deployment
 //! wrote before it reads any of them. The buyer pool table carries its own
-//! per-row deployment tag and is not touched.
+//! per-row deployment tag (the contract address alone — no chain id) and is
+//! not touched.
 //!
 //! The lane table is buffered in memory: `open()`
 //! hydrates the working set from disk, `record`/`forget` mutate that working
@@ -93,9 +94,7 @@ use decdn_incentive::{
     AdvanceOutcome, BuyerLaneProgress, BuyerLoad, BuyerPoolState, BuyerPoolStore, DepositOutcome,
     LaneChain, LaneKey, LaneState, PoolId,
 };
-use redb::{
-    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
-};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 /// File name of the seller lane redb database within `data_dir`.
@@ -181,7 +180,7 @@ const WATCHER_CHECKPOINT_TABLE: TableDefinition<'_, &str, u64> =
 /// redb table holding the store's deployment stamp: the [`Deployment`] every
 /// row in [`LANE_TABLE`], both pending-settle tables, and
 /// [`WATCHER_CHECKPOINT_TABLE`] was written against. Lives in `lanes.redb`, so
-/// the stamp and the lane rows commit in one transaction.
+/// a restamp and the lane-table drop it forces commit in one transaction.
 ///
 /// One row, key [`DEPLOYMENT_KEY`], value `chain_id (8 bytes, big-endian) ‖
 /// payment_pool (20 bytes)`. A fixed-width value needs no postcard envelope.
@@ -206,6 +205,9 @@ pub struct Deployment {
     /// EIP-712 `chainId` of the voucher domain.
     pub chain_id: u64,
     /// The `PaymentPool` contract, the voucher domain's `verifyingContract`.
+    /// The nonzero check lives at the config boundary
+    /// ([`decdn_common::address::parse_nonzero_address`]); a new construction
+    /// site validates there, not here.
     pub payment_pool: Address,
 }
 
@@ -230,11 +232,13 @@ impl Deployment {
             ),
         };
         let bytes: &[u8; DEPLOYMENT_LEN] = bytes.try_into().map_err(|_| corrupt())?;
-        let (chain, pool) = bytes.split_at(8);
-        let chain: [u8; 8] = chain.try_into().map_err(|_| corrupt())?;
+        // Width is proven above; these splits re-prove it to the compiler
+        // without reaching for a panicking accessor.
+        let (chain, pool) = bytes.split_first_chunk::<8>().ok_or_else(corrupt)?;
+        let pool: &[u8; 20] = pool.try_into().map_err(|_| corrupt())?;
         Ok(Self {
-            chain_id: u64::from_be_bytes(chain),
-            payment_pool: Address::from_slice(pool),
+            chain_id: u64::from_be_bytes(*chain),
+            payment_pool: Address::from(*pool),
         })
     }
 }
@@ -686,8 +690,9 @@ impl PersistentPoolStateStore {
     /// - The stamp names `deployment`: nothing changes. The check runs in a READ
     ///   transaction, so a boot against the same deployment takes no write and
     ///   the #527 file-stability guarantee holds.
-    /// - No stamp: the store is new, and this open claims it for `deployment`.
-    ///   Existing rows stay.
+    /// - No stamp: the first open against this store claims it for
+    ///   `deployment`. Existing rows stay — they were written before the stamp
+    ///   existed, by the deployment the node was already configured against.
     /// - The stamp names another deployment: every row it wrote is dropped —
     ///   the lane table, both pending-settle sets, and the watcher checkpoints —
     ///   and the stamp is rewritten. Those rows name pool ids that repeat on the
@@ -699,7 +704,12 @@ impl PersistentPoolStateStore {
     /// The settle and checkpoint files clear first. The lane table clears in the
     /// same `lanes.redb` transaction that writes the new stamp, so a crash at any
     /// point leaves either the old stamp (the next boot repeats the clear) or the
-    /// new stamp with every lane row gone.
+    /// new stamp with every lane row gone. That guarantee assumes the next boot
+    /// keeps the NEW config: a crash after the settle/checkpoint clears followed
+    /// by a config revert to the OLD deployment matches the surviving stamp and
+    /// keeps the lanes, but that deployment's pending settles and checkpoints are
+    /// already gone (safe today — a lost checkpoint only widens a rescan — but a
+    /// future pending-settle consumer inherits this one-directional invariant).
     ///
     /// # Errors
     /// [`StoreError::Corrupt`] for a malformed stamp; [`StoreError::Backend`]
@@ -726,33 +736,16 @@ impl PersistentPoolStateStore {
                 )));
             }
         };
-        let foreign_lanes = match (stamp, read_txn.open_table(LANE_TABLE)) {
-            (Some(stamp), _) if stamp == deployment => return Ok(()),
-            (None, _) => None,
-            (Some(foreign), Ok(table)) => Some((
-                foreign,
-                table
-                    .len()
-                    .map_err(|err| StoreError::Backend(format!("len (lanes): {err}")))?,
-            )),
-            (Some(foreign), Err(redb::TableError::TableDoesNotExist(_))) => Some((foreign, 0)),
-            (Some(_), Err(err)) => {
-                return Err(StoreError::Backend(format!("open_table (lanes): {err}")));
-            }
+        let foreign = match stamp {
+            Some(stamp) if stamp == deployment => return Ok(()),
+            None => None,
+            Some(foreign) => Some(foreign),
         };
+        if let Some(foreign) = foreign {
+            Self::log_forfeited_lanes(&read_txn, foreign, deployment)?;
+        }
         drop(read_txn);
-
-        if let Some((foreign, lanes)) = foreign_lanes {
-            tracing::warn!(
-                foreign_chain_id = foreign.chain_id,
-                foreign_payment_pool = %foreign.payment_pool,
-                configured_chain_id = deployment.chain_id,
-                configured_payment_pool = %deployment.payment_pool,
-                dropped_lanes = lanes,
-                "dropping seller lane state, pending settles and watcher checkpoints written \
-                 against another PaymentPool deployment; pool ids repeat across deployments, \
-                 and the dropped lanes' unredeemed vouchers are forfeit"
-            );
+        if foreign.is_some() {
             Self::delete_tables(settle_db, "settle", |txn| {
                 txn.delete_table(PENDING_SETTLE_TABLE)?;
                 txn.delete_table(BUYER_PENDING_SETTLE_TABLE)?;
@@ -769,7 +762,7 @@ impl PersistentPoolStateStore {
             .map_err(|err| StoreError::Backend(format!("begin_write (deployment): {err}")))?;
         txn.set_durability(Durability::Immediate)
             .map_err(|err| StoreError::Backend(format!("set_durability (deployment): {err}")))?;
-        if foreign_lanes.is_some() {
+        if foreign.is_some() {
             txn.delete_table(LANE_TABLE)
                 .map_err(|err| StoreError::Backend(format!("delete_table (lanes): {err}")))?;
         }
@@ -783,6 +776,83 @@ impl PersistentPoolStateStore {
         }
         txn.commit()
             .map_err(|err| StoreError::Backend(format!("commit (deployment): {err}")))
+    }
+
+    /// Walk the lane table once before the deployment rebind drops it: each
+    /// per-lane WARN is the LAST RECORD of that lane's unredeemed claim on the
+    /// old deployment (mirroring the buyer-side `drop_foreign_row` convention
+    /// of naming the recovery target), and the walk sums the forfeited value
+    /// for the summary WARN. A row that fails to decode is logged raw and
+    /// still counted — it is about to be deleted, so a foreign store's corrupt
+    /// row must not abort THIS deployment's bring-up. An absent lane table
+    /// logs a zero-lane summary.
+    fn log_forfeited_lanes(
+        read_txn: &redb::ReadTransaction,
+        foreign: Deployment,
+        configured: Deployment,
+    ) -> Result<(), StoreError> {
+        let mut dropped_lanes: u64 = 0;
+        let mut forfeited = U256::ZERO;
+        match read_txn.open_table(LANE_TABLE) {
+            Ok(table) => {
+                let iter = table
+                    .iter()
+                    .map_err(|err| StoreError::Backend(format!("lanes iter: {err}")))?;
+                for entry in iter {
+                    let (key_guard, value_guard) = entry
+                        .map_err(|err| StoreError::Backend(format!("lanes iter entry: {err}")))?;
+                    let key_bytes: [u8; LANE_KEY_LEN] = *key_guard.value();
+                    dropped_lanes = dropped_lanes.saturating_add(1);
+                    match decode_record(&key_bytes, value_guard.value()) {
+                        Ok(state) => {
+                            let unredeemed =
+                                state.last_amount().saturating_sub(state.paid_cumulative);
+                            forfeited = forfeited.saturating_add(unredeemed);
+                            tracing::warn!(
+                                pool_id = %state.pool_id,
+                                signer = %state.signer,
+                                provider = %state.provider,
+                                last_amount = %state.last_amount(),
+                                paid_cumulative = %state.paid_cumulative,
+                                unredeemed_micro_usdc = %unredeemed,
+                                foreign_payment_pool = %foreign.payment_pool,
+                                "dropping this seller lane with the deployment rebind; \
+                                 this line is the last record of its unredeemed claim \
+                                 on the old deployment"
+                            );
+                        }
+                        Err(err) => {
+                            let (pool_id, signer, provider) = lane_key_parts(&key_bytes);
+                            tracing::warn!(
+                                %pool_id,
+                                %signer,
+                                %provider,
+                                error = %err,
+                                foreign_payment_pool = %foreign.payment_pool,
+                                "dropping an undecodable seller lane with the \
+                                 deployment rebind; its value cannot be reported"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(err) => {
+                return Err(StoreError::Backend(format!("open_table (lanes): {err}")));
+            }
+        }
+        tracing::warn!(
+            foreign_chain_id = foreign.chain_id,
+            foreign_payment_pool = %foreign.payment_pool,
+            configured_chain_id = configured.chain_id,
+            configured_payment_pool = %configured.payment_pool,
+            dropped_lanes,
+            forfeited_micro_usdc = %forfeited,
+            "dropping seller lane state, pending settles and watcher checkpoints written \
+             against another PaymentPool deployment; pool ids repeat across deployments, \
+             and the dropped lanes' unredeemed vouchers are forfeit"
+        );
+        Ok(())
     }
 
     /// Delete tables from `db` in one fsynced write transaction. `what` names
@@ -2071,6 +2141,13 @@ mod tests {
             store.load_all()? == vec![lane],
             "new deployment's lane kept"
         );
+        drop(store);
+        // The stamp survives the record/flush cycles above: a lost stamp would
+        // silently degrade the NEXT repoint to the claim-and-keep path.
+        anyhow::ensure!(
+            stored_stamp(dir.path())? == Some(redeployed),
+            "stamp survives record/flush cycles"
+        );
         Ok(())
     }
 
@@ -2103,8 +2180,21 @@ mod tests {
             txn.commit()?;
         }
 
-        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
-        anyhow::ensure!(store.load_all()? == vec![lane], "rows kept");
+        let store = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
+        anyhow::ensure!(store.load_all()? == vec![lane], "lanes kept");
+        // The claim keeps every family, not just the lanes.
+        anyhow::ensure!(store.load_pending()?.len() == 1, "seller pending kept");
+        anyhow::ensure!(
+            BuyerPendingSettleStoreHandle::new(Arc::clone(&store))
+                .load_pending()?
+                .len()
+                == 1,
+            "buyer pending kept"
+        );
+        anyhow::ensure!(
+            store.load_checkpoint(CheckpointKey::PoolOpened)? == Some(4_242),
+            "checkpoint kept"
+        );
         drop(store);
         anyhow::ensure!(
             stored_stamp(dir.path())? == Some(DEPLOYMENT),
@@ -2150,6 +2240,107 @@ mod tests {
         anyhow::ensure!(
             matches!(err, StoreError::Corrupt { .. }),
             "expected Corrupt, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// A boot that crashed between the settle/checkpoint clears and the
+    /// lanes+stamp commit leaves the OLD stamp with those tables already gone.
+    /// The next boot against the new deployment repeats the whole drop: clearing
+    /// the already-missing tables is a no-op, and the lanes and stamp land.
+    #[test]
+    fn a_crashed_drop_is_repeated_by_the_next_boot() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        seed_seller_state(dir.path(), DEPLOYMENT)?;
+        // The crash state: settle and checkpoint tables deleted, foreign stamp
+        // and lane rows intact.
+        for (file, tables) in [
+            (
+                SETTLE_DB_FILE,
+                vec!["pending_settle_v1", "buyer_pending_settle_v1"],
+            ),
+            (CHECKPOINT_DB_FILE, vec!["watcher_checkpoint_v1"]),
+        ] {
+            let db = Database::create(dir.path().join(file))?;
+            let txn = db.begin_write()?;
+            for name in tables {
+                let table: TableDefinition<'_, &[u8; 32], u64> = TableDefinition::new(name);
+                // The checkpoint table's real key type is &str, but
+                // delete_table drops by NAME; the definition's types are not
+                // checked on delete.
+                txn.delete_table(table)?;
+            }
+            txn.commit()?;
+        }
+
+        let redeployed = Deployment {
+            payment_pool: address!("00000000000000000000000000000000000000cf"),
+            ..DEPLOYMENT
+        };
+        let store = Arc::new(PersistentPoolStateStore::open(dir.path(), redeployed)?);
+        anyhow::ensure!(seller_state_is_empty(&store)?, "the repeated drop lands");
+        drop(store);
+        anyhow::ensure!(
+            stored_stamp(dir.path())? == Some(redeployed),
+            "the repeated drop restamps"
+        );
+        Ok(())
+    }
+
+    /// A foreign stamp over a store that never flushed a lane (the lane table
+    /// was never created) drops cleanly: the walk tolerates the absent table
+    /// and the unconditional lane `delete_table` is a no-op.
+    #[test]
+    fn a_foreign_stamp_without_a_lane_table_drops_cleanly() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        // Open + close without recording a lane: the stamp exists, the lane
+        // table does not (only a flush creates it).
+        drop(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
+
+        let redeployed = Deployment {
+            payment_pool: address!("00000000000000000000000000000000000000cf"),
+            ..DEPLOYMENT
+        };
+        let store = Arc::new(PersistentPoolStateStore::open(dir.path(), redeployed)?);
+        anyhow::ensure!(seller_state_is_empty(&store)?, "nothing to drop, no error");
+        drop(store);
+        anyhow::ensure!(
+            stored_stamp(dir.path())? == Some(redeployed),
+            "store restamped"
+        );
+        Ok(())
+    }
+
+    /// The deployment rebind never touches `buyer.redb`: a buyer pool row
+    /// survives a foreign reopen. The buyer table carries its own per-row
+    /// deployment tag and its own drop path (`drop_foreign_row`, #2087).
+    #[test]
+    fn a_buyer_pool_row_survives_a_seller_side_drop() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let pool_id = sample(0x31).pool_id;
+        {
+            let store = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
+            let buyer = BuyerPoolStoreHandle::new(Arc::clone(&store));
+            buyer.record(&BuyerPoolState::new(
+                pool_id,
+                DEPLOYMENT.payment_pool,
+                Address::repeat_byte(0x0a),
+                Address::repeat_byte(0x0b),
+                U256::from(1_000_000u64),
+            ))?;
+        }
+
+        let redeployed = Deployment {
+            payment_pool: address!("00000000000000000000000000000000000000cf"),
+            ..DEPLOYMENT
+        };
+        let store = Arc::new(PersistentPoolStateStore::open(dir.path(), redeployed)?);
+        let row = BuyerPoolStoreHandle::new(Arc::clone(&store))
+            .get_by_pool_id(pool_id)?
+            .ok_or_else(|| anyhow::anyhow!("buyer row gone after the seller-side drop"))?;
+        anyhow::ensure!(
+            row.payment_pool == DEPLOYMENT.payment_pool,
+            "the buyer row keeps its own deployment tag"
         );
         Ok(())
     }
