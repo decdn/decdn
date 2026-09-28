@@ -700,7 +700,7 @@ async fn range_set_gaps<St: RangedStore + ?Sized>(
 fn keep_decisive(kept: anyhow::Error, new: anyhow::Error) -> anyhow::Error {
     let rank = |e: &anyhow::Error| {
         (
-            crate::retry_disposition(e) == crate::RetryDisposition::Terminal,
+            matches!(crate::fault::classify(e), crate::fault::Fault::Fatal(_)),
             e.downcast_ref::<PoolExhausted>().is_some(),
         )
     };

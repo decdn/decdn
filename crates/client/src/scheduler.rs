@@ -90,10 +90,10 @@ use crate::ledgers::LaneLedgers;
 use crate::pacer::DownstreamFrontier;
 use crate::segment::{split_evenly, steal_split};
 use crate::source::{BlobSource, Funder, IngestStore, SourceFuture};
-use crate::source_set::{Holder, SourceProvider, SourceSet, StaticSources};
-use crate::stop::{SCRIPT_GIVE_UP, StopPolicy};
+use crate::source_set::{Holder, SourceProvider, SourceSet};
+use crate::stop::StopPolicy;
 use crate::streamer::StreamCandidate;
-use crate::{Pacer, PoolContext, PoolLedger, UpstreamPullHeader, VoucherProgress};
+use crate::{Pacer, PoolContext, PoolLedger};
 
 /// How long a lane may go without a verified byte, with bytes of its range
 /// still missing, before its range moves to other lanes and its source cools.
@@ -159,40 +159,6 @@ impl<Pc, F> std::fmt::Debug for AcquireEnv<'_, Pc, F> {
     }
 }
 
-/// One paid delivery lane in a multi-source fetch: a source paired with the
-/// `(ctx, ledger)` that pays IT, never shared across sources.
-///
-/// A voucher is scoped to one on-chain `provider` (ADR 039 § Payment model): the
-/// [`PoolContext::provider`](crate::PoolContext) it is signed against, and it is
-/// invalid if redeemed by any other node. And a [`PoolLedger`] tracks ONE
-/// `(signer, provider)` lane's cumulative watermark. So each source carries its
-/// OWN `ctx` and its OWN `ledger`; one shared pool DEPOSIT still backs every
-/// lane.
-pub struct SourceLane<'a, S> {
-    /// The paid source this lane fetches from.
-    pub source: &'a S,
-    /// The buyer context that pays this source: its `provider` is this lane's
-    /// payee, behind the shared `Arc<Mutex<..>>` so a reactive top-up's new
-    /// deposit is visible to this lane's next open.
-    pub ctx: Arc<Mutex<PoolContext>>,
-    /// This lane's voucher ledger, seeded from its persisted cumulative: the
-    /// per-`(signer, provider)` watermark, never shared with another lane.
-    pub ledger: Arc<PoolLedger>,
-    /// Which discovery blocks this source actually holds (#1506). This lane is
-    /// never assigned, and never steals, a range outside it.
-    pub coverage: Coverage,
-    /// The range this lane opens first, when its caller already opened it:
-    /// a pull parked in a [`crate::PrimedSource`] that this lane's first open
-    /// adopts (#2063). It is ignored, and planned like any other range, unless
-    /// it aligns against this blob, lies wholly inside the still-missing
-    /// request, sits inside this lane's coverage, and overlaps no earlier
-    /// lane's reserved first unit.
-    pub first_unit: Option<AlignedRange>,
-    /// What the lane holds while the fetch runs ([`LaneLease`]), released when
-    /// the fetch returns, or `None`.
-    pub lease: Option<&'a LaneLease>,
-}
-
 /// A resource one source lane holds while it takes part in an acquire, such as
 /// the caller's stream permit for the lane's provider. [`acquire`] releases it
 /// when it returns or is dropped, including for a lane that cooled mid-fetch.
@@ -219,29 +185,6 @@ impl std::fmt::Debug for LaneLease {
         let held = self.0.lock().is_ok_and(|held| held.is_some());
         f.debug_struct("LaneLease").field("held", &held).finish()
     }
-}
-
-impl<S> std::fmt::Debug for SourceLane<'_, S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The source is opaque and `PoolContext` guards a signing key, so print
-        // only the non-sensitive lane identity (its payee provider).
-        let provider = self.ctx.lock().ok().map(|c| c.provider);
-        f.debug_struct("SourceLane")
-            .field("provider", &provider)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Client-side knobs for [`multi_source_fetch`].
-#[derive(Debug, Clone, Copy)]
-pub struct MultiSourceConfig {
-    /// The most lanes that stream at once, and the most of the given lanes the
-    /// fetch uses, highest-ranked first.
-    pub max_sources: usize,
-    /// The lane watchdog's window: a lane with no verified progress for this
-    /// long ends and its range moves to other lanes. `Duration::ZERO` turns the
-    /// watchdog off.
-    pub unit_deadline: Duration,
 }
 
 /// A range [`Work::pick`] handed to a worker. `victim` is set when the range is
@@ -1767,182 +1710,6 @@ where
     }
 }
 
-/// A borrowed lane's source, as an owned [`BlobSource`].
-struct LaneRef<'a, S>(&'a S);
-
-impl<S: BlobSource> BlobSource for LaneRef<'_, S> {
-    type Reader = S::Reader;
-
-    fn open(
-        &self,
-        hash: [u8; 32],
-        range: AlignedRange,
-    ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
-        self.0.open(hash, range)
-    }
-
-    fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
-        self.0.finish(reader)
-    }
-
-    fn max_blob_size_bytes(&self) -> u64 {
-        self.0.max_blob_size_bytes()
-    }
-}
-
-/// Releases each borrowed lane's [`LaneLease`] when [`multi_source_fetch_until`]
-/// returns or is dropped.
-struct ReleaseBorrowed<'a, 'b, S>(&'a [SourceLane<'b, S>]);
-
-impl<S> Drop for ReleaseBorrowed<'_, '_, S> {
-    fn drop(&mut self) {
-        for lane in self.0 {
-            if let Some(lease) = lane.lease {
-                lease.release();
-            }
-        }
-    }
-}
-
-/// Fetch `hash`'s request `[offset, offset+len)` across `lanes`, all writing into
-/// the one shared `store`: the lane-slice entry point over [`acquire`].
-///
-/// The first `ms.max_sources` lanes become the fetch's sources, ranked in slice
-/// order, and at most `ms.max_sources` of them stream at once. Each keeps its
-/// `first_unit`. The lane watchdog runs at `ms.unit_deadline`, and is off when
-/// that is zero or `pacing` is set. The fetch gives up after
-/// [`SCRIPT_GIVE_UP`] without a verified byte. Every lane's `lease` is released
-/// when the fetch returns.
-///
-/// # Errors
-///
-/// An empty `lanes` or two lanes on one provider, or any error [`acquire`]
-/// returns.
-#[allow(clippy::too_many_arguments)]
-pub async fn multi_source_fetch<St, S, P, F>(
-    store: &St,
-    lanes: &[SourceLane<'_, S>],
-    pacer: &P,
-    funder: &F,
-    hash: [u8; 32],
-    offset: u64,
-    len: u64,
-    drive: &DriveConfig,
-    ms: &MultiSourceConfig,
-    on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
-    ledgers: Option<&LaneLedgers>,
-    pacing: Option<&ConsumptionPacing<'_>>,
-) -> anyhow::Result<()>
-where
-    St: IngestStore,
-    S: BlobSource,
-    P: Pacer,
-    F: Funder,
-{
-    multi_source_fetch_until(
-        store,
-        lanes,
-        pacer,
-        funder,
-        hash,
-        offset,
-        len,
-        drive,
-        ms,
-        on_progress,
-        ledgers,
-        pacing,
-        std::future::pending(),
-    )
-    .await
-}
-
-/// [`multi_source_fetch`] under a caller's `stop`: when `stop` resolves first,
-/// the fetch is dropped, the present record is flushed so the bytes that landed
-/// stay recorded for a resume, and the fetch returns `stop`'s error as it is.
-///
-/// # Errors
-///
-/// `stop`'s error when it resolves first, or any error
-/// [`multi_source_fetch`] returns.
-#[allow(clippy::too_many_arguments)]
-pub async fn multi_source_fetch_until<St, S, P, F>(
-    store: &St,
-    lanes: &[SourceLane<'_, S>],
-    pacer: &P,
-    funder: &F,
-    hash: [u8; 32],
-    offset: u64,
-    len: u64,
-    drive: &DriveConfig,
-    ms: &MultiSourceConfig,
-    on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
-    ledgers: Option<&LaneLedgers>,
-    pacing: Option<&ConsumptionPacing<'_>>,
-    stop: impl Future<Output = anyhow::Error>,
-) -> anyhow::Result<()>
-where
-    St: IngestStore,
-    S: BlobSource,
-    P: Pacer,
-    F: Funder,
-{
-    anyhow::ensure!(
-        !lanes.is_empty(),
-        "multi_source_fetch requires at least one source lane"
-    );
-    let _release = ReleaseBorrowed(lanes);
-    let lanes = lanes
-        .get(..lanes.len().min(ms.max_sources.max(1)))
-        .unwrap_or(lanes);
-    let candidates = lanes
-        .iter()
-        .map(|lane| StreamCandidate {
-            source: LaneRef(lane.source),
-            ctx: Arc::clone(&lane.ctx),
-            ledger: Arc::clone(&lane.ledger),
-            coverage: Some(lane.coverage.clone()),
-            first_unit: lane.first_unit.clone(),
-            lease: LaneLease::new(()),
-        })
-        .collect();
-    let provider = StaticSources::new(candidates).map_err(|e| {
-        e.context(
-            "multi_source_fetch requires one lane per provider: two lanes on one provider \
-             would run two concurrent voucher streams on one (signer, provider) lane",
-        )
-    })?;
-    let mut set = SourceSet::new(&provider, hash, Arc::default(), provider.holders());
-    let policy = StopPolicy::new(false, Some(SCRIPT_GIVE_UP), Arc::default());
-    let watchdog = if pacing.is_some() {
-        Duration::ZERO
-    } else {
-        ms.unit_deadline
-    };
-    let ranges = [(offset, len)];
-    let env = AcquireEnv {
-        pacer,
-        funder,
-        drive,
-        max_lanes: ms.max_sources,
-        stop: &policy,
-        on_progress,
-        ledgers,
-        pacing,
-    };
-    let target = AcquireTarget {
-        store,
-        hash,
-        total_bytes: store.total_bytes(),
-        ranges: &ranges,
-    };
-    tokio::select! {
-        biased;
-        fetched = acquire_with_watchdog(target, &mut set, &env, watchdog) => fetched,
-        stopped = stop => Err(flushed(store, stopped).await),
-    }
-}
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -2147,7 +1914,7 @@ mod tests {
 
         // The SECOND lane holds the primed pull, so the unit is not simply what
         // lane 0 would have been planned anyway.
-        let unit = crate::download_first_unit(total, 2)?;
+        let unit = decdn_bao_range::align_range(0, total / 2, total)?;
         let (header, reader) = inner_b.open(root, unit.clone()).await?;
         src_b.prime(
             root,

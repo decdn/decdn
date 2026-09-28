@@ -154,19 +154,15 @@ impl RangeTargets {
 /// ([`discovery::admit_sources`]): one node per operator, at most
 /// `max_sources`. A partial holder or a proxy-warming non-holder is left out,
 /// so no striped range lands on a node that lacks it. The rest of `candidates`
-/// follow in their own order as failover reserve. With multi-source off, or
-/// fewer than two admitted holders, the order is unchanged and the stripe is
-/// one: plain single-source failover.
+/// follow in their own order as failover reserve. With fewer than two admitted
+/// holders, the order is unchanged and the stripe is one: plain single-source
+/// failover.
 fn stripe_order(
     candidates: Vec<NodeCandidate>,
     coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
     total: u64,
-    multi_source: bool,
     max_sources: usize,
 ) -> (Vec<NodeCandidate>, usize) {
-    if !multi_source {
-        return (candidates, 1);
-    }
     let blocks = decdn_protocol::num_blocks(total);
     let full_holders: Vec<NodeCandidate> = candidates
         .iter()
@@ -1789,7 +1785,7 @@ async fn run_with_retries<G, R, Fut>(
 /// a `Semaphore(N)` admits N concurrent same-lane streams, and N == 1 runs a
 /// single ordered voucher sequence per lane. Cross-lane parallelism (distinct
 /// providers) is never bounded here — only by `--jobs`.
-struct LaneStreamCap {
+pub(crate) struct LaneStreamCap {
     /// Per-provider semaphores, created on first use. The `tokio::sync::Mutex`
     /// guards the map so the cap is `Sync` and shareable across the entry futures.
     map: tokio::sync::Mutex<HashMap<Address, Arc<tokio::sync::Semaphore>>>,
@@ -1819,32 +1815,15 @@ impl LaneStreamCap {
     /// Acquire one stream permit for `provider`, held until the returned permit
     /// drops. At `n == 1` a second concurrent caller for the same provider waits
     /// here until the first releases.
-    async fn permit(&self, provider: Address) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+    pub(crate) async fn permit(
+        &self,
+        provider: Address,
+    ) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
         self.semaphore(provider)
             .await
             .acquire_owned()
             .await
             .map_err(|_| anyhow!("bundle pull lane-stream cap closed"))
-    }
-
-    /// Acquire one stream permit for every distinct provider in `providers`, in
-    /// one global order (sorted, deduped `Address`), and return each with its
-    /// provider. Every caller that waits on a permit holds none while it
-    /// waits, and a multi-provider set waits in this one order, so the cap is
-    /// deadlock-free: a task never waits on a lower-address permit while
-    /// holding a higher one.
-    async fn permit_set(
-        &self,
-        providers: &[Address],
-    ) -> anyhow::Result<Vec<(Address, tokio::sync::OwnedSemaphorePermit)>> {
-        let mut ordered = providers.to_vec();
-        ordered.sort_unstable();
-        ordered.dedup();
-        let mut permits = Vec::with_capacity(ordered.len());
-        for provider in ordered {
-            permits.push((provider, self.permit(provider).await?));
-        }
-        Ok(permits)
     }
 }
 
@@ -2024,98 +2003,66 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             // budget bounds both stages. The pull carries no overall wall-clock cap —
             // `drive` never consults one — so it completes for any blob size as long
             // as the upstream keeps feeding it bytes.
-            deadlines: PullDeadlines::new(
-                self.common.stall_timeout(),
-                self.common.stall_timeout(),
-                self.common.min_throughput_bps(),
-            )?,
+            deadlines: PullDeadlines::new(fetch::STALL_WINDOW, fetch::STALL_WINDOW, 0)?,
         })
     }
 
     /// The ADR 039 multi-source pre-branch for one entry (#1774). Returns
-    /// `Ok(Some(()))` once the blob is fetched in parallel across the admitted
-    /// set, `Ok(None)` when the engagement gate declines (the caller then runs
-    /// the single-source failover loop), and `Err` when the fan-out engaged and
-    /// failed.
+    /// `Ok(Some(()))` once the blob is fetched through the acquire loop across
+    /// the entry's holders, `Ok(None)` when fewer than two operator-distinct
+    /// holders exist (the caller then runs the single-source failover loop),
+    /// and `Err` when the fetch engaged and failed.
     ///
     /// The bundle's `open_lock` is passed through so every lane's pool
     /// open-or-reuse still serializes against the other entries sharing the
-    /// one on-chain pool. The pre-probe gate (kill switch, holder count,
-    /// size-hint floor) runs before the fan-out: a fetch the gate declines
-    /// never engages a lane.
+    /// one on-chain pool, and each lane holds one of its provider's stream
+    /// permits ([`LaneStreamCap`]) while the fetch runs.
     ///
-    /// Every admitted provider's lane draws vouchers from the run's shared
+    /// Every provider's lane draws vouchers from the run's shared
     /// `LaneLedgers` (ADR 039): each `(pool_id, signer, provider)` lane has one
     /// monotonic issuer, so concurrent entries fanning out over the same
     /// provider issue vouchers off the same watermark instead of racing it.
     /// `--jobs 3` with overlapping provider sets runs those entries'
     /// transfers concurrently; only the per-lane voucher issuance
     /// serializes, not the transfer.
-    ///
-    /// `total` is the manifest's optional `size`, which the first open is cut
-    /// from (#2063).
     async fn try_multi_source(
         &self,
         order: &fetch::ResolvedTargets,
         hash: [u8; 32],
         staging: &Path,
-        total: Option<u64>,
         progress: Option<&ProgressCallback>,
     ) -> anyhow::Result<Option<()>> {
-        // Admission is computed once and reused for the gate and the fan-out
-        // itself — `try_multi_source_fetch` would otherwise recompute the
-        // same `admit_sources` from `order.candidates`.
         let admitted = discovery::admit_sources(order.candidates.clone(), self.common.max_sources);
-        if fetch::multi_source_gate_declines(
-            self.common,
-            &order.candidates,
-            &admitted,
-            order.size_hint,
-        ) {
+        if admitted.len() < 2 {
+            tracing::info!(
+                "multi-source: not engaging — {} operator-distinct holder(s) among {} \
+                 candidate(s), and fan-out needs two",
+                admitted.len(),
+                order.candidates.len()
+            );
             return Ok(None);
         }
-        // One lane-stream permit per admitted provider: every admitted lane
-        // opens a stream at once, so the cap must admit the set together.
-        // Acquired in sorted `Address` order (deadlock free) and only after the
-        // gate accepts, so a declined fetch takes none. Each permit rides on its
-        // provider's lane as a lease, which the scheduler drops when that lane
-        // stops, so a dead lane frees its provider for a sibling entry.
-        let providers: Vec<Address> = admitted.iter().map(|c| c.eth_address).collect();
-        let leases = self
-            .lane_cap
-            .permit_set(&providers)
-            .await?
-            .into_iter()
-            .map(|(provider, permit)| (provider, decdn_client::LaneLease::new(permit)))
-            .collect();
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
         let deps = self.drive_deps(max_blob_bytes)?;
-        // The entry's per-file bar callback (ADR 039 fan-out reports one monotonic
-        // total the lanes fold their per-leg deltas into, so the bar never jumps
-        // between lanes). The admitted set already computed for the gate is
-        // moved into the fan-out so `admit_sources` runs only once.
         fetch::multi_source_download(
             &deps,
             self.common,
             self.grant.as_ref(),
             self.signer,
             self.voucher_dom,
-            admitted,
-            &order.coverage_by_node,
+            order,
             self.relays,
             hash,
             staging,
-            // The manifest's size, else the probed hint. Neither is signed: it
-            // cuts the first open (#2063) and can decline fan-out early, and the
-            // signed header decides the size.
-            total.or(order.size_hint),
             progress,
-            Some(&self.open_lock),
-            Some(&self.ledgers),
-            leases,
+            fetch::BundleShared {
+                open_lock: Some(&self.open_lock),
+                ledgers: Some(&self.ledgers),
+                lane_cap: Some(&self.lane_cap),
+            },
         )
         .await
-        .map(|opt| opt.map(|_bytes| ()))
+        .map(|_bytes| Some(()))
     }
 
     /// Fetch one blob after explicit selection or discovery, streaming it into
@@ -2130,14 +2077,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// candidate, a terminal one stops, and the last error surfaces once the list
     /// is exhausted. Every attempt draws on the ONE shared pool and resumes the
     /// entry's `.partial` beside `staging`, so a fail-over re-pays nothing.
-    ///
-    /// `total` is the manifest's optional `size`, passed to the multi-source
-    /// fan-out to cut its first open from (#2063).
     async fn fetch_to_staging(
         &self,
         hash: [u8; 32],
         staging: &Path,
-        total: Option<u64>,
         progress: Option<&ProgressCallback>,
     ) -> anyhow::Result<()> {
         let _permit = self
@@ -2172,31 +2115,26 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // payment section below all run concurrently across entries; only the
         // per-lane voucher watermark is serialized, by the ledger itself.
 
-        // Multi-source fan-out (ADR 039, #1774): the same pre-branch `decdn
-        // fetch` runs. One entry engages N provider lanes at once, drawing
-        // each lane's vouchers from the shared ledger, then fans out. The
-        // engagement gate (kill switch off, too few admissible holders, below
-        // the size floor) is decided inside `try_multi_source` and falls
-        // through to the single-source failover loop below unchanged; a
-        // retryable fan-out failure does the same, resuming the entry's
-        // `.partial` so nothing paid for is re-bought.
-        match self
-            .try_multi_source(&order, hash, staging, total, progress)
-            .await
-        {
+        // Multi-source fan-out (ADR 039, #1774): one entry runs the acquire
+        // loop over its holders, drawing each lane's vouchers from the shared
+        // ledger. Fewer than two operator-distinct holders fall through to the
+        // single-source failover loop below unchanged; a fan-out that fails
+        // with anything the user need not fix does the same, resuming the
+        // entry's `.partial` so nothing paid for is re-bought.
+        match self.try_multi_source(&order, hash, staging, progress).await {
             Ok(Some(())) => return Ok(()),
             Ok(None) => {}
+            // `multi_source_download` already reconnected the error to its
+            // remedy, the delegated owner-side one included.
             Err(err)
                 if retry_disposition(&err) == RetryDisposition::Terminal
-                    || err.downcast_ref::<PoolExhausted>().is_some() =>
+                    || err.downcast_ref::<PoolExhausted>().is_some()
+                    || matches!(
+                        decdn_client::classify(&err),
+                        decdn_client::Fault::Fatal(decdn_client::FatalScope::Command)
+                    ) =>
             {
-                // On the delegated path reconnect a terminal exhaustion to
-                // the owner remedy, same as the single-source path does.
-                return Err(if self.grant.is_some() {
-                    fetch::annotate_delegated_exhaustion(err)
-                } else {
-                    err
-                });
+                return Err(err);
             }
             Err(err) => {
                 tracing::warn!(
@@ -2427,7 +2365,6 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             resolved.candidates,
             &resolved.coverage_by_node,
             total,
-            self.common.multi_source_enabled(),
             self.common.max_sources,
         );
         Ok(RangeTargets::Discovered { order, stripe })
@@ -2445,7 +2382,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let staging = staging_path(out_root, hash)?;
         // The manifest blob fetch is silent (no bar): `progress` is disabled here
         // anyway, and the per-file bars belong to the entries, not the manifest.
-        self.fetch_to_staging(hash, &staging, None, None).await?;
+        self.fetch_to_staging(hash, &staging, None).await?;
         let bytes =
             std::fs::read(&staging).with_context(|| format!("read {}", staging.display()))?;
         remove_staging_off_runtime(&staging).await;
@@ -2752,8 +2689,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             // register its chunks so a *later* entry can dedup against it. The paid
             // count is the verified blob's length, not the manifest's optional
             // `size`: this path never checks `size`, so a wrong one still fetches.
-            self.fetch_to_staging(hash, staging, total, progress)
-                .await?;
+            self.fetch_to_staging(hash, staging, progress).await?;
             index.register(hints, staging);
             let paid = tokio::fs::metadata(staging).await.map_or(0, |m| m.len());
             return Ok(EntryBytes { paid, spliced: 0 });
@@ -3545,7 +3481,7 @@ impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
             let ((_, provider), _) = self.target(index)?;
             by_provider.push((*provider, index));
         }
-        // One global order, the same as `LaneStreamCap::permit_set`.
+        // One global order: sorted by provider address.
         by_provider.sort_unstable();
         // A second wait on one provider while holding its first permit could
         // wait on itself for good.
@@ -8602,17 +8538,17 @@ mod tests {
                 .collect()
         };
 
-        let (striped, stripe) = stripe_order(order.clone(), &coverage, total, true, 2);
+        let (striped, stripe) = stripe_order(order.clone(), &coverage, total, 2);
         assert_eq!(stripe, 2);
         assert_eq!(ids(&striped), expect(&[2, 5, 1, 3, 4, 6]));
 
-        let (all, stripe) = stripe_order(order.clone(), &coverage, total, true, 8);
+        let (all, stripe) = stripe_order(order.clone(), &coverage, total, 8);
         assert_eq!(stripe, 3, "one per operator: 2 and 3 share one");
         assert_eq!(ids(&all), expect(&[2, 5, 6, 1, 3, 4]));
     }
 
-    /// With multi-source off, or fewer than two admitted full holders, the
-    /// order is unchanged and there is no stripe.
+    /// With fewer than two admitted full holders, the order is unchanged and
+    /// there is no stripe.
     #[test]
     fn stripe_order_falls_back_to_plain_failover() {
         let total = 4 * decdn_protocol::DISCOVERY_BLOCK_BYTES;
@@ -8626,14 +8562,8 @@ mod tests {
             );
         }
         let ids: Vec<PublicKey> = order.iter().map(|c| c.node_id).collect();
-        let (same, stripe) = stripe_order(order.clone(), &coverage, total, false, 4);
-        assert_eq!(
-            (same.iter().map(|c| c.node_id).collect::<Vec<_>>(), stripe),
-            (ids.clone(), 1)
-        );
-
         let one_holder: HashMap<_, _> = coverage.into_iter().take(1).collect();
-        let (same, stripe) = stripe_order(order, &one_holder, total, true, 4);
+        let (same, stripe) = stripe_order(order, &one_holder, total, 4);
         assert_eq!(
             (same.iter().map(|c| c.node_id).collect::<Vec<_>>(), stripe),
             (ids, 1)
@@ -9063,26 +8993,6 @@ mod tests {
             .expect("two same-provider permits must coexist at n == 2")
             .unwrap();
         drop((a, b));
-
-        // permit_set over an out-of-order, duplicated set acquires every distinct
-        // provider (in sorted order internally) and returns one permit each.
-        let cap3 = LaneStreamCap::new(1);
-        let permits = cap3.permit_set(&[p2, p1, p2]).await.unwrap();
-        assert_eq!(permits.len(), 2, "duplicates collapse to one permit each");
-        // With both lanes held, a fresh single acquire for either must block.
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), cap3.permit(p1))
-                .await
-                .is_err(),
-            "P1 is held by the set"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), cap3.permit(p2))
-                .await
-                .is_err(),
-            "P2 is held by the set"
-        );
-        drop(permits);
     }
 
     /// A plain entry's line keeps its one rate, taken from what it downloaded.

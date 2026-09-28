@@ -52,9 +52,9 @@ use decdn_client::driver::DriveConfig;
 use decdn_client::sink::PullReader;
 use decdn_client::source::{BlobSource as _, Funder, SourceFuture};
 use decdn_client::{
-    CoveredRun, DownstreamFrontier, HashMismatch as ClientPullHashMismatch, LegNoProgress,
-    PacingWait, PeerSource, PoolLedger, PrimedSource, RampPacer, RetryDisposition, SharedPool,
-    UpstreamPullHeader, WaitReason, drive, first_leg, shared_pool_disposition,
+    CoveredRun, DownstreamFrontier, Fault, HashMismatch as ClientPullHashMismatch, LegNoProgress,
+    PacingWait, PeerSource, PoolLedger, PrimedSource, RampPacer, SharedPool, UpstreamPullHeader,
+    WaitReason, classify, drive, first_leg,
 };
 use decdn_incentive::DepositOutcome;
 
@@ -850,12 +850,13 @@ fn handshake_verdict(
 /// paid frontier, not on the run, and a later run's lane still `Wait`s on the same
 /// frontier the earlier one did.
 ///
-/// A run whose `drive` returns a NON-terminal fault ([`decdn_client::retry_disposition`]
-/// `== RetryElsewhere`) drops that source and re-plans the still-missing remainder
-/// against the survivors — the loop-level reassign-only tail. The store keeps the
-/// verified bytes, so the replacement lane resumes at the gap and re-pays nothing
-/// (#1682). A TERMINAL fault (a shared-pool voucher rejection, an origin blacklist,
-/// an over-cap blob) ends the whole assembly. The assembly also ends `Unavailable`
+/// A run whose `drive` returns a source fault ([`decdn_client::classify`] other
+/// than `Fatal` or `Unaffordable`) drops that source and re-plans the
+/// still-missing remainder against the survivors — the loop-level reassign-only
+/// tail. The store keeps the verified bytes, so the replacement lane resumes at
+/// the gap and re-pays nothing (#1682). A fatal or unaffordable fault (a voucher
+/// rejection, an origin blacklist, an over-cap blob, the shared pool running
+/// dry) ends the whole assembly. The assembly also ends `Unavailable`
 /// when every covering candidate faulted, when a round made no progress, when the
 /// reassign budget ran out, or when no surviving candidate covers a still-missing
 /// range ([`super::ranged_pull::UnavailableCause`]). The serve leg refuses before
@@ -1471,11 +1472,12 @@ impl PeerRunSink<'_> {
                         &err,
                     );
                 }
-                // A terminal fault (shared-pool voucher rejection or exhaustion,
-                // origin blacklist, over-cap blob) cannot be fixed by another lane;
-                // anything else is a property of THIS source's delivery — drop it
-                // and re-plan.
-                if shared_pool_disposition(&err) == RetryDisposition::Terminal {
+                // A fatal fault (voucher rejection, origin blacklist, over-cap
+                // blob) cannot be fixed by another lane, and an unaffordable one
+                // cannot either: the node's one shared pool funds every holder,
+                // so once it is dry no holder can be paid. Anything else is a
+                // property of THIS source's delivery — drop it and re-plan.
+                if matches!(classify(&err), Fault::Fatal(_) | Fault::Unaffordable) {
                     RunOutcome::Terminal(FillError::new(format!("{err:#}")))
                 } else {
                     RunOutcome::Reassign

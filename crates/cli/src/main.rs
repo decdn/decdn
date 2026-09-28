@@ -41,14 +41,30 @@ async fn main() -> std::process::ExitCode {
                 .is_some()
             {
                 eprintln!("interrupted; run the same command again to resume");
-                return std::process::ExitCode::from(
-                    decdn_cli::commands::interrupt::INTERRUPTED_EXIT,
-                );
+            } else if let Some(gave_up) = e.downcast_ref::<decdn_client::GaveUp>() {
+                // Not an error to fix: the message names the wait and the rerun.
+                eprintln!("{gave_up}");
+            } else {
+                eprintln!("Error: {}", decdn_common::redact::sanitize_err_chain(&e));
             }
-            eprintln!("Error: {}", decdn_common::redact::sanitize_err_chain(&e));
-            std::process::ExitCode::FAILURE
+            exit_code_for(&e)
         }
     }
+}
+
+/// The process exit code for a command's error: 130 for an interrupt, 75
+/// (`EX_TEMPFAIL`) for a fetch that gave up for lack of progress, 1 otherwise.
+fn exit_code_for(err: &anyhow::Error) -> std::process::ExitCode {
+    if err
+        .downcast_ref::<decdn_cli::commands::interrupt::Interrupted>()
+        .is_some()
+    {
+        return std::process::ExitCode::from(decdn_cli::commands::interrupt::INTERRUPTED_EXIT);
+    }
+    if err.downcast_ref::<decdn_client::GaveUp>().is_some() {
+        return std::process::ExitCode::from(decdn_cli::commands::interrupt::GAVE_UP_EXIT);
+    }
+    std::process::ExitCode::FAILURE
 }
 
 async fn run() -> anyhow::Result<()> {
@@ -92,5 +108,27 @@ async fn run() -> anyhow::Result<()> {
                 commands::appeal::run(&slash, config_path.as_deref()).await
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exit_code_for;
+    use std::process::ExitCode;
+
+    #[test]
+    fn gave_up_exits_75_and_anything_else_fails_with_1() {
+        let gave_up = anyhow::Error::new(decdn_client::GaveUp {
+            idle: std::time::Duration::from_mins(10),
+        });
+        assert_eq!(exit_code_for(&gave_up), ExitCode::from(75));
+        let wrapped = gave_up.context("fetch");
+        assert_eq!(exit_code_for(&wrapped), ExitCode::from(75));
+        let interrupted = anyhow::Error::new(decdn_cli::commands::interrupt::Interrupted);
+        assert_eq!(exit_code_for(&interrupted), ExitCode::from(130));
+        assert_eq!(
+            exit_code_for(&anyhow::anyhow!("pool empty")),
+            ExitCode::FAILURE
+        );
     }
 }

@@ -71,7 +71,7 @@ pub(crate) const MAX_BACKPRESSURE_RETRIES: u32 = 6;
 pub(crate) enum RunOutcome {
     /// The run's `[offset, offset+len)` is fully present in the store now.
     Filled,
-    /// A non-terminal fault (`retry_disposition == RetryElsewhere`): drop this
+    /// A source fault (`classify` neither `Fatal` nor `Unaffordable`): drop this
     /// run's source and re-plan its still-missing remainder against the
     /// surviving candidates. The reassign-only tail.
     Reassign,
@@ -81,9 +81,9 @@ pub(crate) enum RunOutcome {
     /// when another survivor covers the gap, and otherwise keeps the source and
     /// drives it again after a [`RunSink::backoff`].
     Backpressure,
-    /// The whole assembly is over — a terminal fault (`retry_disposition ==
-    /// Terminal`) that another lane cannot fix (a shared-pool voucher rejection,
-    /// an origin blacklist, an over-cap blob). Propagate it.
+    /// The whole assembly is over — a `Fatal` or `Unaffordable` fault
+    /// (`classify`) that another lane cannot fix (a voucher rejection, an origin
+    /// blacklist, an over-cap blob, the shared pool running dry). Propagate it.
     Terminal(FillError),
     /// Cooperative cancellation: the serve leg finished first (client
     /// disconnect / shutdown), so the whole pull stops.

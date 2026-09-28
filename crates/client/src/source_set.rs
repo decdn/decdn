@@ -63,6 +63,25 @@ pub trait SourceProvider: Send + Sync {
     fn on_source_fault(&self, _holder: &Holder) {}
 }
 
+impl<P: SourceProvider> SourceProvider for &P {
+    type Source = P::Source;
+
+    fn discover(&self, hash: [u8; 32]) -> SourceFuture<'_, Vec<Holder>> {
+        (**self).discover(hash)
+    }
+
+    fn connect<'a>(
+        &'a self,
+        holder: &'a Holder,
+    ) -> SourceFuture<'a, StreamCandidate<Self::Source>> {
+        (**self).connect(holder)
+    }
+
+    fn on_source_fault(&self, holder: &Holder) {
+        (**self).on_source_fault(holder);
+    }
+}
+
 /// No known source can be paid from the pool's deposit, the top-up budget is
 /// spent, and a fresh discovery found no cheaper source.
 #[derive(Debug)]
@@ -237,6 +256,13 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     #[must_use]
     pub fn cached_lane(&self, provider: Address) -> Option<Arc<StreamCandidate<P::Source>>> {
         self.lanes.get(&provider).cloned()
+    }
+
+    /// Take every built lane out of the set, keyed by provider. A caller that
+    /// ran [`crate::first_open()`] on this set hands the lanes on to the set its
+    /// fetch builds, so the fetch reuses them instead of building them again.
+    pub fn take_lanes(&mut self) -> Vec<(Address, Arc<StreamCandidate<P::Source>>)> {
+        self.lanes.drain().collect()
     }
 
     /// Record the result of `connect` for `provider`. A failure schedules a
@@ -474,7 +500,9 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
 
 /// A [`SourceProvider`] over a fixed set of prebuilt lanes: for SDK callers
 /// that dial their own providers, and for tests. Discovery returns the same
-/// set; each lane is handed out once.
+/// set; each lane is handed out once. So a static set serves one blob's
+/// [`SourceSet`]: a [`crate::Downloader`] over it fetches one target, and a
+/// second target finds no lane to build.
 pub struct StaticSources<S> {
     holders: Vec<Holder>,
     lanes: std::sync::Mutex<HashMap<Address, StreamCandidate<S>>>,

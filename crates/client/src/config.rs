@@ -16,18 +16,10 @@
 pub(crate) const DEFAULT_READ_AHEAD_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Default [`PullConfig::streamer_lane_cap`]: two. A `Streamer` keeps a small,
-/// bounded set of provider lanes on the front — enough for same-region fan-out
-/// and free failover, without the wide fan-out a full download wants. The
-/// `Downloader` uncaps this.
+/// bounded set of provider lanes on the front — enough for same-region fan-out,
+/// without the wide fan-out a full download wants. The `Downloader` runs one
+/// lane per holder instead.
 pub(crate) const DEFAULT_STREAMER_LANE_CAP: usize = 2;
-
-/// Default [`PullConfig::download_unit_deadline`]: 30 seconds. A downloading lane
-/// that makes no verified progress for this long is reassigned to another holder
-/// (the multi-source stall watchdog). A full-throughput download has no consumer
-/// to pace against, so the watchdog — not consumption backpressure — is what
-/// fails a silently-stalled source over.
-pub(crate) const DEFAULT_DOWNLOAD_UNIT_DEADLINE: std::time::Duration =
-    std::time::Duration::from_secs(30);
 
 /// Zero-config tunables shared by the consumption faces.
 ///
@@ -35,16 +27,14 @@ pub(crate) const DEFAULT_DOWNLOAD_UNIT_DEADLINE: std::time::Duration =
 /// caller needs. Override a field with struct-update syntax:
 ///
 /// ```
-/// use std::time::Duration;
-///
 /// use decdn_client::PullConfig;
 ///
-/// // Fail a silent download lane over after 10 s instead of the default.
+/// // Let a stream run 64 MiB ahead of its reader instead of the default.
 /// let config = PullConfig {
-///     download_unit_deadline: Duration::from_secs(10),
+///     read_ahead_bytes: 64 * 1024 * 1024,
 ///     ..PullConfig::new()
 /// };
-/// assert_eq!(config.read_ahead_bytes, PullConfig::new().read_ahead_bytes);
+/// assert_eq!(config.streamer_lane_cap, PullConfig::new().streamer_lane_cap);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PullConfig {
@@ -58,18 +48,11 @@ pub struct PullConfig {
     /// fetches the whole blob at full throughput.
     pub read_ahead_bytes: u64,
     /// The `Streamer`'s provider-lane cap: how many discovered holders it fetches
-    /// the front across at once (the multi-source `max_sources`). Small by design
-    /// — a paced stream wants a little same-region parallelism and free failover
-    /// on the front, not the wide striping a full download does. The `Downloader`
-    /// uncaps it.
+    /// the front across at once (the acquire loop's `max_lanes`). Small by design
+    /// — a paced stream wants a little same-region parallelism on the front, not
+    /// the wide striping a full download does. The `Downloader` runs one lane
+    /// per holder instead.
     pub streamer_lane_cap: usize,
-    /// The `Downloader`'s per-lane stall watchdog: a downloading lane that makes
-    /// no verified progress for this long is reassigned to another holder. A
-    /// full-throughput download has no consumer to pace against, so this — not
-    /// consumption backpressure — is what fails a silently-stalled source over.
-    /// The `Streamer` ignores it (a paced lane parked on the consumer cursor is
-    /// not a stall).
-    pub download_unit_deadline: std::time::Duration,
 }
 
 impl PullConfig {
@@ -80,7 +63,6 @@ impl PullConfig {
         Self {
             read_ahead_bytes: DEFAULT_READ_AHEAD_BYTES,
             streamer_lane_cap: DEFAULT_STREAMER_LANE_CAP,
-            download_unit_deadline: DEFAULT_DOWNLOAD_UNIT_DEADLINE,
         }
     }
 }
@@ -110,17 +92,5 @@ mod tests {
         // or chain access can hide in a `const fn`.
         const CFG: PullConfig = PullConfig::new();
         assert_eq!(CFG.read_ahead_bytes, DEFAULT_READ_AHEAD_BYTES);
-    }
-
-    #[test]
-    fn default_download_unit_deadline_is_the_documented_constant() {
-        assert_eq!(
-            PullConfig::default().download_unit_deadline,
-            super::DEFAULT_DOWNLOAD_UNIT_DEADLINE
-        );
-        assert_eq!(
-            super::DEFAULT_DOWNLOAD_UNIT_DEADLINE,
-            std::time::Duration::from_secs(30)
-        );
     }
 }

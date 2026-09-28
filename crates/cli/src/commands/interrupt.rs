@@ -26,6 +26,10 @@ impl std::error::Error for Interrupted {}
 /// The exit status for an interrupted command: 128 + SIGINT.
 pub const INTERRUPTED_EXIT: u8 = 130;
 
+/// The exit status for a fetch that gave up after its no-progress limit:
+/// `EX_TEMPFAIL`, since a rerun resumes it.
+pub const GAVE_UP_EXIT: u8 = 75;
+
 /// A handle that resolves on the first Ctrl-C. Dropping it hands Ctrl-C back
 /// to an immediate exit.
 pub(crate) struct Interrupt {

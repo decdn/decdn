@@ -36,15 +36,16 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::Notify;
 
 use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, align_range};
-use decdn_protocol::{Coverage, num_blocks};
+use decdn_protocol::Coverage;
 
 use crate::driver::{DriveConfig, PacingWait, WaitReason};
+use crate::health::PeerHealth;
 use crate::pacer::{DownstreamFrontier, PULL_WINDOW_FLOOR, WindowPacer};
-use crate::scheduler::{
-    ConsumptionPacing, LaneLease, MultiSourceConfig, SourceLane, multi_source_fetch,
-};
+use crate::scheduler::{AcquireEnv, AcquireTarget, ConsumptionPacing, LaneLease, acquire};
 use crate::sink::BlobCache;
-use crate::source::{BlobSource, Funder};
+use crate::source::Funder;
+use crate::source_set::{Holder, SourceProvider, SourceSet};
+use crate::stop::StopPolicy;
 use crate::{ClientRangedStore, PoolContext, PoolLedger, PullConfig, RangedStore};
 
 /// The most verified bytes one store read hands the reader. It bounds the
@@ -137,14 +138,13 @@ impl PacingWait for ConsumedWait {
     }
 }
 
-/// A candidate provider the `Streamer` may fetch from: the paid source plus the
-/// `(ctx, ledger)` that pays it.
+/// One provider's paid lane: the paid source plus the `(ctx, ledger)` that
+/// pays it. A [`SourceProvider`] builds one per holder, and both faces fetch
+/// across them.
 ///
-/// The `Streamer` fetches the front across up to
-/// [`PullConfig::streamer_lane_cap`] candidates at once and fails over between
-/// them — a candidate that faults mid-stream cools and its remainder
-/// continues from another, resuming from the store's verified frontier so no
-/// delivered byte is re-pulled or re-paid. Every candidate must name a distinct
+/// A lane that faults mid-fetch cools and returns; its remainder continues
+/// from another lane meanwhile, resuming from the store's verified frontier so
+/// no delivered byte is re-pulled or re-paid. Every lane names a distinct
 /// on-chain provider (one voucher stream per `(signer, provider)` lane).
 pub struct StreamCandidate<S> {
     /// The paid source — one provider's `cdn/client/v1` requester.
@@ -164,12 +164,14 @@ pub struct StreamCandidate<S> {
     /// single-target fetch.
     pub coverage: Option<Coverage>,
     /// The range this candidate opens first, when the caller already opened it
-    /// and parked the pull in a [`crate::PrimedSource`] (#2063); see
-    /// [`SourceLane::first_unit`]. [`crate::download_first_unit`] and
-    /// [`stream_first_unit`] name the range each face opens first. Like
+    /// and parked the pull in a [`crate::PrimedSource`] (#2063).
+    /// [`stream_first_unit`] names the range the `Streamer` opens first. Like
     /// `coverage`, it names one blob: set it only on a single-target fetch.
-    /// Only lanes in the fetch's first connected batch open their first unit;
-    /// a lane that joins later plans it like any range.
+    /// It is ignored, and planned like any other range, unless it aligns
+    /// against this blob, lies wholly inside the still-missing request, sits
+    /// inside this lane's coverage, and overlaps no earlier lane's reserved
+    /// first unit. Only lanes in the fetch's first connected batch open their
+    /// first unit; a lane that joins later plans it like any range.
     pub first_unit: Option<AlignedRange>,
     /// What this candidate's lane holds while the fetch runs, released when the
     /// fetch returns ([`crate::LaneLease`]). Like `coverage`, set it only on a
@@ -199,59 +201,51 @@ pub fn stream_first_unit(total_bytes: u64, config: &PullConfig) -> anyhow::Resul
     Ok(align_range(0, window.min(total_bytes), total_bytes)?)
 }
 
-/// Build the per-provider [`SourceLane`] set for one blob, threading each
-/// candidate's measured coverage (or [`Coverage::full`] for a `None` candidate,
-/// sized to this blob's block count). Both faces build their lanes here so a
-/// partial holder is treated identically whether it is streamed or downloaded.
-pub(crate) fn source_lanes<S>(
-    candidates: &[StreamCandidate<S>],
-    total: u64,
-) -> Vec<SourceLane<'_, S>> {
-    candidates
-        .iter()
-        .map(|c| SourceLane {
-            source: &c.source,
-            ctx: Arc::clone(&c.ctx),
-            ledger: Arc::clone(&c.ledger),
-            coverage: c
-                .coverage
-                .clone()
-                .unwrap_or_else(|| Coverage::full(num_blocks(total))),
-            first_unit: c.first_unit.clone(),
-            lease: Some(&c.lease),
-        })
-        .collect()
-}
-
 impl<S> std::fmt::Debug for StreamCandidate<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamCandidate").finish_non_exhaustive()
     }
 }
 
-/// Run the streaming fetch across `candidates` into the store, bounded to one
-/// read-ahead window ahead of the consumer's cursor and capped to `lane_cap`
-/// concurrent lanes, then (on a clean finish) tee the whole verified blob to
-/// `cache` for revisits.
-///
-/// A candidate that faults cools and its remainder moves to another
-/// (shared-pool free failover, #1174), resuming from the store's verified
-/// frontier so no delivered byte is re-pulled or re-paid.
-#[allow(clippy::too_many_arguments)]
-async fn run_drive<S, F>(
-    state: Arc<StreamState>,
-    candidates: Vec<StreamCandidate<S>>,
-    read_ahead: u64,
-    lane_cap: usize,
+/// What one stream's drive fetches with: the sources, the payment seams and
+/// the stop, moved into the drive future.
+struct DriveInputs<P, F> {
+    provider: P,
+    holders: Vec<Holder>,
+    health: Arc<PeerHealth>,
     funder: F,
     drive_config: DriveConfig,
+    stop: StopPolicy,
+}
+
+/// Run the streaming fetch into the store through [`crate::acquire`], bounded
+/// to one read-ahead window ahead of the consumer's cursor and capped to
+/// `lane_cap` concurrent lanes, then (on a clean finish) tee the whole verified
+/// blob to `cache` for revisits.
+///
+/// A source that faults cools and returns, and its remainder moves to another
+/// meanwhile, resuming from the store's verified frontier so no delivered byte
+/// is re-pulled or re-paid.
+async fn run_drive<P, F>(
+    state: Arc<StreamState>,
+    inputs: DriveInputs<P, F>,
+    read_ahead: u64,
+    lane_cap: usize,
     cache: Arc<dyn BlobCache>,
     hash: [u8; 32],
 ) -> anyhow::Result<()>
 where
-    S: BlobSource,
+    P: SourceProvider,
     F: Funder,
 {
+    let DriveInputs {
+        provider,
+        holders,
+        health,
+        funder,
+        drive_config,
+        stop,
+    } = inputs;
     // Below one pull-window floor (one payment interval plus the chunk-group
     // roundings, see `PULL_WINDOW_FLOOR`) the window can floor a lane's room to
     // zero before the consumer has a byte to read, and neither side then moves.
@@ -276,33 +270,32 @@ where
         downstream: &downstream,
         pacing_wait: &wait,
     };
-    // Each lane carries its candidate's measured coverage (a `None` candidate is
-    // a full holder), so a partial holder (#1506) is never assigned a range it
-    // does not hold.
-    let lanes = source_lanes(&candidates, state.total);
-    let ms = MultiSourceConfig {
+    let mut sources = SourceSet::new(&provider, hash, health, holders);
+    let ranges = [(0, state.total)];
+    // Under consumption pacing `acquire` turns its lane watchdog off: a lane
+    // parked on the consumer cursor is waiting, not stalled. A genuinely silent
+    // source trips its own per-stream throughput floor mid-read instead.
+    let env = AcquireEnv {
+        pacer: &pacer,
+        funder: &funder,
+        drive: &drive_config,
         // Small, bounded front parallelism: a paced stream wants a little
-        // same-region fan-out and free failover, not a full download's striping.
-        max_sources: lane_cap.max(1),
-        // The Streamer parks lanes on the consumer cursor — a full read-ahead
-        // window is not a stall — so the no-verified-progress watchdog is off. A
-        // genuinely silent source instead trips its own per-stream throughput
-        // floor mid-read and is reassigned that way.
-        unit_deadline: Duration::ZERO,
+        // same-region fan-out, not a full download's striping.
+        max_lanes: lane_cap.max(1),
+        stop: &stop,
+        on_progress: Some(&on_progress),
+        ledgers: None,
+        pacing: Some(&pacing),
     };
-    let result = multi_source_fetch(
-        &state.store,
-        &lanes,
-        &pacer,
-        &funder,
-        hash,
-        0,
-        state.total,
-        &drive_config,
-        &ms,
-        Some(&on_progress),
-        None,
-        Some(&pacing),
+    let result = acquire(
+        AcquireTarget {
+            store: &state.store,
+            hash,
+            total_bytes: state.total,
+            ranges: &ranges,
+        },
+        &mut sources,
+        &env,
     )
     .await;
     if result.is_ok() {
@@ -325,11 +318,12 @@ where
 
 /// Stream a single blob's verified front to a consumer, paced by consumption.
 ///
-/// Holds the injected pull machinery — a set of provider `candidates` (each a
-/// source + its paying `(ctx, ledger)`) and one `funder` — plus a scratch
-/// directory for the fill store. The front is fetched across a small, bounded
-/// set of candidates with free failover between them. [`Streamer::open`] consumes
-/// it to start one stream.
+/// Holds the injected pull machinery — the blob's `holders`, the
+/// [`SourceProvider`] that builds their lanes, the command-wide
+/// [`PeerHealth`], and one `funder` — plus a scratch directory for the fill
+/// store. The front is fetched through [`crate::acquire`] across a small,
+/// bounded set of lanes; a lane that faults cools and returns.
+/// [`Streamer::open`] consumes it to start one stream.
 ///
 /// Read inside [`StreamDrive::alongside`], so the drive keeps paying and
 /// draining open legs while the reader waits on its consumer. See the `stream`
@@ -341,7 +335,9 @@ where
 ///
 /// use decdn_client::driver::DriveConfig;
 /// use decdn_client::source::{BlobSource, Funder};
-/// use decdn_client::{NoCache, PullConfig, StreamCandidate, Streamer};
+/// use decdn_client::{
+///     NoCache, ProgressClock, PullConfig, StaticSources, StopPolicy, StreamCandidate, Streamer,
+/// };
 ///
 /// async fn stream<S: BlobSource, F: Funder>(
 ///     candidates: Vec<StreamCandidate<S>>,
@@ -350,17 +346,23 @@ where
 ///     total_bytes: u64,
 ///     scratch: &Path,
 /// ) -> anyhow::Result<()> {
-///     let streamer = Streamer::new(candidates, funder, DriveConfig::cli(Default::default()), scratch);
+///     let sources = StaticSources::new(candidates)?;
+///     let holders = sources.holders();
+///     let drive = DriveConfig::cli(Default::default());
+///     let streamer = Streamer::new(sources, holders, Default::default(), funder, drive, scratch);
+///     let stop = StopPolicy::new(true, None, Arc::new(ProgressClock::new()));
 ///     let (mut reader, mut drive) = streamer
-///         .open(hash, total_bytes, &PullConfig::new(), Arc::new(NoCache))
+///         .open(hash, total_bytes, &PullConfig::new(), Arc::new(NoCache), stop)
 ///         .await?;
 ///     let mut out = tokio::io::stdout();
 ///     drive.alongside(tokio::io::copy(&mut reader, &mut out)).await?;
 ///     Ok(())
 /// }
 /// ```
-pub struct Streamer<'a, S, F> {
-    candidates: Vec<StreamCandidate<S>>,
+pub struct Streamer<'a, P, F> {
+    provider: P,
+    holders: Vec<Holder>,
+    health: Arc<PeerHealth>,
     funder: F,
     drive_config: DriveConfig,
     /// A scratch directory the fill store's `.partial` lives in for the stream's
@@ -371,29 +373,33 @@ pub struct Streamer<'a, S, F> {
     scratch: &'a Path,
 }
 
-impl<S, F> std::fmt::Debug for Streamer<'_, S, F> {
+impl<P, F> std::fmt::Debug for Streamer<'_, P, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Streamer")
-            .field("candidates", &self.candidates.len())
+            .field("holders", &self.holders.len())
             .field("drive_config", &self.drive_config)
             .field("scratch", &self.scratch)
             .finish_non_exhaustive()
     }
 }
 
-impl<'a, S, F> Streamer<'a, S, F> {
-    /// Build a streamer over the injected pull machinery, filling into `scratch`.
-    /// `candidates` are the discovered blob holders to fetch across and fail over
-    /// between; each must name a distinct on-chain provider.
+impl<'a, P, F> Streamer<'a, P, F> {
+    /// Build a streamer over `holders`, whose lanes `provider` builds, filling
+    /// into `scratch`. `health` is the command-wide health the stream's sources
+    /// record into.
     #[must_use]
     pub const fn new(
-        candidates: Vec<StreamCandidate<S>>,
+        provider: P,
+        holders: Vec<Holder>,
+        health: Arc<PeerHealth>,
         funder: F,
         drive_config: DriveConfig,
         scratch: &'a Path,
     ) -> Self {
         Self {
-            candidates,
+            provider,
+            holders,
+            health,
             funder,
             drive_config,
             scratch,
@@ -401,9 +407,9 @@ impl<'a, S, F> Streamer<'a, S, F> {
     }
 }
 
-impl<S, F> Streamer<'_, S, F>
+impl<P, F> Streamer<'_, P, F>
 where
-    S: BlobSource,
+    P: SourceProvider,
     F: Funder,
 {
     /// Open a consumption-paced stream over `hash` (whose content length is
@@ -419,8 +425,11 @@ where
     ///
     /// The drive borrows `'a` from its sources — a real `PeerSource` over a
     /// borrowed `Endpoint` is not `'static` — so the caller keeps the endpoint
-    /// (and candidates) alive for as long as it polls the drive. The reader owns
+    /// (and provider) alive for as long as it polls the drive. The reader owns
     /// its state and borrows nothing.
+    ///
+    /// `stop` decides when a stream that makes no verified progress gives up;
+    /// the reader then ends with [`crate::GaveUp`]'s message.
     ///
     /// On a REVISIT — `cache` already holds the whole blob — the reader serves
     /// straight from the cache, the drive is already complete, and the network is
@@ -444,9 +453,10 @@ where
         total_bytes: u64,
         config: &PullConfig,
         cache: Arc<dyn BlobCache>,
+        stop: StopPolicy,
     ) -> anyhow::Result<(VerifiedReader, StreamDrive<'a>)>
     where
-        S: 'a,
+        P: 'a,
         F: 'a,
     {
         if let Some(cached) = cache.get(hash, 0, total_bytes).await?
@@ -478,11 +488,16 @@ where
         });
         let fetch = Box::pin(run_drive(
             Arc::clone(&state),
-            self.candidates,
+            DriveInputs {
+                provider: self.provider,
+                holders: self.holders,
+                health: self.health,
+                funder: self.funder,
+                drive_config: self.drive_config,
+                stop,
+            },
             config.read_ahead_bytes,
             config.streamer_lane_cap,
-            self.funder,
-            self.drive_config,
             cache,
             hash,
         ));
@@ -790,8 +805,8 @@ mod tests {
     use crate::sink::MemoryBlobCache;
     use crate::source::{BlobSource, FakeFunder, ScriptedSource, SourceFuture};
     use crate::{
-        BlobCache, Cumulative, NoCache, PoolContext, PoolLedger, PullConfig, UpstreamPullHeader,
-        VoucherProgress,
+        BlobCache, Cumulative, NoCache, PoolContext, PoolLedger, ProgressClock, PullConfig,
+        StaticSources, StopPolicy, UpstreamPullHeader, VoucherProgress,
     };
 
     fn healthy_ctx() -> PoolContext {
@@ -823,31 +838,33 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_candidates_lease_reaches_its_lane() {
-        // The scheduler releases a lane's lease when the lane stops, so the
-        // lease the caller put on a candidate must be the one its lane holds.
-        let led = Arc::new(PoolLedger::new(Cumulative::default()));
-        let candidates = vec![
-            candidate((), Arc::clone(&led), 1),
-            candidate((), Arc::clone(&led), 2),
-        ];
-        let built = super::source_lanes(&candidates, 1024);
-        assert_eq!(built.len(), candidates.len());
-        for (lane, cand) in built.iter().zip(&candidates) {
-            assert!(
-                lane.lease
-                    .is_some_and(|lease| std::ptr::eq(lease, &raw const cand.lease)),
-                "each lane holds its own candidate's lease"
-            );
-        }
+    /// A streamer over the static lanes `candidates`, filling into `scratch`.
+    fn streamer<S: BlobSource>(
+        candidates: Vec<StreamCandidate<S>>,
+        scratch: &std::path::Path,
+    ) -> anyhow::Result<Streamer<'_, StaticSources<S>, FakeFunder>> {
+        let sources = StaticSources::new(candidates)?;
+        let holders = sources.holders();
+        Ok(Streamer::new(
+            sources,
+            holders,
+            Arc::default(),
+            funder(),
+            drive_config(),
+            scratch,
+        ))
+    }
+
+    /// The stop a script gets: give up after [`crate::SCRIPT_GIVE_UP`].
+    fn stop() -> StopPolicy {
+        StopPolicy::new(false, None, Arc::new(ProgressClock::new()))
     }
 
     #[test]
-    fn a_candidates_measured_coverage_reaches_its_lane() {
-        // A partial holder's measured coverage (#1506) must reach its SourceLane
+    fn a_candidates_measured_coverage_reaches_its_holder() -> anyhow::Result<()> {
+        // A partial holder's measured coverage (#1506) must reach its holder
         // so the scheduler never assigns it a range it does not hold; a candidate
-        // with no measured coverage (`None`) falls back to a full holder.
+        // with no measured coverage (`None`) is a full holder.
         let total: u64 = 500 * 1024 * 1024;
         let nb = decdn_protocol::num_blocks(total);
         assert!(
@@ -860,21 +877,16 @@ mod tests {
         let mut c0 = candidate((), Arc::clone(&led), 1);
         c0.coverage = Some(partial.clone());
         let c1 = candidate((), Arc::clone(&led), 2);
-        let candidates = vec![c0, c1];
-
-        let built = super::source_lanes(&candidates, total);
-        let [partial_lane, full_lane] = built.as_slice() else {
-            unreachable!("source_lanes yields one lane per candidate");
+        let holders = StaticSources::new(vec![c0, c1])?.holders();
+        let [partial_holder, full_holder] = holders.as_slice() else {
+            anyhow::bail!("one holder per candidate");
         };
+        assert_eq!(partial_holder.coverage, Some(partial));
         assert_eq!(
-            partial_lane.coverage, partial,
-            "a partial holder's measured coverage must reach its lane",
+            full_holder.coverage, None,
+            "a `None` candidate is a full holder"
         );
-        assert_eq!(
-            full_lane.coverage,
-            decdn_protocol::Coverage::full(nb),
-            "a `None` candidate is a full holder",
-        );
+        Ok(())
     }
 
     fn funder() -> FakeFunder {
@@ -919,13 +931,8 @@ mod tests {
         let root = source.root();
         let total = source.total_bytes();
         let scratch = tempfile::tempdir()?;
-        let streamer = Streamer::new(
-            vec![candidate(source, ledger, 0xA1)],
-            funder(),
-            drive_config(),
-            scratch.path(),
-        );
-        let (mut reader, mut drive) = streamer.open(root, total, config, cache).await?;
+        let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
+        let (mut reader, mut drive) = streamer.open(root, total, config, cache, stop()).await?;
         let mut out = Vec::new();
         drive.alongside(reader.read_to_end(&mut out)).await?;
         Ok(out)
@@ -1009,14 +1016,9 @@ mod tests {
         cache.put(root, 0, Bytes::from(blob.clone())).await?;
 
         let scratch = tempfile::tempdir()?;
-        let streamer = Streamer::new(
-            vec![candidate(source, ledger, 0xA1)],
-            funder(),
-            drive_config(),
-            scratch.path(),
-        );
+        let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
         let (mut reader, mut drive) = streamer
-            .open(root, total, &PullConfig::default(), cache)
+            .open(root, total, &PullConfig::default(), cache, stop())
             .await?;
         anyhow::ensure!(
             matches!(reader, VerifiedReader::Cached { .. }),
@@ -1046,14 +1048,15 @@ mod tests {
 
         let scratch = tempfile::tempdir()?;
         let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-        let streamer = Streamer::new(
-            vec![candidate(source, ledger, 0xA1)],
-            funder(),
-            drive_config(),
-            scratch.path(),
-        );
+        let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
         let (mut reader, mut drive) = streamer
-            .open(root, total, &PullConfig::default(), Arc::new(NoCache))
+            .open(
+                root,
+                total,
+                &PullConfig::default(),
+                Arc::new(NoCache),
+                stop(),
+            )
             .await?;
 
         let mut out = Vec::new();
@@ -1104,17 +1107,21 @@ mod tests {
         let faulty_probe = faulty.clone();
 
         let scratch = tempfile::tempdir()?;
-        let streamer = Streamer::new(
+        let streamer = streamer(
             vec![
                 candidate(faulty, ledger_a, 0xA1),
                 candidate(healthy, ledger_b, 0xB2),
             ],
-            funder(),
-            drive_config(),
             scratch.path(),
-        );
+        )?;
         let (mut reader, mut drive) = streamer
-            .open(root, total, &PullConfig::default(), Arc::new(NoCache))
+            .open(
+                root,
+                total,
+                &PullConfig::default(),
+                Arc::new(NoCache),
+                stop(),
+            )
             .await?;
         let mut out = Vec::new();
         drive.alongside(reader.read_to_end(&mut out)).await?;
@@ -1163,14 +1170,12 @@ mod tests {
         cand_b.first_unit = Some(unit.clone());
 
         let scratch = tempfile::tempdir()?;
-        let streamer = Streamer::new(
+        let streamer = streamer(
             vec![candidate(PrimedSource::new(src_a), ledger_a, 0xA1), cand_b],
-            funder(),
-            drive_config(),
             scratch.path(),
-        );
+        )?;
         let (mut reader, mut drive) = streamer
-            .open(root, total, &config, Arc::new(NoCache))
+            .open(root, total, &config, Arc::new(NoCache), stop())
             .await?;
         let out = drive
             .alongside(async {
@@ -1214,14 +1219,9 @@ mod tests {
         };
 
         let scratch = tempfile::tempdir()?;
-        let streamer = Streamer::new(
-            vec![candidate(source, ledger, 0xA1)],
-            funder(),
-            drive_config(),
-            scratch.path(),
-        );
+        let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
         let (mut reader, mut drive) = streamer
-            .open(root, total, &config, Arc::new(NoCache))
+            .open(root, total, &config, Arc::new(NoCache), stop())
             .await?;
 
         // Drain a few bytes at a time while the drive runs beside the reads;
@@ -1274,14 +1274,9 @@ mod tests {
             ..PullConfig::default()
         };
         let scratch = tempfile::tempdir()?;
-        let streamer = Streamer::new(
-            vec![candidate(source, ledger, 0xA1)],
-            funder(),
-            drive_config(),
-            scratch.path(),
-        );
+        let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
         let (mut reader, mut drive) = streamer
-            .open(root, total, &config, Arc::new(NoCache))
+            .open(root, total, &config, Arc::new(NoCache), stop())
             .await?;
 
         // A paused consumer: nothing is read while the drive runs.
@@ -1344,21 +1339,19 @@ mod tests {
         let root = healthy.root();
         let total = healthy.total_bytes();
         let scratch = tempfile::tempdir()?;
-        let streamer = Streamer::new(
+        let streamer = streamer(
             vec![
                 candidate(faulty, ledger_a, 0xA1),
                 candidate(healthy, ledger_b, 0xB2),
             ],
-            funder(),
-            drive_config(),
             scratch.path(),
-        );
+        )?;
         let config = PullConfig {
             read_ahead_bytes: PULL_WINDOW_FLOOR,
             ..PullConfig::default()
         };
         let (mut reader, mut drive) = streamer
-            .open(root, total, &config, Arc::new(NoCache))
+            .open(root, total, &config, Arc::new(NoCache), stop())
             .await?;
         let mut out = Vec::new();
         tokio::time::timeout(

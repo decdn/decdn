@@ -55,14 +55,6 @@ fn parse_region_flag(raw: &str) -> Result<String, String> {
 /// see. `--node-id` requires `--provider-address` at the clap layer; the reverse
 /// pairing (`--provider-address` needs `--node-id`) is enforced in `validate()`.
 /// `--addr` requires `--node-id` at the clap layer.
-// The bool fields (`proxy_warming`, `multi_source`, `no_multi_source`,
-// `rediscover`) are independent operator toggles on one flattened CLI arg
-// set, not a state machine — a bitflags or two-variant-enum refactor would
-// only obscure the clap surface.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "independent CLI flags, not modelled state"
-)]
 #[derive(Debug, Clone, Args)]
 pub struct ClientFetchArgs {
     /// Target node id (iroh `EndpointId`, z-base32). Omit it to auto-discover:
@@ -141,10 +133,10 @@ pub struct ClientFetchArgs {
     /// / `--proxy-warming-margin-ms`); otherwise routes direct.
     ///
     /// **Defaults on (ADR 037 § Fallback).** A chosen proxy that declines or
-    /// stalls is not a regression: `fetch` fails over to the next candidate and
-    /// finally to the direct holder over the SAME shared pool (each provider is
-    /// its own lane, so no new on-chain deposit is escrowed), resuming the
-    /// partial it already has. The only client-observable cost is a bounded
+    /// stalls is not a regression: it cools, and the fetch carries on from the
+    /// other candidates and the direct holder over the SAME shared pool (each
+    /// provider is its own lane, so no new on-chain deposit is escrowed),
+    /// resuming the partial it already has. The only client-observable cost is a bounded
     /// one-request latency premium the first time a locale warms a given blob.
     /// Pass `--proxy-warming false` to route direct and never warm.
     #[arg(long, value_name = "BOOL", default_value_t = true, action = clap::ArgAction::Set)]
@@ -160,58 +152,17 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "MS", default_value_t = 30)]
     pub proxy_warming_margin_ms: u64,
 
-    /// Multi-source parallel fetch (ADR 039): fan a large blob out across
-    /// several admissible holders at once via a shared-store scheduler with
-    /// tail-stealing, rather than the single-source failover loop. Engages
-    /// only when the blob clears `--multi-source-min-bytes` AND at least two
-    /// admissible holders are found (see [`Self::multi_source_min_bytes`],
-    /// [`Self::max_sources`]); a small blob or a single-holder blob always
-    /// takes the single-source path regardless of this flag.
-    ///
-    /// **Defaults on.** Pass `--no-multi-source` to always use the
-    /// single-source path.
-    ///
-    /// Read directly ONLY when `--no-multi-source` cannot also be set (e.g.
-    /// after `overrides_with` has resolved a conflict some other way);
-    /// callers wanting the effective value use [`Self::multi_source_enabled`],
-    /// which also accounts for `--no-multi-source`.
-    #[arg(long, default_value_t = true, overrides_with = "no_multi_source")]
-    pub multi_source: bool,
-
-    /// Off-switch for `--multi-source` (clap negation companion — mirrors the
-    /// `--proxy-warming`/direct-route pairing above, but as a flag pair
-    /// rather than a `bool`-valued flag). Never read directly outside
-    /// [`Self::multi_source_enabled`]: clap has no built-in way to make one
-    /// flag *write* another derive field, so the two fields are resolved by
-    /// that method rather than by clap itself. `pub` only because callers
-    /// outside this crate build `ClientFetchArgs` literals (test fixtures)
-    /// rather than going through clap.
-    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "multi_source")]
-    pub no_multi_source: bool,
-
-    /// Cap on concurrently-used holders for a multi-source fetch — the initial
-    /// segment count `admit_sources` admits and `multi_source_fetch` fans out
-    /// across (ADR 039). Enough to saturate typical downlinks without paying
-    /// for marginal lanes. It also caps how many holders a `bundle pull`
-    /// range-dedup entry stripes its ranges across.
+    /// Cap on concurrently-used holders (ADR 039): a fetch stripes a blob
+    /// across at most this many holders at once. Enough to saturate typical
+    /// downlinks without paying for marginal lanes. It also caps how many
+    /// holders a `bundle pull` range-dedup entry stripes its ranges across.
     #[arg(long, value_name = "N", default_value_t = 4)]
     pub max_sources: usize,
 
-    /// Multi-source engagement floor, in bytes: a blob at or below this size
-    /// always takes the single-source path — fanning it out across several
-    /// lanes only adds redemption overhead (one `redeem` call per lane) for no
-    /// parallelism win on a transfer that small. Defaults to 64 MiB.
-    #[arg(long, value_name = "BYTES", default_value_t = 67_108_864)]
-    pub multi_source_min_bytes: u64,
-
-    /// No-verified-progress deadline before a multi-source worker's remaining
-    /// range is reassigned to another source (ADR 039), in milliseconds. A
-    /// source that sends no bao-verified byte for a whole deadline window is
-    /// reassigned, so a gap between verified bytes shorter than the deadline,
-    /// time to first byte included, never trips it. `0` disables it. Defaults
-    /// to 10 s.
-    #[arg(long, value_name = "MS", default_value_t = 10_000)]
-    pub unit_deadline_ms: u64,
+    /// Stop after this many seconds with no verified progress. Without it, a
+    /// terminal waits until Ctrl-C and a script stops after 10 minutes.
+    #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub give_up_after_secs: Option<u64>,
 
     /// EIP-712 `chainId` for both domains. Overrides `blockchain.chain_id`;
     /// defaults to Arbitrum Sepolia.
@@ -277,40 +228,18 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "UNITS", default_value_t = 0)]
     pub max_rate_per_mb: u64,
 
-    /// Trailing window, in milliseconds, over which the fetch measures upstream throughput
-    /// (#1797). This is the primary timeout: bytes are counted off the QUIC stream sub-frame,
-    /// and the fetch is abandoned when the bytes across this window fall below
-    /// `--min-throughput-bps`. Frame-size-independent, so a 700 MiB blob on a slow link keeps
-    /// going as long as it stays above the floor. For `bundle pull` this applies per entry.
-    ///
-    /// Must be non-zero: at 0 the throughput floor is unsatisfiable and every fetch fails
-    /// instantly.
-    #[arg(long, value_name = "MS", default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(1..))]
-    pub stall_timeout_ms: u64,
-
-    /// Minimum sustained upstream throughput in bytes per second over `--stall-timeout-ms`
-    /// (#1797). A stream that stays below this floor for a full window is abandoned — catching
-    /// both a wedged provider (throughput to zero) and a slow drip (a trickle that never trips
-    /// a bare idle timeout). `0` disables the throughput test and leaves pure idle detection:
-    /// at least one byte per window. For `bundle pull` this applies per entry.
-    #[arg(long, value_name = "BPS", default_value_t = 4096)]
-    pub min_throughput_bps: u64,
-
     /// Hard cap on the total wall-clock time of the `CapacityBond` registry read
     /// (discovery), in milliseconds. Defaults to 1 hour.
     ///
-    /// It does NOT bound the blob fetch: a progressing pull carries no overall wall-clock cap
-    /// and is bounded only by `--stall-timeout-ms` and `--min-throughput-bps`, which together
-    /// catch a dead or drip-feeding provider (#1134, #1797) — so a healthy transfer of any
-    /// size completes as long as the upstream keeps feeding it bytes.
+    /// It does NOT bound the blob fetch: a progressing pull carries no overall wall-clock
+    /// cap, so a healthy transfer of any size completes as long as the upstream keeps
+    /// feeding it bytes (#1134). `--give-up-after-secs` bounds a fetch that stops making
+    /// progress.
     ///
     /// Exceeding this budget on the registry read (including its retry schedule) is treated
     /// as a read failure, so a cached peer list is still used if one is present. It does NOT
     /// bound the probe fan-out that ranks candidates either — probing is bounded per node by
     /// the probe timeout, not by this flag.
-    ///
-    /// It must exceed TWICE `--stall-timeout-ms`: a discovery budget at or below twice a
-    /// single delivery attempt's stall budget is almost certainly a misconfiguration.
     #[arg(long, value_name = "MS", default_value_t = 3_600_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout_ms: u64,
 
@@ -333,49 +262,11 @@ pub struct ClientFetchArgs {
 }
 
 impl ClientFetchArgs {
-    /// Throughput-floor window for the streaming stage — the primary timeout (#1797).
-    ///
-    /// Returned as its own value (rather than a `decdn_client::PullDeadlines`)
-    /// because `decdn-common` is upstream of the pull crate in the dependency flow;
-    /// the CLI assembles the halves into a `PullDeadlines`.
-    #[must_use]
-    pub const fn stall_timeout(&self) -> Duration {
-        Duration::from_millis(self.stall_timeout_ms)
-    }
-
-    /// Minimum sustained upstream throughput (bytes/sec) over [`Self::stall_timeout`]; `0` =
-    /// idle detection only (#1797). Assembled with the window into a `PullDeadlines`.
-    #[must_use]
-    pub const fn min_throughput_bps(&self) -> u64 {
-        self.min_throughput_bps
-    }
-
-    /// The `--timeout-ms` value as a `Duration`. It bounds discovery ([`Self::discovery_cap`]
-    /// returns the same value); the delivery pull itself carries no overall wall-clock cap
-    /// and is bounded only by its open bound and stall window (#1134). Despite the name, this
-    /// value does not cap the whole exchange.
-    ///
-    /// Returns a `Duration`, not an `Option<Duration>`. `--timeout-ms` has a default and clap
-    /// rejects a zero, so it is ALWAYS present on this path; an `Option` here would be
-    /// structurally always `Some` and would exist only to shape-match `PullDeadlines`'s
-    /// optional cap — misinforming every reader and forcing a pointless match (#1145 review).
-    /// A caller that wants the optional form wraps it.
-    #[must_use]
-    pub const fn hard_cap(&self) -> Duration {
-        Duration::from_millis(self.timeout_ms)
-    }
-
     /// Wall-clock cap on the `CapacityBond` registry read, including its ADR 012 retry
-    /// schedule (#1349).
-    ///
-    /// The same `--timeout-ms` value as [`Self::hard_cap`], deliberately not a knob of
-    /// its own. The read had no bound at all, and a dedicated flag would be a fifth
-    /// timeout for operators to reason about when the one they already reach for —
-    /// "how long may this command take" — is the right question.
+    /// schedule (#1349): the `--timeout-ms` value.
     ///
     /// A separate budget, not a shared one: sharing would make `bundle pull`'s per-entry
-    /// fetch cap depend on how long the read took, turning a documented per-entry bound
-    /// into a whole-run one.
+    /// fetch depend on how long the read took.
     ///
     /// # What this does NOT bound
     ///
@@ -387,48 +278,22 @@ impl ClientFetchArgs {
         Duration::from_millis(self.timeout_ms)
     }
 
-    /// Reject a `--timeout-ms` / `--stall-timeout-ms` pair the flags cannot sensibly honor.
-    ///
-    /// Clap enforces each knob is non-zero, but the two are only meaningful in relation to
-    /// each other. `--timeout-ms` bounds discovery ([`Self::discovery_cap`]); the delivery
-    /// pull itself carries NO overall wall-clock cap — a progressing pull is bounded only by
-    /// its open bound and stall window, so it completes for any blob size as long as the
-    /// upstream keeps feeding it bytes (#1134). `--stall-timeout-ms` sets both that open
-    /// bound and that stall window on every delivery attempt (a node that accepts a
-    /// connection and never answers is as dead as one that stops mid-stream, so the same
-    /// budget answers both).
-    ///
-    /// The check keeps the discovery budget from being set implausibly small next to a
-    /// single delivery attempt's stall budget:
-    ///
-    /// ```text
-    /// timeout_ms > 2 × stall_timeout_ms
-    /// ```
-    ///
-    /// A `--timeout-ms` at or below `2 × --stall-timeout-ms` is almost certainly a
-    /// misconfiguration, so it is rejected at argument-parse time — naming the flags the
-    /// user typed — rather than surfacing several frames into a fetch. `decdn-common` sits
-    /// UPSTREAM of `decdn-client` in the dependency flow and cannot name the delivery
-    /// deadline type, so the relationship is stated here rather than imported.
+    /// The `--give-up-after-secs` override of the no-progress limit, or `None`
+    /// for the default (a terminal waits, a script stops after 10 minutes).
+    #[must_use]
+    pub const fn give_up_after(&self) -> Option<Duration> {
+        match self.give_up_after_secs {
+            Some(secs) => Some(Duration::from_secs(secs)),
+            None => None,
+        }
+    }
+
+    /// Reject a flag combination clap cannot express.
     ///
     /// # Errors
     ///
-    /// When `--timeout-ms` does not exceed twice `--stall-timeout-ms`.
-    ///
     /// When `--provider-address` is set without `--node-id`.
     pub fn validate(&self) -> anyhow::Result<()> {
-        let need = self.stall_timeout_ms.saturating_mul(2);
-        anyhow::ensure!(
-            self.timeout_ms > need,
-            "--timeout-ms ({}) must exceed twice --stall-timeout-ms ({} × 2 = {}): \
-             --timeout-ms bounds discovery and --stall-timeout-ms bounds each delivery \
-             attempt, so a discovery budget at or below twice a single attempt's is almost \
-             certainly a misconfiguration",
-            self.timeout_ms,
-            self.stall_timeout_ms,
-            need,
-        );
-
         // `--provider-address` is the delivering node's address on the
         // explicit-node path, where it pairs with `--node-id`. Standing alone it
         // names no node to dial, so it is meaningless.
@@ -438,15 +303,6 @@ impl ClientFetchArgs {
              names no node",
         );
         Ok(())
-    }
-
-    /// The effective multi-source kill switch: on by default, off if either
-    /// `--no-multi-source` was passed (regardless of `--multi-source`'s own
-    /// value — the negation always wins) or `--multi-source` was explicitly
-    /// set to `false`.
-    #[must_use]
-    pub const fn multi_source_enabled(&self) -> bool {
-        self.multi_source && !self.no_multi_source
     }
 
     /// The `dcap1:` capability token this fetch adopts, if any: the inline
@@ -497,7 +353,7 @@ pub struct FetchArgs {
     pub namespace: Option<u64>,
 
     /// Retrieval flags shared with `decdn bundle pull`: peer discovery, chain
-    /// and payment-pool coordinates, multi-source and deadline tuning.
+    /// and payment-pool coordinates, the source cap and the give-up limit.
     #[command(flatten)]
     pub common: ClientFetchArgs,
 }
@@ -576,14 +432,38 @@ mod tests {
         );
     }
 
-    /// The default deadlines (#1134): blob size and link speed cannot kill a healthy
-    /// transfer. Liveness on the delivery pull comes from the STALL bound and the throughput
-    /// floor; `--timeout-ms` bounds discovery and defaults far above any honest registry read.
     #[test]
-    fn the_default_stall_and_timeout_values() {
-        let c = parse(&[]);
-        assert_eq!(c.stall_timeout(), Duration::from_secs(30));
-        assert_eq!(c.hard_cap(), Duration::from_hours(1));
+    fn give_up_after_is_unset_by_default_and_parses_whole_seconds() {
+        let args = parse(&[]);
+        assert_eq!(args.give_up_after(), None);
+        let args = parse(&["--give-up-after-secs", "90"]);
+        assert_eq!(args.give_up_after(), Some(Duration::from_secs(90)));
+        assert!(
+            TestCli::try_parse_from(["test", "--give-up-after-secs", "0"]).is_err(),
+            "a zero limit would give up before the first byte"
+        );
+    }
+
+    #[test]
+    fn removed_recovery_flags_are_rejected() {
+        for flag in [
+            "--stall-timeout-ms",
+            "--unit-deadline-ms",
+            "--min-throughput-bps",
+            "--multi-source-min-bytes",
+            "--no-multi-source",
+            "--multi-source",
+        ] {
+            let parsed = TestCli::try_parse_from(["test", flag, "1"]);
+            assert!(parsed.is_err(), "{flag} must be gone");
+        }
+    }
+
+    /// `--timeout-ms` bounds discovery and defaults to an hour, far above any
+    /// honest registry read.
+    #[test]
+    fn the_default_discovery_bound_is_an_hour() {
+        assert_eq!(parse(&[]).discovery_cap(), Duration::from_hours(1));
     }
 
     /// `--region` is validated at parse time, not silently discarded. Before
@@ -624,97 +504,13 @@ mod tests {
         );
     }
 
+    /// `--timeout-ms` bounds discovery (#1349), so a small `--timeout-ms` does not sit
+    /// through the registry read's full retry schedule.
     #[test]
-    fn hard_cap_is_overridable() {
-        let c = parse(&["--timeout-ms", "5000"]);
-        assert_eq!(c.hard_cap(), Duration::from_secs(5));
-    }
-
-    /// `--timeout-ms` bounds discovery (#1349), from the same value the type exposes as
-    /// `hard_cap`, with no separate flag — so a small `--timeout-ms` does not sit through
-    /// the registry read's full retry schedule.
-    ///
-    /// Asserted as equality to `hard_cap` rather than a literal so the two cannot silently
-    /// diverge: if a future change gives discovery its own knob, this is the test that says
-    /// so out loud.
-    #[test]
-    fn discovery_is_bounded_by_the_same_flag() {
+    fn discovery_is_bounded_by_the_timeout_flag() {
         let c = parse(&["--timeout-ms", "5000"]);
         assert_eq!(c.discovery_cap(), Duration::from_secs(5));
-        assert_eq!(c.discovery_cap(), c.hard_cap());
-        assert_eq!(
-            parse(&[]).discovery_cap(),
-            parse(&[]).hard_cap(),
-            "the default is shared too — discovery is never left unbounded"
-        );
-    }
-
-    /// The two deadlines are only meaningful in relation to each other, and the threshold
-    /// is `2 × stall`, not `1 × stall` (#1145 review). `--timeout-ms` bounds discovery and
-    /// `--stall-timeout-ms` bounds each delivery attempt (both its open bound and its stall
-    /// window), so a discovery budget at or below twice a single attempt's stall budget is a
-    /// misconfiguration `validate` rejects. The threshold is strict `> 2 ×`, so the boundary
-    /// (`10000` for a `5000` stall) is pinned as an ERROR and `10001` as OK.
-    #[test]
-    fn validate_rejects_a_timeout_at_or_below_twice_the_stall_budget() {
-        assert!(
-            parse(&["--stall-timeout-ms", "60000", "--timeout-ms", "1000"])
-                .validate()
-                .is_err(),
-            "a discovery budget far below the per-attempt stall budget is rejected"
-        );
-        assert!(
-            parse(&["--stall-timeout-ms", "5000", "--timeout-ms", "5000"])
-                .validate()
-                .is_err(),
-            "equal is rejected: the threshold is twice the stall budget, not once"
-        );
-        assert!(
-            parse(&["--stall-timeout-ms", "5000", "--timeout-ms", "5001"])
-                .validate()
-                .is_err(),
-            "stall+1ms clears a naive `timeout > stall` check but sits below `2 × stall`"
-        );
-        assert!(
-            parse(&["--stall-timeout-ms", "5000", "--timeout-ms", "10000"])
-                .validate()
-                .is_err(),
-            "exactly 2× is rejected — the threshold is strict"
-        );
-        assert!(
-            parse(&["--stall-timeout-ms", "5000", "--timeout-ms", "10001"])
-                .validate()
-                .is_ok(),
-            "just past 2 × the stall budget is accepted"
-        );
-        assert!(
-            parse(&[]).validate().is_ok(),
-            "the defaults (30s stall, 1h cap) must be a legal pair"
-        );
-    }
-
-    #[test]
-    fn stall_timeout_is_overridable() {
-        let c = parse(&["--stall-timeout-ms", "1500"]);
-        assert_eq!(c.stall_timeout(), Duration::from_millis(1500));
-    }
-
-    /// `stall_timeout()` feeds BOTH `PullDeadlines::open` and `.stall`, so a zero here
-    /// elapses on the first poll of the stream open and kills every fetch. The node's
-    /// config resolver already rejects the equivalent knob; the CLI must too.
-    #[test]
-    fn a_zero_stall_timeout_is_rejected() {
-        assert!(TestCli::try_parse_from(["test", "--stall-timeout-ms", "0"]).is_err());
-    }
-
-    /// `--max-blob-mb` is an optional size ceiling, nothing more. It does not scale
-    /// the timeout: a size flag has no business setting a deadline (#1134).
-    #[test]
-    fn max_blob_mb_does_not_influence_the_deadlines() {
-        let small = parse(&["--max-blob-mb", "1"]);
-        let huge = parse(&["--max-blob-mb", "1048576"]);
-        assert_eq!(small.stall_timeout(), huge.stall_timeout());
-        assert_eq!(small.hard_cap(), huge.hard_cap());
+        assert!(parse(&[]).validate().is_ok(), "the defaults are legal");
     }
 
     /// `--provider-address` alone (no `--node-id`) names no node to dial and is
@@ -770,25 +566,6 @@ mod tests {
     fn rediscover_defaults_false_and_flag_sets_true() {
         assert!(!parse(&[]).rediscover, "defaults to false");
         assert!(parse(&["--rediscover"]).rediscover, "flag sets it true");
-    }
-
-    /// `--multi-source` defaults on; `--no-multi-source` is the off-switch.
-    /// [`ClientFetchArgs::multi_source_enabled`] is the resolved value every
-    /// caller reads (mirroring `--proxy-warming`'s bool style above, but as a
-    /// flag pair rather than a `bool`-valued flag). `overrides_with` clears
-    /// the OTHER flag's occurrence, so whichever of the pair appears LAST on
-    /// the command line wins.
-    #[test]
-    fn multi_source_defaults_on_and_no_multi_source_disables_it() {
-        assert!(parse(&[]).multi_source_enabled(), "defaults on");
-        assert!(
-            !parse(&["--no-multi-source"]).multi_source_enabled(),
-            "--no-multi-source disables it"
-        );
-        assert!(
-            parse(&["--no-multi-source", "--multi-source"]).multi_source_enabled(),
-            "a later --multi-source overrides an earlier --no-multi-source"
-        );
     }
 
     /// `--capability-file` returns the file's trimmed contents; the two forms are

@@ -12,7 +12,7 @@
 //! |---|---|
 //! | Save one blob, or a set of blobs, to files as fast as possible, and resume a partial download | [`Downloader`] |
 //! | Read one blob in order, and pay only for what your reader reaches | [`Streamer`] |
-//! | Drive the pull loop yourself (a node, or a custom scheduler) | [`driver::drive`], [`multi_source_fetch`], [`open_progressive_pull`] |
+//! | Drive the pull loop yourself (a node, or a custom scheduler) | [`driver::drive`], [`acquire`], [`first_open()`],[`open_progressive_pull`] |
 //!
 //! Most callers want one of the two faces. The [`Downloader`] stripes a blob
 //! across every holder at once, and writes each verified range at its offset in
@@ -48,7 +48,8 @@
 //!    [`PoolContext::new_ledger`], and wrap both in a [`PeerSource`] inside a
 //!    [`StreamCandidate`]. Cap the lane's rate at the rate the node signed in
 //!    its probe answer ([`effective_rate_ceiling`]).
-//! 6. **Fetch** with [`Downloader::fetch_to_paths`] or [`Streamer::open`].
+//! 6. **Fetch** with [`Downloader::fetch_to_paths`] or [`Streamer::open`], over
+//!    a [`StaticSources`] of the lanes and its [`StaticSources::holders`].
 //! 7. **Record what each lane paid**, whatever the outcome: build a
 //!    [`VoucherProgress`] from the ledger's settlement, and apply the
 //!    [`buyer_pool::ProgressWrite`] it calls for to the buyer store.
@@ -66,9 +67,10 @@
 //! - **Quotes are checked against your ceiling.** A stream response whose
 //!   signed rate exceeds the `max_rate_per_mb` given to [`PeerSource::new`] is
 //!   refused before any payment ([`RateAboveCeiling`]).
-//! - **Failover is free.** Every lane draws on one shared pool, so a holder that
-//!   stalls or refuses is dropped and its range goes to another holder. No
-//!   delivered byte is fetched or paid for twice.
+//! - **Recovery is free.** Every lane draws on one shared pool. A source that
+//!   faults cools and returns, and its range goes to another holder meanwhile.
+//!   [`acquire`] ends on done, a fatal fault, or the stop policy
+//!   ([`StopPolicy`]). No delivered byte is fetched or paid for twice.
 //!
 //! # What stays yours
 //!
@@ -77,8 +79,9 @@
 //!   from a stale watermark next time, and its provider rejects the vouchers.
 //! - **Funding policy.** A [`source::Funder`] decides whether a fetch that runs
 //!   the pool low tops it up. One whose [`max_topups`](source::Funder::max_topups)
-//!   is `0` never does. The fetch then fails with a [`PoolExhausted`], and
-//!   [`shared_pool_disposition`] classifies that as terminal.
+//!   is `0` never does. A source whose next voucher the deposit cannot cover
+//!   then waits for the deposit to rise, and once every known source waits
+//!   the fetch fails with a [`NoAffordableSource`].
 //! - **Which holders to use.** Discovery gives candidates; ordering and
 //!   admission ([`discovery::admit_sources`]) are the caller's choice.
 //!
@@ -153,6 +156,7 @@ pub mod endpoint;
 /// What a failed lane, lane build, or discovery means for the acquire loop
 /// (spec § Fault classes): a pure classifier over `anyhow::Error`.
 pub mod fault;
+mod first_open;
 /// Command-wide health of each provider (spec § Unit 1): cooling backoff on a
 /// delivery fault, parking on an unaffordable price.
 pub mod health;
@@ -215,12 +219,13 @@ pub use config::PullConfig;
 pub use connection::WarmConnection;
 pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
 pub use decdn_bao_range::RangedStore;
-pub use downloader::{DownloadTarget, Downloader, download_first_unit};
+pub use downloader::{DownloadTarget, Downloader};
 pub use driver::{
     LaneGrowth, LaneRelease, LegNoProgress, PacingWait, PoolExhausted, RangeLane, RangeSetOutcome,
     SharedPool, WaitReason, drive, drive_range_lanes, drive_range_set, first_leg, range_set_reach,
 };
 pub use fault::{FatalScope, Fault, LaneBuildFault, classify};
+pub use first_open::first_open;
 pub use health::{Health, PeerHealth};
 pub use ledger::{ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released};
 pub use ledgers::{LaneHandle, LaneLedgers};
@@ -234,8 +239,7 @@ pub use ranged_store::ClientRangedStore;
 pub use rate_limited::UpstreamRateLimited;
 pub use retry::{RetryDisposition, retry_disposition, shared_pool_disposition};
 pub use scheduler::{
-    AcquireEnv, AcquireTarget, ConsumptionPacing, LANE_WATCHDOG, LaneLease, MultiSourceConfig,
-    SourceLane, acquire, multi_source_fetch, multi_source_fetch_until,
+    AcquireEnv, AcquireTarget, ConsumptionPacing, LANE_WATCHDOG, LaneLease, acquire,
 };
 pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{
@@ -1646,7 +1650,7 @@ pub async fn stream_fetch_tracked(
 /// bar. Both slots are **content** bytes: `received` is the content position the
 /// verifying decoder has reached and `expected` is the blob's content
 /// `total_bytes`, constant across the pull — so a bar keyed on the two fills to
-/// exactly 100%. `drive` / `multi_source_fetch` (the resumable [`crate::driver`]
+/// exactly 100%. `drive` / `acquire` (the resumable [`crate::driver`]
 /// path the CLI `fetch` and `bundle pull` use) additionally emit the
 /// already-present resume base (`base_present`) once before streaming begins; the
 /// `test-util` `stream_fetch_tracked_with_progress` wrapper reports the same

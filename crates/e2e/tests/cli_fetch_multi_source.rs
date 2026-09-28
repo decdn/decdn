@@ -17,11 +17,9 @@
 //! each pre-warmed with the SAME blob (so they share a hash and are both
 //! admissible sources). The client never pins `--node-id`, so `decdn fetch`
 //! auto-discovers both via the on-chain `CapacityBond` registry, probes them,
-//! and — the blob cleared past a (test-lowered) `--multi-source-min-bytes`
-//! floor and two admissible holders found — engages
-//! `decdn_client::multi_source_fetch` (`try_multi_source_fetch` in
-//! `crates/cli/src/commands/fetch.rs`) instead of the single-source
-//! failover loop.
+//! and runs the acquire loop (`decdn_client::acquire`, through the
+//! `Downloader` face in `crates/cli/src/commands/fetch.rs`) with one lane per
+//! holder.
 //!
 //! What this test asserts:
 //!   1. The fetched output is byte-identical to the source blob.
@@ -76,16 +74,8 @@ const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 /// chunk-log 4 == 16 KiB chunk groups).
 const CHUNK_GROUP: usize = 16 * 1024;
 
-/// Multi-source engagement floor for this journey (`--multi-source-min-bytes`),
-/// lowered far below the production 64 MiB default so the test blob clears it
-/// in well under a second of transfer. The gate logic (`should_multi_source`)
-/// is size-relative, not size-absolute, so a lowered floor with a blob
-/// comfortably above it still exercises the exact same gate the production
-/// default guards.
-const MULTI_SOURCE_MIN_BYTES: u64 = 200_000;
-
-/// Deterministic pseudo-random blob comfortably above [`MULTI_SOURCE_MIN_BYTES`]
-/// (~640 KiB), spanning many chunk groups plus a ragged final group.
+/// Deterministic pseudo-random blob (~640 KiB), spanning many chunk groups plus
+/// a ragged final group.
 fn make_blob() -> Vec<u8> {
     let mut v = vec![0u8; 40 * CHUNK_GROUP + 777];
     let mut x: u32 = 0xC0FF_EE11;
@@ -294,12 +284,11 @@ fn distinct_pool_ids(
 /// per-operator billed-bytes baselines that invocation started from.
 ///
 /// The nodes' chain watchers observe the freshly-opened pool asynchronously, and
-/// a holder whose watcher has not caught up refuses the stream pre-serve. The
-/// fetch SURVIVES that: a retryable refusal on one lane falls back to
-/// single-source failover (ADR 039 § Failure handling), so `decdn fetch` exits 0
-/// having been served by the other holder alone. Exit status is therefore not a
-/// readiness signal for this journey — the thing to wait for is one invocation
-/// that bills both lanes.
+/// a holder whose watcher has not caught up refuses the stream pre-serve. That
+/// holder's lane cools while the other lane carries on, and a small blob can
+/// finish on the other lane before the cooled one returns. So `decdn fetch`
+/// exits 0 either way, and exit status is not a readiness signal for this
+/// journey — the thing to wait for is one invocation that bills both lanes.
 ///
 /// Requiring both within a SINGLE invocation is what keeps the assertion honest:
 /// a loop that merely accumulated payments across attempts would pass on two
@@ -379,12 +368,10 @@ fn reset_fetch_artifacts(out: &std::path::Path) -> anyhow::Result<()> {
 
 /// The `decdn fetch` argv (after the `fetch` subcommand) to pull `hash` via
 /// AUTO-DISCOVERY — deliberately no `--node-id`/`--addr`/`--provider-address`,
-/// since multi-source only ever runs on the auto-discovered candidate set
-/// (`crates/cli/src/commands/fetch.rs`'s `multi_source_target` doc comment).
-/// `--capacity-bond-address` is what `resolve_target_node` reads to enumerate
-/// the active registry instead. Carries the lowered `--multi-source-min-bytes`
-/// floor and an explicit `--max-sources` so the journey's intent is visible in
-/// the argv rather than relying on the (already-on) defaults alone.
+/// so discovery finds both holders. `--capacity-bond-address` is what
+/// `resolve_target_node` reads to enumerate the active registry instead.
+/// Carries an explicit `--max-sources` so the journey's intent is visible in
+/// the argv rather than relying on the default alone.
 fn fetch_argv(
     chain: &ChainFixture,
     hash: &Hash,
@@ -413,10 +400,7 @@ fn fetch_argv(
         keystore.display().to_string(),
         "--working-deposit-micro-usdc".into(),
         DEPOSIT_MICRO_USDC.to_string(),
-        "--multi-source".into(),
         "--max-sources".into(),
         "4".into(),
-        "--multi-source-min-bytes".into(),
-        MULTI_SOURCE_MIN_BYTES.to_string(),
     ]
 }

@@ -6,7 +6,7 @@
 //!
 //! Set the `DECDN_*` variables that `common::Env::from_env` lists first. The
 //! download stripes across every verified holder, checks every byte against the
-//! hash, and fails over between holders. A download that stops keeps its
+//! hash, and cools a holder that faults while the others carry on. A download that stops keeps its
 //! `.partial` file beside the output, and a rerun fetches only the missing
 //! ranges.
 
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use alloy::primitives::U256;
 use anyhow::{Context, Result};
 use decdn_client::driver::DriveConfig;
-use decdn_client::{DownloadTarget, Downloader, PullConfig};
+use decdn_client::{DownloadTarget, Downloader, PullConfig, StaticSources};
 
 use common::{Buyer, Env, NoTopUp};
 
@@ -36,13 +36,22 @@ async fn main() -> Result<()> {
 
     // `U256::ZERO` as the working deposit turns reactive top-up off, which
     // matches the `NoTopUp` funder.
-    let downloader = Downloader::new(candidates, NoTopUp, DriveConfig::cli(U256::ZERO));
+    let sources = StaticSources::new(candidates)?;
+    let holders = sources.holders();
+    let downloader = Downloader::new(
+        sources,
+        holders,
+        std::sync::Arc::default(),
+        NoTopUp,
+        DriveConfig::cli(U256::ZERO),
+    );
     let result = downloader
         .fetch_to_paths(
             &[DownloadTarget {
                 hash: *hash.as_bytes(),
                 total_bytes,
                 dest: &dest,
+                ranges: None,
             }],
             &PullConfig::new(),
             None,

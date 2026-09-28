@@ -2,14 +2,15 @@
 //! content-addressed blob over `cdn/client/v1` (issues #391, #940).
 //!
 //! Turnkey paying sibling of [`super::probe`]: dial a node by explicit
-//! `--node-id`/`--addr`/`--relay-url` (or auto-discover one, #936),
-//! **auto-open-or-reuse** the caller's own `PaymentPool` deposit, run one
-//! delivery exchange through the gap-driven [`decdn_client::drive`] core
-//! over a [`decdn_client::PeerSource`] (signing cumulative vouchers,
-//! resuming the pool lane's persisted watermark), verify the `slash_sig`
-//! recovers to the provider
-//! (ADR 014 §1), BLAKE3-check the whole blob, persist the new watermark, and
-//! write the bytes atomically.
+//! `--node-id`/`--addr`/`--relay-url` (or auto-discover the holders, #936),
+//! **auto-open-or-reuse** the caller's own `PaymentPool` deposit, learn the
+//! blob's signed size, and fetch it through the acquire loop
+//! ([`decdn_client::acquire`]) across one [`decdn_client::PeerSource`] lane
+//! per holder (signing cumulative vouchers, resuming each lane's persisted
+//! watermark, verifying the `slash_sig` recovers to the provider, ADR 014 §1).
+//! Every byte is bao-verified; each lane's new watermark is persisted, and the
+//! file is promoted atomically. A holder that faults cools and returns; the
+//! command ends on done, a fault only the user can fix, or the stop policy.
 //!
 //! Pool lifecycle: the caller's live pool in the persistent
 //! [`RedbBuyerPoolStore`] is reused (the `(signer, provider)` lane watermark is
@@ -35,7 +36,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::signers::local::PrivateKeySigner;
-use decdn_bao_range::{AlignedRange, align_range};
+use decdn_bao_range::align_range;
 use decdn_client::buyer_pool::{
     LOW_WATER_DIVISOR, ProgressWrite, ToppedUpPool, ensure_allowance, escrowed_but_untracked,
     grade_deposit_credit, open_pool, refill_amount, self_owned_lane_ctx, top_up, topped_up_effect,
@@ -44,12 +45,14 @@ use decdn_client::driver::{DriveConfig, RangeLane, RangeSetOutcome, drive_range_
 use decdn_client::sink::PullReader;
 use decdn_client::source::{BlobSource as _, Funder, PrimedSource, SourceFuture};
 use decdn_client::{
-    BudgetPacer, ClientRangedStore, Cumulative, DownloadTarget, Downloader, LaneHandle, LaneLease,
-    LaneLedgers, NoCache, PeerSource, PoolContext, PoolExhausted, PoolLedger, ProgressCallback,
-    PullConfig, PullDeadlines, RetryDisposition, SharedPool, StreamCandidate, Streamer,
-    UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
-    open_progressive_pull, retry_disposition, sign_client_binding,
+    BudgetPacer, ClientRangedStore, Cumulative, DownloadTarget, Downloader, Holder, LaneHandle,
+    LaneLedgers, NoAffordableSource, NoCache, NoSourceHasBlob, PeerHealth, PeerSource, PoolContext,
+    PoolExhausted, PoolLedger, ProgressCallback, ProgressClock, PullConfig, PullDeadlines,
+    SharedPool, StopPolicy, Streamer, UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected,
+    VoucherProgress, sign_client_binding,
 };
+
+use super::cli_sources::CliSources;
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
 use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore, DepositOutcome};
@@ -112,10 +115,9 @@ pub(crate) fn micros_now() -> u64 {
 /// during the pre-byte connect/handshake so the command never looks hung. The
 /// bar counts verified **content** bytes against the blob's `total_bytes` — the
 /// unit the [`decdn_client::ProgressCallback`] reports — so length and
-/// position share one unit and the bar fills to exactly 100%. On a single-source fetch the
-/// driver reports this lane's `base_present + received`; a multi-source fetch
-/// instead reports one monotonic total the lanes fold their per-leg deltas into,
-/// so the bar never jumps between lanes' divergent local positions.
+/// position share one unit and the bar fills to exactly 100%. The acquire loop
+/// reports one monotonic total the lanes fold their per-leg deltas into, so
+/// the bar never jumps between lanes' divergent local positions.
 fn new_progress_bar() -> indicatif::ProgressBar {
     let style = indicatif::ProgressStyle::with_template(
         // Rate/ETA come from `{msg}` (see `delivery_progress`), not the built-in
@@ -645,7 +647,6 @@ pub(crate) async fn probe_and_order(
     }
     Ok(ResolvedTargets {
         candidates: ordered.order,
-        size_hint: ordered.size_hint,
         coverage_by_node: ordered.coverage_by_node,
         probed_samples,
         skipped_registry_read: false, // just probed: reachability-checked
@@ -664,14 +665,6 @@ struct FailoverOrder {
     /// `Some((proxy_node_id, proxy_rtt_ms, best_holder_rtt_ms))` when a warming
     /// proxy is prepended; `None` when the list is just the holders.
     warming_lead: Option<(PublicKey, f64, f64)>,
-    /// The largest blob size any holder reported in its probe, when any did
-    /// (`ProbeResponse::total_bytes`). The LARGEST rather than the first: the
-    /// field is unsigned, and as a gate it only DECLINES fan-out, so taking the
-    /// maximum keeps one node's understated hint from suppressing multi-source
-    /// for the whole set. The first multi-source open is also cut from it
-    /// (#2063): an overstated one costs that open one extra round trip, and the
-    /// signed header decides the size.
-    size_hint: Option<u64>,
     /// Each probed holder's measured [`decdn_protocol::Coverage`] (#1506),
     /// keyed by `node_id`. Proxy-warming candidates never appear here — they
     /// are non-holders by definition, so a lookup miss on them (and on any
@@ -700,7 +693,7 @@ struct FailoverOrder {
 /// even when its cache store answers `has_blob:false`. This fallback is
 /// independent of proxy warming — it is how a caching network bootstraps cold
 /// content, not a latency optimization — so it applies whether warming is on or
-/// off. `warming_lead`, `size_hint`, and `coverage_by_node` are all empty here,
+/// off. `warming_lead` and `coverage_by_node` are both empty here,
 /// since no holder answered.
 fn failover_order(
     mut holders: Vec<discovery::Probed>,
@@ -727,7 +720,6 @@ fn failover_order(
         return FailoverOrder {
             order,
             warming_lead: None,
-            size_hint: None,
             coverage_by_node: HashMap::new(),
         };
     }
@@ -772,11 +764,9 @@ fn failover_order(
     let order = proxies
         .chain(holders.iter().map(|h| h.candidate.clone()))
         .collect();
-    let size_hint = holders.iter().filter_map(|h| h.total_bytes).max();
     FailoverOrder {
         order,
         warming_lead,
-        size_hint,
         coverage_by_node,
     }
 }
@@ -953,7 +943,6 @@ fn store_fast_path(
     }
     Some(ResolvedTargets {
         candidates,
-        size_hint: None,
         coverage_by_node: HashMap::new(),
         probed_samples: Vec::new(),
         // The one site that sets this: these candidates are projected from the
@@ -1110,31 +1099,21 @@ fn harvest(
 
 /// Seconds since the Unix epoch, saturating to 0 on a clock before the epoch
 /// (never on this platform in practice) rather than panicking.
-fn now_secs_cli() -> u64 {
+pub(crate) fn now_secs_cli() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
 
-/// The ordered failover list plus what discovery already learned about the
-/// blob's size.
+/// The ordered holder list plus what discovery learned about each holder.
 pub(crate) struct ResolvedTargets {
-    /// The candidates to try in turn (#1174).
+    /// The candidates, nearest first (#1174).
     pub(crate) candidates: Vec<NodeCandidate>,
-    /// The blob size a holder reported in its probe, when any did. Lets the
-    /// multi-source engagement gate apply its size floor BEFORE opening a pool
-    /// and a throwaway header stream just to learn the size — work the
-    /// single-source path then repeats when the gate declines. `None` on the
-    /// pinned `--node-id` path and whenever no holder reported a size, where the
-    /// gate falls back to the header open. The first multi-source open is cut
-    /// from it too (#2063).
-    pub(crate) size_hint: Option<u64>,
     /// Each probed holder's measured [`decdn_protocol::Coverage`] (#1506),
-    /// keyed by `node_id` — what the multi-source lane builder reads instead of
-    /// assuming every admitted candidate is a full holder. Empty on the pinned
+    /// keyed by `node_id` — what a holder's lane is planned against instead of
+    /// assuming every candidate is a full holder. Empty on the pinned
     /// `--node-id` path, where nothing was probed; a lookup miss there (as
-    /// everywhere else) reads as "no measured coverage" and the lane builder
-    /// falls back to [`decdn_protocol::Coverage::full`].
+    /// everywhere else) reads as "no measured coverage", a full holder.
     pub(crate) coverage_by_node: HashMap<PublicKey, decdn_protocol::Coverage>,
     /// `(node_id, rtt_ms, rate_per_mb)` for each holder that answered a probe
     /// this fetch — harvested into the peer store.
@@ -1186,11 +1165,8 @@ pub(crate) async fn resolve_target_node(
                 // `--addr` at the dial site, not from the registry.
                 multiaddrs: Bytes::new(),
             }],
-            // A pinned node is one candidate, so multi-source never engages and
-            // no size hint is needed.
-            size_hint: None,
             // Nothing was probed on this path, so no holder coverage was
-            // measured; irrelevant anyway since multi-source never engages here.
+            // measured: the pinned node is a full holder.
             coverage_by_node: HashMap::new(),
             // Nothing was probed on this path, so there is nothing to harvest.
             probed_samples: Vec::new(),
@@ -1265,13 +1241,14 @@ fn short_address(addr: &Address) -> String {
 /// so nothing to sign) cannot authorize the node to reactively pull a
 /// cache-missed blob from its origin, so the node returns a bare `NotFound` —
 /// indistinguishable, without this, from a genuinely absent/blacklisted/wrong
-/// hash. Scoped to `NotFound` — a size or blacklist refusal is fixed by neither
-/// cause — so every other error is returned verbatim.
-fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext) -> anyhow::Error {
-    let Some(refused) = err.downcast_ref::<UpstreamRefused>() else {
-        return err;
-    };
-    if !matches!(refused.error(), StreamError::NotFound) {
+/// hash. Scoped to `NotFound`, and to [`NoSourceHasBlob`] (every source said
+/// `NotFound`) — a size or blacklist refusal is fixed by neither cause — so
+/// every other error is returned verbatim.
+pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext) -> anyhow::Error {
+    let refused = err
+        .downcast_ref::<UpstreamRefused>()
+        .filter(|refused| matches!(refused.error(), StreamError::NotFound));
+    if refused.is_none() && err.downcast_ref::<NoSourceHasBlob>().is_none() {
         return err;
     }
 
@@ -1295,7 +1272,10 @@ fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext) -> anyhow:
     // that estimate is exactly the quoted per-MB rate. The miss direction is "we
     // stay silent when we could have spoken" — never a fabricated shortfall — so
     // it is phrased as a possibility and as a lower bound.
-    if let Some(quoted_rate) = refused.evidence().map(|resp| resp.body.rate_per_mb) {
+    if let Some(quoted_rate) = refused
+        .and_then(UpstreamRefused::evidence)
+        .map(|resp| resp.body.rate_per_mb)
+    {
         let headroom = ctx.deposit.saturating_sub(ctx.prior_amount);
         let estimate = min_payment(decdn_protocol::client::CHUNK_BYTES, quoted_rate);
         if quoted_rate > 0 && headroom < estimate {
@@ -1428,18 +1408,17 @@ fn persist_watermark(
 /// With `--node-id` the node is dialed explicitly. Without it, `fetch`
 /// auto-discovers (#936): read the active set from `CapacityBond`, probe a
 /// random, region-first sample of candidates, and derive `--provider-address` from each
-/// candidate's registry entry, failing over across them (#1174).
-// Linear provider-failover loop over the resolved candidates plus the one-time
-// provider-independent setup: long, and its branch count is the fallback ladder
-// itself (multi-source, per-candidate failover, one-shot rediscovery), each arm
-// carrying a `tracing` diagnostic. Kept as one flat orchestrator rather than
-// split across helpers that would only pass the shared loop state back and forth.
+/// candidate's registry entry, striping across them (#1174).
+///
+/// # Errors
+///
+/// [`Interrupted`] on Ctrl-C, [`decdn_client::GaveUp`] once the stop policy's
+/// no-progress limit passes, or the fault that ended the fetch.
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let hash = parse_hash(&args.hash)?;
     let common = &args.common;
-    // Before any network or keystore work, reject a `--timeout-ms` / `--stall-timeout-ms`
-    // pair the flags cannot honor, naming the flags the user actually typed rather than
-    // failing several frames into a fetch (#1145 review).
+    // Before any network or keystore work, reject a flag combination clap
+    // cannot express, naming the flags the user actually typed.
     common.validate()?;
 
     // Relays: `--relay-url` overrides `network.relay_urls` (#935). Discovery:
@@ -1477,13 +1456,18 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     result
 }
 
+/// The per-stream idle floor inside one paid leg: a leg whose stream opens no
+/// byte, or delivers none, for this long ends as a source fault. The acquire
+/// loop's lane watchdog ([`decdn_client::LANE_WATCHDOG`]) covers a lane that
+/// makes slow progress.
+pub(crate) const STALL_WINDOW: Duration = Duration::from_secs(30);
+
 /// The part of [`fetch`] that runs over its open `endpoint`: resolve the
-/// providers, then pay and fetch with failover.
+/// holders, learn the blob's signed size, then fetch it through the acquire
+/// loop. The command ends on done, a fault only the user can fix, or the stop
+/// policy: a terminal waits for Ctrl-C, a script gives up after 10 minutes
+/// without progress, and `--give-up-after-secs` overrides both.
 #[allow(clippy::too_many_lines)]
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "flat failover ladder; the branches are the fallback arms, not nesting"
-)]
 async fn fetch_over(
     args: &cli::FetchArgs,
     hash: [u8; 32],
@@ -1494,14 +1478,8 @@ async fn fetch_over(
     endpoint: &Endpoint,
 ) -> anyhow::Result<()> {
     let common = &args.common;
-    // Resolve the ordered failover list: explicit `--node-id`, or auto-discover.
-    // These are `mut` so the store-fast-path rediscovery fallback below can
-    // replace them with a freshly discovered set within this same fetch.
-    let targets = resolve_target_node(common, chain, endpoint, relays, hash).await?;
-    let mut candidates = targets.candidates;
-    let mut coverage_by_node = targets.coverage_by_node;
-    let mut size_hint = targets.size_hint;
-    let mut skipped_registry_read = targets.skipped_registry_read;
+    // The holders to start from: the explicit `--node-id`, or auto-discovery.
+    let resolved = resolve_target_node(common, chain, endpoint, relays, hash).await?;
 
     // Buyer signer (vouchers + the openPool/topUp tx). Loaded after selection so a
     // failed discovery never prompts for a keystore password. Password from env,
@@ -1544,22 +1522,12 @@ async fn fetch_over(
             alloy::primitives::U256::from(n).to_be_bytes()
         });
     // A node that accepts the connection and never answers is as dead as one that
-    // stops mid-stream, so the same budget answers both (#1134). The pull carries no
-    // overall wall-clock cap: a progressing pull is bounded only by the open bound
-    // and the stall window, so it completes for any blob size as long as the upstream
-    // keeps feeding it bytes (#1134) — `drive` never consults a hard cap. This same
-    // stall budget is the ADR 037 § Fallback progress deadline: a proxy (or holder)
-    // that makes no progress within it trips the stall, and the failover loop below
-    // routes to the next candidate.
-    let deadlines = PullDeadlines::new(
-        common.stall_timeout(),
-        common.stall_timeout(),
-        common.min_throughput_bps(),
-    )?;
+    // stops mid-stream, so the same window answers both (#1134). The pull carries
+    // no overall wall-clock cap: it completes for any blob size as long as the
+    // upstream keeps feeding it bytes.
+    let deadlines = PullDeadlines::new(STALL_WINDOW, STALL_WINDOW, 0)?;
 
-    // The shared pull/funding deps the driver core borrows for the whole fetch.
-    // Every field is provider-independent, so it is built once and reused across
-    // every failover candidate (the provider is passed to `drive_fetch` per-try).
+    // The shared pull/funding deps every lane borrows for the whole fetch.
     let deps = DriveFetchDeps {
         endpoint,
         store,
@@ -1575,263 +1543,76 @@ async fn fetch_over(
         deadlines,
     };
 
-    // `-o -`: stream verified bytes to stdout via the Streamer consumption face
-    // (#1848 4b) instead of the file-writing multi/single-source paths below.
-    // Only bao-verified bytes reach the pipe, the fetch is consumption-paced, and
-    // candidate failover still applies — but there is no resume-to-disk on a pipe.
-    if wants_stdout(&args.output) {
-        let streamed = stream_to_stdout(
-            &deps,
-            &args.common,
-            grant.as_ref(),
-            &signer,
-            &voucher_dom,
-            &candidates,
-            &coverage_by_node,
-            relays,
-            hash,
-            size_hint,
-        )
-        .await?;
-        tracing::info!("streamed {streamed} verified bytes to stdout");
-        return Ok(());
-    }
-
-    // The fetch runs at most twice: once over the resolved candidate set, and —
-    // if that set came from the probe-less store fast path and its failover
-    // exhausts with a RETRYABLE error — once more over a freshly DISCOVERED set.
-    // The store must never make a fetch fail that probing would have served
-    // (ADR 037 § in-fetch discovery fallback), so a fresh-but-unreachable
-    // fast-path set falls through to real discovery within this same fetch. The
-    // second pass forces discovery (fast path off), so it cannot loop back into
-    // the fast path; `rediscovered` caps it at one retry regardless.
-    let mut rediscovered = false;
-    loop {
-        // Multi-source fan-out (ADR 039): when enabled, the blob clears the size
-        // floor, and at least two operator-distinct holders are admissible, fetch
-        // it in parallel across a per-provider lane set. A `None` gate (kill switch
-        // off, too small, too few holders) falls through to the single-source loop
-        // below unchanged. Each lane pays its OWN provider on its OWN `(ctx,
-        // ledger)`; the scheduler gates every lane on the shared pool's remaining
-        // balance.
-        {
-            let (bar, on_progress, meter) = delivery_progress();
-            let multi = download_to_file(
-                &deps,
-                &args.common,
-                grant.as_ref(),
-                &signer,
-                &voucher_dom,
-                &candidates,
-                &coverage_by_node,
-                relays,
-                hash,
-                &args.output,
-                size_hint,
-                Some(&on_progress),
-            )
-            .await;
-            bar.finish_and_clear();
-            match multi {
-                Ok(Some(bytes)) => {
-                    print_fetch_summary(bytes, &meter, &args.output);
-                    return Ok(());
-                }
-                // Gate not met: run the single-source failover loop below. The gate
-                // itself reports which condition it was.
-                Ok(None) => {}
-                // The fan-out engaged and failed. Only a TERMINAL failure ends the
-                // fetch: a pool exhaustion (no lane and no provider can fund it) or
-                // what the shared classifier rules terminal. Anything else is
-                // precisely the class the failover loop below was built to survive —
-                // returning it here would fail a recoverable fetch that the
-                // pre-fan-out path completed by trying the next candidate. The loop
-                // resumes the same `.partial`, so nothing already paid for is
-                // re-bought.
-                Err(err)
-                    if retry_disposition(&err) == RetryDisposition::Terminal
-                        || err.downcast_ref::<PoolExhausted>().is_some() =>
-                {
-                    // On the delegated path reconnect a terminal exhaustion to the
-                    // owner remedy, same as the single-source path does.
-                    return Err(if grant.is_some() {
-                        annotate_delegated_exhaustion(err)
-                    } else {
-                        err
-                    });
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "multi-source fetch failed ({err:#}); falling back to single-source \
-                         failover over the same candidates"
-                    );
-                }
-            }
-        }
-
-        // Provider failover (#1174, ADR 037 § Fallback): try each resolved
-        // candidate in turn until one delivers the blob. All candidates draw on the
-        // ONE shared pool (ADR 003) — each provider is a distinct lane, and a lane
-        // for a not-yet-paid provider opens nothing on-chain — and the
-        // `ClientRangedStore` beside `--output` is keyed on `(hash, total_bytes)`,
-        // so a fail-over resumes the partial and re-pays nothing already delivered.
-        // A retryable failure (a cache-miss `NotFound`, a stall, a transport fault)
-        // advances to the next candidate; a terminal one (pool/funder exhausted,
-        // blob over the cap) stops immediately; the last error is carried out when
-        // the list is exhausted.
-        let mut last_err: Option<anyhow::Error> = None;
-        for (attempt, candidate) in candidates.iter().enumerate() {
-            let provider = candidate.eth_address;
-
-            // Delegated (`--capability`): adopt the named pool + owner capability,
-            // no open. Self-owned: reuse the caller's live pool (resuming this
-            // provider's lane watermark) or open and persist a new one. Both attach
-            // the ADR 005 client binding. Rebuilt per candidate because the lane is
-            // per-provider.
-            let ctx = build_ctx_for_fetch(
-                grant.as_ref(),
-                store,
-                &contract,
-                &rpc,
-                &signer,
-                &voucher_dom,
-                provider,
-                self_address,
-                chain,
-                endpoint,
-            )
+    let clock = Arc::new(ProgressClock::new());
+    let stop = StopPolicy::new(
+        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        common.give_up_after(),
+        clock,
+    );
+    let health = Arc::new(PeerHealth::default());
+    let sources = CliSources::new(
+        &deps,
+        common,
+        relays,
+        grant.as_ref(),
+        &signer,
+        &voucher_dom,
+        None,
+        None,
+        None,
+    );
+    let holders = sources.holders_from(&resolved);
+    // A fetch dropped by Ctrl-C records every lane's vouchers too.
+    let on_drop = SettleOnDrop::new(|| sources.persist_watermarks());
+    let result = async {
+        let total_bytes = sources
+            .signed_size(hash, holders.clone(), &health, &stop)
             .await?;
-
-            let mut target = EndpointAddr::new(candidate.node_id);
-            // `--addr` requires `--node-id` (clap), so it only pins the single
-            // explicit-node candidate; a discovered node is reached via its
-            // resolved address + relay hint.
-            if let Some(addr) = common.addr {
-                target = target.with_ip_addr(addr);
-            }
-            if let Some(url) = relays.first() {
-                target = target.with_relay_url(url.clone());
-            }
-            // A discovered node also carries its registry multiaddrs as
-            // direct-address hints, so a reachable node connects relay-free
-            // (ADR 001 § Node Discovery). On the explicit `--addr` path this
-            // adds nothing — a pinned candidate has empty `multiaddrs`.
-            target = discovery::with_dial_addrs(target, candidate);
-
-            // Immutable pool fact captured before `ctx` moves into `drive_fetch`.
-            let pool_id = ctx.pool_id;
-
-            // A fresh delivery progress bar per attempt (#1118). `indicatif` draws
-            // to stderr and hides itself when stderr is not a terminal. On a resumed
-            // fail-over it counts only the remaining transfer — the ranged store
-            // re-pulls only the missing ranges.
-            let (bar, on_progress, meter) = delivery_progress();
-            let result = drive_fetch(
+        if wants_stdout(&args.output) {
+            stream_to_stdout(
                 &deps,
-                ctx,
-                target,
-                provider,
-                pool_id,
+                &sources,
+                holders,
+                health,
                 hash,
-                &args.output,
-                Some(&on_progress),
-                || bar.finish_and_clear(),
-                // A solo `decdn fetch` has no concurrent siblings on this
-                // deposit, so the per-fetch ledger view is the whole story.
-                None,
+                total_bytes,
+                stop,
+                common.max_sources,
             )
-            .await;
-            // Safety net for the header-probe-failure early-return path inside
-            // `drive_fetch` (before `drive()` ever runs). `finish_and_clear` is
-            // idempotent, so this is a harmless no-op on paths where the hook
-            // already cleared the bar.
-            bar.finish_and_clear();
-
-            // On the delegated path `SpendingCapExhausted`, `CapabilityExpired`, and
-            // `PoolExhausted` are all terminal — the delegate cannot top up an
-            // owner's pool or raise/re-mint its own capability — so reconnect them
-            // to the owner-side remedy rather than leaving a bare "voucher
-            // rejected: ...".
-            let err = match result {
-                Ok(bytes) => {
-                    print_fetch_summary(bytes, &meter, &args.output);
-                    return Ok(());
-                }
-                Err(err) if grant.is_some() => annotate_delegated_exhaustion(err),
-                Err(err) => err,
-            };
-
-            // Stop on a terminal failure immediately. On a retryable one, route to
-            // the next candidate, or — when this was the last — break out with it so
-            // the store-fast-path rediscovery fallback below can consider it.
-            if retry_disposition(&err) == RetryDisposition::Terminal {
-                return Err(err);
-            }
-            let more_candidates = attempt + 1 < candidates.len();
-            if !more_candidates {
-                last_err = Some(err);
-                break;
-            }
-            tracing::warn!(
-                "fetch: provider {provider} could not deliver ({err:#}); failing over to the \
-                 next of {} candidate(s)",
-                candidates.len(),
-            );
-            last_err = Some(err);
+            .await
+        } else {
+            // `--max-sources` caps the holders the download stripes across;
+            // rediscovery can bring in more once they cool.
+            let holders = holders
+                .into_iter()
+                .take(common.max_sources.max(1))
+                .collect();
+            download_to_file(
+                &deps,
+                &sources,
+                holders,
+                health,
+                hash,
+                total_bytes,
+                &args.output,
+                &stop,
+            )
+            .await
         }
-
-        // The candidate list exhausted with a retryable error (or, in the
-        // never-reached empty-list case, none at all). `last_err` is set whenever
-        // the loop ran a candidate; keep a defensive error for the unreachable
-        // empty case.
-        let exhausted_err = last_err.unwrap_or_else(|| {
-            anyhow::anyhow!("no candidate node could deliver the requested blob")
-        });
-
-        // In-fetch discovery fallback (ADR 037 § in-fetch discovery fallback,
-        // acceptance criterion 5): when the exhausted set was resolved without a
-        // registry read (the probe-less store fast path, or the identity-fresh
-        // candidate set) and the failure is retryable, re-resolve ONCE via full
-        // discovery and run the failover again over the probed candidates. The
-        // `.partial` ranged store and the shared payment pool's lane watermarks are
-        // persisted on disk and keyed by content, so the second pass resumes the
-        // partial and re-pays nothing already delivered (ADR 003) — it is a
-        // continuation, not a fresh from-zero fetch. A terminal failure is never
-        // retried this way; it returns unchanged.
-        if skipped_registry_read
-            && !rediscovered
-            && retry_disposition(&exhausted_err) != RetryDisposition::Terminal
-        {
-            rediscovered = true;
-            tracing::warn!(
-                "fetch: every cached-membership candidate was unreachable ({exhausted_err:#}); \
-                 re-resolving via full discovery within this fetch and resuming the partial \
-                 already held (ADR 037)"
-            );
-            // Force discovery for this second resolve by cloning the args and
-            // setting `rediscover` — a clone, so the user's own args are untouched
-            // and identity/stats harvest still runs on the discovery path.
-            let mut disc_args = common.clone();
-            disc_args.rediscover = true;
-            let fresh = resolve_target_node(&disc_args, chain, endpoint, relays, hash).await?;
-            candidates = fresh.candidates;
-            coverage_by_node = fresh.coverage_by_node;
-            size_hint = fresh.size_hint;
-            // False by construction (discovery forced), which — together with
-            // `rediscovered` — guarantees the loop cannot rediscover again.
-            skipped_registry_read = fresh.skipped_registry_read;
-            continue;
-        }
-
-        return Err(exhausted_err);
     }
+    .await;
+    on_drop.disarm();
+    sources.persist_watermarks();
+    result.map_err(|err| sources.annotate(err))
 }
 
 /// Reconnect a delegated fetch's terminal owner-remedy voucher rejection
 /// (`SpendingCapExhausted`, `CapabilityExpired`, `PoolExhausted`) to the
 /// owner-side remedy: the delegate holds no wallet on this pool, so it cannot
-/// `topUp`, raise its own cap, or mint itself a fresh capability. A terminal
-/// `Underpaid` — the resync budget ran out — gets its own next step. Any other
+/// `topUp`, raise its own cap, or mint itself a fresh capability. A
+/// [`NoAffordableSource`] — no provider's next voucher fits the pool — gets the
+/// same owner-side remedy. A terminal `Underpaid` — the resync budget ran
+/// out — gets its own next step. Any other
 /// error passes through verbatim (a stall, a transport fault, or a `NotFound`
 /// already annotated by [`annotate_unbound_cache_miss`] inside `drive_fetch`).
 pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error {
@@ -1850,7 +1631,12 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
     let underpaid = err
         .downcast_ref::<UpstreamVoucherRejected>()
         .is_some_and(|rejected| rejected.reason == VoucherRejectReason::Underpaid);
-    if needs_owner {
+    if err.downcast_ref::<NoAffordableSource>().is_some() {
+        err.context(
+            "no provider's next voucher fits what the delegated pool holds — ask the pool \
+             owner to top up the pool (a delegated client cannot top up a pool it does not own)",
+        )
+    } else if needs_owner {
         err.context(
             "capability cap exhausted, capability expired, or pool balance exhausted — ask the \
              pool owner to top up the pool or issue a fresh, higher-cap capability (a delegated \
@@ -1866,90 +1652,6 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
         err
     }
 }
-
-/// The multi-source engagement gate (ADR 039): whether a fetch should fan out
-/// across several holders via [`decdn_client::multi_source_fetch`] rather
-/// than the single-source failover loop above.
-///
-/// All three conditions must hold: the kill switch (`--multi-source`) is on,
-/// the blob clears the size floor (fanning out a small blob only adds lane
-/// overhead for no parallelism win), and at least two admissible holders
-/// exist to fan out across (one holder is exactly the single-source path,
-/// just with extra bookkeeping).
-///
-/// Consumed by the shared [`multi_source_download`] engagement — reached by
-/// [`download_to_file`] for `decdn fetch` and by `bundle pull` — which builds one
-/// per-provider payment lane per admitted candidate, each with its OWN
-/// `(signer, provider)` `PoolContext`/`PoolLedger` (ADR 039 § Payment model), and
-/// fetches across them through the `Downloader` face; a `false` gate falls
-/// through to the single-source provider-failover loop unchanged.
-#[must_use]
-pub(crate) const fn should_multi_source(
-    enabled: bool,
-    total_bytes: u64,
-    min_bytes: u64,
-    admissible: usize,
-) -> bool {
-    enabled && total_bytes > min_bytes && admissible >= 2
-}
-
-/// The engagement-gate conditions decidable without a probe: the kill switch,
-/// the operator-distinct holder count, and the probe-reported size floor.
-/// Returns `true` when multi-source must not engage — and says which condition
-/// declined, since a user who passed `--multi-source --max-sources 8` and then
-/// watches the blob arrive over one connection has no other way to tell the
-/// size floor from the operator-spread filter from the kill switch.
-///
-/// Shared by [`download_to_file`] and `bundle_pull`'s multi-source
-/// pre-branch, which needs the answer BEFORE taking its lane lock-set: taking
-/// the locks for a fetch the gate then declines would block concurrent
-/// bundle entries sharing those providers for no fan-out.
-///
-/// `admitted` must be `discovery::admit_sources(candidates.to_vec(),
-/// common.max_sources)` — the operator-distinct set the fan-out would actually
-/// use. Passing it in avoids recomputing the same admission in the caller
-/// (bundle pull needs it for its lane-lock set) and inside this gate.
-pub(crate) fn multi_source_gate_declines(
-    common: &cli::ClientFetchArgs,
-    candidates: &[NodeCandidate],
-    admitted: &[NodeCandidate],
-    size_hint: Option<u64>,
-) -> bool {
-    if !common.multi_source_enabled() {
-        return true;
-    }
-    if admitted.len() < 2 {
-        tracing::info!(
-            "multi-source: not engaging — {} operator-distinct holder(s) among {} candidate(s), \
-             and fan-out needs two (one lane per operator: two nodes of one operator would \
-             share a voucher lane)",
-            admitted.len(),
-            candidates.len()
-        );
-        return true;
-    }
-    // The size floor, applied against discovery's probe-reported hint when there
-    // is one, so a below-floor blob declines here instead of after a pool open
-    // and a throwaway header stream the single-source path then repeats. The
-    // hint is unsigned, so it only ever DECLINES: an overstated one falls
-    // through to the authoritative header check in the engagement path.
-    if let Some(hint) = size_hint
-        && !should_multi_source(true, hint, common.multi_source_min_bytes, admitted.len())
-    {
-        tracing::info!(
-            "multi-source: not engaging — the blob is ~{hint} bytes, below the {} byte fan-out \
-             floor (--multi-source-min-bytes)",
-            common.multi_source_min_bytes
-        );
-        return true;
-    }
-    false
-}
-
-// Failover classification (`retry_disposition` / `RetryDisposition`) is shared
-// with the multi-source scheduler, so it lives in `decdn_client::retry` and
-// is imported above — the single-source loop below and the scheduler classify
-// failures identically.
 
 /// Shared pull/funding deps [`drive_fetch`] borrows for the lifetime of one
 /// fetch. Mirrors the locals `fetch()` and `bundle_pull::PullCtx` already hold so
@@ -2270,7 +1972,7 @@ impl<F: Funder> Funder for PausingFunder<'_, F> {
 }
 
 /// The drive-level throughput floor (#2120), as the `stop` a drive runs under:
-/// the same `--min-throughput-bps` over `--stall-timeout-ms` a single stream is
+/// the same floor over the same window ([`PullDeadlines`]) a single stream is
 /// held to, judged on `watch`'s position across every leg and the time between
 /// them. Resolves with [`EntryStalled`] when it trips, which the driver returns
 /// and the caller fails over on. At `-v` it logs the drive's position, rate and
@@ -2679,7 +2381,7 @@ where
         rpc: deps.rpc,
         store: deps.store,
         owner: deps.self_address,
-        pool_id,
+        pool_id: FunderPool::Known(pool_id),
         token: deps.token,
         payment_pool_addr: deps.chain.payment_pool,
         max_approve: deps.chain.max_approve,
@@ -3045,52 +2747,21 @@ where
     StripeDriven { faulted, result }
 }
 
-/// One built payment lane for a multi-source fetch: the per-provider
-/// `PoolContext`/`PoolLedger` and the [`PeerSource`] that pays with them. Owns
-/// the `PeerSource` so [`split_face_lanes`] can move it into the
-/// [`StreamCandidate`] a face consumes; the `ctx`/`ledger` `Arc`s are cloned into
-/// that candidate and its watermark handle.
-struct MultiLane<'a> {
-    /// The candidate's `node_id` — the key the coverage map built in
-    /// [`failover_order`] is keyed on, so the scheduler lane this becomes can
-    /// look up its real measured coverage instead of assuming a full holder.
-    node_id: PublicKey,
-    provider: Address,
-    pool_id: PoolId,
+/// One built payment lane: the per-provider `PoolContext`/`PoolLedger` and the
+/// [`PeerSource`] that pays with them. [`super::cli_sources::CliSources`] moves
+/// the source into the [`decdn_client::StreamCandidate`] the acquire loop
+/// consumes and keeps
+/// a [`FaceLaneHandle`] on the same `ctx`/`ledger` for the watermark.
+pub(crate) struct MultiLane<'a> {
+    pub(crate) provider: Address,
+    pub(crate) pool_id: PoolId,
     /// The lane's persisted prior amount — the baseline
     /// [`select_watermark`]/[`persist_watermark`] compute the advance against.
-    prior_amount: U256,
-    ctx: Arc<Mutex<PoolContext>>,
-    ledger: Arc<PoolLedger>,
-    /// The lane's source. A pull opened on it before the fetch is parked here
-    /// for the lane's first open to adopt (#2063).
-    source: PrimedSource<PeerSource<'a>>,
-    /// The range the parked pull covers, which the face hands this lane first;
-    /// `None` when nothing is parked.
-    first_unit: Option<AlignedRange>,
-}
-
-/// The `SourceLane::coverage` for one multi-source lane: the REAL measured
-/// `Coverage` the `cdn/probe/v1` round trip reported for that holder (#1506),
-/// looked up by `node_id` in the map [`failover_order`] built from the probed
-/// `holders`.
-///
-/// A lookup miss — a source with no entry in `coverage_by_node` — gets
-/// `Coverage::full`: every source reaching a multi-source lane already passed
-/// the `has_blob`/`coverage` probe consistency check EXCEPT a proxy-warming
-/// source (a non-holder promoted into the set to seed a regional copy via
-/// pull-through, and so will serve any range) and the pinned `--node-id` path
-/// (which probes nothing and passes an empty map). Both cases mean "will
-/// serve", matching the full-coverage semantic.
-fn lane_coverage(
-    coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
-    node_id: PublicKey,
-    num_blocks: u32,
-) -> decdn_protocol::Coverage {
-    coverage_by_node
-        .get(&node_id)
-        .cloned()
-        .unwrap_or_else(|| decdn_protocol::Coverage::full(num_blocks))
+    pub(crate) prior_amount: U256,
+    pub(crate) ctx: Arc<Mutex<PoolContext>>,
+    pub(crate) ledger: Arc<PoolLedger>,
+    /// The lane's source.
+    pub(crate) source: PeerSource<'a>,
 }
 
 /// Build a probe target for a discovered candidate: its `node_id`, an optional
@@ -3104,12 +2775,19 @@ fn probe_target(cand: &NodeCandidate, relay: Option<RelayUrl>) -> EndpointAddr {
     discovery::with_dial_addrs(target, cand)
 }
 
-/// Build the target address for a discovered candidate: its `node_id`, the
+/// Build the target address for a candidate: its `node_id`, the pinned
+/// `addr` when the user gave one (`--addr`, which requires `--node-id`), the
 /// first configured relay hint, and its registry multiaddrs as direct-address
-/// hints (ADR 001 § Node Discovery). Multi-source only runs on the auto-discovered
-/// set (never the single explicit `--node-id`/`--addr`), so no pinned IP applies.
-fn multi_source_target(candidate: &NodeCandidate, relays: &[RelayUrl]) -> EndpointAddr {
+/// hints (ADR 001 § Node Discovery).
+pub(crate) fn lane_target(
+    candidate: &NodeCandidate,
+    addr: Option<std::net::SocketAddr>,
+    relays: &[RelayUrl],
+) -> EndpointAddr {
     let mut target = EndpointAddr::new(candidate.node_id);
+    if let Some(addr) = addr {
+        target = target.with_ip_addr(addr);
+    }
     if let Some(url) = relays.first() {
         target = target.with_relay_url(url.clone());
     }
@@ -3118,33 +2796,31 @@ fn multi_source_target(candidate: &NodeCandidate, relays: &[RelayUrl]) -> Endpoi
     discovery::with_dial_addrs(target, candidate)
 }
 
-/// Build one [`MultiLane`] for `candidate`: open/reuse its per-provider pool,
-/// seed a ledger from that lane's persisted cumulative, and wrap a [`PeerSource`]
-/// over it. Mirrors the single-source per-candidate construction in `fetch()`'s
-/// failover loop, hoisted so the whole admitted set is built up front.
+/// Build one [`MultiLane`] for `provider` at `target`: open/reuse the pool,
+/// seed a ledger from that lane's persisted cumulative, and wrap a
+/// [`PeerSource`] over it.
 ///
 /// `open_lock`, when `Some`, serializes the pool open-or-reuse inside
 /// [`build_ctx_for_fetch`] against other fetches sharing the one on-chain pool
 /// (bundle pull's cross-entry concurrency, #1774); the guard is dropped before
 /// any streaming, and skipped entirely on the delegated path, which opens
-/// nothing on-chain. Callers must already hold every provider lock for the
-/// fetch's admitted set, so the lock order stays provider-locks → `open_lock`
-/// and no hold-and-wait cycle can form.
+/// nothing on-chain. A caller that holds a provider's stream permit takes it
+/// before `open_lock`, so the lock order stays permit → `open_lock` and no
+/// hold-and-wait cycle can form.
 #[allow(clippy::too_many_arguments)]
-async fn build_multi_lane<'a, P>(
+pub(crate) async fn build_multi_lane<'a, P>(
     deps: &DriveFetchDeps<'a, P>,
     grant: Option<&CapabilityGrant>,
     signer: &Arc<PrivateKeySigner>,
     voucher_dom: &Eip712Domain,
-    candidate: &NodeCandidate,
-    relays: &[RelayUrl],
+    provider: Address,
+    target: EndpointAddr,
     open_lock: Option<&tokio::sync::Mutex<()>>,
     ledgers: Option<&LaneLedgers>,
 ) -> anyhow::Result<MultiLane<'a>>
 where
     P: alloy::providers::Provider + Clone,
 {
-    let provider = candidate.eth_address;
     let ctx = {
         // Bundle pull funnels every entry — and every lane of a multi-source
         // entry — through the one shared `PaymentPool` deposit, so the
@@ -3186,8 +2862,7 @@ where
         },
         ctx,
     );
-    let target = multi_source_target(candidate, relays);
-    let source = PrimedSource::new(PeerSource::new(
+    let source = PeerSource::new(
         deps.endpoint,
         target,
         Arc::clone(&ctx),
@@ -3198,35 +2873,36 @@ where
         deps.max_blob_bytes,
         deps.max_rate_per_mb,
         deps.deadlines,
-    ));
+    );
     Ok(MultiLane {
-        node_id: candidate.node_id,
         provider,
         pool_id,
         prior_amount,
         ctx,
         ledger,
         source,
-        first_unit: None,
     })
 }
 
-/// One lane's watermark-persistence handle for the stdout stream: what
-/// [`stream_lane_watermarks`] needs to settle the lane AFTER the stream, kept
-/// alive after the lane's owned [`PeerSource`] has moved into its
-/// [`StreamCandidate`]. The `ledger` is the SAME `Arc` the stream paid through,
-/// so its settlement is read here once the stream ends.
-struct StreamLane {
-    pool_id: PoolId,
-    provider: Address,
-    prior_amount: U256,
-    ledger: Arc<PoolLedger>,
+/// One lane's watermark-persistence handle: what [`stream_lane_watermarks`]
+/// needs to settle the lane AFTER the fetch, kept alive after the lane's owned
+/// [`PeerSource`] has moved into its [`decdn_client::StreamCandidate`]. The
+/// `ledger` and
+/// `ctx` are the SAME `Arc`s the fetch paid through, so the lane's settlement
+/// is read here once the fetch ends.
+pub(crate) struct FaceLaneHandle {
+    pub(crate) pool_id: PoolId,
+    pub(crate) provider: Address,
+    pub(crate) prior_amount: U256,
+    pub(crate) ledger: Arc<PoolLedger>,
+    /// The lane's buyer context, read to annotate an unbound cache miss.
+    pub(crate) ctx: Arc<Mutex<PoolContext>>,
 }
 
 /// The per-lane [`LaneWatermark`]s to persist after a face fetch, read from the
-/// retained [`StreamLane`] handles — the same settle-at-armed-cumulative rule
+/// retained [`FaceLaneHandle`]s — the same settle-at-armed-cumulative rule
 /// [`multi_lane_watermarks`] then keys for persistence.
-fn stream_lane_watermarks(lanes: &[StreamLane]) -> Vec<LaneWatermark> {
+fn stream_lane_watermarks(lanes: &[FaceLaneHandle]) -> Vec<LaneWatermark> {
     lanes
         .iter()
         .map(|l| LaneWatermark {
@@ -3283,115 +2959,6 @@ where
     Ok(drained)
 }
 
-/// Learn the blob's `total_bytes` from a header-only open, building one payment
-/// lane per admitted candidate in order and FAILING OVER to the next until one
-/// answers (the handshake signs no voucher, so it pays nothing). An unreachable
-/// or refusing first holder therefore does not sink the fetch when other
-/// candidates are healthy; a candidate refused only for OUR deposit
-/// (`InsufficientDeposit`) is not suppressed as a peer fault (mirrors
-/// `open_fetch_prelude`). Shared by the stdout stream, the file download, and
-/// `bundle pull`'s multi-source face paths.
-///
-/// Returns the lanes built so far — every candidate up to and including the
-/// one that answered, in `admitted` order — so a caller whose size gate then
-/// declines has built no lane past it. [`build_remaining_lanes`] builds the rest.
-///
-/// The open is dropped once its header is read. It asks for the whole blob
-/// because the size is not known before it, and nothing parks it for a lane. A
-/// caller that knows the size before the first open calls
-/// [`build_primed_lanes`] instead, whose first open is a lane's first unit
-/// (#2063).
-///
-/// `open_lock` serializes each lane's pool open-or-reuse against other fetches on
-/// the same on-chain pool (`bundle pull` passes its bundle-wide lock; a solo
-/// `decdn fetch` passes `None`). `ledgers`, when set, seeds each lane's ledger
-/// from the run's shared `LaneLedgers` so concurrent entries share one per-lane
-/// voucher watermark.
-#[allow(clippy::too_many_arguments)]
-async fn probe_admitted_total<'a, P>(
-    deps: &DriveFetchDeps<'a, P>,
-    grant: Option<&CapabilityGrant>,
-    signer: &Arc<PrivateKeySigner>,
-    voucher_dom: &Eip712Domain,
-    admitted: &[NodeCandidate],
-    relays: &[RelayUrl],
-    hash: [u8; 32],
-    open_lock: Option<&tokio::sync::Mutex<()>>,
-    ledgers: Option<&LaneLedgers>,
-) -> anyhow::Result<(Vec<MultiLane<'a>>, u64)>
-where
-    P: alloy::providers::Provider + Clone,
-{
-    let peer_store = decdn_client::PeerStore::open(&deps.chain.data_dir);
-    let mut lanes = Vec::with_capacity(admitted.len());
-    let mut total_bytes = None;
-    let mut last_probe_err = None;
-    for candidate in admitted {
-        let lane = build_multi_lane(
-            deps,
-            grant,
-            signer,
-            voucher_dom,
-            candidate,
-            relays,
-            open_lock,
-            ledgers,
-        )
-        .await?;
-        let probe_target = multi_source_target(candidate, relays);
-        let ctx = lane
-            .ctx
-            .lock()
-            .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
-            .clone();
-        match open_progressive_pull(
-            deps.endpoint,
-            probe_target,
-            &ctx,
-            Arc::clone(&lane.ledger),
-            deps.slash_dom,
-            lane.provider,
-            hash,
-            deps.namespace_id,
-            0,
-            micros_now(),
-            deps.max_blob_bytes,
-            deps.max_rate_per_mb,
-            deps.deadlines,
-            0,
-            None,
-        )
-        .await
-        {
-            Ok((header, pull)) => {
-                drop(pull);
-                record_first_open(&peer_store, &lane.node_id, Ok(&header));
-                total_bytes = Some(header.total_bytes);
-            }
-            Err(err) => {
-                record_first_open(&peer_store, &lane.node_id, Err(&err));
-                last_probe_err = Some(match lane.ctx.lock() {
-                    Ok(guard) => annotate_unbound_cache_miss(err, &guard),
-                    Err(_) => err,
-                });
-            }
-        }
-        lanes.push(lane);
-        if total_bytes.is_some() {
-            break;
-        }
-    }
-    match total_bytes {
-        Some(total_bytes) => Ok((lanes, total_bytes)),
-        None => Err(last_probe_err.unwrap_or_else(|| {
-            anyhow::anyhow!(
-                "no admitted holder answered the header open for {}",
-                blake3::Hash::from_bytes(hash).to_hex()
-            )
-        })),
-    }
-}
-
 /// File a lane's first open in the peer store: a success's quoted rate (the
 /// figure this fetch actually pays) with the failure stamp cleared, or a
 /// failure stamp. A success folds no latency: on a cache miss its open time
@@ -3418,365 +2985,14 @@ fn record_first_open(
     }
 }
 
-/// The multi-source size gate for a blob of `total_bytes` over `holders`
-/// admitted holders: below the floor a single fast holder saturates the
-/// downlink, so fan-out is pure overhead. `signed` says whether the size is the
-/// header's or an unsigned expected size, so the log never states a hint as the
-/// blob's size. Returns whether the gate declines.
-fn multi_source_declines(
-    common: &cli::ClientFetchArgs,
-    total_bytes: u64,
-    holders: usize,
-    signed: bool,
-) -> bool {
-    let declines = !should_multi_source(
-        common.multi_source_enabled(),
-        total_bytes,
-        common.multi_source_min_bytes,
-        holders,
-    );
-    if declines {
-        let (approx, source) = if signed {
-            ("", "signed")
-        } else {
-            ("~", "unsigned, expected")
-        };
-        tracing::info!(
-            "multi-source: not engaging — the blob is {approx}{total_bytes} bytes ({source}), \
-             below the {} byte fan-out floor (--multi-source-min-bytes)",
-            common.multi_source_min_bytes
-        );
-    }
-    declines
-}
-
-/// The size a download's first open is cut from: `expected`, unless the
-/// download resumes a ranged store beside `output`. A size known before the
-/// first open lets that open be a lane's first unit rather than a size probe
-/// that is dropped (#2063); a resume starts at its first gap, not at that unit,
-/// so it reads the size with a whole-blob open ([`build_probed_lanes`]).
-fn fresh_download_size(expected: Option<u64>, output: &Path) -> anyhow::Result<Option<u64>> {
-    let Some(expected) = expected else {
-        return Ok(None);
-    };
-    let (dir, stem) = ranged_store_location(output)?;
-    let resumes = ClientRangedStore::has_record(&dir, &stem)
-        .with_context(|| format!("stat the ranged store for {}", output.display()))?;
-    Ok((!resumes).then_some(expected))
-}
-
-/// Learn the size with [`probe_admitted_total`], gate on it, and only then
-/// build the lanes past the one that answered, so a declined fetch builds no
-/// extra lane. `declines` is the gate on the signed size. Returns `None` when
-/// it declines.
-#[allow(clippy::too_many_arguments)]
-async fn build_probed_lanes<'a, P>(
-    deps: &DriveFetchDeps<'a, P>,
-    grant: Option<&CapabilityGrant>,
-    signer: &Arc<PrivateKeySigner>,
-    voucher_dom: &Eip712Domain,
-    admitted: &[NodeCandidate],
-    relays: &[RelayUrl],
-    hash: [u8; 32],
-    open_lock: Option<&tokio::sync::Mutex<()>>,
-    ledgers: Option<&LaneLedgers>,
-    declines: impl FnOnce(u64) -> bool,
-) -> anyhow::Result<Option<(Vec<MultiLane<'a>>, u64)>>
-where
-    P: alloy::providers::Provider + Clone,
-{
-    let (mut lanes, total_bytes) = probe_admitted_total(
-        deps,
-        grant,
-        signer,
-        voucher_dom,
-        admitted,
-        relays,
-        hash,
-        open_lock,
-        ledgers,
-    )
-    .await?;
-    if declines(total_bytes) {
-        return Ok(None);
-    }
-    build_remaining_lanes(
-        deps,
-        grant,
-        signer,
-        voucher_dom,
-        admitted,
-        relays,
-        open_lock,
-        ledgers,
-        &mut lanes,
-    )
-    .await?;
-    Ok(Some((lanes, total_bytes)))
-}
-
-/// Build a payment lane for every admitted candidate, then prime one with the
-/// face's first unit ([`prime_admitted_lanes`]). `unit` names that unit for the
-/// number of lanes built, cut from `expected`. Returns the lanes and the
-/// signed `total_bytes`.
-///
-/// Every lane is built before the first open, so no pool open (which can wait
-/// on the chain) sits between the priming open and the face's adopting one.
-#[allow(clippy::too_many_arguments)]
-async fn build_primed_lanes<'a, P>(
-    deps: &DriveFetchDeps<'a, P>,
-    grant: Option<&CapabilityGrant>,
-    signer: &Arc<PrivateKeySigner>,
-    voucher_dom: &Eip712Domain,
-    admitted: &[NodeCandidate],
-    relays: &[RelayUrl],
-    hash: [u8; 32],
-    open_lock: Option<&tokio::sync::Mutex<()>>,
-    ledgers: Option<&LaneLedgers>,
-    coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
-    expected: u64,
-    unit: impl FnOnce(usize) -> anyhow::Result<AlignedRange>,
-    prime_cap: usize,
-) -> anyhow::Result<(Vec<MultiLane<'a>>, u64)>
-where
-    P: alloy::providers::Provider + Clone,
-{
-    let mut lanes = Vec::with_capacity(admitted.len());
-    build_remaining_lanes(
-        deps,
-        grant,
-        signer,
-        voucher_dom,
-        admitted,
-        relays,
-        open_lock,
-        ledgers,
-        &mut lanes,
-    )
-    .await?;
-    let unit = unit(lanes.len())?;
-    let total_bytes = prime_admitted_lanes(
-        deps,
-        &mut lanes,
-        coverage_by_node,
-        hash,
-        expected,
-        &unit,
-        prime_cap,
-    )
-    .await?;
-    Ok((lanes, total_bytes))
-}
-
-/// Whether the `ix`-th lane opens the face's first `unit` rather than the whole
-/// blob: it sits below `prime_cap` (a face's lane cap, past which the face
-/// never hands it the first unit) and its `coverage` includes every discovery
-/// block of `unit`, since the scheduler reserves a unit only on a lane that
-/// covers it.
-fn lane_opens_unit(
-    ix: usize,
-    prime_cap: usize,
-    coverage: &decdn_protocol::Coverage,
-    unit: &AlignedRange,
-) -> bool {
-    if ix >= prime_cap || unit.fetch_len() == 0 {
-        return false;
-    }
-    let block_bytes = decdn_protocol::discovery_block_bytes();
-    let first = unit.fetch_start() / block_bytes;
-    let last = (unit.fetch_end() - 1) / block_bytes;
-    (first..=last).all(|block| u32::try_from(block).is_ok_and(|block| coverage.covers(block)))
-}
-
-/// Open `unit`, the range a face hands a lane first, on each of `lanes` in
-/// turn until one answers, and park the answering pull on that lane with
-/// `unit` as its first unit, so the lane's first open adopts it (#2063). The
-/// node treats every open as real (it signs, claims a fill, and on a miss
-/// starts an origin draw), so this first open is also paid work rather than a
-/// size probe that is dropped. Returns the signed `total_bytes`.
-///
-/// `expected` is the size `unit` was cut from: the bundle manifest's `size`, or
-/// the largest probe-reported size. Neither is signed, so a provider that signs
-/// another size wins: its pull is dropped and the fetch runs at the signed size,
-/// unprimed. A bounded open that fails because the range runs past the blob's
-/// end ([`decdn_client::is_range_past_end`]) is asked again for the whole blob,
-/// so a wrong `expected` never sinks a healthy holder; any other failure fails
-/// the lane at once, as it would the whole-blob open. Only a lane that
-/// [`lane_opens_unit`] opens `unit`; any other opens the whole blob, as
-/// [`probe_admitted_total`] does.
-///
-/// Call it only once every lane is built: a pull parked longer than
-/// [`decdn_client::PRIMED_MAX_IDLE`] is dropped unadopted, and a lane's pool
-/// open can wait on the chain. A parked pull no open takes closes when the face
-/// drops its candidates.
-///
-/// # Errors
-///
-/// The last lane's open error, when no lane answers.
-#[allow(clippy::too_many_arguments)]
-async fn prime_admitted_lanes<P>(
-    deps: &DriveFetchDeps<'_, P>,
-    lanes: &mut [MultiLane<'_>],
-    coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
-    hash: [u8; 32],
-    expected: u64,
-    unit: &AlignedRange,
-    prime_cap: usize,
-) -> anyhow::Result<u64>
-where
-    P: alloy::providers::Provider + Clone,
-{
-    let peer_store = decdn_client::PeerStore::open(&deps.chain.data_dir);
-    let mut last_err = None;
-    let num_blocks = decdn_protocol::num_blocks(expected);
-    for (ix, lane) in lanes.iter_mut().enumerate() {
-        let peer = lane.source.inner();
-        let coverage = lane_coverage(coverage_by_node, lane.node_id, num_blocks);
-        let bounded = if lane_opens_unit(ix, prime_cap, &coverage, unit) {
-            match peer.open(hash, unit.clone()).await {
-                Ok((header, reader)) => Ok(Some((header, reader, tokio::time::Instant::now()))),
-                // A range past the blob's end means `expected` was wrong, not the
-                // holder: ask it for the whole blob instead.
-                Err(err) if decdn_client::is_range_past_end(&err) => {
-                    tracing::debug!(
-                        peer = %lane.node_id,
-                        "the first unit runs past the blob's end ({err:#}); opening the whole \
-                         blob, as the expected size is wrong"
-                    );
-                    Ok(None)
-                }
-                Err(err) => Err(err),
-            }
-        } else {
-            Ok(None)
-        };
-        let opened = match bounded {
-            Ok(Some((header, reader, opened_at))) => Ok((header, Some((reader, opened_at)))),
-            Ok(None) => peer
-                .open_whole(hash)
-                .await
-                .map(|(header, _whole)| (header, None)),
-            Err(err) => Err(err),
-        };
-        match opened {
-            Ok((header, parked)) => {
-                record_first_open(&peer_store, &lane.node_id, Ok(&header));
-                let total_bytes = header.total_bytes;
-                match parked {
-                    Some((reader, opened_at)) if total_bytes == expected => {
-                        lane.source
-                            .prime(hash, unit.clone(), header, reader, opened_at);
-                        lane.first_unit = Some(unit.clone());
-                    }
-                    Some(_) => tracing::warn!(
-                        peer = %lane.node_id,
-                        signed = total_bytes,
-                        expected,
-                        "the provider signs another size than expected; dropping its first open"
-                    ),
-                    None => {}
-                }
-                return Ok(total_bytes);
-            }
-            Err(err) => {
-                record_first_open(&peer_store, &lane.node_id, Err(&err));
-                last_err = Some(match lane.ctx.lock() {
-                    Ok(guard) => annotate_unbound_cache_miss(err, &guard),
-                    Err(_) => err,
-                });
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| {
-        anyhow::anyhow!(
-            "no admitted holder answered the first open for {}",
-            blake3::Hash::from_bytes(hash).to_hex()
-        )
-    }))
-}
-
-/// Build a payment lane for every admitted candidate past the `lanes` that
-/// [`probe_admitted_total`] already built, keeping `admitted` order. Called only
-/// once the caller has decided to fan out, so a declined fetch builds no extra
-/// lane (no pool open-or-reuse, no `open_lock` turn).
-#[allow(clippy::too_many_arguments)]
-async fn build_remaining_lanes<'a, P>(
-    deps: &DriveFetchDeps<'a, P>,
-    grant: Option<&CapabilityGrant>,
-    signer: &Arc<PrivateKeySigner>,
-    voucher_dom: &Eip712Domain,
-    admitted: &[NodeCandidate],
-    relays: &[RelayUrl],
-    open_lock: Option<&tokio::sync::Mutex<()>>,
-    ledgers: Option<&LaneLedgers>,
-    lanes: &mut Vec<MultiLane<'a>>,
-) -> anyhow::Result<()>
-where
-    P: alloy::providers::Provider + Clone,
-{
-    for candidate in admitted.iter().skip(lanes.len()) {
-        lanes.push(
-            build_multi_lane(
-                deps,
-                grant,
-                signer,
-                voucher_dom,
-                candidate,
-                relays,
-                open_lock,
-                ledgers,
-            )
-            .await?,
-        );
-    }
-    Ok(())
-}
-
-/// Split each built [`MultiLane`] into the [`StreamCandidate`] a face owns (it
-/// takes the `PeerSource`) and the [`StreamLane`] watermark handle that outlives
-/// it (a clone of the same `ledger` Arc the fetch pays through), threading each
-/// candidate's measured coverage and its provider's lease (taken from `leases`)
-/// into the [`StreamCandidate`].
-fn split_face_lanes<'a>(
-    lanes: Vec<MultiLane<'a>>,
-    coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
-    total_bytes: u64,
-    leases: &mut HashMap<Address, LaneLease>,
-) -> (
-    Vec<StreamCandidate<PrimedSource<PeerSource<'a>>>>,
-    Vec<StreamLane>,
-) {
-    let num_blocks = decdn_protocol::num_blocks(total_bytes);
-    let mut candidates = Vec::with_capacity(lanes.len());
-    let mut handles = Vec::with_capacity(lanes.len());
-    for lane in lanes {
-        let coverage = lane_coverage(coverage_by_node, lane.node_id, num_blocks);
-        handles.push(StreamLane {
-            pool_id: lane.pool_id,
-            provider: lane.provider,
-            prior_amount: lane.prior_amount,
-            ledger: Arc::clone(&lane.ledger),
-        });
-        candidates.push(StreamCandidate {
-            source: lane.source,
-            ctx: lane.ctx,
-            ledger: lane.ledger,
-            coverage: Some(coverage),
-            first_unit: lane.first_unit,
-            lease: leases.remove(&lane.provider).unwrap_or_default(),
-        });
-    }
-    (candidates, handles)
-}
-
 /// Persist every face lane's voucher watermark from the retained handles — the
 /// same settle-at-armed-cumulative rule the file path applies. The faces do not
 /// persist, so the thin CLI layer does it after the fetch, before surfacing any
 /// error: the bytes each lane delivered are paid for whatever the outcome.
-fn persist_face_watermarks(
+pub(crate) fn persist_face_watermarks(
     store: &RedbBuyerPoolStore,
     self_address: Address,
-    handles: &[StreamLane],
+    handles: &[FaceLaneHandle],
 ) {
     for (lane, vprogress) in multi_lane_watermarks(self_address, &stream_lane_watermarks(handles)) {
         persist_watermark(store, self_address, lane.pool_id, lane, &vprogress);
@@ -3786,120 +3002,33 @@ fn persist_face_watermarks(
 /// Stream `hash`'s verified bytes to STDOUT via the [`Streamer`] consumption face
 /// (#1848 4b). Only bao-verified bytes ever reach the pipe — safe to `| tar x` —
 /// the fetch is consumption-paced (a slow or early-quit consumer stops the pull
-/// and the spend within one read-ahead window), and a candidate that faults
-/// mid-stream fails over to another with no re-pull or re-pay. Returns the
-/// content bytes streamed.
+/// and the spend within one read-ahead window), and a source that faults
+/// mid-stream cools while another carries on, with no re-pull or re-pay.
 ///
-/// Progress draws on stderr, only when stderr is a terminal; stdout carries
-/// nothing but the verified bytes. Each lane's voucher watermark is
-/// persisted after the stream, exactly as the file path does — the `Streamer`
-/// face does not persist, so this thin CLI layer does.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// `max_sources` is the front lane cap. Progress draws on stderr, only when
+/// stderr is a terminal; stdout carries nothing but the verified bytes. The
+/// caller persists each lane's voucher watermark after the stream.
+#[allow(clippy::too_many_arguments)]
 async fn stream_to_stdout<P>(
     deps: &DriveFetchDeps<'_, P>,
-    common: &cli::ClientFetchArgs,
-    grant: Option<&CapabilityGrant>,
-    signer: &Arc<PrivateKeySigner>,
-    voucher_dom: &Eip712Domain,
-    candidates: &[NodeCandidate],
-    coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
-    relays: &[RelayUrl],
+    sources: &CliSources<'_, P>,
+    holders: Vec<Holder>,
+    health: Arc<PeerHealth>,
     hash: [u8; 32],
-    size_hint: Option<u64>,
-) -> anyhow::Result<u64>
+    total_bytes: u64,
+    stop: StopPolicy,
+    max_sources: usize,
+) -> anyhow::Result<()>
 where
     P: alloy::providers::Provider + Clone,
 {
-    // Stream across every admissible holder; a single holder is fine too. Clamp
-    // `--max-sources` to at least one so a `0` never admits an empty set — the
-    // Streamer caps at >=1 lane regardless, and a paced stream's fan-out is that
-    // small cap, not the file path's size floor (so there is no size gate here).
-    let admitted = discovery::admit_sources(candidates.to_vec(), common.max_sources.max(1));
-    if admitted.is_empty() {
-        anyhow::bail!(
-            "no candidate holders to stream {} from",
-            blake3::Hash::from_bytes(hash).to_hex()
-        );
-    }
-
-    // The user's `--max-sources` is the front lane cap; read-ahead stays the
-    // default (the outstanding-spend bound for an abandoned pipe). With the
-    // multi-source kill switch off, the stream holds one lane at a time and the
-    // other holders stay failover candidates only.
-    let lane_cap = if common.multi_source_enabled() {
-        common.max_sources.max(1)
-    } else {
-        1
-    };
+    // Read-ahead stays the default: the outstanding-spend bound for an
+    // abandoned pipe.
     let pull_config = PullConfig {
-        streamer_lane_cap: lane_cap,
+        streamer_lane_cap: max_sources.max(1),
         ..PullConfig::new()
     };
-
-    // A solo stdout stream has no shared pool lock or ledger registry. With a
-    // size hint the first open is the stream's first unit (#2063); without one
-    // it only reads the size.
-    let (lanes, total_bytes) = if let Some(expected) = size_hint {
-        let unit = decdn_client::stream_first_unit(expected, &pull_config)?;
-        build_primed_lanes(
-            deps,
-            grant,
-            signer,
-            voucher_dom,
-            &admitted,
-            relays,
-            hash,
-            None,
-            None,
-            coverage_by_node,
-            expected,
-            |_| Ok(unit),
-            lane_cap,
-        )
-        .await?
-    } else {
-        let (mut lanes, total_bytes) = probe_admitted_total(
-            deps,
-            grant,
-            signer,
-            voucher_dom,
-            &admitted,
-            relays,
-            hash,
-            None,
-            None,
-        )
-        .await?;
-        build_remaining_lanes(
-            deps,
-            grant,
-            signer,
-            voucher_dom,
-            &admitted,
-            relays,
-            None,
-            None,
-            &mut lanes,
-        )
-        .await?;
-        (lanes, total_bytes)
-    };
-    let (stream_candidates, handles) =
-        split_face_lanes(lanes, coverage_by_node, total_bytes, &mut HashMap::new());
-    // Keep the first lane's ctx to annotate an unbound-namespace cache miss on
-    // failure, as the file path does.
-    let first_ctx = stream_candidates.first().map(|c| Arc::clone(&c.ctx));
-
-    let funder = CliFunder {
-        contract: deps.contract,
-        rpc: deps.rpc,
-        store: deps.store,
-        owner: deps.self_address,
-        pool_id: handles.first().map_or(PoolId::ZERO, |h| h.pool_id),
-        token: deps.token,
-        payment_pool_addr: deps.chain.payment_pool,
-        max_approve: deps.chain.max_approve,
-    };
+    let funder = sources.funder();
     let drive_config = DriveConfig::cli(deps.chain.working_deposit);
 
     // The fill store's `.partial` lives here for the stream's lifetime; a streamed
@@ -3907,15 +3036,16 @@ where
     // natural home.
     let scratch = tempfile::tempdir_in(&deps.chain.data_dir)
         .map_err(|e| anyhow::anyhow!("open stream scratch dir: {e}"))?;
-
-    // A dropped stream records every lane's vouchers (its scratch store is
-    // discarded either way).
-    let on_drop = SettleOnDrop::new(|| {
-        persist_face_watermarks(deps.store, deps.self_address, &handles);
-    });
-    let streamer = Streamer::new(stream_candidates, funder, drive_config, scratch.path());
+    let streamer = Streamer::new(
+        sources,
+        holders,
+        health,
+        funder,
+        drive_config,
+        scratch.path(),
+    );
     let (mut reader, mut drive) = streamer
-        .open(hash, total_bytes, &pull_config, Arc::new(NoCache))
+        .open(hash, total_bytes, &pull_config, Arc::new(NoCache), stop)
         .await?;
 
     // The bar draws on stderr, so it shows only when stderr is a terminal; stdout
@@ -3940,101 +3070,68 @@ where
     if let Some((bar, _, _)) = &bar {
         bar.finish_and_clear();
     }
-
-    // Persist every lane's watermark before surfacing a stream error.
-    on_drop.disarm();
-    persist_face_watermarks(deps.store, deps.self_address, &handles);
-
-    copy_result.map_err(|err| match first_ctx.as_ref().map(|c| c.lock()) {
-        Some(Ok(guard)) => annotate_unbound_cache_miss(err, &guard),
-        _ => err,
-    })
+    let copied = copy_result?;
+    tracing::info!("streamed {copied} verified bytes to stdout");
+    Ok(())
 }
 
-/// Fetch `hash` to `output` via the [`Downloader`] consumption face (#1848 4c) —
-/// the multi-source engagement for `decdn fetch -o <file>`.
-///
-/// Returns `Ok(Some(total_bytes))` once the blob is written, `Ok(None)` when the
-/// multi-source gate declines (the caller then runs the single-source failover
-/// loop, unchanged), or `Err` when the parallel fetch fails after every candidate
-/// is exhausted — the `.partial` beside `output` is left in place for a later
-/// resume, exactly like a single-source failure.
-///
-/// A solo `decdn fetch` has no shared on-chain pool lock or ledger registry, so
-/// it hands `None`/`None` to [`multi_source_download`].
+/// Fetch `hash` to `output` via the [`Downloader`] consumption face (#1848 4c),
+/// striping across `holders`, and print the summary line. The `.partial`
+/// beside `output` stays in place on a failure for a later resume. The caller
+/// persists each lane's voucher watermark after the fetch.
 #[allow(clippy::too_many_arguments)]
 async fn download_to_file<P>(
     deps: &DriveFetchDeps<'_, P>,
-    common: &cli::ClientFetchArgs,
-    grant: Option<&CapabilityGrant>,
-    signer: &Arc<PrivateKeySigner>,
-    voucher_dom: &Eip712Domain,
-    candidates: &[NodeCandidate],
-    coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
-    relays: &[RelayUrl],
+    sources: &CliSources<'_, P>,
+    holders: Vec<Holder>,
+    health: Arc<PeerHealth>,
     hash: [u8; 32],
+    total_bytes: u64,
     output: &Path,
-    size_hint: Option<u64>,
-    progress: Option<&ProgressCallback>,
-) -> anyhow::Result<Option<u64>>
+    stop: &StopPolicy,
+) -> anyhow::Result<()>
 where
     P: alloy::providers::Provider + Clone,
 {
-    // Pre-probe gate: short-circuit BEFORE any chain/network work when the kill
-    // switch is off, too few holders are admissible, or a discovery size hint is
-    // already below the fan-out floor.
-    let admitted = discovery::admit_sources(candidates.to_vec(), common.max_sources);
-    if multi_source_gate_declines(common, candidates, &admitted, size_hint) {
-        return Ok(None);
-    }
-    multi_source_download(
-        deps,
-        common,
-        grant,
-        signer,
-        voucher_dom,
-        admitted,
-        coverage_by_node,
-        relays,
-        hash,
-        output,
-        size_hint,
-        progress,
+    let (bar, on_progress, meter) = delivery_progress();
+    let downloader = Downloader::new(
+        sources,
+        holders,
+        health,
+        sources.funder(),
+        DriveConfig::cli(deps.chain.working_deposit),
+    );
+    let result = Box::pin(downloader.fetch_to_paths_until(
+        &[DownloadTarget {
+            hash,
+            total_bytes,
+            dest: output,
+            ranges: None,
+        }],
+        &PullConfig::new(),
         None,
-        None,
-        HashMap::new(),
-    )
-    .await
+        Some(&on_progress),
+        stop,
+    ))
+    .await;
+    bar.finish_and_clear();
+    result?;
+    print_fetch_summary(total_bytes, &meter, output);
+    Ok(())
 }
 
-/// Fetch `hash` to `output` in parallel across the ALREADY-ADMITTED candidate set
-/// via the [`Downloader`] face — the shared multi-source engagement for both
-/// `decdn fetch -o <file>` ([`download_to_file`]) and `bundle pull`'s per-entry
-/// whole-file path.
+/// Fetch `hash` to `output` through the acquire loop across `order`'s
+/// holders — `bundle pull`'s per-entry whole-file path. Returns the blob's
+/// signed `total_bytes` once it is written.
 ///
-/// Returns `Ok(Some(total_bytes))` once the blob is written, `Ok(None)` when the
-/// size gate declines (the caller runs its single-source failover loop), or
-/// `Err` when the parallel fetch fails after every candidate is exhausted — the
-/// `.partial` beside `output` is left for a later resume. The gate runs on
-/// `expected_size` before any open, and again on the signed header size.
-///
-/// `expected_size` is the unsigned size the first open is cut from, so that
-/// open is a lane's first unit (#2063). A resume, or `None`, reads the size
-/// with a whole-blob open instead.
-///
-/// Each admitted candidate becomes its OWN payment lane; the Downloader stripes
-/// across them, fails over between them (#1174), bao-verifies every byte, and
-/// promotes the `.partial` beside `output` to `output`. Every lane's voucher
-/// watermark is persisted after — the face does not persist, so this thin CLI
-/// layer does. `open_lock` and `ledgers` thread `bundle pull`'s shared pool lock
-/// and ledger registry through; a solo `decdn fetch` passes `None`/`None`.
-/// `leases` holds what each provider's lane keeps while it takes work, keyed by
-/// provider: the lane drops it when it stops ([`LaneLease`]). A solo `decdn
-/// fetch` passes none.
-///
-/// The fetch runs under the drive-level floor ([`drive_floor`]), judged on the
-/// position across every lane. A trip returns [`EntryStalled`], which is
-/// retryable, so the caller resumes the `.partial` on its single-source path.
+/// The size comes from a signed header-only open ([`CliSources::signed_size`]),
+/// never from the manifest or the probe hint. At most `--max-sources` holders
+/// stripe at once. `open_lock`, `ledgers` and `lane_cap` thread `bundle pull`'s
+/// shared pool lock, ledger registry and per-provider stream cap through. The
+/// fetch gives up after [`decdn_client::SCRIPT_GIVE_UP`] without a verified
+/// byte, so the caller's own fallback can run. Every lane's voucher watermark
+/// is persisted before the result is returned, whatever it is; the `.partial`
+/// beside `output` stays for a resume.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn multi_source_download<P>(
     deps: &DriveFetchDeps<'_, P>,
@@ -4042,137 +3139,84 @@ pub(crate) async fn multi_source_download<P>(
     grant: Option<&CapabilityGrant>,
     signer: &Arc<PrivateKeySigner>,
     voucher_dom: &Eip712Domain,
-    admitted: Vec<NodeCandidate>,
-    coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
+    order: &ResolvedTargets,
     relays: &[RelayUrl],
     hash: [u8; 32],
     output: &Path,
-    expected_size: Option<u64>,
     progress: Option<&ProgressCallback>,
-    open_lock: Option<&tokio::sync::Mutex<()>>,
-    ledgers: Option<&LaneLedgers>,
-    mut leases: HashMap<Address, LaneLease>,
-) -> anyhow::Result<Option<u64>>
+    shared: BundleShared<'_>,
+) -> anyhow::Result<u64>
 where
     P: alloy::providers::Provider + Clone,
 {
-    // Size gate: below the floor a single fast holder saturates the downlink, so
-    // fan-out is pure overhead — fall through to the single-source path.
-    let declines = |total_bytes: u64, signed: bool| {
-        multi_source_declines(common, total_bytes, admitted.len(), signed)
-    };
-    let (lanes, total_bytes) = if let Some(expected) = fresh_download_size(expected_size, output)? {
-        if declines(expected, false) {
-            return Ok(None);
-        }
-        let (lanes, total_bytes) = build_primed_lanes(
-            deps,
-            grant,
-            signer,
-            voucher_dom,
-            &admitted,
-            relays,
-            hash,
-            open_lock,
-            ledgers,
-            coverage_by_node,
-            expected,
-            |lanes| decdn_client::download_first_unit(expected, lanes),
-            usize::MAX,
-        )
-        .await?;
-        // The gate ran on an unsigned size; run it again on the signed one.
-        if total_bytes != expected && declines(total_bytes, true) {
-            return Ok(None);
-        }
-        (lanes, total_bytes)
-    } else {
-        let probed = build_probed_lanes(
-            deps,
-            grant,
-            signer,
-            voucher_dom,
-            &admitted,
-            relays,
-            hash,
-            open_lock,
-            ledgers,
-            |total_bytes| declines(total_bytes, true),
-        )
-        .await?;
-        let Some(probed) = probed else {
-            return Ok(None);
-        };
-        probed
-    };
-
-    let (stream_candidates, handles) =
-        split_face_lanes(lanes, coverage_by_node, total_bytes, &mut leases);
-    // A lease no built lane took (a holder that did not open) frees now.
-    drop(leases);
-    // Keep the first lane's ctx to annotate an unbound-namespace cache miss on
-    // failure.
-    let first_ctx = stream_candidates.first().map(|c| Arc::clone(&c.ctx));
-
-    let funder = CliFunder {
-        contract: deps.contract,
-        rpc: deps.rpc,
-        store: deps.store,
-        owner: deps.self_address,
-        pool_id: handles.first().map_or(PoolId::ZERO, |h| h.pool_id),
-        token: deps.token,
-        payment_pool_addr: deps.chain.payment_pool,
-        max_approve: deps.chain.max_approve,
-    };
-    let drive_config = DriveConfig::cli(deps.chain.working_deposit);
-    // Honor `--unit-deadline-ms` as the download stall watchdog. Read-ahead and
-    // the lane cap are Streamer tunables; the Downloader uncaps fan-out across the
-    // admitted set (already capped to `--max-sources` by `admit_sources`).
-    let pull_config = PullConfig {
-        download_unit_deadline: Duration::from_millis(common.unit_deadline_ms),
-        ..PullConfig::new()
-    };
-
-    // The drive-level floor spans every lane (#2120). The scheduler's unit
-    // watchdog judges one lane's unit at a time, so it cannot see a fetch whose
-    // lanes all crawl just inside their deadlines. The observe hook is always
-    // installed: the scheduler reports no progress without a callback.
-    let watch = EntryWatch::default();
-    let watched = watch.observing(progress);
-    let funder = PausingFunder {
-        inner: &funder,
-        watch: &watch,
-    };
-    let downloader = Downloader::new(stream_candidates, funder, drive_config);
+    let sources = CliSources::new(
+        deps,
+        common,
+        relays,
+        grant,
+        signer,
+        voucher_dom,
+        shared.open_lock,
+        shared.ledgers,
+        shared.lane_cap,
+    );
+    let holders = sources.holders_from(order);
+    let stop = StopPolicy::new(
+        false,
+        Some(decdn_client::SCRIPT_GIVE_UP),
+        Arc::new(ProgressClock::new()),
+    );
+    let health = Arc::new(PeerHealth::default());
     // A dropped download records every lane's vouchers.
-    let on_drop = SettleOnDrop::new(|| {
-        persist_face_watermarks(deps.store, deps.self_address, &handles);
-    });
-    let result = Box::pin(downloader.fetch_to_paths_until(
-        &[DownloadTarget {
-            hash,
-            total_bytes,
-            dest: output,
-        }],
-        &pull_config,
-        ledgers,
-        Some(&watched),
-        drive_floor(deps.deadlines, hash, total_bytes, &watch),
-    ))
+    let on_drop = SettleOnDrop::new(|| sources.persist_watermarks());
+    let result = async {
+        let total_bytes = sources
+            .signed_size(hash, holders.clone(), &health, &stop)
+            .await?;
+        let holders = holders
+            .into_iter()
+            .take(common.max_sources.max(1))
+            .collect();
+        let downloader = Downloader::new(
+            &sources,
+            holders,
+            health,
+            sources.funder(),
+            DriveConfig::cli(deps.chain.working_deposit),
+        );
+        Box::pin(downloader.fetch_to_paths_until(
+            &[DownloadTarget {
+                hash,
+                total_bytes,
+                dest: output,
+                ranges: None,
+            }],
+            &PullConfig::new(),
+            shared.ledgers,
+            progress,
+            &stop,
+        ))
+        .await?;
+        Ok(total_bytes)
+    }
     .await;
-
     // Persist every lane's watermark before surfacing an error: paid bytes are
     // paid whatever the fetch's outcome.
     on_drop.disarm();
-    persist_face_watermarks(deps.store, deps.self_address, &handles);
+    sources.persist_watermarks();
+    result.map_err(|err| sources.annotate(err))
+}
 
-    match result {
-        Ok(_written) => Ok(Some(total_bytes)),
-        Err(err) => Err(match first_ctx.as_ref().map(|c| c.lock()) {
-            Some(Ok(guard)) => annotate_unbound_cache_miss(err, &guard),
-            _ => err,
-        }),
-    }
+/// What `bundle pull` shares across the entries of one run, for
+/// [`multi_source_download`].
+#[derive(Clone, Copy, Default)]
+pub(crate) struct BundleShared<'a> {
+    /// Serializes each lane's pool open-or-reuse against the other entries.
+    pub(crate) open_lock: Option<&'a tokio::sync::Mutex<()>>,
+    /// The run's shared voucher-ledger registry.
+    pub(crate) ledgers: Option<&'a LaneLedgers>,
+    /// The run's per-provider stream cap.
+    pub(crate) lane_cap: Option<&'a super::bundle_pull::LaneStreamCap>,
 }
 
 /// One lane's persisted-watermark inputs, lifted out of [`MultiLane`] so the
@@ -4238,15 +3282,39 @@ fn multi_lane_watermarks(
 /// There is no funder-vs-delegate split here: the CLI fetcher is always its
 /// own pool owner, so `top_up` is unconditionally authorized (`topUp` is
 /// owner-only on-chain, and owner == signer on this path).
-struct CliFunder<'a, P> {
-    contract: &'a PaymentPool::PaymentPoolInstance<P>,
-    rpc: &'a P,
-    store: &'a RedbBuyerPoolStore,
-    owner: Address,
-    pool_id: PoolId,
-    token: Address,
-    payment_pool_addr: Address,
-    max_approve: bool,
+pub(crate) struct CliFunder<'a, P> {
+    pub(crate) contract: &'a PaymentPool::PaymentPoolInstance<P>,
+    pub(crate) rpc: &'a P,
+    pub(crate) store: &'a RedbBuyerPoolStore,
+    pub(crate) owner: Address,
+    pub(crate) pool_id: FunderPool<'a>,
+    pub(crate) token: Address,
+    pub(crate) payment_pool_addr: Address,
+    pub(crate) max_approve: bool,
+}
+
+/// The pool a [`CliFunder`] tops up.
+#[derive(Clone, Copy)]
+pub(crate) enum FunderPool<'a> {
+    /// A pool the caller already built its lane on.
+    Known(PoolId),
+    /// The pool the first lane a [`super::cli_sources::CliSources`] builds
+    /// opens or reuses. Every lane pays from the one pool, and a top-up runs
+    /// only from a running lane, so it is set by then.
+    FirstLane(&'a std::sync::OnceLock<PoolId>),
+}
+
+impl FunderPool<'_> {
+    /// The pool to top up.
+    fn get(self) -> anyhow::Result<PoolId> {
+        match self {
+            Self::Known(pool_id) => Ok(pool_id),
+            Self::FirstLane(cell) => cell
+                .get()
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("no payment lane is built, so no pool to top up")),
+        }
+    }
 }
 
 impl<P> Funder for CliFunder<'_, P>
@@ -4259,6 +3327,7 @@ where
 
     fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
         Box::pin(async move {
+            let pool_id = self.pool_id.get()?;
             // `topUp` pulls `additional` USDC via `transferFrom`, so the
             // standing allowance must cover it first: unlimited under
             // `--max-approve`, else exactly `additional`.
@@ -4274,16 +3343,15 @@ where
                 },
             )
             .await?;
-            let ToppedUpPool { credited, tx } =
-                top_up(self.contract, self.pool_id, additional).await?;
+            let ToppedUpPool { credited, tx } = top_up(self.contract, pool_id, additional).await?;
             // Grade here rather than handing the escrowed-but-untracked
             // outcomes back for the driver to bail on. The driver treats them
             // as terminal either way, but `DepositOutcome` has nowhere to carry
             // the tx or the pool, so its bail names neither — and this is the
             // one leg where the escrow has already moved.
-            let effect = topped_up_effect(self.pool_id, credited);
+            let effect = topped_up_effect(pool_id, credited);
             let new_deposit = grade_deposit_credit(
-                self.store.add_deposit(self.owner, self.pool_id, credited),
+                self.store.add_deposit(self.owner, pool_id, credited),
                 &effect,
                 tx,
             )?;
@@ -5196,11 +4264,8 @@ mod tests {
             proxy_warming: false,
             proxy_warming_rtt_threshold_ms: 150,
             proxy_warming_margin_ms: 30,
-            multi_source: false,
-            no_multi_source: false,
             max_sources: 4,
-            multi_source_min_bytes: 67_108_864,
-            unit_deadline_ms: 10_000,
+            give_up_after_secs: None,
             chain_id: None,
             keystore: None,
             keystore_password_file: None,
@@ -5208,8 +4273,6 @@ mod tests {
             working_deposit_micro_usdc: None,
             max_blob_mb: 1024,
             max_rate_per_mb: 0,
-            stall_timeout_ms: 30_000,
-            min_throughput_bps: 4096,
             timeout_ms: 3_600_000,
             capability: None,
             capability_file: None,
@@ -5283,17 +4346,6 @@ mod tests {
             "the final progress report reaches the blob's total"
         );
         Ok(())
-    }
-
-    /// The pure multi-source engagement gate (#1760-series follow-on): engage
-    /// only when the kill switch is on, the blob clears the size floor, and at
-    /// least two admissible holders exist to fan out across.
-    #[test]
-    fn engagement_gate_requires_enabled_size_and_two_holders() {
-        assert!(should_multi_source(true, 100 << 20, 64 << 20, 2));
-        assert!(!should_multi_source(false, 100 << 20, 64 << 20, 4)); // kill switch
-        assert!(!should_multi_source(true, 10 << 20, 64 << 20, 4)); // below size gate
-        assert!(!should_multi_source(true, 100 << 20, 64 << 20, 1)); // one holder
     }
 
     /// `spawn_harvest`/`NodeCandidate` are `pub(crate)`, unreachable from an
@@ -5481,7 +4533,6 @@ mod tests {
         assert_eq!(targets.candidates[2].node_id, harvest_key(1));
         assert!(targets.coverage_by_node.is_empty());
         assert!(targets.probed_samples.is_empty());
-        assert!(targets.size_hint.is_none());
         // The fast path is the one construction site that marks its result, so
         // the driver can fall through to discovery if every one of these
         // never-probed candidates turns out to be unreachable (ADR 037 § in-fetch
@@ -5669,32 +4720,12 @@ mod tests {
         anyhow::Error::new(UpstreamRefused::mid_stream(error))
     }
 
-    // `retry_disposition` classification is unit-tested at its home in
-    // `decdn_client::retry`; the CLI reuses that exact function, so the
-    // failover loop and the multi-source scheduler share one classifier.
-
     fn node_key(seed: u8) -> PublicKey {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
     fn holder(seed: u8, rtt_ms: f64) -> discovery::Probed {
-        holder_sized(seed, rtt_ms, None)
-    }
-
-    /// A holder whose probe reported (or withheld) a blob size — the hint the
-    /// multi-source engagement gate applies its floor against.
-    fn holder_sized(seed: u8, rtt_ms: f64, total_bytes: Option<u64>) -> discovery::Probed {
-        discovery::Probed {
-            candidate: NodeCandidate {
-                node_id: node_key(seed),
-                eth_address: Address::repeat_byte(seed),
-                region_hint: None,
-                multiaddrs: Bytes::new(),
-            },
-            rtt_ms,
-            total_bytes,
-            coverage: decdn_protocol::Coverage::empty(),
-        }
+        super::tests_support::holder(seed, rtt_ms)
     }
 
     fn warming_params(enabled: bool) -> ProxyWarmingParams {
@@ -5803,7 +4834,6 @@ mod tests {
         let out = super::failover_order(Vec::new(), &non_holders, warming_params(false));
 
         assert!(out.warming_lead.is_none(), "no holder to warm toward");
-        assert!(out.size_hint.is_none(), "no holder reported a size");
         assert!(
             out.coverage_by_node.is_empty(),
             "non-holders carry no measured coverage"
@@ -5851,81 +4881,6 @@ mod tests {
         assert_ne!(h1.coverage, h2.coverage);
         // A node that was never probed has no entry.
         assert!(!out.coverage_by_node.contains_key(&node_key(99)));
-    }
-
-    /// Only a lane below the face's lane cap whose coverage holds every block of
-    /// the unit opens it; the scheduler would refuse to reserve it on any other.
-    #[test]
-    fn only_a_capped_covering_lane_opens_the_first_unit() {
-        let block = decdn_protocol::discovery_block_bytes();
-        let total = 3 * block;
-        let blocks = decdn_protocol::num_blocks(total);
-        let full = decdn_protocol::Coverage::full(blocks);
-        let head = decdn_protocol::Coverage::from_block_indices(blocks, [0].into_iter());
-        let tail = decdn_protocol::Coverage::from_block_indices(blocks, [1, 2].into_iter());
-        let first_block = align_range(0, block, total).expect("align");
-        let two_blocks = align_range(0, 2 * block, total).expect("align");
-
-        assert!(super::lane_opens_unit(0, 1, &full, &first_block));
-        assert!(super::lane_opens_unit(0, 1, &head, &first_block));
-        assert!(
-            !super::lane_opens_unit(1, 1, &full, &first_block),
-            "past the cap"
-        );
-        assert!(
-            !super::lane_opens_unit(0, 1, &tail, &first_block),
-            "block 0 uncovered"
-        );
-        assert!(
-            !super::lane_opens_unit(0, 1, &head, &two_blocks),
-            "block 1 uncovered"
-        );
-        let empty = align_range(0, 0, 0).expect("align");
-        assert!(
-            !super::lane_opens_unit(0, 1, &full, &empty),
-            "nothing to open"
-        );
-    }
-
-    /// A download cuts its first open from the expected size only when it starts
-    /// fresh: a `.ranges` record beside the output is a resume, whose first
-    /// gap is not the first unit (#2063).
-    #[test]
-    fn a_fresh_download_uses_the_expected_size_and_a_resume_does_not() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let output = dir.path().join("blob");
-        assert_eq!(
-            super::fresh_download_size(None, &output).expect("stat"),
-            None
-        );
-        assert_eq!(
-            super::fresh_download_size(Some(42), &output).expect("stat"),
-            Some(42)
-        );
-        std::fs::write(dir.path().join("blob.partial.ranges"), b"").expect("record");
-        assert_eq!(
-            super::fresh_download_size(Some(42), &output).expect("stat"),
-            None
-        );
-    }
-
-    /// [`lane_coverage`] is the read side of the same map: a holder with a
-    /// measured (possibly partial) coverage gets exactly that back, while a
-    /// node absent from the map — a proxy-warming source or the pinned
-    /// `--node-id` path's empty map — falls back to a full holder rather than
-    /// silently dropping out of the fan-out.
-    #[test]
-    fn lane_coverage_prefers_measured_coverage_and_falls_back_to_full() {
-        let measured = decdn_protocol::Coverage::from_block_indices(4, [0, 2].into_iter());
-        let mut map = HashMap::new();
-        map.insert(node_key(1), measured.clone());
-
-        assert_eq!(super::lane_coverage(&map, node_key(1), 4), measured);
-        assert_eq!(
-            super::lane_coverage(&map, node_key(2), 4),
-            decdn_protocol::Coverage::full(4),
-            "an unmeasured source (proxy / pinned --node-id) is treated as a full holder"
-        );
     }
 
     /// The delegated signer gate accepts the authorized key and rejects any
@@ -6016,6 +4971,42 @@ mod tests {
         assert!(
             annotated.to_string().contains("capacity_bond_address"),
             "expected the binding hint, got: {annotated}"
+        );
+    }
+
+    /// Every source saying `NotFound` ends the fetch as `NoSourceHasBlob`, with
+    /// no `UpstreamRefused` left in the chain: an unbound fetch still gets the
+    /// binding hint, and a bound one passes through untouched.
+    #[test]
+    fn unbound_no_source_has_blob_gets_the_binding_hint() {
+        let absent = || anyhow::Error::new(NoSourceHasBlob);
+        let annotated = annotate_unbound_cache_miss(absent(), &ctx_with(None));
+        assert!(
+            annotated.to_string().contains("capacity_bond_address"),
+            "expected the binding hint, got: {annotated}"
+        );
+        assert!(annotated.downcast_ref::<NoSourceHasBlob>().is_some());
+
+        let signer = PrivateKeySigner::random();
+        let binding =
+            sign_client_binding(&signer, B256::ZERO, &bind_node_id_domain(1, Address::ZERO))
+                .expect("sign binding");
+        let bound = annotate_unbound_cache_miss(absent(), &ctx_with(Some(binding)));
+        assert_eq!(bound.to_string(), NoSourceHasBlob.to_string());
+    }
+
+    /// A delegated fetch no provider's voucher fits names the owner-side remedy.
+    #[test]
+    fn delegated_no_affordable_source_gets_the_owner_remedy_hint() {
+        let err = anyhow::Error::new(NoAffordableSource {
+            deposit: U256::from(5u32),
+        });
+        let annotated = annotate_delegated_exhaustion(err);
+        assert!(
+            annotated
+                .to_string()
+                .contains("ask the pool owner to top up"),
+            "{annotated}"
         );
     }
 
@@ -6353,31 +5344,6 @@ mod tests {
         );
     }
 
-    // ---- the probe size hint that spares the engagement gate a throwaway open ----
-
-    /// The gate's size hint is the LARGEST size any holder reported. The field is
-    /// unsigned and only ever DECLINES fan-out, so taking the maximum keeps one
-    /// node's understated hint from suppressing multi-source for the whole set.
-    #[test]
-    fn failover_order_takes_the_largest_reported_size_hint() {
-        let holders = vec![
-            holder_sized(1, 10.0, Some(1024)),
-            holder_sized(2, 20.0, Some(64 * 1024 * 1024)),
-            holder_sized(3, 30.0, None),
-        ];
-        let out = super::failover_order(holders, &[], warming_params(false));
-        assert_eq!(out.size_hint, Some(64 * 1024 * 1024));
-    }
-
-    /// No holder reported a size: the gate has no hint and falls back to the
-    /// authoritative header open.
-    #[test]
-    fn failover_order_has_no_size_hint_when_no_holder_reports_one() {
-        let holders = vec![holder_sized(1, 10.0, None), holder_sized(2, 20.0, None)];
-        let out = super::failover_order(holders, &[], warming_params(false));
-        assert_eq!(out.size_hint, None);
-    }
-
     /// A usable rate renders as a human `X/s`; a sub-1-byte/s rate (no data yet,
     /// or a stall) and any non-finite value both render as `--`.
     #[test]
@@ -6521,7 +5487,7 @@ mod tests {
             "{took:?}"
         );
         assert!(is_entry_stall(&err));
-        assert_eq!(retry_disposition(&err), RetryDisposition::RetryElsewhere);
+        assert_eq!(decdn_client::classify(&err), decdn_client::Fault::Source);
         assert!(format!("{err}").contains("1000 of 1048576 bytes"), "{err}");
     }
 
@@ -6880,5 +5846,61 @@ mod adoption_tests {
                 .pool_id,
             id
         );
+    }
+}
+
+/// Probe-shaped fixtures shared by the fetch and source tests.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::{
+        Address, Bytes, NodeCandidate, ProxyWarmingParams, PublicKey, ResolvedTargets, discovery,
+    };
+
+    /// A node key derived from `seed`.
+    pub(crate) fn node_key(seed: u8) -> PublicKey {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    /// A probed holder of the whole blob at `rtt_ms`, paid at the address
+    /// `seed` repeated.
+    pub(crate) fn holder(seed: u8, rtt_ms: f64) -> discovery::Probed {
+        discovery::Probed {
+            candidate: NodeCandidate {
+                node_id: node_key(seed),
+                eth_address: Address::repeat_byte(seed),
+                region_hint: None,
+                multiaddrs: Bytes::new(),
+            },
+            rtt_ms,
+            total_bytes: None,
+            coverage: decdn_protocol::Coverage::empty(),
+        }
+    }
+
+    /// Two probed holders resolved the way discovery resolves them, with
+    /// different measured coverage: the targets, then each holder's node.
+    pub(crate) fn two_holder_targets() -> (ResolvedTargets, NodeCandidate, NodeCandidate) {
+        let mut a = holder(1, 10.0);
+        a.coverage = decdn_protocol::Coverage::from_block_indices(4, [0, 1].into_iter());
+        let mut b = holder(2, 20.0);
+        b.coverage = decdn_protocol::Coverage::from_block_indices(4, [2, 3].into_iter());
+        let (node_a, node_b) = (a.candidate.clone(), b.candidate.clone());
+        let probed_samples = vec![(node_a.node_id, a.rtt_ms, 1), (node_b.node_id, b.rtt_ms, 1)];
+        let ordered = super::failover_order(
+            vec![b, a],
+            &[],
+            ProxyWarmingParams {
+                enabled: false,
+                rtt_threshold_ms: 150.0,
+                margin_ms: 30.0,
+            },
+        );
+        let targets = ResolvedTargets {
+            candidates: ordered.order,
+            coverage_by_node: ordered.coverage_by_node,
+            probed_samples,
+            skipped_registry_read: false,
+        };
+        (targets, node_a, node_b)
     }
 }
