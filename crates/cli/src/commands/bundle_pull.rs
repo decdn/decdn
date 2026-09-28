@@ -1161,8 +1161,9 @@ impl Transfer {
     }
 }
 
-/// Read the registry once and keep the region-nearest candidates, which every
-/// entry in the manifest then reuses.
+/// Read the registry once. Each entry draws its own candidate sample from the
+/// whole list ([`entry_candidates`]), so no registered node is hidden from every
+/// entry by one draw.
 async fn discover_candidates(
     chain: &fetch::ResolvedChain,
     registry_cap: std::time::Duration,
@@ -1185,11 +1186,14 @@ async fn discover_candidates(
     if all.is_empty() {
         bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
     }
-    Ok(discovery::select_candidates(
-        all,
-        chain.region.as_deref(),
-        discovery::SELECT_K,
-    ))
+    Ok(all)
+}
+
+/// One entry's probe candidates: a fresh region-nearest sample of `registry`.
+/// A sample per entry costs no extra probe, because each entry probes its own
+/// candidates, and it lets every registered holder reach some entry.
+fn entry_candidates(registry: &[NodeCandidate], region: Option<&str>) -> Vec<NodeCandidate> {
+    discovery::select_candidates(registry.to_vec(), region, discovery::SELECT_K)
 }
 
 /// Load the buyer's Ethereum signer (vouchers + any openPool/topUp tx) and its
@@ -1215,9 +1219,10 @@ fn load_buyer_signer(
 /// The resolved node selection and buyer signer for a pull run.
 struct Selection {
     /// `Some((node, provider))` pins every entry to one node; `None` discovers per
-    /// entry against `candidates`.
+    /// entry against a sample of `registry`.
     explicit: Option<FetchTarget>,
-    candidates: Option<Vec<NodeCandidate>>,
+    /// Every active registered node, read once for the run.
+    registry: Option<Vec<NodeCandidate>>,
     signer: Arc<PrivateKeySigner>,
     self_address: Address,
 }
@@ -1233,19 +1238,18 @@ async fn resolve_selection(
     // Explicit single node for every entry, or a per-entry discovery candidate list
     // read from `CapacityBond` once.
     let explicit = explicit_target(common)?;
-    let candidates = match explicit {
+    let registry = match explicit {
         Some(_) => None,
         // The registry read is bounded by `--timeout-ms` (#1349), inside
         // `bootstrap_nodes` so a timeout still falls through to the peer store.
-        // No probing happens here — `discover_candidates` is the registry read
-        // plus `select_candidates`; probing is per entry, in `pick_excluding`
-        // below.
+        // No sampling or probing happens here: each entry samples and probes
+        // its own candidates (`PullCtx::entry_candidates`).
         None => Some(discover_candidates(chain, common.discovery_cap()).await?),
     };
     let (signer, self_address) = load_buyer_signer(chain)?;
     Ok(Selection {
         explicit,
-        candidates,
+        registry,
         signer,
         self_address,
     })
@@ -1348,7 +1352,7 @@ async fn pull_over(
     // Selection + the buyer signer, resolved per path (see `resolve_selection`).
     let Selection {
         explicit,
-        candidates,
+        registry,
         signer,
         self_address,
     } = resolve_selection(common, chain).await?;
@@ -1381,7 +1385,7 @@ async fn pull_over(
         chain,
         relays,
         explicit,
-        candidates,
+        registry,
         common,
         namespace_id,
         grant,
@@ -1899,9 +1903,11 @@ struct PullCtx<'a, P: Provider + Clone> {
     chain: &'a fetch::ResolvedChain,
     relays: &'a [RelayUrl],
     /// `Some((node_id, provider))` pins every entry to one node (`--node-id`);
-    /// `None` discovers per entry against `candidates`.
+    /// `None` discovers per entry against a sample of `registry`.
     explicit: Option<FetchTarget>,
-    candidates: Option<Vec<NodeCandidate>>,
+    /// Every active registered node, read once for the run; `None` when
+    /// `explicit` pins the node.
+    registry: Option<Vec<NodeCandidate>>,
     common: &'a ClientFetchArgs,
     /// Delegated capability adopted for every entry (`--capability`), or `None`
     /// for the self-owned pool path. When `Some`, every entry presents this
@@ -2102,13 +2108,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 .fetch_to_staging_from(hash, pinned, &[], staging, progress)
                 .await;
         }
-        let candidates = self
-            .candidates
-            .as_deref()
-            .ok_or_else(|| anyhow!("no discovery candidates available"))?;
+        let candidates = self.entry_candidates()?;
         let order = fetch::probe_and_order(
             self.endpoint,
-            candidates,
+            &candidates,
             self.relays.first(),
             hash,
             fetch::ProxyWarmingParams::from_args(self.common),
@@ -2339,6 +2342,16 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         .await
     }
 
+    /// This entry's probe candidates: a fresh sample of the run's registry read
+    /// ([`entry_candidates`]).
+    fn entry_candidates(&self) -> anyhow::Result<Vec<NodeCandidate>> {
+        let registry = self
+            .registry
+            .as_deref()
+            .ok_or_else(|| anyhow!("no discovery candidates available"))?;
+        Ok(entry_candidates(registry, self.chain.region.as_deref()))
+    }
+
     /// Resolve the provider order for one dedup entry's range drives ONCE — the
     /// pinned `--node-id`, or a single [`fetch::probe_and_order`] over the
     /// discovery candidates. [`Self::pull_entry`] resolves this before its first
@@ -2355,13 +2368,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         if let Some(pinned) = self.explicit {
             return Ok(RangeTargets::Pinned(pinned));
         }
-        let candidates = self
-            .candidates
-            .as_deref()
-            .ok_or_else(|| anyhow!("no discovery candidates available"))?;
+        let candidates = self.entry_candidates()?;
         let resolved = fetch::probe_and_order(
             self.endpoint,
-            candidates,
+            &candidates,
             self.relays.first(),
             hash,
             fetch::ProxyWarmingParams::from_args(self.common),
@@ -5226,6 +5236,25 @@ mod tests {
     }
 
     /// The walk stops at the first success and never tries the rest.
+    /// Every entry draws its own sample of the registry, so a node that one
+    /// draw leaves out still reaches other entries.
+    #[test]
+    fn entry_candidates_resample_the_registry_for_each_entry() {
+        let registry: Vec<NodeCandidate> = (1u8..=7).map(|b| stripe_candidate(b, b)).collect();
+        let mut seen = HashSet::new();
+        let mut draws = HashSet::new();
+        for _ in 0..200 {
+            let sample = entry_candidates(&registry, None);
+            assert_eq!(sample.len(), discovery::SELECT_K);
+            let ids: std::collections::BTreeSet<PublicKey> =
+                sample.iter().map(|c| c.node_id).collect();
+            seen.extend(ids.iter().copied());
+            draws.insert(ids);
+        }
+        assert_eq!(seen.len(), registry.len(), "every node reaches some entry");
+        assert!(draws.len() > 1, "entries draw different samples");
+    }
+
     #[tokio::test]
     async fn walk_candidates_stops_at_the_first_success() {
         let tried = std::sync::Mutex::new(Vec::new());
