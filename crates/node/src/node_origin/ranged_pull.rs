@@ -103,22 +103,55 @@ impl RunOutcome {
     }
 }
 
+/// Why an assembly ended [`AssembleOutcome::Unavailable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnavailableCause {
+    /// Every candidate that covered a still-missing range faulted and was
+    /// dropped, and none is left to try.
+    NoSurvivors,
+    /// A round dropped no source and waited on none, yet did not shrink the
+    /// gap, so the next round would re-plan the same runs.
+    NoProgress,
+    /// No surviving candidate covers part of the still-missing range.
+    Uncovered,
+    /// [`MAX_REASSIGN_ATTEMPTS`] sources were dropped and re-planned. Other
+    /// candidates, an origin among them, may still survive.
+    ReassignBudget,
+}
+
+impl UnavailableCause {
+    /// The cause as a short stable label for logs and fill errors.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSurvivors => "every covering candidate faulted",
+            Self::NoProgress => "a round made no progress",
+            Self::Uncovered => "no surviving candidate covers a still-missing range",
+            Self::ReassignBudget => "the reassign budget ran out",
+        }
+    }
+}
+
 /// The outcome of assembling a byte range across partial holders.
 pub(crate) enum AssembleOutcome {
     /// Every gap byte was pulled and admitted.
     Complete,
-    /// Some still-missing range no surviving candidate covers. Origins advertise
-    /// all-ones coverage, so an admitted origin candidate makes this
-    /// unreachable; without one it means the blob is not fully available across
-    /// the known holders. This runs on the serve-miss pull thread, which the serve
-    /// leg spawns only AFTER it has already signed and sent `ok: true` (the
-    /// response commits to `total_bytes` before any byte is pulled). So this
-    /// surfaces to the client as a TRUNCATED stream — the leg fills nothing and
-    /// the serve encoder ends short — not as a signed `NotFound`. A pre-serve
-    /// coverage-union refusal would be needed to answer `NotFound` here, and the
-    /// coverage-union probe gather (#1506) narrows how often the gap is uncoverable
-    /// in the first place rather than adding one.
-    Unavailable,
+    /// The assembly cannot finish the gap, for the reason the
+    /// [`UnavailableCause`] names.
+    ///
+    /// The serve leg refuses before `ok: true` when the candidates cannot cover
+    /// the missing range at all, so an `Uncovered` end needs the store to have
+    /// lost bytes or the candidate set to have shrunk after that check. Origins
+    /// advertise all-ones coverage, and the probe round admits the namespace's
+    /// origins only when the discovered holders do not span the blob. So a
+    /// holder that faults after a spanning probe round, or a namespace with no
+    /// reachable origin, can still end here.
+    ///
+    /// This runs on the serve-miss pull thread, which the serve leg spawns only
+    /// AFTER it has already signed and sent `ok: true` (the response commits to
+    /// `total_bytes` before any byte is pulled). So this surfaces to the client
+    /// as a TRUNCATED stream — the leg fills nothing more and the serve encoder
+    /// ends short — not as a signed `NotFound`.
+    Unavailable(UnavailableCause),
     /// The only source for a still-missing range kept refusing for backpressure
     /// past [`MAX_BACKPRESSURE_RETRIES`] waits. Surfaces to the client the same
     /// way as [`Self::Unavailable`] — a truncated stream — but names a different
@@ -214,7 +247,7 @@ pub(crate) async fn assemble<S: RunSink>(
         if surviving.is_empty() {
             // Every candidate that covered a still-missing range faulted; nothing
             // left to try. Wire-identical to the no-provider miss.
-            return AssembleOutcome::Unavailable;
+            return AssembleOutcome::Unavailable(UnavailableCause::NoSurvivors);
         }
         let gap_chunks = chunk_count(&gap);
         if let Some(prev) = prev_gap_chunks {
@@ -228,7 +261,7 @@ pub(crate) async fn assemble<S: RunSink>(
             // and did not shrink the gap will re-plan identically next round. End
             // rather than spin.
             if !repaired_last_round && gap_chunks >= prev {
-                return AssembleOutcome::Unavailable;
+                return AssembleOutcome::Unavailable(UnavailableCause::NoProgress);
             }
         }
         prev_gap_chunks = Some(gap_chunks);
@@ -236,7 +269,7 @@ pub(crate) async fn assemble<S: RunSink>(
         // planner ties-breaks on.
         let (runs, uncovered) = plan_over(&gap, total_bytes, coverage, &surviving);
         if !uncovered.is_empty() {
-            return AssembleOutcome::Unavailable;
+            return AssembleOutcome::Unavailable(UnavailableCause::Uncovered);
         }
         let mut faulted: Option<(usize, bool)> = None;
         for run in &runs {
@@ -293,10 +326,19 @@ pub(crate) async fn assemble<S: RunSink>(
         // per survivor.
         reassigns += 1;
         if reassigns >= MAX_REASSIGN_ATTEMPTS {
-            return AssembleOutcome::Unavailable;
+            return AssembleOutcome::Unavailable(UnavailableCause::ReassignBudget);
         }
         surviving.retain(|&s| s != ix);
     }
+}
+
+/// The part of `gap` that no candidate in `coverage` covers — the test
+/// [`assemble`]'s first round applies before it drives any run. The serve leg
+/// runs it before `ok: true`, so a gap no candidate can fill is refused rather
+/// than committed and truncated.
+pub(crate) fn uncovered(gap: &ChunkRanges, total_bytes: u64, coverage: &[Coverage]) -> ChunkRanges {
+    let all: Vec<usize> = (0..coverage.len()).collect();
+    plan_over(gap, total_bytes, coverage, &all).1
 }
 
 /// Plan `gap` into covered runs over the `ranked` candidate indices, returning
@@ -346,7 +388,7 @@ mod tests {
 
     use super::{
         AssembleOutcome, MAX_BACKPRESSURE_RETRIES, MAX_REASSIGN_ATTEMPTS, RunOutcome, RunSink,
-        assemble,
+        UnavailableCause, assemble,
     };
 
     const BAO_CHUNK_BYTES: u64 = 1024;
@@ -606,7 +648,26 @@ mod tests {
         let coverage = vec![cov(2, &[0])];
 
         let outcome = assemble(&sink, &coverage, 0, total, total).await;
-        assert!(matches!(outcome, AssembleOutcome::Unavailable));
+        assert!(matches!(
+            outcome,
+            AssembleOutcome::Unavailable(UnavailableCause::Uncovered)
+        ));
+    }
+
+    /// A sole covering holder that faults non-terminally is dropped, and with no
+    /// survivor left the assembly ends `NoSurvivors`, under the reassign budget.
+    #[tokio::test]
+    async fn last_covering_holder_faulting_ends_with_no_survivors() {
+        let total = DISCOVERY_BLOCK_BYTES;
+        let sink = FakeSink::new(total).script(0, &[Disposition::Reassign]);
+        let coverage = vec![cov(1, &[0])];
+
+        let outcome = assemble(&sink, &coverage, 0, total, total).await;
+        assert!(matches!(
+            outcome,
+            AssembleOutcome::Unavailable(UnavailableCause::NoSurvivors)
+        ));
+        assert_eq!(sink.driven.borrow().len(), 1);
     }
 
     /// No-progress guard (#1506 I2): a source that reports `Filled` while
@@ -622,7 +683,10 @@ mod tests {
         let coverage = vec![cov(1, &[0])];
 
         let outcome = assemble(&sink, &coverage, 0, total, total).await;
-        assert!(matches!(outcome, AssembleOutcome::Unavailable));
+        assert!(matches!(
+            outcome,
+            AssembleOutcome::Unavailable(UnavailableCause::NoProgress)
+        ));
         // Ended after ONE fruitless run rather than re-driving it forever.
         assert_eq!(sink.driven.borrow().len(), 1);
     }
@@ -644,7 +708,10 @@ mod tests {
         }
 
         let outcome = assemble(&sink, &coverage, 0, total, total).await;
-        assert!(matches!(outcome, AssembleOutcome::Unavailable));
+        assert!(matches!(
+            outcome,
+            AssembleOutcome::Unavailable(UnavailableCause::ReassignBudget)
+        ));
         // Exactly `MAX_REASSIGN_ATTEMPTS` lanes were opened, not one per holder.
         assert_eq!(sink.driven.borrow().len(), MAX_REASSIGN_ATTEMPTS);
     }

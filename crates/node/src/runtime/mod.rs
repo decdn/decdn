@@ -1050,9 +1050,10 @@ async fn build_chain_and_handlers(
     let record_store = Arc::new(std::sync::Mutex::new(RecordStore::new(
         RecordStoreConfig::default(),
     )));
-    // Origin directory with a single consumer: the node-origin FIND_VALUE
-    // last-resort fallback used when the DHT returns no providers (ADR 022
-    // §FIND_VALUE Flow; #912). When the operator configures the
+    // Origin directory for the node-origin FIND_VALUE reads — the last-resort
+    // fallback when the DHT returns no providers, and the supplement when a ranged
+    // pull's probed holders do not span the blob (ADR 022 §FIND_VALUE Flow; #912,
+    // #2195) — and for the reactive pull-through gate. When the operator configures the
     // OriginAssignment + PublisherRegistry addresses, use the chain-backed
     // `ChainOriginDirectory` — a lazy TTL cache resolving hash → namespace →
     // authorized origin → active NodeId on demand, reusing the
@@ -2112,12 +2113,14 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     dial_runtime: tokio::runtime::Handle::current(),
                     routing_table: dht_routing_c,
                     staker_set: staker_set_c,
-                    // FIND_VALUE last-resort fallback when the DHT returns no
-                    // providers (ADR 022 §FIND_VALUE Flow; #912). Shares the
-                    // single origin directory built above with the reactive
-                    // pull-through gate, so a configured `ChainOriginDirectory`
-                    // backs this fallback for every node. Absent chain addresses
-                    // it is empty (same prior behavior).
+                    // FIND_VALUE directory reads: the last-resort fallback when
+                    // the DHT returns no providers, and the supplement when a
+                    // ranged pull's probed holders do not span the blob (ADR 022
+                    // §FIND_VALUE Flow; #912, #2195). Shares the single origin
+                    // directory built above with the reactive pull-through gate,
+                    // so a configured `ChainOriginDirectory` backs both reads for
+                    // every node. Absent chain addresses it is empty, and both
+                    // reads find no origin.
                     origin_directory: origin_directory_c,
                     addr_resolver: Arc::clone(resolver),
                     buyer: Arc::clone(&service) as Arc<dyn crate::buyer_channel::PoolOpener>,

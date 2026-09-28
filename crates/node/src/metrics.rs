@@ -891,14 +891,17 @@ pub struct DecdnMetrics {
     /// `decdn_probe_cache_misses_total` (#1165): cache-miss pulls that had to run
     /// a fresh DHT lookup + probe. Counts an entry that was absent, expired, OR
     /// fully suppressed (every cached provider negative-cached, wedged, no longer
-    /// an active staker, or otherwise unselectable) — all three cost the same
-    /// network work, which is what this measures.
+    /// an active staker, or otherwise unselectable), and on the ranged pull leg an
+    /// entry whose providers do not cover every block of the blob (#2195) — all
+    /// cost the same network work, which is what this measures.
     pub probe_cache_misses: Counter,
     /// `decdn_probe_collection_latency_seconds` (ADR 001 §Probe response
     /// collection): the time from the start of the concurrent probes, dials
     /// included, to the end of collection — the early stop once enough holders
     /// answer, or the drain of the probe set, which `PROBE_TIMEOUT` bounds per
-    /// probe. A round that sends no probe records nothing.
+    /// probe. A round that sends no probe records nothing. Each probe round
+    /// records one sample, so a ranged miss whose holders do not span the blob,
+    /// and that then probes origin-directory candidates, records two (#2195).
     #[default(Histogram::new(PROBE_COLLECTION_BUCKETS.to_vec()))]
     pub probe_collection_latency_seconds: Histogram,
     /// `decdn_probe_post_eviction_failures_total` (ADR 001 §Probe cache,

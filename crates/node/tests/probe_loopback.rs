@@ -1408,6 +1408,8 @@ async fn probe_has_blob_true_and_partial_coverage_for_cached_partial_holder() ->
     // this test also catches the handler quietly diverging from it.
     let direct_coverage = cache.coverage(hash).await?;
     anyhow::ensure!(direct_coverage.covers(0) && !direct_coverage.covers(1));
+    let (_, direct_size) = cache.coverage_sized(hash).await?;
+    anyhow::ensure!(direct_size.is_some(), "the fixture partial knows its size");
 
     let server_sk = fresh_key();
     let server_id = server_sk.public();
@@ -1437,6 +1439,13 @@ async fn probe_has_blob_true_and_partial_coverage_for_cached_partial_holder() ->
     anyhow::ensure!(
         resp_ext.coverage == direct_coverage,
         "the handler's advertised coverage must match the cache's own derivation exactly"
+    );
+    // A partial holder advertises its blob size with its blocks (#2195), so a
+    // requester can tell whether a set of partials spans the blob.
+    anyhow::ensure!(
+        resp_ext.total_bytes == direct_size,
+        "a partial holder must advertise its size {direct_size:?}, got {:?}",
+        resp_ext.total_bytes
     );
     anyhow::ensure!(
         resp_ext.consistent_with(resp.body.has_blob),
