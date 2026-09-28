@@ -685,6 +685,26 @@ mod doubles {
     const SCRIPTED_RATE_PER_MB: u64 = 1;
     const SCRIPTED_INTERVAL_BYTES: u64 = 1024 * 1024;
 
+    /// A healthy buyer context paying `provider`, with `deposit` on the pool.
+    #[cfg(test)]
+    pub(crate) fn ctx_with(provider: u8, deposit: U256) -> crate::PoolContext {
+        use alloy::primitives::{Address, B256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        crate::PoolContext {
+            pool_id: B256::ZERO,
+            provider: Address::repeat_byte(provider),
+            deposit,
+            client_signer: Arc::new(signer),
+            voucher_domain: decdn_incentive::bind_node_id_domain(1, Address::ZERO),
+            prior_bytes_delivered: U256::ZERO,
+            prior_amount: U256::ZERO,
+            client_binding: None,
+            capability: None,
+        }
+    }
+
     /// Builds a typed fault to park mid-range. Boxed so a source can be re-opened
     /// (an `anyhow::Error` is not `Clone`, so it is regenerated per open).
     type FaultFn = Arc<dyn Fn() -> anyhow::Error + Send + Sync>;
@@ -1123,6 +1143,9 @@ mod doubles {
 
 #[cfg(any(test, feature = "test-util"))]
 pub use doubles::{FakeFunder, ScriptedReader, ScriptedSource};
+
+#[cfg(test)]
+pub(crate) use doubles::ctx_with;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::cast_possible_truncation)] // tests

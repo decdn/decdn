@@ -206,6 +206,10 @@ pub mod sink;
 /// (raw-bao byte source for a range) and [`source::Funder`] (injected top-up
 /// seam), plus scripted test doubles.
 pub mod source;
+/// The sources of one blob (spec § Unit 1): [`source_set::SourceSet`] tracks
+/// each holder's health, lane, and retry timing behind the injected
+/// [`source_set::SourceProvider`] seam.
+pub mod source_set;
 
 pub use config::PullConfig;
 pub use connection::WarmConnection;
@@ -237,6 +241,9 @@ pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{
     BaoRangeReader, BlobSource, Funder, IngestStore, PRIMED_MAX_IDLE, PeerSource, PrimedSource,
     SourceFuture,
+};
+pub use source_set::{
+    Holder, NoAffordableSource, NoSourceAgreesOnSize, SourceProvider, SourceSet, StaticSources,
 };
 pub use stop::{GaveUp, ProgressClock, SCRIPT_GIVE_UP, StopPolicy};
 pub use streamer::{

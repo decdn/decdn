@@ -56,6 +56,21 @@ impl std::error::Error for LaneBuildFault {}
 /// Classify `err` for the acquire loop.
 #[must_use]
 pub fn classify(err: &anyhow::Error) -> Fault {
+    if err
+        .downcast_ref::<crate::source_set::NoAffordableSource>()
+        .is_some()
+    {
+        return Fault::Fatal(FatalScope::Command);
+    }
+    if err
+        .downcast_ref::<crate::source_set::NoSourceAgreesOnSize>()
+        .is_some()
+        || err
+            .downcast_ref::<crate::source_set::NoSourceHasBlob>()
+            .is_some()
+    {
+        return Fault::Fatal(FatalScope::Item);
+    }
     if err.downcast_ref::<UpstreamVoucherRejected>().is_some()
         || err.downcast_ref::<LocalPullFault>().is_some()
         || is_local_disk_fault(err)
@@ -84,6 +99,18 @@ pub fn classify(err: &anyhow::Error) -> Fault {
         };
     }
     Fault::Source
+}
+
+/// Whether `err` is a source saying it does not hold the blob.
+#[must_use]
+pub fn says_absent(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<UpstreamRefused>()
+        .is_some_and(|refused| {
+            matches!(
+                refused.error(),
+                StreamError::NotFound | StreamError::EvictedSinceProbe
+            )
+        })
 }
 
 /// Whether `err`'s chain holds an I/O error only this machine can fix.
@@ -197,5 +224,26 @@ mod tests {
             classify(&anyhow::anyhow!("connection reset")),
             Fault::Source
         );
+    }
+
+    #[test]
+    fn not_found_is_a_source_fault_that_says_absent() {
+        let err = refusal(StreamError::NotFound);
+        assert_eq!(classify(&err), Fault::Source);
+        assert!(super::says_absent(&err));
+        assert!(!super::says_absent(&refusal(StreamError::Overloaded)));
+    }
+
+    #[test]
+    fn unanimous_stops_are_fatal_with_their_scope() {
+        use crate::source_set::{NoAffordableSource, NoSourceAgreesOnSize};
+        let dry = anyhow::Error::new(NoAffordableSource {
+            deposit: alloy::primitives::U256::ZERO,
+        });
+        assert_eq!(classify(&dry), Fault::Fatal(FatalScope::Command));
+        let size = anyhow::Error::new(NoSourceAgreesOnSize);
+        assert_eq!(classify(&size), Fault::Fatal(FatalScope::Item));
+        let absent = anyhow::Error::new(crate::source_set::NoSourceHasBlob);
+        assert_eq!(classify(&absent), Fault::Fatal(FatalScope::Item));
     }
 }

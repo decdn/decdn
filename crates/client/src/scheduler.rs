@@ -1537,7 +1537,6 @@ mod tests {
     use std::time::Duration;
 
     use alloy::primitives::{Address, B256, U256};
-    use alloy::signers::local::PrivateKeySigner;
     use decdn_incentive::{DepositOutcome, LaneKey};
     use decdn_protocol::{Coverage, DISCOVERY_BLOCK_BYTES, num_blocks};
 
@@ -1546,7 +1545,7 @@ mod tests {
     use crate::driver::{DriveConfig, ranges_content_len};
     use crate::ledgers::{LaneHandle, LaneLedgers};
     use crate::pacer::{BudgetPacer, PaceDecision, PaceState, Pacer};
-    use crate::source::{FakeFunder, ScriptedSource};
+    use crate::source::{FakeFunder, ScriptedSource, ctx_with};
     use crate::{ClientRangedStore, Cumulative, PoolContext, PoolLedger};
     use decdn_bao_range::RangedStore;
 
@@ -1554,22 +1553,6 @@ mod tests {
     /// tests, so a `ScriptedSource` over it yields verifiable wire.
     fn blob(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
-    }
-
-    /// A healthy buyer context paying `provider`, with `deposit` on the pool.
-    fn ctx_with(provider: u8, deposit: U256) -> PoolContext {
-        let signer = PrivateKeySigner::random();
-        PoolContext {
-            pool_id: B256::ZERO,
-            provider: Address::repeat_byte(provider),
-            deposit,
-            client_signer: Arc::new(signer),
-            voucher_domain: decdn_incentive::bind_node_id_domain(1, Address::ZERO),
-            prior_bytes_delivered: U256::ZERO,
-            prior_amount: U256::ZERO,
-            client_binding: None,
-            capability: None,
-        }
     }
 
     /// A shared handle to a healthy buyer context (huge deposit so the pacer never
