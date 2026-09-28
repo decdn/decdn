@@ -250,7 +250,7 @@ recorded here as intended design, not a live config key.
 
 ## Multi-Source Download
 
-Splitting a large blob across multiple nodes and fetching byte ranges in parallel is specified in [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1). Sequential single-source delivery is the default.
+Splitting a large blob across multiple nodes and fetching byte ranges in parallel is specified in [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1). Every fetch runs one acquire loop. A blob with one holder gets a lane set of size one.
 
 ## Download Resume
 

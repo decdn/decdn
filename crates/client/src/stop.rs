@@ -3,7 +3,7 @@
 //! The clock measures time since the last verified byte anywhere in the
 //! command, never time since the start. A command in a terminal has no limit:
 //! the human watches the bar and presses Ctrl-C. A script gets
-//! [`SCRIPT_GIVE_UP`]. `--give-up-after` overrides both.
+//! [`SCRIPT_GIVE_UP`]. `--give-up-after-secs` overrides both.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -85,7 +85,7 @@ pub struct StopPolicy {
 
 impl StopPolicy {
     /// The policy for a command whose stderr `is_terminal`, with the user's
-    /// optional `--give-up-after` override.
+    /// optional `--give-up-after-secs` override.
     #[must_use]
     pub fn new(
         is_terminal: bool,

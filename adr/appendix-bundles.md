@@ -265,7 +265,7 @@ as `decdn fetch`):
   its ranges through one session per provider. A session opens one
   connection and reuses it for every range of the entry. The entry stripes
   its ranges across its admitted full holders: one holder per operator, at
-  most `--max-sources`, with multi-source on. A partial holder and a
+  most `--max-sources`. A partial holder and a
   proxy-warming non-holder do not join the stripe. Each lane takes ranges
   from one shared queue and fills up to `--max-lane-streams` of them at once,
   within the lane permits that are free. A lane holds one permit for each
@@ -277,28 +277,28 @@ as `decdn fetch`):
   every lane, so all striped lanes leave the stripe. When no striped lane is
   left, the entry fails over to its other candidates one at a time. All lanes
   write into one ranged store. Concurrent ranges top up the one deposit one at
-  a time, from one top-up budget for the entry. A blob that clears
-  the multi-source gate fans out to its admitted holders per
-  [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1).
-- **Failover and retry.** Each entry tries its probed candidates in order. A
-  retryable failure moves to the next candidate. A terminal failure stops
-  the entry. A stall is a retryable failure. A stream stalls when it stays
-  below `--min-throughput-bps` for `--stall-timeout-ms`. A drive stalls when
-  its delivered bytes, counted across all of its legs and the waits between
-  them, stay below the same floor for `--stall-timeout-ms`. A multi-source
-  fetch counts its delivered bytes across all of its sources. The drive's clock
-  stops while the entry waits on its own top-up. The clock does not run
-  during the local check of a complete blob. When the last candidate fails,
-  the entry's error says that every candidate failed. After the first pass
-  over the bundle, `--entry-retries N` (default 2) gives each entry that
-  failed retryably up to N more rounds. Before each round the pull waits:
-  2 s, then double the last wait, to a maximum of 30 s. Each round probes the
-  holders again, so a provider that failed before is a candidate again. Each
-  round continues from the entry's `.partial`, so no byte is paid for twice.
-  A pool exhaustion moves to the next candidate in a pass, but it does not
-  start a new round: every provider refuses the same deposit. A size that
-  disagrees with the manifest and a local disk fault do not start a new
-  round either.
+  a time, from one top-up budget for the entry. A whole-file entry runs the
+  acquire loop of
+  [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)
+  over its probed holders.
+- **Failover and retry.** All entries of a pull share one holder health
+  table and one progress clock. The manifest fetch uses the same table and
+  the same clock. When a holder faults, the holder cools, and the loop gives
+  its ranges to the other holders. When the cooldown ends, the holder comes
+  back into the same loop. A holder that faults for one entry also cools for
+  every other entry. A failed entry does not retry in rounds. The size in
+  the manifest keys the store of the entry. A holder that signs a different
+  size leaves that entry. When no holder signs the manifest size, only that
+  entry fails. A blob over the client's size cap also fails only its entry.
+  A fault that only the user can fix stops all entries: a voucher rejection,
+  an origin blacklist, no affordable holder, or a local disk fault. The pull
+  then starts no new entry, stops the entries that run, and exits with
+  code 1. The clock measures the time since the last verified byte of any
+  entry, so a stuck entry waits while other entries make progress. A pull in
+  a terminal has no limit. A pull in a script stops after 10 minutes with no
+  verified byte. `--give-up-after-secs` overrides both limits. When the limit
+  expires, the pull stops all entries and exits with code 75. Each entry
+  keeps its `.partial`, so a rerun pays for no byte twice.
 - **Output** files are written under `-o <dir>` at each entry's relative
   path, resolved with the § Path-safety rules above (`..`, absolute, and
   escaping paths rejected). Writes are atomic (temp-then-rename after the

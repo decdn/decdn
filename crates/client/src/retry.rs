@@ -109,8 +109,7 @@ pub fn retry_disposition(err: &anyhow::Error) -> RetryDisposition {
 ///
 /// No lane can fund a dry pool, so reassigning the range only churns each
 /// remaining candidate (a fresh dial and a first-voucher attempt) before the same
-/// failure. The multi-source scheduler, a node's ranged assembly across partial
-/// holders, and a bundle pull's retry rounds each ask this question.
+/// failure.
 #[must_use]
 pub fn shared_pool_disposition(err: &anyhow::Error) -> RetryDisposition {
     if err.downcast_ref::<crate::PoolExhausted>().is_some() {

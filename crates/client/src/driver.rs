@@ -14,8 +14,8 @@
 //! funds, and resumes one missing range at a time. [`drive_range_lanes`] runs
 //! the same per-gap loop over a set of ranges, several gaps at once across one
 //! or more providers' lanes, and [`drive_range_set`] is its one-lane case; the
-//! CLI's `decdn fetch` and `bundle pull` run it as their fetch core (via
-//! `drive_fetch` and `drive_stripe` in `crates/cli/src/commands/fetch.rs`). The
+//! CLI's `bundle pull` runs it for its range-dedup entries (via `drive_stripe`
+//! in `crates/cli/src/commands/fetch.rs`). The
 //! branches are:
 //!
 //! - **Draw** (the happy path): open the gap's [`AlignedRange`](decdn_bao_range::AlignedRange), stream it through
