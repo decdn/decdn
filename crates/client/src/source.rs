@@ -667,7 +667,7 @@ impl<S: BlobSource> BlobSource for PrimedSource<S> {
 
 #[cfg(any(test, feature = "test-util"))]
 mod doubles {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -718,6 +718,9 @@ mod doubles {
         blob: Bytes,
         outboard: Bytes,
         fault: Option<(usize, FaultFn)>,
+        /// When set, `fault` fires on the first reader that reaches it and never
+        /// again. Shared by clones.
+        fault_once: Option<Arc<AtomicBool>>,
         /// Every range this source was `open`ed for, in call order, as
         /// `(fetch_start, fetch_len)`. Shared behind an `Arc<Mutex<..>>` so a
         /// clone handed to the driver records into the same log the test
@@ -793,6 +796,7 @@ mod doubles {
                 blob,
                 outboard: ob.data.into(),
                 fault: None,
+                fault_once: None,
                 opened: Arc::new(Mutex::new(Vec::new())),
                 delivered: Arc::new(AtomicU64::new(0)),
                 first_read_stall: None,
@@ -912,6 +916,20 @@ mod doubles {
             self
         }
 
+        #[cfg(test)]
+        /// [`Self::with_fault_after`], but only the first reader that reaches
+        /// `wire_bytes` faults: a peer that blips once and then recovers.
+        #[must_use]
+        pub(crate) fn fault_once_after(
+            self,
+            wire_bytes: usize,
+            make: impl Fn() -> anyhow::Error + Send + Sync + 'static,
+        ) -> Self {
+            let mut this = self.with_fault_after(wire_bytes, make);
+            this.fault_once = Some(Arc::new(AtomicBool::new(false)));
+            this
+        }
+
         /// The header-less bao wire for `range` (content plus interleaved proof,
         /// the same bytes `UpstreamPull::next_chunk` yields).
         fn wire_for(&self, range: &AlignedRange) -> anyhow::Result<Bytes> {
@@ -952,6 +970,10 @@ mod doubles {
                 let mut fault = None;
                 if let Some((after, make)) = &self.fault
                     && *after < wire.len()
+                    && self
+                        .fault_once
+                        .as_ref()
+                        .is_none_or(|fired| !fired.swap(true, Ordering::SeqCst))
                 {
                     wire = wire.slice(..*after);
                     fault = Some(make());
@@ -1153,7 +1175,7 @@ mod tests {
     use super::{BlobSource, Funder};
     use crate::sink::StashedFault;
     use alloy::primitives::U256;
-    use decdn_bao_range::align_range;
+    use decdn_bao_range::{AlignedRange, align_range};
     use decdn_incentive::DepositOutcome;
     use iroh_io::AsyncStreamReader;
 
@@ -1187,13 +1209,37 @@ mod tests {
         let source = super::ScriptedSource::new(data.clone())?
             .with_fault_after(4096, || anyhow::anyhow!("scripted stall"));
         let range = align_range(0, 0, data.len() as u64)?;
-        let (_header, mut reader) = source.open(source.root(), range).await?;
-        // Drain the truncated wire.
-        while !reader.read_bytes(64 * 1024).await?.is_empty() {}
         assert!(
-            reader.take_fault().is_some(),
+            drain(&source, &range).await.is_err(),
             "the scripted fault must be parked once the truncated wire is drained"
         );
+        Ok(())
+    }
+
+    /// Open `range` on `src` and read its wire to the end. Returns the wire
+    /// bytes read, or the fault the reader parked.
+    async fn drain(src: &super::ScriptedSource, range: &AlignedRange) -> anyhow::Result<u64> {
+        let (_header, mut reader) = src.open(src.root(), range.clone()).await?;
+        let mut read = 0u64;
+        loop {
+            let chunk = reader.read_bytes(64 * 1024).await?;
+            if chunk.is_empty() {
+                break;
+            }
+            read += chunk.len() as u64;
+        }
+        reader.take_fault().map_or(Ok(read), Err)
+    }
+
+    #[tokio::test]
+    async fn fault_once_after_fires_on_the_first_reader_only() -> anyhow::Result<()> {
+        let src = super::ScriptedSource::new(vec![3u8; 64 * 1024])?
+            .fault_once_after(4096, || anyhow::anyhow!("scripted reset"));
+        let range = align_range(0, 64 * 1024, 64 * 1024)?;
+        let first = drain(&src, &range).await;
+        assert!(first.is_err(), "the first reader faults");
+        let second = drain(&src, &range).await;
+        assert!(second.is_ok(), "the second reader delivers");
         Ok(())
     }
 
