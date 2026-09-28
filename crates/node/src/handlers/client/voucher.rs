@@ -694,6 +694,7 @@ impl ClientHandler {
             .last_voucher_at
             .store(self.coarse_clock.unix_millis(), Ordering::Relaxed);
         drop(guard);
+        self.metrics.preimage_reveal_received();
 
         // Post-acceptance bookkeeping, off the durability path. The receipt
         // amount is the lane's new total claim — the same number a voucher's

@@ -2533,7 +2533,7 @@
       },
       "title": "Vouchers, redemptions and grace closes",
       "type": "timeseries",
-      "description": "vouchers accepted counts signed vouchers on inbound streams (PayWord reveals are not vouchers). vouchers redeemed counts lane claims that landed on chain — one cumulative voucher per lane. A grace close is a pool its owner is closing while this node still holds unredeemed vouchers on it.",
+      "description": "vouchers accepted counts signed vouchers on inbound streams. reveals accepted counts PayWord preimage reveals that advanced a lane's chain frontier; reveals are not vouchers. vouchers redeemed counts lane claims that landed on chain — one cumulative voucher per lane. A grace close is a pool its owner is closing while this node still holds unredeemed vouchers on it.",
       "targets": [
         {
           "datasource": {
@@ -2561,6 +2561,15 @@
           "expr": "sum(rate(decdn_pool_grace_closes_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "C",
           "legendFormat": "grace closes with unredeemed vouchers"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_preimage_reveals_received_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "D",
+          "legendFormat": "reveals accepted"
         }
       ],
       "fieldConfig": {
