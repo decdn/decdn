@@ -1,4 +1,5 @@
-//! When a command gives up (spec § Unit 3).
+//! When a command gives up (ADR 039 § Failure handling: reassign-only tail,
+//! the stop policy).
 //!
 //! The clock measures time since the last verified byte anywhere in the
 //! command, never time since the start. A command in a terminal has no limit:

@@ -1,15 +1,15 @@
 //! Live anvil-backed e2e for `decdn bundle pull`'s **multi-source parallel
 //! fetch** path (ADR 039, #1774): a bundle whose large blob is held by TWO
-//! nodes pulls that blob fanned out across both, while small entries in the
-//! same bundle stay single-source.
+//! nodes pulls that blob fanned out across both, while each small entry in the
+//! same bundle pulls from its one holder.
 //!
 //! Shape: two independently-bonded nodes ("holder A" and "holder B") are each
 //! pre-warmed with the SAME large blob; A additionally holds `small-a.bin` and
 //! B `small-b.bin`. A local three-entry manifest is pulled with `--jobs 3` and
-//! no `--node-id`, so every entry auto-discovers its holders. The large blob
-//! has two admissible holders, so it runs the acquire loop across both lanes;
-//! each small blob has exactly ONE holder, so its gate declines and it pulls
-//! single-source.
+//! no `--node-id`, so every entry auto-discovers its holders. Every entry runs
+//! the same acquire loop: the large blob has two admissible holders, so its
+//! loop runs a lane on each; each small blob has exactly ONE holder, so its
+//! loop runs one lane.
 //!
 //! What this test asserts:
 //!   1. All three outputs are byte-identical to their source blobs.

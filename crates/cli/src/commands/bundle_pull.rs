@@ -972,7 +972,8 @@ impl GroupRun {
     }
 }
 
-/// What a failed entry fetch stops (spec § Bundle pull fatal scope): a fault
+/// What a failed entry fetch stops (ADR 039 § Failure handling: reassign-only
+/// tail): a fault
 /// only the user can fix stops every entry, and a size fault stops its own
 /// entry. A manifest `size` no provider signs is the manifest's fault, so it
 /// stops its own entry. Every other fault is its entry's alone.
@@ -1737,8 +1738,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         })
     }
 
-    /// Fetch one whole blob into `staging` through the acquire loop (spec §
-    /// Unit 4), across the entry's holders ([`Self::entry_targets`]). See
+    /// Fetch one whole blob into `staging` through the acquire loop (ADR 039),
+    /// across the entry's holders ([`Self::entry_targets`]). See
     /// [`Self::acquire_entry`] for the fetch itself.
     async fn fetch_to_staging(
         &self,

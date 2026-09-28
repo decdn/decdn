@@ -1,4 +1,5 @@
-//! Pure byte-range helpers for the multi-source scheduler (spec §5.3, #1506).
+//! Pure byte-range helpers for the multi-source scheduler (ADR 039 § Dynamic
+//! segmentation and tail-stealing, #1506).
 //! No I/O, no async. WHICH source gets WHICH discovery block is the coverage
 //! planner's job ([`crate::coverage_plan::spread_segments`]); this module only
 //! turns one planner-assigned run into fetchable `AlignedRange`s
@@ -9,7 +10,7 @@
 use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, RangeVerifyError, align_range};
 
 /// Floor below which an idle source does not split/steal a remaining range —
-/// no fresh stream for a tail smaller than this (spec §8).
+/// no fresh stream for a tail smaller than this (ADR 039 § Parameters).
 pub(crate) const MIN_SPLIT_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Round `[start, start + len)` out to its enclosing 16 KiB chunk-group

@@ -1,4 +1,5 @@
-//! Command-wide health of each provider (spec § Unit 1).
+//! Command-wide health of each provider (ADR 039 § Failure handling:
+//! reassign-only tail).
 //!
 //! One `PeerHealth` spans a whole command, so a bundle pull cools a flaky
 //! provider once for every entry. A source is never removed: a delivery fault

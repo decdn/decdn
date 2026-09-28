@@ -155,11 +155,13 @@ pub mod driver;
 /// the `cdn/client/v1` and `cdn/probe/v1` dial paths (#935/#936).
 pub mod endpoint;
 /// What a failed lane, lane build, or discovery means for the acquire loop
-/// (spec § Fault classes): a pure classifier over `anyhow::Error`.
+/// (ADR 039 § Failure handling: reassign-only tail): a pure classifier over
+/// `anyhow::Error`.
 pub mod fault;
 mod first_open;
-/// Command-wide health of each provider (spec § Unit 1): cooling backoff on a
-/// delivery fault, parking on an unaffordable price.
+/// Command-wide health of each provider (ADR 039 § Failure handling:
+/// reassign-only tail): cooling backoff on a delivery fault, parking on an
+/// unaffordable price.
 pub mod health;
 mod ledger;
 /// Run-scoped registry of live per-lane voucher ledgers:
@@ -188,10 +190,10 @@ pub mod ranged_store;
 pub(crate) mod rate_limited;
 mod scheduler;
 /// Pure segmentation and tail-steal helpers for the multi-source scheduler
-/// (spec §5.3): no I/O, no async.
+/// (ADR 039 § Dynamic segmentation and tail-stealing): no I/O, no async.
 mod segment;
-/// When a command gives up (spec § Unit 3): the progress clock and the stop
-/// policy that watches it.
+/// When a command gives up (ADR 039 § Failure handling: reassign-only tail):
+/// the progress clock and the stop policy that watches it.
 pub mod stop;
 /// The `Streamer` consumption face (#1848): stream one blob's verified,
 /// contiguous front to a consumer as it arrives, paced by consumption and bounded
@@ -207,7 +209,8 @@ pub mod sink;
 /// (raw-bao byte source for a range) and [`source::Funder`] (injected top-up
 /// seam), plus scripted test doubles.
 pub mod source;
-/// The sources of one blob (spec § Unit 1): [`source_set::SourceSet`] tracks
+/// The sources of one blob (ADR 039 § Source set and selection):
+/// [`source_set::SourceSet`] tracks
 /// each holder's health, lane, and retry timing behind the injected
 /// [`source_set::SourceProvider`] seam.
 pub mod source_set;

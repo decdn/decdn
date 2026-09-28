@@ -1,4 +1,4 @@
-//! The sources of one blob (spec § Unit 1).
+//! The sources of one blob (ADR 039 § Source set and selection).
 //!
 //! A `SourceSet` holds every provider known to hold the blob, the lane built
 //! for each, and when each may be tried again. It never drops a source: a

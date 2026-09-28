@@ -574,7 +574,7 @@ where
     let gaps = contiguous_byte_ranges(&missing, total_bytes);
 
     // Fill every gap while a single periodic tick flushes the `.ranges` present
-    // record (spec §5.5, single-writer flush point). The ranged store's ingest
+    // record (the single-writer flush point). The ranged store's ingest
     // `checkpoint` never persists the record, so without this interval flush
     // a crash mid-fetch would leave `.ranges` at pre-session state and re-download
     // (and re-pay for) the whole in-flight range on resume; the interval bounds
@@ -3525,7 +3525,7 @@ mod tests {
     }
 
     /// The interval flush persists resume progress MID-fetch, not only at
-    /// completion (spec §5.5): `drive_with_interval_flush` is raced against a
+    /// completion: `drive_with_interval_flush` is raced against a
     /// work future that stays pending for several short intervals, and the
     /// store's `flush_present_record` must fire ONCE PER ELAPSED INTERVAL before
     /// the work resolves — so a crash between the last flush and completion loses
@@ -3550,7 +3550,7 @@ mod tests {
         let inner = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
         // Durably checkpoint a real, verified 4 MiB prefix into the store — the
         // resume progress the interval flush must persist — without yet writing
-        // the `.ranges` record (checkpoint never does, spec §5.5).
+        // the `.ranges` record (checkpoint never does).
         let prefix = align_range(0, 4 * 1024 * 1024, total).expect("align prefix");
         preadmit(&inner, &plaintext, &outboard, &prefix).await;
 

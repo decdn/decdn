@@ -1,4 +1,5 @@
-//! The client's acquire loop (spec § Unit 2): fill a list of byte ranges of one
+//! The client's acquire loop (ADR 039 § Dynamic segmentation and
+//! tail-stealing): fill a list of byte ranges of one
 //! blob from the paid sources a [`SourceSet`] holds, all writing into ONE shared
 //! [`IngestStore`], until every byte is present, a fault only the human can fix
 //! arrives, the sources agree the blob cannot be had, or the [`StopPolicy`]
@@ -1348,7 +1349,8 @@ fn seed_deposit<S>(deposit: &tokio::sync::watch::Sender<U256>, lane: &StreamCand
     });
 }
 
-/// Fill `target.ranges` of one blob from `sources` (spec § Unit 2).
+/// Fill `target.ranges` of one blob from `sources` (ADR 039 § Dynamic
+/// segmentation and tail-stealing).
 ///
 /// Lanes start nearest-first up to [`AcquireEnv::max_lanes`], each driving
 /// `fill_gap` over one range at a time and stealing from the largest range in
@@ -1376,7 +1378,7 @@ fn seed_deposit<S>(deposit: &tokio::sync::watch::Sender<U256>, lane: &StreamCand
 /// node redeeming past the deposit stays on-chain.
 ///
 /// Finalization is the caller's job: this only flushes the present record
-/// (spec §5.5 single-writer flush point), periodically and once more when it
+/// (its single-writer flush point), periodically and once more when it
 /// returns. Every started lane's [`LaneLease`] is released when it returns or
 /// is dropped. Before it returns, it stops every lane and awaits each lane
 /// build still in flight, for at most 30 s: a build can be in the middle of an

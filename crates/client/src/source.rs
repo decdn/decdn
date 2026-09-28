@@ -146,7 +146,7 @@ pub trait IngestStore: decdn_bao_range::RangedStore {
         R: BaoRangeReader + 'a;
 
     /// Persist the store's current in-memory present-range snapshot to its
-    /// durable record. The single-writer flush point (spec §5.5): several
+    /// durable record. The single-writer flush point: several
     /// `ingest_stream` calls can run concurrently on one store (the
     /// multi-source scheduler), so no checkpoint writes the record — callers
     /// flush it explicitly instead. `drive` calls this once after its gap loop,
@@ -726,8 +726,8 @@ mod doubles {
         /// sleeps for `stall` rather than returning bytes, so the source stops
         /// making verified progress without ever erroring (see
         /// [`stall_after`](Self::stall_after)). Pair a `stall` well above the
-        /// scheduler's `unit_deadline` with a checkpoint-crossing `after_bytes`
-        /// to trip the stall watchdog deterministically.
+        /// scheduler's lane watchdog (`LANE_WATCHDOG`) with a nonzero
+        /// `after_bytes` to trip the watchdog deterministically.
         #[must_use]
         pub(crate) const fn stall_after(mut self, after_bytes: u64, stall: Duration) -> Self {
             self.stall_after = Some((after_bytes, stall));

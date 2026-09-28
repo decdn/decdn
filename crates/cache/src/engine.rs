@@ -3249,7 +3249,7 @@ impl CacheEngine {
     }
 
     /// Consult the admission policy for `ctx`, mapping its verdict onto a
-    /// [`crate::policy::Segment`]. `PassThrough` is reserved (spec §3) — no
+    /// [`crate::policy::Segment`]. `PassThrough` is reserved: no
     /// shipped policy returns it yet, and no pass-through-without-storing leg
     /// exists, so it is treated as `Store { Probation }` until one does.
     fn admission_segment(&self, ctx: &crate::policy::AdmissionContext) -> crate::policy::Segment {

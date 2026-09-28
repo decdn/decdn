@@ -1,4 +1,5 @@
-//! What a failed lane means for the acquire loop (spec § Fault classes).
+//! What a failed lane means for the acquire loop (ADR 039 § Failure handling:
+//! reassign-only tail).
 //!
 //! A fault belongs to the command (only the human can fix it), to one item, to
 //! one source's delivery, to one source's price against the pool, to one

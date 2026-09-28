@@ -722,7 +722,7 @@ impl ClientRangedStore {
     }
 
     /// Persist the current in-memory `present` snapshot to the `.ranges`
-    /// record. The single-writer flush point (spec §5.5): callers (the
+    /// record. The single-writer flush point: callers (the
     /// scheduler's flush owner for multi-source fetches, and `finalize`, and
     /// the end of single-source `drive`) invoke this so no two writers race
     /// the record file. `present` only ever grows and is unioned under the
@@ -2236,8 +2236,8 @@ mod tests {
             "the parked typed fault must survive: {err}"
         );
 
-        // Checkpoints no longer persist the `.ranges` record themselves
-        // (single-writer flush point, spec §5.5) — a real caller reaches this
+        // Checkpoints do not persist the `.ranges` record themselves (the
+        // single-writer flush point): a real caller reaches this
         // via `drive`'s post-gap-loop flush, but this test drives
         // `ingest_stream` directly, so it flushes explicitly here before
         // simulating the resumed process re-opening the store.
