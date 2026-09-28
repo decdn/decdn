@@ -838,7 +838,7 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
-- **Partial holders no longer pull a blob from each other in a loop (#PR).**
+- **Partial holders no longer pull a blob from each other in a loop (#2227).**
   A serve-miss read the blob size by opening the whole blob at its
   top-ranked candidate, even a partial holder that lacked the first block.
   That holder treated the open as a miss and started its own pull, often
