@@ -49,8 +49,8 @@ pub(crate) struct CliSources<'a, P> {
     peer_store: decdn_client::PeerStore,
     /// Every built lane's watermark handle, in build order.
     handles: Mutex<Vec<FaceLaneHandle>>,
-    /// Lanes built for the first open, handed to the fetch's first `connect`
-    /// for their provider.
+    /// The lane that answered the first open, handed to the fetch's first
+    /// `connect` for its provider.
     parked: Mutex<HashMap<Address, StreamCandidate<PeerSource<'a>>>>,
     /// The pool the first built lane pays from.
     pool_id: OnceLock<PoolId>,
@@ -115,8 +115,9 @@ where
     /// ([`first_open`]), with the acquire loop's recovery: a holder that
     /// faults cools and another is tried until one answers, a fault only the
     /// user can fix ends it, and `stop` gives up. The open's pull is dropped
-    /// once its header is read. Every lane the open built is parked for the
-    /// fetch's `connect`, so the fetch reuses it.
+    /// once its header is read. The lane that answered is parked for the
+    /// fetch's `connect`, so the fetch reuses it; every other lane the open
+    /// built drops, and with it any stream permit it held.
     ///
     /// # Errors
     ///
@@ -140,13 +141,13 @@ where
             Ok(header.total_bytes)
         })
         .await;
-        let mut parked = self.parked.lock().unwrap_or_else(PoisonError::into_inner);
-        for (provider, lane) in set.take_lanes() {
-            if let Ok(lane) = Arc::try_unwrap(lane) {
-                parked.insert(provider, lane);
-            }
+        let answered = opened.as_ref().ok().map(|&(provider, _)| provider);
+        if let Some((provider, lane)) = keep_answering(set.take_lanes(), answered) {
+            self.parked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(provider, lane);
         }
-        drop(parked);
         opened.map(|(_, total_bytes)| total_bytes)
     }
 
@@ -282,6 +283,21 @@ async fn lane_lease(cap: Option<&LaneStreamCap>, provider: Address) -> anyhow::R
         })
 }
 
+/// Of the lanes a first open built, the one whose provider `answered`, owned.
+/// Every other lane drops here, and with it its lease, so a provider that
+/// faulted the first open does not keep its stream permit from sibling
+/// entries.
+fn keep_answering<L>(
+    lanes: Vec<(Address, Arc<L>)>,
+    answered: Option<Address>,
+) -> Option<(Address, L)> {
+    let answered = answered?;
+    lanes
+        .into_iter()
+        .find(|(provider, _)| *provider == answered)
+        .and_then(|(provider, lane)| Arc::try_unwrap(lane).ok().map(|lane| (provider, lane)))
+}
+
 /// Name the top-up command on a self-owned pool no provider's voucher fits.
 fn with_top_up_hint(err: anyhow::Error, pool_id: Option<PoolId>) -> anyhow::Error {
     if err.downcast_ref::<NoAffordableSource>().is_none() {
@@ -414,6 +430,31 @@ mod tests {
         let y_takes_a = lane_lease(Some(&cap), a).await?;
         drop((y_takes_a, y_holds_b));
         assert!(lane_lease(None, a).await.is_ok(), "no cap, no permit");
+        Ok(())
+    }
+
+    /// Only the lane that answered the first open is kept; every other lane's
+    /// lease drops, so its provider's permit frees for sibling entries.
+    #[tokio::test]
+    async fn only_the_answering_lane_keeps_its_permit() -> anyhow::Result<()> {
+        let (a, b) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
+        let cap = LaneStreamCap::new(1);
+        let lanes = vec![
+            (a, std::sync::Arc::new(lane_lease(Some(&cap), a).await?)),
+            (b, std::sync::Arc::new(lane_lease(Some(&cap), b).await?)),
+        ];
+        let kept = super::keep_answering(lanes, Some(b));
+        assert_eq!(kept.as_ref().map(|(p, _)| *p), Some(b));
+        assert!(
+            lane_lease(Some(&cap), a).await.is_ok(),
+            "A's permit is free"
+        );
+        assert!(
+            lane_lease(Some(&cap), b).await.is_err(),
+            "B's lane holds its own"
+        );
+        drop(kept);
+        assert!(super::keep_answering::<()>(Vec::new(), None).is_none());
         Ok(())
     }
 

@@ -1616,7 +1616,7 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
         )
     } else if needs_owner {
         err.context(
-            "capability cap exhausted, capability expired, or pool balance exhausted — ask the \
+            "capability cap exhausted, capability expired, or pool balance exhausted. Ask the \
              pool owner to top up the pool or issue a fresh, higher-cap capability (a delegated \
              client cannot top up a pool it does not own)",
         )

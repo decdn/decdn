@@ -109,11 +109,26 @@ impl StreamState {
 
 /// The [`PacingWait`] the streaming drive parks on when its read-ahead window is
 /// full: it resolves once the consumer's cursor advances past what the `Wait`
-/// observed. The stop policy's clock holds while it waits: a consumer that
-/// pauses is not a source that stalls.
+/// observed.
+///
+/// While verified bytes sit unread ahead of the consumer's cursor, the stop
+/// policy's clock holds: the consumer is the bottleneck, and a consumer that
+/// pauses is not a source that stalls. Once the consumer has read everything
+/// present, the missing bytes are the fetch's to deliver, so the clock runs
+/// even while a lane waits here.
 struct ConsumedWait {
     state: Arc<StreamState>,
     clock: Arc<ProgressClock>,
+}
+
+impl ConsumedWait {
+    /// Whether verified bytes wait unread ahead of the consumer's `cursor`. A
+    /// store fault reads as nothing unread, so the clock runs.
+    async fn unread_ahead(&self, cursor: u64) -> bool {
+        present_frontier(&self.state.store, self.state.total)
+            .await
+            .is_ok_and(|frontier| frontier > cursor)
+    }
 }
 
 impl PacingWait for ConsumedWait {
@@ -123,19 +138,27 @@ impl PacingWait for ConsumedWait {
         _reason: WaitReason,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let _hold = self.clock.hold();
             // A lane parks only between legs, after its last leg's bytes are in
             // the store. Wake the reader so it hands them out: the cursor can
             // only advance from bytes the reader has seen.
             self.state.progressed.notify_waiters();
             loop {
-                // Register interest BEFORE the check, so a consume between the
-                // check and the await cannot be missed.
-                let notified = self.state.consumed.notified();
-                if self.state.cursor.load(Ordering::SeqCst) > observed.served_paid {
+                // Register interest BEFORE the checks, so a consume or a landed
+                // byte between the checks and the await cannot be missed.
+                let consumed = self.state.consumed.notified();
+                let landed = self.state.progressed.notified();
+                tokio::pin!(consumed, landed);
+                consumed.as_mut().enable();
+                landed.as_mut().enable();
+                let cursor = self.state.cursor.load(Ordering::SeqCst);
+                if cursor > observed.served_paid {
                     return;
                 }
-                notified.await;
+                let _hold = self.unread_ahead(cursor).await.then(|| self.clock.hold());
+                tokio::select! {
+                    () = consumed => {}
+                    () = landed => {}
+                }
             }
         })
     }
@@ -1365,6 +1388,68 @@ mod tests {
         drive.alongside(reader.read_to_end(&mut out)).await?;
         anyhow::ensure!(out == blob, "the stream must complete byte-identical");
         anyhow::ensure!(drive.take_error().is_none(), "the drive must not give up");
+        Ok(())
+    }
+
+    /// A lane parked on the consumer holds the stop clock only while verified
+    /// bytes wait unread ahead of the cursor. With everything present already
+    /// read, the missing bytes (a gap whose only holder is dead) are the
+    /// fetch's to deliver, so the clock runs and the stream gives up at the
+    /// limit; with unread bytes ahead, it waits on the consumer past it.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_lane_holds_the_clock_only_while_bytes_wait_unread() -> anyhow::Result<()> {
+        use crate::driver::PacingWait as _;
+        use crate::pacer::DownstreamFrontier;
+        use std::sync::atomic::AtomicU64;
+        use tokio::sync::Notify;
+
+        let blob = payload(2 * 1024 * 1024);
+        let total = u64::try_from(blob.len())?;
+        let root = *PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE)
+            .root
+            .as_bytes();
+        let dir = tempfile::tempdir()?;
+        crate::ClientRangedStore::seed_checkpointed_prefix(dir.path(), "s", &blob, total / 2)?;
+        let limit = Duration::from_secs(30);
+
+        for cursor_at_frontier in [true, false] {
+            let store = crate::ClientRangedStore::open(dir.path(), "s", root, total)?;
+            let frontier = super::present_frontier(&store, total).await?;
+            anyhow::ensure!(frontier > 0 && frontier < total, "a partial store");
+            let cursor = if cursor_at_frontier { frontier } else { 0 };
+            let state = Arc::new(super::StreamState {
+                store,
+                cursor: AtomicU64::new(cursor),
+                total,
+                consumed: Notify::new(),
+                progressed: Notify::new(),
+                outcome: Mutex::new(None),
+            });
+            let clock = Arc::new(ProgressClock::new());
+            let stop = StopPolicy::new(false, Some(limit), Arc::clone(&clock));
+            let wait = super::ConsumedWait { state, clock };
+            let observed = DownstreamFrontier {
+                served_paid: cursor,
+                serve_demand: 0,
+            };
+            let start = tokio::time::Instant::now();
+            tokio::select! {
+                () = wait.wait(observed, crate::driver::WaitReason::WindowFull) => {
+                    anyhow::bail!("nothing moves the cursor, so the wait must not end");
+                }
+                gave_up = stop.expired() => {
+                    anyhow::ensure!(cursor_at_frontier, "unread bytes ahead must hold the clock");
+                    anyhow::ensure!(gave_up.idle == limit);
+                    anyhow::ensure!(tokio::time::Instant::now() - start == limit);
+                }
+                () = tokio::time::sleep(limit * 10) => {
+                    anyhow::ensure!(
+                        !cursor_at_frontier,
+                        "with everything read, the clock must run while the lane waits"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
