@@ -839,7 +839,7 @@ since project inception and will roll into the first tagged release.
 ### Fixed
 
 - **A serve-miss pull draws for its parked serve leg while a sibling stream
-  of the same blob waits further down (#PR).** Every serve leg's demand went to
+  of the same blob waits further down (#2219).** Every serve leg's demand went to
   every live fill of the hash as one high-water mark, so a sibling stream's
   demand hid a leg parked at its own pull's frontier. That pull paced to
   `Wait` and neither leg moved until the client gave up. On the testnet, lon1
