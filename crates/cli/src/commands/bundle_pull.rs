@@ -1842,13 +1842,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // records every lane's vouchers too.
         let on_drop = fetch::SettleOnDrop::new(|| sources.persist_watermarks());
         let result = async {
-            let (total_bytes, holders) = match total {
-                Some(total) => (total, holders),
-                None => {
-                    sources
-                        .signed_size(hash, holders, &self.health, &self.stop)
-                        .await?
-                }
+            let (total_bytes, holders) = if let Some(total) = total {
+                (total, holders)
+            } else {
+                let size = sources
+                    .signed_size(hash, holders, &[], &self.health, &self.stop)
+                    .await?;
+                (size.total_bytes, size.holders)
             };
             // `--max-sources` caps the lanes the entry stripes across at
             // once; every other holder waits as a reserve.
@@ -1866,6 +1866,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                     total_bytes,
                     dest: staging,
                     ranges,
+                    // Only `decdn fetch` keys a store again from another
+                    // signer; a bundle entry keeps its first key.
+                    size_signer: None,
                 }],
                 Some(&self.ledgers),
                 progress,
@@ -7624,6 +7627,7 @@ mod tests {
                     total_bytes: u64::try_from(blob.len())?,
                     dest: &dest,
                     ranges: Some(&ranges),
+                    size_signer: None,
                 }],
                 None,
                 None,

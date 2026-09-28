@@ -177,6 +177,11 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// The refusal that last marked a source absent: the cause the
     /// [`NoSourceHasBlob`] stop carries.
     last_absent: Option<UpstreamRefused>,
+    /// The provider whose signed size keys the store, when one source's
+    /// header set it ([`Self::set_size_signer`]).
+    size_signer: Option<Address>,
+    /// Providers that delivered a verified byte in this set.
+    delivered: HashSet<Address>,
     discovery: Option<Backoff>,
     /// Bumped each time a source newly joins `absent` or `wrong_size`.
     mark_epoch: u64,
@@ -218,6 +223,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             absent: HashSet::new(),
             not_found: HashMap::new(),
             last_absent: None,
+            size_signer: None,
+            delivered: HashSet::new(),
             discovery: None,
             mark_epoch: 0,
             discovered_at: None,
@@ -244,6 +251,23 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     #[must_use]
     pub const fn health(&self) -> &Arc<PeerHealth> {
         &self.health
+    }
+
+    /// Name the provider whose signed size keys the store. If every other
+    /// known holder signs a different size, and this one has delivered no
+    /// verified byte, the set reaches the unanimous
+    /// [`NoSourceAgreesOnSize`] verdict: the signer is the likelier one to be
+    /// wrong, and the caller can key the store again from another source.
+    pub const fn set_size_signer(&mut self, provider: Address) {
+        self.size_signer = Some(provider);
+    }
+
+    /// Exclude `provider` for this blob, as a source that signs the wrong
+    /// size.
+    pub fn mark_wrong_size(&mut self, provider: Address) {
+        if self.wrong_size.insert(provider) {
+            self.mark_epoch = self.mark_epoch.saturating_add(1);
+        }
     }
 
     /// Every known holder: the starting ones and those discovery added.
@@ -334,11 +358,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     ) -> Fault {
         let fault = classify(err);
         match fault {
-            Fault::WrongSize => {
-                if self.wrong_size.insert(provider) {
-                    self.mark_epoch = self.mark_epoch.saturating_add(1);
-                }
-            }
+            Fault::WrongSize => self.mark_wrong_size(provider),
             Fault::Source => {
                 if crate::fault::says_absent(err)
                     && let Some(refused) = err.downcast_ref::<UpstreamRefused>()
@@ -378,6 +398,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     pub fn record_progress(&mut self, provider: Address) {
         self.absent.remove(&provider);
         self.not_found.remove(&provider);
+        self.delivered.insert(provider);
         self.health.record_progress(provider);
     }
 
@@ -485,6 +506,9 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         if self.holders.is_empty() || self.discovered_at != Some((deposit, self.mark_epoch)) {
             return None;
         }
+        if self.size_signer_outvoted() {
+            return Some(anyhow::Error::new(NoSourceAgreesOnSize));
+        }
         if self.all_item_marked() {
             return Some(if self.absent.is_empty() {
                 anyhow::Error::new(NoSourceAgreesOnSize)
@@ -501,13 +525,34 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         (!topups_left).then(|| anyhow::Error::new(NoAffordableSource { deposit }))
     }
 
-    /// Whether every known source says the blob is absent or signs the wrong size.
+    /// Whether every known source says the blob is absent or signs the wrong
+    /// size, or the size signer is outvoted ([`Self::size_signer_outvoted`]).
     fn all_item_marked(&self) -> bool {
-        !self.holders.is_empty()
-            && self
-                .holders
-                .iter()
-                .all(|h| self.absent.contains(&h.provider) || self.wrong_size.contains(&h.provider))
+        self.size_signer_outvoted()
+            || (!self.holders.is_empty()
+                && self.holders.iter().all(|h| {
+                    self.absent.contains(&h.provider) || self.wrong_size.contains(&h.provider)
+                }))
+    }
+
+    /// Whether the size signer ([`Self::set_size_signer`]) delivered no
+    /// verified byte, and every other known holder signs a different size
+    /// (or is absent), with at least one such wrong-size holder.
+    fn size_signer_outvoted(&self) -> bool {
+        let Some(signer) = self.size_signer else {
+            return false;
+        };
+        if self.delivered.contains(&signer) {
+            return false;
+        }
+        let mut others = self.holders.iter().filter(|h| h.provider != signer);
+        let mut any_wrong = false;
+        let all_marked = others.all(|h| {
+            let wrong = self.wrong_size.contains(&h.provider);
+            any_wrong |= wrong;
+            wrong || self.absent.contains(&h.provider)
+        });
+        all_marked && any_wrong
     }
 
     /// Whether every known source is priced out at `deposit`, disagrees on
@@ -898,6 +943,38 @@ mod tests {
         set.discovery_done(Ok(vec![]), now, U256::ZERO);
         let err = set.exhausted(U256::ZERO, true);
         assert!(err.is_some_and(|e| e.downcast_ref::<NoSourceAgreesOnSize>().is_some()));
+    }
+
+    /// A size signer every other holder disagrees with, and that delivered no
+    /// verified byte, ends the item on size; one that delivered does not.
+    #[tokio::test(start_paused = true)]
+    async fn an_outvoted_size_signer_ends_the_item_on_size() {
+        let p = provider(vec![]);
+        let holders = vec![holder(A, 10.0), holder(B, 20.0)];
+        let wrong = || {
+            anyhow::Error::new(SignedSizeMismatch {
+                signed: 2,
+                expected: 1,
+            })
+        };
+        let now = Instant::now();
+
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), holders.clone());
+        set.set_size_signer(A);
+        set.record_fault(B, &wrong(), now, U256::ZERO);
+        set.discovery_done(Ok(vec![]), now, U256::ZERO);
+        let err = set.exhausted(U256::ZERO, true);
+        assert!(err.is_some_and(|e| e.downcast_ref::<NoSourceAgreesOnSize>().is_some()));
+
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), holders);
+        set.set_size_signer(A);
+        set.record_progress(A);
+        set.record_fault(B, &wrong(), now, U256::ZERO);
+        set.discovery_done(Ok(vec![]), now, U256::ZERO);
+        assert!(
+            set.exhausted(U256::ZERO, true).is_none(),
+            "a signer whose bytes verify signs the right size"
+        );
     }
 
     fn not_found() -> anyhow::Error {

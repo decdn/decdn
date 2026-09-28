@@ -878,7 +878,14 @@ mod doubles {
                 if let Ok(mut log) = self.opened.lock() {
                     log.push((range.fetch_start(), range.fetch_len()));
                 }
-                let mut wire = self.wire_for(&range)?;
+                // A range aligned against another size than this blob's has
+                // no wire here: the caller keyed its store by a size this
+                // source does not sign, and refuses the header anyway.
+                let mut wire = if range.blob_size() == self.total_bytes() {
+                    self.wire_for(&range)?
+                } else {
+                    Bytes::new()
+                };
                 let mut fault = None;
                 if let Some((after, make)) = &self.fault
                     && *after < wire.len()

@@ -93,6 +93,7 @@ pub struct decdn_client::downloader::DownloadTarget<'a>
 pub decdn_client::downloader::DownloadTarget::dest: &'a std::path::Path
 pub decdn_client::downloader::DownloadTarget::hash: [u8; 32]
 pub decdn_client::downloader::DownloadTarget::ranges: core::option::Option<&'a [(u64, u64)]>
+pub decdn_client::downloader::DownloadTarget::size_signer: core::option::Option<alloy_primitives::bits::address::Address>
 pub decdn_client::downloader::DownloadTarget::total_bytes: u64
 pub struct decdn_client::downloader::Downloader<P, F>
 impl<P, F> decdn_client::downloader::Downloader<P, F> where P: decdn_client::source_set::SourceProvider, F: decdn_client::source::Funder
@@ -299,6 +300,7 @@ pub mod decdn_client::ranged_store
 pub struct decdn_client::ranged_store::ClientRangedStore
 impl decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::create(&std::path::Path, &str, [u8; 32], u64) -> std::io::error::Result<Self>
+pub fn decdn_client::ranged_store::ClientRangedStore::discard(&std::path::Path, &str) -> std::io::error::Result<()>
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> std::io::error::Result<()>
 pub fn decdn_client::ranged_store::ClientRangedStore::has_record(&std::path::Path, &str) -> std::io::error::Result<bool>
 pub async fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<R>(&self, &decdn_bao_range::AlignedRange, R, core::option::Option<&(dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>) -> anyhow::Result<R> where R: iroh_io::AsyncStreamReader + decdn_client::sink::StashedFault + core::marker::Send
@@ -428,12 +430,14 @@ pub const fn decdn_client::source_set::SourceSet<'p, P>::health(&self) -> &alloc
 pub fn decdn_client::source_set::SourceSet<'p, P>::holder(&self, alloy_primitives::bits::address::Address) -> core::option::Option<&decdn_client::source_set::Holder>
 pub fn decdn_client::source_set::SourceSet<'p, P>::holders(&self) -> &[decdn_client::source_set::Holder]
 pub fn decdn_client::source_set::SourceSet<'p, P>::lane_built(&mut self, alloy_primitives::bits::address::Address, anyhow::Result<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>, tokio::time::instant::Instant) -> anyhow::Result<alloc::sync::Arc<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>>
+pub fn decdn_client::source_set::SourceSet<'p, P>::mark_wrong_size(&mut self, alloy_primitives::bits::address::Address)
 pub fn decdn_client::source_set::SourceSet<'p, P>::new(&'p P, [u8; 32], alloc::sync::Arc<decdn_client::health::PeerHealth>, alloc::vec::Vec<decdn_client::source_set::Holder>) -> Self
 pub fn decdn_client::source_set::SourceSet<'p, P>::next_to_start(&self, tokio::time::instant::Instant, alloy_primitives::aliases::U256, &std::collections::hash::set::HashSet<alloy_primitives::bits::address::Address>) -> core::option::Option<decdn_client::source_set::Holder>
 pub fn decdn_client::source_set::SourceSet<'p, P>::next_wake(&self, tokio::time::instant::Instant) -> core::option::Option<tokio::time::instant::Instant>
 pub const fn decdn_client::source_set::SourceSet<'p, P>::provider(&self) -> &'p P
 pub fn decdn_client::source_set::SourceSet<'p, P>::record_fault(&mut self, alloy_primitives::bits::address::Address, &anyhow::Error, tokio::time::instant::Instant, alloy_primitives::aliases::U256) -> decdn_client::fault::Fault
 pub fn decdn_client::source_set::SourceSet<'p, P>::record_progress(&mut self, alloy_primitives::bits::address::Address)
+pub const fn decdn_client::source_set::SourceSet<'p, P>::set_size_signer(&mut self, alloy_primitives::bits::address::Address)
 pub fn decdn_client::source_set::SourceSet<'p, P>::take_lanes(&mut self) -> alloc::vec::Vec<(alloy_primitives::bits::address::Address, alloc::sync::Arc<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>)>
 pub fn decdn_client::source_set::SourceSet<'p, P>::wants_discovery(&self, tokio::time::instant::Instant, alloy_primitives::aliases::U256, usize, bool) -> bool
 impl<P: decdn_client::source_set::SourceProvider> core::fmt::Debug for decdn_client::source_set::SourceSet<'_, P>
@@ -630,6 +634,7 @@ pub const decdn_client::ChainCommit::SEALED: Self
 pub struct decdn_client::ClientRangedStore
 impl decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::create(&std::path::Path, &str, [u8; 32], u64) -> std::io::error::Result<Self>
+pub fn decdn_client::ranged_store::ClientRangedStore::discard(&std::path::Path, &str) -> std::io::error::Result<()>
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> std::io::error::Result<()>
 pub fn decdn_client::ranged_store::ClientRangedStore::has_record(&std::path::Path, &str) -> std::io::error::Result<bool>
 pub async fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<R>(&self, &decdn_bao_range::AlignedRange, R, core::option::Option<&(dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>) -> anyhow::Result<R> where R: iroh_io::AsyncStreamReader + decdn_client::sink::StashedFault + core::marker::Send
@@ -671,6 +676,7 @@ pub struct decdn_client::DownloadTarget<'a>
 pub decdn_client::DownloadTarget::dest: &'a std::path::Path
 pub decdn_client::DownloadTarget::hash: [u8; 32]
 pub decdn_client::DownloadTarget::ranges: core::option::Option<&'a [(u64, u64)]>
+pub decdn_client::DownloadTarget::size_signer: core::option::Option<alloy_primitives::bits::address::Address>
 pub decdn_client::DownloadTarget::total_bytes: u64
 pub struct decdn_client::Downloader<P, F>
 impl<P, F> decdn_client::downloader::Downloader<P, F> where P: decdn_client::source_set::SourceProvider, F: decdn_client::source::Funder
@@ -947,12 +953,14 @@ pub const fn decdn_client::source_set::SourceSet<'p, P>::health(&self) -> &alloc
 pub fn decdn_client::source_set::SourceSet<'p, P>::holder(&self, alloy_primitives::bits::address::Address) -> core::option::Option<&decdn_client::source_set::Holder>
 pub fn decdn_client::source_set::SourceSet<'p, P>::holders(&self) -> &[decdn_client::source_set::Holder]
 pub fn decdn_client::source_set::SourceSet<'p, P>::lane_built(&mut self, alloy_primitives::bits::address::Address, anyhow::Result<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>, tokio::time::instant::Instant) -> anyhow::Result<alloc::sync::Arc<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>>
+pub fn decdn_client::source_set::SourceSet<'p, P>::mark_wrong_size(&mut self, alloy_primitives::bits::address::Address)
 pub fn decdn_client::source_set::SourceSet<'p, P>::new(&'p P, [u8; 32], alloc::sync::Arc<decdn_client::health::PeerHealth>, alloc::vec::Vec<decdn_client::source_set::Holder>) -> Self
 pub fn decdn_client::source_set::SourceSet<'p, P>::next_to_start(&self, tokio::time::instant::Instant, alloy_primitives::aliases::U256, &std::collections::hash::set::HashSet<alloy_primitives::bits::address::Address>) -> core::option::Option<decdn_client::source_set::Holder>
 pub fn decdn_client::source_set::SourceSet<'p, P>::next_wake(&self, tokio::time::instant::Instant) -> core::option::Option<tokio::time::instant::Instant>
 pub const fn decdn_client::source_set::SourceSet<'p, P>::provider(&self) -> &'p P
 pub fn decdn_client::source_set::SourceSet<'p, P>::record_fault(&mut self, alloy_primitives::bits::address::Address, &anyhow::Error, tokio::time::instant::Instant, alloy_primitives::aliases::U256) -> decdn_client::fault::Fault
 pub fn decdn_client::source_set::SourceSet<'p, P>::record_progress(&mut self, alloy_primitives::bits::address::Address)
+pub const fn decdn_client::source_set::SourceSet<'p, P>::set_size_signer(&mut self, alloy_primitives::bits::address::Address)
 pub fn decdn_client::source_set::SourceSet<'p, P>::take_lanes(&mut self) -> alloc::vec::Vec<(alloy_primitives::bits::address::Address, alloc::sync::Arc<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>)>
 pub fn decdn_client::source_set::SourceSet<'p, P>::wants_discovery(&self, tokio::time::instant::Instant, alloy_primitives::aliases::U256, usize, bool) -> bool
 impl<P: decdn_client::source_set::SourceProvider> core::fmt::Debug for decdn_client::source_set::SourceSet<'_, P>

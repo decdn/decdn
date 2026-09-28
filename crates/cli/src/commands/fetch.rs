@@ -44,12 +44,12 @@ use decdn_client::driver::DriveConfig;
 use decdn_client::source::{Funder, SourceFuture};
 use decdn_client::{
     Cumulative, DownloadTarget, Downloader, Holder, LaneHandle, LaneLedgers, NoAffordableSource,
-    NoCache, NoSourceHasBlob, PeerHealth, PeerSource, PoolContext, PoolLedger, ProgressClock,
-    PullConfig, PullDeadlines, StopPolicy, Streamer, UpstreamRefused, UpstreamVoucherRejected,
-    VoucherProgress, sign_client_binding,
+    NoCache, NoSourceAgreesOnSize, NoSourceHasBlob, PeerHealth, PeerSource, PoolContext,
+    PoolLedger, ProgressClock, PullConfig, PullDeadlines, StopPolicy, Streamer, UpstreamRefused,
+    UpstreamVoucherRejected, VoucherProgress, sign_client_binding,
 };
 
-use super::cli_sources::CliSources;
+use super::cli_sources::{CliSources, SignedSize};
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
 use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore, DepositOutcome};
@@ -1593,33 +1593,56 @@ async fn fetch_over(
     // A fetch dropped by Ctrl-C records every lane's vouchers too.
     let on_drop = SettleOnDrop::new(|| sources.persist_watermarks());
     let result = async {
-        let (total_bytes, holders) = sources.signed_size(hash, holders, &health, &stop).await?;
         if wants_stdout(&args.output) {
-            stream_to_stdout(
+            let size = sources
+                .signed_size(hash, holders, &[], &health, &stop)
+                .await?;
+            return stream_to_stdout(
                 &deps,
                 &sources,
-                holders,
+                size.holders,
                 health,
                 hash,
-                total_bytes,
+                size.total_bytes,
                 stop,
                 common.max_sources,
             )
-            .await
-        } else {
-            download_to_file(
-                &deps,
-                &sources,
-                holders,
-                health,
-                hash,
-                total_bytes,
-                &args.output,
-                &stop,
-                common.max_sources,
-            )
-            .await
+            .await;
         }
+        let (sources, health, stop, deps) = (&sources, &health, &stop, &deps);
+        download_rekeying(
+            holders,
+            |holders, excluded: Vec<Address>| async move {
+                sources
+                    .signed_size(hash, holders, &excluded, health, stop)
+                    .await
+            },
+            |holders, total_bytes, signer| {
+                download_to_file(
+                    deps,
+                    sources,
+                    holders,
+                    Arc::clone(health),
+                    DownloadTarget {
+                        hash,
+                        total_bytes,
+                        dest: &args.output,
+                        ranges: None,
+                        size_signer: Some(signer),
+                    },
+                    stop,
+                    common.max_sources,
+                )
+            },
+            || {
+                // Record what the wrong-size lanes paid before new lanes to
+                // the same providers build, and drop the store the wrong
+                // size keyed.
+                sources.persist_watermarks();
+                discard_partial(&args.output)
+            },
+        )
+        .await
     }
     .await;
     on_drop.disarm();
@@ -2052,15 +2075,12 @@ fn stream_error(read_err: anyhow::Error, fetch_err: Option<anyhow::Error>) -> an
 /// line. The `.partial` beside `output` stays in place on a failure for a
 /// later resume. The caller persists each lane's voucher watermark after the
 /// fetch.
-#[allow(clippy::too_many_arguments)]
 async fn download_to_file<P>(
     deps: &DriveFetchDeps<'_, P>,
     sources: &CliSources<'_, P>,
     holders: Vec<Holder>,
     health: Arc<PeerHealth>,
-    hash: [u8; 32],
-    total_bytes: u64,
-    output: &Path,
+    target: DownloadTarget<'_>,
     stop: &StopPolicy,
     max_sources: usize,
 ) -> anyhow::Result<()>
@@ -2076,22 +2096,89 @@ where
         DriveConfig::cli(deps.chain.working_deposit),
         max_sources,
     );
-    let result = Box::pin(downloader.fetch_to_paths_until(
-        &[DownloadTarget {
-            hash,
-            total_bytes,
-            dest: output,
-            ranges: None,
-        }],
-        None,
-        Some(&on_progress),
-        stop,
-    ))
-    .await;
+    let result =
+        Box::pin(downloader.fetch_to_paths_until(&[target], None, Some(&on_progress), stop)).await;
     bar.finish_and_clear();
     result?;
-    print_fetch_summary(total_bytes, &meter, output);
+    print_fetch_summary(target.total_bytes, &meter, target.dest);
     Ok(())
+}
+
+/// Fetch a blob to a file keyed by the size one holder signs, and key it again
+/// from another holder when every other holder disagrees with that signer.
+///
+/// `signed_size` learns the size from one holder, skipping the providers it
+/// is given. `download` fetches the blob at that size, naming the signer
+/// ([`DownloadTarget::size_signer`]). When the download ends with
+/// [`NoSourceAgreesOnSize`] (every other holder signs a different size and the
+/// signer delivered no verified byte), the signer is excluded, `rekey` runs
+/// (it records what the lanes paid and discards the wrong-size `.partial`),
+/// and the fetch starts over from the next signer. Each signer is excluded at
+/// most once, so the fetch ends once no holder is left to sign.
+///
+/// # Errors
+///
+/// The error `signed_size`, `download` or `rekey` ends with.
+pub(crate) async fn download_rekeying<Sz, SzFut, Dl, DlFut>(
+    mut holders: Vec<Holder>,
+    signed_size: Sz,
+    download: Dl,
+    rekey: impl Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<()>
+where
+    Sz: Fn(Vec<Holder>, Vec<Address>) -> SzFut,
+    SzFut: std::future::Future<Output = anyhow::Result<SignedSize>>,
+    Dl: Fn(Vec<Holder>, u64, Address) -> DlFut,
+    DlFut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let mut excluded: Vec<Address> = Vec::new();
+    loop {
+        let signed = signed_size(holders, excluded.clone()).await?;
+        let SignedSize {
+            total_bytes,
+            signer,
+            holders: known,
+        } = signed;
+        match download(known.clone(), total_bytes, signer).await {
+            Err(err)
+                if err.downcast_ref::<NoSourceAgreesOnSize>().is_some()
+                    && !excluded.contains(&signer) =>
+            {
+                tracing::warn!(
+                    %signer,
+                    total_bytes,
+                    "every other holder signs a different size than this one; keying the fetch \
+                     from another holder"
+                );
+                excluded.push(signer);
+                rekey()?;
+                holders = known;
+            }
+            done => return done,
+        }
+    }
+}
+
+/// Remove the `.partial` store beside `output`.
+///
+/// # Errors
+///
+/// A removal that fails for a reason other than the file being gone.
+fn discard_partial(output: &Path) -> anyhow::Result<()> {
+    let dir = match output.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let stem = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("output {} has no usable file name", output.display()))?;
+    decdn_client::ClientRangedStore::discard(dir, stem).map_err(|e| {
+        anyhow::anyhow!(
+            "discard the wrong-size partial of {}: {e}",
+            output.display()
+        )
+    })
 }
 
 /// One lane's persisted-watermark inputs, lifted out of [`MultiLane`] so the
@@ -4207,6 +4294,178 @@ mod tests {
             state: Arc::new(Mutex::new(SpeedState::default())),
         };
         assert!(meter.summary().is_none());
+    }
+}
+
+/// [`download_rekeying`] over scripted holders: a wrong size one holder signs
+/// is keyed away from once every other holder disagrees.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod rekey_tests {
+    use std::sync::{Arc, Mutex};
+
+    use alloy::primitives::{Address, U256};
+    use alloy::signers::local::PrivateKeySigner;
+    use decdn_client::source::{BlobSource, FakeFunder, ScriptedSource, SourceFuture};
+    use decdn_client::{
+        Cumulative, DownloadTarget, Downloader, Holder, LaneLease, PoolContext, PoolLedger,
+        SourceProvider, SourceSet, StopPolicy, StreamCandidate, first_open,
+    };
+
+    use super::{SignedSize, download_rekeying};
+
+    /// Holders that build a fresh lane on every connect, as the CLI does.
+    struct Rebuild {
+        sources: Vec<(Address, ScriptedSource)>,
+    }
+
+    impl Rebuild {
+        fn holders(&self) -> Vec<Holder> {
+            self.sources
+                .iter()
+                .zip(1u32..)
+                .map(|((provider, _), rank)| Holder {
+                    provider: *provider,
+                    coverage: None,
+                    rtt_ms: f64::from(rank),
+                    probed_holder: true,
+                })
+                .collect()
+        }
+    }
+
+    impl SourceProvider for Rebuild {
+        type Source = ScriptedSource;
+
+        fn discover(&self, _hash: [u8; 32]) -> SourceFuture<'_, Vec<Holder>> {
+            let holders = self.holders();
+            Box::pin(async move { Ok(holders) })
+        }
+
+        fn connect<'a>(
+            &'a self,
+            holder: &'a Holder,
+        ) -> SourceFuture<'a, StreamCandidate<ScriptedSource>> {
+            let found = self
+                .sources
+                .iter()
+                .find(|(provider, _)| *provider == holder.provider)
+                .map(|(provider, source)| (*provider, source.clone()));
+            Box::pin(async move {
+                let (provider, source) = found.ok_or_else(|| anyhow::anyhow!("unknown holder"))?;
+                let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+                Ok(StreamCandidate {
+                    source: source.paying(Arc::clone(&ledger)),
+                    ctx: Arc::new(Mutex::new(PoolContext {
+                        pool_id: alloy::primitives::B256::ZERO,
+                        provider,
+                        deposit: U256::from(u128::MAX),
+                        client_signer: Arc::new(PrivateKeySigner::random()),
+                        voucher_domain: decdn_incentive::bind_node_id_domain(1, Address::ZERO),
+                        prior_bytes_delivered: U256::ZERO,
+                        prior_amount: U256::ZERO,
+                        client_binding: None,
+                        capability: None,
+                    })),
+                    ledger,
+                    coverage: None,
+                    first_unit: None,
+                    lease: LaneLease::default(),
+                })
+            })
+        }
+    }
+
+    fn drive_config() -> decdn_client::driver::DriveConfig {
+        decdn_client::driver::DriveConfig {
+            working_deposit: U256::from(u128::MAX),
+            seller_reserve: U256::ZERO,
+            max_settle_waits: 2,
+            settle_backoff: std::time::Duration::ZERO,
+        }
+    }
+
+    /// The nearest holder signs a wrong size and two others agree on the true
+    /// size: the fetch keys away from the nearest one and completes with the
+    /// true bytes.
+    #[tokio::test(start_paused = true)]
+    async fn a_wrong_size_signer_is_keyed_away_from() -> anyhow::Result<()> {
+        let blob: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let honest = ScriptedSource::new(blob.clone())?;
+        let (root, total) = (honest.root(), honest.total_bytes());
+        let provider = Rebuild {
+            sources: vec![
+                (
+                    Address::repeat_byte(0xA1),
+                    honest.clone().signing_size(total / 2),
+                ),
+                (Address::repeat_byte(0xB2), honest.clone()),
+                (Address::repeat_byte(0xC3), honest),
+            ],
+        };
+        let health = Arc::default();
+        let stop = StopPolicy::new(
+            false,
+            Some(std::time::Duration::from_mins(10)),
+            Arc::default(),
+        );
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("blob.bin");
+        let rekeys = std::sync::atomic::AtomicU32::new(0);
+        let (provider, health, stop, dest_ref) = (&provider, &health, &stop, dest.as_path());
+        download_rekeying(
+            provider.holders(),
+            |holders, excluded: Vec<Address>| async move {
+                let mut set = SourceSet::new(provider, root, Arc::clone(health), holders);
+                for signer in &excluded {
+                    set.mark_wrong_size(*signer);
+                }
+                let (signer, total_bytes) = first_open(&mut set, stop, |lane| async move {
+                    let range = decdn_bao_range::align_range(0, 16 * 1024, total)?;
+                    let (header, _reader) = lane.source.open(root, range).await?;
+                    Ok(header.total_bytes)
+                })
+                .await?;
+                Ok(SignedSize {
+                    total_bytes,
+                    signer,
+                    holders: set.holders().to_vec(),
+                })
+            },
+            |holders, total_bytes, signer| async move {
+                let downloader = Downloader::new(
+                    provider,
+                    holders,
+                    Arc::clone(health),
+                    FakeFunder::new(0, decdn_incentive::DepositOutcome::Added(U256::ZERO)),
+                    drive_config(),
+                    3,
+                );
+                downloader
+                    .fetch_to_paths_until(
+                        &[DownloadTarget {
+                            hash: root,
+                            total_bytes,
+                            dest: dest_ref,
+                            ranges: None,
+                            size_signer: Some(signer),
+                        }],
+                        None,
+                        None,
+                        stop,
+                    )
+                    .await
+                    .map(|_| ())
+            },
+            || {
+                rekeys.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                super::discard_partial(dest_ref)
+            },
+        )
+        .await?;
+        assert_eq!(std::fs::read(&dest)?, blob);
+        assert_eq!(rekeys.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
     }
 }
 

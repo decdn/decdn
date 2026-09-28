@@ -54,6 +54,7 @@ async fn main() -> Result<()> {
                 total_bytes,
                 dest: &dest,
                 ranges: None,
+                size_signer: None,
             }],
             None,
             None,

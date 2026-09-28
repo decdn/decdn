@@ -83,6 +83,8 @@ Five faults end the fetch, because only the user can fix them:
 
 On the wire, `NotFound` also means load shed, a per-signer cap, or a pool that the node cannot confirm yet. So a `NotFound` from a holder that the probe reported, or from a node that the user pinned, only cools that holder. A pull-through target that answers `NotFound` three times, with no verified byte between the answers, is absent. The item also ends when every known source is absent or signs a different size, and a fresh discovery finds no new holder. No other fault ends the fetch. The loop keeps trying.
 
+`decdn fetch` learns the blob size from the header of one holder. When every other holder signs a different size, and that holder delivered no verified byte, the client does not trust that holder. It excludes the holder, discards the partial store, and learns the size again from the next holder. It does this at most once for each holder. A bundle entry keeps the size of its manifest.
+
 Speculative duplicate requests are out of scope **by decision, not by sequencing**. Racing an outstanding range against idle sources — BitTorrent's final-piece duplication tactic — shortens the tail only by paying for the copies that lose the race; BitTorrent accepts that cost because a leecher has no cost signal, but here every byte is paid, so the tail is bounded by source selection and deadline-based reassignment instead. A capped, opt-in paid hedge — duplicating only the final sub-`min_split_size` tail and cancelling the loser — stays a closed door: it returns only if measured tail latency on real large blobs proves reassignment insufficient.
 
 ### Payment

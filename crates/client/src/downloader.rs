@@ -53,6 +53,13 @@ pub struct DownloadTarget<'a> {
     /// caller that writes the bytes outside them itself (a bundle entry's
     /// donor splice) finds them in the `.partial` beside `dest`.
     pub ranges: Option<&'a [(u64, u64)]>,
+    /// The provider whose signed header gave `total_bytes`, or `None` when the
+    /// size came from elsewhere (a bundle manifest). With a signer, the target
+    /// ends with [`crate::NoSourceAgreesOnSize`] once every other holder signs
+    /// a different size and the signer has delivered no verified byte, so the
+    /// caller can key the store again from another source
+    /// ([`SourceSet::set_size_signer`]).
+    pub size_signer: Option<alloy::primitives::Address>,
 }
 
 /// Fetch content-addressed blobs — a bundle, or a single blob — to files in a
@@ -97,7 +104,7 @@ pub struct DownloadTarget<'a> {
 ///     let drive = DriveConfig::cli(Default::default());
 ///     let downloader =
 ///         Downloader::new(sources, holders, Default::default(), funder, drive, lanes);
-///     let target = DownloadTarget { hash, total_bytes, dest, ranges: None };
+///     let target = DownloadTarget { hash, total_bytes, dest, ranges: None, size_signer: None };
 ///     downloader
 ///         .fetch_to_paths(&[target], None, None)
 ///         .await?;
@@ -192,6 +199,7 @@ where
                 total_bytes,
                 dest,
                 ranges: None,
+                size_signer: None,
             })
             .collect();
         self.fetch_to_paths(&targets, None, on_progress).await
@@ -281,6 +289,9 @@ where
                 Arc::clone(&self.health),
                 self.holders.clone(),
             );
+            if let Some(signer) = target.size_signer {
+                sources.set_size_signer(signer);
+            }
             let env = AcquireEnv {
                 pacer: &pacer,
                 funder: &self.funder,
@@ -569,6 +580,7 @@ mod tests {
                     total_bytes: total,
                     dest: &dest,
                     ranges: None,
+                    size_signer: None,
                 }],
                 None,
                 None,
@@ -609,6 +621,7 @@ mod tests {
                     total_bytes: total,
                     dest: &part,
                     ranges: Some(&half),
+                    size_signer: None,
                 }],
                 None,
                 None,
@@ -628,6 +641,7 @@ mod tests {
                     total_bytes: total,
                     dest: &whole,
                     ranges: Some(&all),
+                    size_signer: None,
                 }],
                 None,
                 None,
@@ -667,6 +681,7 @@ mod tests {
                     total_bytes: total,
                     dest: &dest,
                     ranges: None,
+                    size_signer: None,
                 }],
                 Some(&registry),
                 None,
@@ -788,6 +803,7 @@ mod tests {
                     total_bytes: total,
                     dest: &dest,
                     ranges: None,
+                    size_signer: None,
                 }],
                 None,
                 None,
@@ -823,6 +839,7 @@ mod tests {
                     total_bytes: total,
                     dest: &dest,
                     ranges: None,
+                    size_signer: None,
                 }],
                 None,
                 None,
@@ -861,6 +878,7 @@ mod tests {
             total_bytes: total,
             dest: &dest,
             ranges: None,
+            size_signer: None,
         }];
         // Well inside the first periodic flush, so only the drop can record.
         let dropped = tokio::time::timeout(
