@@ -90,17 +90,18 @@ pool up from the treasury whenever its remaining balance falls below
 
 ## The `decdn-sponsored` flow
 
-The website shows one command per model, with the model's BLAKE3 hash from
-`models.json`. On macOS and Linux:
+The website shows one command per model, with the model's BLAKE3 hash and
+the namespace it is published under, both from `models.json`. On macOS and
+Linux:
 
 ```bash
-curl -fsSL https://up.decdn.org/decdn.sh | sh -s -- pull b3:<hash>
+curl -fsSL https://up.decdn.org/decdn.sh | sh -s -- pull b3:<hash> --namespace <id>
 ```
 
 On Windows (x64 and ARM64), in PowerShell:
 
 ```powershell
-irm https://up.decdn.org/decdn.ps1 | iex; decdn-sponsored pull b3:<hash>
+irm https://up.decdn.org/decdn.ps1 | iex; decdn-sponsored pull b3:<hash> --namespace <id>
 ```
 
 1. The installer served at `GET /decdn.sh` (`assets/decdn.sh`), or its
@@ -113,8 +114,8 @@ irm https://up.decdn.org/decdn.ps1 | iex; decdn-sponsored pull b3:<hash>
    filled in. Any
    arguments are passed on to `decdn-sponsored`. Running it again is
    harmless, and `decdn-sponsored pull ...` works on its own once installed.
-2. `decdn-sponsored pull <hash> [-o <dir>]` (output defaults to the current
-   directory) opens the state directory for that hash, `~/.decdn/sponsored/downloads/<hash>/`, and generates a throwaway
+2. `decdn-sponsored pull <hash> [-o <dir>] [--namespace <id>]` (output
+   defaults to the current directory) opens the state directory for that hash, `~/.decdn/sponsored/downloads/<hash>/`, and generates a throwaway
    voucher-signing key there with a random password stored beside it. The
    user never sees a key, keystore, or password.
 3. It polls `GET /capability?client=<addr>` and, while that answers `204`,
@@ -124,7 +125,9 @@ irm https://up.decdn.org/decdn.ps1 | iex; decdn-sponsored pull b3:<hash>
    --keystore ... --data-dir <state dir>` with inherited stdio, so `decdn`'s
    own progress and errors reach the user unchanged. The name-to-hash
    mapping happens on the website; the CLI accepts only a hash, and `decdn`
-   verifies every byte against it.
+   verifies every byte against it. `--namespace` is passed through as-is: it
+   lets a node that has not cached the bundle pull from that namespace's
+   origins, and never changes which bytes are accepted.
 5. On success the state directory is deleted. On failure it is kept: running
    the same command again resumes with the same key and capability (no new
    captcha), and `bundle pull` resumes from its `.partial` files. A saved

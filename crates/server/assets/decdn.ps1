@@ -138,7 +138,7 @@ chain_id = $ChainId
 
     Write-Host ''
     Write-Host 'decdn-sponsored is ready. Download with:'
-    Write-Host '  decdn-sponsored pull b3:<hash> [-o <dir>]'
+    Write-Host '  decdn-sponsored pull b3:<hash> [-o <dir>] [--namespace <id>]'
   } finally {
     [Net.ServicePointManager]::SecurityProtocol = $PriorProtocol
   }

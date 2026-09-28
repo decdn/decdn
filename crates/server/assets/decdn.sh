@@ -111,7 +111,7 @@ fi
 
 echo ""
 echo "decdn-sponsored is ready. Download with:"
-echo "  decdn-sponsored pull b3:<hash> [-o <dir>]"
+echo "  decdn-sponsored pull b3:<hash> [-o <dir>] [--namespace <id>]"
 case ":${PATH}:" in
   *":${BINDIR}:"*) ;;
   *) echo "(add ${BINDIR} to your PATH first)" ;;

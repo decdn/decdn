@@ -1,6 +1,7 @@
 //! `decdn-sponsored`: download a content-addressed bundle through the
 //! sponsord gateway, with no wallet. See `flow::pull`.
 
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -27,6 +28,13 @@ enum Command {
         /// Directory the bundle's files are written under.
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
+
+        /// Namespace the bundle is published under. Lets a node that has not
+        /// cached it pull from that namespace's origins; without it the bundle
+        /// is served from caches only. Never changes which bytes you get: they
+        /// are verified against the hash either way.
+        #[arg(long, value_name = "ID")]
+        namespace: Option<NonZeroU64>,
     },
 }
 
@@ -43,7 +51,11 @@ async fn main() -> ExitCode {
     };
 
     let result = match &cli.command {
-        Command::Pull { hash, output } => flow::pull(hash, output, &cfg).await,
+        Command::Pull {
+            hash,
+            output,
+            namespace,
+        } => flow::pull(hash, output, *namespace, &cfg).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

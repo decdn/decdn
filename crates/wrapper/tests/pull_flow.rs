@@ -8,6 +8,7 @@
     clippy::indexing_slicing
 )]
 
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -109,14 +110,20 @@ async fn success_runs_bundle_pull_and_discards_state() {
     let gateway = gateway_with_capability(now() + 3600, 1).await;
     let cfg = config(&gateway.uri(), &stub_decdn(tmp.path(), 0), &data);
 
-    flow::pull(&format!("b3:{HASH}"), &tmp.path().join("out"), &cfg)
-        .await
-        .unwrap();
+    flow::pull(
+        &format!("b3:{HASH}"),
+        &tmp.path().join("out"),
+        NonZeroU64::new(1),
+        &cfg,
+    )
+    .await
+    .unwrap();
 
     let calls = std::fs::read_to_string(tmp.path().join("calls")).unwrap();
     assert!(calls.starts_with(&format!("bundle pull --hash {HASH} -o ")));
     assert!(calls.contains("--capability-file"));
     assert!(calls.contains("--keystore-password-file"));
+    assert!(calls.contains("--namespace 1"));
     assert!(!state_dir(&data).exists());
 }
 
@@ -127,7 +134,7 @@ async fn failure_keeps_state_and_rerun_reuses_capability() {
     let gateway = gateway_with_capability(now() + 3600, 1).await;
 
     let failing = config(&gateway.uri(), &stub_decdn(tmp.path(), 1), &data);
-    let err = flow::pull(HASH, &tmp.path().join("out"), &failing)
+    let err = flow::pull(HASH, &tmp.path().join("out"), None, &failing)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("Re-run the same command"));
@@ -136,7 +143,7 @@ async fn failure_keeps_state_and_rerun_reuses_capability() {
     // The mock allows exactly one GET /capability, so this run must reuse
     // the saved capability and key rather than asking the gateway again.
     let ok = config(&gateway.uri(), &stub_decdn(tmp.path(), 0), &data);
-    flow::pull(HASH, &tmp.path().join("out"), &ok)
+    flow::pull(HASH, &tmp.path().join("out"), None, &ok)
         .await
         .unwrap();
     let calls = std::fs::read_to_string(tmp.path().join("calls")).unwrap();
@@ -153,7 +160,7 @@ async fn expired_capability_rotates_to_a_fresh_key() {
     // First run leaves state behind holding an already-expired capability.
     let stale = gateway_with_capability(now().saturating_sub(10), 1).await;
     let failing = config(&stale.uri(), &stub_decdn(tmp.path(), 1), &data);
-    flow::pull(HASH, &tmp.path().join("out"), &failing)
+    flow::pull(HASH, &tmp.path().join("out"), None, &failing)
         .await
         .unwrap_err();
     let old_key = std::fs::read(state_dir(&data).join("keystore.json")).unwrap();
@@ -161,7 +168,7 @@ async fn expired_capability_rotates_to_a_fresh_key() {
     // Second run must throw the old key away and fetch a new capability.
     let fresh = gateway_with_capability(now() + 3600, 1).await;
     let failing_again = config(&fresh.uri(), &stub_decdn(tmp.path(), 1), &data);
-    flow::pull(HASH, &tmp.path().join("out"), &failing_again)
+    flow::pull(HASH, &tmp.path().join("out"), None, &failing_again)
         .await
         .unwrap_err();
     let new_key = std::fs::read(state_dir(&data).join("keystore.json")).unwrap();

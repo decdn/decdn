@@ -6,6 +6,7 @@
 //! unchanged; this module only builds its argument vector.
 
 use std::ffi::OsString;
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
@@ -22,6 +23,10 @@ pub struct PullArgs {
     pub hash: String,
     /// `-o`/`--output`: directory the bundle's files are written under.
     pub output: PathBuf,
+    /// `--namespace`: the namespace the bundle is published under, so a
+    /// cache-missing node can pull from its origins (ADR 002). Namespace 0
+    /// means "no namespace" to `decdn`, so the type rules it out.
+    pub namespace: Option<NonZeroU64>,
     /// `--capability-file`: the sponsor-issued `dcap1:` token, read from a
     /// file to keep it off the process table.
     pub capability_file: PathBuf,
@@ -69,6 +74,10 @@ impl PullArgs {
             "--chain-id".into(),
             self.chain_id.to_string().into(),
         ];
+        if let Some(namespace) = self.namespace {
+            args.push("--namespace".into());
+            args.push(namespace.to_string().into());
+        }
         if let Some(addr) = &self.capacity_bond_address {
             args.push("--capacity-bond-address".into());
             args.push(addr.clone().into());
@@ -106,6 +115,7 @@ mod tests {
         PullArgs {
             hash: "ab".repeat(32),
             output: PathBuf::from("out"),
+            namespace: NonZeroU64::new(1),
             capability_file: PathBuf::from("/s/capability"),
             keystore: PathBuf::from("/s/keystore.json"),
             password_file: PathBuf::from("/s/password"),
@@ -142,6 +152,7 @@ mod tests {
             "0x02"
         );
         assert!(!args.iter().any(|a| a == "--capability"));
+        assert_eq!(value_after(&args, "--namespace").unwrap(), "1");
         assert!(!args.iter().any(|a| a == "--slash-judge-address"));
     }
 }
