@@ -577,15 +577,7 @@ async fn provisioned_origin_with_deadlines(
     Arc<Mutex<Vec<ProgressEntry>>>,
     tempfile::TempDir,
 ) {
-    let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
-    let buyer = Arc::new(StubOpener {
-        pool_id,
-        deposit: U256::from(DEPOSIT_MICRO_USDC),
-        signer: Arc::clone(buyer_signer),
-        voucher_domain: voucher_dom(),
-        recorded: Arc::clone(&recorded),
-        retired: Arc::new(Mutex::new(Vec::new())),
-    }) as Arc<dyn PoolOpener>;
+    let (buyer, recorded) = stub_opener(pool_id, buyer_signer);
     let (origin, engine, engine_tmp) = build_origin_with_timeout(
         ep_b,
         b_dht,
@@ -601,6 +593,24 @@ async fn provisioned_origin_with_deadlines(
     )
     .await;
     (origin, engine, recorded, engine_tmp)
+}
+
+/// A [`StubOpener`] on the fixed `pool_id` signing as `signer`, plus its
+/// `recorded` voucher-progress log.
+fn stub_opener(
+    pool_id: B256,
+    signer: &Arc<PrivateKeySigner>,
+) -> (Arc<dyn PoolOpener>, Arc<Mutex<Vec<ProgressEntry>>>) {
+    let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(StubOpener {
+        pool_id,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(signer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::clone(&recorded),
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn PoolOpener>;
+    (buyer, recorded)
 }
 
 /// Like [`provisioned_origin`], but the buyer enforces a `max_blob_size_bytes`
@@ -788,14 +798,93 @@ async fn build_origin_with_probe_caches(
     // channel runs dry still fails the way its test asserts.
     working_deposit: U256,
 ) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
-    // Providers are active stakers, matching production (a probe-cache HIT
-    // re-checks `is_active`, so an empty set would make every cached provider
-    // un-servable on a hit). `find_providers` still returns empty for them — no
-    // routing entries — so fetch #1 resolves via the directory under
-    // `directory_namespace`. Built before `providers` is moved into `dir`.
-    let stakers = ConfigStakerSet::new(providers.iter().copied().collect());
-    let mut dir = HashMap::new();
-    dir.insert(directory_namespace, providers);
+    build_origin_with_discovery(
+        ep_b,
+        b_dht,
+        buyer,
+        local_rep,
+        metrics,
+        FixtureDiscovery::directory_only(providers, directory_namespace),
+        addr_map,
+        pull_timeout,
+        stall_timeout,
+        max_blob_size_bytes,
+        negative_cache,
+        probe_cache,
+        working_deposit,
+    )
+    .await
+}
+
+/// The discovery state a fixture `NodeOrigin` sees: its staker set, what the
+/// origin directory answers per namespace, and the DHT peers that seed its
+/// routing table.
+struct FixtureDiscovery {
+    /// Active stakers. A probe-cache HIT re-checks `is_active` and
+    /// `find_providers` drops a non-staked holder, so every provider a test
+    /// expects to be pulled from belongs here.
+    stakers: HashSet<DhtNodeId>,
+    /// The origin directory's answer per namespace.
+    directory: HashMap<U256, Vec<DhtNodeId>>,
+    /// DHT servers to seed the routing table with, as `(id, socket)`. The
+    /// builder primes the endpoint's address cache for each one, so the lookup
+    /// can dial it by id.
+    dht_peers: Vec<(iroh::PublicKey, std::net::SocketAddr)>,
+    /// `NodeOriginConfig::probe_fanout`: how many peers one probe round may probe.
+    probe_fanout: usize,
+}
+
+impl FixtureDiscovery {
+    /// Directory-only discovery: `providers` are active stakers, the routing
+    /// table is empty so `find_providers` returns nothing, and the directory
+    /// answers `providers` under `namespace`.
+    fn directory_only(providers: Vec<DhtNodeId>, namespace: U256) -> Self {
+        Self {
+            stakers: providers.iter().copied().collect(),
+            directory: HashMap::from([(namespace, providers)]),
+            dht_peers: Vec::new(),
+            probe_fanout: 5,
+        }
+    }
+}
+
+/// Provision a `NodeOrigin` around an explicit [`FixtureDiscovery`], so a test can
+/// give the DHT and the origin directory different answers.
+#[allow(clippy::too_many_arguments, clippy::expect_used)]
+async fn build_origin_with_discovery(
+    ep_b: &iroh::Endpoint,
+    b_dht: DhtNodeId,
+    buyer: Arc<dyn PoolOpener>,
+    local_rep: &Arc<LocalReputation>,
+    metrics: &Arc<Metrics>,
+    discovery: FixtureDiscovery,
+    addr_map: HashMap<DhtNodeId, Address>,
+    pull_timeout: Duration,
+    stall_timeout: Duration,
+    max_blob_size_bytes: u64,
+    negative_cache: NegativeProbeCache,
+    probe_cache: PositiveProbeCache,
+    working_deposit: U256,
+) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
+    let FixtureDiscovery {
+        stakers,
+        directory,
+        dht_peers,
+        probe_fanout,
+    } = discovery;
+    let mut routing = RoutingTable::new(b_dht);
+    for (peer_id, peer_addr) in dht_peers {
+        let peer = DhtNodeId::from_bytes(*peer_id.as_bytes());
+        decdn_node::dht::client::find_node(
+            ep_b,
+            EndpointAddr::new(peer_id).with_ip_addr(peer_addr),
+            peer,
+            b_dht,
+        )
+        .await
+        .expect("prime the fixture's address cache for a DHT peer");
+        routing.insert(peer);
+    }
 
     let (engine, engine_tmp) = throwaway_engine()
         .await
@@ -804,9 +893,10 @@ async fn build_origin_with_probe_caches(
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
         dial_runtime: tokio::runtime::Handle::current(),
-        routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
-        staker_set: Arc::new(stakers) as Arc<dyn StakerSet>,
-        origin_directory: Arc::new(StaticOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,
+        routing_table: Arc::new(Mutex::new(routing)),
+        staker_set: Arc::new(ConfigStakerSet::new(stakers)) as Arc<dyn StakerSet>,
+        origin_directory: Arc::new(StaticOriginDirectory::new(directory))
+            as Arc<dyn OriginDirectory>,
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
         buyer,
@@ -819,7 +909,7 @@ async fn build_origin_with_probe_caches(
         metrics: Arc::clone(metrics),
         registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
-            probe_fanout: 5,
+            probe_fanout,
             // Taken verbatim from the caller. Two fixtures feed the same budgets to
             // `selection::outer_pull_deadline` and assert on what it derives, so a
             // margin applied behind the caller's back would put the config and that
@@ -14531,15 +14621,17 @@ async fn spawn_partial_holder(
 }
 
 /// Build serving node S: an empty-cache window-paced `ClientHandler` whose
-/// `NodeOrigin` discovers the two partial holders, plus each leaf's own lane in
-/// S's seller store (`leaves` is `(channel_id, owner)` per leaf). A focused twin of [`build_node_b_with_leaves`] for the
-/// two-holder ranged pull (that helper hardwires a single provider).
+/// `NodeOrigin` discovers holders through `discovery` (and `probe_cache`, when a
+/// test seeds it), plus each leaf's own lane in S's seller store (`leaves` is
+/// `(channel_id, owner)` per leaf). A focused twin of [`build_node_b_with_leaves`]
+/// for the multi-holder ranged pull (that helper hardwires a single provider).
 #[allow(clippy::too_many_arguments)]
 async fn build_serving_node(
     hash: Hash,
     ab_pool_id: B256,
     s_buyer: &Arc<PrivateKeySigner>,
-    providers: Vec<DhtNodeId>,
+    discovery: FixtureDiscovery,
+    probe_cache: PositiveProbeCache,
     addr_map: HashMap<DhtNodeId, Address>,
     holder_dials: &[(iroh::PublicKey, std::net::SocketAddr)],
     leaves: &[(B256, Address)],
@@ -14573,18 +14665,21 @@ async fn build_serving_node(
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let s_metrics = Arc::new(Metrics::new());
-    let (origin, _engine, recorded, _engine_tmp) = provisioned_origin_with_deadlines(
+    let (buyer, recorded) = stub_opener(ab_pool_id, s_buyer);
+    let (origin, _engine, _engine_tmp) = build_origin_with_discovery(
         &ep_s,
         DhtNodeId::from_bytes(*s_id.as_bytes()),
-        hash,
-        ab_pool_id,
-        s_buyer,
+        buyer,
         &local_rep,
         &s_metrics,
-        providers,
+        discovery,
         addr_map,
-        DEFAULT_TEST_PULL_DEADLINES,
-        0, // max_blob_size_bytes: 0 = unlimited; this test does not exercise the size ceiling
+        DEFAULT_TEST_PULL_DEADLINES.0,
+        DEFAULT_TEST_PULL_DEADLINES.1,
+        0, // max_blob_size_bytes: 0 = unlimited; these tests do not exercise the size ceiling
+        NegativeProbeCache::new(),
+        probe_cache,
+        U256::ZERO,
     )
     .await;
     let origin_s = Arc::new(origin);
@@ -14719,7 +14814,8 @@ async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
             hash,
             ab_pool_id,
             &s_buyer,
-            providers,
+            FixtureDiscovery::directory_only(providers, U256::ZERO),
+            PositiveProbeCache::new(),
             addr_map,
             &[(a_id, a_addr), (b_id, b_addr)],
             &[(leaf_channel_id, leaf_eth.address())],
@@ -14825,6 +14921,366 @@ async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
     Ok(())
 }
 
+/// Spin up a DHT server whose record store names `holder` as a provider of
+/// `hash` with `coverage`, so a `find_providers` lookup through it returns
+/// exactly that one holder — the shape a ranged-fill partial announce leaves
+/// behind (#2188). Returns `(id, socket, endpoint, accept task)`.
+async fn spawn_dht_record_server(
+    hash: Hash,
+    holder: DhtNodeId,
+    coverage: Coverage,
+) -> Result<(
+    iroh::PublicKey,
+    std::net::SocketAddr,
+    iroh::Endpoint,
+    tokio::task::JoinHandle<()>,
+)> {
+    use decdn_node::dht::rate_limit::DhtRateLimitConfig;
+    use decdn_node::dht::{DhtRateLimiter, InsertOutcome, RecordStore, RecordStoreConfig};
+    use iroh::protocol::ProtocolHandler;
+
+    let sk = fresh_key();
+    let id = sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let rate_limiter = Arc::new(DhtRateLimiter::new(
+        &DhtRateLimitConfig {
+            per_peer_rate_per_sec: 1e6,
+            per_peer_burst: u32::MAX,
+            per_ip_rate_per_sec: 1e6,
+            per_ip_burst: u32::MAX,
+            global_rate_per_sec: 1e6,
+            global_burst: u32::MAX,
+            max_tracked_per_ip: 4096,
+            max_tracked_per_peer: 4096,
+        },
+        Arc::clone(&metrics),
+    ));
+    let records = Arc::new(Mutex::new(RecordStore::new(RecordStoreConfig::default())));
+    let receive_us = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros()),
+    )
+    .unwrap_or(u64::MAX);
+    let outcome = records
+        .lock()
+        .map_err(|_| anyhow::anyhow!("record store mutex poisoned"))?
+        .insert_at(
+            holder,
+            ContentHash::from_bytes(*hash.as_bytes()),
+            coverage,
+            receive_us,
+        );
+    anyhow::ensure!(
+        matches!(outcome, InsertOutcome::Inserted),
+        "fixture record insert must succeed: {outcome:?}"
+    );
+    let handler = Arc::new(decdn_node::handlers::dht::DhtHandler::with_routing(
+        id,
+        Arc::new(Mutex::new(RoutingTable::new(DhtNodeId::from_bytes(
+            *id.as_bytes(),
+        )))),
+        rate_limiter,
+        permissive_limiter(&metrics),
+        Arc::clone(&metrics),
+        Arc::new(ConfigStakerSet::new(HashSet::new())) as Arc<dyn StakerSet>,
+        records,
+    ));
+    let (ep, addr) = local_endpoint(sk, vec![decdn_protocol::ALPN_DHT.to_vec()]).await?;
+    let task = {
+        let ep = ep.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = ep.accept().await {
+                let Ok(connecting) = incoming.accept() else {
+                    continue;
+                };
+                let Ok(conn) = connecting.await else { continue };
+                let handler = Arc::clone(&handler);
+                tokio::spawn(async move {
+                    let _ = handler.accept(conn).await;
+                });
+            }
+        })
+    };
+    Ok((id, addr, ep, task))
+}
+
+/// A tiny two-discovery-block blob for the partial-holder tests: the block
+/// size is overridden to 16 KiB, so the blob is 32 KiB. Returns the guard (keep
+/// it alive for the test), the payload, and its hash.
+fn two_block_blob() -> Result<(decdn_protocol::TestBlockSizeGuard, Vec<u8>, Hash)> {
+    let block: u64 = 16 * 1024;
+    let guard = decdn_protocol::override_discovery_block_bytes_for_test(block);
+    anyhow::ensure!(
+        decdn_protocol::discovery_block_bytes() == block,
+        "override did not take"
+    );
+    let payload_len = usize::try_from(2 * block).unwrap_or(usize::MAX);
+    let payload: Vec<u8> = (0..payload_len)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let hash = Hash::new(&payload);
+    anyhow::ensure!(
+        decdn_protocol::num_blocks(2 * block) == 2,
+        "the blob must span exactly two discovery blocks under the override"
+    );
+    Ok((guard, payload, hash))
+}
+
+/// A discovery scenario for serving node S in [`serve_miss_discovery_case`]. P
+/// is a partial holder of block 0 of 2; O is an origin that covers both blocks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiscoveryCase {
+    /// A DHT lookup returns P alone; the directory lists O.
+    DhtPartial,
+    /// A probe-cache entry lists P alone; the DHT is empty; the directory lists O.
+    CachedPartial,
+    /// A probe-cache entry lists P and O, whose coverage spans the blob together.
+    CachedSpanning,
+    /// A DHT lookup returns O alone; the directory lists P.
+    DhtSpanning,
+    /// The DHT is empty; the directory lists P, then O; one probe per round.
+    DirectoryPastFanout,
+    /// The DHT is empty; the directory lists P and a dead peer D; no origin.
+    NoCoveringCandidate,
+}
+
+impl DiscoveryCase {
+    /// The probe rounds S runs: a second round means the origin supplement ran.
+    const fn probe_rounds(self) -> u64 {
+        match self {
+            Self::CachedSpanning => 0,
+            Self::CachedPartial | Self::DhtSpanning | Self::NoCoveringCandidate => 1,
+            Self::DhtPartial | Self::DirectoryPastFanout => 2,
+        }
+    }
+}
+
+/// #2195: drive one leaf pull through serving node S under `case` and check that
+/// S either assembles the blob with O's help or refuses before `ok: true`, never
+/// a truncated stream. The probe-round count pins whether the origin supplement
+/// ran, independent of how the live probe RTT ranks P and O.
+#[allow(clippy::too_many_lines)]
+async fn serve_miss_discovery_case(case: DiscoveryCase) -> Result<()> {
+    let (_block_guard, payload, hash) = two_block_blob()?;
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let partial = Coverage::from_block_indices(2, [0].into_iter());
+
+    let ab_pool_id = B256::repeat_byte(0xA3);
+    let s_buyer = Arc::new(PrivateKeySigner::random());
+    let (p_id, p_addr, p_eth, ep_p, task_p, _store_p) =
+        spawn_partial_holder(&payload, ab_pool_id, s_buyer.address(), partial.clone(), 0).await?;
+    let (o_id, o_addr, o_eth, ep_o, task_o, store_o) = spawn_partial_holder(
+        &payload,
+        ab_pool_id,
+        s_buyer.address(),
+        Coverage::full(2),
+        0,
+    )
+    .await?;
+    let p_dht = DhtNodeId::from_bytes(*p_id.as_bytes());
+    let o_dht = DhtNodeId::from_bytes(*o_id.as_bytes());
+    // A staked peer with no endpoint: every probe to it fails.
+    let d_dht = DhtNodeId::from_bytes(*fresh_key().public().as_bytes());
+    let probed = |node_id: DhtNodeId, coverage: Coverage| ProbedProvider {
+        node_id,
+        rate_per_mb: RATE,
+        rtt_ms: 1,
+        coverage,
+        total_bytes_hint: Some(total_bytes),
+    };
+
+    // Directories are keyed under `NO_NAMESPACE`, like the leaf's request
+    // (`StaticOriginDirectory` does not apply production's namespace-0 rule).
+    let directory = match case {
+        DiscoveryCase::DhtPartial
+        | DiscoveryCase::CachedPartial
+        | DiscoveryCase::CachedSpanning => {
+            vec![o_dht]
+        }
+        DiscoveryCase::DhtSpanning => vec![p_dht],
+        DiscoveryCase::DirectoryPastFanout => vec![p_dht, o_dht],
+        DiscoveryCase::NoCoveringCandidate => vec![p_dht, d_dht],
+    };
+    let mut discovery = FixtureDiscovery {
+        stakers: HashSet::from([p_dht, o_dht, d_dht]),
+        directory: HashMap::from([(U256::ZERO, directory)]),
+        dht_peers: Vec::new(),
+        probe_fanout: if case == DiscoveryCase::DirectoryPastFanout {
+            1
+        } else {
+            5
+        },
+    };
+    let probe_cache = PositiveProbeCache::new();
+    let target = ContentHash::from_bytes(*hash.as_bytes());
+    let dht_record = match case {
+        DiscoveryCase::DhtPartial => Some((p_dht, partial.clone())),
+        DiscoveryCase::DhtSpanning => Some((o_dht, Coverage::full(2))),
+        DiscoveryCase::CachedPartial => {
+            probe_cache.insert(target, vec![probed(p_dht, partial.clone())]);
+            None
+        }
+        DiscoveryCase::CachedSpanning => {
+            probe_cache.insert(
+                target,
+                vec![
+                    probed(p_dht, partial.clone()),
+                    probed(o_dht, Coverage::full(2)),
+                ],
+            );
+            None
+        }
+        DiscoveryCase::DirectoryPastFanout | DiscoveryCase::NoCoveringCandidate => None,
+    };
+    let mut dht_server = None;
+    if let Some((holder, coverage)) = dht_record {
+        let (dht_id, dht_addr, dht_ep, dht_task) =
+            spawn_dht_record_server(hash, holder, coverage).await?;
+        discovery.dht_peers.push((dht_id, dht_addr));
+        dht_server = Some((dht_ep, dht_task));
+    }
+    let addr_map = HashMap::from([(p_dht, p_eth), (o_dht, o_eth)]);
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x2F);
+    let (handler_s, s_target, ep_s, _recorded, cache_s, s_operator, s_metrics, _) =
+        build_serving_node(
+            hash,
+            ab_pool_id,
+            &s_buyer,
+            discovery,
+            probe_cache,
+            addr_map,
+            &[(p_id, p_addr), (o_id, o_addr)],
+            &[(leaf_channel_id, leaf_eth.address())],
+            U256::from(DEPOSIT_MICRO_USDC),
+        )
+        .await?;
+    let task_s = spawn_server(ep_s.clone(), handler_s);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let pulled = leaf_paced_pull(
+        &leaf_ep,
+        s_target,
+        leaf_node_id,
+        &leaf_eth,
+        s_operator,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await;
+
+    if case == DiscoveryCase::NoCoveringCandidate {
+        // No candidate covers block 1, so S refuses with a signed miss before
+        // `ok: true` rather than committing and truncating.
+        let Err(err) = pulled else {
+            anyhow::bail!("S must refuse when no candidate covers block 1");
+        };
+        anyhow::ensure!(
+            format!("{err:#}").contains("delivery refused"),
+            "S must refuse before committing, not truncate after `ok: true`: {err:#}"
+        );
+    } else {
+        let outcome = pulled?;
+        anyhow::ensure!(outcome.completed, "leaf delivery did not complete");
+        anyhow::ensure!(outcome.hash_ok, "leaf received bytes failed the hash check");
+        anyhow::ensure!(
+            outcome.received == total_bytes,
+            "leaf received {} of {total_bytes} bytes",
+            outcome.received
+        );
+        anyhow::ensure!(
+            cache_s.has(hash).await?,
+            "S must promote the assembled blob on a complete delivery"
+        );
+        // O is the only coverer of block 1 in every completing case.
+        let o_delivered = store_o
+            .get(LaneKey {
+                pool_id: ab_pool_id,
+                signer: s_buyer.address(),
+                provider: o_eth,
+            })?
+            .ok_or_else(|| anyhow::anyhow!("origin lane vanished"))?
+            .last_bytes_delivered();
+        anyhow::ensure!(
+            o_delivered > U256::ZERO,
+            "the origin must have served the block the partial holder lacks"
+        );
+    }
+    let rounds = counter_value(&s_metrics, "probe_collection_latency_seconds_count")?;
+    anyhow::ensure!(
+        rounds == case.probe_rounds(),
+        "expected {} probe rounds, got {rounds}",
+        case.probe_rounds()
+    );
+    let expected_cache = match case {
+        // A cached list that cannot span the blob cannot complete the ranged
+        // assembly, so it counts as a miss, not a hit.
+        DiscoveryCase::CachedPartial => Some((0, 1)),
+        DiscoveryCase::CachedSpanning => Some((1, 0)),
+        _ => None,
+    };
+    if let Some((hits, misses)) = expected_cache {
+        let got = (
+            counter_value(&s_metrics, "probe_cache_hits_total")?,
+            counter_value(&s_metrics, "probe_cache_misses_total")?,
+        );
+        anyhow::ensure!(
+            got == (hits, misses),
+            "expected (hits, misses) = ({hits}, {misses}), got {got:?}"
+        );
+    }
+
+    match dht_server {
+        Some((dht_ep, dht_task)) => {
+            shutdown(
+                [task_s, task_p, task_o, dht_task],
+                [&leaf_ep, &ep_s, &ep_p, &ep_o, &dht_ep],
+            )
+            .await?;
+        }
+        None => {
+            shutdown([task_s, task_p, task_o], [&leaf_ep, &ep_s, &ep_p, &ep_o]).await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dht_answer_of_partial_holders_only_pulls_in_the_directory_origin() -> Result<()> {
+    serve_miss_discovery_case(DiscoveryCase::DhtPartial).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_only_probe_cache_hit_falls_through_to_the_directory_origin() -> Result<()> {
+    serve_miss_discovery_case(DiscoveryCase::CachedPartial).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spanning_probe_cache_hit_serves_without_probing() -> Result<()> {
+    serve_miss_discovery_case(DiscoveryCase::CachedSpanning).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spanning_dht_holders_skip_the_origin_supplement() -> Result<()> {
+    serve_miss_discovery_case(DiscoveryCase::DhtSpanning).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_origin_past_the_probe_fanout_is_probed() -> Result<()> {
+    serve_miss_discovery_case(DiscoveryCase::DirectoryPastFanout).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_covering_candidate_refuses_before_commit() -> Result<()> {
+    serve_miss_discovery_case(DiscoveryCase::NoCoveringCandidate).await
+}
+
 /// #2178: a holder that refuses a leg with a signed `NotFound` — the wire shape
 /// of a seller's per-signer live-cap refusal — is waited on and asked again when
 /// no other candidate covers its range, and is not suppressed for the hash. Every
@@ -14890,7 +15346,8 @@ async fn sole_coverer_refusal_is_retried(leaves: usize) -> Result<()> {
             hash,
             ab_pool_id,
             &s_buyer,
-            providers,
+            FixtureDiscovery::directory_only(providers, U256::ZERO),
+            PositiveProbeCache::new(),
             addr_map,
             &[(a_id, a_addr), (b_id, b_addr)],
             &leaf_lanes,

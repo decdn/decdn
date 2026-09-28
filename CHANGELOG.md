@@ -832,6 +832,31 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **A serve-miss whose DHT answer names only partial holders reaches the
+  namespace's origin instead of truncating the client's stream (#2195).**
+  The on-chain origin directory was read only when the DHT answer was empty.
+  Since #2188 a DHT answer can name only partial holders, so the ranged
+  assembly ran out of candidates for the blocks none of them held, and the
+  client got a short stream after `ok: true`.
+  - On the ranged pull leg, when the probed holders' coverage does not span the
+    blob, the node probes the origin-directory candidates that the first round
+    did not probe, an origin past the `probe_fanout` cut among them. A
+    supplemented miss probes at most twice `probe_fanout` peers and records two
+    `decdn_probe_collection_latency_seconds` samples.
+  - A probe-cache entry whose providers do not span the blob counts as a
+    `decdn_probe_cache_misses_total` on the ranged pull leg and runs a fresh
+    lookup.
+  - A partial holder's probe response carries the blob size
+    (`ProbeResponseExt.total_bytes`) with its coverage, so a set of partials
+    that covers every block counts as spanning. No wire change: the field
+    already exists.
+  - Before it signs `ok: true`, the serving node checks, against the signed
+    blob size, that its candidates cover the part of the pull range it does
+    not hold. If they do not, it refuses with a signed miss the client can fail
+    over on, and logs an `info!` naming the range.
+  - A ranged assembly that still ends early logs a `warn!` with its cause:
+    every covering candidate faulted, no progress, an uncovered range, or the
+    reassign budget.
 - **A serve-miss pull no longer re-pays one upstream range for hours after its
   client leaves (#2194).** Two faults combined.
   - A serve leg that waits on its pull for the next frame now also watches the

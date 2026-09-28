@@ -14,7 +14,7 @@ Two questions are in scope:
 
 ## Decision
 
-All bonded nodes form a flat peer mesh with no fixed routing hierarchy. Node discovery is the on-chain `CapacityBond` registry active set; content discovery uses `cdn/dht/v1` (a lightweight Kademlia subset — see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)), with the on-chain origin directory as the deterministic fallback when the DHT returns no providers:
+All bonded nodes form a flat peer mesh with no fixed routing hierarchy. Node discovery is the on-chain `CapacityBond` registry active set; content discovery uses `cdn/dht/v1` (a lightweight Kademlia subset — see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)), with the on-chain origin directory as the deterministic fallback when the DHT returns no providers, or when the probed holders do not cover every block of the blob:
 
 ```mermaid
 graph TD
@@ -25,7 +25,7 @@ graph TD
     DHT -->|providers found| PROBE["cdn/probe/v1<br/>targeted probe"]
     DHT -->|no providers| DIR["On-chain origin directory<br/>(ADR 022 last-resort fallback)"]
     PROBE -->|has_blob: true| SELECT["Select best by unified selection score"]
-    PROBE -->|no provider found| DIR
+    PROBE -->|holders do not cover<br/>every block| DIR
     DIR -->|provider found| PROBE
     DIR -->|no provider found| MISS["No Known Provider<br/>(serve from local origin if configured,<br/>otherwise reject)"]
 ```
@@ -48,7 +48,7 @@ Content discovery uses `cdn/dht/v1` as the primary mechanism. The full iterative
 
 #### Probe cache
 
-A short-lived LRU cache holds `hash → Vec<(NodeId, rate_per_mb, rtt)>` entries, TTL 15 seconds, max 1024 entries. Each hash entry retains at most 10 responses (top 10 by selection score). Approximate memory: 1,024 × 10 × ~100 bytes ≈ 1 MB. On a cache miss the requester checks the probe cache first; if a valid entry exists, it skips DHT lookup and goes straight to selection. On probe cache hit, if the selected provider no longer has the blob (evicted — rare with eviction holds), try the next-best cached provider; if all fail, run a fresh DHT lookup + probe. **Observability:** track `EvictedSinceProbe` response rate; sustained >1% may indicate eviction hold failures ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)).
+A short-lived LRU cache holds `hash → Vec<(NodeId, rate_per_mb, rtt)>` entries, TTL 15 seconds, max 1024 entries. Each hash entry retains at most 10 responses (top 10 by selection score). Approximate memory: 1,024 × 10 × ~100 bytes ≈ 1 MB. On a cache miss the requester checks the probe cache first; if a valid entry exists, it skips DHT lookup and goes straight to selection. On the ranged pull leg, an entry whose providers do not cover every block of the blob is not valid, and the requester runs a fresh DHT lookup + probe ([ADR 022 § FIND_VALUE Flow](022-content-discovery.md#find_value-flow-cache-miss--dht-lookup)). On probe cache hit, if the selected provider no longer has the blob (evicted — rare with eviction holds), try the next-best cached provider; if all fail, run a fresh DHT lookup + probe. **Observability:** track `EvictedSinceProbe` response rate; sustained >1% may indicate eviction hold failures ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)).
 
 **Probe cache TTL is 15 seconds** — half the 30-second slashing window from [ADR 005](005-protocol.md#adr-005-wire-protocol) and below `probe_hold_duration` (35s), so any stream opened from a cached entry falls within the window during which a misbehaving provider is still slashable, and within the eviction hold period whenever a hold was actually placed (holds are best-effort — see [ADR 005 § Hold budget](005-protocol.md#hold-budget)).
 

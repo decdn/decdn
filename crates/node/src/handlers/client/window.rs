@@ -93,7 +93,13 @@ impl ClientHandler {
     /// regardless of origin health, and they collapse to `NotFound` deliberately so
     /// a prober cannot map out other clients' channel balances
     /// ([`ServeRejectReason::wire_error`]).
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    // The numbered steps (1)–(7) are one ordered sequence whose refusals must all
+    // land before the signed `ok: true`; splitting a step out would hide that order.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::cognitive_complexity
+    )]
     pub(super) async fn serve_via_window_pull_through(
         &self,
         mut send: SendStream,
@@ -187,10 +193,11 @@ impl ClientHandler {
         // retire the peeked session between the peek and the claim, so `claim_fill`
         // can still return `Owner`; that branch opens the pull leg LATE (step 6b) —
         // it alone needs a `target`. The namespace (ADR 005 §Namespace routing)
-        // drives the origin-directory fallback inside `discover` on a total DHT miss
-        // and is threaded onto the node-to-node leg so a directory-discovered cold
-        // origin's own pull-through gate resolves (#1401); big-endian to the on-chain
-        // `uint256` shape.
+        // drives the origin-directory reads — the fallback inside `discover` on a
+        // total DHT miss, and the supplement in `probe_and_rank` when the discovered
+        // holders do not span the blob — and is threaded onto the node-to-node leg so
+        // a directory-discovered cold origin's own pull-through gate resolves (#1401);
+        // big-endian to the on-chain `uint256` shape.
         let deadline = self.pull_through.unwrap_or(WINDOW_PULL_FALLBACK_DEADLINE);
         let namespace_id = U256::from_be_bytes(req.namespace_id);
         // The lane's banked ramp credit, taken once for this stream (ADR 003
@@ -346,6 +353,24 @@ impl ClientHandler {
                         .await;
                 }
             }
+        }
+
+        // (6c) Coverage gate (#2195): refuse with a signed miss the client can fail over
+        // on, instead of `ok: true` and a truncated stream, when the ranked candidates
+        // cannot cover the part of the pull range this node does not hold.
+        if self
+            .pull_range_uncovered(hash, total_bytes, pull_range, target.as_ref())
+            .await
+        {
+            release_reservation_unspent(floor_reservation.as_ref());
+            return self
+                .respond_error(
+                    &mut send,
+                    req,
+                    FillOutcome::miss_reason(fault_seen),
+                    rate_per_mb,
+                )
+                .await;
         }
 
         // (7) Sign + send the response now that the fill mechanism is secured for every
@@ -901,6 +926,53 @@ impl ClientHandler {
                 Err(FillOutcome::miss_reason(fault_seen))
             }
         }
+    }
+
+    /// Whether `target`'s candidates leave part of `pull_range` uncovered, counting
+    /// only the chunks this node does not already hold (#2195). `false` when this
+    /// serve drives no pull.
+    ///
+    /// It is the test the ranged assembly's first round applies, judged against the
+    /// signed `total_bytes`, so `true` means the pull cannot fill the range and the
+    /// serve must refuse before `ok: true`. A store read fault fails open (`false`):
+    /// the assembly's own read raises and classifies it.
+    async fn pull_range_uncovered(
+        &self,
+        hash: Hash,
+        total_bytes: u64,
+        pull_range: Option<(u64, u64)>,
+        target: Option<&PullLegTarget>,
+    ) -> bool {
+        use decdn_bao_range::RangedStore as _;
+        let (Some((pull_offset, pull_len)), Some(target)) = (pull_range, target) else {
+            return false;
+        };
+        let store = decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
+        let gap = match store.missing_ranges(pull_offset, pull_len).await {
+            Ok(gap) => gap,
+            Err(err) => {
+                tracing::warn!(
+                    %hash,
+                    error = %err,
+                    "serve-miss: cannot read the missing range for the coverage gate; \
+                     committing without it"
+                );
+                return false;
+            }
+        };
+        let uncovered = target.uncovered(&gap);
+        if uncovered.is_empty() {
+            return false;
+        }
+        tracing::info!(
+            %hash,
+            pull_offset,
+            pull_len,
+            candidates = target.candidate_count(),
+            first_uncovered_chunk = uncovered.boundaries().first().map(|c| c.0),
+            "serve-miss: no candidate covers part of the missing range; refusing before commit"
+        );
+        true
     }
 
     /// Seed the shared fill session's outboard with proof nodes for ranges this

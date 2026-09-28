@@ -2451,8 +2451,22 @@ impl CacheEngine {
     /// blocks (where `status()` would leave the size unknown until the last
     /// chunk). A `NotFound`, evicted, or refused hash reports no blocks.
     pub async fn coverage(&self, hash: Hash) -> CacheResult<decdn_protocol::Coverage> {
+        Ok(self.coverage_sized(hash).await?.0)
+    }
+
+    /// [`Self::coverage`] plus the blob size it was derived from, so a partial
+    /// holder can advertise its size alongside its blocks. The size is `None`
+    /// exactly when the coverage is empty for want of a known size: an absent,
+    /// evicted, or refused hash.
+    ///
+    /// The size comes from the same `observe()` bitfield read as the coverage,
+    /// so the pair costs one read and cannot disagree.
+    pub async fn coverage_sized(
+        &self,
+        hash: Hash,
+    ) -> CacheResult<(decdn_protocol::Coverage, Option<u64>)> {
         if self.refuses(hash) {
-            return Ok(decdn_protocol::Coverage::empty());
+            return Ok((decdn_protocol::Coverage::empty(), None));
         }
         // The size comes from the `observe()` bitfield (via `present_ranges`),
         // not `status()`: iroh-blobs leaves a partial blob's size unknown
@@ -2462,10 +2476,11 @@ impl CacheEngine {
         // already handles the absent/evicted guards (size 0 there too).
         let present = self.present_ranges(hash).await?;
         let size = present.size();
-        Ok(decdn_protocol::Coverage::from_block_indices(
+        let coverage = decdn_protocol::Coverage::from_block_indices(
             decdn_protocol::num_blocks(size),
             covered_blocks(size, present.chunk_ranges()),
-        ))
+        );
+        Ok((coverage, (size > 0).then_some(size)))
     }
 
     /// Announce `hash` on [`Self::subscribe_inserts`] when the admit of
@@ -10791,6 +10806,8 @@ mod tests {
         let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
         let cov = engine.coverage(Hash::from([7u8; 32])).await.unwrap();
         assert!(cov.is_empty(), "an absent hash has no covered blocks");
+        let (_, size) = engine.coverage_sized(Hash::from([7u8; 32])).await.unwrap();
+        assert_eq!(size, None, "an absent hash has no size to advertise");
     }
 
     #[tokio::test]
@@ -10938,6 +10955,15 @@ mod tests {
         assert!(
             cov.covers(0),
             "block 0 is fully present; coverage must not depend on status()'s size"
+        );
+        // The partial advertises its size with its blocks (#2195), read from the
+        // same bitfield, before `status()` knows it.
+        let (sized_cov, size) = engine.coverage_sized(hash).await.unwrap();
+        assert_eq!(sized_cov, cov, "the sized read reports the same blocks");
+        assert_eq!(
+            size,
+            Some(total),
+            "a front partial reports the full blob size"
         );
     }
 

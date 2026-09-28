@@ -2,9 +2,9 @@
 //! "Origin discovery" and §Bootstrap "the on-chain origin directory
 //! provides the deterministic fallback").
 //!
-//! When a DHT lookup for a `namespaceId != 0` request returns no providers, the
-//! requester falls back to the deterministic chain-derived directory keyed on
-//! the request's namespace:
+//! When a DHT lookup for a `namespaceId != 0` request returns no providers, or
+//! the probed holders do not cover every block of the blob, the requester reads
+//! the deterministic chain-derived directory keyed on the request's namespace:
 //!
 //!   `OriginAssignment.getOrigins(namespace_id)` → `[operator...]`
 //!     → `CapacityBond.nodeIdOf(operator) → (NodeId, active)`
@@ -53,10 +53,10 @@ use crate::dht::routing::NodeId;
 /// request is published under (ADR 002 §Retrieval by namespace).
 ///
 /// Implementations MUST be cheap to clone (typically `Arc<inner>`); consumers
-/// hold a long-lived `Arc<dyn OriginDirectory>` and only invoke
-/// `lookup_origins` on lookup miss (an uncommon path per ADR 022 §FIND\_VALUE
-/// Flow "This fallback is uncommon — under normal operation the DHT contains
-/// entries for every actively-serving authorized origin").
+/// hold a long-lived `Arc<dyn OriginDirectory>` and invoke `lookup_origins` on
+/// a lookup miss, or on a ranged pull whose probed holders do not cover every
+/// block (ADR 022 §FIND\_VALUE Flow). Both are uncommon: under normal operation
+/// the DHT holds an entry for every actively-serving authorized origin.
 ///
 /// `async` because the chain-backed implementation may issue one on-demand
 /// `getOrigins` RPC on a cold-namespace miss; `Empty`/`Static` resolve

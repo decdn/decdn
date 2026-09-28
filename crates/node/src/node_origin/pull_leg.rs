@@ -71,8 +71,8 @@ use super::ranged_pull::{AssembleOutcome, RunOutcome, RunSink, assemble};
 use super::timed_source::{TimedReader, TimedSource, timed_open};
 use super::{
     EconGate, NodeOrigin, NodeOriginDeps, ProbeGather, PullMiss, PullOutcome, PullVerdict,
-    SettleOnDrop, bind_upstream_ctx, cached_candidates, classify_pull_failure, discover,
-    economic_ceiling, heat_of, lane_ledger, mb_of, now_micros, probe_and_rank,
+    SettleOnDrop, bind_upstream_ctx, cached_candidates, classify_pull_failure, coverage_spans,
+    discover, economic_ceiling, heat_of, lane_ledger, mb_of, now_micros, probe_and_rank,
     record_backpressure_exhausted, record_backpressure_refusal, record_outcome,
     record_pool_open_failure,
 };
@@ -113,6 +113,20 @@ pub(crate) struct PullLegTarget {
 }
 
 impl PullLegTarget {
+    /// How many ranked candidates the pull plans over.
+    pub(crate) const fn candidate_count(&self) -> usize {
+        self.candidates.len()
+    }
+
+    /// The part of `gap` no candidate covers ([`super::ranged_pull::uncovered`]),
+    /// judged against the signed `total_bytes` rather than any candidate's
+    /// unsigned size hint.
+    pub(crate) fn uncovered(&self, gap: &ChunkRanges) -> ChunkRanges {
+        let coverages: Vec<decdn_protocol::Coverage> =
+            self.candidates.iter().map(|c| c.coverage.clone()).collect();
+        super::ranged_pull::uncovered(gap, self.total_bytes, &coverages)
+    }
+
     /// Keep the handshake's primed pull only when this serve drives the pull it
     /// was cut for: an owning claim over exactly `prime`'s range. Any other claim
     /// (an attach, or a mixed remainder) starts its pull elsewhere, so the pull
@@ -433,6 +447,31 @@ fn is_bao_corruption(err: &anyhow::Error) -> bool {
     })
 }
 
+/// The probe-cache candidates for `target`, when their coverage spans the blob.
+///
+/// A cached list that cannot span the blob is no hit for the ranged assembly: a
+/// partial holder can win the handshake, and the blocks no cached holder covers
+/// would then stay unfilled (#2195). The caller's cold path re-runs discovery, and
+/// its probe round adds the directory's origins when the discovered holders do not
+/// span the blob. The entry is not invalidated here: that probe round overwrites
+/// it.
+async fn spanning_cached_candidates(
+    deps: &NodeOriginDeps,
+    target: DhtHash,
+    hash: Hash,
+) -> Option<Vec<Candidate>> {
+    let cached = cached_candidates(deps, target).await?;
+    if coverage_spans(&cached) {
+        return Some(cached);
+    }
+    debug!(
+        %hash,
+        cached = cached.len(),
+        "node-origin: probe-cache entry does not span the blob; running a fresh lookup"
+    );
+    None
+}
+
 impl NodeOrigin {
     /// Discover, probe, rank, and open a channel to the best available provider for
     /// `hash`, returning the bound [`PullLegTarget`] (with the upstream `total_bytes`)
@@ -469,7 +508,7 @@ impl NodeOrigin {
         let mut attempt_metered = false;
         let mut miss = PullMiss::Clean;
 
-        if let Some(cached) = cached_candidates(deps, target).await {
+        if let Some(cached) = spanning_cached_candidates(deps, target, hash).await {
             deps.metrics.probe_cache_hit();
             deps.metrics.node_pull_attempt();
             attempt_metered = true;
@@ -511,8 +550,16 @@ impl NodeOrigin {
         // The ranged-drive assembly (#1506) plans over the coverage UNION of these
         // candidates, so the probe round must gather holders until their union spans
         // the blob — not stop at a fixed count that could miss the holders of the
-        // still-uncovered blocks.
-        let ranked = probe_and_rank(deps, providers, hash_bytes, ProbeGather::CoverageUnion).await;
+        // still-uncovered blocks — and adds the origin-directory candidates when the
+        // discovered holders cannot span it (#2195).
+        let ranked = probe_and_rank(
+            deps,
+            providers,
+            hash_bytes,
+            ProbeGather::CoverageUnion,
+            namespace_id,
+        )
+        .await;
         let outcome = self
             .handshake_from_candidates(deps, &ranked, hash_bytes, namespace_id, budget, prime)
             .await;
@@ -808,9 +855,12 @@ fn handshake_verdict(
 /// against the survivors — the loop-level reassign-only tail. The store keeps the
 /// verified bytes, so the replacement lane resumes at the gap and re-pays nothing
 /// (#1682). A TERMINAL fault (a shared-pool voucher rejection, an origin blacklist,
-/// an over-cap blob) ends the whole assembly. A still-missing range no surviving
-/// candidate covers ends it as an `Unavailable` outcome (origins advertise all-ones
-/// coverage, so an admitted origin candidate makes this unreachable). This function
+/// an over-cap blob) ends the whole assembly. The assembly also ends `Unavailable`
+/// when every covering candidate faulted, when a round made no progress, when the
+/// reassign budget ran out, or when no surviving candidate covers a still-missing
+/// range ([`super::ranged_pull::UnavailableCause`]). The serve leg refuses before
+/// `ok: true` when the candidates cannot cover the missing range at all, so these
+/// are faults that arise after the commit. This function
 /// runs on the pull thread the serve leg spawns AFTER it has already signed and sent
 /// `ok: true`, so none of these failure outcomes reaches the client as a signed
 /// `NotFound` — they surface as a truncated stream (`session.mark_ended(Err(..))`
@@ -931,7 +981,7 @@ pub(crate) async fn run_pull_leg(
     // leg finished first) is neither.
     match &outcome {
         AssembleOutcome::Complete => deps.metrics.outbound_stream_ended(true),
-        AssembleOutcome::Unavailable
+        AssembleOutcome::Unavailable(_)
         | AssembleOutcome::Backpressured
         | AssembleOutcome::Terminal(_) => {
             deps.metrics.outbound_stream_ended(false);
@@ -944,9 +994,23 @@ pub(crate) async fn run_pull_leg(
     // existing miss.
     let result = match outcome {
         AssembleOutcome::Complete | AssembleOutcome::Cancelled => Ok(()),
-        AssembleOutcome::Unavailable => Err(FillError::new(
-            "node-origin ranged pull: a still-missing range is held by no reachable provider",
-        )),
+        AssembleOutcome::Unavailable(cause) => {
+            // Signed `ok: true` is already out, so this is a truncated stream. Name
+            // the cause for the operator: the downstream fault line carries only the
+            // fill error.
+            warn!(
+                %hash,
+                offset,
+                len,
+                candidates = candidates.len(),
+                cause = cause.as_str(),
+                "node-origin ranged pull ended before the range was filled"
+            );
+            Err(FillError::new(format!(
+                "node-origin ranged pull: {}",
+                cause.as_str()
+            )))
+        }
         AssembleOutcome::Backpressured => Err(FillError::new(
             "node-origin ranged pull: the only holder of a still-missing range kept refusing \
              for backpressure",

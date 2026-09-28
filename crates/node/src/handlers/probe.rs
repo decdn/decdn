@@ -588,13 +588,20 @@ impl ProbeHandler {
         //   unaffected — it never reaches this arm because it is already
         //   `is_origin_sourced`).
         let is_origin_sourced = has_blob && !store_present;
-        let coverage = if chain_stale {
+        // The coverage and the size the response advertises, bound together: a
+        // partial holder reads its size from the same bitfield as its blocks
+        // (#2195), because the store branch above sizes only a `Complete` blob and
+        // ADR 005 asks a node to include the size whenever it knows it.
+        let (coverage, total_bytes) = if chain_stale {
             // Chain-stale (above): advertise no coverage, so the re-derived
             // `has_blob` below stays false. This is the arm that actually binds the
             // stale answer — `has_blob` is the coverage biconditional.
-            Coverage::empty()
+            (Coverage::empty(), total_bytes)
         } else if is_origin_sourced {
-            total_bytes.map_or_else(Coverage::empty, |size| Coverage::full(num_blocks(size)))
+            (
+                total_bytes.map_or_else(Coverage::empty, |size| Coverage::full(num_blocks(size))),
+                total_bytes,
+            )
         } else if holds_disabled || !self.relay_foreign_namespaces {
             // `holds_disabled`: the operator's explicit store opt-out (above).
             // `!self.relay_foreign_namespaces`: the origin-only policy (ADR
@@ -604,17 +611,17 @@ impl ProbeHandler {
             // would read as "advertised but didn't serve", the reputation
             // hazard that policy closes). Consulting the cache's coverage
             // here would leak exactly that hit back in.
-            Coverage::empty()
+            (Coverage::empty(), total_bytes)
         } else {
-            match self.cache.coverage(hash).await {
-                Ok(c) => c,
+            match self.cache.coverage_sized(hash).await {
+                Ok((c, size)) => (c, total_bytes.or(size)),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         %hash,
                         "cache error deriving probe coverage; advertising none"
                     );
-                    Coverage::empty()
+                    (Coverage::empty(), total_bytes)
                 }
             }
         };
