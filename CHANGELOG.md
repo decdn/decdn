@@ -840,7 +840,10 @@ since project inception and will roll into the first tagged release.
   on the probe-less fast path for the next 10 minutes. Only probes now feed
   `latency_ms`; a stream open files its quoted rate and clears the failure
   stamp (`PeerStore::record_open`). `UpstreamPullHeader::ttfb_ms` is removed
-  from the `decdn-client` API, since nothing else read it.
+  from the `decdn-client` API, since nothing else read it. Every peer-store
+  mutation now takes one process-wide lock, so a stream open that races the
+  off-path probe harvest no longer writes back a record read before the probe
+  sample landed.
 
 - **A serve-miss whose DHT answer names only partial holders reaches the
   namespace's origin instead of truncating the client's stream (#2195).**

@@ -168,6 +168,23 @@ impl PeerRecord {
 }
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// Serializes every mutation of the store within this process. Each mutation
+/// reads a whole record, changes it, and writes the whole record back, so two
+/// unserialized writers lose one update: a stream open that races the
+/// off-path probe harvest writes back a record read before the probe sample
+/// landed. The lock is process-wide rather than per store, because each
+/// [`PeerStore::open`] of one directory is a separate value. Concurrent
+/// `decdn` processes are not serialized: the atomic rename keeps each record
+/// whole, and the last writer wins.
+static MUTATION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Take [`MUTATION_LOCK`]. The guarded value is `()`, so a writer that
+/// panicked leaves nothing inconsistent behind and the poison is ignored.
+fn mutation_guard() -> MutexGuard<'static, ()> {
+    MUTATION_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Directory-backed peer knowledge base: one JSON file per peer under `<data_dir>/peers`.
 #[derive(Debug, Clone)]
@@ -275,6 +292,7 @@ impl PeerStore {
 
     /// Refresh identity, preserving existing stats.
     pub fn upsert_identity(&self, cand: &NodeCandidate, now_secs: u64) -> anyhow::Result<()> {
+        let _guard = mutation_guard();
         let mut rec = self.get(&cand.node_id).unwrap_or(PeerRecord {
             node_id: cand.node_id,
             eth_address: cand.eth_address,
@@ -305,6 +323,7 @@ impl PeerStore {
         now_secs: u64,
         cfg: &StoreConfig,
     ) -> anyhow::Result<()> {
+        let _guard = mutation_guard();
         let mut rec = self.get(node_id).unwrap_or(PeerRecord {
             node_id: *node_id,
             eth_address: Address::ZERO,
@@ -331,6 +350,7 @@ impl PeerStore {
     /// peer with no record is left alone: a stats-only placeholder is never
     /// selectable.
     pub fn record_open(&self, node_id: &PublicKey, rate_per_mb: u64) -> anyhow::Result<()> {
+        let _guard = mutation_guard();
         let Some(mut rec) = self.get(node_id) else {
             return Ok(());
         };
@@ -341,6 +361,7 @@ impl PeerStore {
 
     /// Stamp a failure so the peer is suppressed from selection.
     pub fn record_failure(&self, node_id: &PublicKey, now_secs: u64) -> anyhow::Result<()> {
+        let _guard = mutation_guard();
         let Some(mut rec) = self.get(node_id) else {
             return Ok(());
         };
@@ -358,6 +379,7 @@ impl PeerStore {
 
     /// Prune very-stale identities, then LRU-evict down to `lru_cap`.
     pub fn prune_and_cap(&self, now_secs: u64, cfg: &StoreConfig) -> anyhow::Result<()> {
+        let _guard = mutation_guard();
         let mut records = self.load_all();
         records.retain(|r| {
             if r.identity_prunable(now_secs, cfg) {
@@ -619,6 +641,37 @@ mod tests {
         assert_eq!(got.latency_ms, Some(57.0));
         assert_eq!(got.sample_count, 1);
         assert_eq!(got.last_sampled_at_secs, Some(5_100));
+        Ok(())
+    }
+
+    /// Concurrent writers never lose a probe sample: a stream open that races
+    /// the harvest must not write back a record read before the sample landed.
+    #[test]
+    fn concurrent_opens_never_drop_a_probe_sample() -> anyhow::Result<()> {
+        const ROUNDS: u32 = 25;
+        const WRITERS: u32 = 4;
+        let cfg = StoreConfig::default();
+        let dir = tempdir()?;
+        let store = PeerStore::open(dir.path());
+        store.upsert_identity(&candidate(7), 5_000)?;
+        std::thread::scope(|scope| {
+            for _ in 0..WRITERS {
+                scope.spawn(|| {
+                    for _ in 0..ROUNDS {
+                        let _ = store.record_sample(&key(7), 50.0, 1, 5_100, &cfg);
+                    }
+                });
+                scope.spawn(|| {
+                    for _ in 0..ROUNDS {
+                        let _ = store.record_open(&key(7), 2);
+                    }
+                });
+            }
+        });
+        let got = store
+            .get(&key(7))
+            .ok_or_else(|| anyhow::anyhow!("missing"))?;
+        assert_eq!(got.sample_count, WRITERS * ROUNDS);
         Ok(())
     }
 
