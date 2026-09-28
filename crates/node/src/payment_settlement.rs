@@ -1853,13 +1853,15 @@ fn holds_unredeemed(states: &[LaneState], pool_id: PoolId, provider: Address) ->
 /// Chunk planned lanes under the per-chunk floor + voucher-count cap and submit
 /// each chunk. `floor == U256::ZERO` forces every lane (the close/shutdown path).
 ///
-/// The floor gates the on-chain read too: the lanes are chunked on their cached
-/// values first, and only lanes in a chunk that clears the floor are reconciled
-/// ([`reconcile_onchain_watermarks`]) and re-chunked. The cached paid watermark
-/// can only lag the chain, so a fresh read can only lower `unredeemed`, and a
-/// chunk that fails the floor on cached values fails it after the read too. A
-/// sub-floor hint therefore costs no `eth_call`. At `floor == 0` every chunk
-/// survives, so the forced paths still read every lane.
+/// The floor gates the on-chain read too: when the whole set's cached
+/// `unredeemed` is below the floor, it returns before
+/// [`reconcile_onchain_watermarks`]. The cached paid watermark can only lag the
+/// chain, so a fresh read can only lower `unredeemed`, and no chunk after the
+/// read can hold more than the whole set. The gate is on the total, not per
+/// chunk, because a lane the read drops can shrink the chunk count and re-pack
+/// lanes from a failing chunk into one that clears. A sub-floor hint therefore
+/// costs no `eth_call`. At `floor == 0` the gate always passes, so the forced
+/// paths still read every lane.
 ///
 /// Floors the redeemed watermark first: flushes the lane store durable AFTER the
 /// lanes were planned (their cumulative amounts already read) and BEFORE any
@@ -1878,18 +1880,14 @@ async fn redeem_planned_lanes<P: Provider + Clone>(
     strict_flush: bool,
     metrics: &Arc<Metrics>,
 ) {
-    // Apply the floor on cached values before any chain read.
-    let candidates: Vec<PlannedLane> = chunk_redemptions(plans, floor, max_vouchers)
-        .into_iter()
-        .flatten()
-        .collect();
-    if candidates.is_empty() {
+    // Apply the floor on the cached total before any chain read.
+    if plans.is_empty() || sum_unredeemed(&plans) < floor {
         return;
     }
     // Last check before spending gas: reconcile against the on-chain watermark
     // and drop lanes the chain already shows settled, so a lagging cache or a
     // concurrent redeemer can never cost a no-op `redeemMany`.
-    let plans = reconcile_onchain_watermarks(contract, candidates, metrics).await;
+    let plans = reconcile_onchain_watermarks(contract, plans, metrics).await;
     let chunks = chunk_redemptions(plans, floor, max_vouchers);
     if chunks.is_empty() {
         return;
@@ -3201,26 +3199,32 @@ mod tests {
         Ok(())
     }
 
-    /// Only lanes in a chunk that clears the floor are read. With one lane per
-    /// chunk, the dust lane's chunk fails the floor and leaves the read, so the
-    /// single queued response pairs with exactly one lane: a two-lane read
-    /// would see a short return and count a reconcile failure.
+    /// A set whose cached total clears the floor reads every lane, even a lane
+    /// whose cached chunk fails the floor: the read can drop a lane, shrink the
+    /// chunk count and re-pack the rest into a chunk that clears. Here the cap
+    /// of 2 deals `[whale, b]` and `[a]`; `[a]` alone is below the floor, but
+    /// `[a, b]` clears it once the read drops the whale. A read of only the
+    /// first chunk would see a short return and count a reconcile failure.
     #[tokio::test]
-    async fn only_lanes_in_chunks_that_clear_the_floor_are_read() -> Result<()> {
+    async fn a_set_that_clears_the_floor_in_total_reads_every_lane() -> Result<()> {
         use decdn_incentive::MemoryPoolStateStore;
 
         let metrics = Arc::new(Metrics::new());
         let store: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
-        // The chain shows the above-floor lane settled, so the reconciled set is
-        // empty and nothing is submitted.
-        let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(1_000_000)]]);
+        // The chain shows every lane settled, so nothing reaches `redeemMany`.
+        let (contract, asserter) =
+            mocked_getwatermarks_pool(&[vec![lane(1_000_000), lane(300_000), lane(300_000)]]);
 
         redeem_planned_lanes(
             &contract,
             &store,
-            vec![planned(1, 0, 1_000_000, false), planned(1, 1, 10, false)],
+            vec![
+                planned(1, 0, 1_000_000, false),
+                planned(1, 1, 300_000, false),
+                planned(1, 2, 300_000, false),
+            ],
             U256::from(500_000u64),
-            1,
+            2,
             true,
             &metrics,
         )
@@ -3231,15 +3235,15 @@ mod tests {
         for expected in [
             "decdn_redemption_reconcile_ok_total 1",
             "decdn_redemption_reconcile_failures_total 0",
-            "decdn_redemption_reconciled_skip_total 1",
+            "decdn_redemption_reconciled_skip_total 3",
         ] {
             anyhow::ensure!(text.lines().any(|l| l == expected), "{expected}\n{text}");
         }
         Ok(())
     }
 
-    /// The forced close/shutdown paths pass `floor == 0`, which keeps every
-    /// chunk, so every lane is still reconciled against the chain.
+    /// The forced close/shutdown paths pass `floor == 0`, which always passes
+    /// the floor gate, so every lane is still reconciled against the chain.
     #[tokio::test]
     async fn a_zero_floor_still_reads_every_lane() -> Result<()> {
         use decdn_incentive::MemoryPoolStateStore;
