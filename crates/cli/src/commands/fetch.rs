@@ -2029,8 +2029,8 @@ struct FetchPrelude<'a, P> {
     /// the shared handle — the baseline a caller's watermark update advances
     /// against.
     prior_amount: U256,
-    /// The key the peer store's stream-derived sample/failure is filed under
-    /// (#1906-series), captured before `target` moved into `PeerSource::new`.
+    /// The key the peer store stamps a drive failure under (`settle_lane`,
+    /// `settle_drive`), captured before `target` moved into `PeerSource::new`.
     node_id: PublicKey,
     peer_store: decdn_client::PeerStore,
     /// Reactive top-ups this fetch has spent, across every lane a shared pool
@@ -2506,12 +2506,11 @@ enum PreludeLeg<'r> {
 /// prior `.partial.ranges` record resumes; only the still-missing bytes are
 /// ever re-pulled and no already-held byte is re-paid.
 ///
-/// The first open is also the observed-TTFB boundary the peer store wants
-/// (#1906-series): a source that cannot complete it is stamped as a failure,
-/// and one that does hands back a real stream-derived latency — best-effort in
-/// both directions (`let _ =`), never failing the fetch. The cache-miss
-/// annotation is applied here too, so an unbound or underfunded refusal is
-/// explained at this first contact.
+/// The first open is also filed in the peer store (`record_first_open`): a
+/// source that cannot complete it is stamped as a failure, and one that does
+/// files its quoted rate — best-effort in both directions, never failing the
+/// fetch. The cache-miss annotation is applied here too, so an unbound or
+/// underfunded refusal is explained at this first contact.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn open_fetch_prelude<'a, P>(
     deps: &DriveFetchDeps<'a, P>,
@@ -2546,10 +2545,9 @@ where
     let (ledger, ctx) = lane_ledger(ledgers, lane, ctx);
 
     // Captured before `target` moves into `PeerSource::new` below — the key the
-    // peer store's stream-derived sample/failure is filed under (#1906-series).
+    // peer store files the first open under, and later any drive failure.
     let node_id = target.id;
     let peer_store = decdn_client::PeerStore::open(&deps.chain.data_dir);
-    let peer_store_cfg = decdn_client::StoreConfig::default();
 
     // The context is already shared behind interior mutability (from
     // `lane_ledger`): the source clones it to open each gap's pull, and the
@@ -2575,35 +2573,18 @@ where
         peer
     });
     let open_store = |total_bytes: u64| open_entry_store(entry_path, hash, total_bytes);
-    // Score the first open: a refusal or fault stamps the peer (except an
-    // `InsufficientDeposit` refusal (option 2 / #2013), which is OUR pool falling
-    // short of this node's floor `M`, not a fault of the peer), and a success
-    // files its stream-derived latency and quoted rate — the authoritative figure
-    // this fetch is actually paying, superseding any remembered probe rate.
-    let scored = |opened: anyhow::Result<(UpstreamPullHeader, PullReader)>| match opened {
-        Ok((header, reader)) => {
-            if let Err(e) = peer_store.record_sample(
-                &node_id,
-                header.ttfb_ms,
-                header.rate_per_mb,
-                now_secs_cli(),
-                &peer_store_cfg,
-            ) {
-                tracing::debug!("could not record a stream sample in the peer store: {e:#}");
-            }
-            Ok((header, reader))
-        }
-        Err(err) => {
-            if !decdn_client::is_insufficient_deposit(&err)
-                && let Err(e) = peer_store.record_failure(&node_id, now_secs_cli())
-            {
-                tracing::debug!("could not record a failed open in the peer store: {e:#}");
-            }
-            Err(match ctx.lock() {
-                Ok(guard) => annotate_unbound_cache_miss(err, &guard),
-                Err(_) => err,
-            })
-        }
+    // Score the first open in the peer store (see `record_first_open`), then
+    // name an unbound cache miss on the error path.
+    let scored = |opened: anyhow::Result<(UpstreamPullHeader, PullReader)>| {
+        record_first_open(
+            &peer_store,
+            &node_id,
+            opened.as_ref().map(|(header, _)| header),
+        );
+        opened.map_err(|err| match ctx.lock() {
+            Ok(guard) => annotate_unbound_cache_miss(err, &guard),
+            Err(_) => err,
+        })
     };
 
     let max_blob = peer_source.max_blob_size_bytes();
@@ -3287,7 +3268,6 @@ where
     P: alloy::providers::Provider + Clone,
 {
     let peer_store = decdn_client::PeerStore::open(&deps.chain.data_dir);
-    let peer_store_cfg = decdn_client::StoreConfig::default();
     let mut lanes = Vec::with_capacity(admitted.len());
     let mut total_bytes = None;
     let mut last_probe_err = None;
@@ -3330,11 +3310,11 @@ where
         {
             Ok((header, pull)) => {
                 drop(pull);
-                record_first_open(&peer_store, &peer_store_cfg, &lane.node_id, Ok(&header));
+                record_first_open(&peer_store, &lane.node_id, Ok(&header));
                 total_bytes = Some(header.total_bytes);
             }
             Err(err) => {
-                record_first_open(&peer_store, &peer_store_cfg, &lane.node_id, Err(&err));
+                record_first_open(&peer_store, &lane.node_id, Err(&err));
                 last_probe_err = Some(match lane.ctx.lock() {
                     Ok(guard) => annotate_unbound_cache_miss(err, &guard),
                     Err(_) => err,
@@ -3357,31 +3337,29 @@ where
     }
 }
 
-/// File a lane's first open in the peer store (#1906-series): a success's
-/// stream-derived latency and quoted rate, or a failure. An
-/// `InsufficientDeposit` refusal is not filed: it is our pool falling short of
-/// the node's floor, not a fault of the peer.
+/// File a lane's first open in the peer store: a success's quoted rate (the
+/// figure this fetch actually pays) with the failure stamp cleared, or a
+/// failure stamp. A success folds no latency: on a cache miss its open time
+/// includes the node's own upstream work, so one cold miss would rank a nearby
+/// node behind a distant origin until the sample goes stale (#2196). An `InsufficientDeposit` refusal is not
+/// filed: it is our pool falling short of the node's floor, not a fault of the
+/// peer.
 fn record_first_open(
     peer_store: &decdn_client::PeerStore,
-    cfg: &decdn_client::StoreConfig,
     node_id: &PublicKey,
     opened: Result<&UpstreamPullHeader, &anyhow::Error>,
 ) {
-    match opened {
-        Ok(header) => {
-            let _ = peer_store.record_sample(
-                node_id,
-                header.ttfb_ms,
-                header.rate_per_mb,
-                now_secs_cli(),
-                cfg,
-            );
-        }
-        Err(err) => {
-            if !decdn_client::is_insufficient_deposit(err) {
-                let _ = peer_store.record_failure(node_id, now_secs_cli());
-            }
-        }
+    let filed = match opened {
+        Ok(header) => peer_store.record_open(node_id, header.rate_per_mb),
+        Err(err) if decdn_client::is_insufficient_deposit(err) => Ok(()),
+        Err(_) => peer_store.record_failure(node_id, now_secs_cli()),
+    };
+    if let Err(e) = filed {
+        tracing::debug!(
+            %node_id,
+            ok = opened.is_ok(),
+            "could not record a first open in the peer store: {e:#}"
+        );
     }
 }
 
@@ -3594,7 +3572,6 @@ where
     P: alloy::providers::Provider + Clone,
 {
     let peer_store = decdn_client::PeerStore::open(&deps.chain.data_dir);
-    let peer_store_cfg = decdn_client::StoreConfig::default();
     let mut last_err = None;
     let num_blocks = decdn_protocol::num_blocks(expected);
     for (ix, lane) in lanes.iter_mut().enumerate() {
@@ -3628,7 +3605,7 @@ where
         };
         match opened {
             Ok((header, parked)) => {
-                record_first_open(&peer_store, &peer_store_cfg, &lane.node_id, Ok(&header));
+                record_first_open(&peer_store, &lane.node_id, Ok(&header));
                 let total_bytes = header.total_bytes;
                 match parked {
                     Some((reader, opened_at)) if total_bytes == expected => {
@@ -3647,7 +3624,7 @@ where
                 return Ok(total_bytes);
             }
             Err(err) => {
-                record_first_open(&peer_store, &peer_store_cfg, &lane.node_id, Err(&err));
+                record_first_open(&peer_store, &lane.node_id, Err(&err));
                 last_err = Some(match lane.ctx.lock() {
                     Ok(guard) => annotate_unbound_cache_miss(err, &guard),
                     Err(_) => err,
@@ -5433,6 +5410,74 @@ mod tests {
             s2.record_sample(&harvest_key(b), 30.0, 1, now, &cfg)?;
         }
         assert!(store_fast_path(&s2, &cfg, 4, now).is_none());
+        Ok(())
+    }
+
+    /// #2196: nearby nodes serving cold misses from a distant origin open slowly,
+    /// but a stream open is not a distance sample. After repeated opens on the
+    /// near nodes, the fast path still ranks them by probe RTT, ahead of the
+    /// origin.
+    #[test]
+    fn stream_opens_do_not_rank_near_nodes_behind_the_origin() -> anyhow::Result<()> {
+        let cfg = decdn_client::StoreConfig::default();
+        let dir = tempfile::tempdir()?;
+        let store = decdn_client::PeerStore::open(dir.path());
+        let now = now_secs_cli();
+        // Probe RTTs: two nearby caches and the transatlantic origin.
+        for (b, rtt) in [(1u8, 57.0), (2, 78.0), (3, 394.0)] {
+            store.upsert_identity(&harvest_candidate(b), now)?;
+            store.record_sample(&harvest_key(b), rtt, 1, now, &cfg)?;
+        }
+        let header = UpstreamPullHeader {
+            total_bytes: 1 << 20,
+            rate_per_mb: 4,
+            interval_bytes: decdn_protocol::client::CHUNK_BYTES,
+        };
+        for _ in 0..5 {
+            for b in [1u8, 2] {
+                record_first_open(&store, &harvest_key(b), Ok(&header));
+            }
+        }
+
+        let near = store
+            .get(&harvest_key(1))
+            .ok_or_else(|| anyhow::anyhow!("missing"))?;
+        assert_eq!(near.latency_ms, Some(57.0));
+        assert_eq!(near.rate_per_mb, Some(4));
+        let targets = store_fast_path(&store, &cfg, 4, now)
+            .ok_or_else(|| anyhow::anyhow!("expected Some"))?;
+        let order: Vec<_> = targets.candidates.iter().map(|c| c.node_id).collect();
+        assert_eq!(order, [harvest_key(1), harvest_key(2), harvest_key(3)]);
+        Ok(())
+    }
+
+    /// A failed first open stamps the peer, so the fast path skips it, and
+    /// leaves its probe RTT alone.
+    #[test]
+    fn failed_first_open_suppresses_the_peer() -> anyhow::Result<()> {
+        let cfg = decdn_client::StoreConfig::default();
+        let dir = tempfile::tempdir()?;
+        let store = decdn_client::PeerStore::open(dir.path());
+        let now = now_secs_cli();
+        for (b, rtt) in [(1u8, 57.0), (2, 78.0), (3, 90.0), (4, 394.0)] {
+            store.upsert_identity(&harvest_candidate(b), now)?;
+            store.record_sample(&harvest_key(b), rtt, 1, now, &cfg)?;
+        }
+        record_first_open(
+            &store,
+            &harvest_key(1),
+            Err(&anyhow::anyhow!("stream reset")),
+        );
+
+        let failed = store
+            .get(&harvest_key(1))
+            .ok_or_else(|| anyhow::anyhow!("missing"))?;
+        assert!(failed.last_failure_at_secs.is_some());
+        assert_eq!(failed.latency_ms, Some(57.0));
+        let targets = store_fast_path(&store, &cfg, 4, now)
+            .ok_or_else(|| anyhow::anyhow!("expected Some"))?;
+        let order: Vec<_> = targets.candidates.iter().map(|c| c.node_id).collect();
+        assert_eq!(order, [harvest_key(2), harvest_key(3), harvest_key(4)]);
         Ok(())
     }
 

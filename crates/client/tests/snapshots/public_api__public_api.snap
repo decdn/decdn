@@ -255,6 +255,7 @@ pub fn decdn_client::peer_store::PeerStore::load_all(&self) -> alloc::vec::Vec<d
 pub fn decdn_client::peer_store::PeerStore::open(&std::path::Path) -> Self
 pub fn decdn_client::peer_store::PeerStore::prune_and_cap(&self, u64, &decdn_client::peer_store::StoreConfig) -> anyhow::Result<()>
 pub fn decdn_client::peer_store::PeerStore::record_failure(&self, &iroh_base::key::PublicKey, u64) -> anyhow::Result<()>
+pub fn decdn_client::peer_store::PeerStore::record_open(&self, &iroh_base::key::PublicKey, u64) -> anyhow::Result<()>
 pub fn decdn_client::peer_store::PeerStore::record_sample(&self, &iroh_base::key::PublicKey, f64, u64, u64, &decdn_client::peer_store::StoreConfig) -> anyhow::Result<()>
 pub fn decdn_client::peer_store::PeerStore::upsert_identity(&self, &decdn_client::discovery::NodeCandidate, u64) -> anyhow::Result<()>
 pub struct decdn_client::peer_store::StoreConfig
@@ -636,6 +637,7 @@ pub fn decdn_client::peer_store::PeerStore::load_all(&self) -> alloc::vec::Vec<d
 pub fn decdn_client::peer_store::PeerStore::open(&std::path::Path) -> Self
 pub fn decdn_client::peer_store::PeerStore::prune_and_cap(&self, u64, &decdn_client::peer_store::StoreConfig) -> anyhow::Result<()>
 pub fn decdn_client::peer_store::PeerStore::record_failure(&self, &iroh_base::key::PublicKey, u64) -> anyhow::Result<()>
+pub fn decdn_client::peer_store::PeerStore::record_open(&self, &iroh_base::key::PublicKey, u64) -> anyhow::Result<()>
 pub fn decdn_client::peer_store::PeerStore::record_sample(&self, &iroh_base::key::PublicKey, f64, u64, u64, &decdn_client::peer_store::StoreConfig) -> anyhow::Result<()>
 pub fn decdn_client::peer_store::PeerStore::upsert_identity(&self, &decdn_client::discovery::NodeCandidate, u64) -> anyhow::Result<()>
 pub struct decdn_client::PoolContext
@@ -829,7 +831,6 @@ pub struct decdn_client::UpstreamPullHeader
 pub decdn_client::UpstreamPullHeader::interval_bytes: u64
 pub decdn_client::UpstreamPullHeader::rate_per_mb: u64
 pub decdn_client::UpstreamPullHeader::total_bytes: u64
-pub decdn_client::UpstreamPullHeader::ttfb_ms: f64
 pub struct decdn_client::UpstreamRateLimited
 pub decdn_client::UpstreamRateLimited::label: core::option::Option<alloc::string::String>
 impl core::error::Error for decdn_client::UpstreamRateLimited

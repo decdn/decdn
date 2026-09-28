@@ -1384,7 +1384,6 @@ mod tests {
                     total_bytes: self.total,
                     rate_per_mb: 0,
                     interval_bytes: decdn_protocol::client::CHUNK_BYTES,
-                    ttfb_ms: 0.0,
                 };
                 Ok((header, Bytes::from(w)))
             })
