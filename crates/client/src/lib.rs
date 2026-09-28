@@ -186,10 +186,6 @@ pub mod ranged_store;
 /// The `APP_ERR_RATE_LIMITED` (`0x10`) transport shed, typed for the pull
 /// orchestrator (ADR 013 §Application Error Codes).
 pub(crate) mod rate_limited;
-/// Failover classification (#1174, ADR 037 § Fallback): decide whether a fetch
-/// failure is terminal or worth retrying against another provider/lane. Shared by
-/// the CLI single-source loop and the multi-source scheduler.
-pub mod retry;
 mod scheduler;
 /// Pure segmentation and tail-steal helpers for the multi-source scheduler
 /// (spec §5.3): no I/O, no async.
@@ -222,8 +218,7 @@ pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
 pub use decdn_bao_range::RangedStore;
 pub use downloader::{DownloadTarget, Downloader};
 pub use driver::{
-    LaneGrowth, LaneRelease, LegNoProgress, PacingWait, PoolExhausted, RangeLane, RangeSetOutcome,
-    SharedPool, WaitReason, drive, drive_range_lanes, drive_range_set, first_leg, range_set_reach,
+    LegNoProgress, PacingWait, PoolExhausted, SharedPool, WaitReason, drive, first_leg,
 };
 pub use fault::{FatalScope, Fault, LaneBuildFault, classify};
 pub use first_open::first_open;
@@ -235,10 +230,8 @@ pub use pacer::{
     Pacer, RampPacer, WindowPacer,
 };
 pub use peer_store::{PeerRecord, PeerStore, StoreConfig};
-pub use progress::throughput_watchdog;
 pub use ranged_store::ClientRangedStore;
 pub use rate_limited::UpstreamRateLimited;
-pub use retry::{RetryDisposition, retry_disposition, shared_pool_disposition};
 pub use scheduler::{
     AcquireEnv, AcquireTarget, ConsumptionPacing, LANE_WATCHDOG, LaneLease, acquire,
 };

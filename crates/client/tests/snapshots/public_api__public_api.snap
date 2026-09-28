@@ -114,12 +114,6 @@ pub decdn_client::driver::DriveConfig::settle_backoff: core::time::Duration
 pub decdn_client::driver::DriveConfig::working_deposit: alloy_primitives::aliases::U256
 impl decdn_client::driver::DriveConfig
 pub const fn decdn_client::driver::DriveConfig::cli(alloy_primitives::aliases::U256) -> Self
-pub struct decdn_client::driver::LaneGrowth<'a>(pub &'a (dyn core::ops::function::Fn(usize) -> usize + core::marker::Send + core::marker::Sync + 'a))
-impl core::fmt::Debug for decdn_client::driver::LaneGrowth<'_>
-pub fn decdn_client::driver::LaneGrowth<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct decdn_client::driver::LaneRelease<'a>(pub &'a (dyn core::ops::function::Fn() + core::marker::Send + core::marker::Sync + 'a))
-impl core::fmt::Debug for decdn_client::driver::LaneRelease<'_>
-pub fn decdn_client::driver::LaneRelease<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::driver::LegNoProgress
 pub decdn_client::driver::LegNoProgress::delivered_frontier: u64
 pub decdn_client::driver::LegNoProgress::len: u64
@@ -135,20 +129,6 @@ pub decdn_client::driver::PoolExhausted::gap_start: u64
 impl core::error::Error for decdn_client::driver::PoolExhausted
 impl core::fmt::Display for decdn_client::driver::PoolExhausted
 pub fn decdn_client::driver::PoolExhausted::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct decdn_client::driver::RangeLane<'a, S>
-pub decdn_client::driver::RangeLane::ctx: &'a alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>
-pub decdn_client::driver::RangeLane::grow: core::option::Option<decdn_client::driver::LaneGrowth<'a>>
-pub decdn_client::driver::RangeLane::ledger: &'a alloc::sync::Arc<decdn_client::PoolLedger>
-pub decdn_client::driver::RangeLane::release: core::option::Option<decdn_client::driver::LaneRelease<'a>>
-pub decdn_client::driver::RangeLane::source: &'a S
-pub decdn_client::driver::RangeLane::takes_first: bool
-pub decdn_client::driver::RangeLane::width: core::num::nonzero::NonZeroUsize
-pub struct decdn_client::driver::RangeSetOutcome
-impl decdn_client::driver::RangeSetOutcome
-pub const fn decdn_client::driver::RangeSetOutcome::drive_error(&self) -> core::option::Option<&anyhow::Error>
-pub fn decdn_client::driver::RangeSetOutcome::into_result(self) -> anyhow::Result<()>
-pub fn decdn_client::driver::RangeSetOutcome::lane_fault(&self, usize) -> core::option::Option<&anyhow::Error>
-pub const fn decdn_client::driver::RangeSetOutcome::succeeded(&self) -> bool
 pub struct decdn_client::driver::SharedPool<'a>
 pub decdn_client::driver::SharedPool::credit: &'a (dyn core::ops::function::Fn(alloy_primitives::aliases::U256) -> anyhow::Result<()> + core::marker::Send + core::marker::Sync)
 pub decdn_client::driver::SharedPool::spent: &'a (dyn core::ops::function::Fn() -> alloy_primitives::aliases::U256 + core::marker::Send + core::marker::Sync)
@@ -159,10 +139,7 @@ pub fn decdn_client::driver::SharedPool<'_>::fmt(&self, &mut core::fmt::Formatte
 pub trait decdn_client::driver::PacingWait: core::marker::Send + core::marker::Sync
 pub fn decdn_client::driver::PacingWait::wait(&self, decdn_client::pacer::DownstreamFrontier, decdn_client::driver::WaitReason) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + '_)>>
 pub async fn decdn_client::driver::drive<St, S, P, F>(&St, &S, &P, &F, &alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, &alloc::sync::Arc<decdn_client::PoolLedger>, [u8; 32], u64, u64, &decdn_client::driver::DriveConfig, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, core::option::Option<&dyn decdn_client::driver::PacingWait>, core::option::Option<&(dyn core::ops::function::Fn() -> decdn_client::pacer::DownstreamFrontier + core::marker::Send + core::marker::Sync)>, core::option::Option<&decdn_client::driver::SharedPool<'_>>) -> anyhow::Result<()> where St: decdn_client::source::IngestStore, S: decdn_client::source::BlobSource, P: decdn_client::pacer::Pacer, F: decdn_client::source::Funder
-pub async fn decdn_client::driver::drive_range_lanes<St, S, P, F>(&St, &[decdn_client::driver::RangeLane<'_, S>], &P, &F, [u8; 32], &[(u64, u64)], &decdn_client::driver::DriveConfig, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, core::option::Option<&decdn_client::driver::SharedPool<'_>>, impl core::future::future::Future<Output = anyhow::Error>) -> decdn_client::driver::RangeSetOutcome where St: decdn_client::source::IngestStore, S: decdn_client::source::BlobSource, P: decdn_client::pacer::Pacer, F: decdn_client::source::Funder
-pub async fn decdn_client::driver::drive_range_set<St, S, P, F>(&St, &S, &P, &F, &alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, &alloc::sync::Arc<decdn_client::PoolLedger>, [u8; 32], &[(u64, u64)], core::num::nonzero::NonZeroUsize, &decdn_client::driver::DriveConfig, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, core::option::Option<&decdn_client::driver::SharedPool<'_>>, impl core::future::future::Future<Output = anyhow::Error>) -> anyhow::Result<()> where St: decdn_client::source::IngestStore, S: decdn_client::source::BlobSource, P: decdn_client::pacer::Pacer, F: decdn_client::source::Funder
 pub async fn decdn_client::driver::first_leg<St: decdn_bao_range::ranged_store::RangedStore + ?core::marker::Sized>(&St, &[(u64, u64)], u64, u64) -> anyhow::Result<core::option::Option<decdn_bao_range::AlignedRange>>
-pub async fn decdn_client::driver::range_set_reach<St: decdn_bao_range::ranged_store::RangedStore + ?core::marker::Sized>(&St, &[(u64, u64)]) -> anyhow::Result<u64>
 pub mod decdn_client::endpoint
 pub fn decdn_client::endpoint::client_discovery(core::option::Option<&std::path::Path>) -> anyhow::Result<decdn_common::config::resolved::ResolvedDiscovery>
 pub async fn decdn_client::endpoint::client_endpoint(&[iroh_base::relay_url::RelayUrl], &decdn_common::config::resolved::ResolvedDiscovery) -> anyhow::Result<iroh::endpoint::Endpoint>
@@ -342,12 +319,6 @@ pub fn decdn_client::ranged_store::ClientRangedStore::total_bytes(&self) -> u64
 impl decdn_client::source::IngestStore for decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
 pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
-pub mod decdn_client::retry
-pub enum decdn_client::retry::RetryDisposition
-pub decdn_client::retry::RetryDisposition::RetryElsewhere
-pub decdn_client::retry::RetryDisposition::Terminal
-pub fn decdn_client::retry::retry_disposition(&anyhow::Error) -> decdn_client::retry::RetryDisposition
-pub fn decdn_client::retry::shared_pool_disposition(&anyhow::Error) -> decdn_client::retry::RetryDisposition
 pub mod decdn_client::sink
 pub struct decdn_client::sink::NoCache
 impl decdn_client::sink::BlobCache for decdn_client::sink::NoCache
@@ -608,9 +579,6 @@ pub decdn_client::Rebase::Rebased
 pub decdn_client::Rebase::Rebased::from: decdn_client::Cumulative
 pub decdn_client::Rebase::Refused
 pub decdn_client::Rebase::Stale
-pub enum decdn_client::RetryDisposition
-pub decdn_client::RetryDisposition::RetryElsewhere
-pub decdn_client::RetryDisposition::Terminal
 pub enum decdn_client::VerifiedReader
 pub decdn_client::VerifiedReader::Cached
 pub decdn_client::VerifiedReader::Cached::data: bytes::bytes::Bytes
@@ -731,9 +699,6 @@ pub struct decdn_client::LaneBuildFault(pub anyhow::Error)
 impl core::error::Error for decdn_client::fault::LaneBuildFault
 impl core::fmt::Display for decdn_client::fault::LaneBuildFault
 pub fn decdn_client::fault::LaneBuildFault::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct decdn_client::LaneGrowth<'a>(pub &'a (dyn core::ops::function::Fn(usize) -> usize + core::marker::Send + core::marker::Sync + 'a))
-impl core::fmt::Debug for decdn_client::driver::LaneGrowth<'_>
-pub fn decdn_client::driver::LaneGrowth<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::LaneHandle
 pub decdn_client::LaneHandle::ctx: alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>
 pub decdn_client::LaneHandle::ledger: alloc::sync::Arc<decdn_client::PoolLedger>
@@ -749,9 +714,6 @@ pub fn decdn_client::ledgers::LaneLedgers::get_or_insert(&self, decdn_incentive:
 pub fn decdn_client::ledgers::LaneLedgers::new() -> Self
 pub const fn decdn_client::ledgers::LaneLedgers::topup_lock(&self) -> &tokio::sync::mutex::Mutex<()>
 pub fn decdn_client::ledgers::LaneLedgers::total_committed(&self) -> alloy_primitives::aliases::U256
-pub struct decdn_client::LaneRelease<'a>(pub &'a (dyn core::ops::function::Fn() + core::marker::Send + core::marker::Sync + 'a))
-impl core::fmt::Debug for decdn_client::driver::LaneRelease<'_>
-pub fn decdn_client::driver::LaneRelease<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::LegNoProgress
 pub decdn_client::LegNoProgress::delivered_frontier: u64
 pub decdn_client::LegNoProgress::len: u64
@@ -937,20 +899,6 @@ pub decdn_client::RampPacer::paid_base: u64
 pub decdn_client::RampPacer::paid_carried: u64
 impl decdn_client::pacer::Pacer for decdn_client::pacer::RampPacer
 pub fn decdn_client::pacer::RampPacer::decide(&self, &decdn_client::pacer::PaceState) -> decdn_client::pacer::PaceDecision
-pub struct decdn_client::RangeLane<'a, S>
-pub decdn_client::RangeLane::ctx: &'a alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>
-pub decdn_client::RangeLane::grow: core::option::Option<decdn_client::driver::LaneGrowth<'a>>
-pub decdn_client::RangeLane::ledger: &'a alloc::sync::Arc<decdn_client::PoolLedger>
-pub decdn_client::RangeLane::release: core::option::Option<decdn_client::driver::LaneRelease<'a>>
-pub decdn_client::RangeLane::source: &'a S
-pub decdn_client::RangeLane::takes_first: bool
-pub decdn_client::RangeLane::width: core::num::nonzero::NonZeroUsize
-pub struct decdn_client::RangeSetOutcome
-impl decdn_client::driver::RangeSetOutcome
-pub const fn decdn_client::driver::RangeSetOutcome::drive_error(&self) -> core::option::Option<&anyhow::Error>
-pub fn decdn_client::driver::RangeSetOutcome::into_result(self) -> anyhow::Result<()>
-pub fn decdn_client::driver::RangeSetOutcome::lane_fault(&self, usize) -> core::option::Option<&anyhow::Error>
-pub const fn decdn_client::driver::RangeSetOutcome::succeeded(&self) -> bool
 pub struct decdn_client::RateAboveCeiling
 impl decdn_client::RateAboveCeiling
 pub const fn decdn_client::RateAboveCeiling::ceiling_rate_per_mb(&self) -> u64
@@ -1184,8 +1132,6 @@ pub fn decdn_client::source_set::StaticSources<S>::on_source_fault(&self, &decdn
 pub async fn decdn_client::acquire<St, P, Pc, F>(decdn_client::AcquireTarget<'_, St>, &mut decdn_client::source_set::SourceSet<'_, P>, &decdn_client::AcquireEnv<'_, Pc, F>) -> anyhow::Result<()> where St: decdn_client::source::IngestStore, P: decdn_client::source_set::SourceProvider, Pc: decdn_client::pacer::Pacer, F: decdn_client::source::Funder
 pub fn decdn_client::classify(&anyhow::Error) -> decdn_client::fault::Fault
 pub async fn decdn_client::drive<St, S, P, F>(&St, &S, &P, &F, &alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, &alloc::sync::Arc<decdn_client::PoolLedger>, [u8; 32], u64, u64, &decdn_client::driver::DriveConfig, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, core::option::Option<&dyn decdn_client::driver::PacingWait>, core::option::Option<&(dyn core::ops::function::Fn() -> decdn_client::pacer::DownstreamFrontier + core::marker::Send + core::marker::Sync)>, core::option::Option<&decdn_client::driver::SharedPool<'_>>) -> anyhow::Result<()> where St: decdn_client::source::IngestStore, S: decdn_client::source::BlobSource, P: decdn_client::pacer::Pacer, F: decdn_client::source::Funder
-pub async fn decdn_client::drive_range_lanes<St, S, P, F>(&St, &[decdn_client::driver::RangeLane<'_, S>], &P, &F, [u8; 32], &[(u64, u64)], &decdn_client::driver::DriveConfig, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, core::option::Option<&decdn_client::driver::SharedPool<'_>>, impl core::future::future::Future<Output = anyhow::Error>) -> decdn_client::driver::RangeSetOutcome where St: decdn_client::source::IngestStore, S: decdn_client::source::BlobSource, P: decdn_client::pacer::Pacer, F: decdn_client::source::Funder
-pub async fn decdn_client::drive_range_set<St, S, P, F>(&St, &S, &P, &F, &alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, &alloc::sync::Arc<decdn_client::PoolLedger>, [u8; 32], &[(u64, u64)], core::num::nonzero::NonZeroUsize, &decdn_client::driver::DriveConfig, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, core::option::Option<&decdn_client::driver::SharedPool<'_>>, impl core::future::future::Future<Output = anyhow::Error>) -> anyhow::Result<()> where St: decdn_client::source::IngestStore, S: decdn_client::source::BlobSource, P: decdn_client::pacer::Pacer, F: decdn_client::source::Funder
 pub const fn decdn_client::effective_rate_ceiling(u64, u64) -> u64
 pub async fn decdn_client::first_leg<St: decdn_bao_range::ranged_store::RangedStore + ?core::marker::Sized>(&St, &[(u64, u64)], u64, u64) -> anyhow::Result<core::option::Option<decdn_bao_range::AlignedRange>>
 pub async fn decdn_client::first_open<P, T, O, Fut>(&mut decdn_client::source_set::SourceSet<'_, P>, &decdn_client::stop::StopPolicy, O) -> anyhow::Result<(alloy_primitives::bits::address::Address, T)> where P: decdn_client::source_set::SourceProvider, O: core::ops::function::Fn(alloc::sync::Arc<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>) -> Fut, Fut: core::future::future::Future<Output = anyhow::Result<T>>
@@ -1194,13 +1140,9 @@ pub fn decdn_client::is_insufficient_deposit(&anyhow::Error) -> bool
 pub fn decdn_client::is_range_past_end(&anyhow::Error) -> bool
 pub async fn decdn_client::open_progressive_pull(&iroh::endpoint::Endpoint, iroh_base::endpoint_addr::EndpointAddr, &decdn_client::PoolContext, alloc::sync::Arc<decdn_client::PoolLedger>, &alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, [u8; 32], [u8; 32], u64, u64, u64, u64, decdn_client::PullDeadlines, u64, core::option::Option<&tokio::runtime::handle::Handle>) -> anyhow::Result<(decdn_client::UpstreamPullHeader, decdn_client::UpstreamPull)>
 pub fn decdn_client::plan_covered_runs(&bao_tree::ChunkRanges, u64, &[decdn_client::SourceCoverage], &[usize]) -> (alloc::vec::Vec<decdn_client::CoveredRun>, bao_tree::ChunkRanges)
-pub async fn decdn_client::range_set_reach<St: decdn_bao_range::ranged_store::RangedStore + ?core::marker::Sized>(&St, &[(u64, u64)]) -> anyhow::Result<u64>
 pub fn decdn_client::resume_may_be_stale(&anyhow::Error) -> bool
-pub fn decdn_client::retry_disposition(&anyhow::Error) -> decdn_client::retry::RetryDisposition
-pub fn decdn_client::shared_pool_disposition(&anyhow::Error) -> decdn_client::retry::RetryDisposition
 pub fn decdn_client::sign_client_binding(&alloy_signer_local::PrivateKeySigner, alloy_primitives::aliases::B256, &alloy_sol_types::eip712::Eip712Domain) -> anyhow::Result<decdn_protocol::client::ClientBinding>
 pub fn decdn_client::stream_first_unit(u64, &decdn_client::config::PullConfig) -> anyhow::Result<decdn_bao_range::AlignedRange>
-pub async fn decdn_client::throughput_watchdog(alloc::sync::Arc<core::sync::atomic::AtomicU64>, core::time::Duration, u64, &core::sync::atomic::AtomicBool)
 pub type decdn_client::ProgressCallback = (dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync)
 pub type decdn_client::SinkFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>
 pub type decdn_client::SourceFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>

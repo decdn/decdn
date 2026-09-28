@@ -261,26 +261,19 @@ as `decdn fetch`):
   ledger keeps voucher issuance monotonic across concurrent streams on a
   lane. The serving node credits each stream's delivered bytes from the
   lane's one cumulative watermark, so a fast stream does not starve a slow
-  co-stream. Distinct lanes proceed in parallel. A range-dedup entry pays for
-  its ranges through one session per provider. A session opens one
-  connection and reuses it for every range of the entry. The entry stripes
-  its ranges across its admitted full holders: one holder per operator, at
-  most `--max-sources`. A partial holder and a
-  proxy-warming non-holder do not join the stripe. Each lane takes ranges
-  from one shared queue and fills up to `--max-lane-streams` of them at once,
-  within the lane permits that are free. A lane holds one permit for each
-  stream it runs, and gives the permit back when that stream stops. A lane
-  that has no range left keeps one permit for one idle stream slot until the
-  drive ends. An entry holds no permit while it waits on a sibling entry. A lane of a fan-out holds
-  one permit until the lane stops. A lane that faults leaves the stripe,
-  and the other lanes fill the ranges it left. A drive stall is a fault of
-  every lane, so all striped lanes leave the stripe. When no striped lane is
-  left, the entry fails over to its other candidates one at a time. All lanes
-  write into one ranged store. Concurrent ranges top up the one deposit one at
-  a time, from one top-up budget for the entry. A whole-file entry runs the
+  co-stream. Distinct lanes proceed in parallel. Every entry runs the
   acquire loop of
   [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)
-  over its probed holders.
+  over its probed holders. A whole-file entry fetches the whole blob. A
+  range-dedup entry fetches only the ranges that no donor supplies, through
+  the same loop. The entry probes its holders once and uses them for each
+  fetch of its ranges. Each lane holds one permit of its provider while it
+  runs. A lane takes a permit only when a permit is free. When no permit is
+  free, the lane build backs off and tries again. An entry holds no lane
+  permit while it waits on a sibling entry. All lanes of an entry write into
+  one ranged store. The entry does not mark its donor ranges present in that
+  store, so the store promotes the blob only when the loop fetched every
+  byte. Concurrent lanes top up the one deposit one at a time.
 - **Failover and retry.** All entries of a pull share one holder health
   table and one progress clock. The manifest fetch uses the same table and
   the same clock. When a holder faults, the holder cools, and the loop gives

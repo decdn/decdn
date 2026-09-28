@@ -24,7 +24,7 @@ use decdn_incentive::{CapabilityGrant, PoolId};
 use iroh::RelayUrl;
 
 use super::bundle_pull::LaneStreamCap;
-use super::fetch::{self, CliFunder, DriveFetchDeps, FaceLaneHandle, FunderPool, ResolvedTargets};
+use super::fetch::{self, CliFunder, DriveFetchDeps, FaceLaneHandle, ResolvedTargets};
 
 /// The [`SourceProvider`] a CLI fetch runs its acquire loop over.
 pub(crate) struct CliSources<'a, P> {
@@ -104,7 +104,7 @@ where
             rpc: self.deps.rpc,
             store: self.deps.store,
             owner: self.deps.self_address,
-            pool_id: FunderPool::FirstLane(&self.pool_id),
+            pool_id: &self.pool_id,
             token: self.deps.token,
             payment_pool_addr: self.deps.chain.payment_pool,
             max_approve: self.deps.chain.max_approve,

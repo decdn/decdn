@@ -1896,10 +1896,10 @@ fn whole_blob_wire_bytes(total: u64) -> u64 {
 }
 
 /// The exact wire bytes a driven `[offset, offset + len)` range of a
-/// `total`-byte blob vouchers for — the same quantity `bundle_pull`'s range
-/// session pays for one complement run. Mirrors `plan_reassembly`'s complement
-/// runs: they are disjoint and non-adjacent, so `drive_range_set` opens (and
-/// bills) each as its own `align_range`.
+/// `total`-byte blob vouchers for — the same quantity a `bundle_pull`
+/// range-dedup entry pays for one complement run. Mirrors `plan_reassembly`'s
+/// complement runs: they are disjoint and non-adjacent, so the acquire loop
+/// opens (and bills) each as its own `align_range`.
 fn range_wire_bytes(offset: u64, len: u64, total: u64) -> anyhow::Result<u64> {
     let aligned = align_range(offset, len, total)
         .map_err(|e| anyhow::anyhow!("align_range({offset}, {len}, {total}): {e}"))?;

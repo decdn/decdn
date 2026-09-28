@@ -763,11 +763,6 @@ mod doubles {
         /// zero and it would never complete. `None` keeps the pre-payment "unpaid
         /// double" behaviour for tests that do not drive `fill_gap` to completion.
         ledger: Option<Arc<crate::PoolLedger>>,
-        /// Legs opened and not yet finished. A faulted leg is never finished, so
-        /// this reads true only on a run with no faults.
-        in_flight: Arc<AtomicU64>,
-        /// The most legs [`in_flight`](Self::in_flight) ever held at once.
-        peak_in_flight: Arc<AtomicU64>,
     }
 
     impl std::fmt::Debug for ScriptedSource {
@@ -803,17 +798,7 @@ mod doubles {
                 finish_stall: None,
                 stall_after: None,
                 ledger: None,
-                in_flight: Arc::new(AtomicU64::new(0)),
-                peak_in_flight: Arc::new(AtomicU64::new(0)),
             })
-        }
-
-        #[cfg(test)]
-        /// The most legs this source ever had open and unfinished at once. A
-        /// driver that runs its gaps one at a time reads `1`.
-        #[must_use]
-        pub(crate) fn peak_in_flight(&self) -> u64 {
-            self.peak_in_flight.load(Ordering::SeqCst)
         }
 
         #[cfg(test)]
@@ -903,11 +888,10 @@ mod doubles {
                 .map_or(0, |o| o.iter().map(|(_, len)| *len).sum())
         }
 
-        #[cfg(test)]
         /// After `wire_bytes` of a range's wire, truncate it and park the fault
         /// `make` produces — the exact shape a stalled/refusing peer leaves.
         #[must_use]
-        pub(crate) fn with_fault_after(
+        pub fn with_fault_after(
             mut self,
             wire_bytes: usize,
             make: impl Fn() -> anyhow::Error + Send + Sync + 'static,
@@ -916,11 +900,10 @@ mod doubles {
             self
         }
 
-        #[cfg(test)]
         /// [`Self::with_fault_after`], but only the first reader that reaches
         /// `wire_bytes` faults: a peer that blips once and then recovers.
         #[must_use]
-        pub(crate) fn fault_once_after(
+        pub fn fault_once_after(
             self,
             wire_bytes: usize,
             make: impl Fn() -> anyhow::Error + Send + Sync + 'static,
@@ -964,8 +947,6 @@ mod doubles {
                 if let Ok(mut log) = self.opened.lock() {
                     log.push((range.fetch_start(), range.fetch_len()));
                 }
-                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                self.peak_in_flight.fetch_max(now, Ordering::SeqCst);
                 let mut wire = self.wire_for(&range)?;
                 let mut fault = None;
                 if let Some((after, make)) = &self.fault
@@ -1011,7 +992,6 @@ mod doubles {
                 if let Some(stall) = self.finish_stall {
                     tokio::time::sleep(stall).await;
                 }
-                self.in_flight.fetch_sub(1, Ordering::SeqCst);
                 let Some(ledger) = &self.ledger else {
                     // Unpaid double: no channel, nothing to drain, no watermark.
                     return Ok(VoucherProgress::default());

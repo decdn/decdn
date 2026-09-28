@@ -84,12 +84,12 @@ use decdn_incentive::eth_identity::{PasswordUse, load_signer};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{slash_judge_domain, voucher_domain};
 use futures_util::StreamExt as _;
-use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
+use iroh::{Endpoint, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
 
 use super::bundle_cache;
 use super::bundle_manifest::{self, SavedManifest, SavedMtime};
-use super::buyer_store::{ChainAdoption, open_client_store_for_buy};
+use super::buyer_store::open_client_store_for_buy;
 use super::chain_ctx;
 use super::fetch;
 use super::interrupt::{Interrupt, Interrupted};
@@ -101,93 +101,13 @@ use decdn_client::driver::DriveConfig;
 use decdn_client::endpoint as client_endpoint;
 use decdn_client::provider;
 use decdn_client::{
-    ClientRangedStore, DownloadTarget, Downloader, LaneLedgers, PeerHealth, PoolContext,
-    ProgressCallback, ProgressClock, PullDeadlines, RetryDisposition, StopPolicy,
-    retry_disposition,
+    ClientRangedStore, DownloadTarget, Downloader, LaneLedgers, PeerHealth, ProgressCallback,
+    ProgressClock, PullDeadlines, StopPolicy,
 };
 
 use super::cli_sources::CliSources;
 
 type FetchTarget = (PublicKey, Address);
-
-/// A dedup entry's resolved range-drive provider order, computed once per entry
-/// and reused across its complement drive, donor re-fetch, and any whole-blob
-/// re-drive (so a self-heal entry probes once, not per sub-drive). `Pinned` is
-/// the `--node-id` target — its own only candidate; `Discovered` is the probed
-/// discovery order.
-enum RangeTargets {
-    Pinned(FetchTarget),
-    /// The probed order. When `stripe` is two or more, its first `stripe`
-    /// candidates are the admitted full holders the entry's drives stripe
-    /// across ([`stripe_order`]) and the rest are failover reserve. When it is
-    /// one, the order is the plain failover order, and its first candidate
-    /// need not be a full holder.
-    Discovered {
-        order: Vec<NodeCandidate>,
-        stripe: usize,
-    },
-}
-
-impl RangeTargets {
-    /// How many of the first candidates a drive stripes across at once.
-    const fn stripe(&self) -> usize {
-        match self {
-            RangeTargets::Pinned(_) => 1,
-            RangeTargets::Discovered { stripe, .. } => *stripe,
-        }
-    }
-
-    /// Each candidate's dial target and registry dial hints, in failover order.
-    /// The pinned target has no hints: it is reached through `--addr`.
-    fn targets(&self) -> Vec<(FetchTarget, Vec<std::net::SocketAddr>)> {
-        match self {
-            RangeTargets::Pinned(pinned) => vec![(*pinned, Vec::new())],
-            RangeTargets::Discovered { order, .. } => order
-                .iter()
-                .map(|c| ((c.node_id, c.eth_address), c.dial_addrs()))
-                .collect(),
-        }
-    }
-}
-
-/// A range-dedup entry's candidate order with its stripe set first (#2123),
-/// and the size of that set.
-///
-/// The stripe set is the probed holders whose coverage spans the whole blob,
-/// admitted as the multi-source fan-out admits its lanes
-/// ([`discovery::admit_sources`]): one node per operator, at most
-/// `max_sources`. A partial holder or a proxy-warming non-holder is left out,
-/// so no striped range lands on a node that lacks it. The rest of `candidates`
-/// follow in their own order as failover reserve. With fewer than two admitted
-/// holders, the order is unchanged and the stripe is one: plain single-source
-/// failover.
-fn stripe_order(
-    candidates: Vec<NodeCandidate>,
-    coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
-    total: u64,
-    max_sources: usize,
-) -> (Vec<NodeCandidate>, usize) {
-    let blocks = decdn_protocol::num_blocks(total);
-    let full_holders: Vec<NodeCandidate> = candidates
-        .iter()
-        .filter(|c| {
-            coverage_by_node
-                .get(&c.node_id)
-                .is_some_and(|cov| (0..blocks).all(|b| cov.covers(b)))
-        })
-        .cloned()
-        .collect();
-    let admitted = discovery::admit_sources(full_holders, max_sources);
-    if admitted.len() < 2 {
-        return (candidates, 1);
-    }
-    let stripe = admitted.len();
-    let striped: HashSet<PublicKey> = admitted.iter().map(|a| a.node_id).collect();
-    let reserve = candidates
-        .into_iter()
-        .filter(|c| !striped.contains(&c.node_id));
-    (admitted.into_iter().chain(reserve).collect(), stripe)
-}
 
 /// Group manifest entries by their blob `hash`, preserving first-seen order both
 /// across groups and within each group. Entries that name the same blob (one
@@ -1057,9 +977,6 @@ impl GroupRun {
 /// entry. A manifest `size` no provider signs is the manifest's fault, so it
 /// stops its own entry. Every other fault is its entry's alone.
 fn entry_scope(err: &anyhow::Error) -> decdn_client::FatalScope {
-    if err.downcast_ref::<fetch::ManifestSizeMismatch>().is_some() {
-        return decdn_client::FatalScope::Item;
-    }
     match decdn_client::classify(err) {
         decdn_client::Fault::Fatal(scope) => scope,
         _ => decdn_client::FatalScope::Item,
@@ -1633,21 +1550,6 @@ struct SettledGroup {
     paid: Option<u64>,
 }
 
-/// A range walk's lane permits disagree with its sessions: a fault of this
-/// client, not of any provider. It ends the walk and the entry at once rather
-/// than failing over, so the report names it instead of blaming each provider
-/// in turn.
-#[derive(Debug)]
-struct LanePermitFault(String);
-
-impl std::fmt::Display for LanePermitFault {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "internal lane-permit fault: {}", self.0)
-    }
-}
-
-impl std::error::Error for LanePermitFault {}
-
 /// Run `items` through `run` once, at most `jobs` at a time.
 ///
 /// `settle` sees every result as it lands, with the item's index in `items`,
@@ -1716,17 +1618,6 @@ impl LaneStreamCap {
         )
     }
 
-    /// Acquire one stream permit for `provider`, held until the returned permit
-    /// drops. At `n == 1` a second concurrent caller for the same provider waits
-    /// here until the first releases.
-    async fn permit(&self, provider: Address) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
-        self.semaphore(provider)
-            .await
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow!("bundle pull lane-stream cap closed"))
-    }
-
     /// One stream permit for `provider` if one is free now, else `None`. It
     /// never waits, so a caller that already holds another provider's permit
     /// cannot deadlock against a sibling that holds this one.
@@ -1735,79 +1626,6 @@ impl LaneStreamCap {
         provider: Address,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         self.semaphore(provider).await.try_acquire_owned().ok()
-    }
-}
-
-/// The stream permits one lane of a range drive holds for its provider: one
-/// for each of the lane's live gap workers.
-///
-/// The lane starts with the base permit its drive pass reserved ([`Self::new`]).
-/// [`Self::grant`] takes only the permits free right now and never waits, so a
-/// lane cannot deadlock against a sibling entry that holds one permit set and
-/// waits for another. The caller calls it once to size the lane, and the drive
-/// calls it again whenever the lane takes a gap and more gaps wait
-/// ([`decdn_client::LaneGrowth`]), so a lane that started narrow widens when a
-/// sibling entry frees its permits. The drive calls [`Self::release_one`] as
-/// each worker stops ([`decdn_client::LaneRelease`]), so a lane that dies gives
-/// its permits back before the drive returns, and a lane that runs out of gaps
-/// keeps only the permit of its one idle worker. What is left returns when the
-/// grant drops.
-struct LaneGrant {
-    /// The provider's per-lane stream semaphore ([`LaneStreamCap`]).
-    semaphore: Arc<tokio::sync::Semaphore>,
-    /// The most permits the lane may hold.
-    room: usize,
-    /// The permits the lane holds now.
-    held: std::sync::Mutex<Vec<tokio::sync::OwnedSemaphorePermit>>,
-}
-
-impl LaneGrant {
-    /// A grant holding `base`, for at most `room` permits in all.
-    fn new(
-        semaphore: Arc<tokio::sync::Semaphore>,
-        room: usize,
-        base: tokio::sync::OwnedSemaphorePermit,
-    ) -> Self {
-        Self {
-            semaphore,
-            room,
-            held: std::sync::Mutex::new(vec![base]),
-        }
-    }
-
-    /// The lane's width: one gap worker for each permit it holds now.
-    fn width(&self) -> std::num::NonZeroUsize {
-        let held = self
-            .held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len();
-        std::num::NonZeroUsize::new(held).unwrap_or(std::num::NonZeroUsize::MIN)
-    }
-
-    /// Give back one held permit, for a worker that stopped.
-    fn release_one(&self) {
-        let released = self
-            .held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop();
-        drop(released);
-    }
-
-    /// Take up to `most` of the free permits the lane still has room for, and
-    /// return how many it took.
-    fn grant(&self, most: usize) -> usize {
-        let mut held = self
-            .held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let before = held.len();
-        let want = self.room.saturating_sub(before).min(most);
-        held.extend(
-            std::iter::from_fn(|| Arc::clone(&self.semaphore).try_acquire_owned().ok()).take(want),
-        );
-        held.len().saturating_sub(before)
     }
 }
 
@@ -1872,8 +1690,8 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// fetched, so it never takes a permit of its own.
     gate: tokio::sync::Semaphore,
     /// Per-provider cap on concurrent same-lane streams (`--max-lane-streams`,
-    /// default 4). Acquired around every stream: one permit for a single-provider
-    /// stream, a sorted permit set for a multi-source fan-out. Bounds only
+    /// default 4). Every lane an entry's fetch builds holds one of its
+    /// provider's permits, taken without waiting ([`CliSources`]). Bounds only
     /// per-provider concurrency; `--jobs` still bounds cross-lane parallelism.
     lane_cap: LaneStreamCap,
     /// The command-wide holder health every entry's fetch records into, so a
@@ -1893,8 +1711,7 @@ struct PullCtx<'a, P: Provider + Clone> {
 impl<P: Provider + Clone> PullCtx<'_, P> {
     /// The shared lane deps, assembled from `PullCtx`'s borrowed chain
     /// plumbing plus this run's per-fetch budgets — the same shape `decdn fetch`
-    /// builds. Shared by the whole-file acquire path ([`Self::fetch_to_staging`])
-    /// and the range-dedup sessions ([`Self::open_range_session`]).
+    /// builds, for every fetch of an entry ([`Self::acquire_entry`]).
     fn drive_deps(&self, max_blob_bytes: u64) -> anyhow::Result<fetch::DriveFetchDeps<'_, P>> {
         Ok(fetch::DriveFetchDeps {
             endpoint: self.endpoint,
@@ -1921,9 +1738,55 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     }
 
     /// Fetch one whole blob into `staging` through the acquire loop (spec §
-    /// Unit 4), across the entry's holders: the pinned `--node-id`, or a
-    /// fresh probe of the entry's own registry sample (proxy-warming
-    /// non-holders first when they help, then holders nearest RTT first).
+    /// Unit 4), across the entry's holders ([`Self::entry_targets`]). See
+    /// [`Self::acquire_entry`] for the fetch itself.
+    async fn fetch_to_staging(
+        &self,
+        hash: [u8; 32],
+        staging: &Path,
+        total: Option<u64>,
+        progress: Option<&ProgressCallback>,
+    ) -> anyhow::Result<()> {
+        let _permit = self
+            .gate
+            .acquire()
+            .await
+            .map_err(|_| anyhow!("bundle pull concurrency gate closed"))?;
+        let targets = self.entry_targets(hash).await?;
+        self.acquire_entry(&targets, hash, staging, total, None, progress)
+            .await
+    }
+
+    /// One entry's holders: the pinned `--node-id`, or a fresh probe of the
+    /// entry's own registry sample (proxy-warming non-holders first when they
+    /// help, then holders nearest RTT first). An entry resolves them once and
+    /// every fetch of the entry reuses them.
+    async fn entry_targets(&self, hash: [u8; 32]) -> anyhow::Result<fetch::ResolvedTargets> {
+        if self.explicit.is_some() {
+            return fetch::resolve_target_node(
+                self.common,
+                self.chain,
+                self.endpoint,
+                self.relays,
+                hash,
+            )
+            .await;
+        }
+        let candidates = self.entry_candidates()?;
+        fetch::probe_and_order(
+            self.endpoint,
+            &candidates,
+            self.relays.first(),
+            hash,
+            fetch::ProxyWarmingParams::from_args(self.common),
+            self.slash_dom,
+        )
+        .await
+    }
+
+    /// Fill `ranges` of blob `hash` (`None` is the whole blob) into the ranged
+    /// store beside `staging` through the acquire loop, across `targets`' holders.
+    /// The store is promoted to `staging` once every byte is present.
     ///
     /// `total` keys the entry's ranged store: the manifest's `size` when it
     /// gives one, so a holder that signs another size is a size fault of that
@@ -1941,33 +1804,15 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// ([`LaneStreamCap`]). Each lane's voucher watermark is persisted before
     /// the result returns, and the `.partial` beside `staging` stays for a
     /// resume.
-    async fn fetch_to_staging(
+    async fn acquire_entry(
         &self,
+        targets: &fetch::ResolvedTargets,
         hash: [u8; 32],
         staging: &Path,
         total: Option<u64>,
+        ranges: Option<&[(u64, u64)]>,
         progress: Option<&ProgressCallback>,
     ) -> anyhow::Result<()> {
-        let _permit = self
-            .gate
-            .acquire()
-            .await
-            .map_err(|_| anyhow!("bundle pull concurrency gate closed"))?;
-        let targets = if self.explicit.is_some() {
-            fetch::resolve_target_node(self.common, self.chain, self.endpoint, self.relays, hash)
-                .await?
-        } else {
-            let candidates = self.entry_candidates()?;
-            fetch::probe_and_order(
-                self.endpoint,
-                &candidates,
-                self.relays.first(),
-                hash,
-                fetch::ProxyWarmingParams::from_args(self.common),
-                self.slash_dom,
-            )
-            .await?
-        };
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
         let deps = self.drive_deps(max_blob_bytes)?;
         let sources = CliSources::new(
@@ -1981,7 +1826,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             Some(&self.ledgers),
             Some(&self.lane_cap),
         );
-        let holders = sources.holders_from(&targets);
+        let holders = sources.holders_from(targets);
         // A fetch dropped by Ctrl-C, or by a sibling's command-wide fault,
         // records every lane's vouchers too.
         let on_drop = fetch::SettleOnDrop::new(|| sources.persist_watermarks());
@@ -2012,7 +1857,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                     hash,
                     total_bytes,
                     dest: staging,
-                    ranges: None,
+                    ranges,
                 }],
                 Some(&self.ledgers),
                 progress,
@@ -2027,113 +1872,6 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         result.map_err(|err| sources.annotate(err))
     }
 
-    /// Build one entry's ready-to-drive [`PoolContext`] and dial target for
-    /// `provider`, for the ranged drive path ([`Self::open_range_session`]).
-    ///
-    /// Delegated (`--capability`): every entry adopts the named pool + owner
-    /// capability (no on-chain open). Self-owned: open-or-reuse the caller's pool
-    /// under the global open lock (every entry shares the one on-chain pool this
-    /// bundle pulls from), then attach the ADR 005 client binding — without it the
-    /// request carries no verified buyer identity, so the node's `pull_authorized`
-    /// gate never fires a cache-miss origin pull and `--namespace` would be inert.
-    /// The binding is signed outside `open_lock` (it touches no on-chain state).
-    async fn build_pull_ctx(
-        &self,
-        (node_id, provider): FetchTarget,
-        dial_addrs: &[std::net::SocketAddr],
-    ) -> anyhow::Result<(PoolContext, EndpointAddr)> {
-        let ctx = if let Some(grant) = &self.grant {
-            fetch::build_delegated_pool_ctx(
-                self.store,
-                self.contract,
-                self.signer,
-                self.voucher_dom,
-                provider,
-                self.self_address,
-                self.chain,
-                self.endpoint,
-                grant,
-            )
-            .await?
-        } else {
-            let ctx = {
-                // The global pool lock: every entry — regardless of provider —
-                // shares the one on-chain pool this bundle pulls from.
-                let _open_guard = self.open_lock.lock().await;
-                fetch::open_or_reuse_pool(
-                    self.store,
-                    self.contract,
-                    self.rpc,
-                    self.signer,
-                    self.voucher_dom,
-                    provider,
-                    self.self_address,
-                    self.chain.payment_pool,
-                    self.chain.working_deposit,
-                    self.chain.max_approve,
-                    // `self.store` was opened from `self.chain.data_dir`, and
-                    // the pull signs with `self.chain.keystore`.
-                    ChainAdoption::for_buy(&self.chain.data_dir, &self.chain.keystore)?,
-                )
-                .await?
-            };
-            fetch::attach_client_binding(ctx, self.chain, self.endpoint, self.signer)?
-        };
-
-        let mut target = EndpointAddr::new(node_id);
-        // `--addr` only applies to the explicit-node path (clap requires
-        // `--node-id`); a discovered node is reached via its resolved address.
-        if self.explicit.is_some()
-            && let Some(addr) = self.common.addr
-        {
-            target = target.with_ip_addr(addr);
-        }
-        if let Some(url) = self.relays.first() {
-            target = target.with_relay_url(url.clone());
-        }
-        // Registry-published direct addresses (empty on the pinned `--addr`
-        // path): a reachable node connects without a relay (ADR 001 § Node
-        // Discovery). Additive — a stale hint loses the path race, never fails it.
-        for sock in dial_addrs {
-            target = target.with_ip_addr(*sock);
-        }
-        Ok((ctx, target))
-    }
-
-    /// Open a range-drive session for `hash` against `node_id`/`provider`, for
-    /// the entry whose ranged store is `entry_store` (#2119). It builds the
-    /// lane's context and target ([`Self::build_pull_ctx`]), then opens a
-    /// [`fetch::RangeSession`] that every range drive of the entry reuses while
-    /// this provider serves it. `first_ranges` are the ranges the
-    /// session's first drive fills; the session opens that drive's first leg
-    /// now, and opens nothing when they are empty.
-    async fn open_range_session<'s>(
-        &'s self,
-        fetch_target: FetchTarget,
-        dial_addrs: &[std::net::SocketAddr],
-        hash: [u8; 32],
-        entry_store: &ClientRangedStore,
-        first_ranges: &[(u64, u64)],
-    ) -> anyhow::Result<fetch::RangeSession<'s, P>> {
-        let provider = fetch_target.1;
-        let (ctx, target) = self.build_pull_ctx(fetch_target, dial_addrs).await?;
-        let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
-        let deps = self.drive_deps(max_blob_bytes)?;
-        let pool_id = ctx.pool_id;
-        fetch::RangeSession::open(
-            &deps,
-            ctx,
-            target,
-            provider,
-            pool_id,
-            hash,
-            entry_store,
-            first_ranges,
-            &self.ledgers,
-        )
-        .await
-    }
-
     /// This entry's probe candidates: a fresh sample of the run's registry read
     /// ([`entry_candidates`]).
     fn entry_candidates(&self) -> anyhow::Result<Vec<NodeCandidate>> {
@@ -2142,41 +1880,6 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             .as_deref()
             .ok_or_else(|| anyhow!("no discovery candidates available"))?;
         Ok(entry_candidates(registry, self.chain.region.as_deref()))
-    }
-
-    /// Resolve the provider order for one dedup entry's range drives ONCE — the
-    /// pinned `--node-id`, or a single [`fetch::probe_and_order`] over the
-    /// discovery candidates. [`Self::pull_entry`] resolves this before its first
-    /// sub-drive and threads it into every one (the complement drive, a donor
-    /// re-fetch, and any whole-blob re-drive), so a self-heal entry probes the
-    /// candidate set once rather than up to three times. `total` is the
-    /// manifest's size, which [`stripe_order`] checks each holder's coverage
-    /// against.
-    async fn resolve_range_targets(
-        &self,
-        hash: [u8; 32],
-        total: u64,
-    ) -> anyhow::Result<RangeTargets> {
-        if let Some(pinned) = self.explicit {
-            return Ok(RangeTargets::Pinned(pinned));
-        }
-        let candidates = self.entry_candidates()?;
-        let resolved = fetch::probe_and_order(
-            self.endpoint,
-            &candidates,
-            self.relays.first(),
-            hash,
-            fetch::ProxyWarmingParams::from_args(self.common),
-            self.slash_dom,
-        )
-        .await?;
-        let (order, stripe) = stripe_order(
-            resolved.candidates,
-            &resolved.coverage_by_node,
-            total,
-            self.common.max_sources,
-        );
-        Ok(RangeTargets::Discovered { order, stripe })
     }
 
     /// Fetch one blob fully into memory — used only for the bundle manifest
@@ -2408,8 +2111,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// - No hints (or `total` unknown, or the blob is already finalized at
     ///   `staging`), or no chunk overlaps a materialized sibling → the plain
     ///   whole-file [`Self::fetch_to_staging`] path.
-    /// - Otherwise the dedup path: pay through a [`CtxRangeDriver`] for only the
-    ///   *complement* (the group-aligned bytes no donor covers) into `staging`'s
+    /// - Otherwise the dedup path: pay through an [`AcquireRangeDriver`] for only
+    ///   the *complement* (the group-aligned bytes no donor covers) into `staging`'s
     ///   `.partial`, then splice each donor range from its sibling's on-disk blob.
     ///   Each donor chunk is confirmed present at the recorded source offset by
     ///   re-hashing the whole chunk against its hint hash before its bytes are
@@ -2513,23 +2216,18 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             .await
             .map_err(|_| anyhow!("bundle pull concurrency gate closed"))?;
 
-        // Resolve the range-drive provider order ONCE for this entry and reuse it
-        // across every sub-drive below (complement, donor re-fetch, whole-blob
-        // re-drive) — the happy path (complement only) still probes exactly once.
-        let targets = self.resolve_range_targets(hash, total).await?;
-        // No lane-stream permit is held here: each drive pass reserves one for
-        // each session it drives (`SessionWalk::fill`), and its lanes give them
-        // back as their workers stop (`LiveSessions::drive`), so the entry holds
-        // none across the splice or its waits on a sibling. Each verified byte
-        // a range drive lands is progress of the command, so it ticks the
-        // command's clock as the whole-file entries' fetches do.
-        let ticking = |position: u64, total: u64| {
-            self.stop.clock.tick();
-            if let Some(cb) = progress {
-                cb(position, total);
-            }
+        // Resolve the entry's holders ONCE and reuse them across every drive
+        // below (complement, donor re-fetch, whole-blob re-drive), so the entry
+        // probes exactly once.
+        let targets = self.entry_targets(hash).await?;
+        let driver = AcquireRangeDriver {
+            ctx: self,
+            targets: &targets,
+            hash,
+            staging,
+            total,
+            progress,
         };
-        let driver = CtxRangeDriver::new(self, &targets, hash, staging, total, Some(&ticking));
 
         // On any dedup-path success, true up the file + total progress bars to
         // 100%: donor bytes are spliced from disk and never flow through `drive`'s
@@ -2838,62 +2536,32 @@ trait RangeDriver {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>>;
 }
 
-/// The production [`RangeDriver`]: the live paid range-drive path over a
-/// pre-resolved provider order (so repeated sub-drives of one entry share one
-/// probe round).
+/// The production [`RangeDriver`]: each drive fills its ranges through the
+/// acquire loop ([`PullCtx::acquire_entry`]) across the entry's holders, which
+/// the entry resolved once.
 ///
-/// Every drive of the entry — the pay-now complement, a donor re-fetch, each
-/// deferred fallback, the self-heal re-drive — reuses the entry's open
-/// [`fetch::RangeSession`]s while their providers serve: one warm connection
-/// per provider for the entry, not one per drive or per range (#2119). The
-/// drives stripe their ranges across the entry's admitted full holders, one
-/// session each (#2123); with one holder, or multi-source off, one session
-/// serves them. A lane that faults retires, and the entry does not go back to
-/// a discovered provider that failed it (a pinned `--node-id` is its only
-/// candidate). Each lane fills up to `--max-lane-streams` gaps at once, one
-/// permit for its provider per gap worker: the base permit its drive pass
-/// reserved, then the permits free when the drive starts, and those a sibling
-/// entry frees while the drive runs ([`LaneGrant`]). Each worker gives its
-/// permit back as it stops: a lane that faults frees each permit as each of its
-/// workers finishes its gap, and a lane that runs out of gaps keeps one permit
-/// for its one idle worker. The entry holds no permit between drives: it waits
-/// on siblings there, and a sibling it waits on may need them.
-struct CtxRangeDriver<'a, P: Provider + Clone> {
+/// Every drive of the entry (the pay-now complement, a donor re-fetch, each
+/// deferred fallback, the self-heal re-drive) runs the same loop as a
+/// whole-file entry: it stripes the ranges across the holders, a holder that
+/// faults cools in the command-wide [`PeerHealth`] and returns, and the drive
+/// ends on done, a fault only the user can fix, a unanimous verdict of the
+/// holders, or the command's [`StopPolicy`]. The store is keyed by the
+/// manifest's size, so a holder that signs another size is a size fault of
+/// that holder. The spliced donor bytes are never marked present in the
+/// store, so a drive promotes the entry only once fetched bytes fill the
+/// whole store: a resumed store that already held the rest, or the self-heal
+/// re-drive of the whole blob.
+struct AcquireRangeDriver<'a, P: Provider + Clone> {
+    ctx: &'a PullCtx<'a, P>,
+    targets: &'a fetch::ResolvedTargets,
     hash: [u8; 32],
     staging: &'a Path,
-    walk: SessionWalk<LiveSessions<'a, P>>,
+    /// The manifest's size, which keys the entry's store.
+    total: u64,
+    progress: Option<&'a ProgressCallback>,
 }
 
-impl<'a, P: Provider + Clone> CtxRangeDriver<'a, P> {
-    /// A driver for one entry, with no session open yet.
-    fn new(
-        ctx: &'a PullCtx<'a, P>,
-        targets: &'a RangeTargets,
-        hash: [u8; 32],
-        staging: &'a Path,
-        total: u64,
-        progress: Option<&'a (dyn Fn(u64, u64) + Send + Sync + 'a)>,
-    ) -> Self {
-        Self {
-            hash,
-            staging,
-            walk: SessionWalk::new(LiveSessions {
-                ctx,
-                pinned: matches!(targets, RangeTargets::Pinned(_)),
-                stripe: targets.stripe(),
-                targets: targets.targets(),
-                hash,
-                staging,
-                total,
-                progress,
-                store: std::sync::OnceLock::new(),
-                topups_used: std::sync::atomic::AtomicU32::new(0),
-            }),
-        }
-    }
-}
-
-impl<P: Provider + Clone> RangeDriver for CtxRangeDriver<'_, P> {
+impl<P: Provider + Clone> RangeDriver for AcquireRangeDriver<'_, P> {
     fn hash(&self) -> [u8; 32] {
         self.hash
     }
@@ -2906,494 +2574,14 @@ impl<P: Provider + Clone> RangeDriver for CtxRangeDriver<'_, P> {
         &'a self,
         ranges: &'a [(u64, u64)],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
-        Box::pin(self.walk.drive(ranges))
-    }
-}
-
-/// How a [`RangeSessions::drive`] over the open sessions ended.
-struct LanesDriven {
-    /// Per open session, in the order given: whether its lane faulted.
-    faulted: Vec<bool>,
-    /// The drive's result.
-    result: anyhow::Result<()>,
-}
-
-/// The candidates a [`SessionWalk`] drives an entry's ranges from.
-trait RangeSessions {
-    /// One candidate's open session.
-    type Session;
-
-    /// One candidate's reserved stream permit ([`LaneStreamCap`]).
-    type Permit;
-
-    /// How many candidates there are, in failover order.
-    fn candidates(&self) -> usize;
-
-    /// How many of the first candidates a drive stripes across at once. The
-    /// rest are failover reserve, opened one at a time once no striped
-    /// session is left. `1` is plain single-source failover.
-    fn stripe(&self) -> usize;
-
-    /// Whether the one candidate was pinned (`--node-id`) rather than probed.
-    fn pinned(&self) -> bool;
-
-    /// Candidate `index`'s name, for the failover warning.
-    fn label(&self, index: usize) -> String;
-
-    /// The entry's name, for the failover warning.
-    fn entry(&self) -> String;
-
-    /// Open a session against candidate `index`, whose first drive fills
-    /// `first_ranges`. Empty `first_ranges` open no first leg.
-    async fn open(
-        &self,
-        index: usize,
-        first_ranges: &[(u64, u64)],
-    ) -> anyhow::Result<Self::Session>;
-
-    /// Reserve one stream permit for each candidate in `indices`, for one
-    /// drive pass. The walk holds no permit when it calls this, and the
-    /// candidates it names have distinct providers.
-    async fn permits(&self, indices: &[usize]) -> anyhow::Result<Vec<(usize, Self::Permit)>>;
-
-    /// Drive `ranges` through every open session at once. Each is
-    /// `(candidate index, session, takes the drive's first gap)`, and
-    /// `permits` holds each one's reserved permit.
-    async fn drive(
-        &self,
-        open: &[(usize, &Self::Session, bool)],
-        permits: Vec<(usize, Self::Permit)>,
-        ranges: &[(u64, u64)],
-    ) -> LanesDriven;
-}
-
-/// An entry's walk over its range-drive candidates (#2119, #2123): one session
-/// per provider, reused by every drive of the entry while that provider
-/// serves.
-///
-/// A drive runs across every open session. It opens the stripe
-/// ([`RangeSessions::stripe`]) up front and, once no striped session is left,
-/// one reserve candidate at a time. A session whose lane faults is dropped,
-/// and a failure no single lane owns (the drive-level floor) drops every open
-/// session. Whatever the drive left missing, it drives again on what is still
-/// open or next in line, so one call returns only when the ranges are filled,
-/// a terminal fault stops them, or no candidate is left. The entry does not go
-/// back to a discovered provider that failed it. A pinned candidate is its own
-/// only one, so a call reopens it after a failure dropped its session. A
-/// terminal fault or a fault only the user can fix (a local disk fault among
-/// them) ends the walk at once: no provider can fix either. The open sessions and the next candidate sit under one lock.
-///
-/// Only the last session a pass opens opens the drive's first leg, and that
-/// session takes the first gap: a pull primed early would go stale while the
-/// other sessions open.
-struct SessionWalk<S: RangeSessions> {
-    sessions: S,
-    state: tokio::sync::Mutex<WalkState<S::Session>>,
-}
-
-/// Record `err` as the walk's last error, unless the error it holds is a
-/// verdict no other candidate changes and `err` is not ([`settles_the_walk`]):
-/// a later transient open failure must not hide a size mismatch or a pool
-/// exhaustion behind a fault of one provider.
-fn keep_walk_error(last: &mut Option<anyhow::Error>, err: anyhow::Error) {
-    let keep_old = last
-        .as_ref()
-        .is_some_and(|old| settles_the_walk(old) && !settles_the_walk(&err));
-    if keep_old {
-        tracing::debug!("bundle pull: a later candidate also failed: {err:#}");
-    } else {
-        *last = Some(err);
-    }
-}
-
-/// Whether a range walk's `err` is a verdict no other candidate changes: a
-/// fault only the user can fix, a spent pool, a size no provider agrees on
-/// with the store, or a lane-permit fault of this client.
-fn settles_the_walk(err: &anyhow::Error) -> bool {
-    matches!(
-        decdn_client::classify(err),
-        decdn_client::Fault::Fatal(_)
-            | decdn_client::Fault::Unaffordable
-            | decdn_client::Fault::WrongSize
-    ) || err.downcast_ref::<LanePermitFault>().is_some()
-        || err.downcast_ref::<fetch::ManifestSizeMismatch>().is_some()
-}
-
-/// A [`SessionWalk`]'s open sessions and where its walk resumes.
-struct WalkState<T> {
-    /// The open sessions and their candidate indices.
-    open: Vec<(usize, T)>,
-    /// The first candidate not yet opened: every earlier one is open or
-    /// failed.
-    next: usize,
-    /// The open session whose source holds the next drive's first leg.
-    primed: Option<usize>,
-}
-
-impl<S: RangeSessions> SessionWalk<S> {
-    fn new(sessions: S) -> Self {
-        Self {
-            sessions,
-            state: tokio::sync::Mutex::new(WalkState {
-                open: Vec::new(),
-                next: 0,
-                primed: None,
-            }),
-        }
-    }
-
-    /// Drive `ranges` from the open sessions, failing over down the rest.
-    async fn drive(&self, ranges: &[(u64, u64)]) -> anyhow::Result<()> {
-        let mut state = self.state.lock().await;
-        let n = self.sessions.candidates();
-        let pinned = self.sessions.pinned();
-        if pinned && state.open.is_empty() {
-            state.next = 0;
-        }
-        let entry = self.sessions.entry();
-        let failed_before = state.next.saturating_sub(state.open.len());
-        let what = if failed_before == 0 {
-            format!("the ranges of entry {entry}")
-        } else {
-            format!(
-                "the ranges of entry {entry} ({failed_before} earlier candidate(s) already \
-                 failed it)"
-            )
-        };
-        let mut last_err: Option<anyhow::Error> = None;
-        loop {
-            let permits = self.fill(&mut state, ranges, &what, &mut last_err).await?;
-            if state.open.is_empty() {
-                return Err(match last_err {
-                    Some(err) if pinned => err,
-                    Some(err) => {
-                        tracing::warn!(
-                            "bundle pull: no provider could deliver {what} ({err:#}); every one \
-                             of {n} candidate(s) has now failed"
-                        );
-                        err.context(format!(
-                            "all {n} candidate provider(s) failed to deliver {what}"
-                        ))
-                    }
-                    None => anyhow!("no candidate node could deliver {what}"),
-                });
-            }
-            let driven = {
-                let primed = state.primed.take();
-                let lanes: Vec<(usize, &S::Session, bool)> = state
-                    .open
-                    .iter()
-                    .map(|(index, session)| (*index, session, primed == Some(*index)))
-                    .collect();
-                self.sessions.drive(&lanes, permits, ranges).await
-            };
-            let failed: Vec<String> = state
-                .open
-                .iter()
-                .zip(&driven.faulted)
-                .filter(|&(_, faulted)| *faulted)
-                .map(|((index, _), _)| self.sessions.label(*index))
-                .collect();
-            // A session with no report is treated as faulted: it is never
-            // reused on a guess.
-            let mut faulted = driven.faulted.iter();
-            state
-                .open
-                .retain(|_| !faulted.next().copied().unwrap_or(true));
-            let err = match driven.result {
-                Ok(()) => return Ok(()),
-                Err(err) => err,
-            };
-            // No provider can fix a terminal fault or a fault only the user
-            // can fix (a local disk fault among them), so neither fails over.
-            if retry_disposition(&err) == RetryDisposition::Terminal
-                || entry_scope(&err) == decdn_client::FatalScope::Command
-                || err.downcast_ref::<LanePermitFault>().is_some()
-            {
-                return Err(err);
-            }
-            let failed = if failed.is_empty() {
-                // No lane owns the failure: every open session failed it.
-                let every = state
-                    .open
-                    .iter()
-                    .map(|(index, _)| self.sessions.label(*index))
-                    .collect();
-                state.open.clear();
-                every
-            } else {
-                failed
-            };
-            if state.next < n || !state.open.is_empty() {
-                tracing::warn!(
-                    "bundle pull: provider(s) {} could not deliver {what} ({err:#}); failing \
-                     over to the rest of {n} candidate(s)",
-                    failed.join(", "),
-                );
-            }
-            keep_walk_error(&mut last_err, err);
-        }
-    }
-
-    /// Open the sessions the next drive needs: every stripe member not yet
-    /// tried, and, when none is open, the next reserve candidate. A candidate
-    /// whose session will not open is skipped for good.
-    ///
-    /// Returns the stream permit of each open session, for the next drive
-    /// pass. They are reserved in one batch, before the new sessions open, so
-    /// no primed first leg waits on a permit. The walk holds no permit when it
-    /// reserves the batch: the last drive gave its permits back, and a later
-    /// batch only follows a pass in which every open failed.
-    async fn fill(
-        &self,
-        state: &mut WalkState<S::Session>,
-        ranges: &[(u64, u64)],
-        what: &str,
-        last_err: &mut Option<anyhow::Error>,
-    ) -> anyhow::Result<Vec<(usize, S::Permit)>> {
-        let n = self.sessions.candidates();
-        let stripe = self.sessions.stripe().max(1);
-        let mut permits: Vec<(usize, S::Permit)> = Vec::new();
-        loop {
-            let end = if state.next < stripe {
-                stripe.min(n)
-            } else if state.open.is_empty() {
-                state.next.saturating_add(1).min(n)
-            } else {
-                state.next
-            };
-            let mut wanted: Vec<usize> = state
-                .open
-                .iter()
-                .map(|&(index, _)| index)
-                .filter(|index| !permits.iter().any(|(held, _)| held == index))
-                .collect();
-            wanted.extend(state.next..end.max(state.next));
-            if !wanted.is_empty() {
-                permits.extend(self.sessions.permits(&wanted).await?);
-            }
-            if end <= state.next {
-                return Ok(permits);
-            }
-            while state.next < end {
-                let index = state.next;
-                state.next = index.saturating_add(1);
-                let primes = state.primed.is_none() && state.next == end;
-                let first: &[(u64, u64)] = if primes { ranges } else { &[] };
-                match self.sessions.open(index, first).await {
-                    Ok(session) => {
-                        if primes {
-                            state.primed = Some(index);
-                        }
-                        state.open.push((index, session));
-                    }
-                    Err(err) => {
-                        permits.retain(|&(held, _)| held != index);
-                        if retry_disposition(&err) == RetryDisposition::Terminal {
-                            return Err(err);
-                        }
-                        if state.next < n || !state.open.is_empty() {
-                            tracing::warn!(
-                                "bundle pull: provider {} could not deliver {what} ({err:#}); \
-                                 failing over to the rest of {n} candidate(s)",
-                                self.sessions.label(index),
-                            );
-                        }
-                        keep_walk_error(last_err, err);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// The live [`RangeSessions`]: paid [`fetch::RangeSession`]s against the
-/// entry's pinned or probed candidates, all filling the entry's one ranged
-/// store.
-struct LiveSessions<'a, P: Provider + Clone> {
-    ctx: &'a PullCtx<'a, P>,
-    pinned: bool,
-    stripe: usize,
-    targets: Vec<(FetchTarget, Vec<std::net::SocketAddr>)>,
-    hash: [u8; 32],
-    staging: &'a Path,
-    total: u64,
-    progress: Option<&'a (dyn Fn(u64, u64) + Send + Sync + 'a)>,
-    /// The entry's ranged store beside `staging`, opened at the first session
-    /// open. Every lane of every drive writes into this one store, so one
-    /// in-memory present set and one writer own the `.ranges` record.
-    store: std::sync::OnceLock<ClientRangedStore>,
-    /// The entry's reactive top-ups, one budget across every lane.
-    topups_used: std::sync::atomic::AtomicU32,
-}
-
-impl<P: Provider + Clone> LiveSessions<'_, P> {
-    /// Candidate `index`'s dial target and hints.
-    fn target(&self, index: usize) -> anyhow::Result<&(FetchTarget, Vec<std::net::SocketAddr>)> {
-        self.targets
-            .get(index)
-            .ok_or_else(|| anyhow!("no range-drive candidate {index}"))
-    }
-
-    /// The entry's ranged store, opened on first use.
-    fn entry_store(&self) -> anyhow::Result<&ClientRangedStore> {
-        if let Some(store) = self.store.get() {
-            return Ok(store);
-        }
-        let opened = fetch::open_entry_store(self.staging, self.hash, self.total)?;
-        Ok(self.store.get_or_init(|| opened))
-    }
-
-    /// On the delegated path a terminal owner-remedy reason reconnects to the
-    /// owner-side remedy (the delegate cannot self-resolve it), the same as
-    /// `fetch`.
-    fn annotate(&self, err: anyhow::Error) -> anyhow::Error {
-        if self.ctx.grant.is_some() {
-            fetch::annotate_delegated_exhaustion(err)
-        } else {
-            err
-        }
-    }
-}
-
-impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
-    type Session = fetch::RangeSession<'a, P>;
-    type Permit = tokio::sync::OwnedSemaphorePermit;
-
-    fn candidates(&self) -> usize {
-        self.targets.len()
-    }
-
-    fn stripe(&self) -> usize {
-        self.stripe
-    }
-
-    fn pinned(&self) -> bool {
-        self.pinned
-    }
-
-    fn label(&self, index: usize) -> String {
-        self.targets.get(index).map_or_else(
-            || format!("#{index}"),
-            |((_, provider), _)| provider.to_string(),
-        )
-    }
-
-    fn entry(&self) -> String {
-        blake3::Hash::from_bytes(self.hash).to_hex().to_string()
-    }
-
-    async fn open(
-        &self,
-        index: usize,
-        first_ranges: &[(u64, u64)],
-    ) -> anyhow::Result<Self::Session> {
-        let (target, dial_addrs) = self.target(index)?;
-        self.ctx
-            .open_range_session(
-                *target,
-                dial_addrs,
-                self.hash,
-                self.entry_store()?,
-                first_ranges,
-            )
-            .await
-            .map_err(|err| self.annotate(err))
-    }
-
-    async fn permits(&self, indices: &[usize]) -> anyhow::Result<Vec<(usize, Self::Permit)>> {
-        let mut by_provider = Vec::with_capacity(indices.len());
-        for &index in indices {
-            let ((_, provider), _) = self.target(index)?;
-            by_provider.push((*provider, index));
-        }
-        // One global order: sorted by provider address.
-        by_provider.sort_unstable();
-        // A second wait on one provider while holding its first permit could
-        // wait on itself for good.
-        let shared = by_provider
-            .iter()
-            .zip(by_provider.iter().skip(1))
-            .find(|(a, b)| a.0 == b.0);
-        if let Some(((provider, first), (_, second))) = shared {
-            return Err(anyhow::Error::new(LanePermitFault(format!(
-                "candidates {first} and {second} of one drive pass share provider {provider}"
-            ))));
-        }
-        let mut permits = Vec::with_capacity(by_provider.len());
-        for (provider, index) in by_provider {
-            permits.push((index, self.ctx.lane_cap.permit(provider).await?));
-        }
-        Ok(permits)
-    }
-
-    async fn drive(
-        &self,
-        open: &[(usize, &Self::Session, bool)],
-        mut permits: Vec<(usize, Self::Permit)>,
-        ranges: &[(u64, u64)],
-    ) -> LanesDriven {
-        let unfaulted = |result: anyhow::Result<()>| LanesDriven {
-            faulted: vec![false; open.len()],
-            result,
-        };
-        let store = match self.entry_store() {
-            Ok(store) => store,
-            Err(err) => return unfaulted(Err(err)),
-        };
-        // Each lane starts on its reserved permit and takes free ones as it
-        // grows. Held for this drive only, never across the entry's waits on a
-        // sibling (`reconcile_deferred`): a donor this entry waits on may be
-        // blocked on the same providers' permits.
-        let mut grants = Vec::with_capacity(open.len());
-        for &(index, _, _) in open {
-            let provider = match self.target(index) {
-                Ok(((_, provider), _)) => *provider,
-                Err(err) => return unfaulted(Err(err)),
-            };
-            let Some(at) = permits.iter().position(|&(held, _)| held == index) else {
-                return unfaulted(Err(anyhow::Error::new(LanePermitFault(format!(
-                    "no stream permit reserved for provider {provider}"
-                )))));
-            };
-            let (_, base) = permits.swap_remove(at);
-            grants.push(LaneGrant::new(
-                self.ctx.lane_cap.semaphore(provider).await,
-                self.ctx.lane_cap.n,
-                base,
-            ));
-        }
-        let hooks: Vec<_> = grants.iter().map(|g| move |most| g.grant(most)).collect();
-        let releases: Vec<_> = grants.iter().map(|g| move || g.release_one()).collect();
-        let lanes: Vec<_> = open
-            .iter()
-            .zip(&grants)
-            .zip(hooks.iter().zip(&releases))
-            .map(|((&(_, session, takes_first), grant), (hook, release))| {
-                grant.grant(usize::MAX);
-                fetch::StripeLane {
-                    session,
-                    width: grant.width(),
-                    takes_first,
-                    grow: Some(decdn_client::LaneGrowth(hook)),
-                    release: Some(decdn_client::LaneRelease(release)),
-                }
-            })
-            .collect();
-        let driven = Box::pin(fetch::drive_stripe(
-            store,
-            &lanes,
-            ranges,
+        Box::pin(self.ctx.acquire_entry(
+            self.targets,
+            self.hash,
+            self.staging,
+            Some(self.total),
+            Some(ranges),
             self.progress,
-            &self.topups_used,
         ))
-        .await;
-        drop(lanes);
-        drop(grants);
-        LanesDriven {
-            faulted: driven.faulted,
-            result: driven.result.map_err(|err| self.annotate(err)),
-        }
     }
 }
 
@@ -5110,12 +4298,8 @@ mod tests {
     /// A manifest size no provider signs is the manifest's fault: it fails its
     /// own entry and leaves the rest of the pull running.
     #[test]
-    fn a_manifest_size_mismatch_fails_only_its_entry() {
-        let err = anyhow::Error::new(fetch::ManifestSizeMismatch {
-            provider: Address::repeat_byte(1),
-            signed: 2,
-            manifest: 1,
-        });
+    fn a_manifest_size_no_holder_signs_fails_only_its_entry() {
+        let err = anyhow::Error::new(decdn_client::NoSourceAgreesOnSize);
         assert_eq!(entry_scope(&err), decdn_client::FatalScope::Item);
         assert!(!ends_the_pull(&err));
     }
@@ -5206,6 +4390,45 @@ mod tests {
         );
         assert_eq!(*started.lock().unwrap(), vec![0, 1]);
         assert_eq!(settled, vec![0, 1]);
+    }
+
+    /// A command-wide fault drops the items still in flight, and each dropped
+    /// item's drop guard runs: a fetch dropped this way still persists its
+    /// lanes' watermarks (`fetch::SettleOnDrop` in `acquire_entry`).
+    #[tokio::test]
+    async fn a_command_fault_settles_the_items_it_drops() {
+        let settled = std::sync::atomic::AtomicU32::new(0);
+        let stopped = run_groups(
+            vec![0u8, 1],
+            2,
+            |i| {
+                let settled = &settled;
+                async move {
+                    if i == 1 {
+                        return Err(anyhow::Error::new(decdn_client::UpstreamVoucherRejected {
+                            reason: decdn_protocol::client::VoucherRejectReason::PoolExhausted,
+                            bundle: None,
+                            proof_generation: None,
+                        }));
+                    }
+                    // In flight when its sibling fails: it never finishes.
+                    let on_drop = fetch::SettleOnDrop::new(|| {
+                        settled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    });
+                    std::future::pending::<()>().await;
+                    on_drop.disarm();
+                    Ok(())
+                }
+            },
+            |_, r: anyhow::Result<()>| r.err().filter(ends_the_pull),
+        )
+        .await;
+        assert!(stopped.is_some(), "the sibling's fault ends the run");
+        assert_eq!(
+            settled.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the dropped item settled on drop"
+        );
     }
 
     /// An item-scoped fault fails its own entry and the pull runs on.
@@ -8169,144 +7392,6 @@ mod tests {
         );
     }
 
-    /// A scripted [`RangeSessions`]: counts opens and drives per candidate and
-    /// fails the lanes listed in `fail` as `(candidate, nth lane-drive)`.
-    struct FakeSessions {
-        candidates: usize,
-        stripe: usize,
-        pinned: bool,
-        /// `(candidate, nth lane-drive)` pairs whose lane faults.
-        fail: Vec<(usize, usize)>,
-        /// Drive calls (1-based) that fail with no lane at fault: a floor trip.
-        stall: Vec<usize>,
-        /// Drive calls (1-based) whose first lane faults with this error.
-        lane_error: Vec<(usize, fn() -> anyhow::Error)>,
-        fail_open: Vec<usize>,
-        opens: std::sync::Mutex<Vec<usize>>,
-        /// Candidates that opened with a first leg.
-        primed_opens: std::sync::Mutex<Vec<usize>>,
-        /// One entry per lane per drive, in drive order.
-        drives: std::sync::Mutex<Vec<usize>>,
-        /// Per drive call: the candidates it ran on, and which took the first
-        /// gap.
-        calls: std::sync::Mutex<Vec<(Vec<usize>, Option<usize>)>>,
-        /// Each permit batch the walk reserved, in order.
-        reserved: std::sync::Mutex<Vec<Vec<usize>>>,
-    }
-
-    impl FakeSessions {
-        fn new(candidates: usize) -> Self {
-            Self {
-                candidates,
-                stripe: 1,
-                pinned: false,
-                fail: Vec::new(),
-                stall: Vec::new(),
-                lane_error: Vec::new(),
-                fail_open: Vec::new(),
-                opens: std::sync::Mutex::new(Vec::new()),
-                primed_opens: std::sync::Mutex::new(Vec::new()),
-                drives: std::sync::Mutex::new(Vec::new()),
-                calls: std::sync::Mutex::new(Vec::new()),
-                reserved: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl RangeSessions for FakeSessions {
-        type Session = usize;
-        type Permit = usize;
-
-        fn candidates(&self) -> usize {
-            self.candidates
-        }
-
-        fn stripe(&self) -> usize {
-            self.stripe
-        }
-
-        fn pinned(&self) -> bool {
-            self.pinned
-        }
-
-        fn label(&self, index: usize) -> String {
-            format!("p{index}")
-        }
-
-        fn entry(&self) -> String {
-            "e".into()
-        }
-
-        async fn open(&self, index: usize, first: &[(u64, u64)]) -> anyhow::Result<usize> {
-            self.opens.lock().unwrap().push(index);
-            if self.fail_open.contains(&index) {
-                bail!("open {index} refused");
-            }
-            if !first.is_empty() {
-                self.primed_opens.lock().unwrap().push(index);
-            }
-            Ok(index)
-        }
-
-        async fn permits(&self, indices: &[usize]) -> anyhow::Result<Vec<(usize, usize)>> {
-            self.reserved.lock().unwrap().push(indices.to_vec());
-            Ok(indices.iter().map(|&index| (index, index)).collect())
-        }
-
-        async fn drive(
-            &self,
-            open: &[(usize, &usize, bool)],
-            permits: Vec<(usize, usize)>,
-            _: &[(u64, u64)],
-        ) -> LanesDriven {
-            let mut held: Vec<usize> = permits.iter().map(|&(index, _)| index).collect();
-            held.sort_unstable();
-            let mut lanes: Vec<usize> = open.iter().map(|&(index, _, _)| index).collect();
-            lanes.sort_unstable();
-            assert_eq!(held, lanes, "a drive gets one permit per open session");
-            let call = {
-                let mut calls = self.calls.lock().unwrap();
-                calls.push((
-                    open.iter().map(|&(i, _, _)| i).collect(),
-                    open.iter()
-                        .find(|&&(_, _, first)| first)
-                        .map(|&(i, _, _)| i),
-                ));
-                calls.len()
-            };
-            if let Some((_, make)) = self.lane_error.iter().find(|(c, _)| *c == call) {
-                let mut faulted = vec![false; open.len()];
-                if let Some(first) = faulted.first_mut() {
-                    *first = true;
-                }
-                return LanesDriven {
-                    faulted,
-                    result: Err(make()),
-                };
-            }
-            let faulted: Vec<bool> = open
-                .iter()
-                .map(|&(index, session, _)| {
-                    assert_eq!(*session, index, "a drive uses its candidate's session");
-                    let nth = {
-                        let mut drives = self.drives.lock().unwrap();
-                        drives.push(index);
-                        drives.len()
-                    };
-                    self.fail.contains(&(index, nth))
-                })
-                .collect();
-            let result = if self.stall.contains(&call) {
-                Err(anyhow!("drive {call} stalled"))
-            } else if faulted.iter().all(|&f| f) {
-                Err(anyhow!("drive {call} failed on every lane"))
-            } else {
-                Ok(())
-            };
-            LanesDriven { faulted, result }
-        }
-    }
-
     /// A candidate on node `node` run by operator `operator`.
     fn stripe_candidate(node: u8, operator: u8) -> NodeCandidate {
         NodeCandidate {
@@ -8315,294 +7400,6 @@ mod tests {
             region_hint: None,
             multiaddrs: alloy::primitives::Bytes::new(),
         }
-    }
-
-    /// The stripe is the full holders, one per operator and at most
-    /// `max_sources`, first in the order; every other candidate follows as
-    /// reserve in its own order.
-    #[test]
-    fn stripe_order_puts_admitted_full_holders_first() {
-        let total = 4 * decdn_protocol::DISCOVERY_BLOCK_BYTES;
-        let blocks = decdn_protocol::num_blocks(total);
-        // 1 is a proxy (no coverage), 2 and 3 full holders of one operator, 4
-        // a partial holder, 5 and 6 full holders of their own operators.
-        let order: Vec<NodeCandidate> = [(1, 1), (2, 2), (3, 2), (4, 4), (5, 5), (6, 6)]
-            .into_iter()
-            .map(|(n, o)| stripe_candidate(n, o))
-            .collect();
-        let mut coverage = HashMap::new();
-        for n in [2, 3, 5, 6] {
-            coverage.insert(
-                stripe_candidate(n, 0).node_id,
-                decdn_protocol::Coverage::full(blocks),
-            );
-        }
-        coverage.insert(
-            stripe_candidate(4, 0).node_id,
-            decdn_protocol::Coverage::from_block_indices(blocks, 0..1),
-        );
-        let ids = |o: &[NodeCandidate]| -> Vec<PublicKey> { o.iter().map(|c| c.node_id).collect() };
-        let expect = |nodes: &[u8]| -> Vec<PublicKey> {
-            nodes
-                .iter()
-                .map(|&n| stripe_candidate(n, 0).node_id)
-                .collect()
-        };
-
-        let (striped, stripe) = stripe_order(order.clone(), &coverage, total, 2);
-        assert_eq!(stripe, 2);
-        assert_eq!(ids(&striped), expect(&[2, 5, 1, 3, 4, 6]));
-
-        let (all, stripe) = stripe_order(order.clone(), &coverage, total, 8);
-        assert_eq!(stripe, 3, "one per operator: 2 and 3 share one");
-        assert_eq!(ids(&all), expect(&[2, 5, 6, 1, 3, 4]));
-    }
-
-    /// With fewer than two admitted full holders, the order is unchanged and
-    /// there is no stripe.
-    #[test]
-    fn stripe_order_falls_back_to_plain_failover() {
-        let total = 4 * decdn_protocol::DISCOVERY_BLOCK_BYTES;
-        let blocks = decdn_protocol::num_blocks(total);
-        let order: Vec<NodeCandidate> = (1..=3).map(|n| stripe_candidate(n, n)).collect();
-        let mut coverage = HashMap::new();
-        for n in 1..=3 {
-            coverage.insert(
-                stripe_candidate(n, 0).node_id,
-                decdn_protocol::Coverage::full(blocks),
-            );
-        }
-        let ids: Vec<PublicKey> = order.iter().map(|c| c.node_id).collect();
-        let one_holder: HashMap<_, _> = coverage.into_iter().take(1).collect();
-        let (same, stripe) = stripe_order(order, &one_holder, total, 4);
-        assert_eq!(
-            (same.iter().map(|c| c.node_id).collect::<Vec<_>>(), stripe),
-            (ids, 1)
-        );
-    }
-
-    /// Every drive of an entry reuses the one session while its provider serves.
-    #[tokio::test]
-    async fn session_walk_reuses_one_session_across_drives() {
-        let walk = SessionWalk::new(FakeSessions::new(3));
-        for _ in 0..3 {
-            walk.drive(&[(0, 1)]).await.unwrap();
-        }
-        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0]);
-        assert_eq!(*walk.sessions.drives.lock().unwrap(), vec![0, 0, 0]);
-    }
-
-    /// A failed drive fails over, and later drives start at the provider that
-    /// took over: the entry never goes back to the one that failed it.
-    #[tokio::test]
-    async fn session_walk_does_not_go_back_to_a_failed_provider() {
-        let mut fake = FakeSessions::new(3);
-        fake.fail = vec![(0, 2)];
-        let walk = SessionWalk::new(fake);
-        walk.drive(&[(0, 1)]).await.unwrap();
-        walk.drive(&[(0, 1)]).await.unwrap();
-        walk.drive(&[(0, 1)]).await.unwrap();
-        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 1]);
-        assert_eq!(*walk.sessions.drives.lock().unwrap(), vec![0, 0, 1, 1]);
-    }
-
-    /// A candidate whose session will not open is skipped for good too, and a
-    /// walk with no candidate left errors without opening anything.
-    #[tokio::test]
-    async fn session_walk_runs_out_and_says_so() {
-        let mut fake = FakeSessions::new(2);
-        fake.fail_open = vec![0, 1];
-        let walk = SessionWalk::new(fake);
-        let err = walk.drive(&[(0, 1)]).await.unwrap_err();
-        assert!(
-            format!("{err:#}").contains("all 2 candidate provider(s)"),
-            "{err:#}"
-        );
-        let err = walk.drive(&[(0, 1)]).await.unwrap_err();
-        assert!(format!("{err}").contains("no candidate node"), "{err}");
-        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 1]);
-    }
-
-    /// A pinned candidate is the only one: a failed drive reopens it next time.
-    #[tokio::test]
-    async fn session_walk_keeps_driving_a_pinned_candidate() {
-        let mut fake = FakeSessions::new(1);
-        fake.pinned = true;
-        fake.fail = vec![(0, 1)];
-        let walk = SessionWalk::new(fake);
-        let err = walk.drive(&[(0, 1)]).await.unwrap_err();
-        assert!(
-            !format!("{err:#}").contains("candidate provider(s)"),
-            "a pinned failure is not a walk that ran out: {err:#}"
-        );
-        walk.drive(&[(0, 1)]).await.unwrap();
-        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 0]);
-    }
-
-    /// A striped walk opens the whole stripe up front and drives every
-    /// session at once. Only the last session it opens opens the first leg,
-    /// and that session takes the first gap.
-    #[tokio::test]
-    async fn session_walk_opens_the_stripe_and_drives_it_at_once() {
-        let mut fake = FakeSessions::new(4);
-        fake.stripe = 3;
-        let walk = SessionWalk::new(fake);
-        walk.drive(&[(0, 1)]).await.unwrap();
-        walk.drive(&[(0, 1)]).await.unwrap();
-        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 1, 2]);
-        assert_eq!(*walk.sessions.primed_opens.lock().unwrap(), vec![2]);
-        assert_eq!(
-            *walk.sessions.calls.lock().unwrap(),
-            vec![(vec![0, 1, 2], Some(2)), (vec![0, 1, 2], None)],
-            "the primed session takes only the first drive's first gap"
-        );
-    }
-
-    /// A faulted lane leaves the stripe for good while the others keep
-    /// serving, and the reserve opens only once no striped session is left.
-    #[tokio::test]
-    async fn session_walk_drops_a_faulted_lane_and_falls_back_to_the_reserve() {
-        let mut fake = FakeSessions::new(3);
-        fake.stripe = 2;
-        // Drive 1: lanes 0 and 1 (entries 1, 2); lane 0 faults. Drive 2: lane
-        // 1 alone (entry 3) faults, so the reserve opens (entry 4).
-        fake.fail = vec![(0, 1), (1, 3)];
-        let walk = SessionWalk::new(fake);
-        walk.drive(&[(0, 1)]).await.unwrap();
-        walk.drive(&[(0, 1)]).await.unwrap();
-        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 1, 2]);
-        let calls: Vec<Vec<usize>> = walk
-            .sessions
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(lanes, _)| lanes.clone())
-            .collect();
-        assert_eq!(calls, vec![vec![0, 1], vec![1], vec![2]]);
-        assert_eq!(
-            *walk.sessions.reserved.lock().unwrap(),
-            vec![vec![0, 1], vec![1], vec![2]],
-            "each pass reserves permits for the sessions it drives, and no more"
-        );
-    }
-
-    /// A failure no lane owns, such as the drive-level floor, fails over every
-    /// open session.
-    #[tokio::test]
-    async fn session_walk_fails_every_lane_over_on_a_drive_level_failure() {
-        let mut fake = FakeSessions::new(3);
-        fake.stripe = 2;
-        fake.stall = vec![1];
-        let walk = SessionWalk::new(fake);
-        walk.drive(&[(0, 1)]).await.unwrap();
-        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 1, 2]);
-        let calls: Vec<Vec<usize>> = walk
-            .sessions
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(lanes, _)| lanes.clone())
-            .collect();
-        assert_eq!(calls, vec![vec![0, 1], vec![2]]);
-    }
-
-    /// A terminal fault ends the walk at once, unwrapped: no reserve candidate
-    /// opens, because no provider can fix it.
-    #[tokio::test]
-    async fn session_walk_stops_on_a_terminal_fault() {
-        let mut fake = FakeSessions::new(4);
-        fake.stripe = 2;
-        fake.lane_error = vec![(1, || {
-            anyhow::Error::new(decdn_client::BlobTooLarge {
-                received: 2,
-                ceiling: 1,
-            })
-        })];
-        let walk = SessionWalk::new(fake);
-        let err = walk.drive(&[(0, 1)]).await.unwrap_err();
-        assert!(err.downcast_ref::<decdn_client::BlobTooLarge>().is_some());
-        assert!(
-            !format!("{err:#}").contains("candidate provider(s)"),
-            "{err:#}"
-        );
-        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 1]);
-    }
-
-    /// A lane-permit fault is this client's own, so it ends the walk rather
-    /// than failing over and blaming each provider in turn.
-    #[tokio::test]
-    async fn session_walk_stops_on_a_lane_permit_fault() {
-        let mut fake = FakeSessions::new(4);
-        fake.lane_error = vec![(1, || {
-            anyhow::Error::new(LanePermitFault("no stream permit reserved".into()))
-        })];
-        let walk = SessionWalk::new(fake);
-        let err = walk.drive(&[(0, 1)]).await.unwrap_err();
-        assert!(err.downcast_ref::<LanePermitFault>().is_some(), "{err:#}");
-        assert!(settles_the_walk(&err));
-        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0]);
-    }
-
-    /// A local disk fault ends the walk too: every provider would meet it.
-    #[tokio::test]
-    async fn session_walk_stops_on_a_local_disk_fault() {
-        let mut fake = FakeSessions::new(3);
-        fake.lane_error = vec![(1, || {
-            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull))
-        })];
-        let walk = SessionWalk::new(fake);
-        let err = walk.drive(&[(0, 1)]).await.unwrap_err();
-        assert_eq!(
-            entry_scope(&err),
-            decdn_client::FatalScope::Command,
-            "{err:#}"
-        );
-        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0]);
-    }
-
-    /// The walk keeps a verdict no other candidate changes over a later fault
-    /// of one provider, and otherwise keeps the latest.
-    #[test]
-    fn keep_walk_error_keeps_the_verdict_over_a_provider_fault() {
-        let mismatch = || {
-            anyhow::Error::new(decdn_client::SignedSizeMismatch {
-                signed: 2,
-                expected: 1,
-            })
-        };
-        let mut last = None;
-        keep_walk_error(&mut last, anyhow!("connect refused"));
-        keep_walk_error(&mut last, mismatch());
-        keep_walk_error(&mut last, anyhow!("connect refused"));
-        assert!(
-            last.as_ref().is_some_and(|e| e
-                .downcast_ref::<decdn_client::SignedSizeMismatch>()
-                .is_some()),
-            "a transient error does not replace the size mismatch"
-        );
-        let mut last = Some(anyhow!("first"));
-        keep_walk_error(&mut last, anyhow!("second"));
-        assert_eq!(format!("{}", last.unwrap()), "second");
-    }
-
-    /// A stripe member that will not open is skipped, and the stripe runs on
-    /// the rest. When the last planned open fails, no session opens the first
-    /// leg for that drive.
-    #[tokio::test]
-    async fn session_walk_stripes_across_the_members_that_open() {
-        let mut fake = FakeSessions::new(3);
-        fake.stripe = 2;
-        fake.fail_open = vec![1];
-        let walk = SessionWalk::new(fake);
-        walk.drive(&[(0, 1)]).await.unwrap();
-        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 1]);
-        assert!(
-            walk.sessions.primed_opens.lock().unwrap().is_empty(),
-            "the last planned open failed, so no first leg was opened"
-        );
-        assert_eq!(*walk.sessions.calls.lock().unwrap(), vec![(vec![0], None)]);
     }
 
     /// Settling a group records its outcomes, flushes only recordable files,
@@ -8657,104 +7454,176 @@ mod tests {
         assert_eq!(rx.try_recv().expect("a flush batch").fetched_bytes, 3);
     }
 
-    /// A lane grant takes only the permits free right now, never more than
-    /// asked and never more than its room. A later call picks up the permits a
-    /// sibling entry freed since (#2168), and every permit returns to the cap
-    /// when the grant drops.
-    #[tokio::test]
-    async fn a_lane_grant_takes_free_permits_now_and_later() {
-        let p1 = Address::repeat_byte(1);
-        let cap = LaneStreamCap::new(4);
-        let held = cap.permit(p1).await.unwrap();
-        let sibling = cap.permit(p1).await.unwrap();
-        let base = cap.permit(p1).await.unwrap();
-        let grant = LaneGrant::new(cap.semaphore(p1).await, cap.n, base);
-        assert_eq!(grant.width().get(), 1, "the base permit alone");
-        assert_eq!(grant.grant(usize::MAX), 1, "the one free permit");
-        assert_eq!(grant.grant(usize::MAX), 0, "the cap is reached");
-        drop(sibling);
-        assert_eq!(grant.grant(0), 0, "no more than asked");
-        assert_eq!(grant.grant(usize::MAX), 1, "the permit the sibling freed");
-        assert_eq!(grant.grant(usize::MAX), 0, "the grant is at its room");
-        assert_eq!(grant.width().get(), 3, "one worker per permit held");
-        drop(grant);
-        drop(held);
-        let base = cap.permit(p1).await.unwrap();
-        let all = LaneGrant::new(cap.semaphore(p1).await, 10, base);
-        assert_eq!(
-            all.grant(usize::MAX),
-            3,
-            "every permit came back, and never past the cap"
-        );
-    }
-
-    /// A lane's base permit counts toward its room, and each stopped worker
-    /// gives one permit back to the provider at once.
-    #[tokio::test]
-    async fn a_lane_grant_gives_back_one_permit_per_stopped_worker() {
-        let p1 = Address::repeat_byte(1);
-        let cap = LaneStreamCap::new(4);
-        let semaphore = cap.semaphore(p1).await;
-        let base = cap.permit(p1).await.unwrap();
-        let grant = LaneGrant::new(Arc::clone(&semaphore), cap.n, base);
-        assert_eq!(
-            grant.grant(usize::MAX),
-            3,
-            "the base plus three free permits"
-        );
-        assert_eq!(semaphore.available_permits(), 0);
-        grant.release_one();
-        assert_eq!(semaphore.available_permits(), 1, "one stopped worker");
-        grant.release_one();
-        grant.release_one();
-        grant.release_one();
-        assert_eq!(semaphore.available_permits(), 4, "every worker stopped");
-        grant.release_one();
-        assert_eq!(
-            semaphore.available_permits(),
-            4,
-            "an extra release frees nothing"
-        );
-    }
-
     #[tokio::test]
     async fn lane_stream_cap_serializes_one_provider_and_frees_the_rest() {
-        use std::time::Duration;
-
         let p1 = Address::repeat_byte(1);
         let p2 = Address::repeat_byte(2);
 
-        // n == 1: the first permit for P1 is held; a second acquire for the same
-        // provider must not resolve until the first drops.
+        // n == 1: while the first permit for P1 is held, no second one is free.
         let cap = LaneStreamCap::new(1);
-        let held = cap.permit(p1).await.unwrap();
-        let second = tokio::time::timeout(Duration::from_millis(100), cap.permit(p1)).await;
+        let held = cap.try_permit(p1).await.unwrap();
         assert!(
-            second.is_err(),
-            "a second same-provider permit must block while the first is held"
+            cap.try_permit(p1).await.is_none(),
+            "a second same-provider permit is taken while the first is held"
         );
         // A different provider never contends.
-        let other = tokio::time::timeout(Duration::from_millis(100), cap.permit(p2)).await;
         assert!(
-            other.is_ok(),
-            "a distinct provider must not wait on P1's permit"
+            cap.try_permit(p2).await.is_some(),
+            "a distinct provider does not share P1's permit"
         );
-        // Dropping the first lets the waiter through.
+        // Dropping the first frees it.
         drop(held);
-        let reacquired = tokio::time::timeout(Duration::from_millis(100), cap.permit(p1))
-            .await
-            .expect("the second permit must resolve once the first is dropped")
-            .unwrap();
-        drop(reacquired);
+        assert!(
+            cap.try_permit(p1).await.is_some(),
+            "the permit is free once the first drops"
+        );
 
         // n == 2: two permits for the same provider coexist.
         let cap2 = LaneStreamCap::new(2);
-        let a = cap2.permit(p1).await.unwrap();
-        let b = tokio::time::timeout(Duration::from_millis(100), cap2.permit(p1))
+        let a = cap2.try_permit(p1).await.unwrap();
+        let b = cap2
+            .try_permit(p1)
             .await
-            .expect("two same-provider permits must coexist at n == 2")
-            .unwrap();
+            .expect("two same-provider permits coexist at n == 2");
         drop((a, b));
+    }
+
+    /// A deterministic `len`-byte blob.
+    fn test_blob(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect()
+    }
+
+    /// One scripted holder of `blob`, paying provider `provider`. A holder
+    /// that `blips` resets its first stream once, 256 KiB in, and then serves.
+    fn scripted_holder(
+        blob: &[u8],
+        provider: u8,
+        blips: bool,
+    ) -> anyhow::Result<decdn_client::StreamCandidate<decdn_client::source::ScriptedSource>> {
+        let ledger = Arc::new(decdn_client::PoolLedger::new(
+            decdn_client::Cumulative::default(),
+        ));
+        let mut source =
+            decdn_client::source::ScriptedSource::new(blob.to_vec())?.paying(Arc::clone(&ledger));
+        if blips {
+            source = source.fault_once_after(256 * 1024, || anyhow!("connection reset"));
+        }
+        Ok(decdn_client::StreamCandidate {
+            source,
+            ctx: Arc::new(std::sync::Mutex::new(decdn_client::PoolContext {
+                pool_id: alloy::primitives::B256::ZERO,
+                provider: Address::repeat_byte(provider),
+                deposit: alloy::primitives::U256::from(u128::MAX),
+                client_signer: Arc::new(PrivateKeySigner::random()),
+                voucher_domain: decdn_incentive::bind_node_id_domain(1, Address::ZERO),
+                prior_bytes_delivered: alloy::primitives::U256::ZERO,
+                prior_amount: alloy::primitives::U256::ZERO,
+                client_binding: None,
+                capability: None,
+            })),
+            ledger,
+            coverage: None,
+            first_unit: None,
+            lease: decdn_client::LaneLease::default(),
+        })
+    }
+
+    /// Two scripted holders of `blob`; the first blips once when `first_blips`.
+    fn two_scripted_holders(
+        blob: &[u8],
+        first_blips: bool,
+    ) -> anyhow::Result<(
+        decdn_client::StaticSources<decdn_client::source::ScriptedSource>,
+        Vec<decdn_client::Holder>,
+    )> {
+        let sources = decdn_client::StaticSources::new(vec![
+            scripted_holder(blob, 0xA1, first_blips)?,
+            scripted_holder(blob, 0xB2, false)?,
+        ])?;
+        let holders = sources.holders();
+        Ok((sources, holders))
+    }
+
+    /// A funder that is never asked: every scripted deposit is huge.
+    fn no_topups() -> decdn_client::source::FakeFunder {
+        decdn_client::source::FakeFunder::new(
+            0,
+            decdn_incentive::DepositOutcome::Added(alloy::primitives::U256::ZERO),
+        )
+    }
+
+    /// A drive config whose working deposit never gates a scripted fetch.
+    fn drive_config() -> DriveConfig {
+        DriveConfig {
+            working_deposit: alloy::primitives::U256::from(u128::MAX),
+            seller_reserve: alloy::primitives::U256::ZERO,
+            max_settle_waits: 2,
+            settle_backoff: std::time::Duration::ZERO,
+        }
+    }
+
+    /// `blob`'s BLAKE3 root, the hash a scripted holder serves it under.
+    fn root(blob: &[u8]) -> [u8; 32] {
+        *blake3::hash(blob).as_bytes()
+    }
+
+    /// `len` bytes at `offset` of the entry's `.partial` beside `dest`: a
+    /// range entry that fetched only some ranges stays unpromoted.
+    fn read_range(dest: &Path, offset: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+        use std::io::{Read as _, Seek as _};
+        let mut f = std::fs::File::open(partial_path(dest))?;
+        f.seek(std::io::SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; usize::try_from(len)?];
+        f.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// A range-dedup entry fetches only the ranges no donor supplies, through
+    /// the acquire loop. Its one blipping holder cools while the other holder
+    /// carries the range, and the entry stays a `.partial` for the splice.
+    #[tokio::test(start_paused = true)]
+    async fn a_range_entry_survives_a_holder_blip() -> anyhow::Result<()> {
+        let blob = test_blob(6 * 1024 * 1024);
+        let ranges = vec![(1024 * 1024, 2 * 1024 * 1024)];
+        let (provider, holders) = two_scripted_holders(&blob, true)?;
+        let staging = tempfile::tempdir()?;
+        let dest = staging.path().join("entry");
+        let downloader = Downloader::new(
+            &provider,
+            holders,
+            Arc::default(),
+            no_topups(),
+            drive_config(),
+        );
+        let stop = StopPolicy::new(
+            false,
+            Some(std::time::Duration::from_mins(1)),
+            Arc::default(),
+        );
+        downloader
+            .fetch_to_paths_until(
+                &[DownloadTarget {
+                    hash: root(&blob),
+                    total_bytes: u64::try_from(blob.len())?,
+                    dest: &dest,
+                    ranges: Some(&ranges),
+                }],
+                None,
+                None,
+                &stop,
+            )
+            .await?;
+        assert_eq!(
+            read_range(&dest, 1024 * 1024, 2 * 1024 * 1024)?,
+            blob[1024 * 1024..3 * 1024 * 1024]
+        );
+        assert!(
+            !dest.exists(),
+            "an entry with donor bytes left is not promoted"
+        );
+        Ok(())
     }
 
     /// A plain entry's line keeps its one rate, taken from what it downloaded.

@@ -49,7 +49,9 @@ pub struct DownloadTarget<'a> {
     /// final file are keyed by this path, so the finished file IS `dest`.
     pub dest: &'a Path,
     /// The `(offset, len)` byte ranges to fill, or `None` for the whole blob.
-    /// Bytes outside them must already be present for the finalize to promote.
+    /// The fetch promotes the blob only when every byte is present, so a
+    /// caller that writes the bytes outside them itself (a bundle entry's
+    /// donor splice) finds them in the `.partial` beside `dest`.
     pub ranges: Option<&'a [(u64, u64)]>,
 }
 
@@ -210,7 +212,9 @@ where
     ///
     /// Each target opens a [`ClientRangedStore`] beside its file and fills its
     /// ranges through [`crate::acquire`] across a fresh [`SourceSet`] of the
-    /// holders, then finalizes — promoting `.partial` to `dest`. Writes land at
+    /// holders, then finalizes — promoting `.partial` to `dest`. A target with
+    /// explicit [`DownloadTarget::ranges`] that leave bytes missing is not
+    /// finalized: its landed ranges stay in the `.partial`. Writes land at
     /// their absolute offsets, so out-of-order and multi-source fills assemble
     /// correctly. The whole blob is fetched at full throughput, with no
     /// read-ahead bound.
@@ -295,8 +299,12 @@ where
             flush_on_drop.disarm();
             fetched?;
             // `acquire` flushes the present record but does not promote; a
-            // download keeps the file, so finalize (verify + promote `.partial`).
-            store.finalize().await?;
+            // download keeps the file, so finalize (verify + promote `.partial`)
+            // once every byte is present. Explicit ranges can leave bytes to
+            // another writer, and the `.partial` then stays for that writer.
+            if target.ranges.is_none() || store.is_complete().await? {
+                store.finalize().await?;
+            }
             written.push(target.dest.to_path_buf());
         }
         Ok(written)

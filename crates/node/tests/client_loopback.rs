@@ -520,9 +520,10 @@ async fn two_hashes_reuse_one_warm_connection() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Drive a scattered range set, then the rest of the blob, through one
-/// `PeerSource` against a live handler, and return how many connections the
-/// server accepted. `warm` builds the source with a warm connection (#2119).
+/// Drive a scattered range set across four concurrent sibling stores, then the
+/// rest of the blob into one of them, through one `PeerSource` on one ledger
+/// against a live handler, and return how many connections the server
+/// accepted. `warm` builds the source with a warm connection (#2119).
 /// `restarted` seeds the lane with a live chain from an earlier payer process
 /// ([`lane_with_proved_reveals`]), so the fresh ledger trails the node's
 /// watermark and every leg's first proof is stale.
@@ -531,7 +532,7 @@ async fn two_hashes_reuse_one_warm_connection() -> anyhow::Result<()> {
     reason = "one fixture: a paid handler, a lane, and the two drives it serves"
 )]
 async fn drive_scattered_through_peer_source(warm: bool, restarted: bool) -> anyhow::Result<usize> {
-    use decdn_client::driver::{DriveConfig, drive_range_set};
+    use decdn_client::driver::{DriveConfig, drive};
     use decdn_client::{BudgetPacer, ClientRangedStore, FakeFunder, PeerSource, SharedPool};
 
     const GROUP: u64 = 16 * 1024;
@@ -598,8 +599,19 @@ async fn drive_scattered_through_peer_source(warm: bool, restarted: bool) -> any
     } else {
         source
     };
+    // Four sibling fetches of the blob, one store each, on the one lane: the
+    // shape of concurrent bundle entries that share a provider.
     let store_dir = tempfile::tempdir()?;
-    let store = ClientRangedStore::create(store_dir.path(), "blob", *hash.as_bytes(), total)?;
+    let stores = (0..4)
+        .map(|i| {
+            ClientRangedStore::create(
+                store_dir.path(),
+                &format!("blob{i}"),
+                *hash.as_bytes(),
+                total,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let spent_ledger = Arc::clone(&ledger);
     let spent = move || spent_ledger.committed().amount;
@@ -615,26 +627,43 @@ async fn drive_scattered_through_peer_source(warm: bool, restarted: bool) -> any
     let funder = FakeFunder::new(0, decdn_incentive::DepositOutcome::UnknownPool);
     let config = DriveConfig::cli(U256::ZERO);
     let scattered: Vec<(u64, u64)> = (0..32).step_by(2).map(|g| (g * GROUP, GROUP)).collect();
-    for ranges in [scattered.as_slice(), &[(0, 0)]] {
-        drive_range_set(
-            &store,
+    let pacer = BudgetPacer::new();
+    let range = |store, (offset, len): (u64, u64)| {
+        drive(
+            store,
             &source,
-            &BudgetPacer::new(),
+            &pacer,
             &funder,
             &ctx,
             &ledger,
             *hash.as_bytes(),
-            ranges,
-            std::num::NonZeroUsize::MIN.saturating_add(3),
+            offset,
+            len,
             &config,
             None,
+            None,
+            None,
             Some(&pool),
-            std::future::pending(),
         )
-        .await?;
+    };
+    // Each sibling drives every fourth range of the set, all four at once.
+    let siblings = stores.iter().enumerate().map(|(i, store)| {
+        let mine: Vec<(u64, u64)> = scattered.iter().copied().skip(i).step_by(4).collect();
+        async move {
+            for r in mine {
+                range(store, r).await?;
+            }
+            anyhow::Ok(())
+        }
+    });
+    for driven in futures_util::future::join_all(siblings).await {
+        driven?;
     }
+    // Then the first sibling drives the rest of the blob.
+    let first = stores.first().ok_or_else(|| anyhow::anyhow!("no store"))?;
+    range(first, (0, 0)).await?;
     anyhow::ensure!(
-        std::fs::read(store_dir.path().join("blob"))? == payload,
+        std::fs::read(store_dir.path().join("blob0"))? == payload,
         "the range set and the rest assemble the blob byte-exact"
     );
     drop(source);
@@ -643,7 +672,7 @@ async fn drive_scattered_through_peer_source(warm: bool, restarted: bool) -> any
     Ok(dialed)
 }
 
-/// A warm `PeerSource` drives a whole scattered range set, four gaps at a time,
+/// A warm `PeerSource` drives a whole scattered range set, four legs at a time,
 /// and then the rest of the blob, on ONE connection: concurrent first opens
 /// share one dial, and later drives reuse it (#2119). Without the warm
 /// connection every leg dials its own.
@@ -656,7 +685,7 @@ async fn a_warm_peer_source_drives_a_range_set_on_one_connection() -> anyhow::Re
     Ok(())
 }
 
-/// A restarted payer drives a scattered range set, four gaps at a time on one
+/// A restarted payer drives a scattered range set, four legs at a time on one
 /// ledger, against a lane whose watermark it lost (#2173). Each 16 KiB leg's
 /// only proof is a sealed closing voucher at or below the node's signed anchor, and
 /// lane headroom cannot pay it, so the node rejects it with the watermark
