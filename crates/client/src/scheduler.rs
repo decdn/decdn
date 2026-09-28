@@ -215,8 +215,8 @@ struct RunSeed {
 
 /// Bytes of `[start, start+len)` the store still misses — this worker's range is
 /// disjoint from every peer's, so this reflects only its own delivery frontier.
-/// An error reads as "no observable progress" (`u64::MAX`), which trips the
-/// watchdog and drops the source — the safe direction.
+/// An error reads as bytes still missing, so a source that also sent no
+/// verified byte still trips.
 async fn missing_bytes<St>(store: &St, start: u64, len: u64) -> u64
 where
     St: IngestStore,
@@ -231,41 +231,40 @@ where
 }
 
 /// Progress-relative stall watchdog: resolve (trip) once a full `deadline`
-/// window passes with the store's missing count over `[start, len)` neither
-/// shrinking nor reaching zero — i.e. no verified progress and not yet done. A
-/// source that keeps delivering, however slowly, resets the window each sample
-/// and never trips; a source that has fully delivered (missing == 0) is left to
-/// `fill_gap`'s own completion, never tripped. A zero deadline disables the
-/// watchdog.
+/// window passes with `verified` unchanged while the store still misses bytes
+/// of `[start, len)` — i.e. no verified progress and not yet done. `verified`
+/// is the unit's verified-byte counter, which every bao-verified leaf advances
+/// as it lands, before the store's 4 MiB checkpoint makes it durable. A source
+/// that keeps delivering verified bytes, however slowly or in however small
+/// paced draws, resets the window each sample and never trips; a range the
+/// store holds in full (missing == 0) is left to `fill_gap`'s own completion,
+/// never tripped. A zero deadline disables the watchdog.
 ///
-/// `missing_bytes` progress is checkpoint-granular — it advances only every 4
-/// MiB `INGEST_CHECKPOINT_BYTES` interval, when the fsync that covers that
-/// batch lands — so `unit_deadline` must sit comfortably above
-/// `4 MiB / min-expected-throughput` plus two fsyncs' disk latency (the fsync
-/// in progress when the batch queues, then the one that covers it), to avoid
-/// falsely reassigning a healthy-but-slow source mid-checkpoint.
-async fn watchdog<St>(store: &St, start: u64, len: u64, deadline: Duration)
+/// `unit_deadline` is thus the longest gap between two verified leaves that a
+/// source may leave, including its time to first byte on the unit's first
+/// open.
+async fn watchdog<St>(store: &St, start: u64, len: u64, deadline: Duration, verified: &AtomicU64)
 where
     St: IngestStore,
 {
     if deadline.is_zero() {
         std::future::pending::<()>().await;
     }
-    let mut prev = missing_bytes(store, start, len).await;
+    let mut prev = verified.load(Ordering::Relaxed);
     loop {
         tokio::time::sleep(deadline).await;
-        let now = missing_bytes(store, start, len).await;
-        if now == 0 {
-            // Delivered in full; `fill_gap` will finish paying and return
-            // `Completed`. Keep waiting rather than tripping a done range.
+        let now = verified.load(Ordering::Relaxed);
+        if now != prev {
             prev = now;
             continue;
         }
-        if now >= prev {
-            // A whole window with no shrink and bytes still missing: a stall.
-            return;
+        if missing_bytes(store, start, len).await == 0 {
+            // Delivered in full; `fill_gap` will finish paying and return
+            // `Completed`. Keep waiting rather than tripping a done range.
+            continue;
         }
-        prev = now;
+        // A whole window with no verified byte and bytes still missing: a stall.
+        return;
     }
 }
 
@@ -834,6 +833,7 @@ where
         // `requeue_missing` (which recomputes the whole range's remainder) agree.
         let mut terminal: Option<UnitOutcome> = None;
         for (g_start, g_len) in gaps {
+            let verified = AtomicU64::new(0);
             let outcome = {
                 let fill = fill_gap(
                     store,
@@ -852,6 +852,8 @@ where
                     // The shared whole-blob delivered counter: every lane folds its
                     // own leg deltas in, so the bar reads one monotonic position.
                     Some(progress_agg),
+                    // This unit's verified bytes, which the watchdog judges.
+                    Some(&verified),
                     // Consumption pacing (#1848): with a `WindowPacer`, gate this
                     // lane against the shared consumer cursor so it never runs more
                     // than one read-ahead window ahead of what the consumer read.
@@ -910,7 +912,7 @@ where
                     ), if pacing.is_some() => UnitOutcome::Cancelled,
                     // A watchdog trip carries no error by construction — the
                     // source simply stopped making verified progress.
-                    () = watchdog(store, g_start, g_len, unit_deadline) => {
+                    () = watchdog(store, g_start, g_len, unit_deadline, &verified) => {
                         UnitOutcome::Faulted(None)
                     }
                 }
@@ -3612,27 +3614,56 @@ mod tests {
         }
     }
 
-    /// How long `watchdog` takes to trip against a scripted progress history, or
-    /// `None` if it does not trip within an hour of virtual time.
-    async fn watchdog_trips(script: &[u64], deadline: Duration) -> bool {
-        let store = ScriptedMissing::new(64 * 1024 * 1024, script);
-        tokio::time::timeout(
-            Duration::from_hours(1),
-            super::watchdog(&store, 0, 64 * 1024 * 1024, deadline),
-        )
-        .await
-        .is_ok()
+    /// Whether `watchdog` trips within an hour of virtual time. `missing` scripts
+    /// the store's still-missing counts; `verified(k)` is the unit's verified-byte
+    /// counter during window `k`, set halfway into that window.
+    async fn watchdog_trips(
+        missing: &[u64],
+        verified: impl Fn(u64) -> u64,
+        deadline: Duration,
+    ) -> bool {
+        let store = ScriptedMissing::new(64 * 1024 * 1024, missing);
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let feed = async {
+            if deadline.is_zero() {
+                return std::future::pending().await;
+            }
+            tokio::time::sleep(deadline / 2).await;
+            for k in 0u64.. {
+                counter.store(verified(k), std::sync::atomic::Ordering::Relaxed);
+                tokio::time::sleep(deadline).await;
+            }
+        };
+        let raced = async {
+            tokio::select! {
+                () = super::watchdog(&store, 0, 64 * 1024 * 1024, deadline, &counter) => true,
+                () = feed => false,
+            }
+        };
+        tokio::time::timeout(Duration::from_hours(1), raced)
+            .await
+            .unwrap_or(false)
     }
 
-    /// A full window with bytes still missing and the count NOT shrinking is the
+    /// A full window with bytes still missing and no verified byte is the
     /// definition of a stall — the watchdog trips and the worker's range is
-    /// reassigned. Flip the comparison to `now > prev` and a wedged source is
-    /// never reassigned: the fetch hangs to the outer cap.
+    /// reassigned. Without the trip a wedged source is never reassigned: the
+    /// fetch hangs to the outer cap.
     #[tokio::test(start_paused = true)]
-    async fn watchdog_trips_when_missing_stops_shrinking() {
+    async fn watchdog_trips_when_no_verified_byte_lands() {
         assert!(
-            watchdog_trips(&[8192, 8192], Duration::from_secs(10)).await,
-            "no progress across a full window must trip the watchdog"
+            watchdog_trips(&[8192], |_| 0, Duration::from_secs(10)).await,
+            "no verified byte across a full window must trip the watchdog"
+        );
+    }
+
+    /// A source that verified bytes and then stops is a stall from the first
+    /// window without a verified byte.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_trips_when_verified_bytes_stop() {
+        assert!(
+            watchdog_trips(&[8192], |k| k.min(3) * 1024, Duration::from_secs(10)).await,
+            "a source that stops verifying bytes must trip the watchdog"
         );
     }
 
@@ -3643,24 +3674,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn watchdog_never_trips_a_fully_delivered_range() {
         assert!(
-            !watchdog_trips(&[8192, 0], Duration::from_secs(10)).await,
+            !watchdog_trips(&[0], |_| 0, Duration::from_secs(10)).await,
             "a delivered range must never be tripped while it finishes paying"
         );
     }
 
-    /// A source that keeps delivering, however slowly, resets the window at each
-    /// sample and is never reassigned. Without the reset, a healthy-but-slow
-    /// source is falsely reassigned mid-checkpoint — and the new lane re-pays the
-    /// credit-window tail.
+    /// A source that keeps verifying bytes resets the window at each sample, even
+    /// when it lands less than one 4 MiB ingest checkpoint per window, so the
+    /// store's missing count never moves. This is a proxy's two-leg cold start:
+    /// paced ~1 MB draws while its own upstream pull ramps up (#2209).
     #[tokio::test(start_paused = true)]
-    async fn watchdog_window_resets_while_missing_shrinks() {
+    async fn watchdog_window_resets_on_verified_bytes_below_a_checkpoint() {
         assert!(
-            !watchdog_trips(
-                &[8192, 7168, 6144, 5120, 4096, 3072, 2048, 1024, 0],
-                Duration::from_secs(10)
-            )
-            .await,
-            "shrinking missing bytes must reset the window, never trip"
+            !watchdog_trips(&[8192], |k| (k + 1) * 1024 * 1024, Duration::from_secs(10)).await,
+            "verified bytes must reset the window before any checkpoint lands"
         );
     }
 
@@ -3669,7 +3696,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn watchdog_zero_deadline_never_trips() {
         assert!(
-            !watchdog_trips(&[8192, 8192], Duration::ZERO).await,
+            !watchdog_trips(&[8192], |_| 0, Duration::ZERO).await,
             "a zero unit deadline must disable the watchdog"
         );
     }

@@ -609,6 +609,8 @@ where
                 // its own present base directly — there is no cross-lane total to
                 // aggregate. Only the multi-source scheduler passes an aggregator.
                 None,
+                // No unit watchdog on the single-source path.
+                None,
                 pacing_wait,
                 downstream,
                 // `None` on the single-source path: this one lane IS the pool,
@@ -1077,6 +1079,7 @@ where
                     None,
                     None,
                     None,
+                    None,
                     pool,
                 )
                 .await;
@@ -1191,6 +1194,7 @@ where
                         &mut counters,
                         on_progress,
                         Some(delivered),
+                        None,
                         None,
                         None,
                         pool,
@@ -1327,6 +1331,10 @@ pub(crate) async fn fill_gap<St, S, P, F>(
     // its own present base directly (there is only ever one lane, so that value is
     // already the whole-blob position).
     progress_agg: Option<&std::sync::atomic::AtomicU64>,
+    // Multi-source only: this unit's verified-byte counter, which the unit
+    // watchdog reads. Every verified leaf adds to it as it lands, before the
+    // store's checkpoint makes it durable.
+    verified: Option<&std::sync::atomic::AtomicU64>,
     pacing_wait: Option<&dyn PacingWait>,
     downstream: Option<&(dyn Fn() -> DownstreamFrontier + Send + Sync)>,
     pool: Option<&SharedPool<'_>>,
@@ -1631,6 +1639,11 @@ where
                 // resets to 0 on each new open — hence a fresh counter per leg).
                 let leg_reported = std::sync::atomic::AtomicU64::new(0);
                 let reporter = move |received: u64| {
+                    let delta =
+                        received.saturating_sub(leg_reported.swap(received, Ordering::Relaxed));
+                    if let Some(verified) = verified {
+                        verified.fetch_add(delta, Ordering::Relaxed);
+                    }
                     let Some(cb) = on_progress else { return };
                     let position = match progress_agg {
                         // Multi-source: fold this leg's monotonic per-leg `received`
@@ -1639,15 +1652,10 @@ where
                         // Clamp the readout to the blob size — a bounded, idempotent
                         // tail re-fetch can re-deliver a few already-counted bytes,
                         // and the bar must never exceed 100%.
-                        Some(delivered) => {
-                            let delta =
-                                received.saturating_sub(leg_reported.load(Ordering::Relaxed));
-                            leg_reported.store(received, Ordering::Relaxed);
-                            delivered
-                                .fetch_add(delta, Ordering::Relaxed)
-                                .saturating_add(delta)
-                                .min(total_bytes)
-                        }
+                        Some(delivered) => delivered
+                            .fetch_add(delta, Ordering::Relaxed)
+                            .saturating_add(delta)
+                            .min(total_bytes),
                         // Single-source: this one lane's present base plus its leg
                         // progress is already the whole-blob position.
                         None => base_present.saturating_add(received),
