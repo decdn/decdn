@@ -189,6 +189,9 @@ mod scheduler;
 /// Pure segmentation and tail-steal helpers for the multi-source scheduler
 /// (spec §5.3): no I/O, no async.
 mod segment;
+/// When a command gives up (spec § Unit 3): the progress clock and the stop
+/// policy that watches it.
+pub mod stop;
 /// The `Streamer` consumption face (#1848): stream one blob's verified,
 /// contiguous front to a consumer as it arrives, paced by consumption and bounded
 /// to one read-ahead window ahead of the read cursor. A fetch-like single-blob
@@ -235,6 +238,7 @@ pub use source::{
     BaoRangeReader, BlobSource, Funder, IngestStore, PRIMED_MAX_IDLE, PeerSource, PrimedSource,
     SourceFuture,
 };
+pub use stop::{GaveUp, ProgressClock, SCRIPT_GIVE_UP, StopPolicy};
 pub use streamer::{
     LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader, stream_first_unit,
 };
