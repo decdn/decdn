@@ -192,8 +192,8 @@ pub struct RepublishScheduler {
     /// Live hash -> its authoritative `due_us`. A hash absent here has no
     /// live entry, whatever the heap still holds.
     scheduled: Arc<Mutex<HashMap<ContentHash, u64>>>,
-    /// Hashes a `Store` with non-empty coverage went out for: an eager publish
-    /// that a peer accepted, or a drain cycle that took the hash. This, not
+    /// Hashes a peer accepted a `Store` with non-empty coverage for, from an
+    /// eager publish or a drain cycle's `BatchStore`. This, not
     /// `scheduled`, is what dedupes the eager publish on cache events. A bulk
     /// seed schedules hashes that have published nothing yet — a partial that
     /// covered no block when the seed walked it — and the block it completes
@@ -249,15 +249,15 @@ impl RepublishScheduler {
         self.schedule_if_absent(hash, offset)
     }
 
-    /// Record that a `Store` with non-empty coverage went out for `hash`.
+    /// Record that a peer accepted a `Store` with non-empty coverage for `hash`.
     pub fn mark_announced(&self, hash: ContentHash) {
         with_lock(&self.announced, "dht republish announced set", |a| {
             a.insert(hash);
         });
     }
 
-    /// Whether a `Store` with non-empty coverage went out for `hash` since it
-    /// was last unscheduled.
+    /// Whether a peer accepted a `Store` with non-empty coverage for `hash`
+    /// since it was last unscheduled.
     #[must_use]
     pub fn is_announced(&self, hash: &ContentHash) -> bool {
         with_lock(&self.announced, "dht republish announced set", |a| {
@@ -1026,12 +1026,8 @@ pub async fn run_republish(
                     // cycle). The reschedule is independent of publish
                     // outcome, so doing it before the publish lets the
                     // publish run detached below.
-                    // The gate passed, so each held hash covers a block and
-                    // this cycle's `Store` counts as its announcement. A
-                    // publish that reaches no peer retries on the next cycle.
                     for hash in &held {
                         scheduler.schedule_steady(*hash);
-                        scheduler.mark_announced(*hash);
                     }
                     // One BatchStore per receiver (ADR 022 §STORE Flow
                     // Batched STORE) rather than a per-hash fan-out — the
@@ -1044,14 +1040,23 @@ pub async fn run_republish(
                     // shutdown signal and eager cache-insert publishes. The
                     // sweep is best-effort — abandoned on shutdown, retried
                     // next cycle.
+                    //
+                    // A hash counts as announced only once a peer accepts it
+                    // with non-empty coverage. One that no peer took — no
+                    // routing peers yet, or every receiver refused — stays
+                    // eligible for the eager publish on its next cache event.
                     let groups = budget.into_groups(&held.into_iter().collect());
                     let ep = endpoint.clone();
                     let cache_cloned = cache.clone();
                     let metrics = Arc::clone(&metrics);
+                    let scheduler = Arc::clone(&scheduler);
                     tokio::spawn(async move {
-                        let accepted =
+                        let outcome =
                             publish_batch(&ep, self_node_id, &cache_cloned, groups).await;
-                        metrics.dht_store_published(accepted);
+                        metrics.dht_store_published(outcome.accepted);
+                        for hash in outcome.announced {
+                            scheduler.mark_announced(hash);
+                        }
                     });
                 }
             }
@@ -1315,17 +1320,18 @@ impl ReceiverBudget {
 /// record retries on the next cycle. Every DHT node implements
 /// `BatchStore`, so there is no per-hash fallback.
 ///
-/// Returns how many `(peer, hash)` records the peers accepted.
+/// Returns how many `(peer, hash)` records the peers accepted, and which
+/// hashes at least one peer accepted with non-empty coverage.
 async fn publish_batch(
     endpoint: &Endpoint,
     self_node_id: NodeId,
     cache: &decdn_cache::CacheEngine,
     groups: HashMap<NodeId, Vec<ContentHash>>,
-) -> u64 {
+) -> BatchOutcome {
     if groups.is_empty() {
         // No routing-table entries yet (e.g. boot before bootstrap).
         // Nothing to do this cycle; the scheduler will retry.
-        return 0;
+        return BatchOutcome::default();
     }
     // Derive each hash's coverage once, up front, and share it across every
     // receiver's batch — the same rationale as `publish_hash`'s single
@@ -1350,11 +1356,12 @@ async fn publish_batch(
                         error = %e,
                         "dht republish: routing-table peer not a valid public key"
                     );
-                    return 0;
+                    return (0, Vec::new());
                 }
             };
             let addr = EndpointAddr::new(target_pk);
             let mut accepted: u64 = 0;
+            let mut announced = Vec::new();
             for chunk in peer_hashes.chunks(MAX_BATCH_STORE_HASHES) {
                 let entries: Vec<(ContentHash, Coverage)> = chunk
                     .iter()
@@ -1363,10 +1370,16 @@ async fn publish_batch(
                         (*h, coverage)
                     })
                     .collect();
-                match client::batch_store(&endpoint_cloned, addr.clone(), entries, self_node_id)
-                    .await
+                match client::batch_store(
+                    &endpoint_cloned,
+                    addr.clone(),
+                    entries.clone(),
+                    self_node_id,
+                )
+                .await
                 {
                     Ok(ack) => {
+                        announced.extend(announced_in_batch(&entries, &ack.results));
                         let ok = ack.results.iter().filter(|accepted| **accepted).count();
                         accepted += u64::try_from(ok).unwrap_or(u64::MAX);
                         let rejected = ack.results.iter().filter(|accepted| !**accepted).count();
@@ -1389,14 +1402,39 @@ async fn publish_batch(
                     }
                 }
             }
-            accepted
+            (accepted, announced)
         }));
     }
-    let mut accepted = 0;
+    let mut outcome = BatchOutcome::default();
     for h in handles {
-        accepted += h.await.unwrap_or(0);
+        let (accepted, announced) = h.await.unwrap_or_default();
+        outcome.accepted += accepted;
+        outcome.announced.extend(announced);
     }
-    accepted
+    outcome
+}
+
+/// What one drain cycle's [`publish_batch`] achieved.
+#[derive(Debug, Default)]
+struct BatchOutcome {
+    /// `(peer, hash)` records the peers accepted.
+    accepted: u64,
+    /// Hashes at least one peer accepted with non-empty coverage.
+    announced: HashSet<ContentHash>,
+}
+
+/// The hashes of `entries` that a `BatchStoreAck` accepted and whose entry
+/// advertised at least one block. `results` answers `entries` in request
+/// order; an entry it does not answer is not accepted.
+fn announced_in_batch<'a>(
+    entries: &'a [(ContentHash, Coverage)],
+    results: &'a [bool],
+) -> impl Iterator<Item = ContentHash> + 'a {
+    entries
+        .iter()
+        .zip(results)
+        .filter(|((_, coverage), accepted)| **accepted && !coverage.is_empty())
+        .map(|((hash, _), _)| *hash)
 }
 
 #[cfg(test)]
@@ -2452,6 +2490,35 @@ mod tests {
 
         s.unschedule(&h(1));
         assert!(!s.is_announced(&h(1)), "unschedule clears the mark");
+    }
+
+    /// A batch counts a hash as announced only where a peer accepted it and its
+    /// entry advertised at least one block. A rejected entry, or an accepted
+    /// one with empty coverage, leaves the hash eligible for the eager retry.
+    #[test]
+    fn announced_in_batch_keeps_accepted_entries_with_coverage() {
+        let covered = Coverage::from_block_indices(1, [0u32].into_iter());
+        let entries = vec![
+            (h(1), covered.clone()),
+            (h(2), covered),
+            (h(3), Coverage::empty()),
+        ];
+
+        let announced = announced_in_batch(&entries, &[true, false, true]);
+
+        assert_eq!(announced.collect::<Vec<_>>(), vec![h(1)]);
+    }
+
+    /// An ack that answers fewer entries than the batch sent credits none of
+    /// the unanswered ones.
+    #[test]
+    fn announced_in_batch_ignores_entries_the_ack_did_not_answer() {
+        let covered = Coverage::from_block_indices(1, [0u32].into_iter());
+        let entries = vec![(h(1), covered.clone()), (h(2), covered)];
+
+        let announced = announced_in_batch(&entries, &[true]);
+
+        assert_eq!(announced.collect::<Vec<_>>(), vec![h(1)]);
     }
 
     #[test]
