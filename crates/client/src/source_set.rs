@@ -246,6 +246,12 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         &self.health
     }
 
+    /// Every known holder: the starting ones and those discovery added.
+    #[must_use]
+    pub fn holders(&self) -> &[Holder] {
+        &self.holders
+    }
+
     /// The known holder for `provider`.
     #[must_use]
     pub fn holder(&self, provider: Address) -> Option<&Holder> {
@@ -574,8 +580,13 @@ impl<S> StaticSources<S> {
     ///
     /// # Errors
     ///
-    /// Two candidates naming the same provider.
+    /// No candidate at all (its discovery could never find one), or two
+    /// candidates naming the same provider.
     pub fn new(candidates: Vec<StreamCandidate<S>>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !candidates.is_empty(),
+            "static sources need at least one candidate to fetch from"
+        );
         let mut holders = Vec::with_capacity(candidates.len());
         let mut lanes = HashMap::with_capacity(candidates.len());
         for (rank, candidate) in candidates.into_iter().enumerate() {

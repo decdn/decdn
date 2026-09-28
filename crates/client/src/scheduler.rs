@@ -1320,12 +1320,15 @@ where
 }
 
 /// A lane build in flight: the provider it builds for, and the result.
-type Connecting<'p, S> = std::pin::Pin<
+pub(crate) type Connecting<'p, S> = std::pin::Pin<
     Box<dyn Future<Output = (Address, anyhow::Result<StreamCandidate<S>>)> + Send + 'p>,
 >;
 
 /// Build `holder`'s lane through `provider`.
-fn connect_future<P: SourceProvider>(provider: &P, holder: Holder) -> Connecting<'_, P::Source> {
+pub(crate) fn connect_future<P: SourceProvider>(
+    provider: &P,
+    holder: Holder,
+) -> Connecting<'_, P::Source> {
     Box::pin(async move {
         let built = provider.connect(&holder).await;
         (holder.provider, built)
@@ -1343,7 +1346,7 @@ async fn poll_opt<T>(slot: &mut Option<SourceFuture<'_, T>>) -> anyhow::Result<T
 }
 
 /// Sleep until `wake`, or forever without one.
-async fn sleep_until_opt(wake: Option<Instant>) {
+pub(crate) async fn sleep_until_opt(wake: Option<Instant>) {
     match wake {
         Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
@@ -4101,6 +4104,43 @@ mod tests {
             &no_topups(),
             4,
             None,
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        Ok(())
+    }
+
+    /// An acquire that starts with no holder discovers one and completes.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_set_discovers_its_holders_and_completes() -> anyhow::Result<()> {
+        let data = blob(1024 * 1024);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&la));
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, dir) = fresh_store(root, total);
+        let provider = StaticSources::new(vec![candidate(a, la, 0xA1, None)])?;
+        let mut set = SourceSet::new(&provider, root, Arc::default(), Vec::new());
+        let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+        let drive = drive_config();
+        acquire(
+            AcquireTarget {
+                store: &store,
+                hash: root,
+                total_bytes: total,
+                ranges: &[(0, total)],
+            },
+            &mut set,
+            &AcquireEnv {
+                pacer: &BudgetPacer::new(),
+                funder: &no_topups(),
+                drive: &drive,
+                max_lanes: 4,
+                stop: &stop,
+                on_progress: None,
+                ledgers: None,
+                pacing: None,
+            },
         )
         .await?;
         store.finalize().await?;

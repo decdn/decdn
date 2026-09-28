@@ -126,7 +126,8 @@ impl<P, F> std::fmt::Debug for Downloader<P, F> {
 impl<P, F> Downloader<P, F> {
     /// Build a downloader over `holders`, whose lanes `provider` builds. The
     /// same holders start every target a later `fetch_to_dir` fetches, and
-    /// `health` is shared across all of them.
+    /// `health` is shared across all of them. With no holder, each target
+    /// starts by discovering them.
     #[must_use]
     pub const fn new(
         provider: P,
@@ -238,7 +239,7 @@ where
     ///
     /// # Errors
     ///
-    /// An empty holder set, a `dest` with no file name, a store
+    /// A `dest` with no file name, a store
     /// open/create/finalize I/O error, or the error [`crate::acquire`] ends a
     /// target with: a fatal fault, a unanimous verdict of the sources, or
     /// [`crate::GaveUp`]. The first failing target aborts the batch; targets
@@ -250,10 +251,6 @@ where
         on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
         stop: &StopPolicy,
     ) -> anyhow::Result<Vec<PathBuf>> {
-        anyhow::ensure!(
-            !self.holders.is_empty(),
-            "a Downloader needs at least one holder to fetch from"
-        );
         let pacer = BudgetPacer::new();
         let mut written = Vec::with_capacity(targets.len());
         for target in targets {
@@ -839,22 +836,44 @@ mod tests {
         Ok(())
     }
 
-    /// An empty holder set fails early with a clear message, not deep inside
-    /// the loop.
+    /// Static sources with no candidate fail early with a clear message: their
+    /// discovery could never find a holder.
     #[tokio::test]
-    async fn an_empty_holder_set_is_a_clear_error() -> anyhow::Result<()> {
-        let downloader = downloader::<ScriptedSource>(Vec::new())?;
-        let dir = tempfile::tempdir()?;
-        let Err(err) = downloader
-            .fetch_to_dir(&[([0u8; 32], 1)], dir.path(), None)
-            .await
-        else {
-            anyhow::bail!("an empty holder set must be rejected");
+    async fn empty_static_sources_are_a_clear_error() -> anyhow::Result<()> {
+        let Err(err) = downloader::<ScriptedSource>(Vec::new()) else {
+            anyhow::bail!("empty static sources must be rejected");
         };
         anyhow::ensure!(
-            err.to_string().contains("at least one holder"),
-            "the error must name the empty holder set, got: {err}"
+            err.to_string().contains("at least one candidate"),
+            "the error must name the empty candidate set, got: {err}"
         );
+        Ok(())
+    }
+
+    /// A downloader that starts with no holder discovers them and fetches.
+    #[tokio::test(start_paused = true)]
+    async fn a_downloader_with_no_holder_discovers_them() -> anyhow::Result<()> {
+        let blob = payload(1_500_000);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
+        let root = source.root();
+        let total = u64::try_from(blob.len())?;
+        let sources = StaticSources::new(vec![candidate(source, ledger, 0xA1)])?;
+        let downloader = Downloader::new(
+            sources,
+            Vec::new(),
+            Arc::default(),
+            funder(),
+            drive_config(),
+        );
+        let dir = tempfile::tempdir()?;
+        let paths = downloader
+            .fetch_to_dir(&[(root, total)], dir.path(), None)
+            .await?;
+        let path = paths
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no path returned"))?;
+        anyhow::ensure!(std::fs::read(path)? == blob);
         Ok(())
     }
 }

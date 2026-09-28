@@ -380,13 +380,13 @@ fn no_serve_target_error(
     unverifiable: usize,
 ) -> anyhow::Error {
     if unverifiable > 0 {
-        return anyhow::anyhow!(
+        return anyhow::Error::new(ResolveConfigFault(format!(
             "{unverifiable} of {probe_count} probed node(s) answered, but their probe \
              signatures did not recover to the operator address each is registered \
              under. That is usually local configuration rather than missing content: \
              check that blockchain.slash_judge_address and blockchain.chain_id match \
              the deployment these nodes registered against"
-        );
+        )));
     }
     // With no unverifiable candidate, every candidate that neither stayed silent
     // nor shed the probe answered but was dropped as unusable (has_blob/coverage
@@ -1094,6 +1094,46 @@ pub(crate) fn now_secs_cli() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// A holder resolution that only the user's configuration can fix: a missing
+/// `capacity_bond_address`, a malformed `--node-id` or `--provider-address`,
+/// or probe signatures that do not recover to their operators.
+#[derive(Debug)]
+pub(crate) struct ResolveConfigFault(pub(crate) String);
+
+impl std::fmt::Display for ResolveConfigFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ResolveConfigFault {}
+
+/// The holders a command starts from. A resolution the configuration breaks
+/// ([`ResolveConfigFault`]) ends the command. Any other failure, such as a
+/// sole holder that is down at start, starts with no holder: the acquire loop
+/// then discovers with backoff under the stop policy.
+///
+/// # Errors
+///
+/// A [`ResolveConfigFault`].
+pub(crate) fn holders_or_none(
+    resolved: anyhow::Result<ResolvedTargets>,
+) -> anyhow::Result<ResolvedTargets> {
+    match resolved {
+        Ok(targets) => Ok(targets),
+        Err(err) if err.downcast_ref::<ResolveConfigFault>().is_some() => Err(err),
+        Err(err) => {
+            tracing::warn!("no holder resolved yet; the fetch keeps looking: {err:#}");
+            Ok(ResolvedTargets {
+                candidates: Vec::new(),
+                coverage_by_node: HashMap::new(),
+                probed_samples: Vec::new(),
+                pinned: false,
+            })
+        }
+    }
+}
+
 /// The ordered holder list plus what discovery learned about each holder.
 pub(crate) struct ResolvedTargets {
     /// The candidates, nearest first (#1174).
@@ -1132,13 +1172,16 @@ pub(crate) async fn resolve_target_node(
         // guarantees `--provider-address` is present alongside `--node-id`.
         // A pinned node is its own only holder: a fault cools it and the fetch
         // waits for it to return.
+        let config = |e: anyhow::Error| anyhow::Error::new(ResolveConfigFault(format!("{e:#}")));
         let node_id = PublicKey::from_str(raw)
-            .map_err(|e| anyhow::anyhow!("invalid --node-id {raw:?}: {e}"))?;
-        let provider_raw = args
-            .provider_address
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--provider-address is required with --node-id"))?;
-        let provider = super::chain_ctx::parse_address(provider_raw, "--provider-address")?;
+            .map_err(|e| config(anyhow::anyhow!("invalid --node-id {raw:?}: {e}")))?;
+        let provider_raw = args.provider_address.as_deref().ok_or_else(|| {
+            config(anyhow::anyhow!(
+                "--provider-address is required with --node-id"
+            ))
+        })?;
+        let provider =
+            super::chain_ctx::parse_address(provider_raw, "--provider-address").map_err(config)?;
         return Ok(ResolvedTargets {
             candidates: vec![NodeCandidate {
                 node_id,
@@ -1158,10 +1201,11 @@ pub(crate) async fn resolve_target_node(
     }
 
     let capacity_bond = chain.capacity_bond.ok_or_else(|| {
-        anyhow::anyhow!(
+        anyhow::Error::new(ResolveConfigFault(
             "auto-discovery needs capacity_bond_address (--capacity-bond-address or \
              blockchain.capacity_bond_address), or pass --node-id to dial directly"
-        )
+                .to_string(),
+        ))
     })?;
     // `--timeout-ms` bounds the registry read (#1349). Nothing did before: its
     // retry schedule alone can burn 36 s, so `decdn fetch --timeout-ms 5000`
@@ -1460,7 +1504,10 @@ async fn fetch_over(
 ) -> anyhow::Result<()> {
     let common = &args.common;
     // The holders to start from: the explicit `--node-id`, or auto-discovery.
-    let resolved = resolve_target_node(common, chain, endpoint, relays, hash).await?;
+    // Only a configuration fault ends the fetch here; with no holder yet, the
+    // first open discovers them.
+    let resolved =
+        holders_or_none(resolve_target_node(common, chain, endpoint, relays, hash).await)?;
 
     // Buyer signer (vouchers + the openPool/topUp tx). Loaded after selection so a
     // failed discovery never prompts for a keystore password. Password from env,
@@ -1546,9 +1593,7 @@ async fn fetch_over(
     // A fetch dropped by Ctrl-C records every lane's vouchers too.
     let on_drop = SettleOnDrop::new(|| sources.persist_watermarks());
     let result = async {
-        let total_bytes = sources
-            .signed_size(hash, holders.clone(), &health, &stop)
-            .await?;
+        let (total_bytes, holders) = sources.signed_size(hash, holders, &health, &stop).await?;
         if wants_stdout(&args.output) {
             stream_to_stdout(
                 &deps,

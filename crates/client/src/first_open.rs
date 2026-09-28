@@ -13,13 +13,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use alloy::primitives::{Address, U256};
 use tokio::time::Instant;
 
 use crate::fault::Fault;
-use crate::source_set::{BUILD_RETRY_BASE, SourceProvider, SourceSet};
+use crate::scheduler::{Connecting, connect_future, sleep_until_opt};
+use crate::source::SourceFuture;
+use crate::source_set::{BUILD_RETRY_BASE, Holder, SourceProvider, SourceSet};
 use crate::stop::StopPolicy;
 use crate::streamer::StreamCandidate;
 
@@ -32,9 +35,11 @@ use crate::streamer::StreamCandidate;
 /// ([`crate::classify`]) and recorded on the source: a fatal fault ends the
 /// open with that error, any other fault moves on to the next source. A
 /// transient `open` error holds that source off for [`BUILD_RETRY_BASE`].
-/// When no source can start, the open runs discovery or sleeps until a source
-/// cools down. An answer counts as progress: it clears the source's absent
-/// mark and ticks the stop policy's clock.
+/// When no source can start, discovery runs, with backoff, beside the open: a
+/// source whose cooldown ends while a discovery is in flight is tried at once.
+/// A set that starts with no holder at all discovers until one appears. An
+/// answer counts as progress: it clears the source's absent mark and ticks
+/// the stop policy's clock.
 ///
 /// The open runs no reactive top-up. A header-only open pays nothing, so a
 /// source refusing it for the deposit (`InsufficientDeposit`) is parked until
@@ -71,9 +76,22 @@ where
     }
 }
 
+/// Await `fut`, or never resolve without one. The future stays in its slot, so
+/// a `select!` branch that loses leaves it to be polled again.
+async fn poll_some<F: Future + Unpin>(fut: Option<&mut F>) -> F::Output {
+    match fut {
+        Some(fut) => fut.await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The body of [`first_open`], without the stop.
-async fn open_loop<P, T, O, Fut>(
-    sources: &mut SourceSet<'_, P>,
+///
+/// One attempt runs at a time: a lane build, then the `open` on that lane.
+/// Discovery runs beside it in the same `select!`, so a slow discovery never
+/// holds back a source whose cooldown ended.
+async fn open_loop<'p, P, T, O, Fut>(
+    sources: &mut SourceSet<'p, P>,
     open: &O,
 ) -> anyhow::Result<(Address, T)>
 where
@@ -85,60 +103,84 @@ where
     let mut deposit = U256::ZERO;
     // Sources a transient `open` error holds off, until the instant given.
     let mut held_off: HashMap<Address, Instant> = HashMap::new();
+    let mut connecting: Option<Connecting<'p, P::Source>> = None;
+    let mut opening: Option<(Address, Pin<Box<Fut>>)> = None;
+    let mut discovering: Option<SourceFuture<'p, Vec<Holder>>> = None;
     loop {
         let now = Instant::now();
         held_off.retain(|_, until| *until > now);
-        let busy: HashSet<Address> = held_off.keys().copied().collect();
-        if let Some(holder) = sources.next_to_start(now, deposit, &busy) {
-            let provider = holder.provider;
-            let lane = if let Some(lane) = sources.cached_lane(provider) {
-                lane
-            } else {
-                let built = sources.provider().connect(&holder).await;
-                match sources.lane_built(provider, built, Instant::now()) {
-                    Ok(lane) => lane,
-                    Err(err) => {
-                        tracing::debug!(%provider, "lane build failed: {err:#}");
-                        continue;
+        if connecting.is_none() && opening.is_none() {
+            let busy: HashSet<Address> = held_off.keys().copied().collect();
+            if let Some(holder) = sources.next_to_start(now, deposit, &busy) {
+                match sources.cached_lane(holder.provider) {
+                    Some(lane) => {
+                        deposit = deposit.max(lane_deposit(&lane));
+                        opening = Some((holder.provider, Box::pin(open(lane))));
                     }
+                    None => connecting = Some(connect_future(sources.provider(), holder)),
                 }
-            };
-            if let Ok(ctx) = lane.ctx.lock() {
-                deposit = deposit.max(ctx.deposit);
             }
-            match open(lane).await {
-                Ok(answer) => {
-                    sources.record_progress(provider);
-                    return Ok((provider, answer));
-                }
-                Err(err) => match sources.record_fault(provider, &err, Instant::now(), deposit) {
-                    Fault::Fatal(_) => return Err(err),
-                    Fault::Transient => {
-                        held_off.insert(provider, Instant::now() + BUILD_RETRY_BASE);
-                    }
-                    Fault::Source | Fault::Unaffordable | Fault::WrongSize => {}
-                },
-            }
-            continue;
         }
-        if let Some(err) = sources.exhausted(deposit, false) {
+        let attempting = connecting.is_some() || opening.is_some();
+        if !attempting
+            && discovering.is_none()
+            && let Some(err) = sources.exhausted(deposit, false)
+        {
             return Err(err);
         }
-        if sources.wants_discovery(now, deposit, 0, false) {
-            let found = sources.provider().discover(sources.hash()).await;
-            sources.discovery_done(found, Instant::now(), deposit);
-            continue;
+        if discovering.is_none()
+            && sources.wants_discovery(now, deposit, usize::from(attempting), false)
+        {
+            discovering = Some(sources.provider().discover(sources.hash()));
         }
         let wake = sources
             .next_wake(now)
             .into_iter()
             .chain(held_off.values().copied())
             .min();
-        match wake {
-            Some(at) => tokio::time::sleep_until(at).await,
-            None => std::future::pending().await,
+
+        tokio::select! {
+            biased;
+            (provider, built) = poll_some(connecting.as_mut()), if connecting.is_some() => {
+                connecting = None;
+                match sources.lane_built(provider, built, Instant::now()) {
+                    Ok(lane) => {
+                        deposit = deposit.max(lane_deposit(&lane));
+                        opening = Some((provider, Box::pin(open(lane))));
+                    }
+                    Err(err) => tracing::debug!(%provider, "lane build failed: {err:#}"),
+                }
+            }
+            answer = poll_some(opening.as_mut().map(|(_, fut)| fut)), if opening.is_some() => {
+                let Some((provider, _)) = opening.take() else {
+                    continue;
+                };
+                match answer {
+                    Ok(answer) => {
+                        sources.record_progress(provider);
+                        return Ok((provider, answer));
+                    }
+                    Err(err) => match sources.record_fault(provider, &err, Instant::now(), deposit) {
+                        Fault::Fatal(_) => return Err(err),
+                        Fault::Transient => {
+                            held_off.insert(provider, Instant::now() + BUILD_RETRY_BASE);
+                        }
+                        Fault::Source | Fault::Unaffordable | Fault::WrongSize => {}
+                    },
+                }
+            }
+            found = poll_some(discovering.as_mut()), if discovering.is_some() => {
+                discovering = None;
+                sources.discovery_done(found, Instant::now(), deposit);
+            }
+            () = sleep_until_opt(wake) => {}
         }
     }
+}
+
+/// The pool deposit `lane`'s context reports.
+fn lane_deposit<S>(lane: &StreamCandidate<S>) -> U256 {
+    lane.ctx.lock().map_or(U256::ZERO, |ctx| ctx.deposit)
 }
 
 #[cfg(test)]
@@ -185,6 +227,87 @@ mod tests {
 
     fn policy(limit: Option<Duration>) -> StopPolicy {
         StopPolicy::new(false, limit, Arc::new(ProgressClock::new()))
+    }
+
+    /// Static lanes behind a scripted discovery: each discovery returns the
+    /// next scripted answer, or never returns once the script runs out.
+    struct ScriptedDiscovery {
+        lanes: StaticSources<ScriptedSource>,
+        answers: Mutex<std::collections::VecDeque<Vec<crate::Holder>>>,
+        discoveries: AtomicU32,
+    }
+
+    impl crate::SourceProvider for ScriptedDiscovery {
+        type Source = ScriptedSource;
+
+        fn discover(&self, hash: [u8; 32]) -> crate::SourceFuture<'_, Vec<crate::Holder>> {
+            let _ = hash;
+            self.discoveries.fetch_add(1, Ordering::SeqCst);
+            let next = self.answers.lock().unwrap().pop_front();
+            Box::pin(async move {
+                match next {
+                    Some(found) => Ok(found),
+                    None => std::future::pending().await,
+                }
+            })
+        }
+
+        fn connect<'a>(
+            &'a self,
+            holder: &'a crate::Holder,
+        ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
+            self.lanes.connect(holder)
+        }
+    }
+
+    /// A fetch that starts with no holder at all discovers until one appears.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_set_discovers_until_a_holder_appears() -> anyhow::Result<()> {
+        let lanes = StaticSources::new(vec![lane(0xA1)])?;
+        let found = lanes.holders();
+        let provider = ScriptedDiscovery {
+            lanes,
+            answers: Mutex::new(vec![Vec::new(), found].into()),
+            discoveries: AtomicU32::new(0),
+        };
+        let mut set = SourceSet::new(&provider, [0; 32], Arc::default(), Vec::new());
+        let (answered, ()) = first_open(
+            &mut set,
+            &policy(Some(Duration::from_mins(10))),
+            |_| async { Ok(()) },
+        )
+        .await?;
+        assert_eq!(answered, A);
+        assert_eq!(provider.discoveries.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    /// A slow discovery does not hold the open up: a source that cools while
+    /// it runs is tried again once its cooldown ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_cooled_source_answers_while_discovery_hangs() -> anyhow::Result<()> {
+        let lanes = StaticSources::new(vec![lane(0xA1)])?;
+        let holders = lanes.holders();
+        let provider = ScriptedDiscovery {
+            lanes,
+            answers: Mutex::new(std::collections::VecDeque::new()),
+            discoveries: AtomicU32::new(0),
+        };
+        let mut set = SourceSet::new(&provider, [0; 32], Arc::default(), holders);
+        let calls = AtomicU32::new(0);
+        let (answered, ()) = first_open(&mut set, &policy(Some(Duration::from_mins(1))), |_| {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call == 0 {
+                    anyhow::bail!("connection reset");
+                }
+                Ok(())
+            }
+        })
+        .await?;
+        assert_eq!(answered, A);
+        assert_eq!(provider.discoveries.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]

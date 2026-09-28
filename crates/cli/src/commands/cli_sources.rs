@@ -117,7 +117,8 @@ where
     /// user can fix ends it, and `stop` gives up. The open's pull is dropped
     /// once its header is read. The lane that answered is parked for the
     /// fetch's `connect`, so the fetch reuses it; every other lane the open
-    /// built drops, and with it any stream permit it held.
+    /// built drops, and with it any stream permit it held. Returns the size
+    /// and every holder the open knows, those its discovery found included.
     ///
     /// # Errors
     ///
@@ -128,7 +129,7 @@ where
         holders: Vec<Holder>,
         health: &Arc<PeerHealth>,
         stop: &StopPolicy,
-    ) -> anyhow::Result<u64> {
+    ) -> anyhow::Result<(u64, Vec<Holder>)> {
         let mut set = SourceSet::new(self, hash, Arc::clone(health), holders);
         let opened = first_open(&mut set, stop, |lane| async move {
             let (header, _whole) = lane.source.open_whole(hash).await?;
@@ -148,7 +149,8 @@ where
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(provider, lane);
         }
-        opened.map(|(_, total_bytes)| total_bytes)
+        let known = set.holders().to_vec();
+        opened.map(|(_, total_bytes)| (total_bytes, known))
     }
 
     /// Persist every built lane's voucher watermark.

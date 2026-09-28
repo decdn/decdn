@@ -1760,8 +1760,19 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// One entry's holders: the pinned `--node-id`, or a fresh probe of the
     /// entry's own registry sample (proxy-warming non-holders first when they
     /// help, then holders nearest RTT first). An entry resolves them once and
-    /// every fetch of the entry reuses them.
+    /// every fetch of the entry reuses them. A resolution that fails for any
+    /// reason but the configuration ([`fetch::holders_or_none`]) starts the
+    /// entry with no holder, and its acquire loop discovers them.
     async fn entry_targets(&self, hash: [u8; 32]) -> anyhow::Result<fetch::ResolvedTargets> {
+        fetch::holders_or_none(self.resolve_entry_targets(hash).await)
+    }
+
+    /// [`Self::entry_targets`] before a failure is sorted into a configuration
+    /// fault or an empty start.
+    async fn resolve_entry_targets(
+        &self,
+        hash: [u8; 32],
+    ) -> anyhow::Result<fetch::ResolvedTargets> {
         if self.explicit.is_some() {
             return fetch::resolve_target_node(
                 self.common,
@@ -1831,11 +1842,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // records every lane's vouchers too.
         let on_drop = fetch::SettleOnDrop::new(|| sources.persist_watermarks());
         let result = async {
-            let total_bytes = match total {
-                Some(total) => total,
+            let (total_bytes, holders) = match total {
+                Some(total) => (total, holders),
                 None => {
                     sources
-                        .signed_size(hash, holders.clone(), &self.health, &self.stop)
+                        .signed_size(hash, holders, &self.health, &self.stop)
                         .await?
                 }
             };
