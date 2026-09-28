@@ -620,6 +620,15 @@ mod tests {
         })
     }
 
+    /// Two lanes on one provider would run two concurrent voucher streams on
+    /// one `(signer, provider)` watermark, so the static set refuses them.
+    #[test]
+    fn two_candidates_for_one_provider_are_refused() -> anyhow::Result<()> {
+        let result = super::StaticSources::new(vec![candidate()?, candidate()?]);
+        assert!(result.is_err());
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_nearest_usable_source_starts_first() {
         let p = provider(vec![]);

@@ -142,7 +142,7 @@ impl PacingWait for ConsumedWait {
 ///
 /// The `Streamer` fetches the front across up to
 /// [`PullConfig::streamer_lane_cap`] candidates at once and fails over between
-/// them — a candidate that faults mid-stream is dropped and its remainder
+/// them — a candidate that faults mid-stream cools and its remainder
 /// continues from another, resuming from the store's verified frontier so no
 /// delivered byte is re-pulled or re-paid. Every candidate must name a distinct
 /// on-chain provider (one voucher stream per `(signer, provider)` lane).
@@ -169,9 +169,9 @@ pub struct StreamCandidate<S> {
     /// [`stream_first_unit`] name the range each face opens first. Like
     /// `coverage`, it names one blob: set it only on a single-target fetch.
     pub first_unit: Option<AlignedRange>,
-    /// What this candidate's lane holds while it takes work, released when the
-    /// lane stops ([`crate::LaneLease`]). Like `coverage`, set it only on a
-    /// single-target fetch: the first target's lane releases it.
+    /// What this candidate's lane holds while the fetch runs, released when the
+    /// fetch returns ([`crate::LaneLease`]). Like `coverage`, set it only on a
+    /// single-target fetch: the first target's fetch releases it.
     pub lease: LaneLease,
 }
 
@@ -232,7 +232,7 @@ impl<S> std::fmt::Debug for StreamCandidate<S> {
 /// concurrent lanes, then (on a clean finish) tee the whole verified blob to
 /// `cache` for revisits.
 ///
-/// A candidate that faults is dropped and its remainder reassigned to another
+/// A candidate that faults cools and its remainder moves to another
 /// (shared-pool free failover, #1174), resuming from the store's verified
 /// frontier so no delivered byte is re-pulled or re-paid.
 #[allow(clippy::too_many_arguments)]
@@ -1033,7 +1033,9 @@ mod tests {
 
     /// A tampered chunk group fails the pull: the reader yields only the verified
     /// prefix before it and then surfaces an error — never the tampered bytes.
-    #[tokio::test]
+    /// The lone source keeps failing its tail, so the fetch gives up once the
+    /// stop policy's limit passes without a verified byte.
+    #[tokio::test(start_paused = true)]
     async fn tampered_tail_fails_and_never_yields_unverified() -> anyhow::Result<()> {
         let blob = payload(400_000);
         let source = TamperTailSource::new(blob.clone())?;
@@ -1054,9 +1056,16 @@ mod tests {
 
         let mut out = Vec::new();
         let result = drive.alongside(reader.read_to_end(&mut out)).await;
+        let err = result.err().ok_or_else(|| {
+            anyhow::anyhow!("a tampered tail must surface as a read error, not EOF")
+        })?;
+        // The reader flattens the drive's error into its message.
+        let gave_up = crate::GaveUp {
+            idle: crate::SCRIPT_GIVE_UP,
+        };
         anyhow::ensure!(
-            result.is_err(),
-            "a tampered tail must surface as a read error, not EOF"
+            err.to_string().contains(&gave_up.to_string()),
+            "the fetch gives up on the lone failing source: {err}"
         );
         anyhow::ensure!(
             (out.len() as u64) < total,

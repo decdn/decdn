@@ -178,11 +178,12 @@ where
     ///
     /// # Errors
     ///
-    /// A store open/create/finalize I/O error, or any fault `multi_source_fetch`
-    /// raises for an entry once every candidate is exhausted (a refused or
-    /// underfunded pull, a stalled peer, a verification failure). The first
-    /// failing entry aborts the batch; entries already written stay on disk (and
-    /// any `.partial` a failed entry left is the resume prefix a retry inherits).
+    /// A store open/create/finalize I/O error, or the error `multi_source_fetch`
+    /// ends an entry with: a fatal fault, a unanimous verdict of the candidates,
+    /// or a give-up after [`crate::SCRIPT_GIVE_UP`] without a verified byte. The
+    /// first failing entry aborts the batch; entries already written stay on
+    /// disk (and any `.partial` a failed entry left is the resume prefix a retry
+    /// inherits).
     pub async fn fetch_to_dir(
         &self,
         entries: &[([u8; 32], u64)],
@@ -242,11 +243,10 @@ where
     ///
     /// # Errors
     ///
-    /// A `dest` with no file name, a store open/create/finalize I/O error, or any
-    /// fault `multi_source_fetch` raises for a target once every candidate is
-    /// exhausted. The first failing target aborts the batch; targets already
-    /// written stay on disk (and any `.partial` a failed target left is the resume
-    /// prefix a retry inherits).
+    /// A `dest` with no file name, a store open/create/finalize I/O error, or the
+    /// error `multi_source_fetch` ends a target with. The first failing target
+    /// aborts the batch; targets already written stay on disk (and any
+    /// `.partial` a failed target left is the resume prefix a retry inherits).
     pub async fn fetch_to_paths(
         &self,
         targets: &[DownloadTarget<'_>],

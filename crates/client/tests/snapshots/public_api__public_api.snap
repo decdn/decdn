@@ -614,6 +614,24 @@ pub fn decdn_client::streamer::VerifiedReader::poll_read(core::pin::Pin<&mut Sel
 pub enum decdn_client::WaitReason
 pub decdn_client::WaitReason::MinDraw
 pub decdn_client::WaitReason::WindowFull
+pub struct decdn_client::AcquireEnv<'a, Pc, F>
+pub decdn_client::AcquireEnv::drive: &'a decdn_client::driver::DriveConfig
+pub decdn_client::AcquireEnv::funder: &'a F
+pub decdn_client::AcquireEnv::ledgers: core::option::Option<&'a decdn_client::ledgers::LaneLedgers>
+pub decdn_client::AcquireEnv::max_lanes: usize
+pub decdn_client::AcquireEnv::on_progress: core::option::Option<&'a (dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + 'a)>
+pub decdn_client::AcquireEnv::pacer: &'a Pc
+pub decdn_client::AcquireEnv::pacing: core::option::Option<&'a decdn_client::ConsumptionPacing<'a>>
+pub decdn_client::AcquireEnv::stop: &'a decdn_client::stop::StopPolicy
+impl<Pc, F> core::fmt::Debug for decdn_client::AcquireEnv<'_, Pc, F>
+pub fn decdn_client::AcquireEnv<'_, Pc, F>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::AcquireTarget<'a, St>
+pub decdn_client::AcquireTarget::hash: [u8; 32]
+pub decdn_client::AcquireTarget::ranges: &'a [(u64, u64)]
+pub decdn_client::AcquireTarget::store: &'a St
+pub decdn_client::AcquireTarget::total_bytes: u64
+impl<St> core::fmt::Debug for decdn_client::AcquireTarget<'_, St>
+pub fn decdn_client::AcquireTarget<'_, St>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::BlobTooLarge
 pub decdn_client::BlobTooLarge::ceiling: u64
 pub decdn_client::BlobTooLarge::received: u64
@@ -1094,6 +1112,7 @@ impl decdn_client::pacer::WindowPacer
 pub const fn decdn_client::pacer::WindowPacer::new(u64) -> Self
 impl decdn_client::pacer::Pacer for decdn_client::pacer::WindowPacer
 pub fn decdn_client::pacer::WindowPacer::decide(&self, &decdn_client::pacer::PaceState) -> decdn_client::pacer::PaceDecision
+pub const decdn_client::LANE_WATCHDOG: core::time::Duration
 pub const decdn_client::MAX_RESUME_ATTEMPTS: u32
 pub const decdn_client::MAX_TOPUP_ATTEMPTS: u32
 pub const decdn_client::MIN_DRAW_WINDOW: u64
@@ -1154,6 +1173,7 @@ pub type decdn_client::source_set::StaticSources<S>::Source = S
 pub fn decdn_client::source_set::StaticSources<S>::connect<'a>(&'a self, &'a decdn_client::source_set::Holder) -> decdn_client::source::SourceFuture<'a, decdn_client::streamer::StreamCandidate<S>>
 pub fn decdn_client::source_set::StaticSources<S>::discover(&self, [u8; 32]) -> decdn_client::source::SourceFuture<'_, alloc::vec::Vec<decdn_client::source_set::Holder>>
 pub fn decdn_client::source_set::StaticSources<S>::on_source_fault(&self, &decdn_client::source_set::Holder)
+pub async fn decdn_client::acquire<St, P, Pc, F>(decdn_client::AcquireTarget<'_, St>, &mut decdn_client::source_set::SourceSet<'_, P>, &decdn_client::AcquireEnv<'_, Pc, F>) -> anyhow::Result<()> where St: decdn_client::source::IngestStore, P: decdn_client::source_set::SourceProvider, Pc: decdn_client::pacer::Pacer, F: decdn_client::source::Funder
 pub fn decdn_client::classify(&anyhow::Error) -> decdn_client::fault::Fault
 pub fn decdn_client::download_first_unit(u64, usize) -> anyhow::Result<decdn_bao_range::AlignedRange>
 pub async fn decdn_client::drive<St, S, P, F>(&St, &S, &P, &F, &alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, &alloc::sync::Arc<decdn_client::PoolLedger>, [u8; 32], u64, u64, &decdn_client::driver::DriveConfig, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, core::option::Option<&dyn decdn_client::driver::PacingWait>, core::option::Option<&(dyn core::ops::function::Fn() -> decdn_client::pacer::DownstreamFrontier + core::marker::Send + core::marker::Sync)>, core::option::Option<&decdn_client::driver::SharedPool<'_>>) -> anyhow::Result<()> where St: decdn_client::source::IngestStore, S: decdn_client::source::BlobSource, P: decdn_client::pacer::Pacer, F: decdn_client::source::Funder

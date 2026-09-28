@@ -234,8 +234,8 @@ pub use ranged_store::ClientRangedStore;
 pub use rate_limited::UpstreamRateLimited;
 pub use retry::{RetryDisposition, retry_disposition, shared_pool_disposition};
 pub use scheduler::{
-    ConsumptionPacing, LaneLease, MultiSourceConfig, SourceLane, multi_source_fetch,
-    multi_source_fetch_until,
+    AcquireEnv, AcquireTarget, ConsumptionPacing, LANE_WATCHDOG, LaneLease, MultiSourceConfig,
+    SourceLane, acquire, multi_source_fetch, multi_source_fetch_until,
 };
 pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{
