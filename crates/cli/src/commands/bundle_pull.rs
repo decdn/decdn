@@ -2963,9 +2963,19 @@ struct EntryBytes {
 }
 
 /// Log a finished entry's line at `-v` (#2120), so a run's slow entries can be
-/// told from its fast ones. See [`entry_done_line`].
+/// told from its fast ones. See [`entry_done_line`]. A staging file it cannot
+/// stat logs its size as 0, after a debug line naming the path and the error.
 fn log_entry_done(hash: [u8; 32], staging: &Path, bytes: EntryBytes, elapsed: std::time::Duration) {
-    let size = std::fs::metadata(staging).map_or(0, |m| m.len());
+    let size = std::fs::metadata(staging).map_or_else(
+        |e| {
+            tracing::debug!(
+                "could not stat {} for its entry line: {e}",
+                staging.display()
+            );
+            0
+        },
+        |m| m.len(),
+    );
     tracing::info!("{}", entry_done_line(hash, size, bytes, elapsed));
 }
 
