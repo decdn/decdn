@@ -174,6 +174,18 @@ impl LaneLease {
     }
 }
 
+/// Releases a lane's [`LaneLease`] when it drops: at the end of the lane's
+/// worker future, whether that future finished or was dropped unfinished.
+struct ReleaseOnDrop<'a>(Option<&'a LaneLease>);
+
+impl Drop for ReleaseOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(lease) = self.0 {
+            lease.release();
+        }
+    }
+}
+
 impl std::fmt::Debug for LaneLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let held = self.0.lock().is_ok_and(|held| held.is_some());
@@ -1430,12 +1442,12 @@ where
             &lane_coverage,
             pacing,
         );
+        // Moved into the worker's future, so the lease is released when the
+        // worker stops and also when a `stop` drops the future unfinished.
+        let release = ReleaseOnDrop(lane.lease);
         async move {
-            let stopped = worker.await;
-            if let Some(lease) = lane.lease {
-                lease.release();
-            }
-            stopped
+            let _release = release;
+            worker.await
         }
     });
     // Drive every worker to completion while a single periodic tick flushes the
@@ -2514,6 +2526,62 @@ mod tests {
             src_b.delivered_bytes() > src_a.delivered_bytes(),
             "lane b fetched the reassigned tail after lane a faulted"
         );
+        Ok(())
+    }
+
+    /// A fetch that `stop` ends drops each lane's unfinished worker, and the
+    /// lane's lease is released with it rather than left held for the caller.
+    #[tokio::test]
+    async fn a_stopped_fetch_releases_every_lease() -> anyhow::Result<()> {
+        let data = blob(8 * 1024 * 1024);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src = ScriptedSource::new(data)?
+            .stall_after(0, Duration::from_hours(1))
+            .paying(Arc::clone(&ledger));
+        let root = src.root();
+        let total = src.total_bytes();
+        let (store, _dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+        let dropped = Arc::new(Mutex::new(None));
+        let lease = super::LaneLease::new(DropStamp(Arc::clone(&dropped)));
+        let mut lanes = vec![lane(&src, Arc::clone(&ledger), 0xA1)];
+        if let Some(l) = lanes.first_mut() {
+            l.lease = Some(&lease);
+        }
+        let stopped = multi_source_fetch_until(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: Duration::ZERO,
+            },
+            None,
+            None,
+            None,
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                anyhow::anyhow!("stopped")
+            },
+        )
+        .await;
+        assert!(stopped.is_err(), "the stop ends the fetch");
+        assert!(
+            dropped.lock().expect("stamp lock").is_some(),
+            "the stopped lane's lease is released"
+        );
+        drop(lanes);
         Ok(())
     }
 

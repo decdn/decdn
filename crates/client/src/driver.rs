@@ -73,7 +73,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -888,8 +888,11 @@ impl std::fmt::Debug for LaneGrowth<'_> {
 
 /// A lane's release hook in a [`drive_range_lanes`] drive.
 ///
-/// The drive calls it once as each gap worker of the lane stops: when no gap
-/// is left for it, when its lane retires on a fault, or when the drive halts.
+/// The drive calls it once as each gap worker of the lane stops: when its lane
+/// retires on a fault, when the drive halts or drains, or when no gap is left
+/// for it while other gaps still run. In that last case the lane keeps one
+/// idle worker for gaps a faulted lane puts back, and grows again through its
+/// [`LaneGrowth`] hook when it takes one while more wait.
 /// A lane runs `width` workers plus one for each unit its [`LaneGrowth`]
 /// grants, so a caller that holds one stream permit per worker gives one back
 /// on each call, and a lane that dies holds nothing for the rest of the drive.
@@ -1144,15 +1147,23 @@ where
         // waits.
         let grown: Mutex<Vec<usize>> = Mutex::new(Vec::new());
         let grow_wake = tokio::sync::Notify::new();
+        // Each lane's running gap workers. A lane with a release hook keeps one
+        // idle worker for gaps a faulted lane puts back, and lets the others
+        // stop and give their permits back.
+        let live: Vec<AtomicUsize> = lanes.iter().map(|_| AtomicUsize::new(0)).collect();
 
         let worker = |index: usize| {
             let (delivered, halted, retired, wake) = (&delivered, &halted, &retired, &wake);
             let (faults, lock, grown, grow_wake) = (&faults, &lock, &grown, &grow_wake);
+            let live = &live;
             async move {
-                let Some(lane) = lanes.get(index) else {
+                let (Some(lane), Some(live)) = (lanes.get(index), live.get(index)) else {
                     return Ok(());
                 };
-                let stopped: anyhow::Result<()> = async {
+                live.fetch_add(1, Ordering::AcqRel);
+                // `Ok(true)`: the worker left an idle lane and already counted
+                // itself out of `live`.
+                let stopped: anyhow::Result<bool> = async {
                     loop {
                         let notified = wake.notified();
                         tokio::pin!(notified);
@@ -1160,7 +1171,7 @@ where
                         let lane_retired =
                             retired.get(index).is_none_or(|r| r.load(Ordering::Acquire));
                         if halted.load(Ordering::Acquire) || lane_retired {
-                            return Ok::<(), anyhow::Error>(());
+                            return Ok::<bool, anyhow::Error>(false);
                         }
                         let taken = {
                             let mut q = lock();
@@ -1181,7 +1192,18 @@ where
                                     q.in_flight = q.in_flight.saturating_add(1);
                                     Some((gap, q.waiting.len()))
                                 }
-                                None if q.in_flight == 0 && q.first.is_none() => return Ok(()),
+                                None if q.in_flight == 0 && q.first.is_none() => {
+                                    return Ok(false);
+                                }
+                                // No gap for this worker while other gaps run.
+                                // Under the queue lock, so two idle workers of
+                                // one lane cannot both leave it.
+                                None if lane.release.is_some()
+                                    && live.load(Ordering::Acquire) > 1 =>
+                                {
+                                    live.fetch_sub(1, Ordering::AcqRel);
+                                    return Ok(true);
+                                }
                                 None => None,
                             }
                         };
@@ -1264,10 +1286,13 @@ where
                     }
                 }
                 .await;
+                if !matches!(stopped, Ok(true)) {
+                    live.fetch_sub(1, Ordering::AcqRel);
+                }
                 if let Some(LaneRelease(release)) = lane.release {
                     release();
                 }
-                stopped
+                stopped.map(|_| ())
             }
         };
         let mut running: futures_util::stream::FuturesUnordered<_> = lanes
@@ -2778,6 +2803,53 @@ mod tests {
             released.load(Ordering::Relaxed),
             2,
             "each worker of the faulted lane released once"
+        );
+    }
+
+    /// A lane with a release hook that runs out of gaps while another lane
+    /// still fills one keeps a single idle worker and lets the others stop, so
+    /// their permits come back before the drive ends.
+    #[tokio::test]
+    async fn an_idle_lane_releases_its_surplus_workers_before_the_drive_ends() {
+        let total = 64 * GROUP;
+        let ranges = scattered(total);
+        let stamps: &'static Mutex<Vec<std::time::Instant>> =
+            Box::leak(Box::new(Mutex::new(Vec::new())));
+        let release: &'static (dyn Fn() + Send + Sync) = Box::leak(Box::new(move || {
+            stamps
+                .lock()
+                .expect("stamps lock")
+                .push(std::time::Instant::now());
+        }));
+        let specs = [
+            LaneSpec {
+                release: Some(LaneRelease(release)),
+                ..LaneSpec::healthy(3)
+            },
+            LaneSpec {
+                width: 1,
+                grow: None,
+                release: None,
+                takes_first: false,
+                tweak: |s| s.slow_finish(std::time::Duration::from_millis(600)),
+            },
+        ];
+        let (outcome, _sources, _store, _plaintext) = lanes_drive(total, &ranges, &specs).await;
+        let ended = std::time::Instant::now();
+        outcome.into_result().expect("drive the range set");
+        let stamps = stamps.lock().expect("stamps lock").clone();
+        assert_eq!(
+            stamps.len(),
+            3,
+            "each worker of the fast lane released once"
+        );
+        let early = stamps
+            .iter()
+            .filter(|&&at| ended.duration_since(at) >= std::time::Duration::from_millis(300))
+            .count();
+        assert_eq!(
+            early, 2,
+            "two surplus workers stop while the slow lane still fills its gap"
         );
     }
 

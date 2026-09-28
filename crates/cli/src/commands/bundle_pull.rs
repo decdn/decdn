@@ -1841,9 +1841,10 @@ impl LaneStreamCap {
 /// calls it again whenever the lane takes a gap and more gaps wait
 /// ([`decdn_client::LaneGrowth`]), so a lane that started narrow widens when a
 /// sibling entry frees its permits. The drive calls [`Self::release_one`] as
-/// each worker stops ([`decdn_client::LaneRelease`]), so a lane that dies or
-/// runs out of gaps gives its permits back before the drive returns. What is
-/// left returns when the grant drops.
+/// each worker stops ([`decdn_client::LaneRelease`]), so a lane that dies gives
+/// its permits back before the drive returns, and a lane that runs out of gaps
+/// keeps only the permit of its one idle worker. What is left returns when the
+/// grant drops.
 struct LaneGrant {
     /// The provider's per-lane stream semaphore ([`LaneStreamCap`]).
     semaphore: Arc<tokio::sync::Semaphore>,
@@ -3076,8 +3077,8 @@ trait RangeDriver {
 /// permit for its provider per gap worker: the base permit its drive pass
 /// reserved, then the permits free when the drive starts, and those a sibling
 /// entry frees while the drive runs ([`LaneGrant`]). Each worker gives its
-/// permit back as it stops, so a lane that faults or runs out of gaps frees
-/// its provider at once. The entry holds no permit between drives: it waits on
+/// permit back as it stops, so a lane that faults frees its provider at once,
+/// and a lane that runs out of gaps keeps one permit for its one idle worker. The entry holds no permit between drives: it waits on
 /// siblings there, and a sibling it waits on may need them.
 struct CtxRangeDriver<'a, P: Provider + Clone> {
     hash: [u8; 32],
