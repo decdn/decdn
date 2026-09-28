@@ -125,16 +125,6 @@ enum RangeTargets {
 }
 
 impl RangeTargets {
-    /// The distinct provider addresses this entry's range drives may stream from —
-    /// the pinned target's one provider, or every discovered candidate's. Used to
-    /// acquire the entry's lane-stream permit set before its drives.
-    fn providers(&self) -> Vec<Address> {
-        match self {
-            RangeTargets::Pinned((_, provider)) => vec![*provider],
-            RangeTargets::Discovered { order, .. } => order.iter().map(|c| c.eth_address).collect(),
-        }
-    }
-
     /// How many of the first candidates a drive stripes across at once.
     const fn stripe(&self) -> usize {
         match self {
@@ -1161,8 +1151,9 @@ impl Transfer {
     }
 }
 
-/// Read the registry once and keep the region-nearest candidates, which every
-/// entry in the manifest then reuses.
+/// Read the registry once. Each entry draws its own candidate sample from the
+/// whole list ([`entry_candidates`]), so no registered node is hidden from every
+/// entry by one draw.
 async fn discover_candidates(
     chain: &fetch::ResolvedChain,
     registry_cap: std::time::Duration,
@@ -1185,11 +1176,15 @@ async fn discover_candidates(
     if all.is_empty() {
         bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
     }
-    Ok(discovery::select_candidates(
-        all,
-        chain.region.as_deref(),
-        discovery::SELECT_K,
-    ))
+    Ok(all)
+}
+
+/// One entry's probe candidates: a fresh sample of `registry`, same-region
+/// nodes first ([`discovery::select_candidates`]). A sample per entry costs no
+/// extra probe, because each entry probes its own candidates, and a node that
+/// one draw leaves out can still reach other entries.
+fn entry_candidates(registry: &[NodeCandidate], region: Option<&str>) -> Vec<NodeCandidate> {
+    discovery::select_candidates(registry.to_vec(), region, discovery::SELECT_K)
 }
 
 /// Load the buyer's Ethereum signer (vouchers + any openPool/topUp tx) and its
@@ -1215,9 +1210,10 @@ fn load_buyer_signer(
 /// The resolved node selection and buyer signer for a pull run.
 struct Selection {
     /// `Some((node, provider))` pins every entry to one node; `None` discovers per
-    /// entry against `candidates`.
+    /// entry against a sample of `registry`.
     explicit: Option<FetchTarget>,
-    candidates: Option<Vec<NodeCandidate>>,
+    /// Every active registered node, read once for the run.
+    registry: Option<Vec<NodeCandidate>>,
     signer: Arc<PrivateKeySigner>,
     self_address: Address,
 }
@@ -1230,22 +1226,21 @@ async fn resolve_selection(
     common: &ClientFetchArgs,
     chain: &fetch::ResolvedChain,
 ) -> anyhow::Result<Selection> {
-    // Explicit single node for every entry, or a per-entry discovery candidate list
-    // read from `CapacityBond` once.
+    // Explicit single node for every entry, or the registry read from
+    // `CapacityBond` once, which each entry samples.
     let explicit = explicit_target(common)?;
-    let candidates = match explicit {
+    let registry = match explicit {
         Some(_) => None,
         // The registry read is bounded by `--timeout-ms` (#1349), inside
         // `bootstrap_nodes` so a timeout still falls through to the peer store.
-        // No probing happens here — `discover_candidates` is the registry read
-        // plus `select_candidates`; probing is per entry, in `pick_excluding`
-        // below.
+        // No sampling or probing happens here: each entry samples and probes
+        // its own candidates (`PullCtx::entry_candidates`).
         None => Some(discover_candidates(chain, common.discovery_cap()).await?),
     };
     let (signer, self_address) = load_buyer_signer(chain)?;
     Ok(Selection {
         explicit,
-        candidates,
+        registry,
         signer,
         self_address,
     })
@@ -1348,7 +1343,7 @@ async fn pull_over(
     // Selection + the buyer signer, resolved per path (see `resolve_selection`).
     let Selection {
         explicit,
-        candidates,
+        registry,
         signer,
         self_address,
     } = resolve_selection(common, chain).await?;
@@ -1381,7 +1376,7 @@ async fn pull_over(
         chain,
         relays,
         explicit,
-        candidates,
+        registry,
         common,
         namespace_id,
         grant,
@@ -1681,12 +1676,28 @@ where
 /// fix.
 fn entry_retryable(err: &anyhow::Error) -> bool {
     shared_pool_disposition(err) == RetryDisposition::RetryElsewhere
+        && err.downcast_ref::<LanePermitFault>().is_none()
         && err.downcast_ref::<fetch::ManifestSizeMismatch>().is_none()
         && err
             .downcast_ref::<decdn_client::SignedSizeMismatch>()
             .is_none()
         && !is_local_disk_fault(err)
 }
+
+/// A range walk's lane permits disagree with its sessions: a fault of this
+/// client, not of any provider. It ends the walk and the entry at once rather
+/// than failing over, so the report names it instead of blaming each provider
+/// in turn.
+#[derive(Debug)]
+struct LanePermitFault(String);
+
+impl std::fmt::Display for LanePermitFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "internal lane-permit fault: {}", self.0)
+    }
+}
+
+impl std::error::Error for LanePermitFault {}
 
 /// Whether `err`'s chain holds an I/O error only this machine can fix.
 fn is_local_disk_fault(err: &anyhow::Error) -> bool {
@@ -1817,52 +1828,81 @@ impl LaneStreamCap {
     }
 
     /// Acquire one stream permit for every distinct provider in `providers`, in
-    /// one global order (sorted, deduped `Address`), and return them held for the
-    /// caller's whole fetch. Acquiring every multi-provider set in the same order
-    /// makes the cap deadlock-free: a task never waits on a lower-address permit
-    /// while holding a higher one.
+    /// one global order (sorted, deduped `Address`), and return each with its
+    /// provider. Every caller that waits on a permit holds none while it
+    /// waits, and a multi-provider set waits in this one order, so the cap is
+    /// deadlock-free: a task never waits on a lower-address permit while
+    /// holding a higher one.
     async fn permit_set(
         &self,
         providers: &[Address],
-    ) -> anyhow::Result<Vec<tokio::sync::OwnedSemaphorePermit>> {
+    ) -> anyhow::Result<Vec<(Address, tokio::sync::OwnedSemaphorePermit)>> {
         let mut ordered = providers.to_vec();
         ordered.sort_unstable();
         ordered.dedup();
         let mut permits = Vec::with_capacity(ordered.len());
         for provider in ordered {
-            permits.push(self.permit(provider).await?);
+            permits.push((provider, self.permit(provider).await?));
         }
         Ok(permits)
     }
 }
 
-/// The extra stream permits one lane of a range drive holds for its provider,
-/// beyond the one its entry holds for the whole fetch.
+/// The stream permits one lane of a range drive holds for its provider: one
+/// for each of the lane's live gap workers.
 ///
+/// The lane starts with the base permit its drive pass reserved ([`Self::new`]).
 /// [`Self::grant`] takes only the permits free right now and never waits, so a
 /// lane cannot deadlock against a sibling entry that holds one permit set and
 /// waits for another. The caller calls it once to size the lane, and the drive
 /// calls it again whenever the lane takes a gap and more gaps wait
-/// ([`decdn_client::LaneGrowth`]), so a
-/// lane that started narrow widens when a sibling entry frees its permits. The
-/// permits return when the grant drops at the end of the drive.
+/// ([`decdn_client::LaneGrowth`]), so a lane that started narrow widens when a
+/// sibling entry frees its permits. The drive calls [`Self::release_one`] as
+/// each worker stops ([`decdn_client::LaneRelease`]), so a lane that dies gives
+/// its permits back before the drive returns, and a lane that runs out of gaps
+/// keeps only the permit of its one idle worker. What is left returns when the
+/// grant drops.
 struct LaneGrant {
     /// The provider's per-lane stream semaphore ([`LaneStreamCap`]).
     semaphore: Arc<tokio::sync::Semaphore>,
-    /// The most extra permits the lane may hold.
+    /// The most permits the lane may hold.
     room: usize,
-    /// The extra permits the lane holds now.
+    /// The permits the lane holds now.
     held: std::sync::Mutex<Vec<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 impl LaneGrant {
-    /// A grant holding no permit yet, for at most `room` extra permits.
-    const fn new(semaphore: Arc<tokio::sync::Semaphore>, room: usize) -> Self {
+    /// A grant holding `base`, for at most `room` permits in all.
+    fn new(
+        semaphore: Arc<tokio::sync::Semaphore>,
+        room: usize,
+        base: tokio::sync::OwnedSemaphorePermit,
+    ) -> Self {
         Self {
             semaphore,
             room,
-            held: std::sync::Mutex::new(Vec::new()),
+            held: std::sync::Mutex::new(vec![base]),
         }
+    }
+
+    /// The lane's width: one gap worker for each permit it holds now.
+    fn width(&self) -> std::num::NonZeroUsize {
+        let held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        std::num::NonZeroUsize::new(held).unwrap_or(std::num::NonZeroUsize::MIN)
+    }
+
+    /// Give back one held permit, for a worker that stopped.
+    fn release_one(&self) {
+        let released = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop();
+        drop(released);
     }
 
     /// Take up to `most` of the free permits the lane still has room for, and
@@ -1899,9 +1939,11 @@ struct PullCtx<'a, P: Provider + Clone> {
     chain: &'a fetch::ResolvedChain,
     relays: &'a [RelayUrl],
     /// `Some((node_id, provider))` pins every entry to one node (`--node-id`);
-    /// `None` discovers per entry against `candidates`.
+    /// `None` discovers per entry against a sample of `registry`.
     explicit: Option<FetchTarget>,
-    candidates: Option<Vec<NodeCandidate>>,
+    /// Every active registered node, read once for the run; `None` when
+    /// `explicit` pins the node.
+    registry: Option<Vec<NodeCandidate>>,
     common: &'a ClientFetchArgs,
     /// Delegated capability adopted for every entry (`--capability`), or `None`
     /// for the self-owned pool path. When `Some`, every entry presents this
@@ -2032,12 +2074,20 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         ) {
             return Ok(None);
         }
-        // Hold one lane-stream permit per admitted provider across the whole
-        // fan-out: every admitted lane opens a stream at once, so the cap must
-        // admit the set together. Acquired in sorted `Address` order (deadlock
-        // free) and only after the gate accepts, so a declined fetch takes none.
+        // One lane-stream permit per admitted provider: every admitted lane
+        // opens a stream at once, so the cap must admit the set together.
+        // Acquired in sorted `Address` order (deadlock free) and only after the
+        // gate accepts, so a declined fetch takes none. Each permit rides on its
+        // provider's lane as a lease, which the scheduler drops when that lane
+        // stops, so a dead lane frees its provider for a sibling entry.
         let providers: Vec<Address> = admitted.iter().map(|c| c.eth_address).collect();
-        let _lane_permits = self.lane_cap.permit_set(&providers).await?;
+        let leases = self
+            .lane_cap
+            .permit_set(&providers)
+            .await?
+            .into_iter()
+            .map(|(provider, permit)| (provider, decdn_client::LaneLease::new(permit)))
+            .collect();
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
         let deps = self.drive_deps(max_blob_bytes)?;
         // The entry's per-file bar callback (ADR 039 fan-out reports one monotonic
@@ -2062,6 +2112,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             progress,
             Some(&self.open_lock),
             Some(&self.ledgers),
+            leases,
         )
         .await
         .map(|opt| opt.map(|_bytes| ()))
@@ -2102,13 +2153,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 .fetch_to_staging_from(hash, pinned, &[], staging, progress)
                 .await;
         }
-        let candidates = self
-            .candidates
-            .as_deref()
-            .ok_or_else(|| anyhow!("no discovery candidates available"))?;
+        let candidates = self.entry_candidates()?;
         let order = fetch::probe_and_order(
             self.endpoint,
-            candidates,
+            &candidates,
             self.relays.first(),
             hash,
             fetch::ProxyWarmingParams::from_args(self.common),
@@ -2339,6 +2387,16 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         .await
     }
 
+    /// This entry's probe candidates: a fresh sample of the run's registry read
+    /// ([`entry_candidates`]).
+    fn entry_candidates(&self) -> anyhow::Result<Vec<NodeCandidate>> {
+        let registry = self
+            .registry
+            .as_deref()
+            .ok_or_else(|| anyhow!("no discovery candidates available"))?;
+        Ok(entry_candidates(registry, self.chain.region.as_deref()))
+    }
+
     /// Resolve the provider order for one dedup entry's range drives ONCE — the
     /// pinned `--node-id`, or a single [`fetch::probe_and_order`] over the
     /// discovery candidates. [`Self::pull_entry`] resolves this before its first
@@ -2355,13 +2413,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         if let Some(pinned) = self.explicit {
             return Ok(RangeTargets::Pinned(pinned));
         }
-        let candidates = self
-            .candidates
-            .as_deref()
-            .ok_or_else(|| anyhow!("no discovery candidates available"))?;
+        let candidates = self.entry_candidates()?;
         let resolved = fetch::probe_and_order(
             self.endpoint,
-            candidates,
+            &candidates,
             self.relays.first(),
             hash,
             fetch::ProxyWarmingParams::from_args(self.common),
@@ -2717,13 +2772,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // across every sub-drive below (complement, donor re-fetch, whole-blob
         // re-drive) — the happy path (complement only) still probes exactly once.
         let targets = self.resolve_range_targets(hash, total).await?;
-        // Hold one lane-stream permit per provider this entry may drive from across
-        // every sub-drive (complement, donor re-fetch, whole-blob re-drive) and the
-        // splice between them — one logical fetch unit — so the entry always keeps
-        // a stream's place on its lane; each drive takes any extra permits it uses
-        // only while it runs. Sorted `Address` order keeps it deadlock-free
-        // against a fan-out entry's permit set.
-        let _lane_permits = self.lane_cap.permit_set(&targets.providers()).await?;
+        // No lane-stream permit is held here: each drive pass reserves one for
+        // each session it drives (`SessionWalk::fill`), and its lanes give them
+        // back as their workers stop (`LiveSessions::drive`), so the entry holds
+        // none across the splice or its waits on a sibling.
         let driver = CtxRangeDriver::new(self, &targets, hash, staging, total, progress);
 
         // On any dedup-path success, true up the file + total progress bars to
@@ -3048,12 +3100,14 @@ trait RangeDriver {
 /// serves them. A lane that faults retires, and the entry does not go back to
 /// a discovered provider that failed it (a pinned `--node-id` is its only
 /// candidate); a retry round (`--entry-retries`) starts a new driver over a
-/// fresh probe. Each lane fills up to `--max-lane-streams` gaps at once, using
-/// the permits for its provider beyond the one the entry already holds: those
-/// free when the drive starts, and those a sibling entry frees while the drive
-/// runs ([`LaneGrant`]). It returns those extra permits when the drive ends:
-/// the entry keeps waiting on siblings between drives, and a sibling it waits
-/// on may need them.
+/// fresh probe. Each lane fills up to `--max-lane-streams` gaps at once, one
+/// permit for its provider per gap worker: the base permit its drive pass
+/// reserved, then the permits free when the drive starts, and those a sibling
+/// entry frees while the drive runs ([`LaneGrant`]). Each worker gives its
+/// permit back as it stops: a lane that faults frees each permit as each of its
+/// workers finishes its gap, and a lane that runs out of gaps keeps one permit
+/// for its one idle worker. The entry holds no permit between drives: it waits
+/// on siblings there, and a sibling it waits on may need them.
 struct CtxRangeDriver<'a, P: Provider + Clone> {
     hash: [u8; 32],
     staging: &'a Path,
@@ -3119,6 +3173,9 @@ trait RangeSessions {
     /// One candidate's open session.
     type Session;
 
+    /// One candidate's reserved stream permit ([`LaneStreamCap`]).
+    type Permit;
+
     /// How many candidates there are, in failover order.
     fn candidates(&self) -> usize;
 
@@ -3144,11 +3201,18 @@ trait RangeSessions {
         first_ranges: &[(u64, u64)],
     ) -> anyhow::Result<Self::Session>;
 
+    /// Reserve one stream permit for each candidate in `indices`, for one
+    /// drive pass. The walk holds no permit when it calls this, and the
+    /// candidates it names have distinct providers.
+    async fn permits(&self, indices: &[usize]) -> anyhow::Result<Vec<(usize, Self::Permit)>>;
+
     /// Drive `ranges` through every open session at once. Each is
-    /// `(candidate index, session, takes the drive's first gap)`.
+    /// `(candidate index, session, takes the drive's first gap)`, and
+    /// `permits` holds each one's reserved permit.
     async fn drive(
         &self,
         open: &[(usize, &Self::Session, bool)],
+        permits: Vec<(usize, Self::Permit)>,
         ranges: &[(u64, u64)],
     ) -> LanesDriven;
 }
@@ -3235,7 +3299,7 @@ impl<S: RangeSessions> SessionWalk<S> {
         };
         let mut last_err: Option<anyhow::Error> = None;
         loop {
-            self.fill(&mut state, ranges, &what, &mut last_err).await?;
+            let permits = self.fill(&mut state, ranges, &what, &mut last_err).await?;
             if state.open.is_empty() {
                 return Err(match last_err {
                     Some(err) if pinned => err,
@@ -3258,7 +3322,7 @@ impl<S: RangeSessions> SessionWalk<S> {
                     .iter()
                     .map(|(index, session)| (*index, session, primed == Some(*index)))
                     .collect();
-                self.sessions.drive(&lanes, ranges).await
+                self.sessions.drive(&lanes, permits, ranges).await
             };
             let failed: Vec<String> = state
                 .open
@@ -3279,7 +3343,10 @@ impl<S: RangeSessions> SessionWalk<S> {
             };
             // No provider can fix a terminal fault or a local disk fault, so
             // neither fails over.
-            if retry_disposition(&err) == RetryDisposition::Terminal || is_local_disk_fault(&err) {
+            if retry_disposition(&err) == RetryDisposition::Terminal
+                || is_local_disk_fault(&err)
+                || err.downcast_ref::<LanePermitFault>().is_some()
+            {
                 return Err(err);
             }
             let failed = if failed.is_empty() {
@@ -3308,15 +3375,22 @@ impl<S: RangeSessions> SessionWalk<S> {
     /// Open the sessions the next drive needs: every stripe member not yet
     /// tried, and, when none is open, the next reserve candidate. A candidate
     /// whose session will not open is skipped for good.
+    ///
+    /// Returns the stream permit of each open session, for the next drive
+    /// pass. They are reserved in one batch, before the new sessions open, so
+    /// no primed first leg waits on a permit. The walk holds no permit when it
+    /// reserves the batch: the last drive gave its permits back, and a later
+    /// batch only follows a pass in which every open failed.
     async fn fill(
         &self,
         state: &mut WalkState<S::Session>,
         ranges: &[(u64, u64)],
         what: &str,
         last_err: &mut Option<anyhow::Error>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<(usize, S::Permit)>> {
         let n = self.sessions.candidates();
         let stripe = self.sessions.stripe().max(1);
+        let mut permits: Vec<(usize, S::Permit)> = Vec::new();
         loop {
             let end = if state.next < stripe {
                 stripe.min(n)
@@ -3325,8 +3399,18 @@ impl<S: RangeSessions> SessionWalk<S> {
             } else {
                 state.next
             };
+            let mut wanted: Vec<usize> = state
+                .open
+                .iter()
+                .map(|&(index, _)| index)
+                .filter(|index| !permits.iter().any(|(held, _)| held == index))
+                .collect();
+            wanted.extend(state.next..end.max(state.next));
+            if !wanted.is_empty() {
+                permits.extend(self.sessions.permits(&wanted).await?);
+            }
             if end <= state.next {
-                return Ok(());
+                return Ok(permits);
             }
             while state.next < end {
                 let index = state.next;
@@ -3341,6 +3425,7 @@ impl<S: RangeSessions> SessionWalk<S> {
                         state.open.push((index, session));
                     }
                     Err(err) => {
+                        permits.retain(|&(held, _)| held != index);
                         if retry_disposition(&err) == RetryDisposition::Terminal {
                             return Err(err);
                         }
@@ -3410,6 +3495,7 @@ impl<P: Provider + Clone> LiveSessions<'_, P> {
 
 impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
     type Session = fetch::RangeSession<'a, P>;
+    type Permit = tokio::sync::OwnedSemaphorePermit;
 
     fn candidates(&self) -> usize {
         self.targets.len()
@@ -3453,9 +3539,36 @@ impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
             .map_err(|err| self.annotate(err))
     }
 
+    async fn permits(&self, indices: &[usize]) -> anyhow::Result<Vec<(usize, Self::Permit)>> {
+        let mut by_provider = Vec::with_capacity(indices.len());
+        for &index in indices {
+            let ((_, provider), _) = self.target(index)?;
+            by_provider.push((*provider, index));
+        }
+        // One global order, the same as `LaneStreamCap::permit_set`.
+        by_provider.sort_unstable();
+        // A second wait on one provider while holding its first permit could
+        // wait on itself for good.
+        let shared = by_provider
+            .iter()
+            .zip(by_provider.iter().skip(1))
+            .find(|(a, b)| a.0 == b.0);
+        if let Some(((provider, first), (_, second))) = shared {
+            return Err(anyhow::Error::new(LanePermitFault(format!(
+                "candidates {first} and {second} of one drive pass share provider {provider}"
+            ))));
+        }
+        let mut permits = Vec::with_capacity(by_provider.len());
+        for (provider, index) in by_provider {
+            permits.push((index, self.ctx.lane_cap.permit(provider).await?));
+        }
+        Ok(permits)
+    }
+
     async fn drive(
         &self,
         open: &[(usize, &Self::Session, bool)],
+        mut permits: Vec<(usize, Self::Permit)>,
         ranges: &[(u64, u64)],
     ) -> LanesDriven {
         let unfaulted = |result: anyhow::Result<()>| LanesDriven {
@@ -3466,33 +3579,44 @@ impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
             Ok(store) => store,
             Err(err) => return unfaulted(Err(err)),
         };
-        // Held for this drive only, never across the entry's waits on a sibling
-        // (`reconcile_deferred`): a donor this entry waits on may be blocked on
-        // the same providers' permits.
+        // Each lane starts on its reserved permit and takes free ones as it
+        // grows. Held for this drive only, never across the entry's waits on a
+        // sibling (`reconcile_deferred`): a donor this entry waits on may be
+        // blocked on the same providers' permits.
         let mut grants = Vec::with_capacity(open.len());
         for &(index, _, _) in open {
             let provider = match self.target(index) {
                 Ok(((_, provider), _)) => *provider,
                 Err(err) => return unfaulted(Err(err)),
             };
+            let Some(at) = permits.iter().position(|&(held, _)| held == index) else {
+                return unfaulted(Err(anyhow::Error::new(LanePermitFault(format!(
+                    "no stream permit reserved for provider {provider}"
+                )))));
+            };
+            let (_, base) = permits.swap_remove(at);
             grants.push(LaneGrant::new(
                 self.ctx.lane_cap.semaphore(provider).await,
-                self.ctx.lane_cap.n.saturating_sub(1),
+                self.ctx.lane_cap.n,
+                base,
             ));
         }
         let hooks: Vec<_> = grants.iter().map(|g| move |most| g.grant(most)).collect();
+        let releases: Vec<_> = grants.iter().map(|g| move || g.release_one()).collect();
         let lanes: Vec<_> = open
             .iter()
             .zip(&grants)
-            .zip(&hooks)
-            .map(
-                |((&(_, session, takes_first), grant), hook)| fetch::StripeLane {
+            .zip(hooks.iter().zip(&releases))
+            .map(|((&(_, session, takes_first), grant), (hook, release))| {
+                grant.grant(usize::MAX);
+                fetch::StripeLane {
                     session,
-                    width: std::num::NonZeroUsize::MIN.saturating_add(grant.grant(usize::MAX)),
+                    width: grant.width(),
                     takes_first,
                     grow: Some(decdn_client::LaneGrowth(hook)),
-                },
-            )
+                    release: Some(decdn_client::LaneRelease(release)),
+                }
+            })
             .collect();
         let driven = Box::pin(fetch::drive_stripe(
             store,
@@ -3614,15 +3738,17 @@ async fn reassemble_dedup(
     // whose chunk no longer hashes to its hint (a lying donor hint, or a short read)
     // is re-fetched normally rather than trusted.
     // Each re-fetched donor is a dropped hint.
-    let (mut spliced_bytes, refetch) = splice_off_runtime(&partial, plan.donor.clone()).await?;
+    let mut ledger = SpliceLedger::default();
+    let refetch = splice_off_runtime(&partial, plan.donor.clone(), &mut ledger).await?;
     let mut hints_ignored = u64::try_from(refetch.len()).unwrap_or(u64::MAX);
     if !refetch.is_empty() {
         driver.drive(&refetch).await?;
+        ledger.driven.extend_from_slice(&refetch);
         if staging.try_exists()? {
             finish_progress();
             index.register(hints, staging);
             return Ok(DedupOutcome {
-                spliced_bytes,
+                spliced_bytes: ledger.spliced_bytes(total),
                 hints_ignored,
             });
         }
@@ -3632,10 +3758,18 @@ async fn reassemble_dedup(
     // registers it, waiting on the index's progress signal. A deferred chunk whose
     // assigned fetcher finishes WITHOUT producing it (a failed fetcher) is driven
     // and paid here instead, so the run never hangs.
-    let (tail_spliced, tail_ignored) =
-        reconcile_deferred(driver, &partial, &plan.deferred, index, fetch_plan, file).await?;
-    spliced_bytes = spliced_bytes.saturating_add(tail_spliced);
+    let tail_ignored = reconcile_deferred(
+        driver,
+        &partial,
+        &plan.deferred,
+        index,
+        fetch_plan,
+        file,
+        &mut ledger,
+    )
+    .await?;
     hints_ignored = hints_ignored.saturating_add(tail_ignored);
+    let mut spliced_bytes = ledger.spliced_bytes(total);
     if staging.try_exists()? {
         finish_progress();
         index.register(hints, staging);
@@ -3718,9 +3852,9 @@ async fn reassemble_dedup(
 /// assigned fetcher FINISHES without registering it (a failed fetcher, or one with
 /// no recorded assignee) — or one registered under a length that disagrees with the
 /// hint — is driven and paid here instead, over the whole groups its span touches,
-/// so the entry always completes and the run never hangs. Returns `(spliced_bytes,
-/// hints_ignored)`: bytes served from a splice, and deferred chunks that fell back to
-/// a paid drive.
+/// so the entry always completes and the run never hangs. Records each splice and
+/// each driven span in `ledger`, and returns the count of deferred chunks that fell
+/// back to a paid drive.
 async fn reconcile_deferred(
     driver: &dyn RangeDriver,
     partial: &Path,
@@ -3728,12 +3862,12 @@ async fn reconcile_deferred(
     index: &ChunkIndex,
     fetch_plan: &FetchPlan,
     file: Option<&pull_progress::FileBar>,
-) -> anyhow::Result<(u64, u64)> {
+    ledger: &mut SpliceLedger,
+) -> anyhow::Result<u64> {
     let mut waiting: Vec<DeferredChunk> = deferred.to_vec();
-    let mut spliced_bytes = 0u64;
     let mut ignored = 0u64;
     if waiting.is_empty() {
-        return Ok((0, 0));
+        return Ok(0);
     }
     let notified = index.progress.notified();
     tokio::pin!(notified);
@@ -3776,24 +3910,24 @@ async fn reconcile_deferred(
         }
 
         if !ready.is_empty() {
-            let (spliced, refetch) = splice_off_runtime(partial, ready).await?;
-            spliced_bytes = spliced_bytes.saturating_add(spliced);
+            let refetch = splice_off_runtime(partial, ready, ledger).await?;
             ignored = ignored.saturating_add(u64::try_from(refetch.len()).unwrap_or(u64::MAX));
             fallback.extend(refetch);
         }
 
         if !fallback.is_empty() {
             driver.drive(&fallback).await?;
+            ledger.driven.extend_from_slice(&fallback);
             // A fallback drive may complete the store (`drive` renames
             // `.partial` -> `<hex>`); no more splicing is then possible or needed.
             if driver.staging().try_exists()? {
-                return Ok((spliced_bytes, ignored));
+                return Ok(ignored);
             }
         }
 
         waiting = still;
         if waiting.is_empty() {
-            return Ok((spliced_bytes, ignored));
+            return Ok(ignored);
         }
 
         // Nothing to do this pass but wait on a sibling — surface it on the file row
@@ -4390,20 +4524,75 @@ fn splice_donors(partial: &Path, donors: &[DonorRange]) -> anyhow::Result<Vec<Do
     Ok(refetch)
 }
 
-/// [`splice_donors`] on the blocking pool. Returns the bytes spliced — the
-/// donors' `dst` spans less those of the donors that could not be trusted — and
-/// the [`DonorRange::refetch`] span of each untrusted donor, which the caller
-/// drives and pays for.
+/// [`splice_donors`] on the blocking pool. Records the `dst` span of each donor
+/// it spliced in `ledger`, and returns the [`DonorRange::refetch`] span of each
+/// untrusted donor, which the caller drives and pays for.
 async fn splice_off_runtime(
     partial: &Path,
     donors: Vec<DonorRange>,
-) -> anyhow::Result<(u64, Vec<(u64, u64)>)> {
-    let span_total = |ds: &[DonorRange]| ds.iter().map(|d| d.dst.1).fold(0u64, u64::saturating_add);
-    let planned = span_total(&donors);
+    ledger: &mut SpliceLedger,
+) -> anyhow::Result<Vec<(u64, u64)>> {
     let partial = partial.to_path_buf();
+    let planned: Vec<((u64, u64), (u64, u64))> =
+        donors.iter().map(|d| (d.dst, d.refetch)).collect();
     let failed = off_runtime("donor splice", move || splice_donors(&partial, &donors)).await?;
-    let spliced = planned.saturating_sub(span_total(&failed));
-    Ok((spliced, failed.iter().map(|d| d.refetch).collect()))
+    let failed_dst: HashSet<(u64, u64)> = failed.iter().map(|d| d.dst).collect();
+    ledger.spliced.extend(
+        planned
+            .iter()
+            .filter(|(dst, _)| !failed_dst.contains(dst))
+            .map(|&(dst, _)| dst),
+    );
+    Ok(failed.iter().map(|d| d.refetch).collect())
+}
+
+/// The byte spans one entry's reassembly spliced from disk and the spans it
+/// drove to replace an untrusted or missing donor. A driven span is widened to
+/// whole chunk groups, so it can cover part of a neighbour's spliced span, and
+/// the drive then writes and pays for those bytes.
+#[derive(Debug, Default)]
+struct SpliceLedger {
+    /// The `dst` span of each donor that spliced cleanly.
+    spliced: Vec<(u64, u64)>,
+    /// Each re-fetch or fallback span that a drive covered.
+    driven: Vec<(u64, u64)>,
+}
+
+impl SpliceLedger {
+    /// Bytes served from a splice: the spliced spans less every driven span.
+    fn spliced_bytes(&self, total: u64) -> u64 {
+        net_spliced(&self.spliced, &self.driven, total)
+    }
+}
+
+/// The bytes of `spliced` that no `driven` span covers, over `[0, total)`. Both
+/// are `(offset, len)` spans, in any order, and may overlap.
+fn net_spliced(spliced: &[(u64, u64)], driven: &[(u64, u64)], total: u64) -> u64 {
+    let kept = complement_runs(driven, total);
+    let mut kept = kept
+        .iter()
+        .map(|&(offset, len)| (offset, offset.saturating_add(len)));
+    let mut current = kept.next();
+    let mut bytes = 0u64;
+    for (start, end) in coalesce_runs(spliced, total) {
+        while let Some((k_start, k_end)) = current {
+            if k_end <= start {
+                current = kept.next();
+                continue;
+            }
+            if k_start >= end {
+                break;
+            }
+            let overlap = end.min(k_end).saturating_sub(start.max(k_start));
+            bytes = bytes.saturating_add(overlap);
+            if k_end <= end {
+                current = kept.next();
+            } else {
+                break;
+            }
+        }
+    }
+    bytes
 }
 
 /// Whether the `len` bytes at `offset` in `src` hash to `expected`. Any read
@@ -5158,6 +5347,25 @@ mod tests {
             received: 1 << 40,
             ceiling: 1 << 20,
         })
+    }
+
+    /// Every entry draws its own sample of the registry, so a node that one
+    /// draw leaves out still reaches other entries.
+    #[test]
+    fn entry_candidates_resample_the_registry_for_each_entry() {
+        let registry: Vec<NodeCandidate> = (1u8..=7).map(|b| stripe_candidate(b, b)).collect();
+        let mut seen = HashSet::new();
+        let mut draws = HashSet::new();
+        for _ in 0..200 {
+            let sample = entry_candidates(&registry, None);
+            assert_eq!(sample.len(), discovery::SELECT_K);
+            let ids: std::collections::BTreeSet<PublicKey> =
+                sample.iter().map(|c| c.node_id).collect();
+            seen.extend(ids.iter().copied());
+            draws.insert(ids);
+        }
+        assert_eq!(seen.len(), registry.len(), "every node reaches some entry");
+        assert!(draws.len() > 1, "entries draw different samples");
     }
 
     /// The walk stops at the first success and never tries the rest.
@@ -6630,7 +6838,8 @@ mod tests {
             vec![(GROUP, total - GROUP)],
             "the failed donor's whole groups are driven, boundary group included"
         );
-        assert_eq!(outcome.spliced_bytes, cut);
+        // The drive wrote and paid for donor A's share of the boundary group.
+        assert_eq!(outcome.spliced_bytes, GROUP);
         assert_eq!(outcome.hints_ignored, 1);
     }
 
@@ -6683,7 +6892,86 @@ mod tests {
             driver.driven.lock().expect("driven lock").clone(),
             vec![(GROUP, total - GROUP)]
         );
-        assert_eq!(outcome.spliced_bytes, cut);
+        // The fallback drive wrote and paid for donor A's share of the boundary group.
+        assert_eq!(outcome.spliced_bytes, GROUP);
+    }
+
+    /// A re-fetch of a failed donor at the first splice can cover part of a
+    /// deferred chunk that the tail splices later. The overlap is paid, so it
+    /// does not count as spliced.
+    #[tokio::test]
+    async fn spliced_bytes_exclude_a_first_splice_refetch_under_a_tail_splice() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let total = 4 * GROUP;
+        let content: Vec<u8> = (0..total)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        let whole = *blake3::hash(&content).as_bytes();
+        let cut = GROUP + 5000;
+        let (hints, mut map) = two_donor_fixture(tmp.path(), &content, cut);
+        // Chunk a is deferred to a sibling that has already registered it.
+        let a_hash = hints[0].hash;
+        map.remove(&a_hash);
+        let mut fetch_plan = FetchPlan::default();
+        fetch_plan.assigned.insert(a_hash, [0xaa; 32]);
+        let plan = plan_reassembly(&hints, &map, &fetch_plan, whole, total);
+        assert_eq!(plan.deferred.len(), 1);
+        assert_eq!(plan.donor.len(), 1);
+        let index = ChunkIndex::default();
+        index.register(Some(&hints[..1]), &tmp.path().join("a"));
+        // Donor b fails its re-hash, so the first splice re-fetches its groups.
+        std::fs::write(tmp.path().join("b"), vec![0u8; 16]).expect("corrupt donor b");
+        let staging = tmp.path().join("blob");
+        let driver = RecordingDriver {
+            hash: whole,
+            staging: staging.clone(),
+            content: content.clone(),
+            driven: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let outcome = reassemble_dedup(
+            &driver,
+            &plan,
+            total,
+            None,
+            &index,
+            &fetch_plan,
+            None,
+            &|| {},
+        )
+        .await
+        .expect("reassembly must succeed");
+
+        assert_eq!(std::fs::read(&staging).expect("read staging"), content);
+        assert_eq!(
+            driver.driven.lock().expect("driven lock").clone(),
+            vec![(GROUP, total - GROUP)]
+        );
+        assert_eq!(outcome.spliced_bytes, GROUP);
+        assert_eq!(outcome.hints_ignored, 1);
+    }
+
+    #[test]
+    fn net_spliced_subtracts_only_the_driven_overlap() {
+        // Disjoint: nothing driven under the splice.
+        assert_eq!(net_spliced(&[(0, 100)], &[(200, 50)], 1000), 100);
+        // Nested: the drive sits inside the splice.
+        assert_eq!(net_spliced(&[(0, 100)], &[(20, 30)], 1000), 70);
+        // The drive covers the whole splice.
+        assert_eq!(net_spliced(&[(10, 20)], &[(0, 100)], 1000), 0);
+        // Touching spans share no byte.
+        assert_eq!(net_spliced(&[(0, 100)], &[(100, 100)], 1000), 100);
+        // Overlapping drives count once, across several splices, in any order.
+        assert_eq!(
+            net_spliced(
+                &[(300, 100), (0, 100)],
+                &[(50, 100), (60, 10), (350, 100)],
+                1000
+            ),
+            100
+        );
+        assert_eq!(net_spliced(&[], &[(0, 10)], 1000), 0);
+        assert_eq!(net_spliced(&[(0, 10)], &[], 1000), 10);
     }
 
     /// A deferred chunk whose assigned fetcher registers its donor only AFTER the
@@ -8155,6 +8443,8 @@ mod tests {
         /// Per drive call: the candidates it ran on, and which took the first
         /// gap.
         calls: std::sync::Mutex<Vec<(Vec<usize>, Option<usize>)>>,
+        /// Each permit batch the walk reserved, in order.
+        reserved: std::sync::Mutex<Vec<Vec<usize>>>,
     }
 
     impl FakeSessions {
@@ -8171,12 +8461,14 @@ mod tests {
                 primed_opens: std::sync::Mutex::new(Vec::new()),
                 drives: std::sync::Mutex::new(Vec::new()),
                 calls: std::sync::Mutex::new(Vec::new()),
+                reserved: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
 
     impl RangeSessions for FakeSessions {
         type Session = usize;
+        type Permit = usize;
 
         fn candidates(&self) -> usize {
             self.candidates
@@ -8209,7 +8501,22 @@ mod tests {
             Ok(index)
         }
 
-        async fn drive(&self, open: &[(usize, &usize, bool)], _: &[(u64, u64)]) -> LanesDriven {
+        async fn permits(&self, indices: &[usize]) -> anyhow::Result<Vec<(usize, usize)>> {
+            self.reserved.lock().unwrap().push(indices.to_vec());
+            Ok(indices.iter().map(|&index| (index, index)).collect())
+        }
+
+        async fn drive(
+            &self,
+            open: &[(usize, &usize, bool)],
+            permits: Vec<(usize, usize)>,
+            _: &[(u64, u64)],
+        ) -> LanesDriven {
+            let mut held: Vec<usize> = permits.iter().map(|&(index, _)| index).collect();
+            held.sort_unstable();
+            let mut lanes: Vec<usize> = open.iter().map(|&(index, _, _)| index).collect();
+            lanes.sort_unstable();
+            assert_eq!(held, lanes, "a drive gets one permit per open session");
             let call = {
                 let mut calls = self.calls.lock().unwrap();
                 calls.push((
@@ -8432,6 +8739,11 @@ mod tests {
             .map(|(lanes, _)| lanes.clone())
             .collect();
         assert_eq!(calls, vec![vec![0, 1], vec![1], vec![2]]);
+        assert_eq!(
+            *walk.sessions.reserved.lock().unwrap(),
+            vec![vec![0, 1], vec![1], vec![2]],
+            "each pass reserves permits for the sessions it drives, and no more"
+        );
     }
 
     /// A failure no lane owns, such as the drive-level floor, fails over every
@@ -8475,6 +8787,22 @@ mod tests {
             "{err:#}"
         );
         assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0, 1]);
+    }
+
+    /// A lane-permit fault is this client's own, so it ends the walk rather
+    /// than failing over and blaming each provider in turn, and no retry
+    /// round repeats it.
+    #[tokio::test]
+    async fn session_walk_stops_on_a_lane_permit_fault() {
+        let mut fake = FakeSessions::new(4);
+        fake.lane_error = vec![(1, || {
+            anyhow::Error::new(LanePermitFault("no stream permit reserved".into()))
+        })];
+        let walk = SessionWalk::new(fake);
+        let err = walk.drive(&[(0, 1)]).await.unwrap_err();
+        assert!(err.downcast_ref::<LanePermitFault>().is_some(), "{err:#}");
+        assert!(!entry_retryable(&err));
+        assert_eq!(*walk.sessions.opens.lock().unwrap(), vec![0]);
     }
 
     /// A local disk fault ends the walk too: every provider would meet it.
@@ -8647,20 +8975,53 @@ mod tests {
         let cap = LaneStreamCap::new(4);
         let held = cap.permit(p1).await.unwrap();
         let sibling = cap.permit(p1).await.unwrap();
-        let grant = LaneGrant::new(cap.semaphore(p1).await, cap.n - 1);
-        assert_eq!(grant.grant(usize::MAX), 2, "the two free permits");
+        let base = cap.permit(p1).await.unwrap();
+        let grant = LaneGrant::new(cap.semaphore(p1).await, cap.n, base);
+        assert_eq!(grant.width().get(), 1, "the base permit alone");
+        assert_eq!(grant.grant(usize::MAX), 1, "the one free permit");
         assert_eq!(grant.grant(usize::MAX), 0, "the cap is reached");
         drop(sibling);
         assert_eq!(grant.grant(0), 0, "no more than asked");
         assert_eq!(grant.grant(usize::MAX), 1, "the permit the sibling freed");
         assert_eq!(grant.grant(usize::MAX), 0, "the grant is at its room");
+        assert_eq!(grant.width().get(), 3, "one worker per permit held");
         drop(grant);
         drop(held);
-        let all = LaneGrant::new(cap.semaphore(p1).await, 10);
+        let base = cap.permit(p1).await.unwrap();
+        let all = LaneGrant::new(cap.semaphore(p1).await, 10, base);
         assert_eq!(
             all.grant(usize::MAX),
-            4,
+            3,
             "every permit came back, and never past the cap"
+        );
+    }
+
+    /// A lane's base permit counts toward its room, and each stopped worker
+    /// gives one permit back to the provider at once.
+    #[tokio::test]
+    async fn a_lane_grant_gives_back_one_permit_per_stopped_worker() {
+        let p1 = Address::repeat_byte(1);
+        let cap = LaneStreamCap::new(4);
+        let semaphore = cap.semaphore(p1).await;
+        let base = cap.permit(p1).await.unwrap();
+        let grant = LaneGrant::new(Arc::clone(&semaphore), cap.n, base);
+        assert_eq!(
+            grant.grant(usize::MAX),
+            3,
+            "the base plus three free permits"
+        );
+        assert_eq!(semaphore.available_permits(), 0);
+        grant.release_one();
+        assert_eq!(semaphore.available_permits(), 1, "one stopped worker");
+        grant.release_one();
+        grant.release_one();
+        grant.release_one();
+        assert_eq!(semaphore.available_permits(), 4, "every worker stopped");
+        grant.release_one();
+        assert_eq!(
+            semaphore.available_permits(),
+            4,
+            "an extra release frees nothing"
         );
     }
 

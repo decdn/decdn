@@ -44,7 +44,7 @@ use decdn_client::driver::{DriveConfig, RangeLane, RangeSetOutcome, drive_range_
 use decdn_client::sink::PullReader;
 use decdn_client::source::{BlobSource as _, Funder, PrimedSource, SourceFuture};
 use decdn_client::{
-    BudgetPacer, ClientRangedStore, Cumulative, DownloadTarget, Downloader, LaneHandle,
+    BudgetPacer, ClientRangedStore, Cumulative, DownloadTarget, Downloader, LaneHandle, LaneLease,
     LaneLedgers, NoCache, PeerSource, PoolContext, PoolExhausted, PoolLedger, ProgressCallback,
     PullConfig, PullDeadlines, RetryDisposition, SharedPool, StreamCandidate, Streamer,
     UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
@@ -1049,15 +1049,63 @@ pub(crate) fn spawn_harvest(
     tokio::spawn(async move {
         let store = decdn_client::PeerStore::open(&dir);
         let cfg = decdn_client::StoreConfig::default();
-        let now = now_secs_cli();
-        for cand in &registry {
-            let _ = store.upsert_identity(cand, now);
-        }
-        for (id, rtt_ms, rate) in probed {
-            let _ = store.record_sample(&id, rtt_ms, rate, now, &cfg);
-        }
-        let _ = store.prune_and_cap(now, &cfg);
+        harvest(&store, &registry, probed, now_secs_cli(), &cfg);
     })
+}
+
+/// How many per-peer record writes one [`harvest`] made, and how many failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HarvestTally {
+    /// Identity and sample writes attempted.
+    writes: usize,
+    /// Of those, the writes the store refused.
+    failed: usize,
+}
+
+/// The body of [`spawn_harvest`]. Probe samples are the only input to the
+/// peer store's latency ranking, so a refused write is logged, not dropped:
+/// each one at `debug` with its peer, and once at `warn` when the store
+/// refuses every record write, because the ranking then stays frozen.
+fn harvest(
+    store: &decdn_client::PeerStore,
+    registry: &[NodeCandidate],
+    probed: Vec<(PublicKey, f64, u64)>,
+    now: u64,
+    cfg: &decdn_client::StoreConfig,
+) -> HarvestTally {
+    let mut tally = HarvestTally {
+        writes: 0,
+        failed: 0,
+    };
+    let mut file = |node_id: &PublicKey, what: &str, written: anyhow::Result<()>| {
+        tally.writes = tally.writes.saturating_add(1);
+        if let Err(e) = written {
+            tally.failed = tally.failed.saturating_add(1);
+            tracing::debug!(%node_id, "could not record {what} in the peer store: {e:#}");
+        }
+    };
+    for cand in registry {
+        file(
+            &cand.node_id,
+            "an identity",
+            store.upsert_identity(cand, now),
+        );
+    }
+    for (node_id, rtt_ms, rate) in probed {
+        let written = store.record_sample(&node_id, rtt_ms, rate, now, cfg);
+        file(&node_id, "a probe sample", written);
+    }
+    if let Err(e) = store.prune_and_cap(now, cfg) {
+        tracing::debug!("could not prune the peer store: {e:#}");
+    }
+    if tally.writes > 0 && tally.failed == tally.writes {
+        tracing::warn!(
+            writes = tally.writes,
+            "the peer store refused every write of this probe round; \
+             its latency ranking stays at its last state"
+        );
+    }
+    tally
 }
 
 /// Seconds since the Unix epoch, saturating to 0 on a clock before the epoch
@@ -2285,6 +2333,7 @@ struct WatchedLane<'p, 'a, P> {
     width: std::num::NonZeroUsize,
     takes_first: bool,
     grow: Option<decdn_client::LaneGrowth<'p>>,
+    release: Option<decdn_client::LaneRelease<'p>>,
 }
 
 /// Whether a failed drive counts against the peer in the peer store. Our own
@@ -2349,6 +2398,7 @@ where
                 width: l.width,
                 takes_first: l.takes_first,
                 grow: l.grow,
+                release: l.release,
             })
             .collect();
         let driven = Box::pin(drive_range_lanes(
@@ -2752,6 +2802,7 @@ where
         width: std::num::NonZeroUsize::MIN,
         takes_first: true,
         grow: None,
+        release: None,
     }];
     // A dropped drive records the ranges it landed and the vouchers it signed.
     let on_drop = SettleOnDrop::new(|| {
@@ -2869,6 +2920,9 @@ pub(crate) struct StripeLane<'s, 'a, P> {
     /// How the lane widens past `width` while the drive runs
     /// ([`decdn_client::LaneGrowth`]).
     pub(crate) grow: Option<decdn_client::LaneGrowth<'s>>,
+    /// What the lane gives back as each of its workers stops
+    /// ([`decdn_client::LaneRelease`]).
+    pub(crate) release: Option<decdn_client::LaneRelease<'s>>,
 }
 
 /// Whether a lane of a striped drive settles at its committed cumulative: it
@@ -2932,6 +2986,7 @@ where
             width: l.width,
             takes_first: l.takes_first,
             grow: l.grow,
+            release: l.release,
         })
         .collect();
     let pool = lead.prelude.pool_with(topups_used);
@@ -3680,11 +3735,13 @@ where
 /// Split each built [`MultiLane`] into the [`StreamCandidate`] a face owns (it
 /// takes the `PeerSource`) and the [`StreamLane`] watermark handle that outlives
 /// it (a clone of the same `ledger` Arc the fetch pays through), threading each
-/// candidate's measured coverage into the [`StreamCandidate`].
+/// candidate's measured coverage and its provider's lease (taken from `leases`)
+/// into the [`StreamCandidate`].
 fn split_face_lanes<'a>(
     lanes: Vec<MultiLane<'a>>,
     coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
     total_bytes: u64,
+    leases: &mut HashMap<Address, LaneLease>,
 ) -> (
     Vec<StreamCandidate<PrimedSource<PeerSource<'a>>>>,
     Vec<StreamLane>,
@@ -3706,6 +3763,7 @@ fn split_face_lanes<'a>(
             ledger: lane.ledger,
             coverage: Some(coverage),
             first_unit: lane.first_unit,
+            lease: leases.remove(&lane.provider).unwrap_or_default(),
         });
     }
     (candidates, handles)
@@ -3826,7 +3884,8 @@ where
         .await?;
         (lanes, total_bytes)
     };
-    let (stream_candidates, handles) = split_face_lanes(lanes, coverage_by_node, total_bytes);
+    let (stream_candidates, handles) =
+        split_face_lanes(lanes, coverage_by_node, total_bytes, &mut HashMap::new());
     // Keep the first lane's ctx to annotate an unbound-namespace cache miss on
     // failure, as the file path does.
     let first_ctx = stream_candidates.first().map(|c| Arc::clone(&c.ctx));
@@ -3943,6 +4002,7 @@ where
         progress,
         None,
         None,
+        HashMap::new(),
     )
     .await
 }
@@ -3968,6 +4028,9 @@ where
 /// watermark is persisted after — the face does not persist, so this thin CLI
 /// layer does. `open_lock` and `ledgers` thread `bundle pull`'s shared pool lock
 /// and ledger registry through; a solo `decdn fetch` passes `None`/`None`.
+/// `leases` holds what each provider's lane keeps while it takes work, keyed by
+/// provider: the lane drops it when it stops ([`LaneLease`]). A solo `decdn
+/// fetch` passes none.
 ///
 /// The fetch runs under the drive-level floor ([`drive_floor`]), judged on the
 /// position across every lane. A trip returns [`EntryStalled`], which is
@@ -3988,6 +4051,7 @@ pub(crate) async fn multi_source_download<P>(
     progress: Option<&ProgressCallback>,
     open_lock: Option<&tokio::sync::Mutex<()>>,
     ledgers: Option<&LaneLedgers>,
+    mut leases: HashMap<Address, LaneLease>,
 ) -> anyhow::Result<Option<u64>>
 where
     P: alloy::providers::Provider + Clone,
@@ -4042,7 +4106,10 @@ where
         probed
     };
 
-    let (stream_candidates, handles) = split_face_lanes(lanes, coverage_by_node, total_bytes);
+    let (stream_candidates, handles) =
+        split_face_lanes(lanes, coverage_by_node, total_bytes, &mut leases);
+    // A lease no built lane took (a holder that did not open) frees now.
+    drop(leases);
     // Keep the first lane's ctx to annotate an unbound-namespace cache miss on
     // failure.
     let first_ctx = stream_candidates.first().map(|c| Arc::clone(&c.ctx));
@@ -5260,6 +5327,25 @@ mod tests {
         let r = store.get(&harvest_key(1)).expect("probed peer persisted");
         assert_eq!(r.latency_ms, Some(42.0));
         assert_eq!(r.rate_per_mb, Some(9));
+    }
+
+    #[test]
+    fn harvest_counts_every_write_the_store_refuses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A file where the store's directory belongs makes every write fail.
+        std::fs::write(dir.path().join("peers"), b"").expect("block the store dir");
+        let store = decdn_client::PeerStore::open(dir.path());
+        let regs = vec![harvest_candidate(1), harvest_candidate(2)];
+        let probed = vec![(harvest_key(1), 42.0_f64, 9_u64)];
+        let cfg = decdn_client::StoreConfig::default();
+        let tally = harvest(&store, &regs, probed, now_secs_cli(), &cfg);
+        assert_eq!(
+            tally,
+            HarvestTally {
+                writes: 3,
+                failed: 3
+            }
+        );
     }
 
     /// `select_with_widening` re-runs unfiltered when a region allowlist filters

@@ -130,6 +130,21 @@ impl ThroughputFloor {
         }
     }
 
+    /// When the newest sample was taken, or `None` before the first. A gap to
+    /// `now` much longer than the sample period means the reader was not polled.
+    pub(crate) fn last_sampled_at(&self) -> Option<Instant> {
+        self.samples.back().map(|&(t, _)| t)
+    }
+
+    /// Bytes counted across the retained window: the newest sample less the
+    /// baseline.
+    pub(crate) fn window_bytes(&self) -> u64 {
+        match (self.samples.front(), self.samples.back()) {
+            (Some(&(_, first)), Some(&(_, last))) => last.saturating_sub(first),
+            _ => 0,
+        }
+    }
+
     /// Sample the counter and judge the trailing window. Returns [`FloorVerdict::Stalled`]
     /// only once the window is warm and the bytes across it fall below `floor_bps · window`
     /// (or below one byte when `floor_bps == 0`).

@@ -28,6 +28,12 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`decdn-client` lanes carry what they hold while they stream (#2208).**
+  `RangeLane` gains `release: Option<LaneRelease>`, which the range driver
+  calls as each gap worker stops. `StreamCandidate` gains `lease: LaneLease`
+  and `SourceLane` gains `lease: Option<&LaneLease>`; the scheduler drops the
+  lease when that lane's worker stops. A caller that builds these structs
+  sets the new field (`None`, or `LaneLease::default()`).
 - **`decdn-client` dials on a caller-chosen runtime (#2185).**
   `PeerSource::with_dial_runtime(Handle)` replaces `with_dial_observer`, and
   `DialObserver` is removed. `open_progressive_pull` and
@@ -832,6 +838,30 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **`bundle pull` holds a lane-stream permit only while that stream runs
+  (#2208).** A range-dedup entry held a permit on every candidate, reserve
+  and proxies included, for the whole entry, and a fan-out held one per
+  provider after its lane died. A proxy lane that needed width then ran one
+  stream at a time. Each drive pass now reserves a permit only for the
+  sessions it drives, and each lane gives a permit back as each of its
+  streams stops. A lane with no range left keeps one permit for one idle
+  stream.
+- **The multi-source unit watchdog counts verified bytes, not durable
+  checkpoints (#2209).** It judged progress by the store's missing-byte
+  count, which moves only per 4 MiB checkpoint, so a proxy warming a cold
+  miss in ~1 MB draws was killed inside the 10 s default deadline.
+  `--unit-deadline-ms` is now the longest gap between verified bytes.
+- **`bundle pull` samples probe candidates per entry (#2204).** One
+  `SELECT_K` sample served the whole run, so with more registered nodes than
+  `SELECT_K` some nodes reached no entry, even when they were an entry's only
+  nearby holders.
+- **`bundle pull` no longer counts re-fetched bytes as spliced (#2193).** A
+  failed donor's group-wide re-fetch can cover part of a neighbour that
+  spliced, and the summary's downloaded bytes read low by that overlap.
+- **A peer store that refuses writes is logged (#2203).** The probe-round
+  harvest dropped every write error, freezing the latency ranking without a
+  trace. Each refused write logs at `debug`, and a round whose every write
+  fails logs once at `warn`.
 - **A serve-miss starts its upstream pull without re-hashing held ranges
   outside the stream's own range (#2205).** Before it spawned the pull, every
   serve-miss stream seeded the shared outboard from all of the blob's held
@@ -2604,6 +2634,11 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Paid-leg diagnostics at `debug` (#2211).** Each paid leg's open logs its
+  peer, hash, `byte_offset` and `byte_len`. A throughput-floor trip logs the
+  range, bytes against expected, the window's bytes, and the gap since the
+  previous floor sample. An ingest wait of 1 s or more on a checkpoint slot
+  logs its length.
 - **`blockchain.get_logs_max_block_span` sets the ceiling on the block span of
   one chain-watcher `eth_getLogs` request** (default 10 000, must be > 0,
   restart-required). Set it to the RPC provider's range limit so the poller

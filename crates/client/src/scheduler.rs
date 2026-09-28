@@ -144,6 +144,53 @@ pub struct SourceLane<'a, S> {
     /// inside the still-missing request, sits inside this lane's coverage, and
     /// overlaps no earlier lane's reserved first unit.
     pub first_unit: Option<AlignedRange>,
+    /// What the lane holds while it takes work, released when its worker
+    /// stops ([`LaneLease`]), or `None`.
+    pub lease: Option<&'a LaneLease>,
+}
+
+/// A resource one source lane holds while it takes work, such as the caller's
+/// stream permit for the lane's provider. The scheduler drops it when the
+/// lane's worker stops — on a fault, on a drained queue, or when the fetch
+/// ends — so a dead lane holds nothing for the rest of the fetch. A lease is
+/// released once: a lane that takes part in a later fetch holds nothing.
+#[derive(Default)]
+pub struct LaneLease(Mutex<Option<Box<dyn Send + Sync>>>);
+
+impl LaneLease {
+    /// A lease that holds `held` until the lane's worker stops.
+    pub fn new(held: impl Send + Sync + 'static) -> Self {
+        Self(Mutex::new(Some(Box::new(held))))
+    }
+
+    /// Drop what the lease holds. A later call does nothing.
+    pub(crate) fn release(&self) {
+        let held = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(held);
+    }
+}
+
+/// Releases a lane's [`LaneLease`] when it drops: at the end of the lane's
+/// worker future, whether that future finished or was dropped unfinished.
+struct ReleaseOnDrop<'a>(Option<&'a LaneLease>);
+
+impl Drop for ReleaseOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(lease) = self.0 {
+            lease.release();
+        }
+    }
+}
+
+impl std::fmt::Debug for LaneLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held = self.0.lock().is_ok_and(|held| held.is_some());
+        f.debug_struct("LaneLease").field("held", &held).finish()
+    }
 }
 
 impl<S> std::fmt::Debug for SourceLane<'_, S> {
@@ -215,8 +262,8 @@ struct RunSeed {
 
 /// Bytes of `[start, start+len)` the store still misses — this worker's range is
 /// disjoint from every peer's, so this reflects only its own delivery frontier.
-/// An error reads as "no observable progress" (`u64::MAX`), which trips the
-/// watchdog and drops the source — the safe direction.
+/// An error reads as bytes still missing, so a source that also sent no
+/// verified byte still trips.
 async fn missing_bytes<St>(store: &St, start: u64, len: u64) -> u64
 where
     St: IngestStore,
@@ -231,41 +278,41 @@ where
 }
 
 /// Progress-relative stall watchdog: resolve (trip) once a full `deadline`
-/// window passes with the store's missing count over `[start, len)` neither
-/// shrinking nor reaching zero — i.e. no verified progress and not yet done. A
-/// source that keeps delivering, however slowly, resets the window each sample
-/// and never trips; a source that has fully delivered (missing == 0) is left to
-/// `fill_gap`'s own completion, never tripped. A zero deadline disables the
+/// window passes with `verified` unchanged while the store still misses bytes
+/// of `[start, len)` — i.e. no verified progress and not yet done. `verified`
+/// is the unit's verified-byte counter, which every bao-verified leaf advances
+/// as it lands, before the store's 4 MiB checkpoint makes it durable. The
+/// watchdog samples the counter once per window, so a source that verifies at
+/// least one byte in every window, however slowly or in however small paced
+/// draws, never trips; a range the store holds in full (missing == 0) is left
+/// to `fill_gap`'s own completion, never tripped. A zero deadline disables the
 /// watchdog.
 ///
-/// `missing_bytes` progress is checkpoint-granular — it advances only every 4
-/// MiB `INGEST_CHECKPOINT_BYTES` interval, when the fsync that covers that
-/// batch lands — so `unit_deadline` must sit comfortably above
-/// `4 MiB / min-expected-throughput` plus two fsyncs' disk latency (the fsync
-/// in progress when the batch queues, then the one that covers it), to avoid
-/// falsely reassigning a healthy-but-slow source mid-checkpoint.
-async fn watchdog<St>(store: &St, start: u64, len: u64, deadline: Duration)
+/// A gap between verified bytes shorter than `unit_deadline`, time to first
+/// byte on any open included, thus never trips it; a source that stops trips
+/// it within one to two deadlines.
+async fn watchdog<St>(store: &St, start: u64, len: u64, deadline: Duration, verified: &AtomicU64)
 where
     St: IngestStore,
 {
     if deadline.is_zero() {
         std::future::pending::<()>().await;
     }
-    let mut prev = missing_bytes(store, start, len).await;
+    let mut prev = verified.load(Ordering::Relaxed);
     loop {
         tokio::time::sleep(deadline).await;
-        let now = missing_bytes(store, start, len).await;
-        if now == 0 {
-            // Delivered in full; `fill_gap` will finish paying and return
-            // `Completed`. Keep waiting rather than tripping a done range.
+        let now = verified.load(Ordering::Relaxed);
+        if now != prev {
             prev = now;
             continue;
         }
-        if now >= prev {
-            // A whole window with no shrink and bytes still missing: a stall.
-            return;
+        if missing_bytes(store, start, len).await == 0 {
+            // Delivered in full; `fill_gap` will finish paying and return
+            // `Completed`. Keep waiting rather than tripping a done range.
+            continue;
         }
-        prev = now;
+        // A whole window with no verified byte and bytes still missing: a stall.
+        return;
     }
 }
 
@@ -284,8 +331,9 @@ enum UnitOutcome {
     /// `fill_gap` error, `None` for a watchdog stall, which has no error by
     /// construction. Dropping it would leave a failed fetch describable only as
     /// "all sources failed", with the node-specific refusal, transport reset, or
-    /// bao mismatch that actually ended it unrecoverable — the CLI installs no
-    /// tracing subscriber, so an unreturned error is a destroyed one.
+    /// bao mismatch that actually ended it unrecoverable — the CLI installs a
+    /// tracing subscriber only on request (`-v`, `--log-level`, `RUST_LOG`), so
+    /// by default an unreturned error is a destroyed one.
     Faulted(Option<anyhow::Error>),
 }
 
@@ -834,6 +882,7 @@ where
         // `requeue_missing` (which recomputes the whole range's remainder) agree.
         let mut terminal: Option<UnitOutcome> = None;
         for (g_start, g_len) in gaps {
+            let verified = AtomicU64::new(0);
             let outcome = {
                 let fill = fill_gap(
                     store,
@@ -852,6 +901,8 @@ where
                     // The shared whole-blob delivered counter: every lane folds its
                     // own leg deltas in, so the bar reads one monotonic position.
                     Some(progress_agg),
+                    // This unit's verified bytes, which the watchdog judges.
+                    Some(&verified),
                     // Consumption pacing (#1848): with a `WindowPacer`, gate this
                     // lane against the shared consumer cursor so it never runs more
                     // than one read-ahead window ahead of what the consumer read.
@@ -910,7 +961,7 @@ where
                     ), if pacing.is_some() => UnitOutcome::Cancelled,
                     // A watchdog trip carries no error by construction — the
                     // source simply stopped making verified progress.
-                    () = watchdog(store, g_start, g_len, unit_deadline) => {
+                    () = watchdog(store, g_start, g_len, unit_deadline, &verified) => {
                         UnitOutcome::Faulted(None)
                     }
                 }
@@ -1371,7 +1422,7 @@ where
     }
 
     let workers = lanes.iter().enumerate().map(|(i, lane)| {
-        run_worker(
+        let worker = run_worker(
             i,
             store,
             lane.source,
@@ -1391,7 +1442,14 @@ where
             &pool,
             &lane_coverage,
             pacing,
-        )
+        );
+        // Moved into the worker's future, so the lease is released when the
+        // worker stops and also when a `stop` drops the future unfinished.
+        let release = ReleaseOnDrop(lane.lease);
+        async move {
+            let _release = release;
+            worker.await
+        }
     });
     // Drive every worker to completion while a single periodic tick flushes the
     // `.ranges` present record (spec §5.5). The workers are the sole work drivers
@@ -1551,6 +1609,7 @@ mod tests {
             ledger,
             coverage,
             first_unit: None,
+            lease: None,
         }
     }
 
@@ -1601,6 +1660,7 @@ mod tests {
                 ledger: Arc::clone(&ledger_a),
                 coverage: full.clone(),
                 first_unit: None,
+                lease: None,
             },
             SourceLane {
                 source: &src_b,
@@ -1608,6 +1668,7 @@ mod tests {
                 ledger: Arc::clone(&ledger_b),
                 coverage: full,
                 first_unit: Some(unit.clone()),
+                lease: None,
             },
         ];
         multi_source_fetch(
@@ -2386,6 +2447,194 @@ mod tests {
         Ok(())
     }
 
+    /// A lane whose paced draws leave gaps shorter than the unit deadline, and
+    /// that reports no progress callback, is never reassigned: the watchdog
+    /// judges the verified bytes `fill_gap` counts as each leaf lands, not the
+    /// store's 4 MiB checkpoints (#2209). Each wait here (the first read, then a
+    /// pause after 1 MiB) is half the deadline, and the first watchdog sample
+    /// falls while bytes are still missing.
+    #[tokio::test]
+    async fn a_lane_pausing_under_the_deadline_is_not_reassigned() -> anyhow::Result<()> {
+        let deadline = Duration::from_millis(500);
+        let data = blob(16 * 1024 * 1024);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src = ScriptedSource::new(data.clone())?
+            .slow_to_start(deadline / 2)
+            .stall_after(1024 * 1024, deadline / 2)
+            .paying(Arc::clone(&ledger));
+        let root = src.root();
+        let total = src.total_bytes();
+        let (store, dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+        let lanes = vec![lane(&src, Arc::clone(&ledger), 0xA1)];
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: deadline,
+            },
+            None,
+            None,
+            None,
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        Ok(())
+    }
+
+    /// Stamps the moment it drops, so a test can see when a lane let go of it.
+    struct DropStamp(Arc<Mutex<Option<std::time::Instant>>>);
+
+    impl Drop for DropStamp {
+        fn drop(&mut self) {
+            if let Ok(mut at) = self.0.lock() {
+                *at = Some(std::time::Instant::now());
+            }
+        }
+    }
+
+    /// A lane that faults drops its lease as its worker stops, while the other
+    /// lane still fetches the reassigned tail, so what the lease holds (a
+    /// caller's stream permit) frees before the fetch returns.
+    #[tokio::test]
+    async fn a_faulted_lane_drops_its_lease_before_the_fetch_ends() -> anyhow::Result<()> {
+        let data = blob(64 * 1024 * 1024);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(data.clone())?
+            .with_fault_after(1024 * 1024, || anyhow::anyhow!("scripted fault"))
+            .paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let total = src_a.total_bytes();
+        let (store, _dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+        let dropped_a = Arc::new(Mutex::new(None));
+        let dropped_b = Arc::new(Mutex::new(None));
+        let lease_a = super::LaneLease::new(DropStamp(Arc::clone(&dropped_a)));
+        let lease_b = super::LaneLease::new(DropStamp(Arc::clone(&dropped_b)));
+        let mut lanes = vec![
+            lane(&src_a, Arc::clone(&ledger_a), 0xA1),
+            lane(&src_b, Arc::clone(&ledger_b), 0xB2),
+        ];
+        for (l, lease) in lanes.iter_mut().zip([&lease_a, &lease_b]) {
+            l.lease = Some(lease);
+        }
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: Duration::from_secs(10),
+            },
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let ended = std::time::Instant::now();
+        let at_a = dropped_a
+            .lock()
+            .expect("stamp lock")
+            .expect("lane a let go");
+        let at_b = dropped_b
+            .lock()
+            .expect("stamp lock")
+            .expect("lane b let go");
+        assert!(
+            at_a <= at_b,
+            "the faulted lane lets go before the lane that finished"
+        );
+        assert!(at_b <= ended, "both lanes let go before the fetch returns");
+        assert!(
+            src_b.delivered_bytes() > src_a.delivered_bytes(),
+            "lane b fetched the reassigned tail after lane a faulted"
+        );
+        Ok(())
+    }
+
+    /// A fetch that `stop` ends drops each lane's unfinished worker, and the
+    /// lane's lease is released with it rather than left held for the caller.
+    #[tokio::test]
+    async fn a_stopped_fetch_releases_every_lease() -> anyhow::Result<()> {
+        let data = blob(8 * 1024 * 1024);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src = ScriptedSource::new(data)?
+            .stall_after(0, Duration::from_hours(1))
+            .paying(Arc::clone(&ledger));
+        let root = src.root();
+        let total = src.total_bytes();
+        let (store, _dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+        let dropped = Arc::new(Mutex::new(None));
+        let lease = super::LaneLease::new(DropStamp(Arc::clone(&dropped)));
+        let mut lanes = vec![lane(&src, Arc::clone(&ledger), 0xA1)];
+        if let Some(l) = lanes.first_mut() {
+            l.lease = Some(&lease);
+        }
+        let stopped = multi_source_fetch_until(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: Duration::ZERO,
+            },
+            None,
+            None,
+            None,
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                anyhow::anyhow!("stopped")
+            },
+        )
+        .await;
+        assert!(stopped.is_err(), "the stop ends the fetch");
+        assert!(
+            dropped.lock().expect("stamp lock").is_some(),
+            "the stopped lane's lease is released"
+        );
+        drop(lanes);
+        Ok(())
+    }
+
     /// Focused [`Work::retire`] fault coverage (#1506): the anti-hang prune, on
     /// the state directly rather than through a whole fetch.
     ///
@@ -2941,6 +3190,7 @@ mod tests {
                 ledger: Arc::clone(&ledger_a),
                 coverage: full.clone(),
                 first_unit: None,
+                lease: None,
             },
             SourceLane {
                 source: &src_b,
@@ -2948,6 +3198,7 @@ mod tests {
                 ledger: Arc::clone(&ledger_b),
                 coverage: full,
                 first_unit: None,
+                lease: None,
             },
         ];
         let result = tokio::time::timeout(
@@ -3085,6 +3336,7 @@ mod tests {
                 ledger: Arc::clone(&handle_a.ledger),
                 coverage: full.clone(),
                 first_unit: None,
+                lease: None,
             },
             SourceLane {
                 source: &src_b,
@@ -3092,6 +3344,7 @@ mod tests {
                 ledger: Arc::clone(&handle_b.ledger),
                 coverage: full,
                 first_unit: None,
+                lease: None,
             },
         ];
         let result = tokio::time::timeout(
@@ -3291,6 +3544,7 @@ mod tests {
                 ledger: Arc::clone(&ledger_a),
                 coverage: full.clone(),
                 first_unit: None,
+                lease: None,
             },
             SourceLane {
                 source: &src_b,
@@ -3298,6 +3552,7 @@ mod tests {
                 ledger: Arc::clone(&ledger_b),
                 coverage: full,
                 first_unit: None,
+                lease: None,
             },
         ];
         multi_source_fetch(
@@ -3425,6 +3680,7 @@ mod tests {
                 ledger: Arc::clone(&ledger_a),
                 coverage: full.clone(),
                 first_unit: None,
+                lease: None,
             },
             SourceLane {
                 source: &src_b,
@@ -3432,6 +3688,7 @@ mod tests {
                 ledger: Arc::clone(&ledger_b),
                 coverage: full,
                 first_unit: None,
+                lease: None,
             },
         ];
         let result = tokio::time::timeout(
@@ -3612,27 +3869,56 @@ mod tests {
         }
     }
 
-    /// How long `watchdog` takes to trip against a scripted progress history, or
-    /// `None` if it does not trip within an hour of virtual time.
-    async fn watchdog_trips(script: &[u64], deadline: Duration) -> bool {
-        let store = ScriptedMissing::new(64 * 1024 * 1024, script);
-        tokio::time::timeout(
-            Duration::from_hours(1),
-            super::watchdog(&store, 0, 64 * 1024 * 1024, deadline),
-        )
-        .await
-        .is_ok()
+    /// Whether `watchdog` trips within an hour of virtual time. `missing` scripts
+    /// the store's still-missing counts; `verified(k)` is the unit's verified-byte
+    /// counter during window `k`, set halfway into that window.
+    async fn watchdog_trips(
+        missing: &[u64],
+        verified: impl Fn(u64) -> u64,
+        deadline: Duration,
+    ) -> bool {
+        let store = ScriptedMissing::new(64 * 1024 * 1024, missing);
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let feed = async {
+            if deadline.is_zero() {
+                return std::future::pending().await;
+            }
+            tokio::time::sleep(deadline / 2).await;
+            for k in 0u64.. {
+                counter.store(verified(k), std::sync::atomic::Ordering::Relaxed);
+                tokio::time::sleep(deadline).await;
+            }
+        };
+        let raced = async {
+            tokio::select! {
+                () = super::watchdog(&store, 0, 64 * 1024 * 1024, deadline, &counter) => true,
+                () = feed => false,
+            }
+        };
+        tokio::time::timeout(Duration::from_hours(1), raced)
+            .await
+            .unwrap_or(false)
     }
 
-    /// A full window with bytes still missing and the count NOT shrinking is the
+    /// A full window with bytes still missing and no verified byte is the
     /// definition of a stall — the watchdog trips and the worker's range is
-    /// reassigned. Flip the comparison to `now > prev` and a wedged source is
-    /// never reassigned: the fetch hangs to the outer cap.
+    /// reassigned. Without the trip a wedged source is never reassigned: the
+    /// fetch hangs to the outer cap.
     #[tokio::test(start_paused = true)]
-    async fn watchdog_trips_when_missing_stops_shrinking() {
+    async fn watchdog_trips_when_no_verified_byte_lands() {
         assert!(
-            watchdog_trips(&[8192, 8192], Duration::from_secs(10)).await,
-            "no progress across a full window must trip the watchdog"
+            watchdog_trips(&[8192], |_| 0, Duration::from_secs(10)).await,
+            "no verified byte across a full window must trip the watchdog"
+        );
+    }
+
+    /// A source that verified bytes and then stops is a stall from the first
+    /// window without a verified byte.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_trips_when_verified_bytes_stop() {
+        assert!(
+            watchdog_trips(&[8192], |k| k.min(3) * 1024, Duration::from_secs(10)).await,
+            "a source that stops verifying bytes must trip the watchdog"
         );
     }
 
@@ -3643,24 +3929,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn watchdog_never_trips_a_fully_delivered_range() {
         assert!(
-            !watchdog_trips(&[8192, 0], Duration::from_secs(10)).await,
+            !watchdog_trips(&[0], |_| 0, Duration::from_secs(10)).await,
             "a delivered range must never be tripped while it finishes paying"
         );
     }
 
-    /// A source that keeps delivering, however slowly, resets the window at each
-    /// sample and is never reassigned. Without the reset, a healthy-but-slow
-    /// source is falsely reassigned mid-checkpoint — and the new lane re-pays the
-    /// credit-window tail.
+    /// A source that keeps verifying bytes resets the window at each sample, even
+    /// when it lands less than one 4 MiB ingest checkpoint per window, so the
+    /// store's missing count never moves. This is a proxy's two-leg cold start:
+    /// paced ~1 MB draws while its own upstream pull ramps up (#2209).
     #[tokio::test(start_paused = true)]
-    async fn watchdog_window_resets_while_missing_shrinks() {
+    async fn watchdog_window_resets_on_verified_bytes_below_a_checkpoint() {
         assert!(
-            !watchdog_trips(
-                &[8192, 7168, 6144, 5120, 4096, 3072, 2048, 1024, 0],
-                Duration::from_secs(10)
-            )
-            .await,
-            "shrinking missing bytes must reset the window, never trip"
+            !watchdog_trips(&[8192], |k| (k + 1) * 1024 * 1024, Duration::from_secs(10)).await,
+            "verified bytes must reset the window before any checkpoint lands"
         );
     }
 
@@ -3669,7 +3951,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn watchdog_zero_deadline_never_trips() {
         assert!(
-            !watchdog_trips(&[8192, 8192], Duration::ZERO).await,
+            !watchdog_trips(&[8192], |_| 0, Duration::ZERO).await,
             "a zero unit deadline must disable the watchdog"
         );
     }
