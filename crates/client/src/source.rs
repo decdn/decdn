@@ -485,6 +485,15 @@ impl BlobSource for PeerSource<'_> {
         range: AlignedRange,
     ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
         Box::pin(async move {
+            // One line per paid leg, so a stalled leg can be matched to the
+            // node's own serve of the same range (#2211).
+            tracing::debug!(
+                peer = %self.target.id,
+                hash = %blake3::Hash::from_bytes(hash).to_hex(),
+                byte_offset = range.fetch_start(),
+                byte_len = range.fetch_len(),
+                "opening a paid leg"
+            );
             let (header, pull) = self
                 .open_pull(hash, range.fetch_start(), range.fetch_len())
                 .await?;

@@ -40,6 +40,10 @@ use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, RangedFuture, RangedStore, 
 
 use crate::sink::{StashedFault, classify_decode_error};
 
+/// A checkpoint-slot wait at least this long is logged at `debug`: ingest does
+/// not read its stream while it waits (#2211).
+const CHECKPOINT_WAIT_LOG_FLOOR: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Client-side [`RangedStore`]: a `.partial` data file, a `.partial.obao4`
 /// pre-order outboard, and a persisted `.partial.ranges` present-range
 /// record, all for one blob `(root, total_bytes)`.
@@ -877,10 +881,21 @@ impl IngestFlusher {
     ///
     /// The worker's own error (or panic) when a checkpoint failed.
     async fn start(&mut self, batch: FlushBatch, received_end: u64) -> anyhow::Result<()> {
+        let waiting_since = tokio::time::Instant::now();
         let slot = Arc::clone(&self.slots)
             .acquire_owned()
             .await
             .map_err(|e| anyhow::anyhow!("ingest checkpoint slots closed: {e}"))?;
+        // While ingest waits here, its stream is not read, and the pull's
+        // throughput floor still counts the time (#2211).
+        let waited = waiting_since.elapsed();
+        if waited >= CHECKPOINT_WAIT_LOG_FLOOR {
+            tracing::debug!(
+                received_end,
+                waited_ms = waited.as_millis(),
+                "ingest waited on a checkpoint slot"
+            );
+        }
         let start_worker = {
             let mut state = self.pipeline.lock_state()?;
             if state.failed {

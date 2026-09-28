@@ -2754,6 +2754,11 @@ pub struct UpstreamPull {
     /// (`AmountRegression`).
     ledger: Arc<PoolLedger>,
     hash: [u8; 32],
+    /// The requested content range's start, kept for the stall diagnostics.
+    byte_offset: u64,
+    /// The requested content range's length (`0` = to the end), kept for the
+    /// stall diagnostics.
+    byte_len: u64,
     rate_per_mb: u64,
     /// This stream's chain anchor — which epoch it has told the upstream about.
     meter: StreamMeter,
@@ -3080,6 +3085,8 @@ async fn open_progressive_pull_impl(
             ctx: ctx.clone(),
             ledger,
             hash,
+            byte_offset,
+            byte_len,
             rate_per_mb,
             meter: StreamMeter::default(),
             expected_wire_bytes,
@@ -3164,9 +3171,24 @@ impl UpstreamPull {
                 biased;
                 r = &mut read => return r,
                 _ = sampler.tick() => {
-                    if let progress::FloorVerdict::Stalled =
-                        floor.evaluate(tokio::time::Instant::now())
-                    {
+                    let now = tokio::time::Instant::now();
+                    let last_sample = floor.last_sampled_at();
+                    if let progress::FloorVerdict::Stalled = floor.evaluate(now) {
+                        // What tells a quiet peer from a reader that was not
+                        // polled (#2211): the gap since the previous sample.
+                        tracing::debug!(
+                            peer = %self.conn.remote_id(),
+                            hash = %blake3::Hash::from_bytes(self.hash).to_hex(),
+                            byte_offset = self.byte_offset,
+                            byte_len = self.byte_len,
+                            cumulative,
+                            expected_wire_bytes = self.expected_wire_bytes,
+                            window_bytes = floor.window_bytes(),
+                            unpolled_ms = last_sample
+                                .map(|t| now.saturating_duration_since(t).as_millis()),
+                            window_ms = window.as_millis(),
+                            "upstream pull fell under its throughput floor"
+                        );
                         return Err(if cumulative == 0 {
                             anyhow::Error::new(PullTimeout { after: window })
                         } else {

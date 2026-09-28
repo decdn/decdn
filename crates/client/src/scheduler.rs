@@ -283,8 +283,9 @@ enum UnitOutcome {
     /// `fill_gap` error, `None` for a watchdog stall, which has no error by
     /// construction. Dropping it would leave a failed fetch describable only as
     /// "all sources failed", with the node-specific refusal, transport reset, or
-    /// bao mismatch that actually ended it unrecoverable — the CLI installs no
-    /// tracing subscriber, so an unreturned error is a destroyed one.
+    /// bao mismatch that actually ended it unrecoverable — the CLI installs a
+    /// tracing subscriber only on request (`-v`, `--log-level`, `RUST_LOG`), so
+    /// by default an unreturned error is a destroyed one.
     Faulted(Option<anyhow::Error>),
 }
 
