@@ -1796,7 +1796,7 @@ pub(crate) struct LaneStreamCap {
 
 impl LaneStreamCap {
     /// A cap admitting `n` concurrent streams per provider (clamped to at least 1).
-    fn new(n: usize) -> Self {
+    pub(crate) fn new(n: usize) -> Self {
         Self {
             map: tokio::sync::Mutex::new(HashMap::new()),
             n: n.max(1),
@@ -1815,15 +1815,22 @@ impl LaneStreamCap {
     /// Acquire one stream permit for `provider`, held until the returned permit
     /// drops. At `n == 1` a second concurrent caller for the same provider waits
     /// here until the first releases.
-    pub(crate) async fn permit(
-        &self,
-        provider: Address,
-    ) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+    async fn permit(&self, provider: Address) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
         self.semaphore(provider)
             .await
             .acquire_owned()
             .await
             .map_err(|_| anyhow!("bundle pull lane-stream cap closed"))
+    }
+
+    /// One stream permit for `provider` if one is free now, else `None`. It
+    /// never waits, so a caller that already holds another provider's permit
+    /// cannot deadlock against a sibling that holds this one.
+    pub(crate) async fn try_permit(
+        &self,
+        provider: Address,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.semaphore(provider).await.try_acquire_owned().ok()
     }
 }
 
@@ -2035,7 +2042,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let admitted = discovery::admit_sources(order.candidates.clone(), self.common.max_sources);
         if admitted.len() < 2 {
             tracing::info!(
-                "multi-source: not engaging — {} operator-distinct holder(s) among {} \
+                "multi-source: not engaging: {} operator-distinct holder(s) among {} \
                  candidate(s), and fan-out needs two",
                 admitted.len(),
                 order.candidates.len()

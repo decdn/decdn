@@ -679,12 +679,6 @@ pub struct Probed {
     pub candidate: NodeCandidate,
     /// Round-trip time measured by the probe, in milliseconds.
     pub rtt_ms: f64,
-    /// The blob size the node reported, when it knew it. UNSIGNED and outside
-    /// `slash_sig` (ADR 005 §`cdn/probe/v1`), so it is a hint for sizing
-    /// decisions only — never for anything a lying node could profit from. It
-    /// spares the multi-source engagement gate a throwaway header open just to
-    /// learn whether the blob clears the fan-out floor.
-    pub total_bytes: Option<u64>,
     /// Which discovery blocks this holder answered `has_blob:true` for
     /// (`decdn_protocol::coverage`), taken from the probe's `ProbeResponseExt`.
     /// Unsigned, like `total_bytes` — a hint for the scheduler's segment
@@ -1260,13 +1254,11 @@ mod tests {
             Probed {
                 candidate: op1.clone(),
                 rtt_ms: 10.0,
-                total_bytes: Some(128 * 1024 * 1024),
                 coverage: Coverage::from_block_indices(2, [0].into_iter()),
             },
             Probed {
                 candidate: op2.clone(),
                 rtt_ms: 12.0,
-                total_bytes: Some(128 * 1024 * 1024),
                 coverage: Coverage::from_block_indices(2, [1].into_iter()),
             },
         ];

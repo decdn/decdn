@@ -12,7 +12,7 @@
 //! |---|---|
 //! | Save one blob, or a set of blobs, to files as fast as possible, and resume a partial download | [`Downloader`] |
 //! | Read one blob in order, and pay only for what your reader reaches | [`Streamer`] |
-//! | Drive the pull loop yourself (a node, or a custom scheduler) | [`driver::drive`], [`acquire`], [`first_open()`],[`open_progressive_pull`] |
+//! | Drive the pull loop yourself (a node, or a custom scheduler) | [`driver::drive`], [`acquire`], [`first_open()`], [`open_progressive_pull`] |
 //!
 //! Most callers want one of the two faces. The [`Downloader`] stripes a blob
 //! across every holder at once, and writes each verified range at its offset in
@@ -40,8 +40,9 @@
 //!    ([`discovery::select_candidates`]), and probe each one
 //!    ([`probe::probe_once`]). Verify every answer
 //!    ([`probe::verify_probe_response`]) before it counts, and drop an answer
-//!    whose `has_blob` and coverage disagree. A verified answer also gives the
-//!    blob's size.
+//!    whose `has_blob` and coverage disagree. The blob's size comes from a
+//!    source's signed stream header, never from a probe answer: open one pull
+//!    and read it ([`first_open()`] does this with recovery).
 //! 5. **Build one lane per holder.** Pin a [`PoolContext`] to the holder's
 //!    provider address with [`buyer_pool::self_owned_lane_ctx`], resuming at
 //!    what the lane has already paid. Create its ledger with
@@ -250,7 +251,7 @@ pub use source_set::{
     Holder, NoAffordableSource, NoSourceAgreesOnSize, NoSourceHasBlob, SourceProvider, SourceSet,
     StaticSources,
 };
-pub use stop::{GaveUp, ProgressClock, SCRIPT_GIVE_UP, StopPolicy};
+pub use stop::{ClockHold, GaveUp, ProgressClock, SCRIPT_GIVE_UP, StopPolicy};
 pub use streamer::{
     LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader, stream_first_unit,
 };

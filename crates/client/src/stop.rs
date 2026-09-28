@@ -5,6 +5,7 @@
 //! the human watches the bar and presses Ctrl-C. A script gets
 //! [`SCRIPT_GIVE_UP`]. `--give-up-after` overrides both.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use tokio::time::{Duration, Instant};
@@ -13,9 +14,14 @@ use tokio::time::{Duration, Instant};
 pub const SCRIPT_GIVE_UP: Duration = Duration::from_mins(10);
 
 /// The instant of the command's last verified byte.
+///
+/// A [`ClockHold`] stops the clock: while any hold is alive the command counts
+/// as making progress, for time spent waiting on the command's own consumer
+/// rather than on a source.
 #[derive(Debug)]
 pub struct ProgressClock {
     last: Mutex<Instant>,
+    holds: AtomicUsize,
 }
 
 impl ProgressClock {
@@ -24,6 +30,7 @@ impl ProgressClock {
     pub fn new() -> Self {
         Self {
             last: Mutex::new(Instant::now()),
+            holds: AtomicUsize::new(0),
         }
     }
 
@@ -32,10 +39,32 @@ impl ProgressClock {
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
     }
 
-    /// The instant of the last verified byte.
+    /// The instant of the last verified byte, or now while a hold is alive.
     #[must_use]
     pub fn last(&self) -> Instant {
+        if self.holds.load(Ordering::Acquire) > 0 {
+            return Instant::now();
+        }
         *self.last.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Stop the clock until the returned hold drops. The drop counts as
+    /// progress, so the no-progress limit restarts from it.
+    #[must_use]
+    pub fn hold(&self) -> ClockHold<'_> {
+        self.holds.fetch_add(1, Ordering::AcqRel);
+        ClockHold(self)
+    }
+}
+
+/// Stops a [`ProgressClock`] while it lives. See [`ProgressClock::hold`].
+#[derive(Debug)]
+pub struct ClockHold<'a>(&'a ProgressClock);
+
+impl Drop for ClockHold<'_> {
+    fn drop(&mut self) {
+        self.0.tick();
+        self.0.holds.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -152,6 +181,21 @@ mod tests {
         };
         let ((), gave_up) = tokio::join!(ticker, policy.expired());
         assert_eq!(Instant::now() - start, Duration::from_secs(110));
+        assert_eq!(gave_up.idle, Duration::from_mins(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hold_stops_the_clock_and_its_drop_restarts_the_limit() {
+        let clock = Arc::new(ProgressClock::new());
+        let policy = StopPolicy::new(false, Some(Duration::from_mins(1)), Arc::clone(&clock));
+        let start = Instant::now();
+        let holder = async {
+            let hold = clock.hold();
+            tokio::time::sleep(Duration::from_mins(5)).await;
+            drop(hold);
+        };
+        let ((), gave_up) = tokio::join!(holder, policy.expired());
+        assert_eq!(Instant::now() - start, Duration::from_mins(6));
         assert_eq!(gave_up.idle, Duration::from_mins(1));
     }
 

@@ -35,6 +35,12 @@ use crate::streamer::StreamCandidate;
 /// cools down. An answer counts as progress: it clears the source's absent
 /// mark and ticks the stop policy's clock.
 ///
+/// The open runs no reactive top-up. A header-only open pays nothing, so a
+/// source refusing it for the deposit (`InsufficientDeposit`) is parked until
+/// the deposit rises. The pool is funded where the caller's `connect` builds
+/// the lane (the CLI's `open_or_reuse_pool` refills it below its low-water
+/// mark), and by the [`crate::acquire`] that follows.
+///
 /// # Errors
 ///
 /// - a fatal fault ([`crate::Fault::Fatal`]) `open` returned, verbatim;

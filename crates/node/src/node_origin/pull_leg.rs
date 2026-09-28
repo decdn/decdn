@@ -53,8 +53,8 @@ use decdn_client::sink::PullReader;
 use decdn_client::source::{BlobSource as _, Funder, SourceFuture};
 use decdn_client::{
     CoveredRun, DownstreamFrontier, Fault, HashMismatch as ClientPullHashMismatch, LegNoProgress,
-    PacingWait, PeerSource, PoolLedger, PrimedSource, RampPacer, SharedPool, UpstreamPullHeader,
-    WaitReason, classify, drive, first_leg,
+    PacingWait, PeerSource, PoolExhausted, PoolLedger, PrimedSource, RampPacer, SharedPool,
+    UpstreamPullHeader, WaitReason, classify, drive, first_leg,
 };
 use decdn_incentive::DepositOutcome;
 
@@ -850,13 +850,13 @@ fn handshake_verdict(
 /// paid frontier, not on the run, and a later run's lane still `Wait`s on the same
 /// frontier the earlier one did.
 ///
-/// A run whose `drive` returns a source fault ([`decdn_client::classify`] other
-/// than `Fatal` or `Unaffordable`) drops that source and re-plans the
-/// still-missing remainder against the survivors — the loop-level reassign-only
-/// tail. The store keeps the verified bytes, so the replacement lane resumes at
-/// the gap and re-pays nothing (#1682). A fatal or unaffordable fault (a voucher
-/// rejection, an origin blacklist, an over-cap blob, the shared pool running
-/// dry) ends the whole assembly. The assembly also ends `Unavailable`
+/// A run whose `drive` returns a fault that does not end the assembly
+/// ([`ends_the_assembly`]) drops that source and re-plans the still-missing
+/// remainder against the survivors — the loop-level reassign-only tail. The
+/// store keeps the verified bytes, so the replacement lane resumes at the gap
+/// and re-pays nothing (#1682). A fatal fault or a dry shared pool (a voucher
+/// rejection, an origin blacklist, an over-cap blob, [`PoolExhausted`]) ends
+/// the whole assembly. The assembly also ends `Unavailable`
 /// when every covering candidate faulted, when a round made no progress, when the
 /// reassign budget ran out, or when no surviving candidate covers a still-missing
 /// range ([`super::ranged_pull::UnavailableCause`]). The serve leg refuses before
@@ -1472,18 +1472,31 @@ impl PeerRunSink<'_> {
                         &err,
                     );
                 }
-                // A fatal fault (voucher rejection, origin blacklist, over-cap
-                // blob) cannot be fixed by another lane, and an unaffordable one
-                // cannot either: the node's one shared pool funds every holder,
-                // so once it is dry no holder can be paid. Anything else is a
-                // property of THIS source's delivery — drop it and re-plan.
-                if matches!(classify(&err), Fault::Fatal(_) | Fault::Unaffordable) {
+                if ends_the_assembly(&err) {
                     RunOutcome::Terminal(FillError::new(format!("{err:#}")))
                 } else {
                     RunOutcome::Reassign
                 }
             }
         }
+    }
+}
+
+/// Whether a run's fault ends the whole assembly rather than moving its range
+/// to another holder.
+///
+/// A fatal fault ([`classify`]: a voucher rejection, an origin blacklist, an
+/// over-cap blob, a local fault) cannot be fixed by another lane. Nor can the
+/// pacer's [`PoolExhausted`]: the node's one shared pool funds every holder, so
+/// once it is dry no holder can be paid. An open-time `InsufficientDeposit` is
+/// this holder's reservation floor outrunning the pool, and a different holder
+/// may reserve a smaller one, so it moves on. Anything else is a property of
+/// this source's delivery.
+fn ends_the_assembly(err: &anyhow::Error) -> bool {
+    match classify(err) {
+        Fault::Fatal(_) => true,
+        Fault::Unaffordable => err.downcast_ref::<PoolExhausted>().is_some(),
+        Fault::Source | Fault::WrongSize | Fault::Transient => false,
     }
 }
 
@@ -2581,5 +2594,40 @@ mod backpressure_backoff_tests {
             .map(backpressure_backoff)
             .sum();
         assert_eq!(total, Duration::from_millis(11_750));
+    }
+}
+
+#[cfg(test)]
+mod assembly_fault_tests {
+    use decdn_client::{PoolExhausted, UpstreamRefused, UpstreamVoucherRejected};
+    use decdn_protocol::client::{StreamError, VoucherRejectReason};
+
+    use super::ends_the_assembly;
+
+    fn refusal(error: StreamError) -> anyhow::Error {
+        anyhow::Error::new(UpstreamRefused::mid_stream(error))
+    }
+
+    /// A holder's reservation floor above the pool moves the range to another
+    /// holder, which may reserve less; a dry pool and a fatal fault end it.
+    #[test]
+    fn insufficient_deposit_reassigns_and_a_dry_pool_ends_the_assembly() {
+        assert!(!ends_the_assembly(&refusal(
+            StreamError::InsufficientDeposit
+        )));
+        assert!(ends_the_assembly(&anyhow::Error::new(PoolExhausted {
+            gap_start: 0,
+            gap_len: 1 << 20,
+        })));
+        assert!(ends_the_assembly(&anyhow::Error::new(
+            UpstreamVoucherRejected {
+                reason: VoucherRejectReason::AmountRegression,
+                bundle: None,
+                proof_generation: None,
+            }
+        )));
+        assert!(ends_the_assembly(&refusal(StreamError::OriginBlacklisted)));
+        assert!(!ends_the_assembly(&refusal(StreamError::NotFound)));
+        assert!(!ends_the_assembly(&anyhow::anyhow!("connection reset")));
     }
 }

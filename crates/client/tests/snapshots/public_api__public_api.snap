@@ -75,7 +75,6 @@ pub struct decdn_client::discovery::Probed
 pub decdn_client::discovery::Probed::candidate: decdn_client::discovery::NodeCandidate
 pub decdn_client::discovery::Probed::coverage: decdn_protocol::coverage::Coverage
 pub decdn_client::discovery::Probed::rtt_ms: f64
-pub decdn_client::discovery::Probed::total_bytes: core::option::Option<u64>
 pub struct decdn_client::discovery::WarmingCandidate
 pub decdn_client::discovery::WarmingCandidate::eth_address: alloy_primitives::bits::address::Address
 pub decdn_client::discovery::WarmingCandidate::node_id: iroh_base::key::PublicKey
@@ -97,9 +96,9 @@ pub decdn_client::downloader::DownloadTarget::ranges: core::option::Option<&'a [
 pub decdn_client::downloader::DownloadTarget::total_bytes: u64
 pub struct decdn_client::downloader::Downloader<P, F>
 impl<P, F> decdn_client::downloader::Downloader<P, F> where P: decdn_client::source_set::SourceProvider, F: decdn_client::source::Funder
-pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_dir(&self, &[([u8; 32], u64)], &std::path::Path, &decdn_client::config::PullConfig, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
-pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths(&self, &[decdn_client::downloader::DownloadTarget<'_>], &decdn_client::config::PullConfig, core::option::Option<&decdn_client::ledgers::LaneLedgers>, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
-pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths_until(&self, &[decdn_client::downloader::DownloadTarget<'_>], &decdn_client::config::PullConfig, core::option::Option<&decdn_client::ledgers::LaneLedgers>, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, &decdn_client::stop::StopPolicy) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
+pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_dir(&self, &[([u8; 32], u64)], &std::path::Path, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
+pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths(&self, &[decdn_client::downloader::DownloadTarget<'_>], core::option::Option<&decdn_client::ledgers::LaneLedgers>, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
+pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths_until(&self, &[decdn_client::downloader::DownloadTarget<'_>], core::option::Option<&decdn_client::ledgers::LaneLedgers>, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, &decdn_client::stop::StopPolicy) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
 impl<P, F> decdn_client::downloader::Downloader<P, F>
 pub const fn decdn_client::downloader::Downloader<P, F>::new(P, alloc::vec::Vec<decdn_client::source_set::Holder>, alloc::sync::Arc<decdn_client::health::PeerHealth>, F, decdn_client::driver::DriveConfig) -> Self
 impl<P, F> core::fmt::Debug for decdn_client::downloader::Downloader<P, F>
@@ -498,6 +497,9 @@ pub fn decdn_client::source_set::StaticSources<S>::connect<'a>(&'a self, &'a dec
 pub fn decdn_client::source_set::StaticSources<S>::discover(&self, [u8; 32]) -> decdn_client::source::SourceFuture<'_, alloc::vec::Vec<decdn_client::source_set::Holder>>
 pub fn decdn_client::source_set::StaticSources<S>::on_source_fault(&self, &decdn_client::source_set::Holder)
 pub mod decdn_client::stop
+pub struct decdn_client::stop::ClockHold<'a>(_)
+impl core::ops::drop::Drop for decdn_client::stop::ClockHold<'_>
+pub fn decdn_client::stop::ClockHold<'_>::drop(&mut self)
 pub struct decdn_client::stop::GaveUp
 pub decdn_client::stop::GaveUp::idle: core::time::Duration
 impl core::error::Error for decdn_client::stop::GaveUp
@@ -505,6 +507,7 @@ impl core::fmt::Display for decdn_client::stop::GaveUp
 pub fn decdn_client::stop::GaveUp::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::stop::ProgressClock
 impl decdn_client::stop::ProgressClock
+pub fn decdn_client::stop::ProgressClock::hold(&self) -> decdn_client::stop::ClockHold<'_>
 pub fn decdn_client::stop::ProgressClock::last(&self) -> tokio::time::instant::Instant
 pub fn decdn_client::stop::ProgressClock::new() -> Self
 pub fn decdn_client::stop::ProgressClock::tick(&self)
@@ -542,6 +545,7 @@ pub fn decdn_client::streamer::StreamCandidate<S>::fmt(&self, &mut core::fmt::Fo
 pub struct decdn_client::streamer::StreamDrive<'a>
 impl decdn_client::streamer::StreamDrive<'_>
 pub async fn decdn_client::streamer::StreamDrive<'_>::alongside<T>(&mut self, impl core::future::future::Future<Output = T>) -> T
+pub const fn decdn_client::streamer::StreamDrive<'_>::take_error(&mut self) -> core::option::Option<anyhow::Error>
 impl core::fmt::Debug for decdn_client::streamer::StreamDrive<'_>
 pub fn decdn_client::streamer::StreamDrive<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::future::future::Future for decdn_client::streamer::StreamDrive<'_>
@@ -676,6 +680,9 @@ pub fn decdn_client::ranged_store::ClientRangedStore::total_bytes(&self) -> u64
 impl decdn_client::source::IngestStore for decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
 pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub struct decdn_client::ClockHold<'a>(_)
+impl core::ops::drop::Drop for decdn_client::stop::ClockHold<'_>
+pub fn decdn_client::stop::ClockHold<'_>::drop(&mut self)
 pub struct decdn_client::ConsumptionPacing<'a>
 pub decdn_client::ConsumptionPacing::downstream: &'a (dyn core::ops::function::Fn() -> decdn_client::pacer::DownstreamFrontier + core::marker::Send + core::marker::Sync)
 pub decdn_client::ConsumptionPacing::pacing_wait: &'a dyn decdn_client::driver::PacingWait
@@ -697,9 +704,9 @@ pub decdn_client::DownloadTarget::ranges: core::option::Option<&'a [(u64, u64)]>
 pub decdn_client::DownloadTarget::total_bytes: u64
 pub struct decdn_client::Downloader<P, F>
 impl<P, F> decdn_client::downloader::Downloader<P, F> where P: decdn_client::source_set::SourceProvider, F: decdn_client::source::Funder
-pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_dir(&self, &[([u8; 32], u64)], &std::path::Path, &decdn_client::config::PullConfig, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
-pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths(&self, &[decdn_client::downloader::DownloadTarget<'_>], &decdn_client::config::PullConfig, core::option::Option<&decdn_client::ledgers::LaneLedgers>, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
-pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths_until(&self, &[decdn_client::downloader::DownloadTarget<'_>], &decdn_client::config::PullConfig, core::option::Option<&decdn_client::ledgers::LaneLedgers>, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, &decdn_client::stop::StopPolicy) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
+pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_dir(&self, &[([u8; 32], u64)], &std::path::Path, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
+pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths(&self, &[decdn_client::downloader::DownloadTarget<'_>], core::option::Option<&decdn_client::ledgers::LaneLedgers>, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
+pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths_until(&self, &[decdn_client::downloader::DownloadTarget<'_>], core::option::Option<&decdn_client::ledgers::LaneLedgers>, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, &decdn_client::stop::StopPolicy) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
 impl<P, F> decdn_client::downloader::Downloader<P, F>
 pub const fn decdn_client::downloader::Downloader<P, F>::new(P, alloc::vec::Vec<decdn_client::source_set::Holder>, alloc::sync::Arc<decdn_client::health::PeerHealth>, F, decdn_client::driver::DriveConfig) -> Self
 impl<P, F> core::fmt::Debug for decdn_client::downloader::Downloader<P, F>
@@ -891,6 +898,7 @@ pub fn decdn_client::source::PrimedSource<S>::max_blob_size_bytes(&self) -> u64
 pub fn decdn_client::source::PrimedSource<S>::open(&self, [u8; 32], decdn_bao_range::AlignedRange) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, Self::Reader)>
 pub struct decdn_client::ProgressClock
 impl decdn_client::stop::ProgressClock
+pub fn decdn_client::stop::ProgressClock::hold(&self) -> decdn_client::stop::ClockHold<'_>
 pub fn decdn_client::stop::ProgressClock::last(&self) -> tokio::time::instant::Instant
 pub fn decdn_client::stop::ProgressClock::new() -> Self
 pub fn decdn_client::stop::ProgressClock::tick(&self)
@@ -1037,6 +1045,7 @@ pub fn decdn_client::streamer::StreamCandidate<S>::fmt(&self, &mut core::fmt::Fo
 pub struct decdn_client::StreamDrive<'a>
 impl decdn_client::streamer::StreamDrive<'_>
 pub async fn decdn_client::streamer::StreamDrive<'_>::alongside<T>(&mut self, impl core::future::future::Future<Output = T>) -> T
+pub const fn decdn_client::streamer::StreamDrive<'_>::take_error(&mut self) -> core::option::Option<anyhow::Error>
 impl core::fmt::Debug for decdn_client::streamer::StreamDrive<'_>
 pub fn decdn_client::streamer::StreamDrive<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::future::future::Future for decdn_client::streamer::StreamDrive<'_>

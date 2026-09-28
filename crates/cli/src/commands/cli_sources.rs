@@ -8,7 +8,6 @@
 //! the next run's fast path reads.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use alloy::dyn_abi::Eip712Domain;
@@ -41,8 +40,9 @@ pub(crate) struct CliSources<'a, P> {
     /// The run's shared voucher-ledger registry (`bundle pull`); `None` for a
     /// solo fetch.
     ledgers: Option<&'a LaneLedgers>,
-    /// The run's per-provider stream cap (`bundle pull`): a lane holds one of
-    /// its provider's permits while the fetch runs.
+    /// The run's per-provider stream cap (`bundle pull`): a lane, the first
+    /// open's included, holds one of its provider's permits while the fetch
+    /// runs.
     lane_cap: Option<&'a LaneStreamCap>,
     /// Every holder's node, keyed by its on-chain provider address.
     nodes: Mutex<HashMap<Address, NodeCandidate>>,
@@ -54,8 +54,6 @@ pub(crate) struct CliSources<'a, P> {
     parked: Mutex<HashMap<Address, StreamCandidate<PeerSource<'a>>>>,
     /// The pool the first built lane pays from.
     pool_id: OnceLock<PoolId>,
-    /// Set while [`Self::signed_size`] runs the first open.
-    sizing: AtomicBool,
 }
 
 impl<'a, P> CliSources<'a, P>
@@ -90,7 +88,6 @@ where
             handles: Mutex::new(Vec::new()),
             parked: Mutex::new(HashMap::new()),
             pool_id: OnceLock::new(),
-            sizing: AtomicBool::new(false),
         }
     }
 
@@ -132,7 +129,6 @@ where
         stop: &StopPolicy,
     ) -> anyhow::Result<u64> {
         let mut set = SourceSet::new(self, hash, Arc::clone(health), holders);
-        self.sizing.store(true, Ordering::Release);
         let opened = first_open(&mut set, stop, |lane| async move {
             let (header, _whole) = lane.source.open_whole(hash).await?;
             let provider = lane
@@ -144,7 +140,6 @@ where
             Ok(header.total_bytes)
         })
         .await;
-        self.sizing.store(false, Ordering::Release);
         let mut parked = self.parked.lock().unwrap_or_else(PoisonError::into_inner);
         for (provider, lane) in set.take_lanes() {
             if let Ok(lane) = Arc::try_unwrap(lane) {
@@ -180,16 +175,7 @@ where
         if self.grant.is_some() {
             return fetch::annotate_delegated_exhaustion(err);
         }
-        if err.downcast_ref::<NoAffordableSource>().is_some() {
-            let pool = self
-                .pool_id
-                .get()
-                .map_or_else(|| "<pool id>".to_string(), ToString::to_string);
-            return err.context(format!(
-                "top up with: decdn pool top-up --pool {pool} --amount-micro-usdc <MICRO_USDC>"
-            ));
-        }
-        err
+        with_top_up_hint(err, self.pool_id.get().copied())
     }
 
     /// File a lane's first answer in the peer store: its quoted rate, with the
@@ -207,25 +193,22 @@ where
         self.nodes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// `holder`'s lane: the one the first open parked, or a fresh build. When
-    /// the run caps streams per provider, a lane the fetch takes holds one of
-    /// its provider's permits; a lane built for the first open holds none, so
-    /// that open never waits on a permit while it holds another.
+    /// `holder`'s lane: the one the first open parked, with the permit it
+    /// already holds, or a fresh build. When the run caps streams per
+    /// provider, a fresh lane holds one of its provider's permits
+    /// ([`lane_lease`]), taken before the build and never waited for.
     async fn build(&self, holder: &Holder) -> anyhow::Result<StreamCandidate<PeerSource<'a>>> {
         let parked = self
             .parked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&holder.provider);
-        let mut lane = match parked {
-            Some(lane) => lane,
-            None => self.build_fresh(holder).await?,
-        };
-        if let Some(cap) = self.lane_cap
-            && !self.sizing.load(Ordering::Acquire)
-        {
-            lane.lease = LaneLease::new(cap.permit(holder.provider).await?);
+        if let Some(lane) = parked {
+            return Ok(lane);
         }
+        let lease = lane_lease(self.lane_cap, holder.provider).await?;
+        let mut lane = self.build_fresh(holder).await?;
+        lane.lease = lease;
         Ok(lane)
     }
 
@@ -271,6 +254,43 @@ where
             lease: LaneLease::default(),
         })
     }
+}
+
+/// What a lane holds for its provider under the run's stream cap: one of the
+/// provider's permits, or nothing without a cap.
+///
+/// It never waits. A lane that waited for one provider's permit while its
+/// fetch held another's could deadlock against a sibling entry doing the
+/// reverse. With every permit taken it fails instead, and the source set backs
+/// the build off and retries it, holding nothing meanwhile.
+///
+/// # Errors
+///
+/// Every permit for `provider` is taken.
+async fn lane_lease(cap: Option<&LaneStreamCap>, provider: Address) -> anyhow::Result<LaneLease> {
+    let Some(cap) = cap else {
+        return Ok(LaneLease::default());
+    };
+    cap.try_permit(provider)
+        .await
+        .map(LaneLease::new)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "every stream permit for provider {provider} is taken; the lane builds once \
+                 one frees"
+            )
+        })
+}
+
+/// Name the top-up command on a self-owned pool no provider's voucher fits.
+fn with_top_up_hint(err: anyhow::Error, pool_id: Option<PoolId>) -> anyhow::Error {
+    if err.downcast_ref::<NoAffordableSource>().is_none() {
+        return err;
+    }
+    let pool = pool_id.map_or_else(|| "<pool id>".to_string(), |id| id.to_string());
+    err.context(format!(
+        "top up with: decdn pool top-up --pool {pool} --amount-micro-usdc <MICRO_USDC>"
+    ))
 }
 
 /// [`fetch::annotate_unbound_cache_miss`] against the lane context `ctx`.
@@ -361,7 +381,60 @@ pub(crate) fn holders_from(
 
 #[cfg(test)]
 mod tests {
-    use super::holders_from;
+    use super::{holders_from, lane_lease, with_top_up_hint};
+    use crate::commands::bundle_pull::LaneStreamCap;
+    use alloy::primitives::{Address, B256, U256};
+    use decdn_client::NoAffordableSource;
+
+    /// Two entries with crossed providers under a cap of one stream each: X
+    /// holds A and wants B while Y holds B and wants A. Neither waits: each
+    /// build fails at once and backs off holding nothing new, and once X
+    /// finishes and frees A, Y takes it.
+    #[tokio::test]
+    async fn crossed_entries_never_wait_for_a_lane_permit() -> anyhow::Result<()> {
+        let (a, b) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
+        let cap = LaneStreamCap::new(1);
+        let x_holds_a = lane_lease(Some(&cap), a).await?;
+        let y_holds_b = lane_lease(Some(&cap), b).await?;
+
+        let crossed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            (
+                lane_lease(Some(&cap), b).await,
+                lane_lease(Some(&cap), a).await,
+            )
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("a lane build waited for a permit"))?;
+        assert!(
+            crossed.0.is_err() && crossed.1.is_err(),
+            "both permits are held"
+        );
+
+        drop(x_holds_a);
+        let y_takes_a = lane_lease(Some(&cap), a).await?;
+        drop((y_takes_a, y_holds_b));
+        assert!(lane_lease(None, a).await.is_ok(), "no cap, no permit");
+        Ok(())
+    }
+
+    /// A self-owned pool no provider's voucher fits names the top-up command
+    /// with the pool id; any other error passes through.
+    #[test]
+    fn a_self_owned_pool_no_voucher_fits_names_the_top_up_command() {
+        let pool = B256::repeat_byte(7);
+        let err = anyhow::Error::new(NoAffordableSource {
+            deposit: U256::from(5u32),
+        });
+        let hinted = format!("{:#}", with_top_up_hint(err, Some(pool)));
+        assert!(
+            hinted.contains(&format!(
+                "decdn pool top-up --pool {pool} --amount-micro-usdc"
+            )),
+            "{hinted}"
+        );
+        let other = with_top_up_hint(anyhow::anyhow!("reset"), Some(pool));
+        assert_eq!(other.to_string(), "reset");
+    }
 
     #[test]
     fn holders_carry_coverage_and_rtt_and_index_their_nodes() {

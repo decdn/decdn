@@ -32,7 +32,7 @@ use crate::scheduler::{AcquireEnv, AcquireTarget, acquire};
 use crate::source::Funder;
 use crate::source_set::{Holder, SourceProvider, SourceSet};
 use crate::stop::{ProgressClock, StopPolicy};
-use crate::{ClientRangedStore, PullConfig, RangedStore};
+use crate::{ClientRangedStore, RangedStore};
 
 /// One blob to fetch and where to write it: the content `hash` (the bao root),
 /// its `total_bytes` (authoritative for keying the store and sizing the fetch),
@@ -79,7 +79,7 @@ pub struct DownloadTarget<'a> {
 ///
 /// use decdn_client::driver::DriveConfig;
 /// use decdn_client::source::{BlobSource, Funder};
-/// use decdn_client::{DownloadTarget, Downloader, PullConfig, StaticSources, StreamCandidate};
+/// use decdn_client::{DownloadTarget, Downloader, StaticSources, StreamCandidate};
 ///
 /// async fn download<S: BlobSource, F: Funder>(
 ///     candidates: Vec<StreamCandidate<S>>,
@@ -94,7 +94,7 @@ pub struct DownloadTarget<'a> {
 ///     let downloader = Downloader::new(sources, holders, Default::default(), funder, drive);
 ///     let target = DownloadTarget { hash, total_bytes, dest, ranges: None };
 ///     downloader
-///         .fetch_to_paths(&[target], &PullConfig::new(), None, None)
+///         .fetch_to_paths(&[target], None, None)
 ///         .await?;
 ///     Ok(())
 /// }
@@ -165,7 +165,6 @@ where
         &self,
         entries: &[([u8; 32], u64)],
         dir: &Path,
-        config: &PullConfig,
         on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
     ) -> anyhow::Result<Vec<PathBuf>> {
         let dests: Vec<PathBuf> = entries
@@ -182,8 +181,7 @@ where
                 ranges: None,
             })
             .collect();
-        self.fetch_to_paths(&targets, config, None, on_progress)
-            .await
+        self.fetch_to_paths(&targets, None, on_progress).await
     }
 
     /// [`Self::fetch_to_paths_until`] under a stop policy with no limit: the
@@ -195,12 +193,11 @@ where
     pub async fn fetch_to_paths(
         &self,
         targets: &[DownloadTarget<'_>],
-        config: &PullConfig,
         ledgers: Option<&LaneLedgers>,
         on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
     ) -> anyhow::Result<Vec<PathBuf>> {
         let stop = StopPolicy::new(true, None, Arc::new(ProgressClock::new()));
-        self.fetch_to_paths_until(targets, config, ledgers, on_progress, &stop)
+        self.fetch_to_paths_until(targets, ledgers, on_progress, &stop)
             .await
     }
 
@@ -215,8 +212,8 @@ where
     /// ranges through [`crate::acquire`] across a fresh [`SourceSet`] of the
     /// holders, then finalizes — promoting `.partial` to `dest`. Writes land at
     /// their absolute offsets, so out-of-order and multi-source fills assemble
-    /// correctly. The whole blob is fetched at full throughput; `config`'s
-    /// read-ahead bound is a `Streamer` tunable and does not apply here.
+    /// correctly. The whole blob is fetched at full throughput, with no
+    /// read-ahead bound.
     ///
     /// `total_bytes` is authoritative for keying the store, and the target `hash`
     /// is the bao root every ingested byte is verified against: a wrong size or
@@ -242,7 +239,6 @@ where
     pub async fn fetch_to_paths_until(
         &self,
         targets: &[DownloadTarget<'_>],
-        _config: &PullConfig,
         ledgers: Option<&LaneLedgers>,
         on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
         stop: &StopPolicy,
@@ -337,7 +333,7 @@ mod tests {
     use crate::driver::DriveConfig;
     use crate::source::{BlobSource, FakeFunder, ScriptedSource};
     use crate::{
-        ClientRangedStore, Cumulative, GaveUp, PoolContext, PoolLedger, ProgressClock, PullConfig,
+        ClientRangedStore, Cumulative, GaveUp, PoolContext, PoolLedger, ProgressClock,
         StaticSources, StopPolicy, StreamCandidate,
     };
 
@@ -425,7 +421,7 @@ mod tests {
         let downloader = downloader(vec![candidate(source, ledger, 0xA1)])?;
         let dir = tempfile::tempdir()?;
         let paths = downloader
-            .fetch_to_dir(&[(root, total)], dir.path(), &PullConfig::default(), None)
+            .fetch_to_dir(&[(root, total)], dir.path(), None)
             .await?;
 
         anyhow::ensure!(
@@ -480,12 +476,7 @@ mod tests {
         };
 
         downloader
-            .fetch_to_dir(
-                &[(root, total)],
-                dir.path(),
-                &PullConfig::default(),
-                Some(&on_progress),
-            )
+            .fetch_to_dir(&[(root, total)], dir.path(), Some(&on_progress))
             .await?;
 
         anyhow::ensure!(
@@ -522,7 +513,6 @@ mod tests {
                     dest: &dest,
                     ranges: None,
                 }],
-                &PullConfig::default(),
                 None,
                 None,
             )
@@ -565,7 +555,6 @@ mod tests {
                     dest: &dest,
                     ranges: None,
                 }],
-                &PullConfig::default(),
                 Some(&registry),
                 None,
             )
@@ -596,7 +585,7 @@ mod tests {
         ])?;
         let dir = tempfile::tempdir()?;
         let paths = downloader
-            .fetch_to_dir(&[(root, total)], dir.path(), &PullConfig::default(), None)
+            .fetch_to_dir(&[(root, total)], dir.path(), None)
             .await?;
 
         let path = paths
@@ -640,7 +629,7 @@ mod tests {
 
         let downloader = downloader(vec![candidate(source, ledger, 0xA1)])?;
         let paths = downloader
-            .fetch_to_dir(&[(root, total)], dir.path(), &PullConfig::default(), None)
+            .fetch_to_dir(&[(root, total)], dir.path(), None)
             .await?;
 
         let path = paths
@@ -687,7 +676,6 @@ mod tests {
                     dest: &dest,
                     ranges: None,
                 }],
-                &PullConfig::default(),
                 None,
                 None,
                 &stop,
@@ -723,7 +711,6 @@ mod tests {
                     dest: &dest,
                     ranges: None,
                 }],
-                &PullConfig::default(),
                 None,
                 None,
                 &stop,
@@ -765,7 +752,7 @@ mod tests {
         // Well inside the first periodic flush, so only the drop can record.
         let dropped = tokio::time::timeout(
             crate::driver::PRESENT_RECORD_FLUSH_INTERVAL / 5,
-            downloader.fetch_to_paths(&targets, &PullConfig::default(), None, None),
+            downloader.fetch_to_paths(&targets, None, None),
         )
         .await;
         anyhow::ensure!(
@@ -792,7 +779,7 @@ mod tests {
         let downloader = downloader::<ScriptedSource>(Vec::new())?;
         let dir = tempfile::tempdir()?;
         let Err(err) = downloader
-            .fetch_to_dir(&[([0u8; 32], 1)], dir.path(), &PullConfig::default(), None)
+            .fetch_to_dir(&[([0u8; 32], 1)], dir.path(), None)
             .await
         else {
             anyhow::bail!("an empty holder set must be rejected");

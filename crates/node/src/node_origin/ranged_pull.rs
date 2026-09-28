@@ -71,9 +71,9 @@ pub(crate) const MAX_BACKPRESSURE_RETRIES: u32 = 6;
 pub(crate) enum RunOutcome {
     /// The run's `[offset, offset+len)` is fully present in the store now.
     Filled,
-    /// A source fault (`classify` neither `Fatal` nor `Unaffordable`): drop this
-    /// run's source and re-plan its still-missing remainder against the
-    /// surviving candidates. The reassign-only tail.
+    /// A fault of this source (a delivery fault, or its reservation floor above
+    /// the pool): drop this run's source and re-plan its still-missing
+    /// remainder against the surviving candidates. The reassign-only tail.
     Reassign,
     /// The source refused to open this run for a reason that usually clears with
     /// time — most often a per-signer live cap, or a load shed (#2178). It says
@@ -81,9 +81,9 @@ pub(crate) enum RunOutcome {
     /// when another survivor covers the gap, and otherwise keeps the source and
     /// drives it again after a [`RunSink::backoff`].
     Backpressure,
-    /// The whole assembly is over — a `Fatal` or `Unaffordable` fault
-    /// (`classify`) that another lane cannot fix (a voucher rejection, an origin
-    /// blacklist, an over-cap blob, the shared pool running dry). Propagate it.
+    /// The whole assembly is over — a fatal fault or a dry shared pool that
+    /// another lane cannot fix (a voucher rejection, an origin blacklist, an
+    /// over-cap blob, the pacer's `PoolExhausted`). Propagate it.
     Terminal(FillError),
     /// Cooperative cancellation: the serve leg finished first (client
     /// disconnect / shutdown), so the whole pull stops.

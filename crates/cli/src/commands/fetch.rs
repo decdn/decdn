@@ -601,7 +601,6 @@ pub(crate) async fn probe_and_order(
             holders.push(discovery::Probed {
                 candidate: cand.clone(),
                 rtt_ms,
-                total_bytes: resp_ext.total_bytes,
                 coverage: resp_ext.coverage.clone(),
             });
         } else {
@@ -649,7 +648,6 @@ pub(crate) async fn probe_and_order(
         candidates: ordered.order,
         coverage_by_node: ordered.coverage_by_node,
         probed_samples,
-        skipped_registry_read: false, // just probed: reachability-checked
     })
 }
 
@@ -821,13 +819,8 @@ async fn discover_provider(
         if selected.len() >= store_cfg.min_fresh_candidates {
             let warming = ProxyWarmingParams::from_args(args);
             let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
-            let mut targets =
+            let targets =
                 probe_and_order(endpoint, &selected, relay_hint, hash, warming, &slash_dom).await?;
-            // Resolved without a registry read, so keep the in-fetch rediscovery
-            // entitlement: an all-unreachable cached set must still fall back to
-            // a real `getRegisteredNodes` (ADR 037), never fail a fetch the
-            // registry would have served.
-            targets.skipped_registry_read = true;
             // Stats-only harvest, never identity — identity refreshes ONLY on a
             // real registry read (same reasoning as the `Bootstrap::Cached`
             // path): re-`upsert_identity` here would "confirm" identity against
@@ -945,9 +938,6 @@ fn store_fast_path(
         candidates,
         coverage_by_node: HashMap::new(),
         probed_samples: Vec::new(),
-        // The one site that sets this: these candidates are projected from the
-        // store without a probe, so the driver must keep discovery in reserve.
-        skipped_registry_read: true,
     })
 }
 
@@ -1118,23 +1108,14 @@ pub(crate) struct ResolvedTargets {
     /// `(node_id, rtt_ms, rate_per_mb)` for each holder that answered a probe
     /// this fetch — harvested into the peer store.
     pub(crate) probed_samples: Vec<(PublicKey, f64, u64)>,
-    /// `true` when this set was resolved WITHOUT reading the registry — the
-    /// probe-less [`store_fast_path`], or the identity-fresh candidate set that
-    /// [`identity_fresh_candidates`] projects and re-probes. The driver reads it
-    /// to enforce the store's approved invariant: a set built from cached
-    /// membership must never make a fetch fail that a registry read would have
-    /// served, so exhausting one with a retryable error triggers a single
-    /// in-fetch rediscovery (a real `getRegisteredNodes`). `false` on every path
-    /// that already read the registry, and on the pinned `--node-id` path (which
-    /// has nothing to rediscover).
-    pub(crate) skipped_registry_read: bool,
 }
 
-/// Resolve the ordered failover list of nodes to fetch from (#1174): the
-/// explicit `--node-id` (requiring `--provider-address`) as a single-element
-/// list, or auto-discovery (#936) when `--node-id` is omitted (deriving each
-/// provider from the chosen node's registry entry). The caller tries the entries
-/// in turn, failing over on a retryable delivery failure (ADR 037 § Fallback).
+/// Resolve the holders to fetch from (#1174): the explicit `--node-id`
+/// (requiring `--provider-address`) as the one holder, or auto-discovery (#936)
+/// when `--node-id` is omitted (deriving each provider from its node's registry
+/// entry), nearest first. The acquire loop stripes across them; a set that goes
+/// stale is refreshed by a later discovery with `--rediscover` forced, which
+/// reads the registry rather than the peer store.
 pub(crate) async fn resolve_target_node(
     args: &cli::ClientFetchArgs,
     chain: &ResolvedChain,
@@ -1147,8 +1128,8 @@ pub(crate) async fn resolve_target_node(
         // node-id resolves via `[network.discovery]` / `presets::N0` (plus its
         // default relays) even without `--addr` or configured relays. `clap`
         // guarantees `--provider-address` is present alongside `--node-id`.
-        // A pinned node is its own only candidate: there is nothing to fail over
-        // to, so the list has one entry and the retry loop runs it once.
+        // A pinned node is its own only holder: a fault cools it and the fetch
+        // waits for it to return.
         let node_id = PublicKey::from_str(raw)
             .map_err(|e| anyhow::anyhow!("invalid --node-id {raw:?}: {e}"))?;
         let provider_raw = args
@@ -1170,9 +1151,6 @@ pub(crate) async fn resolve_target_node(
             coverage_by_node: HashMap::new(),
             // Nothing was probed on this path, so there is nothing to harvest.
             probed_samples: Vec::new(),
-            // A pinned `--node-id` is not a store projection; there is nothing
-            // to rediscover if it fails.
-            skipped_registry_read: false,
         });
     }
 
@@ -1633,7 +1611,7 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
         .is_some_and(|rejected| rejected.reason == VoucherRejectReason::Underpaid);
     if err.downcast_ref::<NoAffordableSource>().is_some() {
         err.context(
-            "no provider's next voucher fits what the delegated pool holds — ask the pool \
+            "no provider's next voucher fits what the delegated pool holds. Ask the pool \
              owner to top up the pool (a delegated client cannot top up a pool it does not own)",
         )
     } else if needs_owner {
@@ -3070,9 +3048,17 @@ where
     if let Some((bar, _, _)) = &bar {
         bar.finish_and_clear();
     }
-    let copied = copy_result?;
+    let copied = copy_result.map_err(|read_err| stream_error(read_err, drive.take_error()))?;
     tracing::info!("streamed {copied} verified bytes to stdout");
     Ok(())
+}
+
+/// The error a failed stdout stream ends with: the fetch's own typed error when
+/// the drive ended with one (so a give-up, a fatal fault or a unanimous verdict
+/// keeps its type for the exit code and the remedy hints), else the read or
+/// write error itself.
+fn stream_error(read_err: anyhow::Error, fetch_err: Option<anyhow::Error>) -> anyhow::Error {
+    fetch_err.unwrap_or(read_err)
 }
 
 /// Fetch `hash` to `output` via the [`Downloader`] consumption face (#1848 4c),
@@ -3108,7 +3094,6 @@ where
             dest: output,
             ranges: None,
         }],
-        &PullConfig::new(),
         None,
         Some(&on_progress),
         stop,
@@ -3191,7 +3176,6 @@ where
                 dest: output,
                 ranges: None,
             }],
-            &PullConfig::new(),
             shared.ledgers,
             progress,
             &stop,
@@ -4319,6 +4303,23 @@ mod tests {
         assert!(!wants_stdout(Path::new("out.bin")));
     }
 
+    /// A stdout stream that failed because the fetch gave up ends with the
+    /// fetch's typed `GaveUp`, not the reader's message, so it exits 75; with
+    /// no fetch error, the read or write error stands.
+    #[test]
+    fn a_stdout_give_up_keeps_its_type() {
+        let gave_up = decdn_client::GaveUp {
+            idle: Duration::from_mins(10),
+        };
+        let read_err = anyhow::anyhow!("read verified stream: stream fetch failed: {gave_up}");
+        let err = stream_error(read_err, Some(anyhow::Error::new(gave_up)));
+        assert_eq!(err.downcast_ref::<decdn_client::GaveUp>(), Some(&gave_up));
+
+        let write_err = stream_error(anyhow::anyhow!("write to stdout: broken pipe"), None);
+        assert!(write_err.downcast_ref::<decdn_client::GaveUp>().is_none());
+        assert!(write_err.to_string().contains("broken pipe"));
+    }
+
     /// `copy_verified` drains every byte to the sink in order and reports the
     /// final cumulative position as the blob's total — the stdout stream's bar
     /// signal (#1848 4b).
@@ -4533,11 +4534,6 @@ mod tests {
         assert_eq!(targets.candidates[2].node_id, harvest_key(1));
         assert!(targets.coverage_by_node.is_empty());
         assert!(targets.probed_samples.is_empty());
-        // The fast path is the one construction site that marks its result, so
-        // the driver can fall through to discovery if every one of these
-        // never-probed candidates turns out to be unreachable (ADR 037 § in-fetch
-        // discovery fallback).
-        assert!(targets.skipped_registry_read);
 
         // Only two selectable records -> below min_fresh_candidates -> None.
         let dir2 = tempfile::tempdir()?;
@@ -5005,7 +5001,7 @@ mod tests {
         assert!(
             annotated
                 .to_string()
-                .contains("ask the pool owner to top up"),
+                .contains("Ask the pool owner to top up"),
             "{annotated}"
         );
     }
@@ -5872,7 +5868,6 @@ pub(crate) mod tests_support {
                 multiaddrs: Bytes::new(),
             },
             rtt_ms,
-            total_bytes: None,
             coverage: decdn_protocol::Coverage::empty(),
         }
     }
@@ -5899,7 +5894,6 @@ pub(crate) mod tests_support {
             candidates: ordered.order,
             coverage_by_node: ordered.coverage_by_node,
             probed_samples,
-            skipped_registry_read: false,
         };
         (targets, node_a, node_b)
     }

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use alloy::primitives::U256;
 use anyhow::{Context, Result};
 use decdn_client::driver::DriveConfig;
-use decdn_client::{DownloadTarget, Downloader, PullConfig, StaticSources};
+use decdn_client::{DownloadTarget, Downloader, StaticSources};
 
 use common::{Buyer, Env, NoTopUp};
 
@@ -53,7 +53,6 @@ async fn main() -> Result<()> {
                 dest: &dest,
                 ranges: None,
             }],
-            &PullConfig::new(),
             None,
             None,
         )

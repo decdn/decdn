@@ -45,7 +45,7 @@ use crate::scheduler::{AcquireEnv, AcquireTarget, ConsumptionPacing, LaneLease, 
 use crate::sink::BlobCache;
 use crate::source::Funder;
 use crate::source_set::{Holder, SourceProvider, SourceSet};
-use crate::stop::StopPolicy;
+use crate::stop::{ProgressClock, StopPolicy};
 use crate::{ClientRangedStore, PoolContext, PoolLedger, PullConfig, RangedStore};
 
 /// The most verified bytes one store read hands the reader. It bounds the
@@ -109,9 +109,11 @@ impl StreamState {
 
 /// The [`PacingWait`] the streaming drive parks on when its read-ahead window is
 /// full: it resolves once the consumer's cursor advances past what the `Wait`
-/// observed.
+/// observed. The stop policy's clock holds while it waits: a consumer that
+/// pauses is not a source that stalls.
 struct ConsumedWait {
     state: Arc<StreamState>,
+    clock: Arc<ProgressClock>,
 }
 
 impl PacingWait for ConsumedWait {
@@ -121,6 +123,7 @@ impl PacingWait for ConsumedWait {
         _reason: WaitReason,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
+            let _hold = self.clock.hold();
             // A lane parks only between legs, after its last leg's bytes are in
             // the store. Wake the reader so it hands them out: the cursor can
             // only advance from bytes the reader has seen.
@@ -265,6 +268,7 @@ where
     };
     let wait = ConsumedWait {
         state: Arc::clone(&state),
+        clock: Arc::clone(&stop.clock),
     };
     let pacing = ConsumptionPacing {
         downstream: &downstream,
@@ -274,7 +278,7 @@ where
     let ranges = [(0, state.total)];
     // Under consumption pacing `acquire` turns its lane watchdog off: a lane
     // parked on the consumer cursor is waiting, not stalled. A genuinely silent
-    // source trips its own per-stream throughput floor mid-read instead.
+    // source trips its own per-stream idle window mid-read instead.
     let env = AcquireEnv {
         pacer: &pacer,
         funder: &funder,
@@ -470,6 +474,7 @@ where
                 StreamDrive {
                     fetch: None,
                     state: None,
+                    error: None,
                 },
             ));
         }
@@ -510,6 +515,7 @@ where
             StreamDrive {
                 fetch: Some(fetch),
                 state: Some(state),
+                error: None,
             },
         ))
     }
@@ -528,6 +534,9 @@ pub struct StreamDrive<'a> {
     fetch: Option<Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>>,
     /// The state the outcome is recorded into. `None` for a cache hit.
     state: Option<Arc<StreamState>>,
+    /// The typed error the fetch ended with, until [`Self::take_error`] takes
+    /// it. The reader carries only its message.
+    error: Option<anyhow::Error>,
 }
 
 impl std::fmt::Debug for StreamDrive<'_> {
@@ -553,6 +562,15 @@ impl StreamDrive<'_> {
             out = &mut consume => out,
         }
     }
+
+    /// The error the fetch ended with, typed as the fetch returned it (a
+    /// [`crate::GaveUp`], a fatal fault, a unanimous verdict of the sources),
+    /// once the drive has resolved with one. A reader error that follows a
+    /// failed fetch carries only this error's message, so a caller that needs
+    /// to act on the error's type takes it here.
+    pub const fn take_error(&mut self) -> Option<anyhow::Error> {
+        self.error.take()
+    }
 }
 
 impl Future for StreamDrive<'_> {
@@ -566,8 +584,16 @@ impl Future for StreamDrive<'_> {
         match fetch.as_mut().poll(cx) {
             Poll::Ready(result) => {
                 this.fetch = None;
+                let recorded = match result {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        let message = anyhow::anyhow!("{err:#}");
+                        this.error = Some(err);
+                        Err(message)
+                    }
+                };
                 if let Some(state) = &this.state {
-                    state.finish(result);
+                    state.finish(recorded);
                 }
                 Poll::Ready(())
             }
@@ -1072,6 +1098,15 @@ mod tests {
             err.to_string().contains(&gave_up.to_string()),
             "the fetch gives up on the lone failing source: {err}"
         );
+        // The drive keeps the error typed, so a caller can map a give-up to
+        // its own exit.
+        let typed = drive
+            .take_error()
+            .ok_or_else(|| anyhow::anyhow!("the drive must hold the fetch's error"))?;
+        anyhow::ensure!(
+            typed.downcast_ref::<crate::GaveUp>() == Some(&gave_up),
+            "the drive's error stays a GaveUp: {typed:#}"
+        );
         anyhow::ensure!(
             (out.len() as u64) < total,
             "the tampered tail must not be yielded ({} of {total} bytes)",
@@ -1300,6 +1335,36 @@ mod tests {
         let mut out = Vec::new();
         drive.alongside(reader.read_to_end(&mut out)).await?;
         anyhow::ensure!(out == blob, "the resumed stream must be identical");
+        Ok(())
+    }
+
+    /// A consumer that pauses longer than the give-up limit, with the drive
+    /// parked on a full read-ahead window, is not a stall: the stop clock holds
+    /// while the drive waits on the consumer, and the stream completes.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_consumer_does_not_give_up() -> anyhow::Result<()> {
+        let blob = payload(4 * 1024 * 1024);
+        let (source, ledger) = paying_source(blob.clone())?;
+        let root = source.root();
+        let total = source.total_bytes();
+        let config = PullConfig {
+            read_ahead_bytes: PULL_WINDOW_FLOOR,
+            ..PullConfig::default()
+        };
+        let scratch = tempfile::tempdir()?;
+        let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
+        let limit = Duration::from_secs(30);
+        let stop = StopPolicy::new(false, Some(limit), Arc::new(ProgressClock::new()));
+        let (mut reader, mut drive) = streamer
+            .open(root, total, &config, Arc::new(NoCache), stop)
+            .await?;
+
+        // The consumer reads nothing for ten times the limit.
+        drive.alongside(tokio::time::sleep(limit * 10)).await;
+        let mut out = Vec::new();
+        drive.alongside(reader.read_to_end(&mut out)).await?;
+        anyhow::ensure!(out == blob, "the stream must complete byte-identical");
+        anyhow::ensure!(drive.take_error().is_none(), "the drive must not give up");
         Ok(())
     }
 

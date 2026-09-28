@@ -451,10 +451,14 @@ mod tests {
             "--unit-deadline-ms",
             "--min-throughput-bps",
             "--multi-source-min-bytes",
-            "--no-multi-source",
-            "--multi-source",
         ] {
             let parsed = TestCli::try_parse_from(["test", flag, "1"]);
+            assert!(parsed.is_err(), "{flag} must be gone");
+        }
+        // The multi-source switches took no value, so a lone flag is what a
+        // parse of the old command line would have seen.
+        for flag in ["--multi-source", "--no-multi-source"] {
+            let parsed = TestCli::try_parse_from(["test", flag]);
             assert!(parsed.is_err(), "{flag} must be gone");
         }
     }
