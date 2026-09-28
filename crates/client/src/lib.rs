@@ -1815,6 +1815,7 @@ enum ConnSource<'a> {
     },
     /// Reuse a caller-owned [`WarmConnection`]'s connection. The pull borrows it
     /// and leaves it open for the next hash; the [`WarmConnection`] closes it once.
+    #[cfg(any(test, feature = "test-util"))]
     Reuse(&'a iroh::endpoint::Connection),
 }
 
@@ -1868,6 +1869,7 @@ async fn open_stream(
             } => connection::dial(endpoint, target, runtime, "connect failed").await?,
             // Already dialled and warm — reuse the handle. A fresh `open_bi` below
             // gives this hash its own stream.
+            #[cfg(any(test, feature = "test-util"))]
             ConnSource::Reuse(conn) => conn.clone(),
         };
         let (mut send, mut recv) = conn
@@ -2928,6 +2930,7 @@ pub async fn open_progressive_pull(
 /// Every other argument behaves exactly as on [`open_progressive_pull`]; see its
 /// docs. There is no `endpoint`/`target` pair — the warm connection already names
 /// its peer.
+#[cfg(any(test, feature = "test-util"))]
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     name = "open_progressive_pull",

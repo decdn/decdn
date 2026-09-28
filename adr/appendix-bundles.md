@@ -267,7 +267,10 @@ as `decdn fetch`):
   over its probed holders. A whole-file entry fetches the whole blob. A
   range-dedup entry fetches only the ranges that no donor supplies, through
   the same loop. The entry probes its holders once and uses them for each
-  fetch of its ranges. Each lane holds one permit of its provider while it
+  fetch of its ranges. A lane of a range-dedup entry can go to a
+  proxy-warming non-holder, as for a whole-file entry, and `--max-sources`
+  counts such a node as one of its sources. The loop admits one node per
+  operator. Each lane holds one permit of its provider while it
   runs. A lane takes a permit only when a permit is free. When no permit is
   free, the lane build backs off and tries again. An entry holds no lane
   permit while it waits on a sibling entry. All lanes of an entry write into

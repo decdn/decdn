@@ -360,11 +360,12 @@ where
     }
 }
 
-/// The holders `targets` names, in its order, one per on-chain provider: each
-/// holder's probed coverage (`None`, a full holder, when nothing was measured)
-/// and its probed RTT, or its rank in the order when it was not probed. Each
-/// holder's node goes into `nodes`, keyed by provider; the first node named for
-/// a provider wins.
+/// The holders `targets` names, in its order, one per operator: a candidate
+/// whose on-chain provider already has a holder is skipped, so the nearer
+/// node by rank wins (the rule of [`decdn_client::discovery::admit_sources`]).
+/// Each holder carries its probed coverage (`None`, a full holder, when
+/// nothing was measured) and its probed RTT, or its rank in the order when it
+/// was not probed. Each holder's node goes into `nodes`, keyed by provider.
 pub(crate) fn holders_from(
     targets: &ResolvedTargets,
     nodes: &mut HashMap<Address, NodeCandidate>,
@@ -475,6 +476,31 @@ mod tests {
         );
         let other = with_top_up_hint(anyhow::anyhow!("reset"), Some(pool));
         assert_eq!(other.to_string(), "reset");
+    }
+
+    /// Two nodes of one operator yield one holder: the nearer one by rank.
+    #[test]
+    fn one_operator_yields_one_holder_the_nearer_by_rank() {
+        let node = |seed: u8| decdn_client::discovery::NodeCandidate {
+            node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+            eth_address: Address::repeat_byte(0xAA),
+            region_hint: None,
+            multiaddrs: alloy::primitives::Bytes::new(),
+        };
+        let (near, far) = (node(1), node(2));
+        let targets = crate::commands::fetch::ResolvedTargets {
+            candidates: vec![near.clone(), far],
+            coverage_by_node: std::collections::HashMap::new(),
+            probed_samples: Vec::new(),
+        };
+        let mut nodes = std::collections::HashMap::new();
+        let holders = holders_from(&targets, &mut nodes);
+        assert_eq!(holders.len(), 1, "one holder per operator");
+        assert_eq!(
+            nodes.get(&Address::repeat_byte(0xAA)).map(|n| n.node_id),
+            Some(near.node_id),
+            "the nearer node by rank is the operator's holder"
+        );
     }
 
     #[test]

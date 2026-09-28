@@ -351,7 +351,6 @@ impl<'a> decdn_client::source::PeerSource<'a>
 pub const fn decdn_client::source::PeerSource<'a>::new(&'a iroh::endpoint::Endpoint, iroh_base::endpoint_addr::EndpointAddr, alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, alloc::sync::Arc<decdn_client::PoolLedger>, &'a alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, [u8; 32], u64, u64, decdn_client::PullDeadlines) -> Self
 pub fn decdn_client::source::PeerSource<'a>::open_whole(&self, [u8; 32]) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, decdn_client::sink::PullReader)>
 pub fn decdn_client::source::PeerSource<'a>::with_dial_runtime(self, tokio::runtime::handle::Handle) -> Self
-pub fn decdn_client::source::PeerSource<'a>::with_warm_connection(self) -> Self
 impl core::fmt::Debug for decdn_client::source::PeerSource<'_>
 pub fn decdn_client::source::PeerSource<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl decdn_client::source::BlobSource for decdn_client::source::PeerSource<'_>
@@ -790,7 +789,6 @@ impl<'a> decdn_client::source::PeerSource<'a>
 pub const fn decdn_client::source::PeerSource<'a>::new(&'a iroh::endpoint::Endpoint, iroh_base::endpoint_addr::EndpointAddr, alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, alloc::sync::Arc<decdn_client::PoolLedger>, &'a alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, [u8; 32], u64, u64, decdn_client::PullDeadlines) -> Self
 pub fn decdn_client::source::PeerSource<'a>::open_whole(&self, [u8; 32]) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, decdn_client::sink::PullReader)>
 pub fn decdn_client::source::PeerSource<'a>::with_dial_runtime(self, tokio::runtime::handle::Handle) -> Self
-pub fn decdn_client::source::PeerSource<'a>::with_warm_connection(self) -> Self
 impl core::fmt::Debug for decdn_client::source::PeerSource<'_>
 pub fn decdn_client::source::PeerSource<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl decdn_client::source::BlobSource for decdn_client::source::PeerSource<'_>

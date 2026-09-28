@@ -485,12 +485,12 @@ async fn run_self_heal() -> anyhow::Result<()> {
 
 /// A recipient that interleaves many donor chunks with small unique runs pays
 /// for its complement as many scattered ranges — one or two chunk groups at
-/// every seam (#2119). The range session drives them over one warm connection,
-/// up to `--max-lane-streams` at once, so this proves the concurrent range set
-/// still assembles byte-exact and bills exactly the complement's wire bytes:
-/// no range paid twice, none skipped.
+/// every seam (#2119). The acquire loop runs one lane per holder, and each
+/// lane fills one range at a time, so this proves the scattered range set
+/// assembles byte-exact and bills exactly the complement's wire bytes: no
+/// range paid twice, none skipped.
 #[tokio::test(flavor = "multi_thread")]
-async fn cli_bundle_pull_drives_a_scattered_complement_concurrently() -> anyhow::Result<()> {
+async fn cli_bundle_pull_pays_exactly_a_scattered_complement() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_scattered_complement()))
         .await
         .context("scattered-complement e2e exceeded the overall timeout")??;
@@ -595,8 +595,9 @@ async fn run_scattered_complement() -> anyhow::Result<()> {
     std::fs::write(&manifest_path, manifest).context("write manifest")?;
     let out_dir = client_dir.path().join("out");
     // `--jobs 1`: `a` lands and registers its chunks before `b` plans, so every
-    // shared chunk is a donor for `b`. `--max-lane-streams 4` lets `b`'s
-    // complement ranges run four at a time on the one lane.
+    // shared chunk is a donor for `b`. `--max-lane-streams 4` bounds how many
+    // entries stream from the one provider at once; `b`'s one lane fills its
+    // complement ranges one at a time.
     let mut args = bundle_pull_argv(
         &chain,
         &node,
@@ -647,9 +648,8 @@ async fn run_scattered_complement() -> anyhow::Result<()> {
         complement.len()
     );
     // Every open the node served was a paid leg (#2063): one whole-blob open for
-    // `a`, whose prelude is its drive's first leg, and one per complement range
-    // of `b`, whose session opens its first range for the drive. A size-only
-    // open thrown away would add one per entry, and a prelude per drive more.
+    // `a`, and one per complement range of `b`, each opened by `b`'s one lane.
+    // A size-only open thrown away would add one per entry.
     let legs = 1 + complement.len() as u64;
     anyhow::ensure!(
         opens == legs,
@@ -660,11 +660,11 @@ async fn run_scattered_complement() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// With two holders of the recipient, its scattered complement stripes across
-/// both (#2123): each holder serves some of `b`'s complement ranges, and the
-/// two lanes together bill exactly `a`'s whole file plus `b`'s complement, so
-/// no range is paid on both lanes. Every open either node served is a paid
-/// leg: the primed first leg of the stripe is adopted, not thrown away.
+/// With two holders of the recipient, the acquire loop runs one lane per
+/// holder (#2123), and each lane fills one of `b`'s complement ranges at a
+/// time. Each holder serves some of them, and the two lanes together bill
+/// exactly `a`'s whole file plus `b`'s complement, so no range is paid on both
+/// lanes. Every open either node served is a paid leg.
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_bundle_pull_stripes_a_complement_across_two_holders() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_striped_complement()))
@@ -735,7 +735,7 @@ async fn run_striped_complement() -> anyhow::Result<()> {
     );
 
     // Two independently bonded holders of both files: distinct operators, so
-    // the stripe admits both.
+    // the entry admits a lane for each (one node per operator).
     let blobs = [file_a.as_slice(), file_b.as_slice()];
     let (holder_x, hashes_x) = NodeFixture::launch_with_blobs(&chain, "US", &blobs).await?;
     let (holder_y, hashes_y) = NodeFixture::launch_with_blobs(&chain, "US", &blobs).await?;
@@ -745,7 +745,7 @@ async fn run_striped_complement() -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         holder_x.operator_addr() != holder_y.operator_addr(),
-        "the two holders must be distinct operators for the stripe to admit both"
+        "the two holders must be distinct operators for the entry to admit both"
     );
 
     let client_dir = tempfile::tempdir().context("client tempdir")?;
@@ -1973,8 +1973,8 @@ async fn run_bundle_pull_until_ready(
 /// The `decdn bundle pull` argv (after the `bundle pull` subcommand) to pull a
 /// local manifest through discovery: no `--node-id`, so every entry probes the
 /// active registry and sees every holder. `--jobs 1` keeps the donor ahead of
-/// its recipient, and `--max-lane-streams 4` lets each lane of a striped drive
-/// run four ranges at once.
+/// its recipient. `--max-lane-streams 4` bounds how many entries stream from
+/// one provider at once; each lane fills one range at a time.
 fn discovered_pull_argv(
     chain: &ChainFixture,
     manifest: &std::path::Path,

@@ -522,16 +522,14 @@ async fn two_hashes_reuse_one_warm_connection() -> anyhow::Result<()> {
 
 /// Drive a scattered range set across four concurrent sibling stores, then the
 /// rest of the blob into one of them, through one `PeerSource` on one ledger
-/// against a live handler, and return how many connections the server
-/// accepted. `warm` builds the source with a warm connection (#2119).
-/// `restarted` seeds the lane with a live chain from an earlier payer process
-/// ([`lane_with_proved_reveals`]), so the fresh ledger trails the node's
-/// watermark and every leg's first proof is stale.
+/// against a live handler. The lane is seeded with a live chain from an
+/// earlier payer process ([`lane_with_proved_reveals`]), so the fresh ledger
+/// trails the node's watermark and every leg's first proof is stale.
 #[allow(
     clippy::too_many_lines,
     reason = "one fixture: a paid handler, a lane, and the two drives it serves"
 )]
-async fn drive_scattered_through_peer_source(warm: bool, restarted: bool) -> anyhow::Result<usize> {
+async fn drive_scattered_as_a_restarted_payer() -> anyhow::Result<()> {
     use decdn_client::driver::{DriveConfig, drive};
     use decdn_client::{BudgetPacer, ClientRangedStore, FakeFunder, PeerSource, SharedPool};
 
@@ -543,21 +541,7 @@ async fn drive_scattered_through_peer_source(warm: bool, restarted: bool) -> any
     let client_signer = Arc::new(PrivateKeySigner::random());
     let deposit = U256::from(1_000_000_000u64);
     let pool_store = Arc::new(MemoryPoolStateStore::new());
-    pool_store.record(&if restarted {
-        lane_with_proved_reveals(&client_signer, deposit)?
-    } else {
-        LaneState::hydrate(
-            pool_id(),
-            client_signer.address(),
-            operator_addr(),
-            deposit,
-            0,
-            U256::ZERO,
-            U256::ZERO,
-            None,
-            decdn_incentive::LaneChain::NONE,
-        )
-    })?;
+    pool_store.record(&lane_with_proved_reveals(&client_signer, deposit)?)?;
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = operator_signer();
@@ -574,7 +558,7 @@ async fn drive_scattered_through_peer_source(warm: bool, restarted: bool) -> any
         RATE_PER_MB,
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let (server_task, accepted) = spawn_server_counting(server_ep.clone(), handler);
+    let (server_task, _accepted) = spawn_server_counting(server_ep.clone(), handler);
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
@@ -594,11 +578,6 @@ async fn drive_scattered_through_peer_source(warm: bool, restarted: bool) -> any
         u64::MAX,
         PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
     );
-    let source = if warm {
-        source.with_warm_connection()
-    } else {
-        source
-    };
     // Four sibling fetches of the blob, one store each, on the one lane: the
     // shape of concurrent bundle entries that share a provider.
     let store_dir = tempfile::tempdir()?;
@@ -667,21 +646,7 @@ async fn drive_scattered_through_peer_source(warm: bool, restarted: bool) -> any
         "the range set and the rest assemble the blob byte-exact"
     );
     drop(source);
-    let dialed = accepted.load(std::sync::atomic::Ordering::SeqCst);
     shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(dialed)
-}
-
-/// A warm `PeerSource` drives a whole scattered range set, four legs at a time,
-/// and then the rest of the blob, on ONE connection: concurrent first opens
-/// share one dial, and later drives reuse it (#2119). Without the warm
-/// connection every leg dials its own.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_warm_peer_source_drives_a_range_set_on_one_connection() -> anyhow::Result<()> {
-    let warm = Box::pin(drive_scattered_through_peer_source(true, false)).await?;
-    anyhow::ensure!(warm == 1, "a warm source dials once, dialled {warm}");
-    let cold = Box::pin(drive_scattered_through_peer_source(false, false)).await?;
-    anyhow::ensure!(cold > 1, "a cold source dials per leg, dialled {cold}");
     Ok(())
 }
 
@@ -694,8 +659,7 @@ async fn a_warm_peer_source_drives_a_range_set_on_one_connection() -> anyhow::Re
 /// set must still assemble.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_payer_heals_a_concurrent_range_set() -> anyhow::Result<()> {
-    Box::pin(drive_scattered_through_peer_source(true, true)).await?;
-    Ok(())
+    Box::pin(drive_scattered_as_a_restarted_payer()).await
 }
 
 /// A restarted payer's sub-chunk transfer (#1946): the node's lane sits two

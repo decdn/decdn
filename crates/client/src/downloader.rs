@@ -204,7 +204,10 @@ where
     }
 
     /// Fetch every [`DownloadTarget`] to its own `dest` path, returning the
-    /// written paths in target order. Each blob's `.partial` and final file are
+    /// `dest` of each target it promoted, in target order. A target without
+    /// explicit ranges is always promoted, so a whole-blob batch returns every
+    /// `dest`; a ranged target that leaves bytes missing is not in the result,
+    /// because no file exists at its `dest`. Each blob's `.partial` and final file are
     /// keyed by `dest` (its parent directory and file name), so a resumed
     /// download re-pulls only what it lacks and the promoted file IS `dest` — no
     /// post-finalize rename. The parent directory of each `dest` is created if
@@ -304,8 +307,8 @@ where
             // another writer, and the `.partial` then stays for that writer.
             if target.ranges.is_none() || store.is_complete().await? {
                 store.finalize().await?;
+                written.push(target.dest.to_path_buf());
             }
-            written.push(target.dest.to_path_buf());
         }
         Ok(written)
     }
@@ -535,6 +538,62 @@ mod tests {
         anyhow::ensure!(
             blake3::hash(&got).as_bytes() == &root,
             "written file is BLAKE3-identical to the entry hash"
+        );
+        Ok(())
+    }
+
+    /// A ranged target whose ranges complete the store is promoted: its `dest`
+    /// exists and is in the result. A ranged target that leaves bytes missing
+    /// stays a `.partial` and is not in the result.
+    #[tokio::test]
+    async fn a_ranged_target_is_promoted_only_when_its_store_completes() -> anyhow::Result<()> {
+        let blob = payload(1_500_000);
+        let total = u64::try_from(blob.len())?;
+        let dir = tempfile::tempdir()?;
+
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
+        let root = source.root();
+        let part = dir.path().join("part.bin");
+        let half = [(0, total / 2)];
+        let paths = downloader(vec![candidate(source, ledger, 0xA1)])?
+            .fetch_to_paths(
+                &[DownloadTarget {
+                    hash: root,
+                    total_bytes: total,
+                    dest: &part,
+                    ranges: Some(&half),
+                }],
+                None,
+                None,
+            )
+            .await?;
+        anyhow::ensure!(paths.is_empty(), "an incomplete target is not returned");
+        anyhow::ensure!(!part.exists(), "an incomplete target is not promoted");
+
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
+        let whole = dir.path().join("whole.bin");
+        let all = [(0, total)];
+        let paths = downloader(vec![candidate(source, ledger, 0xA1)])?
+            .fetch_to_paths(
+                &[DownloadTarget {
+                    hash: root,
+                    total_bytes: total,
+                    dest: &whole,
+                    ranges: Some(&all),
+                }],
+                None,
+                None,
+            )
+            .await?;
+        anyhow::ensure!(
+            paths == vec![whole.clone()],
+            "the promoted dest is returned"
+        );
+        anyhow::ensure!(
+            std::fs::read(&whole)? == blob,
+            "the promoted file is the blob"
         );
         Ok(())
     }

@@ -7496,19 +7496,23 @@ mod tests {
     }
 
     /// One scripted holder of `blob`, paying provider `provider`. A holder
-    /// that `blips` resets its first stream once, 256 KiB in, and then serves.
+    /// given a `blip` flag resets its first stream once, 256 KiB in, sets the
+    /// flag as it does, and then serves.
     fn scripted_holder(
         blob: &[u8],
         provider: u8,
-        blips: bool,
+        blip: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> anyhow::Result<decdn_client::StreamCandidate<decdn_client::source::ScriptedSource>> {
         let ledger = Arc::new(decdn_client::PoolLedger::new(
             decdn_client::Cumulative::default(),
         ));
         let mut source =
             decdn_client::source::ScriptedSource::new(blob.to_vec())?.paying(Arc::clone(&ledger));
-        if blips {
-            source = source.fault_once_after(256 * 1024, || anyhow!("connection reset"));
+        if let Some(fired) = blip {
+            source = source.fault_once_after(256 * 1024, move || {
+                fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                anyhow!("connection reset")
+            });
         }
         Ok(decdn_client::StreamCandidate {
             source,
@@ -7530,17 +7534,18 @@ mod tests {
         })
     }
 
-    /// Two scripted holders of `blob`; the first blips once when `first_blips`.
+    /// Two scripted holders of `blob`; the first (0xA1) blips once and sets
+    /// `first_blip` when given one.
     fn two_scripted_holders(
         blob: &[u8],
-        first_blips: bool,
+        first_blip: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> anyhow::Result<(
         decdn_client::StaticSources<decdn_client::source::ScriptedSource>,
         Vec<decdn_client::Holder>,
     )> {
         let sources = decdn_client::StaticSources::new(vec![
-            scripted_holder(blob, 0xA1, first_blips)?,
-            scripted_holder(blob, 0xB2, false)?,
+            scripted_holder(blob, 0xA1, first_blip)?,
+            scripted_holder(blob, 0xB2, None)?,
         ])?;
         let holders = sources.holders();
         Ok((sources, holders))
@@ -7587,7 +7592,8 @@ mod tests {
     async fn a_range_entry_survives_a_holder_blip() -> anyhow::Result<()> {
         let blob = test_blob(6 * 1024 * 1024);
         let ranges = vec![(1024 * 1024, 2 * 1024 * 1024)];
-        let (provider, holders) = two_scripted_holders(&blob, true)?;
+        let blipped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (provider, holders) = two_scripted_holders(&blob, Some(Arc::clone(&blipped)))?;
         let staging = tempfile::tempdir()?;
         let dest = staging.path().join("entry");
         let downloader = Downloader::new(
@@ -7615,6 +7621,10 @@ mod tests {
                 &stop,
             )
             .await?;
+        assert!(
+            blipped.load(std::sync::atomic::Ordering::SeqCst),
+            "holder 0xA1 reset a stream mid-range"
+        );
         assert_eq!(
             read_range(&dest, 1024 * 1024, 2 * 1024 * 1024)?,
             blob[1024 * 1024..3 * 1024 * 1024]

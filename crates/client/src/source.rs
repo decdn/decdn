@@ -35,7 +35,6 @@ use decdn_bao_range::AlignedRange;
 use decdn_incentive::DepositOutcome;
 use iroh::{Endpoint, EndpointAddr};
 
-use crate::connection::WarmConnection;
 use crate::sink::{PullReader, StashedFault};
 use crate::{
     PoolContext, PoolLedger, PullDeadlines, UpstreamPull, UpstreamPullHeader, VoucherProgress,
@@ -232,17 +231,15 @@ fn micros_now() -> u64 {
 /// borrow would freeze it for the whole fetch and forbid the driver's `&mut`;
 /// the `Arc<Mutex<..>>` lets both see one state. `open` locks it only to CLONE
 /// the context out, then drops the guard before awaiting, so no lock is ever
-/// held across an `.await`. A range set driven several gaps at a time opens
-/// concurrently with a sibling gap's top-up, so an open's snapshot can predate
-/// a deposit that is about to land: it under-states the deposit, never
-/// over-states it. The gap that topped up waits out the node's view of the new
-/// deposit; a sibling refused on the stale view takes its own fund-and-retry
+/// held across an `.await`. Concurrent lanes pay from one pool, so one lane
+/// can open while another lane tops the pool up, and an open's snapshot can
+/// predate a deposit that is about to land: it under-states the deposit, never
+/// over-states it. The lane that topped up waits out the node's view of the
+/// new deposit; a lane refused on the stale view takes its own fund-and-retry
 /// path, and the pool's top-up lock ([`crate::SharedPool::topup_lock`]) makes
 /// it re-read the raised deposit instead of escrowing again.
 ///
-/// By default every open dials its own connection. A source built
-/// [`with_warm_connection`](Self::with_warm_connection) dials once and opens
-/// every pull as a new stream on that connection instead (#2119).
+/// Every open dials its own connection.
 pub struct PeerSource<'a> {
     endpoint: &'a Endpoint,
     target: EndpointAddr,
@@ -259,11 +256,6 @@ pub struct PeerSource<'a> {
     /// dials on the caller's runtime. See
     /// [`with_dial_runtime`](Self::with_dial_runtime).
     dial_runtime: Option<tokio::runtime::Handle>,
-    /// The one connection every open reuses, when the source keeps one warm.
-    /// `None` dials per open. The inner `None` is a warm source that has not
-    /// dialled yet, or whose connection closed and is dialled again on the next
-    /// open.
-    warm: Option<tokio::sync::Mutex<Option<Arc<WarmConnection>>>>,
 }
 
 impl std::fmt::Debug for PeerSource<'_> {
@@ -277,7 +269,6 @@ impl std::fmt::Debug for PeerSource<'_> {
             .field("max_blob_size_bytes", &self.max_blob_size_bytes)
             .field("max_rate_per_mb", &self.max_rate_per_mb)
             .field("deadlines", &self.deadlines)
-            .field("warm", &self.warm.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -316,7 +307,6 @@ impl<'a> PeerSource<'a> {
             max_rate_per_mb,
             deadlines,
             dial_runtime: None,
-            warm: None,
         }
     }
 
@@ -337,23 +327,6 @@ impl<'a> PeerSource<'a> {
         self
     }
 
-    /// Keep one connection to the target warm and open every pull on it.
-    ///
-    /// A fetch that opens many small legs against one provider (a range-dedup
-    /// entry's boundary groups) otherwise pays a dial, a QUIC handshake and a
-    /// teardown per leg (#2119). Each pull is still its own stream with its own
-    /// signed request and response, so nothing about payment changes. A
-    /// connection that closes (an idle timeout while the fetch waits on a
-    /// sibling, a peer close) is dialled again on the next open, and an open that
-    /// fails because the connection closed under it is retried once on a fresh
-    /// one; an open sends no voucher, so the retry pays nothing. The connection
-    /// closes when the source drops.
-    #[must_use]
-    pub fn with_warm_connection(mut self) -> Self {
-        self.warm = Some(tokio::sync::Mutex::new(None));
-        self
-    }
-
     /// Open the whole blob (`byte_len == 0`, "to end") from offset 0.
     ///
     /// For a caller that must read the signed `total_bytes` before it can size
@@ -371,8 +344,8 @@ impl<'a> PeerSource<'a> {
         })
     }
 
-    /// Open `[byte_offset, +byte_len)` of `hash` (`byte_len == 0` = to end), on
-    /// the warm connection when the source keeps one.
+    /// Open `[byte_offset, +byte_len)` of `hash` (`byte_len == 0` = to end) on
+    /// a connection of its own.
     async fn open_pull(
         &self,
         hash: [u8; 32],
@@ -388,78 +361,10 @@ impl<'a> PeerSource<'a> {
                 .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
                 .clone()
         };
-        let Some(slot) = &self.warm else {
-            return crate::open_progressive_pull(
-                self.endpoint,
-                self.target.clone(),
-                &ctx,
-                Arc::clone(&self.ledger),
-                self.slash_domain,
-                self.expected_signer,
-                hash,
-                self.namespace_id,
-                byte_offset,
-                micros_now(),
-                self.max_blob_size_bytes,
-                self.max_rate_per_mb,
-                self.deadlines,
-                byte_len,
-                self.dial_runtime.as_ref(),
-            )
-            .await;
-        };
-        let conn = self.warm_connection(slot).await?;
-        match self.open_on(&conn, &ctx, hash, byte_offset, byte_len).await {
-            // The connection closed under the open (an idle timeout, a peer
-            // restart): the open never reached a decision, so dial again once.
-            // A refusal the peer did send is its answer, and is not asked twice.
-            Err(err)
-                if conn.is_closed() && err.downcast_ref::<crate::UpstreamRefused>().is_none() =>
-            {
-                tracing::debug!("warm connection closed under an open ({err:#}); redialling once");
-                let conn = self.warm_connection(slot).await?;
-                self.open_on(&conn, &ctx, hash, byte_offset, byte_len).await
-            }
-            opened => opened,
-        }
-    }
-
-    /// The warm connection, dialled when there is none yet or the last one
-    /// closed. The slot's lock is held across the dial, so concurrent opens share
-    /// one dial rather than racing several.
-    async fn warm_connection(
-        &self,
-        slot: &tokio::sync::Mutex<Option<Arc<WarmConnection>>>,
-    ) -> anyhow::Result<Arc<WarmConnection>> {
-        let mut held = slot.lock().await;
-        if let Some(conn) = held.as_ref().filter(|c| !c.is_closed()) {
-            return Ok(Arc::clone(conn));
-        }
-        let conn = Arc::new(
-            WarmConnection::connect(
-                self.endpoint,
-                self.target.clone(),
-                self.deadlines.open(),
-                self.dial_runtime.as_ref(),
-            )
-            .await?,
-        );
-        *held = Some(Arc::clone(&conn));
-        Ok(conn)
-    }
-
-    /// Open one pull as a new stream on `conn`.
-    async fn open_on(
-        &self,
-        conn: &WarmConnection,
-        ctx: &PoolContext,
-        hash: [u8; 32],
-        byte_offset: u64,
-        byte_len: u64,
-    ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
-        crate::open_progressive_pull_on(
-            conn,
-            ctx,
+        crate::open_progressive_pull(
+            self.endpoint,
+            self.target.clone(),
+            &ctx,
             Arc::clone(&self.ledger),
             self.slash_domain,
             self.expected_signer,
@@ -471,6 +376,7 @@ impl<'a> PeerSource<'a> {
             self.max_rate_per_mb,
             self.deadlines,
             byte_len,
+            self.dial_runtime.as_ref(),
         )
         .await
     }
