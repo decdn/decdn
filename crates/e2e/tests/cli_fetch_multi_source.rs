@@ -106,8 +106,7 @@ async fn run() -> anyhow::Result<()> {
     let chain = ChainFixture::launch().await?;
 
     // BOTH nodes are pre-warmed with the SAME blob bytes, so they share a hash
-    // and are both admissible sources — the gate `try_multi_source_fetch`
-    // checks (`admit_sources` + `should_multi_source`) needs at least two
+    // and are both admissible sources: the acquire loop stripes across two
     // distinct-operator holders of the exact hash requested.
     let blob = make_blob();
     let blob_hash = Hash::new(&blob);
