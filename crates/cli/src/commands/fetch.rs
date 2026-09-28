@@ -1049,15 +1049,63 @@ pub(crate) fn spawn_harvest(
     tokio::spawn(async move {
         let store = decdn_client::PeerStore::open(&dir);
         let cfg = decdn_client::StoreConfig::default();
-        let now = now_secs_cli();
-        for cand in &registry {
-            let _ = store.upsert_identity(cand, now);
-        }
-        for (id, rtt_ms, rate) in probed {
-            let _ = store.record_sample(&id, rtt_ms, rate, now, &cfg);
-        }
-        let _ = store.prune_and_cap(now, &cfg);
+        harvest(&store, &registry, probed, now_secs_cli(), &cfg);
     })
+}
+
+/// How many per-peer record writes one [`harvest`] made, and how many failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HarvestTally {
+    /// Identity and sample writes attempted.
+    writes: usize,
+    /// Of those, the writes the store refused.
+    failed: usize,
+}
+
+/// The body of [`spawn_harvest`]. Probe samples are the only input to the
+/// peer store's latency ranking, so a refused write is logged, not dropped:
+/// each one at `debug` with its peer, and once at `warn` when the store
+/// refuses every record write, because the ranking then stays frozen.
+fn harvest(
+    store: &decdn_client::PeerStore,
+    registry: &[NodeCandidate],
+    probed: Vec<(PublicKey, f64, u64)>,
+    now: u64,
+    cfg: &decdn_client::StoreConfig,
+) -> HarvestTally {
+    let mut tally = HarvestTally {
+        writes: 0,
+        failed: 0,
+    };
+    let mut file = |node_id: &PublicKey, what: &str, written: anyhow::Result<()>| {
+        tally.writes = tally.writes.saturating_add(1);
+        if let Err(e) = written {
+            tally.failed = tally.failed.saturating_add(1);
+            tracing::debug!(%node_id, "could not record {what} in the peer store: {e:#}");
+        }
+    };
+    for cand in registry {
+        file(
+            &cand.node_id,
+            "an identity",
+            store.upsert_identity(cand, now),
+        );
+    }
+    for (node_id, rtt_ms, rate) in probed {
+        let written = store.record_sample(&node_id, rtt_ms, rate, now, cfg);
+        file(&node_id, "a probe sample", written);
+    }
+    if let Err(e) = store.prune_and_cap(now, cfg) {
+        tracing::debug!("could not prune the peer store: {e:#}");
+    }
+    if tally.writes > 0 && tally.failed == tally.writes {
+        tracing::warn!(
+            writes = tally.writes,
+            "the peer store refused every write of this probe round; \
+             its latency ranking stays at its last state"
+        );
+    }
+    tally
 }
 
 /// Seconds since the Unix epoch, saturating to 0 on a clock before the epoch
@@ -5260,6 +5308,25 @@ mod tests {
         let r = store.get(&harvest_key(1)).expect("probed peer persisted");
         assert_eq!(r.latency_ms, Some(42.0));
         assert_eq!(r.rate_per_mb, Some(9));
+    }
+
+    #[test]
+    fn harvest_counts_every_write_the_store_refuses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A file where the store's directory belongs makes every write fail.
+        std::fs::write(dir.path().join("peers"), b"").expect("block the store dir");
+        let store = decdn_client::PeerStore::open(dir.path());
+        let regs = vec![harvest_candidate(1), harvest_candidate(2)];
+        let probed = vec![(harvest_key(1), 42.0_f64, 9_u64)];
+        let cfg = decdn_client::StoreConfig::default();
+        let tally = harvest(&store, &regs, probed, now_secs_cli(), &cfg);
+        assert_eq!(
+            tally,
+            HarvestTally {
+                writes: 3,
+                failed: 3
+            }
+        );
     }
 
     /// `select_with_widening` re-runs unfiltered when a region allowlist filters
