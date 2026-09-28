@@ -2948,6 +2948,35 @@ mod tests {
         assert_eq!(reach(&resumed, &[(2 * GROUP, GROUP)]).await, 2 * GROUP);
         assert_eq!(reach(&resumed, &[(0, 2 * GROUP)]).await, 2 * GROUP);
         assert_eq!(reach(&resumed, &[(0, 0)]).await, total);
+
+        // A partial last group counts at its real length, in both the gaps and
+        // the present content, never padded to a whole group.
+        let ragged = 4 * GROUP + 37;
+        let (root, plaintext, outboard) = synth_blob(ragged as usize);
+        let fresh = fresh_store(root, ragged);
+        assert_eq!(reach(&fresh, &[(0, 0)]).await, ragged);
+        assert_eq!(reach(&fresh, &[(4 * GROUP, 37)]).await, 37);
+
+        let resumed = fresh_store(root, ragged);
+        preadmit(
+            &resumed,
+            &plaintext,
+            &outboard,
+            &align_range(0, GROUP, ragged).expect("align"),
+        )
+        .await;
+        assert_eq!(reach(&resumed, &[(4 * GROUP, 37)]).await, GROUP + 37);
+
+        let tail_held = fresh_store(root, ragged);
+        preadmit(
+            &tail_held,
+            &plaintext,
+            &outboard,
+            &align_range(4 * GROUP, 37, ragged).expect("align"),
+        )
+        .await;
+        assert_eq!(reach(&tail_held, &[(0, GROUP)]).await, GROUP + 37);
+        assert_eq!(reach(&tail_held, &[(0, 0)]).await, ragged);
     }
 
     /// `first_leg` is exactly the range the drive opens first, both on a fresh
