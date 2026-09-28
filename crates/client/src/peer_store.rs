@@ -1,5 +1,5 @@
-//! Persisted per-peer knowledge base: registry-fed identity plus interaction-fed
-//! latency and price, keyed by iroh [`iroh::PublicKey`], one JSON file per peer.
+//! Persisted per-peer knowledge base: registry-fed identity, probe-fed latency,
+//! and price from probes and stream opens, keyed by iroh [`iroh::PublicKey`], one JSON file per peer.
 
 use crate::discovery::NodeCandidate;
 use alloy::primitives::{Address, Bytes};
@@ -57,7 +57,7 @@ impl Default for StoreConfig {
 }
 
 /// Everything the client knows about one peer: identity (registry-fed) and
-/// stats (interaction-fed), aging on separate clocks.
+/// stats (probe- and stream-fed), aging on separate clocks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerRecord {
     /// iroh endpoint id — the record's key and filename.
@@ -83,11 +83,16 @@ pub struct PeerRecord {
     pub multiaddrs: Bytes,
     /// Seconds since the Unix epoch when identity was last confirmed against the registry.
     pub identity_seen_at_secs: u64,
-    /// EWMA-smoothed observed latency in milliseconds; `None` until the first sample.
+    /// EWMA-smoothed probe round-trip time in milliseconds (dial to the signed
+    /// `cdn/probe/v1` response); `None` until the first sample. Only probes feed
+    /// it: on a cache miss a stream open's latency includes the node's own
+    /// upstream work, so it measures the content's cache state, not the node's
+    /// distance.
     pub latency_ms: Option<f64>,
-    /// Seconds since the Unix epoch of the most recent latency/price sample.
+    /// Seconds since the Unix epoch of the most recent latency sample.
     pub last_sampled_at_secs: Option<u64>,
-    /// Last observed price quote; a ranking hint only, never authoritative.
+    /// Most recent price quote from a probe or stream response; a diagnostic
+    /// hint only, never authoritative.
     pub rate_per_mb: Option<u64>,
     /// Number of latency samples folded so far (gates EWMA warm-up).
     pub sample_count: u32,
@@ -163,6 +168,23 @@ impl PeerRecord {
 }
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// Serializes every mutation of the store within this process. Each mutation
+/// reads a whole record, changes it, and writes the whole record back, so two
+/// unserialized writers lose one update: a stream open that races the
+/// off-path probe harvest writes back a record read before the probe sample
+/// landed. The lock is process-wide rather than per store, because each
+/// [`PeerStore::open`] of one directory is a separate value. Concurrent
+/// `decdn` processes are not serialized: the atomic rename keeps each record
+/// whole, and the last writer wins.
+static MUTATION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Take [`MUTATION_LOCK`]. The guarded value is `()`, so a writer that
+/// panicked leaves nothing inconsistent behind and the poison is ignored.
+fn mutation_guard() -> MutexGuard<'static, ()> {
+    MUTATION_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Directory-backed peer knowledge base: one JSON file per peer under `<data_dir>/peers`.
 #[derive(Debug, Clone)]
@@ -270,6 +292,7 @@ impl PeerStore {
 
     /// Refresh identity, preserving existing stats.
     pub fn upsert_identity(&self, cand: &NodeCandidate, now_secs: u64) -> anyhow::Result<()> {
+        let _guard = mutation_guard();
         let mut rec = self.get(&cand.node_id).unwrap_or(PeerRecord {
             node_id: cand.node_id,
             eth_address: cand.eth_address,
@@ -291,7 +314,7 @@ impl PeerStore {
         self.write(&rec)
     }
 
-    /// Fold a latency sample, set price, stamp freshness, and clear any failure.
+    /// Fold a probe RTT sample, set price, stamp freshness, and clear any failure.
     pub fn record_sample(
         &self,
         node_id: &PublicKey,
@@ -300,6 +323,7 @@ impl PeerStore {
         now_secs: u64,
         cfg: &StoreConfig,
     ) -> anyhow::Result<()> {
+        let _guard = mutation_guard();
         let mut rec = self.get(node_id).unwrap_or(PeerRecord {
             node_id: *node_id,
             eth_address: Address::ZERO,
@@ -319,8 +343,25 @@ impl PeerStore {
         self.write(&rec)
     }
 
+    /// File a successful stream open: set the quoted price and clear any
+    /// failure. Folds no latency and leaves freshness unstamped, so neither the
+    /// fast-path TTL nor the LRU order sees the open: on a cache miss the open's
+    /// latency includes the node's own upstream work, not just its distance. A
+    /// peer with no record is left alone: a stats-only placeholder is never
+    /// selectable.
+    pub fn record_open(&self, node_id: &PublicKey, rate_per_mb: u64) -> anyhow::Result<()> {
+        let _guard = mutation_guard();
+        let Some(mut rec) = self.get(node_id) else {
+            return Ok(());
+        };
+        rec.rate_per_mb = Some(rate_per_mb);
+        rec.last_failure_at_secs = None;
+        self.write(&rec)
+    }
+
     /// Stamp a failure so the peer is suppressed from selection.
     pub fn record_failure(&self, node_id: &PublicKey, now_secs: u64) -> anyhow::Result<()> {
+        let _guard = mutation_guard();
         let Some(mut rec) = self.get(node_id) else {
             return Ok(());
         };
@@ -338,6 +379,7 @@ impl PeerStore {
 
     /// Prune very-stale identities, then LRU-evict down to `lru_cap`.
     pub fn prune_and_cap(&self, now_secs: u64, cfg: &StoreConfig) -> anyhow::Result<()> {
+        let _guard = mutation_guard();
         let mut records = self.load_all();
         records.retain(|r| {
             if r.identity_prunable(now_secs, cfg) {
@@ -579,6 +621,69 @@ mod tests {
         Ok(())
     }
 
+    /// A stream open (#2196) files its quote and clears the failure stamp, but
+    /// its time-to-first-byte is not a distance measure, so the probe RTT and
+    /// its freshness clock stay exactly as the last probe left them.
+    #[test]
+    fn record_open_files_rate_and_clears_failure_without_touching_latency() -> anyhow::Result<()> {
+        let cfg = StoreConfig::default();
+        let dir = tempdir()?;
+        let store = PeerStore::open(dir.path());
+        store.upsert_identity(&candidate(5), 5_000)?;
+        store.record_sample(&key(5), 57.0, 3, 5_100, &cfg)?;
+        store.record_failure(&key(5), 5_200)?;
+        store.record_open(&key(5), 9)?;
+        let got = store
+            .get(&key(5))
+            .ok_or_else(|| anyhow::anyhow!("missing"))?;
+        assert_eq!(got.rate_per_mb, Some(9));
+        assert_eq!(got.last_failure_at_secs, None);
+        assert_eq!(got.latency_ms, Some(57.0));
+        assert_eq!(got.sample_count, 1);
+        assert_eq!(got.last_sampled_at_secs, Some(5_100));
+        Ok(())
+    }
+
+    /// Concurrent writers never lose a probe sample: a stream open that races
+    /// the harvest must not write back a record read before the sample landed.
+    #[test]
+    fn concurrent_opens_never_drop_a_probe_sample() -> anyhow::Result<()> {
+        const ROUNDS: u32 = 25;
+        const WRITERS: u32 = 4;
+        let cfg = StoreConfig::default();
+        let dir = tempdir()?;
+        let store = PeerStore::open(dir.path());
+        store.upsert_identity(&candidate(7), 5_000)?;
+        std::thread::scope(|scope| {
+            for _ in 0..WRITERS {
+                scope.spawn(|| {
+                    for _ in 0..ROUNDS {
+                        let _ = store.record_sample(&key(7), 50.0, 1, 5_100, &cfg);
+                    }
+                });
+                scope.spawn(|| {
+                    for _ in 0..ROUNDS {
+                        let _ = store.record_open(&key(7), 2);
+                    }
+                });
+            }
+        });
+        let got = store
+            .get(&key(7))
+            .ok_or_else(|| anyhow::anyhow!("missing"))?;
+        assert_eq!(got.sample_count, WRITERS * ROUNDS);
+        Ok(())
+    }
+
+    #[test]
+    fn record_open_on_unknown_peer_is_a_noop() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let store = PeerStore::open(dir.path());
+        store.record_open(&key(8), 9)?;
+        assert!(store.get(&key(8)).is_none());
+        Ok(())
+    }
+
     #[test]
     fn load_all_skips_corrupt_files() -> anyhow::Result<()> {
         let dir = tempdir()?;
@@ -606,18 +711,19 @@ mod tests {
     }
 
     #[test]
-    fn stream_sample_supersedes_probe_sample() -> anyhow::Result<()> {
+    fn successive_samples_fold_by_ewma() -> anyhow::Result<()> {
         let cfg = StoreConfig::default();
         let dir = tempdir()?;
         let store = PeerStore::open(dir.path());
         store.upsert_identity(&candidate(1), 1_000)?;
-        store.record_sample(&key(1), 200.0, 5, 1_000, &cfg)?; // probe-derived
-        store.record_sample(&key(1), 20.0, 5, 1_100, &cfg)?; // stream-derived TTFB
+        store.record_sample(&key(1), 200.0, 5, 1_000, &cfg)?;
+        store.record_sample(&key(1), 20.0, 5, 1_100, &cfg)?;
         let r = store
             .get(&key(1))
             .ok_or_else(|| anyhow::anyhow!("missing"))?;
-        // EWMA: 0.7*200 + 0.3*20 = 146; the fresh stream pulls latency down toward TTFB.
-        assert!(r.latency_ms.unwrap_or_default() < 200.0);
+        // EWMA: 0.7*200 + 0.3*20 = 146.
+        assert!((r.latency_ms.unwrap_or_default() - 146.0).abs() < 1e-9);
+        assert_eq!(r.sample_count, 2);
         Ok(())
     }
 

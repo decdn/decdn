@@ -131,7 +131,6 @@ impl BlobSource for BackendSource {
                 rate_per_mb: 0,
                 interval_bytes: 0,
                 // A local origin re-encode, not a network round trip.
-                ttfb_ms: 0.0,
             };
             Ok((header, BackendReader::new(wire, range.wire_len())))
         })

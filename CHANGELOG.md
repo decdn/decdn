@@ -832,6 +832,19 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **The client peer store no longer ranks a nearby node behind the origin
+  after a cold miss (#2196).** The store's `latency_ms` folded each stream
+  open's time to first byte alongside the probe RTT. On a cache miss that time
+  includes the serving node's own upstream pull, so after a bundle pull the EU
+  nodes read 1–1.8 s against a 57–78 ms RTT, and the sole origin ranked first
+  on the probe-less fast path for the next 10 minutes. Only probes now feed
+  `latency_ms`; a stream open files its quoted rate and clears the failure
+  stamp (`PeerStore::record_open`). `UpstreamPullHeader::ttfb_ms` is removed
+  from the `decdn-client` API, since nothing else read it. Every peer-store
+  mutation now takes one process-wide lock, so a stream open that races the
+  off-path probe harvest no longer writes back a record read before the probe
+  sample landed.
+
 - **A serve-miss whose DHT answer names only partial holders reaches the
   namespace's origin instead of truncating the client's stream (#2195).**
   The on-chain origin directory was read only when the DHT answer was empty.
