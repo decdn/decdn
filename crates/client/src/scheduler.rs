@@ -144,6 +144,41 @@ pub struct SourceLane<'a, S> {
     /// inside the still-missing request, sits inside this lane's coverage, and
     /// overlaps no earlier lane's reserved first unit.
     pub first_unit: Option<AlignedRange>,
+    /// What the lane holds while it takes work, released when its worker
+    /// stops ([`LaneLease`]), or `None`.
+    pub lease: Option<&'a LaneLease>,
+}
+
+/// A resource one source lane holds while it takes work, such as the caller's
+/// stream permit for the lane's provider. The scheduler drops it when the
+/// lane's worker stops — on a fault, on a drained queue, or when the fetch
+/// ends — so a dead lane holds nothing for the rest of the fetch. A lease is
+/// released once: a lane that takes part in a later fetch holds nothing.
+#[derive(Default)]
+pub struct LaneLease(Mutex<Option<Box<dyn Send + Sync>>>);
+
+impl LaneLease {
+    /// A lease that holds `held` until the lane's worker stops.
+    pub fn new(held: impl Send + Sync + 'static) -> Self {
+        Self(Mutex::new(Some(Box::new(held))))
+    }
+
+    /// Drop what the lease holds. A later call does nothing.
+    pub(crate) fn release(&self) {
+        let held = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(held);
+    }
+}
+
+impl std::fmt::Debug for LaneLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held = self.0.lock().is_ok_and(|held| held.is_some());
+        f.debug_struct("LaneLease").field("held", &held).finish()
+    }
 }
 
 impl<S> std::fmt::Debug for SourceLane<'_, S> {
@@ -1374,7 +1409,7 @@ where
     }
 
     let workers = lanes.iter().enumerate().map(|(i, lane)| {
-        run_worker(
+        let worker = run_worker(
             i,
             store,
             lane.source,
@@ -1394,7 +1429,14 @@ where
             &pool,
             &lane_coverage,
             pacing,
-        )
+        );
+        async move {
+            let stopped = worker.await;
+            if let Some(lease) = lane.lease {
+                lease.release();
+            }
+            stopped
+        }
     });
     // Drive every worker to completion while a single periodic tick flushes the
     // `.ranges` present record (spec §5.5). The workers are the sole work drivers
@@ -1554,6 +1596,7 @@ mod tests {
             ledger,
             coverage,
             first_unit: None,
+            lease: None,
         }
     }
 
@@ -1604,6 +1647,7 @@ mod tests {
                 ledger: Arc::clone(&ledger_a),
                 coverage: full.clone(),
                 first_unit: None,
+                lease: None,
             },
             SourceLane {
                 source: &src_b,
@@ -1611,6 +1655,7 @@ mod tests {
                 ledger: Arc::clone(&ledger_b),
                 coverage: full,
                 first_unit: Some(unit.clone()),
+                lease: None,
             },
         ];
         multi_source_fetch(
@@ -2389,6 +2434,89 @@ mod tests {
         Ok(())
     }
 
+    /// Stamps the moment it drops, so a test can see when a lane let go of it.
+    struct DropStamp(Arc<Mutex<Option<std::time::Instant>>>);
+
+    impl Drop for DropStamp {
+        fn drop(&mut self) {
+            if let Ok(mut at) = self.0.lock() {
+                *at = Some(std::time::Instant::now());
+            }
+        }
+    }
+
+    /// A lane that faults drops its lease as its worker stops, while the other
+    /// lane still fetches the reassigned tail, so what the lease holds (a
+    /// caller's stream permit) frees before the fetch returns.
+    #[tokio::test]
+    async fn a_faulted_lane_drops_its_lease_before_the_fetch_ends() -> anyhow::Result<()> {
+        let data = blob(64 * 1024 * 1024);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(data.clone())?
+            .with_fault_after(1024 * 1024, || anyhow::anyhow!("scripted fault"))
+            .paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let total = src_a.total_bytes();
+        let (store, _dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+        let dropped_a = Arc::new(Mutex::new(None));
+        let dropped_b = Arc::new(Mutex::new(None));
+        let lease_a = super::LaneLease::new(DropStamp(Arc::clone(&dropped_a)));
+        let lease_b = super::LaneLease::new(DropStamp(Arc::clone(&dropped_b)));
+        let mut lanes = vec![
+            lane(&src_a, Arc::clone(&ledger_a), 0xA1),
+            lane(&src_b, Arc::clone(&ledger_b), 0xB2),
+        ];
+        for (l, lease) in lanes.iter_mut().zip([&lease_a, &lease_b]) {
+            l.lease = Some(lease);
+        }
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: Duration::from_secs(10),
+            },
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let ended = std::time::Instant::now();
+        let at_a = dropped_a
+            .lock()
+            .expect("stamp lock")
+            .expect("lane a let go");
+        let at_b = dropped_b
+            .lock()
+            .expect("stamp lock")
+            .expect("lane b let go");
+        assert!(
+            at_a <= at_b,
+            "the faulted lane lets go before the lane that finished"
+        );
+        assert!(at_b <= ended, "both lanes let go before the fetch returns");
+        assert!(
+            src_b.delivered_bytes() > src_a.delivered_bytes(),
+            "lane b fetched the reassigned tail after lane a faulted"
+        );
+        Ok(())
+    }
+
     /// Focused [`Work::retire`] fault coverage (#1506): the anti-hang prune, on
     /// the state directly rather than through a whole fetch.
     ///
@@ -2944,6 +3072,7 @@ mod tests {
                 ledger: Arc::clone(&ledger_a),
                 coverage: full.clone(),
                 first_unit: None,
+                lease: None,
             },
             SourceLane {
                 source: &src_b,
@@ -2951,6 +3080,7 @@ mod tests {
                 ledger: Arc::clone(&ledger_b),
                 coverage: full,
                 first_unit: None,
+                lease: None,
             },
         ];
         let result = tokio::time::timeout(
@@ -3088,6 +3218,7 @@ mod tests {
                 ledger: Arc::clone(&handle_a.ledger),
                 coverage: full.clone(),
                 first_unit: None,
+                lease: None,
             },
             SourceLane {
                 source: &src_b,
@@ -3095,6 +3226,7 @@ mod tests {
                 ledger: Arc::clone(&handle_b.ledger),
                 coverage: full,
                 first_unit: None,
+                lease: None,
             },
         ];
         let result = tokio::time::timeout(
@@ -3294,6 +3426,7 @@ mod tests {
                 ledger: Arc::clone(&ledger_a),
                 coverage: full.clone(),
                 first_unit: None,
+                lease: None,
             },
             SourceLane {
                 source: &src_b,
@@ -3301,6 +3434,7 @@ mod tests {
                 ledger: Arc::clone(&ledger_b),
                 coverage: full,
                 first_unit: None,
+                lease: None,
             },
         ];
         multi_source_fetch(
@@ -3428,6 +3562,7 @@ mod tests {
                 ledger: Arc::clone(&ledger_a),
                 coverage: full.clone(),
                 first_unit: None,
+                lease: None,
             },
             SourceLane {
                 source: &src_b,
@@ -3435,6 +3570,7 @@ mod tests {
                 ledger: Arc::clone(&ledger_b),
                 coverage: full,
                 first_unit: None,
+                lease: None,
             },
         ];
         let result = tokio::time::timeout(

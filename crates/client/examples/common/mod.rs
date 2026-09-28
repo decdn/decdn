@@ -256,6 +256,7 @@ impl Buyer {
                 ledger,
                 coverage: Some(holder.coverage),
                 first_unit: None,
+                lease: decdn_client::LaneLease::default(),
             });
         }
         Ok((candidates, lanes))

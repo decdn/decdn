@@ -125,16 +125,6 @@ enum RangeTargets {
 }
 
 impl RangeTargets {
-    /// The distinct provider addresses this entry's range drives may stream from —
-    /// the pinned target's one provider, or every discovered candidate's. Used to
-    /// acquire the entry's lane-stream permit set before its drives.
-    fn providers(&self) -> Vec<Address> {
-        match self {
-            RangeTargets::Pinned((_, provider)) => vec![*provider],
-            RangeTargets::Discovered { order, .. } => order.iter().map(|c| c.eth_address).collect(),
-        }
-    }
-
     /// How many of the first candidates a drive stripes across at once.
     const fn stripe(&self) -> usize {
         match self {
@@ -1821,52 +1811,70 @@ impl LaneStreamCap {
     }
 
     /// Acquire one stream permit for every distinct provider in `providers`, in
-    /// one global order (sorted, deduped `Address`), and return them held for the
-    /// caller's whole fetch. Acquiring every multi-provider set in the same order
-    /// makes the cap deadlock-free: a task never waits on a lower-address permit
-    /// while holding a higher one.
+    /// one global order (sorted, deduped `Address`), and return each with its
+    /// provider. Every caller that waits on a permit holds none while it
+    /// waits, and a multi-provider set waits in this one order, so the cap is
+    /// deadlock-free: a task never waits on a lower-address permit while
+    /// holding a higher one.
     async fn permit_set(
         &self,
         providers: &[Address],
-    ) -> anyhow::Result<Vec<tokio::sync::OwnedSemaphorePermit>> {
+    ) -> anyhow::Result<Vec<(Address, tokio::sync::OwnedSemaphorePermit)>> {
         let mut ordered = providers.to_vec();
         ordered.sort_unstable();
         ordered.dedup();
         let mut permits = Vec::with_capacity(ordered.len());
         for provider in ordered {
-            permits.push(self.permit(provider).await?);
+            permits.push((provider, self.permit(provider).await?));
         }
         Ok(permits)
     }
 }
 
-/// The extra stream permits one lane of a range drive holds for its provider,
-/// beyond the one its entry holds for the whole fetch.
+/// The stream permits one lane of a range drive holds for its provider: one
+/// for each of the lane's live gap workers.
 ///
+/// The lane starts with the base permit its drive pass reserved ([`Self::new`]).
 /// [`Self::grant`] takes only the permits free right now and never waits, so a
 /// lane cannot deadlock against a sibling entry that holds one permit set and
 /// waits for another. The caller calls it once to size the lane, and the drive
 /// calls it again whenever the lane takes a gap and more gaps wait
-/// ([`decdn_client::LaneGrowth`]), so a
-/// lane that started narrow widens when a sibling entry frees its permits. The
-/// permits return when the grant drops at the end of the drive.
+/// ([`decdn_client::LaneGrowth`]), so a lane that started narrow widens when a
+/// sibling entry frees its permits. The drive calls [`Self::release_one`] as
+/// each worker stops ([`decdn_client::LaneRelease`]), so a lane that dies or
+/// runs out of gaps gives its permits back before the drive returns. What is
+/// left returns when the grant drops.
 struct LaneGrant {
     /// The provider's per-lane stream semaphore ([`LaneStreamCap`]).
     semaphore: Arc<tokio::sync::Semaphore>,
-    /// The most extra permits the lane may hold.
+    /// The most permits the lane may hold.
     room: usize,
-    /// The extra permits the lane holds now.
+    /// The permits the lane holds now.
     held: std::sync::Mutex<Vec<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 impl LaneGrant {
-    /// A grant holding no permit yet, for at most `room` extra permits.
-    const fn new(semaphore: Arc<tokio::sync::Semaphore>, room: usize) -> Self {
+    /// A grant holding `base`, for at most `room` permits in all.
+    fn new(
+        semaphore: Arc<tokio::sync::Semaphore>,
+        room: usize,
+        base: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Self {
         Self {
             semaphore,
             room,
-            held: std::sync::Mutex::new(Vec::new()),
+            held: std::sync::Mutex::new(base.into_iter().collect()),
         }
+    }
+
+    /// Give back one held permit, for a worker that stopped.
+    fn release_one(&self) {
+        let released = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop();
+        drop(released);
     }
 
     /// Take up to `most` of the free permits the lane still has room for, and
@@ -2038,12 +2046,20 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         ) {
             return Ok(None);
         }
-        // Hold one lane-stream permit per admitted provider across the whole
-        // fan-out: every admitted lane opens a stream at once, so the cap must
-        // admit the set together. Acquired in sorted `Address` order (deadlock
-        // free) and only after the gate accepts, so a declined fetch takes none.
+        // One lane-stream permit per admitted provider: every admitted lane
+        // opens a stream at once, so the cap must admit the set together.
+        // Acquired in sorted `Address` order (deadlock free) and only after the
+        // gate accepts, so a declined fetch takes none. Each permit rides on its
+        // provider's lane as a lease, which the scheduler drops when that lane
+        // stops, so a dead lane frees its provider for a sibling entry.
         let providers: Vec<Address> = admitted.iter().map(|c| c.eth_address).collect();
-        let _lane_permits = self.lane_cap.permit_set(&providers).await?;
+        let leases = self
+            .lane_cap
+            .permit_set(&providers)
+            .await?
+            .into_iter()
+            .map(|(provider, permit)| (provider, decdn_client::LaneLease::new(permit)))
+            .collect();
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
         let deps = self.drive_deps(max_blob_bytes)?;
         // The entry's per-file bar callback (ADR 039 fan-out reports one monotonic
@@ -2068,6 +2084,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             progress,
             Some(&self.open_lock),
             Some(&self.ledgers),
+            leases,
         )
         .await
         .map(|opt| opt.map(|_bytes| ()))
@@ -2727,13 +2744,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // across every sub-drive below (complement, donor re-fetch, whole-blob
         // re-drive) — the happy path (complement only) still probes exactly once.
         let targets = self.resolve_range_targets(hash, total).await?;
-        // Hold one lane-stream permit per provider this entry may drive from across
-        // every sub-drive (complement, donor re-fetch, whole-blob re-drive) and the
-        // splice between them — one logical fetch unit — so the entry always keeps
-        // a stream's place on its lane; each drive takes any extra permits it uses
-        // only while it runs. Sorted `Address` order keeps it deadlock-free
-        // against a fan-out entry's permit set.
-        let _lane_permits = self.lane_cap.permit_set(&targets.providers()).await?;
+        // No lane-stream permit is held here: each drive pass reserves one for
+        // each session it drives, and its lanes give them back as they stop
+        // (`LiveSessions::drive`), so the entry holds none across the splice or
+        // its waits on a sibling.
         let driver = CtxRangeDriver::new(self, &targets, hash, staging, total, progress);
 
         // On any dedup-path success, true up the file + total progress bars to
@@ -3058,12 +3072,13 @@ trait RangeDriver {
 /// serves them. A lane that faults retires, and the entry does not go back to
 /// a discovered provider that failed it (a pinned `--node-id` is its only
 /// candidate); a retry round (`--entry-retries`) starts a new driver over a
-/// fresh probe. Each lane fills up to `--max-lane-streams` gaps at once, using
-/// the permits for its provider beyond the one the entry already holds: those
-/// free when the drive starts, and those a sibling entry frees while the drive
-/// runs ([`LaneGrant`]). It returns those extra permits when the drive ends:
-/// the entry keeps waiting on siblings between drives, and a sibling it waits
-/// on may need them.
+/// fresh probe. Each lane fills up to `--max-lane-streams` gaps at once, one
+/// permit for its provider per gap worker: the base permit its drive pass
+/// reserved, then the permits free when the drive starts, and those a sibling
+/// entry frees while the drive runs ([`LaneGrant`]). Each worker gives its
+/// permit back as it stops, so a lane that faults or runs out of gaps frees
+/// its provider at once. The entry holds no permit between drives: it waits on
+/// siblings there, and a sibling it waits on may need them.
 struct CtxRangeDriver<'a, P: Provider + Clone> {
     hash: [u8; 32],
     staging: &'a Path,
@@ -3129,6 +3144,9 @@ trait RangeSessions {
     /// One candidate's open session.
     type Session;
 
+    /// One candidate's reserved stream permit ([`LaneStreamCap`]).
+    type Permit;
+
     /// How many candidates there are, in failover order.
     fn candidates(&self) -> usize;
 
@@ -3154,11 +3172,18 @@ trait RangeSessions {
         first_ranges: &[(u64, u64)],
     ) -> anyhow::Result<Self::Session>;
 
+    /// Reserve one stream permit for each candidate in `indices`, for one
+    /// drive pass. The walk holds no permit when it calls this, and the
+    /// candidates it names have distinct providers.
+    async fn permits(&self, indices: &[usize]) -> anyhow::Result<Vec<(usize, Self::Permit)>>;
+
     /// Drive `ranges` through every open session at once. Each is
-    /// `(candidate index, session, takes the drive's first gap)`.
+    /// `(candidate index, session, takes the drive's first gap)`, and
+    /// `permits` holds each one's reserved permit.
     async fn drive(
         &self,
         open: &[(usize, &Self::Session, bool)],
+        permits: Vec<(usize, Self::Permit)>,
         ranges: &[(u64, u64)],
     ) -> LanesDriven;
 }
@@ -3245,7 +3270,7 @@ impl<S: RangeSessions> SessionWalk<S> {
         };
         let mut last_err: Option<anyhow::Error> = None;
         loop {
-            self.fill(&mut state, ranges, &what, &mut last_err).await?;
+            let permits = self.fill(&mut state, ranges, &what, &mut last_err).await?;
             if state.open.is_empty() {
                 return Err(match last_err {
                     Some(err) if pinned => err,
@@ -3268,7 +3293,7 @@ impl<S: RangeSessions> SessionWalk<S> {
                     .iter()
                     .map(|(index, session)| (*index, session, primed == Some(*index)))
                     .collect();
-                self.sessions.drive(&lanes, ranges).await
+                self.sessions.drive(&lanes, permits, ranges).await
             };
             let failed: Vec<String> = state
                 .open
@@ -3318,15 +3343,22 @@ impl<S: RangeSessions> SessionWalk<S> {
     /// Open the sessions the next drive needs: every stripe member not yet
     /// tried, and, when none is open, the next reserve candidate. A candidate
     /// whose session will not open is skipped for good.
+    ///
+    /// Returns the stream permit of each open session, for the next drive
+    /// pass. They are reserved in one batch, before the new sessions open, so
+    /// no primed first leg waits on a permit. The walk holds no permit when it
+    /// reserves the batch: the last drive gave its permits back, and a later
+    /// batch only follows a pass in which every open failed.
     async fn fill(
         &self,
         state: &mut WalkState<S::Session>,
         ranges: &[(u64, u64)],
         what: &str,
         last_err: &mut Option<anyhow::Error>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<(usize, S::Permit)>> {
         let n = self.sessions.candidates();
         let stripe = self.sessions.stripe().max(1);
+        let mut permits: Vec<(usize, S::Permit)> = Vec::new();
         loop {
             let end = if state.next < stripe {
                 stripe.min(n)
@@ -3335,8 +3367,18 @@ impl<S: RangeSessions> SessionWalk<S> {
             } else {
                 state.next
             };
+            let mut wanted: Vec<usize> = state
+                .open
+                .iter()
+                .map(|&(index, _)| index)
+                .filter(|index| !permits.iter().any(|(held, _)| held == index))
+                .collect();
+            wanted.extend(state.next..end.max(state.next));
+            if !wanted.is_empty() {
+                permits.extend(self.sessions.permits(&wanted).await?);
+            }
             if end <= state.next {
-                return Ok(());
+                return Ok(permits);
             }
             while state.next < end {
                 let index = state.next;
@@ -3351,6 +3393,7 @@ impl<S: RangeSessions> SessionWalk<S> {
                         state.open.push((index, session));
                     }
                     Err(err) => {
+                        permits.retain(|&(held, _)| held != index);
                         if retry_disposition(&err) == RetryDisposition::Terminal {
                             return Err(err);
                         }
@@ -3420,6 +3463,7 @@ impl<P: Provider + Clone> LiveSessions<'_, P> {
 
 impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
     type Session = fetch::RangeSession<'a, P>;
+    type Permit = tokio::sync::OwnedSemaphorePermit;
 
     fn candidates(&self) -> usize {
         self.targets.len()
@@ -3463,9 +3507,25 @@ impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
             .map_err(|err| self.annotate(err))
     }
 
+    async fn permits(&self, indices: &[usize]) -> anyhow::Result<Vec<(usize, Self::Permit)>> {
+        let mut by_provider = Vec::with_capacity(indices.len());
+        for &index in indices {
+            let ((_, provider), _) = self.target(index)?;
+            by_provider.push((*provider, index));
+        }
+        // One global order, the same as `LaneStreamCap::permit_set`.
+        by_provider.sort_unstable();
+        let mut permits = Vec::with_capacity(by_provider.len());
+        for (provider, index) in by_provider {
+            permits.push((index, self.ctx.lane_cap.permit(provider).await?));
+        }
+        Ok(permits)
+    }
+
     async fn drive(
         &self,
         open: &[(usize, &Self::Session, bool)],
+        mut permits: Vec<(usize, Self::Permit)>,
         ranges: &[(u64, u64)],
     ) -> LanesDriven {
         let unfaulted = |result: anyhow::Result<()>| LanesDriven {
@@ -3476,31 +3536,41 @@ impl<'a, P: Provider + Clone> RangeSessions for LiveSessions<'a, P> {
             Ok(store) => store,
             Err(err) => return unfaulted(Err(err)),
         };
-        // Held for this drive only, never across the entry's waits on a sibling
-        // (`reconcile_deferred`): a donor this entry waits on may be blocked on
-        // the same providers' permits.
+        // Each lane starts on its reserved permit and takes free ones as it
+        // grows. Held for this drive only, never across the entry's waits on a
+        // sibling (`reconcile_deferred`): a donor this entry waits on may be
+        // blocked on the same providers' permits.
         let mut grants = Vec::with_capacity(open.len());
         for &(index, _, _) in open {
             let provider = match self.target(index) {
                 Ok(((_, provider), _)) => *provider,
                 Err(err) => return unfaulted(Err(err)),
             };
+            let Some(at) = permits.iter().position(|&(held, _)| held == index) else {
+                return unfaulted(Err(anyhow!(
+                    "no stream permit reserved for provider {provider}"
+                )));
+            };
+            let (_, base) = permits.swap_remove(at);
             grants.push(LaneGrant::new(
                 self.ctx.lane_cap.semaphore(provider).await,
-                self.ctx.lane_cap.n.saturating_sub(1),
+                self.ctx.lane_cap.n,
+                Some(base),
             ));
         }
         let hooks: Vec<_> = grants.iter().map(|g| move |most| g.grant(most)).collect();
+        let releases: Vec<_> = grants.iter().map(|g| move || g.release_one()).collect();
         let lanes: Vec<_> = open
             .iter()
             .zip(&grants)
-            .zip(&hooks)
+            .zip(hooks.iter().zip(&releases))
             .map(
-                |((&(_, session, takes_first), grant), hook)| fetch::StripeLane {
+                |((&(_, session, takes_first), grant), (hook, release))| fetch::StripeLane {
                     session,
                     width: std::num::NonZeroUsize::MIN.saturating_add(grant.grant(usize::MAX)),
                     takes_first,
                     grow: Some(decdn_client::LaneGrowth(hook)),
+                    release: Some(decdn_client::LaneRelease(release)),
                 },
             )
             .collect();
@@ -8329,6 +8399,8 @@ mod tests {
         /// Per drive call: the candidates it ran on, and which took the first
         /// gap.
         calls: std::sync::Mutex<Vec<(Vec<usize>, Option<usize>)>>,
+        /// Each permit batch the walk reserved, in order.
+        reserved: std::sync::Mutex<Vec<Vec<usize>>>,
     }
 
     impl FakeSessions {
@@ -8345,12 +8417,14 @@ mod tests {
                 primed_opens: std::sync::Mutex::new(Vec::new()),
                 drives: std::sync::Mutex::new(Vec::new()),
                 calls: std::sync::Mutex::new(Vec::new()),
+                reserved: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
 
     impl RangeSessions for FakeSessions {
         type Session = usize;
+        type Permit = usize;
 
         fn candidates(&self) -> usize {
             self.candidates
@@ -8383,7 +8457,22 @@ mod tests {
             Ok(index)
         }
 
-        async fn drive(&self, open: &[(usize, &usize, bool)], _: &[(u64, u64)]) -> LanesDriven {
+        async fn permits(&self, indices: &[usize]) -> anyhow::Result<Vec<(usize, usize)>> {
+            self.reserved.lock().unwrap().push(indices.to_vec());
+            Ok(indices.iter().map(|&index| (index, index)).collect())
+        }
+
+        async fn drive(
+            &self,
+            open: &[(usize, &usize, bool)],
+            permits: Vec<(usize, usize)>,
+            _: &[(u64, u64)],
+        ) -> LanesDriven {
+            let mut held: Vec<usize> = permits.iter().map(|&(index, _)| index).collect();
+            held.sort_unstable();
+            let mut lanes: Vec<usize> = open.iter().map(|&(index, _, _)| index).collect();
+            lanes.sort_unstable();
+            assert_eq!(held, lanes, "a drive gets one permit per open session");
             let call = {
                 let mut calls = self.calls.lock().unwrap();
                 calls.push((
@@ -8606,6 +8695,11 @@ mod tests {
             .map(|(lanes, _)| lanes.clone())
             .collect();
         assert_eq!(calls, vec![vec![0, 1], vec![1], vec![2]]);
+        assert_eq!(
+            *walk.sessions.reserved.lock().unwrap(),
+            vec![vec![0, 1], vec![1], vec![2]],
+            "each pass reserves permits for the sessions it drives, and no more"
+        );
     }
 
     /// A failure no lane owns, such as the drive-level floor, fails over every
@@ -8821,7 +8915,7 @@ mod tests {
         let cap = LaneStreamCap::new(4);
         let held = cap.permit(p1).await.unwrap();
         let sibling = cap.permit(p1).await.unwrap();
-        let grant = LaneGrant::new(cap.semaphore(p1).await, cap.n - 1);
+        let grant = LaneGrant::new(cap.semaphore(p1).await, cap.n - 1, None);
         assert_eq!(grant.grant(usize::MAX), 2, "the two free permits");
         assert_eq!(grant.grant(usize::MAX), 0, "the cap is reached");
         drop(sibling);
@@ -8830,11 +8924,40 @@ mod tests {
         assert_eq!(grant.grant(usize::MAX), 0, "the grant is at its room");
         drop(grant);
         drop(held);
-        let all = LaneGrant::new(cap.semaphore(p1).await, 10);
+        let all = LaneGrant::new(cap.semaphore(p1).await, 10, None);
         assert_eq!(
             all.grant(usize::MAX),
             4,
             "every permit came back, and never past the cap"
+        );
+    }
+
+    /// A lane's base permit counts toward its room, and each stopped worker
+    /// gives one permit back to the provider at once.
+    #[tokio::test]
+    async fn a_lane_grant_gives_back_one_permit_per_stopped_worker() {
+        let p1 = Address::repeat_byte(1);
+        let cap = LaneStreamCap::new(4);
+        let semaphore = cap.semaphore(p1).await;
+        let base = cap.permit(p1).await.unwrap();
+        let grant = LaneGrant::new(Arc::clone(&semaphore), cap.n, Some(base));
+        assert_eq!(
+            grant.grant(usize::MAX),
+            3,
+            "the base plus three free permits"
+        );
+        assert_eq!(semaphore.available_permits(), 0);
+        grant.release_one();
+        assert_eq!(semaphore.available_permits(), 1, "one stopped worker");
+        grant.release_one();
+        grant.release_one();
+        grant.release_one();
+        assert_eq!(semaphore.available_permits(), 4, "every worker stopped");
+        grant.release_one();
+        assert_eq!(
+            semaphore.available_permits(),
+            4,
+            "an extra release frees nothing"
         );
     }
 

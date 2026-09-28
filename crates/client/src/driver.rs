@@ -822,6 +822,7 @@ where
         width: concurrency,
         takes_first: true,
         grow: None,
+        release: None,
     };
     drive_range_lanes(
         store,
@@ -861,16 +862,20 @@ pub struct RangeLane<'a, S> {
     /// How the lane grows past `width` while the drive runs, or `None` to stay
     /// at `width`.
     pub grow: Option<LaneGrowth<'a>>,
+    /// What the lane gives back as each of its gap workers stops, or `None`.
+    pub release: Option<LaneRelease<'a>>,
 }
 
 /// A lane's growth hook in a [`drive_range_lanes`] drive.
 ///
 /// Each time a gap worker of the lane takes a gap and more gaps still wait,
 /// the drive calls the hook with the number of gaps that wait, and it adds one
-/// worker to the lane for each unit the hook returns, up to that number. The hook must not wait: it grants only what it can grant
-/// now, such as stream permits that another fetch has released since the
-/// drive started, and the caller holds what it grants until the drive
-/// returns. A lane that starts narrow because a sibling fetch holds its
+/// worker to the lane for each unit the hook returns, up to that number. The
+/// hook must not wait: it grants only what it can grant now, such as stream
+/// permits that another fetch has released since the drive started. The
+/// caller holds one unit for each worker until that worker stops
+/// ([`LaneRelease`]), or until the drive returns when the lane has no release
+/// hook. A lane that starts narrow because a sibling fetch holds its
 /// provider's streams thus widens when that sibling finishes.
 #[derive(Clone, Copy)]
 pub struct LaneGrowth<'a>(pub &'a (dyn Fn(usize) -> usize + Send + Sync + 'a));
@@ -878,6 +883,22 @@ pub struct LaneGrowth<'a>(pub &'a (dyn Fn(usize) -> usize + Send + Sync + 'a));
 impl std::fmt::Debug for LaneGrowth<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("LaneGrowth")
+    }
+}
+
+/// A lane's release hook in a [`drive_range_lanes`] drive.
+///
+/// The drive calls it once as each gap worker of the lane stops: when no gap
+/// is left for it, when its lane retires on a fault, or when the drive halts.
+/// A lane runs `width` workers plus one for each unit its [`LaneGrowth`]
+/// grants, so a caller that holds one stream permit per worker gives one back
+/// on each call, and a lane that dies holds nothing for the rest of the drive.
+#[derive(Clone, Copy)]
+pub struct LaneRelease<'a>(pub &'a (dyn Fn() + Send + Sync + 'a));
+
+impl std::fmt::Debug for LaneRelease<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LaneRelease")
     }
 }
 
@@ -1131,114 +1152,122 @@ where
                 let Some(lane) = lanes.get(index) else {
                     return Ok(());
                 };
-                loop {
-                    let notified = wake.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    let lane_retired = retired.get(index).is_none_or(|r| r.load(Ordering::Acquire));
-                    if halted.load(Ordering::Acquire) || lane_retired {
-                        return Ok::<(), anyhow::Error>(());
-                    }
-                    let taken = {
-                        let mut q = lock();
-                        // The first gap waits for its lane, unless every lane
-                        // that takes it has retired.
-                        let first_is_free = lane.takes_first
-                            || lanes
-                                .iter()
-                                .zip(retired.iter())
-                                .all(|(l, r)| !l.takes_first || r.load(Ordering::Acquire));
-                        let next = if first_is_free && q.first.is_some() {
-                            q.first.take()
-                        } else {
-                            q.waiting.pop_front()
+                let stopped: anyhow::Result<()> = async {
+                    loop {
+                        let notified = wake.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+                        let lane_retired =
+                            retired.get(index).is_none_or(|r| r.load(Ordering::Acquire));
+                        if halted.load(Ordering::Acquire) || lane_retired {
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                        let taken = {
+                            let mut q = lock();
+                            // The first gap waits for its lane, unless every lane
+                            // that takes it has retired.
+                            let first_is_free = lane.takes_first
+                                || lanes
+                                    .iter()
+                                    .zip(retired.iter())
+                                    .all(|(l, r)| !l.takes_first || r.load(Ordering::Acquire));
+                            let next = if first_is_free && q.first.is_some() {
+                                q.first.take()
+                            } else {
+                                q.waiting.pop_front()
+                            };
+                            match next {
+                                Some(gap) => {
+                                    q.in_flight = q.in_flight.saturating_add(1);
+                                    Some((gap, q.waiting.len()))
+                                }
+                                None if q.in_flight == 0 && q.first.is_none() => return Ok(()),
+                                None => None,
+                            }
                         };
-                        match next {
-                            Some(gap) => {
-                                q.in_flight = q.in_flight.saturating_add(1);
-                                Some((gap, q.waiting.len()))
-                            }
-                            None if q.in_flight == 0 && q.first.is_none() => return Ok(()),
-                            None => None,
-                        }
-                    };
-                    let Some(((gap_start, gap_len), waiting)) = taken else {
-                        notified.await;
-                        continue;
-                    };
-                    if waiting > 0
-                        && let Some(LaneGrowth(grow)) = lane.grow
-                    {
-                        let extra = grow(waiting).min(waiting);
-                        if extra > 0 {
-                            grown
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .extend(std::iter::repeat_n(index, extra));
-                            grow_wake.notify_one();
-                        }
-                    }
-                    let mut counters = DriveCounters::new();
-                    let filled = fill_gap(
-                        store,
-                        lane.source,
-                        pacer,
-                        funder,
-                        lane.ctx,
-                        lane.ledger,
-                        hash,
-                        gap_start,
-                        gap_len,
-                        total_bytes,
-                        config,
-                        &mut counters,
-                        on_progress,
-                        Some(delivered),
-                        None,
-                        None,
-                        None,
-                        pool,
-                    )
-                    .await;
-                    let rest = if let Err(err) = filled {
-                        if crate::retry_disposition(&err) == crate::RetryDisposition::Terminal {
-                            halted.store(true, Ordering::Release);
-                        }
-                        if let Some(r) = retired.get(index) {
-                            r.store(true, Ordering::Release);
-                        }
-                        if let Some(slot) = faults.get(index) {
-                            let mut slot = slot
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            *slot = Some(match slot.take() {
-                                None => err,
-                                Some(kept) => keep_decisive(kept, err),
-                            });
-                        }
-                        // Put back what this gap left missing, for the other
-                        // lanes. A store error here is the drive's own.
-                        let missing = store.missing_ranges(gap_start, gap_len).await;
-                        Some(missing.map(|m| contiguous_byte_ranges(&m, total_bytes)))
-                    } else {
-                        None
-                    };
-                    {
-                        let mut q = lock();
-                        if let Some(Ok(rest)) = &rest {
-                            for gap in rest.iter().rev() {
-                                q.waiting.push_front(*gap);
+                        let Some(((gap_start, gap_len), waiting)) = taken else {
+                            notified.await;
+                            continue;
+                        };
+                        if waiting > 0
+                            && let Some(LaneGrowth(grow)) = lane.grow
+                        {
+                            let extra = grow(waiting).min(waiting);
+                            if extra > 0 {
+                                grown
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .extend(std::iter::repeat_n(index, extra));
+                                grow_wake.notify_one();
                             }
                         }
-                        q.in_flight = q.in_flight.saturating_sub(1);
-                    }
-                    wake.notify_waiters();
-                    if let Some(Err(err)) = rest {
-                        halted.store(true, Ordering::Release);
+                        let mut counters = DriveCounters::new();
+                        let filled = fill_gap(
+                            store,
+                            lane.source,
+                            pacer,
+                            funder,
+                            lane.ctx,
+                            lane.ledger,
+                            hash,
+                            gap_start,
+                            gap_len,
+                            total_bytes,
+                            config,
+                            &mut counters,
+                            on_progress,
+                            Some(delivered),
+                            None,
+                            None,
+                            None,
+                            pool,
+                        )
+                        .await;
+                        let rest = if let Err(err) = filled {
+                            if crate::retry_disposition(&err) == crate::RetryDisposition::Terminal {
+                                halted.store(true, Ordering::Release);
+                            }
+                            if let Some(r) = retired.get(index) {
+                                r.store(true, Ordering::Release);
+                            }
+                            if let Some(slot) = faults.get(index) {
+                                let mut slot = slot
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                *slot = Some(match slot.take() {
+                                    None => err,
+                                    Some(kept) => keep_decisive(kept, err),
+                                });
+                            }
+                            // Put back what this gap left missing, for the other
+                            // lanes. A store error here is the drive's own.
+                            let missing = store.missing_ranges(gap_start, gap_len).await;
+                            Some(missing.map(|m| contiguous_byte_ranges(&m, total_bytes)))
+                        } else {
+                            None
+                        };
+                        {
+                            let mut q = lock();
+                            if let Some(Ok(rest)) = &rest {
+                                for gap in rest.iter().rev() {
+                                    q.waiting.push_front(*gap);
+                                }
+                            }
+                            q.in_flight = q.in_flight.saturating_sub(1);
+                        }
                         wake.notify_waiters();
-                        return Err(err.into());
+                        if let Some(Err(err)) = rest {
+                            halted.store(true, Ordering::Release);
+                            wake.notify_waiters();
+                            return Err(err.into());
+                        }
                     }
                 }
+                .await;
+                if let Some(LaneRelease(release)) = lane.release {
+                    release();
+                }
+                stopped
             }
         };
         let mut running: futures_util::stream::FuturesUnordered<_> = lanes
@@ -1860,9 +1889,9 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use super::{
-        DriveConfig, LaneGrowth, LegNoProgress, PoolExhausted, RangeLane, RangeSetOutcome,
-        SharedPool, contiguous_byte_ranges, drive, drive_range_lanes, drive_range_set, first_leg,
-        range_set_reach, ranges_content_len,
+        DriveConfig, LaneGrowth, LaneRelease, LegNoProgress, PoolExhausted, RangeLane,
+        RangeSetOutcome, SharedPool, contiguous_byte_ranges, drive, drive_range_lanes,
+        drive_range_set, first_leg, range_set_reach, ranges_content_len,
     };
     use crate::ProgressCallback;
     use crate::pacer::{BudgetPacer, PaceDecision, PaceState};
@@ -2515,6 +2544,7 @@ mod tests {
         takes_first: bool,
         tweak: fn(ScriptedSource) -> ScriptedSource,
         grow: Option<LaneGrowth<'static>>,
+        release: Option<LaneRelease<'static>>,
     }
 
     impl LaneSpec {
@@ -2524,6 +2554,7 @@ mod tests {
                 takes_first: false,
                 tweak: |s| s,
                 grow: None,
+                release: None,
             }
         }
     }
@@ -2546,12 +2577,22 @@ mod tests {
                         .is_ok(),
                 )
             }));
+        let released: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
+        let release: &'static (dyn Fn() + Send + Sync) = Box::leak(Box::new(move || {
+            released.fetch_add(1, Ordering::Relaxed);
+        }));
         let spec = LaneSpec {
             grow: Some(LaneGrowth(hook)),
+            release: Some(LaneRelease(release)),
             ..LaneSpec::healthy(1)
         };
         let (outcome, sources, store, plaintext) = lanes_drive(total, &ranges, &[spec]).await;
         outcome.into_result().expect("drive the range set");
+        assert_eq!(
+            released.load(Ordering::Relaxed),
+            3,
+            "the base worker and both grown workers each release once"
+        );
 
         let source = sources.first().expect("one lane");
         let mut opened = source.opened_ranges();
@@ -2627,6 +2668,7 @@ mod tests {
                 width: NonZeroUsize::new(spec.width).expect("non-zero"),
                 takes_first: spec.takes_first,
                 grow: spec.grow,
+                release: spec.release,
             })
             .collect();
         let spent_ledgers = ledgers.clone();
@@ -2701,6 +2743,44 @@ mod tests {
         assert_ranges_present(&store, &plaintext, &ranges).await;
     }
 
+    /// A lane that faults releases each of its workers as it stops, so a
+    /// caller's per-worker permits free when the lane dies.
+    #[tokio::test]
+    async fn a_faulted_lane_releases_each_of_its_workers() {
+        let total = 64 * GROUP;
+        let ranges = scattered(total);
+        let released: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
+        let release: &'static (dyn Fn() + Send + Sync) = Box::leak(Box::new(move || {
+            released.fetch_add(1, Ordering::Relaxed);
+        }));
+        let specs = [
+            LaneSpec {
+                width: 2,
+                grow: None,
+                release: Some(LaneRelease(release)),
+                takes_first: true,
+                tweak: |s| s.with_fault_after(512, || anyhow::anyhow!("stream reset")),
+            },
+            LaneSpec {
+                width: 1,
+                grow: None,
+                release: None,
+                takes_first: false,
+                tweak: |s| s,
+            },
+        ];
+        let (outcome, _sources, _store, _plaintext) = lanes_drive(total, &ranges, &specs).await;
+        assert!(outcome.lane_fault(0).is_some(), "lane 0 faulted");
+        outcome
+            .into_result()
+            .expect("the healthy lane finishes the set");
+        assert_eq!(
+            released.load(Ordering::Relaxed),
+            2,
+            "each worker of the faulted lane released once"
+        );
+    }
+
     /// A lane that faults retires, and the other lanes fill what it left: the
     /// drive succeeds, and the fault is reported on the faulted lane only.
     #[tokio::test]
@@ -2711,6 +2791,7 @@ mod tests {
             LaneSpec {
                 width: 1,
                 grow: None,
+                release: None,
                 takes_first: true,
                 tweak: |s| s.with_fault_after(512, || anyhow::anyhow!("stream reset")),
             },
@@ -2742,6 +2823,7 @@ mod tests {
             LaneSpec {
                 width: 1,
                 grow: None,
+                release: None,
                 takes_first: true,
                 tweak: |s| {
                     s.with_fault_after(512, || {
@@ -2756,6 +2838,7 @@ mod tests {
             LaneSpec {
                 width: 1,
                 grow: None,
+                release: None,
                 takes_first: false,
                 tweak: |s| s.slow_finish(std::time::Duration::from_millis(200)),
             },
@@ -2787,12 +2870,14 @@ mod tests {
             LaneSpec {
                 width: 1,
                 grow: None,
+                release: None,
                 takes_first: true,
                 tweak: reset,
             },
             LaneSpec {
                 width: 1,
                 grow: None,
+                release: None,
                 takes_first: false,
                 tweak: reset,
             },
@@ -2819,6 +2904,7 @@ mod tests {
             LaneSpec {
                 width: 1,
                 grow: None,
+                release: None,
                 takes_first: true,
                 tweak: |s| s.slow_to_start(std::time::Duration::from_millis(20)),
             },
@@ -2945,6 +3031,7 @@ mod tests {
             LaneSpec {
                 width: 1,
                 grow: None,
+                release: None,
                 takes_first: true,
                 tweak: |s| {
                     s.slow_to_start(std::time::Duration::from_millis(300))
@@ -3033,6 +3120,7 @@ mod tests {
             width: NonZeroUsize::MIN,
             takes_first: false,
             grow: None,
+            release: None,
         };
         let err = drive_range_lanes(
             &store,

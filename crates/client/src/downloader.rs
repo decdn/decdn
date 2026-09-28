@@ -401,6 +401,7 @@ mod tests {
             ledger,
             coverage: None,
             first_unit: None,
+            lease: crate::LaneLease::default(),
         }
     }
 

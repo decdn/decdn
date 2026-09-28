@@ -44,7 +44,7 @@ use decdn_client::driver::{DriveConfig, RangeLane, RangeSetOutcome, drive_range_
 use decdn_client::sink::PullReader;
 use decdn_client::source::{BlobSource as _, Funder, PrimedSource, SourceFuture};
 use decdn_client::{
-    BudgetPacer, ClientRangedStore, Cumulative, DownloadTarget, Downloader, LaneHandle,
+    BudgetPacer, ClientRangedStore, Cumulative, DownloadTarget, Downloader, LaneHandle, LaneLease,
     LaneLedgers, NoCache, PeerSource, PoolContext, PoolExhausted, PoolLedger, ProgressCallback,
     PullConfig, PullDeadlines, RetryDisposition, SharedPool, StreamCandidate, Streamer,
     UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
@@ -2333,6 +2333,7 @@ struct WatchedLane<'p, 'a, P> {
     width: std::num::NonZeroUsize,
     takes_first: bool,
     grow: Option<decdn_client::LaneGrowth<'p>>,
+    release: Option<decdn_client::LaneRelease<'p>>,
 }
 
 /// Whether a failed drive counts against the peer in the peer store. Our own
@@ -2397,6 +2398,7 @@ where
                 width: l.width,
                 takes_first: l.takes_first,
                 grow: l.grow,
+                release: l.release,
             })
             .collect();
         let driven = Box::pin(drive_range_lanes(
@@ -2800,6 +2802,7 @@ where
         width: std::num::NonZeroUsize::MIN,
         takes_first: true,
         grow: None,
+        release: None,
     }];
     // A dropped drive records the ranges it landed and the vouchers it signed.
     let on_drop = SettleOnDrop::new(|| {
@@ -2917,6 +2920,9 @@ pub(crate) struct StripeLane<'s, 'a, P> {
     /// How the lane widens past `width` while the drive runs
     /// ([`decdn_client::LaneGrowth`]).
     pub(crate) grow: Option<decdn_client::LaneGrowth<'s>>,
+    /// What the lane gives back as each of its workers stops
+    /// ([`decdn_client::LaneRelease`]).
+    pub(crate) release: Option<decdn_client::LaneRelease<'s>>,
 }
 
 /// Whether a lane of a striped drive settles at its committed cumulative: it
@@ -2980,6 +2986,7 @@ where
             width: l.width,
             takes_first: l.takes_first,
             grow: l.grow,
+            release: l.release,
         })
         .collect();
     let pool = lead.prelude.pool_with(topups_used);
@@ -3728,11 +3735,13 @@ where
 /// Split each built [`MultiLane`] into the [`StreamCandidate`] a face owns (it
 /// takes the `PeerSource`) and the [`StreamLane`] watermark handle that outlives
 /// it (a clone of the same `ledger` Arc the fetch pays through), threading each
-/// candidate's measured coverage into the [`StreamCandidate`].
+/// candidate's measured coverage and its provider's lease (taken from `leases`)
+/// into the [`StreamCandidate`].
 fn split_face_lanes<'a>(
     lanes: Vec<MultiLane<'a>>,
     coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
     total_bytes: u64,
+    leases: &mut HashMap<Address, LaneLease>,
 ) -> (
     Vec<StreamCandidate<PrimedSource<PeerSource<'a>>>>,
     Vec<StreamLane>,
@@ -3754,6 +3763,7 @@ fn split_face_lanes<'a>(
             ledger: lane.ledger,
             coverage: Some(coverage),
             first_unit: lane.first_unit,
+            lease: leases.remove(&lane.provider).unwrap_or_default(),
         });
     }
     (candidates, handles)
@@ -3874,7 +3884,8 @@ where
         .await?;
         (lanes, total_bytes)
     };
-    let (stream_candidates, handles) = split_face_lanes(lanes, coverage_by_node, total_bytes);
+    let (stream_candidates, handles) =
+        split_face_lanes(lanes, coverage_by_node, total_bytes, &mut HashMap::new());
     // Keep the first lane's ctx to annotate an unbound-namespace cache miss on
     // failure, as the file path does.
     let first_ctx = stream_candidates.first().map(|c| Arc::clone(&c.ctx));
@@ -3991,6 +4002,7 @@ where
         progress,
         None,
         None,
+        HashMap::new(),
     )
     .await
 }
@@ -4016,6 +4028,9 @@ where
 /// watermark is persisted after — the face does not persist, so this thin CLI
 /// layer does. `open_lock` and `ledgers` thread `bundle pull`'s shared pool lock
 /// and ledger registry through; a solo `decdn fetch` passes `None`/`None`.
+/// `leases` holds what each provider's lane keeps while it takes work, keyed by
+/// provider: the lane drops it when it stops ([`LaneLease`]). A solo `decdn
+/// fetch` passes none.
 ///
 /// The fetch runs under the drive-level floor ([`drive_floor`]), judged on the
 /// position across every lane. A trip returns [`EntryStalled`], which is
@@ -4036,6 +4051,7 @@ pub(crate) async fn multi_source_download<P>(
     progress: Option<&ProgressCallback>,
     open_lock: Option<&tokio::sync::Mutex<()>>,
     ledgers: Option<&LaneLedgers>,
+    mut leases: HashMap<Address, LaneLease>,
 ) -> anyhow::Result<Option<u64>>
 where
     P: alloy::providers::Provider + Clone,
@@ -4090,7 +4106,10 @@ where
         probed
     };
 
-    let (stream_candidates, handles) = split_face_lanes(lanes, coverage_by_node, total_bytes);
+    let (stream_candidates, handles) =
+        split_face_lanes(lanes, coverage_by_node, total_bytes, &mut leases);
+    // A lease no built lane took (a holder that did not open) frees now.
+    drop(leases);
     // Keep the first lane's ctx to annotate an unbound-namespace cache miss on
     // failure.
     let first_ctx = stream_candidates.first().map(|c| Arc::clone(&c.ctx));

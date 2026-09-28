@@ -40,7 +40,9 @@ use decdn_protocol::{Coverage, num_blocks};
 
 use crate::driver::{DriveConfig, PacingWait, WaitReason};
 use crate::pacer::{DownstreamFrontier, PULL_WINDOW_FLOOR, WindowPacer};
-use crate::scheduler::{ConsumptionPacing, MultiSourceConfig, SourceLane, multi_source_fetch};
+use crate::scheduler::{
+    ConsumptionPacing, LaneLease, MultiSourceConfig, SourceLane, multi_source_fetch,
+};
 use crate::sink::BlobCache;
 use crate::source::{BlobSource, Funder};
 use crate::{ClientRangedStore, PoolContext, PoolLedger, PullConfig, RangedStore};
@@ -167,6 +169,10 @@ pub struct StreamCandidate<S> {
     /// [`stream_first_unit`] name the range each face opens first. Like
     /// `coverage`, it names one blob: set it only on a single-target fetch.
     pub first_unit: Option<AlignedRange>,
+    /// What this candidate's lane holds while it takes work, released when the
+    /// lane stops ([`crate::LaneLease`]). Like `coverage`, set it only on a
+    /// single-target fetch: the first target's lane releases it.
+    pub lease: LaneLease,
 }
 
 /// The range a [`Streamer`] opens first on a fresh `total_bytes`-byte blob
@@ -210,6 +216,7 @@ pub(crate) fn source_lanes<S>(
                 .clone()
                 .unwrap_or_else(|| Coverage::full(num_blocks(total))),
             first_unit: c.first_unit.clone(),
+            lease: Some(&c.lease),
         })
         .collect()
 }
@@ -810,6 +817,7 @@ mod tests {
             ledger,
             coverage: None,
             first_unit: None,
+            lease: crate::LaneLease::default(),
         }
     }
 

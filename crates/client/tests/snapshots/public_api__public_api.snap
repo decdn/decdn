@@ -119,6 +119,9 @@ pub const fn decdn_client::driver::DriveConfig::cli(alloy_primitives::aliases::U
 pub struct decdn_client::driver::LaneGrowth<'a>(pub &'a (dyn core::ops::function::Fn(usize) -> usize + core::marker::Send + core::marker::Sync + 'a))
 impl core::fmt::Debug for decdn_client::driver::LaneGrowth<'_>
 pub fn decdn_client::driver::LaneGrowth<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::driver::LaneRelease<'a>(pub &'a (dyn core::ops::function::Fn() + core::marker::Send + core::marker::Sync + 'a))
+impl core::fmt::Debug for decdn_client::driver::LaneRelease<'_>
+pub fn decdn_client::driver::LaneRelease<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::driver::LegNoProgress
 pub decdn_client::driver::LegNoProgress::delivered_frontier: u64
 pub decdn_client::driver::LegNoProgress::len: u64
@@ -138,6 +141,7 @@ pub struct decdn_client::driver::RangeLane<'a, S>
 pub decdn_client::driver::RangeLane::ctx: &'a alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>
 pub decdn_client::driver::RangeLane::grow: core::option::Option<decdn_client::driver::LaneGrowth<'a>>
 pub decdn_client::driver::RangeLane::ledger: &'a alloc::sync::Arc<decdn_client::PoolLedger>
+pub decdn_client::driver::RangeLane::release: core::option::Option<decdn_client::driver::LaneRelease<'a>>
 pub decdn_client::driver::RangeLane::source: &'a S
 pub decdn_client::driver::RangeLane::takes_first: bool
 pub decdn_client::driver::RangeLane::width: core::num::nonzero::NonZeroUsize
@@ -410,6 +414,7 @@ pub struct decdn_client::streamer::StreamCandidate<S>
 pub decdn_client::streamer::StreamCandidate::coverage: core::option::Option<decdn_protocol::coverage::Coverage>
 pub decdn_client::streamer::StreamCandidate::ctx: alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>
 pub decdn_client::streamer::StreamCandidate::first_unit: core::option::Option<decdn_bao_range::AlignedRange>
+pub decdn_client::streamer::StreamCandidate::lease: decdn_client::LaneLease
 pub decdn_client::streamer::StreamCandidate::ledger: alloc::sync::Arc<decdn_client::PoolLedger>
 pub decdn_client::streamer::StreamCandidate::source: S
 impl<S> core::fmt::Debug for decdn_client::streamer::StreamCandidate<S>
@@ -556,6 +561,11 @@ pub fn decdn_client::driver::LaneGrowth<'_>::fmt(&self, &mut core::fmt::Formatte
 pub struct decdn_client::LaneHandle
 pub decdn_client::LaneHandle::ctx: alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>
 pub decdn_client::LaneHandle::ledger: alloc::sync::Arc<decdn_client::PoolLedger>
+pub struct decdn_client::LaneLease(_)
+impl decdn_client::LaneLease
+pub fn decdn_client::LaneLease::new(impl core::marker::Send + core::marker::Sync + 'static) -> Self
+impl core::fmt::Debug for decdn_client::LaneLease
+pub fn decdn_client::LaneLease::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::LaneLedgers
 impl decdn_client::ledgers::LaneLedgers
 pub fn decdn_client::ledgers::LaneLedgers::credit_all(&self, alloy_primitives::aliases::U256)
@@ -563,6 +573,9 @@ pub fn decdn_client::ledgers::LaneLedgers::get_or_insert(&self, decdn_incentive:
 pub fn decdn_client::ledgers::LaneLedgers::new() -> Self
 pub const fn decdn_client::ledgers::LaneLedgers::topup_lock(&self) -> &tokio::sync::mutex::Mutex<()>
 pub fn decdn_client::ledgers::LaneLedgers::total_committed(&self) -> alloy_primitives::aliases::U256
+pub struct decdn_client::LaneRelease<'a>(pub &'a (dyn core::ops::function::Fn() + core::marker::Send + core::marker::Sync + 'a))
+impl core::fmt::Debug for decdn_client::driver::LaneRelease<'_>
+pub fn decdn_client::driver::LaneRelease<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::LegNoProgress
 pub decdn_client::LegNoProgress::delivered_frontier: u64
 pub decdn_client::LegNoProgress::len: u64
@@ -728,6 +741,7 @@ pub struct decdn_client::RangeLane<'a, S>
 pub decdn_client::RangeLane::ctx: &'a alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>
 pub decdn_client::RangeLane::grow: core::option::Option<decdn_client::driver::LaneGrowth<'a>>
 pub decdn_client::RangeLane::ledger: &'a alloc::sync::Arc<decdn_client::PoolLedger>
+pub decdn_client::RangeLane::release: core::option::Option<decdn_client::driver::LaneRelease<'a>>
 pub decdn_client::RangeLane::source: &'a S
 pub decdn_client::RangeLane::takes_first: bool
 pub decdn_client::RangeLane::width: core::num::nonzero::NonZeroUsize
@@ -777,6 +791,7 @@ pub struct decdn_client::SourceLane<'a, S>
 pub decdn_client::SourceLane::coverage: decdn_protocol::coverage::Coverage
 pub decdn_client::SourceLane::ctx: alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>
 pub decdn_client::SourceLane::first_unit: core::option::Option<decdn_bao_range::AlignedRange>
+pub decdn_client::SourceLane::lease: core::option::Option<&'a decdn_client::LaneLease>
 pub decdn_client::SourceLane::ledger: alloc::sync::Arc<decdn_client::PoolLedger>
 pub decdn_client::SourceLane::source: &'a S
 impl<S> core::fmt::Debug for decdn_client::SourceLane<'_, S>
@@ -795,6 +810,7 @@ pub struct decdn_client::StreamCandidate<S>
 pub decdn_client::StreamCandidate::coverage: core::option::Option<decdn_protocol::coverage::Coverage>
 pub decdn_client::StreamCandidate::ctx: alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>
 pub decdn_client::StreamCandidate::first_unit: core::option::Option<decdn_bao_range::AlignedRange>
+pub decdn_client::StreamCandidate::lease: decdn_client::LaneLease
 pub decdn_client::StreamCandidate::ledger: alloc::sync::Arc<decdn_client::PoolLedger>
 pub decdn_client::StreamCandidate::source: S
 impl<S> core::fmt::Debug for decdn_client::streamer::StreamCandidate<S>

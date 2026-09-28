@@ -204,8 +204,8 @@ pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
 pub use decdn_bao_range::RangedStore;
 pub use downloader::{DownloadTarget, Downloader, download_first_unit};
 pub use driver::{
-    LaneGrowth, LegNoProgress, PacingWait, PoolExhausted, RangeLane, RangeSetOutcome, SharedPool,
-    WaitReason, drive, drive_range_lanes, drive_range_set, first_leg, range_set_reach,
+    LaneGrowth, LaneRelease, LegNoProgress, PacingWait, PoolExhausted, RangeLane, RangeSetOutcome,
+    SharedPool, WaitReason, drive, drive_range_lanes, drive_range_set, first_leg, range_set_reach,
 };
 pub use ledger::{ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released};
 pub use ledgers::{LaneHandle, LaneLedgers};
@@ -219,7 +219,8 @@ pub use ranged_store::ClientRangedStore;
 pub use rate_limited::UpstreamRateLimited;
 pub use retry::{RetryDisposition, retry_disposition, shared_pool_disposition};
 pub use scheduler::{
-    ConsumptionPacing, MultiSourceConfig, SourceLane, multi_source_fetch, multi_source_fetch_until,
+    ConsumptionPacing, LaneLease, MultiSourceConfig, SourceLane, multi_source_fetch,
+    multi_source_fetch_until,
 };
 pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{
