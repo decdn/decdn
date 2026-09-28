@@ -1454,7 +1454,7 @@ fn plan_lanes(
 
 /// Hint-path redemption: plan one lane and, if it clears the per-chunk `floor`,
 /// submit it as a one-lane `redeemMany`. A sub-floor hint defers to the next
-/// sweep, which packs it with other lanes.
+/// sweep, which packs it with other lanes, and reads nothing from the chain.
 #[allow(clippy::too_many_arguments)]
 async fn redeem_one<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
@@ -1853,6 +1853,14 @@ fn holds_unredeemed(states: &[LaneState], pool_id: PoolId, provider: Address) ->
 /// Chunk planned lanes under the per-chunk floor + voucher-count cap and submit
 /// each chunk. `floor == U256::ZERO` forces every lane (the close/shutdown path).
 ///
+/// The floor gates the on-chain read too: the lanes are chunked on their cached
+/// values first, and only lanes in a chunk that clears the floor are reconciled
+/// ([`reconcile_onchain_watermarks`]) and re-chunked. The cached paid watermark
+/// can only lag the chain, so a fresh read can only lower `unredeemed`, and a
+/// chunk that fails the floor on cached values fails it after the read too. A
+/// sub-floor hint therefore costs no `eth_call`. At `floor == 0` every chunk
+/// survives, so the forced paths still read every lane.
+///
 /// Floors the redeemed watermark first: flushes the lane store durable AFTER the
 /// lanes were planned (their cumulative amounts already read) and BEFORE any
 /// chunk goes on-chain, so a crash right after a submit still finds on-disk
@@ -1870,10 +1878,18 @@ async fn redeem_planned_lanes<P: Provider + Clone>(
     strict_flush: bool,
     metrics: &Arc<Metrics>,
 ) {
+    // Apply the floor on cached values before any chain read.
+    let candidates: Vec<PlannedLane> = chunk_redemptions(plans, floor, max_vouchers)
+        .into_iter()
+        .flatten()
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
     // Last check before spending gas: reconcile against the on-chain watermark
     // and drop lanes the chain already shows settled, so a lagging cache or a
     // concurrent redeemer can never cost a no-op `redeemMany`.
-    let plans = reconcile_onchain_watermarks(contract, plans, metrics).await;
+    let plans = reconcile_onchain_watermarks(contract, candidates, metrics).await;
     let chunks = chunk_redemptions(plans, floor, max_vouchers);
     if chunks.is_empty() {
         return;
@@ -3146,6 +3162,113 @@ mod tests {
             1,
             "the queued getWatermarks response is untouched by an empty plan set"
         );
+    }
+
+    /// A sub-floor hint issues no `getWatermarks` call (#2217): the floor runs
+    /// on the cached values before the read, and a set that fails it there
+    /// cannot pass it after the read.
+    #[tokio::test]
+    async fn a_sub_floor_plan_set_reads_nothing_from_the_chain() -> Result<()> {
+        use decdn_incentive::MemoryPoolStateStore;
+
+        let metrics = Arc::new(Metrics::new());
+        let store: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
+        let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0)]]);
+
+        redeem_planned_lanes(
+            &contract,
+            &store,
+            vec![planned(1, 0, 10, false)],
+            U256::from(1_000_000u64),
+            300,
+            true,
+            &metrics,
+        )
+        .await;
+
+        assert_eq!(
+            asserter.read_q().len(),
+            1,
+            "the queued getWatermarks response is untouched by a sub-floor set"
+        );
+        let text = metrics.encode()?;
+        for expected in [
+            "decdn_redemption_reconcile_ok_total 0",
+            "decdn_redemption_reconcile_failures_total 0",
+        ] {
+            anyhow::ensure!(text.lines().any(|l| l == expected), "{expected}\n{text}");
+        }
+        Ok(())
+    }
+
+    /// Only lanes in a chunk that clears the floor are read. With one lane per
+    /// chunk, the dust lane's chunk fails the floor and leaves the read, so the
+    /// single queued response pairs with exactly one lane: a two-lane read
+    /// would see a short return and count a reconcile failure.
+    #[tokio::test]
+    async fn only_lanes_in_chunks_that_clear_the_floor_are_read() -> Result<()> {
+        use decdn_incentive::MemoryPoolStateStore;
+
+        let metrics = Arc::new(Metrics::new());
+        let store: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
+        // The chain shows the above-floor lane settled, so the reconciled set is
+        // empty and nothing is submitted.
+        let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(1_000_000)]]);
+
+        redeem_planned_lanes(
+            &contract,
+            &store,
+            vec![planned(1, 0, 1_000_000, false), planned(1, 1, 10, false)],
+            U256::from(500_000u64),
+            1,
+            true,
+            &metrics,
+        )
+        .await;
+
+        assert_eq!(asserter.read_q().len(), 0, "the one read was issued");
+        let text = metrics.encode()?;
+        for expected in [
+            "decdn_redemption_reconcile_ok_total 1",
+            "decdn_redemption_reconcile_failures_total 0",
+            "decdn_redemption_reconciled_skip_total 1",
+        ] {
+            anyhow::ensure!(text.lines().any(|l| l == expected), "{expected}\n{text}");
+        }
+        Ok(())
+    }
+
+    /// The forced close/shutdown paths pass `floor == 0`, which keeps every
+    /// chunk, so every lane is still reconciled against the chain.
+    #[tokio::test]
+    async fn a_zero_floor_still_reads_every_lane() -> Result<()> {
+        use decdn_incentive::MemoryPoolStateStore;
+
+        let metrics = Arc::new(Metrics::new());
+        let store: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
+        // Both dust lanes read as settled, so nothing reaches `redeemMany`.
+        let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(1), lane(1)]]);
+
+        redeem_planned_lanes(
+            &contract,
+            &store,
+            vec![planned(1, 0, 1, false), planned(1, 1, 1, false)],
+            U256::ZERO,
+            300,
+            false,
+            &metrics,
+        )
+        .await;
+
+        assert_eq!(asserter.read_q().len(), 0, "the dust lanes were read");
+        let text = metrics.encode()?;
+        for expected in [
+            "decdn_redemption_reconcile_ok_total 1",
+            "decdn_redemption_reconciled_skip_total 2",
+        ] {
+            anyhow::ensure!(text.lines().any(|l| l == expected), "{expected}\n{text}");
+        }
+        Ok(())
     }
 
     #[test]

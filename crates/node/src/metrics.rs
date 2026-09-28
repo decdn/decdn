@@ -1918,6 +1918,12 @@ pub struct DecdnMetrics {
     /// the payee on an inbound stream. `PayWord` preimage reveals are not
     /// vouchers and do not count; a `PayWord` stream counts its anchor voucher.
     pub vouchers_received: Counter,
+    /// `decdn_preimage_reveals_received_total`: `PayWord` hash-chain preimage
+    /// reveals this node accepted as the payee on an inbound stream, counted
+    /// when a reveal advances the lane's chain frontier. Each one also hints the
+    /// redeemer, so this rate bounds the redeemer's hint rate beside
+    /// `decdn_vouchers_received_total`.
+    pub preimage_reveals_received: Counter,
     /// `decdn_pool_grace_closes_total`: pools that entered the owner-close grace
     /// window while this node still held unredeemed vouchers on them, read from
     /// the flushed lane store when the close event arrives. Each one is revenue
@@ -3258,6 +3264,9 @@ recorders! {
     pool_redemptions(vouchers: u64) => pool_redemptions.inc_by(vouchers);
     /// An inbound stream accepted a voucher as the payee.
     voucher_received => vouchers_received.inc();
+    /// An inbound stream accepted a `PayWord` preimage reveal that advanced its
+    /// lane's chain frontier.
+    preimage_reveal_received => preimage_reveals_received.inc();
     /// A pool entered the owner-close grace window while this node held
     /// unredeemed vouchers on it.
     pool_grace_close => pool_grace_closes.inc();
@@ -4630,6 +4639,7 @@ mod tests {
             "decdn_bytes_received_total",
             "decdn_pool_redemptions_total",
             "decdn_vouchers_received_total",
+            "decdn_preimage_reveals_received_total",
             "decdn_pool_grace_closes_total",
             "decdn_onchain_tx_landed_total",
             "decdn_onchain_tx_reverted_total",
