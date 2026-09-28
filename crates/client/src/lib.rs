@@ -150,6 +150,9 @@ pub mod driver;
 /// One-shot client `Endpoint` construction: relay + discovery resolution for
 /// the `cdn/client/v1` and `cdn/probe/v1` dial paths (#935/#936).
 pub mod endpoint;
+/// What a failed lane, lane build, or discovery means for the acquire loop
+/// (spec § Fault classes): a pure classifier over `anyhow::Error`.
+pub mod fault;
 mod ledger;
 /// Run-scoped registry of live per-lane voucher ledgers:
 /// [`ledgers::LaneLedgers`] maps each `(pool_id, signer, provider)` lane to
@@ -207,6 +210,7 @@ pub use driver::{
     LaneGrowth, LaneRelease, LegNoProgress, PacingWait, PoolExhausted, RangeLane, RangeSetOutcome,
     SharedPool, WaitReason, drive, drive_range_lanes, drive_range_set, first_leg, range_set_reach,
 };
+pub use fault::{FatalScope, Fault, LaneBuildFault, classify};
 pub use ledger::{ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released};
 pub use ledgers::{LaneHandle, LaneLedgers};
 pub use pacer::{
