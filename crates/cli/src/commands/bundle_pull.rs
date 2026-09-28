@@ -8774,7 +8774,9 @@ mod tests {
             std::time::Duration::from_secs(2),
         );
         assert!(
-            line.ends_with(" in 2.0s (0 B downloaded at --, 12.00 MiB spliced from disk)"),
+            line.ends_with(
+                ": 12.00 MiB in 2.0s (0 B downloaded at --, 12.00 MiB spliced from disk)"
+            ),
             "{line}"
         );
     }
@@ -8791,6 +8793,6 @@ mod tests {
             },
             std::time::Duration::ZERO,
         );
-        assert!(line.ends_with(" in 0.0s (--)"), "{line}");
+        assert!(line.ends_with(": 1.00 MiB in 0.0s (--)"), "{line}");
     }
 }
