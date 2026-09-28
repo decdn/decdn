@@ -20,6 +20,7 @@ use alloy::primitives::{Address, U256};
 use decdn_protocol::Coverage;
 use tokio::time::{Duration, Instant};
 
+use crate::UpstreamRefused;
 use crate::fault::{Fault, LaneBuildFault, classify};
 use crate::health::PeerHealth;
 use crate::source::{BlobSource, SourceFuture};
@@ -44,7 +45,19 @@ pub struct Holder {
     pub coverage: Option<Coverage>,
     /// The probed round-trip time. Lower starts first.
     pub rtt_ms: f64,
+    /// Whether a probe reported that this provider holds the blob. A
+    /// `NotFound` from a probed holder is a delivery fault only: on the wire
+    /// it also means load shed, a per-signer cap, or a pool the node cannot
+    /// confirm yet. A provider the probe did not report as a holder (a
+    /// pull-through or proxy-warming target) counts as absent after
+    /// [`ABSENT_AFTER_NOT_FOUND`] such answers with no verified byte between
+    /// them.
+    pub probed_holder: bool,
 }
+
+/// How many `NotFound` answers in a row, with no verified byte between them,
+/// mark a provider that is not a probed holder as absent.
+pub const ABSENT_AFTER_NOT_FOUND: u32 = 3;
 
 /// Where a [`SourceSet`] finds holders and builds their lanes.
 pub trait SourceProvider: Send + Sync {
@@ -115,7 +128,9 @@ impl std::fmt::Display for NoSourceAgreesOnSize {
 impl std::error::Error for NoSourceAgreesOnSize {}
 
 /// Every known source says it does not hold the blob, and a fresh discovery
-/// found no other holder.
+/// found no other holder. The acquire loop raises it as context on the last
+/// refusal that marked a source absent, so the error chain also holds that
+/// [`UpstreamRefused`].
 #[derive(Debug)]
 pub struct NoSourceHasBlob;
 
@@ -157,6 +172,11 @@ pub struct SourceSet<'p, P: SourceProvider> {
     build_retry: HashMap<Address, Backoff>,
     wrong_size: HashSet<Address>,
     absent: HashSet<Address>,
+    /// Each non-holder's `NotFound` answers since its last verified byte.
+    not_found: HashMap<Address, u32>,
+    /// The refusal that last marked a source absent: the cause the
+    /// [`NoSourceHasBlob`] stop carries.
+    last_absent: Option<UpstreamRefused>,
     discovery: Option<Backoff>,
     /// Bumped each time a source newly joins `absent` or `wrong_size`.
     mark_epoch: u64,
@@ -196,6 +216,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             build_retry: HashMap::new(),
             wrong_size: HashSet::new(),
             absent: HashSet::new(),
+            not_found: HashMap::new(),
+            last_absent: None,
             discovery: None,
             mark_epoch: 0,
             discovered_at: None,
@@ -312,8 +334,10 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 }
             }
             Fault::Source => {
-                if crate::fault::says_absent(err) && self.absent.insert(provider) {
-                    self.mark_epoch = self.mark_epoch.saturating_add(1);
+                if crate::fault::says_absent(err)
+                    && let Some(refused) = err.downcast_ref::<UpstreamRefused>()
+                {
+                    self.record_not_found(provider, refused);
                 }
                 if let Some(holder) = self.holder(provider) {
                     self.provider.on_source_fault(holder);
@@ -326,9 +350,28 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         fault
     }
 
+    /// Count a `NotFound` from `provider`. A probed holder is never marked
+    /// absent. Any other provider is marked absent once its count reaches
+    /// [`ABSENT_AFTER_NOT_FOUND`].
+    fn record_not_found(&mut self, provider: Address, refused: &UpstreamRefused) {
+        if self.holder(provider).is_none_or(|h| h.probed_holder) {
+            return;
+        }
+        let count = self.not_found.entry(provider).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count < ABSENT_AFTER_NOT_FOUND {
+            return;
+        }
+        self.last_absent = Some(refused.clone());
+        if self.absent.insert(provider) {
+            self.mark_epoch = self.mark_epoch.saturating_add(1);
+        }
+    }
+
     /// Record a verified byte from `provider`: it holds the blob after all.
     pub fn record_progress(&mut self, provider: Address) {
         self.absent.remove(&provider);
+        self.not_found.remove(&provider);
         self.health.record_progress(provider);
     }
 
@@ -440,7 +483,10 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             return Some(if self.absent.is_empty() {
                 anyhow::Error::new(NoSourceAgreesOnSize)
             } else {
-                anyhow::Error::new(NoSourceHasBlob)
+                match &self.last_absent {
+                    Some(refused) => anyhow::Error::new(refused.clone()).context(NoSourceHasBlob),
+                    None => anyhow::Error::new(NoSourceHasBlob),
+                }
             });
         }
         if !self.all_excluded(deposit) {
@@ -484,8 +530,14 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         )
     }
 
+    /// Add new holders and update known ones. A provider a probe now reports
+    /// as a holder loses its absent mark and its `NotFound` count.
     fn merge(&mut self, holders: Vec<Holder>) {
         for holder in holders {
+            if holder.probed_holder {
+                self.absent.remove(&holder.provider);
+                self.not_found.remove(&holder.provider);
+            }
             match self
                 .holders
                 .iter_mut()
@@ -517,7 +569,8 @@ impl<S> std::fmt::Debug for StaticSources<S> {
 }
 
 impl<S> StaticSources<S> {
-    /// Wrap `candidates`, keyed by each one's on-chain provider.
+    /// Wrap `candidates`, keyed by each one's on-chain provider. Each one is
+    /// a probed holder ([`Holder::probed_holder`]).
     ///
     /// # Errors
     ///
@@ -536,6 +589,7 @@ impl<S> StaticSources<S> {
                 provider,
                 coverage: candidate.coverage.clone(),
                 rtt_ms,
+                probed_holder: true,
             });
             anyhow::ensure!(
                 lanes.insert(provider, candidate).is_none(),
@@ -552,6 +606,17 @@ impl<S> StaticSources<S> {
     #[must_use]
     pub fn holders(&self) -> Vec<Holder> {
         self.holders.clone()
+    }
+
+    /// The same sources, with no probe reporting any of them as a holder:
+    /// pull-through targets.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn not_probed(mut self) -> Self {
+        for holder in &mut self.holders {
+            holder.probed_holder = false;
+        }
+        self
     }
 }
 
@@ -597,6 +662,15 @@ mod tests {
             provider,
             coverage: None,
             rtt_ms,
+            probed_holder: true,
+        }
+    }
+
+    /// A provider the probe did not report as a holder: a pull-through target.
+    fn non_holder(provider: Address, rtt_ms: f64) -> Holder {
+        Holder {
+            probed_holder: false,
+            ..holder(provider, rtt_ms)
         }
     }
 
@@ -821,6 +895,18 @@ mod tests {
         ))
     }
 
+    /// Record `times` `NotFound` answers from `provider`.
+    fn say_not_found<P: SourceProvider>(
+        set: &mut SourceSet<'_, P>,
+        provider: Address,
+        times: u32,
+        now: Instant,
+    ) {
+        for _ in 0..times {
+            set.record_fault(provider, &not_found(), now, U256::ZERO);
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn every_source_saying_not_found_ends_the_item() {
         let p = provider(vec![]);
@@ -828,15 +914,15 @@ mod tests {
             &p,
             [0; 32],
             Arc::default(),
-            vec![holder(A, 10.0), holder(B, 20.0)],
+            vec![non_holder(A, 10.0), non_holder(B, 20.0)],
         );
         let now = Instant::now();
-        set.record_fault(A, &not_found(), now, U256::ZERO);
+        say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
         assert!(
             set.exhausted(U256::ZERO, true).is_none(),
             "B has not answered"
         );
-        set.record_fault(B, &not_found(), now, U256::ZERO);
+        say_not_found(&mut set, B, super::ABSENT_AFTER_NOT_FOUND, now);
         assert!(
             set.exhausted(U256::ZERO, true).is_none(),
             "no discovery since the last mark"
@@ -850,22 +936,97 @@ mod tests {
         assert!(err.is_some_and(|e| e.downcast_ref::<super::NoSourceHasBlob>().is_some()));
     }
 
+    /// A probed holder's `NotFound` is a delivery fault only: it may mean load
+    /// shed or a per-signer cap, so it never marks the holder absent.
     #[tokio::test(start_paused = true)]
-    async fn a_new_holder_from_discovery_keeps_the_item_alive() {
+    async fn a_probed_holder_saying_not_found_is_never_absent() {
         let p = provider(vec![]);
         let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
         let now = Instant::now();
-        set.record_fault(A, &not_found(), now, U256::ZERO);
+        say_not_found(&mut set, A, 10, now);
+        set.discovery_done(Ok(vec![]), now, U256::ZERO);
+        assert!(set.exhausted(U256::ZERO, true).is_none());
+        let cooled = set.health().cooling_until(A, now).is_some_and(|until| {
+            set.next_to_start(until, U256::ZERO, &HashSet::new())
+                .is_some()
+        });
+        assert!(cooled, "the holder cools and comes back");
+    }
+
+    /// A non-holder that says `NotFound` three times ends the item, and the
+    /// stop names the refusal: it downcasts to both the stop and the refusal.
+    #[tokio::test(start_paused = true)]
+    async fn a_non_holder_saying_not_found_three_times_ends_the_item() -> anyhow::Result<()> {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![non_holder(A, 10.0)]);
+        let now = Instant::now();
+        say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND - 1, now);
+        set.discovery_done(Ok(vec![]), now, U256::ZERO);
+        assert!(
+            set.exhausted(U256::ZERO, true).is_none(),
+            "two answers are not enough"
+        );
+        say_not_found(&mut set, A, 1, now);
+        set.discovery_done(Ok(vec![]), now, U256::ZERO);
+        let err = set
+            .exhausted(U256::ZERO, true)
+            .ok_or_else(|| anyhow::anyhow!("three answers end the item"))?;
+        assert!(
+            err.downcast_ref::<super::NoSourceHasBlob>().is_some(),
+            "{err:#}"
+        );
+        assert!(
+            err.downcast_ref::<crate::UpstreamRefused>().is_some(),
+            "{err:#}"
+        );
+        assert_eq!(
+            crate::fault::classify(&err),
+            Fault::Fatal(crate::fault::FatalScope::Item)
+        );
+        Ok(())
+    }
+
+    /// A verified byte resets a non-holder's `NotFound` count.
+    #[tokio::test(start_paused = true)]
+    async fn a_byte_between_not_found_answers_resets_the_count() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![non_holder(A, 10.0)]);
+        let now = Instant::now();
+        say_not_found(&mut set, A, 2, now);
+        set.record_progress(A);
+        say_not_found(&mut set, A, 2, now);
+        set.discovery_done(Ok(vec![]), now, U256::ZERO);
+        assert!(set.exhausted(U256::ZERO, true).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_holder_from_discovery_keeps_the_item_alive() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![non_holder(A, 10.0)]);
+        let now = Instant::now();
+        say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
         set.discovery_done(Ok(vec![holder(B, 5.0)]), now, U256::ZERO);
+        assert!(set.exhausted(U256::ZERO, true).is_none());
+    }
+
+    /// A discovery whose probe now reports an absent provider as a holder
+    /// clears its absent mark.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_that_reports_the_blob_clears_an_absent_mark() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![non_holder(A, 10.0)]);
+        let now = Instant::now();
+        say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
+        set.discovery_done(Ok(vec![holder(A, 10.0)]), now, U256::ZERO);
         assert!(set.exhausted(U256::ZERO, true).is_none());
     }
 
     #[tokio::test(start_paused = true)]
     async fn progress_clears_a_not_found_mark() {
         let p = provider(vec![]);
-        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![non_holder(A, 10.0)]);
         let now = Instant::now();
-        set.record_fault(A, &not_found(), now, U256::ZERO);
+        say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
         set.record_progress(A);
         set.discovery_done(Ok(vec![]), now, U256::ZERO);
         assert!(set.exhausted(U256::ZERO, true).is_none());
@@ -880,11 +1041,11 @@ mod tests {
             &p,
             [0; 32],
             Arc::default(),
-            vec![holder(A, 10.0), holder(B, 20.0)],
+            vec![non_holder(A, 10.0), non_holder(B, 20.0)],
         );
         let now = Instant::now();
-        set.record_fault(A, &not_found(), now, U256::ZERO);
-        set.record_fault(B, &not_found(), now, U256::ZERO);
+        say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
+        say_not_found(&mut set, B, super::ABSENT_AFTER_NOT_FOUND, now);
         set.discovery_done(Err(anyhow::anyhow!("registry rpc down")), now, U256::ZERO);
         assert!(!set.wants_discovery(now, U256::ZERO, 0, false));
         assert!(!set.wants_discovery(
@@ -902,12 +1063,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_unanimous_absent_set_still_wants_discovery_once_cooldowns_clear() {
         let p = provider(vec![]);
-        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![non_holder(A, 10.0)]);
         let now = Instant::now();
-        set.record_fault(A, &not_found(), now, U256::ZERO);
+        say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
         set.discovery_done(Err(anyhow::anyhow!("registry rpc down")), now, U256::ZERO);
-        let later = now + DISCOVERY_BASE;
-        // A's delivery cooldown (2 s) is long over by `later` (5 s), so it is
+        // Three faults in a row cool A until 8 s after `now`.
+        let later = now + super::DISCOVERY_CAP;
+        // A's delivery cooldown is long over by `later`, so it is
         // startable again and `running == 0` no longer implies "starved".
         assert!(
             set.next_to_start(later, U256::ZERO, &HashSet::new())
@@ -932,7 +1094,7 @@ mod tests {
             &p,
             [0; 32],
             Arc::default(),
-            vec![holder(A, 10.0), holder(B, 20.0)],
+            vec![holder(A, 10.0), non_holder(B, 20.0)],
         );
         let now = Instant::now();
         let dep = U256::from(100u64);
@@ -941,7 +1103,9 @@ mod tests {
             gap_len: 1,
         });
         set.record_fault(A, &dry, now, dep);
-        set.record_fault(B, &not_found(), now, dep);
+        for _ in 0..super::ABSENT_AFTER_NOT_FOUND {
+            set.record_fault(B, &not_found(), now, dep);
+        }
         set.discovery_done(Ok(vec![]), now, dep);
         assert!(set.exhausted(dep, true).is_none(), "top-ups left");
         let err = set.exhausted(dep, false);

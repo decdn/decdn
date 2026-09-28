@@ -81,7 +81,7 @@ Five faults end the fetch, because only the user can fix them:
 - no affordable holder: every known holder has refused on price after the client spends its top-up budget,
 - a local disk fault.
 
-The item also ends when every known holder reports that it does not hold the blob, or signs a different size, after a fresh discovery finds no new holder. No other fault ends the fetch. The loop keeps trying.
+On the wire, `NotFound` also means load shed, a per-signer cap, or a pool that the node cannot confirm yet. So a `NotFound` from a holder that the probe reported, or from a node that the user pinned, only cools that holder. A pull-through target that answers `NotFound` three times, with no verified byte between the answers, is absent. The item also ends when every known source is absent or signs a different size, and a fresh discovery finds no new holder. No other fault ends the fetch. The loop keeps trying.
 
 Speculative duplicate requests are out of scope **by decision, not by sequencing**. Racing an outstanding range against idle sources — BitTorrent's final-piece duplication tactic — shortens the tail only by paying for the copies that lose the race; BitTorrent accepts that cost because a leecher has no cost signal, but here every byte is paid, so the tail is bounded by source selection and deadline-based reassignment instead. A capped, opt-in paid hedge — duplicating only the final sub-`min_split_size` tail and cancelling the loser — stays a closed door: it returns only if measured tail latency on real large blobs proves reassignment insufficient.
 

@@ -402,6 +402,7 @@ pub type decdn_client::source::SourceFuture<'a, T> = core::pin::Pin<alloc::boxed
 pub mod decdn_client::source_set
 pub struct decdn_client::source_set::Holder
 pub decdn_client::source_set::Holder::coverage: core::option::Option<decdn_protocol::coverage::Coverage>
+pub decdn_client::source_set::Holder::probed_holder: bool
 pub decdn_client::source_set::Holder::provider: alloy_primitives::bits::address::Address
 pub decdn_client::source_set::Holder::rtt_ms: f64
 pub struct decdn_client::source_set::NoAffordableSource
@@ -447,6 +448,7 @@ pub fn decdn_client::source_set::StaticSources<S>::discover(&self, [u8; 32]) -> 
 pub fn decdn_client::source_set::StaticSources<S>::on_source_fault(&self, &decdn_client::source_set::Holder)
 impl<S> core::fmt::Debug for decdn_client::source_set::StaticSources<S>
 pub fn decdn_client::source_set::StaticSources<S>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub const decdn_client::source_set::ABSENT_AFTER_NOT_FOUND: u32
 pub const decdn_client::source_set::BUILD_RETRY_BASE: core::time::Duration
 pub const decdn_client::source_set::BUILD_RETRY_CAP: core::time::Duration
 pub const decdn_client::source_set::DISCOVERY_BASE: core::time::Duration
@@ -692,6 +694,7 @@ impl core::fmt::Display for decdn_client::HashMismatch
 pub fn decdn_client::HashMismatch::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::Holder
 pub decdn_client::Holder::coverage: core::option::Option<decdn_protocol::coverage::Coverage>
+pub decdn_client::Holder::probed_holder: bool
 pub decdn_client::Holder::provider: alloy_primitives::bits::address::Address
 pub decdn_client::Holder::rtt_ms: f64
 pub struct decdn_client::LaneBuildFault(pub anyhow::Error)

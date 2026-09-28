@@ -573,7 +573,7 @@ impl<S: BlobSource> BlobSource for PrimedSource<S> {
 
 #[cfg(any(test, feature = "test-util"))]
 mod doubles {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -624,9 +624,11 @@ mod doubles {
         blob: Bytes,
         outboard: Bytes,
         fault: Option<(usize, FaultFn)>,
-        /// When set, `fault` fires on the first reader that reaches it and never
-        /// again. Shared by clones.
-        fault_once: Option<Arc<AtomicBool>>,
+        /// When set, `fault` fires on the readers that reach it while this
+        /// count is above zero, and never again. Shared by clones.
+        faults_left: Option<Arc<AtomicU32>>,
+        /// When set, the size every header signs in place of the blob's own.
+        signed_size: Option<u64>,
         /// Every range this source was `open`ed for, in call order, as
         /// `(fetch_start, fetch_len)`. Shared behind an `Arc<Mutex<..>>` so a
         /// clone handed to the driver records into the same log the test
@@ -697,7 +699,8 @@ mod doubles {
                 blob,
                 outboard: ob.data.into(),
                 fault: None,
-                fault_once: None,
+                faults_left: None,
+                signed_size: None,
                 opened: Arc::new(Mutex::new(Vec::new())),
                 delivered: Arc::new(AtomicU64::new(0)),
                 first_read_stall: None,
@@ -814,9 +817,31 @@ mod doubles {
             wire_bytes: usize,
             make: impl Fn() -> anyhow::Error + Send + Sync + 'static,
         ) -> Self {
+            self.fault_times_after(1, wire_bytes, make)
+        }
+
+        /// [`Self::with_fault_after`], but only the first `times` readers that
+        /// reach `wire_bytes` fault: a peer that refuses a few times and then
+        /// serves.
+        #[must_use]
+        pub fn fault_times_after(
+            self,
+            times: u32,
+            wire_bytes: usize,
+            make: impl Fn() -> anyhow::Error + Send + Sync + 'static,
+        ) -> Self {
             let mut this = self.with_fault_after(wire_bytes, make);
-            this.fault_once = Some(Arc::new(AtomicBool::new(false)));
+            this.faults_left = Some(Arc::new(AtomicU32::new(times)));
             this
+        }
+
+        /// Sign `total_bytes` in every header in place of the blob's own size:
+        /// a peer that reports a wrong size. Its wire stays the blob's own, so
+        /// a store keyed by the signed size fails to verify it.
+        #[must_use]
+        pub const fn signing_size(mut self, total_bytes: u64) -> Self {
+            self.signed_size = Some(total_bytes);
+            self
         }
 
         /// The header-less bao wire for `range` (content plus interleaved proof,
@@ -857,16 +882,16 @@ mod doubles {
                 let mut fault = None;
                 if let Some((after, make)) = &self.fault
                     && *after < wire.len()
-                    && self
-                        .fault_once
-                        .as_ref()
-                        .is_none_or(|fired| !fired.swap(true, Ordering::SeqCst))
+                    && self.faults_left.as_ref().is_none_or(|left| {
+                        left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                            .is_ok()
+                    })
                 {
                     wire = wire.slice(..*after);
                     fault = Some(make());
                 }
                 let header = UpstreamPullHeader {
-                    total_bytes: self.total_bytes(),
+                    total_bytes: self.signed_size.unwrap_or_else(|| self.total_bytes()),
                     rate_per_mb: SCRIPTED_RATE_PER_MB,
                     interval_bytes: SCRIPTED_INTERVAL_BYTES,
                     // No real network round trip in this scripted double.

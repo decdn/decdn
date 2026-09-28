@@ -5,8 +5,9 @@
 //! A caller that does not know a blob's signed size opens one source's pull
 //! for its header before it can key the ranged store. That open is a delivery
 //! like any other: a source that faults cools and another is tried, a lane
-//! build that fails backs off, a source that says it lacks the blob is marked
-//! absent, and discovery runs when nothing can start. The open ends on a
+//! build that fails backs off, a pull-through target that keeps saying it
+//! lacks the blob is marked absent ([`crate::Holder::probed_holder`]), and
+//! discovery runs when nothing can start. The open ends on a
 //! header, a fatal fault, a unanimous verdict of the sources, or the stop
 //! policy. The lane it builds stays cached in the [`SourceSet`].
 
@@ -240,9 +241,11 @@ mod tests {
         Ok(())
     }
 
+    /// Pull-through targets (not probed holders) that each say `NotFound`
+    /// often enough are absent, and the open ends.
     #[tokio::test(start_paused = true)]
     async fn every_source_saying_not_found_ends_with_no_source_has_blob() -> anyhow::Result<()> {
-        let sources = StaticSources::new(vec![lane(0xA1), lane(0xB2)])?;
+        let sources = StaticSources::new(vec![lane(0xA1), lane(0xB2)])?.not_probed();
         let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
         let err = first_open(&mut set, &policy(None), |_lane| async {
             Err::<(), _>(not_found())
@@ -251,6 +254,28 @@ mod tests {
         .err()
         .ok_or_else(|| anyhow::anyhow!("an absent blob must end the open"))?;
         assert!(err.downcast_ref::<NoSourceHasBlob>().is_some(), "{err:#}");
+        Ok(())
+    }
+
+    /// A sole probed holder that says `NotFound` twice (a load shed, say) and
+    /// then answers is waited for, not marked absent.
+    #[tokio::test(start_paused = true)]
+    async fn a_probed_holder_saying_not_found_twice_then_answers() -> anyhow::Result<()> {
+        let sources = StaticSources::new(vec![lane(0xA1)])?;
+        let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
+        let calls = AtomicU32::new(0);
+        let (provider, ()) = first_open(&mut set, &policy(None), |_lane| {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call < 2 {
+                    return Err(not_found());
+                }
+                Ok(())
+            }
+        })
+        .await?;
+        assert_eq!(provider, A);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         Ok(())
     }
 

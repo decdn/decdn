@@ -365,7 +365,10 @@ where
 /// node by rank wins (the rule of [`decdn_client::discovery::admit_sources`]).
 /// Each holder carries its probed coverage (`None`, a full holder, when
 /// nothing was measured) and its probed RTT, or its rank in the order when it
-/// was not probed. Each holder's node goes into `nodes`, keyed by provider.
+/// was not probed. A candidate with measured coverage, and a pinned
+/// `--node-id`, is a probed holder ([`Holder::probed_holder`]); a
+/// pull-through or proxy-warming target and a peer-store fast-path candidate
+/// are not. Each holder's node goes into `nodes`, keyed by provider.
 pub(crate) fn holders_from(
     targets: &ResolvedTargets,
     nodes: &mut HashMap<Address, NodeCandidate>,
@@ -384,9 +387,11 @@ pub(crate) fn holders_from(
             .get(&candidate.node_id)
             .copied()
             .unwrap_or_else(|| f64::from(u32::try_from(rank).unwrap_or(u32::MAX)));
+        let coverage = targets.coverage_by_node.get(&candidate.node_id).cloned();
         holders.push(Holder {
             provider: candidate.eth_address,
-            coverage: targets.coverage_by_node.get(&candidate.node_id).cloned(),
+            probed_holder: targets.pinned || coverage.is_some(),
+            coverage,
             rtt_ms,
         });
         nodes
@@ -492,10 +497,15 @@ mod tests {
             candidates: vec![near.clone(), far],
             coverage_by_node: std::collections::HashMap::new(),
             probed_samples: Vec::new(),
+            pinned: false,
         };
         let mut nodes = std::collections::HashMap::new();
         let holders = holders_from(&targets, &mut nodes);
         assert_eq!(holders.len(), 1, "one holder per operator");
+        assert!(
+            holders.iter().all(|h| !h.probed_holder),
+            "no probe reported the blob"
+        );
         assert_eq!(
             nodes.get(&Address::repeat_byte(0xAA)).map(|n| n.node_id),
             Some(near.node_id),
@@ -523,6 +533,27 @@ mod tests {
             a_holder,
             Some(targets.coverage_by_node.get(&a.node_id).cloned()),
             "a probed holder carries its measured coverage"
+        );
+        assert!(holders.iter().all(|h| h.probed_holder));
+    }
+
+    /// A pinned `--node-id` counts as a holder: its `NotFound` never marks it
+    /// absent.
+    #[test]
+    fn a_pinned_node_is_a_probed_holder() {
+        let (mut targets, _, _) = crate::commands::fetch::tests_support::two_holder_targets();
+        targets.coverage_by_node.clear();
+        let mut nodes = std::collections::HashMap::new();
+        assert!(
+            holders_from(&targets, &mut nodes)
+                .iter()
+                .all(|h| !h.probed_holder)
+        );
+        targets.pinned = true;
+        assert!(
+            holders_from(&targets, &mut nodes)
+                .iter()
+                .all(|h| h.probed_holder)
         );
     }
 }

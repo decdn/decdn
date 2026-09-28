@@ -1001,10 +1001,12 @@ impl std::error::Error for UpstreamVoucherRejected {}
 /// keeps the only paths to a value the two constructors, so the "present response
 /// ⇒ open-stage, verified" invariant is a property of the type rather than a
 /// convention.
+#[derive(Clone)]
 pub struct UpstreamRefused {
     kind: Kind,
 }
 
+#[derive(Clone)]
 enum Kind {
     /// Open-stage refusal: the upstream signed a [`StreamResponse`] with
     /// `body.ok == false`, already verified against `expected_signer` by

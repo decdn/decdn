@@ -645,6 +645,7 @@ pub(crate) async fn probe_and_order(
         candidates: ordered.order,
         coverage_by_node: ordered.coverage_by_node,
         probed_samples,
+        pinned: false,
     })
 }
 
@@ -935,6 +936,7 @@ fn store_fast_path(
         candidates,
         coverage_by_node: HashMap::new(),
         probed_samples: Vec::new(),
+        pinned: false,
     })
 }
 
@@ -1105,6 +1107,9 @@ pub(crate) struct ResolvedTargets {
     /// `(node_id, rtt_ms, rate_per_mb)` for each holder that answered a probe
     /// this fetch — harvested into the peer store.
     pub(crate) probed_samples: Vec<(PublicKey, f64, u64)>,
+    /// The one candidate is the `--node-id` the user pinned. It counts as a
+    /// holder, as a probe-reported holder does.
+    pub(crate) pinned: bool,
 }
 
 /// Resolve the holders to fetch from (#1174): the explicit `--node-id`
@@ -1148,6 +1153,7 @@ pub(crate) async fn resolve_target_node(
             coverage_by_node: HashMap::new(),
             // Nothing was probed on this path, so there is nothing to harvest.
             probed_samples: Vec::new(),
+            pinned: true,
         });
     }
 
@@ -4464,6 +4470,7 @@ pub(crate) mod tests_support {
             candidates: ordered.order,
             coverage_by_node: ordered.coverage_by_node,
             probed_samples,
+            pinned: false,
         };
         (targets, node_a, node_b)
     }

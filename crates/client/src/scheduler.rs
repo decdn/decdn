@@ -4045,6 +4045,8 @@ mod tests {
         Ok(())
     }
 
+    /// A pull-through target (not a probed holder) that keeps saying
+    /// `NotFound` ends the item, and the stop carries the refusal.
     #[tokio::test(start_paused = true)]
     async fn unanimous_not_found_ends_only_the_item() -> anyhow::Result<()> {
         let data = blob(1024 * 1024);
@@ -4056,7 +4058,7 @@ mod tests {
             });
         let (root, total) = (a.root(), a.total_bytes());
         let (store, _dir) = fresh_store(root, total);
-        let provider = StaticSources::new(vec![candidate(a, la, 0xA1, None)])?;
+        let provider = StaticSources::new(vec![candidate(a, la, 0xA1, None)])?.not_probed();
         let err = run_acquire(
             &store,
             &provider,
@@ -4071,7 +4073,38 @@ mod tests {
         .err()
         .ok_or_else(|| anyhow::anyhow!("must stop"))?;
         assert!(err.downcast_ref::<NoSourceHasBlob>().is_some(), "{err:#}");
+        assert!(err.downcast_ref::<UpstreamRefused>().is_some(), "{err:#}");
         assert_eq!(classify(&err), Fault::Fatal(FatalScope::Item));
+        Ok(())
+    }
+
+    /// A sole probed holder that says `NotFound` twice (a load shed, say) and
+    /// then serves completes the fetch: its `NotFound` only cools it.
+    #[tokio::test(start_paused = true)]
+    async fn a_probed_holder_saying_not_found_twice_then_serving_completes() -> anyhow::Result<()> {
+        let data = blob(1024 * 1024);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let a = ScriptedSource::new(data.clone())?
+            .paying(Arc::clone(&la))
+            .fault_times_after(2, 0, || {
+                anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::NotFound))
+            });
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, dir) = fresh_store(root, total);
+        let provider = StaticSources::new(vec![candidate(a, la, 0xA1, None)])?;
+        run_acquire(
+            &store,
+            &provider,
+            root,
+            total,
+            &BudgetPacer::new(),
+            &no_topups(),
+            4,
+            None,
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
         Ok(())
     }
 
