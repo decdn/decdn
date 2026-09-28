@@ -14646,10 +14646,92 @@ async fn spawn_partial_holder(
     Arc<MemoryPoolStateStore>,
 )> {
     let hash = Hash::new(payload);
-    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let (cache, hash_h, tmp) = cache_with_blob(payload).await?;
     anyhow::ensure!(hash_h == hash, "holder fixture hash mismatch");
     std::mem::forget(tmp);
+    let (id, addr, eth, ep, task, store, _metrics) = spawn_holder_on(
+        cache,
+        payload,
+        ab_pool_id,
+        s_buyer_addr,
+        coverage,
+        refuse_client_conns,
+    )
+    .await?;
+    Ok((id, addr, eth, ep, task, store))
+}
+
+/// Spin up a holder whose cache holds ONLY `blocks` of `payload` and whose probe
+/// advertises exactly those blocks: a real partial holder, so a request for any
+/// other block is a miss it refuses. Also returns the holder's metrics, so a test
+/// can count those refusals.
+async fn spawn_block_holder(
+    payload: &[u8],
+    ab_pool_id: B256,
+    s_buyer_addr: Address,
+    blocks: &[u32],
+) -> Result<(
+    iroh::PublicKey,
+    std::net::SocketAddr,
+    Address,
+    iroh::Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<MemoryPoolStateStore>,
+    Arc<Metrics>,
+)> {
+    let hash = Hash::new(payload);
+    let total = u64::try_from(payload.len())?;
+    let block = decdn_protocol::discovery_block_bytes();
+    let outboard = bytes::Bytes::from(
+        bao_tree::io::outboard::PreOrderMemOutboard::create(
+            payload,
+            decdn_cache::range_pull::IROH_BLOCK_SIZE,
+        )
+        .data,
+    );
+    let cache_tmp = tempfile::tempdir()?;
+    let cache = CacheEngine::open(cache_tmp.path(), vec![], 16).await?;
+    std::mem::forget(cache_tmp);
+    for &b in blocks {
+        let start = u64::from(b) * block;
+        let aligned = decdn_cache::range_pull::align_range(start, block.min(total - start), total)?;
+        let data = payload
+            .get(usize::try_from(aligned.fetch_start())?..usize::try_from(aligned.fetch_end())?)
+            .ok_or_else(|| anyhow::anyhow!("held block out of bounds"))?;
+        let bao = decdn_cache::range_pull::encode_verified_range(
+            *hash.as_bytes(),
+            &aligned,
+            data,
+            outboard.clone(),
+        )?;
+        cache
+            .admit_bao(hash, aligned.chunk_ranges().clone(), bao)
+            .await?;
+    }
+    let coverage =
+        Coverage::from_block_indices(decdn_protocol::num_blocks(total), blocks.iter().copied());
+    spawn_holder_on(cache, payload, ab_pool_id, s_buyer_addr, coverage, 0).await
+}
+
+/// Serve `cache` as a holder of `payload` that advertises `coverage` on probe; the
+/// shared body of [`spawn_partial_holder`] and [`spawn_block_holder`].
+async fn spawn_holder_on(
+    cache: CacheEngine,
+    payload: &[u8],
+    ab_pool_id: B256,
+    s_buyer_addr: Address,
+    coverage: Coverage,
+    refuse_client_conns: usize,
+) -> Result<(
+    iroh::PublicKey,
+    std::net::SocketAddr,
+    Address,
+    iroh::Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<MemoryPoolStateStore>,
+    Arc<Metrics>,
+)> {
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let sk = fresh_key();
     let id = sk.public();
@@ -14685,6 +14767,7 @@ async fn spawn_partial_holder(
         &domains,
         16,
     )?;
+    let holder_metrics = Arc::clone(&metrics);
     let (ep, addr) = local_endpoint(sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
     // Accept loop: real `ClientHandler` for the paid pull, a coverage-carrying
     // probe responder for `cdn/probe/v1`.
@@ -14746,7 +14829,7 @@ async fn spawn_partial_holder(
             }
         })
     };
-    Ok((id, addr, eth.address(), ep, task, store))
+    Ok((id, addr, eth.address(), ep, task, store, holder_metrics))
 }
 
 /// Build serving node S: an empty-cache window-paced `ClientHandler` whose
@@ -15408,6 +15491,181 @@ async fn a_directory_origin_past_the_probe_fanout_is_probed() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn no_covering_candidate_refuses_before_commit() -> Result<()> {
     serve_miss_discovery_case(DiscoveryCase::NoCoveringCandidate).await
+}
+
+/// The holders a serve-miss discovers before it pulls, and what serving node S
+/// then does with them: the leaf pulls the whole two-block blob through S, whose
+/// probe cache lists `first` ahead of the full holder O.
+struct HolderPull {
+    /// Blocks the first-ranked holder holds and advertises.
+    first_blocks: &'static [u32],
+    /// The leaf pulls from the first-ranked holder's own endpoint, so it is the
+    /// requester S discovers.
+    leaf_is_first: bool,
+}
+
+/// What [`holder_pull_case`] observed at the first-ranked holder.
+struct FirstHolderSeen {
+    /// Requests it refused as a miss: bytes it was asked for and does not hold.
+    refused_misses: u64,
+    /// Bytes S's lane paid it for.
+    paid_bytes: U256,
+}
+
+/// Run one [`HolderPull`]: the leaf pulls the whole blob through S, which must
+/// complete byte-exact from its discovered holders.
+#[allow(clippy::too_many_lines)]
+async fn holder_pull_case(case: HolderPull) -> Result<FirstHolderSeen> {
+    let (_block_guard, payload, hash) = two_block_blob()?;
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let ab_pool_id = B256::repeat_byte(0xA4);
+    let s_buyer = Arc::new(PrivateKeySigner::random());
+    let (f_id, f_addr, f_eth, ep_f, task_f, store_f, metrics_f) =
+        spawn_block_holder(&payload, ab_pool_id, s_buyer.address(), case.first_blocks).await?;
+    let (o_id, o_addr, o_eth, ep_o, task_o, store_o) = spawn_partial_holder(
+        &payload,
+        ab_pool_id,
+        s_buyer.address(),
+        Coverage::full(2),
+        0,
+    )
+    .await?;
+    let f_dht = DhtNodeId::from_bytes(*f_id.as_bytes());
+    let o_dht = DhtNodeId::from_bytes(*o_id.as_bytes());
+    let first_coverage = Coverage::from_block_indices(2, case.first_blocks.iter().copied());
+    let probed = |node_id: DhtNodeId, coverage: Coverage, rtt_ms: u32| ProbedProvider {
+        node_id,
+        rate_per_mb: RATE,
+        rtt_ms,
+        coverage,
+        total_bytes_hint: Some(total_bytes),
+    };
+    let probe_cache = PositiveProbeCache::new();
+    probe_cache.insert(
+        ContentHash::from_bytes(*hash.as_bytes()),
+        vec![
+            probed(f_dht, first_coverage, 1),
+            probed(o_dht, Coverage::full(2), 500),
+        ],
+    );
+    let discovery = FixtureDiscovery {
+        stakers: HashSet::from([f_dht, o_dht]),
+        directory: HashMap::from([(U256::ZERO, vec![o_dht])]),
+        dht_peers: Vec::new(),
+        probe_fanout: 5,
+    };
+    let addr_map = HashMap::from([(f_dht, f_eth), (o_dht, o_eth)]);
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x2E);
+    let (handler_s, s_target, ep_s, _recorded, _cache_s, s_operator, _s_metrics, _) =
+        build_serving_node(
+            hash,
+            ab_pool_id,
+            &s_buyer,
+            discovery,
+            probe_cache,
+            addr_map,
+            &[(f_id, f_addr), (o_id, o_addr)],
+            &[(leaf_channel_id, leaf_eth.address())],
+            U256::from(DEPOSIT_MICRO_USDC),
+        )
+        .await?;
+    let task_s = spawn_server(ep_s.clone(), handler_s);
+
+    let (leaf_ep, leaf_node_id, own_leaf) = if case.leaf_is_first {
+        (ep_f.clone(), B256::from(*f_id.as_bytes()), false)
+    } else {
+        let leaf_sk = fresh_key();
+        let id = B256::from(*leaf_sk.public().as_bytes());
+        let (ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+        (ep, id, true)
+    };
+    let outcome = leaf_paced_pull(
+        &leaf_ep,
+        s_target,
+        leaf_node_id,
+        &leaf_eth,
+        s_operator,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await?;
+    anyhow::ensure!(outcome.completed, "leaf delivery did not complete");
+    anyhow::ensure!(outcome.hash_ok, "leaf received bytes failed the hash check");
+    anyhow::ensure!(
+        outcome.received == total_bytes,
+        "leaf received {} of {total_bytes} bytes",
+        outcome.received
+    );
+    let paid = |store: &Arc<MemoryPoolStateStore>, provider: Address| -> Result<U256> {
+        Ok(store
+            .get(LaneKey {
+                pool_id: ab_pool_id,
+                signer: s_buyer.address(),
+                provider,
+            })?
+            .map_or(U256::ZERO, |lane| lane.last_bytes_delivered()))
+    };
+    anyhow::ensure!(
+        paid(&store_o, o_eth)? > U256::ZERO,
+        "the full holder must have served S"
+    );
+    let seen = FirstHolderSeen {
+        refused_misses: counter_value(&metrics_f, "serve_stream_rejected_cache_miss_total")?,
+        paid_bytes: paid(&store_f, f_eth)?,
+    };
+    if own_leaf {
+        shutdown([task_s, task_f, task_o], [&leaf_ep, &ep_s, &ep_f, &ep_o]).await?;
+    } else {
+        shutdown([task_s, task_f, task_o], [&ep_s, &ep_f, &ep_o]).await?;
+    }
+    Ok(seen)
+}
+
+/// A serve-miss asks a partial holder only for bytes it advertised. The partial
+/// holder ranks first but lacks block 0, where the pull starts; learning the
+/// blob's size from it must not ask it for the whole blob, or a holder that
+/// pulls through would start its own pull for bytes it does not have, and
+/// partial holders asking each other form a loop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_serve_miss_asks_a_partial_holder_only_for_blocks_it_holds() -> Result<()> {
+    let seen = holder_pull_case(HolderPull {
+        first_blocks: &[1],
+        leaf_is_first: false,
+    })
+    .await?;
+    anyhow::ensure!(
+        seen.refused_misses == 0,
+        "the partial holder was asked for bytes it does not hold ({} refused misses)",
+        seen.refused_misses
+    );
+    Ok(())
+}
+
+/// A serve-miss never pulls from the node that asked for the blob: when the
+/// requester is itself a discovered holder, pulling from it would hand it back
+/// its own bytes, and between two nodes that each lack part of the blob it
+/// forms a loop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_serve_miss_never_pulls_from_its_requester() -> Result<()> {
+    let seen = holder_pull_case(HolderPull {
+        first_blocks: &[0, 1],
+        leaf_is_first: true,
+    })
+    .await?;
+    anyhow::ensure!(
+        seen.paid_bytes == U256::ZERO,
+        "S pulled {} bytes from the node that asked it",
+        seen.paid_bytes
+    );
+    anyhow::ensure!(
+        seen.refused_misses == 0,
+        "the requester was sent a request it had to refuse"
+    );
+    Ok(())
 }
 
 /// #2178: a holder that refuses a leg with a signed `NotFound` — the wire shape
