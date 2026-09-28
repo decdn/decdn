@@ -2089,6 +2089,7 @@ const ENTRY_RATE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 pub(crate) struct EntryStalled {
     window: Duration,
     floor_bps: u64,
+    /// The drive's whole-blob position when the floor tripped.
     landed: u64,
     /// The position the drive reaches once done: the whole blob, or less for
     /// a range set that leaves bytes to a splice.
@@ -2227,10 +2228,10 @@ impl<F: Funder> Funder for PausingFunder<'_, F> {
 /// and the caller fails over on. At `-v` it logs the drive's position, rate and
 /// ETA every [`ENTRY_RATE_LOG_INTERVAL`] while it waits.
 ///
-/// `target` is the position the drive reaches once done
-/// ([`decdn_client::range_set_reach`]), not the blob size: a range-dedup drive
-/// never downloads the ranges it splices from disk, so its ETA must not count
-/// them.
+/// `target` is the position the drive reaches once done: the blob size for a
+/// whole-blob drive, and less for a range set
+/// ([`decdn_client::range_set_reach`]). A range-dedup drive never downloads the
+/// ranges it splices from disk, so its ETA must not count them.
 async fn drive_floor(
     deadlines: PullDeadlines,
     hash: [u8; 32],
@@ -2260,7 +2261,8 @@ async fn drive_floor(
                 });
             }
             _ = tick.tick() => {
-                let landed = watch.landed();
+                // A re-delivered tail can carry the position past the target.
+                let landed = watch.landed().min(target);
                 let bps = speed.observe(Instant::now(), landed);
                 tracing::info!(
                     "{}: {} of {} ({}, {})",
@@ -2321,12 +2323,15 @@ where
         progress: Option<&ProgressCallback>,
         deadlines: PullDeadlines,
     ) -> RangeSetOutcome {
-        // Only the `-v` line's denominator: a store fault here fails the drive
-        // itself a moment later.
+        // Feeds only the `-v` line and the stall message. A store fault here
+        // recurs in the drive's own setup, which fails first.
         let target = decdn_client::range_set_reach(store, ranges)
             .await
             .unwrap_or_else(|e| {
-                tracing::debug!("could not size the drive's target: {e:#}");
+                tracing::debug!(
+                    "{}: could not size the drive's target: {e:#}",
+                    blake3::Hash::from_bytes(hash).to_hex(),
+                );
                 self.total_bytes
             });
         let watch = EntryWatch::default();

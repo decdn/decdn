@@ -2957,7 +2957,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 struct EntryBytes {
     /// Content bytes the entry paid for (see [`PullCtx::pull_entry_untimed`]).
     paid: u64,
-    /// Bytes the entry spliced from a local donor, never downloaded.
+    /// Bytes the entry spliced from a local donor on disk rather than
+    /// downloading them itself.
     spliced: u64,
 }
 
@@ -2968,10 +2969,11 @@ fn log_entry_done(hash: [u8; 32], staging: &Path, bytes: EntryBytes, elapsed: st
     tracing::info!("{}", entry_done_line(hash, size, bytes, elapsed));
 }
 
-/// A finished entry's size, the time it took, and its download rate. The rate
-/// counts only the bytes the entry paid for, so a range-dedup entry reports its
-/// spliced bytes apart rather than as download (#2189). The time covers the
-/// whole entry: probing, every drive, any splice and the whole-file check.
+/// A finished entry's size, the time it took, and its rate over the bytes it
+/// paid for (see [`PullCtx::pull_entry_untimed`]). When the entry spliced bytes
+/// from disk, the line reports them apart from the paid bytes (#2189). The time
+/// covers the whole entry: probing, every drive, any splice and the whole-file
+/// check.
 fn entry_done_line(
     hash: [u8; 32],
     size: u64,
@@ -8745,6 +8747,24 @@ mod tests {
                 ": 12.00 MiB in 2.0s (2.00 MiB downloaded at 1.00 MiB/s, 10.00 MiB spliced \
                  from disk)"
             ),
+            "{line}"
+        );
+    }
+
+    /// An entry spliced whole from disk downloads nothing and has no rate.
+    #[test]
+    fn entry_done_line_renders_a_fully_spliced_entry() {
+        let line = entry_done_line(
+            [1; 32],
+            12 << 20,
+            EntryBytes {
+                paid: 0,
+                spliced: 12 << 20,
+            },
+            std::time::Duration::from_secs(2),
+        );
+        assert!(
+            line.ends_with(" in 2.0s (0 B downloaded at --, 12.00 MiB spliced from disk)"),
             "{line}"
         );
     }

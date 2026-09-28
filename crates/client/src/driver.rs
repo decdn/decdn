@@ -650,11 +650,13 @@ pub async fn first_leg<St: RangedStore + ?Sized>(
     .map(Some)
 }
 
-/// The whole-blob position a drive of `ranges` over `store` reports once it
+/// The whole-blob position a drive of `ranges` over `store` reaches once it
 /// completes: the content already present plus every missing gap of `ranges`.
-/// It is the denominator of the drive's progress positions: the whole blob for
-/// `(0, 0)`, and less for a range set that leaves bytes to another writer, such
-/// as the donor ranges a range-dedup entry splices from disk.
+/// The drive's progress callback still reports against `total_bytes`. A caller
+/// that wants a done-mark for this range set, such as a `-v` line or an ETA,
+/// reads it here. It is the whole blob for `(0, 0)`, and less for a range set
+/// that leaves bytes to another writer, such as the donor ranges a range-dedup
+/// entry splices from disk.
 ///
 /// # Errors
 ///
@@ -2138,8 +2140,9 @@ mod tests {
     }
 
     /// Concurrent gaps report one non-decreasing whole-blob position that starts
-    /// at the present base and ends at the bytes present, so a drive-level
-    /// floor watching it sees steady progress.
+    /// at the present base and ends at the bytes present, which is the set's
+    /// [`range_set_reach`], so a drive-level floor watching it sees steady
+    /// progress toward a known mark.
     #[tokio::test]
     async fn a_concurrent_range_set_reports_one_rising_position() {
         let total = 32 * GROUP;
@@ -2155,6 +2158,11 @@ mod tests {
         let seen = Mutex::new(Vec::new());
         let record = |position: u64, _: u64| seen.lock().expect("lock").push(position);
         let ranges: Vec<(u64, u64)> = (1..32).step_by(2).map(|g| (g * GROUP, GROUP)).collect();
+        let reach = range_set_reach(&store, &ranges).await.expect("reach");
+        assert!(
+            reach < total,
+            "the set leaves the even groups to another writer"
+        );
         let (result, source, store, _) = drive_set_into(
             store,
             &ranges,
@@ -2179,6 +2187,7 @@ mod tests {
         );
         let present = ranges_content_len(&store.present_ranges().await.expect("present"), total);
         assert_eq!(seen.last().copied(), Some(present));
+        assert_eq!(present, reach, "the drive ends at the set's reach");
     }
 
     /// A primed first leg is adopted even when the rest of the set runs
