@@ -66,12 +66,14 @@ pub struct DownstreamFrontier {
     /// [`WindowPacer`]'s window check. Inert on the client path, same as
     /// `pulled_frontier`.
     pub served_paid: u64,
-    /// Content end of the furthest span the node's downstream serve legs have waited
-    /// on (a high-water mark, never lowered). When it lies within one chunk group
-    /// past [`PaceState::pulled_frontier`], a serve leg is parked on this pull,
-    /// collecting no payment; [`WindowPacer`] then draws one [`PULL_WINDOW_FLOOR`]
-    /// even with its window full, or neither leg moves again. A demand further out
-    /// is ignored. `0` on the client path.
+    /// Content end of the nearest span a starved downstream serve leg waits on for
+    /// this pull's content, or `0` when none waits. Each serve leg stands its own
+    /// demand and withdraws it once it moves again, so a leg parked further down
+    /// the blob never hides one parked at this pull's frontier. When it lies within
+    /// one chunk group past [`PaceState::pulled_frontier`], a serve leg is parked on
+    /// this pull, collecting no payment; [`WindowPacer`] then draws one
+    /// [`PULL_WINDOW_FLOOR`] even with its window full, or neither leg moves again.
+    /// A demand further out is ignored. `0` on the client path.
     pub serve_demand: u64,
 }
 
