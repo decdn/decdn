@@ -204,8 +204,8 @@ pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
 pub use decdn_bao_range::RangedStore;
 pub use downloader::{DownloadTarget, Downloader, download_first_unit};
 pub use driver::{
-    LaneGrowth, PacingWait, PoolExhausted, RangeLane, RangeSetOutcome, SharedPool, WaitReason,
-    drive, drive_range_lanes, drive_range_set, first_leg, range_set_reach,
+    LaneGrowth, LegNoProgress, PacingWait, PoolExhausted, RangeLane, RangeSetOutcome, SharedPool,
+    WaitReason, drive, drive_range_lanes, drive_range_set, first_leg, range_set_reach,
 };
 pub use ledger::{ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released};
 pub use ledgers::{LaneHandle, LaneLedgers};

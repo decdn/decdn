@@ -1164,6 +1164,17 @@ pub struct DecdnMetrics {
     /// does not clear: a holder whose cap never releases, or one of the refusals
     /// the seller collapses onto `NotFound` that is not a cap at all.
     pub node_pull_backpressure_exhausted: Counter,
+    /// `decdn_node_pull_leg_no_progress_total` (#2194): a pull leg streamed and
+    /// finished cleanly, yet moved neither the gap's paid frontier nor the store's
+    /// delivered frontier. The drive ends the gap rather than re-open and re-pay the
+    /// same range. An upstream leg is not scored: its `(peer, hash)` pair is
+    /// suppressed briefly and the run re-plans onto another source. A `warn!` names
+    /// the range, both frontiers and the channel's paid wire since the leg opened.
+    ///
+    /// Zero is the expected value. A tick means this node's store did not keep a
+    /// leg's bytes, its ledger did not record the leg's payment, or the upstream
+    /// ended the stream without taking the leg's final proof.
+    pub node_pull_leg_no_progress: Counter,
     /// `decdn_node_pull_stalled_total` (#1797): an upstream's throughput fell below the
     /// floor mid-stream — the bytes across `node_pull_stall_window_sec` dropped under
     /// `node_pull_min_throughput_bps` — so the pull was abandoned after at least one byte had
@@ -2994,6 +3005,10 @@ recorders! {
     /// The sole covering source outlasted the backpressure wait budget and the
     /// assembly ended short (#2178) — see the counter's docs.
     node_pull_backpressure_exhausted => node_pull_backpressure_exhausted.inc();
+
+    /// A clean upstream leg moved neither frontier and the run dropped its source
+    /// (#2194) — see the counter's docs.
+    node_pull_leg_no_progress => node_pull_leg_no_progress.inc();
 
     /// An upstream went silent mid-stream (#1134); the pull was abandoned and the
     /// provider scored `Unreachable`.

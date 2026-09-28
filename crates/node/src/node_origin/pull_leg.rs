@@ -52,9 +52,9 @@ use decdn_client::driver::DriveConfig;
 use decdn_client::sink::PullReader;
 use decdn_client::source::{BlobSource as _, Funder, SourceFuture};
 use decdn_client::{
-    CoveredRun, DownstreamFrontier, HashMismatch as ClientPullHashMismatch, PacingWait, PeerSource,
-    PoolLedger, PrimedSource, RampPacer, RetryDisposition, SharedPool, UpstreamPullHeader,
-    WaitReason, drive, first_leg, shared_pool_disposition,
+    CoveredRun, DownstreamFrontier, HashMismatch as ClientPullHashMismatch, LegNoProgress,
+    PacingWait, PeerSource, PoolLedger, PrimedSource, RampPacer, RetryDisposition, SharedPool,
+    UpstreamPullHeader, WaitReason, drive, first_leg, shared_pool_disposition,
 };
 use decdn_incentive::DepositOutcome;
 
@@ -1375,6 +1375,17 @@ impl PeerRunSink<'_> {
                 RunOutcome::Filled
             }
             Err(err) => {
+                // A clean leg that moved neither frontier (#2194) was served and
+                // paid for, so a speculative run spends its warming allowance on it
+                // as a clean run does. `classify_pull_failure` below meters and logs
+                // it and suppresses the pair without scoring the source.
+                if speculative && let Some(stuck) = err.downcast_ref::<LegNoProgress>() {
+                    self.deps.config.warming.debit_speculative(
+                        (*pk.as_bytes()).into(),
+                        Hash::from_bytes(self.hash_bytes),
+                        candidate.rate_per_mb.saturating_mul(mb_of(stuck.len)),
+                    );
+                }
                 if is_bao_corruption(&err) {
                     tracing::warn!(
                         provider = %pk, %provider_addr,
@@ -1616,16 +1627,23 @@ pub(crate) async fn run_local_pull_leg(
     // meter it as a local fault and NEVER score a provider or a bao-corruption against
     // an upstream that does not exist. Skipped on cancel (nobody waits).
     // An internal fault (an encode panic or a broken invariant) is a code bug, not
-    // the origin's: say so, so the operator does not audit a healthy origin.
+    // the origin's: say so, so the operator does not audit a healthy origin. A
+    // clean leg that moved neither frontier gets its own counter and log for the
+    // same reason.
     if !cancelled && let Err(err) = &result {
-        metrics.node_pull_local_fault();
-        if is_internal_fault(err) {
+        if let Some(stuck) = err.downcast_ref::<LegNoProgress>() {
+            // Not the origin's fault: the store or the bookkeeping ledger did not
+            // record a leg that finished cleanly (#2194).
+            super::warn_leg_no_progress(&metrics, *hash.as_bytes(), None, stuck);
+        } else if is_internal_fault(err) {
+            metrics.node_pull_local_fault();
             tracing::error!(
                 %hash,
                 error = %format_args!("{err:#}"),
                 "own-origin pull leg failed on an internal fault (code bug), not the origin"
             );
         } else {
+            metrics.node_pull_local_fault();
             tracing::warn!(
                 %hash,
                 error = %format_args!("{err:#}"),

@@ -123,6 +123,103 @@ impl std::fmt::Display for PoolExhausted {
 
 impl std::error::Error for PoolExhausted {}
 
+/// A leg of a gap opened, streamed and finished cleanly, yet left both the gap's
+/// paid frontier and the store's delivered frontier where they were.
+///
+/// A clean finish leaves the ledger crediting every wire byte the leg received:
+/// one reveal per whole chunk, plus a closing signature for any residual. The
+/// paid frontier therefore reaches the end of what the leg delivered, capped at
+/// the delivered frontier, and the leg's bytes land in the store. A clean leg
+/// that moves neither frontier means the store did not keep the bytes, the
+/// ledger did not record the payment, or the upstream ended the stream without
+/// taking the leg's final proof. It never means a slow peer: a stalled leg ends
+/// with a stall error, not a clean finish. Opening the same range again would
+/// pay for the same bytes to the same effect, so the gap-fill loop behind
+/// [`drive`], [`drive_range_set`] and [`drive_range_lanes`] ends the gap with
+/// this error instead (#2194).
+///
+/// [`crate::retry_disposition`] rules it `RetryElsewhere`. The cause may be the
+/// source, and each further source costs at most one more leg before it ends the
+/// same way.
+#[derive(Debug)]
+pub struct LegNoProgress {
+    /// Start of the range the leg opened.
+    pub offset: u64,
+    /// Length of the range the leg opened.
+    pub len: u64,
+    /// The gap's paid frontier when the leg opened. The pass after the leg found
+    /// it no further on.
+    pub paid_frontier: u64,
+    /// The store's delivered frontier in the gap when the leg opened. The pass
+    /// after the leg found it no further on.
+    pub delivered_frontier: u64,
+    /// The channel ledger's committed WIRE bytes since the leg opened. The ledger
+    /// is shared, so this counts concurrent pulls on the same channel too. With no
+    /// concurrent pull, enough wire to cover the leg's first chunk group points at
+    /// the store (it did not keep what was paid for), and zero points at the
+    /// ledger or the upstream (the leg's payment was never recorded).
+    pub paid_wire: u64,
+}
+
+impl std::fmt::Display for LegNoProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "leg [{}, +{}) finished cleanly but advanced neither the paid frontier ({}) nor \
+             the delivered frontier ({}), with {} wire bytes credited; refusing to re-open \
+             and re-pay the same range",
+            self.offset, self.len, self.paid_frontier, self.delivered_frontier, self.paid_wire
+        )
+    }
+}
+
+impl std::error::Error for LegNoProgress {}
+
+/// The last leg of a gap that finished cleanly, as the pass that opened it saw the
+/// gap. [`fill_gap`]'s next pass must see one of the two frontiers move.
+#[derive(Debug, Clone, Copy)]
+struct CleanLeg {
+    /// Start of the range the leg opened.
+    offset: u64,
+    /// Length of the range the leg opened.
+    len: u64,
+    /// The gap's paid frontier when the leg opened.
+    paid_frontier: u64,
+    /// The store's delivered frontier when the leg opened.
+    delivered_frontier: u64,
+    /// The ledger generation when the leg opened. A rebase since then moved the
+    /// shared watermark under the leg, so its paid-frontier reading is void.
+    generation: u64,
+}
+
+impl CleanLeg {
+    /// The [`LegNoProgress`] this leg amounts to, given what the next pass reads:
+    /// both frontiers, the wire the ledger credited since the leg opened, and the
+    /// ledger generation. `None` when either frontier moved, or when a rebase makes
+    /// the paid frontier incomparable.
+    const fn stalled(
+        self,
+        paid_frontier: u64,
+        delivered_frontier: u64,
+        paid_wire: u64,
+        generation: u64,
+    ) -> Option<LegNoProgress> {
+        if generation != self.generation
+            || paid_frontier > self.paid_frontier
+            || delivered_frontier > self.delivered_frontier
+        {
+            return None;
+        }
+        Some(LegNoProgress {
+            offset: self.offset,
+            len: self.len,
+            paid_frontier: self.paid_frontier,
+            delivered_frontier: self.delivered_frontier,
+            paid_wire,
+        })
+    }
+}
+
 /// The state ONE pool deposit's concurrent lanes share, injected by the
 /// multi-source scheduler. Absent (`None`) on the single-source path, where the
 /// one lane IS the pool and its own `DriveCounters` and [`PoolContext`] already
@@ -434,8 +531,9 @@ pub(crate) fn ranges_content_len(ranges: &ChunkRanges, total_bytes: u64) -> u64 
 /// # Errors
 ///
 /// A [`PaceDecision::Refuse`] (out of budget/attempts), a terminal source/store
-/// fault that is neither a healable desync nor a fundable exhaustion, an escrowed-
-/// but-untracked top-up outcome, or a `finalize` failure.
+/// fault that is neither a healable desync nor a fundable exhaustion, a clean leg
+/// that moved neither frontier ([`LegNoProgress`]), an escrowed-but-untracked
+/// top-up outcome, or a `finalize` failure.
 #[allow(clippy::too_many_arguments)]
 pub async fn drive<St, S, P, F>(
     store: &St,
@@ -1284,6 +1382,10 @@ where
     // frontier), nothing already-paid is re-pulled (the `cli_fetch_resume` property).
     let mut leg_anchor: Option<(u64, U256)> = None;
 
+    // The last leg that finished cleanly, with the gap's two frontiers as the pass
+    // that opened it read them. The next pass must see one of them move (#2194).
+    let mut clean_leg: Option<CleanLeg> = None;
+
     let gap_end = gap_start.saturating_add(gap_len);
 
     loop {
@@ -1347,6 +1449,21 @@ where
                 .min(gap_end)
                 .min(delivered_frontier);
         let paid_cleared = paid_frontier.saturating_sub(gap_start);
+
+        // A clean leg's payment moves the paid frontier to the end of what it
+        // delivered, and its bytes land in the store, so this pass sees one of the
+        // two frontiers move. One that moved neither would re-open the same range
+        // and pay for the same bytes to the same effect. End the gap.
+        if let Some(stuck) = clean_leg.take().and_then(|leg| {
+            leg.stalled(
+                paid_frontier,
+                delivered_frontier,
+                paid_wire_this_leg,
+                ledger.generation(),
+            )
+        }) {
+            return Err(anyhow::Error::new(stuck));
+        }
 
         let downstream_now = downstream.map_or(
             DownstreamFrontier {
@@ -1539,6 +1656,7 @@ where
                 };
 
                 // One paid leg: open -> stream into the store -> drain the pull.
+                let generation_at_open = ledger.generation();
                 let leg: anyhow::Result<()> = match source.open(hash, aligned.clone()).await {
                     // The store is keyed by the blob's size, so a leg whose signed
                     // size disagrees would verify against the wrong tree. Refuse
@@ -1698,6 +1816,13 @@ where
                 // later re-open can still meet the same stale refusal. The next
                 // top-up re-arms the budget; a stale refusal past it is terminal.
                 exhaustion_confirmed = false;
+                clean_leg = Some(CleanLeg {
+                    offset: aligned.fetch_start(),
+                    len: aligned.fetch_len(),
+                    paid_frontier,
+                    delivered_frontier,
+                    generation: generation_at_open,
+                });
             }
         }
     }
@@ -1727,8 +1852,8 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use super::{
-        DriveConfig, LaneGrowth, PoolExhausted, RangeLane, RangeSetOutcome, SharedPool,
-        contiguous_byte_ranges, drive, drive_range_lanes, drive_range_set, first_leg,
+        DriveConfig, LaneGrowth, LegNoProgress, PoolExhausted, RangeLane, RangeSetOutcome,
+        SharedPool, contiguous_byte_ranges, drive, drive_range_lanes, drive_range_set, first_leg,
         range_set_reach, ranges_content_len,
     };
     use crate::ProgressCallback;
@@ -5088,5 +5213,213 @@ mod tests {
         .expect("the empty blob under the empty root completes");
         assert_eq!(source.delivered_bytes(), 0, "nothing to pull");
         assert_eq!(ledger.committed().bytes, U256::ZERO, "nothing to pay");
+    }
+
+    /// A store whose ingest verifies and drains every leg but keeps nothing: its
+    /// queries answer from an empty store, so every range stays missing after a
+    /// leg that returned `Ok`.
+    struct ForgetfulStore {
+        empty: ClientRangedStore,
+        sink: ClientRangedStore,
+    }
+
+    impl RangedStore for ForgetfulStore {
+        fn total_bytes(&self) -> u64 {
+            self.empty.total_bytes()
+        }
+        fn present_ranges(&self) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
+            self.empty.present_ranges()
+        }
+        fn missing_ranges(
+            &self,
+            byte_offset: u64,
+            byte_len: u64,
+        ) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
+            self.empty.missing_ranges(byte_offset, byte_len)
+        }
+        fn admit(
+            &self,
+            range: AlignedRange,
+            bao_bytes: Bytes,
+        ) -> decdn_bao_range::RangedFuture<'_, ()> {
+            self.sink.admit(range, bao_bytes)
+        }
+        fn read(
+            &self,
+            byte_offset: u64,
+            byte_len: u64,
+        ) -> decdn_bao_range::RangedFuture<'_, Bytes> {
+            self.empty.read(byte_offset, byte_len)
+        }
+        fn is_complete(&self) -> decdn_bao_range::RangedFuture<'_, bool> {
+            self.empty.is_complete()
+        }
+        fn finalize(&self) -> decdn_bao_range::RangedFuture<'_, ()> {
+            self.empty.finalize()
+        }
+    }
+
+    impl crate::source::IngestStore for ForgetfulStore {
+        fn ingest_stream<'a, R>(
+            &'a self,
+            range: &'a AlignedRange,
+            reader: R,
+            on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
+        where
+            R: crate::source::BaoRangeReader + 'a,
+        {
+            Box::pin(self.sink.ingest_stream(range, reader, on_progress))
+        }
+
+        fn flush_present_record(&self) -> crate::source::SourceFuture<'_, ()> {
+            crate::source::IngestStore::flush_present_record(&self.empty)
+        }
+    }
+
+    /// Drive `[0, total)` of `store` from `source` under a hard timeout, so a
+    /// drive that re-opens forever fails the test instead of hanging it.
+    async fn drive_bounded<St: crate::source::IngestStore>(
+        store: &St,
+        source: &ScriptedSource,
+        ledger: &Arc<PoolLedger>,
+    ) -> anyhow::Result<()> {
+        let pacer = BudgetPacer::new();
+        let funder = healthy_funder();
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(
+                store,
+                source,
+                &pacer,
+                &funder,
+                &ctx,
+                ledger,
+                source.root(),
+                0,
+                0,
+                &config(),
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("drive re-opened without end"))?
+    }
+
+    fn clean_leg() -> super::CleanLeg {
+        super::CleanLeg {
+            offset: 0,
+            len: 3 * GROUP,
+            paid_frontier: GROUP,
+            delivered_frontier: 2 * GROUP,
+            generation: 4,
+        }
+    }
+
+    /// Either frontier moving clears a clean leg; neither moving stalls it and
+    /// carries the credited wire.
+    #[test]
+    fn a_clean_leg_stalls_only_when_neither_frontier_moves() {
+        let leg = clean_leg();
+        assert!(
+            leg.stalled(2 * GROUP, 2 * GROUP, 9, 4).is_none(),
+            "paid moved"
+        );
+        assert!(
+            leg.stalled(GROUP, 3 * GROUP, 9, 4).is_none(),
+            "delivered moved"
+        );
+        let stuck = leg.stalled(GROUP, 2 * GROUP, 9, 4).expect("neither moved");
+        assert_eq!(
+            (
+                stuck.offset,
+                stuck.len,
+                stuck.paid_frontier,
+                stuck.delivered_frontier
+            ),
+            (0, 3 * GROUP, GROUP, 2 * GROUP)
+        );
+        assert_eq!(stuck.paid_wire, 9);
+        assert!(
+            leg.stalled(0, 0, 0, 4).is_some(),
+            "a frontier that fell back is no progress either"
+        );
+    }
+
+    /// A sibling's rebase of the shared ledger during the leg voids the leg's
+    /// paid-frontier reading, so it cannot convict the leg.
+    #[test]
+    fn a_rebase_during_the_leg_voids_the_check() {
+        assert!(clean_leg().stalled(0, 2 * GROUP, 0, 5).is_none());
+    }
+
+    /// #2194: a leg that streams, pays and finishes `Ok` while the store still
+    /// reports its range missing ends the gap with [`LegNoProgress`] after that
+    /// one open. It never re-opens (and re-pays) the identical range.
+    #[tokio::test]
+    async fn a_clean_leg_the_store_does_not_keep_is_never_reopened() {
+        let total = 3 * GROUP;
+        let (root, plaintext, _) = synth_blob(total as usize);
+        let store = ForgetfulStore {
+            empty: fresh_store(root, total),
+            sink: fresh_store(root, total),
+        };
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(plaintext)
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+
+        let err = drive_bounded(&store, &source, &ledger)
+            .await
+            .expect_err("a leg that leaves both frontiers put fails the gap");
+
+        let stuck = err
+            .downcast_ref::<LegNoProgress>()
+            .unwrap_or_else(|| panic!("expected LegNoProgress, got {err:#}"));
+        assert_eq!((stuck.offset, stuck.len), (0, total));
+        assert!(
+            stuck.paid_wire > 0,
+            "the ledger paid; the store dropped the bytes"
+        );
+        assert_eq!(
+            source.opened_ranges(),
+            vec![(0, total)],
+            "one open, no repeat"
+        );
+        assert_eq!(
+            crate::retry_disposition(&err),
+            crate::RetryDisposition::RetryElsewhere,
+            "another source may still fill the gap"
+        );
+    }
+
+    /// #2194: a leg the store keeps but the ledger never pays for advances the
+    /// delivered frontier once. The next clean leg moves neither frontier, so the
+    /// gap ends with [`LegNoProgress`] after two opens rather than re-opening
+    /// forever.
+    #[tokio::test]
+    async fn an_unpaid_clean_leg_is_reopened_at_most_once() {
+        let total = 3 * GROUP;
+        let (root, plaintext, _) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(plaintext).expect("source");
+
+        let err = drive_bounded(&store, &source, &ledger)
+            .await
+            .expect_err("an unpaid leg cannot complete the gap");
+
+        let stuck = err
+            .downcast_ref::<LegNoProgress>()
+            .unwrap_or_else(|| panic!("expected LegNoProgress, got {err:#}"));
+        assert_eq!(
+            stuck.paid_wire, 0,
+            "the store kept the bytes; the ledger paid nothing"
+        );
+        assert_eq!(source.opened_ranges(), vec![(0, total), (0, total)]);
     }
 }
