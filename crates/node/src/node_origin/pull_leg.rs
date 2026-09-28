@@ -2191,8 +2191,7 @@ mod downstream_wait_tests {
 
     /// A pull whose window is full draws one floor for the serve leg parked at its
     /// frontier, even while a serve leg of a sibling fill of the same blob waits
-    /// further down. On the testnet the sibling's demand hid the parked leg, the
-    /// pull paced to `Wait`, and neither leg moved until the client gave up.
+    /// further down. Pacing to `Wait` here leaves both legs waiting on each other.
     #[tokio::test]
     async fn a_full_window_draws_for_its_parked_leg_despite_a_far_sibling() {
         use decdn_client::{PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, WindowPacer};

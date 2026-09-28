@@ -1778,10 +1778,9 @@ mod fill_registry_tests {
     }
 
     /// A serve leg parked in a sibling fill's range, further down the blob, does
-    /// not hide a nearer parked leg from the fill that produces its bytes. On the
-    /// testnet a 30 s stall came from exactly this: a sibling stream's demand
-    /// masked the demand of a stream parked at its own pull's frontier, so that
-    /// pull waited on a payment its parked serve leg could not collect.
+    /// not hide a nearer parked leg from the fill that produces its bytes. A
+    /// masked demand leaves that fill's pull waiting on a payment its parked serve
+    /// leg cannot collect, so neither leg moves.
     #[test]
     fn a_sibling_fills_far_demand_does_not_hide_a_near_one() {
         let total = 8 * G;
