@@ -9514,6 +9514,45 @@ async fn leaf_reads_first_interval(
     pool_id: B256,
     hash: Hash,
 ) -> Result<LeafStream> {
+    let LeafStream {
+        conn,
+        send,
+        mut recv,
+        ..
+    } = leaf_opens_paid_stream(leaf_ep, target, leaf_node_id, leaf_eth, pool_id, hash).await?;
+    let interval_bytes = CHUNK_BYTES;
+
+    let mut delivered: u64 = 0;
+    loop {
+        match read_client(&mut recv).await? {
+            ClientMessage::ChunkData(chunk) => {
+                delivered = delivered.saturating_add(chunk.bytes().len() as u64);
+                if delivered >= interval_bytes {
+                    break;
+                }
+            }
+            ClientMessage::StreamEnd => anyhow::bail!("stream ended before the first interval"),
+            other => anyhow::bail!("unexpected message mid-delivery: {other:?}"),
+        }
+    }
+    Ok(LeafStream {
+        conn,
+        send,
+        recv,
+        delivered,
+    })
+}
+
+/// Open a paid stream from the leaf to B for `hash` and read B's accepting
+/// `StreamResponse`, but no chunk.
+async fn leaf_opens_paid_stream(
+    leaf_ep: &iroh::Endpoint,
+    target: EndpointAddr,
+    leaf_node_id: B256,
+    leaf_eth: &Arc<PrivateKeySigner>,
+    pool_id: B256,
+    hash: Hash,
+) -> Result<LeafStream> {
     let conn = leaf_ep
         .connect(target, ALPN_CLIENT)
         .await
@@ -9552,26 +9591,11 @@ async fn leaf_reads_first_interval(
 
     let (resp, resp_ext) = read_client_response(&mut recv).await?;
     anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
-    let interval_bytes = CHUNK_BYTES;
-
-    let mut delivered: u64 = 0;
-    loop {
-        match read_client(&mut recv).await? {
-            ClientMessage::ChunkData(chunk) => {
-                delivered = delivered.saturating_add(chunk.bytes().len() as u64);
-                if delivered >= interval_bytes {
-                    break;
-                }
-            }
-            ClientMessage::StreamEnd => anyhow::bail!("stream ended before the first interval"),
-            other => anyhow::bail!("unexpected message mid-delivery: {other:?}"),
-        }
-    }
     Ok(LeafStream {
         conn,
         send,
         recv,
-        delivered,
+        delivered: 0,
     })
 }
 
@@ -10100,6 +10124,98 @@ async fn window_pull_through_leaf_drop_before_paying_is_an_abandon_and_a_decline
     assert_counter(&b_metrics, "serve_stream_node_fault_total", 0)?;
     // The leaf left before paying the first interval: a decline on the serve leg.
     assert_counter(&b_metrics, "serve_stream_client_declined_total", 1)?;
+    support::assert_inbound_failures_attributed(&b_metrics, 1).await?;
+
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    Ok(())
+}
+
+/// #2194: a leaf that leaves while B's serve leg waits on the pull for its first
+/// byte ends that serve at once, and the serve's lease release cancels the pull. A
+/// answers and then sends nothing, and B's pull budgets run a minute, so only the
+/// leaf leaving can end the serve and the fill inside the bound.
+/// A serve leg that does not watch its client stays parked, holds its lease, and
+/// keeps the pull alive.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_leaf_gone_while_the_pull_owes_the_first_byte_ends_the_serve()
+-> Result<()> {
+    let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3)).unwrap_or(usize::MAX);
+    let payload = vec![0x3Cu8; payload_len];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
+
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_a, a_addr) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_mid_stream_silent_server(
+        ep_a.clone(),
+        Arc::clone(&a_eth),
+        slash_domain(),
+        Arc::new(honest_bao_wire(&payload)?),
+        total_bytes,
+        RATE,
+        0,
+    );
+
+    let ab_channel_id = B256::repeat_byte(0x3C);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x3D);
+    let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics, _local_rep, _b_operator) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let leaf = leaf_opens_paid_stream(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+    )
+    .await?;
+    // B's fill for the leaf is live: B claims it before it signs the response.
+    anyhow::ensure!(
+        cache_b.in_flight_total(hash).is_some(),
+        "B's serve waits on a live fill"
+    );
+    leaf.conn.close(0u32.into(), b"gone");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while (assert_counter(&b_metrics, "streams_failed_total{direction=\"inbound\"}", 1).is_err()
+        || cache_b.in_flight_total(hash).is_some())
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_counter(&b_metrics, "streams_failed_total{direction=\"inbound\"}", 1)?;
+    // A has a minute left on both budgets, so a fill that is no longer live was
+    // cancelled by its last observer leaving.
+    anyhow::ensure!(
+        cache_b.in_flight_total(hash).is_none(),
+        "the serve's lease release cancels the pull"
+    );
+    assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
+    assert_counter(&b_metrics, "serve_stream_node_fault_total", 0)?;
+    assert_counter(&b_metrics, "serve_stream_client_declined_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_leg_no_progress_total", 0)?;
     support::assert_inbound_failures_attributed(&b_metrics, 1).await?;
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
@@ -14598,17 +14714,18 @@ async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x1F);
-    let (handler_s, s_target, ep_s, recorded, cache_s, s_operator, _, _) = build_serving_node(
-        hash,
-        ab_pool_id,
-        &s_buyer,
-        providers,
-        addr_map,
-        &[(a_id, a_addr), (b_id, b_addr)],
-        &[(leaf_channel_id, leaf_eth.address())],
-        U256::from(DEPOSIT_MICRO_USDC),
-    )
-    .await?;
+    let (handler_s, s_target, ep_s, recorded, cache_s, s_operator, s_metrics, _) =
+        build_serving_node(
+            hash,
+            ab_pool_id,
+            &s_buyer,
+            providers,
+            addr_map,
+            &[(a_id, a_addr), (b_id, b_addr)],
+            &[(leaf_channel_id, leaf_eth.address())],
+            U256::from(DEPOSIT_MICRO_USDC),
+        )
+        .await?;
     let task_s = spawn_server(ep_s.clone(), handler_s);
 
     // The leaf pulls the whole blob from S; S serve-misses and assembles it from
@@ -14696,6 +14813,12 @@ async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
     anyhow::ensure!(
         paid_providers == std::collections::HashSet::from([a_eth, b_eth]),
         "both holders' lanes must have persisted a watermark, got {paid_providers:?}"
+    );
+    // Every leg of the assembly made progress (#2194): a false no-progress verdict
+    // would re-plan onto the other holder and still complete, hiding the double pay.
+    anyhow::ensure!(
+        counter_value(&s_metrics, "node_pull_leg_no_progress_total")? == 0,
+        "no clean leg may stall a healthy two-holder assembly"
     );
 
     shutdown([task_s, task_a, task_b], [&leaf_ep, &ep_s, &ep_a, &ep_b]).await?;
@@ -14828,6 +14951,10 @@ async fn sole_coverer_refusal_is_retried(leaves: usize) -> Result<()> {
     anyhow::ensure!(
         counter_value(&s_metrics, "node_pull_backpressure_exhausted_total")? == 0,
         "the refusal cleared inside the wait budget"
+    );
+    anyhow::ensure!(
+        counter_value(&s_metrics, "node_pull_leg_no_progress_total")? == 0,
+        "every leg of the retried assembly made progress (#2194)"
     );
     anyhow::ensure!(
         counter_value(&s_metrics, "node_pull_refused_total")? >= 1

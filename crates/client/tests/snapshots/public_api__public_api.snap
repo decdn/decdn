@@ -119,6 +119,15 @@ pub const fn decdn_client::driver::DriveConfig::cli(alloy_primitives::aliases::U
 pub struct decdn_client::driver::LaneGrowth<'a>(pub &'a (dyn core::ops::function::Fn(usize) -> usize + core::marker::Send + core::marker::Sync + 'a))
 impl core::fmt::Debug for decdn_client::driver::LaneGrowth<'_>
 pub fn decdn_client::driver::LaneGrowth<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::driver::LegNoProgress
+pub decdn_client::driver::LegNoProgress::delivered_frontier: u64
+pub decdn_client::driver::LegNoProgress::len: u64
+pub decdn_client::driver::LegNoProgress::offset: u64
+pub decdn_client::driver::LegNoProgress::paid_frontier: u64
+pub decdn_client::driver::LegNoProgress::paid_wire: u64
+impl core::error::Error for decdn_client::driver::LegNoProgress
+impl core::fmt::Display for decdn_client::driver::LegNoProgress
+pub fn decdn_client::driver::LegNoProgress::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::driver::PoolExhausted
 pub decdn_client::driver::PoolExhausted::gap_len: u64
 pub decdn_client::driver::PoolExhausted::gap_start: u64
@@ -553,6 +562,15 @@ pub fn decdn_client::ledgers::LaneLedgers::get_or_insert(&self, decdn_incentive:
 pub fn decdn_client::ledgers::LaneLedgers::new() -> Self
 pub const fn decdn_client::ledgers::LaneLedgers::topup_lock(&self) -> &tokio::sync::mutex::Mutex<()>
 pub fn decdn_client::ledgers::LaneLedgers::total_committed(&self) -> alloy_primitives::aliases::U256
+pub struct decdn_client::LegNoProgress
+pub decdn_client::LegNoProgress::delivered_frontier: u64
+pub decdn_client::LegNoProgress::len: u64
+pub decdn_client::LegNoProgress::offset: u64
+pub decdn_client::LegNoProgress::paid_frontier: u64
+pub decdn_client::LegNoProgress::paid_wire: u64
+impl core::error::Error for decdn_client::driver::LegNoProgress
+impl core::fmt::Display for decdn_client::driver::LegNoProgress
+pub fn decdn_client::driver::LegNoProgress::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::LiveReader
 impl core::fmt::Debug for decdn_client::streamer::LiveReader
 pub fn decdn_client::streamer::LiveReader::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result

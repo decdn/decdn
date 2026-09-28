@@ -46,6 +46,7 @@
 
 use decdn_cache::{FillSession, NodeRangedStore};
 use decdn_client::sink::content_paid_frontier;
+use iroh::endpoint::{ConnectionError, StoppedError};
 
 use crate::metrics::FirstByteClock;
 
@@ -141,6 +142,33 @@ impl ClientHandler {
         )
         .await
         .map_err(|e| super::wire::tag_paid_progress(e, paid))
+    }
+
+    /// Await `frame`, the encoder's next frame, unless the stream ends first.
+    ///
+    /// `client_left` is the send stream's `stopped()` future. Before the leg
+    /// finishes its stream, it resolves when the client stops the stream or the
+    /// connection closes for any reason, this node's own close included. A frame
+    /// that is ready wins. [`client_left_error`] attributes the end, and a client
+    /// that left meters a pull-through abandon.
+    async fn frame_unless_client_left<T>(
+        &self,
+        frame: impl Future<Output = anyhow::Result<T>>,
+        client_left: std::pin::Pin<
+            &mut impl Future<Output = Result<Option<super::VarInt>, StoppedError>>,
+        >,
+    ) -> anyhow::Result<T> {
+        tokio::select! {
+            biased;
+            frame = frame => frame.map_err(|e| self.meter_frame_fault(e)),
+            left = client_left => {
+                let (err, abandoned) = client_left_error(left);
+                if abandoned {
+                    self.metrics.node_pull_through_client_abandoned();
+                }
+                Err(err)
+            }
+        }
     }
 
     /// The body of [`Self::serve_leg`]. `paid` counts the bytes accepted vouchers
@@ -239,16 +267,24 @@ impl ClientHandler {
             total_bytes,
         )?;
 
+        // Resolves once the client stops the stream or the connection drops. A
+        // frame wait touches neither stream, so without it a serve leg parked on
+        // the pull would never learn its client left, and would hold its lease and
+        // the pull alive (#2194).
+        let mut client_left = std::pin::pin!(send.stopped());
+
         // The first frame — awaiting the pull leg if `R` opens on a gap. A pull
         // that ends `Err` here fails the serve rather than hanging.
         // The first byte is about to go out: from here a stream that ends unpaid
         // forfeits its ramp credit (ADR 003 §Credit window).
         carry.start_delivery();
         let opening_window = self.credit_window(chunk_bytes, carry.ramp_paid(0));
-        let mut next_chunk = producer
-            .next_frame_chunks(self.frame_target(0, chunk_bytes, opening_window))
-            .await
-            .map_err(|e| self.meter_frame_fault(e))?;
+        let mut next_chunk = self
+            .frame_unless_client_left(
+                producer.next_frame_chunks(self.frame_target(0, chunk_bytes, opening_window)),
+                client_left.as_mut(),
+            )
+            .await?;
 
         // Wall-clock cadence for the mid-stream pool-solvency re-check below (ADR
         // 003 §Pool solvency). Start the clock at loop entry — admission already
@@ -317,10 +353,16 @@ impl ClientHandler {
                 // what keeps this from parking on upstream bytes that this loop must
                 // exit to recoup before they can be pulled.
                 let room = window.saturating_sub(delivered.saturating_sub(*paid));
-                next_chunk = producer
-                    .next_frame_chunks(self.frame_target(unvouchered, chunk_bytes, room))
-                    .await
-                    .map_err(|e| self.meter_frame_fault(e))?;
+                next_chunk = self
+                    .frame_unless_client_left(
+                        producer.next_frame_chunks(self.frame_target(
+                            unvouchered,
+                            chunk_bytes,
+                            room,
+                        )),
+                        client_left.as_mut(),
+                    )
+                    .await?;
             }
             let done_delivering = next_chunk.is_none();
 
@@ -624,5 +666,83 @@ impl ClientHandler {
         // hash), on the same clean-completion edge as the ADR 040 hit sighting.
         self.credit_warming_serve(hash, delivered);
         Ok(ServeEnd::Completed { bytes: delivered })
+    }
+}
+
+/// Attribute a serve leg's stream ending while the leg waits on the pull: the error
+/// to end the serve with, and whether the client abandoned it.
+///
+/// - The client stopped the stream, or the connection was lost on the client's
+///   side: a [`PeerFault`](super::wire::PeerFault) and an abandon, as a write to a
+///   gone client is. The connection error stays in the chain.
+/// - This node closed the connection (shutdown): a `PeerFault`, as the write path
+///   files it, but no abandon. The client did not leave.
+/// - The stream state is gone before this node finished it (`Ok(None)`), or a 0-RTT
+///   rejection: faults in this node's own stream state machine, so no marker, as
+///   `write_chunk_error` files them.
+fn client_left_error(left: Result<Option<super::VarInt>, StoppedError>) -> (anyhow::Error, bool) {
+    const WAITING: &str = "while the serve waited on the pull";
+    match left {
+        Ok(Some(code)) => (
+            anyhow::Error::new(super::wire::PeerFault)
+                .context(format!("client stopped the stream (code {code}) {WAITING}")),
+            true,
+        ),
+        Err(e @ StoppedError::ConnectionLost(ConnectionError::LocallyClosed)) => (
+            anyhow::Error::new(e)
+                .context(super::wire::PeerFault)
+                .context(format!("this node closed the connection {WAITING}")),
+            false,
+        ),
+        Err(e @ StoppedError::ConnectionLost(_)) => (
+            anyhow::Error::new(e)
+                .context(super::wire::PeerFault)
+                .context(format!("client connection lost {WAITING}")),
+            true,
+        ),
+        Ok(None) => (
+            anyhow::anyhow!("send stream closed on this node {WAITING}"),
+            false,
+        ),
+        Err(e @ StoppedError::ZeroRttRejected) => (
+            anyhow::Error::new(e).context(format!("send stream {WAITING}")),
+            false,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iroh::endpoint::{ConnectionError, StoppedError, VarInt};
+
+    use super::client_left_error;
+    use crate::handlers::client::wire::{PeerFault, is_peer_attributable};
+
+    /// Only the client leaving is an abandon. A local close is attributed like the
+    /// write path attributes it, and a stream this node already closed is a node
+    /// fault.
+    #[test]
+    fn only_the_client_leaving_is_an_abandon() {
+        let (stop, abandoned) = client_left_error(Ok(Some(VarInt::from_u32(7))));
+        assert!(abandoned && stop.is::<PeerFault>());
+
+        let (lost, abandoned) =
+            client_left_error(Err(StoppedError::ConnectionLost(ConnectionError::TimedOut)));
+        assert!(abandoned && lost.is::<PeerFault>());
+        assert!(
+            format!("{lost:#}").contains("timed out"),
+            "the connection error stays in the chain: {lost:#}"
+        );
+
+        let (local, abandoned) = client_left_error(Err(StoppedError::ConnectionLost(
+            ConnectionError::LocallyClosed,
+        )));
+        assert!(!abandoned && local.is::<PeerFault>());
+
+        let (closed, abandoned) = client_left_error(Ok(None));
+        assert!(!abandoned && !is_peer_attributable(&closed));
+
+        let (zero_rtt, abandoned) = client_left_error(Err(StoppedError::ZeroRttRejected));
+        assert!(!abandoned && !is_peer_attributable(&zero_rtt));
     }
 }

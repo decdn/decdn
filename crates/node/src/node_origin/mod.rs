@@ -93,10 +93,10 @@ use crate::selection::{
 use decdn_client::buyer_pool::ProgressWrite;
 use decdn_client::probe::probe_once;
 use decdn_client::{
-    BlobTooLarge, Cumulative, HashMismatch, LocalPullFault, PoolContext, PoolLedger, PullDeadlines,
-    PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd, UpstreamRateLimited,
-    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, effective_rate_ceiling,
-    sign_client_binding,
+    BlobTooLarge, Cumulative, HashMismatch, LegNoProgress, LocalPullFault, PoolContext, PoolLedger,
+    PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd,
+    UpstreamRateLimited, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
+    effective_rate_ceiling, sign_client_binding,
 };
 
 /// How a probe round decides it has collected enough holders (#1506).
@@ -1385,6 +1385,7 @@ impl PullMiss {
                 | RefusalVerdict::Transient,
             )
             | PullVerdict::Corruption
+            | PullVerdict::LegNoProgress
             | PullVerdict::Unreachable => Self::Clean,
             // Spelled out rather than folded into `Refused(_)` above, because it is the
             // one refusal `classify_refusal` calls "everything about us": our operator
@@ -2381,6 +2382,12 @@ enum PullVerdict {
     OurLocalFault,
     /// Reachable, paid, and served the wrong bytes.
     Corruption,
+    /// A leg finished cleanly but moved neither the paid nor the delivered frontier
+    /// ([`LegNoProgress`], #2194): this node's store did not keep the bytes, its ledger
+    /// did not record the payment, or the upstream ended the stream without taking the
+    /// final proof. Metered, logged and suppressed for the pair, never scored: the
+    /// likelier cause is on this node, and the pair would only repeat the paid leg.
+    LegNoProgress,
     /// Everything else: a failed dial, a dropped connection, a bad slash signature, an
     /// unexpected frame. The residual — and the arm that actually scores a dead node.
     Unreachable,
@@ -2556,6 +2563,11 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
     // the offset, not about the peer".
     if err.downcast_ref::<ResumeOffsetPastEnd>().is_some() {
         return PullVerdict::OurLocalFault;
+    }
+    // Ahead of the catch-all, which would score an honest upstream `Unreachable` for a
+    // leg it served and was paid for.
+    if err.downcast_ref::<LegNoProgress>().is_some() {
+        return PullVerdict::LegNoProgress;
     }
     if err.downcast_ref::<PullTimeout>().is_some() {
         return PullVerdict::OurDeadline;
@@ -2919,6 +2931,12 @@ fn classify_pull_failure(
                  cannot pay; exonerating the upstream"
             );
         }
+        PullVerdict::LegNoProgress => {
+            if let Some(stuck) = err.downcast_ref::<LegNoProgress>() {
+                warn_leg_no_progress(&deps.metrics, hash_bytes, Some((pk, provider_addr)), stuck);
+            }
+            suppress(Some(REFUSAL_SUPPRESSION_TTL));
+        }
         PullVerdict::Corruption => {
             debug!(peer = %pk, %provider_addr, error = %err, "node-origin: upstream served corrupt bytes; scoring corruption");
             record_outcome(deps, pk, &Outcome::Corruption);
@@ -2929,6 +2947,31 @@ fn classify_pull_failure(
         }
     }
     verdict
+}
+
+/// Meter and log a [`LegNoProgress`] (#2194): a leg that finished cleanly but moved
+/// neither frontier. `provider` is the upstream's key and operator address, or
+/// `None` for an own-origin leg. The log carries the range, both frontiers and the
+/// channel's paid wire, which tell a store fault from a ledger fault.
+pub(super) fn warn_leg_no_progress(
+    metrics: &crate::metrics::Metrics,
+    hash_bytes: [u8; 32],
+    provider: Option<(PublicKey, Address)>,
+    stuck: &LegNoProgress,
+) {
+    metrics.node_pull_leg_no_progress();
+    warn!(
+        hash = %DhtHash::from_bytes(hash_bytes),
+        provider = ?provider.map(|(pk, _)| pk),
+        provider_addr = ?provider.map(|(_, addr)| addr),
+        offset = stuck.offset,
+        len = stuck.len,
+        paid_frontier = stuck.paid_frontier,
+        delivered_frontier = stuck.delivered_frontier,
+        paid_wire = stuck.paid_wire,
+        "node-origin: a clean leg advanced neither the paid nor the delivered frontier; \
+         ending the gap instead of re-paying the range",
+    );
 }
 
 /// The local reputation for `pk`, as the `f32` the selection score consumes.
@@ -3548,6 +3591,22 @@ mod tests {
         );
     }
 
+    /// A clean leg that moved neither frontier (#2194) gets its own verdict, even under
+    /// context layers: the catch-all would score the upstream `Unreachable` for a leg it
+    /// served and was paid for.
+    #[test]
+    fn a_no_progress_leg_is_not_scored_unreachable() {
+        let err = anyhow::Error::new(LegNoProgress {
+            offset: 0,
+            len: 16_384,
+            paid_frontier: 0,
+            delivered_frontier: 0,
+            paid_wire: 0,
+        })
+        .context("pull from candidate");
+        assert_eq!(pull_verdict(&err), PullVerdict::LegNoProgress);
+    }
+
     /// Only a fault in THIS node may stop a failed pull answering `NotFound` (#1560).
     ///
     /// The asymmetry is the whole point, and both halves of it can regress silently. Widen
@@ -3586,6 +3645,7 @@ mod tests {
             PullVerdict::Refused(RefusalVerdict::OurFault),
             PullVerdict::Refused(RefusalVerdict::DurableMiss(DurableMissCause::BlobTooLarge)),
             PullVerdict::Corruption,
+            PullVerdict::LegNoProgress,
             PullVerdict::Unreachable,
             PullVerdict::RateLimited,
         ] {

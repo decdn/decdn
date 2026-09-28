@@ -832,6 +832,28 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **A serve-miss pull no longer re-pays one upstream range for hours after its
+  client leaves (#2194).** Two faults combined.
+  - A serve leg that waits on its pull for the next frame now also watches the
+    client's stream. Before, a wait touched neither stream, so a client that
+    left went unseen. The serve leg held its observer lease and kept the pull
+    alive until the node restarted. A client that stops the stream or loses the
+    connection now ends the serve at once and meters
+    `decdn_node_pull_through_client_abandoned_total`. The serve releases its
+    lease, which cancels the pull once no other serve leg observes it. The
+    node's own close (shutdown) ends the wait without counting an abandon, and a
+    send stream this node already closed is a node fault, as on the write path.
+  - `drive`, `drive_range_set` and `drive_range_lanes` never re-open a range
+    after a clean leg that moved neither the paid nor the delivered frontier.
+    The gap ends with the new `decdn_client::LegNoProgress` error, which fails
+    over to another source (at most one more leg each). A rebase of the shared
+    ledger during the leg voids the check. On a node, every pull path (ranged
+    runs, whole-blob pulls, own-origin fills) bumps
+    `decdn_node_pull_leg_no_progress_total` and logs a `warn!` with the range,
+    both frontiers and the channel's paid wire since the leg opened. An
+    upstream is not scored for it: the `(peer, hash)` pair is suppressed
+    briefly, and a speculative run still debits its warming allowance for the
+    paid leg.
 - **Monitoring: four dashboard panels show live data (#2197).** Each panel
   showed zero, NaN or a dead series by construction.
   - The delivery dashboard's "Bytes served, received and pulled through" panel

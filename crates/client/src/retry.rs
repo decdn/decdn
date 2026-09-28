@@ -55,6 +55,9 @@ pub enum RetryDisposition {
 ///   over**. When every candidate is exhausted the caller returns the last such
 ///   error, so a genuinely absent or wrong hash still surfaces its refusal.
 ///
+/// A [`crate::LegNoProgress`] **fails over** too. The fault may be the source's,
+/// and each further source costs at most one leg before it ends the same way.
+///
 /// A shared-pool exhaustion ([`crate::PoolExhausted`], the pacer's
 /// [`PaceDecision::Refuse`](crate::PaceDecision)) is deliberately **NOT** terminal
 /// here — it is `RetryElsewhere`. Single-source failover (#1174) intends to try
@@ -69,6 +72,13 @@ pub fn retry_disposition(err: &anyhow::Error) -> RetryDisposition {
         || err.downcast_ref::<BlobTooLarge>().is_some()
     {
         return Terminal;
+    }
+    // A clean leg that moved neither frontier (#2194) may be the source's doing
+    // (a stream ended without taking the final proof), and each further source
+    // costs at most one leg before it ends the same way. Spelled out so a change
+    // to the default below cannot silently make it terminal.
+    if err.downcast_ref::<crate::LegNoProgress>().is_some() {
+        return RetryElsewhere;
     }
     if let Some(refused) = err.downcast_ref::<UpstreamRefused>() {
         return match refused.error() {
