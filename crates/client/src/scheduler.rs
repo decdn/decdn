@@ -1414,7 +1414,9 @@ fn seed_deposit<S>(deposit: &tokio::sync::watch::Sender<U256>, lane: &StreamCand
 /// Finalization is the caller's job: this only flushes the present record
 /// (spec §5.5 single-writer flush point), periodically and once more when it
 /// returns. Every started lane's [`LaneLease`] is released when it returns or
-/// is dropped.
+/// is dropped. Before it returns, it stops every lane and awaits each lane
+/// build still in flight, for at most 30 s: a build can be in the middle of an
+/// on-chain top-up. A lane built there never starts.
 ///
 /// # Errors
 ///
@@ -1573,143 +1575,181 @@ where
         Instant::now() + PRESENT_RECORD_FLUSH_INTERVAL,
         PRESENT_RECORD_FLUSH_INTERVAL,
     );
-    loop {
-        if running.is_empty() && ready.is_empty() && all_present(store, ranges, &work).await? {
-            store.flush_present_record().await?;
-            return Ok(());
-        }
-        let now = Instant::now();
-        let deposit = *deposit_rx.borrow();
-
-        // Start lanes up to the cap, nearest first, for sources that cover work
-        // still to do: cached lanes at once, the rest through `connect`.
-        let busy: HashSet<Address> = running
-            .iter()
-            .chain(&connecting_set)
-            .copied()
-            .chain(ready.iter().map(|(p, _)| *p))
-            .collect();
-        let room = max_lanes.saturating_sub(busy.len());
-        let starts = {
-            let w = work.lock().await;
-            lanes_to_start(sources, &w, total_bytes, now, deposit, busy, room)
-        };
-        for holder in starts {
-            if let Some(lane) = sources.cached_lane(holder.provider) {
-                ready.push((holder.provider, lane));
-            } else {
-                connecting_set.insert(holder.provider);
-                connecting.push(connect_future(sources.provider(), holder));
-            }
-        }
-
-        // Start every ready lane. The first batch plans the work.
-        if !ready.is_empty() {
-            let batch = std::mem::take(&mut ready);
-            let mut w = work.lock().await;
-            if !seeded {
-                seeded = true;
-                let lanes: Vec<(Coverage, Option<AlignedRange>)> = batch
-                    .iter()
-                    .map(|(_, lane)| (lane_coverage(lane, total_bytes), lane.first_unit.clone()))
-                    .collect();
-                let missing = missing_chunks(store, ranges).await?;
-                for ((provider, _), slot) in
-                    batch.iter().zip(w.seed(missing, total_bytes, &lanes)?)
-                {
-                    slots.insert(*provider, slot);
-                }
-            }
-            for (provider, lane) in batch {
-                let slot = if let Some(&slot) = slots.get(&provider) {
-                    w.revive(slot);
-                    slot
-                } else {
-                    let slot = w.add_lane(lane_coverage(&lane, total_bytes), None);
-                    slots.insert(provider, slot);
-                    slot
-                };
-                if !started.0.iter().any(|l| Arc::ptr_eq(l, &lane)) {
-                    join_pool(&lane, *deposit_rx.borrow(), &pool_lanes);
-                    started.0.push(Arc::clone(&lane));
-                }
-                running.insert(provider);
-                workers.push(run_worker(&engine, slot, lane, provider, &health));
-            }
-        }
-
-        // A lane ends priced out only once its driver's own top-up path has
-        // declined, so the top-up budget cannot revive a source at this deposit.
-        if running.is_empty()
-            && connecting.is_empty()
-            && discovering.is_none()
-            && let Some(err) = sources.exhausted(deposit, false)
-        {
-            return Err(flushed(store, err).await);
-        }
-        let uncovered = work.lock().await.uncovered(total_bytes);
-        if discovering.is_none() && sources.wants_discovery(now, deposit, running.len(), uncovered)
-        {
-            discovering = Some(sources.provider().discover(sources.hash()));
-        }
-        let wake = sources.next_wake(now);
-
-        tokio::select! {
-            biased;
-            Some(end) = workers.next(), if !workers.is_empty() => {
-                // `Err` here is this process's fault (store I/O, a slot bug).
-                let (provider, end, delivered) = match end {
-                    Ok(end) => end,
-                    Err(err) => return Err(flushed(store, err).await),
-                };
-                running.remove(&provider);
-                if delivered {
-                    sources.record_progress(provider);
-                }
-                if let LaneEnd::Faulted(err) = end {
-                    let err = err.unwrap_or_else(|| {
-                        anyhow::anyhow!("no verified progress for {watchdog:?}")
-                    });
-                    let deposit = *deposit_rx.borrow();
-                    if let Fault::Fatal(_) =
-                        sources.record_fault(provider, &err, Instant::now(), deposit)
-                    {
-                        return Err(flushed(store, err).await);
-                    }
-                }
-                progress_wake.notify_waiters();
-            }
-            Some((provider, built)) = connecting.next(), if !connecting.is_empty() => {
-                // Every other build that already finished lands in this batch
-                // too, so lanes that build together are planned together.
-                let mut builds = vec![(provider, built)];
-                while let Some(Some(more)) = connecting.next().now_or_never() {
-                    builds.push(more);
-                }
-                for (provider, built) in builds {
-                    connecting_set.remove(&provider);
-                    match sources.lane_built(provider, built, Instant::now()) {
-                        Ok(lane) => {
-                            seed_deposit(&deposit_tx, &lane);
-                            ready.push((provider, lane));
-                        }
-                        Err(err) => tracing::debug!(%provider, "lane build failed: {err:#}"),
-                    }
-                }
-            }
-            found = poll_opt(&mut discovering), if discovering.is_some() => {
-                discovering = None;
-                sources.discovery_done(found, Instant::now(), *deposit_rx.borrow());
-            }
-            () = sleep_until_opt(wake) => {}
-            Ok(()) = deposit_rx.changed() => {}
-            _ = flush.tick() => {
+    let result: anyhow::Result<()> = async {
+        loop {
+            if running.is_empty() && ready.is_empty() && all_present(store, ranges, &work).await? {
                 store.flush_present_record().await?;
+                return Ok(());
             }
-            gave_up = env.stop.expired() => {
-                return Err(flushed(store, anyhow::Error::new(gave_up)).await);
+            let now = Instant::now();
+            let deposit = *deposit_rx.borrow();
+
+            // Start lanes up to the cap, nearest first, for sources that cover work
+            // still to do: cached lanes at once, the rest through `connect`.
+            let busy: HashSet<Address> = running
+                .iter()
+                .chain(&connecting_set)
+                .copied()
+                .chain(ready.iter().map(|(p, _)| *p))
+                .collect();
+            let room = max_lanes.saturating_sub(busy.len());
+            let starts = {
+                let w = work.lock().await;
+                lanes_to_start(sources, &w, total_bytes, now, deposit, busy, room)
+            };
+            for holder in starts {
+                if let Some(lane) = sources.cached_lane(holder.provider) {
+                    ready.push((holder.provider, lane));
+                } else {
+                    connecting_set.insert(holder.provider);
+                    connecting.push(connect_future(sources.provider(), holder));
+                }
+            }
+
+            // Start every ready lane. The first batch plans the work.
+            if !ready.is_empty() {
+                let batch = std::mem::take(&mut ready);
+                let mut w = work.lock().await;
+                if !seeded {
+                    seeded = true;
+                    let lanes: Vec<(Coverage, Option<AlignedRange>)> = batch
+                        .iter()
+                        .map(|(_, lane)| {
+                            (lane_coverage(lane, total_bytes), lane.first_unit.clone())
+                        })
+                        .collect();
+                    let missing = missing_chunks(store, ranges).await?;
+                    for ((provider, _), slot) in
+                        batch.iter().zip(w.seed(missing, total_bytes, &lanes)?)
+                    {
+                        slots.insert(*provider, slot);
+                    }
+                }
+                for (provider, lane) in batch {
+                    let slot = if let Some(&slot) = slots.get(&provider) {
+                        w.revive(slot);
+                        slot
+                    } else {
+                        let slot = w.add_lane(lane_coverage(&lane, total_bytes), None);
+                        slots.insert(provider, slot);
+                        slot
+                    };
+                    if !started.0.iter().any(|l| Arc::ptr_eq(l, &lane)) {
+                        join_pool(&lane, *deposit_rx.borrow(), &pool_lanes);
+                        started.0.push(Arc::clone(&lane));
+                    }
+                    running.insert(provider);
+                    workers.push(run_worker(&engine, slot, lane, provider, &health));
+                }
+            }
+
+            // A lane ends priced out only once its driver's own top-up path has
+            // declined, so the top-up budget cannot revive a source at this deposit.
+            if running.is_empty()
+                && connecting.is_empty()
+                && discovering.is_none()
+                && let Some(err) = sources.exhausted(deposit, false)
+            {
+                return Err(flushed(store, err).await);
+            }
+            let uncovered = work.lock().await.uncovered(total_bytes);
+            if discovering.is_none()
+                && sources.wants_discovery(now, deposit, running.len(), uncovered)
+            {
+                discovering = Some(sources.provider().discover(sources.hash()));
+            }
+            let wake = sources.next_wake(now);
+
+            tokio::select! {
+                biased;
+                Some(end) = workers.next(), if !workers.is_empty() => {
+                    // `Err` here is this process's fault (store I/O, a slot bug).
+                    let (provider, end, delivered) = match end {
+                        Ok(end) => end,
+                        Err(err) => return Err(flushed(store, err).await),
+                    };
+                    running.remove(&provider);
+                    if delivered {
+                        sources.record_progress(provider);
+                    }
+                    if let LaneEnd::Faulted(err) = end {
+                        let err = err.unwrap_or_else(|| {
+                            anyhow::anyhow!("no verified progress for {watchdog:?}")
+                        });
+                        let deposit = *deposit_rx.borrow();
+                        if let Fault::Fatal(_) =
+                            sources.record_fault(provider, &err, Instant::now(), deposit)
+                        {
+                            return Err(flushed(store, err).await);
+                        }
+                    }
+                    progress_wake.notify_waiters();
+                }
+                Some((provider, built)) = connecting.next(), if !connecting.is_empty() => {
+                    // Every other build that already finished lands in this batch
+                    // too, so lanes that build together are planned together.
+                    let mut builds = vec![(provider, built)];
+                    while let Some(Some(more)) = connecting.next().now_or_never() {
+                        builds.push(more);
+                    }
+                    for (provider, built) in builds {
+                        connecting_set.remove(&provider);
+                        match sources.lane_built(provider, built, Instant::now()) {
+                            Ok(lane) => {
+                                seed_deposit(&deposit_tx, &lane);
+                                ready.push((provider, lane));
+                            }
+                            Err(err) => tracing::debug!(%provider, "lane build failed: {err:#}"),
+                        }
+                    }
+                }
+                found = poll_opt(&mut discovering), if discovering.is_some() => {
+                    discovering = None;
+                    sources.discovery_done(found, Instant::now(), *deposit_rx.borrow());
+                }
+                () = sleep_until_opt(wake) => {}
+                Ok(()) = deposit_rx.changed() => {}
+                _ = flush.tick() => {
+                    store.flush_present_record().await?;
+                }
+                gave_up = env.stop.expired() => {
+                    return Err(flushed(store, anyhow::Error::new(gave_up)).await);
+                }
             }
         }
+    }
+    .await;
+    // Stop every lane first, so no paid leg sits open while the builds drain.
+    drop(workers);
+    drop(discovering);
+    drain_builds(&mut connecting).await;
+    result
+}
+
+/// How long [`acquire`] waits, as it returns, for lane builds still in flight.
+const BUILD_DRAIN: Duration = Duration::from_secs(30);
+
+/// Await every lane build still in `connecting`, for at most [`BUILD_DRAIN`].
+/// A build can be in the middle of an on-chain top-up; dropping it there
+/// would escrow funds its caller never records. A lane that builds here never
+/// starts and drops at once.
+async fn drain_builds<S>(connecting: &mut FuturesUnordered<Connecting<'_, S>>) {
+    if connecting.is_empty() {
+        return;
+    }
+    let drained = tokio::time::timeout(BUILD_DRAIN, async {
+        while let Some((provider, built)) = connecting.next().await {
+            if let Err(err) = built {
+                tracing::debug!(%provider, "a lane build that ended after the fetch failed: {err:#}");
+            }
+        }
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(
+            builds = connecting.len(),
+            "lane builds still running {BUILD_DRAIN:?} after the fetch ended are dropped"
+        );
     }
 }
 
@@ -4108,6 +4148,87 @@ mod tests {
         .await?;
         store.finalize().await?;
         assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        Ok(())
+    }
+
+    /// Static lanes, one of whose builds takes `delay` and sets `built` when
+    /// it finishes: a lane build in the middle of an on-chain top-up.
+    struct SlowBuild {
+        lanes: StaticSources<ScriptedSource>,
+        slow: Address,
+        delay: Duration,
+        built: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::SourceProvider for SlowBuild {
+        type Source = ScriptedSource;
+
+        fn discover(&self, hash: [u8; 32]) -> crate::SourceFuture<'_, Vec<crate::Holder>> {
+            self.lanes.discover(hash)
+        }
+
+        fn connect<'a>(
+            &'a self,
+            holder: &'a crate::Holder,
+        ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
+            let slow = holder.provider == self.slow;
+            Box::pin(async move {
+                if slow {
+                    tokio::time::sleep(self.delay).await;
+                    self.built.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                self.lanes.connect(holder).await
+            })
+        }
+    }
+
+    /// A lane build still in flight when the loop decides to return is awaited,
+    /// not dropped mid-way.
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_build_in_flight_is_awaited_before_acquire_returns() -> anyhow::Result<()> {
+        let data = blob(1024 * 1024);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let lb = Arc::new(PoolLedger::new(Cumulative::default()));
+        let a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&la));
+        let b = ScriptedSource::new(data)?.paying(Arc::clone(&lb));
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, _dir) = fresh_store(root, total);
+        let provider = SlowBuild {
+            lanes: StaticSources::new(vec![
+                candidate(a, la, 0xA1, None),
+                candidate(b, lb, 0xB2, None),
+            ])?,
+            slow: Address::repeat_byte(0xB2),
+            delay: Duration::from_secs(5),
+            built: std::sync::atomic::AtomicBool::new(false),
+        };
+        let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
+        let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+        let drive = drive_config();
+        acquire(
+            AcquireTarget {
+                store: &store,
+                hash: root,
+                total_bytes: total,
+                ranges: &[(0, total)],
+            },
+            &mut set,
+            &AcquireEnv {
+                pacer: &BudgetPacer::new(),
+                funder: &no_topups(),
+                drive: &drive,
+                max_lanes: 2,
+                stop: &stop,
+                on_progress: None,
+                ledgers: None,
+                pacing: None,
+            },
+        )
+        .await?;
+        assert!(
+            provider.built.load(std::sync::atomic::Ordering::SeqCst),
+            "the slow build ran to its end before acquire returned"
+        );
         Ok(())
     }
 
