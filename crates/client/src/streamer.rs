@@ -168,6 +168,8 @@ pub struct StreamCandidate<S> {
     /// [`SourceLane::first_unit`]. [`crate::download_first_unit`] and
     /// [`stream_first_unit`] name the range each face opens first. Like
     /// `coverage`, it names one blob: set it only on a single-target fetch.
+    /// Only lanes in the fetch's first connected batch open their first unit;
+    /// a lane that joins later plans it like any range.
     pub first_unit: Option<AlignedRange>,
     /// What this candidate's lane holds while the fetch runs, released when the
     /// fetch returns ([`crate::LaneLease`]). Like `coverage`, set it only on a

@@ -496,12 +496,19 @@ impl Work {
                 .any(|&(s, l)| covers_byte_range(coverage, s, l, total_bytes))
     }
 
-    /// Whether a pending entry has no running lane that covers it.
+    /// Whether a pending entry holds a chunk no running lane covers.
     fn uncovered(&self, total_bytes: u64) -> bool {
         self.pending.iter().any(|seg| {
-            !self.alive.iter().zip(&self.coverage).any(|(&alive, c)| {
-                alive && covers_byte_range(c, seg.fetch_start(), seg.fetch_len(), total_bytes)
-            })
+            let mut held = ChunkRanges::empty();
+            for (_, coverage) in self
+                .alive
+                .iter()
+                .zip(&self.coverage)
+                .filter(|&(&alive, _)| alive)
+            {
+                held |= covered_part(coverage, seg.chunk_ranges(), total_bytes);
+            }
+            !(seg.chunk_ranges().clone() - held).is_empty()
         })
     }
 
@@ -1685,11 +1692,12 @@ where
             }
         }
 
-        let topups_left = topups_used.load(Ordering::SeqCst) < env.funder.max_topups();
+        // A lane ends priced out only once its driver's own top-up path has
+        // declined, so the top-up budget cannot revive a source at this deposit.
         if running.is_empty()
             && connecting.is_empty()
             && discovering.is_none()
-            && let Some(err) = sources.exhausted(deposit, topups_left)
+            && let Some(err) = sources.exhausted(deposit, false)
         {
             return Err(flushed(store, err).await);
         }
@@ -2841,18 +2849,43 @@ mod tests {
         let mut lane_b = candidate(src_b.clone(), ledger_b, 0xB2, None);
         lane_b.lease = LaneLease::new(DropStamp(Arc::clone(&dropped_b)));
         let provider = StaticSources::new(vec![lane_a, lane_b])?;
-        run_acquire(
+        // Past 12 MiB of the 16 MiB blob, lane a (which faults 1 MiB into every
+        // open) has faulted; its lease must still be held.
+        let a_released_mid_fetch: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let on_progress = {
+            let seen = Arc::clone(&a_released_mid_fetch);
+            let dropped_a = Arc::clone(&dropped_a);
+            move |position: u64, _total: u64| {
+                if position >= 12 * 1024 * 1024
+                    && let (Ok(mut seen), Ok(at)) = (seen.lock(), dropped_a.lock())
+                {
+                    seen.push(at.is_some());
+                }
+            }
+        };
+        run_acquire_with(
             &store,
             &provider,
             root,
-            total,
             &BudgetPacer::new(),
             &no_topups(),
-            4,
-            None,
+            Knobs {
+                on_progress: Some(&on_progress),
+                ..Knobs::lanes(4)
+            },
         )
         .await?;
         let ended = std::time::Instant::now();
+        let seen = a_released_mid_fetch.lock().expect("seen lock").clone();
+        assert!(!seen.is_empty(), "progress passed lane a's fault point");
+        assert!(
+            seen.iter().all(|released| !released),
+            "the faulted lane's lease is held until the acquire returns"
+        );
+        assert!(
+            src_a.delivered_bytes() > 0 && src_a.delivered_bytes() < total,
+            "lane a delivered a prefix and faulted"
+        );
         let at_a = dropped_a
             .lock()
             .expect("stamp lock")
@@ -4071,6 +4104,11 @@ mod tests {
         .await?;
         store.finalize().await?;
         assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        assert!(
+            src.opened_ranges().len() >= 2,
+            "the source faulted once and was reopened: {:?}",
+            src.opened_ranges()
+        );
         Ok(())
     }
 
@@ -4173,6 +4211,70 @@ mod tests {
             err.downcast_ref::<NoAffordableSource>().is_some(),
             "{err:#}"
         );
+        Ok(())
+    }
+
+    /// A source priced out at the pool's deposit stays priced out after a
+    /// top-up the driver's own pacer declined, so a set top-up budget does not
+    /// keep the acquire waiting: it stops with the top-up remedy.
+    #[tokio::test(start_paused = true)]
+    async fn every_source_priced_out_stops_even_with_top_ups_left() -> anyhow::Result<()> {
+        let data = blob(1024 * 1024);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let a = ScriptedSource::new(data)?
+            .paying(Arc::clone(&la))
+            .with_fault_after(0, || {
+                anyhow::Error::new(PoolExhausted {
+                    gap_start: 0,
+                    gap_len: 1,
+                })
+            });
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, _dir) = fresh_store(root, total);
+        let provider = StaticSources::new(vec![candidate(a, la, 0xA1, None)])?;
+        // `run_acquire` drives with `working_deposit = 0`.
+        let funder = FakeFunder::new(1, DepositOutcome::Added(U256::ZERO));
+        let err = run_acquire(
+            &store,
+            &provider,
+            root,
+            total,
+            &BudgetPacer::new(),
+            &funder,
+            4,
+            None,
+        )
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("must stop"))?;
+        assert!(
+            err.downcast_ref::<NoAffordableSource>().is_some(),
+            "{err:#}"
+        );
+        Ok(())
+    }
+
+    /// An entry two running lanes cover between them is not uncovered, even
+    /// though neither covers it whole.
+    #[test]
+    fn an_entry_covered_only_by_two_lanes_together_is_not_uncovered() -> anyhow::Result<()> {
+        use std::collections::VecDeque;
+
+        use decdn_bao_range::align_range;
+
+        use super::Work;
+
+        let total = 2 * DISCOVERY_BLOCK_BYTES;
+        let both_blocks = align_range(0, total, total)?;
+        let mut work = Work::new(VecDeque::from(vec![both_blocks]), false);
+        let a = work.add_lane(cov(2, &[0]), None);
+        let b = work.add_lane(cov(2, &[1]), None);
+        assert!(!work.uncovered(total), "a and b cover it between them");
+        work.park(b);
+        assert!(work.uncovered(total), "block 1 has no running lane");
+        work.revive(b);
+        work.park(a);
+        assert!(work.uncovered(total), "block 0 has no running lane");
         Ok(())
     }
 
