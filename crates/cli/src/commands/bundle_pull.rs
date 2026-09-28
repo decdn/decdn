@@ -2578,8 +2578,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     }
 
     /// Run [`Self::pull_entry_untimed`] and, when the entry lands, log one `-v`
-    /// line with its size, the time the whole entry took, and its effective rate
-    /// (#2120). Returns the content bytes the entry paid for (see
+    /// line with its size, the time the whole entry took, and its download rate
+    /// (#2120, #2189). Returns the content bytes the entry paid for (see
     /// [`Self::pull_entry_untimed`]).
     #[allow(clippy::too_many_arguments)]
     async fn pull_entry(
@@ -2595,7 +2595,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let started = std::time::Instant::now();
         self.pull_entry_untimed(hash, hints, total, staging, index, fetch_plan, file)
             .await
-            .inspect(|_| log_entry_done(hash, staging, started.elapsed()))
+            .map(|bytes| {
+                log_entry_done(hash, staging, bytes, started.elapsed());
+                bytes.paid
+            })
     }
 
     /// Reconstruct one entry's blob into `staging` (the finalized per-hash staging
@@ -2617,8 +2620,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     ///   chunk) the whole blob is re-driven and re-verified before the entry fails.
     ///
     /// On success the entry's chunks are registered into `index` so later entries
-    /// can splice from this blob, and the content bytes the entry paid for are
-    /// returned: the whole blob on the plain path, the blob less its spliced bytes
+    /// can splice from this blob, and its [`EntryBytes`] are returned. The paid
+    /// count is the whole blob on the plain path, the blob less its spliced bytes
     /// on the dedup path, and 0 for an already-finalized staging blob. It is a
     /// content count — bao proof overhead is not in it, and a `.partial` prefix
     /// resumed from an earlier run counts again.
@@ -2632,7 +2635,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         index: &ChunkIndex,
         fetch_plan: &FetchPlan,
         file: Option<&pull_progress::FileBar>,
-    ) -> anyhow::Result<u64> {
+    ) -> anyhow::Result<EntryBytes> {
         // The byte-delivery callback drives the file bar's download and the total
         // bar's download meter; the `file` handle also carries the phase transitions
         // (discovering / pending / reconstructing) the byte callback cannot express.
@@ -2658,7 +2661,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                     cb(total, total);
                 }
                 index.register(hints, staging);
-                return Ok(0);
+                return Ok(EntryBytes::default());
             }
             remove_staging_off_runtime(staging).await;
         }
@@ -2698,7 +2701,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 .await?;
             index.register(hints, staging);
             let paid = tokio::fs::metadata(staging).await.map_or(0, |m| m.len());
-            return Ok(paid);
+            return Ok(EntryBytes { paid, spliced: 0 });
         };
 
         // Dedup path. Hold one fetch permit across the complement drive, the donor
@@ -2751,7 +2754,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         self.dedup_stats
             .hints_ignored
             .fetch_add(outcome.hints_ignored, Ordering::Relaxed);
-        Ok(total.saturating_sub(outcome.spliced_bytes))
+        Ok(EntryBytes {
+            paid: total.saturating_sub(outcome.spliced_bytes),
+            spliced: outcome.spliced_bytes,
+        })
     }
 
     /// Fetch the blob shared by one hash-group and write it under `out_root` at
@@ -2945,23 +2951,65 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     }
 }
 
-/// Log a finished entry's size, time and effective rate at `-v` (#2120), so a
-/// run's slow entries can be told from its fast ones. The time covers the whole
-/// entry: probing, every drive, any splice and the whole-file check.
-fn log_entry_done(hash: [u8; 32], staging: &Path, elapsed: std::time::Duration) {
-    let bytes = std::fs::metadata(staging).map_or(0, |m| m.len());
+/// The content bytes one landed entry paid for and spliced from disk, as
+/// [`PullCtx::pull_entry_untimed`] counts them.
+#[derive(Clone, Copy, Debug, Default)]
+struct EntryBytes {
+    /// Content bytes the entry paid for (see [`PullCtx::pull_entry_untimed`]).
+    paid: u64,
+    /// Bytes the entry spliced from a local donor on disk rather than
+    /// downloading them itself.
+    spliced: u64,
+}
+
+/// Log a finished entry's line at `-v` (#2120), so a run's slow entries can be
+/// told from its fast ones. See [`entry_done_line`]. A staging file it cannot
+/// stat logs its size as 0, after a debug line naming the path and the error.
+fn log_entry_done(hash: [u8; 32], staging: &Path, bytes: EntryBytes, elapsed: std::time::Duration) {
+    let size = std::fs::metadata(staging).map_or_else(
+        |e| {
+            tracing::debug!(
+                "could not stat {} for its entry line: {e}",
+                staging.display()
+            );
+            0
+        },
+        |m| m.len(),
+    );
+    tracing::info!("{}", entry_done_line(hash, size, bytes, elapsed));
+}
+
+/// A finished entry's size, the time it took, and its rate over the bytes it
+/// paid for (see [`PullCtx::pull_entry_untimed`]). When the entry spliced bytes
+/// from disk, the line reports them apart from the paid bytes (#2189). The time
+/// covers the whole entry: probing, every drive, any splice and the whole-file
+/// check.
+fn entry_done_line(
+    hash: [u8; 32],
+    size: u64,
+    bytes: EntryBytes,
+    elapsed: std::time::Duration,
+) -> String {
     let secs = elapsed.as_secs_f64();
     let rate = if secs > 0.0 {
-        fetch::fmt_rate(fetch::bytes_as_f64(bytes) / secs)
+        fetch::fmt_rate(fetch::bytes_as_f64(bytes.paid) / secs)
     } else {
         fetch::fmt_rate(0.0)
     };
-    tracing::info!(
-        "bundle pull: {}: {} in {:.1}s ({rate})",
+    let detail = if bytes.spliced > 0 {
+        format!(
+            "{} downloaded at {rate}, {} spliced from disk",
+            indicatif::HumanBytes(bytes.paid),
+            indicatif::HumanBytes(bytes.spliced),
+        )
+    } else {
+        rate
+    };
+    format!(
+        "bundle pull: {}: {} in {secs:.1}s ({detail})",
         blake3::Hash::from_bytes(hash).to_hex(),
-        indicatif::HumanBytes(bytes),
-        secs,
-    );
+        indicatif::HumanBytes(size),
+    )
 }
 
 /// The range-drive step [`reassemble_dedup`] performs against one entry: drive
@@ -8674,5 +8722,77 @@ mod tests {
             "P2 is held by the set"
         );
         drop(permits);
+    }
+
+    /// A plain entry's line keeps its one rate, taken from what it downloaded.
+    #[test]
+    fn entry_done_line_rates_a_plain_entry_on_its_download() {
+        let line = entry_done_line(
+            [1; 32],
+            4 << 20,
+            EntryBytes {
+                paid: 4 << 20,
+                spliced: 0,
+            },
+            std::time::Duration::from_secs(2),
+        );
+        assert!(line.ends_with(": 4.00 MiB in 2.0s (2.00 MiB/s)"), "{line}");
+    }
+
+    /// A range-dedup entry's rate counts only its downloaded bytes, and its
+    /// spliced bytes are reported apart (#2189).
+    #[test]
+    fn entry_done_line_splits_a_dedup_entrys_spliced_bytes() {
+        let line = entry_done_line(
+            [1; 32],
+            12 << 20,
+            EntryBytes {
+                paid: 2 << 20,
+                spliced: 10 << 20,
+            },
+            std::time::Duration::from_secs(2),
+        );
+        assert!(
+            line.ends_with(
+                ": 12.00 MiB in 2.0s (2.00 MiB downloaded at 1.00 MiB/s, 10.00 MiB spliced \
+                 from disk)"
+            ),
+            "{line}"
+        );
+    }
+
+    /// An entry spliced whole from disk downloads nothing and has no rate.
+    #[test]
+    fn entry_done_line_renders_a_fully_spliced_entry() {
+        let line = entry_done_line(
+            [1; 32],
+            12 << 20,
+            EntryBytes {
+                paid: 0,
+                spliced: 12 << 20,
+            },
+            std::time::Duration::from_secs(2),
+        );
+        assert!(
+            line.ends_with(
+                ": 12.00 MiB in 2.0s (0 B downloaded at --, 12.00 MiB spliced from disk)"
+            ),
+            "{line}"
+        );
+    }
+
+    /// An entry that took no measurable time renders the placeholder rate.
+    #[test]
+    fn entry_done_line_guards_a_zero_elapsed() {
+        let line = entry_done_line(
+            [1; 32],
+            1 << 20,
+            EntryBytes {
+                paid: 1 << 20,
+                spliced: 0,
+            },
+            std::time::Duration::ZERO,
+        );
+        assert!(line.ends_with(": 1.00 MiB in 0.0s (--)"), "{line}");
     }
 }

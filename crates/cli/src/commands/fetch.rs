@@ -2089,8 +2089,11 @@ const ENTRY_RATE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 pub(crate) struct EntryStalled {
     window: Duration,
     floor_bps: u64,
+    /// The drive's whole-blob position when the floor tripped.
     landed: u64,
-    total: u64,
+    /// The position the drive reaches once done: the whole blob, or less for
+    /// a range set that leaves bytes to a splice.
+    target: u64,
 }
 
 impl std::fmt::Display for EntryStalled {
@@ -2102,7 +2105,7 @@ impl std::fmt::Display for EntryStalled {
             self.floor_bps,
             self.window.as_secs_f64(),
             self.landed,
-            self.total,
+            self.target,
         )
     }
 }
@@ -2224,10 +2227,15 @@ impl<F: Funder> Funder for PausingFunder<'_, F> {
 /// them. Resolves with [`EntryStalled`] when it trips, which the driver returns
 /// and the caller fails over on. At `-v` it logs the drive's position, rate and
 /// ETA every [`ENTRY_RATE_LOG_INTERVAL`] while it waits.
+///
+/// `target` is the position the drive reaches once done: the blob size for a
+/// whole-blob drive, and less for a range set
+/// ([`decdn_client::range_set_reach`]). A range-dedup drive never downloads the
+/// ranges it splices from disk, so its ETA must not count them.
 async fn drive_floor(
     deadlines: PullDeadlines,
     hash: [u8; 32],
-    total: u64,
+    target: u64,
     watch: &EntryWatch,
 ) -> anyhow::Error {
     let floor = decdn_client::throughput_watchdog(
@@ -2249,19 +2257,20 @@ async fn drive_floor(
                     window: deadlines.window(),
                     floor_bps: deadlines.floor_bps(),
                     landed: watch.landed(),
-                    total,
+                    target,
                 });
             }
             _ = tick.tick() => {
-                let landed = watch.landed();
+                // A re-delivered tail can carry the position past the target.
+                let landed = watch.landed().min(target);
                 let bps = speed.observe(Instant::now(), landed);
                 tracing::info!(
                     "{}: {} of {} ({}, {})",
                     blake3::Hash::from_bytes(hash).to_hex(),
                     indicatif::HumanBytes(landed),
-                    indicatif::HumanBytes(total),
+                    indicatif::HumanBytes(target),
                     fmt_rate(bps),
-                    fmt_eta(total.saturating_sub(landed), bps),
+                    fmt_eta(target.saturating_sub(landed), bps),
                 );
             }
         }
@@ -2314,6 +2323,17 @@ where
         progress: Option<&ProgressCallback>,
         deadlines: PullDeadlines,
     ) -> RangeSetOutcome {
+        // Feeds only the `-v` line and the stall message. A store fault here
+        // recurs in the drive's own setup, which fails first.
+        let target = decdn_client::range_set_reach(store, ranges)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::debug!(
+                    "{}: could not size the drive's target: {e:#}",
+                    blake3::Hash::from_bytes(hash).to_hex(),
+                );
+                self.total_bytes
+            });
         let watch = EntryWatch::default();
         let watched = watch.observing(progress);
         let funder = PausingFunder {
@@ -2341,7 +2361,7 @@ where
             &self.drive_config,
             Some(&watched),
             pool,
-            drive_floor(deadlines, hash, self.total_bytes, &watch),
+            drive_floor(deadlines, hash, target, &watch),
         ))
         .await;
         for lane in lanes {

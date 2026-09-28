@@ -650,6 +650,30 @@ pub async fn first_leg<St: RangedStore + ?Sized>(
     .map(Some)
 }
 
+/// The whole-blob position a drive of `ranges` over `store` reaches once it
+/// completes: the content already present plus every missing gap of `ranges`.
+/// The drive's progress callback still reports against `total_bytes`. A caller
+/// that wants a done-mark for this range set, such as a `-v` line or an ETA,
+/// reads it here. It is the whole blob for `(0, 0)`, and less for a range set
+/// that leaves bytes to another writer, such as the donor ranges a range-dedup
+/// entry splices from disk.
+///
+/// # Errors
+///
+/// A store query failure, or a range that does not align against the blob.
+pub async fn range_set_reach<St: RangedStore + ?Sized>(
+    store: &St,
+    ranges: &[(u64, u64)],
+) -> anyhow::Result<u64> {
+    let total_bytes = store.total_bytes();
+    let present = ranges_content_len(&store.present_ranges().await?, total_bytes);
+    Ok(range_set_gaps(store, ranges)
+        .await?
+        .iter()
+        .map(|(_, len)| *len)
+        .fold(present, u64::saturating_add))
+}
+
 /// Satisfy every range in `ranges` of blob `hash`, filling their gaps up to
 /// `concurrency` at a time (#2119). Each range is `(offset, len)`, and
 /// `len == 0` means "to the end of the blob".
@@ -1705,7 +1729,7 @@ mod tests {
     use super::{
         DriveConfig, LaneGrowth, PoolExhausted, RangeLane, RangeSetOutcome, SharedPool,
         contiguous_byte_ranges, drive, drive_range_lanes, drive_range_set, first_leg,
-        ranges_content_len,
+        range_set_reach, ranges_content_len,
     };
     use crate::ProgressCallback;
     use crate::pacer::{BudgetPacer, PaceDecision, PaceState};
@@ -2116,8 +2140,9 @@ mod tests {
     }
 
     /// Concurrent gaps report one non-decreasing whole-blob position that starts
-    /// at the present base and ends at the bytes present, so a drive-level
-    /// floor watching it sees steady progress.
+    /// at the present base and ends at the bytes present, which is the set's
+    /// [`range_set_reach`], so a drive-level floor watching it sees steady
+    /// progress toward a known mark.
     #[tokio::test]
     async fn a_concurrent_range_set_reports_one_rising_position() {
         let total = 32 * GROUP;
@@ -2133,6 +2158,11 @@ mod tests {
         let seen = Mutex::new(Vec::new());
         let record = |position: u64, _: u64| seen.lock().expect("lock").push(position);
         let ranges: Vec<(u64, u64)> = (1..32).step_by(2).map(|g| (g * GROUP, GROUP)).collect();
+        let reach = range_set_reach(&store, &ranges).await.expect("reach");
+        assert!(
+            reach < total,
+            "the set leaves the even groups to another writer"
+        );
         let (result, source, store, _) = drive_set_into(
             store,
             &ranges,
@@ -2157,6 +2187,7 @@ mod tests {
         );
         let present = ranges_content_len(&store.present_ranges().await.expect("present"), total);
         assert_eq!(seen.last().copied(), Some(present));
+        assert_eq!(present, reach, "the drive ends at the set's reach");
     }
 
     /// A primed first leg is adopted even when the rest of the set runs
@@ -2887,6 +2918,65 @@ mod tests {
         .expect_err("refused");
         assert!(format!("{err}").contains("shared pool"), "{err}");
         assert!(source.opened_ranges().is_empty());
+    }
+
+    /// `range_set_reach` counts what is present plus what the ranges still
+    /// miss, never a byte the ranges leave to another writer (#2189).
+    #[tokio::test]
+    async fn range_set_reach_counts_present_plus_the_ranges_gaps() {
+        let total = 4 * GROUP;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        let fresh = fresh_store(root, total);
+        let reach =
+            |store, ranges| async move { range_set_reach(store, ranges).await.expect("reach") };
+        assert_eq!(reach(&fresh, &[(0, 0)]).await, total);
+        assert_eq!(reach(&fresh, &[(GROUP, GROUP)]).await, GROUP);
+        assert_eq!(
+            reach(&fresh, &[(0, GROUP), (0, 2 * GROUP)]).await,
+            2 * GROUP
+        );
+
+        let resumed = fresh_store(root, total);
+        preadmit(
+            &resumed,
+            &plaintext,
+            &outboard,
+            &align_range(0, GROUP, total).expect("align"),
+        )
+        .await;
+        assert_eq!(reach(&resumed, &[(2 * GROUP, GROUP)]).await, 2 * GROUP);
+        assert_eq!(reach(&resumed, &[(0, 2 * GROUP)]).await, 2 * GROUP);
+        assert_eq!(reach(&resumed, &[(0, 0)]).await, total);
+
+        // A partial last group counts at its real length, in both the gaps and
+        // the present content, never padded to a whole group.
+        let ragged = 4 * GROUP + 37;
+        let (root, plaintext, outboard) = synth_blob(ragged as usize);
+        let fresh = fresh_store(root, ragged);
+        assert_eq!(reach(&fresh, &[(0, 0)]).await, ragged);
+        assert_eq!(reach(&fresh, &[(4 * GROUP, 37)]).await, 37);
+
+        let resumed = fresh_store(root, ragged);
+        preadmit(
+            &resumed,
+            &plaintext,
+            &outboard,
+            &align_range(0, GROUP, ragged).expect("align"),
+        )
+        .await;
+        assert_eq!(reach(&resumed, &[(4 * GROUP, 37)]).await, GROUP + 37);
+
+        let tail_held = fresh_store(root, ragged);
+        preadmit(
+            &tail_held,
+            &plaintext,
+            &outboard,
+            &align_range(4 * GROUP, 37, ragged).expect("align"),
+        )
+        .await;
+        assert_eq!(reach(&tail_held, &[(0, GROUP)]).await, GROUP + 37);
+        assert_eq!(reach(&tail_held, &[(0, 0)]).await, ragged);
     }
 
     /// `first_leg` is exactly the range the drive opens first, both on a fresh
