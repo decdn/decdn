@@ -1777,7 +1777,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     };
 
     // DHT republish scheduler (ADR 022 §STORE Flow). The subscribe
-    // handle is taken before the cold-start seed so a commit racing
+    // handle is taken before the cold-start seed so an announcement racing
     // with seed-time lands in the channel backlog rather than the
     // gap between the snapshot and the spawn.
     let republish_scheduler = Arc::new(crate::dht::RepublishScheduler::new());
@@ -1788,19 +1788,21 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let republish_stop = CancellationToken::new();
     let cache_inserts_rx = infra.cache.subscribe_inserts();
     // Walk the on-disk store (NOT `access_times_snapshot`, which maps `Hash →
-    // Instant` and is empty on every cold start) so every committed,
-    // non-evicted blob gets a `uniform(0, 40 min)` republish entry per ADR
-    // 022 §Bootstrap AC 15. On a transient list-error we degrade: the
+    // Instant` and is empty on every cold start) so every held (complete or
+    // partial), non-evicted blob gets a `uniform(0, 40 min)` republish entry
+    // per ADR 022 §Bootstrap AC 15. On a transient list-error we degrade: the
     // steady-state `subscribe_inserts` path catches only blobs newly fetched
-    // post-boot — blobs already on disk that get cache-HIT requests are NOT
-    // re-scheduled until the next successful restart.
+    // or blocks newly completed post-boot — blobs already on disk that get
+    // cache-HIT requests are NOT re-scheduled until the next lag sweep or
+    // successful restart.
     // Populate the origin-held index before seeding announces (#1130) so cold
     // origin content (fs directory entries + present pins) is advertised from
     // the first republish, not only after a warm pulls it into the store.
     infra.cache.rescan_origins().await;
 
-    // Union store-complete blobs with origin-held content — the same snapshot
-    // the republisher's lag sweep re-seeds from, so the two cannot drift apart.
+    // Union stored blobs (complete or partial) with origin-held content — the
+    // same snapshot the republisher's lag sweep re-seeds from, so the two
+    // cannot drift apart.
     // The union coalesces a hash that is both stored and origin-held into one
     // jitter draw, and on a store list-error the origin-held half still seeds:
     // announce degrades only for the store half. See `holder_snapshot` for why

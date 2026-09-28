@@ -342,11 +342,15 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
     )
     .await?;
 
-    // Spin up `run_republish` with a fake cache + insert channel.
-    // We need a real `CacheEngine` for the stop-on-evict check; use
-    // an empty cache rooted in a tempdir.
+    // Spin up `run_republish` with a real cache and a hand-driven insert
+    // channel. The cache holds one whole blob; the channel names it and one
+    // hash the cache does not hold.
     let cache_dir = tempfile::tempdir()?;
     let cache = decdn_cache::CacheEngine::open(cache_dir.path(), vec![], 16).await?;
+    let total = 4 * decdn_bao_range::CHUNK_GROUP_BYTES;
+    let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?, 2);
+    let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
+    cache.admit_bao(hash, ranges, bao).await?;
     let scheduler = Arc::new(RepublishScheduler::new());
     let (inserts_tx, inserts_rx) = broadcast::channel::<iroh_blobs::Hash>(16);
     let stop = CancellationToken::new();
@@ -362,26 +366,44 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
         stop.clone(),
     ));
 
-    // Simulate a cache insert by broadcasting on the channel. The
-    // republish task MUST send a `Store` to the server immediately;
-    // we verify by checking the server's RecordStore picks it up.
-    let hash = iroh_blobs::Hash::from_bytes([0xA5u8; 32]);
+    // An event for a hash that covers no block sends nothing: a record with
+    // empty coverage advertises nothing a requester can fetch. The loop
+    // handles events in order, so it has handled this one by the time the
+    // held blob's record lands below.
+    let absent = iroh_blobs::Hash::from_bytes([0xA5u8; 32]);
+    inserts_tx.send(absent).unwrap();
+    // The held blob MUST reach the server immediately.
     inserts_tx.send(hash).unwrap();
 
     // Poll the server's record store with a generous timeout — the
     // republish task is async + needs one RTT.
+    let holder = NodeId::from_bytes(*publisher_id.as_bytes());
+    let providers = |h: iroh_blobs::Hash| {
+        let now_us = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros(),
+        )
+        .unwrap();
+        server
+            .records
+            .lock()
+            .unwrap()
+            .providers_at(&ContentHash::from_bytes(*h.as_bytes()), now_us)
+            .into_iter()
+            .filter(|p| p.node == holder)
+            .count()
+    };
     let mut got_record = false;
-    for _ in 0..30 {
+    for _ in 0..200 {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let n = {
-            let r = server.records.lock().unwrap();
-            r.publisher_record_count(&NodeId::from_bytes(*publisher_id.as_bytes()))
-        };
-        if n >= 1 {
+        if providers(hash) >= 1 {
             got_record = true;
             break;
         }
     }
+    let absent_records = providers(absent);
     stop.cancel();
     let _ = task.await;
 
@@ -389,7 +411,11 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
         got_record,
         "republish task must send `Store` immediately on cache-insert; \
          server's RecordStore should hold the publisher's record within \
-         1.5s but did not"
+         10 s but did not"
+    );
+    assert_eq!(
+        absent_records, 0,
+        "a hash that covers no block must not be published"
     );
 
     publisher_ep.close().await;
@@ -693,4 +719,271 @@ fn stub_origin(payload: &'static [u8]) -> Arc<dyn decdn_cache::Origin> {
         data: bytes::Bytes::from_static(payload),
         hash: decdn_cache::Hash::new(payload),
     })
+}
+
+/// A deterministic `len`-byte blob and its pre-order outboard, keyed by root.
+/// Distinct `seed`s give distinct blobs.
+fn synth_blob(len: usize, seed: u32) -> ([u8; 32], Vec<u8>, bytes::Bytes) {
+    let mut plaintext = vec![0u8; len];
+    let mut x: u32 = 0x9e37_79b9 ^ seed;
+    for b in &mut plaintext {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = x.to_le_bytes()[0];
+    }
+    let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
+        &plaintext,
+        decdn_bao_range::IROH_BLOCK_SIZE,
+    );
+    (*ob.root.as_bytes(), plaintext, bytes::Bytes::from(ob.data))
+}
+
+/// A verified `admit_bao` encoding of `[off, off + len)` of a `total`-byte blob.
+fn bao_for(
+    root: [u8; 32],
+    plaintext: &[u8],
+    outboard: bytes::Bytes,
+    off: u64,
+    len: u64,
+    total: u64,
+) -> (iroh_blobs::Hash, bao_tree::ChunkRanges, bytes::Bytes) {
+    let aligned = decdn_bao_range::align_range(off, len, total).unwrap();
+    let s = usize::try_from(aligned.fetch_start()).unwrap();
+    let e = usize::try_from(aligned.fetch_end()).unwrap();
+    let encoded =
+        decdn_bao_range::encode_verified_range(root, &aligned, &plaintext[s..e], outboard).unwrap();
+    (
+        iroh_blobs::Hash::from_bytes(root),
+        aligned.chunk_ranges().clone(),
+        encoded,
+    )
+}
+
+/// A blob of two discovery blocks: block 0 is 64 MiB, block 1 is three groups.
+struct TwoBlockBlob {
+    root: [u8; 32],
+    plaintext: Vec<u8>,
+    outboard: bytes::Bytes,
+    total: u64,
+}
+
+impl TwoBlockBlob {
+    fn new() -> Self {
+        let total = decdn_protocol::DISCOVERY_BLOCK_BYTES + 3 * decdn_bao_range::CHUNK_GROUP_BYTES;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total).unwrap(), 0);
+        Self {
+            root,
+            plaintext,
+            outboard,
+            total,
+        }
+    }
+
+    const fn hash(&self) -> iroh_blobs::Hash {
+        iroh_blobs::Hash::from_bytes(self.root)
+    }
+
+    /// Admit `[off, off + len)` of the blob into `cache`.
+    async fn admit(&self, cache: &decdn_cache::CacheEngine, off: u64, len: u64) {
+        let (hash, ranges, bao) = bao_for(
+            self.root,
+            &self.plaintext,
+            self.outboard.clone(),
+            off,
+            len,
+            self.total,
+        );
+        cache.admit_bao(hash, ranges, bao).await.unwrap();
+    }
+}
+
+/// A publisher running the real `run_republish` loop against a real
+/// `CacheEngine`, fed by the cache's own `subscribe_inserts`, with one staked
+/// DHT server as its only peer.
+struct Publisher {
+    server: TestServer,
+    ep: Endpoint,
+    holder: NodeId,
+    cache: decdn_cache::CacheEngine,
+    stop: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+    _cache_dir: tempfile::TempDir,
+}
+
+impl Publisher {
+    /// Start the loop. `seed` runs against the scheduler before the loop sees
+    /// any event, the way the runtime seeds it at bring-up.
+    async fn start(
+        seed: impl FnOnce(&decdn_cache::CacheEngine, &decdn_node::dht::RepublishScheduler),
+    ) -> anyhow::Result<Self> {
+        use decdn_node::dht::{RepublishScheduler, publish::run_republish};
+
+        let sk = fresh_key();
+        let id = sk.public();
+        let holder = NodeId::from_bytes(*id.as_bytes());
+        let server = spin_up_server(HashSet::from([*id.as_bytes()])).await?;
+        let (ep, _) = local_endpoint(sk, vec![]).await?;
+        let routing = Arc::new(Mutex::new(RoutingTable::new(holder)));
+        routing
+            .lock()
+            .unwrap()
+            .insert(NodeId::from_bytes(*server.id.as_bytes()));
+        // Loopback tests disable discovery; one `FindNode` resolves the path.
+        let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
+        let _ = client::find_node(
+            &ep,
+            target,
+            NodeId::from_bytes(*server.id.as_bytes()),
+            holder,
+        )
+        .await?;
+
+        let cache_dir = tempfile::tempdir()?;
+        let cache = decdn_cache::CacheEngine::open(cache_dir.path(), vec![], 16).await?;
+        let scheduler = Arc::new(RepublishScheduler::new());
+        let inserts = cache.subscribe_inserts();
+        seed(&cache, &scheduler);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(run_republish(
+            ep.clone(),
+            id,
+            routing,
+            Arc::clone(&scheduler),
+            cache.clone(),
+            true,
+            Arc::new(Metrics::new()),
+            inserts,
+            stop.clone(),
+        ));
+        Ok(Self {
+            server,
+            ep,
+            holder,
+            cache,
+            stop,
+            task,
+            _cache_dir: cache_dir,
+        })
+    }
+
+    /// This publisher's coverage for `hash` at the server, once a record lands.
+    fn coverage_at_server(&self, hash: iroh_blobs::Hash) -> Option<Coverage> {
+        let now_us = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros(),
+        )
+        .unwrap();
+        let mut records = self.server.records.lock().unwrap();
+        records
+            .providers_at(&ContentHash::from_bytes(*hash.as_bytes()), now_us)
+            .into_iter()
+            .find(|p| p.node == self.holder)
+            .map(|p| p.coverage)
+    }
+
+    /// Poll for `hash`'s record at the server for up to 10 s.
+    async fn await_record(&self, hash: iroh_blobs::Hash) -> Option<Coverage> {
+        for _ in 0..200 {
+            if let Some(coverage) = self.coverage_at_server(hash) {
+                return Some(coverage);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        None
+    }
+
+    /// Admit a whole small blob and wait for its record. The loop handles
+    /// events one at a time and awaits each eager publish, so once this record
+    /// lands every earlier event has been handled.
+    async fn barrier(&self) {
+        let total = 4 * decdn_bao_range::CHUNK_GROUP_BYTES;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total).unwrap(), 1);
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
+        self.cache.admit_bao(hash, ranges, bao).await.unwrap();
+        assert!(
+            self.await_record(hash).await.is_some(),
+            "the barrier blob's record must land"
+        );
+    }
+
+    async fn stop(self) {
+        self.stop.cancel();
+        let _ = self.task.await;
+        self.ep.close().await;
+        self.server.endpoint.close().await;
+        self.server.accept_task.abort();
+    }
+}
+
+/// #2186: a node that fills a blob only through ranged admits must publish a
+/// provider record once it verifies the first 64 MiB block (ADR 022 §STORE
+/// Flow, AC 21), and must not re-publish on every later block.
+///
+/// Drives the real chain — `CacheEngine::admit_bao` → `subscribe_inserts` →
+/// `run_republish` → `Store` → the server's `RecordStore` — with no pull-through
+/// anywhere, which is the shape of a serve-miss-only node.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_republish_publishes_a_ranged_partial_once_its_first_block_verifies()
+-> anyhow::Result<()> {
+    let p = Publisher::start(|_, _| {}).await?;
+    let blob = TwoBlockBlob::new();
+    let block = decdn_protocol::DISCOVERY_BLOCK_BYTES;
+
+    blob.admit(&p.cache, 0, block).await;
+    let coverage = p
+        .await_record(blob.hash())
+        .await
+        .expect("a ranged admit that verifies block 0 must publish a provider record");
+    assert!(coverage.covers(0), "the record advertises block 0");
+    assert!(!coverage.covers(1), "block 1 is not held yet");
+
+    // Completing block 1 announces the hash again. It was already published,
+    // so no second `Store` goes out: the wider coverage waits for the cycle.
+    blob.admit(&p.cache, block, blob.total - block).await;
+    assert!(p.cache.coverage(blob.hash()).await?.covers(1));
+    p.barrier().await;
+    assert!(
+        !p.coverage_at_server(blob.hash()).unwrap().covers(1),
+        "a hash already published must not publish again on a later block"
+    );
+
+    p.stop().await;
+    Ok(())
+}
+
+/// A partial seeded at bring-up before it covered any block has published
+/// nothing, so the block it completes later must publish at once rather than
+/// wait out its cold-start due time.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_republish_publishes_a_seeded_partial_when_its_first_block_verifies()
+-> anyhow::Result<()> {
+    let blob = TwoBlockBlob::new();
+    let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+    let seeded = ContentHash::from_bytes(*blob.hash().as_bytes());
+    let p = Publisher::start(|_, scheduler| {
+        assert_eq!(scheduler.seed_cold_start([seeded]), 1);
+    })
+    .await?;
+    // One group first, so the store holds a partial with no whole block —
+    // the shape a restart finds mid-fill.
+    blob.admit(&p.cache, 0, group).await;
+    assert!(p.cache.coverage(blob.hash()).await?.is_empty());
+
+    blob.admit(
+        &p.cache,
+        group,
+        decdn_protocol::DISCOVERY_BLOCK_BYTES - group,
+    )
+    .await;
+
+    let coverage = p
+        .await_record(blob.hash())
+        .await
+        .expect("a seeded partial must publish when its first block verifies");
+    assert!(coverage.covers(0));
+    p.stop().await;
+    Ok(())
 }
