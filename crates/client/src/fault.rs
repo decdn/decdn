@@ -2,16 +2,14 @@
 //! reassign-only tail).
 //!
 //! A fault belongs to the command (only the human can fix it), to one item, to
-//! one source's delivery, to one source's price against the pool, to one
-//! source's view of the blob size, or to the chain side of building a lane.
-//! The acquire loop acts on the class; it never inspects the error further.
+//! one source's delivery, to one source's price against the pool, or to the
+//! chain side of building a lane. The acquire loop acts on the class; it never
+//! inspects the error further.
 
 use decdn_protocol::client::StreamError;
 
 use crate::driver::PoolExhausted;
-use crate::{
-    BlobTooLarge, LocalPullFault, SignedSizeMismatch, UpstreamRefused, UpstreamVoucherRejected,
-};
+use crate::{BlobTooLarge, LocalPullFault, UpstreamRefused, UpstreamVoucherRejected};
 
 /// What a failed lane, lane build, or discovery means for the acquire loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,9 +22,6 @@ pub enum Fault {
     /// This source's next voucher does not fit the pool's current deposit. The
     /// source waits for the deposit to rise.
     Unaffordable,
-    /// This source signs a size other than the one the store is keyed by. The
-    /// source is excluded for this item.
-    WrongSize,
     /// A chain or RPC fault outside any source's delivery. The loop retries
     /// with backoff and the source keeps its health.
     Transient,
@@ -64,11 +59,8 @@ pub fn classify(err: &anyhow::Error) -> Fault {
         return Fault::Fatal(FatalScope::Command);
     }
     if err
-        .downcast_ref::<crate::source_set::NoSourceAgreesOnSize>()
+        .downcast_ref::<crate::source_set::NoSourceHasBlob>()
         .is_some()
-        || err
-            .downcast_ref::<crate::source_set::NoSourceHasBlob>()
-            .is_some()
     {
         return Fault::Fatal(FatalScope::Item);
     }
@@ -83,9 +75,6 @@ pub fn classify(err: &anyhow::Error) -> Fault {
     }
     if err.downcast_ref::<PoolExhausted>().is_some() {
         return Fault::Unaffordable;
-    }
-    if err.downcast_ref::<SignedSizeMismatch>().is_some() {
-        return Fault::WrongSize;
     }
     if err.downcast_ref::<LaneBuildFault>().is_some() {
         return Fault::Transient;
@@ -139,9 +128,7 @@ fn is_local_disk_fault(err: &anyhow::Error) -> bool {
 mod tests {
     use super::{FatalScope, Fault, LaneBuildFault, classify};
     use crate::driver::PoolExhausted;
-    use crate::{
-        BlobTooLarge, LocalPullFault, SignedSizeMismatch, UpstreamRefused, UpstreamVoucherRejected,
-    };
+    use crate::{BlobTooLarge, LocalPullFault, UpstreamRefused, UpstreamVoucherRejected};
     use decdn_protocol::client::{StreamError, VoucherRejectReason};
 
     fn refusal(error: StreamError) -> anyhow::Error {
@@ -194,15 +181,6 @@ mod tests {
     }
 
     #[test]
-    fn a_signed_size_disagreement_is_wrong_size() {
-        let err = anyhow::Error::new(SignedSizeMismatch {
-            signed: 10,
-            expected: 11,
-        });
-        assert_eq!(classify(&err), Fault::WrongSize);
-    }
-
-    #[test]
     fn a_lane_build_error_is_transient() {
         let err = anyhow::Error::new(LaneBuildFault(anyhow::anyhow!("rpc timed out")));
         assert_eq!(classify(&err), Fault::Transient);
@@ -240,13 +218,11 @@ mod tests {
 
     #[test]
     fn unanimous_stops_are_fatal_with_their_scope() {
-        use crate::source_set::{NoAffordableSource, NoSourceAgreesOnSize};
+        use crate::source_set::NoAffordableSource;
         let dry = anyhow::Error::new(NoAffordableSource {
             deposit: alloy::primitives::U256::ZERO,
         });
         assert_eq!(classify(&dry), Fault::Fatal(FatalScope::Command));
-        let size = anyhow::Error::new(NoSourceAgreesOnSize);
-        assert_eq!(classify(&size), Fault::Fatal(FatalScope::Item));
         let absent = anyhow::Error::new(crate::source_set::NoSourceHasBlob);
         assert_eq!(classify(&absent), Fault::Fatal(FatalScope::Item));
     }

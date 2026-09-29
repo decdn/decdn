@@ -1539,7 +1539,7 @@ fn ends_the_assembly(err: &anyhow::Error) -> bool {
     match classify(err) {
         Fault::Fatal(_) => true,
         Fault::Unaffordable => err.downcast_ref::<PoolExhausted>().is_some(),
-        Fault::Source | Fault::WrongSize | Fault::Transient => false,
+        Fault::Source | Fault::Transient => false,
     }
 }
 

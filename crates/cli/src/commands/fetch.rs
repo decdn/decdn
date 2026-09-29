@@ -44,12 +44,12 @@ use decdn_client::driver::DriveConfig;
 use decdn_client::source::{Funder, SourceFuture};
 use decdn_client::{
     Cumulative, DownloadTarget, Downloader, Holder, LaneHandle, LaneLedgers, NoAffordableSource,
-    NoCache, NoSourceAgreesOnSize, NoSourceHasBlob, PeerHealth, PeerSource, PoolContext,
-    PoolLedger, ProgressClock, PullConfig, PullDeadlines, StopPolicy, Streamer, UpstreamRefused,
-    UpstreamVoucherRejected, VoucherProgress, sign_client_binding,
+    NoCache, NoSourceHasBlob, PeerHealth, PeerSource, PoolContext, PoolLedger, ProgressClock,
+    PullConfig, PullDeadlines, StopPolicy, Streamer, UpstreamRefused, UpstreamVoucherRejected,
+    VoucherProgress, sign_client_binding,
 };
 
-use super::cli_sources::{CliSources, SignedSize};
+use super::cli_sources::CliSources;
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
 use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore, DepositOutcome};
@@ -1594,9 +1594,7 @@ async fn fetch_over(
     let on_drop = SettleOnDrop::new(|| sources.persist_watermarks());
     let result = async {
         if wants_stdout(&args.output) {
-            let size = sources
-                .signed_size(hash, holders, &[], &health, &stop)
-                .await?;
+            let size = sources.signed_size(hash, holders, &health, &stop).await?;
             return stream_to_stdout(
                 &deps,
                 &sources,
@@ -1609,38 +1607,20 @@ async fn fetch_over(
             )
             .await;
         }
-        let (sources, health, stop, deps) = (&sources, &health, &stop, &deps);
-        download_rekeying(
-            holders,
-            |holders, excluded: Vec<Address>| async move {
-                sources
-                    .signed_size(hash, holders, &excluded, health, stop)
-                    .await
+        let size = sources.signed_size(hash, holders, &health, &stop).await?;
+        download_to_file(
+            &deps,
+            &sources,
+            size.holders,
+            Arc::clone(&health),
+            DownloadTarget {
+                hash,
+                total_bytes: size.total_bytes,
+                dest: &args.output,
+                ranges: None,
             },
-            |holders, total_bytes, signer| {
-                download_to_file(
-                    deps,
-                    sources,
-                    holders,
-                    Arc::clone(health),
-                    DownloadTarget {
-                        hash,
-                        total_bytes,
-                        dest: &args.output,
-                        ranges: None,
-                        size_signer: Some(signer),
-                    },
-                    stop,
-                    common.max_sources,
-                )
-            },
-            || {
-                // Record what the wrong-size lanes paid before new lanes to
-                // the same providers build, and drop the store the wrong
-                // size keyed.
-                sources.persist_watermarks();
-                discard_partial(&args.output)
-            },
+            &stop,
+            common.max_sources,
         )
         .await
     }
@@ -2102,83 +2082,6 @@ where
     result?;
     print_fetch_summary(target.total_bytes, &meter, target.dest);
     Ok(())
-}
-
-/// Fetch a blob to a file keyed by the size one holder signs, and key it again
-/// from another holder when every other holder disagrees with that signer.
-///
-/// `signed_size` learns the size from one holder, skipping the providers it
-/// is given. `download` fetches the blob at that size, naming the signer
-/// ([`DownloadTarget::size_signer`]). When the download ends with
-/// [`NoSourceAgreesOnSize`] (every other holder signs a different size and the
-/// signer delivered no verified byte), the signer is excluded, `rekey` runs
-/// (it records what the lanes paid and discards the wrong-size `.partial`),
-/// and the fetch starts over from the next signer. Each signer is excluded at
-/// most once, so the fetch ends once no holder is left to sign.
-///
-/// # Errors
-///
-/// The error `signed_size`, `download` or `rekey` ends with.
-pub(crate) async fn download_rekeying<Sz, SzFut, Dl, DlFut>(
-    mut holders: Vec<Holder>,
-    signed_size: Sz,
-    download: Dl,
-    rekey: impl Fn() -> anyhow::Result<()>,
-) -> anyhow::Result<()>
-where
-    Sz: Fn(Vec<Holder>, Vec<Address>) -> SzFut,
-    SzFut: std::future::Future<Output = anyhow::Result<SignedSize>>,
-    Dl: Fn(Vec<Holder>, u64, Address) -> DlFut,
-    DlFut: std::future::Future<Output = anyhow::Result<()>>,
-{
-    let mut excluded: Vec<Address> = Vec::new();
-    loop {
-        let signed = signed_size(holders, excluded.clone()).await?;
-        let SignedSize {
-            total_bytes,
-            signer,
-            holders: known,
-        } = signed;
-        match download(known.clone(), total_bytes, signer).await {
-            Err(err)
-                if err.downcast_ref::<NoSourceAgreesOnSize>().is_some()
-                    && !excluded.contains(&signer) =>
-            {
-                tracing::warn!(
-                    %signer,
-                    total_bytes,
-                    "every other holder signs a different size than this one; keying the fetch \
-                     from another holder"
-                );
-                excluded.push(signer);
-                rekey()?;
-                holders = known;
-            }
-            done => return done,
-        }
-    }
-}
-
-/// Remove the `.partial` store beside `output`.
-///
-/// # Errors
-///
-/// A removal that fails for a reason other than the file being gone.
-fn discard_partial(output: &Path) -> anyhow::Result<()> {
-    let dir = match output.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    let stem = output
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("output {} has no usable file name", output.display()))?;
-    decdn_client::ClientRangedStore::discard(dir, stem).map_err(|e| {
-        anyhow::anyhow!(
-            "discard the wrong-size partial of {}: {e}",
-            output.display()
-        )
-    })
 }
 
 /// One lane's persisted-watermark inputs, lifted out of [`MultiLane`] so the

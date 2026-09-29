@@ -94,7 +94,7 @@ impl PeerHealth {
             Fault::Unaffordable => Health::Unaffordable {
                 at_deposit: deposit,
             },
-            Fault::Fatal(_) | Fault::WrongSize | Fault::Transient => current,
+            Fault::Fatal(_) | Fault::Transient => current,
         };
         map.insert(provider, next);
     }
@@ -189,7 +189,6 @@ mod tests {
             now,
             U256::ZERO,
         );
-        health.record(A, Fault::WrongSize, now, U256::ZERO);
         assert_eq!(health.health(A), Health::Healthy { streak: 0 });
     }
 }

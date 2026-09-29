@@ -1800,11 +1800,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// store beside `staging` through the acquire loop, across `targets`' holders.
     /// The store is promoted to `staging` once every byte is present.
     ///
-    /// `total` keys the entry's ranged store: the manifest's `size` when it
-    /// gives one, so a holder that signs another size is a size fault of that
-    /// holder, and the entry fails with `NoSourceAgreesOnSize` once no holder
-    /// signs it. With no manifest size (the manifest blob itself, or an
-    /// unsized entry), a header-only first open learns the signed size.
+    /// `total` is the entry's first size claim: the manifest's `size` when it
+    /// gives one. The fetch grows or shrinks it as bytes land, so a manifest
+    /// size that differs from the blob never fails the entry. With no manifest
+    /// size (the manifest blob itself, or an unsized entry), the first claim
+    /// comes from the probe's size hint, or else from a header-only first open.
     ///
     /// A holder that faults cools in the command-wide [`PeerHealth`] and
     /// returns inside the same loop, so a holder that fails one entry is
@@ -1847,7 +1847,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 (total, holders)
             } else {
                 let size = sources
-                    .signed_size(hash, holders, &[], &self.health, &self.stop)
+                    .signed_size(hash, holders, &self.health, &self.stop)
                     .await?;
                 (size.total_bytes, size.holders)
             };
@@ -1867,9 +1867,6 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                     total_bytes,
                     dest: staging,
                     ranges,
-                    // Only `decdn fetch` keys a store again from another
-                    // signer; a bundle entry keeps its first key.
-                    size_signer: None,
                 }],
                 Some(&self.ledgers),
                 progress,
@@ -4316,11 +4313,11 @@ mod tests {
         assert!(draws.len() > 1, "entries draw different samples");
     }
 
-    /// A manifest size no provider signs is the manifest's fault: it fails its
-    /// own entry and leaves the rest of the pull running.
+    /// A blob no provider holds is its entry's fault: it fails its own entry
+    /// and leaves the rest of the pull running.
     #[test]
-    fn a_manifest_size_no_holder_signs_fails_only_its_entry() {
-        let err = anyhow::Error::new(decdn_client::NoSourceAgreesOnSize);
+    fn a_blob_no_holder_has_fails_only_its_entry() {
+        let err = anyhow::Error::new(decdn_client::NoSourceHasBlob);
         assert_eq!(entry_scope(&err), decdn_client::FatalScope::Item);
         assert!(!ends_the_pull(&err));
     }
@@ -7636,7 +7633,6 @@ mod tests {
                     total_bytes: u64::try_from(blob.len())?,
                     dest: &dest,
                     ranges: Some(&ranges),
-                    size_signer: None,
                 }],
                 None,
                 None,

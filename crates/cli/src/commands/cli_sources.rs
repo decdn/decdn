@@ -30,8 +30,6 @@ use super::fetch::{self, CliFunder, DriveFetchDeps, FaceLaneHandle, ResolvedTarg
 pub(crate) struct SignedSize {
     /// The signed size.
     pub(crate) total_bytes: u64,
-    /// The provider that signed it.
-    pub(crate) signer: Address,
     /// Every holder the first open knows.
     pub(crate) holders: Vec<Holder>,
 }
@@ -127,10 +125,8 @@ where
     /// user can fix ends it, and `stop` gives up. The open's pull is dropped
     /// once its header is read. The lane that answered is parked for the
     /// fetch's `connect`, so the fetch reuses it; every other lane the open
-    /// built drops, and with it any stream permit it held. A provider in
-    /// `excluded` signed a size every other holder disagreed with, and is not
-    /// asked again. Returns the size, the provider that signed it, and every
-    /// holder the open knows, those its discovery found included.
+    /// built drops, and with it any stream permit it held. Returns the size and
+    /// every holder the open knows, those its discovery found included.
     ///
     /// # Errors
     ///
@@ -139,14 +135,10 @@ where
         &self,
         hash: [u8; 32],
         holders: Vec<Holder>,
-        excluded: &[Address],
         health: &Arc<PeerHealth>,
         stop: &StopPolicy,
     ) -> anyhow::Result<SignedSize> {
         let mut set = SourceSet::new(self, hash, Arc::clone(health), holders);
-        for &provider in excluded {
-            set.mark_wrong_size(provider);
-        }
         let opened = first_open(&mut set, stop, |lane| async move {
             let (header, _whole) = lane.source.open_whole(hash).await?;
             let provider = lane
@@ -166,9 +158,8 @@ where
                 .insert(provider, lane);
         }
         let holders = set.holders().to_vec();
-        opened.map(|(signer, total_bytes)| SignedSize {
+        opened.map(|(_signer, total_bytes)| SignedSize {
             total_bytes,
-            signer,
             holders,
         })
     }

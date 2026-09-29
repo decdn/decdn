@@ -50,8 +50,8 @@ use crate::streamer::StreamCandidate;
 /// # Errors
 ///
 /// - a fatal fault ([`crate::Fault::Fatal`]) `open` returned, verbatim;
-/// - [`crate::NoAffordableSource`], [`crate::NoSourceAgreesOnSize`] or
-///   [`crate::NoSourceHasBlob`] on a unanimous verdict of the sources;
+/// - [`crate::NoAffordableSource`] or [`crate::NoSourceHasBlob`] on a
+///   unanimous verdict of the sources;
 /// - [`crate::GaveUp`] once the stop policy's limit passes without an answer.
 pub async fn first_open<P, T, O, Fut>(
     sources: &mut SourceSet<'_, P>,
@@ -165,7 +165,7 @@ where
                         Fault::Transient => {
                             held_off.insert(provider, Instant::now() + BUILD_RETRY_BASE);
                         }
-                        Fault::Source | Fault::Unaffordable | Fault::WrongSize => {}
+                        Fault::Source | Fault::Unaffordable => {}
                     },
                 }
             }

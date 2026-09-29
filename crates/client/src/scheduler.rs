@@ -1389,8 +1389,8 @@ fn seed_deposit<S>(deposit: &tokio::sync::watch::Sender<U256>, lane: &StreamCand
 /// - a fatal fault ([`crate::Fault::Fatal`]) a lane ended with, verbatim;
 /// - [`crate::GaveUp`] once the stop policy's limit passes without a verified
 ///   byte;
-/// - [`crate::NoAffordableSource`], [`crate::NoSourceAgreesOnSize`] or
-///   [`crate::NoSourceHasBlob`] on a unanimous verdict of the sources;
+/// - [`crate::NoAffordableSource`] or [`crate::NoSourceHasBlob`] on a
+///   unanimous verdict of the sources;
 /// - a store I/O failure or a segmentation alignment error.
 pub async fn acquire<St, P, Pc, F>(
     target: AcquireTarget<'_, St>,
@@ -1435,11 +1435,6 @@ where
         total_bytes,
         ranges,
     } = target;
-    anyhow::ensure!(
-        total_bytes == store.total_bytes(),
-        "acquire target names {total_bytes} bytes but the store is keyed by {}",
-        store.total_bytes()
-    );
     let health = Arc::clone(sources.health());
     let mut pending = VecDeque::new();
     for (start, len) in contiguous_byte_ranges(&missing_chunks(store, ranges).await?, total_bytes) {

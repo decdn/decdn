@@ -389,25 +389,6 @@ impl ClientRangedStore {
         ranges_path.try_exists()
     }
 
-    /// Remove the `.partial` store for `stem` in `dir`: the data file and its
-    /// record. A file that is already gone is not an error.
-    ///
-    /// # Errors
-    ///
-    /// A removal that fails for a reason other than `NotFound`.
-    pub fn discard(dir: &Path, stem: &str) -> io::Result<()> {
-        let (data_path, ranges_path) = sidecar_paths(dir, stem);
-        // The record goes first: without it the store no longer resumes.
-        for path in [ranges_path, data_path] {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-
     /// Reopen an existing `.partial` store for `root` if one is on disk,
     /// otherwise [`create`](Self::create) a fresh one with `bound_hint` as its
     /// bound. The presence of the `.partial.ranges` record is the resume
