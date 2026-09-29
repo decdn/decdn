@@ -3186,18 +3186,19 @@ mod tests {
 
     /// A lane with release and growth hooks that runs out of gaps while
     /// another lane still fills one keeps a single idle worker and lets the
-    /// others stop, so their permits come back before the drive ends.
+    /// others stop, so their permits come back before the drive ends. The slow
+    /// lane's gap finishes only once two workers of the fast lane release, so a
+    /// lane that kept its surplus workers would never end the drive.
     #[tokio::test]
     async fn an_idle_lane_releases_its_surplus_workers_before_the_drive_ends() {
+        static GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
         let total = 64 * GROUP;
         let ranges = scattered(total);
-        let stamps: &'static Mutex<Vec<std::time::Instant>> =
-            Box::leak(Box::new(Mutex::new(Vec::new())));
+        let released: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
         let release: &'static (dyn Fn() + Send + Sync) = Box::leak(Box::new(move || {
-            stamps
-                .lock()
-                .expect("stamps lock")
-                .push(std::time::Instant::now());
+            if released.fetch_add(1, Ordering::AcqRel) + 1 == 2 {
+                GATE.add_permits(1);
+            }
         }));
         let no_growth: &'static (dyn Fn(usize) -> usize + Send + Sync) = &|_| 0;
         let specs = [
@@ -3211,25 +3212,28 @@ mod tests {
                 grow: None,
                 release: None,
                 takes_first: false,
-                tweak: |s| s.slow_finish(std::time::Duration::from_millis(600)),
+                tweak: |s| s.gated_finish(&GATE),
             },
         ];
-        let (outcome, _sources, _store, _plaintext) = lanes_drive(total, &ranges, &specs).await;
-        let ended = std::time::Instant::now();
+        let (outcome, sources, _store, _plaintext) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            lanes_drive(total, &ranges, &specs),
+        )
+        .await
+        .expect("two surplus workers stop while the slow lane still fills its gap");
         outcome.into_result().expect("drive the range set");
-        let stamps = stamps.lock().expect("stamps lock").clone();
+        assert!(
+            !sources
+                .get(1)
+                .expect("two lanes")
+                .opened_ranges()
+                .is_empty(),
+            "the slow lane held a gap open behind the gate"
+        );
         assert_eq!(
-            stamps.len(),
+            released.load(Ordering::Acquire),
             3,
             "each worker of the fast lane released once"
-        );
-        let early = stamps
-            .iter()
-            .filter(|&&at| ended.duration_since(at) >= std::time::Duration::from_millis(300))
-            .count();
-        assert_eq!(
-            early, 2,
-            "two surplus workers stop while the slow lane still fills its gap"
         );
     }
 

@@ -731,6 +731,11 @@ mod doubles {
         /// steal of an already-present range is deterministic — the exact
         /// completed-but-uncleared window the present-bytes backstop must close.
         finish_stall: Option<Duration>,
+        /// Gate every `finish` waits on after its range is fully delivered: it
+        /// returns only once `gate` holds a permit. A test opens the gate when an
+        /// event it asserts on occurs, so a completed range stays in flight until
+        /// then with no wall-clock window.
+        finish_gate: Option<&'static tokio::sync::Semaphore>,
         /// Wedge every reader after it has delivered `n` wire bytes: it sleeps
         /// for the given duration instead of yielding the next chunk. Models a
         /// source that opens, delivers a prefix, then stops making progress
@@ -783,6 +788,7 @@ mod doubles {
                 delivered: Arc::new(AtomicU64::new(0)),
                 first_read_stall: None,
                 finish_stall: None,
+                finish_gate: None,
                 stall_after: None,
                 ledger: None,
                 in_flight: Arc::new(AtomicU64::new(0)),
@@ -806,6 +812,16 @@ mod doubles {
         #[must_use]
         pub(crate) const fn slow_finish(mut self, stall: Duration) -> Self {
             self.finish_stall = Some(stall);
+            self
+        }
+
+        #[cfg(test)]
+        /// Hold every `finish` after its range is fully delivered until `gate`
+        /// holds a permit (see `finish_gate`). One permit opens the gate for
+        /// every later `finish`, because each one drops its permit at once.
+        #[must_use]
+        pub(crate) const fn gated_finish(mut self, gate: &'static tokio::sync::Semaphore) -> Self {
+            self.finish_gate = Some(gate);
             self
         }
 
@@ -1007,6 +1023,10 @@ mod doubles {
                 // not yet returned) so a peer can steal it while it is present.
                 if let Some(stall) = self.finish_stall {
                     tokio::time::sleep(stall).await;
+                }
+                if let Some(gate) = self.finish_gate {
+                    // A closed gate is open too: either way the permit is not kept.
+                    drop(gate.acquire().await);
                 }
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
                 let Some(ledger) = &self.ledger else {
