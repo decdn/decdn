@@ -63,6 +63,12 @@ pub struct LaneRange {
     pub len: u64,
     /// The bytes of the range that verified before the fault.
     pub landed: u64,
+    /// The piece that faulted starts at or past the end the fetch knows: the
+    /// proven size, or with none proven the smaller of the first size claim
+    /// and the bound. The bound can overshoot the blob, so a `NotFound` for
+    /// such a piece is an overshoot refusal: it cools the provider and never
+    /// counts toward marking it absent ([`ABSENT_AFTER_NOT_FOUND`]).
+    pub past_end: bool,
 }
 
 /// How many `NotFound` answers in a row, with no verified byte between them,
@@ -339,6 +345,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             offset,
             len,
             landed,
+            past_end,
         }) = range
         {
             tracing::info!(
@@ -347,6 +354,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 offset,
                 len,
                 landed,
+                past_end,
                 ?fault,
                 error = %format_args!("{err:#}"),
                 "a lane faulted; its remainder goes to the other lanes"
@@ -363,6 +371,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         match fault {
             Fault::Source => {
                 if crate::fault::says_absent(err)
+                    && !range.is_some_and(|r| r.past_end)
                     && let Some(refused) = err.downcast_ref::<UpstreamRefused>()
                 {
                     self.record_not_found(provider, refused);
@@ -377,7 +386,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         fault
     }
 
-    /// Count a `NotFound` from `provider`. A probed holder is never marked
+    /// Count a `NotFound` from `provider` for a piece below the end the fetch
+    /// knows ([`LaneRange::past_end`]). A probed holder is never marked
     /// absent. Any other provider is marked absent once its count reaches
     /// [`ABSENT_AFTER_NOT_FOUND`].
     fn record_not_found(&mut self, provider: Address, refused: &UpstreamRefused) {
@@ -952,6 +962,36 @@ mod tests {
                 .is_some()
         });
         assert!(cooled, "the holder cools and comes back");
+    }
+
+    /// A bound that overshoots the blob sends pieces past its true end, and an
+    /// honest node refuses them with `NotFound`. Such overshoot refusals from a
+    /// non-holder cool it but never mark it absent, so the item does not end
+    /// with a wrong "check the hash".
+    #[tokio::test(start_paused = true)]
+    async fn overshoot_refusals_never_mark_a_non_holder_absent() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![non_holder(A, 10.0)]);
+        let now = Instant::now();
+        let overshoot = super::LaneRange {
+            offset: 64 << 20,
+            len: 64 << 20,
+            landed: 0,
+            past_end: true,
+        };
+        for _ in 0..10 {
+            let fault = set.record_fault(A, &not_found(), Some(overshoot), now, U256::ZERO);
+            assert_eq!(fault, Fault::Source);
+        }
+        set.discovery_done(Ok(vec![]), now, U256::ZERO);
+        assert!(
+            set.exhausted(U256::ZERO, true).is_none(),
+            "overshoot refusals never mark the node absent"
+        );
+        assert!(
+            set.health().cooling_until(A, now).is_some(),
+            "the node cools"
+        );
     }
 
     /// A non-holder that says `NotFound` three times ends the item, and the

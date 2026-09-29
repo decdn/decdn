@@ -139,6 +139,15 @@ pub(crate) fn grown_bound(bound: u64, c0: u64, extra: u64) -> u64 {
     want.div_ceil(SEED).saturating_mul(SEED)
 }
 
+/// The end of the blob as the fetch knows it: the proven size, or with none
+/// proven the smaller of the first claim `c0` and the store's bound. A piece
+/// that starts at or past it can lie past the true end.
+fn known_end<St: IngestStore>(store: &St, c0: u64) -> u64 {
+    store
+        .proven()
+        .unwrap_or_else(|| c0.min(store.total_bytes()))
+}
+
 /// Bytes of the store's `present` chunks at or past `from`, against `bound`.
 fn bytes_past(present: &ChunkRanges, from: u64, bound: u64) -> u64 {
     contiguous_byte_ranges(present, bound)
@@ -480,11 +489,12 @@ enum LaneEnd {
     /// The worker found nothing it could take: for a lane's own worker, with
     /// no peer holding work; for an extra worker, once its one piece ended.
     Idle,
-    /// The worker faulted on `range`: `err` is `Some(e)` for a `fill_gap`
-    /// error, `None` for a watchdog trip.
+    /// The worker faulted on `range`, in the piece that starts at `piece_at`:
+    /// `err` is `Some(e)` for a `fill_gap` error, `None` for a watchdog trip.
     Faulted {
         err: Option<anyhow::Error>,
         range: crate::source_set::LaneRange,
+        piece_at: u64,
     },
 }
 
@@ -1445,7 +1455,10 @@ where
         let mut terminal: Option<UnitOutcome> = None;
         // The unit's verified bytes across its gaps, for the fault's log line.
         let mut landed = 0u64;
+        // The start of the gap the unit ended on, for an overshoot check.
+        let mut piece_at = r_start;
         for (g_start, g_len) in gaps {
+            piece_at = g_start;
             let verified = AtomicU64::new(0);
             let outcome = {
                 let fill = fill_gap(
@@ -1552,10 +1565,16 @@ where
                     offset: r_start,
                     len: r_len,
                     landed,
+                    // The loop knows the first claim; it sets this.
+                    past_end: false,
                 };
                 return Ok(WorkerEnd {
                     provider,
-                    end: LaneEnd::Faulted { err, range },
+                    end: LaneEnd::Faulted {
+                        err,
+                        range,
+                        piece_at,
+                    },
                     delivered,
                     extra,
                 });
@@ -1614,6 +1633,7 @@ fn log_extra_fault(
         offset,
         len,
         landed,
+        past_end: _,
     } = range;
     if landed > 0 {
         tracing::info!(
@@ -2351,10 +2371,19 @@ where
                         sources.record_progress(provider);
                         charged.remove(&provider);
                     }
-                    if let LaneEnd::Faulted { err, range } = end {
+                    if let LaneEnd::Faulted {
+                        err,
+                        range,
+                        piece_at,
+                    } = end
+                    {
                         let err = err.unwrap_or_else(|| {
                             anyhow::anyhow!("no verified progress for {watchdog:?}")
                         });
+                        let range = crate::source_set::LaneRange {
+                            past_end: piece_at >= known_end(store, c0),
+                            ..range
+                        };
                         // A fault on an extra stream stops only that stream: it
                         // is most often a refusal of the additional stream, so
                         // it neither cools the node nor asks for more growth
@@ -6032,6 +6061,34 @@ mod tests {
             Health::Healthy { streak: 0 },
             "the source is not cooled for our fault"
         );
+        Ok(())
+    }
+
+    /// With no size proven, the end the fetch knows is the smaller of the
+    /// first claim and the bound; a proven size replaces both.
+    #[tokio::test]
+    async fn the_known_end_is_the_claim_or_bound_until_a_size_is_proven() -> anyhow::Result<()> {
+        let data = blob(3 * MIB as usize);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src = ScriptedSource::new(data)?.paying(Arc::clone(&ledger));
+        let root = src.root();
+        let (store, _dir) = fresh_store(root, 8 * MIB);
+        assert_eq!(super::known_end(&store, MIB), MIB, "a short claim");
+        assert_eq!(super::known_end(&store, 16 * MIB), 8 * MIB, "the bound");
+
+        let provider = StaticSources::new(vec![candidate(src, ledger, 0xA1, None)])?;
+        run_acquire(
+            &store,
+            &provider,
+            root,
+            8 * MIB,
+            &BudgetPacer::new(),
+            &no_topups(),
+            1,
+            None,
+        )
+        .await?;
+        assert_eq!(super::known_end(&store, MIB), 3 * MIB, "the proven size");
         Ok(())
     }
 

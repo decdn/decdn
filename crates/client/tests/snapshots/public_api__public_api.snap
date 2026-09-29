@@ -423,6 +423,7 @@ pub struct decdn_client::source_set::LaneRange
 pub decdn_client::source_set::LaneRange::landed: u64
 pub decdn_client::source_set::LaneRange::len: u64
 pub decdn_client::source_set::LaneRange::offset: u64
+pub decdn_client::source_set::LaneRange::past_end: bool
 pub struct decdn_client::source_set::NoAffordableSource
 pub decdn_client::source_set::NoAffordableSource::deposit: alloy_primitives::aliases::U256
 impl core::error::Error for decdn_client::source_set::NoAffordableSource
@@ -745,6 +746,7 @@ pub struct decdn_client::LaneRange
 pub decdn_client::LaneRange::landed: u64
 pub decdn_client::LaneRange::len: u64
 pub decdn_client::LaneRange::offset: u64
+pub decdn_client::LaneRange::past_end: bool
 pub struct decdn_client::LaneWiden
 impl decdn_client::LaneWiden
 pub fn decdn_client::LaneWiden::new(impl core::ops::function::Fn(usize) -> usize + core::marker::Send + core::marker::Sync + 'static, impl core::ops::function::Fn() + core::marker::Send + core::marker::Sync + 'static) -> Self
