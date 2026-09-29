@@ -673,8 +673,11 @@ pub(crate) fn reject_empty_claim_for_nonempty_root(
 /// wire size of a ceiling-sized blob. The gap-driven driver (`fill_gap`) meters
 /// CONTENT bytes (the store's delivered frontier) and the resume-offset guard in
 /// [`open_progressive_pull`] meters a CONTENT offset, both against the configured
-/// `max_blob_size_bytes` directly. Every one is a faithful "the byte position
-/// crossed the ceiling" report.
+/// `max_blob_size_bytes` directly. [`acquire`] meters CONTENT bytes against
+/// [`AcquireEnv::max_blob_bytes`]: it clamps a size claim to the cap and
+/// reports a blob whose bytes run past it once every byte below the cap is
+/// present and no leg proved a size within it. Every one is a faithful "the
+/// byte position crossed the ceiling" report.
 #[derive(Debug)]
 pub struct BlobTooLarge {
     /// The byte position that crossed `ceiling` — wire bytes taken off the stream

@@ -215,6 +215,8 @@ struct DriveInputs<P, F> {
     funder: F,
     drive_config: DriveConfig,
     stop: StopPolicy,
+    /// The largest blob accepted, or `0` for no cap.
+    max_blob_bytes: u64,
 }
 
 /// Run the streaming fetch into the store through [`crate::acquire`], bounded
@@ -244,6 +246,7 @@ where
         funder,
         drive_config,
         stop,
+        max_blob_bytes,
     } = inputs;
     // Below one pull-window floor (one payment interval plus the chunk-group
     // roundings, see `PULL_WINDOW_FLOOR`) the window can floor a lane's room to
@@ -286,6 +289,7 @@ where
         on_progress: Some(&on_progress),
         ledgers: None,
         pacing: Some(&pacing),
+        max_blob_bytes,
     };
     let result = acquire(
         AcquireTarget {
@@ -372,6 +376,9 @@ pub struct Streamer<'a, P, F> {
     /// to the whole blob as the stream advances, so the directory needs room
     /// for all of it.
     scratch: &'a Path,
+    /// The largest blob accepted, in bytes, or `0` for no cap
+    /// ([`Self::max_blob_bytes`]).
+    max_blob_bytes: u64,
 }
 
 impl<P, F> std::fmt::Debug for Streamer<'_, P, F> {
@@ -404,7 +411,18 @@ impl<'a, P, F> Streamer<'a, P, F> {
             funder,
             drive_config,
             scratch,
+            max_blob_bytes: 0,
         }
+    }
+
+    /// Cap the stream at `max_blob_bytes` (`0` for no cap). A size claim above
+    /// the cap is clamped to it before the fill store is sized, and a blob that
+    /// holds bytes past the cap ends the stream with [`crate::BlobTooLarge`]
+    /// ([`crate::AcquireEnv::max_blob_bytes`]).
+    #[must_use]
+    pub const fn max_blob_bytes(mut self, max_blob_bytes: u64) -> Self {
+        self.max_blob_bytes = max_blob_bytes;
+        self
     }
 }
 
@@ -477,6 +495,12 @@ where
         }
 
         let stem = blake3::Hash::from_bytes(hash).to_hex();
+        // A claim above the cap never sizes the store.
+        let total_bytes = if self.max_blob_bytes > 0 {
+            total_bytes.min(self.max_blob_bytes)
+        } else {
+            total_bytes
+        };
         // Off the runtime: opening a finalized blob hashes its final file.
         let store = {
             let (scratch, stem) = (self.scratch.to_path_buf(), stem.to_string());
@@ -504,6 +528,7 @@ where
                 funder: self.funder,
                 drive_config: self.drive_config,
                 stop,
+                max_blob_bytes: self.max_blob_bytes,
             },
             config.read_ahead_bytes,
             config.streamer_lane_cap,

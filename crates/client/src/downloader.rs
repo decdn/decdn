@@ -119,6 +119,9 @@ pub struct Downloader<P, F> {
     /// wait as reserves, and a holder discovery adds later can use a free
     /// lane.
     max_lanes: usize,
+    /// The largest blob accepted, in bytes, or `0` for no cap
+    /// ([`Self::max_blob_bytes`]).
+    max_blob_bytes: u64,
 }
 
 impl<P, F> std::fmt::Debug for Downloader<P, F> {
@@ -152,7 +155,18 @@ impl<P, F> Downloader<P, F> {
             funder,
             drive_config,
             max_lanes,
+            max_blob_bytes: 0,
         }
+    }
+
+    /// Cap every target at `max_blob_bytes` (`0` for no cap). A target's size
+    /// claim above the cap is clamped to it before its store is sized, and a
+    /// blob that holds bytes past the cap fails with [`crate::BlobTooLarge`]
+    /// ([`crate::AcquireEnv::max_blob_bytes`]).
+    #[must_use]
+    pub const fn max_blob_bytes(mut self, max_blob_bytes: u64) -> Self {
+        self.max_blob_bytes = max_blob_bytes;
+        self
     }
 }
 
@@ -272,6 +286,12 @@ where
             let store = {
                 let (dir, stem) = (dir.clone(), stem.clone());
                 let (hash, total) = (target.hash, target.total_bytes);
+                // A claim above the cap never sizes the store.
+                let total = if self.max_blob_bytes > 0 {
+                    total.min(self.max_blob_bytes)
+                } else {
+                    total
+                };
                 tokio::task::spawn_blocking(move || {
                     ClientRangedStore::open_or_create(&dir, &stem, hash, total)
                 })
@@ -299,6 +319,7 @@ where
                 ledgers,
                 // No consumption pacing: a download runs at full throughput.
                 pacing: None,
+                max_blob_bytes: self.max_blob_bytes,
             };
             // A dropped download still records the ranges that landed.
             let flush_on_drop = store.flush_on_drop();

@@ -67,8 +67,9 @@ pub(crate) struct CliSources<'a, P> {
     grant: Option<&'a CapabilityGrant>,
     signer: &'a Arc<PrivateKeySigner>,
     voucher_dom: &'a Eip712Domain,
-    /// Serializes each lane's pool open-or-reuse against sibling fetches on
-    /// the same pool (`bundle pull`); `None` for a solo fetch.
+    /// Serializes each lane's pool open-or-reuse: across one fetch's
+    /// concurrently built lanes, which all open or reuse the one pool, and
+    /// across sibling fetches on that pool (`bundle pull`).
     open_lock: Option<&'a tokio::sync::Mutex<()>>,
     /// The run's shared voucher-ledger registry (`bundle pull`); `None` for a
     /// solo fetch.

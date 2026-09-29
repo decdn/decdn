@@ -22,8 +22,10 @@
 //! The ranges' missing bytes are spread once across the first lanes that start,
 //! by discovery-block coverage ([`crate::coverage_plan::spread_segments`]): each
 //! block goes to one covering lane, rarest-cover-first, and a run several lanes
-//! hold whole is split evenly across them (`split_evenly`). A block no started
-//! lane covers stays queued for a lane that joins later. A lane with nothing
+//! hold whole is split evenly across them (`split_evenly`). Coverage is a
+//! preference (#2225): a lane takes what it covers first, and a block no
+//! running lane covers goes to any lane, whose node serves it by pull-through,
+//! while discovery keeps looking for a node that covers it. A lane with nothing
 //! queued *steals* the aligned second half of the largest range in flight that
 //! it also covers ([`steal_split`]), so a fast source keeps helping a slow one,
 //! and a lane that joins late starts by stealing.
@@ -41,7 +43,9 @@
 //! on one `(signer, provider)` lane share its one voucher ledger, which
 //! serializes their issuance (ADR 003 § Concurrent Streams). It takes one
 //! piece, never steals, and gives its grant back when it stops. A fault on it
-//! stops only that stream: it does not cool the node.
+//! stops only that stream and does not cool the node while the lane's own
+//! worker runs; once that worker has stopped, the extra is the lane's last
+//! live worker and its fault is the lane's.
 //!
 //! # Cancellation: closing the double-pay
 //!
@@ -209,6 +213,11 @@ pub struct AcquireEnv<'a, Pc, F> {
     /// Bounds every lane to a read-ahead window ahead of a live consumer, or
     /// `None` for the eager fetch. See [`ConsumptionPacing`].
     pub pacing: Option<&'a ConsumptionPacing<'a>>,
+    /// The largest blob the caller accepts, in bytes, or `0` for no cap. A
+    /// size claim above it is clamped to it before any work is sized, and the
+    /// bound never grows past it: a blob that holds bytes past it ends the
+    /// acquire with [`crate::BlobTooLarge`].
+    pub max_blob_bytes: u64,
 }
 
 impl<Pc, F> std::fmt::Debug for AcquireEnv<'_, Pc, F> {
@@ -497,10 +506,11 @@ struct WorkerEnd {
 /// and the "at most one lane owns any range" ledger. Every per-lane `Vec` is
 /// indexed by the lane's stable slot ([`Work::add_lane`]).
 struct Work {
-    /// Ranges no lane owns (drains as workers pick). A worker only ever pops
-    /// an entry its own [`Coverage`] includes (#1506): [`Work::pick`] skips
-    /// past any entry it cannot serve rather than dequeuing it, so an entry
-    /// stays here until a covering lane is free to take it.
+    /// Ranges no lane owns (drains as workers pick). A worker takes an entry
+    /// its own [`Coverage`] includes first (#1506), and [`Work::pick`] skips
+    /// past an entry another running lane covers. An entry no running lane
+    /// covers goes to any worker, whose node serves it by pull-through (#2225),
+    /// while discovery keeps looking for a node that covers it.
     pending: VecDeque<AlignedRange>,
     /// Per-lane current range, `None` when the lane holds nothing.
     in_flight: Vec<Option<(u64, u64)>>,
@@ -1062,7 +1072,9 @@ impl Work {
 /// WHOLE, so every piece stays inside its holders' coverage; `split_evenly` keeps
 /// each piece chunk-group aligned, below `steal_split`'s `MIN_SPLIT_SIZE` if need
 /// be, so a small blob still engages every full holder from the start. A block
-/// no lane covers is queued whole, for a lane that joins later.
+/// no lane covers is queued whole; any lane takes it and serves it by
+/// pull-through (#2225), while discovery keeps looking for a node that covers
+/// it.
 ///
 /// # Errors
 ///
@@ -1588,7 +1600,8 @@ where
 /// Log, where it happens, that an extra worker's stream faulted on `range`.
 /// Such a fault is most often a refusal of the additional stream, which is
 /// routine, so the line is at debug when nothing landed and at info
-/// otherwise. It never cools the node.
+/// otherwise. Such a fault, logged while the lane's own worker runs, does not
+/// cool the node.
 fn log_extra_fault(
     provider: Address,
     hash: [u8; 32],
@@ -1668,23 +1681,21 @@ struct Want {
 }
 
 impl Want {
-    /// `ranges` against a first bound of `bound`. A zero length reads as "to
-    /// the end of the blob".
+    /// `ranges` against a first bound of `bound`, each clipped to it. A zero
+    /// length reads as "to the end of the blob".
     fn new(ranges: &[(u64, u64)], bound: u64) -> Self {
+        let tail = ranges
+            .iter()
+            .any(|&(start, len)| len == 0 || start.saturating_add(len) >= bound);
         let ranges: Vec<(u64, u64)> = ranges
             .iter()
+            .filter(|&&(start, _)| start < bound)
             .map(|&(start, len)| {
-                let len = if len == 0 {
-                    bound.saturating_sub(start)
-                } else {
-                    len
-                };
+                let room = bound - start;
+                let len = if len == 0 { room } else { len.min(room) };
                 (start, len)
             })
             .collect();
-        let tail = ranges
-            .iter()
-            .any(|&(start, len)| start.saturating_add(len) >= bound);
         Self {
             ranges,
             tail,
@@ -1991,8 +2002,23 @@ where
         ranges,
     } = target;
     let health = Arc::clone(sources.health());
+    // A claim is peer- or manifest-controlled: clamp it to the caller's cap
+    // before it sizes any work or coverage bitmap.
+    let cap = env.max_blob_bytes;
+    let capped = |size: u64| if cap > 0 { size.min(cap) } else { size };
+    let c0 = capped(c0);
+    if cap > 0 && store.total_bytes() > cap {
+        store.set_bound(cap);
+    }
     // A resumed record's bound wins over the caller's hint.
     let first_bound = store.total_bytes();
+    if cap > 0 && first_bound > cap {
+        // Only a proven size is past the cap after the clamp above.
+        return Err(anyhow::Error::new(crate::BlobTooLarge {
+            received: first_bound,
+            ceiling: cap,
+        }));
+    }
     let mut want = Want::new(ranges, first_bound);
     let mut pending = VecDeque::new();
     for (start, len) in
@@ -2128,9 +2154,18 @@ where
                     return Ok(());
                 }
                 // Every byte below the bound is present and no leg proved a
-                // size: the claim was short. Grow and plan the new region.
+                // size: the claim was short. Grow and plan the new region, but
+                // never past the cap: a bound already at the cap with no proof
+                // means the blob holds bytes past it.
+                if cap > 0 && bound >= cap {
+                    let too_large = crate::BlobTooLarge {
+                        received: bound.saturating_add(1),
+                        ceiling: cap,
+                    };
+                    return Err(flushed(store, anyhow::Error::new(too_large)).await);
+                }
                 let extra = bytes_past(&store.present_ranges().await?, c0, bound);
-                let grown = grown_bound(bound, c0, extra);
+                let grown = capped(grown_bound(bound, c0, extra));
                 tracing::debug!(
                     hash = %blake3::Hash::from_bytes(hash).to_hex(),
                     bound,
@@ -2296,12 +2331,15 @@ where
                         let err = err.unwrap_or_else(|| {
                             anyhow::anyhow!("no verified progress for {watchdog:?}")
                         });
-                        if extra {
-                            // A fault on an extra stream stops only that stream:
-                            // it is most often a refusal of the additional
-                            // stream, so it neither cools the node nor asks for
-                            // more growth. A fatal fault is the pool's or ours,
-                            // not the stream's, and still ends the acquire.
+                        // A fault on an extra stream stops only that stream: it
+                        // is most often a refusal of the additional stream, so
+                        // it neither cools the node nor asks for more growth
+                        // while the lane's own worker still runs. A lane's last
+                        // live worker faults for the lane, so once the own
+                        // worker has stopped, the extra's fault is recorded
+                        // like the lane's own. A fatal fault is the pool's or
+                        // ours, not the stream's, and always ends the acquire.
+                        if extra && running.contains(&provider) {
                             if let Fault::Fatal(_) = crate::fault::classify(&err) {
                                 return Err(flushed(store, err).await);
                             }
@@ -2494,6 +2532,7 @@ mod tests {
         ledgers: Option<&'a LaneLedgers>,
         pacing: Option<&'a ConsumptionPacing<'a>>,
         health: Arc<PeerHealth>,
+        max_blob_bytes: u64,
     }
 
     impl Knobs<'_> {
@@ -2505,6 +2544,7 @@ mod tests {
                 ledgers: None,
                 pacing: None,
                 health: Arc::default(),
+                max_blob_bytes: 0,
             }
         }
     }
@@ -2543,6 +2583,7 @@ mod tests {
                 on_progress: knobs.on_progress,
                 ledgers: knobs.ledgers,
                 pacing: knobs.pacing,
+                max_blob_bytes: knobs.max_blob_bytes,
             },
         )
         .await
@@ -4834,6 +4875,7 @@ mod tests {
                 on_progress: None,
                 ledgers: None,
                 pacing: None,
+                max_blob_bytes: 0,
             },
         )
         .await?;
@@ -4920,6 +4962,7 @@ mod tests {
                 on_progress: None,
                 ledgers: None,
                 pacing: None,
+                max_blob_bytes: 0,
             },
         )
         .await?;
@@ -4957,6 +5000,7 @@ mod tests {
                 on_progress: None,
                 ledgers: None,
                 pacing: None,
+                max_blob_bytes: 0,
             },
         )
         .await?;
@@ -4994,6 +5038,7 @@ mod tests {
                 on_progress: None,
                 ledgers: None,
                 pacing: None,
+                max_blob_bytes: 0,
             },
         )
         .await?;
@@ -5285,6 +5330,106 @@ mod tests {
         Ok(())
     }
 
+    // ---- the caller's size cap bounds every claim ----
+
+    /// Acquire `data`'s blob from one honest lane into a store sized by
+    /// `claim`, under `cap`. Returns the result, every progress total, and
+    /// the store.
+    async fn acquire_capped(
+        data: &[u8],
+        claim: u64,
+        cap: u64,
+    ) -> anyhow::Result<(
+        anyhow::Result<()>,
+        Vec<u64>,
+        ClientRangedStore,
+        tempfile::TempDir,
+    )> {
+        let (sources, provider) = honest_lanes(data, &[0xA1])?;
+        let root = sources
+            .first()
+            .map(ScriptedSource::root)
+            .unwrap_or_default();
+        let (store, dir) = fresh_store(root, claim);
+        let totals: Arc<Mutex<Vec<u64>>> = Arc::default();
+        let seen = Arc::clone(&totals);
+        let on_progress: Box<crate::ProgressCallback> = Box::new(move |_, total| {
+            if let Ok(mut t) = seen.lock() {
+                t.push(total);
+            }
+        });
+        let result = run_acquire_with(
+            &store,
+            &provider,
+            root,
+            &BudgetPacer::new(),
+            &no_topups(),
+            Knobs {
+                on_progress: Some(&on_progress),
+                max_blob_bytes: cap,
+                ..Knobs::lanes(1)
+            },
+        )
+        .await;
+        let totals = totals.lock().map(|t| t.clone()).unwrap_or_default();
+        Ok((result, totals, store, dir))
+    }
+
+    /// A first claim above the cap is clamped to it before any work is sized:
+    /// no bound past the cap is ever planned, and a blob within the cap
+    /// completes.
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_above_the_cap_is_clamped_to_it() -> anyhow::Result<()> {
+        let data = blob(3 * MIB as usize);
+        let cap = 8 * MIB;
+        let (result, totals, store, dir) = acquire_capped(&data, u64::MAX / 2, cap).await?;
+        result?;
+        assert!(totals.iter().all(|&t| t <= cap), "{totals:?}");
+        assert_eq!(store.proven(), Some(3 * MIB));
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        Ok(())
+    }
+
+    /// Growth never raises the bound past the cap: a short claim grows to the
+    /// cap at most, and a blob within it completes.
+    #[tokio::test(start_paused = true)]
+    async fn growth_stops_at_the_cap() -> anyhow::Result<()> {
+        let data = blob(3 * MIB as usize);
+        let cap = 5 * MIB;
+        let (result, totals, store, _dir) = acquire_capped(&data, MIB, cap).await?;
+        result?;
+        assert!(totals.iter().all(|&t| t <= cap), "{totals:?}");
+        assert!(
+            totals.contains(&cap),
+            "the claim grew to the cap: {totals:?}"
+        );
+        assert_eq!(store.proven(), Some(3 * MIB));
+        Ok(())
+    }
+
+    /// A blob that holds bytes past the cap ends the item with `BlobTooLarge`
+    /// once the bound reaches the cap with no size proven, whether the claim
+    /// was short or above the cap.
+    #[tokio::test(start_paused = true)]
+    async fn a_blob_past_the_cap_ends_the_item() -> anyhow::Result<()> {
+        let data = blob(3 * MIB as usize);
+        let cap = 2 * MIB;
+        for claim in [MIB, 3 * MIB] {
+            let (result, totals, _store, _dir) = acquire_capped(&data, claim, cap).await?;
+            let err = result
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("a blob past the cap must fail"))?;
+            assert!(
+                err.downcast_ref::<crate::BlobTooLarge>().is_some(),
+                "{err:#}"
+            );
+            assert_eq!(classify(&err), Fault::Fatal(FatalScope::Item));
+            assert!(totals.iter().all(|&t| t <= cap), "{totals:?}");
+        }
+        Ok(())
+    }
+
     // ---- a busy lane grows for a faulted lane's remainder (#2231) ----
 
     /// Counts what a [`super::LaneWiden`] granted and got back.
@@ -5383,6 +5528,7 @@ mod tests {
                 on_progress: None,
                 ledgers: None,
                 pacing: None,
+                max_blob_bytes: 0,
             },
         )
         .await
@@ -5526,6 +5672,53 @@ mod tests {
         Ok(())
     }
 
+    /// A lane's last live worker faults for the lane (#2231): when the lane's
+    /// own worker has faulted and stopped, a fault on its extra stream cools
+    /// the node too.
+    #[tokio::test(start_paused = true)]
+    async fn an_extra_stream_that_outlives_its_lane_faults_for_the_lane() -> anyhow::Result<()> {
+        let data = blob(32 * MIB as usize);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let lb = Arc::new(PoolLedger::new(Cumulative::default()));
+        let a = dead_after_first_mib(&data, &la)?;
+        // B's first two readers (its own range, then the extra stream opened
+        // for A's remainder) fault after 4 MiB. The own leg started first, so
+        // it faults first; the extra faults after it, with no own worker left.
+        let b = ScriptedSource::new(data.clone())?
+            .fault_times_after(2, 4 * MIB as usize, || anyhow::anyhow!("scripted reset"))
+            .paying(Arc::clone(&lb));
+        let (widen, count) = counting_widen(1);
+        let mut cand_b = candidate(b.clone(), Arc::clone(&lb), 0xB2, None);
+        cand_b.widen = Some(widen);
+        let lanes = StaticSources::new(vec![candidate(a.clone(), la, 0xA1, None), cand_b])?;
+        let provider = FaultLog {
+            inner: &lanes,
+            faulted: Mutex::new(Vec::new()),
+        };
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, dir) = fresh_store(root, total);
+        acquire_over(&store, &provider, lanes.holders(), root, 2).await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+        assert!(count.granted() >= 1, "B grew an extra stream");
+        assert_eq!(count.released(), count.granted());
+        let b_faults = provider
+            .faulted
+            .lock()
+            .map(|f| {
+                f.iter()
+                    .filter(|&&p| p == Address::repeat_byte(0xB2))
+                    .count()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            b_faults, 2,
+            "the own worker's fault and the last live worker's fault both cool B"
+        );
+        Ok(())
+    }
+
     /// A store that fails `missing_ranges` once `fail` is set: a local disk or
     /// store fault in the middle of a unit.
     struct FailingMissing {
@@ -5643,6 +5836,7 @@ mod tests {
             on_progress: None,
             ledgers: None,
             pacing: None,
+            max_blob_bytes: 0,
         };
         let fetch = acquire(
             AcquireTarget {

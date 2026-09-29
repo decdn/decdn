@@ -101,6 +101,7 @@ pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_dir(&self, &[(
 pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths(&self, &[decdn_client::downloader::DownloadTarget<'_>], core::option::Option<&decdn_client::ledgers::LaneLedgers>, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
 pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths_until(&self, &[decdn_client::downloader::DownloadTarget<'_>], core::option::Option<&decdn_client::ledgers::LaneLedgers>, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, &decdn_client::stop::StopPolicy) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
 impl<P, F> decdn_client::downloader::Downloader<P, F>
+pub const fn decdn_client::downloader::Downloader<P, F>::max_blob_bytes(self, u64) -> Self
 pub const fn decdn_client::downloader::Downloader<P, F>::new(P, alloc::vec::Vec<decdn_client::source_set::Holder>, alloc::sync::Arc<decdn_client::health::PeerHealth>, F, decdn_client::driver::DriveConfig, usize) -> Self
 impl<P, F> core::fmt::Debug for decdn_client::downloader::Downloader<P, F>
 pub fn decdn_client::downloader::Downloader<P, F>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -536,6 +537,7 @@ impl core::ops::drop::Drop for decdn_client::streamer::StreamDrive<'_>
 pub fn decdn_client::streamer::StreamDrive<'_>::drop(&mut self)
 pub struct decdn_client::streamer::Streamer<'a, P, F>
 impl<'a, P, F> decdn_client::streamer::Streamer<'a, P, F>
+pub const fn decdn_client::streamer::Streamer<'a, P, F>::max_blob_bytes(self, u64) -> Self
 pub const fn decdn_client::streamer::Streamer<'a, P, F>::new(P, alloc::vec::Vec<decdn_client::source_set::Holder>, alloc::sync::Arc<decdn_client::health::PeerHealth>, F, decdn_client::driver::DriveConfig, &'a std::path::Path) -> Self
 impl<P, F> decdn_client::streamer::Streamer<'_, P, F> where P: decdn_client::source_set::SourceProvider, F: decdn_client::source::Funder
 pub async fn decdn_client::streamer::Streamer<'_, P, F>::open<'a>(self, [u8; 32], u64, &decdn_client::config::PullConfig, alloc::sync::Arc<dyn decdn_client::sink::BlobCache>, decdn_client::stop::StopPolicy) -> anyhow::Result<(decdn_client::streamer::VerifiedReader, decdn_client::streamer::StreamDrive<'a>)> where P: 'a, F: 'a
@@ -603,6 +605,7 @@ pub struct decdn_client::AcquireEnv<'a, Pc, F>
 pub decdn_client::AcquireEnv::drive: &'a decdn_client::driver::DriveConfig
 pub decdn_client::AcquireEnv::funder: &'a F
 pub decdn_client::AcquireEnv::ledgers: core::option::Option<&'a decdn_client::ledgers::LaneLedgers>
+pub decdn_client::AcquireEnv::max_blob_bytes: u64
 pub decdn_client::AcquireEnv::max_lanes: usize
 pub decdn_client::AcquireEnv::on_progress: core::option::Option<&'a (dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + 'a)>
 pub decdn_client::AcquireEnv::pacer: &'a Pc
@@ -688,6 +691,7 @@ pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_dir(&self, &[(
 pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths(&self, &[decdn_client::downloader::DownloadTarget<'_>], core::option::Option<&decdn_client::ledgers::LaneLedgers>, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
 pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths_until(&self, &[decdn_client::downloader::DownloadTarget<'_>], core::option::Option<&decdn_client::ledgers::LaneLedgers>, core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, &decdn_client::stop::StopPolicy) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
 impl<P, F> decdn_client::downloader::Downloader<P, F>
+pub const fn decdn_client::downloader::Downloader<P, F>::max_blob_bytes(self, u64) -> Self
 pub const fn decdn_client::downloader::Downloader<P, F>::new(P, alloc::vec::Vec<decdn_client::source_set::Holder>, alloc::sync::Arc<decdn_client::health::PeerHealth>, F, decdn_client::driver::DriveConfig, usize) -> Self
 impl<P, F> core::fmt::Debug for decdn_client::downloader::Downloader<P, F>
 pub fn decdn_client::downloader::Downloader<P, F>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -1015,6 +1019,7 @@ impl core::ops::drop::Drop for decdn_client::streamer::StreamDrive<'_>
 pub fn decdn_client::streamer::StreamDrive<'_>::drop(&mut self)
 pub struct decdn_client::Streamer<'a, P, F>
 impl<'a, P, F> decdn_client::streamer::Streamer<'a, P, F>
+pub const fn decdn_client::streamer::Streamer<'a, P, F>::max_blob_bytes(self, u64) -> Self
 pub const fn decdn_client::streamer::Streamer<'a, P, F>::new(P, alloc::vec::Vec<decdn_client::source_set::Holder>, alloc::sync::Arc<decdn_client::health::PeerHealth>, F, decdn_client::driver::DriveConfig, &'a std::path::Path) -> Self
 impl<P, F> decdn_client::streamer::Streamer<'_, P, F> where P: decdn_client::source_set::SourceProvider, F: decdn_client::source::Funder
 pub async fn decdn_client::streamer::Streamer<'_, P, F>::open<'a>(self, [u8; 32], u64, &decdn_client::config::PullConfig, alloc::sync::Arc<dyn decdn_client::sink::BlobCache>, decdn_client::stop::StopPolicy) -> anyhow::Result<(decdn_client::streamer::VerifiedReader, decdn_client::streamer::StreamDrive<'a>)> where P: 'a, F: 'a

@@ -1936,7 +1936,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 sources.funder(),
                 DriveConfig::cli(self.chain.working_deposit),
                 self.common.max_sources,
-            );
+            )
+            .max_blob_bytes(max_blob_bytes);
             Box::pin(downloader.fetch_to_paths_until(
                 &[DownloadTarget {
                     hash,
@@ -1974,7 +1975,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// staging file under `out_root` and reading it back is cheap; it also
     /// means a manifest fetch runs the same acquire loop, under the same
     /// health table and progress clock, as every entry. A manifest has no
-    /// manifest size, so a first open learns its signed size. The staging
+    /// manifest size, so the fetch takes the first size claim (the probe hint,
+    /// or a header-only open when there is none). The staging
     /// file is removed once read back — a manifest fetch has nothing further
     /// to resume once its bytes are safely in memory.
     async fn fetch_to_memory(&self, hash: [u8; 32], out_root: &Path) -> anyhow::Result<Vec<u8>> {
@@ -3983,20 +3985,6 @@ fn record_one(out_root: &Path, en: &ManifestEntry) -> Option<bundle_manifest::Sa
     })
 }
 
-/// Build the skip-cache updates for a batch of `entries` paired with THIS run's
-/// `outcomes` for them, in order — `fetch_group` returns one outcome per entry,
-/// in order, so position correlates a path to its outcome. Only an entry whose
-/// outcome is a success this run (`Fetched`, `Linked`, or `Skipped`) is
-/// eligible; a `Failed` entry is omitted, because its fetch left the OLD bytes in
-/// place (materialize renames new content only on success) and pairing the *new*
-/// manifest hash with them would let a later mtime/hash fast path wrongly treat
-/// the stale file as up to date and never re-fetch it.
-///
-/// Correlating by position — rather than "every entry not in the failed set" —
-/// is what makes this safe to call MID-RUN: an entry whose group has not
-/// completed yet is simply absent from `outcomes`, so it is never recorded from
-/// bytes this run has not landed. A batch may be one completed group or the whole
-/// run's outcomes; the result is the same records either way.
 /// One line for each entry whose landed file differs in size from its
 /// manifest's `size`: `<path>: manifest says X bytes, the blob is Y bytes`. A
 /// manifest size is only the fetch's first claim, so such an entry succeeds;
@@ -4021,6 +4009,20 @@ fn size_warnings(
         .collect()
 }
 
+/// Build the skip-cache updates for a batch of `entries` paired with THIS run's
+/// `outcomes` for them, in order — `fetch_group` returns one outcome per entry,
+/// in order, so position correlates a path to its outcome. Only an entry whose
+/// outcome is a success this run (`Fetched`, `Linked`, or `Skipped`) is
+/// eligible; a `Failed` entry is omitted, because its fetch left the OLD bytes in
+/// place (materialize renames new content only on success) and pairing the *new*
+/// manifest hash with them would let a later mtime/hash fast path wrongly treat
+/// the stale file as up to date and never re-fetch it.
+///
+/// Correlating by position — rather than "every entry not in the failed set" —
+/// is what makes this safe to call MID-RUN: an entry whose group has not
+/// completed yet is simply absent from `outcomes`, so it is never recorded from
+/// bytes this run has not landed. A batch may be one completed group or the whole
+/// run's outcomes; the result is the same records either way.
 fn build_completed_updates(
     entries: &[&ManifestEntry],
     outcomes: &[EntryOutcome],

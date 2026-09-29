@@ -3,8 +3,9 @@
 //!
 //! Turnkey paying sibling of [`super::probe`]: dial a node by explicit
 //! `--node-id`/`--addr`/`--relay-url` (or auto-discover the holders, #936),
-//! **auto-open-or-reuse** the caller's own `PaymentPool` deposit, learn the
-//! blob's signed size, and fetch it through the acquire loop
+//! **auto-open-or-reuse** the caller's own `PaymentPool` deposit, take the
+//! first size claim (the probe hint, or a header-only open when there is
+//! none), and fetch it through the acquire loop
 //! ([`decdn_client::acquire`]) across one [`decdn_client::PeerSource`] lane
 //! per holder (signing cumulative vouchers, resuming each lane's persisted
 //! watermark, verifying the `slash_sig` recovers to the provider, ADR 014 §1).
@@ -1172,6 +1173,29 @@ pub(crate) struct ResolvedTargets {
     pub(crate) size_hint: Option<u64>,
 }
 
+/// The one holder of a pinned `--node-id` at `provider`. Nothing was probed,
+/// so it carries no size hint.
+fn pinned_targets(node_id: PublicKey, provider: Address) -> ResolvedTargets {
+    ResolvedTargets {
+        candidates: vec![NodeCandidate {
+            node_id,
+            eth_address: provider,
+            region_hint: None,
+            // A `--node-id`-pinned target takes its direct address from
+            // `--addr` at the dial site, not from the registry.
+            multiaddrs: Bytes::new(),
+        }],
+        // Nothing was probed on this path, so no holder coverage was
+        // measured: the pinned node is a full holder.
+        coverage_by_node: HashMap::new(),
+        // Nothing was probed on this path, so there is nothing to harvest.
+        probed_samples: Vec::new(),
+        pinned: true,
+        // Nothing was probed, so the first claim comes from a header.
+        size_hint: None,
+    }
+}
+
 /// Resolve the holders to fetch from (#1174): the explicit `--node-id`
 /// (requiring `--provider-address`) as the one holder, or auto-discovery (#936)
 /// when `--node-id` is omitted (deriving each provider from its node's registry
@@ -1202,24 +1226,7 @@ pub(crate) async fn resolve_target_node(
         })?;
         let provider =
             super::chain_ctx::parse_address(provider_raw, "--provider-address").map_err(config)?;
-        return Ok(ResolvedTargets {
-            candidates: vec![NodeCandidate {
-                node_id,
-                eth_address: provider,
-                region_hint: None,
-                // A `--node-id`-pinned target takes its direct address from
-                // `--addr` at the dial site, not from the registry.
-                multiaddrs: Bytes::new(),
-            }],
-            // Nothing was probed on this path, so no holder coverage was
-            // measured: the pinned node is a full holder.
-            coverage_by_node: HashMap::new(),
-            // Nothing was probed on this path, so there is nothing to harvest.
-            probed_samples: Vec::new(),
-            pinned: true,
-            // Nothing was probed, so the first claim comes from a header.
-            size_hint: None,
-        });
+        return Ok(pinned_targets(node_id, provider));
     }
 
     let capacity_bond = chain.capacity_bond.ok_or_else(|| {
@@ -1510,8 +1517,8 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
 pub(crate) const STALL_WINDOW: Duration = Duration::from_secs(30);
 
 /// The part of [`fetch`] that runs over its open `endpoint`: resolve the
-/// holders, learn the blob's signed size, then fetch it through the acquire
-/// loop. The command ends on done, a fault only the user can fix, or the stop
+/// holders, take the first size claim (the probe hint, or a header-only open
+/// when there is none), then fetch it through the acquire loop. The command ends on done, a fault only the user can fix, or the stop
 /// policy: a terminal waits for Ctrl-C, a script gives up after 10 minutes
 /// without progress, and `--give-up-after-secs` overrides both.
 #[allow(clippy::too_many_lines)]
@@ -1820,8 +1827,9 @@ pub(crate) fn lane_target(
 /// [`PeerSource`] over it.
 ///
 /// `open_lock`, when `Some`, serializes the pool open-or-reuse inside
-/// [`build_ctx_for_fetch`] against other fetches sharing the one on-chain pool
-/// (bundle pull's cross-entry concurrency, #1774); the guard is dropped before
+/// [`build_ctx_for_fetch`]: across one fetch's concurrently built lanes, which
+/// all open or reuse the one on-chain pool, and across other fetches sharing
+/// that pool (bundle pull's cross-entry concurrency, #1774); the guard is dropped before
 /// any streaming, and skipped entirely on the delegated path, which opens
 /// nothing on-chain. A caller that holds a provider's stream permit takes it
 /// before `open_lock`, so the lock order stays permit → `open_lock` and no
@@ -2035,7 +2043,8 @@ where
         funder,
         drive_config,
         scratch.path(),
-    );
+    )
+    .max_blob_bytes(deps.max_blob_bytes);
     let (mut reader, mut drive) = streamer
         .open(hash, total_bytes, &pull_config, Arc::new(NoCache), stop)
         .await?;
@@ -2101,7 +2110,8 @@ where
         sources.funder(),
         DriveConfig::cli(deps.chain.working_deposit),
         max_sources,
-    );
+    )
+    .max_blob_bytes(deps.max_blob_bytes);
     let result =
         Box::pin(downloader.fetch_to_paths_until(&[target], None, Some(&on_progress), stop)).await;
     bar.finish_and_clear();
@@ -3400,8 +3410,24 @@ mod tests {
         Ok(())
     }
 
+    /// A pinned `--node-id` is one probed-as-holder candidate with no size
+    /// hint (#2218): its first claim comes from a header-only open.
+    #[test]
+    fn a_pinned_node_resolves_with_no_size_hint() {
+        let provider = Address::repeat_byte(0x42);
+        let targets = super::pinned_targets(harvest_key(7), provider);
+        assert!(targets.pinned);
+        assert!(targets.size_hint.is_none());
+        assert_eq!(targets.candidates.len(), 1);
+        assert_eq!(
+            targets.candidates.first().map(|c| c.eth_address),
+            Some(provider)
+        );
+    }
+
     /// `store_fast_path` ranks selectable records by latency and excludes a
-    /// suppressed one, and refuses to engage below `min_fresh_candidates`.
+    /// suppressed one, and refuses to engage below `min_fresh_candidates`. It
+    /// probes nothing, so it carries no size hint (#2218).
     /// It takes no [`Endpoint`], so it structurally cannot issue a network
     /// probe — this is the probe-less fast path itself, not merely tested
     /// without one.
@@ -3429,6 +3455,10 @@ mod tests {
         assert_eq!(targets.candidates[2].node_id, harvest_key(1));
         assert!(targets.coverage_by_node.is_empty());
         assert!(targets.probed_samples.is_empty());
+        assert!(
+            targets.size_hint.is_none(),
+            "nothing was probed, so the first claim comes from a header open"
+        );
 
         // Only two selectable records -> below min_fresh_candidates -> None.
         let dir2 = tempfile::tempdir()?;

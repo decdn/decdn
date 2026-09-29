@@ -500,9 +500,13 @@ impl ClientRangedStore {
     }
 
     /// Move the planner's bound to `bound`. The record picks it up at its next
-    /// flush.
+    /// flush. A proven size is final: once a leg has proved one, the bound
+    /// stays at it and this does nothing.
     pub fn set_bound(&self, bound: u64) {
-        self.lock_state().bound = bound;
+        let mut state = self.lock_state();
+        if state.proven.is_none() {
+            state.bound = bound;
+        }
     }
 
     /// The state under its lock. A poisoned lock still holds a consistent
@@ -1590,6 +1594,16 @@ mod tests {
         store.set_bound(5 * GROUP);
         assert_eq!(store.total_bytes(), 5 * GROUP);
         assert_eq!(store.proven(), None);
+    }
+
+    /// A proven size is final: moving the bound after a proof does nothing.
+    #[tokio::test]
+    async fn set_bound_is_a_no_op_once_a_size_is_proven() {
+        let store = store_with_present(3 * GROUP, ChunkRanges::empty());
+        store.state.lock().expect("lock").prove(2 * GROUP);
+        store.set_bound(9 * GROUP);
+        assert_eq!(store.bound(), 2 * GROUP);
+        assert_eq!(store.proven(), Some(2 * GROUP));
     }
 
     #[tokio::test]
