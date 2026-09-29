@@ -436,7 +436,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
     async fn final_redeem_sweep(&self) {
         // Shutdown redeems regardless of a flush failure (`strict_flush` false):
         // forfeiting the claim across the stop is worse than a bounded re-serve
-        // risk, matching the close path.
+        // risk. The per-chunk floor still applies, so sub-floor chunks defer.
         redeem_sweep(
             &self.contract,
             &self.store,
@@ -1149,8 +1149,8 @@ fn group_by_pool(lanes: &[PlannedLane]) -> Vec<PaymentPool::PoolBatch> {
 /// Partition planned lanes into gas-bounded redemption chunks (each an
 /// independent `redeemMany`). Every returned chunk has at most `max_vouchers`
 /// lanes and an aggregate unredeemed value `>= floor`; a chunk that cannot clear
-/// the floor is dropped and its lanes defer to a later sweep (the force path
-/// passes `floor == 0` to keep every chunk). The chunk count is the minimum that
+/// the floor is dropped and its lanes defer to a later sweep (`floor == 0` keeps
+/// every chunk). The chunk count is the minimum that
 /// respects `max_vouchers`, and high-value lanes are dealt round-robin across the
 /// chunks so dust rides alongside real value instead of segregating into a
 /// below-floor chunk.
@@ -1671,8 +1671,8 @@ fn record_landed_chunk(store: &Arc<dyn PoolStateStore>, lanes: &[PlannedLane], m
 ///
 /// `strict` says what the caller does with a `false`, and is carried here only
 /// so the log reports the outcome the caller actually takes: the periodic sweep
-/// and hint paths defer their submit, while the forced close/shutdown paths
-/// redeem anyway — with the residual that a `CapabilityReg` can go on-chain
+/// and hint paths defer their submit, while the shutdown sweep redeems anyway —
+/// with the residual that a `CapabilityReg` can go on-chain
 /// against material that never reached disk.
 async fn flush_store_durable(
     store: &Arc<dyn PoolStateStore>,
@@ -1689,8 +1689,8 @@ async fn flush_store_durable(
             } else {
                 warn!(
                     error = %err,
-                    "pre-redeem lane store flush failed; proceeding on the forced \
-                     close/shutdown path with un-flushed lane and capability state"
+                    "pre-redeem lane store flush failed; proceeding on the shutdown \
+                     sweep with un-flushed lane and capability state"
                 );
             }
             false
@@ -1769,7 +1769,7 @@ async fn reconcile_onchain_watermarks<P: Provider + Clone>(
         // order. Any other length means the decoder and the chain disagree about
         // the return shape, so the batch's values cannot be trusted to pair with
         // this chunk's plans — a long return may be offset, and dropping a lane
-        // on a mis-paired watermark forfeits its claim on the forced-close path.
+        // on a mis-paired watermark skips a claim the chain has not paid.
         // Keep only a short return's prefix, which is still positionally sound,
         // and stop either way; `reconcile_plans` keeps the untouched tail.
         if lanes.len() != chunk.len() {
@@ -1851,7 +1851,10 @@ fn holds_unredeemed(states: &[LaneState], pool_id: PoolId, provider: Address) ->
 }
 
 /// Chunk planned lanes under the per-chunk floor + voucher-count cap and submit
-/// each chunk. `floor == U256::ZERO` forces every lane (the close/shutdown path).
+/// each chunk. Every caller — the hint path, the periodic sweep, and the
+/// shutdown sweep — passes the configured per-chunk floor
+/// (`redeem_threshold_micro_usdc`, which config load holds above zero), so a
+/// sub-floor chunk defers to a later sweep on every path, shutdown included.
 ///
 /// The floor gates the on-chain read too: when the whole set's cached
 /// `unredeemed` is below the floor, it returns before
@@ -1860,17 +1863,17 @@ fn holds_unredeemed(states: &[LaneState], pool_id: PoolId, provider: Address) ->
 /// read can hold more than the whole set. The gate is on the total, not per
 /// chunk, because a lane the read drops can shrink the chunk count and re-pack
 /// lanes from a failing chunk into one that clears. A sub-floor hint therefore
-/// costs no `eth_call`. At `floor == 0` the gate always passes, so the forced
-/// paths still read every lane.
+/// costs no `eth_call`.
 ///
 /// Floors the redeemed watermark first: flushes the lane store durable AFTER the
 /// lanes were planned (their cumulative amounts already read) and BEFORE any
 /// chunk goes on-chain, so a crash right after a submit still finds on-disk
 /// `owed ≥ submitted` (`record` is monotone, so the flush persists at least every
-/// value in the batch). The periodic sweep and hint path require this floor and
-/// skip their submit on a failed flush (`strict_flush`); the forced
-/// close/shutdown paths redeem regardless, since forfeiting the whole claim at the
-/// deadline is worse than a bounded re-serve risk.
+/// value in the batch). `strict_flush` is the only difference between the paths.
+/// The periodic sweep and hint path pass `true` and skip their submit on a
+/// failed flush. The shutdown sweep passes `false` and redeems regardless: it is
+/// the last pass before the node stops, and leaving the claim un-redeemed across
+/// the stop is worse than a bounded re-serve risk.
 async fn redeem_planned_lanes<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
@@ -3242,8 +3245,8 @@ mod tests {
         Ok(())
     }
 
-    /// The forced close/shutdown paths pass `floor == 0`, which always passes
-    /// the floor gate, so every lane is still reconciled against the chain.
+    /// A `floor == 0` always passes the floor gate, so every lane, dust
+    /// included, is still reconciled against the chain.
     #[tokio::test]
     async fn a_zero_floor_still_reads_every_lane() -> Result<()> {
         use decdn_incentive::MemoryPoolStateStore;
@@ -3295,7 +3298,7 @@ mod tests {
 
     #[test]
     fn chunk_redemptions_zero_floor_keeps_everything() {
-        // Force path: floor 0 keeps even a pure-dust chunk.
+        // Floor 0 keeps even a pure-dust chunk.
         let plans = vec![planned(1, 0, 1, false), planned(1, 1, 1, false)];
         let chunks = chunk_redemptions(plans, U256::ZERO, 300);
         assert_eq!(chunks.len(), 1);

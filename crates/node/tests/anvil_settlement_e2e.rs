@@ -1350,8 +1350,8 @@ async fn run_e2e() -> anyhow::Result<()> {
     settlement_poller.shutdown();
     service.shutdown(Duration::from_secs(30)).await;
 
-    // PRE-REDEEM RECONCILIATION GATE (#2076). Asserted here, after the forced
-    // close/shutdown sweep, so the shutdown leg's reads are covered too.
+    // PRE-REDEEM RECONCILIATION GATE (#2076). Asserted here, after the
+    // shutdown sweep, so the shutdown leg's reads are covered too.
     //
     // Both halves are needed. The failure count alone is an assertion of
     // absence, satisfied equally by "every read landed" and "no read was ever
