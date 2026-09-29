@@ -731,10 +731,11 @@ mod doubles {
         /// steal of an already-present range is deterministic — the exact
         /// completed-but-uncleared window the present-bytes backstop must close.
         finish_stall: Option<Duration>,
-        /// Gate every `finish` waits on after its range is fully delivered: it
-        /// returns only once `gate` holds a permit. A test opens the gate when an
-        /// event it asserts on occurs, so a completed range stays in flight until
-        /// then with no wall-clock window.
+        /// Semaphore every `finish` waits on after its range is fully delivered:
+        /// `finish` returns once the semaphore holds a permit (or is closed) and
+        /// hands the permit straight back. A test adds the permit when an event it
+        /// asserts on occurs, so a completed range stays in flight until that
+        /// event, however long it takes.
         finish_gate: Option<&'static tokio::sync::Semaphore>,
         /// Wedge every reader after it has delivered `n` wire bytes: it sleeps
         /// for the given duration instead of yielding the next chunk. Models a
@@ -817,8 +818,9 @@ mod doubles {
 
         #[cfg(test)]
         /// Hold every `finish` after its range is fully delivered until `gate`
-        /// holds a permit (see `finish_gate`). One permit opens the gate for
-        /// every later `finish`, because each one drops its permit at once.
+        /// holds a permit (see `finish_gate`). One permit lets every waiting and
+        /// later `finish` through, one at a time, because each one hands the
+        /// permit straight back.
         #[must_use]
         pub(crate) const fn gated_finish(mut self, gate: &'static tokio::sync::Semaphore) -> Self {
             self.finish_gate = Some(gate);
@@ -1025,7 +1027,9 @@ mod doubles {
                     tokio::time::sleep(stall).await;
                 }
                 if let Some(gate) = self.finish_gate {
-                    // A closed gate is open too: either way the permit is not kept.
+                    // `acquire` errs at once on a closed gate, which lets `finish`
+                    // through; a granted permit drops here, so the gate stays open
+                    // for the next `finish`.
                     drop(gate.acquire().await);
                 }
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);

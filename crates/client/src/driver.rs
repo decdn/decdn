@@ -3187,17 +3187,31 @@ mod tests {
     /// A lane with release and growth hooks that runs out of gaps while
     /// another lane still fills one keeps a single idle worker and lets the
     /// others stop, so their permits come back before the drive ends. The slow
-    /// lane's gap finishes only once two workers of the fast lane release, so a
-    /// lane that kept its surplus workers would never end the drive.
+    /// lane's gap finishes only once two workers of the fast lane release, and
+    /// the third worker releases only after that gap. A lane that keeps its
+    /// surplus workers hangs the drive and the timeout fails the test; a lane
+    /// that lets its last worker go while the gate is shut fails the kept-worker
+    /// assertion.
     #[tokio::test]
     async fn an_idle_lane_releases_its_surplus_workers_before_the_drive_ends() {
         static GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
         let total = 64 * GROUP;
         let ranges = scattered(total);
         let released: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
+        let third_after_gate: &'static std::sync::atomic::AtomicBool =
+            Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
         let release: &'static (dyn Fn() + Send + Sync) = Box::leak(Box::new(move || {
-            if released.fetch_add(1, Ordering::AcqRel) + 1 == 2 {
-                GATE.add_permits(1);
+            match released.fetch_add(1, Ordering::AcqRel) + 1 {
+                // The gate opens a while after the second release, so the third
+                // worker has gone idle while the slow gap is still held.
+                2 => {
+                    tokio::spawn(async {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        GATE.add_permits(1);
+                    });
+                }
+                3 => third_after_gate.store(GATE.available_permits() > 0, Ordering::Release),
+                _ => {}
             }
         }));
         let no_growth: &'static (dyn Fn(usize) -> usize + Send + Sync) = &|_| 0;
@@ -3220,20 +3234,25 @@ mod tests {
             lanes_drive(total, &ranges, &specs),
         )
         .await
-        .expect("two surplus workers stop while the slow lane still fills its gap");
-        outcome.into_result().expect("drive the range set");
+        .expect("the drive ends: two surplus workers stop and open the slow lane's gate");
         assert!(
-            !sources
-                .get(1)
-                .expect("two lanes")
-                .opened_ranges()
-                .is_empty(),
-            "the slow lane held a gap open behind the gate"
+            outcome.lane_fault(0).is_none(),
+            "the fast lane's workers release from idleness, not a fault"
+        );
+        outcome.into_result().expect("drive the range set");
+        assert_eq!(
+            sources.get(1).expect("two lanes").opened_ranges().len(),
+            1,
+            "the slow lane took one gap, so its finish waited on the gate"
         );
         assert_eq!(
             released.load(Ordering::Acquire),
             3,
             "each worker of the fast lane released once"
+        );
+        assert!(
+            third_after_gate.load(Ordering::Acquire),
+            "the lane keeps one idle worker while the slow lane holds its gap"
         );
     }
 
