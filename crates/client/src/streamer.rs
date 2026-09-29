@@ -193,6 +193,11 @@ pub struct StreamCandidate<S> {
     /// fetch returns ([`crate::LaneLease`]). Like `coverage`, set it only on a
     /// single-target fetch: the first target's fetch releases it.
     pub lease: LaneLease,
+    /// How this lane adds one concurrent stream for a faulted lane's
+    /// remainder that no idle lane can take ([`crate::LaneWiden`]), or `None`
+    /// to stay at one stream. Each granted stream is given back as its worker
+    /// stops, so it serves every target of a [`crate::Downloader`] alike.
+    pub widen: Option<crate::LaneWiden>,
 }
 
 impl<S> std::fmt::Debug for StreamCandidate<S> {
@@ -860,6 +865,7 @@ mod tests {
             ledger,
             coverage: None,
             lease: crate::LaneLease::default(),
+            widen: None,
         }
     }
 

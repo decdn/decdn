@@ -1645,6 +1645,63 @@ impl LaneStreamCap {
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         self.semaphore(provider).await.try_acquire_owned().ok()
     }
+
+    /// How a lane to `provider` adds a concurrent stream for a faulted lane's
+    /// remainder ([`decdn_client::LaneWiden`]): `grow` takes only permits of
+    /// `provider` that are free now and never waits, and `release` gives one
+    /// back. The lane's own stream holds its permit as its lease, so the
+    /// extra streams fit in the rest of the cap.
+    pub(crate) async fn widen(&self, provider: Address) -> decdn_client::LaneWiden {
+        let extras = Arc::new(ExtraPermits::new(self.semaphore(provider).await));
+        let released = Arc::clone(&extras);
+        decdn_client::LaneWiden::new(
+            move |most| extras.grant(most),
+            move || released.release_one(),
+        )
+    }
+}
+
+/// The extra stream permits one lane holds beside its lease
+/// ([`LaneStreamCap::widen`]).
+struct ExtraPermits {
+    /// The provider's per-lane stream semaphore.
+    semaphore: Arc<tokio::sync::Semaphore>,
+    /// The permits granted and not yet given back.
+    held: std::sync::Mutex<Vec<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+impl ExtraPermits {
+    const fn new(semaphore: Arc<tokio::sync::Semaphore>) -> Self {
+        Self {
+            semaphore,
+            held: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Take up to `most` permits that are free now, never waiting, and return
+    /// how many were taken.
+    fn grant(&self, most: usize) -> usize {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut granted = 0;
+        while granted < most {
+            let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
+                break;
+            };
+            held.push(permit);
+            granted += 1;
+        }
+        granted
+    }
+
+    /// Give back one held permit. With none held it does nothing.
+    fn release_one(&self) {
+        let permit = self
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        drop(permit);
+    }
 }
 
 /// Shared, by-reference state for the entry fetch loop. Borrowed by every
@@ -7615,6 +7672,31 @@ mod tests {
         assert_eq!(rx.try_recv().expect("a flush batch").fetched_bytes, 3);
     }
 
+    /// A lane's widen hooks grant only the provider's permits that are free
+    /// now, beside the lane's own lease, and give each one back.
+    #[tokio::test]
+    async fn a_lane_widens_only_into_free_permits_and_gives_them_back() {
+        let p1 = Address::repeat_byte(1);
+        let cap = LaneStreamCap::new(3);
+        let lease = cap.try_permit(p1).await.expect("the lane's own permit");
+        let extras = ExtraPermits::new(cap.semaphore(p1).await);
+        assert_eq!(extras.grant(1), 1, "one extra stream");
+        assert_eq!(extras.grant(usize::MAX), 1, "the last free permit");
+        assert_eq!(extras.grant(1), 0, "the cap is full");
+        extras.release_one();
+        assert_eq!(extras.grant(1), 1, "a released permit is free again");
+        extras.release_one();
+        extras.release_one();
+        extras.release_one();
+        drop(lease);
+        let all: Vec<_> = futures_util::future::join_all((0..3).map(|_| cap.try_permit(p1)))
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(all.len(), 3, "every permit came back");
+    }
+
     #[tokio::test]
     async fn lane_stream_cap_serializes_one_provider_and_frees_the_rest() {
         let p1 = Address::repeat_byte(1);
@@ -7691,6 +7773,7 @@ mod tests {
             ledger,
             coverage: None,
             lease: decdn_client::LaneLease::default(),
+            widen: None,
         })
     }
 

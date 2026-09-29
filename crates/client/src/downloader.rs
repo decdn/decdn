@@ -386,6 +386,7 @@ mod tests {
             ledger,
             coverage: None,
             lease: crate::LaneLease::default(),
+            widen: None,
         }
     }
 

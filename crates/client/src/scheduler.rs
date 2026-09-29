@@ -28,14 +28,20 @@
 //! it also covers ([`steal_split`]), so a fast source keeps helping a slow one,
 //! and a lane that joins late starts by stealing.
 //!
-//! # Lane correctness: one unit per source
+//! # Lane correctness: one unit per worker, one worker per lane by default
 //!
 //! Each worker holds EXACTLY ONE outstanding range at a time (structural: the
 //! worker loop drives one `fill_gap` to completion before it picks the next
-//! range), and each source has at most one lane. Two concurrent units to the
-//! same node would share one `(signer, provider)` payment lane and reintroduce
-//! the concurrent-same-lane voucher hazard, so parallelism comes only from
-//! having many sources, never from stacking one source.
+//! range), and each source has at most one lane. A lane runs one worker, so
+//! parallelism comes from having many sources. The one exception is a faulted
+//! lane's remainder (#2231): when no idle worker will take it, a busy lane that
+//! covers it takes it on ONE extra worker, granted by the lane's
+//! [`LaneWiden`], so the remainder does not wait behind the busy lane's whole
+//! range. The extra worker shares the lane's `(ctx, ledger)`: several streams
+//! on one `(signer, provider)` lane share its one voucher ledger, which
+//! serializes their issuance (ADR 003 § Concurrent Streams). It takes one
+//! piece, never steals, and gives its grant back when it stops. A fault on it
+//! stops only that stream: it does not cool the node.
 //!
 //! # Cancellation: closing the double-pay
 //!
@@ -243,6 +249,66 @@ impl std::fmt::Debug for LaneLease {
     }
 }
 
+/// How one lane adds a concurrent stream while an [`acquire`] runs
+/// ([`StreamCandidate::widen`]): a `grow` hook that grants extra streams and a
+/// `release` hook that gives one back.
+///
+/// The acquire relies on three rules. `grow` never waits: it grants only what
+/// it can grant now, such as a stream permit that is free. `grow` never grants
+/// more than it is asked for. And `release` is called exactly once for each
+/// stream `grow` granted, when that stream's worker stops for any reason.
+pub struct LaneWiden {
+    /// Grants up to the given number of extra streams now, without waiting,
+    /// and returns how many it granted.
+    grow: Box<dyn Fn(usize) -> usize + Send + Sync>,
+    /// Gives back one granted stream's hold.
+    release: Box<dyn Fn() + Send + Sync>,
+}
+
+impl LaneWiden {
+    /// A pair of `grow`, which grants up to the given number of extra streams
+    /// now and returns how many, and `release`, which gives one back. See the
+    /// type's rules for both.
+    pub fn new(
+        grow: impl Fn(usize) -> usize + Send + Sync + 'static,
+        release: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            grow: Box::new(grow),
+            release: Box::new(release),
+        }
+    }
+
+    /// Ask for up to `most` extra streams; returns how many were granted, at
+    /// most `most`.
+    pub(crate) fn grow(&self, most: usize) -> usize {
+        (self.grow)(most).min(most)
+    }
+
+    /// Give back one granted stream's hold.
+    pub(crate) fn release(&self) {
+        (self.release)();
+    }
+}
+
+impl std::fmt::Debug for LaneWiden {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LaneWiden")
+    }
+}
+
+/// Gives back one extra stream's grant ([`LaneWiden::release`]) when the
+/// extra worker's future ends or is dropped unfinished.
+struct ReleaseGrant<S>(Arc<StreamCandidate<S>>);
+
+impl<S> Drop for ReleaseGrant<S> {
+    fn drop(&mut self) {
+        if let Some(widen) = &self.0.widen {
+            widen.release();
+        }
+    }
+}
+
 /// A range [`Work::pick`] handed to a worker. `victim` is set when the range is
 /// a stolen tail: the peer it was taken from and that peer's unit number
 /// ([`Work::units`]) at the steal, for [`Work::cancel_victim`].
@@ -399,13 +465,30 @@ enum UnitOutcome {
     Faulted(Option<anyhow::Error>),
 }
 
-/// How one lane's run ended.
+/// How one worker's run ended.
 enum LaneEnd {
-    /// The lane found nothing it could take, with no peer holding work.
+    /// The worker found nothing it could take: for a lane's own worker, with
+    /// no peer holding work; for an extra worker, once its one piece ended.
     Idle,
-    /// The lane faulted: `Some(e)` for a `fill_gap` error, `None` for a
-    /// watchdog trip.
-    Faulted(Option<anyhow::Error>),
+    /// The worker faulted on `range`: `err` is `Some(e)` for a `fill_gap`
+    /// error, `None` for a watchdog trip.
+    Faulted {
+        err: Option<anyhow::Error>,
+        range: crate::source_set::LaneRange,
+    },
+}
+
+/// What [`run_worker`] hands back to the loop.
+struct WorkerEnd {
+    /// The lane's payee.
+    provider: Address,
+    /// How the worker ended.
+    end: LaneEnd,
+    /// Whether the worker verified any byte.
+    delivered: bool,
+    /// Whether it was an extra worker ([`Work::add_extra`]): its end touches
+    /// neither the lane's running state nor its source's health.
+    extra: bool,
 }
 
 /// Shared work-state, guarded by one [`AsyncMutex`]. `pending` holds the
@@ -440,6 +523,16 @@ struct Work {
     /// A lane without one holds the whole blob, so its coverage follows the
     /// bound as it grows ([`Work::regrow`]).
     measured: Vec<bool>,
+    /// `lane_of[i]` is the lane slot worker slot `i` fetches for: `i` itself
+    /// for a lane's own worker, the lane's slot for an extra worker
+    /// ([`Work::add_extra`]).
+    lane_of: Vec<usize>,
+    /// `extra[i]` is `true` when slot `i` is an extra worker: one more stream
+    /// a lane's [`LaneWiden`] granted for a faulted lane's remainder.
+    extra: Vec<bool>,
+    /// `widened[lane]` is `true` while the lane runs an extra worker. A lane
+    /// runs at most one.
+    widened: Vec<bool>,
     /// Pick the lowest-offset pending segment first, not the oldest. Set for a
     /// consumption-paced fetch ([`ConsumptionPacing`]): the consumer reads in
     /// offset order, so the earliest missing range is always the one it waits
@@ -458,6 +551,9 @@ impl Work {
             alive: Vec::new(),
             coverage: Vec::new(),
             measured: Vec::new(),
+            lane_of: Vec::new(),
+            extra: Vec::new(),
+            widened: Vec::new(),
             front_first,
         }
     }
@@ -466,6 +562,7 @@ impl Work {
     /// slot. `coverage` is the lane's probed bitmap, or `None` for a lane that
     /// holds the whole blob of `total_bytes`.
     fn add_lane(&mut self, coverage: Option<Coverage>, total_bytes: u64) -> usize {
+        let slot = self.in_flight.len();
         self.in_flight.push(None);
         self.cancel.push(Arc::new(CancelHandle::new()));
         self.units.push(0);
@@ -473,7 +570,91 @@ impl Work {
         self.measured.push(coverage.is_some());
         self.coverage
             .push(coverage.unwrap_or_else(|| Coverage::full(num_blocks(total_bytes))));
-        self.in_flight.len() - 1
+        self.lane_of.push(slot);
+        self.extra.push(false);
+        self.widened.push(false);
+        slot
+    }
+
+    /// Give lane `lane` an extra worker's slot, alive and holding nothing, and
+    /// mark the lane widened. Returns the slot.
+    fn add_extra(&mut self, lane: usize) -> usize {
+        let slot = self.in_flight.len();
+        self.in_flight.push(None);
+        self.cancel.push(Arc::new(CancelHandle::new()));
+        self.units.push(0);
+        self.alive.push(true);
+        self.measured
+            .push(self.measured.get(lane).copied().unwrap_or(true));
+        self.coverage.push(
+            self.coverage
+                .get(lane)
+                .cloned()
+                .unwrap_or_else(Coverage::empty),
+        );
+        self.lane_of.push(lane);
+        self.extra.push(true);
+        self.widened.push(false);
+        if let Some(widened) = self.widened.get_mut(lane) {
+            *widened = true;
+        }
+        slot
+    }
+
+    /// End extra worker slot `i`: it is gone for good, and its lane may be
+    /// widened again.
+    fn end_extra(&mut self, i: usize) {
+        self.park(i);
+        if let Some(&lane) = self.lane_of.get(i)
+            && let Some(widened) = self.widened.get_mut(lane)
+        {
+            *widened = false;
+        }
+    }
+
+    /// Who can grow for each pending range no idle worker will take: per such
+    /// range, the running lanes that may be asked for one extra worker for it,
+    /// in lane order (#2231).
+    ///
+    /// Ranges are matched to idle workers one to one, in queue order: an idle
+    /// worker is an alive slot that holds no range, and it takes a range it
+    /// covers, or one no running lane covers (#2225), on its next pick. A lane
+    /// may be asked for a range only while its own worker runs a range of its
+    /// own, it has no extra worker yet, `can_grow` says it has a growth hook,
+    /// and it covers part of that range.
+    fn growth_wanted(&self, total_bytes: u64, can_grow: impl Fn(usize) -> bool) -> Vec<Vec<usize>> {
+        let covers = |slot: usize, seg: &AlignedRange| {
+            self.coverage
+                .get(slot)
+                .is_some_and(|c| !covered_part(c, seg.chunk_ranges(), total_bytes).is_empty())
+        };
+        let mut idle: Vec<usize> = (0..self.in_flight.len())
+            .filter(|&i| {
+                self.alive.get(i) == Some(&true)
+                    && self.in_flight.get(i).is_some_and(Option::is_none)
+            })
+            .collect();
+        let mut wanted = Vec::new();
+        for seg in &self.pending {
+            let orphan = !self.uncovered_part(seg, total_bytes).is_empty();
+            if let Some(pos) = idle.iter().position(|&i| orphan || covers(i, seg)) {
+                idle.swap_remove(pos);
+                continue;
+            }
+            wanted.push(
+                (0..self.in_flight.len())
+                    .filter(|&lane| {
+                        self.extra.get(lane) == Some(&false)
+                            && self.alive.get(lane) == Some(&true)
+                            && self.in_flight.get(lane).is_some_and(Option::is_some)
+                            && self.widened.get(lane) == Some(&false)
+                            && can_grow(lane)
+                            && covers(lane, seg)
+                    })
+                    .collect(),
+            );
+        }
+        wanted
     }
 
     /// Plan `missing` afresh under a grown bound of `total_bytes`: every lane
@@ -650,6 +831,10 @@ impl Work {
     /// `Ok(None)` means there is nothing this worker can start right now: it
     /// parks while [`Work::busy`] holds, and ends otherwise.
     ///
+    /// With `steal` off, the pick stops before the steal: an extra worker
+    /// takes one queued piece and never steals, so it adds at most one stream
+    /// beside its lane's own.
+    ///
     /// # Errors
     ///
     /// An out-of-range worker index; or the alignment error [`steal_split`]
@@ -660,6 +845,7 @@ impl Work {
         i: usize,
         total_bytes: u64,
         coverage: &Coverage,
+        steal: bool,
     ) -> anyhow::Result<Option<Picked>> {
         // This worker is starting a fresh unit: clear any cancel signal left from
         // a prior unit, under the lock, so a stale `notify_one` permit cannot
@@ -714,6 +900,10 @@ impl Work {
                 range: picked,
                 victim: None,
             }));
+        }
+        if !steal {
+            *self.slot_mut(i)? = None;
+            return Ok(None);
         }
 
         // Nothing pending this worker can serve: every remaining byte is
@@ -1079,24 +1269,30 @@ struct Engine<'a, St, Pc, F> {
 /// because a peer's range may yet be re-queued or become splittable. It ends
 /// [`LaneEnd::Idle`] once no lane holds work, and [`LaneEnd::Faulted`] on a
 /// fault, after re-queueing its remainder. Either way it parks its slot
-/// ([`Work::park`]) before it returns. The `bool` says whether the lane
-/// verified any byte in this run.
+/// ([`Work::park`]) before it returns.
+///
+/// An `extra` worker (#2231) is one more stream of a busy lane, granted for a
+/// faulted lane's remainder: it takes one queued piece, never steals, and ends
+/// when that piece ends, when it finds none, or when its lane's own worker
+/// has stopped.
 ///
 /// # Errors
 ///
 /// A store I/O failure or an out-of-range slot: faults of this process, not of
 /// the source.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 // One pick -> drive -> outcome loop. The three unit outcomes each justify a
-// money-relevant decision against the loop state they act on; splitting them
-// out would separate the two.
+// money-relevant decision against the loop state they act on, and an extra
+// worker's one-piece exits sit beside them; splitting them out would separate
+// the decisions from that state.
 async fn run_worker<St, S, Pc, F>(
     engine: &Engine<'_, St, Pc, F>,
     i: usize,
     lane: Arc<StreamCandidate<S>>,
     provider: Address,
     health: &PeerHealth,
-) -> anyhow::Result<(Address, LaneEnd, bool)>
+    extra: bool,
+) -> anyhow::Result<WorkerEnd>
 where
     St: IngestStore,
     S: BlobSource,
@@ -1146,21 +1342,44 @@ where
         // Tiny critical section: pick a range, then DROP the guard before the
         // `fill_gap` await (the guard does not cross the await point).
         let total_bytes = store.total_bytes();
+        let idle = || WorkerEnd {
+            provider,
+            end: LaneEnd::Idle,
+            delivered,
+            extra,
+        };
         let picked = {
             let mut w = work.lock().await;
-            w.pick(i, total_bytes, &my_coverage)?
+            // An extra worker whose lane's own worker stopped takes nothing.
+            let lane_stopped = extra
+                && w.lane_of
+                    .get(i)
+                    .and_then(|&l| w.alive.get(l))
+                    .is_none_or(|alive| !alive);
+            if lane_stopped {
+                None
+            } else {
+                w.pick(i, total_bytes, &my_coverage, !extra)?
+            }
         };
         let Some(Picked { range, victim }) = picked else {
-            // Nothing to start right now. End only when no lane holds work;
-            // otherwise park: a peer's range is still draining toward a
-            // requeue or a splittable size.
+            // Nothing to start right now. An extra worker ends here. A lane's
+            // own worker ends only when no lane holds work; otherwise it
+            // parks: a peer's range is still draining toward a requeue or a
+            // splittable size.
             {
                 let mut w = work.lock().await;
+                if extra {
+                    w.end_extra(i);
+                    drop(w);
+                    wake();
+                    return Ok(idle());
+                }
                 if !w.busy() {
                     w.park(i);
                     drop(w);
                     wake();
-                    return Ok((provider, LaneEnd::Idle, delivered));
+                    return Ok(idle());
                 }
             }
             parked.await;
@@ -1185,7 +1404,15 @@ where
             store.total_bytes(),
         );
         if gaps.is_empty() {
-            work.lock().await.clear(i)?;
+            let mut w = work.lock().await;
+            w.clear(i)?;
+            if extra {
+                w.end_extra(i);
+                drop(w);
+                wake();
+                return Ok(idle());
+            }
+            drop(w);
             wake();
             continue;
         }
@@ -1203,6 +1430,8 @@ where
         // whole picked range so a peer's steal-trim and this worker's
         // `requeue_missing` (which recomputes the whole range's remainder) agree.
         let mut terminal: Option<UnitOutcome> = None;
+        // The unit's verified bytes across its gaps, for the fault's log line.
+        let mut landed = 0u64;
         for (g_start, g_len) in gaps {
             let verified = AtomicU64::new(0);
             let outcome = {
@@ -1264,7 +1493,9 @@ where
                     }
                 }
             };
-            if verified.load(Ordering::Relaxed) > 0 {
+            let gap_landed = verified.load(Ordering::Relaxed);
+            landed = landed.saturating_add(gap_landed);
+            if gap_landed > 0 {
                 delivered = true;
                 health.record_progress(provider);
             }
@@ -1281,7 +1512,6 @@ where
             // Every gap filled: free the lane and pick again.
             None | Some(UnitOutcome::Completed) => {
                 work.lock().await.clear(i)?;
-                wake();
             }
             // Stolen: re-queue the trimmed remainder and stay live. The
             // credit-window tail [paid_frontier, checkpointed_frontier) is NOT
@@ -1292,16 +1522,105 @@ where
             // the single-source cross-invocation resume.
             Some(UnitOutcome::Cancelled) => {
                 requeue_missing(store, work, i).await?;
-                wake();
             }
-            // Stalled/faulted: re-queue the remainder and end the lane.
+            // Stalled/faulted: re-queue the remainder and end the worker.
             Some(UnitOutcome::Faulted(err)) => {
                 requeue_missing(store, work, i).await?;
-                work.lock().await.park(i);
+                {
+                    let mut w = work.lock().await;
+                    if extra {
+                        w.end_extra(i);
+                    } else {
+                        w.park(i);
+                    }
+                }
                 wake();
-                return Ok((provider, LaneEnd::Faulted(err), delivered));
+                let range = crate::source_set::LaneRange {
+                    offset: r_start,
+                    len: r_len,
+                    landed,
+                };
+                return Ok(WorkerEnd {
+                    provider,
+                    end: LaneEnd::Faulted { err, range },
+                    delivered,
+                    extra,
+                });
             }
         }
+        // An extra worker takes one piece, then gives its stream back.
+        if extra {
+            work.lock().await.end_extra(i);
+            wake();
+            return Ok(WorkerEnd {
+                provider,
+                end: LaneEnd::Idle,
+                delivered,
+                extra,
+            });
+        }
+        wake();
+    }
+}
+
+/// One worker's future: [`run_worker`], holding `grant` for an extra worker.
+/// The grant moves into the future when it is built, so it is given back when
+/// the worker ends, and also when the future is dropped, polled or not.
+async fn worker<St, S, Pc, F>(
+    engine: &Engine<'_, St, Pc, F>,
+    i: usize,
+    lane: Arc<StreamCandidate<S>>,
+    provider: Address,
+    health: &PeerHealth,
+    grant: Option<ReleaseGrant<S>>,
+) -> anyhow::Result<WorkerEnd>
+where
+    St: IngestStore,
+    S: BlobSource,
+    Pc: Pacer,
+    F: Funder,
+{
+    let extra = grant.is_some();
+    let _grant = grant;
+    run_worker(engine, i, lane, provider, health, extra).await
+}
+
+/// Log, where it happens, that an extra worker's stream faulted on `range`.
+/// Such a fault is most often a refusal of the additional stream, which is
+/// routine, so the line is at debug when nothing landed and at info
+/// otherwise. It never cools the node.
+fn log_extra_fault(
+    provider: Address,
+    hash: [u8; 32],
+    range: crate::source_set::LaneRange,
+    err: &anyhow::Error,
+) {
+    let hash = blake3::Hash::from_bytes(hash).to_hex();
+    let crate::source_set::LaneRange {
+        offset,
+        len,
+        landed,
+    } = range;
+    if landed > 0 {
+        tracing::info!(
+            %provider,
+            %hash,
+            offset,
+            len,
+            landed,
+            error = %format_args!("{err:#}"),
+            "an extra stream of a lane faulted; its remainder goes back to the queue"
+        );
+    } else {
+        tracing::debug!(
+            %provider,
+            %hash,
+            offset,
+            len,
+            error = %format_args!("{err:#}"),
+            "an extra stream of a lane faulted before any verified byte; its range goes back \
+             to the queue"
+        );
     }
 }
 
@@ -1411,6 +1730,9 @@ impl<S> Drop for ReleaseLeases<S> {
 /// Every started lane's `(ctx, ledger)`: the pool-wide view of an acquire
 /// with no run registry.
 type PoolLanes = Vec<(Arc<Mutex<PoolContext>>, Arc<PoolLedger>)>;
+
+/// Each lane slot's provider and lane, keyed by the lane's slot in [`Work`].
+type LaneAt<S> = HashMap<usize, (Address, Arc<StreamCandidate<S>>)>;
 
 /// Add a lane that starts for the first time to the pool view. A lane that
 /// joins late adopts a top-up credited before it did, so it never gates on a
@@ -1775,6 +2097,12 @@ where
     let mut discovering: Option<SourceFuture<'p, Vec<Holder>>> = None;
     let mut running: HashSet<Address> = HashSet::new();
     let mut slots: HashMap<Address, usize> = HashMap::new();
+    // Each lane slot's provider and lane, for a growth request (#2231).
+    let mut lane_at: LaneAt<P::Source> = HashMap::new();
+    // Extra workers still running, and whether a lane fault wants a growth
+    // request once this pass has started its lanes.
+    let mut extras_running = 0usize;
+    let mut want_growth = false;
     let mut ready: Vec<(Address, Arc<StreamCandidate<P::Source>>)> = Vec::new();
     let mut seeded = false;
     let mut flush = tokio::time::interval_at(
@@ -1792,6 +2120,7 @@ where
             }
             if running.is_empty()
                 && ready.is_empty()
+                && extras_running == 0
                 && all_present(store, &want.ranges, &work).await?
             {
                 if store.proven().is_some() || !want.tail {
@@ -1877,7 +2206,56 @@ where
                         started.0.push(Arc::clone(&lane));
                     }
                     running.insert(provider);
-                    workers.push(run_worker(&engine, slot, lane, provider, &health));
+                    lane_at.insert(slot, (provider, Arc::clone(&lane)));
+                    workers.push(worker(&engine, slot, lane, provider, &health, None));
+                }
+            }
+
+            // A lane faulted and put its remainder back: when no idle worker
+            // will take a range, a busy lane that covers it takes it on one
+            // extra stream, so it does not wait for that lane's whole range
+            // (#2231). Asked after this pass started its lanes, so a lane
+            // that just started counts as a taker.
+            if std::mem::take(&mut want_growth) {
+                let mut w = work.lock().await;
+                let wanted = w.growth_wanted(total_bytes, |lane| {
+                    lane_at.get(&lane).is_some_and(|(_, l)| l.widen.is_some())
+                });
+                let mut asked: HashSet<usize> = HashSet::new();
+                let mut waiting = 0usize;
+                for candidates in wanted {
+                    // Ask each covering lane once per request, in lane order,
+                    // until one grants a stream. `grow` never waits.
+                    let taker = candidates.into_iter().find_map(|lane| {
+                        if !asked.insert(lane) {
+                            return None;
+                        }
+                        let (provider, l) = lane_at.get(&lane)?;
+                        let granted = l.widen.as_ref().is_some_and(|widen| widen.grow(1) > 0);
+                        granted.then(|| (lane, *provider, Arc::clone(l)))
+                    });
+                    let Some((lane, provider, l)) = taker else {
+                        waiting = waiting.saturating_add(1);
+                        continue;
+                    };
+                    // The grant is built before the future and moves into it,
+                    // so it is given back however the worker ends.
+                    let grant = ReleaseGrant(Arc::clone(&l));
+                    let slot = w.add_extra(lane);
+                    workers.push(worker(&engine, slot, l, provider, &health, Some(grant)));
+                    extras_running = extras_running.saturating_add(1);
+                    tracing::debug!(
+                        %provider,
+                        "a busy lane takes one extra stream for a faulted lane's remainder"
+                    );
+                }
+                if waiting > 0 {
+                    tracing::info!(
+                        hash = %blake3::Hash::from_bytes(hash).to_hex(),
+                        waiting,
+                        "a faulted lane's remainder waits for a busy lane: no running lane \
+                         could take one more stream"
+                    );
                 }
             }
 
@@ -1902,23 +2280,41 @@ where
                 biased;
                 Some(end) = workers.next(), if !workers.is_empty() => {
                     // `Err` here is this process's fault (store I/O, a slot bug).
-                    let (provider, end, delivered) = match end {
+                    let WorkerEnd { provider, end, delivered, extra } = match end {
                         Ok(end) => end,
                         Err(err) => return Err(flushed(store, err).await),
                     };
-                    running.remove(&provider);
+                    if extra {
+                        extras_running = extras_running.saturating_sub(1);
+                    } else {
+                        running.remove(&provider);
+                    }
                     if delivered {
                         sources.record_progress(provider);
                     }
-                    if let LaneEnd::Faulted(err) = end {
+                    if let LaneEnd::Faulted { err, range } = end {
                         let err = err.unwrap_or_else(|| {
                             anyhow::anyhow!("no verified progress for {watchdog:?}")
                         });
-                        let deposit = pool_deposit(&deposit_rx, &started.0);
-                        if let Fault::Fatal(_) =
-                            sources.record_fault(provider, &err, Instant::now(), deposit)
-                        {
-                            return Err(flushed(store, err).await);
+                        if extra {
+                            // A fault on an extra stream stops only that stream:
+                            // it is most often a refusal of the additional
+                            // stream, so it neither cools the node nor asks for
+                            // more growth. A fatal fault is the pool's or ours,
+                            // not the stream's, and still ends the acquire.
+                            if let Fault::Fatal(_) = crate::fault::classify(&err) {
+                                return Err(flushed(store, err).await);
+                            }
+                            log_extra_fault(provider, hash, range, &err);
+                        } else {
+                            let deposit = pool_deposit(&deposit_rx, &started.0);
+                            let now = Instant::now();
+                            if let Fault::Fatal(_) =
+                                sources.record_fault(provider, &err, Some(range), now, deposit)
+                            {
+                                return Err(flushed(store, err).await);
+                            }
+                            want_growth = true;
                         }
                     }
                     progress_wake.notify_waiters();
@@ -2065,6 +2461,7 @@ mod tests {
             ledger,
             coverage,
             lease: LaneLease::new(()),
+            widen: None,
         }
     }
 
@@ -2943,6 +3340,9 @@ mod tests {
             units: vec![1, 0, 0],
             coverage: vec![coverage.clone(), coverage.clone(), coverage.clone()],
             measured: vec![true; 3],
+            lane_of: (0..3).collect(),
+            extra: vec![false; 3],
+            widened: vec![false; 3],
             front_first: false,
         };
         let victim_flag = |w: &Work| {
@@ -2954,7 +3354,7 @@ mod tests {
         // A single steal: `pick` trims but does not cancel; `cancel_victim` does.
         let mut work = fresh_work();
         let first = work
-            .pick(1, total, &coverage)?
+            .pick(1, total, &coverage, true)?
             .ok_or_else(|| anyhow::anyhow!("worker 1 must steal worker 0's tail"))?;
         let (victim, unit) = first
             .victim
@@ -2976,7 +3376,7 @@ mod tests {
         // stealer's cancel still fires even if the second stealer skips its own.
         let mut work = fresh_work();
         let first = work
-            .pick(1, total, &coverage)?
+            .pick(1, total, &coverage, true)?
             .ok_or_else(|| anyhow::anyhow!("worker 1 must steal"))?;
         let (v1, u1) = first
             .victim
@@ -2992,7 +3392,7 @@ mod tests {
         // The victim finished and started a new unit: a late cancel must not hit it.
         let mut work = fresh_work();
         let stolen = work
-            .pick(1, total, &coverage)?
+            .pick(1, total, &coverage, true)?
             .ok_or_else(|| anyhow::anyhow!("worker 1 must steal"))?;
         let (victim, unit) = stolen
             .victim
@@ -3000,7 +3400,7 @@ mod tests {
         work.clear(victim)?;
         work.pending
             .push_back(decdn_bao_range::align_range(0, 1, total)?);
-        work.pick(victim, total, &coverage)?
+        work.pick(victim, total, &coverage, true)?
             .ok_or_else(|| anyhow::anyhow!("the victim must pick its new unit"))?;
         work.cancel_victim(victim, unit);
         assert!(
@@ -4881,6 +5281,247 @@ mod tests {
         assert!(
             took_last < covered_done,
             "the uncovered block started before the covered work ended"
+        );
+        Ok(())
+    }
+
+    // ---- a busy lane grows for a faulted lane's remainder (#2231) ----
+
+    /// Counts what a [`super::LaneWiden`] granted and got back.
+    #[derive(Default)]
+    struct WidenCount {
+        granted: std::sync::atomic::AtomicUsize,
+        released: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WidenCount {
+        fn granted(&self) -> usize {
+            self.granted.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn released(&self) -> usize {
+            self.released.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A lane's widen hooks over `room` stream permits, like the CLI's permit
+    /// grant: `grow` hands out only what is free now, and `release` frees one.
+    fn counting_widen(room: usize) -> (super::LaneWiden, Arc<WidenCount>) {
+        use std::sync::atomic::Ordering;
+        let count = Arc::new(WidenCount::default());
+        let (on_grow, on_release) = (Arc::clone(&count), Arc::clone(&count));
+        let widen = super::LaneWiden::new(
+            move |most| {
+                let held = on_grow.granted().saturating_sub(on_grow.released());
+                let give = most.min(room.saturating_sub(held));
+                on_grow.granted.fetch_add(give, Ordering::SeqCst);
+                give
+            },
+            move || {
+                on_release.released.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        (widen, count)
+    }
+
+    /// Static lanes that report every source fault the set records.
+    struct FaultLog<'a> {
+        inner: &'a StaticSources<ScriptedSource>,
+        faulted: Mutex<Vec<Address>>,
+    }
+
+    impl crate::SourceProvider for FaultLog<'_> {
+        type Source = ScriptedSource;
+
+        fn discover(&self, hash: [u8; 32]) -> crate::SourceFuture<'_, Vec<crate::Holder>> {
+            self.inner.discover(hash)
+        }
+
+        fn connect<'b>(
+            &'b self,
+            holder: &'b crate::Holder,
+        ) -> crate::SourceFuture<'b, StreamCandidate<ScriptedSource>> {
+            self.inner.connect(holder)
+        }
+
+        fn on_source_fault(&self, holder: &crate::Holder) {
+            if let Ok(mut f) = self.faulted.lock() {
+                f.push(holder.provider);
+            }
+        }
+    }
+
+    /// Acquire the whole blob into `store` over `provider`'s lanes, with the
+    /// lane watchdog on.
+    async fn acquire_over<P: crate::SourceProvider>(
+        store: &ClientRangedStore,
+        provider: &P,
+        holders: Vec<crate::Holder>,
+        root: [u8; 32],
+        lanes: usize,
+    ) -> anyhow::Result<()> {
+        let total = store.total_bytes();
+        let mut set = SourceSet::new(provider, root, Arc::default(), holders);
+        let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+        let drive = drive_config();
+        let (pacer, funder) = (BudgetPacer::new(), no_topups());
+        let whole = [(0, total)];
+        acquire(
+            AcquireTarget {
+                store,
+                hash: root,
+                total_bytes: total,
+                ranges: &whole,
+            },
+            &mut set,
+            &AcquireEnv {
+                pacer: &pacer,
+                funder: &funder,
+                drive: &drive,
+                max_lanes: lanes,
+                stop: &stop,
+                on_progress: None,
+                ledgers: None,
+                pacing: None,
+            },
+        )
+        .await
+    }
+
+    /// A lane that dies after its first MiB and refuses every later stream.
+    fn dead_after_first_mib(
+        data: &[u8],
+        ledger: &Arc<PoolLedger>,
+    ) -> anyhow::Result<ScriptedSource> {
+        Ok(ScriptedSource::new(data.to_vec())?
+            .with_fault_after(MIB as usize, || anyhow::anyhow!("scripted reset"))
+            .refusing_opens_from(1, || anyhow::anyhow!("scripted refusal"))
+            .paying(Arc::clone(ledger)))
+    }
+
+    /// A lane busy with a long range: every leg pauses 5 s after its first MiB.
+    fn busy(data: &[u8], ledger: &Arc<PoolLedger>) -> anyhow::Result<ScriptedSource> {
+        Ok(ScriptedSource::new(data.to_vec())?
+            .stall_after(MIB, Duration::from_secs(5))
+            .paying(Arc::clone(ledger)))
+    }
+
+    /// Three lanes, no reserve: one node dies mid-range while the other two
+    /// are busy with long ranges. A busy lane that covers the dead node's
+    /// remainder takes it on one extra stream, so the remainder starts before
+    /// either busy lane finishes its own range, and the grant comes back.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_nodes_remainder_is_taken_by_a_busy_covering_lane() -> anyhow::Result<()> {
+        let data = blob(48 * MIB as usize);
+        let ledgers: Vec<Arc<PoolLedger>> = (0..3)
+            .map(|_| Arc::new(PoolLedger::new(Cumulative::default())))
+            .collect();
+        let [la, lb, lc] = ledgers.as_slice() else {
+            anyhow::bail!("three ledgers");
+        };
+        let a = dead_after_first_mib(&data, la)?;
+        let b = busy(&data, lb)?;
+        let c = busy(&data, lc)?;
+        let (widen_b, count_b) = counting_widen(1);
+        let (widen_c, count_c) = counting_widen(1);
+        let mut cand_b = candidate(b.clone(), Arc::clone(lb), 0xB2, None);
+        cand_b.widen = Some(widen_b);
+        let mut cand_c = candidate(c.clone(), Arc::clone(lc), 0xC3, None);
+        cand_c.widen = Some(widen_c);
+        let provider = StaticSources::new(vec![
+            candidate(a.clone(), Arc::clone(la), 0xA1, None),
+            cand_b,
+            cand_c,
+        ])?;
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, dir) = fresh_store(root, total);
+        acquire_over(&store, &provider, provider.holders(), root, 3).await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+        let (dead_start, _, _) = a
+            .timeline()
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("A opened its range"))?;
+        let dead_end = dead_start + total / 3;
+        let remainder_opened = b
+            .timeline()
+            .into_iter()
+            .chain(c.timeline())
+            .filter(|&(start, _, _)| start > dead_start && start < dead_end)
+            .map(|(_, opened, _)| opened)
+            .min()
+            .ok_or_else(|| anyhow::anyhow!("a busy lane took the remainder"))?;
+        let first_finish = |src: &ScriptedSource| {
+            src.timeline()
+                .first()
+                .and_then(|&(_, _, finished)| finished)
+        };
+        let busy_done = first_finish(&b)
+            .into_iter()
+            .chain(first_finish(&c))
+            .min()
+            .ok_or_else(|| anyhow::anyhow!("the busy lanes finished their ranges"))?;
+        assert!(
+            remainder_opened < busy_done,
+            "the remainder started before either busy lane finished its own range"
+        );
+        let granted = count_b.granted() + count_c.granted();
+        assert!(granted >= 1, "a busy lane grew one extra stream");
+        assert_eq!(
+            count_b.released() + count_c.released(),
+            granted,
+            "every extra stream gave its grant back"
+        );
+        Ok(())
+    }
+
+    /// A node that refuses the extra stream is not cooled for it: the refusal
+    /// stops only that stream, the lane's own worker takes the range once its
+    /// own range ends, the fetch completes, and the grant comes back.
+    #[tokio::test(start_paused = true)]
+    async fn a_fault_on_an_extra_stream_does_not_cool_the_node() -> anyhow::Result<()> {
+        let data = blob(32 * MIB as usize);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let lb = Arc::new(PoolLedger::new(Cumulative::default()));
+        let a = dead_after_first_mib(&data, &la)?;
+        // B's second open is the extra stream: it refuses it.
+        let b = busy(&data, &lb)?.refusing_open(1, || anyhow::anyhow!("scripted overload"));
+        let (widen, count) = counting_widen(1);
+        let mut cand_b = candidate(b.clone(), Arc::clone(&lb), 0xB2, None);
+        cand_b.widen = Some(widen);
+        let lanes = StaticSources::new(vec![candidate(a.clone(), la, 0xA1, None), cand_b])?;
+        let provider = FaultLog {
+            inner: &lanes,
+            faulted: Mutex::new(Vec::new()),
+        };
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, dir) = fresh_store(root, total);
+        acquire_over(&store, &provider, lanes.holders(), root, 2).await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+        // A returns after its cooldown, faults again, and B may be asked again
+        // once its first extra stream has ended: at most one at a time.
+        assert!(count.granted() >= 1, "B grew an extra stream");
+        assert_eq!(
+            count.released(),
+            count.granted(),
+            "every grant came back, the refused one included"
+        );
+        let faulted = provider
+            .faulted
+            .lock()
+            .map(|f| f.clone())
+            .unwrap_or_default();
+        assert!(
+            !faulted.contains(&Address::repeat_byte(0xB2)),
+            "the refused extra stream must not cool B: {faulted:?}"
+        );
+        assert!(
+            faulted.contains(&Address::repeat_byte(0xA1)),
+            "A's death is A's"
         );
         Ok(())
     }

@@ -838,6 +838,33 @@ mod doubles {
         }
 
         #[cfg(test)]
+        /// Refuse the open with 0-based index `nth`, in call order, with the
+        /// fault `make` produces. Every other open is served as usual.
+        #[must_use]
+        pub(crate) fn refusing_open(
+            mut self,
+            nth: usize,
+            make: impl Fn() -> anyhow::Error + Send + Sync + 'static,
+        ) -> Self {
+            self.refuse_open = Some((nth..nth.saturating_add(1), Arc::new(make)));
+            self
+        }
+
+        #[cfg(test)]
+        /// Refuse every open from 0-based index `first` on, in call order,
+        /// with the fault `make` produces: a node that serves the streams it
+        /// already has and refuses any more.
+        #[must_use]
+        pub(crate) fn refusing_opens_from(
+            mut self,
+            first: usize,
+            make: impl Fn() -> anyhow::Error + Send + Sync + 'static,
+        ) -> Self {
+            self.refuse_open = Some((first..usize::MAX, Arc::new(make)));
+            self
+        }
+
+        #[cfg(test)]
         /// Each leg's `(fetch_start, opened_at, finished_at)`, in open order
         /// (see `timeline`).
         #[must_use]

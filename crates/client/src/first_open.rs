@@ -160,7 +160,7 @@ where
                         sources.record_progress(provider);
                         return Ok((provider, answer));
                     }
-                    Err(err) => match sources.record_fault(provider, &err, Instant::now(), deposit) {
+                    Err(err) => match sources.record_fault(provider, &err, None, Instant::now(), deposit) {
                         Fault::Fatal(_) => return Err(err),
                         Fault::Transient => {
                             held_off.insert(provider, Instant::now() + BUILD_RETRY_BASE);
@@ -213,6 +213,7 @@ mod tests {
             ledger: Arc::new(PoolLedger::new(Cumulative::default())),
             coverage: None,
             lease: LaneLease::new(()),
+            widen: None,
         }
     }
 

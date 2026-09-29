@@ -54,6 +54,17 @@ pub struct Holder {
     pub probed_holder: bool,
 }
 
+/// The range a lane held when it faulted ([`SourceSet::record_fault`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneRange {
+    /// The range's first byte.
+    pub offset: u64,
+    /// The range's length in bytes.
+    pub len: u64,
+    /// The bytes of the range that verified before the fault.
+    pub landed: u64,
+}
+
 /// How many `NotFound` answers in a row, with no verified byte between them,
 /// mark a provider that is not a probed holder as absent.
 pub const ABSENT_AFTER_NOT_FOUND: u32 = 3;
@@ -309,14 +320,46 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// Record the fault `provider`'s lane ended with, and return its class.
+    ///
+    /// Each fault is logged at info where it is recorded: the provider, the
+    /// blob, the lane's `range` and the bytes of it that landed when the lane
+    /// held one, and the error. A fetch that recovers reports no lane fault,
+    /// so this line is the record of it.
     pub fn record_fault(
         &mut self,
         provider: Address,
         err: &anyhow::Error,
+        range: Option<LaneRange>,
         now: Instant,
         deposit: U256,
     ) -> Fault {
         let fault = classify(err);
+        let hash = blake3::Hash::from_bytes(self.hash).to_hex();
+        if let Some(LaneRange {
+            offset,
+            len,
+            landed,
+        }) = range
+        {
+            tracing::info!(
+                %provider,
+                %hash,
+                offset,
+                len,
+                landed,
+                ?fault,
+                error = %format_args!("{err:#}"),
+                "a lane faulted; its remainder goes to the other lanes"
+            );
+        } else {
+            tracing::info!(
+                %provider,
+                %hash,
+                ?fault,
+                error = %format_args!("{err:#}"),
+                "a source faulted"
+            );
+        }
         match fault {
             Fault::Source => {
                 if crate::fault::says_absent(err)
@@ -331,7 +374,6 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             Fault::Fatal(_) | Fault::Unaffordable | Fault::Transient => {}
         }
         self.health.record(provider, fault, now, deposit);
-        tracing::debug!(%provider, ?fault, "source fault: {err:#}");
         fault
     }
 
@@ -699,6 +741,7 @@ mod tests {
             ledger: Arc::new(PoolLedger::new(Cumulative::default())),
             coverage: None,
             lease: LaneLease::new(()),
+            widen: None,
         })
     }
 
@@ -733,7 +776,7 @@ mod tests {
         let p = provider(vec![]);
         let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
         let now = Instant::now();
-        let fault = set.record_fault(A, &anyhow::anyhow!("reset"), now, U256::ZERO);
+        let fault = set.record_fault(A, &anyhow::anyhow!("reset"), None, now, U256::ZERO);
         assert_eq!(fault, Fault::Source);
         assert!(
             set.next_to_start(now, U256::ZERO, &HashSet::new())
@@ -786,7 +829,7 @@ mod tests {
         let p = provider(vec![]);
         let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
         let now = Instant::now();
-        set.record_fault(A, &anyhow::anyhow!("reset"), now, U256::ZERO);
+        set.record_fault(A, &anyhow::anyhow!("reset"), None, now, U256::ZERO);
         assert!(
             set.wants_discovery(now, U256::ZERO, 0, false),
             "starved: A is cooling"
@@ -830,8 +873,8 @@ mod tests {
                 gap_len: 1,
             })
         };
-        set.record_fault(A, &dry(), now, dep);
-        set.record_fault(B, &dry(), now, dep);
+        set.record_fault(A, &dry(), None, now, dep);
+        set.record_fault(B, &dry(), None, now, dep);
         assert!(set.exhausted(dep, true).is_none(), "top-ups left");
         assert!(
             set.exhausted(dep, false).is_none(),
@@ -861,7 +904,7 @@ mod tests {
         now: Instant,
     ) {
         for _ in 0..times {
-            set.record_fault(provider, &not_found(), now, U256::ZERO);
+            set.record_fault(provider, &not_found(), None, now, U256::ZERO);
         }
     }
 
@@ -1060,9 +1103,9 @@ mod tests {
             gap_start: 0,
             gap_len: 1,
         });
-        set.record_fault(A, &dry, now, dep);
+        set.record_fault(A, &dry, None, now, dep);
         for _ in 0..super::ABSENT_AFTER_NOT_FOUND {
-            set.record_fault(B, &not_found(), now, dep);
+            set.record_fault(B, &not_found(), None, now, dep);
         }
         set.discovery_done(Ok(vec![]), now, dep);
         assert!(set.exhausted(dep, true).is_none(), "top-ups left");

@@ -238,7 +238,7 @@ pub use peer_store::{PeerRecord, PeerStore, StoreConfig};
 pub use ranged_store::ClientRangedStore;
 pub use rate_limited::UpstreamRateLimited;
 pub use scheduler::{
-    AcquireEnv, AcquireTarget, ConsumptionPacing, LANE_WATCHDOG, LaneLease, acquire,
+    AcquireEnv, AcquireTarget, ConsumptionPacing, LANE_WATCHDOG, LaneLease, LaneWiden, acquire,
 };
 pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{
@@ -246,7 +246,8 @@ pub use source::{
     SourceFuture,
 };
 pub use source_set::{
-    Holder, NoAffordableSource, NoSourceHasBlob, SourceProvider, SourceSet, StaticSources,
+    Holder, LaneRange, NoAffordableSource, NoSourceHasBlob, SourceProvider, SourceSet,
+    StaticSources,
 };
 pub use stop::{ClockHold, GaveUp, ProgressClock, SCRIPT_GIVE_UP, StopPolicy};
 pub use streamer::{LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader};

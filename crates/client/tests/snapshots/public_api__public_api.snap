@@ -75,6 +75,7 @@ pub struct decdn_client::discovery::Probed
 pub decdn_client::discovery::Probed::candidate: decdn_client::discovery::NodeCandidate
 pub decdn_client::discovery::Probed::coverage: decdn_protocol::coverage::Coverage
 pub decdn_client::discovery::Probed::rtt_ms: f64
+pub decdn_client::discovery::Probed::total_bytes: core::option::Option<u64>
 pub struct decdn_client::discovery::WarmingCandidate
 pub decdn_client::discovery::WarmingCandidate::eth_address: alloy_primitives::bits::address::Address
 pub decdn_client::discovery::WarmingCandidate::node_id: iroh_base::key::PublicKey
@@ -93,7 +94,6 @@ pub struct decdn_client::downloader::DownloadTarget<'a>
 pub decdn_client::downloader::DownloadTarget::dest: &'a std::path::Path
 pub decdn_client::downloader::DownloadTarget::hash: [u8; 32]
 pub decdn_client::downloader::DownloadTarget::ranges: core::option::Option<&'a [(u64, u64)]>
-pub decdn_client::downloader::DownloadTarget::size_signer: core::option::Option<alloy_primitives::bits::address::Address>
 pub decdn_client::downloader::DownloadTarget::total_bytes: u64
 pub struct decdn_client::downloader::Downloader<P, F>
 impl<P, F> decdn_client::downloader::Downloader<P, F> where P: decdn_client::source_set::SourceProvider, F: decdn_client::source::Funder
@@ -155,7 +155,6 @@ pub decdn_client::fault::Fault::Fatal(decdn_client::fault::FatalScope)
 pub decdn_client::fault::Fault::Source
 pub decdn_client::fault::Fault::Transient
 pub decdn_client::fault::Fault::Unaffordable
-pub decdn_client::fault::Fault::WrongSize
 pub struct decdn_client::fault::LaneBuildFault(pub anyhow::Error)
 impl core::error::Error for decdn_client::fault::LaneBuildFault
 impl core::fmt::Display for decdn_client::fault::LaneBuildFault
@@ -301,7 +300,6 @@ pub struct decdn_client::ranged_store::ClientRangedStore
 impl decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::bound(&self) -> u64
 pub fn decdn_client::ranged_store::ClientRangedStore::create(&std::path::Path, &str, [u8; 32], u64) -> std::io::error::Result<Self>
-pub fn decdn_client::ranged_store::ClientRangedStore::discard(&std::path::Path, &str) -> std::io::error::Result<()>
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> std::io::error::Result<()>
 pub fn decdn_client::ranged_store::ClientRangedStore::has_record(&std::path::Path, &str) -> std::io::error::Result<bool>
 pub async fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<R>(&self, &decdn_bao_range::AlignedRange, R, core::option::Option<&(dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> anyhow::Result<R> where R: iroh_io::AsyncStreamReader + decdn_client::sink::StashedFault + core::marker::Send
@@ -323,6 +321,8 @@ pub fn decdn_client::ranged_store::ClientRangedStore::total_bytes(&self) -> u64
 impl decdn_client::source::IngestStore for decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
 pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::ranged_store::ClientRangedStore::proven(&self) -> core::option::Option<u64>
+pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)
 pub mod decdn_client::sink
 pub struct decdn_client::sink::NoCache
 impl decdn_client::sink::BlobCache for decdn_client::sink::NoCache
@@ -399,9 +399,13 @@ pub fn decdn_client::source::Funder::top_up(&self, alloy_primitives::aliases::U2
 pub trait decdn_client::source::IngestStore: decdn_bao_range::ranged_store::RangedStore
 pub fn decdn_client::source::IngestStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
 pub fn decdn_client::source::IngestStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::source::IngestStore::proven(&self) -> core::option::Option<u64>
+pub fn decdn_client::source::IngestStore::set_bound(&self, u64)
 impl decdn_client::source::IngestStore for decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
 pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::ranged_store::ClientRangedStore::proven(&self) -> core::option::Option<u64>
+pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)
 pub type decdn_client::source::SourceFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>
 pub mod decdn_client::source_set
 pub struct decdn_client::source_set::Holder
@@ -409,15 +413,15 @@ pub decdn_client::source_set::Holder::coverage: core::option::Option<decdn_proto
 pub decdn_client::source_set::Holder::probed_holder: bool
 pub decdn_client::source_set::Holder::provider: alloy_primitives::bits::address::Address
 pub decdn_client::source_set::Holder::rtt_ms: f64
+pub struct decdn_client::source_set::LaneRange
+pub decdn_client::source_set::LaneRange::landed: u64
+pub decdn_client::source_set::LaneRange::len: u64
+pub decdn_client::source_set::LaneRange::offset: u64
 pub struct decdn_client::source_set::NoAffordableSource
 pub decdn_client::source_set::NoAffordableSource::deposit: alloy_primitives::aliases::U256
 impl core::error::Error for decdn_client::source_set::NoAffordableSource
 impl core::fmt::Display for decdn_client::source_set::NoAffordableSource
 pub fn decdn_client::source_set::NoAffordableSource::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct decdn_client::source_set::NoSourceAgreesOnSize
-impl core::error::Error for decdn_client::source_set::NoSourceAgreesOnSize
-impl core::fmt::Display for decdn_client::source_set::NoSourceAgreesOnSize
-pub fn decdn_client::source_set::NoSourceAgreesOnSize::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::source_set::NoSourceHasBlob
 impl core::error::Error for decdn_client::source_set::NoSourceHasBlob
 impl core::fmt::Display for decdn_client::source_set::NoSourceHasBlob
@@ -432,14 +436,12 @@ pub const fn decdn_client::source_set::SourceSet<'p, P>::health(&self) -> &alloc
 pub fn decdn_client::source_set::SourceSet<'p, P>::holder(&self, alloy_primitives::bits::address::Address) -> core::option::Option<&decdn_client::source_set::Holder>
 pub fn decdn_client::source_set::SourceSet<'p, P>::holders(&self) -> &[decdn_client::source_set::Holder]
 pub fn decdn_client::source_set::SourceSet<'p, P>::lane_built(&mut self, alloy_primitives::bits::address::Address, anyhow::Result<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>, tokio::time::instant::Instant) -> anyhow::Result<alloc::sync::Arc<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>>
-pub fn decdn_client::source_set::SourceSet<'p, P>::mark_wrong_size(&mut self, alloy_primitives::bits::address::Address)
 pub fn decdn_client::source_set::SourceSet<'p, P>::new(&'p P, [u8; 32], alloc::sync::Arc<decdn_client::health::PeerHealth>, alloc::vec::Vec<decdn_client::source_set::Holder>) -> Self
 pub fn decdn_client::source_set::SourceSet<'p, P>::next_to_start(&self, tokio::time::instant::Instant, alloy_primitives::aliases::U256, &std::collections::hash::set::HashSet<alloy_primitives::bits::address::Address>) -> core::option::Option<decdn_client::source_set::Holder>
 pub fn decdn_client::source_set::SourceSet<'p, P>::next_wake(&self, tokio::time::instant::Instant) -> core::option::Option<tokio::time::instant::Instant>
 pub const fn decdn_client::source_set::SourceSet<'p, P>::provider(&self) -> &'p P
-pub fn decdn_client::source_set::SourceSet<'p, P>::record_fault(&mut self, alloy_primitives::bits::address::Address, &anyhow::Error, tokio::time::instant::Instant, alloy_primitives::aliases::U256) -> decdn_client::fault::Fault
+pub fn decdn_client::source_set::SourceSet<'p, P>::record_fault(&mut self, alloy_primitives::bits::address::Address, &anyhow::Error, core::option::Option<decdn_client::source_set::LaneRange>, tokio::time::instant::Instant, alloy_primitives::aliases::U256) -> decdn_client::fault::Fault
 pub fn decdn_client::source_set::SourceSet<'p, P>::record_progress(&mut self, alloy_primitives::bits::address::Address)
-pub const fn decdn_client::source_set::SourceSet<'p, P>::set_size_signer(&mut self, alloy_primitives::bits::address::Address)
 pub fn decdn_client::source_set::SourceSet<'p, P>::take_lanes(&mut self) -> alloc::vec::Vec<(alloy_primitives::bits::address::Address, alloc::sync::Arc<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>)>
 pub fn decdn_client::source_set::SourceSet<'p, P>::wants_discovery(&self, tokio::time::instant::Instant, alloy_primitives::aliases::U256, usize, bool) -> bool
 impl<P: decdn_client::source_set::SourceProvider> core::fmt::Debug for decdn_client::source_set::SourceSet<'_, P>
@@ -518,6 +520,7 @@ pub decdn_client::streamer::StreamCandidate::ctx: alloc::sync::Arc<std::sync::po
 pub decdn_client::streamer::StreamCandidate::lease: decdn_client::LaneLease
 pub decdn_client::streamer::StreamCandidate::ledger: alloc::sync::Arc<decdn_client::PoolLedger>
 pub decdn_client::streamer::StreamCandidate::source: S
+pub decdn_client::streamer::StreamCandidate::widen: core::option::Option<decdn_client::LaneWiden>
 impl<S> core::fmt::Debug for decdn_client::streamer::StreamCandidate<S>
 pub fn decdn_client::streamer::StreamCandidate<S>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::streamer::StreamDrive<'a>
@@ -559,7 +562,6 @@ pub decdn_client::Fault::Fatal(decdn_client::fault::FatalScope)
 pub decdn_client::Fault::Source
 pub decdn_client::Fault::Transient
 pub decdn_client::Fault::Unaffordable
-pub decdn_client::Fault::WrongSize
 pub enum decdn_client::Health
 pub decdn_client::Health::Cooling
 pub decdn_client::Health::Cooling::streak: u32
@@ -635,7 +637,6 @@ pub struct decdn_client::ClientRangedStore
 impl decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::bound(&self) -> u64
 pub fn decdn_client::ranged_store::ClientRangedStore::create(&std::path::Path, &str, [u8; 32], u64) -> std::io::error::Result<Self>
-pub fn decdn_client::ranged_store::ClientRangedStore::discard(&std::path::Path, &str) -> std::io::error::Result<()>
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> std::io::error::Result<()>
 pub fn decdn_client::ranged_store::ClientRangedStore::has_record(&std::path::Path, &str) -> std::io::error::Result<bool>
 pub async fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<R>(&self, &decdn_bao_range::AlignedRange, R, core::option::Option<&(dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> anyhow::Result<R> where R: iroh_io::AsyncStreamReader + decdn_client::sink::StashedFault + core::marker::Send
@@ -657,6 +658,8 @@ pub fn decdn_client::ranged_store::ClientRangedStore::total_bytes(&self) -> u64
 impl decdn_client::source::IngestStore for decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
 pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::ranged_store::ClientRangedStore::proven(&self) -> core::option::Option<u64>
+pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)
 pub struct decdn_client::ClockHold<'a>(_)
 impl core::ops::drop::Drop for decdn_client::stop::ClockHold<'_>
 pub fn decdn_client::stop::ClockHold<'_>::drop(&mut self)
@@ -678,7 +681,6 @@ pub struct decdn_client::DownloadTarget<'a>
 pub decdn_client::DownloadTarget::dest: &'a std::path::Path
 pub decdn_client::DownloadTarget::hash: [u8; 32]
 pub decdn_client::DownloadTarget::ranges: core::option::Option<&'a [(u64, u64)]>
-pub decdn_client::DownloadTarget::size_signer: core::option::Option<alloy_primitives::bits::address::Address>
 pub decdn_client::DownloadTarget::total_bytes: u64
 pub struct decdn_client::Downloader<P, F>
 impl<P, F> decdn_client::downloader::Downloader<P, F> where P: decdn_client::source_set::SourceProvider, F: decdn_client::source::Funder
@@ -725,6 +727,15 @@ pub fn decdn_client::ledgers::LaneLedgers::get_or_insert(&self, decdn_incentive:
 pub fn decdn_client::ledgers::LaneLedgers::new() -> Self
 pub const fn decdn_client::ledgers::LaneLedgers::topup_lock(&self) -> &tokio::sync::mutex::Mutex<()>
 pub fn decdn_client::ledgers::LaneLedgers::total_committed(&self) -> alloy_primitives::aliases::U256
+pub struct decdn_client::LaneRange
+pub decdn_client::LaneRange::landed: u64
+pub decdn_client::LaneRange::len: u64
+pub decdn_client::LaneRange::offset: u64
+pub struct decdn_client::LaneWiden
+impl decdn_client::LaneWiden
+pub fn decdn_client::LaneWiden::new(impl core::ops::function::Fn(usize) -> usize + core::marker::Send + core::marker::Sync + 'static, impl core::ops::function::Fn() + core::marker::Send + core::marker::Sync + 'static) -> Self
+impl core::fmt::Debug for decdn_client::LaneWiden
+pub fn decdn_client::LaneWiden::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::LegNoProgress
 pub decdn_client::LegNoProgress::delivered_frontier: u64
 pub decdn_client::LegNoProgress::len: u64
@@ -751,10 +762,6 @@ impl decdn_client::sink::BlobCache for decdn_client::sink::NoCache
 pub fn decdn_client::sink::NoCache::caches(&self) -> bool
 pub fn decdn_client::sink::NoCache::get(&self, [u8; 32], u64, u64) -> decdn_client::sink::SinkFuture<'_, core::option::Option<bytes::bytes::Bytes>>
 pub fn decdn_client::sink::NoCache::put(&self, [u8; 32], u64, bytes::bytes::Bytes) -> decdn_client::sink::SinkFuture<'_, ()>
-pub struct decdn_client::NoSourceAgreesOnSize
-impl core::error::Error for decdn_client::source_set::NoSourceAgreesOnSize
-impl core::fmt::Display for decdn_client::source_set::NoSourceAgreesOnSize
-pub fn decdn_client::source_set::NoSourceAgreesOnSize::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::NoSourceHasBlob
 impl core::error::Error for decdn_client::source_set::NoSourceHasBlob
 impl core::fmt::Display for decdn_client::source_set::NoSourceHasBlob
@@ -936,12 +943,6 @@ pub decdn_client::SharedPool::topup_lock: &'a tokio::sync::mutex::Mutex<()>
 pub decdn_client::SharedPool::topups_used: &'a core::sync::atomic::AtomicU32
 impl core::fmt::Debug for decdn_client::driver::SharedPool<'_>
 pub fn decdn_client::driver::SharedPool<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct decdn_client::SignedSizeMismatch
-pub decdn_client::SignedSizeMismatch::expected: u64
-pub decdn_client::SignedSizeMismatch::signed: u64
-impl core::error::Error for decdn_client::SignedSizeMismatch
-impl core::fmt::Display for decdn_client::SignedSizeMismatch
-pub fn decdn_client::SignedSizeMismatch::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::SourceCoverage
 pub decdn_client::SourceCoverage::coverage: decdn_protocol::coverage::Coverage
 pub decdn_client::SourceCoverage::source_ix: usize
@@ -955,14 +956,12 @@ pub const fn decdn_client::source_set::SourceSet<'p, P>::health(&self) -> &alloc
 pub fn decdn_client::source_set::SourceSet<'p, P>::holder(&self, alloy_primitives::bits::address::Address) -> core::option::Option<&decdn_client::source_set::Holder>
 pub fn decdn_client::source_set::SourceSet<'p, P>::holders(&self) -> &[decdn_client::source_set::Holder]
 pub fn decdn_client::source_set::SourceSet<'p, P>::lane_built(&mut self, alloy_primitives::bits::address::Address, anyhow::Result<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>, tokio::time::instant::Instant) -> anyhow::Result<alloc::sync::Arc<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>>
-pub fn decdn_client::source_set::SourceSet<'p, P>::mark_wrong_size(&mut self, alloy_primitives::bits::address::Address)
 pub fn decdn_client::source_set::SourceSet<'p, P>::new(&'p P, [u8; 32], alloc::sync::Arc<decdn_client::health::PeerHealth>, alloc::vec::Vec<decdn_client::source_set::Holder>) -> Self
 pub fn decdn_client::source_set::SourceSet<'p, P>::next_to_start(&self, tokio::time::instant::Instant, alloy_primitives::aliases::U256, &std::collections::hash::set::HashSet<alloy_primitives::bits::address::Address>) -> core::option::Option<decdn_client::source_set::Holder>
 pub fn decdn_client::source_set::SourceSet<'p, P>::next_wake(&self, tokio::time::instant::Instant) -> core::option::Option<tokio::time::instant::Instant>
 pub const fn decdn_client::source_set::SourceSet<'p, P>::provider(&self) -> &'p P
-pub fn decdn_client::source_set::SourceSet<'p, P>::record_fault(&mut self, alloy_primitives::bits::address::Address, &anyhow::Error, tokio::time::instant::Instant, alloy_primitives::aliases::U256) -> decdn_client::fault::Fault
+pub fn decdn_client::source_set::SourceSet<'p, P>::record_fault(&mut self, alloy_primitives::bits::address::Address, &anyhow::Error, core::option::Option<decdn_client::source_set::LaneRange>, tokio::time::instant::Instant, alloy_primitives::aliases::U256) -> decdn_client::fault::Fault
 pub fn decdn_client::source_set::SourceSet<'p, P>::record_progress(&mut self, alloy_primitives::bits::address::Address)
-pub const fn decdn_client::source_set::SourceSet<'p, P>::set_size_signer(&mut self, alloy_primitives::bits::address::Address)
 pub fn decdn_client::source_set::SourceSet<'p, P>::take_lanes(&mut self) -> alloc::vec::Vec<(alloy_primitives::bits::address::Address, alloc::sync::Arc<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>)>
 pub fn decdn_client::source_set::SourceSet<'p, P>::wants_discovery(&self, tokio::time::instant::Instant, alloy_primitives::aliases::U256, usize, bool) -> bool
 impl<P: decdn_client::source_set::SourceProvider> core::fmt::Debug for decdn_client::source_set::SourceSet<'_, P>
@@ -1000,6 +999,7 @@ pub decdn_client::StreamCandidate::ctx: alloc::sync::Arc<std::sync::poison::mute
 pub decdn_client::StreamCandidate::lease: decdn_client::LaneLease
 pub decdn_client::StreamCandidate::ledger: alloc::sync::Arc<decdn_client::PoolLedger>
 pub decdn_client::StreamCandidate::source: S
+pub decdn_client::StreamCandidate::widen: core::option::Option<decdn_client::LaneWiden>
 impl<S> core::fmt::Debug for decdn_client::streamer::StreamCandidate<S>
 pub fn decdn_client::streamer::StreamCandidate<S>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::StreamDrive<'a>
@@ -1113,9 +1113,13 @@ pub fn decdn_client::Funder::top_up(&self, alloy_primitives::aliases::U256) -> d
 pub trait decdn_client::IngestStore: decdn_bao_range::ranged_store::RangedStore
 pub fn decdn_client::IngestStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
 pub fn decdn_client::IngestStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::IngestStore::proven(&self) -> core::option::Option<u64>
+pub fn decdn_client::IngestStore::set_bound(&self, u64)
 impl decdn_client::source::IngestStore for decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
 pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::ranged_store::ClientRangedStore::proven(&self) -> core::option::Option<u64>
+pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)
 pub trait decdn_client::Pacer: core::marker::Send + core::marker::Sync
 pub fn decdn_client::Pacer::decide(&self, &decdn_client::pacer::PaceState) -> decdn_client::pacer::PaceDecision
 impl decdn_client::pacer::Pacer for decdn_client::pacer::BudgetPacer

@@ -268,7 +268,9 @@ where
     /// `holder`'s lane: the one the first open parked, with the permit it
     /// already holds, or a fresh build. When the run caps streams per
     /// provider, a fresh lane holds one of its provider's permits
-    /// ([`lane_lease`]), taken before the build and never waited for.
+    /// ([`lane_lease`]), taken before the build and never waited for, and it
+    /// can add a stream for a faulted lane's remainder only from the
+    /// provider's permits that are free ([`LaneStreamCap::widen`]).
     async fn build(&self, holder: &Holder) -> anyhow::Result<StreamCandidate<PeerSource<'a>>> {
         let parked = self
             .parked
@@ -281,6 +283,9 @@ where
         let lease = lane_lease(self.lane_cap, holder.provider).await?;
         let mut lane = self.build_fresh(holder).await?;
         lane.lease = lease;
+        if let Some(cap) = self.lane_cap {
+            lane.widen = Some(cap.widen(holder.provider).await);
+        }
         Ok(lane)
     }
 
@@ -323,6 +328,7 @@ where
             ledger: lane.ledger,
             coverage: holder.coverage.clone(),
             lease: LaneLease::default(),
+            widen: None,
         })
     }
 }
