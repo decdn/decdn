@@ -197,8 +197,12 @@ impl PrimeLeg {
         let request_end = if self.len == 0 {
             total_bytes
         } else {
+            // `saturating_add`, not `checked_add`: an overflowing end (size by
+            // growth can widen `self.len` toward `u64::MAX`) still primes a
+            // first leg — the `.min(total_bytes)` below clamps it back down
+            // regardless of how far the raw sum overshot.
             self.offset
-                .checked_add(self.len)?
+                .saturating_add(self.len)
                 .div_ceil(CHUNK_GROUP_BYTES)
                 .saturating_mul(CHUNK_GROUP_BYTES)
                 .min(total_bytes)
@@ -2420,6 +2424,24 @@ mod prime_tests {
         assert_eq!(
             prime.predicted_leg(total, &full, 0),
             align_range(0, PULL_WINDOW_FLOOR, total).ok()
+        );
+        // A nonzero offset paired with `len == u64::MAX` genuinely overflows
+        // `offset + len` (unlike offset 0, which does not). Size by growth can
+        // widen `len` this far, and `saturating_add` plus the `.min(total_bytes)`
+        // clamp right after it means this still primes a leg — the same one a
+        // `byte_len == 0` "to end" request from the same offset would — rather
+        // than losing the first leg to `None`.
+        assert_eq!(
+            PrimeLeg::new(
+                CHUNK_GROUP_BYTES,
+                u64::MAX,
+                2,
+                PULL_WINDOW_FLOOR,
+                64 * MIB,
+                0
+            )
+            .predicted_leg(total, &full, 0),
+            align_range(CHUNK_GROUP_BYTES, PULL_WINDOW_FLOOR, total).ok()
         );
         // A mid-group start rounds down to its group; a short request is cut
         // to its own end.
