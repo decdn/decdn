@@ -2650,8 +2650,8 @@ pub fn is_insufficient_deposit(err: &anyhow::Error) -> bool {
 
 /// Whether a failed open of a bounded range could mean only that the range's
 /// START is past the blob's end: the size it was cut from was wrong. An end
-/// past the blob is no longer such a failure — it clamps and serves (size by
-/// growth) — so this now fires only on a start with no bytes to serve.
+/// past the blob clamps and serves rather than failing, so this fires only on
+/// a start with no bytes to serve.
 ///
 /// A holder refuses such a range before it signs (`RangeNotSatisfiable`, which
 /// reaches the wire as [`StreamError::NotFound`]). A relay signs its own size
@@ -4244,11 +4244,10 @@ mod tests {
         ));
     }
 
-    /// Size by growth: a response header whose `total_bytes` is smaller than
-    /// the requested end no longer faults — the leg is served, and priced, up
-    /// to the blob's end. `aligned_wire_len` must clamp rather than wrap the
-    /// clamp in `LocalPullFault`, and the clamped wire length must equal the
-    /// whole blob's.
+    /// A response header whose `total_bytes` is smaller than the requested end
+    /// is served, and priced, up to the blob's end. `aligned_wire_len` must
+    /// clamp rather than wrap the clamp in `LocalPullFault`, and the clamped
+    /// wire length must equal the whole blob's.
     #[test]
     fn aligned_wire_len_clamps_when_the_response_total_is_smaller_than_the_requested_end()
     -> anyhow::Result<()> {

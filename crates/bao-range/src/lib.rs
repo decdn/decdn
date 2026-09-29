@@ -190,9 +190,9 @@ fn intersecting_parents(n: u64, base: u64, a: u64, b: u64) -> u64 {
 pub enum RangeVerifyError {
     /// `byte_offset` is at or past a non-empty blob's end, or (for the empty
     /// blob) the request is not `(0, 0)`. [`align_range`] also raises this when
-    /// `byte_offset + byte_len` runs past the blob or overflows; ADR 005 requires
-    /// rejecting such a request rather than silently clamping it, and
-    /// [`align_range_clamped`] serves it up to the blob's end instead.
+    /// `byte_offset + byte_len` runs past the blob or overflows, rejecting the
+    /// request; [`align_range_clamped`] clamps that same case to the blob's end
+    /// instead of raising it.
     #[error("range [{offset}, +{len}) is out of bounds for a {blob_size}-byte blob")]
     RangeOutOfBounds {
         /// Requested start offset.
@@ -699,11 +699,11 @@ mod tests {
         assert_eq!(clamped.chunk_ranges(), plain.chunk_ranges());
     }
 
-    /// The empty blob behaves exactly as [`align_range`]: addressable only as
-    /// `(0, 0)`, and any positive offset or length is still refused, never
+    /// The empty blob is addressable only as `(0, 0)`, the same as
+    /// [`align_range`]: any positive offset or length is refused, never
     /// clamped to nothing.
     #[test]
-    fn align_range_clamped_empty_blob_behaves_as_before() {
+    fn align_range_clamped_empty_blob_is_whole_blob_only() {
         assert!(align_range_clamped(0, 0, 0).is_ok());
         assert!(matches!(
             align_range_clamped(1, 0, 0),
@@ -713,5 +713,51 @@ mod tests {
             align_range_clamped(0, 1, 0),
             Err(RangeVerifyError::RangeOutOfBounds { .. })
         ));
+    }
+
+    /// Edges [`align_range_clamped`] must get right beyond the group-scale cases
+    /// above: a 1-byte blob, an end landing exactly at the size (no clamp
+    /// needed), a start and end that both sit mid-group (unaligned either way),
+    /// and an offset paired with `u64::MAX` (the widest possible overflowing
+    /// end).
+    #[test]
+    fn align_range_clamped_sub_group_and_overflow_edges() {
+        // A 1-byte blob: the whole blob is addressable, and any end past it
+        // (here `byte_len` overflowing entirely) still clamps to the 1 byte.
+        let one_byte = align_range_clamped(0, 0, 1).expect("1-byte whole blob");
+        assert_eq!(one_byte.fetch_end(), 1);
+        let one_byte_overflow = align_range_clamped(0, u64::MAX, 1).expect("clamps to 1 byte");
+        assert_eq!(one_byte_overflow.fetch_end(), 1);
+        assert_eq!(one_byte_overflow.chunk_ranges(), one_byte.chunk_ranges());
+
+        // An end landing EXACTLY at the size: not a clamp case (the request was
+        // already in bounds), and must equal the explicit whole-blob request.
+        let total = 5 * CHUNK_GROUP_BYTES + 123;
+        let exact_end = align_range_clamped(0, total, total).expect("exact end aligns");
+        let whole = align_range_clamped(0, 0, total).expect("whole blob");
+        assert_eq!(exact_end.fetch_end(), whole.fetch_end());
+        assert_eq!(exact_end.chunk_ranges(), whole.chunk_ranges());
+
+        // A start AND end that both sit mid-group, still fully in bounds: no
+        // clamp fires, and the result must match `align_range`'s own answer.
+        let (offset, len) = (CHUNK_GROUP_BYTES / 2, CHUNK_GROUP_BYTES);
+        let unaligned_clamped = align_range_clamped(offset, len, total).expect("in bounds");
+        let unaligned_plain = align_range(offset, len, total).expect("in bounds");
+        assert_eq!(
+            unaligned_clamped.fetch_start(),
+            unaligned_plain.fetch_start()
+        );
+        assert_eq!(unaligned_clamped.fetch_end(), unaligned_plain.fetch_end());
+        assert_eq!(
+            unaligned_clamped.chunk_ranges(),
+            unaligned_plain.chunk_ranges()
+        );
+
+        // `(1, u64::MAX)`: an in-bounds offset paired with the widest possible
+        // overflowing end clamps to the blob's end, same as the whole tail.
+        let widest = align_range_clamped(1, u64::MAX, total).expect("clamps");
+        let tail = align_range_clamped(1, 0, total).expect("whole tail");
+        assert_eq!(widest.fetch_end(), tail.fetch_end());
+        assert_eq!(widest.chunk_ranges(), tail.chunk_ranges());
     }
 }

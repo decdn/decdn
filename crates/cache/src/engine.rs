@@ -2525,7 +2525,8 @@ impl CacheEngine {
     }
 
     /// The chunk-aligned sub-ranges of `[byte_offset, byte_offset + byte_len)`
-    /// (`byte_len == 0` = to `blob_size`) that are NOT present on disk.
+    /// (`byte_len == 0` = to `blob_size`, an end past `blob_size` clamped to it —
+    /// size by growth) that are NOT present on disk.
     ///
     /// Empty ⇒ the requested span is fully present: a completeness-aware read can
     /// serve it with no fetch, and a resumed pull is a no-op. `blob_size` is
@@ -2538,9 +2539,11 @@ impl CacheEngine {
         byte_len: u64,
         blob_size: u64,
     ) -> CacheResult<ChunkRanges> {
-        // Same align_range error mapping as `export_bao_range_stream`: a range
-        // that does not fit `blob_size` is an argument error, not an origin fault.
-        let aligned = align_range(byte_offset, byte_len, blob_size).map_err(|e| {
+        // Same align_range_clamped error mapping as `export_bao_range_stream`:
+        // only a `byte_offset` at or past `blob_size` is an argument error, not an
+        // origin fault; an end past `blob_size` clamps rather than erroring, so a
+        // partial holder does not refuse its own already-complete partial hit.
+        let aligned = align_range_clamped(byte_offset, byte_len, blob_size).map_err(|e| {
             CacheError::Store(anyhow::Error::from(e).context("missing_ranges: range alignment"))
         })?;
         let present = self.present_ranges(hash).await?;
@@ -4676,8 +4679,8 @@ impl CacheEngine {
         // reallocates; `wire_len` walks the same node set the export stream emits.
         // The range re-validated cleanly inside the call above, so a re-alignment
         // fault here is unreachable — degrade to an unsized buffer rather than
-        // duplicating the error mapping. `align_range_clamped` (not `align_range`)
-        // so an end past the blob still sizes the buffer instead of degrading to 0.
+        // duplicating the error mapping. `align_range_clamped` sizes the buffer
+        // for an end past the blob too, rather than degrading to 0.
         let cap = align_range_clamped(byte_offset, byte_len, blob_size)
             .map_or(0, |a| usize::try_from(a.wire_len()).unwrap_or(0));
         let mut out = Vec::with_capacity(cap);
@@ -4761,9 +4764,9 @@ impl CacheEngine {
         // construction (#915, ADR 038).
 
         // Snap to chunk-group boundaries. Only a start at or past the blob end
-        // is rejected; an end past the blob clamps to it instead (size by
-        // growth, ADR 005 amendment) — `align_range_clamped` owns the bound
-        // check, the same one the dispatch-tier gate applies before this runs.
+        // is rejected; an end past the blob clamps to it instead —
+        // `align_range_clamped` owns the bound check, the same one the
+        // dispatch-tier gate applies before this runs.
         let aligned = align_range_clamped(byte_offset, byte_len, blob_size).map_err(|e| {
             CacheError::Store(anyhow::Error::from(e).context("export_bao_range: range alignment"))
         })?;

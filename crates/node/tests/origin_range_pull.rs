@@ -225,9 +225,9 @@ async fn ranged_paid_pull(
     // ADR 038: the wire carries the bao verified-stream (content + interleaved
     // proof) for the group-aligned superset of the request, so the paid/closing
     // boundary is the bao-encoded WIRE size, not the requested content length.
-    // `align_range_clamped` (not `align_range`) because `byte_len` may run past
-    // `total_bytes`: the server serves and bills that clamped to the blob's end
-    // rather than refusing it.
+    // `align_range_clamped`, because `byte_len` may run past `total_bytes`: the
+    // server serves and bills that clamped to the blob's end rather than
+    // refusing it.
     let aligned =
         decdn_cache::range_pull::align_range_clamped(byte_offset, byte_len, resp.body.total_bytes)
             .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
@@ -980,9 +980,115 @@ async fn resume_to_end_range_pull_serves_tail() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn end_past_the_blob_own_origin_cold_miss_serves_clamped_tail() -> anyhow::Result<()> {
+    // The twin of `resume_to_end_range_pull_serves_tail`, but with an EXPLICIT
+    // `byte_len` (the whole blob's size) rather than the `byte_len == 0` "to
+    // end" convention, so the requested end runs well past the blob. The
+    // own-origin two-leg tier's pull leg computes its gap via
+    // `NodeRangedStore::missing_ranges`, which must clamp the same way the
+    // serve tiers clamp — an unclamped `missing_ranges` faults `drive` after
+    // the node has already signed `ok: true` (the regression this test guards
+    // against).
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let req_off = 16 * 1024u64;
+    let aligned = align_range(req_off, 0, blob_size)?;
+    let (a_start, a_end) = (aligned.fetch_start(), aligned.fetch_end());
+    anyhow::ensure!(a_end == blob_size, "a clamped tail aligns to the blob end");
+    let span = blob
+        .get(usize::try_from(a_start)?..usize::try_from(a_end)?)
+        .ok_or_else(|| anyhow::anyhow!("aligned tail out of bounds"))?
+        .to_vec();
+    let range_val = format!("bytes={a_start}-{}", a_end - 1);
+
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
+        .mount(&server)
+        .await;
+    mount_range_probe(&server, &hex, &blob).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header("range", range_val.as_str()))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(span))
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x49);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
+    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let got = ranged_paid_pull(
+        &client_ep,
+        target,
+        client_node_id,
+        &client_eth,
+        pool_id,
+        provider,
+        hash,
+        req_off,
+        blob_size, // explicit end far past the blob, not `byte_len == 0`
+        RATE_PER_MB,
+    )
+    .await?;
+
+    let want = blob
+        .get(usize::try_from(req_off)?..)
+        .ok_or_else(|| anyhow::anyhow!("offset past blob"))?;
+    anyhow::ensure!(
+        got.as_slice() == want,
+        "an end past the blob must deliver clamped to the blob's end through the \
+         own-origin cold-miss tier, got {} of {} bytes",
+        got.len(),
+        want.len()
+    );
+    anyhow::ensure!(
+        !cache.has(hash).await?,
+        "a tail range pull leaves the blob partial"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "a clamped cold miss must take the own-origin two-leg tier"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn offset_past_the_blob_is_rejected_before_delivery() -> anyhow::Result<()> {
-    // ADR 005 §Bounded byte ranges (size-by-growth amendment): a range whose
-    // START is at or past the blob end MUST be refused with a `StreamError` —
+    // ADR 005 §Bounded byte ranges: a range whose START is at or past the blob
+    // end MUST be refused with a `StreamError` —
     // and the refusal must land BEFORE a success response is signed, so the
     // client never accepts an `ok: true` the delivery then aborts. Exercised
     // against a cache hit so the request reaches the bounds gate directly.
@@ -1074,9 +1180,9 @@ async fn offset_past_the_blob_is_rejected_before_delivery() -> anyhow::Result<()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn end_past_the_blob_is_served_clamped_not_refused() -> anyhow::Result<()> {
-    // Size-by-growth (ADR 005 amendment): a request whose start is in bounds
-    // but whose end runs past the blob is served up to the blob's end instead
-    // of refused — a claimed size is a hint, and this leg reaches the true end,
+    // ADR 005 §Bounded byte ranges: a request whose start is in bounds but
+    // whose end runs past the blob is served up to the blob's end instead of
+    // refused — a claimed size is a hint, and this leg reaches the true end,
     // proving it. Exercised against a cache hit so the request reaches the
     // bounds gate directly (the same gate `offset_past_the_blob_is_rejected_...`
     // exercises for a genuinely out-of-bounds start).

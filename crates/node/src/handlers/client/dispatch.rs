@@ -1188,8 +1188,8 @@ impl ClientHandler {
             };
             total_bytes
         };
-        // Bounded-range bounds check (ADR 005 §Bounded byte ranges, size-by-growth
-        // amendment). Reject a request whose START has no bytes to serve with a
+        // Bounded-range bounds check (ADR 005 §Bounded byte ranges). Reject a
+        // request whose START has no bytes to serve with a
         // `StreamError` *before* signing the success response below — otherwise
         // the client accepts a signed `ok: true` that `deliver`'s `export_range`
         // then aborts mid-stream. A whole-blob request (`byte_offset == 0 &&
@@ -1443,8 +1443,8 @@ mod range_helper_tests {
         assert!(range_out_of_bounds(0, 1, 0));
     }
 
-    /// The clamped rule the serve tiers apply (ADR 005 amendment, size by
-    /// growth): a request whose end runs past the blob is served, not refused.
+    /// The clamped rule the serve tiers apply (ADR 005 §Bounded byte ranges): a
+    /// request whose end runs past the blob is served, not refused.
     #[test]
     fn a_request_whose_end_runs_past_the_blob_is_served_clamped() {
         let total = 100 * 1024;

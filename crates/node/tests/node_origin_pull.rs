@@ -6826,8 +6826,10 @@ async fn leaf_ranged_paid_pull(
     anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
     let total = resp.body.total_bytes;
     // The paid/closing boundary is the bao-encoded WIRE size of the aligned
-    // superset (ADR 038), not the requested content length.
-    let aligned = decdn_cache::range_pull::align_range(byte_offset, byte_len, total)
+    // superset (ADR 038), not the requested content length. `align_range_clamped`,
+    // because `byte_len` may run past `total`: the server serves and bills that
+    // clamped to the blob's end rather than refusing it.
+    let aligned = decdn_cache::range_pull::align_range_clamped(byte_offset, byte_len, total)
         .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
     let expected_wire = decdn_cache::range_pull::bao_encoded_size(total, aligned.chunk_ranges());
     let interval_bytes = CHUNK_BYTES;
@@ -6897,7 +6899,9 @@ async fn leaf_ranged_paid_pull(
     let want = if byte_len == 0 {
         plaintext.len().saturating_sub(lead)
     } else {
-        usize::try_from(byte_len).map_err(|e| anyhow::anyhow!("len: {e}"))?
+        // An end past `total` clamps to the blob's end, same as the server.
+        let end = byte_offset.saturating_add(byte_len).min(total);
+        usize::try_from(end.saturating_sub(byte_offset)).map_err(|e| anyhow::anyhow!("len: {e}"))?
     };
     let end = lead.saturating_add(want);
     plaintext
@@ -8845,6 +8849,77 @@ async fn window_pull_through_resumed_offset_is_served_by_the_fused_path() -> Res
     anyhow::ensure!(
         got.as_slice() == want,
         "the fused path must serve the requested tail byte-exact"
+    );
+
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    Ok(())
+}
+
+/// The peer-relay twin of `end_past_the_blob_own_origin_cold_miss_serves_clamped_tail`
+/// (`origin_range_pull.rs`): a cold cache-miss request through the fused window
+/// path whose end runs past the blob (an explicit `byte_len` far larger than the
+/// blob, not the `byte_len == 0` "to end" convention) is served clamped to the
+/// blob's end rather than refused. B relays leaf → A with no cached bytes of its
+/// own, so this exercises `NodeRangedStore::missing_ranges`'s clamp on the actual
+/// pull-leg gap computation, not just the pre-flight bounds gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_end_past_the_blob_is_served_by_the_fused_path_clamped() -> Result<()> {
+    let payload = vec![0x7Eu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total = u64::try_from(PAYLOAD_LEN)?;
+
+    let ab_channel_id = B256::repeat_byte(0xA6);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x76);
+    let (handler_b, b_target, ep_b, _recorded, _cache_b, _b_metrics, _local_rep, b_operator) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+
+    // Resume from one interval in, with an explicit `byte_len` (the whole blob's
+    // size) that runs the requested end well past the true blob end. Drained
+    // delivery is the proof: an unclamped `missing_ranges` faults the pull leg
+    // instead (the regression this test guards against).
+    let req_off = MB_BYTES;
+    let got = leaf_ranged_paid_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        b_operator,
+        leaf_channel_id,
+        hash,
+        req_off,
+        total,
+        RATE,
+    )
+    .await?;
+    let want = payload
+        .get(usize::try_from(req_off)?..)
+        .ok_or_else(|| anyhow::anyhow!("tail out of bounds"))?;
+    anyhow::ensure!(
+        got.as_slice() == want,
+        "an end past the blob must serve clamped to the blob's end through the \
+         fused window path, byte-exact"
     );
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
