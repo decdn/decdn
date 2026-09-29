@@ -61,7 +61,7 @@ A node that receives a `cdn/client/v1` `StreamRequest` for a blob (or byte range
 
 Because per-request speculative exposure is a bounded, ramped window rather than the entire blob, implicit pull-through is cheap enough that **the `StreamRequest` itself is the trigger** — there is no warming flag, no `allow_pull_through` field, and no accept/decline handshake. A request for content the node lacks is the demand signal. This also makes the probe-to-evict race benign: a node that advertised `H`, was selected, then evicted `H` before the request arrives re-pulls the needed range and continues serving, rather than erroring.
 
-The node's own upstream pull is an ordinary cache-miss pull against actual holders, so a proxy never chains its pull through another non-holding proxy.
+The node's own upstream pull is an ordinary cache-miss pull against actual holders, so a proxy never chains its pull through another non-holding proxy. The node asks each upstream only for blocks that the upstream advertises. This includes the first open that reads the blob size. The node never uses the node that sent the request as its own upstream. So partial holders cannot pull the same blob from each other in a loop.
 
 ### Warming is a relay-edge mechanism
 

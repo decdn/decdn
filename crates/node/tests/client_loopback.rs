@@ -1073,8 +1073,8 @@ async fn a_released_preimage_pays_for_a_chunk_and_resumes_delivery() -> anyhow::
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, _deposit) = seeded_store()?;
 
-    let (target, _server_eth, server_ep, server_task) =
-        spawn_pipelined_server(cache, Arc::clone(&store), CREDIT_MAX, 2).await?;
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_pipelined_server_with_metrics(cache, Arc::clone(&store), CREDIT_MAX, 2).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let conn = client_ep
@@ -1112,6 +1112,9 @@ async fn a_released_preimage_pays_for_a_chunk_and_resumes_delivery() -> anyhow::
         "one chunk at the quoted rate, owed on top of a zero anchor: {}",
         lane.owed()
     );
+    // The anchor counts as a voucher and the reveal counts apart from it.
+    anyhow::ensure!(counter(&metrics, "decdn_vouchers_received_total")? == 1);
+    anyhow::ensure!(counter(&metrics, "decdn_preimage_reveals_received_total")? == 1);
 
     conn.close(0u32.into(), b"done");
     shutdown([server_task], [&client_ep, &server_ep]).await?;

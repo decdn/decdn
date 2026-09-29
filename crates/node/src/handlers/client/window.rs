@@ -257,6 +257,7 @@ impl ClientHandler {
                         deadline,
                         fault_seen,
                         Some(prime_for(req.byte_offset, req.byte_len)),
+                        client_node_id,
                     )
                     .await
                 {
@@ -364,6 +365,7 @@ impl ClientHandler {
                     deadline,
                     fault_seen,
                     prime,
+                    client_node_id,
                 )
                 .await
             {
@@ -933,6 +935,8 @@ impl ClientHandler {
     ///
     /// `prime` is the pull this miss expects to own, when it can say: the handshake
     /// then opens that pull's first leg for the pull leg to adopt (#2063).
+    /// `requester` is the node this serve answers, never a candidate upstream.
+    #[allow(clippy::too_many_arguments)]
     async fn open_pull_leg_bounded(
         &self,
         origin: &NodeOrigin,
@@ -941,9 +945,10 @@ impl ClientHandler {
         deadline: std::time::Duration,
         fault_seen: bool,
         prime: Option<PrimeLeg>,
+        requester: B256,
     ) -> Result<PullLegTarget, ServeRejectReason> {
-        match tokio::time::timeout(deadline, origin.open_pull_leg(hash, namespace_id, prime)).await
-        {
+        let open = origin.open_pull_leg(hash, namespace_id, prime, requester.0);
+        match tokio::time::timeout(deadline, open).await {
             Ok(Ok(target)) => Ok(target),
             Ok(Err(miss)) => Err(FillOutcome::miss_reason(
                 fault_seen || miss.is_local_fault(),
