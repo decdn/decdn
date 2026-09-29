@@ -976,9 +976,8 @@ impl GroupRun {
 
 /// What a failed entry fetch stops (ADR 039 § Failure handling: reassign-only
 /// tail): a fault
-/// only the user can fix stops every entry, and a size fault stops its own
-/// entry. A manifest `size` no provider signs is the manifest's fault, so it
-/// stops its own entry. Every other fault is its entry's alone.
+/// only the user can fix stops every entry. Every other fault belongs to its
+/// entry alone.
 fn entry_scope(err: &anyhow::Error) -> decdn_client::FatalScope {
     match decdn_client::classify(err) {
         decdn_client::Fault::Fatal(scope) => scope,
@@ -2298,8 +2297,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let Some((plan, total)) = plan else {
             // No donor overlap and nothing deferred — pay for the whole file, then
             // register its chunks so a *later* entry can dedup against it. The
-            // manifest's `size`, when it gives one, keys the store; the paid count
-            // is the verified blob's length.
+            // manifest's `size`, when it gives one, is the entry's first size claim,
+            // a hint; the paid count is the verified blob's length.
             self.fetch_to_staging(hash, staging, total, progress)
                 .await?;
             index.register(hints, staging);

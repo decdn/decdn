@@ -457,9 +457,10 @@ where
     /// of the consumer's cursor, and the verified blob is teed to `cache` for the
     /// next revisit.
     ///
-    /// `total_bytes` keys the fill store and `hash` is the bao root every byte is
-    /// verified against; a wrong size or hash surfaces as a read error, never as
-    /// silent corruption.
+    /// `total_bytes` is the first size claim, a hint. A resumed store's bound
+    /// wins, and a leg that verifies the final chunk proves the size. `hash` is
+    /// the bao root every byte is verified against; a wrong hash surfaces as a
+    /// read error, never as silent corruption.
     ///
     /// # Errors
     ///

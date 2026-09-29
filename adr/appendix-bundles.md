@@ -43,18 +43,18 @@ and present only for a chunked file. When a key is present it holds this
 order — field declaration order is load-bearing, see
 [Determinism](#determinism).
 
-- `path` — relative POSIX path (`/` separator on every platform), UTF-8.
+- `path`: relative POSIX path (`/` separator on every platform), UTF-8.
   `..`, absolute paths, root prefixes, and non-UTF-8 components are
   rejected at create time.
-- `hash` — `b3:` followed by the 64-character lowercase hex of the
+- `hash`: `b3:` followed by the 64-character lowercase hex of the
   file's BLAKE3. See [Hash format](#hash-format).
-- `size` — file size in bytes, unsigned 64-bit integer. Optional and a
+- `size`: file size in bytes, unsigned 64-bit integer. Optional and a
   hint on the read side. `bundle pull` uses it for the dry-run plan and as
   the first size claim of the entry, and fetches without it. The fetch
   proves the true size ([ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)).
   When the proven size differs from `size`, the entry succeeds and the
   pull prints `<path>: manifest says X bytes, the blob is Y bytes`.
-- `chunks` — optional ordered list of range-dedup hints over the file's
+- `chunks`: optional ordered list of range-dedup hints over the file's
   bytes. See [Chunked files](#chunked-files). When absent, the file is
   one blob addressed by `hash`.
 
