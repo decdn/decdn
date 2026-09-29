@@ -37,6 +37,7 @@ use super::buyer_store::{
     BuyerStoreOwner, classify_buyer_store, client_buyer_db, node_buyer_db,
     open_client_store_for_escrow,
 };
+use super::chain_ctx;
 
 /// Dispatch `decdn pool <subcommand>`.
 pub async fn pool_dispatch(args: &cli::PoolArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
@@ -425,8 +426,10 @@ enum ClosePlan {
     Skip(&'static str),
 }
 
-/// What `reclaim --all` does with one enumerated pool, decided from its status
-/// and dispute deadline against the current time.
+/// What `reclaim` does with one pool, decided from its status and dispute
+/// deadline against the chain's head time. It drives the `--all` sweep, the
+/// `--pool` pre-check (`single_reclaim_gate`), and the `pool list` Reclaimable
+/// column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReclaimPlan {
     /// `Closing` and its dispute window has elapsed — send `reclaim`.
@@ -467,7 +470,7 @@ const fn plan_close(status: PaymentPool::Status) -> ClosePlan {
     }
 }
 
-/// Classify one enumerated pool for `reclaim --all`. `reclaim` reverts unless
+/// Classify one pool for `reclaim`. `reclaim` reverts unless
 /// the pool is `Closing` past its deadline, so the plan pre-filters to exactly
 /// that case and names why each other pool is skipped. `now == deadline` counts
 /// as elapsed, matching the on-chain `block.timestamp >= disputeDeadline` gate.
@@ -483,16 +486,18 @@ const fn plan_reclaim(status: PaymentPool::Status, dispute_deadline: u64, now: u
     }
 }
 
-/// Decide from one `getPool` read whether `reclaim --pool` may send. Every pool
-/// that `reclaim` would revert on is refused here with its specific cause, so
-/// the operator learns what to do (and, in the dispute window, when) without a
-/// transaction or a keystore unlock.
+/// Decide from one `getPool` read and the chain's head time whether `reclaim
+/// --pool` may send. Each status or deadline condition that makes `reclaim`
+/// revert is refused here with its own cause, so the operator learns what to
+/// do (and, in the dispute window, when) without a transaction or a keystore
+/// unlock.
 ///
 /// # Errors
 ///
-/// Errors when the pool does not exist (a zero `owner`: a never-opened pool
-/// reads as status `0`, which is `Open`), is still `Open`, is `Closing` inside
-/// its dispute window, is already `Closed`, or has an unrecognized status.
+/// Errors when the pool does not exist, is still `Open`, is `Closing` inside
+/// its dispute window, is already `Closed`, or has an unrecognized status. The
+/// zero-`owner` check runs first: a never-opened pool reads as status `0`,
+/// which is `Open`, and would otherwise be reported as still Open.
 fn single_reclaim_gate(
     pool_id: PoolId,
     owner: Address,
@@ -599,15 +604,15 @@ where
 
 /// Send `reclaim(pool_id)`, wait for the receipt, and on success best-effort
 /// clear the local row. `reclaim` is permissionless, so no ownership check is
-/// needed. The caller has already run the pool through `plan_reclaim`, so a
-/// revert here means the chain disagreed with that pre-check. Returns `Ok(())`
-/// once the refund lands.
+/// needed. Callers pre-check the pool with `plan_reclaim`, so a revert here
+/// means the chain disagreed with that pre-check. Returns `Ok(())` once the
+/// refund lands.
 ///
 /// # Errors
 ///
 /// Errors when the send is rejected, the receipt cannot be read, or the tx
-/// reverted (a concurrent reclaim, or a local clock ahead of the chain's block
-/// time). A failed local row-clear only warns — the refund itself landed.
+/// reverted after the pre-check passed (see `reclaim_reverted`). A failed local
+/// row-clear only warns — the refund itself landed.
 async fn reclaim_and_forget<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: LocalBookkeeping<'_>,
@@ -636,13 +641,12 @@ where
     }
 }
 
-/// The error for a `reclaim` the chain rejected after the local pre-check
-/// passed. One message for the estimation-time and receipt-time reverts, so the
+/// The error for a `reclaim` the chain rejected after the pre-check passed. One message for the estimation-time and receipt-time reverts, so the
 /// two cannot drift apart.
 fn reclaim_reverted(pool_id: PoolId) -> String {
     format!(
-        "reclaim reverted on-chain for pool {pool_id} after the pre-check passed (a concurrent \
-         reclaim, or this machine's clock is ahead of the chain's block time)"
+        "reclaim reverted on-chain for pool {pool_id} after the pre-check passed (most likely \
+         a concurrent reclaim; the USDC refund transfer to the owner can also revert)"
     )
 }
 
@@ -752,7 +756,8 @@ where
 /// `decdn pool reclaim`: refund the residual deposit of a pool once its grace
 /// window has elapsed (`reclaim`; permissionless — callable by anyone, but only
 /// the owner receives funds). `--all` reclaims every pool this keystore owns
-/// whose window has elapsed; `--pool` reclaims exactly one.
+/// whose window has elapsed; `--pool` reclaims exactly one, after a read-only
+/// pre-check of its status and deadline that runs before the keystore unlock.
 async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let file = load_file_config(config_path)?;
     // Parse the target id before any store/keystore/provider work, so a
@@ -766,9 +771,9 @@ async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> any
     }
     let chain = resolve_chain(&args.chain, &file)?;
     if let Some(pool_id) = target {
-        // `getPool` is a read, so it runs on a wallet-free provider before the
-        // keystore unlock: a pool that is not yet reclaimable fails here with
-        // its cause and asks for no password.
+        // `getPool` and the head block are reads, so they run on a wallet-free
+        // provider before the keystore unlock: a pool that `reclaim` would
+        // refuse fails here with its cause and asks for no password.
         let reader = PaymentPool::new(
             chain.payment_pool,
             provider::build_read_provider(&chain.rpc_url)?,
@@ -778,13 +783,8 @@ async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> any
             .call()
             .await
             .map_err(|e| anyhow::anyhow!("getPool failed: {e}"))?;
-        single_reclaim_gate(
-            pool_id,
-            pool.owner,
-            pool.status,
-            pool.disputeDeadline,
-            unix_now()?,
-        )?;
+        let now = chain_ctx::head_timestamp(reader.provider()).await?;
+        single_reclaim_gate(pool_id, pool.owner, pool.status, pool.disputeDeadline, now)?;
     }
     let store = store_owner.open_for_write()?;
     let buyer_db = node_buyer_db(&chain.data_dir);
@@ -816,12 +816,12 @@ async fn reclaim_all<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let now = unix_now()?;
     let ids = enumerate_owned_pools(contract, owner).await?;
     if ids.is_empty() {
         println!("no pools found for this keystore — nothing to reclaim");
         return Ok(());
     }
+    let now = chain_ctx::head_timestamp(contract.provider()).await?;
 
     let mut tally = BatchTally::default();
     for pool_id in ids {
@@ -1159,7 +1159,7 @@ async fn list_all(
 
     let ids = enumerate_owned_pools(&contract, owner).await?;
     let tracked = tracked_pool_ids(args, config_path, data_dir).await;
-    let now = unix_now()?;
+    let now = chain_ctx::head_timestamp(contract.provider()).await?;
 
     let mut rows = Vec::with_capacity(ids.len());
     for pool_id in ids {
@@ -2603,7 +2603,7 @@ mod tests {
     }
 
     /// The `--pool` gate refuses each non-reclaimable pool with its own cause,
-    /// never the blanket two-cause revert text.
+    /// never with the post-send `reclaim_reverted` text.
     #[test]
     fn single_reclaim_gate_names_the_cause() {
         let owner = Address::repeat_byte(0x22);
@@ -2644,8 +2644,8 @@ mod tests {
             let msg = msg.unwrap_or_default();
             assert!(msg.contains(cause), "expected {cause:?} in {msg:?}");
             assert!(
-                !msg.contains("not closed, or"),
-                "must name one cause: {msg}"
+                !msg.contains("reclaim reverted"),
+                "must name its own cause: {msg}"
             );
         }
     }
