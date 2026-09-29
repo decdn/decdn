@@ -661,6 +661,9 @@ mod doubles {
         /// a node that refuses one more stream while it serves the others. A
         /// refused open is still recorded in `opened`.
         refuse_open: Option<(std::ops::Range<usize>, FaultFn)>,
+        /// Hold the open with this 0-based index (in call order) for the
+        /// given time before it is served or refused.
+        delay_open: Option<(usize, Duration)>,
         /// When each `open` started and each clean `finish` ended, on the
         /// runtime's clock, as `(fetch_start, opened_at, finished_at)`. A leg
         /// that faulted or was dropped has no `finished_at`. Shared by clones.
@@ -741,6 +744,7 @@ mod doubles {
                 faults_left: None,
                 signed_size: None,
                 refuse_open: None,
+                delay_open: None,
                 timeline: Arc::new(Mutex::new(Vec::new())),
                 opened: Arc::new(Mutex::new(Vec::new())),
                 delivered: Arc::new(AtomicU64::new(0)),
@@ -847,6 +851,15 @@ mod doubles {
             make: impl Fn() -> anyhow::Error + Send + Sync + 'static,
         ) -> Self {
             self.refuse_open = Some((nth..nth.saturating_add(1), Arc::new(make)));
+            self
+        }
+
+        #[cfg(test)]
+        /// Hold the open with 0-based index `nth`, in call order, for `delay`
+        /// before it is served or refused.
+        #[must_use]
+        pub(crate) const fn delaying_open(mut self, nth: usize, delay: Duration) -> Self {
+            self.delay_open = Some((nth, delay));
             self
         }
 
@@ -970,6 +983,11 @@ mod doubles {
                     t.push((range.fetch_start(), tokio::time::Instant::now(), None));
                     t.len().saturating_sub(1)
                 });
+                if let Some((nth, delay)) = self.delay_open
+                    && nth == index
+                {
+                    tokio::time::sleep(delay).await;
+                }
                 if let Some((refused, make)) = &self.refuse_open
                     && refused.contains(&index)
                 {

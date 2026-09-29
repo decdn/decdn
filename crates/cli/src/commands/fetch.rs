@@ -1518,8 +1518,9 @@ pub(crate) const STALL_WINDOW: Duration = Duration::from_secs(30);
 
 /// The part of [`fetch`] that runs over its open `endpoint`: resolve the
 /// holders, take the first size claim (the probe hint, or a header-only open
-/// when there is none), then fetch it through the acquire loop. The command ends on done, a fault only the user can fix, or the stop
-/// policy: a terminal waits for Ctrl-C, a script gives up after 10 minutes
+/// when there is none), then fetch it through the acquire loop. The command
+/// ends on done, a fault only the user can fix, or the stop policy: a
+/// terminal waits for Ctrl-C, a script gives up after 10 minutes
 /// without progress, and `--give-up-after-secs` overrides both.
 #[allow(clippy::too_many_lines)]
 async fn fetch_over(

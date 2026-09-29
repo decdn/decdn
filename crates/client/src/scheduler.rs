@@ -45,7 +45,8 @@
 //! piece, never steals, and gives its grant back when it stops. A fault on it
 //! stops only that stream and does not cool the node while the lane's own
 //! worker runs; once that worker has stopped, the extra is the lane's last
-//! live worker and its fault is the lane's.
+//! live worker and its fault is the lane's, charged once per outage: a node
+//! already charged with no verified byte since is not charged again.
 //!
 //! # Cancellation: closing the double-pay
 //!
@@ -2129,6 +2130,9 @@ where
     // request once this pass has started its lanes.
     let mut extras_running = 0usize;
     let mut want_growth = false;
+    // Providers charged a fault since their last verified byte: a lane's
+    // outage is charged once, however many of its workers fault in it.
+    let mut charged: HashSet<Address> = HashSet::new();
     let mut ready: Vec<(Address, Arc<StreamCandidate<P::Source>>)> = Vec::new();
     let mut seeded = false;
     let mut flush = tokio::time::interval_at(
@@ -2149,6 +2153,18 @@ where
                 && extras_running == 0
                 && all_present(store, &want.ranges, &work).await?
             {
+                if let Some(proven) = store.proven()
+                    && cap > 0
+                    && proven > cap
+                {
+                    // A cap off the chunk-group grid lets a leg that ends at
+                    // it prove a size up to one group past it.
+                    let too_large = crate::BlobTooLarge {
+                        received: proven,
+                        ceiling: cap,
+                    };
+                    return Err(flushed(store, anyhow::Error::new(too_large)).await);
+                }
                 if store.proven().is_some() || !want.tail {
                     store.flush_present_record().await?;
                     return Ok(());
@@ -2326,6 +2342,7 @@ where
                     }
                     if delivered {
                         sources.record_progress(provider);
+                        charged.remove(&provider);
                     }
                     if let LaneEnd::Faulted { err, range } = end {
                         let err = err.unwrap_or_else(|| {
@@ -2337,9 +2354,13 @@ where
                         // while the lane's own worker still runs. A lane's last
                         // live worker faults for the lane, so once the own
                         // worker has stopped, the extra's fault is recorded
-                        // like the lane's own. A fatal fault is the pool's or
+                        // like the lane's own, unless the node is already
+                        // charged for this outage (no verified byte since its
+                        // last recorded fault). A fatal fault is the pool's or
                         // ours, not the stream's, and always ends the acquire.
-                        if extra && running.contains(&provider) {
+                        if extra
+                            && (running.contains(&provider) || charged.contains(&provider))
+                        {
                             if let Fault::Fatal(_) = crate::fault::classify(&err) {
                                 return Err(flushed(store, err).await);
                             }
@@ -2347,6 +2368,7 @@ where
                         } else {
                             let deposit = pool_deposit(&deposit_rx, &started.0);
                             let now = Instant::now();
+                            charged.insert(provider);
                             if let Fault::Fatal(_) =
                                 sources.record_fault(provider, &err, Some(range), now, deposit)
                             {
@@ -5430,6 +5452,37 @@ mod tests {
         Ok(())
     }
 
+    /// A blob exactly at the cap completes: the cap is a ceiling, not a
+    /// bound it must stay under.
+    #[tokio::test(start_paused = true)]
+    async fn a_blob_exactly_at_the_cap_completes() -> anyhow::Result<()> {
+        let data = blob(2 * MIB as usize);
+        let (result, _, store, _dir) = acquire_capped(&data, 3 * MIB, 2 * MIB).await?;
+        result?;
+        assert_eq!(store.proven(), Some(2 * MIB));
+        Ok(())
+    }
+
+    /// A cap off the chunk-group grid: a leg that ends at the cap is served to
+    /// its group's end and can prove a size past the cap. That proven size
+    /// still ends the item with `BlobTooLarge`.
+    #[tokio::test(start_paused = true)]
+    async fn a_proven_size_past_an_unaligned_cap_ends_the_item() -> anyhow::Result<()> {
+        let data = blob(2 * MIB as usize + 100);
+        let cap = 2 * MIB + 50;
+        let (result, _, store, _dir) = acquire_capped(&data, 3 * MIB, cap).await?;
+        let err = result
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("a proven size past the cap must fail"))?;
+        assert!(
+            err.downcast_ref::<crate::BlobTooLarge>().is_some(),
+            "{err:#}"
+        );
+        assert_eq!(classify(&err), Fault::Fatal(FatalScope::Item));
+        assert_eq!(store.proven(), Some(2 * MIB + 100));
+        Ok(())
+    }
+
     // ---- a busy lane grows for a faulted lane's remainder (#2231) ----
 
     /// Counts what a [`super::LaneWiden`] granted and got back.
@@ -5716,6 +5769,52 @@ mod tests {
             b_faults, 2,
             "the own worker's fault and the last live worker's fault both cool B"
         );
+        Ok(())
+    }
+
+    /// A node is charged once per outage: after its lane's own worker faulted
+    /// and was charged, its extra stream refused with no verified byte in
+    /// between does not charge it again.
+    #[tokio::test(start_paused = true)]
+    async fn an_outage_charges_the_node_once() -> anyhow::Result<()> {
+        let data = blob(32 * MIB as usize);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let lb = Arc::new(PoolLedger::new(Cumulative::default()));
+        let a = dead_after_first_mib(&data, &la)?;
+        // B's own leg faults after 4 MiB. Its second open, the extra stream
+        // for A's remainder, is held for 1 s and then refused, so the refusal
+        // lands after the own worker's fault, with no byte in between.
+        let b = ScriptedSource::new(data.clone())?
+            .fault_once_after(4 * MIB as usize, || anyhow::anyhow!("scripted reset"))
+            .delaying_open(1, Duration::from_secs(1))
+            .refusing_open(1, || anyhow::anyhow!("scripted overload"))
+            .paying(Arc::clone(&lb));
+        let (widen, count) = counting_widen(1);
+        let mut cand_b = candidate(b.clone(), Arc::clone(&lb), 0xB2, None);
+        cand_b.widen = Some(widen);
+        let lanes = StaticSources::new(vec![candidate(a.clone(), la, 0xA1, None), cand_b])?;
+        let provider = FaultLog {
+            inner: &lanes,
+            faulted: Mutex::new(Vec::new()),
+        };
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, dir) = fresh_store(root, total);
+        acquire_over(&store, &provider, lanes.holders(), root, 2).await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+        assert!(count.granted() >= 1, "B grew an extra stream");
+        assert_eq!(count.released(), count.granted());
+        let b_faults = provider
+            .faulted
+            .lock()
+            .map(|f| {
+                f.iter()
+                    .filter(|&&p| p == Address::repeat_byte(0xB2))
+                    .count()
+            })
+            .unwrap_or_default();
+        assert_eq!(b_faults, 1, "one outage, one charge");
         Ok(())
     }
 
