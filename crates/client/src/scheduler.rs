@@ -2190,7 +2190,7 @@ where
                         received: proven,
                         ceiling: cap,
                     };
-                    return Err(flushed(store, anyhow::Error::new(too_large)).await);
+                    return Err(anyhow::Error::new(too_large));
                 }
                 if store.proven().is_some() || !want.tail {
                     store.flush_present_record().await?;
@@ -2205,7 +2205,7 @@ where
                         received: bound.saturating_add(1),
                         ceiling: cap,
                     };
-                    return Err(flushed(store, anyhow::Error::new(too_large)).await);
+                    return Err(anyhow::Error::new(too_large));
                 }
                 let extra = bytes_past(&store.present_ranges().await?, c0, bound);
                 let grown = capped(grown_bound(bound, c0, extra));
@@ -2344,7 +2344,7 @@ where
                 && discovering.is_none()
                 && let Some(err) = sources.exhausted(deposit, false)
             {
-                return Err(flushed(store, err).await);
+                return Err(err);
             }
             let uncovered = work.lock().await.uncovered(total_bytes);
             if discovering.is_none()
@@ -2360,7 +2360,7 @@ where
                     // `Err` here is this process's fault (store I/O, a slot bug).
                     let WorkerEnd { provider, end, delivered, extra } = match end {
                         Ok(end) => end,
-                        Err(err) => return Err(flushed(store, err).await),
+                        Err(err) => return Err(err),
                     };
                     if extra {
                         extras_running = extras_running.saturating_sub(1);
@@ -2398,7 +2398,7 @@ where
                             && (running.contains(&provider) || charged.contains(&provider))
                         {
                             if let Fault::Fatal(_) = crate::fault::classify(&err) {
-                                return Err(flushed(store, err).await);
+                                return Err(err);
                             }
                             log_extra_fault(provider, hash, range, &err);
                         } else {
@@ -2408,7 +2408,7 @@ where
                             if let Fault::Fatal(_) =
                                 sources.record_fault(provider, &err, Some(range), now, deposit)
                             {
-                                return Err(flushed(store, err).await);
+                                return Err(err);
                             }
                             want_growth = true;
                         }
@@ -2446,7 +2446,7 @@ where
                     store.flush_present_record().await?;
                 }
                 gave_up = env.stop.expired() => {
-                    return Err(flushed(store, anyhow::Error::new(gave_up)).await);
+                    return Err(anyhow::Error::new(gave_up));
                 }
             }
         }
@@ -2455,6 +2455,11 @@ where
     // Stop every lane first, so no paid leg sits open while the builds drain.
     drop(workers);
     drop(discovering);
+    // Every error exit keeps the bytes that landed recorded for a resume.
+    let result = match result {
+        Err(err) => Err(flushed(store, err).await),
+        ok => ok,
+    };
     drain_builds(&mut connecting).await;
     result
 }

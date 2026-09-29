@@ -35,12 +35,10 @@
 //! 3. **Corrupt checkpoint.** Seeded with a valid checkpoint whose `.partial` data
 //!    is then flipped a byte, while the record still claims the group present.
 //!    `finalize`'s whole-file BLAKE3 of `[0, proven)` is the guarantee: a
-//!    corrupt group can never be silently promoted. The first run pulls the
-//!    missing suffix, the hash catches the drift, the record drops its claim to
-//!    every byte, and the run FAILS and writes no `--output`. The store keeps the
-//!    `.partial` and its record, so the very next run re-pulls the blob over it
-//!    and promotes the correct blob. Never a silently wrong output; never a
-//!    wedge.
+//!    corrupt group can never be silently promoted. The run pulls the missing
+//!    suffix, the hash catches the drift, and the record drops its claim to
+//!    every byte. The same run then re-pulls the blob over the `.partial` and
+//!    promotes the correct blob. Never a silently wrong output; never a wedge.
 //! 4. **Checkpoint from a different blob.** Seeded from a FOREIGN blob's bytes at
 //!    `--output`'s location. On open against the real blob's root the foreign
 //!    prefix fails the `finalize` hash, the claim is dropped, and the blob is
@@ -308,11 +306,11 @@ async fn run() -> anyhow::Result<()> {
     // trusts the record for what to SKIP, so the corrupt group is never re-pulled
     // on its own: only `finalize`'s whole-file hash can catch it.
     //
-    // First run: `drive` pulls the missing suffix, `finalize` hashes, the hash
-    // does not match, and the record drops its claim to every byte. So the run
-    // FAILS and writes no `--output` (a silently wrong output file is the exact
-    // bug this guards). The store keeps the `.partial` and its record, so the
-    // corruption is not promoted and not left to poison presence.
+    // `drive` pulls the missing suffix, `finalize` hashes, the hash does not
+    // match, and the record drops its claim to every byte; the corruption is
+    // never promoted. The same command then fetches the blob once more and
+    // promotes the correct one: the self-heal needs no second run, and no
+    // wrong `--output` ever exists.
     std::fs::remove_file(&out).context("remove output before corrupt run")?;
     ClientRangedStore::seed_checkpointed_prefix(
         client_dir.path(),
@@ -331,24 +329,15 @@ async fn run() -> anyhow::Result<()> {
             .await
             .context("spawn decdn fetch over a corrupt checkpoint")?;
     anyhow::ensure!(
-        !output.status.success(),
-        "a fetch whose finalize hash catches a corrupt group must fail, not write a wrong \
-         output file"
+        output.status.success(),
+        "one fetch over a corrupt checkpoint must heal and succeed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    anyhow::ensure!(
-        !out.exists(),
-        "a failed finalize hash must not leave a (wrong) output file behind"
-    );
-
-    // Second run: the failed hash already dropped the record's claim, so the
-    // resume re-pulls the blob and promotes the correct one: the self-heal the
-    // client guarantees without ever emitting a wrong output.
-    run_fetch_until_ready(client_dir.path(), &args).await?;
     let got = std::fs::read(&out).context("read output after corruption recovery")?;
     anyhow::ensure!(
         got == blob,
-        "the run after a caught corruption must re-pull the blob and promote the correct \
-         blob: got {} bytes, expected {}",
+        "a fetch whose finalize hash catches a corrupt group must re-pull the blob and \
+         promote the correct blob: got {} bytes, expected {}",
         got.len(),
         blob.len()
     );
@@ -363,7 +352,7 @@ async fn run() -> anyhow::Result<()> {
     // Seed a checkpoint from a FOREIGN blob's bytes at `--output`'s location. On
     // open against the real blob's root the record claims a prefix present, so
     // `drive` pulls only the (real) suffix, but the foreign prefix fails
-    // `finalize`'s whole-file hash and the claim is dropped. A subsequent run
+    // `finalize`'s whole-file hash and the claim is dropped. The same run then
     // re-pulls the blob from the node (overwriting the foreign bytes) and
     // promotes the correct blob. The command must recover, never wedge and never
     // promote foreign bytes.

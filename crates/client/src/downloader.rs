@@ -247,9 +247,13 @@ where
     /// correctly. The whole blob is fetched at full throughput, with no
     /// read-ahead bound.
     ///
-    /// `total_bytes` is authoritative for keying the store, and the target `hash`
-    /// is the bao root every ingested byte is verified against: a wrong size or
-    /// hash surfaces as a verification failure, never as silent corruption.
+    /// `total_bytes` is the first size claim, a hint: a resumed store's bound
+    /// wins over it, and a leg that verifies the final chunk proves the size.
+    /// The target `hash` is the bao root every ingested byte is verified
+    /// against: a wrong hash surfaces as a verification failure, never as
+    /// silent corruption. A finalize whose whole-file hash does not match
+    /// (bytes that drifted on disk after they verified) fetches the target
+    /// once more.
     ///
     /// `ledgers`, when set, is a shared voucher-ledger registry (a bundle run's
     /// `LaneLedgers`): the loop reads and credits EVERY lane registered across
@@ -264,10 +268,11 @@ where
     /// # Errors
     ///
     /// A `dest` with no file name, a store
-    /// open/create/finalize I/O error, or the error [`crate::acquire`] ends a
-    /// target with: a fatal fault, a unanimous verdict of the sources, or
-    /// [`crate::GaveUp`]. The first failing target aborts the batch; targets
-    /// already written stay on disk.
+    /// open/create/finalize I/O error, a second [`crate::HashMismatch`] at
+    /// finalize, or the error [`crate::acquire`] ends a target with: a fatal
+    /// fault, a unanimous verdict of the sources, or [`crate::GaveUp`]. The
+    /// first failing target aborts the batch; targets already written stay on
+    /// disk.
     pub async fn fetch_to_paths_until(
         &self,
         targets: &[DownloadTarget<'_>],
@@ -321,32 +326,61 @@ where
                 pacing: None,
                 max_blob_bytes: self.max_blob_bytes,
             };
-            // A dropped download still records the ranges that landed.
-            let flush_on_drop = store.flush_on_drop();
-            let fetched = acquire(
-                AcquireTarget {
-                    store: &store,
-                    hash: target.hash,
-                    total_bytes: target.total_bytes,
-                    ranges,
-                },
-                &mut sources,
-                &env,
-            )
-            .await;
-            flush_on_drop.disarm();
-            fetched?;
-            // `acquire` flushes the present record but does not promote; a
-            // download keeps the file, so finalize (verify + promote `.partial`)
-            // once every byte is present. Explicit ranges can leave bytes to
-            // another writer, and the `.partial` then stays for that writer.
-            if target.ranges.is_none() || store.is_complete().await? {
-                store.finalize().await?;
-                written.push(target.dest.to_path_buf());
+            // A finalize whose hash does not match clears every claim and
+            // keeps the file, so one more pass fetches the blob again. A
+            // second mismatch is a local fault and ends the target.
+            let mut passes_left = 2u8;
+            loop {
+                passes_left = passes_left.saturating_sub(1);
+                // A dropped download still records the ranges that landed.
+                let flush_on_drop = store.flush_on_drop();
+                let fetched = acquire(
+                    AcquireTarget {
+                        store: &store,
+                        hash: target.hash,
+                        total_bytes: target.total_bytes,
+                        ranges,
+                    },
+                    &mut sources,
+                    &env,
+                )
+                .await;
+                flush_on_drop.disarm();
+                fetched?;
+                // `acquire` flushes the present record but does not promote; a
+                // download keeps the file, so finalize (verify + promote
+                // `.partial`) once every byte is present. Explicit ranges can
+                // leave bytes to another writer, and the `.partial` then stays
+                // for that writer.
+                if target.ranges.is_some() && !store.is_complete().await? {
+                    break;
+                }
+                match store.finalize().await {
+                    Ok(()) => {
+                        written.push(target.dest.to_path_buf());
+                        break;
+                    }
+                    Err(err) if passes_left > 0 && is_hash_mismatch(&err) => {
+                        tracing::warn!(
+                            hash = %blake3::Hash::from_bytes(target.hash).to_hex(),
+                            dest = %target.dest.display(),
+                            "the finalized file does not match its hash; fetching it once more"
+                        );
+                    }
+                    Err(err) => return Err(err.into()),
+                }
             }
         }
         Ok(written)
     }
+}
+
+/// Whether a finalize failed its whole-file hash ([`crate::HashMismatch`]).
+fn is_hash_mismatch(err: &decdn_bao_range::RangedStoreError) -> bool {
+    matches!(
+        err,
+        decdn_bao_range::RangedStoreError::Backend(inner) if inner.is::<crate::HashMismatch>()
+    )
 }
 
 /// The directory and stem a [`DownloadTarget`]'s `.partial` store lives under, so
@@ -871,6 +905,33 @@ mod tests {
                 .iter()
                 .all(|&(start, len)| start >= held && start + len <= total - group),
             "only the missing middle is opened: {opened:?}"
+        );
+        Ok(())
+    }
+
+    /// Bytes that drift on disk after they verified fail the finalize hash.
+    /// The same fetch runs once more over the blob and completes.
+    #[tokio::test]
+    async fn a_finalize_hash_mismatch_fetches_again_and_completes() -> anyhow::Result<()> {
+        let blob = payload(2 * 1024 * 1024);
+        let total = u64::try_from(blob.len())?;
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("model.bin");
+        // A record that claims and proves every byte over a data file with one
+        // flipped byte: the drift the finalize hash exists to catch.
+        let mut drifted = blob.clone();
+        if let Some(b) = drifted.get_mut(1000) {
+            *b ^= 0xFF;
+        }
+        ClientRangedStore::seed_checkpointed_prefix(dir.path(), "model.bin", &drifted, total)?;
+
+        let (probe, paths) = fetch_ranges(&blob, &dest, total, None).await?;
+        anyhow::ensure!(paths == vec![dest.clone()], "the fetch promotes");
+        anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
+        anyhow::ensure!(
+            probe.opened_bytes() >= total,
+            "the second pass fetched the blob again: {}",
+            probe.opened_bytes()
         );
         Ok(())
     }
