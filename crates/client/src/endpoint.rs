@@ -33,12 +33,12 @@ use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
 /// knowledge of the node's config and covers the common case.
 const CLIENT_STREAM_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
 
-/// Whole-connection QUIC receive window for a client pull. A pull runs one bulk
-/// stream per connection (`per_source_inflight = 1`, one connection per
-/// provider), so this only needs to hold at least
-/// [`CLIENT_STREAM_RECEIVE_WINDOW`]; the 2x headroom leaves slack for the
-/// connection's control traffic without letting worst-case buffering grow
-/// larger than it must.
+/// Whole-connection QUIC receive window for a client pull. A pull usually runs
+/// one bulk stream per connection (one connection per provider), so this only
+/// needs to hold at least [`CLIENT_STREAM_RECEIVE_WINDOW`]; the 2x headroom
+/// leaves slack for the connection's control traffic without letting
+/// worst-case buffering grow larger than it must. Several streams of one lane
+/// on one connection share this window.
 const CLIENT_RECEIVE_WINDOW: u32 = 128 * 1024 * 1024;
 
 // A single stream must be able to fill its own window within the

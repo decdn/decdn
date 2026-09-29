@@ -28,6 +28,22 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`decdn-client` lanes grow for a faulted lane's remainder (#2230).**
+  `SourceLane` gains `widen: Option<&LaneWiden>` and `StreamCandidate` gains
+  `widen: Option<LaneWiden>`; `LaneWiden` (new) pairs a non-waiting `grow`
+  hook with a `release` hook. When a lane faults and no idle worker can take
+  the range it re-queues, the multi-source scheduler asks the live lanes that
+  cover it, in lane order, for one more stream each until the range has a
+  taker, so it runs beside the survivor's own range instead of after it.
+  `drive_range_lanes` asks its lanes the same way when a faulted lane puts a
+  gap back. A fault on such an additional stream stops only that stream: it
+  does not retire the lane, and `RangeSetOutcome::lane_extra_fault` (new)
+  reports it apart from `lane_fault`. `bundle pull` grants the additional
+  streams from the provider's free `--max-lane-streams` permits. A caller
+  that builds these structs sets the new fields (`None`). Each lane fault now
+  logs a warning where it happens, with provider, hash, range and bytes
+  landed; a remainder no lane can grow for logs at info; and a leg phase
+  (`unpolled`, `pay` or `read`) that runs past 5 s logs at debug.
 - **`decdn-client` lanes carry what they hold while they stream (#2208).**
   `RangeLane` gains `release: Option<LaneRelease>`, which the range driver
   calls as each gap worker stops. `StreamCandidate` gains `lease: LaneLease`

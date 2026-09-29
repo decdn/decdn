@@ -698,6 +698,11 @@ mod doubles {
         blob: Bytes,
         outboard: Bytes,
         fault: Option<(usize, FaultFn)>,
+        /// Refuse every open whose 0-based index (in call order) lies in the
+        /// range, with the fault its `FaultFn` produces, before any byte flows:
+        /// a node that refuses one more stream while it serves the others. A
+        /// refused open is still recorded in `opened`.
+        refuse_open: Option<(std::ops::Range<usize>, FaultFn)>,
         /// Every range this source was `open`ed for, in call order, as
         /// `(fetch_start, fetch_len)`. Shared behind an `Arc<Mutex<..>>` so a
         /// clone handed to the driver records into the same log the test
@@ -773,6 +778,7 @@ mod doubles {
                 blob,
                 outboard: ob.data.into(),
                 fault: None,
+                refuse_open: None,
                 opened: Arc::new(Mutex::new(Vec::new())),
                 delivered: Arc::new(AtomicU64::new(0)),
                 first_read_stall: None,
@@ -880,6 +886,33 @@ mod doubles {
         }
 
         #[cfg(test)]
+        /// Refuse the open with 0-based index `nth`, in call order, with the
+        /// fault `make` produces. Every other open is served as usual.
+        #[must_use]
+        pub(crate) fn refusing_open(
+            mut self,
+            nth: usize,
+            make: impl Fn() -> anyhow::Error + Send + Sync + 'static,
+        ) -> Self {
+            self.refuse_open = Some((nth..nth.saturating_add(1), Arc::new(make)));
+            self
+        }
+
+        #[cfg(test)]
+        /// Refuse every open from 0-based index `first` on, in call order,
+        /// with the fault `make` produces: a node that serves the streams it
+        /// already has and refuses any more.
+        #[must_use]
+        pub(crate) fn refusing_opens_from(
+            mut self,
+            first: usize,
+            make: impl Fn() -> anyhow::Error + Send + Sync + 'static,
+        ) -> Self {
+            self.refuse_open = Some((first..usize::MAX, Arc::new(make)));
+            self
+        }
+
+        #[cfg(test)]
         /// After `wire_bytes` of a range's wire, truncate it and park the fault
         /// `make` produces — the exact shape a stalled/refusing peer leaves.
         #[must_use]
@@ -923,8 +956,14 @@ mod doubles {
                 if hash != self.root {
                     anyhow::bail!("scripted source opened for a foreign hash");
                 }
-                if let Ok(mut log) = self.opened.lock() {
+                let index = self.opened.lock().map_or(0, |mut log| {
                     log.push((range.fetch_start(), range.fetch_len()));
+                    log.len().saturating_sub(1)
+                });
+                if let Some((refused, make)) = &self.refuse_open
+                    && refused.contains(&index)
+                {
+                    return Err(make());
                 }
                 let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 self.peak_in_flight.fetch_max(now, Ordering::SeqCst);

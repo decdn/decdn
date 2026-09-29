@@ -45,9 +45,9 @@ use decdn_client::sink::PullReader;
 use decdn_client::source::{BlobSource as _, Funder, PrimedSource, SourceFuture};
 use decdn_client::{
     BudgetPacer, ClientRangedStore, Cumulative, DownloadTarget, Downloader, LaneHandle, LaneLease,
-    LaneLedgers, NoCache, PeerSource, PoolContext, PoolExhausted, PoolLedger, ProgressCallback,
-    PullConfig, PullDeadlines, RetryDisposition, SharedPool, StreamCandidate, Streamer,
-    UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
+    LaneLedgers, LaneWiden, NoCache, PeerSource, PoolContext, PoolExhausted, PoolLedger,
+    ProgressCallback, PullConfig, PullDeadlines, RetryDisposition, SharedPool, StreamCandidate,
+    Streamer, UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
     open_progressive_pull, retry_disposition, sign_client_binding,
 };
 use decdn_common::cli::{self, common::expand_tilde};
@@ -2925,11 +2925,12 @@ pub(crate) struct StripeLane<'s, 'a, P> {
     pub(crate) release: Option<decdn_client::LaneRelease<'s>>,
 }
 
-/// Whether a lane of a striped drive settles at its committed cumulative: it
-/// served every gap it took, in a drive that filled every range. Anything else
-/// settles at the armed settlement ([`FetchPrelude::settle_lane`]).
-const fn settles_clean(drive_succeeded: bool, lane_fault: Option<&anyhow::Error>) -> bool {
-    drive_succeeded && lane_fault.is_none()
+/// Whether a lane of a striped drive settles at its committed cumulative: no
+/// worker of it faulted ([`RangeSetOutcome::lane_fault`] or
+/// [`RangeSetOutcome::lane_extra_fault`]), in a drive that filled every range.
+/// Anything else settles at the armed settlement ([`FetchPrelude::settle_lane`]).
+const fn settles_clean(drive_succeeded: bool, any_fault: Option<&anyhow::Error>) -> bool {
+    drive_succeeded && any_fault.is_none()
 }
 
 /// How a [`drive_stripe`] drive ended: which lanes faulted, and the drive's
@@ -2947,7 +2948,9 @@ pub(crate) struct StripeDriven {
 /// `lanes`, one session per provider (#2123), then settle every lane.
 ///
 /// The gaps of `ranges` spread over every lane ([`drive_range_lanes`]). A
-/// lane that faults retires, and the other lanes fill what it left. The drive
+/// lane that faults retires, and the other lanes fill what it left. A fault of
+/// a stream a lane's growth hook granted leaves the lane live: it blames no
+/// one and keeps the session, but the lane still settles as faulted. The drive
 /// runs under one drive-level throughput floor ([`drive_floor`]) across every
 /// lane, because its many short legs each clear the per-stream floor however
 /// slowly the entry as a whole advances. Every lane pays from one pool, and
@@ -2959,8 +2962,8 @@ pub(crate) struct StripeDriven {
 /// own fault, except where our own pool ran dry, the node's floor exceeds our
 /// deposit, or the signed size disagrees with the store's
 /// ([`blames_the_peer`]). A floor trip ([`EntryStalled`]) blames every lane. A
-/// local fault of the drive itself blames none. Each lane fault is logged
-/// with its provider.
+/// local fault of the drive itself blames none. The drive logs each fault with
+/// its provider where it happens.
 pub(crate) async fn drive_stripe<P>(
     store: &ClientRangedStore,
     lanes: &[StripeLane<'_, '_, P>],
@@ -3022,9 +3025,13 @@ where
         .enumerate()
         .map(|(i, lane)| {
             let fault = outcome.lane_fault(i);
+            // A granted stream's fault leaves the lane live and blames no one,
+            // but its leg can still have left a voucher armed.
+            let armed = fault.or_else(|| outcome.lane_extra_fault(i));
             let s = lane.session;
+            // The drive already warned where the fault happened.
             if let Some(fault) = fault {
-                tracing::warn!(
+                tracing::debug!(
                     "provider {} left the stripe for {}: {fault:#}",
                     s.lane.provider,
                     blake3::Hash::from_bytes(lead.hash).to_hex(),
@@ -3032,7 +3039,7 @@ where
             }
             let blamed = stalled || fault.is_some_and(blames_the_peer);
             s.prelude
-                .settle_lane(s.store, s.lane, blamed, settles_clean(succeeded, fault));
+                .settle_lane(s.store, s.lane, blamed, settles_clean(succeeded, armed));
             fault.is_some()
         })
         .collect();
@@ -3732,16 +3739,27 @@ where
     Ok(())
 }
 
+/// What one provider's lane holds for a multi-source fetch: the lease its first
+/// worker keeps while the lane takes work, and how the lane adds a concurrent
+/// stream while a faulted lane's remainder waits.
+#[derive(Default)]
+pub(crate) struct LaneHold {
+    /// Kept by the lane's first worker, dropped when it stops ([`LaneLease`]).
+    pub(crate) lease: LaneLease,
+    /// How the lane grows past one stream ([`LaneWiden`]), or `None`.
+    pub(crate) widen: Option<LaneWiden>,
+}
+
 /// Split each built [`MultiLane`] into the [`StreamCandidate`] a face owns (it
 /// takes the `PeerSource`) and the [`StreamLane`] watermark handle that outlives
 /// it (a clone of the same `ledger` Arc the fetch pays through), threading each
-/// candidate's measured coverage and its provider's lease (taken from `leases`)
+/// candidate's measured coverage and its provider's hold (taken from `holds`)
 /// into the [`StreamCandidate`].
 fn split_face_lanes<'a>(
     lanes: Vec<MultiLane<'a>>,
     coverage_by_node: &HashMap<PublicKey, decdn_protocol::Coverage>,
     total_bytes: u64,
-    leases: &mut HashMap<Address, LaneLease>,
+    holds: &mut HashMap<Address, LaneHold>,
 ) -> (
     Vec<StreamCandidate<PrimedSource<PeerSource<'a>>>>,
     Vec<StreamLane>,
@@ -3751,6 +3769,7 @@ fn split_face_lanes<'a>(
     let mut handles = Vec::with_capacity(lanes.len());
     for lane in lanes {
         let coverage = lane_coverage(coverage_by_node, lane.node_id, num_blocks);
+        let hold = holds.remove(&lane.provider).unwrap_or_default();
         handles.push(StreamLane {
             pool_id: lane.pool_id,
             provider: lane.provider,
@@ -3763,7 +3782,8 @@ fn split_face_lanes<'a>(
             ledger: lane.ledger,
             coverage: Some(coverage),
             first_unit: lane.first_unit,
-            lease: leases.remove(&lane.provider).unwrap_or_default(),
+            lease: hold.lease,
+            widen: hold.widen,
         });
     }
     (candidates, handles)
@@ -4028,9 +4048,10 @@ where
 /// watermark is persisted after — the face does not persist, so this thin CLI
 /// layer does. `open_lock` and `ledgers` thread `bundle pull`'s shared pool lock
 /// and ledger registry through; a solo `decdn fetch` passes `None`/`None`.
-/// `leases` holds what each provider's lane keeps while it takes work, keyed by
-/// provider: the lane drops it when it stops ([`LaneLease`]). A solo `decdn
-/// fetch` passes none.
+/// `holds` maps each provider to what its lane keeps while it takes work
+/// ([`LaneHold`]): the lane drops its lease when its first worker stops, and
+/// grows through its widen hooks while a faulted lane's remainder waits. A solo
+/// `decdn fetch` passes none.
 ///
 /// The fetch runs under the drive-level floor ([`drive_floor`]), judged on the
 /// position across every lane. A trip returns [`EntryStalled`], which is
@@ -4051,7 +4072,7 @@ pub(crate) async fn multi_source_download<P>(
     progress: Option<&ProgressCallback>,
     open_lock: Option<&tokio::sync::Mutex<()>>,
     ledgers: Option<&LaneLedgers>,
-    mut leases: HashMap<Address, LaneLease>,
+    mut holds: HashMap<Address, LaneHold>,
 ) -> anyhow::Result<Option<u64>>
 where
     P: alloy::providers::Provider + Clone,
@@ -4107,9 +4128,9 @@ where
     };
 
     let (stream_candidates, handles) =
-        split_face_lanes(lanes, coverage_by_node, total_bytes, &mut leases);
-    // A lease no built lane took (a holder that did not open) frees now.
-    drop(leases);
+        split_face_lanes(lanes, coverage_by_node, total_bytes, &mut holds);
+    // A hold no built lane took (a holder that did not open) frees now.
+    drop(holds);
     // Keep the first lane's ctx to annotate an unbound-namespace cache miss on
     // failure.
     let first_ctx = stream_candidates.first().map(|c| Arc::clone(&c.ctx));
