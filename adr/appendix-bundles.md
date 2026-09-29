@@ -48,9 +48,12 @@ order — field declaration order is load-bearing, see
   rejected at create time.
 - `hash` — `b3:` followed by the 64-character lowercase hex of the
   file's BLAKE3. See [Hash format](#hash-format).
-- `size` — file size in bytes, unsigned 64-bit integer. Optional and
-  informational on the read side: `bundle pull` uses it for the dry-run
-  plan and size hints, and fetches without it.
+- `size` — file size in bytes, unsigned 64-bit integer. Optional and a
+  hint on the read side. `bundle pull` uses it for the dry-run plan and as
+  the first size claim of the entry, and fetches without it. The fetch
+  proves the true size ([ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)).
+  When the proven size differs from `size`, the entry succeeds and the
+  pull prints `<path>: manifest says X bytes, the blob is Y bytes`.
 - `chunks` — optional ordered list of range-dedup hints over the file's
   bytes. See [Chunked files](#chunked-files). When absent, the file is
   one blob addressed by `hash`.
@@ -283,9 +286,10 @@ as `decdn fetch`):
   its ranges to the other holders. When the cooldown ends, the holder comes
   back into the same loop. A holder that faults for one entry also cools for
   every other entry. A failed entry does not retry in rounds. The size in
-  the manifest keys the store of the entry. A holder that signs a different
-  size leaves that entry. When no holder signs the manifest size, only that
-  entry fails. A blob over the client's size cap also fails only its entry.
+  the manifest is the first size claim of the entry (C0). It is a hint. A
+  holder that signs a different size does not leave the entry. An entry
+  whose proven size differs from its manifest size succeeds with a warning
+  line. A blob over the client's size cap fails only its entry.
   A fault that only the user can fix stops all entries: a voucher rejection,
   an origin blacklist, no affordable holder, or a local disk fault. The pull
   then starts no new entry, stops the entries that run, and exits with
@@ -300,7 +304,9 @@ as `decdn fetch`):
   escaping paths rejected). Writes are atomic (temp-then-rename after the
   BLAKE3 check the fetch path already performs), so a present file is
   verified-good: pull **skips existing files** by default (re-runs
-  resume), and `--overwrite` forces a re-fetch.
+  resume), and `--overwrite` forces a re-fetch. The skip check accepts a
+  file by its hash. A saved record whose size and mtime match is a fast
+  path. Without a match, the pull hashes the file against the manifest.
 - **`--dry-run`** reports the plan without any network/chain activity
   (entries are only enumerable for the `-i` form; `--hash` cannot list
   them without first fetching the manifest).
