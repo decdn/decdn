@@ -2080,7 +2080,12 @@ where
         Box::pin(downloader.fetch_to_paths_until(&[target], None, Some(&on_progress), stop)).await;
     bar.finish_and_clear();
     result?;
-    print_fetch_summary(target.total_bytes, &meter, target.dest);
+    // The finished file holds exactly the proven size, which can differ from
+    // the first claim the fetch started from.
+    let proven = tokio::fs::metadata(target.dest)
+        .await
+        .map_or(target.total_bytes, |m| m.len());
+    print_fetch_summary(proven, &meter, target.dest);
     Ok(())
 }
 
@@ -2379,28 +2384,29 @@ fn delivery_progress() -> (
     (bar, on_progress, meter)
 }
 
-/// Build the callback that drives `bar` — setting its length to the blob's
-/// `total_bytes` once, advancing its position to the cumulative verified
-/// content-byte count, and folding each update into a [`SpeedState`] for the
-/// rate/ETA `{msg}` — and return it with the [`DeliveryMeter`] the caller reads
-/// after the bar finishes. `tab`, when set, shows the same percent in the
-/// terminal's tab bar.
+/// Build the callback that drives `bar` — setting its length to the fetch's
+/// current size bound whenever it changes, advancing its position to the
+/// cumulative verified content-byte count, and folding each update into a
+/// [`SpeedState`] for the rate/ETA `{msg}` — and return it with the
+/// [`DeliveryMeter`] the caller reads after the bar finishes. `tab`, when set,
+/// shows the same percent in the terminal's tab bar.
 ///
 /// The callback's `received`/`expected` are content bytes, per
-/// [`decdn_client::ProgressCallback`]. Both the bar length and its position
-/// are therefore in the same unit, so the bar fills to exactly 100% and never
-/// overshoots.
+/// [`decdn_client::ProgressCallback`]. `expected` is the size bound: a size
+/// claim the fetch grows or shrinks until a leg proves the size. Both the bar
+/// length and its position are in the same unit.
 fn bar_callback(
     bar: indicatif::ProgressBar,
     tab: Option<Arc<TabProgress>>,
 ) -> (impl Fn(u64, u64) + 'static, DeliveryMeter) {
-    // `expected` is constant across the pull, so set the bar length once (it
-    // takes a write lock) rather than on every chunk in the hot receive loop.
-    let length_set = std::sync::atomic::AtomicBool::new(false);
+    // Setting the length takes a write lock, so it is set only when the bound
+    // moves, not on every chunk in the hot receive loop. `u64::MAX` is never a
+    // bound, so the first report always sets it.
+    let length = std::sync::atomic::AtomicU64::new(u64::MAX);
     let state = Arc::new(Mutex::new(SpeedState::default()));
     let cb_state = Arc::clone(&state);
     let on_progress = move |received: u64, expected: u64| {
-        if !length_set.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if length.swap(expected, std::sync::atomic::Ordering::Relaxed) != expected {
             bar.set_length(expected);
         }
         bar.set_position(received);

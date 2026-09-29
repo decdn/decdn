@@ -68,8 +68,9 @@ struct StreamState {
     /// [`WindowPacer`] gates the pull against, so the fetch stays within one
     /// read-ahead window of it.
     cursor: AtomicU64,
-    /// Whole-blob content length.
-    total: u64,
+    /// The caller's size hint: the fetch's first claim. The stream ends at the
+    /// size a leg proves ([`ClientRangedStore::proven`]), whatever this says.
+    hint: u64,
     /// Woken by the reader when `cursor` advances, so a pull parked on a full
     /// read-ahead window ([`PaceDecision::Wait`](crate::pacer::PaceDecision::Wait))
     /// re-decides.
@@ -124,7 +125,7 @@ impl ConsumedWait {
     /// Whether verified bytes wait unread ahead of the consumer's `cursor`. A
     /// store fault reads as nothing unread, so the clock runs.
     async fn unread_ahead(&self, cursor: u64) -> bool {
-        present_frontier(&self.state.store, self.state.total)
+        present_frontier(&self.state.store)
             .await
             .is_ok_and(|frontier| frontier > cursor)
     }
@@ -265,7 +266,7 @@ where
         pacing_wait: &wait,
     };
     let mut sources = SourceSet::new(&provider, hash, health, holders);
-    let ranges = [(0, state.total)];
+    let ranges = [(0, state.store.bound())];
     // Under consumption pacing `acquire` turns its lane watchdog off: a lane
     // parked on the consumer cursor is waiting, not stalled. A genuinely silent
     // source trips its own per-stream idle window mid-read instead.
@@ -285,7 +286,7 @@ where
         AcquireTarget {
             store: &state.store,
             hash,
-            total_bytes: state.total,
+            total_bytes: state.hint,
             ranges: &ranges,
         },
         &mut sources,
@@ -293,16 +294,17 @@ where
     )
     .await;
     if result.is_ok() {
-        // Tee the whole verified blob to the cache for a revisit. Best-effort:
-        // a cache write failure never fails the delivered stream. The store is
-        // left at `.partial` (a stream is not kept as a file), and reading its
-        // fully-present content needs no finalize.
+        // Tee the whole verified blob, `[0, proven)`, to the cache for a
+        // revisit. Best-effort: a cache write failure never fails the delivered
+        // stream. The store is left at `.partial` (a stream is not kept as a
+        // file), and reading its fully-present content needs no finalize.
         //
         // Only when the cache actually stores it: a `NoCache` (the `decdn fetch
         // -o -` path) reports `caches() == false`, so a huge blob is never read
         // whole into memory just to be dropped — the stream stays memory-bounded.
         if cache.caches()
-            && let Ok(whole) = state.store.read(0, state.total).await
+            && let Some(proven) = state.store.proven()
+            && let Ok(whole) = state.store.read(0, proven).await
         {
             let _ = cache.put(hash, 0, whole).await;
         }
@@ -483,7 +485,7 @@ where
         let state = Arc::new(StreamState {
             store,
             cursor: AtomicU64::new(0),
-            total: total_bytes,
+            hint: total_bytes,
             consumed: Notify::new(),
             progressed: Notify::new(),
             outcome: Mutex::new(None),
@@ -655,13 +657,13 @@ pub struct LiveReader {
 /// A store fault reading its present ranges (I/O, a poisoned lock). Surfaced to
 /// the reader rather than masked as "nothing present", so a real fault does not
 /// look like an empty stream that stalls or ends early.
-async fn present_frontier(store: &ClientRangedStore, total: u64) -> anyhow::Result<u64> {
+async fn present_frontier(store: &ClientRangedStore) -> anyhow::Result<u64> {
     let present = store
         .present_ranges()
         .await
         .map_err(|e| anyhow::anyhow!("read present ranges: {e}"))?;
     Ok(
-        match crate::driver::contiguous_byte_ranges(&present, total).first() {
+        match crate::driver::contiguous_byte_ranges(&present, store.bound()).first() {
             Some(&(0, len)) => len,
             _ => 0,
         },
@@ -669,11 +671,12 @@ async fn present_frontier(store: &ClientRangedStore, total: u64) -> anyhow::Resu
 }
 
 /// Wait until verified bytes past `cursor` are in the store, then read up to
-/// [`MAX_READ_CHUNK`] of them. `None` is the end of the stream. A drive failure
-/// surfaces only once every verified byte before it has been read.
+/// [`MAX_READ_CHUNK`] of them. `None` is the end of the stream: the cursor has
+/// reached the size a leg proved. A drive failure surfaces only once every
+/// verified byte before it has been read.
 async fn next_verified(state: Arc<StreamState>, cursor: u64) -> io::Result<Option<Bytes>> {
     loop {
-        if cursor >= state.total {
+        if state.store.proven().is_some_and(|proven| cursor >= proven) {
             return Ok(None);
         }
         // Register for the drive's wakeup BEFORE reading the frontier, so a
@@ -684,7 +687,7 @@ async fn next_verified(state: Arc<StreamState>, cursor: u64) -> io::Result<Optio
         // Read the outcome before the frontier: a drive that ended before this
         // frontier read left every verified byte in it.
         let outcome = state.outcome();
-        let frontier = present_frontier(&state.store, state.total)
+        let frontier = present_frontier(&state.store)
             .await
             .map_err(|e| io::Error::other(format!("present frontier: {e:#}")))?;
         if frontier > cursor {
@@ -703,7 +706,7 @@ async fn next_verified(state: Arc<StreamState>, cursor: u64) -> io::Result<Optio
             Some(Ok(())) => {
                 return Err(io::Error::other(format!(
                     "stream fetch finished with {cursor} of {} bytes readable",
-                    state.total
+                    state.store.bound()
                 )));
             }
             None => {}
@@ -717,7 +720,7 @@ impl std::fmt::Debug for LiveReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LiveReader")
             .field("cursor", &self.state.cursor.load(Ordering::SeqCst))
-            .field("total", &self.state.total)
+            .field("bound", &self.state.store.bound())
             .field("buffered", &self.buffered.len())
             .finish_non_exhaustive()
     }
@@ -976,6 +979,37 @@ mod tests {
         Ok(())
     }
 
+    /// A first claim far below the blob does not end the stream at the claim:
+    /// the fetch grows it, and the stream ends at the size a leg proves, with
+    /// every byte of the blob.
+    #[tokio::test]
+    async fn the_stream_ends_at_the_proven_size_when_the_claim_was_small() -> anyhow::Result<()> {
+        let blob = payload(3 * 1024 * 1024 + 777);
+        let (source, ledger) = paying_source(blob.clone())?;
+        let root = source.root();
+        let scratch = tempfile::tempdir()?;
+        let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
+        let (mut reader, mut drive) = streamer
+            .open(
+                root,
+                64 * 1024,
+                &PullConfig::default(),
+                Arc::new(NoCache),
+                stop(),
+            )
+            .await?;
+        let mut out = Vec::new();
+        drive.alongside(reader.read_to_end(&mut out)).await?;
+        anyhow::ensure!(
+            out.len() == blob.len(),
+            "{} of {} bytes",
+            out.len(),
+            blob.len()
+        );
+        anyhow::ensure!(out == blob, "the grown stream must be byte-identical");
+        Ok(())
+    }
+
     /// A sink that reports `caches() == false` is NEVER teed the whole blob on a
     /// clean finish — the `Streamer` skips the whole-blob read (and the memory it
     /// would cost) that only exists to populate a cache. This is what keeps a
@@ -1210,7 +1244,7 @@ mod tests {
                     let consumed = u64::try_from(out.len())?;
                     let ahead = match &reader {
                         VerifiedReader::Live(live) => {
-                            let present = super::present_frontier(&live.state.store, total).await?;
+                            let present = super::present_frontier(&live.state.store).await?;
                             present.saturating_sub(consumed)
                         }
                         VerifiedReader::Cached { .. } => 0,
@@ -1254,7 +1288,7 @@ mod tests {
             .alongside(tokio::time::sleep(Duration::from_millis(300)))
             .await;
         let present = match &reader {
-            VerifiedReader::Live(live) => super::present_frontier(&live.state.store, total).await?,
+            VerifiedReader::Live(live) => super::present_frontier(&live.state.store).await?,
             VerifiedReader::Cached { .. } => anyhow::bail!("a cold stream must be live"),
         };
         anyhow::ensure!(
@@ -1326,13 +1360,13 @@ mod tests {
 
         for cursor_at_frontier in [true, false] {
             let store = crate::ClientRangedStore::open(dir.path(), "s", root)?;
-            let frontier = super::present_frontier(&store, total).await?;
+            let frontier = super::present_frontier(&store).await?;
             anyhow::ensure!(frontier > 0 && frontier < total, "a partial store");
             let cursor = if cursor_at_frontier { frontier } else { 0 };
             let state = Arc::new(super::StreamState {
                 store,
                 cursor: AtomicU64::new(cursor),
-                total,
+                hint: total,
                 consumed: Notify::new(),
                 progressed: Notify::new(),
                 outcome: Mutex::new(None),

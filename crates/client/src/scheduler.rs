@@ -109,6 +109,54 @@ pub const LANE_WATCHDOG: Duration = Duration::from_secs(10);
 /// the per-stream idle window a paid leg allows before its first byte.
 const FIRST_BYTE_GRACE: Duration = Duration::from_secs(30);
 
+/// The unit the planner grows a size claim by. A claim is a hint: when every
+/// byte below the bound is present and no leg has proved the size, the bound
+/// grows by at least one `SEED` ([`grown_bound`]). It is one discovery block,
+/// the unit the planner assigns to nodes.
+pub(crate) const SEED: u64 = decdn_protocol::DISCOVERY_BLOCK_BYTES;
+
+/// The next bound after every byte below `bound` is present and no size is
+/// proven: `max(bound + SEED, c0 + 2 * extra)`, rounded up to a multiple of
+/// [`SEED`]. `c0` is the first claim and `extra` the verified bytes past it,
+/// so a claim that falls far short of the blob grows geometrically. The sum
+/// saturates at `u64::MAX`.
+#[must_use]
+pub(crate) fn grown_bound(bound: u64, c0: u64, extra: u64) -> u64 {
+    let want = bound
+        .saturating_add(SEED)
+        .max(c0.saturating_add(extra.saturating_mul(2)));
+    want.div_ceil(SEED).saturating_mul(SEED)
+}
+
+/// Bytes of the store's `present` chunks at or past `from`, against `bound`.
+fn bytes_past(present: &ChunkRanges, from: u64, bound: u64) -> u64 {
+    contiguous_byte_ranges(present, bound)
+        .into_iter()
+        .map(|(start, len)| start.saturating_add(len).saturating_sub(start.max(from)))
+        .fold(0, u64::saturating_add)
+}
+
+/// The chunks of `[start, start+len)` the store misses, clipped to its
+/// current bound: a range at or past the bound misses nothing. A store error
+/// is this process's fault ([`crate::LocalPullFault`]), never a source's.
+///
+/// # Errors
+///
+/// The store's error, marked [`crate::LocalPullFault`].
+async fn store_missing<St>(store: &St, start: u64, len: u64) -> anyhow::Result<ChunkRanges>
+where
+    St: IngestStore,
+{
+    let end = start.saturating_add(len).min(store.total_bytes());
+    if start >= end {
+        return Ok(ChunkRanges::empty());
+    }
+    store
+        .missing_ranges(start, end - start)
+        .await
+        .map_err(|e| anyhow::Error::new(e).context(crate::LocalPullFault))
+}
+
 /// What one [`acquire`] fills: byte ranges of one blob, in one store.
 pub struct AcquireTarget<'a, St> {
     /// The ranged store every lane writes into. Keyed by `hash` and
@@ -253,29 +301,29 @@ struct RunSeed {
 
 /// Bytes of `[start, start+len)` the store still misses. This worker's range is
 /// disjoint from every peer's, so this reflects only its own delivery frontier.
-/// An error reads as bytes still missing, so a source that also sent no
-/// verified byte still trips.
-async fn missing_bytes<St>(store: &St, start: u64, len: u64) -> u64
+///
+/// # Errors
+///
+/// A store error ([`store_missing`]): this process's fault, not the source's.
+async fn missing_bytes<St>(store: &St, start: u64, len: u64) -> anyhow::Result<u64>
 where
     St: IngestStore,
 {
-    match store.missing_ranges(start, len).await {
-        Ok(ranges) => contiguous_byte_ranges(&ranges, store.total_bytes())
-            .iter()
-            .map(|(_, l)| *l)
-            .fold(0, u64::saturating_add),
-        Err(_) => u64::MAX,
-    }
+    let ranges = store_missing(store, start, len).await?;
+    Ok(contiguous_byte_ranges(&ranges, store.total_bytes())
+        .iter()
+        .map(|(_, l)| *l)
+        .fold(0, u64::saturating_add))
 }
 
-/// The chunks of `ranges` the store still misses.
+/// The chunks of `ranges` the store still misses, each clipped to its bound.
 async fn missing_chunks<St>(store: &St, ranges: &[(u64, u64)]) -> anyhow::Result<ChunkRanges>
 where
     St: IngestStore,
 {
     let mut missing = ChunkRanges::empty();
     for &(start, len) in ranges {
-        missing |= store.missing_ranges(start, len).await?;
+        missing |= store_missing(store, start, len).await?;
     }
     Ok(missing)
 }
@@ -296,12 +344,21 @@ where
 /// node's own upstream is not a stall. After it, a gap between verified bytes
 /// shorter than the deadline never trips; a source that stops trips it within
 /// one to two deadlines.
-async fn watchdog<St>(store: &St, start: u64, len: u64, deadline: Duration, verified: &AtomicU64)
+///
+/// It resolves with `None` on a trip. A store error while it checks resolves
+/// with that error ([`store_missing`]), which is this process's fault.
+async fn watchdog<St>(
+    store: &St,
+    start: u64,
+    len: u64,
+    deadline: Duration,
+    verified: &AtomicU64,
+) -> Option<anyhow::Error>
 where
     St: IngestStore,
 {
     if deadline.is_zero() {
-        std::future::pending::<()>().await;
+        return std::future::pending().await;
     }
     let mut prev = verified.load(Ordering::Relaxed);
     let mut window = if prev == 0 {
@@ -317,13 +374,15 @@ where
             prev = now;
             continue;
         }
-        if missing_bytes(store, start, len).await == 0 {
+        match missing_bytes(store, start, len).await {
             // Delivered in full; `fill_gap` will finish paying and return
             // `Completed`. Keep waiting rather than tripping a done range.
-            continue;
+            Ok(0) => {}
+            // A whole window with no verified byte and bytes still missing: a
+            // stall.
+            Ok(_) => return None,
+            Err(err) => return Some(err),
         }
-        // A whole window with no verified byte and bytes still missing: a stall.
-        return;
     }
 }
 
@@ -374,9 +433,13 @@ struct Work {
     /// clears it when the worker ends; [`Work::revive`] sets it when the loop
     /// starts the lane again.
     alive: Vec<bool>,
-    /// Per-lane block coverage: the predicate every pick, steal and coverage
-    /// check filters against.
+    /// Per-lane block coverage: what a lane prefers to pick, and the only
+    /// ranges it steals from ([`Work::pick`]).
     coverage: Vec<Coverage>,
+    /// `measured[i]` is `true` when lane `i`'s coverage is a probed bitmap.
+    /// A lane without one holds the whole blob, so its coverage follows the
+    /// bound as it grows ([`Work::regrow`]).
+    measured: Vec<bool>,
     /// Pick the lowest-offset pending segment first, not the oldest. Set for a
     /// consumption-paced fetch ([`ConsumptionPacing`]): the consumer reads in
     /// offset order, so the earliest missing range is always the one it waits
@@ -394,19 +457,86 @@ impl Work {
             units: Vec::new(),
             alive: Vec::new(),
             coverage: Vec::new(),
+            measured: Vec::new(),
             front_first,
         }
     }
 
     /// Give a new lane a stable slot, alive and holding nothing. Returns the
-    /// slot.
-    fn add_lane(&mut self, coverage: Coverage) -> usize {
+    /// slot. `coverage` is the lane's probed bitmap, or `None` for a lane that
+    /// holds the whole blob of `total_bytes`.
+    fn add_lane(&mut self, coverage: Option<Coverage>, total_bytes: u64) -> usize {
         self.in_flight.push(None);
         self.cancel.push(Arc::new(CancelHandle::new()));
         self.units.push(0);
         self.alive.push(true);
-        self.coverage.push(coverage);
+        self.measured.push(coverage.is_some());
+        self.coverage
+            .push(coverage.unwrap_or_else(|| Coverage::full(num_blocks(total_bytes))));
         self.in_flight.len() - 1
+    }
+
+    /// Plan `missing` afresh under a grown bound of `total_bytes`: every lane
+    /// without a probed bitmap now covers the grown region, and `pending` is
+    /// replanned across the lanes. Only called while no range is in flight.
+    ///
+    /// # Errors
+    ///
+    /// A segmentation alignment error.
+    fn regrow(&mut self, missing: &ChunkRanges, total_bytes: u64) -> anyhow::Result<()> {
+        self.grow_coverage(total_bytes);
+        self.pending = plan_pending(missing, total_bytes, &self.coverage)?;
+        Ok(())
+    }
+
+    /// Size every lane without a probed bitmap to the whole blob of
+    /// `total_bytes`.
+    fn grow_coverage(&mut self, total_bytes: u64) {
+        for (coverage, &measured) in self.coverage.iter_mut().zip(&self.measured) {
+            if !measured {
+                *coverage = Coverage::full(num_blocks(total_bytes));
+            }
+        }
+    }
+
+    /// Clip every range to a proven size of `total_bytes`: drop the pending
+    /// ranges at or past it and cut the rest there. A lane whose range starts
+    /// at or past it is cancelled, so it stops fetching a range the blob does
+    /// not have; a lane whose range crosses it is trimmed, and its own drive
+    /// ends at the proven size.
+    ///
+    /// # Errors
+    ///
+    /// A segmentation alignment error.
+    fn clip(&mut self, total_bytes: u64) -> anyhow::Result<()> {
+        let mut kept = VecDeque::with_capacity(self.pending.len());
+        for seg in self.pending.drain(..) {
+            let start = seg.fetch_start();
+            if start >= total_bytes {
+                continue;
+            }
+            if seg.fetch_end() > total_bytes {
+                kept.push_back(align_range(start, total_bytes - start, total_bytes)?);
+            } else {
+                kept.push_back(seg);
+            }
+        }
+        self.pending = kept;
+        for i in 0..self.in_flight.len() {
+            let Some(Some((start, len))) = self.in_flight.get(i).copied() else {
+                continue;
+            };
+            if start >= total_bytes {
+                if let Some(unit) = self.units.get(i).copied() {
+                    self.cancel_victim(i, unit);
+                }
+            } else if start.saturating_add(len) > total_bytes
+                && let Some(Some(slot)) = self.in_flight.get_mut(i)
+            {
+                slot.1 = total_bytes - start;
+            }
+        }
+        Ok(())
     }
 
     /// Mark lane `i`'s worker ended. Every `pending` entry stays: a cooling
@@ -433,11 +563,14 @@ impl Work {
     }
 
     /// Whether a lane over `coverage` has anything to take: a pending entry it
-    /// covers at least in part, or a range in flight it could steal from.
+    /// covers at least in part, a pending chunk no running lane covers (any
+    /// lane may take that one, #2225), or a range in flight it could steal
+    /// from.
     fn has_work_for(&self, coverage: &Coverage, total_bytes: u64) -> bool {
         self.pending
             .iter()
             .any(|seg| !covered_part(coverage, seg.chunk_ranges(), total_bytes).is_empty())
+            || self.uncovered(total_bytes)
             || self
                 .in_flight
                 .iter()
@@ -445,25 +578,33 @@ impl Work {
                 .any(|&(s, l)| covers_byte_range(coverage, s, l, total_bytes))
     }
 
-    /// Whether a pending entry holds a chunk no running lane covers.
+    /// The chunks of `seg` no running lane covers.
+    fn uncovered_part(&self, seg: &AlignedRange, total_bytes: u64) -> ChunkRanges {
+        let mut held = ChunkRanges::empty();
+        for (_, coverage) in self
+            .alive
+            .iter()
+            .zip(&self.coverage)
+            .filter(|&(&alive, _)| alive)
+        {
+            held |= covered_part(coverage, seg.chunk_ranges(), total_bytes);
+        }
+        seg.chunk_ranges().clone() - held
+    }
+
+    /// Whether a pending entry holds a chunk no running lane covers. Such a
+    /// chunk goes to any lane, which serves it by pull-through, and it keeps
+    /// discovery looking for a node that covers it.
     fn uncovered(&self, total_bytes: u64) -> bool {
-        self.pending.iter().any(|seg| {
-            let mut held = ChunkRanges::empty();
-            for (_, coverage) in self
-                .alive
-                .iter()
-                .zip(&self.coverage)
-                .filter(|&(&alive, _)| alive)
-            {
-                held |= covered_part(coverage, seg.chunk_ranges(), total_bytes);
-            }
-            !(seg.chunk_ranges().clone() - held).is_empty()
-        })
+        self.pending
+            .iter()
+            .any(|seg| !self.uncovered_part(seg, total_bytes).is_empty())
     }
 
     /// Plan the first batch of lanes: give every lane a slot, and replace
-    /// `pending` with `missing` spread across the lanes' `coverages`. Returns
-    /// the lanes' slots, in order.
+    /// `pending` with `missing` spread across the lanes' `coverages` (`None`
+    /// for a lane that holds the whole blob). Returns the lanes' slots, in
+    /// order.
     ///
     /// # Errors
     ///
@@ -472,13 +613,18 @@ impl Work {
         &mut self,
         missing: &ChunkRanges,
         total_bytes: u64,
-        coverages: &[Coverage],
+        coverages: &[Option<Coverage>],
     ) -> anyhow::Result<Vec<usize>> {
-        self.pending = plan_pending(missing, total_bytes, coverages)?;
-        Ok(coverages
+        let slots: Vec<usize> = coverages
             .iter()
-            .map(|coverage| self.add_lane(coverage.clone()))
-            .collect())
+            .map(|coverage| self.add_lane(coverage.clone(), total_bytes))
+            .collect();
+        let planned: Vec<Coverage> = slots
+            .iter()
+            .filter_map(|&slot| self.coverage.get(slot).cloned())
+            .collect();
+        self.pending = plan_pending(missing, total_bytes, &planned)?;
+        Ok(slots)
     }
 
     /// Worker `i`'s in-flight slot. An out-of-range `i` is a wiring bug, not a
@@ -493,9 +639,10 @@ impl Work {
     }
 
     /// Under the caller's lock, choose worker `i`'s next range. Pop the FIRST
-    /// pending segment `coverage` includes (a worker skips past, never
-    /// dequeues, an entry it cannot serve, #1506); when none remain, steal
-    /// the aligned second half of the largest COVERABLE range still in flight
+    /// pending segment `coverage` includes (a worker prefers what it covers,
+    /// #1506), else the first covered run of a pending entry, else the first
+    /// run of pending chunks no running lane covers (#2225); when none remain,
+    /// steal the aligned second half of the largest COVERABLE range still in flight
     /// ([`steal_split`]), trimming the victim so no other freed worker can
     /// re-steal the same tail. Records the choice in `in_flight[i]`. A steal
     /// does NOT cancel the victim here: the caller does that with
@@ -552,7 +699,16 @@ impl Work {
         // An entry this worker covers only in part (queued before any lane's
         // coverage split it): take its first covered run and leave the rest
         // queued in its place.
-        if let Some(picked) = self.take_covered_part(coverage, total_bytes)? {
+        // Coverage is a preference (#2225): a pending chunk no running lane
+        // covers goes to this worker, whose node serves it by pull-through,
+        // rather than waiting for a covering node to join.
+        let taken = match self.take_part(total_bytes, |_, seg| {
+            covered_part(coverage, seg.chunk_ranges(), total_bytes)
+        })? {
+            Some(part) => Some(part),
+            None => self.take_part(total_bytes, |w, seg| w.uncovered_part(seg, total_bytes))?,
+        };
+        if let Some(picked) = taken {
             *self.slot_mut(i)? = Some((picked.fetch_start(), picked.fetch_len()));
             return Ok(Some(Picked {
                 range: picked,
@@ -617,21 +773,21 @@ impl Work {
         }))
     }
 
-    /// Take the first covered run of the first pending entry `coverage` holds
-    /// in part (the lowest-offset one under `front_first`), and queue the
+    /// Take the first run of `part_of` of the first pending entry where it is
+    /// not empty (the lowest-offset one under `front_first`), and queue the
     /// entry's other pieces where it stood.
     ///
     /// # Errors
     ///
     /// An alignment error on a piece (never on the ranges this scheduler
     /// queues).
-    fn take_covered_part(
+    fn take_part(
         &mut self,
-        coverage: &Coverage,
         total_bytes: u64,
+        part_of: impl Fn(&Self, &AlignedRange) -> ChunkRanges,
     ) -> anyhow::Result<Option<AlignedRange>> {
         let mut parts = self.pending.iter().enumerate().filter_map(|(pos, seg)| {
-            let part = covered_part(coverage, seg.chunk_ranges(), total_bytes);
+            let part = part_of(self, seg);
             let &(start, len) = contiguous_byte_ranges(&part, total_bytes).first()?;
             Some((pos, start, len))
         });
@@ -803,7 +959,7 @@ where
         return Ok(());
     };
     let total_bytes = store.total_bytes();
-    let missing = store.missing_ranges(start, len).await?;
+    let missing = store_missing(store, start, len).await?;
     let remainder = contiguous_byte_ranges(&missing, total_bytes);
     if remainder.is_empty() {
         return Ok(());
@@ -890,9 +1046,11 @@ async fn yield_to_front(
 /// Everything a worker shares with the loop and its peers, borrowed from
 /// [`acquire`]'s frame.
 struct Engine<'a, St, Pc, F> {
+    /// The store every lane writes. Its bound is the planner's size, read
+    /// fresh at each use: it grows while no size is proven and shrinks to a
+    /// proven size.
     store: &'a St,
     hash: [u8; 32],
-    total_bytes: u64,
     pacer: &'a Pc,
     funder: &'a F,
     drive: &'a DriveConfig,
@@ -948,7 +1106,6 @@ where
     let Engine {
         store,
         hash,
-        total_bytes,
         work,
         progress_wake,
         ..
@@ -988,6 +1145,7 @@ where
 
         // Tiny critical section: pick a range, then DROP the guard before the
         // `fill_gap` await (the guard does not cross the await point).
+        let total_bytes = store.total_bytes();
         let picked = {
             let mut w = work.lock().await;
             w.pick(i, total_bytes, &my_coverage)?
@@ -1022,8 +1180,10 @@ where
         // present byte. Interior holes never arise (a picked range is contiguous
         // and delivered front-to-back), so this is normally one suffix gap or
         // (for a stolen completed range) none.
-        let gaps =
-            contiguous_byte_ranges(&store.missing_ranges(r_start, r_len).await?, total_bytes);
+        let gaps = contiguous_byte_ranges(
+            &store_missing(store, r_start, r_len).await?,
+            store.total_bytes(),
+        );
         if gaps.is_empty() {
             work.lock().await.clear(i)?;
             wake();
@@ -1056,7 +1216,6 @@ where
                     hash,
                     g_start,
                     g_len,
-                    total_bytes,
                     engine.drive,
                     &mut counters,
                     Some(engine.on_progress),
@@ -1098,9 +1257,10 @@ where
                         progress_wake,
                     ), if engine.pacing.is_some() => UnitOutcome::Cancelled,
                     // A watchdog trip carries no error by construction: the
-                    // source simply stopped making verified progress.
-                    () = watchdog(store, g_start, g_len, engine.watchdog, &verified) => {
-                        UnitOutcome::Faulted(None)
+                    // source simply stopped making verified progress. A store
+                    // error while it checks is ours (#2213).
+                    err = watchdog(store, g_start, g_len, engine.watchdog, &verified) => {
+                        UnitOutcome::Faulted(err)
                     }
                 }
             };
@@ -1175,11 +1335,65 @@ impl std::fmt::Debug for ConsumptionPacing<'_> {
     }
 }
 
-/// A lane's coverage, or the whole blob for a full holder.
-fn lane_coverage<S>(lane: &StreamCandidate<S>, total_bytes: u64) -> Coverage {
-    lane.coverage
-        .clone()
-        .unwrap_or_else(|| Coverage::full(num_blocks(total_bytes)))
+/// The byte ranges one [`acquire`] fills, fitted to the store's bound as it
+/// moves (ADR 039 § Dynamic segmentation and tail-stealing).
+struct Want {
+    /// The `(offset, len)` ranges still to fill, each inside `bound`.
+    ranges: Vec<(u64, u64)>,
+    /// The ranges reach the bound's end: a whole-blob target, or explicit
+    /// ranges that hold the tail. Such a target follows the bound as it grows
+    /// and needs a proven size to complete.
+    tail: bool,
+    /// The bound the ranges were last fitted to.
+    bound: u64,
+}
+
+impl Want {
+    /// `ranges` against a first bound of `bound`. A zero length reads as "to
+    /// the end of the blob".
+    fn new(ranges: &[(u64, u64)], bound: u64) -> Self {
+        let ranges: Vec<(u64, u64)> = ranges
+            .iter()
+            .map(|&(start, len)| {
+                let len = if len == 0 {
+                    bound.saturating_sub(start)
+                } else {
+                    len
+                };
+                (start, len)
+            })
+            .collect();
+        let tail = ranges
+            .iter()
+            .any(|&(start, len)| start.saturating_add(len) >= bound);
+        Self {
+            ranges,
+            tail,
+            bound,
+        }
+    }
+
+    /// Fit the ranges to a new `bound`. A tail target gains `[old, bound)`
+    /// when the bound grows; every range is clipped when it shrinks. Returns
+    /// whether the bound moved.
+    fn fit(&mut self, bound: u64) -> bool {
+        if bound == self.bound {
+            return false;
+        }
+        if bound > self.bound && self.tail {
+            self.ranges.push((self.bound, bound - self.bound));
+        }
+        if bound < self.bound {
+            self.ranges = self
+                .ranges
+                .iter()
+                .filter(|&&(start, _)| start < bound)
+                .map(|&(start, len)| (start, len.min(bound - start)))
+                .collect();
+        }
+        self.bound = bound;
+        true
+    }
 }
 
 /// Releases every started lane's [`LaneLease`] when [`acquire`] returns or is
@@ -1364,6 +1578,25 @@ fn seed_deposit<S>(deposit: &tokio::sync::watch::Sender<U256>, lane: &StreamCand
 /// The lane watchdog ([`LANE_WATCHDOG`]) is on for an eager fetch and off
 /// under consumption pacing.
 ///
+/// # The size is a hint
+///
+/// `target.total_bytes` is the first size claim, `C0`, from a probe hint, a
+/// signed header or a manifest; a resumed store keeps the bound its record
+/// holds. The loop corrects the claim as bytes land:
+///
+/// - **Shrink.** A leg that verifies the final chunk of its sender's claim
+///   proves that size, and the store's bound moves to it. The loop clips every
+///   pending and in-flight range to it and cancels a lane whose range starts
+///   past it.
+/// - **Grow.** When every byte below the bound is present and no size is
+///   proven, the bound grows to `max(bound + SEED, C0 + 2 * extra)`, rounded
+///   up to a multiple of `SEED` (one discovery block), where `extra` is the
+///   verified bytes past `C0`. The loop plans the new region.
+///
+/// A target whose ranges reach the bound's end completes once a size is
+/// proven and every byte below it is present. Explicit ranges that stop short
+/// of the end complete once they are present.
+///
 /// # Per-source payment (ADR 039 § Payment)
 ///
 /// Each lane pays with its OWN `(ctx, ledger)`: a voucher is scoped to one
@@ -1432,13 +1665,18 @@ where
     let AcquireTarget {
         store,
         hash,
-        total_bytes,
+        total_bytes: c0,
         ranges,
     } = target;
     let health = Arc::clone(sources.health());
+    // A resumed record's bound wins over the caller's hint.
+    let first_bound = store.total_bytes();
+    let mut want = Want::new(ranges, first_bound);
     let mut pending = VecDeque::new();
-    for (start, len) in contiguous_byte_ranges(&missing_chunks(store, ranges).await?, total_bytes) {
-        pending.push_back(align_range(start, len, total_bytes)?);
+    for (start, len) in
+        contiguous_byte_ranges(&missing_chunks(store, &want.ranges).await?, first_bound)
+    {
+        pending.push_back(align_range(start, len, first_bound)?);
     }
     let work = AsyncMutex::new(Work::new(pending, env.pacing.is_some()));
     let progress_wake = Notify::new();
@@ -1493,15 +1731,23 @@ where
 
     // Seeded with the bytes already present, so a resumed fetch's bar starts
     // where the last run left off; each lane folds in its own leg deltas.
-    let base_present = ranges_content_len(&store.present_ranges().await?, total_bytes);
+    let base_present = ranges_content_len(&store.present_ranges().await?, first_bound);
     let progress_agg = AtomicU64::new(base_present);
     // Surface the resume base on the bar before any lane opens a channel.
     if let Some(cb) = env.on_progress {
-        cb(base_present, total_bytes);
+        cb(base_present, first_bound);
     }
+    // The bound the loop last fitted its work to. A leg that proves a size
+    // moves the store's bound; the progress report sees that first and wakes
+    // the loop to clip the work.
+    let bound_seen = AtomicU64::new(first_bound);
+    let bound_moved = Notify::new();
     // Every verified byte ticks the stop clock, then reaches the caller.
     let on_progress = |position: u64, total: u64| {
         env.stop.clock.tick();
+        if store.total_bytes() != bound_seen.load(Ordering::Acquire) {
+            bound_moved.notify_one();
+        }
         if let Some(cb) = env.on_progress {
             cb(position, total);
         }
@@ -1509,7 +1755,6 @@ where
     let engine = Engine {
         store,
         hash,
-        total_bytes,
         pacer: env.pacer,
         funder: env.funder,
         drive: env.drive,
@@ -1538,10 +1783,44 @@ where
     );
     let result: anyhow::Result<()> = async {
         loop {
-            if running.is_empty() && ready.is_empty() && all_present(store, ranges, &work).await? {
-                store.flush_present_record().await?;
-                return Ok(());
+            let bound = store.total_bytes();
+            if want.fit(bound) {
+                bound_seen.store(bound, Ordering::Release);
+                let mut w = work.lock().await;
+                w.grow_coverage(bound);
+                w.clip(bound)?;
             }
+            if running.is_empty()
+                && ready.is_empty()
+                && all_present(store, &want.ranges, &work).await?
+            {
+                if store.proven().is_some() || !want.tail {
+                    store.flush_present_record().await?;
+                    return Ok(());
+                }
+                // Every byte below the bound is present and no leg proved a
+                // size: the claim was short. Grow and plan the new region.
+                let extra = bytes_past(&store.present_ranges().await?, c0, bound);
+                let grown = grown_bound(bound, c0, extra);
+                tracing::debug!(
+                    hash = %blake3::Hash::from_bytes(hash).to_hex(),
+                    bound,
+                    grown,
+                    extra,
+                    "every byte below the size claim is present and none proves the size; \
+                     growing the claim"
+                );
+                store.set_bound(grown);
+                want.fit(grown);
+                bound_seen.store(grown, Ordering::Release);
+                let missing = missing_chunks(store, &want.ranges).await?;
+                work.lock().await.regrow(&missing, grown)?;
+                if let Some(cb) = env.on_progress {
+                    cb(progress_agg.load(Ordering::Relaxed), grown);
+                }
+                continue;
+            }
+            let total_bytes = bound;
             let now = Instant::now();
             let deposit = pool_deposit(&deposit_rx, &started.0);
 
@@ -1573,11 +1852,11 @@ where
                 let mut w = work.lock().await;
                 if !seeded {
                     seeded = true;
-                    let coverages: Vec<Coverage> = batch
+                    let coverages: Vec<Option<Coverage>> = batch
                         .iter()
-                        .map(|(_, lane)| lane_coverage(lane, total_bytes))
+                        .map(|(_, lane)| lane.coverage.clone())
                         .collect();
-                    let missing = missing_chunks(store, ranges).await?;
+                    let missing = missing_chunks(store, &want.ranges).await?;
                     for ((provider, _), slot) in
                         batch.iter().zip(w.seed(&missing, total_bytes, &coverages)?)
                     {
@@ -1589,7 +1868,7 @@ where
                         w.revive(slot);
                         slot
                     } else {
-                        let slot = w.add_lane(lane_coverage(&lane, total_bytes));
+                        let slot = w.add_lane(lane.coverage.clone(), total_bytes);
                         slots.insert(provider, slot);
                         slot
                     };
@@ -1669,6 +1948,8 @@ where
                 }
                 () = sleep_until_opt(wake) => {}
                 Ok(()) = deposit_rx.changed() => {}
+                // A leg proved a size: the loop top clips the work to it.
+                () = bound_moved.notified() => {}
                 _ = flush.tick() => {
                     store.flush_present_record().await?;
                 }
@@ -2617,8 +2898,8 @@ mod tests {
         let in_block0 = align_range(0, 1, total)?;
         let in_block1 = align_range(DISCOVERY_BLOCK_BYTES, 1, total)?;
         let mut work = Work::new(VecDeque::from(vec![in_block0, in_block1]), false);
-        let a = work.add_lane(cov(2, &[0]));
-        let b = work.add_lane(cov(2, &[1]));
+        let a = work.add_lane(Some(cov(2, &[0])), total);
+        let b = work.add_lane(Some(cov(2, &[1])), total);
 
         work.park(a);
         work.park(b);
@@ -2661,6 +2942,7 @@ mod tests {
             alive: vec![true, true, true],
             units: vec![1, 0, 0],
             coverage: vec![coverage.clone(), coverage.clone(), coverage.clone()],
+            measured: vec![true; 3],
             front_first: false,
         };
         let victim_flag = |w: &Work| {
@@ -2733,11 +3015,12 @@ mod tests {
         Ok(())
     }
 
-    /// THE double-pay test: a fast source and an artificially slow one over a
-    /// 64 MiB blob, arranged so a steal DEFINITELY fires (the slow source stalls
-    /// before its first byte, so the fast source finishes its own segment and
-    /// steals the slow source's tail). With steal-cancellation the stolen tail is
-    /// fetched by exactly ONE source, so total delivered ≈ the blob size.
+    /// THE double-pay test: a fast source and a held-back one over a 64 MiB
+    /// blob, arranged so a steal DEFINITELY fires: every leg of the slow source
+    /// waits before its first byte until the test sees the fast source open a
+    /// second range, which is the steal of the slow source's tail. With
+    /// steal-cancellation the stolen tail is fetched by exactly ONE source, so
+    /// total delivered ≈ the blob size.
     #[tokio::test]
     async fn forced_steal_does_not_double_fetch_the_stolen_tail() -> anyhow::Result<()> {
         let data = blob(64 * 1024 * 1024);
@@ -2745,11 +3028,12 @@ mod tests {
         let ledger_fast = Arc::new(PoolLedger::new(Cumulative::default()));
         let ledger_slow = Arc::new(PoolLedger::new(Cumulative::default()));
         let src_fast = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_fast));
-        // Every leg the slow source opens stalls 1 s before its first byte:
-        // long enough that the fast source always finishes its 32 MiB first and
-        // steals, deterministically forcing the steal path.
+        // The slow source delivers nothing until the gate opens, so the fast
+        // source always finishes its own 32 MiB first and steals, whatever the
+        // machine's speed.
+        let (gate, gated) = tokio::sync::watch::channel(false);
         let src_slow = ScriptedSource::new(data.clone())?
-            .slow_to_start(Duration::from_secs(1))
+            .gated_on(gated)
             .paying(Arc::clone(&ledger_slow));
         let root = src_fast.root();
         let (store, dir) = fresh_store(root, total);
@@ -2757,17 +3041,23 @@ mod tests {
             candidate(src_fast.clone(), ledger_fast, 0xA1, None),
             candidate(src_slow.clone(), ledger_slow, 0xB2, None),
         ])?;
-        run_acquire(
-            &store,
-            &provider,
-            root,
-            total,
-            &BudgetPacer::new(),
-            &no_topups(),
-            2,
-            None,
+        let (pacer, funder) = (BudgetPacer::new(), no_topups());
+        let fetch = run_acquire(&store, &provider, root, total, &pacer, &funder, 2, None);
+        // Open the gate once the fast source has opened a second range: its
+        // steal of the slow source's tail.
+        let release = async {
+            while src_fast.opened_ranges().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            gate.send_replace(true);
+        };
+        let (fetched, ()) = tokio::time::timeout(
+            Duration::from_mins(5),
+            futures_util::future::join(fetch, release),
         )
-        .await?;
+        .await
+        .map_err(|_| anyhow::anyhow!("the fetch or the steal never happened"))?;
+        fetched?;
 
         store.finalize().await?;
         assert_eq!(
@@ -3450,7 +3740,9 @@ mod tests {
         };
         let raced = async {
             tokio::select! {
-                () = super::watchdog(&store, 0, 64 * 1024 * 1024, deadline, &counter) => true,
+                err = super::watchdog(&store, 0, 64 * 1024 * 1024, deadline, &counter) => {
+                    err.is_none()
+                }
                 () = feed => false,
             }
         };
@@ -3519,7 +3811,9 @@ mod tests {
         };
         let tripped = tokio::time::timeout(Duration::from_mins(2), async {
             tokio::select! {
-                () = super::watchdog(&store, 0, 64 * 1024 * 1024, LANE_WATCHDOG, &counter) => true,
+                err = super::watchdog(&store, 0, 64 * 1024 * 1024, LANE_WATCHDOG, &counter) => {
+                    err.is_none()
+                }
                 () = feed => false,
             }
         })
@@ -3530,7 +3824,8 @@ mod tests {
         // With no first byte at all, it trips once the grace ends.
         let silent = std::sync::atomic::AtomicU64::new(0);
         let start = tokio::time::Instant::now();
-        super::watchdog(&store, 0, 64 * 1024 * 1024, LANE_WATCHDOG, &silent).await;
+        let err = super::watchdog(&store, 0, 64 * 1024 * 1024, LANE_WATCHDOG, &silent).await;
+        assert!(err.is_none(), "a trip, not a store error");
         assert_eq!(start.elapsed(), super::FIRST_BYTE_GRACE);
     }
 
@@ -3994,8 +4289,8 @@ mod tests {
         let total = 2 * DISCOVERY_BLOCK_BYTES;
         let both_blocks = align_range(0, total, total)?;
         let mut work = Work::new(VecDeque::from(vec![both_blocks]), false);
-        let a = work.add_lane(cov(2, &[0]));
-        let b = work.add_lane(cov(2, &[1]));
+        let a = work.add_lane(Some(cov(2, &[0])), total);
+        let b = work.add_lane(Some(cov(2, &[1])), total);
         assert!(!work.uncovered(total), "a and b cover it between them");
         work.park(b);
         assert!(work.uncovered(total), "block 1 has no running lane");
@@ -4311,6 +4606,434 @@ mod tests {
         );
         let present = ranges_content_len(&store.present_ranges().await?, total);
         assert_eq!(present, 2 * mib, "exactly the two listed ranges landed");
+        Ok(())
+    }
+
+    // ---- the size is a hint: grow and shrink the bound ----
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn a_claim_with_nothing_past_it_grows_by_one_seed() {
+        use super::{SEED, grown_bound};
+        let gib = 1 << 30;
+        assert_eq!(grown_bound(gib, gib, 0), gib + SEED);
+        // A claim off the SEED grid rounds up to it.
+        let gb = 1_000_000_000;
+        let want = (gb + SEED).div_ceil(SEED) * SEED;
+        assert_eq!(grown_bound(gb, gb, 0), want);
+        assert_eq!(want % SEED, 0);
+    }
+
+    #[test]
+    fn bytes_past_the_claim_grow_the_bound_twice_as_far() {
+        use super::{SEED, grown_bound};
+        let (gb, mb): (u64, u64) = (1_000_000_000, 1_000_000);
+        let want = (gb + 100 * mb).div_ceil(SEED) * SEED;
+        assert_eq!(grown_bound(gb, gb, 50 * mb), want);
+    }
+
+    #[test]
+    fn a_grown_bound_saturates_near_the_top() {
+        use super::grown_bound;
+        assert_eq!(grown_bound(u64::MAX - 10, 0, 0), u64::MAX);
+        assert_eq!(grown_bound(1, 0, u64::MAX), u64::MAX);
+        assert_eq!(grown_bound(1, u64::MAX, 1), u64::MAX);
+    }
+
+    /// The bounds the growth rule steps through from a first claim of `c0`
+    /// while every source honestly serves a `truth`-byte blob: each round
+    /// fetches up to the bound, so everything past `c0` below it is present.
+    fn predicted_growth(c0: u64, truth: u64) -> Vec<u64> {
+        let mut bounds = Vec::new();
+        let mut bound = c0;
+        while bound < truth {
+            bound = super::grown_bound(bound, c0, bound.saturating_sub(c0));
+            bounds.push(bound);
+        }
+        bounds
+    }
+
+    /// Acquire the whole blob into `store` from `provider`, recording every
+    /// `(position, total)` the progress callback reports.
+    async fn acquire_recording<S: BlobSource>(
+        store: &ClientRangedStore,
+        provider: &StaticSources<S>,
+        root: [u8; 32],
+        lanes: usize,
+    ) -> (anyhow::Result<()>, Vec<(u64, u64)>) {
+        let samples: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
+        let cb_samples = Arc::clone(&samples);
+        let on_progress: Box<crate::ProgressCallback> = Box::new(move |position, total| {
+            if let Ok(mut s) = cb_samples.lock() {
+                s.push((position, total));
+            }
+        });
+        let result = run_acquire_with(
+            store,
+            provider,
+            root,
+            &BudgetPacer::new(),
+            &no_topups(),
+            Knobs {
+                on_progress: Some(&on_progress),
+                ..Knobs::lanes(lanes)
+            },
+        )
+        .await;
+        let samples = samples.lock().map(|s| s.clone()).unwrap_or_default();
+        (result, samples)
+    }
+
+    /// Honest lanes over `data`, one per provider byte in `providers`.
+    fn honest_lanes(
+        data: &[u8],
+        providers: &[u8],
+    ) -> anyhow::Result<(Vec<ScriptedSource>, StaticSources<ScriptedSource>)> {
+        let mut sources = Vec::new();
+        let mut candidates = Vec::new();
+        for &p in providers {
+            let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+            let src = ScriptedSource::new(data.to_vec())?.paying(Arc::clone(&ledger));
+            candidates.push(candidate(src.clone(), ledger, p, None));
+            sources.push(src);
+        }
+        Ok((sources, StaticSources::new(candidates)?))
+    }
+
+    /// A first claim far below the blob grows by the rule until a leg
+    /// verifies the true final chunk, and the fetch completes byte-identical.
+    #[tokio::test(start_paused = true)]
+    async fn a_too_small_claim_grows_until_the_true_end_is_proven() -> anyhow::Result<()> {
+        let (c0, truth) = (MIB, 70 * MIB);
+        let data = blob(truth as usize);
+        let (sources, provider) = honest_lanes(&data, &[0xA1, 0xB2])?;
+        let root = sources
+            .first()
+            .map(ScriptedSource::root)
+            .unwrap_or_default();
+        let (store, dir) = fresh_store(root, c0);
+        let (result, samples) = acquire_recording(&store, &provider, root, 2).await;
+        result?;
+        assert_eq!(store.proven(), Some(truth));
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        let grown: std::collections::BTreeSet<u64> = samples
+            .iter()
+            .map(|&(_, total)| total)
+            .filter(|&total| total != c0 && total != truth)
+            .collect();
+        let predicted: std::collections::BTreeSet<u64> = predicted_growth(c0, truth)
+            .into_iter()
+            .filter(|&b| b != truth)
+            .collect();
+        assert_eq!(grown, predicted, "one growth round per the rule");
+        assert_eq!(predicted.len(), 1);
+        Ok(())
+    }
+
+    /// A first claim past the blob shrinks once a leg verifies the true final
+    /// chunk: the fetch completes and the bound ends at the proven size.
+    #[tokio::test(start_paused = true)]
+    async fn a_too_big_claim_shrinks_when_a_leg_proves_the_end() -> anyhow::Result<()> {
+        let (c0, truth) = (200 * MIB, 70 * MIB);
+        let data = blob(truth as usize);
+        let (sources, provider) = honest_lanes(&data, &[0xA1, 0xB2])?;
+        let root = sources
+            .first()
+            .map(ScriptedSource::root)
+            .unwrap_or_default();
+        let (store, dir) = fresh_store(root, c0);
+        let (result, _) = acquire_recording(&store, &provider, root, 2).await;
+        result?;
+        assert_eq!(store.proven(), Some(truth));
+        assert_eq!(store.bound(), truth, "the bound ends at the proven size");
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        Ok(())
+    }
+
+    /// A proven size clips the work: nothing at or past it stays pending, a
+    /// range across it is cut there, and a lane whose range starts past it is
+    /// cancelled.
+    #[test]
+    fn a_proven_size_clips_pending_and_in_flight_work() -> anyhow::Result<()> {
+        use std::collections::VecDeque;
+        use std::sync::atomic::Ordering;
+
+        use decdn_bao_range::align_range;
+
+        let old = 200 * MIB;
+        let proven = 70 * MIB;
+        let pending = VecDeque::from(vec![
+            align_range(0, 10 * MIB, old)?,
+            align_range(60 * MIB, 20 * MIB, old)?,
+            align_range(100 * MIB, 20 * MIB, old)?,
+        ]);
+        let mut work = super::Work::new(pending, false);
+        let past = work.add_lane(None, old);
+        let across = work.add_lane(None, old);
+        if let Some(slot) = work.in_flight.get_mut(past) {
+            *slot = Some((90 * MIB, 10 * MIB));
+        }
+        if let Some(slot) = work.in_flight.get_mut(across) {
+            *slot = Some((65 * MIB, 10 * MIB));
+        }
+        work.clip(proven)?;
+        let pending: Vec<(u64, u64)> = work
+            .pending
+            .iter()
+            .map(|seg| (seg.fetch_start(), seg.fetch_end()))
+            .collect();
+        assert_eq!(pending, vec![(0, 10 * MIB), (60 * MIB, proven)]);
+        assert!(pending.iter().all(|&(_, end)| end <= proven));
+        assert_eq!(
+            work.in_flight.get(across).copied().flatten(),
+            Some((65 * MIB, 5 * MIB))
+        );
+        let cancelled = |i: usize| {
+            work.cancel
+                .get(i)
+                .is_some_and(|h| h.flag.load(Ordering::Acquire))
+        };
+        assert!(cancelled(past), "a lane past the proven size stops");
+        assert!(!cancelled(across), "a lane across it finishes at it");
+        Ok(())
+    }
+
+    /// A source that signs a size one byte short is never believed: its size
+    /// is only the first claim, the honest sources prove the true one, and the
+    /// fetch completes.
+    #[tokio::test(start_paused = true)]
+    async fn a_lying_small_first_claim_never_fails_the_fetch() -> anyhow::Result<()> {
+        let truth = 3 * MIB + 12_345;
+        let data = blob(truth as usize);
+        let mut candidates = Vec::new();
+        let mut root = [0; 32];
+        for (p, signs) in [(0xA1, truth - 1), (0xB2, truth), (0xC3, truth)] {
+            let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+            let src = ScriptedSource::new(data.clone())?
+                .signing_size(signs)
+                .paying(Arc::clone(&ledger));
+            root = src.root();
+            candidates.push(candidate(src, ledger, p, None));
+        }
+        let provider = StaticSources::new(candidates)?;
+        let (store, dir) = fresh_store(root, truth - 1);
+        let (result, _) = acquire_recording(&store, &provider, root, 3).await;
+        result?;
+        assert_eq!(store.proven(), Some(truth));
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        Ok(())
+    }
+
+    /// Coverage is a preference (#2225): two partial holders whose coverage
+    /// leaves the last block to nobody still complete the fetch. One of them
+    /// takes that block, served by pull-through, while the other is still on
+    /// its own covered block.
+    #[tokio::test(start_paused = true)]
+    async fn blocks_no_lane_covers_are_taken_by_a_partial_holder() -> anyhow::Result<()> {
+        let total = 2 * DISCOVERY_BLOCK_BYTES + MIB;
+        let data = blob(total as usize);
+        let n = num_blocks(total);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?
+            .slow_to_start(Duration::from_secs(5))
+            .paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let (store, dir) = fresh_store(root, total);
+        let provider = StaticSources::new(vec![
+            candidate(src_a.clone(), ledger_a, 0xA1, Some(cov(n, &[0]))),
+            candidate(src_b.clone(), ledger_b, 0xB2, Some(cov(n, &[1]))),
+        ])?;
+        run_acquire(
+            &store,
+            &provider,
+            root,
+            total,
+            &BudgetPacer::new(),
+            &no_topups(),
+            2,
+            None,
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+        let last_block = 2 * DISCOVERY_BLOCK_BYTES;
+        let took_last = src_a
+            .timeline()
+            .into_iter()
+            .chain(src_b.timeline())
+            .filter(|&(start, _, _)| start >= last_block)
+            .map(|(_, opened, _)| opened)
+            .min()
+            .ok_or_else(|| anyhow::anyhow!("nobody opened the uncovered block"))?;
+        let covered_done = src_b
+            .timeline()
+            .into_iter()
+            .filter_map(|(start, _, finished)| (start < last_block).then_some(finished).flatten())
+            .max()
+            .ok_or_else(|| anyhow::anyhow!("B finished no covered leg"))?;
+        assert!(
+            took_last < covered_done,
+            "the uncovered block started before the covered work ended"
+        );
+        Ok(())
+    }
+
+    /// A store that fails `missing_ranges` once `fail` is set: a local disk or
+    /// store fault in the middle of a unit.
+    struct FailingMissing {
+        inner: ClientRangedStore,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl RangedStore for FailingMissing {
+        fn total_bytes(&self) -> u64 {
+            self.inner.total_bytes()
+        }
+
+        fn present_ranges(&self) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
+            self.inner.present_ranges()
+        }
+
+        fn missing_ranges(
+            &self,
+            byte_offset: u64,
+            byte_len: u64,
+        ) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(async {
+                    Err(decdn_bao_range::RangedStoreError::Backend(Box::from(
+                        "injected store read fault",
+                    )))
+                });
+            }
+            self.inner.missing_ranges(byte_offset, byte_len)
+        }
+
+        fn admit(
+            &self,
+            range: decdn_bao_range::AlignedRange,
+            bao_bytes: bytes::Bytes,
+        ) -> decdn_bao_range::RangedFuture<'_, ()> {
+            self.inner.admit(range, bao_bytes)
+        }
+
+        fn read(&self, offset: u64, len: u64) -> decdn_bao_range::RangedFuture<'_, bytes::Bytes> {
+            self.inner.read(offset, len)
+        }
+
+        fn is_complete(&self) -> decdn_bao_range::RangedFuture<'_, bool> {
+            self.inner.is_complete()
+        }
+
+        fn finalize(&self) -> decdn_bao_range::RangedFuture<'_, ()> {
+            self.inner.finalize()
+        }
+    }
+
+    impl crate::source::IngestStore for FailingMissing {
+        fn ingest_stream<'a, R>(
+            &'a self,
+            range: &'a decdn_bao_range::AlignedRange,
+            reader: R,
+            on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+            claimed_total: u64,
+        ) -> core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<R>> + 'a>>
+        where
+            R: crate::BaoRangeReader + 'a,
+        {
+            crate::source::IngestStore::ingest_stream(
+                &self.inner,
+                range,
+                reader,
+                on_progress,
+                claimed_total,
+            )
+        }
+
+        fn flush_present_record(&self) -> crate::source::SourceFuture<'_, ()> {
+            crate::source::IngestStore::flush_present_record(&self.inner)
+        }
+
+        fn proven(&self) -> Option<u64> {
+            self.inner.proven()
+        }
+
+        fn set_bound(&self, bound: u64) {
+            self.inner.set_bound(bound);
+        }
+    }
+
+    /// A store that cannot read its own record while the watchdog checks a
+    /// stalled unit is this process's fault (#2213): the acquire ends with
+    /// that error as a command-wide fatal, and the source is not cooled.
+    #[tokio::test(start_paused = true)]
+    async fn a_store_read_error_in_the_watchdog_is_our_fault() -> anyhow::Result<()> {
+        let data = blob(8 * MIB as usize);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src = ScriptedSource::new(data)?
+            .stall_after(MIB, Duration::from_mins(1))
+            .paying(Arc::clone(&ledger));
+        let (root, total) = (src.root(), src.total_bytes());
+        let (inner, _dir) = fresh_store(root, total);
+        let store = FailingMissing {
+            inner,
+            fail: std::sync::atomic::AtomicBool::new(false),
+        };
+        let provider = StaticSources::new(vec![candidate(src, ledger, 0xA1, None)])?;
+        let health: Arc<PeerHealth> = Arc::default();
+        let mut set = SourceSet::new(&provider, root, Arc::clone(&health), provider.holders());
+        let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+        let drive = drive_config();
+        let (pacer, funder) = (BudgetPacer::new(), no_topups());
+        let whole = [(0, total)];
+        let env = AcquireEnv {
+            pacer: &pacer,
+            funder: &funder,
+            drive: &drive,
+            max_lanes: 1,
+            stop: &stop,
+            on_progress: None,
+            ledgers: None,
+            pacing: None,
+        };
+        let fetch = acquire(
+            AcquireTarget {
+                store: &store,
+                hash: root,
+                total_bytes: total,
+                ranges: &whole,
+            },
+            &mut set,
+            &env,
+        );
+        // The unit stalls after its first MiB; the store breaks before the
+        // lane watchdog's next check.
+        let breaks = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        };
+        let err = tokio::select! {
+            res = fetch => res.err().ok_or_else(|| anyhow::anyhow!("a broken store must end it"))?,
+            () = breaks => unreachable!("never resolves"),
+        };
+        assert!(
+            format!("{err:#}").contains("injected store read fault"),
+            "{err:#}"
+        );
+        assert_eq!(classify(&err), Fault::Fatal(FatalScope::Command), "{err:#}");
+        assert_eq!(
+            health.health(Address::repeat_byte(0xA1)),
+            Health::Healthy { streak: 0 },
+            "the source is not cooled for our fault"
+        );
         Ok(())
     }
 }

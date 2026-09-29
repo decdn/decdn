@@ -275,11 +275,13 @@ async fn resolve_disk_state(
         if !meta.is_file() {
             continue; // symlink / dir / non-regular → not skippable, not a donor
         }
-        // Fast-skip: saved record agrees on hash, size, and mtime.
+        // Fast-skip: the saved record agrees with the file on hash, size, and
+        // mtime. The file is accepted by its hash: the manifest's `size` is only
+        // a first claim, and a blob whose true size differs from it is still
+        // the entry's blob, so it is not fetched again on every run.
         let fast = saved.get(&en.path).is_some_and(|rec| {
             rec.hash == en.hash
                 && rec.size == meta.len()
-                && en.size.is_none_or(|s| s == rec.size)
                 && SavedMtime::of(&meta).as_ref() == Some(&rec.mtime)
         });
         if fast {
@@ -1386,6 +1388,7 @@ async fn pull_manifest<P: Provider + Clone>(
     let mut interrupt = Interrupt::watch();
     let PullRun {
         outcomes,
+        warnings,
         transfer,
         interrupted,
         stopped,
@@ -1405,7 +1408,14 @@ async fn pull_manifest<P: Provider + Clone>(
         spliced_bytes: ctx.dedup_stats.spliced_bytes.load(Ordering::Relaxed),
         hints_ignored: ctx.dedup_stats.hints_ignored.load(Ordering::Relaxed),
     };
-    let reported = report(&outcomes, transfer, dedup, &args.output, args.json);
+    let reported = report(
+        &outcomes,
+        &warnings,
+        transfer,
+        dedup,
+        &args.output,
+        args.json,
+    );
     if interrupted {
         return Err(Interrupted.into());
     }
@@ -1444,6 +1454,9 @@ async fn drive_until_interrupted(
 /// settled.
 struct PullRun {
     outcomes: Vec<EntryOutcome>,
+    /// One line per landed entry whose blob differs in size from its
+    /// manifest ([`size_warnings`]).
+    warnings: Vec<String>,
     transfer: Transfer,
     interrupted: bool,
     /// The fault that ended the whole pull ([`ends_the_pull`]), if one did.
@@ -1515,6 +1528,7 @@ fn settle_group_run(
     i: usize,
     run: GroupRun,
     updates: BTreeMap<String, bundle_manifest::SavedFile>,
+    warnings: Vec<String>,
 ) -> Option<anyhow::Error> {
     if !updates.is_empty() {
         // Newly-fetched content bytes drive the byte-cadence flush; a link/skip
@@ -1537,6 +1551,7 @@ fn settle_group_run(
     if let Some(slot) = groups.get_mut(i) {
         *slot = SettledGroup {
             outcomes: run.outcomes,
+            warnings,
             paid: run.paid,
         };
     }
@@ -1548,6 +1563,8 @@ fn settle_group_run(
 #[derive(Clone, Default)]
 struct SettledGroup {
     outcomes: Vec<EntryOutcome>,
+    /// The group's size warnings ([`size_warnings`]).
+    warnings: Vec<String>,
     paid: Option<u64>,
 }
 
@@ -2051,7 +2068,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                         "fetch_group must return one outcome per entry"
                     );
                     let updates = build_completed_updates(&group_entries, &run.outcomes, out_root);
-                    (run, updates)
+                    let warnings = size_warnings(&group_entries, &updates);
+                    (run, updates, warnings)
                 }
             };
             stopped = run_groups(
@@ -2060,7 +2078,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 // in-flight-fetch cap.
                 self.jobs.min(group_count),
                 run,
-                |i, (run, updates)| settle_group_run(&mut groups, &flush_tx, i, run, updates),
+                |i, (run, updates, warnings)| {
+                    settle_group_run(&mut groups, &flush_tx, i, run, updates, warnings)
+                },
             )
             .await;
             // Closing the channel tells the flush task to do its final write.
@@ -2080,9 +2100,14 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             .iter()
             .map(|g| group_transfer(&g.outcomes, g.paid))
             .fold(Transfer::default(), Transfer::add);
+        let warnings = groups
+            .iter_mut()
+            .flat_map(|g| std::mem::take(&mut g.warnings))
+            .collect();
         let outcomes = groups.into_iter().flat_map(|g| g.outcomes).collect();
         PullRun {
             outcomes,
+            warnings,
             transfer,
             interrupted,
             stopped,
@@ -3913,6 +3938,30 @@ fn record_one(out_root: &Path, en: &ManifestEntry) -> Option<bundle_manifest::Sa
 /// completed yet is simply absent from `outcomes`, so it is never recorded from
 /// bytes this run has not landed. A batch may be one completed group or the whole
 /// run's outcomes; the result is the same records either way.
+/// One line for each entry whose landed file differs in size from its
+/// manifest's `size`: `<path>: manifest says X bytes, the blob is Y bytes`. A
+/// manifest size is only the fetch's first claim, so such an entry succeeds;
+/// the line tells the user the manifest is stale. `updates` holds the landed
+/// files' records ([`build_completed_updates`]).
+fn size_warnings(
+    entries: &[&ManifestEntry],
+    updates: &BTreeMap<String, bundle_manifest::SavedFile>,
+) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|en| {
+            let manifest = en.size?;
+            let landed = updates.get(&en.path)?.size;
+            (landed != manifest).then(|| {
+                format!(
+                    "{}: manifest says {manifest} bytes, the blob is {landed} bytes",
+                    en.path
+                )
+            })
+        })
+        .collect()
+}
+
 fn build_completed_updates(
     entries: &[&ManifestEntry],
     outcomes: &[EntryOutcome],
@@ -4124,8 +4173,11 @@ fn dry_run(args: &BundlePullArgs, filter: &EntryFilter, filters_given: bool) -> 
 }
 
 /// Summarize outcomes; return an error if any entry failed (after reporting all).
+/// Each of `warnings` ([`size_warnings`]) prints one line on stderr and never
+/// changes the result.
 fn report(
     outcomes: &[EntryOutcome],
+    warnings: &[String],
     transfer: Transfer,
     dedup: DedupSummary,
     output: &Path,
@@ -4154,6 +4206,9 @@ fn report(
                 eprintln!("failed: {path}: {err}");
             }
         }
+    }
+    for line in warnings {
+        eprintln!("warning: {line}");
     }
 
     let rep = PullReport {
@@ -6390,6 +6445,7 @@ mod tests {
         ];
         let err = report(
             &outcomes,
+            &[],
             Transfer::default(),
             DedupSummary::default(),
             Path::new("/out"),
@@ -6405,12 +6461,56 @@ mod tests {
         assert!(
             report(
                 &outcomes,
+                &[],
                 Transfer::default(),
                 DedupSummary::default(),
                 Path::new("/out"),
                 false
             )
             .is_ok()
+        );
+    }
+
+    /// An entry whose blob differs in size from its manifest succeeds: the
+    /// report names it on one warning line and the pull still succeeds.
+    #[test]
+    fn a_manifest_size_mismatch_warns_and_succeeds() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        std::fs::write(tmp.path().join("big.bin"), b"twelve bytes").expect("write");
+        std::fs::write(tmp.path().join("ok.bin"), b"four").expect("write");
+        let entries = [
+            ManifestEntry {
+                path: "big.bin".into(),
+                hash: "b3:aa".into(),
+                size: Some(4),
+                chunks: None,
+            },
+            ManifestEntry {
+                path: "ok.bin".into(),
+                hash: "b3:bb".into(),
+                size: Some(4),
+                chunks: None,
+            },
+        ];
+        let refs: Vec<&ManifestEntry> = entries.iter().collect();
+        let outcomes = vec![EntryOutcome::Fetched(12), EntryOutcome::Fetched(4)];
+        let updates = build_completed_updates(&refs, &outcomes, tmp.path());
+        let warnings = size_warnings(&refs, &updates);
+        assert_eq!(
+            warnings,
+            vec!["big.bin: manifest says 4 bytes, the blob is 12 bytes".to_string()]
+        );
+        assert!(
+            report(
+                &outcomes,
+                &warnings,
+                Transfer::default(),
+                DedupSummary::default(),
+                tmp.path(),
+                false
+            )
+            .is_ok(),
+            "a size warning is not a failure"
         );
     }
 
@@ -6786,6 +6886,43 @@ mod tests {
         let st = resolve_disk_state(&entries, &saved, tmp.path(), false).await;
         // Skipped on the record alone; a re-hash of the (non-matching) bytes would fetch.
         assert!(st.skip.contains("a.txt"));
+    }
+
+    /// An entry whose blob landed at a size other than its manifest's is
+    /// accepted on the next run by its record's hash: the manifest size is only
+    /// a first claim, so it is neither fetched nor re-hashed again.
+    #[tokio::test]
+    async fn a_mismatched_entry_is_not_refetched_on_rerun() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // Bytes that do not hash to the recorded hash: only a record-trusting
+        // skip can pass, so a skip proves no re-hash ran.
+        let body = b"the blob is longer than the manifest says";
+        std::fs::write(tmp.path().join("a.bin"), body).expect("write");
+        let meta = std::fs::metadata(tmp.path().join("a.bin")).expect("meta");
+        let size = u64::try_from(body.len()).expect("len");
+        let hash =
+            "b3:1111111111111111111111111111111111111111111111111111111111111111".to_string();
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "a.bin".to_string(),
+            bundle_manifest::SavedFile {
+                hash: hash.clone(),
+                size,
+                mtime: SavedMtime::of(&meta).expect("mtime"),
+                chunks: None,
+            },
+        );
+        bundle_manifest::merge_and_write(tmp.path(), SavedManifest::default(), updates)
+            .expect("write saved manifest");
+        let saved = bundle_manifest::load(tmp.path());
+        let entries = [ManifestEntry {
+            path: "a.bin".into(),
+            hash,
+            size: Some(size - 7),
+            chunks: None,
+        }];
+        let st = resolve_disk_state(&entries, &saved, tmp.path(), false).await;
+        assert!(st.skip.contains("a.bin"), "accepted by its hash");
     }
 
     /// A file whose mtime drifted but whose content is unchanged is NOT
@@ -7341,6 +7478,7 @@ mod tests {
         assert!(
             report(
                 &outcomes,
+                &[],
                 Transfer::default(),
                 DedupSummary::default(),
                 Path::new("/out"),
@@ -7433,7 +7571,9 @@ mod tests {
             }]
         };
         let failed = GroupRun::fetch_failed(slot(), anyhow!("stream reset"));
-        assert!(settle_group_run(&mut groups, &tx, 0, failed, BTreeMap::new()).is_none());
+        assert!(
+            settle_group_run(&mut groups, &tx, 0, failed, BTreeMap::new(), Vec::new()).is_none()
+        );
         assert!(matches!(
             groups[0].outcomes.as_slice(),
             [EntryOutcome::Failed { .. }]
@@ -7449,6 +7589,7 @@ mod tests {
             0,
             GroupRun::fetch_failed(slot(), disk),
             BTreeMap::new(),
+            Vec::new(),
         );
         assert!(stopped.is_some(), "a local disk fault ends the pull");
 
@@ -7463,7 +7604,7 @@ mod tests {
             },
         );
         let landed = GroupRun::landed(vec![EntryOutcome::Fetched(3)], 2);
-        assert!(settle_group_run(&mut groups, &tx, 1, landed, updates).is_none());
+        assert!(settle_group_run(&mut groups, &tx, 1, landed, updates, Vec::new()).is_none());
         assert!(matches!(
             groups[1].outcomes.as_slice(),
             [EntryOutcome::Fetched(3)]

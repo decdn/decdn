@@ -168,6 +168,23 @@ pub trait IngestStore: decdn_bao_range::RangedStore {
     ///
     /// Any I/O failure persisting the record.
     fn flush_present_record(&self) -> SourceFuture<'_, ()>;
+
+    /// The size a verified final chunk proved, if any leg has proved one. A
+    /// store keyed by a fixed size knows that size from the start, so the
+    /// default is [`total_bytes`](decdn_bao_range::RangedStore::total_bytes).
+    /// [`crate::acquire`] completes once a size is proven and every byte below
+    /// it is present.
+    fn proven(&self) -> Option<u64> {
+        Some(self.total_bytes())
+    }
+
+    /// Move the planner's bound ([`total_bytes`](decdn_bao_range::RangedStore::total_bytes))
+    /// to `bound`. [`crate::acquire`] grows the bound this way while no size is
+    /// proven. A store keyed by a fixed size keeps it, so the default does
+    /// nothing.
+    fn set_bound(&self, bound: u64) {
+        let _ = bound;
+    }
 }
 
 /// The injected pool top-up seam. Wraps the deployment's funding path — the
@@ -621,6 +638,10 @@ mod doubles {
     /// (an `anyhow::Error` is not `Clone`, so it is regenerated per open).
     type FaultFn = Arc<dyn Fn() -> anyhow::Error + Send + Sync>;
 
+    /// One leg's `(fetch_start, opened_at, finished_at)` on the runtime's
+    /// clock; `finished_at` is `None` for a leg that faulted or was dropped.
+    type LegTimes = (u64, tokio::time::Instant, Option<tokio::time::Instant>);
+
     /// A scripted [`BlobSource`](super::BlobSource) that yields the real bao wire
     /// for any requested range of a fixed blob, and can truncate a range's wire
     /// and park a typed fault to simulate a mid-range peer failure.
@@ -635,6 +656,15 @@ mod doubles {
         faults_left: Option<Arc<AtomicU32>>,
         /// When set, the size every header signs in place of the blob's own.
         signed_size: Option<u64>,
+        /// Refuse every open whose 0-based index (in call order) lies in the
+        /// range, with the fault its `FaultFn` produces, before any byte flows:
+        /// a node that refuses one more stream while it serves the others. A
+        /// refused open is still recorded in `opened`.
+        refuse_open: Option<(std::ops::Range<usize>, FaultFn)>,
+        /// When each `open` started and each clean `finish` ended, on the
+        /// runtime's clock, as `(fetch_start, opened_at, finished_at)`. A leg
+        /// that faulted or was dropped has no `finished_at`. Shared by clones.
+        timeline: Arc<Mutex<Vec<LegTimes>>>,
         /// Every range this source was `open`ed for, in call order, as
         /// `(fetch_start, fetch_len)`. Shared behind an `Arc<Mutex<..>>` so a
         /// clone handed to the driver records into the same log the test
@@ -651,6 +681,9 @@ mod doubles {
         /// exactly what lets the multi-source no-double-pay assertion see that a
         /// stolen tail was fetched by ONE source, not two.
         delivered: Arc<AtomicU64>,
+        /// When set, every reader waits on its first read until the gate reads
+        /// `true`: a source held back until the test releases it.
+        gate: Option<tokio::sync::watch::Receiver<bool>>,
         /// One-time stall injected on the FIRST read of every reader this source
         /// yields. Models a slow-to-start peer; a fast peer (no stall) then
         /// reliably finishes its own segment and steals the slow peer's tail,
@@ -707,8 +740,11 @@ mod doubles {
                 fault: None,
                 faults_left: None,
                 signed_size: None,
+                refuse_open: None,
+                timeline: Arc::new(Mutex::new(Vec::new())),
                 opened: Arc::new(Mutex::new(Vec::new())),
                 delivered: Arc::new(AtomicU64::new(0)),
+                gate: None,
                 first_read_stall: None,
                 finish_stall: None,
                 stall_after: None,
@@ -737,6 +773,15 @@ mod doubles {
         #[must_use]
         pub(crate) const fn stall_after(mut self, after_bytes: u64, stall: Duration) -> Self {
             self.stall_after = Some((after_bytes, stall));
+            self
+        }
+
+        #[cfg(test)]
+        /// Hold every reader's first read until `gate` reads `true`, so a test
+        /// decides when this source starts to deliver.
+        #[must_use]
+        pub(crate) fn gated_on(mut self, gate: tokio::sync::watch::Receiver<bool>) -> Self {
+            self.gate = Some(gate);
             self
         }
 
@@ -790,6 +835,14 @@ mod doubles {
         #[must_use]
         pub(crate) fn opened_ranges(&self) -> Vec<(u64, u64)> {
             self.opened.lock().map(|o| o.clone()).unwrap_or_default()
+        }
+
+        #[cfg(test)]
+        /// Each leg's `(fetch_start, opened_at, finished_at)`, in open order
+        /// (see `timeline`).
+        #[must_use]
+        pub(crate) fn timeline(&self) -> Vec<LegTimes> {
+            self.timeline.lock().map(|t| t.clone()).unwrap_or_default()
         }
 
         #[cfg(test)]
@@ -882,8 +935,18 @@ mod doubles {
                 if hash != self.root {
                     anyhow::bail!("scripted source opened for a foreign hash");
                 }
-                if let Ok(mut log) = self.opened.lock() {
+                let index = self.opened.lock().map_or(0, |mut log| {
                     log.push((range.fetch_start(), range.fetch_len()));
+                    log.len().saturating_sub(1)
+                });
+                let leg = self.timeline.lock().ok().map(|mut t| {
+                    t.push((range.fetch_start(), tokio::time::Instant::now(), None));
+                    t.len().saturating_sub(1)
+                });
+                if let Some((refused, make)) = &self.refuse_open
+                    && refused.contains(&index)
+                {
+                    return Err(make());
                 }
                 // Serve the request clamped to this blob's end, as a node
                 // does: the requester's range may be aligned under another
@@ -921,8 +984,10 @@ mod doubles {
                     ScriptedReader {
                         wire,
                         fault,
+                        leg,
                         wire_len,
                         delivered: Arc::clone(&self.delivered),
+                        gate: self.gate.clone(),
                         first_read_stall: self.first_read_stall,
                         stall_after: self.stall_after,
                         read_so_far: 0,
@@ -937,6 +1002,12 @@ mod doubles {
                 // not yet returned) so a peer can steal it while it is present.
                 if let Some(stall) = self.finish_stall {
                     tokio::time::sleep(stall).await;
+                }
+                if let Some(leg) = reader.leg
+                    && let Ok(mut timeline) = self.timeline.lock()
+                    && let Some(entry) = timeline.get_mut(leg)
+                {
+                    entry.2 = Some(tokio::time::Instant::now());
                 }
                 let Some(ledger) = &self.ledger else {
                     // Unpaid double: no channel, nothing to drain, no watermark.
@@ -971,6 +1042,11 @@ mod doubles {
     pub struct ScriptedReader {
         wire: Bytes,
         fault: Option<anyhow::Error>,
+        /// This leg's index in its source's timeline, stamped when it finishes.
+        leg: Option<usize>,
+        /// Waited on before the first read (see `ScriptedSource::gated_on`);
+        /// `None` once passed.
+        gate: Option<tokio::sync::watch::Receiver<bool>>,
         /// The wire byte count this reader was handed (before consumption), used by
         /// `ScriptedSource`'s [`BlobSource::finish`](crate::BlobSource::finish) to advance a paying ledger by
         /// this leg's spend.
@@ -996,6 +1072,10 @@ mod doubles {
             // peer reliably wins the race, finishes its own segment, and steals
             // this reader's tail — the deterministic steal trigger. Cancellation
             // drops this future while it sleeps, delivering nothing on this leg.
+            if let Some(mut gate) = self.gate.take() {
+                // A closed gate channel reads as open.
+                let _ = gate.wait_for(|open| *open).await;
+            }
             if let Some(stall) = self.first_read_stall.take() {
                 tokio::time::sleep(stall).await;
             }

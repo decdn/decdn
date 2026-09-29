@@ -593,7 +593,6 @@ where
                 hash,
                 gap_start,
                 gap_len,
-                total_bytes,
                 config,
                 &mut counters,
                 on_progress,
@@ -725,6 +724,10 @@ pub async fn first_leg<St: RangedStore + ?Sized>(
 /// The per-gap resume/pay loop. Fills the contiguous content span
 /// `[gap_start, gap_start + gap_len)` — a single gap of `missing_ranges` — driving
 /// the [`Pacer`] until it is fully present. `counters` persist across gaps.
+///
+/// Each pass reads the store's current bound ([`RangedStore::total_bytes`]) and
+/// clips the gap to it, so a gap past a size a leg has just proved ends at
+/// that size. Progress reports `(position, bound)`.
 #[allow(clippy::too_many_arguments)]
 // One sequential decide -> act -> classify loop. The five `PaceDecision` arms and
 // the four-way fault classification each justify a money-relevant decision inline
@@ -742,7 +745,6 @@ pub(crate) async fn fill_gap<St, S, P, F>(
     hash: [u8; 32],
     gap_start: u64,
     gap_len: u64,
-    total_bytes: u64,
     config: &DriveConfig,
     counters: &mut DriveCounters,
     on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
@@ -816,13 +818,26 @@ where
     // that opened it read them. The next pass must see one of them move (#2194).
     let mut clean_leg: Option<CleanLeg> = None;
 
-    let gap_end = gap_start.saturating_add(gap_len);
+    let asked_end = gap_start.saturating_add(gap_len);
 
     loop {
+        // The bound the planner works to now: a leg that proves a smaller size
+        // shrinks it, and the gap ends there.
+        let total_bytes = store.total_bytes();
+        let gap_end = asked_end.min(total_bytes);
+        if gap_start >= gap_end {
+            return Ok(());
+        }
+        let gap_len = gap_end - gap_start;
         // The store's DELIVERED frontier for this gap (contiguous from `gap_start`):
         // where its present ranges end. Used only to re-anchor after a reseed and
         // for the progress bar base — NOT for completion, which is payment-based.
-        let still_missing = store.missing_ranges(gap_start, gap_len).await?;
+        // A store that cannot answer is this process's fault, not the
+        // source's (#2213).
+        let still_missing = store
+            .missing_ranges(gap_start, gap_len)
+            .await
+            .map_err(|e| anyhow::Error::new(e).context(crate::LocalPullFault))?;
         let missing_bytes = ranges_content_len(&still_missing, total_bytes);
         let delivered_frontier = gap_end.saturating_sub(missing_bytes);
 
@@ -1054,8 +1069,13 @@ where
                 // Whole-blob content already present, so `ingest_stream`'s
                 // per-range progress can be offset into overall progress: the bar
                 // reports `base + received` against `total_bytes`.
-                let base_present =
-                    ranges_content_len(&(store.present_ranges().await?), total_bytes);
+                let base_present = ranges_content_len(
+                    &(store
+                        .present_ranges()
+                        .await
+                        .map_err(|e| anyhow::Error::new(e).context(crate::LocalPullFault))?),
+                    total_bytes,
+                );
                 // This leg's own previously-reported cumulative, so the multi-source
                 // aggregator folds in DELTAS (`received` is monotonic per leg, and
                 // resets to 0 on each new open — hence a fresh counter per leg).

@@ -1478,6 +1478,14 @@ impl crate::source::IngestStore for ClientRangedStore {
         let write = self.write_record_blocking();
         Box::pin(async move { Ok(write.await?) })
     }
+
+    fn proven(&self) -> Option<u64> {
+        Self::proven(self)
+    }
+
+    fn set_bound(&self, bound: u64) {
+        Self::set_bound(self, bound);
+    }
 }
 
 #[cfg(test)]
