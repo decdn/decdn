@@ -3200,7 +3200,11 @@ impl UpstreamPull {
         let (peer, hash, byte_offset) = (self.conn.remote_id(), self.hash, self.byte_offset);
         let unproved = self.unproved;
         let read_started = tokio::time::Instant::now();
-        let mut read_stall_logged = false;
+        // The `read` stall line runs on its own timer, not on the sampler,
+        // whose period follows the configurable window and can be later than
+        // the node's proof timeout.
+        let read_stall_at = read_started + PROOF_STALL_DEBUG_AFTER;
+        let mut read_stall_logged = cumulative == 0;
         let mut reader = progress::ProgressReader::new(recv, Arc::clone(&self.progress_counter));
         // Pin ONE read future and poll it across ticks. `read_client_message` is not
         // cancellation-safe — `read_frame` fills a frame with `read_exact`, so dropping the
@@ -3241,14 +3245,14 @@ impl UpstreamPull {
                             anyhow::Error::new(PullStalled { after: window })
                         });
                     }
-                    // Once bytes have flowed, a long wait here is the leg
-                    // waiting on the node while the node may wait on a proof.
-                    let waited = now.saturating_duration_since(read_started);
-                    if cumulative > 0 && !read_stall_logged && waited >= PROOF_STALL_DEBUG_AFTER {
-                        read_stall_logged = true;
-                        let pull = (&peer as &dyn std::fmt::Display, hash, byte_offset);
-                        log_proof_stall(pull, cumulative, unproved, "read", waited);
-                    }
+                }
+                // Once bytes have flowed, a long wait here is the leg waiting
+                // on the node while the node may wait on a proof.
+                () = tokio::time::sleep_until(read_stall_at), if !read_stall_logged => {
+                    read_stall_logged = true;
+                    let waited = read_started.elapsed();
+                    let pull = (&peer as &dyn std::fmt::Display, hash, byte_offset);
+                    log_proof_stall(pull, cumulative, unproved, "read", waited);
                 }
             }
         }

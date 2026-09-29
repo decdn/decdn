@@ -759,7 +759,8 @@ impl Work {
     ///
     /// Ranges are matched to takers by coverage, one idle worker per range, in
     /// queue order. An idle worker is a live slot of a live lane that holds no
-    /// range: it takes a range it covers on its next wake. A lane may be asked
+    /// range and has no reserved first unit: it takes a range it covers on its
+    /// next wake. A lane may be asked
     /// for a range only while it is live, has a growth hook (`can_grow`), and
     /// covers that range.
     fn growth_wanted(
@@ -773,13 +774,16 @@ impl Work {
                 covers_byte_range(c, seg.fetch_start(), seg.fetch_len(), total_bytes)
             })
         };
+        // A slot with a reserved first unit takes that unit next, so it is not
+        // a taker for anything pending.
         let mut idle: Vec<usize> = self
             .in_flight
             .iter()
+            .zip(&self.first)
             .zip(&self.alive)
             .zip(&self.lane_of)
-            .filter(|&((slot, &is_alive), &lane)| {
-                slot.is_none() && is_alive && !self.lane_retired(lane)
+            .filter(|&(((slot, first), &is_alive), &lane)| {
+                slot.is_none() && first.is_none() && is_alive && !self.lane_retired(lane)
             })
             .map(|(_, &lane)| lane)
             .collect();
@@ -3173,6 +3177,22 @@ mod tests {
         // Lane 2's worker is live and idle: it takes the range, so nobody grows.
         // Lane 3's idle worker does not count: it cannot serve the range.
         assert!(work.growth_wanted(&coverage, total, |_| true).is_empty());
+        // A worker with a reserved first unit takes that unit next, so it does
+        // not count as the range's taker.
+        if let Some(first) = work.first.get_mut(2) {
+            *first = Some(align_range(
+                3 * DISCOVERY_BLOCK_BYTES,
+                DISCOVERY_BLOCK_BYTES,
+                total,
+            )?);
+        }
+        assert_eq!(
+            work.growth_wanted(&coverage, total, |_| true),
+            vec![vec![0, 2]]
+        );
+        if let Some(first) = work.first.get_mut(2) {
+            *first = None;
+        }
         // Once it holds a range, the live covering lanes with a hook may be
         // asked, in lane order: not lane 1 (retired), not lane 3 (no cover).
         if let Some(slot) = work.in_flight.get_mut(2) {
