@@ -2645,9 +2645,9 @@ trait RangeDriver {
 /// whole-file entry: it stripes the ranges across the holders, a holder that
 /// faults cools in the command-wide [`PeerHealth`] and returns, and the drive
 /// ends on done, a fault only the user can fix, a unanimous verdict of the
-/// holders, or the command's [`StopPolicy`]. The store is keyed by the
-/// manifest's size, so a holder that signs another size is a size fault of
-/// that holder. The spliced donor bytes are never marked present in the
+/// holders, or the command's [`StopPolicy`]. The manifest's size is the
+/// drive's first claim, a hint: a leg that verifies the final chunk proves
+/// the true size. The spliced donor bytes are never marked present in the
 /// store, so a drive promotes the entry only once fetched bytes fill the
 /// whole store: a resumed store that already held the rest, or the self-heal
 /// re-drive of the whole blob.
@@ -2656,7 +2656,7 @@ struct AcquireRangeDriver<'a, P: Provider + Clone> {
     targets: &'a fetch::ResolvedTargets,
     hash: [u8; 32],
     staging: &'a Path,
-    /// The manifest's size, which keys the entry's store.
+    /// The manifest's size: the entry's first size claim.
     total: u64,
     progress: Option<&'a ProgressCallback>,
 }
@@ -2693,8 +2693,8 @@ impl<P: Provider + Clone> RangeDriver for AcquireRangeDriver<'_, P> {
 /// makes a real store with its `.ranges` record, never a bare `.partial`: a
 /// later drive into the same entry (a donor re-fetch, a deferred fallback, the
 /// self-heal re-drive) calls `open_or_create`, which keys resume on the
-/// `.ranges` record and truncates a `.partial` that lacks one — wiping every
-/// byte already spliced into it. A store that already has its record (a drive
+/// `.ranges` record and truncates a `.partial` that lacks one, which wipes
+/// every byte already spliced into it. A store that already has its record (a drive
 /// made it, or a resumed run) is reopened as is. The data file is then extended
 /// to `total`, sparsely, because the whole-file hash reads its full length.
 ///

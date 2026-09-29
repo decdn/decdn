@@ -2448,10 +2448,10 @@ fn delivery_progress() -> (
     (bar, on_progress, meter)
 }
 
-/// Build the callback that drives `bar` — setting its length to the fetch's
-/// current size bound whenever it changes, advancing its position to the
-/// cumulative verified content-byte count, and folding each update into a
-/// [`SpeedState`] for the rate/ETA `{msg}` — and return it with the
+/// Build the callback that drives `bar` (it sets the bar's length to the
+/// fetch's current size bound whenever it changes, advances its position to
+/// the cumulative verified content-byte count, and folds each update into a
+/// [`SpeedState`] for the rate/ETA `{msg}`), and return it with the
 /// [`DeliveryMeter`] the caller reads after the bar finishes. `tab`, when set,
 /// shows the same percent in the terminal's tab bar.
 ///

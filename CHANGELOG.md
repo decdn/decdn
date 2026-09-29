@@ -55,8 +55,26 @@ since project inception and will roll into the first tagged release.
   Wire-visible: a node serves a range up to the blob's end and refuses
   (`RangeNotSatisfiable`) only a start at or past the end, on every serve tier.
   The client's ranged store is keyed by offset, not by size, so a partial
-  written under one claim resumes under another. ADR 039, ADR 005, ADR 037 and
-  the bundles appendix describe the behavior.
+  written under one claim resumes under another. A finalize whose whole-file
+  hash does not match fetches the blob once more before the item fails. One
+  command keeps one connection per node for all of its entries and lanes. When
+  a lane faults and no idle lane covers its remainder, a busy lane that covers
+  it takes one extra stream for it (#2231). Config-breaking:
+  `--max-lane-streams` takes 1 to 64; 0 and values above 64 are refused.
+  `decdn-client` SDK breaks: `PeerSource::new` and
+  `IngestStore::ingest_stream` take new parameters, `IngestStore` gains
+  `proven` and `set_bound`, `SourceSet::record_fault` takes the faulted
+  `LaneRange`, `ClientRangedStore::open` takes no size and
+  `ClientRangedStore::create` takes a bound hint. Removed:
+  `SignedSizeMismatch`, `NoSourceAgreesOnSize`, `DownloadTarget::size_signer`,
+  `Fault::WrongSize`, `SourceSet::mark_wrong_size`,
+  `SourceSet::set_size_signer`, `ClientRangedStore::discard` and
+  `ClientRangedStore::tree`. Added: `Connections`, `LaneWiden`, `LaneRange`,
+  `StreamCandidate::widen`, `Probed::total_bytes`,
+  `ClientRangedStore::{bound, proven, set_bound}`, `AcquireEnv::max_blob_bytes`
+  and the `Downloader::max_blob_bytes` and `Streamer::max_blob_bytes`
+  builders. ADR 039, ADR 005, ADR 037 and the bundles appendix describe the
+  behavior.
 - **`decdn-client` lanes carry what they hold while they stream (#2208).**
   `RangeLane` gains `release: Option<LaneRelease>`, which the range driver
   calls as each gap worker stops. `StreamCandidate` gains `lease: LaneLease`

@@ -7004,7 +7004,7 @@ async fn leaf_paced_pull(
 }
 
 /// [`leaf_paced_pull`], but the request's `byte_len` is `byte_len` instead of
-/// the whole-blob `0` — for a test that must ask for a specific (possibly
+/// the whole-blob `0`: for a test that must ask for a specific (possibly
 /// end-past-the-blob) span rather than the whole thing. `byte_offset` stays 0.
 #[allow(clippy::too_many_arguments)]
 async fn leaf_paced_pull_ranged(
@@ -8896,14 +8896,14 @@ async fn window_pull_through_resumed_offset_is_served_by_the_fused_path() -> Res
 /// own, so this exercises `NodeRangedStore::missing_ranges`'s clamp on the actual
 /// pull-leg gap computation, not just the pre-flight bounds gate.
 ///
-/// The drained, byte-exact delivery alone does not pin the fix: `assemble`'s
+/// The drained, byte-exact delivery alone does not pin the clamp: `assemble`'s
 /// `plan_over` step independently clips demand against `total_bytes`, so a
-/// stale `missing_ranges` that never shrinks toward empty (the unclamped
-/// behavior) can still let ONE run complete before the no-progress guard on
-/// round two ends the assembly `Unavailable(NoProgress)` — which the leaf sees
-/// as a mid-stream fault, not necessarily as a wrong answer the byte comparison
+/// `missing_ranges` that never shrinks toward empty (an unclamped one) can let
+/// ONE run complete before the no-progress guard on round two ends the
+/// assembly `Unavailable(NoProgress)`, which the leaf sees as a mid-stream
+/// fault, not necessarily as a wrong answer the byte comparison
 /// above would catch on its own. The relay's own outbound metrics are the load-
-/// bearing assertion: with the fix, B's upstream pull leg ends Complete and B
+/// bearing assertion: with the clamp, B's upstream pull leg ends Complete and B
 /// counts one completed (not failed) outbound stream; without it, round two
 /// fails no-progress and `streams_failed_total{direction="outbound"}` is 1.
 #[tokio::test(flavor = "multi_thread")]
@@ -15401,11 +15401,11 @@ impl DiscoveryCase {
 /// ran, independent of how the live probe RTT ranks P and O.
 ///
 /// `byte_len` is the leaf's requested `byte_len` (`0` = whole blob, the shape
-/// every case but the size-by-growth one below uses). A `byte_len` that runs
-/// the requested end past the blob exercises the SAME coverage gate
-/// (`pull_range_uncovered`) with a range the pre-clamp code could only align
-/// with an error — which the gate then failed open on, wrongly reporting the
-/// (genuinely uncovered) range as covered.
+/// every case but the end-past-the-blob one below uses). A `byte_len` that
+/// runs the requested end past the blob exercises the SAME coverage gate
+/// (`pull_range_uncovered`) with a range that aligns only by clamping; an
+/// unclamped alignment errors there, and a gate that failed open on the error
+/// would report the (genuinely uncovered) range as covered.
 #[allow(clippy::too_many_lines)]
 async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result<()> {
     let (_block_guard, payload, hash) = two_block_blob()?;
@@ -15642,14 +15642,14 @@ async fn no_covering_candidate_refuses_before_commit() -> Result<()> {
     serve_miss_discovery_case(DiscoveryCase::NoCoveringCandidate, 0).await
 }
 
-/// The size-by-growth twin of `no_covering_candidate_refuses_before_commit`:
+/// The end-past-the-blob twin of `no_covering_candidate_refuses_before_commit`:
 /// the identical no-covering-candidate discovery (P covers block 0 only, D is
 /// unreachable, no origin), but the leaf's requested end runs past the blob.
-/// `pull_range_uncovered`'s coverage gate must still refuse before `ok: true` —
-/// pre-clamp, its `missing_ranges` call errored on the out-of-bounds end and
-/// the gate failed open (treated the error as "not uncovered"), so a genuinely
-/// uncovered range slipped through into a signed `ok: true` that then
-/// truncated instead of a clean refusal.
+/// `pull_range_uncovered`'s coverage gate refuses before `ok: true` here too.
+/// Its `missing_ranges` call clamps the end; an unclamped call errors on it,
+/// and a gate that read the error as "not uncovered" would let a genuinely
+/// uncovered range through into a signed `ok: true` that then truncates
+/// instead of a clean refusal.
 #[tokio::test(flavor = "multi_thread")]
 async fn no_covering_candidate_with_end_past_the_blob_refuses_before_commit() -> Result<()> {
     // `two_block_blob`'s fixed 16 KiB discovery-block override always yields a

@@ -660,11 +660,11 @@ impl ClientHandler {
         //
         // (2) Bounds gate first, on the probed geometry, BEFORE the guard and the
         // signature: an offset at or past the end is `RangeNotSatisfiable` here
-        // exactly as on the direct-serve path — never `InsufficientDeposit` (the
+        // exactly as on the direct-serve path: never `InsufficientDeposit` (the
         // range, not the pool, is the problem), and never a signed `ok: true`
         // that turns a bad range into a stream failure. An end past the blob is
-        // NOT out of bounds: it is served clamped to the blob's end (size by
-        // growth). This total is the node's OWN origin probe, so unlike the peer
+        // NOT out of bounds: it is served clamped to the blob's end (a claimed
+        // size is a hint). This total is the node's OWN origin probe, so unlike the peer
         // twin the gate cannot be steered by a lying counterparty (#1895).
         if range_out_of_bounds(req.byte_offset, req.byte_len, total_bytes) {
             release_reservation_unspent(floor_reservation.as_ref());

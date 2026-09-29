@@ -206,11 +206,11 @@ async fn ranged_paid_pull(
     anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
     // The advertised size is the *whole* blob; the range delivers `byte_len`, or
     // the whole tail when `byte_len == 0`. `byte_offset` must be inside the
-    // advertised total — a signed `total_bytes` at or before the offset is
+    // advertised total: a signed `total_bytes` at or before the offset is
     // surfaced here as a server bug. An end past the advertised total is not a
-    // bug: it clamps and serves up to the blob's end (size by growth), so it is
-    // NOT checked here — `align_range_clamped` below is the single source of
-    // truth for the served (and billed) span.
+    // bug: it clamps and serves up to the blob's end (a claimed size is a
+    // hint), so it is NOT checked here. `align_range_clamped` below is the
+    // single source of truth for the served (and billed) span.
     if byte_len == 0 {
         resp.body
             .total_bytes
@@ -290,7 +290,7 @@ async fn ranged_paid_pull(
 
 /// Decode the header-less bao verified-stream `wire` for `[byte_offset,
 /// byte_offset+byte_len)` (`byte_len == 0` ⇒ to end, and an end past
-/// `total_bytes` clamps to it — size by growth), verifying every chunk group
+/// `total_bytes` clamps to it), verifying every chunk group
 /// against `hash`, and trim the group-aligned superset back to the exact
 /// served span. Mirrors the production receiver (`decdn-client`).
 fn decode_bao_range(
@@ -986,9 +986,8 @@ async fn end_past_the_blob_own_origin_cold_miss_serves_clamped_tail() -> anyhow:
     // end" convention, so the requested end runs well past the blob. The
     // own-origin two-leg tier's pull leg computes its gap via
     // `NodeRangedStore::missing_ranges`, which must clamp the same way the
-    // serve tiers clamp — an unclamped `missing_ranges` faults `drive` after
-    // the node has already signed `ok: true` (the regression this test guards
-    // against).
+    // serve tiers clamp: an unclamped `missing_ranges` faults `drive` after
+    // the node has already signed `ok: true`.
     let (blob, outboard, hash) = blob_with_outboard();
     let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
     let hex = hash.to_hex();
@@ -1088,8 +1087,8 @@ async fn end_past_the_blob_own_origin_cold_miss_serves_clamped_tail() -> anyhow:
 #[tokio::test(flavor = "multi_thread")]
 async fn offset_past_the_blob_is_rejected_before_delivery() -> anyhow::Result<()> {
     // ADR 005 §Bounded byte ranges: a range whose START is at or past the blob
-    // end MUST be refused with a `StreamError` —
-    // and the refusal must land BEFORE a success response is signed, so the
+    // end MUST be refused with a `StreamError`, and the refusal must land
+    // BEFORE a success response is signed, so the
     // client never accepts an `ok: true` the delivery then aborts. Exercised
     // against a cache hit so the request reaches the bounds gate directly.
     let (blob, _outboard, hash) = blob_with_outboard();
@@ -1136,8 +1135,8 @@ async fn offset_past_the_blob_is_rejected_before_delivery() -> anyhow::Result<()
         .open_bi()
         .await
         .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
-    // `byte_offset` itself is at the blob end — no chunk group to anchor,
-    // clamped or not, so this must still refuse.
+    // `byte_offset` itself is at the blob end: no chunk group to anchor,
+    // clamped or not, so this must refuse.
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
@@ -1182,7 +1181,7 @@ async fn offset_past_the_blob_is_rejected_before_delivery() -> anyhow::Result<()
 async fn end_past_the_blob_is_served_clamped_not_refused() -> anyhow::Result<()> {
     // ADR 005 §Bounded byte ranges: a request whose start is in bounds but
     // whose end runs past the blob is served up to the blob's end instead of
-    // refused — a claimed size is a hint, and this leg reaches the true end,
+    // refused: a claimed size is a hint, and this leg reaches the true end,
     // proving it. Exercised against a cache hit so the request reaches the
     // bounds gate directly (the same gate `offset_past_the_blob_is_rejected_...`
     // exercises for a genuinely out-of-bounds start).

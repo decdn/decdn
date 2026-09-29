@@ -2525,8 +2525,8 @@ impl CacheEngine {
     }
 
     /// The chunk-aligned sub-ranges of `[byte_offset, byte_offset + byte_len)`
-    /// (`byte_len == 0` = to `blob_size`, an end past `blob_size` clamped to it —
-    /// size by growth) that are NOT present on disk.
+    /// (`byte_len == 0` = to `blob_size`, an end past `blob_size` clamped to
+    /// it) that are NOT present on disk.
     ///
     /// Empty ⇒ the requested span is fully present: a completeness-aware read can
     /// serve it with no fetch, and a resumed pull is a no-op. `blob_size` is
@@ -4706,8 +4706,8 @@ impl CacheEngine {
     ///
     /// The range widens to enclosing 16 KiB chunk-group boundaries
     /// ([`align_range_clamped`]) because a bao proof anchors whole groups; an
-    /// end past the blob clamps to it (size by growth) rather than being
-    /// refused. The serve side does **not** trim back to the requested offset
+    /// end past the blob clamps to it rather than being refused: a claimed
+    /// size is a hint. The serve side does **not** trim back to the requested offset
     /// (trimming would break verification). The receiver discards the
     /// group-aligned prefix. The outboard is read from the store (built at
     /// import).
@@ -4745,9 +4745,9 @@ impl CacheEngine {
     /// # Errors
     ///
     /// [`CacheError::Store`] if `byte_offset` is at or past the blob end, or
-    /// (for the 0-byte case) the blob is absent. An end past the blob is not an
-    /// error — it clamps. Faults discovered while exporting — including the
-    /// truncation refusal — arrive as `Err` items in the stream.
+    /// (for the 0-byte case) the blob is absent. An end past the blob clamps.
+    /// Faults discovered while exporting, the truncation refusal included,
+    /// arrive as `Err` items in the stream.
     pub async fn export_bao_range_stream(
         &self,
         hash: Hash,
@@ -4764,7 +4764,7 @@ impl CacheEngine {
         // construction (#915, ADR 038).
 
         // Snap to chunk-group boundaries. Only a start at or past the blob end
-        // is rejected; an end past the blob clamps to it instead —
+        // is rejected; an end past the blob clamps to it instead.
         // `align_range_clamped` owns the bound check, the same one the
         // dispatch-tier gate applies before this runs.
         let aligned = align_range_clamped(byte_offset, byte_len, blob_size).map_err(|e| {

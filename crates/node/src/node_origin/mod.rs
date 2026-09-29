@@ -3683,8 +3683,8 @@ mod tests {
     ///
     /// The wiring is guarded where the wiring lives:
     /// `node_origin_an_unverifiable_voucher_is_a_local_fault_not_a_payment_one` drives a
-    /// real pull whose signature the upstream cannot verify — the production shape of "our
-    /// buyer key is broken" — and asserts `node_pull_local_fault_total` moves while the
+    /// real pull whose signature the upstream cannot verify (the production shape of "our
+    /// buyer key is broken") and asserts `node_pull_local_fault_total` moves while the
     /// peer is left unscored.
     #[test]
     fn a_local_fault_outranks_every_arm_that_blames_the_peer() {

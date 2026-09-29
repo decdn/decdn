@@ -286,8 +286,8 @@ as `decdn fetch`):
   its ranges to the other holders. When the cooldown ends, the holder comes
   back into the same loop. A holder that faults for one entry also cools for
   every other entry. A failed entry does not retry in rounds. The size in
-  the manifest is the first size claim of the entry (C0). It is a hint. A
-  holder that signs a different size does not leave the entry. An entry
+  the manifest is the first size claim of the entry. It is a hint. A holder
+  that signs a different size stays a holder of the entry. An entry
   whose proven size differs from its manifest size succeeds with a warning
   line. A blob over the client's size cap fails only its entry.
   A fault that only the user can fix stops all entries: a voucher rejection,

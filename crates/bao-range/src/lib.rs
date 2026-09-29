@@ -379,12 +379,12 @@ pub fn align_range(
 }
 
 /// [`align_range`], but an end past the blob clamps to the blob's end instead
-/// of being refused (size-by-growth: a claimed size is a hint, and the
-/// planner's bound can overshoot it). Only `byte_offset >= blob_size` (for a
-/// non-empty blob) is still refused with [`RangeVerifyError::RangeOutOfBounds`]
-/// — a start past the end has no chunk group to anchor either way, clamped or
-/// not. `(0, 0)` still means the whole blob, and the empty blob is still
-/// addressable only as `(0, 0)`, exactly as [`align_range`].
+/// of being refused: a claimed size is a hint, and the planner's bound can
+/// overshoot it. Only `byte_offset >= blob_size` (for a non-empty blob) is
+/// refused, with [`RangeVerifyError::RangeOutOfBounds`]: a start past the end
+/// has no chunk group to anchor, clamped or not. `(0, 0)` means the whole
+/// blob, and the empty blob is addressable only as `(0, 0)`, exactly as in
+/// [`align_range`].
 ///
 /// Both a node deciding what to serve and a client deciding what wire length to
 /// expect call this, so the two always agree on the served range.
@@ -657,8 +657,8 @@ mod tests {
     }
 
     /// A request whose end runs past the blob clamps to the blob's end instead
-    /// of erroring — the size-by-growth planner bound can overshoot a claimed
-    /// size, and a leg that reaches the true end proves it.
+    /// of erroring: the planner's bound can overshoot a claimed size, and a
+    /// leg that reaches the true end proves it.
     #[test]
     fn align_range_clamped_clamps_an_end_past_the_blob() {
         let total = 5 * CHUNK_GROUP_BYTES;
@@ -673,10 +673,10 @@ mod tests {
         assert_eq!(interior.fetch_end(), total);
     }
 
-    /// Only a start at or past the blob end (for a non-empty blob) is still
-    /// refused — the mirror case to the clamp above.
+    /// A start at or past the blob end (for a non-empty blob) is refused: the
+    /// mirror case to the clamp above.
     #[test]
-    fn align_range_clamped_still_refuses_an_offset_at_or_past_the_end() {
+    fn align_range_clamped_refuses_an_offset_at_or_past_the_end() {
         let total = 5 * CHUNK_GROUP_BYTES;
         assert!(matches!(
             align_range_clamped(total, 0, total),

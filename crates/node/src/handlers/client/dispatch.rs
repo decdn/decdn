@@ -1190,7 +1190,7 @@ impl ClientHandler {
         };
         // Bounded-range bounds check (ADR 005 §Bounded byte ranges). Reject a
         // request whose START has no bytes to serve with a
-        // `StreamError` *before* signing the success response below — otherwise
+        // `StreamError` *before* signing the success response below. Otherwise
         // the client accepts a signed `ok: true` that `deliver`'s `export_range`
         // then aborts mid-stream. A whole-blob request (`byte_offset == 0 &&
         // byte_len == 0`) is always in bounds for a present blob; `byte_len == 0`
@@ -1382,9 +1382,9 @@ impl ClientHandler {
 /// i.e. the chunk-group-aligned superset `export_bao_range_stream` serves.
 ///
 /// Mirrors `decdn_bao_range::align_range_clamped`: the start floors to its group
-/// boundary, the end ceils to one and clamps to the blob — an end past the blob
+/// boundary, the end ceils to one and clamps to the blob: an end past the blob
 /// clamps rather than being an error here. The serve path does not trim back to
-/// `byte_offset` (trimming would break bao verification — the receiver discards
+/// `byte_offset` (trimming would break bao verification; the receiver discards
 /// the leading bytes itself), so the payer covers the whole aligned range. A
 /// pre-flight price computed on the *requested* span would under-reserve by up
 /// to two groups.
@@ -1409,12 +1409,13 @@ pub(super) fn aligned_span(byte_offset: u64, byte_len: u64, total_bytes: u64) ->
 
 /// Whether `[byte_offset, byte_offset + byte_len)` (`byte_len == 0` = to the
 /// blob end) has no start to serve from a `total_bytes`-byte blob. Mirrors
-/// [`decdn_bao_range::align_range_clamped`]'s bound check so every serve tier —
-/// the direct-serve gate and the own-origin twin — refuses the same starts with
+/// [`decdn_bao_range::align_range_clamped`]'s bound check so every serve tier
+/// (the direct-serve gate and the own-origin twin) refuses the same starts with
 /// `RangeNotSatisfiable` BEFORE it signs a response. A whole-blob request
 /// (`0, 0`) is always in bounds, including for the empty blob. An end past the
-/// blob is NOT out of bounds here: it is served clamped to the blob's end
-/// (size by growth), so only a start at or past a non-empty blob's end refuses.
+/// blob is NOT out of bounds here: it is served clamped to the blob's end (a
+/// claimed size is a hint), so only a start at or past a non-empty blob's end
+/// refuses.
 pub(super) fn range_out_of_bounds(byte_offset: u64, byte_len: u64, total_bytes: u64) -> bool {
     decdn_bao_range::align_range_clamped(byte_offset, byte_len, total_bytes).is_err()
 }
@@ -1432,7 +1433,7 @@ mod range_helper_tests {
         assert!(!range_out_of_bounds(16 * 1024, 32 * 1024, total));
         assert!(!range_out_of_bounds(0, total, total));
         // An end past the blob, or an overflowing end, clamps to the blob end
-        // rather than refusing — only a start at or past the end still refuses.
+        // rather than refusing; only a start at or past the end refuses.
         assert!(!range_out_of_bounds(16 * 1024, total, total));
         assert!(!range_out_of_bounds(1, u64::MAX, total));
         assert!(range_out_of_bounds(total, 0, total));

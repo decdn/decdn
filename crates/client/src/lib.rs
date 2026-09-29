@@ -2664,7 +2664,7 @@ pub fn is_range_past_end(err: &anyhow::Error) -> bool {
 /// size of the chunk-group-aligned range (content plus interleaved proof, ADR
 /// 038 §Payment metering), exactly the byte count the server emits. The server
 /// widens the request to enclosing 16 KiB groups and clamps an end past the
-/// blob to the blob's end (size by growth); `total_bytes` here is the response
+/// blob to the blob's end (a claimed size is a hint); `total_bytes` here is the response
 /// header's signed size, so [`align_range_clamped`] /
 /// [`AlignedRange::wire_len`](decdn_bao_range::AlignedRange::wire_len)
 /// reproduce the same clamp the server applied, keeping the two sides in
@@ -2975,8 +2975,8 @@ pub async fn open_progressive_pull(
 /// `conn` instead of dialling a fresh one (#1848). `owner` names where `conn`
 /// comes from: a caller-owned [`WarmConnection`] or a [`Connections`] map's
 /// connection. The warm connection is reused across
-/// many hashes — one dial, a fresh bi-stream per hash (one stream = one hash, no
-/// wire change) — and stays open when this pull ends, so the pull never closes
+/// many hashes (one dial, a fresh bi-stream per hash: one stream = one hash, no
+/// wire change) and stays open when this pull ends, so the pull never closes
 /// it. A map's connection is held by the pull while it runs, and a transport
 /// fault on the open or on a later read unpins it from the map
 /// ([`Connections::invalidate`]).
@@ -3630,7 +3630,7 @@ impl UpstreamPull {
     /// connection so the upstream's serve task stops and the paid stream does not
     /// linger half-open. A WARM connection (a [`WarmConnection`] reused across
     /// hashes, caller-owned or from a [`Connections`] map) is left open for the
-    /// next hash — only THIS stream is torn down: the send half is finished (a
+    /// next hash, and only THIS stream is torn down: the send half is finished (a
     /// clean FIN) and the recv half is stopped. The warm connection's own `Drop`
     /// closes the connection once, later.
     ///

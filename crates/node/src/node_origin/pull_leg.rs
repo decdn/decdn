@@ -197,9 +197,9 @@ impl PrimeLeg {
         let request_end = if self.len == 0 {
             total_bytes
         } else {
-            // `saturating_add`, not `checked_add`: an overflowing end (size by
-            // growth can widen `self.len` toward `u64::MAX`) still primes a
-            // first leg — the `.min(total_bytes)` below clamps it back down
+            // `saturating_add`, not `checked_add`: an overflowing end (a grown
+            // size claim can widen `self.len` toward `u64::MAX`) primes a
+            // first leg too; the `.min(total_bytes)` below clamps it back down
             // regardless of how far the raw sum overshot.
             self.offset
                 .saturating_add(self.len)
@@ -804,7 +804,7 @@ impl NodeOrigin {
         }
 
         // The header handshake: open a range to read the committed `total_bytes`,
-        // then abort — no `next_chunk`, so no bytes are pulled and no voucher is
+        // then abort: no `next_chunk`, so no bytes are pulled and no voucher is
         // paid, and the ledger watermark is unchanged. The actual range-minimized
         // pull re-opens per gap via `PeerSource` on this same (now cached) channel.
         // The range lies in a block the candidate advertised, so a partial holder
@@ -2469,10 +2469,10 @@ mod prime_tests {
             align_range(0, PULL_WINDOW_FLOOR, total).ok()
         );
         // A nonzero offset paired with `len == u64::MAX` genuinely overflows
-        // `offset + len` (unlike offset 0, which does not). Size by growth can
-        // widen `len` this far, and `saturating_add` plus the `.min(total_bytes)`
-        // clamp right after it means this still primes a leg — the same one a
-        // `byte_len == 0` "to end" request from the same offset would — rather
+        // `offset + len` (unlike offset 0, which does not). A grown size claim
+        // can widen `len` this far, and `saturating_add` plus the
+        // `.min(total_bytes)` clamp right after it primes a leg (the same one a
+        // `byte_len == 0` "to end" request from the same offset would) rather
         // than losing the first leg to `None`.
         assert_eq!(
             PrimeLeg::new(
