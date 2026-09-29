@@ -2407,7 +2407,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             Ok(paid) => paid,
             Err(e) => {
                 // `pull_entry` (whole-file or dedup) leaves the `<hex>.partial` +
-                // `.obao4`/`.ranges` sidecars in place on error — they are what the
+                // `.ranges` record in place on error — they are what the
                 // next run resumes from rather than re-paying for bytes already landed
                 // (same contract as `fetch`'s `<output>.partial` store).
                 return GroupRun::fetch_failed(slots, e);
@@ -2683,7 +2683,7 @@ async fn reassemble_dedup(
     if !plan.drive.is_empty() {
         driver.drive(&plan.drive).await?;
         // A resumed run may already hold every range in `.partial`, so this first
-        // drive can COMPLETE the store — `drive` then ran its whole-blob bao sweep
+        // drive can COMPLETE the store — `drive` then ran its whole-file hash
         // against `hash` and renamed `<hex>.partial` -> `<hex>`. The blob is
         // finalized and verified; splicing would open a `.partial` that no longer
         // exists. Register the donor chunks and return. No splice ran this run.
@@ -2768,7 +2768,7 @@ async fn reassemble_dedup(
         );
         driver.drive(&[(0, total)]).await?;
         // The whole-blob re-drive covers `[0, total)`, so `drive` finalized it: its
-        // bao sweep verified the bytes against `hash` and renamed `.partial` ->
+        // whole-file hash verified the bytes against `hash` and renamed `.partial` ->
         // `staging`. The blob is verified — do not re-hash a `.partial` that no
         // longer exists; register the donor chunks and return.
         if staging.try_exists()? {
@@ -3637,18 +3637,14 @@ fn hash_partial_with_progress(
 fn promote_partial(partial: &Path, staging: &Path) -> anyhow::Result<()> {
     std::fs::rename(partial, staging)
         .with_context(|| format!("promote {} -> {}", partial.display(), staging.display()))?;
-    for sidecar in [
-        staging.with_extension("partial.obao4"),
-        staging.with_extension("partial.ranges"),
-    ] {
-        if let Err(e) = std::fs::remove_file(&sidecar)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(
-                "failed to remove staging sidecar {}: {e}",
-                sidecar.display()
-            );
-        }
+    let sidecar = staging.with_extension("partial.ranges");
+    if let Err(e) = std::fs::remove_file(&sidecar)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            "failed to remove staging sidecar {}: {e}",
+            sidecar.display()
+        );
     }
     Ok(())
 }
@@ -3662,9 +3658,9 @@ const STAGING_DIR: &str = ".decdn-partial";
 /// Per-hash staging file an entry's fetch finalizes to before `fetch_group`
 /// materializes it at the manifest's destination path(s) —
 /// `<out_root>/.decdn-partial/<hex>` (#1497). This is the *plain* final path:
-/// the entry's ranged store owns the `.partial` suffix and the
-/// `.obao4`/`.ranges` sidecars itself, streaming into `<hex>.partial` beside
-/// this and renaming to `<hex>` on `finalize`. Those sidecars are what survives
+/// the entry's ranged store owns the `.partial` suffix and the `.ranges`
+/// record itself, streaming into `<hex>.partial` beside this and renaming to
+/// `<hex>` on `finalize`. Those sidecars are what survives
 /// an interrupted pull — a rerun resumes from them rather than re-paying for
 /// bytes already landed. Creates the staging directory (idempotent, and only
 /// ever called once a group has real work to do — an all-skipped group never
@@ -3750,7 +3746,7 @@ async fn remove_staging_off_runtime(staging: &Path) {
 /// Best-effort cleanup of a finalized staging blob whose content is safely
 /// elsewhere (materialized to disk, or read into memory) and so has nothing left
 /// to resume. Removes the plain `<hex>` finalized blob itself and, best-effort,
-/// any leftover `<hex>.partial{,.obao4,.ranges}` sidecars: the ranged store's
+/// any leftover `<hex>.partial{,.ranges}` sidecars: the ranged store's
 /// `finalize` normally clears those on success, but this is the belt to that
 /// brace and never runs on an errored entry (whose sidecars are the resume
 /// prefix a rerun needs). A leftover here is harmless clutter, not a
@@ -3760,7 +3756,6 @@ fn remove_staging(staging: &Path) {
     let paths_to_remove = [
         staging.to_path_buf(),
         staging.with_extension("partial"),
-        staging.with_extension("partial.obao4"),
         staging.with_extension("partial.ranges"),
     ];
     for path in paths_to_remove {

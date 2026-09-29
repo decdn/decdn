@@ -2046,8 +2046,10 @@ mod tests {
         // throwaway source so the lane sources' opened-byte logs stay clean.
         let held = align_range(0, 2 * CHUNK_GROUP_BYTES, total).expect("align held");
         let seed = ScriptedSource::new(data.clone())?;
-        let (_h, reader) = seed.open(root, held.clone()).await?;
-        store.ingest_stream(&held, reader, None).await?;
+        let (h, reader) = seed.open(root, held.clone()).await?;
+        store
+            .ingest_stream(&held, reader, None, h.total_bytes)
+            .await?;
         let base_present = ranges_content_len(&store.present_ranges().await?, total);
         assert_eq!(
             base_present,
@@ -3418,6 +3420,7 @@ mod tests {
             _range: &'a decdn_bao_range::AlignedRange,
             _reader: R,
             _on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+            _claimed_total: u64,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
         where
             R: crate::BaoRangeReader + 'a,
@@ -3668,7 +3671,7 @@ mod tests {
         }
         drop(store);
 
-        let reopened = ClientRangedStore::open(dir.path(), "b", root, total)?;
+        let reopened = ClientRangedStore::open(dir.path(), "b", root)?;
         let recorded = ranges_content_len(&reopened.present_ranges().await?, total);
         assert!(
             recorded >= 8 * 1024 * 1024,

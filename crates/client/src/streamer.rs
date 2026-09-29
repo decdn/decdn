@@ -1318,7 +1318,7 @@ mod tests {
         let limit = Duration::from_secs(30);
 
         for cursor_at_frontier in [true, false] {
-            let store = crate::ClientRangedStore::open(dir.path(), "s", root, total)?;
+            let store = crate::ClientRangedStore::open(dir.path(), "s", root)?;
             let frontier = super::present_frontier(&store, total).await?;
             anyhow::ensure!(frontier > 0 && frontier < total, "a partial store");
             let cursor = if cursor_at_frontier { frontier } else { 0 };

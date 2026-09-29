@@ -890,7 +890,7 @@ mod tests {
             "the stalled download must still be running"
         );
 
-        let partial = ClientRangedStore::open(dir.path(), "model.bin", root, total)?;
+        let partial = ClientRangedStore::open(dir.path(), "model.bin", root)?;
         let recorded = crate::driver::ranges_content_len(
             &decdn_bao_range::RangedStore::present_ranges(&partial).await?,
             total,

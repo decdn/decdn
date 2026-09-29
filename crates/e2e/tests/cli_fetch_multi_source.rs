@@ -353,7 +353,6 @@ fn reset_fetch_artifacts(out: &std::path::Path) -> anyhow::Result<()> {
     for path in [
         out.to_path_buf(),
         dir.join(format!("{stem}.partial")),
-        dir.join(format!("{stem}.partial.obao4")),
         dir.join(format!("{stem}.partial.ranges")),
     ] {
         match std::fs::remove_file(&path) {

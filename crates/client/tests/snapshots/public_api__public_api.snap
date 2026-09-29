@@ -299,15 +299,17 @@ pub fn decdn_client::provider::is_permanent_rpc_error(&alloy_transport::error::T
 pub mod decdn_client::ranged_store
 pub struct decdn_client::ranged_store::ClientRangedStore
 impl decdn_client::ranged_store::ClientRangedStore
+pub fn decdn_client::ranged_store::ClientRangedStore::bound(&self) -> u64
 pub fn decdn_client::ranged_store::ClientRangedStore::create(&std::path::Path, &str, [u8; 32], u64) -> std::io::error::Result<Self>
 pub fn decdn_client::ranged_store::ClientRangedStore::discard(&std::path::Path, &str) -> std::io::error::Result<()>
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> std::io::error::Result<()>
 pub fn decdn_client::ranged_store::ClientRangedStore::has_record(&std::path::Path, &str) -> std::io::error::Result<bool>
-pub async fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<R>(&self, &decdn_bao_range::AlignedRange, R, core::option::Option<&(dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>) -> anyhow::Result<R> where R: iroh_io::AsyncStreamReader + decdn_client::sink::StashedFault + core::marker::Send
-pub fn decdn_client::ranged_store::ClientRangedStore::open(&std::path::Path, &str, [u8; 32], u64) -> std::io::error::Result<Self>
+pub async fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<R>(&self, &decdn_bao_range::AlignedRange, R, core::option::Option<&(dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> anyhow::Result<R> where R: iroh_io::AsyncStreamReader + decdn_client::sink::StashedFault + core::marker::Send
+pub fn decdn_client::ranged_store::ClientRangedStore::open(&std::path::Path, &str, [u8; 32]) -> std::io::error::Result<Self>
 pub fn decdn_client::ranged_store::ClientRangedStore::open_or_create(&std::path::Path, &str, [u8; 32], u64) -> std::io::error::Result<Self>
+pub fn decdn_client::ranged_store::ClientRangedStore::proven(&self) -> core::option::Option<u64>
 pub const fn decdn_client::ranged_store::ClientRangedStore::root(&self) -> [u8; 32]
-pub const fn decdn_client::ranged_store::ClientRangedStore::tree(&self) -> bao_tree::BaoTree
+pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)
 impl core::fmt::Debug for decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl decdn_bao_range::ranged_store::RangedStore for decdn_client::ranged_store::ClientRangedStore
@@ -320,7 +322,7 @@ pub fn decdn_client::ranged_store::ClientRangedStore::read(&self, u64, u64) -> d
 pub fn decdn_client::ranged_store::ClientRangedStore::total_bytes(&self) -> u64
 impl decdn_client::source::IngestStore for decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
-pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
 pub mod decdn_client::sink
 pub struct decdn_client::sink::NoCache
 impl decdn_client::sink::BlobCache for decdn_client::sink::NoCache
@@ -343,6 +345,8 @@ pub fn decdn_client::sink::NoCache::get(&self, [u8; 32], u64, u64) -> decdn_clie
 pub fn decdn_client::sink::NoCache::put(&self, [u8; 32], u64, bytes::bytes::Bytes) -> decdn_client::sink::SinkFuture<'_, ()>
 pub trait decdn_client::sink::StashedFault
 pub fn decdn_client::sink::StashedFault::take_fault(&mut self) -> core::option::Option<anyhow::Error>
+impl decdn_client::sink::StashedFault for bytes::bytes::Bytes
+pub fn bytes::bytes::Bytes::take_fault(&mut self) -> core::option::Option<anyhow::Error>
 impl decdn_client::sink::StashedFault for decdn_client::sink::PullReader
 pub fn decdn_client::sink::PullReader::take_fault(&mut self) -> core::option::Option<anyhow::Error>
 pub fn decdn_client::sink::content_paid_frontier(u64, u64, u64) -> u64
@@ -396,10 +400,10 @@ pub fn decdn_client::source::Funder::max_topups(&self) -> u32
 pub fn decdn_client::source::Funder::top_up(&self, alloy_primitives::aliases::U256) -> decdn_client::source::SourceFuture<'_, decdn_incentive::buyer_pool::DepositOutcome>
 pub trait decdn_client::source::IngestStore: decdn_bao_range::ranged_store::RangedStore
 pub fn decdn_client::source::IngestStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
-pub fn decdn_client::source::IngestStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::source::IngestStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
 impl decdn_client::source::IngestStore for decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
-pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
 pub type decdn_client::source::SourceFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>
 pub mod decdn_client::source_set
 pub struct decdn_client::source_set::Holder
@@ -631,15 +635,17 @@ impl decdn_client::ChainCommit
 pub const decdn_client::ChainCommit::SEALED: Self
 pub struct decdn_client::ClientRangedStore
 impl decdn_client::ranged_store::ClientRangedStore
+pub fn decdn_client::ranged_store::ClientRangedStore::bound(&self) -> u64
 pub fn decdn_client::ranged_store::ClientRangedStore::create(&std::path::Path, &str, [u8; 32], u64) -> std::io::error::Result<Self>
 pub fn decdn_client::ranged_store::ClientRangedStore::discard(&std::path::Path, &str) -> std::io::error::Result<()>
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> std::io::error::Result<()>
 pub fn decdn_client::ranged_store::ClientRangedStore::has_record(&std::path::Path, &str) -> std::io::error::Result<bool>
-pub async fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<R>(&self, &decdn_bao_range::AlignedRange, R, core::option::Option<&(dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>) -> anyhow::Result<R> where R: iroh_io::AsyncStreamReader + decdn_client::sink::StashedFault + core::marker::Send
-pub fn decdn_client::ranged_store::ClientRangedStore::open(&std::path::Path, &str, [u8; 32], u64) -> std::io::error::Result<Self>
+pub async fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<R>(&self, &decdn_bao_range::AlignedRange, R, core::option::Option<&(dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> anyhow::Result<R> where R: iroh_io::AsyncStreamReader + decdn_client::sink::StashedFault + core::marker::Send
+pub fn decdn_client::ranged_store::ClientRangedStore::open(&std::path::Path, &str, [u8; 32]) -> std::io::error::Result<Self>
 pub fn decdn_client::ranged_store::ClientRangedStore::open_or_create(&std::path::Path, &str, [u8; 32], u64) -> std::io::error::Result<Self>
+pub fn decdn_client::ranged_store::ClientRangedStore::proven(&self) -> core::option::Option<u64>
 pub const fn decdn_client::ranged_store::ClientRangedStore::root(&self) -> [u8; 32]
-pub const fn decdn_client::ranged_store::ClientRangedStore::tree(&self) -> bao_tree::BaoTree
+pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)
 impl core::fmt::Debug for decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl decdn_bao_range::ranged_store::RangedStore for decdn_client::ranged_store::ClientRangedStore
@@ -652,7 +658,7 @@ pub fn decdn_client::ranged_store::ClientRangedStore::read(&self, u64, u64) -> d
 pub fn decdn_client::ranged_store::ClientRangedStore::total_bytes(&self) -> u64
 impl decdn_client::source::IngestStore for decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
-pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
 pub struct decdn_client::ClockHold<'a>(_)
 impl core::ops::drop::Drop for decdn_client::stop::ClockHold<'_>
 pub fn decdn_client::stop::ClockHold<'_>::drop(&mut self)
@@ -1108,10 +1114,10 @@ pub fn decdn_client::Funder::max_topups(&self) -> u32
 pub fn decdn_client::Funder::top_up(&self, alloy_primitives::aliases::U256) -> decdn_client::source::SourceFuture<'_, decdn_incentive::buyer_pool::DepositOutcome>
 pub trait decdn_client::IngestStore: decdn_bao_range::ranged_store::RangedStore
 pub fn decdn_client::IngestStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
-pub fn decdn_client::IngestStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::IngestStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
 impl decdn_client::source::IngestStore for decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
-pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
 pub trait decdn_client::Pacer: core::marker::Send + core::marker::Sync
 pub fn decdn_client::Pacer::decide(&self, &decdn_client::pacer::PaceState) -> decdn_client::pacer::PaceDecision
 impl decdn_client::pacer::Pacer for decdn_client::pacer::BudgetPacer

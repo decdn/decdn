@@ -12,10 +12,10 @@
 //! persisted voucher watermark across two runs.
 //!
 //! **New-model on-disk state (#1621).** The gap-driven fetch resumes from a
-//! [`ClientRangedStore`]'s three sidecars beside `--output`, NOT from a raw
-//! `.partial`: a positioned `<stem>.partial` data file, a whole-blob
-//! `<stem>.partial.obao4` pre-order outboard, and a `<stem>.partial.ranges` JSON
-//! present-range record. The `.ranges` record is the resume signal — a raw
+//! [`ClientRangedStore`]'s two files beside `--output`, NOT from a raw
+//! `.partial`: a positioned `<stem>.partial` data file and a
+//! `<stem>.partial.ranges` JSON record of its bound, proven size and present
+//! ranges. The `.ranges` record is the resume signal — a raw
 //! `.partial` with no record is truncated and re-fetched from scratch. So these
 //! journeys construct a real *checkpointed* on-disk state with
 //! [`ClientRangedStore::seed_checkpointed_prefix`] (the `test-util` fixture seam)
@@ -26,27 +26,27 @@
 //! 1. **Clean fetch.** Output matches the blob and the `.partial` scratch file is
 //!    gone — a fetch that leaves litter beside `--output` would be a regression
 //!    users notice immediately.
-//! 2. **Resume.** Seeded with a genuine checkpointed prefix (data + outboard +
-//!    record), the fetch completes correctly AND bills strictly fewer bytes than
+//! 2. **Resume.** Seeded with a genuine checkpointed prefix (data + record),
+//!    the fetch completes correctly AND bills strictly fewer bytes than
 //!    the clean run did: `drive` reads the recorded prefix locally and pulls only
 //!    the still-missing suffix. The inequality is the assertion that matters;
 //!    without it the test would pass on an implementation that silently
 //!    re-downloaded everything.
 //! 3. **Corrupt checkpoint.** Seeded with a valid checkpoint whose `.partial` data
 //!    is then flipped a byte — the record still claims the group present.
-//!    `finalize`'s whole-blob `valid_ranges` sweep is the guarantee: a
+//!    `finalize`'s whole-file BLAKE3 of `[0, proven)` is the guarantee: a
 //!    corrupt group can never be silently promoted. The first run pulls the
-//!    missing suffix, the sweep catches the bad group, shrinks the present set to
-//!    exclude it, and returns `Incomplete` — so the run FAILS and writes no
-//!    `--output`. The store keeps the (now-shrunk) sidecars, so the very next run
-//!    re-pulls exactly the dropped group and promotes the correct blob. Never a
-//!    silently wrong output; never a wedge.
-//! 4. **Checkpoint from a different blob.** Seeded from a FOREIGN blob's bytes and
-//!    outboard at `--output`'s location. On open against the real blob's root the
-//!    foreign groups fail the `finalize` sweep, are dropped, and re-fetched. The
-//!    fetch recovers to the correct blob rather than wedging or promoting foreign
-//!    bytes. Adjacent to journey 3 and driven by the same sweep, which is exactly
-//!    why both are here.
+//!    missing suffix, the hash catches the drift, the record drops its claim to
+//!    every byte, and the run FAILS and writes no `--output`. The store keeps the
+//!    `.partial` and its record, so the very next run re-pulls the blob over it
+//!    and promotes the correct blob. Never a silently wrong output; never a
+//!    wedge.
+//! 4. **Checkpoint from a different blob.** Seeded from a FOREIGN blob's bytes at
+//!    `--output`'s location. On open against the real blob's root the foreign
+//!    prefix fails the `finalize` hash, the claim is dropped, and the blob is
+//!    re-fetched. The fetch recovers to the correct blob rather than wedging or
+//!    promoting foreign bytes. Adjacent to journey 3 and driven by the same hash,
+//!    which is exactly why both are here.
 //! 5. **Complete checkpoint, exact-multiple-of-16-KiB blob.** A complete
 //!    checkpointed partial whose blob size is an exact multiple of the chunk-group
 //!    size. `drive` sees an empty `missing_ranges`, pulls NOTHING, and `finalize`
@@ -136,9 +136,9 @@ fn make_aligned_blob() -> Vec<u8> {
 }
 
 /// Flip the first byte of a checkpoint's `.partial` data file in place, leaving
-/// its `.obao4` outboard and `.ranges` record untouched — so the record still
-/// claims the (now-corrupt) group present. This is the "bit rot after a durable
-/// checkpoint" state `finalize`'s `valid_ranges` sweep exists to catch.
+/// its `.ranges` record untouched — so the record still claims the (now-corrupt)
+/// group present. This is the "bit rot after a durable checkpoint" state
+/// `finalize`'s whole-file hash exists to catch.
 fn corrupt_partial_byte(partial: &std::path::Path) -> anyhow::Result<()> {
     let mut bytes = std::fs::read(partial).context("read .partial to corrupt")?;
     let first = bytes
@@ -258,8 +258,8 @@ async fn run() -> anyhow::Result<()> {
 
     // ---- Journey 2: resume from a genuine checkpointed partial ----
     //
-    // Seed a real group-aligned CHECKPOINT (positioned `.partial` + `.obao4`
-    // outboard + `.ranges` record) and remove the output, so the fetch has to
+    // Seed a real group-aligned CHECKPOINT (positioned `.partial` + `.ranges`
+    // record) and remove the output, so the fetch has to
     // resume from it. This stands in for "a previous run was interrupted after
     // durably checkpointing this prefix": the on-disk state is byte-identical to
     // what `ingest_stream`'s checkpoint leaves, and constructing it directly makes
@@ -301,18 +301,18 @@ async fn run() -> anyhow::Result<()> {
          clean billed {clean_cost} — the {seeded}-byte prefix on disk was re-fetched"
     );
 
-    // ---- Journey 3: a corrupt checkpoint is caught by the finalize sweep ----
+    // ---- Journey 3: a corrupt checkpoint is caught by the finalize hash ----
     //
     // Seed a valid checkpoint, then flip a byte in its `.partial` data while the
     // `.ranges` record still claims the group present. The client
     // trusts the record for what to SKIP, so the corrupt group is never re-pulled
-    // on its own — only `finalize`'s whole-blob `valid_ranges` sweep can catch it.
+    // on its own — only `finalize`'s whole-file hash can catch it.
     //
-    // First run: `drive` pulls the missing suffix, `finalize` sweeps, the flipped
-    // group fails, `present` is shrunk to drop exactly it, and `finalize` returns
-    // `Incomplete` — so the run FAILS and writes no `--output` (a silently wrong
-    // output file is the exact bug this guards). The store keeps its now-shrunk
-    // sidecars, so the corruption is not promoted and not left to poison presence.
+    // First run: `drive` pulls the missing suffix, `finalize` hashes, the hash
+    // does not match, and the record drops its claim to every byte — so the run
+    // FAILS and writes no `--output` (a silently wrong output file is the exact
+    // bug this guards). The store keeps the `.partial` and its record, so the
+    // corruption is not promoted and not left to poison presence.
     std::fs::remove_file(&out).context("remove output before corrupt run")?;
     ClientRangedStore::seed_checkpointed_prefix(
         client_dir.path(),
@@ -332,22 +332,22 @@ async fn run() -> anyhow::Result<()> {
             .context("spawn decdn fetch over a corrupt checkpoint")?;
     anyhow::ensure!(
         !output.status.success(),
-        "a fetch whose finalize sweep catches a corrupt group must fail, not write a wrong \
+        "a fetch whose finalize hash catches a corrupt group must fail, not write a wrong \
          output file"
     );
     anyhow::ensure!(
         !out.exists(),
-        "a failed finalize sweep must not leave a (wrong) output file behind"
+        "a failed finalize hash must not leave a (wrong) output file behind"
     );
 
-    // Second run: the sweep already dropped the bad group from the record, so the
-    // resume re-pulls exactly it and promotes the correct blob — the self-heal the
+    // Second run: the failed hash already dropped the record's claim, so the
+    // resume re-pulls the blob and promotes the correct one — the self-heal the
     // client guarantees without ever emitting a wrong output.
     run_fetch_until_ready(client_dir.path(), &args).await?;
     let got = std::fs::read(&out).context("read output after corruption recovery")?;
     anyhow::ensure!(
         got == blob,
-        "the run after a caught corruption must re-pull the dropped group and promote the correct \
+        "the run after a caught corruption must re-pull the blob and promote the correct \
          blob: got {} bytes, expected {}",
         got.len(),
         blob.len()
@@ -359,14 +359,14 @@ async fn run() -> anyhow::Result<()> {
 
     // ---- Journey 4: a checkpoint belonging to a DIFFERENT blob ----
     //
-    // The trap journey 3 does not cover, and the two are driven by the same sweep.
-    // Seed a checkpoint from a FOREIGN blob's bytes and outboard at `--output`'s
-    // location. On open against the real blob's `(root, total_bytes)` the record
-    // claims a prefix present, so `drive` pulls only the (real) suffix — but the
-    // foreign prefix groups fail `finalize`'s `valid_ranges` sweep and are dropped.
-    // A subsequent run re-pulls them from the node (overwriting the foreign bytes)
-    // and promotes the correct blob. The command must recover, never wedge and
-    // never promote foreign bytes.
+    // The trap journey 3 does not cover, and the two are driven by the same hash.
+    // Seed a checkpoint from a FOREIGN blob's bytes at `--output`'s location. On
+    // open against the real blob's root the record claims a prefix present, so
+    // `drive` pulls only the (real) suffix — but the foreign prefix fails
+    // `finalize`'s whole-file hash and the claim is dropped. A subsequent run
+    // re-pulls the blob from the node (overwriting the foreign bytes) and
+    // promotes the correct blob. The command must recover, never wedge and never
+    // promote foreign bytes.
     //
     // Mundane trigger: fetch one blob to `-o out.bin`, interrupt it, then fetch a
     // different one to the same `-o`.

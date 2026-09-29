@@ -116,8 +116,8 @@ pub trait BlobSource: Send + Sync {
 
 /// The store/sink capability the gap-driven [`crate::drive`] needs beyond
 /// [`decdn_bao_range::RangedStore`]'s queries: ingest one gap's raw bao. The
-/// client backend writes `.partial`/`.obao4`; a node backend admits to
-/// the cache and tees to its downstream client. Kept a generic method (not
+/// client backend writes `.partial`; a node backend admits to the cache and
+/// tees to its downstream client. Kept a generic method (not
 /// `dyn`) so an impl can stream any [`BaoRangeReader`]; `drive` is already
 /// fully generic.
 ///
@@ -136,11 +136,17 @@ pub trait IngestStore: decdn_bao_range::RangedStore {
     /// drained `reader` (its typed fault, if any, surfaces via
     /// [`StashedFault`] on the caller's copy) so the
     /// source can [`finish`](BlobSource::finish) the pull.
+    ///
+    /// `claimed_total` is the blob size the leg's sender signs in its header.
+    /// The sender serves `range` clamped to that size and encodes it under
+    /// that size's tree, so a store keyed by offset verifies the leg under
+    /// it.
     fn ingest_stream<'a, R>(
         &'a self,
         range: &'a AlignedRange,
         reader: R,
         on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+        claimed_total: u64,
     ) -> core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<R>> + 'a>>
     where
         R: BaoRangeReader + 'a;
@@ -837,7 +843,8 @@ mod doubles {
 
         /// Sign `total_bytes` in every header in place of the blob's own size:
         /// a peer that reports a wrong size. Its wire stays the blob's own, so
-        /// a store keyed by the signed size fails to verify it.
+        /// a leg that holds the final chunk fails to verify under the signed
+        /// size.
         #[must_use]
         pub const fn signing_size(mut self, total_bytes: u64) -> Self {
             self.signed_size = Some(total_bytes);
@@ -878,14 +885,15 @@ mod doubles {
                 if let Ok(mut log) = self.opened.lock() {
                     log.push((range.fetch_start(), range.fetch_len()));
                 }
-                // A range aligned against another size than this blob's has
-                // no wire here: the caller keyed its store by a size this
-                // source does not sign, and refuses the header anyway.
-                let mut wire = if range.blob_size() == self.total_bytes() {
-                    self.wire_for(&range)?
-                } else {
-                    Bytes::new()
-                };
+                // Serve the request clamped to this blob's end, as a node
+                // does: the requester's range may be aligned under another
+                // size than this blob's.
+                let served = decdn_bao_range::align_range_clamped(
+                    range.fetch_start(),
+                    range.fetch_len(),
+                    self.total_bytes(),
+                )?;
+                let mut wire = self.wire_for(&served)?;
                 let mut fault = None;
                 if let Some((after, make)) = &self.fault
                     && *after < wire.len()

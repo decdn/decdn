@@ -62,7 +62,7 @@
 //!
 //! The store is generic over [`crate::source::IngestStore`] (`RangedStore` +
 //! `ingest_stream`), not the concrete `&ClientRangedStore` — [`crate::ClientRangedStore`]
-//! is one implementer (the CLI/client backend, writing `.partial`/`.obao4`); a
+//! is one implementer (the CLI/client backend, writing `.partial`/`.ranges`); a
 //! node backend admits to the cache and tees to its downstream client
 //! through the same seam.
 
@@ -1088,15 +1088,6 @@ where
                 // One paid leg: open -> stream into the store -> drain the pull.
                 let generation_at_open = ledger.generation();
                 let leg: anyhow::Result<()> = match source.open(hash, aligned.clone()).await {
-                    // The store is keyed by the blob's size, so a leg whose signed
-                    // size disagrees would verify against the wrong tree. Refuse
-                    // it before a byte is read or paid for.
-                    Ok((header, _)) if header.total_bytes != total_bytes => {
-                        Err(anyhow::Error::new(crate::SignedSizeMismatch {
-                            signed: header.total_bytes,
-                            expected: total_bytes,
-                        }))
-                    }
                     Ok((header, reader)) => {
                         counters.next_voucher_cost = voucher_cost(&header);
                         // A new leg has opened: re-anchor the paid-frontier baseline
@@ -1106,7 +1097,12 @@ where
                         // pre-#1608 CLI loop re-anchored `fetch_start_offset` /
                         // `fetch_start_committed_bytes` identically on every open).
                         leg_anchor = Some((resume_start, ledger.committed().bytes));
-                        match store.ingest_stream(&aligned, reader, Some(&reporter)).await {
+                        // The store is keyed by offset: the leg verifies under
+                        // the size its own sender signs, whatever the bound.
+                        match store
+                            .ingest_stream(&aligned, reader, Some(&reporter), header.total_bytes)
+                            .await
+                        {
                             Ok(reader) => {
                                 // Drain to stream end and recover the acked voucher
                                 // watermark. It lives in the ledger the caller owns
@@ -1552,48 +1548,21 @@ mod tests {
         assert_eq!(source.opened_ranges().len(), 2);
     }
 
-    /// A source that serves `inner`'s blob but signs `signed` as its size.
-    struct ResignedSize {
-        inner: ScriptedSource,
-        signed: u64,
-    }
-
-    impl BlobSource for ResignedSize {
-        type Reader = <ScriptedSource as BlobSource>::Reader;
-
-        fn open(
-            &self,
-            hash: [u8; 32],
-            range: AlignedRange,
-        ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
-            Box::pin(async move {
-                let (mut header, reader) = self.inner.open(hash, range).await?;
-                header.total_bytes = self.signed;
-                Ok((header, reader))
-            })
-        }
-
-        fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
-            self.inner.finish(reader)
-        }
-    }
-
-    /// A leg whose signed size disagrees with the store's is refused before a
-    /// byte is read: the store would verify it against the wrong tree.
+    /// A leg whose signed size differs from the store's bound verifies under its
+    /// own claim: the planner's bound is too small, the leg's range lies inside
+    /// both sizes, and its bytes land at their offsets.
     #[tokio::test]
-    async fn a_leg_whose_signed_size_disagrees_with_the_store_is_refused() {
-        let total = 8 * GROUP;
-        let (root, plaintext, _) = synth_blob(total as usize);
-        let store = fresh_store(root, total);
+    async fn a_leg_whose_claim_differs_from_the_bound_is_ingested_under_its_claim() {
+        let truth = 8 * GROUP;
+        let bound = 6 * GROUP;
+        let (root, plaintext, _) = synth_blob(truth as usize);
+        let store = fresh_store(root, bound);
         let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-        let source = ResignedSize {
-            inner: ScriptedSource::new(plaintext)
-                .expect("source")
-                .paying(Arc::clone(&ledger)),
-            signed: total + GROUP,
-        };
+        let source = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
         let ctx = Arc::new(Mutex::new(healthy_ctx()));
-        let err = drive(
+        drive(
             &store,
             &source,
             &BudgetPacer::new(),
@@ -1601,8 +1570,8 @@ mod tests {
             &ctx,
             &ledger,
             root,
-            0,
-            GROUP,
+            4 * GROUP,
+            2 * GROUP,
             &config(),
             None,
             None,
@@ -1610,17 +1579,23 @@ mod tests {
             None,
         )
         .await
-        .expect_err("refused");
-        let mismatch = err
-            .downcast_ref::<crate::SignedSizeMismatch>()
-            .unwrap_or_else(|| panic!("typed size mismatch, got {err:#}"));
-        assert_eq!((mismatch.signed, mismatch.expected), (total + GROUP, total));
-        assert_eq!(source.inner.delivered_bytes(), 0, "no byte was read");
+        .expect("the leg verifies under its own claim");
+
+        let leg = align_range(4 * GROUP, 2 * GROUP, truth).expect("align");
         assert_eq!(
-            ledger.committed(),
-            Cumulative::default(),
-            "nothing was paid"
+            &store.present_ranges().await.expect("present"),
+            leg.chunk_ranges()
         );
+        assert_eq!(
+            store
+                .read(4 * GROUP, 2 * GROUP)
+                .await
+                .expect("read")
+                .as_ref(),
+            &plaintext[(4 * GROUP) as usize..(6 * GROUP) as usize]
+        );
+        assert_eq!(store.proven(), None, "a non-final leg proves no size");
+        assert_eq!(store.bound(), bound);
     }
 
     /// `first_leg` is exactly the range the drive opens first, both on a fresh
@@ -3505,11 +3480,15 @@ mod tests {
             range: &'a AlignedRange,
             reader: R,
             on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+            claimed_total: u64,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
         where
             R: crate::source::BaoRangeReader + 'a,
         {
-            Box::pin(self.inner.ingest_stream(range, reader, on_progress))
+            Box::pin(
+                self.inner
+                    .ingest_stream(range, reader, on_progress, claimed_total),
+            )
         }
 
         fn flush_present_record(&self) -> crate::source::SourceFuture<'_, ()> {
@@ -3587,7 +3566,7 @@ mod tests {
         // The interval flush is a REAL persist: reopening the store from disk
         // recovers exactly the checkpointed 4 MiB prefix — a crash right here
         // would resume from it, not refetch from zero.
-        let reopened = ClientRangedStore::open(dir.path(), "blob", root, total).expect("reopen");
+        let reopened = ClientRangedStore::open(dir.path(), "blob", root).expect("reopen");
         let present = reopened.present_ranges().await.expect("present");
         assert_eq!(
             present,
@@ -3782,11 +3761,15 @@ mod tests {
             range: &'a AlignedRange,
             reader: R,
             on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+            claimed_total: u64,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
         where
             R: crate::source::BaoRangeReader + 'a,
         {
-            Box::pin(self.sink.ingest_stream(range, reader, on_progress))
+            Box::pin(
+                self.sink
+                    .ingest_stream(range, reader, on_progress, claimed_total),
+            )
         }
 
         fn flush_present_record(&self) -> crate::source::SourceFuture<'_, ()> {

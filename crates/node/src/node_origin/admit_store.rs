@@ -141,11 +141,16 @@ impl IngestStore for NodeAdmitStore {
         range: &'a AlignedRange,
         reader: R,
         _on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+        _claimed_total: u64,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<R>> + 'a>>
     where
         R: BaoRangeReader + 'a,
     {
         Box::pin(async move {
+            // The cache verifies under the size this store was opened with,
+            // which is the size the serve leg signs downstream, so the
+            // upstream's claim plays no part here.
+            //
             // `admit_bao_stream` verifies + admits the range and, when a
             // [`FillSession`] is wired, captures its outboard proof nodes into it
             // cache-side (no-op when no serve leg reads beside this pull).
@@ -306,9 +311,10 @@ mod tests {
         let store = NodeAdmitStore::new(engine, hash, total, None);
 
         let reader = MemReader { wire };
-        let mut drained = IngestStore::ingest_stream(&store, &aligned, reader, None)
-            .await
-            .unwrap();
+        let mut drained =
+            IngestStore::ingest_stream(&store, &aligned, reader, None, aligned.blob_size())
+                .await
+                .unwrap();
         assert_eq!(
             drained.read_bytes(1).await.unwrap().len(),
             0,
@@ -343,9 +349,10 @@ mod tests {
         );
 
         let reader = MemReader { wire };
-        let _drained = IngestStore::ingest_stream(&store, &aligned, reader, None)
-            .await
-            .unwrap();
+        let _drained =
+            IngestStore::ingest_stream(&store, &aligned, reader, None, aligned.blob_size())
+                .await
+                .unwrap();
 
         let after = RangedStore::missing_ranges(&store, aligned.fetch_start(), aligned.fetch_len())
             .await
@@ -383,9 +390,15 @@ mod tests {
         let combined =
             encode_verified_range(root, &aligned, &plaintext, outboard).expect("encode whole blob");
         let wire = combined.slice(8..);
-        IngestStore::ingest_stream(&store, &aligned, MemReader { wire }, None)
-            .await
-            .unwrap();
+        IngestStore::ingest_stream(
+            &store,
+            &aligned,
+            MemReader { wire },
+            None,
+            aligned.blob_size(),
+        )
+        .await
+        .unwrap();
 
         // Compare the captured outboard against the blob's true outboard, node by node.
         let mut reader = session.outboard_reader();
