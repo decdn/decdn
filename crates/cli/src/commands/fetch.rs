@@ -1600,6 +1600,10 @@ async fn fetch_over(
         clock,
     );
     let health = Arc::new(PeerHealth::default());
+    // The fetch's lanes build concurrently and every one opens or reuses the
+    // one pool on-chain, so the open-or-reuse runs one lane at a time, as it
+    // does across a bundle pull's entries.
+    let open_lock = tokio::sync::Mutex::new(());
     let sources = CliSources::new(
         &deps,
         common,
@@ -1607,7 +1611,7 @@ async fn fetch_over(
         grant.as_ref(),
         &signer,
         &voucher_dom,
-        None,
+        Some(&open_lock),
         None,
         None,
     );
