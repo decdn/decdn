@@ -1266,10 +1266,13 @@ impl RangedStore for ClientRangedStore {
         Box::pin(async move { Ok(self.snapshot().present) })
     }
 
+    /// An end past the bound clamps to it, as on the node's store: the bound
+    /// can shrink under a caller that read it first. A start at or past the
+    /// bound is an alignment error.
     fn missing_ranges(&self, byte_offset: u64, byte_len: u64) -> RangedFuture<'_, ChunkRanges> {
         Box::pin(async move {
             let state = self.snapshot();
-            let aligned = decdn_bao_range::align_range(byte_offset, byte_len, state.bound)?;
+            let aligned = decdn_bao_range::align_range_clamped(byte_offset, byte_len, state.bound)?;
             Ok(aligned.chunk_ranges().clone() - &state.present)
         })
     }
@@ -1303,10 +1306,12 @@ impl RangedStore for ClientRangedStore {
         })
     }
 
+    /// The bytes of `[byte_offset, byte_offset + byte_len)`, with an end past
+    /// the bound clamped to it ([`Self::missing_ranges`]).
     fn read(&self, byte_offset: u64, byte_len: u64) -> RangedFuture<'_, Bytes> {
         Box::pin(async move {
             let state = self.snapshot();
-            let aligned = decdn_bao_range::align_range(byte_offset, byte_len, state.bound)?;
+            let aligned = decdn_bao_range::align_range_clamped(byte_offset, byte_len, state.bound)?;
             if !(aligned.chunk_ranges().clone() - &state.present).is_empty() {
                 return Err(RangedStoreError::Backend(
                     "requested range not present".into(),
@@ -1314,10 +1319,11 @@ impl RangedStore for ClientRangedStore {
             }
 
             let read_start = byte_offset;
+            let room = state.bound.saturating_sub(byte_offset);
             let read_len = if byte_len == 0 {
-                state.bound.saturating_sub(byte_offset)
+                room
             } else {
-                byte_len
+                byte_len.min(room)
             };
 
             let data_path = Arc::clone(&self.data_path);
@@ -1675,6 +1681,27 @@ mod tests {
             .await
             .expect_err("oob must error");
         assert!(matches!(err, RangedStoreError::Alignment(_)));
+    }
+
+    /// An end past the bound clamps to it, as on the node's store: the bound
+    /// can shrink under a caller that read it first. Only a start at or past
+    /// the bound is an alignment error.
+    #[tokio::test]
+    async fn an_end_past_the_bound_clamps() {
+        let total = 2 * GROUP;
+        let store = store_with_present(total, whole(total));
+        let data: Vec<u8> = (0..total)
+            .map(|i| u8::try_from(i % 251).expect("fits"))
+            .collect();
+        write_plaintext(&store, &data);
+
+        let missing = store
+            .missing_ranges(GROUP, 4 * GROUP)
+            .await
+            .expect("an end past the bound clamps");
+        assert!(missing.is_empty());
+        let got = store.read(GROUP, 4 * GROUP).await.expect("read clamps");
+        assert_eq!(got.as_ref(), &data[usize::try_from(GROUP).expect("fits")..]);
     }
 
     #[tokio::test]
