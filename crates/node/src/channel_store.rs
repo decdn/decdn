@@ -691,8 +691,11 @@ impl PersistentPoolStateStore {
     ///   transaction, so a boot against the same deployment takes no write and
     ///   the #527 file-stability guarantee holds.
     /// - No stamp: the first open against this store claims it for
-    ///   `deployment`. Existing rows stay — they were written before the stamp
-    ///   existed, by the deployment the node was already configured against.
+    ///   `deployment`. Existing rows stay — they are presumed written by the
+    ///   deployment the node was already configured against, before the stamp
+    ///   existed. The presumption fails for a node that was repointed at a
+    ///   redeploy BEFORE the stamp existed: it claims the colliding rows, and
+    ///   the operator clears them by hand (see the CHANGELOG entry).
     /// - The stamp names another deployment: every row it wrote is dropped —
     ///   the lane table, both pending-settle sets, and the watcher checkpoints —
     ///   and the stamp is rewritten. Those rows name pool ids that repeat on the
@@ -742,7 +745,7 @@ impl PersistentPoolStateStore {
             Some(foreign) => Some(foreign),
         };
         if let Some(foreign) = foreign {
-            Self::log_forfeited_lanes(&read_txn, foreign, deployment)?;
+            Self::log_forfeited_lanes(&read_txn, foreign, deployment);
         }
         drop(read_txn);
         if foreign.is_some() {
@@ -782,64 +785,64 @@ impl PersistentPoolStateStore {
     /// per-lane WARN is the LAST RECORD of that lane's unredeemed claim on the
     /// old deployment (mirroring the buyer-side `drop_foreign_row` convention
     /// of naming the recovery target), and the walk sums the forfeited value
-    /// for the summary WARN. A row that fails to decode is logged raw and
-    /// still counted — it is about to be deleted, so a foreign store's corrupt
-    /// row must not abort THIS deployment's bring-up. An absent lane table
-    /// logs a zero-lane summary.
+    /// for the summary WARN. The forfeited value is the lane's full claim —
+    /// [`LaneState::owed`], the signed cumulative plus the chain-verified
+    /// frontier — minus its paid watermark, the same figure the redeemer
+    /// collects; counting the signed amount alone would understate a lane by
+    /// up to one whole chain.
+    ///
+    /// This walk is observational: the rows are about to be deleted, so
+    /// nothing it hits may abort THIS deployment's bring-up. A row that fails
+    /// to decode is WARN-logged by its key parts, counted in `dropped_lanes`
+    /// AND in the summary's `undecodable_lanes` (its value cannot enter the
+    /// forfeited sum, so that field marks the sum as a lower bound), and a
+    /// table or iterator error degrades to one WARN with the audit marked
+    /// unknown — the `delete_table` that follows is the arbiter of real
+    /// corruption. An absent lane table logs a zero-lane summary.
     fn log_forfeited_lanes(
         read_txn: &redb::ReadTransaction,
         foreign: Deployment,
         configured: Deployment,
-    ) -> Result<(), StoreError> {
+    ) {
         let mut dropped_lanes: u64 = 0;
+        let mut undecodable_lanes: u64 = 0;
         let mut forfeited = U256::ZERO;
+        let mut audit_err: Option<String> = None;
         match read_txn.open_table(LANE_TABLE) {
-            Ok(table) => {
-                let iter = table
-                    .iter()
-                    .map_err(|err| StoreError::Backend(format!("lanes iter: {err}")))?;
-                for entry in iter {
-                    let (key_guard, value_guard) = entry
-                        .map_err(|err| StoreError::Backend(format!("lanes iter entry: {err}")))?;
-                    let key_bytes: [u8; LANE_KEY_LEN] = *key_guard.value();
-                    dropped_lanes = dropped_lanes.saturating_add(1);
-                    match decode_record(&key_bytes, value_guard.value()) {
-                        Ok(state) => {
-                            let unredeemed =
-                                state.last_amount().saturating_sub(state.paid_cumulative);
-                            forfeited = forfeited.saturating_add(unredeemed);
-                            tracing::warn!(
-                                pool_id = %state.pool_id,
-                                signer = %state.signer,
-                                provider = %state.provider,
-                                last_amount = %state.last_amount(),
-                                paid_cumulative = %state.paid_cumulative,
-                                unredeemed_micro_usdc = %unredeemed,
-                                foreign_payment_pool = %foreign.payment_pool,
-                                "dropping this seller lane with the deployment rebind; \
-                                 this line is the last record of its unredeemed claim \
-                                 on the old deployment"
-                            );
-                        }
-                        Err(err) => {
-                            let (pool_id, signer, provider) = lane_key_parts(&key_bytes);
-                            tracing::warn!(
-                                %pool_id,
-                                %signer,
-                                %provider,
-                                error = %err,
-                                foreign_payment_pool = %foreign.payment_pool,
-                                "dropping an undecodable seller lane with the \
-                                 deployment rebind; its value cannot be reported"
-                            );
+            Ok(table) => match table.iter() {
+                Ok(iter) => {
+                    for entry in iter {
+                        let (key_guard, value_guard) = match entry {
+                            Ok(pair) => pair,
+                            Err(err) => {
+                                audit_err = Some(format!("lanes iter entry: {err}"));
+                                break;
+                            }
+                        };
+                        let key_bytes: [u8; LANE_KEY_LEN] = *key_guard.value();
+                        dropped_lanes = dropped_lanes.saturating_add(1);
+                        match Self::log_one_forfeited_lane(&key_bytes, value_guard.value(), foreign)
+                        {
+                            Some(unredeemed) => {
+                                forfeited = forfeited.saturating_add(unredeemed);
+                            }
+                            None => {
+                                undecodable_lanes = undecodable_lanes.saturating_add(1);
+                            }
                         }
                     }
                 }
-            }
+                Err(err) => audit_err = Some(format!("lanes iter: {err}")),
+            },
             Err(redb::TableError::TableDoesNotExist(_)) => {}
-            Err(err) => {
-                return Err(StoreError::Backend(format!("open_table (lanes): {err}")));
-            }
+            Err(err) => audit_err = Some(format!("open_table (lanes): {err}")),
+        }
+        if let Some(error) = audit_err {
+            tracing::warn!(
+                error,
+                "could not enumerate the seller lanes for the forfeit audit; proceeding \
+                 with the deployment rebind's drop, forfeited value unknown"
+            );
         }
         tracing::warn!(
             foreign_chain_id = foreign.chain_id,
@@ -847,12 +850,56 @@ impl PersistentPoolStateStore {
             configured_chain_id = configured.chain_id,
             configured_payment_pool = %configured.payment_pool,
             dropped_lanes,
+            undecodable_lanes,
             forfeited_micro_usdc = %forfeited,
             "dropping seller lane state, pending settles and watcher checkpoints written \
              against another PaymentPool deployment; pool ids repeat across deployments, \
              and the dropped lanes' unredeemed vouchers are forfeit"
         );
-        Ok(())
+    }
+
+    /// WARN one lane the rebind is about to drop — the last record of its
+    /// claim — and return its forfeited value, or `None` for a row that fails
+    /// to decode (WARN-logged by its key parts; its value cannot be reported).
+    fn log_one_forfeited_lane(
+        key_bytes: &[u8; LANE_KEY_LEN],
+        value_bytes: &[u8],
+        foreign: Deployment,
+    ) -> Option<U256> {
+        match decode_record(key_bytes, value_bytes) {
+            Ok(state) => {
+                let unredeemed = forfeited_value(&state);
+                tracing::warn!(
+                    pool_id = %state.pool_id,
+                    signer = %state.signer,
+                    provider = %state.provider,
+                    owed = %state.owed(),
+                    last_amount = %state.last_amount(),
+                    paid_cumulative = %state.paid_cumulative,
+                    unredeemed_micro_usdc = %unredeemed,
+                    foreign_chain_id = foreign.chain_id,
+                    foreign_payment_pool = %foreign.payment_pool,
+                    "dropping this seller lane with the deployment rebind; \
+                     this line is the last record of its unredeemed claim \
+                     on the old deployment"
+                );
+                Some(unredeemed)
+            }
+            Err(err) => {
+                let (pool_id, signer, provider) = lane_key_parts(key_bytes);
+                tracing::warn!(
+                    %pool_id,
+                    %signer,
+                    %provider,
+                    error = %err,
+                    foreign_chain_id = foreign.chain_id,
+                    foreign_payment_pool = %foreign.payment_pool,
+                    "dropping an undecodable seller lane with the \
+                     deployment rebind; its value cannot be reported"
+                );
+                None
+            }
+        }
     }
 
     /// Delete tables from `db` in one fsynced write transaction. `what` names
@@ -1056,6 +1103,16 @@ impl PersistentPoolStateStore {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// The value the deployment rebind forfeits for one dropped lane: the lane's
+/// full claim — [`LaneState::owed`], the signed cumulative plus the
+/// chain-verified frontier — minus its on-chain paid watermark, saturating.
+/// This is the figure the redeemer collects; counting `last_amount` alone
+/// would understate a lane by up to one whole chain, and a chain-extended
+/// redemption can leave `paid_cumulative` above `last_amount`.
+fn forfeited_value(state: &LaneState) -> U256 {
+    state.owed().saturating_sub(state.paid_cumulative)
 }
 
 /// Decode one stored record (table value) into a [`LaneState`], given its table
@@ -2267,8 +2324,13 @@ mod tests {
                 let table: TableDefinition<'_, &[u8; 32], u64> = TableDefinition::new(name);
                 // The checkpoint table's real key type is &str, but
                 // delete_table drops by NAME; the definition's types are not
-                // checked on delete.
-                txn.delete_table(table)?;
+                // checked on delete. Require the delete to have found the
+                // table: a drifted name literal would silently turn this test
+                // into a plain foreign-stamp drop.
+                anyhow::ensure!(
+                    txn.delete_table(table)?,
+                    "crash-state setup: table {name} was not present"
+                );
             }
             txn.commit()?;
         }
@@ -2296,6 +2358,20 @@ mod tests {
         // Open + close without recording a lane: the stamp exists, the lane
         // table does not (only a flush creates it).
         drop(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
+        // Precondition: the lane table really is absent — if open() ever
+        // creates it eagerly, this test silently stops covering the
+        // TableDoesNotExist arms.
+        {
+            let db = Database::create(dir.path().join(LANES_DB_FILE))?;
+            let txn = db.begin_read()?;
+            anyhow::ensure!(
+                matches!(
+                    txn.open_table(LANE_TABLE),
+                    Err(redb::TableError::TableDoesNotExist(_))
+                ),
+                "precondition: the lane table must not exist before a flush"
+            );
+        }
 
         let redeployed = Deployment {
             payment_pool: address!("00000000000000000000000000000000000000cf"),
@@ -2307,6 +2383,79 @@ mod tests {
         anyhow::ensure!(
             stored_stamp(dir.path())? == Some(redeployed),
             "store restamped"
+        );
+        Ok(())
+    }
+
+    /// The forfeit audit reports the lane's FULL claim: the signed cumulative
+    /// plus the chain-verified frontier, minus the paid watermark — the same
+    /// figure the redeemer collects. `last_amount` alone would understate a
+    /// lane with chain progress, and an over-paid lane saturates to zero.
+    #[test]
+    fn forfeited_value_counts_the_chain_frontier() {
+        let mut lane = LaneState::hydrate(
+            B256::repeat_byte(0x21),
+            Address::repeat_byte(0x22),
+            Address::repeat_byte(0x23),
+            U256::from(10_000_000u64),
+            1_900_000_000,
+            U256::from(1_000u64), // signed cumulative
+            U256::from(4_096u64),
+            Some([0x11u8; 65]),
+            LaneChain {
+                chain_root: B256::repeat_byte(0x31),
+                chunk_price: U256::from(5u64),
+                verified_index: 3, // frontier worth 15 on top of the signature
+                tip: B256::repeat_byte(0x32),
+            },
+        );
+        lane.paid_cumulative = U256::from(400u64);
+        assert_eq!(
+            forfeited_value(&lane),
+            U256::from(1_000u64 + 15 - 400),
+            "owed (signed + chain frontier) minus paid"
+        );
+
+        // A chain-extended redemption can leave paid above the signed amount:
+        // the difference saturates instead of underflowing.
+        lane.paid_cumulative = U256::from(2_000u64);
+        assert_eq!(forfeited_value(&lane), U256::ZERO);
+    }
+
+    /// A corrupt row in a FOREIGN store must not abort this deployment's
+    /// bring-up: the rebind logs it as undecodable and drops it with the rest.
+    /// (A corrupt row under a MATCHING stamp still aborts — `hydrate_lanes`
+    /// would use it; here it is about to be deleted.)
+    #[test]
+    fn a_corrupt_foreign_lane_row_does_not_abort_the_rebind() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let lane = seed_seller_state(dir.path(), DEPLOYMENT)?;
+        {
+            // A garbage value under a fresh, valid 72-byte key.
+            let mut key = lane_key_bytes(&lane.key());
+            key[71] ^= 0xFF;
+            let db = Database::create(dir.path().join(LANES_DB_FILE))?;
+            let txn = db.begin_write()?;
+            {
+                let mut table = txn.open_table(LANE_TABLE)?;
+                table.insert(&key, [0xDEu8, 0xAD].as_slice())?;
+            }
+            txn.commit()?;
+        }
+
+        let redeployed = Deployment {
+            payment_pool: address!("00000000000000000000000000000000000000cf"),
+            ..DEPLOYMENT
+        };
+        let store = Arc::new(PersistentPoolStateStore::open(dir.path(), redeployed)?);
+        anyhow::ensure!(
+            seller_state_is_empty(&store)?,
+            "the corrupt row and the healthy row are both dropped"
+        );
+        drop(store);
+        anyhow::ensure!(
+            stored_stamp(dir.path())? == Some(redeployed),
+            "store restamped despite the corrupt row"
         );
         Ok(())
     }

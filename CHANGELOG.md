@@ -1029,7 +1029,9 @@ since project inception and will roll into the first tagged release.
   A store with no record yet takes the configured deployment and keeps its
   rows — so a node that was repointed at a redeploy **before** this upgrade
   still carries the colliding rows under the new record; delete its
-  `lanes.redb`, `settle.redb` and `checkpoint.redb` by hand to clear them.
+  `lanes.redb`, `settle.redb` and `checkpoint.redb` by hand to clear them,
+  and leave `buyer.redb` in place — its rows carry per-row deployment tags
+  and are handled individually.
   `PersistentPoolStateStore::open` takes the configured `Deployment`.
 
 - **`decdn-node` no longer hangs until systemd's stop timeout after

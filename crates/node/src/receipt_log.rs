@@ -52,9 +52,9 @@
 //! Replay protection rests on the *redeemed* watermark instead, which the
 //! pre-redemption flush floors. That floor holds wherever the node can afford
 //! to wait for it: the periodic sweep and the redeem-hint path skip their
-//! submit when the flush fails, while a forced close or shutdown redeems
-//! anyway, because forfeiting the whole claim at the deadline is worse than a
-//! bounded re-serve risk (see [`crate::payment_settlement`]). Skipping the
+//! submit when the flush fails, while the shutdown sweep redeems anyway,
+//! because forfeiting the claim across the stop is worse than a bounded
+//! re-serve risk (see [`crate::payment_settlement`]). Skipping the
 //! per-line fsync keeps the cost off the hot delivery path (ADR 003).
 //!
 //! The append is also crash-atomic at the line level only in the usual POSIX

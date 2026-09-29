@@ -446,16 +446,18 @@ async fn build_infra(
     // differs, so a typo'd chain id or contract address must abort bring-up
     // here, while the store is untouched, rather than trigger an irreversible
     // drop on a WARN.
+    // The URL is not echoed on a parse failure: it can embed a provider API
+    // key, and the reachability probe above has already reported unusable
+    // endpoints with a sanitized display.
+    let preflight_rpc_url: HttpUrl = cfg
+        .blockchain
+        .rpc_url
+        .parse()
+        .context("blockchain.rpc_url is not a valid URL (value redacted; check the config)")?;
     check_deployment_preflight(
-        cfg.blockchain.rpc_url.parse().with_context(|| {
-            format!(
-                "blockchain.rpc_url {:?} is not a valid URL",
-                cfg.blockchain.rpc_url
-            )
-        })?,
+        ProviderFactory::shared_head(preflight_rpc_url),
         channel_store_deployment,
-        &BootRetry::new(BOOT_CHAIN_RETRY_BUDGET, Arc::clone(&node_metrics))
-            .capped(DEPLOYMENT_PREFLIGHT_BUDGET),
+        &BootRetry::new(DEPLOYMENT_PREFLIGHT_BUDGET, Arc::clone(&node_metrics)),
     )
     .await?;
     // Keep the concrete store `Arc` so it can back the seller
@@ -3670,37 +3672,31 @@ enum RpcProbe {
     Fatal(String),
 }
 
-/// Number of preflight attempts before a persistent transient failure is treated
-/// as fatal (a real outage still aborts bring-up). Backoff caps at 8s, so the
-/// worst-case wait is bounded (~5×5s request timeouts + 1+2+4+8s backoff).
-const RPC_PREFLIGHT_MAX_ATTEMPTS: u32 = 5;
-
-/// Verify that the JSON-RPC endpoint is reachable by sending a lightweight
-/// `net_version` request with a short timeout, retrying a transient (429/5xx/
-/// timeout) response with bounded backoff (#1108) — a rate-limited endpoint must
-/// not crash-loop the node at startup. A fatal (other 4xx) response, or an
-/// exhausted retry budget, aborts bring-up so operators still catch typos and
-/// dead endpoints before the node binds ports and starts serving.
-/// Retry budget for [`check_deployment_preflight`]'s two chain reads. A capped
-/// sub-budget of [`BOOT_CHAIN_RETRY_BUDGET`]: the RPC endpoint has just passed
+/// Retry budget for [`check_deployment_preflight`]'s chain reads. Its own
+/// [`BootRetry`] budget, independent of the shared boot deadline the chain
+/// bootstraps below share: the RPC endpoint has just passed
 /// [`check_rpc_reachability`], so a transient hiccup clears fast, and a real
-/// outage should not hold the lane store hostage for the whole boot budget.
+/// outage should not hold the lane store hostage for long.
 const DEPLOYMENT_PREFLIGHT_BUDGET: Duration = Duration::from_mins(1);
 
 /// Verify the configured `PaymentPool` deployment against the live chain:
-/// the RPC's `eth_chainId` must equal `blockchain.chain_id`, and the contract
-/// must have code. Runs BEFORE the lane store opens, because the store's
-/// deployment binding ([`crate::channel_store::Deployment`]) drops the seller
-/// lane state when the stamp differs — a typo in either field must abort
-/// bring-up while the store is untouched, not destroy unredeemed lane state
-/// on a WARN. The reads retry transient RPC errors on `retry`; the mismatch
-/// verdicts themselves are deterministic and fail at once.
-async fn check_deployment_preflight(
-    rpc_url: HttpUrl,
+/// the RPC's `eth_chainId` must equal `blockchain.chain_id`, the configured
+/// address must have code, and that code must answer `PaymentPool.usdc()` —
+/// a code-presence check alone would pass a sibling contract pasted from the
+/// same deploy manifest (`CapacityBond`, `FeeRouter`, the USDC token), and that
+/// is the likeliest wrong-address typo. Runs BEFORE the lane store opens,
+/// because the store's deployment binding
+/// ([`crate::channel_store::Deployment`]) drops the seller lane state when
+/// the stamp differs — a typo in either field must abort bring-up while the
+/// store is untouched, not destroy unredeemed lane state on a WARN. The
+/// reads retry transient RPC errors on `retry`; the mismatch verdicts are
+/// deterministic and fail at once, and a non-`PaymentPool` target surfaces
+/// from `usdc()` as a permanent contract error, not a retry spin.
+async fn check_deployment_preflight<P: Provider + Clone>(
+    provider: P,
     deployment: crate::channel_store::Deployment,
     retry: &BootRetry,
 ) -> anyhow::Result<()> {
-    let provider = ProviderFactory::shared_head(rpc_url);
     let (rpc_chain_id, code_len) = retry
         .run(
             "deployment preflight (eth_chainId + PaymentPool code)",
@@ -3731,9 +3727,38 @@ async fn check_deployment_preflight(
          blockchain.payment_pool_address",
         deployment.payment_pool,
     );
+    // Contract-identity probe: `usdc()` is a cheap immutable view every
+    // `PaymentPool` answers. A contract without it returns no data, which
+    // decodes as a permanent contract error and aborts at once.
+    let contract =
+        decdn_incentive::payment_pool::PaymentPool::new(deployment.payment_pool, provider);
+    retry
+        .run("deployment preflight (PaymentPool.usdc())", || async {
+            contract.usdc().call().await.with_context(|| {
+                format!(
+                    "blockchain.payment_pool_address {} does not answer PaymentPool.usdc() \
+                     on chain {rpc_chain_id}; the address hosts some other contract, and a \
+                     wrong address would rebind the lane store and drop its seller state — \
+                     fix blockchain.payment_pool_address",
+                    deployment.payment_pool,
+                )
+            })
+        })
+        .await?;
     Ok(())
 }
 
+/// Number of preflight attempts before a persistent transient failure is treated
+/// as fatal (a real outage still aborts bring-up). Backoff caps at 8s, so the
+/// worst-case wait is bounded (~5×5s request timeouts + 1+2+4+8s backoff).
+const RPC_PREFLIGHT_MAX_ATTEMPTS: u32 = 5;
+
+/// Verify that the JSON-RPC endpoint is reachable by sending a lightweight
+/// `net_version` request with a short timeout, retrying a transient (429/5xx/
+/// timeout) response with bounded backoff (#1108) — a rate-limited endpoint must
+/// not crash-loop the node at startup. A fatal (other 4xx) response, or an
+/// exhausted retry budget, aborts bring-up so operators still catch typos and
+/// dead endpoints before the node binds ports and starts serving.
 async fn check_rpc_reachability(rpc_url: &str) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -5272,5 +5297,157 @@ mod tests {
             close_router(&router, Duration::from_secs(10)).await,
             "a close with a driven connection must finish inside the deadline"
         );
+    }
+
+    // ---- deployment preflight (the guard for the irreversible lane-store drop) ----
+
+    /// The deployment every preflight test configures.
+    const PREFLIGHT_DEPLOYMENT: crate::channel_store::Deployment =
+        crate::channel_store::Deployment {
+            chain_id: 421_614,
+            payment_pool: alloy::primitives::Address::repeat_byte(0x77),
+        };
+
+    /// A mocked provider answering the preflight's reads in order:
+    /// `eth_chainId`, `eth_getCode`, then (when reached) the `usdc()` call.
+    fn preflight_provider(responses: Vec<Result<serde_json::Value, ()>>) -> impl Provider + Clone {
+        let asserter = alloy::providers::mock::Asserter::new();
+        for response in responses {
+            match response {
+                Ok(value) => asserter.push_success(&value),
+                Err(()) => asserter.push_failure_msg("transient rpc fault"),
+            }
+        }
+        ProviderBuilder::new().connect_mocked_client(asserter)
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "feeds preflight_provider's response list beside Err(()) entries"
+    )]
+    fn chain_id_ok() -> Result<serde_json::Value, ()> {
+        Ok(serde_json::json!(alloy::primitives::U64::from(421_614u64)))
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "feeds preflight_provider's response list beside Err(()) entries"
+    )]
+    fn code_present() -> Result<serde_json::Value, ()> {
+        Ok(serde_json::json!(alloy::primitives::Bytes::from(vec![
+            0x60
+        ])))
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "feeds preflight_provider's response list beside Err(()) entries"
+    )]
+    fn usdc_answers() -> Result<serde_json::Value, ()> {
+        use alloy::sol_types::SolValue;
+        let token = alloy::primitives::Address::repeat_byte(0x0c);
+        Ok(serde_json::json!(alloy::primitives::Bytes::from(
+            token.abi_encode()
+        )))
+    }
+
+    fn preflight_retry_budget() -> BootRetry {
+        BootRetry::new(
+            DEPLOYMENT_PREFLIGHT_BUDGET,
+            Arc::new(crate::metrics::Metrics::new()),
+        )
+    }
+
+    /// The healthy path: matching chain id, code present, `usdc()` answers.
+    #[tokio::test]
+    async fn a_matching_deployment_passes_the_preflight() {
+        let provider = preflight_provider(vec![chain_id_ok(), code_present(), usdc_answers()]);
+        check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
+            .await
+            .expect("a matching deployment must pass");
+    }
+
+    /// A chain-id mismatch aborts at once with an error naming the config key
+    /// and the consequence — it must never be retried into the 60s budget.
+    #[tokio::test]
+    async fn a_chain_id_mismatch_aborts_the_preflight() {
+        let provider = preflight_provider(vec![
+            Ok(serde_json::json!(alloy::primitives::U64::from(1u64))),
+            code_present(),
+        ]);
+        let err = check_deployment_preflight(
+            provider,
+            PREFLIGHT_DEPLOYMENT,
+            &BootRetry::single_attempt(Arc::new(crate::metrics::Metrics::new())),
+        )
+        .await
+        .expect_err("a mismatched chain id must abort");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("blockchain.chain_id") && msg.contains("rebind the lane store"),
+            "the error must name the key and the consequence: {msg}"
+        );
+    }
+
+    /// A codeless address aborts: nothing is deployed there.
+    #[tokio::test]
+    async fn a_codeless_payment_pool_address_aborts_the_preflight() {
+        let provider = preflight_provider(vec![
+            chain_id_ok(),
+            Ok(serde_json::json!(alloy::primitives::Bytes::default())),
+        ]);
+        let err = check_deployment_preflight(
+            provider,
+            PREFLIGHT_DEPLOYMENT,
+            &BootRetry::single_attempt(Arc::new(crate::metrics::Metrics::new())),
+        )
+        .await
+        .expect_err("a codeless address must abort");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("has no code") && msg.contains("blockchain.payment_pool_address"),
+            "the error must name the key: {msg}"
+        );
+    }
+
+    /// A contract that does not answer `usdc()` — a sibling address pasted from
+    /// the same deploy manifest — aborts as a permanent contract error rather
+    /// than passing on code presence alone. Run on the full retry budget
+    /// (`start_paused`, so any sleep is free) to pin that the no-data decode
+    /// classifies PERMANENT: the "not retried" context proves the budget was
+    /// not spun on a deterministic misconfig.
+    #[tokio::test(start_paused = true)]
+    async fn a_non_payment_pool_contract_aborts_the_preflight() {
+        let provider = preflight_provider(vec![
+            chain_id_ok(),
+            code_present(),
+            // `usdc()` returns no data: the target hosts some other contract.
+            Ok(serde_json::json!(alloy::primitives::Bytes::default())),
+        ]);
+        let err =
+            check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
+                .await
+                .expect_err("a non-PaymentPool target must abort");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not answer PaymentPool.usdc()"),
+            "the error must say the contract identity check failed: {msg}"
+        );
+        assert!(
+            msg.contains("not retried"),
+            "a wrong contract is deterministic and must not spin the retry budget: {msg}"
+        );
+    }
+
+    /// A transient RPC fault is retried and the preflight then passes — a
+    /// rate-limited endpoint must not brick boot. `start_paused` makes the
+    /// retry backoff sleep cost no real time.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_rpc_error_is_retried_by_the_preflight() {
+        let provider =
+            preflight_provider(vec![Err(()), chain_id_ok(), code_present(), usdc_answers()]);
+        check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
+            .await
+            .expect("a transient fault must be retried to success");
     }
 }

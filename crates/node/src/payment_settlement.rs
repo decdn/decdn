@@ -1770,7 +1770,8 @@ async fn reconcile_onchain_watermarks<P: Provider + Clone>(
         // order. Any other length means the decoder and the chain disagree about
         // the return shape, so the batch's values cannot be trusted to pair with
         // this chunk's plans — a long return may be offset, and dropping a lane
-        // on a mis-paired watermark forfeits its claim on the forced-close path.
+        // on a mis-paired watermark could forfeit real claim value at the next
+        // shutdown sweep.
         // Keep only a short return's prefix, which is still positionally sound,
         // and stop either way; `reconcile_plans` keeps the untouched tail.
         if lanes.len() != chunk.len() {
@@ -1855,8 +1856,10 @@ fn holds_unredeemed(states: &[LaneState], pool_id: PoolId, provider: Address) ->
 /// each chunk. Every caller passes the configured
 /// `blockchain.redeem_threshold_micro_usdc`, which config keeps above zero, so a
 /// sub-floor chunk defers on every path — the hint, the self-tick sweep, and the
-/// graceful-shutdown sweep alike. Sub-floor dust stays unredeemed until the
-/// lane's value grows past the floor or the pool owner reclaims it.
+/// graceful-shutdown sweep alike. The floor is per CHUNK, and value is spread
+/// so dust rides alongside larger lanes: a sub-floor lane stays unredeemed
+/// only until its chunk's aggregate clears the floor, or until the pool owner
+/// reclaims it.
 ///
 /// The floor gates the on-chain read too: when the whole set's cached
 /// `unredeemed` is below the floor, it returns before

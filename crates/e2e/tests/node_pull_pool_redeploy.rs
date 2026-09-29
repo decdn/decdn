@@ -379,11 +379,24 @@ async fn run_repointed_seeder() -> anyhow::Result<()> {
                 &foreign,
                 &configured,
                 "dropped_lanes=1",
+                // The lane decoded, so the forfeited sum is exact, not a
+                // lower bound.
+                "undecodable_lanes=0",
             ],
             SETTLE,
         )
         .await
         .context("the repointed SEEDER #1 never logged dropping its #1 lane")?;
+    // The per-lane last-record line names the dropped lane. Its exact
+    // unredeemed value is not asserted here: it depends on whether the
+    // seeder's paid watermark flushed before the restart killed it, which
+    // races. The value math is pinned by the `forfeited_value` unit test.
+    anyhow::ensure!(
+        r.seeder1
+            .log_line(&["last record of its unredeemed claim", &foreign])
+            .is_some(),
+        "the repointed SEEDER #1 must log the per-lane last-record line"
+    );
 
     r.server
         .repoint_payment_pool(r.pool2, &[r.leg_two_seeder()])
