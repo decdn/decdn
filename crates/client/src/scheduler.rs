@@ -170,15 +170,18 @@ where
 
 /// What one [`acquire`] fills: byte ranges of one blob, in one store.
 pub struct AcquireTarget<'a, St> {
-    /// The ranged store every lane writes into. Keyed by `hash` and
-    /// `total_bytes`.
+    /// The ranged store every lane writes into, keyed by `hash`. Its bound is
+    /// the size the planner works to.
     pub store: &'a St,
     /// The blob's BLAKE3 root.
     pub hash: [u8; 32],
-    /// The blob's size in bytes, as the store is keyed.
+    /// The first size claim: a hint. A resumed store's bound wins over it,
+    /// and a leg that verifies the final chunk proves the size.
     pub total_bytes: u64,
-    /// The `(offset, len)` byte ranges to fill. Bytes outside them are never
-    /// fetched.
+    /// The `(offset, len)` byte ranges to fill. A range that reaches
+    /// `total_bytes` or the store's bound, or has a zero length, is a tail: it
+    /// follows the bound as it grows or shrinks. Bytes outside the ranges and
+    /// their tail are never fetched.
     pub ranges: &'a [(u64, u64)],
 }
 
@@ -1682,18 +1685,25 @@ struct Want {
 }
 
 impl Want {
-    /// `ranges` against a first bound of `bound`, each clipped to it. A zero
-    /// length reads as "to the end of the blob".
-    fn new(ranges: &[(u64, u64)], bound: u64) -> Self {
-        let tail = ranges
-            .iter()
-            .any(|&(start, len)| len == 0 || start.saturating_add(len) >= bound);
+    /// `ranges` against a first bound of `bound`, cut from a first claim of
+    /// `c0`. A range that reaches the end of the blob as the caller knows it,
+    /// `min(c0, bound)`, or has a zero length, is a tail: it runs to `bound`.
+    /// Every other range is clipped to `bound`. A resumed record's bound can
+    /// be past `c0`, so a whole-blob target cut from `c0` still reaches it.
+    fn new(ranges: &[(u64, u64)], bound: u64, c0: u64) -> Self {
+        let end = c0.min(bound);
+        let reaches_end = |start: u64, len: u64| len == 0 || start.saturating_add(len) >= end;
+        let tail = ranges.iter().any(|&(start, len)| reaches_end(start, len));
         let ranges: Vec<(u64, u64)> = ranges
             .iter()
             .filter(|&&(start, _)| start < bound)
             .map(|&(start, len)| {
                 let room = bound - start;
-                let len = if len == 0 { room } else { len.min(room) };
+                let len = if reaches_end(start, len) {
+                    room
+                } else {
+                    len.min(room)
+                };
                 (start, len)
             })
             .collect();
@@ -2020,7 +2030,7 @@ where
             ceiling: cap,
         }));
     }
-    let mut want = Want::new(ranges, first_bound);
+    let mut want = Want::new(ranges, first_bound, c0);
     let mut pending = VecDeque::new();
     for (start, len) in
         contiguous_byte_ranges(&missing_chunks(store, &want.ranges).await?, first_bound)

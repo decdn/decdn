@@ -794,6 +794,87 @@ mod tests {
         Ok(())
     }
 
+    /// Fetch `ranges` of `blob` to `dest` under a first claim of `claim`,
+    /// from one fresh source. Returns the source, so the test can read what it
+    /// opened, and the promoted paths.
+    async fn fetch_ranges(
+        blob: &[u8],
+        dest: &std::path::Path,
+        claim: u64,
+        ranges: Option<&[(u64, u64)]>,
+    ) -> anyhow::Result<(ScriptedSource, Vec<std::path::PathBuf>)> {
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(blob.to_vec())?.paying(Arc::clone(&ledger));
+        let probe = source.clone();
+        let paths = downloader(vec![candidate(source, ledger, 0xA1)])?
+            .fetch_to_paths(
+                &[DownloadTarget {
+                    hash: probe.root(),
+                    total_bytes: claim,
+                    dest,
+                    ranges,
+                }],
+                None,
+                None,
+            )
+            .await?;
+        Ok((probe, paths))
+    }
+
+    /// A resumed record whose bound is past the first claim finishes: the
+    /// whole-blob target reaches the record's bound, the file is the blob, and
+    /// no byte the record holds is opened again.
+    #[tokio::test]
+    async fn a_resumed_record_with_a_bound_past_the_claim_finishes() -> anyhow::Result<()> {
+        let blob = payload(3 * 1024 * 1024);
+        let total = u64::try_from(blob.len())?;
+        let held = 1024 * 1024;
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("model.bin");
+        // A first run under the true size lands `[0, held)` and proves nothing.
+        let (_, paths) = fetch_ranges(&blob, &dest, total, Some(&[(0, held)])).await?;
+        anyhow::ensure!(paths.is_empty(), "the first run leaves a partial");
+
+        // The rerun claims only `held` bytes: the record's bound wins.
+        let (probe, paths) = fetch_ranges(&blob, &dest, held, None).await?;
+        anyhow::ensure!(paths == vec![dest.clone()], "the rerun promotes");
+        anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
+        let opened = probe.opened_ranges();
+        anyhow::ensure!(
+            opened.iter().all(|&(start, _)| start >= held),
+            "no held byte is opened again: {opened:?}"
+        );
+        Ok(())
+    }
+
+    /// A resumed record whose proven size is past the first claim finishes
+    /// the same way, and opens only the bytes the record lacks.
+    #[tokio::test]
+    async fn a_resumed_record_with_a_proven_size_past_the_claim_finishes() -> anyhow::Result<()> {
+        let blob = payload(3 * 1024 * 1024);
+        let total = u64::try_from(blob.len())?;
+        let held = 1024 * 1024;
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("model.bin");
+        // A first run lands the head and the final group, which proves the size.
+        let first = [(0, held), (total - group, group)];
+        let (_, paths) = fetch_ranges(&blob, &dest, total, Some(&first)).await?;
+        anyhow::ensure!(paths.is_empty(), "the first run leaves a partial");
+
+        let (probe, paths) = fetch_ranges(&blob, &dest, held, None).await?;
+        anyhow::ensure!(paths == vec![dest.clone()], "the rerun promotes");
+        anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
+        let opened = probe.opened_ranges();
+        anyhow::ensure!(
+            opened
+                .iter()
+                .all(|&(start, len)| start >= held && start + len <= total - group),
+            "only the missing middle is opened: {opened:?}"
+        );
+        Ok(())
+    }
+
     /// A lone source that stalls mid-blob trips the lane watchdog, cools, and
     /// comes back to finish the blob from the gap: one holder recovers.
     #[tokio::test(start_paused = true)]
