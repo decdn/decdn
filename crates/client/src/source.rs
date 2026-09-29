@@ -726,9 +726,12 @@ mod doubles {
         /// a node that refuses one more stream while it serves the others. A
         /// refused open is still recorded in `opened`.
         refuse_open: Option<(std::ops::Range<usize>, FaultFn)>,
-        /// Hold the open with this 0-based index (in call order) for the
-        /// given time before it is served or refused.
-        delay_open: Option<(usize, Duration)>,
+        /// Hold the fault of the open with each 0-based index (in call order)
+        /// until its gate reads `true`: a refusal waits inside `open`, and a
+        /// parked mid-range fault waits once the reader has delivered every
+        /// byte before it. A test orders one leg's fault after another event
+        /// this way, whatever the machine's speed.
+        fault_gates: Vec<(usize, tokio::sync::watch::Receiver<bool>)>,
         /// When each `open` started and each clean `finish` ended, on the
         /// runtime's clock, as `(fetch_start, opened_at, finished_at)`. A leg
         /// that faulted or was dropped has no `finished_at`. Shared by clones.
@@ -809,7 +812,7 @@ mod doubles {
                 faults_left: None,
                 signed_size: None,
                 refuse_open: None,
-                delay_open: None,
+                fault_gates: Vec::new(),
                 timeline: Arc::new(Mutex::new(Vec::new())),
                 opened: Arc::new(Mutex::new(Vec::new())),
                 delivered: Arc::new(AtomicU64::new(0)),
@@ -920,11 +923,16 @@ mod doubles {
         }
 
         #[cfg(test)]
-        /// Hold the open with 0-based index `nth`, in call order, for `delay`
-        /// before it is served or refused.
+        /// Hold the fault of the open with 0-based index `nth`, in call order,
+        /// until `gate` reads `true` (see `fault_gates`). An open with no fault
+        /// is served as usual.
         #[must_use]
-        pub(crate) const fn delaying_open(mut self, nth: usize, delay: Duration) -> Self {
-            self.delay_open = Some((nth, delay));
+        pub(crate) fn holding_fault(
+            mut self,
+            nth: usize,
+            gate: tokio::sync::watch::Receiver<bool>,
+        ) -> Self {
+            self.fault_gates.push((nth, gate));
             self
         }
 
@@ -1048,14 +1056,18 @@ mod doubles {
                     t.push((range.fetch_start(), tokio::time::Instant::now(), None));
                     t.len().saturating_sub(1)
                 });
-                if let Some((nth, delay)) = self.delay_open
-                    && nth == index
-                {
-                    tokio::time::sleep(delay).await;
-                }
+                let fault_gate = self
+                    .fault_gates
+                    .iter()
+                    .find(|(nth, _)| *nth == index)
+                    .map(|(_, gate)| gate.clone());
                 if let Some((refused, make)) = &self.refuse_open
                     && refused.contains(&index)
                 {
+                    if let Some(mut gate) = fault_gate {
+                        // A closed gate channel reads as open.
+                        let _ = gate.wait_for(|open| *open).await;
+                    }
                     return Err(make());
                 }
                 // Serve the request clamped to this blob's end, as a node
@@ -1078,6 +1090,7 @@ mod doubles {
                     wire = wire.slice(..*after);
                     fault = Some(make());
                 }
+                let fault_gate = fault.as_ref().and(fault_gate);
                 let header = UpstreamPullHeader {
                     total_bytes: self.signed_size.unwrap_or_else(|| self.total_bytes()),
                     rate_per_mb: SCRIPTED_RATE_PER_MB,
@@ -1098,6 +1111,7 @@ mod doubles {
                         wire_len,
                         delivered: Arc::clone(&self.delivered),
                         gate: self.gate.clone(),
+                        fault_gate,
                         first_read_stall: self.first_read_stall,
                         stall_after: self.stall_after,
                         read_so_far: 0,
@@ -1157,6 +1171,10 @@ mod doubles {
         /// Waited on before the first read (see `ScriptedSource::gated_on`);
         /// `None` once passed.
         gate: Option<tokio::sync::watch::Receiver<bool>>,
+        /// Waited on by the first read the remaining wire cannot fill, so the
+        /// parked fault is revealed only once it reads `true` (see
+        /// `ScriptedSource::holding_fault`); `None` once passed.
+        fault_gate: Option<tokio::sync::watch::Receiver<bool>>,
         /// The wire byte count this reader was handed (before consumption), used by
         /// `ScriptedSource`'s [`BlobSource::finish`](crate::BlobSource::finish) to advance a paying ledger by
         /// this leg's spend.
@@ -1174,6 +1192,16 @@ mod doubles {
         /// Wire bytes this reader has yielded so far, against `stall_after`'s
         /// threshold.
         read_so_far: u64,
+    }
+
+    impl ScriptedReader {
+        /// Wait until the fault gate reads `true`, once (see `fault_gate`).
+        async fn pass_fault_gate(&mut self) {
+            if let Some(mut gate) = self.fault_gate.take() {
+                // A closed gate channel reads as open.
+                let _ = gate.wait_for(|open| *open).await;
+            }
+        }
     }
 
     impl iroh_io::AsyncStreamReader for ScriptedReader {
@@ -1206,6 +1234,9 @@ mod doubles {
             // waits would. Behavior-neutral for the single-source driver tests
             // (a yield only reschedules the same task).
             tokio::task::yield_now().await;
+            if self.wire.len() < len {
+                self.pass_fault_gate().await;
+            }
             let take = self.wire.len().min(len);
             let chunk = self.wire.split_to(take);
             self.delivered
@@ -1216,6 +1247,7 @@ mod doubles {
 
         async fn read<const L: usize>(&mut self) -> std::io::Result<[u8; L]> {
             if self.wire.len() < L {
+                self.pass_fault_gate().await;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "scripted reader exhausted before a fixed-size bao read",

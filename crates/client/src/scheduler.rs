@@ -5815,6 +5815,45 @@ mod tests {
         Ok(())
     }
 
+    /// Open `gate` once `ready` holds, checking each virtual millisecond.
+    async fn open_when(ready: impl Fn() -> bool, gate: &tokio::sync::watch::Sender<bool>) {
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        gate.send_replace(true);
+    }
+
+    /// How many times `provider` recorded a fault for the node `byte` names.
+    fn faults_of(provider: &FaultLog<'_>, byte: u8) -> usize {
+        provider
+            .faulted
+            .lock()
+            .map(|f| {
+                f.iter()
+                    .filter(|&&p| p == Address::repeat_byte(byte))
+                    .count()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Acquire over `provider` while `release` opens the scenario's gates in
+    /// order. A gate that never opens ends the test with an error.
+    async fn acquire_gated(
+        store: &ClientRangedStore,
+        provider: &FaultLog<'_>,
+        root: [u8; 32],
+        release: impl std::future::Future<Output = ()>,
+    ) -> anyhow::Result<()> {
+        let fetch = acquire_over(store, provider, provider.inner.holders(), root, 2);
+        let (fetched, ()) = tokio::time::timeout(
+            Duration::from_mins(5),
+            futures_util::future::join(fetch, release),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the fetch ended or stalled before a gate opened"))?;
+        fetched
+    }
+
     /// A lane's last live worker faults for the lane (#2231): when the lane's
     /// own worker has faulted and stopped, a fault on its extra stream cools
     /// the node too.
@@ -5825,10 +5864,16 @@ mod tests {
         let lb = Arc::new(PoolLedger::new(Cumulative::default()));
         let a = dead_after_first_mib(&data, &la)?;
         // B's first two readers (its own range, then the extra stream opened
-        // for A's remainder) fault after 4 MiB. The own leg started first, so
-        // it faults first; the extra faults after it, with no own worker left.
+        // for A's remainder) fault after 4 MiB. The own leg's fault waits
+        // until the extra stream has opened, and the extra's fault waits
+        // until the own worker's fault is recorded, so the extra faults with
+        // no own worker left.
+        let (own_gate, own_held) = tokio::sync::watch::channel(false);
+        let (extra_gate, extra_held) = tokio::sync::watch::channel(false);
         let b = ScriptedSource::new(data.clone())?
             .fault_times_after(2, 4 * MIB as usize, || anyhow::anyhow!("scripted reset"))
+            .holding_fault(0, own_held)
+            .holding_fault(1, extra_held)
             .paying(Arc::clone(&lb));
         let (widen, count) = counting_widen(1);
         let mut cand_b = candidate(b.clone(), Arc::clone(&lb), 0xB2, None);
@@ -5840,23 +5885,19 @@ mod tests {
         };
         let (root, total) = (a.root(), a.total_bytes());
         let (store, dir) = fresh_store(root, total);
-        acquire_over(&store, &provider, lanes.holders(), root, 2).await?;
+        let release = async {
+            open_when(|| b.opened_ranges().len() >= 2, &own_gate).await;
+            open_when(|| faults_of(&provider, 0xB2) >= 1, &extra_gate).await;
+        };
+        acquire_gated(&store, &provider, root, release).await?;
         store.finalize().await?;
         assert_eq!(std::fs::read(dir.path().join("b"))?, data);
 
         assert!(count.granted() >= 1, "B grew an extra stream");
         assert_eq!(count.released(), count.granted());
-        let b_faults = provider
-            .faulted
-            .lock()
-            .map(|f| {
-                f.iter()
-                    .filter(|&&p| p == Address::repeat_byte(0xB2))
-                    .count()
-            })
-            .unwrap_or_default();
         assert_eq!(
-            b_faults, 2,
+            faults_of(&provider, 0xB2),
+            2,
             "the own worker's fault and the last live worker's fault both cool B"
         );
         Ok(())
@@ -5871,13 +5912,16 @@ mod tests {
         let la = Arc::new(PoolLedger::new(Cumulative::default()));
         let lb = Arc::new(PoolLedger::new(Cumulative::default()));
         let a = dead_after_first_mib(&data, &la)?;
-        // B's own leg faults after 4 MiB. Its second open, the extra stream
-        // for A's remainder, is held for 1 s and then refused, so the refusal
-        // lands after the own worker's fault, with no byte in between.
+        // B's own leg faults after 4 MiB, once the extra stream for A's
+        // remainder has opened. The extra is refused only once the own
+        // worker's fault is recorded, with no byte in between.
+        let (own_gate, own_held) = tokio::sync::watch::channel(false);
+        let (extra_gate, extra_held) = tokio::sync::watch::channel(false);
         let b = ScriptedSource::new(data.clone())?
             .fault_once_after(4 * MIB as usize, || anyhow::anyhow!("scripted reset"))
-            .delaying_open(1, Duration::from_secs(1))
             .refusing_open(1, || anyhow::anyhow!("scripted overload"))
+            .holding_fault(0, own_held)
+            .holding_fault(1, extra_held)
             .paying(Arc::clone(&lb));
         let (widen, count) = counting_widen(1);
         let mut cand_b = candidate(b.clone(), Arc::clone(&lb), 0xB2, None);
@@ -5889,22 +5933,17 @@ mod tests {
         };
         let (root, total) = (a.root(), a.total_bytes());
         let (store, dir) = fresh_store(root, total);
-        acquire_over(&store, &provider, lanes.holders(), root, 2).await?;
+        let release = async {
+            open_when(|| b.opened_ranges().len() >= 2, &own_gate).await;
+            open_when(|| faults_of(&provider, 0xB2) >= 1, &extra_gate).await;
+        };
+        acquire_gated(&store, &provider, root, release).await?;
         store.finalize().await?;
         assert_eq!(std::fs::read(dir.path().join("b"))?, data);
 
         assert!(count.granted() >= 1, "B grew an extra stream");
         assert_eq!(count.released(), count.granted());
-        let b_faults = provider
-            .faulted
-            .lock()
-            .map(|f| {
-                f.iter()
-                    .filter(|&&p| p == Address::repeat_byte(0xB2))
-                    .count()
-            })
-            .unwrap_or_default();
-        assert_eq!(b_faults, 1, "one outage, one charge");
+        assert_eq!(faults_of(&provider, 0xB2), 1, "one outage, one charge");
         Ok(())
     }
 
