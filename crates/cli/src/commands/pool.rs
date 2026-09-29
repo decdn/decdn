@@ -483,6 +483,46 @@ const fn plan_reclaim(status: PaymentPool::Status, dispute_deadline: u64, now: u
     }
 }
 
+/// Decide from one `getPool` read whether `reclaim --pool` may send. Every pool
+/// that `reclaim` would revert on is refused here with its specific cause, so
+/// the operator learns what to do (and, in the dispute window, when) without a
+/// transaction or a keystore unlock.
+///
+/// # Errors
+///
+/// Errors when the pool does not exist (a zero `owner`: a never-opened pool
+/// reads as status `0`, which is `Open`), is still `Open`, is `Closing` inside
+/// its dispute window, is already `Closed`, or has an unrecognized status.
+fn single_reclaim_gate(
+    pool_id: PoolId,
+    owner: Address,
+    status: PaymentPool::Status,
+    dispute_deadline: u64,
+    now: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        owner != Address::ZERO,
+        "pool {pool_id} does not exist on this PaymentPool contract — a mistyped --pool, or \
+         the wrong payment_pool address"
+    );
+    match plan_reclaim(status, dispute_deadline, now) {
+        ReclaimPlan::Reclaim => Ok(()),
+        ReclaimPlan::SkipOpen => anyhow::bail!(
+            "pool {pool_id} is still Open — run `decdn pool close --pool {pool_id}` first"
+        ),
+        ReclaimPlan::SkipInWindow(deadline) => anyhow::bail!(
+            "pool {pool_id} is still in its dispute window; reclaimable after {}",
+            format_expiry(deadline, now)
+        ),
+        ReclaimPlan::SkipClosed => {
+            anyhow::bail!("pool {pool_id} is already Closed — its residual was already reclaimed")
+        }
+        ReclaimPlan::SkipUnknown => {
+            anyhow::bail!("pool {pool_id} has an unrecognized on-chain status — nothing to reclaim")
+        }
+    }
+}
+
 /// Turn a finished `--all` sweep into a process result. Any failed pool is a
 /// nonzero exit; "nothing eligible" is success — the summary line already says
 /// so.
@@ -559,13 +599,15 @@ where
 
 /// Send `reclaim(pool_id)`, wait for the receipt, and on success best-effort
 /// clear the local row. `reclaim` is permissionless, so no ownership check is
-/// needed. Returns `Ok(())` once the refund lands.
+/// needed. The caller has already run the pool through `plan_reclaim`, so a
+/// revert here means the chain disagreed with that pre-check. Returns `Ok(())`
+/// once the refund lands.
 ///
 /// # Errors
 ///
 /// Errors when the send is rejected, the receipt cannot be read, or the tx
-/// reverted (not closed, or the dispute window has not elapsed). A failed local
-/// row-clear only warns — the refund itself landed.
+/// reverted (a concurrent reclaim, or a local clock ahead of the chain's block
+/// time). A failed local row-clear only warns — the refund itself landed.
 async fn reclaim_and_forget<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: LocalBookkeeping<'_>,
@@ -577,12 +619,7 @@ where
 {
     let pending = match contract.reclaim(pool_id).send().await {
         Ok(pending) => pending,
-        Err(e) if e.as_revert_data().is_some() => {
-            anyhow::bail!(
-                "reclaim reverted on-chain for pool {pool_id} (not closed, or its dispute \
-                 window has not elapsed yet)"
-            )
-        }
+        Err(e) if e.as_revert_data().is_some() => anyhow::bail!(reclaim_reverted(pool_id)),
         Err(e) => anyhow::bail!("reclaim send failed: {e}"),
     };
     let receipt = pending
@@ -595,11 +632,18 @@ where
             store.forget_after_reclaim(owner, pool_id);
             Ok(())
         }
-        TxOutcome::Reverted => anyhow::bail!(
-            "reclaim reverted on-chain for pool {pool_id} (not closed, or its dispute window \
-             has not elapsed yet)"
-        ),
+        TxOutcome::Reverted => anyhow::bail!(reclaim_reverted(pool_id)),
     }
+}
+
+/// The error for a `reclaim` the chain rejected after the local pre-check
+/// passed. One message for the estimation-time and receipt-time reverts, so the
+/// two cannot drift apart.
+fn reclaim_reverted(pool_id: PoolId) -> String {
+    format!(
+        "reclaim reverted on-chain for pool {pool_id} after the pre-check passed (a concurrent \
+         reclaim, or this machine's clock is ahead of the chain's block time)"
+    )
 }
 
 /// `decdn pool close`: start the grace-window close on a pool the caller owns
@@ -721,6 +765,27 @@ async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> any
         store_owner.refuse_sweep("reclaim")?;
     }
     let chain = resolve_chain(&args.chain, &file)?;
+    if let Some(pool_id) = target {
+        // `getPool` is a read, so it runs on a wallet-free provider before the
+        // keystore unlock: a pool that is not yet reclaimable fails here with
+        // its cause and asks for no password.
+        let reader = PaymentPool::new(
+            chain.payment_pool,
+            provider::build_read_provider(&chain.rpc_url)?,
+        );
+        let pool = reader
+            .getPool(pool_id)
+            .call()
+            .await
+            .map_err(|e| anyhow::anyhow!("getPool failed: {e}"))?;
+        single_reclaim_gate(
+            pool_id,
+            pool.owner,
+            pool.status,
+            pool.disputeDeadline,
+            unix_now()?,
+        )?;
+    }
     let store = store_owner.open_for_write()?;
     let buyer_db = node_buyer_db(&chain.data_dir);
     let books = LocalBookkeeping::new(store.as_ref(), &buyer_db);
@@ -795,8 +860,8 @@ where
             }
             ReclaimPlan::SkipInWindow(deadline) => {
                 println!(
-                    "skipped pool {pool_id}: dispute window open — reclaimable after Unix \
-                     {deadline}"
+                    "skipped pool {pool_id}: dispute window open — reclaimable after {}",
+                    format_expiry(deadline, now)
                 );
                 tally.skipped += 1;
             }
@@ -2535,6 +2600,54 @@ mod tests {
             plan_reclaim(PaymentPool::Status::Closed, 0, 300),
             ReclaimPlan::SkipClosed
         );
+    }
+
+    /// The `--pool` gate refuses each non-reclaimable pool with its own cause,
+    /// never the blanket two-cause revert text.
+    #[test]
+    fn single_reclaim_gate_names_the_cause() {
+        let owner = Address::repeat_byte(0x22);
+        let gate = |owner, status, deadline, now| {
+            single_reclaim_gate(a_pool(), owner, status, deadline, now)
+                .err()
+                .map(|e| e.to_string())
+        };
+
+        // Past (or at) the deadline: send.
+        assert_eq!(gate(owner, PaymentPool::Status::Closing, 200, 200), None);
+        assert_eq!(gate(owner, PaymentPool::Status::Closing, 200, 300), None);
+
+        let refusals = [
+            (
+                gate(Address::ZERO, PaymentPool::Status::Open, 0, 300),
+                "does not exist",
+            ),
+            (
+                gate(owner, PaymentPool::Status::Open, 0, 300),
+                "decdn pool close --pool",
+            ),
+            (
+                gate(
+                    owner,
+                    PaymentPool::Status::Closing,
+                    1_790_875_000,
+                    1_790_700_000,
+                ),
+                "dispute window; reclaimable after Unix 1790875000 (in 2d 0h 36m)",
+            ),
+            (
+                gate(owner, PaymentPool::Status::Closed, 200, 300),
+                "already reclaimed",
+            ),
+        ];
+        for (msg, cause) in refusals {
+            let msg = msg.unwrap_or_default();
+            assert!(msg.contains(cause), "expected {cause:?} in {msg:?}");
+            assert!(
+                !msg.contains("not closed, or"),
+                "must name one cause: {msg}"
+            );
+        }
     }
 
     #[test]

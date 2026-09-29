@@ -1,6 +1,7 @@
 //! Wallet-filled HTTP provider builder shared by the client commands
 //! (`fetch`, `bundle pull`, `channel`) and the on-chain operator commands
-//! (`register`, `bond`, `setup`), plus the retryable-vs-permanent classifier
+//! (`register`, `bond`, `setup`), a wallet-free builder for reads that must
+//! run before a keystore is unlocked, plus the retryable-vs-permanent classifier
 //! for a failed chain read
 //! ([`is_permanent_contract_error`](crate::provider::is_permanent_contract_error),
 //! [`is_permanent_rpc_error`](crate::provider::is_permanent_rpc_error)).
@@ -17,16 +18,12 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 
 /// Build a wallet-filled HTTP provider that signs and sends transactions as
-/// `signer`. The `Url` type is inferred from `connect_http`'s parameter;
-/// naming it explicitly would need `alloy::transports`, which is not exposed
-/// under this crate's alloy feature set.
+/// `signer`.
 ///
 /// # Errors
 ///
-/// Fails if `rpc_url` is not a valid URL. The value is never echoed into the
-/// error: an `rpc_url` secret commonly lives in the path/query, which userinfo
-/// redaction wouldn't scrub, so the value is hidden entirely (matching
-/// `config validate`'s `<redacted> (N chars)`).
+/// Fails if `rpc_url` is not a valid URL. The error never echoes the value,
+/// which can carry an API key.
 // `use<>` pins the returned provider to capture *no* input lifetimes: it owns
 // a clone of `signer` and the parsed URL, so it is genuinely `'static`. Without
 // the precise-capturing bound, Rust 2024's RPIT rules over-capture `&signer`,
@@ -38,12 +35,42 @@ pub fn build_provider(
 ) -> anyhow::Result<impl Provider + Clone + use<>> {
     Ok(ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer.clone()))
-        .connect_http(rpc_url.parse().with_context(|| {
-            format!(
-                "rpc_url is not a valid URL (<redacted>, {} chars)",
-                rpc_url.len()
-            )
-        })?))
+        .connect_http(parse_rpc_url(rpc_url)?))
+}
+
+/// Build a wallet-free HTTP provider for read-only calls. It lets a command
+/// read chain state before it unlocks a keystore, so a check that fails asks
+/// for no password.
+///
+/// # Errors
+///
+/// Fails if `rpc_url` is not a valid URL. The error never echoes the value,
+/// which can carry an API key.
+pub fn build_read_provider(rpc_url: &str) -> anyhow::Result<impl Provider + Clone + use<>> {
+    Ok(ProviderBuilder::new().connect_http(parse_rpc_url(rpc_url)?))
+}
+
+/// Parse the configured RPC endpoint. The `Url` type is inferred from
+/// `connect_http`'s parameter; naming it explicitly would need
+/// `alloy::transports`, which is not exposed under this crate's alloy feature
+/// set.
+///
+/// # Errors
+///
+/// Fails if `rpc_url` is not a valid URL. The value is never echoed into the
+/// error: an `rpc_url` secret commonly lives in the path/query, which userinfo
+/// redaction wouldn't scrub, so the value is hidden entirely (matching
+/// `config validate`'s `<redacted> (N chars)`).
+fn parse_rpc_url<U: std::str::FromStr>(rpc_url: &str) -> anyhow::Result<U>
+where
+    U::Err: std::error::Error + Send + Sync + 'static,
+{
+    rpc_url.parse().with_context(|| {
+        format!(
+            "rpc_url is not a valid URL (<redacted>, {} chars)",
+            rpc_url.len()
+        )
+    })
 }
 
 /// Whether a failed contract call is deterministic — the same call fails the
