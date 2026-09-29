@@ -5308,18 +5308,25 @@ mod tests {
             payment_pool: alloy::primitives::Address::repeat_byte(0x77),
         };
 
+    /// One queued answer for [`preflight_provider`]. The value is JSON, not
+    /// raw bytes (unlike `buyer_channel.rs`' `MockCall`), because
+    /// `eth_chainId` answers with a quantity.
+    enum MockAnswer {
+        /// Answer the call with this value.
+        Ok(serde_json::Value),
+        /// Fault the call as a transient RPC error does, so the preflight
+        /// retries it.
+        TransientError,
+    }
+
     /// A mocked provider answering the preflight's reads in order:
     /// `eth_chainId`, `eth_getCode`, then (when reached) the `usdc()` call.
-    /// `Some` answers with that value; `None` faults the call as a transient
-    /// RPC error does — the convention `payment_pool.rs`' `mocked` uses. The
-    /// values are JSON, not raw bytes, because `eth_chainId` answers with a
-    /// quantity.
-    fn preflight_provider(responses: Vec<Option<serde_json::Value>>) -> impl Provider + Clone {
+    fn preflight_provider(answers: Vec<MockAnswer>) -> impl Provider + Clone {
         let asserter = alloy::providers::mock::Asserter::new();
-        for response in responses {
-            match response {
-                Some(value) => asserter.push_success(&value),
-                None => asserter.push_failure_msg("transient rpc fault"),
+        for answer in answers {
+            match answer {
+                MockAnswer::Ok(value) => asserter.push_success(&value),
+                MockAnswer::TransientError => asserter.push_failure_msg("transient rpc fault"),
             }
         }
         ProviderBuilder::new().connect_mocked_client(asserter)
@@ -5360,9 +5367,9 @@ mod tests {
     #[tokio::test]
     async fn a_matching_deployment_passes_the_preflight() {
         let provider = preflight_provider(vec![
-            Some(chain_id_ok()),
-            Some(code_present()),
-            Some(usdc_answers()),
+            MockAnswer::Ok(chain_id_ok()),
+            MockAnswer::Ok(code_present()),
+            MockAnswer::Ok(usdc_answers()),
         ]);
         check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
             .await
@@ -5374,8 +5381,8 @@ mod tests {
     #[tokio::test]
     async fn a_chain_id_mismatch_aborts_the_preflight() {
         let provider = preflight_provider(vec![
-            Some(serde_json::json!(alloy::primitives::U64::from(1u64))),
-            Some(code_present()),
+            MockAnswer::Ok(serde_json::json!(alloy::primitives::U64::from(1u64))),
+            MockAnswer::Ok(code_present()),
         ]);
         let err = check_deployment_preflight(
             provider,
@@ -5394,7 +5401,10 @@ mod tests {
     /// A codeless address aborts: nothing is deployed there.
     #[tokio::test]
     async fn a_codeless_payment_pool_address_aborts_the_preflight() {
-        let provider = preflight_provider(vec![Some(chain_id_ok()), Some(empty_bytes())]);
+        let provider = preflight_provider(vec![
+            MockAnswer::Ok(chain_id_ok()),
+            MockAnswer::Ok(empty_bytes()),
+        ]);
         let err = check_deployment_preflight(
             provider,
             PREFLIGHT_DEPLOYMENT,
@@ -5418,10 +5428,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_non_payment_pool_contract_aborts_the_preflight() {
         let provider = preflight_provider(vec![
-            Some(chain_id_ok()),
-            Some(code_present()),
+            MockAnswer::Ok(chain_id_ok()),
+            MockAnswer::Ok(code_present()),
             // `usdc()` returns no data: the target hosts some other contract.
-            Some(empty_bytes()),
+            MockAnswer::Ok(empty_bytes()),
         ]);
         let err =
             check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
@@ -5444,10 +5454,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_transient_rpc_error_is_retried_by_the_preflight() {
         let provider = preflight_provider(vec![
-            None,
-            Some(chain_id_ok()),
-            Some(code_present()),
-            Some(usdc_answers()),
+            MockAnswer::TransientError,
+            MockAnswer::Ok(chain_id_ok()),
+            MockAnswer::Ok(code_present()),
+            MockAnswer::Ok(usdc_answers()),
         ]);
         check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
             .await
