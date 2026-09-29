@@ -42,7 +42,7 @@ use crate::origin_range::{
 };
 use crate::outboard_cache::{OUTBOARD_CACHE_BYTES, OUTBOARD_CACHE_ENTRIES, OutboardCache};
 use crate::probe_hold::ProbeHoldOutcome;
-use crate::range_pull::{AlignedRange, align_range};
+use crate::range_pull::{AlignedRange, align_range, align_range_clamped};
 use crate::retry::{
     TerminalFailure, classify_io_error, drain_to_bytes, run_with_retry_classified, should_buffer,
 };
@@ -4676,8 +4676,9 @@ impl CacheEngine {
         // reallocates; `wire_len` walks the same node set the export stream emits.
         // The range re-validated cleanly inside the call above, so a re-alignment
         // fault here is unreachable — degrade to an unsized buffer rather than
-        // duplicating the error mapping.
-        let cap = align_range(byte_offset, byte_len, blob_size)
+        // duplicating the error mapping. `align_range_clamped` (not `align_range`)
+        // so an end past the blob still sizes the buffer instead of degrading to 0.
+        let cap = align_range_clamped(byte_offset, byte_len, blob_size)
             .map_or(0, |a| usize::try_from(a.wire_len()).unwrap_or(0));
         let mut out = Vec::with_capacity(cap);
         while let Some(item) = stream.next().await {
@@ -4701,10 +4702,12 @@ impl CacheEngine {
     /// (avoids a second, unauthenticated size source — ADR 038 §Wire format).
     ///
     /// The range widens to enclosing 16 KiB chunk-group boundaries
-    /// ([`align_range`]) because a bao proof anchors whole groups; the serve side
-    /// does **not** trim back to the requested offset (trimming would break
-    /// verification). The receiver discards the group-aligned prefix. The outboard
-    /// is read from the store (built at import).
+    /// ([`align_range_clamped`]) because a bao proof anchors whole groups; an
+    /// end past the blob clamps to it (size by growth) rather than being
+    /// refused. The serve side does **not** trim back to the requested offset
+    /// (trimming would break verification). The receiver discards the
+    /// group-aligned prefix. The outboard is read from the store (built at
+    /// import).
     /// Works against a **partial** blob (only imported/verified chunk groups are
     /// exportable, exactly like [`Self::export_range`]).
     ///
@@ -4738,9 +4741,10 @@ impl CacheEngine {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Store`] if the requested range is out of bounds, or (for the
-    /// 0-byte case) the blob is absent. Faults discovered while exporting —
-    /// including the truncation refusal — arrive as `Err` items in the stream.
+    /// [`CacheError::Store`] if `byte_offset` is at or past the blob end, or
+    /// (for the 0-byte case) the blob is absent. An end past the blob is not an
+    /// error — it clamps. Faults discovered while exporting — including the
+    /// truncation refusal — arrive as `Err` items in the stream.
     pub async fn export_bao_range_stream(
         &self,
         hash: Hash,
@@ -4756,9 +4760,11 @@ impl CacheEngine {
         // function of the whole-blob size, so the partial and the caller agree by
         // construction (#915, ADR 038).
 
-        // Snap to chunk-group boundaries (ADR 005: reject, never clamp, an
-        // out-of-bounds range). `align_range` owns the bound check.
-        let aligned = align_range(byte_offset, byte_len, blob_size).map_err(|e| {
+        // Snap to chunk-group boundaries. Only a start at or past the blob end
+        // is rejected; an end past the blob clamps to it instead (size by
+        // growth, ADR 005 amendment) — `align_range_clamped` owns the bound
+        // check, the same one the dispatch-tier gate applies before this runs.
+        let aligned = align_range_clamped(byte_offset, byte_len, blob_size).map_err(|e| {
             CacheError::Store(anyhow::Error::from(e).context("export_bao_range: range alignment"))
         })?;
 

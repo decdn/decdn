@@ -205,28 +205,31 @@ async fn ranged_paid_pull(
     let (resp, resp_ext) = read_stream_response(&mut recv).await?;
     anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
     // The advertised size is the *whole* blob; the range delivers `byte_len`, or
-    // the whole tail when `byte_len == 0`. Reject an impossible advertised total
-    // rather than masking a server bug: a signed `total_bytes` before the offset
-    // or shorter than the requested range end is surfaced here.
+    // the whole tail when `byte_len == 0`. `byte_offset` must be inside the
+    // advertised total — a signed `total_bytes` at or before the offset is
+    // surfaced here as a server bug. An end past the advertised total is not a
+    // bug: it clamps and serves up to the blob's end (size by growth), so it is
+    // NOT checked here — `align_range_clamped` below is the single source of
+    // truth for the served (and billed) span.
     if byte_len == 0 {
         resp.body
             .total_bytes
             .checked_sub(byte_offset)
             .ok_or_else(|| anyhow::anyhow!("response total_bytes is before byte_offset"))?;
     } else {
-        let end = byte_offset
-            .checked_add(byte_len)
-            .ok_or_else(|| anyhow::anyhow!("requested range overflows"))?;
         anyhow::ensure!(
-            end <= resp.body.total_bytes,
-            "response total_bytes is smaller than the requested range end"
+            byte_offset < resp.body.total_bytes,
+            "response total_bytes is at or before the requested offset"
         );
     }
     // ADR 038: the wire carries the bao verified-stream (content + interleaved
     // proof) for the group-aligned superset of the request, so the paid/closing
     // boundary is the bao-encoded WIRE size, not the requested content length.
+    // `align_range_clamped` (not `align_range`) because `byte_len` may run past
+    // `total_bytes`: the server serves and bills that clamped to the blob's end
+    // rather than refusing it.
     let aligned =
-        decdn_cache::range_pull::align_range(byte_offset, byte_len, resp.body.total_bytes)
+        decdn_cache::range_pull::align_range_clamped(byte_offset, byte_len, resp.body.total_bytes)
             .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
     let expected_wire =
         decdn_cache::range_pull::bao_encoded_size(resp.body.total_bytes, aligned.chunk_ranges());
@@ -286,9 +289,10 @@ async fn ranged_paid_pull(
 }
 
 /// Decode the header-less bao verified-stream `wire` for `[byte_offset,
-/// byte_offset+byte_len)` (`byte_len == 0` ⇒ to end), verifying every chunk
-/// group against `hash`, and trim the group-aligned superset back to the exact
-/// requested span. Mirrors the production receiver (`decdn-client`).
+/// byte_offset+byte_len)` (`byte_len == 0` ⇒ to end, and an end past
+/// `total_bytes` clamps to it — size by growth), verifying every chunk group
+/// against `hash`, and trim the group-aligned superset back to the exact
+/// served span. Mirrors the production receiver (`decdn-client`).
 fn decode_bao_range(
     hash: Hash,
     total_bytes: u64,
@@ -300,7 +304,7 @@ fn decode_bao_range(
     use bao_tree::io::BaoContentItem;
     use bao_tree::io::sync::DecodeResponseIter;
 
-    let aligned = decdn_cache::range_pull::align_range(byte_offset, byte_len, total_bytes)
+    let aligned = decdn_cache::range_pull::align_range_clamped(byte_offset, byte_len, total_bytes)
         .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
     let tree = BaoTree::new(total_bytes, decdn_cache::range_pull::IROH_BLOCK_SIZE);
     let reader = std::io::Cursor::new(wire);
@@ -316,7 +320,9 @@ fn decode_bao_range(
     let want = if byte_len == 0 {
         plaintext.len().saturating_sub(lead)
     } else {
-        usize::try_from(byte_len)?
+        // An end past `total_bytes` clamps to the blob's end, same as the server.
+        let end = byte_offset.saturating_add(byte_len).min(total_bytes);
+        usize::try_from(end.saturating_sub(byte_offset))?
     };
     let end = lead.saturating_add(want);
     let slice = plaintext
@@ -974,12 +980,12 @@ async fn resume_to_end_range_pull_serves_tail() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()> {
-    // ADR 005 §Bounded byte ranges: a range whose end exceeds the blob MUST be
-    // refused with a `StreamError` — and the refusal must land BEFORE a success
-    // response is signed, so the client never accepts an `ok: true` the delivery
-    // then aborts. Exercised against a cache hit so the request reaches the size
-    // gate directly.
+async fn offset_past_the_blob_is_rejected_before_delivery() -> anyhow::Result<()> {
+    // ADR 005 §Bounded byte ranges (size-by-growth amendment): a range whose
+    // START is at or past the blob end MUST be refused with a `StreamError` —
+    // and the refusal must land BEFORE a success response is signed, so the
+    // client never accepts an `ok: true` the delivery then aborts. Exercised
+    // against a cache hit so the request reaches the bounds gate directly.
     let (blob, _outboard, hash) = blob_with_outboard();
     let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
     let hex = hash.to_hex();
@@ -1024,13 +1030,14 @@ async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()>
         .open_bi()
         .await
         .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
-    // `byte_offset` in bounds but `byte_offset + byte_len` past the blob end.
+    // `byte_offset` itself is at the blob end — no chunk group to anchor,
+    // clamped or not, so this must still refuse.
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
         pool_id: pool_id.into(),
-        byte_offset: 16 * 1024,
-        byte_len: blob_size,
+        byte_offset: blob_size,
+        byte_len: 0,
         timestamp_us: 0x9001,
     };
     let payload = encode_stream_request(&req, Some(&StreamRequestExt::default()))
@@ -1043,7 +1050,7 @@ async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()>
         ClientMessage::StreamResponse(r) => {
             anyhow::ensure!(
                 !r.body.ok,
-                "an out-of-bounds range must be refused, not served"
+                "an offset at or past the blob end must be refused, not served"
             );
         }
         other => anyhow::bail!("expected a refusing StreamResponse, got {other:?}"),
@@ -1059,6 +1066,91 @@ async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()>
             "serve_stream_rejected_range_not_satisfiable_total"
         )? == 1,
         "the out-of-bounds reject must increment the range-not-satisfiable counter"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn end_past_the_blob_is_served_clamped_not_refused() -> anyhow::Result<()> {
+    // Size-by-growth (ADR 005 amendment): a request whose start is in bounds
+    // but whose end runs past the blob is served up to the blob's end instead
+    // of refused — a claimed size is a hint, and this leg reaches the true end,
+    // proving it. Exercised against a cache hit so the request reaches the
+    // bounds gate directly (the same gate `offset_past_the_blob_is_rejected_...`
+    // exercises for a genuinely out-of-bounds start).
+    let (blob, _outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x48);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
+    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+    // Pre-populate the blob so the ranged request is a cache hit.
+    cache.populate(hash).await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let req_off = 16 * 1024u64;
+    // `byte_offset` in bounds but `byte_offset + byte_len` well past the blob
+    // end (`blob_size`, not `blob_size - req_off`): must clamp, not refuse.
+    let got = ranged_paid_pull(
+        &client_ep,
+        target,
+        client_node_id,
+        &client_eth,
+        pool_id,
+        provider,
+        hash,
+        req_off,
+        blob_size,
+        RATE_PER_MB,
+    )
+    .await?;
+
+    let want = blob
+        .get(usize::try_from(req_off)?..)
+        .ok_or_else(|| anyhow::anyhow!("offset past blob"))?;
+    anyhow::ensure!(
+        got.as_slice() == want,
+        "an end past the blob must deliver clamped to the blob's end, got {} of {} bytes",
+        got.len(),
+        want.len()
+    );
+    // The clamp is not a range-not-satisfiable rejection: the reject-path
+    // counter must stay untouched.
+    anyhow::ensure!(
+        counter_value(
+            &metrics,
+            "serve_stream_rejected_range_not_satisfiable_total"
+        )? == 0,
+        "a clamped end must not fire the range-not-satisfiable reject path"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;

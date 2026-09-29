@@ -269,7 +269,9 @@ use bao_tree::io::BaoContentItem;
 #[cfg(any(test, feature = "test-util"))]
 use bao_tree::io::fsm::{ResponseDecoder, ResponseDecoderNext};
 use bytes::Bytes;
+#[cfg(any(test, feature = "test-util"))]
 use decdn_bao_range::align_range;
+use decdn_bao_range::align_range_clamped;
 #[cfg(any(test, feature = "test-util"))]
 use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE};
 use decdn_incentive::{
@@ -2646,8 +2648,10 @@ pub fn is_insufficient_deposit(err: &anyhow::Error) -> bool {
         })
 }
 
-/// Whether a failed open of a bounded range could mean only that the range runs
-/// past the blob's end: the size it was cut from was wrong.
+/// Whether a failed open of a bounded range could mean only that the range's
+/// START is past the blob's end: the size it was cut from was wrong. An end
+/// past the blob is no longer such a failure — it clamps and serves (size by
+/// growth) — so this now fires only on a start with no bytes to serve.
 ///
 /// A holder refuses such a range before it signs (`RangeNotSatisfiable`, which
 /// reaches the wire as [`StreamError::NotFound`]). A relay signs its own size
@@ -2677,12 +2681,16 @@ pub fn is_range_past_end(err: &anyhow::Error) -> bool {
 /// (`byte_len == 0` meaning "to end") of a `total_bytes` blob: the bao-encoded
 /// size of the chunk-group-aligned range (content plus interleaved proof, ADR
 /// 038 §Payment metering), exactly the byte count the server emits. The server
-/// widens the request to enclosing 16 KiB groups; [`align_range`] /
+/// widens the request to enclosing 16 KiB groups and clamps an end past the
+/// blob to the blob's end (size by growth); `total_bytes` here is the response
+/// header's signed size, so [`align_range_clamped`] /
 /// [`AlignedRange::wire_len`](decdn_bao_range::AlignedRange::wire_len)
-/// reproduce that, keeping encoder and receiver in lock-step. The one site every
-/// pull derives its wire bound (and its received-byte ceiling) through.
+/// reproduce the same clamp the server applied, keeping the two sides in
+/// lock-step. The one site every pull derives its wire bound (and its
+/// received-byte ceiling) through. Only a `byte_offset` at or past a non-empty
+/// `total_bytes` still faults, as [`LocalPullFault`] (see [`is_range_past_end`]).
 fn aligned_wire_len(byte_offset: u64, byte_len: u64, total_bytes: u64) -> anyhow::Result<u64> {
-    let aligned = align_range(byte_offset, byte_len, total_bytes).map_err(|e| {
+    let aligned = align_range_clamped(byte_offset, byte_len, total_bytes).map_err(|e| {
         anyhow::Error::new(e)
             .context("range alignment")
             .context(LocalPullFault)
@@ -4204,9 +4212,11 @@ mod tests {
 
     #[test]
     fn the_range_helpers_mark_their_own_faults_as_local() {
-        // A 4 KiB blob cannot be resumed from byte 8192 — `align_range` errors rather than
-        // clamping (ADR 005), and the caller must own that as OURS. The assertion covers
-        // both halves at once: `None` here means the call wrongly SUCCEEDED, and a `Some`
+        // A 4 KiB blob cannot be resumed from byte 8192 — the offset itself is
+        // at or past the end, so `align_range_clamped` still errors rather than
+        // clamping (a start past the end has no chunk group to anchor), and the
+        // caller must own that as OURS. The assertion covers both halves at
+        // once: `None` here means the call wrongly SUCCEEDED, and a `Some`
         // without the marker means it failed and blamed the peer.
         let aligned = aligned_wire_len(8192, 0, 4096).err();
         assert!(
@@ -4232,6 +4242,31 @@ mod tests {
         assert!(!super::is_range_past_end(
             &anyhow::anyhow!("dial timed out").context(LocalPullFault)
         ));
+    }
+
+    /// Size by growth: a response header whose `total_bytes` is smaller than
+    /// the requested end no longer faults — the leg is served, and priced, up
+    /// to the blob's end. `aligned_wire_len` must clamp rather than wrap the
+    /// clamp in `LocalPullFault`, and the clamped wire length must equal the
+    /// whole blob's.
+    #[test]
+    fn aligned_wire_len_clamps_when_the_response_total_is_smaller_than_the_requested_end()
+    -> anyhow::Result<()> {
+        let total = 4096;
+        let requested_end_past_total = total + 8192;
+        let clamped = aligned_wire_len(0, requested_end_past_total, total);
+        assert!(
+            !clamped
+                .as_ref()
+                .is_err_and(|e| e.downcast_ref::<LocalPullFault>().is_some()),
+            "a clamped end must never be marked LocalPullFault: {clamped:?}"
+        );
+        let whole = aligned_wire_len(0, 0, total)?;
+        assert_eq!(
+            clamped?, whole,
+            "the clamped wire length must equal the whole blob's"
+        );
+        Ok(())
     }
 
     /// `client_binding_ext` maps an unbound context to `None` (so

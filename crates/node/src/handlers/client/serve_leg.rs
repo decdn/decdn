@@ -209,7 +209,8 @@ impl ClientHandler {
         // clean `StreamEnd`. Refuse it instead. `dispatch`'s bounds gate already
         // refuses the same ranges with `RangeNotSatisfiable` before it signs, so
         // this is a backstop for a caller that skips that gate; it mirrors
-        // `align_range`'s own bound.
+        // `align_range_clamped`'s own bound — an end past the blob clamps below
+        // rather than being refused here.
         anyhow::ensure!(
             total_bytes == 0 || offset < total_bytes,
             "serve offset {offset} is at or past the {total_bytes}-byte blob end"
