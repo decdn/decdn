@@ -753,39 +753,49 @@ impl Work {
         slot
     }
 
-    /// Who can grow for the pending ranges no idle worker will take: the lanes
-    /// that may be asked for one more worker each, in lane order, and how many
-    /// ranges want a taker. An idle worker is a live slot of a live lane that
-    /// holds no range and covers a pending range: it takes one on its next
-    /// wake. A lane may be asked only while it is live, has a growth hook
-    /// (`can_grow`), and covers a pending range.
+    /// Who can grow for each pending range no idle worker will take: per such
+    /// range, the lanes that may be asked for one more worker for it, in lane
+    /// order.
+    ///
+    /// Ranges are matched to takers by coverage, one idle worker per range, in
+    /// queue order. An idle worker is a live slot of a live lane that holds no
+    /// range: it takes a range it covers on its next wake. A lane may be asked
+    /// for a range only while it is live, has a growth hook (`can_grow`), and
+    /// covers that range.
     fn growth_wanted(
         &self,
         coverage: &[Coverage],
         total_bytes: u64,
         can_grow: impl Fn(usize) -> bool,
-    ) -> (Vec<usize>, usize) {
-        let covers_pending = |lane: usize| {
+    ) -> Vec<Vec<usize>> {
+        let covers = |lane: usize, seg: &AlignedRange| {
             coverage.get(lane).is_some_and(|c| {
-                self.pending.iter().any(|seg| {
-                    covers_byte_range(c, seg.fetch_start(), seg.fetch_len(), total_bytes)
-                })
+                covers_byte_range(c, seg.fetch_start(), seg.fetch_len(), total_bytes)
             })
         };
-        let idle = self
+        let mut idle: Vec<usize> = self
             .in_flight
             .iter()
             .zip(&self.alive)
             .zip(&self.lane_of)
             .filter(|&((slot, &is_alive), &lane)| {
-                slot.is_none() && is_alive && !self.lane_retired(lane) && covers_pending(lane)
+                slot.is_none() && is_alive && !self.lane_retired(lane)
             })
-            .count();
-        let unclaimed = self.pending.len().saturating_sub(idle);
-        let lanes = (0..self.retired.len())
-            .filter(|&lane| !self.lane_retired(lane) && can_grow(lane) && covers_pending(lane))
+            .map(|(_, &lane)| lane)
             .collect();
-        (lanes, unclaimed)
+        let mut wanted = Vec::new();
+        for seg in &self.pending {
+            if let Some(taker) = idle.iter().position(|&lane| covers(lane, seg)) {
+                idle.swap_remove(taker);
+                continue;
+            }
+            wanted.push(
+                (0..self.retired.len())
+                    .filter(|&lane| !self.lane_retired(lane) && can_grow(lane) && covers(lane, seg))
+                    .collect(),
+            );
+        }
+        wanted
     }
 }
 
@@ -1008,9 +1018,10 @@ impl Growth<'_> {
         self.widen.get(lane).copied().flatten()
     }
 
-    /// Ask the live lanes that can grow, in lane order, for one more worker
-    /// each until every pending range no idle worker will take has a taker
-    /// ([`Work::growth_wanted`]), and record each grant for the join loop. A
+    /// For each pending range no idle worker will take
+    /// ([`Work::growth_wanted`]), ask the live lanes that cover that range, in
+    /// lane order, for one more worker until one grants it, and record each
+    /// grant for the join loop. A lane is asked at most once per request, and a
     /// lane that grants none is passed over for the next one. The hooks never
     /// wait, so this runs under the `Work` lock.
     ///
@@ -1019,20 +1030,31 @@ impl Growth<'_> {
     /// growth exists to avoid.
     fn request(&self, work: &Work, coverage: &[Coverage], total_bytes: u64, hash: [u8; 32]) {
         let can_grow = |lane: usize| self.hooks(lane).is_some();
-        let (asked, unclaimed) = work.growth_wanted(coverage, total_bytes, can_grow);
-        let mut granted = Vec::new();
-        for lane in asked.iter().copied() {
-            if granted.len() >= unclaimed {
-                break;
+        let wanted = work.growth_wanted(coverage, total_bytes, can_grow);
+        let mut asked: Vec<usize> = Vec::new();
+        let mut granted: Vec<usize> = Vec::new();
+        let mut waiting = 0_usize;
+        for candidates in &wanted {
+            let mut taken = false;
+            for &lane in candidates {
+                if asked.contains(&lane) {
+                    continue;
+                }
+                asked.push(lane);
+                if self.hooks(lane).is_some_and(|w| w.grow(1) > 0) {
+                    granted.push(lane);
+                    taken = true;
+                    break;
+                }
             }
-            if self.hooks(lane).is_some_and(|w| w.grow(1) > 0) {
-                granted.push(lane);
+            if !taken {
+                waiting = waiting.saturating_add(1);
             }
         }
-        if granted.len() < unclaimed {
+        if waiting > 0 {
             tracing::info!(
                 hash = %blake3::Hash::from_bytes(hash).to_hex(),
-                waiting = unclaimed - granted.len(),
+                waiting,
                 asked = ?asked,
                 "a faulted lane's remainder waits for a busy lane: no live lane could take one \
                  more stream"
@@ -3150,7 +3172,7 @@ mod tests {
         };
         // Lane 2's worker is live and idle: it takes the range, so nobody grows.
         // Lane 3's idle worker does not count: it cannot serve the range.
-        assert_eq!(work.growth_wanted(&coverage, total, |_| true).1, 0);
+        assert!(work.growth_wanted(&coverage, total, |_| true).is_empty());
         // Once it holds a range, the live covering lanes with a hook may be
         // asked, in lane order: not lane 1 (retired), not lane 3 (no cover).
         if let Some(slot) = work.in_flight.get_mut(2) {
@@ -3158,15 +3180,61 @@ mod tests {
         }
         assert_eq!(
             work.growth_wanted(&coverage, total, |_| true),
-            (vec![0, 2], 1)
+            vec![vec![0, 2]]
         );
         assert_eq!(
             work.growth_wanted(&coverage, total, |lane| lane == 2),
-            (vec![2], 1)
+            vec![vec![2]]
         );
         assert_eq!(
             work.growth_wanted(&coverage, total, |lane| lane == 1),
-            (vec![], 1)
+            vec![Vec::<usize>::new()]
+        );
+        Ok(())
+    }
+
+    /// Ranges are matched to takers by coverage, not by count: an idle worker
+    /// that covers one pending range does not stand in for another range it
+    /// cannot serve, and only lanes that cover the unserved range are asked.
+    #[test]
+    fn growth_matches_takers_to_ranges_by_coverage() -> anyhow::Result<()> {
+        use decdn_bao_range::align_range;
+
+        let total = 8 * DISCOVERY_BLOCK_BYTES;
+        let blocks = num_blocks(total);
+        let first = Coverage::from_block_indices(blocks, std::iter::once(0));
+        let last = Coverage::from_block_indices(blocks, std::iter::once(blocks - 1));
+        // Lane 0 holds block 0 and has an idle worker; lane 1 holds block 0 and
+        // is busy; lane 2 holds the last block and is busy.
+        let coverage = vec![first.clone(), first, last];
+        let work = super::Work {
+            // The range lane 0's idle worker cannot serve is first in queue
+            // order, so a match by count would spend that worker on it.
+            pending: [
+                align_range(7 * DISCOVERY_BLOCK_BYTES, DISCOVERY_BLOCK_BYTES, total)?,
+                align_range(0, DISCOVERY_BLOCK_BYTES, total)?,
+            ]
+            .into(),
+            first: vec![None; 3],
+            in_flight: vec![
+                None,
+                Some((DISCOVERY_BLOCK_BYTES, 1)),
+                Some((2 * DISCOVERY_BLOCK_BYTES, 1)),
+            ],
+            cancel: (0..3)
+                .map(|_| Arc::new(super::CancelHandle::new()))
+                .collect(),
+            units: vec![0; 3],
+            alive: vec![true; 3],
+            lane_of: (0..3).collect(),
+            retired: vec![false; 3],
+            front_first: false,
+        };
+        // Lane 0's idle worker takes block 0. The last block has no idle taker,
+        // and only lane 2 covers it: lane 1, first in lane order, is not asked.
+        assert_eq!(
+            work.growth_wanted(&coverage, total, |_| true),
+            vec![vec![2]]
         );
         Ok(())
     }

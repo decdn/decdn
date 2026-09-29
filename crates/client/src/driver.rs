@@ -1358,6 +1358,11 @@ where
                         }
                         let taken = {
                             let mut q = lock();
+                            // Checked again under the lock a faulting sibling
+                            // retires the lane under.
+                            if retired.get(index).is_none_or(|r| r.load(Ordering::Acquire)) {
+                                return Ok(false);
+                            }
                             // The first gap waits for its lane, unless every lane
                             // that takes it has retired.
                             let first_is_free = lane.takes_first
@@ -1456,6 +1461,13 @@ where
                                 && live.load(Ordering::Acquire) > 1;
                             if extra_fault {
                                 live.fetch_sub(1, Ordering::AcqRel);
+                            } else if fault.is_some()
+                                && let Some(r) = retired.get(index)
+                            {
+                                // Retired before the rest goes back, under the
+                                // lock a sibling worker takes a gap under, so
+                                // no worker of this lane takes the rest.
+                                r.store(true, Ordering::Release);
                             }
                             if let Some(Ok(rest)) = &rest {
                                 for gap in rest.iter().rev() {
@@ -1475,9 +1487,6 @@ where
                                 log_extra_fault(lane, hash, (gap_start, gap_len, landed), &err);
                             } else {
                                 warn_gap_fault(lane, hash, (gap_start, gap_len, landed), &err);
-                                if let Some(r) = retired.get(index) {
-                                    r.store(true, Ordering::Release);
-                                }
                             }
                             let slots = if extra_fault { extra_faults } else { faults };
                             if let Some(slot) = slots.get(index) {
