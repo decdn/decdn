@@ -219,7 +219,7 @@ pub use ranged_store::ClientRangedStore;
 pub use rate_limited::UpstreamRateLimited;
 pub use retry::{RetryDisposition, retry_disposition, shared_pool_disposition};
 pub use scheduler::{
-    ConsumptionPacing, LaneLease, MultiSourceConfig, SourceLane, multi_source_fetch,
+    ConsumptionPacing, LaneLease, LaneWiden, MultiSourceConfig, SourceLane, multi_source_fetch,
     multi_source_fetch_until,
 };
 pub use sink::{BlobCache, NoCache, SinkFuture};
@@ -2682,6 +2682,43 @@ pub(crate) fn stall_sample_period(window: Duration) -> Duration {
 /// steady-state one.
 const TERMINAL_AFTER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long one phase of a leg may run before the leg logs it at debug
+/// ([`log_proof_stall`]). A node stops a stream whose proof it has waited on
+/// for 10 s, so this names the slow phase before that happens.
+const PROOF_STALL_DEBUG_AFTER: Duration = Duration::from_secs(5);
+
+/// Log at debug that `phase` of one leg took `elapsed`, once it reaches
+/// [`PROOF_STALL_DEBUG_AFTER`]. Each phase names one place a leg can stall:
+/// `unpolled` (the caller did not read the stream, so a proof the node waits
+/// for was not sent), `pay` (waiting for the lane's ledger, signing and
+/// writing the proof), or `read` (the leg waited for bytes). A `read` stall
+/// with `unproved > 0` can be the node waiting for a proof this leg does not
+/// yet owe; with `unproved == 0` the leg owes nothing and the node is slow to
+/// send. `unpolled` and `pay` are logged when the phase ends; `read` is logged
+/// while the leg still waits.
+fn log_proof_stall(
+    pull: (&dyn std::fmt::Display, [u8; 32], u64),
+    cumulative: u64,
+    unproved: u64,
+    phase: &'static str,
+    elapsed: Duration,
+) {
+    if elapsed < PROOF_STALL_DEBUG_AFTER {
+        return;
+    }
+    let (peer, hash, byte_offset) = pull;
+    tracing::debug!(
+        peer = %peer,
+        hash = %blake3::Hash::from_bytes(hash).to_hex(),
+        byte_offset,
+        cumulative,
+        unproved,
+        phase,
+        elapsed_ms = elapsed.as_millis(),
+        "a leg phase ran past {PROOF_STALL_DEBUG_AFTER:?}"
+    );
+}
+
 /// Header fields from the upstream `StreamResponse`, surfaced by
 /// [`open_progressive_pull`] before the first chunk so the fused serve path
 /// (#856) knows `total_bytes` up front — it must sign its OWN downstream
@@ -2790,6 +2827,9 @@ pub struct UpstreamPull {
     /// `StreamEnd` seen — `next_chunk` returns `None` and `finish` skips the
     /// drain.
     ended: bool,
+    /// When `next_chunk` last returned a chunk, so the next call can tell how
+    /// long the caller left the stream unread ([`log_proof_stall`]).
+    returned_at: Option<tokio::time::Instant>,
 }
 
 impl std::fmt::Debug for UpstreamPull {
@@ -3095,6 +3135,7 @@ async fn open_progressive_pull_impl(
             cumulative: 0,
             unproved: 0,
             ended: false,
+            returned_at: None,
         };
         Ok((header, pull))
     }
@@ -3156,6 +3197,10 @@ impl UpstreamPull {
         let recv = &mut self.recv;
         let sampler = &mut self.sampler;
         let floor = &mut self.floor;
+        let (peer, hash, byte_offset) = (self.conn.remote_id(), self.hash, self.byte_offset);
+        let unproved = self.unproved;
+        let read_started = tokio::time::Instant::now();
+        let mut read_stall_logged = false;
         let mut reader = progress::ProgressReader::new(recv, Arc::clone(&self.progress_counter));
         // Pin ONE read future and poll it across ticks. `read_client_message` is not
         // cancellation-safe — `read_frame` fills a frame with `read_exact`, so dropping the
@@ -3196,6 +3241,14 @@ impl UpstreamPull {
                             anyhow::Error::new(PullStalled { after: window })
                         });
                     }
+                    // Once bytes have flowed, a long wait here is the leg
+                    // waiting on the node while the node may wait on a proof.
+                    let waited = now.saturating_duration_since(read_started);
+                    if cumulative > 0 && !read_stall_logged && waited >= PROOF_STALL_DEBUG_AFTER {
+                        read_stall_logged = true;
+                        let pull = (&peer as &dyn std::fmt::Display, hash, byte_offset);
+                        log_proof_stall(pull, cumulative, unproved, "read", waited);
+                    }
                 }
             }
         }
@@ -3221,6 +3274,15 @@ impl UpstreamPull {
     pub async fn next_chunk(&mut self) -> anyhow::Result<Option<Bytes>> {
         if self.ended {
             return Ok(None);
+        }
+        if let Some(returned_at) = self.returned_at.take() {
+            log_proof_stall(
+                (&self.conn.remote_id(), self.hash, self.byte_offset),
+                self.cumulative,
+                self.unproved,
+                "unpolled",
+                returned_at.elapsed(),
+            );
         }
         // Read exactly one message. In the pool model there is no positive ack to
         // consume (acceptance is implicit — continued delivery IS acceptance, ADR
@@ -3284,9 +3346,18 @@ impl UpstreamPull {
                     // Gate the floor across our own payment: while we owe the covering proof
                     // the upstream legitimately pauses (ADR 005 §Payment pacing), so that
                     // pause is self-inflicted, not a sender stall (#1797).
-                    self.floor.pause(tokio::time::Instant::now());
+                    let pay_started = tokio::time::Instant::now();
+                    self.floor.pause(pay_started);
                     let paid = self.pay_one(unproved, complete).await;
-                    self.floor.resume(tokio::time::Instant::now());
+                    let paid_at = tokio::time::Instant::now();
+                    self.floor.resume(paid_at);
+                    log_proof_stall(
+                        (&self.conn.remote_id(), self.hash, self.byte_offset),
+                        self.cumulative,
+                        unproved,
+                        "pay",
+                        paid_at.saturating_duration_since(pay_started),
+                    );
                     match paid {
                         Ok(remaining) => self.unproved = remaining,
                         // A voucher write that failed at end-of-stream may only mean the
@@ -3302,6 +3373,7 @@ impl UpstreamPull {
                             }
                         }
                     }
+                    self.returned_at = Some(tokio::time::Instant::now());
                     Ok(Some(Bytes::from(chunk.into_bytes())))
                 }
                 // A mid-stream `StreamError` is either a `VoucherRejected` (our

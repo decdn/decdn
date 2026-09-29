@@ -402,6 +402,7 @@ mod tests {
             coverage: None,
             first_unit: None,
             lease: crate::LaneLease::default(),
+            widen: None,
         }
     }
 

@@ -257,6 +257,7 @@ impl Buyer {
                 coverage: Some(holder.coverage),
                 first_unit: None,
                 lease: decdn_client::LaneLease::default(),
+                widen: None,
             });
         }
         Ok((candidates, lanes))

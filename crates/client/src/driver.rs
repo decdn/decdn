@@ -694,7 +694,8 @@ async fn range_set_gaps<St: RangedStore + ?Sized>(
 }
 
 /// Of two gap failures in one range set, the one that decides more for the
-/// caller's failover, logging the other. A terminal fault outranks a pool
+/// caller's failover. The other is logged at debug: each gap fault is already
+/// logged where it happened. A terminal fault outranks a pool
 /// exhaustion, which outranks any other fault; between equals the earlier one
 /// stays.
 fn keep_decisive(kept: anyhow::Error, new: anyhow::Error) -> anyhow::Error {
@@ -709,8 +710,91 @@ fn keep_decisive(kept: anyhow::Error, new: anyhow::Error) -> anyhow::Error {
     } else {
         (kept, new)
     };
-    tracing::warn!("a concurrent gap of the same range set also failed: {drop:#}");
+    tracing::debug!("a concurrent gap of the same range set also failed: {drop:#}");
     keep
+}
+
+/// Bytes of the gap `[gap_start, gap_start+gap_len)` present in `store`, or
+/// `None` when the store cannot say.
+async fn gap_landed<St: RangedStore + ?Sized>(
+    store: &St,
+    gap_start: u64,
+    gap_len: u64,
+) -> Option<u64> {
+    let missing = store.missing_ranges(gap_start, gap_len).await.ok()?;
+    let rest = contiguous_byte_ranges(&missing, store.total_bytes());
+    Some(landed_bytes(gap_len, &rest))
+}
+
+/// Bytes of a `gap_len`-byte gap present, given `rest`, the `(start, len)`
+/// byte ranges of it still missing.
+fn landed_bytes(gap_len: u64, rest: &[(u64, u64)]) -> u64 {
+    let left = rest.iter().map(|(_, l)| *l).fold(0, u64::saturating_add);
+    gap_len.saturating_sub(left)
+}
+
+/// `lane`'s payee, read for a log line. A poisoned lock still holds a valid
+/// address.
+fn lane_provider<S>(lane: &RangeLane<'_, S>) -> alloy::primitives::Address {
+    lane.ctx
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .provider
+}
+
+/// Warn, where it happens, that `lane` faulted on the gap `[offset,
+/// offset+len)` of `hash` with `landed` bytes of it present. A drive that
+/// recovers reports the fault only through [`RangeSetOutcome::lane_fault`],
+/// so this line is the operator's record of it.
+fn warn_gap_fault<S>(
+    lane: &RangeLane<'_, S>,
+    hash: [u8; 32],
+    (offset, len, landed): (u64, u64, Option<u64>),
+    err: &anyhow::Error,
+) {
+    tracing::warn!(
+        provider = %lane_provider(lane),
+        hash = %blake3::Hash::from_bytes(hash).to_hex(),
+        offset,
+        len,
+        landed = ?landed,
+        error = %format_args!("{err:#}"),
+        "a lane faulted mid-drive; putting its gap's rest back for the other lanes"
+    );
+}
+
+/// Log that a worker of `lane` that the lane's growth hook granted faulted on
+/// the gap `[offset, offset+len)` of `hash`. Most such faults are a refusal of
+/// the additional stream, which is routine, so the line is at debug when
+/// nothing landed and at warn otherwise.
+fn log_extra_fault<S>(
+    lane: &RangeLane<'_, S>,
+    hash: [u8; 32],
+    (offset, len, landed): (u64, u64, Option<u64>),
+    err: &anyhow::Error,
+) {
+    let provider = lane_provider(lane);
+    let hash = blake3::Hash::from_bytes(hash).to_hex();
+    if landed.is_some_and(|n| n > 0) {
+        tracing::warn!(
+            %provider,
+            %hash,
+            offset,
+            len,
+            landed = ?landed,
+            error = %format_args!("{err:#}"),
+            "an additional stream of a lane faulted mid-drive; putting its gap's rest back"
+        );
+    } else {
+        tracing::debug!(
+            %provider,
+            %hash,
+            offset,
+            len,
+            error = %format_args!("{err:#}"),
+            "an additional stream of a lane faulted before any byte landed; putting its gap back"
+        );
+    }
 }
 
 /// The aligned range a drive of `ranges` over `store` opens first, or `None`
@@ -824,7 +908,8 @@ where
         grow: None,
         release: None,
     };
-    drive_range_lanes(
+    // Boxed: the lane drive's future is large, and this keeps callers' small.
+    Box::pin(drive_range_lanes(
         store,
         std::slice::from_ref(&lane),
         pacer,
@@ -835,7 +920,7 @@ where
         on_progress,
         pool,
         stop,
-    )
+    ))
     .await
     .into_result()
 }
@@ -870,13 +955,17 @@ pub struct RangeLane<'a, S> {
 ///
 /// Each time a gap worker of the lane takes a gap and more gaps still wait,
 /// the drive calls the hook with the number of gaps that wait, and it adds one
-/// worker to the lane for each unit the hook returns, up to that number. The
-/// hook must not wait: it grants only what it can grant now, such as stream
-/// permits that another fetch has released since the drive started. The
-/// caller holds one unit for each worker until that worker stops
+/// worker to the lane for each unit the hook returns, up to that number. When a
+/// lane faults and puts its gap's rest back, the drive also asks the live
+/// lanes, in lane order, for one more worker each until every waiting gap has
+/// a taker, so the rest does not wait for a busy lane to finish a whole gap.
+/// The hook must not wait: it grants only what it can grant now, such as
+/// stream permits that another fetch has released since the drive started.
+/// The caller holds one unit for each worker until that worker stops
 /// ([`LaneRelease`]), or until the drive returns when the lane has no release
-/// hook or a `stop` ends the drive. A lane that starts narrow because a sibling fetch holds its
-/// provider's streams thus widens when that sibling finishes.
+/// hook or a `stop` ends the drive. A lane that starts narrow because a
+/// sibling fetch holds its provider's streams thus widens when that sibling
+/// finishes.
 #[derive(Clone, Copy)]
 pub struct LaneGrowth<'a>(pub &'a (dyn Fn(usize) -> usize + Send + Sync + 'a));
 
@@ -917,8 +1006,11 @@ impl std::fmt::Debug for LaneRelease<'_> {
 #[derive(Debug)]
 #[must_use]
 pub struct RangeSetOutcome {
-    /// Each lane's decisive fault, in lane order.
+    /// Each lane's decisive fault, in lane order. A lane with one retired.
     faults: Vec<Option<anyhow::Error>>,
+    /// Each lane's decisive fault of a worker its growth hook granted, in lane
+    /// order. Such a fault leaves the lane live.
+    extra_faults: Vec<Option<anyhow::Error>>,
     /// A failure of the drive itself: `stop`'s error, a store query, a flush
     /// or a finalize.
     error: Option<anyhow::Error>,
@@ -932,10 +1024,22 @@ pub struct RangeSetOutcome {
 }
 
 impl RangeSetOutcome {
-    /// Lane `lane`'s fault, or `None` when it served every gap it took.
+    /// Lane `lane`'s fault, which retired it, or `None` when the lane stayed
+    /// live to the end of the drive.
     #[must_use]
     pub fn lane_fault(&self, lane: usize) -> Option<&anyhow::Error> {
         self.faults.get(lane).and_then(Option::as_ref)
+    }
+
+    /// The fault of a worker lane `lane`'s growth hook granted
+    /// ([`LaneGrowth`]), or `None`. It is most often a refusal of the
+    /// additional stream, so it did not retire the lane and does not count
+    /// toward [`Self::into_result`]. A leg that faulted can still leave a
+    /// voucher armed, so a caller settles such a lane as it settles a faulted
+    /// one.
+    #[must_use]
+    pub fn lane_extra_fault(&self, lane: usize) -> Option<&anyhow::Error> {
+        self.extra_faults.get(lane).and_then(Option::as_ref)
     }
 
     /// The failure of the drive itself, not of one lane: `stop`'s error, a
@@ -1001,7 +1105,12 @@ struct GapQueue {
 ///
 /// A lane that faults retires: its other gaps in flight finish, it takes no new
 /// one, and what its failed gap left missing goes back to the front of the
-/// queue for the other lanes. A terminal fault ([`crate::retry_disposition`])
+/// queue for the other lanes, which grow for it ([`LaneGrowth`]) when no idle
+/// worker will take it. A worker the growth hook granted stops at a fault that
+/// is not terminal, but does not retire its lane, because such a fault is most
+/// often a refusal of the additional stream: the drive keeps it apart
+/// ([`RangeSetOutcome::lane_extra_fault`]) and asks for no growth in its place.
+/// A terminal fault ([`crate::retry_disposition`])
 /// stops every lane from taking a new gap. The drive ends when the queue is
 /// empty and no gap is in flight, or when no lane can take the rest. At most
 /// one lane takes the first gap ([`RangeLane::takes_first`]).
@@ -1041,16 +1150,24 @@ where
 {
     let faults: Vec<Mutex<Option<anyhow::Error>>> =
         lanes.iter().map(|_| Mutex::new(None)).collect();
+    let extra_faults: Vec<Mutex<Option<anyhow::Error>>> =
+        lanes.iter().map(|_| Mutex::new(None)).collect();
     let failed = AtomicBool::new(false);
+    let into_inner = |slots: Vec<Mutex<Option<anyhow::Error>>>| -> Vec<Option<anyhow::Error>> {
+        slots
+            .into_iter()
+            .map(|f| {
+                f.into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+            .collect()
+    };
     let finish =
-        |error: Option<anyhow::Error>, faults: Vec<Mutex<Option<anyhow::Error>>>| RangeSetOutcome {
-            faults: faults
-                .into_iter()
-                .map(|f| {
-                    f.into_inner()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                })
-                .collect(),
+        |error: Option<anyhow::Error>,
+         faults: Vec<Mutex<Option<anyhow::Error>>>,
+         extra_faults: Vec<Mutex<Option<anyhow::Error>>>| RangeSetOutcome {
+            faults: into_inner(faults),
+            extra_faults: into_inner(extra_faults),
             error,
             failed: failed.load(Ordering::Acquire),
         };
@@ -1075,7 +1192,7 @@ where
     };
     let (base_present, gaps) = match setup.await {
         Ok(ready) => ready,
-        Err(err) => return finish(Some(err), faults),
+        Err(err) => return finish(Some(err), faults, extra_faults),
     };
     if let Some(cb) = on_progress {
         cb(base_present, total_bytes);
@@ -1111,6 +1228,8 @@ where
                 .await;
                 if let Err(err) = filled {
                     failed.store(true, Ordering::Release);
+                    let landed = gap_landed(store, gap_start, gap_len).await;
+                    warn_gap_fault(lead, hash, (gap_start, gap_len, landed), &err);
                     if let Some(slot) = faults.first() {
                         *slot
                             .lock()
@@ -1154,18 +1273,79 @@ where
         // the others stop and give their permits back, and grows again when
         // gaps come back.
         let live: Vec<AtomicUsize> = lanes.iter().map(|_| AtomicUsize::new(0)).collect();
+        // Each lane's workers that hold a gap now. `live` minus `busy` is the
+        // lane's idle workers, which take a gap put back on their next wake.
+        let busy: Vec<AtomicUsize> = lanes.iter().map(|_| AtomicUsize::new(0)).collect();
+        // Ask lane `index`'s growth hook for up to `want` more workers, and
+        // record each grant for the join loop below. Returns how many it
+        // granted.
+        let grow_lane = |index: usize, want: usize| -> usize {
+            let Some(LaneGrowth(grow)) = lanes.get(index).and_then(|l| l.grow) else {
+                return 0;
+            };
+            if want == 0 {
+                return 0;
+            }
+            let extra = grow(want).min(want);
+            if extra > 0 {
+                grown
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(std::iter::repeat_n(index, extra));
+                grow_wake.notify_one();
+            }
+            extra
+        };
+        // After a lane's own fault put gaps back, `waiting` gaps wait for a
+        // whole busy gap unless a live lane has an idle worker or grows one for
+        // them: ask the live lanes for one more stream each, in lane order,
+        // until every waiting gap has a taker.
+        let grow_for_waiting = |waiting: usize| {
+            let is_live = |j: usize| {
+                !halted.load(Ordering::Acquire)
+                    && retired.get(j).is_some_and(|r| !r.load(Ordering::Acquire))
+            };
+            let idle = (0..lanes.len())
+                .filter(|&j| is_live(j))
+                .map(|j| {
+                    let running = live.get(j).map_or(0, |n| n.load(Ordering::Acquire));
+                    let taken = busy.get(j).map_or(0, |n| n.load(Ordering::Acquire));
+                    running.saturating_sub(taken)
+                })
+                .fold(0, usize::saturating_add);
+            let mut left = waiting.saturating_sub(idle);
+            for j in (0..lanes.len()).filter(|&j| is_live(j)) {
+                if left == 0 {
+                    break;
+                }
+                left = left.saturating_sub(grow_lane(j, 1));
+            }
+            if left > 0 {
+                tracing::info!(
+                    hash = %blake3::Hash::from_bytes(hash).to_hex(),
+                    waiting = left,
+                    "a faulted lane's gaps wait for a busy lane: no live lane could take one \
+                     more stream"
+                );
+            }
+        };
 
-        let worker = |index: usize| {
+        // Lane `index`'s worker. A `granted` worker is one the lane's growth
+        // hook granted while the drive ran.
+        let worker = |index: usize, granted: bool| {
             let (delivered, halted, retired, wake) = (&delivered, &halted, &retired, &wake);
-            let (faults, lock, grown, grow_wake) = (&faults, &lock, &grown, &grow_wake);
-            let live = &live;
+            let (faults, extra_faults, lock) = (&faults, &extra_faults, &lock);
+            let (grow_lane, grow_for_waiting) = (&grow_lane, &grow_for_waiting);
+            let (lives, busy) = (&live, &busy);
             async move {
-                let (Some(lane), Some(live)) = (lanes.get(index), live.get(index)) else {
+                let (Some(lane), Some(live), Some(my_busy)) =
+                    (lanes.get(index), lives.get(index), busy.get(index))
+                else {
                     return Ok(());
                 };
                 live.fetch_add(1, Ordering::AcqRel);
-                // `Ok(true)`: the worker left an idle lane and already counted
-                // itself out of `live`.
+                // `Ok(true)`: the worker left its lane (idle, or on an extra
+                // fault) and already counted itself out of `live`.
                 let stopped: anyhow::Result<bool> = async {
                     loop {
                         let notified = wake.notified();
@@ -1193,6 +1373,7 @@ where
                             match next {
                                 Some(gap) => {
                                     q.in_flight = q.in_flight.saturating_add(1);
+                                    my_busy.fetch_add(1, Ordering::AcqRel);
                                     Some((gap, q.waiting.len()))
                                 }
                                 None if q.in_flight == 0 && q.first.is_none() => {
@@ -1215,18 +1396,7 @@ where
                             notified.await;
                             continue;
                         };
-                        if waiting > 0
-                            && let Some(LaneGrowth(grow)) = lane.grow
-                        {
-                            let extra = grow(waiting).min(waiting);
-                            if extra > 0 {
-                                grown
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .extend(std::iter::repeat_n(index, extra));
-                                grow_wake.notify_one();
-                            }
-                        }
+                        grow_lane(index, waiting);
                         let mut counters = DriveCounters::new();
                         let filled = fill_gap(
                             store,
@@ -1249,14 +1419,68 @@ where
                             pool,
                         )
                         .await;
-                        let rest = if let Err(err) = filled {
-                            if crate::retry_disposition(&err) == crate::RetryDisposition::Terminal {
-                                halted.store(true, Ordering::Release);
+                        // A granted worker's fault that is not terminal is most
+                        // often a refusal of the additional stream, not a fault
+                        // of the lane: it goes to `extra_faults`, the lane stays
+                        // live, and this worker stops.
+                        // Put back what a failed gap left missing, for the other
+                        // workers. A store error here is the drive's own.
+                        let (fault, rest) = match filled {
+                            Ok(()) => (None, None),
+                            Err(err) => {
+                                let rest = store
+                                    .missing_ranges(gap_start, gap_len)
+                                    .await
+                                    .map(|m| contiguous_byte_ranges(&m, total_bytes));
+                                (Some(err), Some(rest))
                             }
-                            if let Some(r) = retired.get(index) {
-                                r.store(true, Ordering::Release);
+                        };
+                        let terminal = fault.as_ref().is_some_and(|err| {
+                            crate::retry_disposition(err) == crate::RetryDisposition::Terminal
+                        });
+                        if terminal {
+                            halted.store(true, Ordering::Release);
+                        }
+                        // A granted worker's fault that is not terminal is most
+                        // often a refusal of the additional stream, not a fault
+                        // of the lane: it goes to `extra_faults`, the lane stays
+                        // live, and this worker stops. Decided under the queue
+                        // lock, where an idle worker leaves its lane, and only
+                        // while another worker of the lane stays live: the
+                        // lane's last worker faults for the lane.
+                        let (waiting, extra_fault) = {
+                            let mut q = lock();
+                            let extra_fault = fault.is_some()
+                                && granted
+                                && !terminal
+                                && live.load(Ordering::Acquire) > 1;
+                            if extra_fault {
+                                live.fetch_sub(1, Ordering::AcqRel);
                             }
-                            if let Some(slot) = faults.get(index) {
+                            if let Some(Ok(rest)) = &rest {
+                                for gap in rest.iter().rev() {
+                                    q.waiting.push_front(*gap);
+                                }
+                            }
+                            q.in_flight = q.in_flight.saturating_sub(1);
+                            my_busy.fetch_sub(1, Ordering::AcqRel);
+                            (q.waiting.len(), extra_fault)
+                        };
+                        if let Some(err) = fault {
+                            let landed = rest
+                                .as_ref()
+                                .and_then(|r| r.as_ref().ok())
+                                .map(|rest| landed_bytes(gap_len, rest));
+                            if extra_fault {
+                                log_extra_fault(lane, hash, (gap_start, gap_len, landed), &err);
+                            } else {
+                                warn_gap_fault(lane, hash, (gap_start, gap_len, landed), &err);
+                                if let Some(r) = retired.get(index) {
+                                    r.store(true, Ordering::Release);
+                                }
+                            }
+                            let slots = if extra_fault { extra_faults } else { faults };
+                            if let Some(slot) = slots.get(index) {
                                 let mut slot = slot
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1265,27 +1489,21 @@ where
                                     Some(kept) => keep_decisive(kept, err),
                                 });
                             }
-                            // Put back what this gap left missing, for the other
-                            // lanes. A store error here is the drive's own.
-                            let missing = store.missing_ranges(gap_start, gap_len).await;
-                            Some(missing.map(|m| contiguous_byte_ranges(&m, total_bytes)))
-                        } else {
-                            None
-                        };
-                        {
-                            let mut q = lock();
-                            if let Some(Ok(rest)) = &rest {
-                                for gap in rest.iter().rev() {
-                                    q.waiting.push_front(*gap);
-                                }
-                            }
-                            q.in_flight = q.in_flight.saturating_sub(1);
+                        }
+                        // A granted worker's fault asks for no growth: it could
+                        // grant the refused stream again. Nor does a halt.
+                        if !extra_fault && !terminal && matches!(rest, Some(Ok(_))) {
+                            grow_for_waiting(waiting);
                         }
                         wake.notify_waiters();
                         if let Some(Err(err)) = rest {
                             halted.store(true, Ordering::Release);
                             wake.notify_waiters();
                             return Err(err.into());
+                        }
+                        if extra_fault {
+                            // Counted out of `live` above, under the queue lock.
+                            return Ok(true);
                         }
                     }
                 }
@@ -1302,7 +1520,7 @@ where
         let mut running: futures_util::stream::FuturesUnordered<_> = lanes
             .iter()
             .enumerate()
-            .flat_map(|(index, lane)| (0..lane.width.get()).map(move |_| worker(index)))
+            .flat_map(|(index, lane)| (0..lane.width.get()).map(move |_| worker(index, false)))
             .collect();
         let mut joined = Vec::new();
         loop {
@@ -1311,7 +1529,7 @@ where
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
-            running.extend(granted.into_iter().map(worker));
+            running.extend(granted.into_iter().map(|index| worker(index, true)));
             // Only a polled worker grants, so an empty set has no grant pending.
             tokio::select! {
                 next = futures_util::StreamExt::next(&mut running) => match next {
@@ -1355,7 +1573,7 @@ where
         Ok::<(), anyhow::Error>(())
     }
     .await;
-    finish(finalized.err(), faults)
+    finish(finalized.err(), faults, extra_faults)
 }
 
 /// The per-gap resume/pay loop. Fills the contiguous content span
@@ -2807,6 +3025,153 @@ mod tests {
             released.load(Ordering::Relaxed),
             2,
             "each worker of the faulted lane released once"
+        );
+    }
+
+    /// Drive two ranges over two lanes: lane 0 takes the first gap and faults
+    /// at once, and lane 1, scripted by `tweak`, has a growth hook that grants
+    /// one worker in all. Returns the outcome, the sources, how many workers the
+    /// hook granted, and whether every byte of both ranges landed.
+    async fn faulted_rest_drive(
+        tweak: fn(ScriptedSource) -> ScriptedSource,
+    ) -> (RangeSetOutcome, Vec<ScriptedSource>, u32, bool) {
+        let total = 64 * GROUP;
+        let ranges = [(0, 16 * GROUP), (32 * GROUP, 16 * GROUP)];
+        // Room for two grants, so a second request would be seen.
+        let granted: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
+        let hook: &'static (dyn Fn(usize) -> usize + Send + Sync) =
+            Box::leak(Box::new(move |_| {
+                usize::from(
+                    granted
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                            (n < 2).then_some(n + 1)
+                        })
+                        .is_ok(),
+                )
+            }));
+        let specs = [
+            LaneSpec {
+                takes_first: true,
+                tweak: |s| s.with_fault_after(512, || anyhow::anyhow!("stream reset")),
+                ..LaneSpec::healthy(1)
+            },
+            LaneSpec {
+                grow: Some(LaneGrowth(hook)),
+                tweak,
+                ..LaneSpec::healthy(1)
+            },
+        ];
+        let (outcome, sources, store, plaintext) = lanes_drive(total, &ranges, &specs).await;
+        let mut present = true;
+        for &(off, len) in &ranges {
+            present &= store
+                .read(off, len)
+                .await
+                .is_ok_and(|got| got.as_ref() == &plaintext[off as usize..(off + len) as usize]);
+        }
+        (outcome, sources, granted.load(Ordering::Relaxed), present)
+    }
+
+    /// A faulted lane's gap rest does not wait for a busy lane to finish its
+    /// own gap (#2230): the busy lane's growth hook is asked, and the rest runs
+    /// on a second concurrent leg beside the gap it already fills.
+    #[tokio::test]
+    async fn a_faulted_lanes_rest_grows_a_busy_lane() {
+        // Lane 1 is busy on its own gap when lane 0 faults.
+        let (outcome, sources, granted, present) =
+            faulted_rest_drive(|s| s.stall_after(GROUP, std::time::Duration::from_millis(1500)))
+                .await;
+        assert!(outcome.lane_fault(0).is_some(), "lane 0 faulted");
+        outcome
+            .into_result()
+            .expect("the busy lane finishes the set");
+        assert_eq!(granted, 1, "lane 1 grew one worker");
+        let peak = sources.get(1).expect("two lanes").peak_in_flight();
+        assert!(
+            peak >= 2,
+            "the rest ran beside lane 1's own gap, not after it: {peak}"
+        );
+        assert!(present, "every byte landed");
+    }
+
+    /// A granted worker whose stream the node refuses does not retire its
+    /// lane or fail the drive: its fault is the lane's extra fault, and the
+    /// lane still fills the rest.
+    #[tokio::test]
+    async fn a_refused_granted_stream_leaves_its_lane_live() {
+        let (outcome, _sources, granted, present) = faulted_rest_drive(|s| {
+            s.stall_after(GROUP, std::time::Duration::from_millis(1500))
+                .refusing_open(1, || anyhow::anyhow!("overloaded"))
+        })
+        .await;
+        assert_eq!(granted, 1, "lane 1 grew one worker");
+        assert!(outcome.lane_fault(1).is_none(), "the lane did not retire");
+        assert!(outcome.lane_extra_fault(1).is_some(), "the refusal is kept");
+        assert!(present, "every byte landed");
+        outcome
+            .into_result()
+            .expect("a refused extra stream fails nothing");
+    }
+
+    /// A granted worker stops at its first fault. Over a node that refuses
+    /// every further stream it opens once, not again and again, and the drive
+    /// asks for no growth in its place.
+    #[tokio::test]
+    async fn a_granted_worker_stops_at_its_first_fault() {
+        let (_outcome, sources, granted, _present) = faulted_rest_drive(|s| {
+            s.stall_after(GROUP, std::time::Duration::from_millis(1500))
+                .refusing_opens_from(1, || anyhow::anyhow!("overloaded"))
+        })
+        .await;
+        assert_eq!(granted, 1, "the refusal asks for no second grant");
+        assert_eq!(
+            sources.get(1).expect("two lanes").opened_ranges().len(),
+            3,
+            "its own gap, the one refused extra, then the first worker's refused take"
+        );
+    }
+
+    /// A granted worker that is its lane's last live worker faults for the
+    /// lane: the first worker has already left the idle lane, so an extra
+    /// fault would leave the drive failed with no lane fault to name.
+    #[tokio::test]
+    async fn a_lanes_last_worker_faults_for_the_lane() {
+        let total = 64 * GROUP;
+        // A one-group gap for the first worker, and a long one for the worker
+        // the lane grows when it takes the first while the second waits.
+        let ranges = [(0, GROUP), (32 * GROUP, 16 * GROUP)];
+        let granted: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
+        let hook: &'static (dyn Fn(usize) -> usize + Send + Sync) =
+            Box::leak(Box::new(move |_| {
+                usize::from(
+                    granted
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                            (n < 1).then_some(n + 1)
+                        })
+                        .is_ok(),
+                )
+            }));
+        let release: &'static (dyn Fn() + Send + Sync) = &|| {};
+        let spec = LaneSpec {
+            grow: Some(LaneGrowth(hook)),
+            release: Some(LaneRelease(release)),
+            // Faults only the long gap, well after the short one is done.
+            tweak: |s| s.with_fault_after(4 * GROUP as usize, || anyhow::anyhow!("stream reset")),
+            ..LaneSpec::healthy(1)
+        };
+        let (outcome, _sources, _store, _plaintext) = lanes_drive(total, &ranges, &[spec]).await;
+        assert_eq!(
+            granted.load(Ordering::Relaxed),
+            1,
+            "the lane grew one worker"
+        );
+        assert!(
+            outcome.lane_fault(0).is_some(),
+            "the last worker's fault is the lane's, so the failed drive names it"
+        );
+        assert!(
+            outcome.into_result().is_err(),
+            "the long gap stayed missing"
         );
     }
 

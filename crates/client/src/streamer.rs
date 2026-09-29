@@ -41,7 +41,7 @@ use decdn_protocol::{Coverage, num_blocks};
 use crate::driver::{DriveConfig, PacingWait, WaitReason};
 use crate::pacer::{DownstreamFrontier, PULL_WINDOW_FLOOR, WindowPacer};
 use crate::scheduler::{
-    ConsumptionPacing, LaneLease, MultiSourceConfig, SourceLane, multi_source_fetch,
+    ConsumptionPacing, LaneLease, LaneWiden, MultiSourceConfig, SourceLane, multi_source_fetch,
 };
 use crate::sink::BlobCache;
 use crate::source::{BlobSource, Funder};
@@ -173,6 +173,11 @@ pub struct StreamCandidate<S> {
     /// lane stops ([`crate::LaneLease`]). Like `coverage`, set it only on a
     /// single-target fetch: the first target's lane releases it.
     pub lease: LaneLease,
+    /// How this candidate's lane adds a concurrent stream while a faulted
+    /// lane's remainder waits ([`SourceLane::widen`]), or `None` to stay at
+    /// one stream. Each granted stream is given back as its worker stops, so
+    /// it serves every target of a [`crate::Downloader`] alike.
+    pub widen: Option<LaneWiden>,
 }
 
 /// The range a [`Streamer`] opens first on a fresh `total_bytes`-byte blob
@@ -217,6 +222,7 @@ pub(crate) fn source_lanes<S>(
                 .unwrap_or_else(|| Coverage::full(num_blocks(total))),
             first_unit: c.first_unit.clone(),
             lease: Some(&c.lease),
+            widen: c.widen.as_ref(),
         })
         .collect()
 }
@@ -818,6 +824,7 @@ mod tests {
             coverage: None,
             first_unit: None,
             lease: crate::LaneLease::default(),
+            widen: None,
         }
     }
 
@@ -839,6 +846,27 @@ mod tests {
                 "each lane holds its own candidate's lease"
             );
         }
+    }
+
+    #[test]
+    fn a_candidates_widen_reaches_its_lane() {
+        // The scheduler grows a lane only through the widen hooks the caller
+        // put on its candidate; a candidate with none stays at one stream.
+        let led = Arc::new(PoolLedger::new(Cumulative::default()));
+        let mut grown = candidate((), Arc::clone(&led), 1);
+        grown.widen = Some(crate::LaneWiden::new(|most| most, || {}));
+        let candidates = vec![grown, candidate((), Arc::clone(&led), 2)];
+        let built = super::source_lanes(&candidates, 1024);
+        let [with, without] = built.as_slice() else {
+            unreachable!("source_lanes yields one lane per candidate");
+        };
+        assert!(
+            with.widen
+                .zip(candidates.first().and_then(|c| c.widen.as_ref()))
+                .is_some_and(|(lane, cand)| std::ptr::eq(lane, cand)),
+            "the lane holds its own candidate's widen hooks"
+        );
+        assert!(without.widen.is_none(), "no hooks, no growth");
     }
 
     #[test]

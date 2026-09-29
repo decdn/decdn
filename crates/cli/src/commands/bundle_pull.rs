@@ -1861,7 +1861,10 @@ impl LaneStreamCap {
 /// each worker stops ([`decdn_client::LaneRelease`]), so a lane that dies gives
 /// its permits back before the drive returns, and a lane that runs out of gaps
 /// keeps only the permit of its one idle worker. What is left returns when the
-/// grant drops.
+/// grant drops. A multi-source lane keeps its base permit as its lease and
+/// holds only the extra streams it grows ([`Self::extras`]): its fetch calls
+/// [`Self::grant`] for one permit at a time, only when a faulted lane's
+/// remainder has no idle taker ([`decdn_client::LaneWiden`]).
 struct LaneGrant {
     /// The provider's per-lane stream semaphore ([`LaneStreamCap`]).
     semaphore: Arc<tokio::sync::Semaphore>,
@@ -1872,6 +1875,17 @@ struct LaneGrant {
 }
 
 impl LaneGrant {
+    /// A grant holding nothing yet, for at most `room` permits: the extra
+    /// streams a lane whose base permit rides elsewhere (a
+    /// [`decdn_client::LaneLease`]) may take while it runs.
+    const fn extras(semaphore: Arc<tokio::sync::Semaphore>, room: usize) -> Self {
+        Self {
+            semaphore,
+            room,
+            held: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
     /// A grant holding `base`, for at most `room` permits in all.
     fn new(
         semaphore: Arc<tokio::sync::Semaphore>,
@@ -2078,16 +2092,36 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // opens a stream at once, so the cap must admit the set together.
         // Acquired in sorted `Address` order (deadlock free) and only after the
         // gate accepts, so a declined fetch takes none. Each permit rides on its
-        // provider's lane as a lease, which the scheduler drops when that lane
-        // stops, so a dead lane frees its provider for a sibling entry.
+        // provider's lane as a lease, which the scheduler drops when that lane's
+        // first worker stops, so a dead lane frees its provider for a sibling
+        // entry. The rest of the provider's cap is the lane's room to grow:
+        // when a faulted lane's remainder has no idle taker, the lane takes one
+        // more stream, but only a permit that is free now (`LaneGrant::grant`).
         let providers: Vec<Address> = admitted.iter().map(|c| c.eth_address).collect();
-        let leases = self
-            .lane_cap
-            .permit_set(&providers)
-            .await?
-            .into_iter()
-            .map(|(provider, permit)| (provider, decdn_client::LaneLease::new(permit)))
-            .collect();
+        let room = self.lane_cap.n.saturating_sub(1);
+        let mut holds = HashMap::with_capacity(providers.len());
+        for (provider, permit) in self.lane_cap.permit_set(&providers).await? {
+            let widen = if room > 0 {
+                let grant = Arc::new(LaneGrant::extras(
+                    self.lane_cap.semaphore(provider).await,
+                    room,
+                ));
+                let released = Arc::clone(&grant);
+                Some(decdn_client::LaneWiden::new(
+                    move |most| grant.grant(most),
+                    move || released.release_one(),
+                ))
+            } else {
+                None
+            };
+            holds.insert(
+                provider,
+                fetch::LaneHold {
+                    lease: decdn_client::LaneLease::new(permit),
+                    widen,
+                },
+            );
+        }
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
         let deps = self.drive_deps(max_blob_bytes)?;
         // The entry's per-file bar callback (ADR 039 fan-out reports one monotonic
@@ -2112,7 +2146,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             progress,
             Some(&self.open_lock),
             Some(&self.ledgers),
-            leases,
+            holds,
         )
         .await
         .map(|opt| opt.map(|_bytes| ()))
@@ -9023,6 +9057,41 @@ mod tests {
             4,
             "an extra release frees nothing"
         );
+    }
+
+    /// A multi-source lane's extras grant holds nothing at first, grows only
+    /// into the room its lease leaves, and gives each extra stream back as its
+    /// worker stops.
+    #[tokio::test]
+    async fn an_extras_grant_grows_beside_the_lease_and_gives_back() {
+        let p1 = Address::repeat_byte(1);
+        let cap = LaneStreamCap::new(3);
+        let semaphore = cap.semaphore(p1).await;
+        let lease = cap.permit(p1).await.unwrap();
+        let grant = LaneGrant::extras(Arc::clone(&semaphore), cap.n - 1);
+        assert_eq!(
+            semaphore.available_permits(),
+            2,
+            "the extras hold nothing yet"
+        );
+        assert_eq!(grant.grant(1), 1, "one extra stream");
+        assert_eq!(grant.grant(usize::MAX), 1, "the last free permit");
+        assert_eq!(
+            grant.grant(usize::MAX),
+            0,
+            "the room beside the lease is full"
+        );
+        assert_eq!(semaphore.available_permits(), 0);
+        grant.release_one();
+        assert_eq!(semaphore.available_permits(), 1, "one extra worker stopped");
+        drop(grant);
+        assert_eq!(
+            semaphore.available_permits(),
+            2,
+            "the grant held only extras"
+        );
+        drop(lease);
+        assert_eq!(semaphore.available_permits(), 3);
     }
 
     #[tokio::test]

@@ -149,6 +149,7 @@ pub struct decdn_client::driver::RangeSetOutcome
 impl decdn_client::driver::RangeSetOutcome
 pub const fn decdn_client::driver::RangeSetOutcome::drive_error(&self) -> core::option::Option<&anyhow::Error>
 pub fn decdn_client::driver::RangeSetOutcome::into_result(self) -> anyhow::Result<()>
+pub fn decdn_client::driver::RangeSetOutcome::lane_extra_fault(&self, usize) -> core::option::Option<&anyhow::Error>
 pub fn decdn_client::driver::RangeSetOutcome::lane_fault(&self, usize) -> core::option::Option<&anyhow::Error>
 pub const fn decdn_client::driver::RangeSetOutcome::succeeded(&self) -> bool
 pub struct decdn_client::driver::SharedPool<'a>
@@ -417,6 +418,7 @@ pub decdn_client::streamer::StreamCandidate::first_unit: core::option::Option<de
 pub decdn_client::streamer::StreamCandidate::lease: decdn_client::LaneLease
 pub decdn_client::streamer::StreamCandidate::ledger: alloc::sync::Arc<decdn_client::PoolLedger>
 pub decdn_client::streamer::StreamCandidate::source: S
+pub decdn_client::streamer::StreamCandidate::widen: core::option::Option<decdn_client::LaneWiden>
 impl<S> core::fmt::Debug for decdn_client::streamer::StreamCandidate<S>
 pub fn decdn_client::streamer::StreamCandidate<S>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::streamer::StreamDrive<'a>
@@ -576,6 +578,11 @@ pub fn decdn_client::ledgers::LaneLedgers::total_committed(&self) -> alloy_primi
 pub struct decdn_client::LaneRelease<'a>(pub &'a (dyn core::ops::function::Fn() + core::marker::Send + core::marker::Sync + 'a))
 impl core::fmt::Debug for decdn_client::driver::LaneRelease<'_>
 pub fn decdn_client::driver::LaneRelease<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::LaneWiden
+impl decdn_client::LaneWiden
+pub fn decdn_client::LaneWiden::new(impl core::ops::function::Fn(usize) -> usize + core::marker::Send + core::marker::Sync + 'static, impl core::ops::function::Fn() + core::marker::Send + core::marker::Sync + 'static) -> Self
+impl core::fmt::Debug for decdn_client::LaneWiden
+pub fn decdn_client::LaneWiden::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::LegNoProgress
 pub decdn_client::LegNoProgress::delivered_frontier: u64
 pub decdn_client::LegNoProgress::len: u64
@@ -749,6 +756,7 @@ pub struct decdn_client::RangeSetOutcome
 impl decdn_client::driver::RangeSetOutcome
 pub const fn decdn_client::driver::RangeSetOutcome::drive_error(&self) -> core::option::Option<&anyhow::Error>
 pub fn decdn_client::driver::RangeSetOutcome::into_result(self) -> anyhow::Result<()>
+pub fn decdn_client::driver::RangeSetOutcome::lane_extra_fault(&self, usize) -> core::option::Option<&anyhow::Error>
 pub fn decdn_client::driver::RangeSetOutcome::lane_fault(&self, usize) -> core::option::Option<&anyhow::Error>
 pub const fn decdn_client::driver::RangeSetOutcome::succeeded(&self) -> bool
 pub struct decdn_client::RateAboveCeiling
@@ -794,6 +802,7 @@ pub decdn_client::SourceLane::first_unit: core::option::Option<decdn_bao_range::
 pub decdn_client::SourceLane::lease: core::option::Option<&'a decdn_client::LaneLease>
 pub decdn_client::SourceLane::ledger: alloc::sync::Arc<decdn_client::PoolLedger>
 pub decdn_client::SourceLane::source: &'a S
+pub decdn_client::SourceLane::widen: core::option::Option<&'a decdn_client::LaneWiden>
 impl<S> core::fmt::Debug for decdn_client::SourceLane<'_, S>
 pub fn decdn_client::SourceLane<'_, S>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::StoreConfig
@@ -813,6 +822,7 @@ pub decdn_client::StreamCandidate::first_unit: core::option::Option<decdn_bao_ra
 pub decdn_client::StreamCandidate::lease: decdn_client::LaneLease
 pub decdn_client::StreamCandidate::ledger: alloc::sync::Arc<decdn_client::PoolLedger>
 pub decdn_client::StreamCandidate::source: S
+pub decdn_client::StreamCandidate::widen: core::option::Option<decdn_client::LaneWiden>
 impl<S> core::fmt::Debug for decdn_client::streamer::StreamCandidate<S>
 pub fn decdn_client::streamer::StreamCandidate<S>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::StreamDrive<'a>

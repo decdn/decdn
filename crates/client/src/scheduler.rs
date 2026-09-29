@@ -3,7 +3,7 @@
 //! into ONE shared [`IngestStore`], assembling a
 //! byte-identical blob.
 //!
-//! One worker future per source drives [`fill_gap`]
+//! One worker future per lane drives [`fill_gap`]
 //! over the request's gap-set. The gap-set is spread across sources by
 //! discovery-block coverage ([`crate::coverage_plan::spread_segments`]): each
 //! block is assigned to one covering source, rarest-cover-first, into
@@ -15,14 +15,23 @@
 //! range it also covers ([`steal_split`]), so a fast source keeps helping a
 //! slow one — but never a range outside its own coverage.
 //!
-//! # Lane correctness — one unit per source
+//! # Workers — one unit per worker, one worker per lane by default
 //!
 //! Each worker holds EXACTLY ONE outstanding range at a time (structural: the
 //! worker loop drives one `fill_gap` to completion before it picks the next
-//! range). Two concurrent units to the same node would share one
-//! `(signer, provider)` payment lane and reintroduce the concurrent-same-lane
-//! voucher hazard bundle pull serializes against — so parallelism comes only
-//! from having many sources, never from stacking one source.
+//! range). A lane runs one worker, so parallelism comes from having many
+//! sources. The one exception is a faulted lane's remainder: when no idle
+//! worker can take it, the live lanes that cover it are asked, in lane order,
+//! for one more worker each through their widen hooks ([`SourceLane::widen`])
+//! until it has a taker, so the remainder does not wait behind a busy lane's
+//! whole range and end the fetch in a serial tail. Each such worker opens one
+//! more concurrent stream to its lane's provider. Several streams on
+//! one `(signer, provider)` lane share its one voucher ledger, which serializes
+//! their issuance (ADR 003 § Concurrent Streams), so an extra worker is safe on
+//! the payment side. A lane whose first worker faults retires: its other
+//! workers finish the range they hold and take no new one. An extra worker
+//! that faults only re-queues its range and stops, because its fault is most
+//! often a refusal of the additional stream, not a fault of the lane.
 //!
 //! # Scope
 //!
@@ -31,7 +40,7 @@
 //!
 //! # Cancellation — closing the double-pay
 //!
-//! A worker's `fill_gap` runs under a [`tokio::select!`] against a per-source
+//! A worker's `fill_gap` runs under a [`tokio::select!`] against a per-worker
 //! `CancelHandle` and a progress-relative watchdog, so it can be interrupted
 //! mid-fetch. Because [`crate::ClientRangedStore::ingest_stream`] durably
 //! checkpoints verified groups every `INGEST_CHECKPOINT_BYTES` as it streams,
@@ -57,8 +66,9 @@
 //!   RETRYABLE `Err` ([`crate::retry_disposition`] ==
 //!   `RetryElsewhere`: a stall, a transport reset, a node-specific refusal), has
 //!   the UN-fetched remainder of its range re-queued to `pending` for a DIFFERENT
-//!   source, and stops taking work. Verified bytes already stored are never
-//!   refetched.
+//!   source, and stops taking work. On an extra worker only that worker stops,
+//!   and its lane's first worker may take the range. Verified bytes already
+//!   stored are never refetched.
 //!
 //! # Terminal faults — no pointless reassignment
 //!
@@ -144,21 +154,78 @@ pub struct SourceLane<'a, S> {
     /// inside the still-missing request, sits inside this lane's coverage, and
     /// overlaps no earlier lane's reserved first unit.
     pub first_unit: Option<AlignedRange>,
-    /// What the lane holds while it takes work, released when its worker
-    /// stops ([`LaneLease`]), or `None`.
+    /// What the lane holds while its first worker takes work, released when
+    /// that worker stops ([`LaneLease`]), or `None`.
     pub lease: Option<&'a LaneLease>,
+    /// How the lane adds a worker while the fetch runs ([`LaneWiden`]), or
+    /// `None` to stay at one. When a lane faults and no idle worker will take
+    /// the remainder it re-queued, the scheduler asks the live lanes that
+    /// cover it, in lane order, for one more worker each until the remainder
+    /// has a taker. Each granted worker opens one more concurrent stream to
+    /// its lane's provider.
+    pub widen: Option<&'a LaneWiden>,
 }
 
-/// A resource one source lane holds while it takes work, such as the caller's
-/// stream permit for the lane's provider. The scheduler drops it when the
-/// lane's worker stops — on a fault, on a drained queue, or when the fetch
-/// ends — so a dead lane holds nothing for the rest of the fetch. A lease is
+/// How one lane adds workers while a multi-source fetch runs
+/// ([`SourceLane::widen`]): a `grow` hook that grants extra workers and a
+/// `release` hook that gives one back.
+///
+/// The scheduler relies on three rules. `grow` never waits: it grants only
+/// what it can grant now, such as a stream permit that is free. `grow` never
+/// grants more than it is asked for. And the scheduler calls `release` exactly
+/// once for each worker `grow` granted: when that worker stops, when a `stop`
+/// or a terminal fault drops it unfinished, and when the fetch ends before the
+/// worker starts.
+pub struct LaneWiden {
+    /// Grants up to the given number of extra workers now, without waiting,
+    /// and returns how many it granted.
+    grow: Box<dyn Fn(usize) -> usize + Send + Sync>,
+    /// Gives back one granted worker's hold.
+    release: Box<dyn Fn() + Send + Sync>,
+}
+
+impl LaneWiden {
+    /// A pair of `grow`, which grants up to the given number of extra workers
+    /// now and returns how many, and `release`, which gives one back. See the
+    /// type's rules for both.
+    pub fn new(
+        grow: impl Fn(usize) -> usize + Send + Sync + 'static,
+        release: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            grow: Box::new(grow),
+            release: Box::new(release),
+        }
+    }
+
+    /// Ask for up to `most` extra workers; returns how many were granted, at
+    /// most `most`.
+    pub(crate) fn grow(&self, most: usize) -> usize {
+        (self.grow)(most).min(most)
+    }
+
+    /// Give back one granted worker's hold.
+    pub(crate) fn release(&self) {
+        (self.release)();
+    }
+}
+
+impl std::fmt::Debug for LaneWiden {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LaneWiden")
+    }
+}
+
+/// A resource one source lane holds while its first worker takes work, such as
+/// the caller's stream permit for the lane's provider. The scheduler drops it
+/// when that worker stops — on a fault, on a drained queue, or when the fetch
+/// ends — so a dead lane holds no lease for the rest of the fetch. A lease is
 /// released once: a lane that takes part in a later fetch holds nothing.
 #[derive(Default)]
 pub struct LaneLease(Mutex<Option<Box<dyn Send + Sync>>>);
 
 impl LaneLease {
-    /// A lease that holds `held` until the lane's worker stops.
+    /// A lease that holds `held` until the lane's first worker stops.
     pub fn new(held: impl Send + Sync + 'static) -> Self {
         Self(Mutex::new(Some(Box::new(held))))
     }
@@ -174,14 +241,22 @@ impl LaneLease {
     }
 }
 
-/// Releases a lane's [`LaneLease`] when it drops: at the end of the lane's
-/// worker future, whether that future finished or was dropped unfinished.
-struct ReleaseOnDrop<'a>(Option<&'a LaneLease>);
+/// What one worker holds for its lane, given back when it drops: at the end of
+/// the worker's future, whether that future finished or was dropped
+/// unfinished, including before its first poll.
+enum WorkerHold<'a> {
+    /// A lane's first worker holds the lane's [`LaneLease`], if any.
+    Lease(Option<&'a LaneLease>),
+    /// A granted worker holds one unit of its lane's [`LaneWiden`].
+    Grant(Option<&'a LaneWiden>),
+}
 
-impl Drop for ReleaseOnDrop<'_> {
+impl Drop for WorkerHold<'_> {
     fn drop(&mut self) {
-        if let Some(lease) = self.0 {
-            lease.release();
+        match self {
+            Self::Lease(Some(lease)) => lease.release(),
+            Self::Grant(Some(widen)) => widen.release(),
+            Self::Lease(None) | Self::Grant(None) => {}
         }
     }
 }
@@ -212,7 +287,7 @@ struct Picked {
     victim: Option<(usize, u64)>,
 }
 
-/// Per-source interrupt: an edge-triggered wakeup ([`Notify`]) plus a `flag`
+/// Per-worker interrupt: an edge-triggered wakeup ([`Notify`]) plus a `flag`
 /// that says the wakeup means "cancel", not a stale permit. The stealer sets
 /// `flag` and wakes the victim under the `Work` lock; the victim clears it on
 /// its next `Work::pick`, also under the lock, so the two never race.
@@ -323,9 +398,11 @@ enum UnitOutcome {
     /// A steal claimed this source's tail — re-queue the trimmed remainder and
     /// stay live (pick again).
     Cancelled,
-    /// The source stalled or hit a RETRYABLE fault — re-queue the remainder for a
-    /// DIFFERENT source and stop taking work. A TERMINAL fault does not reach
-    /// here: the worker returns its typed error directly, aborting the fetch.
+    /// The source stalled or hit a RETRYABLE fault — re-queue the remainder and
+    /// stop taking work. A lane's first worker also retires the lane, so the
+    /// remainder goes to a DIFFERENT source; an extra worker leaves its lane
+    /// live ([`hand_off_faulted`]). A TERMINAL fault does not reach here: the
+    /// worker returns its typed error directly, aborting the fetch.
     ///
     /// Carries the cause so the fetch can name it: `Some(e)` for a retryable
     /// `fill_gap` error, `None` for a watchdog stall, which has no error by
@@ -337,9 +414,9 @@ enum UnitOutcome {
     Faulted(Option<anyhow::Error>),
 }
 
-/// Why one lane stopped taking work, kept for the diagnosis a failed fetch
-/// reports. `provider` is the lane's payee address — the only stable identity
-/// the scheduler holds for a source.
+/// Why one lane stopped taking work (its first worker faulted), kept for the
+/// diagnosis a failed fetch reports. `provider` is the lane's payee address —
+/// the only stable identity the scheduler holds for a source.
 struct LaneFault {
     provider: Option<Address>,
     /// `None` for a watchdog stall (no error exists), `Some` for a retryable fault.
@@ -378,10 +455,15 @@ pub struct MultiSourceConfig {
 }
 
 /// Shared work-state, guarded by one [`AsyncMutex`]. `pending` seeds with the
-/// coverage-planned initial segments; `in_flight[i]` is source `i`'s
+/// coverage-planned initial segments; `in_flight[i]` is worker `i`'s
 /// currently-owned range as `(start, len)` (`None` = idle), which is both the
-/// tail-steal remaining-set and the "at most one source owns any range"
+/// tail-steal remaining-set and the "at most one worker owns any range"
 /// ledger.
+///
+/// Every per-worker vector is indexed by worker slot. Slot `i` below the lane
+/// count is lane `i`'s first worker; a slot past it is an extra worker a
+/// lane's growth hook granted ([`Work::add_worker`]), and `lane_of` names its
+/// lane.
 struct Work {
     /// Segments not yet claimed by any worker (drains as workers pick). A
     /// worker only ever pops an entry its own [`Coverage`] includes (#1506):
@@ -389,17 +471,18 @@ struct Work {
     /// dequeuing it, so an item stays here until a covering worker is free to
     /// take it.
     pending: VecDeque<AlignedRange>,
-    /// Per-source range reserved as that source's first unit
-    /// ([`SourceLane::first_unit`]), taken on its first [`Work::pick`] before
-    /// anything in `pending`. No other worker picks or steals it until then.
+    /// Per-worker range reserved as the lane's first unit
+    /// ([`SourceLane::first_unit`]), set only on a lane's first worker and
+    /// taken on its first [`Work::pick`] before anything in `pending`. No other
+    /// worker picks or steals it until then.
     first: Vec<Option<AlignedRange>>,
-    /// Per-source current range, `None` when the source holds nothing.
+    /// Per-worker current range, `None` when the worker holds nothing.
     in_flight: Vec<Option<(u64, u64)>>,
-    /// Per-source interrupt handles, indexed like `in_flight`.
+    /// Per-worker interrupt handles, indexed like `in_flight`.
     /// [`Work::cancel_victim`] signals `cancel[victim]` after a steal; the
     /// victim clears it on its next `pick`.
     cancel: Vec<Arc<CancelHandle>>,
-    /// Per-source count of units started, indexed like `in_flight`. Every
+    /// Per-worker count of units started, indexed like `in_flight`. Every
     /// [`Work::pick`] by worker `i` bumps `units[i]`, so a number names one
     /// unit. A steal only trims its victim's slot and never bumps it, so a
     /// victim trimmed by two stealers is still on the same unit.
@@ -408,6 +491,11 @@ struct Work {
     /// [`Work::retire`]) — never coming back to `pick` again, whether because
     /// it ran out of coverable work or because it faulted.
     alive: Vec<bool>,
+    /// Each worker's lane, indexed like `in_flight`.
+    lane_of: Vec<usize>,
+    /// `retired[lane]` is `true` once the lane's first worker faulted. The
+    /// lane's other workers finish the range they hold and take no new one.
+    retired: Vec<bool>,
     /// Pick the lowest-offset pending segment first, not the oldest. Set for a
     /// consumption-paced fetch ([`ConsumptionPacing`]): the consumer reads in
     /// offset order, so the earliest missing range is always the one it waits
@@ -443,9 +531,9 @@ impl Work {
     /// re-steal the same tail. Records the choice in `in_flight[i]`. A steal
     /// does NOT cancel the victim here: the caller does that with
     /// [`Work::cancel_victim`] once it knows the tail still has missing bytes.
-    /// `Ok(None)` means there is nothing this worker can start right now — it
-    /// parks until a peer changes the work state, and exits only once
-    /// [`Work::all_idle`] holds.
+    /// `Ok(None)` means there is nothing this worker can start right now. A
+    /// lane's first worker parks until a peer changes the work state, and
+    /// exits only once [`Work::all_idle`] holds; an extra worker exits.
     ///
     /// # Errors
     ///
@@ -609,8 +697,8 @@ impl Work {
 
     /// Mark worker `i` as permanently gone — it will never call `pick` again,
     /// whether it simply ran out of coverable work or it faulted on something
-    /// ELSE and dropped out mid-fetch — and drop any `pending` entry no other
-    /// still-alive worker's `coverage` includes.
+    /// ELSE and dropped out mid-fetch — and drop any `pending` entry that no
+    /// alive worker of a live (unretired) lane covers.
     ///
     /// Coverage partitions the source set (#1506), so a `pending` entry can
     /// have exactly one, a few, or NO covering worker left once one exits.
@@ -633,15 +721,71 @@ impl Work {
         if let Some(unit) = self.first.get_mut(i).and_then(Option::take) {
             self.pending.push_back(unit);
         }
-        let alive = self.alive.clone();
+        let takers: Vec<&Coverage> = self
+            .alive
+            .iter()
+            .zip(&self.lane_of)
+            .filter(|&(&is_alive, &lane)| is_alive && !self.lane_retired(lane))
+            .filter_map(|(_, &lane)| coverage.get(lane))
+            .collect();
         self.pending.retain(|seg| {
-            alive.iter().enumerate().any(|(j, &is_alive)| {
-                is_alive
-                    && coverage.get(j).is_some_and(|c| {
-                        covers_byte_range(c, seg.fetch_start(), seg.fetch_len(), total_bytes)
-                    })
-            })
+            takers
+                .iter()
+                .any(|c| covers_byte_range(c, seg.fetch_start(), seg.fetch_len(), total_bytes))
         });
+    }
+
+    /// Whether `lane` has retired on a fault. An unknown lane reads as retired,
+    /// so a wiring bug stops a worker rather than letting it take work.
+    fn lane_retired(&self, lane: usize) -> bool {
+        self.retired.get(lane).is_none_or(|&r| r)
+    }
+
+    /// Add a slot for an extra worker of `lane` and return its index.
+    fn add_worker(&mut self, lane: usize) -> usize {
+        let slot = self.in_flight.len();
+        self.in_flight.push(None);
+        self.first.push(None);
+        self.cancel.push(Arc::new(CancelHandle::new()));
+        self.units.push(0);
+        self.alive.push(true);
+        self.lane_of.push(lane);
+        slot
+    }
+
+    /// Who can grow for the pending ranges no idle worker will take: the lanes
+    /// that may be asked for one more worker each, in lane order, and how many
+    /// ranges want a taker. An idle worker is a live slot of a live lane that
+    /// holds no range and covers a pending range: it takes one on its next
+    /// wake. A lane may be asked only while it is live, has a growth hook
+    /// (`can_grow`), and covers a pending range.
+    fn growth_wanted(
+        &self,
+        coverage: &[Coverage],
+        total_bytes: u64,
+        can_grow: impl Fn(usize) -> bool,
+    ) -> (Vec<usize>, usize) {
+        let covers_pending = |lane: usize| {
+            coverage.get(lane).is_some_and(|c| {
+                self.pending.iter().any(|seg| {
+                    covers_byte_range(c, seg.fetch_start(), seg.fetch_len(), total_bytes)
+                })
+            })
+        };
+        let idle = self
+            .in_flight
+            .iter()
+            .zip(&self.alive)
+            .zip(&self.lane_of)
+            .filter(|&((slot, &is_alive), &lane)| {
+                slot.is_none() && is_alive && !self.lane_retired(lane) && covers_pending(lane)
+            })
+            .count();
+        let unclaimed = self.pending.len().saturating_sub(idle);
+        let lanes = (0..self.retired.len())
+            .filter(|&lane| !self.lane_retired(lane) && can_grow(lane) && covers_pending(lane))
+            .collect();
+        (lanes, unclaimed)
     }
 }
 
@@ -672,6 +816,40 @@ where
     for (s, l) in remainder {
         w.pending.push_back(align_range(s, l, total_bytes)?);
     }
+    Ok(())
+}
+
+/// Hand off the range of worker slot `i` of `lane` after it faulted: re-queue
+/// what the range still misses ([`requeue_missing`]).
+///
+/// A lane's first worker also retires the lane and asks the live lanes to grow
+/// for the remainder ([`Growth::request`]). The lane is retired first, so the
+/// request neither asks it nor counts its idle workers as takers.
+///
+/// An `extra` worker retires nothing and asks for no growth. Its fault is most
+/// often a refusal of the additional stream (the node is busy, or the signer's
+/// live cap is full), which says nothing about the lane's first stream. The
+/// lane's first worker, or another live worker that covers the range, takes
+/// it once its own range ends, and a request here could grant the same
+/// refused stream again.
+async fn hand_off_faulted<St>(
+    store: &St,
+    work: &AsyncMutex<Work>,
+    (i, lane, extra): (usize, usize, bool),
+    growth: &Growth<'_>,
+    (coverage, hash): (&[Coverage], [u8; 32]),
+) -> anyhow::Result<()>
+where
+    St: IngestStore,
+{
+    if extra {
+        return requeue_missing(store, work, i).await;
+    }
+    if let Some(retired) = work.lock().await.retired.get_mut(lane) {
+        *retired = true;
+    }
+    requeue_missing(store, work, i).await?;
+    growth.request(&*work.lock().await, coverage, store.total_bytes(), hash);
     Ok(())
 }
 
@@ -747,18 +925,168 @@ async fn yield_to_front(
     }
 }
 
-/// One worker future per source: loop picking a range and driving `fill_gap`
-/// over it, under a cancel/stall [`tokio::select!`], until the fan-out has no
-/// work left or the source is dropped. Exactly one outstanding range at a time
-/// (the loop drives one `fill_gap` to a terminal outcome before the next pick) —
-/// the one-unit-per-source lane invariant, structurally.
+/// Log, where it happens, that a worker of `fault`'s lane faulted while it
+/// fetched `[offset, offset+len)` of `hash`, having verified `received` bytes
+/// of it.
 ///
-/// A worker that cannot pick PARKS on `progress` rather than retiring. Nothing
-/// to pick is the routine end-of-fetch shape — every in-flight range is below
-/// [`crate::segment::MIN_SPLIT_SIZE`], so no split is worth a fresh stream — and
-/// a worker that exited there is gone when a peer faults moments later and
-/// re-queues its remainder, stranding recoverable work at healthy, already-paid
-/// lanes. It exits only once [`Work::all_idle`] holds, or once IT faults.
+/// A lane's first worker warns and keeps the fault in `faults` for the report
+/// of a fetch that runs out of lanes. A fetch that recovers reports no lane
+/// fault, so the warning is the only record of the fault on that path.
+///
+/// An `extra` worker's fault is most often a refusal of the additional stream,
+/// which is routine: it logs at debug when nothing was verified, and at warn
+/// otherwise. It is not kept, because it did not stop the lane and must not
+/// become the cause a failed fetch reports.
+fn record_lane_fault(
+    faults: &Mutex<Vec<LaneFault>>,
+    (fault, extra): (LaneFault, bool),
+    hash: [u8; 32],
+    (offset, len, received): (u64, u64, u64),
+    unit_deadline: Duration,
+) {
+    let cause = fault.err.as_ref().map_or_else(
+        || format!("no verified progress within {unit_deadline:?}"),
+        |e| format!("{e:#}"),
+    );
+    let provider = fault
+        .provider
+        .map_or_else(|| "unknown".to_string(), |p| p.to_string());
+    let hash_hex = blake3::Hash::from_bytes(hash).to_hex();
+    if !extra {
+        tracing::warn!(
+            provider,
+            hash = %hash_hex,
+            offset,
+            len,
+            received,
+            error = %cause,
+            "a lane faulted mid-fetch; re-queueing its remainder for another lane"
+        );
+        faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(fault);
+    } else if received > 0 {
+        tracing::warn!(
+            provider,
+            hash = %hash_hex,
+            offset,
+            len,
+            received,
+            error = %cause,
+            "an additional stream of a lane faulted mid-fetch; re-queueing its remainder"
+        );
+    } else {
+        tracing::debug!(
+            provider,
+            hash = %hash_hex,
+            offset,
+            len,
+            error = %cause,
+            "an additional stream of a lane faulted before any verified byte; re-queueing its \
+             range"
+        );
+    }
+}
+
+/// How a fetch grows its lanes while a faulted lane's remainder waits: each
+/// lane's [`LaneWiden`], indexed like the lanes, and where a granted worker is
+/// recorded for the join loop to start.
+struct Growth<'g> {
+    /// Each lane's widen hooks, or `None` for a lane that stays at one worker.
+    widen: &'g [Option<&'g LaneWiden>],
+    /// One entry per granted worker, naming its lane, for the join loop to
+    /// start. A lane can appear more than once across requests.
+    grown: &'g Mutex<Vec<usize>>,
+    /// Wakes the join loop once a grant lands in `grown`.
+    wake: &'g Notify,
+}
+
+impl Growth<'_> {
+    /// `lane`'s widen hooks, or `None` for a lane that stays at one worker.
+    fn hooks(&self, lane: usize) -> Option<&LaneWiden> {
+        self.widen.get(lane).copied().flatten()
+    }
+
+    /// Ask the live lanes that can grow, in lane order, for one more worker
+    /// each until every pending range no idle worker will take has a taker
+    /// ([`Work::growth_wanted`]), and record each grant for the join loop. A
+    /// lane that grants none is passed over for the next one. The hooks never
+    /// wait, so this runs under the `Work` lock.
+    ///
+    /// When ranges are still left without a taker, it says so at info: they
+    /// wait for a busy worker to finish its whole range, the serial tail this
+    /// growth exists to avoid.
+    fn request(&self, work: &Work, coverage: &[Coverage], total_bytes: u64, hash: [u8; 32]) {
+        let can_grow = |lane: usize| self.hooks(lane).is_some();
+        let (asked, unclaimed) = work.growth_wanted(coverage, total_bytes, can_grow);
+        let mut granted = Vec::new();
+        for lane in asked.iter().copied() {
+            if granted.len() >= unclaimed {
+                break;
+            }
+            if self.hooks(lane).is_some_and(|w| w.grow(1) > 0) {
+                granted.push(lane);
+            }
+        }
+        if granted.len() < unclaimed {
+            tracing::info!(
+                hash = %blake3::Hash::from_bytes(hash).to_hex(),
+                waiting = unclaimed - granted.len(),
+                asked = ?asked,
+                "a faulted lane's remainder waits for a busy lane: no live lane could take one \
+                 more stream"
+            );
+        }
+        if granted.is_empty() {
+            return;
+        }
+        tracing::debug!(lanes = ?granted, "growing lanes for a faulted lane's remainder");
+        self.grown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(granted);
+        self.wake.notify_one();
+    }
+
+    /// Take the grants recorded since the last take, one lane index per
+    /// granted worker, for the join loop to start.
+    fn take_granted(&self) -> Vec<usize> {
+        std::mem::take(
+            &mut *self
+                .grown
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Give back each grant whose worker never started, because the fetch
+    /// ended first.
+    fn release_unstarted(&self) {
+        for lane in self.take_granted() {
+            if let Some(widen) = self.hooks(lane) {
+                widen.release();
+            }
+        }
+    }
+}
+
+/// One worker future: loop picking a range and driving `fill_gap` over it,
+/// under a cancel/stall [`tokio::select!`], until the fan-out has no work left
+/// or the worker's lane is dropped. Exactly one outstanding range per worker
+/// (the loop drives one `fill_gap` to a terminal outcome before the next pick).
+/// Slot `i` is the worker's own slot in [`Work`]; `lane` is the lane it pays and
+/// fetches through.
+///
+/// A lane's first worker that cannot pick PARKS on `progress` rather than
+/// retiring. Nothing to pick is the routine end-of-fetch shape — every
+/// in-flight range is below [`crate::segment::MIN_SPLIT_SIZE`], so no split is
+/// worth a fresh stream — and a worker that exited there is gone when a peer
+/// faults moments later and re-queues its remainder, stranding recoverable work
+/// at healthy, already-paid lanes. It exits only once [`Work::all_idle`] holds,
+/// or once it faults, which retires its lane. An `extra` worker, which a
+/// growth hook granted, exits as soon as it cannot pick or faults, so its
+/// stream goes back to the caller.
 #[allow(clippy::too_many_arguments)]
 // One pick -> drive -> classify loop. The fault classification and the three
 // unit outcomes each justify a money-relevant decision against the loop state
@@ -766,6 +1094,8 @@ async fn yield_to_front(
 #[allow(clippy::too_many_lines)]
 async fn run_worker<St, S, P, F>(
     i: usize,
+    lane: usize,
+    extra: bool,
     store: &St,
     source: &S,
     pacer: &P,
@@ -784,6 +1114,7 @@ async fn run_worker<St, S, P, F>(
     pool: &SharedPool<'_>,
     lane_coverage: &[Coverage],
     pacing: Option<&ConsumptionPacing<'_>>,
+    growth: &Growth<'_>,
 ) -> anyhow::Result<()>
 where
     St: IngestStore,
@@ -793,8 +1124,8 @@ where
 {
     // This worker's own coverage — the predicate `Work::pick` filters both its
     // pending-pop and its steal candidates against (#1506).
-    let Some(my_coverage) = lane_coverage.get(i) else {
-        anyhow::bail!("worker index {i} out of range for lane coverage");
+    let Some(my_coverage) = lane_coverage.get(lane) else {
+        anyhow::bail!("lane index {lane} out of range for lane coverage");
     };
     // This worker's cancel handle, cloned once so `cancelled` can await it
     // OUTSIDE the `Work` lock while a peer's `Work::cancel_victim` signals it
@@ -831,16 +1162,21 @@ where
         parked.as_mut().enable();
 
         // Tiny critical section: pick a range, then DROP the guard before the
-        // `fill_gap` await (the guard does not cross the await point).
+        // `fill_gap` await (the guard does not cross the await point). A lane
+        // that faulted takes no new range.
         let picked = {
             let mut w = work.lock().await;
+            if w.lane_retired(lane) {
+                break;
+            }
             w.pick(i, total_bytes, my_coverage)?
         };
         let Some(Picked { range, victim }) = picked else {
             // Nothing to start right now. Exit only when no peer holds anything
             // and nothing is queued; otherwise park — a peer's range is still
-            // draining toward a requeue or a splittable size.
-            if work.lock().await.all_idle() {
+            // draining toward a requeue or a splittable size. An extra worker
+            // exits here: its lane's first worker stays for later work.
+            if extra || work.lock().await.all_idle() {
                 break;
             }
             parked.await;
@@ -880,7 +1216,9 @@ where
         // leaves the store's checkpointed prefix intact. `in_flight[i]` stays the
         // whole picked range so a peer's steal-trim and this worker's
         // `requeue_missing` (which recomputes the whole range's remainder) agree.
-        let mut terminal: Option<UnitOutcome> = None;
+        // The unit's outcome when a gap did not complete, with that gap and the
+        // bytes it verified before it stopped.
+        let mut terminal: Option<(UnitOutcome, u64, u64, u64)> = None;
         for (g_start, g_len) in gaps {
             let verified = AtomicU64::new(0);
             let outcome = {
@@ -932,13 +1270,13 @@ where
                         //   still tries a cheaper provider on a budget refusal
                         //   (#1174).
                         //
-                        // `try_join_all` cancels the peer workers, so the failed
+                        // The join drops the peer workers, so the failed
                         // source's range is NOT reassigned. A RETRYABLE fault (a
                         // stall, a transport reset, a node-specific refusal, or a
                         // single-source-style budget refusal) faults this one
-                        // source: its remainder is re-queued for a DIFFERENT lane,
-                        // and the error is KEPT so a fetch that runs out of lanes
-                        // can say what each one did.
+                        // worker: its remainder is re-queued (`hand_off_faulted`),
+                        // and a first worker's error is KEPT so a fetch that runs
+                        // out of lanes can say what each one did.
                         Err(e) => {
                             if shared_pool_disposition(&e) == RetryDisposition::Terminal {
                                 return Err(e);
@@ -969,7 +1307,7 @@ where
             match outcome {
                 UnitOutcome::Completed => {}
                 other => {
-                    terminal = Some(other);
+                    terminal = Some((other, g_start, g_len, verified.load(Ordering::Relaxed)));
                     break;
                 }
             }
@@ -990,21 +1328,26 @@ where
             // client-favorable gap identical to the existing single-source
             // cross-invocation resume, deliberately NOT the single-source
             // same-leg re-bill contract.
-            Some(UnitOutcome::Cancelled) => {
+            Some((UnitOutcome::Cancelled, ..)) => {
                 requeue_missing(store, work, i).await?;
                 wake();
             }
-            // Stalled/faulted: record why, re-queue for a different source, then
-            // stop taking work.
-            Some(UnitOutcome::Faulted(err)) => {
-                if let Ok(mut f) = faults.lock() {
-                    f.push(LaneFault { provider, err });
-                }
-                requeue_missing(store, work, i).await?;
+            // Stalled/faulted: say so now, hand the remainder off
+            // (`hand_off_faulted`), then stop taking work.
+            Some((UnitOutcome::Faulted(err), offset, len, received)) => {
+                record_lane_fault(
+                    faults,
+                    (LaneFault { provider, err }, extra),
+                    hash,
+                    (offset, len, received),
+                    unit_deadline,
+                );
+                hand_off_faulted(store, work, (i, lane, extra), growth, (lane_coverage, hash))
+                    .await?;
                 wake();
                 break;
             }
-            Some(UnitOutcome::Completed) => {}
+            Some((UnitOutcome::Completed, ..)) => {}
         }
     }
     // This worker is leaving the set: retire it BEFORE the final wake, so a
@@ -1094,8 +1437,10 @@ fn reserve_first_units<S>(
 
 /// Fetch `hash`'s request `[offset, offset+len)` by fanning it out across
 /// `lanes`, all writing into the one shared `store` (spec §5.3). Splits the
-/// gap-set into bao-aligned segments, drives one worker per lane, and lets a
-/// freed lane steal the tail of the largest range still in flight.
+/// gap-set into bao-aligned segments, drives one worker per lane (plus the
+/// extra workers a lane's growth hook grants while a faulted lane's remainder
+/// waits), and lets a freed worker steal the tail of the largest range still
+/// in flight.
 ///
 /// `pacing` bounds the fetch to a read-ahead window ahead of a live consumer
 /// (the `Streamer`, #1848): `None` is the eager unbounded fan-out every other
@@ -1106,10 +1451,12 @@ fn reserve_first_units<S>(
 /// Each [`SourceLane`] pays with its OWN `(ctx, ledger)`: a voucher is scoped to
 /// one on-chain provider and one `(signer, provider)` watermark, so lane `i`'s
 /// worker signs against `lanes[i].ctx.provider` and advances `lanes[i].ledger`
-/// alone. Two lanes on the SAME provider would be two concurrent voucher streams
-/// on one `(signer, provider)` watermark — the hazard the one-unit-per-source
-/// rule exists to prevent — so the set is checked for duplicate providers here,
-/// at the boundary, rather than assumed from the caller's admission policy.
+/// alone. Two lanes on the SAME provider would be two ledgers for one
+/// `(signer, provider)` watermark, each signing cumulatives the other never
+/// sees, so they regress each other. The set is therefore checked for duplicate
+/// providers here, at the boundary, rather than assumed from the caller's
+/// admission policy. Several workers of ONE lane share its one ledger, which
+/// serializes their issuance, so a lane's growth is safe.
 ///
 /// One shared pool DEPOSIT backs the whole set, and every lane draws through one
 /// shared view of it. `ledgers` picks which view: `None` subtracts
@@ -1124,10 +1471,10 @@ fn reserve_first_units<S>(
 /// to its deposit), exactly as on the single-source path.
 ///
 /// Returns once every gap is filled, or once a worker hits a TERMINAL fault (a
-/// retryable one only drops that lane). Finalization is the caller's job —
-/// unlike [`crate::drive`], which promotes a complete blob itself, this only
-/// flushes the present record (spec §5.5 single-writer flush point) once all
-/// workers finish.
+/// retryable one retires that lane, or, on an extra worker, stops only that
+/// worker). Finalization is the caller's job — unlike [`crate::drive`], which
+/// promotes a complete blob itself, this only flushes the present record (spec
+/// §5.5 single-writer flush point) once all workers finish.
 ///
 /// # Errors
 ///
@@ -1231,8 +1578,8 @@ where
         .unwrap_or(lanes);
     // The premise the whole payment model rests on, checked rather than trusted:
     // one lane per on-chain provider. Two lanes sharing a provider share a
-    // `(signer, provider)` watermark, and their concurrent voucher streams
-    // regress each other — the failure the caller's operator-spread admission is
+    // `(signer, provider)` watermark, and their two ledgers regress each
+    // other — the failure the caller's operator-spread admission is
     // supposed to make impossible.
     let mut seen_providers = HashSet::with_capacity(lanes.len());
     for lane in lanes {
@@ -1244,7 +1591,7 @@ where
         if !seen_providers.insert(provider) {
             anyhow::bail!(
                 "multi_source_fetch requires one lane per provider: {provider} appears twice, \
-                 which would run two concurrent voucher streams on one (signer, provider) lane"
+                 which would run two voucher ledgers on one (signer, provider) watermark"
             );
         }
     }
@@ -1346,6 +1693,8 @@ where
             .collect(),
         alive: vec![true; lanes.len()],
         units: vec![0; lanes.len()],
+        lane_of: (0..lanes.len()).collect(),
+        retired: vec![false; lanes.len()],
         front_first: pacing.is_some(),
     });
     // Wakes workers parked because nothing was pickable, whenever a peer frees,
@@ -1421,36 +1770,69 @@ where
         cb(base_present, total_bytes);
     }
 
-    let workers = lanes.iter().enumerate().map(|(i, lane)| {
-        let worker = run_worker(
-            i,
-            store,
-            lane.source,
-            pacer,
-            funder,
-            &lane.ctx,
-            &lane.ledger,
-            hash,
-            total_bytes,
-            drive,
-            &work,
-            &progress_wake,
-            &faults,
-            on_progress,
-            &progress_agg,
-            ms.unit_deadline,
-            &pool,
-            &lane_coverage,
-            pacing,
-        );
-        // Moved into the worker's future, so the lease is released when the
-        // worker stops and also when a `stop` drops the future unfinished.
-        let release = ReleaseOnDrop(lane.lease);
+    // One entry per worker a lane's widen hook granted, for the join loop
+    // below to start. `notify_one` keeps a wake that lands before the loop
+    // waits.
+    let widen: Vec<Option<&LaneWiden>> = lanes.iter().map(|l| l.widen).collect();
+    let grown: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    let grow_wake = Notify::new();
+    let growth = Growth {
+        widen: &widen,
+        grown: &grown,
+        wake: &grow_wake,
+    };
+    // Lane `lane`'s first worker (`extra == false`, slot `lane`) or one more
+    // worker its growth hook granted (`extra == true`, a fresh slot).
+    let worker = |lane: usize, extra: bool| {
+        let (work, progress_wake, faults, progress_agg) =
+            (&work, &progress_wake, &faults, &progress_agg);
+        let (pool, lane_coverage, growth) = (&pool, &lane_coverage, &growth);
+        let l = lanes.get(lane);
+        // Built before the future and moved into it, so the lease (or the
+        // extra worker's grant) is released when the worker stops, when a
+        // `stop` drops it unfinished, and when it is dropped unpolled.
+        let hold = if extra {
+            WorkerHold::Grant(l.and_then(|l| l.widen))
+        } else {
+            WorkerHold::Lease(l.and_then(|l| l.lease))
+        };
         async move {
-            let _release = release;
-            worker.await
+            let _hold = hold;
+            let Some(l) = l else {
+                anyhow::bail!("lane index {lane} out of range for the fetch's lanes");
+            };
+            let slot = if extra {
+                work.lock().await.add_worker(lane)
+            } else {
+                lane
+            };
+            run_worker(
+                slot,
+                lane,
+                extra,
+                store,
+                l.source,
+                pacer,
+                funder,
+                &l.ctx,
+                &l.ledger,
+                hash,
+                total_bytes,
+                drive,
+                work,
+                progress_wake,
+                faults,
+                on_progress,
+                progress_agg,
+                ms.unit_deadline,
+                pool,
+                lane_coverage,
+                pacing,
+                growth,
+            )
+            .await
         }
-    });
+    };
     // Drive every worker to completion while a single periodic tick flushes the
     // `.ranges` present record (spec §5.5). The workers are the sole work drivers
     // and this interval owner is the sole periodic flush owner — no worker flushes,
@@ -1458,15 +1840,40 @@ where
     // leave `.ranges` at pre-session state and re-download (and re-pay for) the
     // whole in-flight fan-out on resume; the interval bounds that loss to one
     // `PRESENT_RECORD_FLUSH_INTERVAL`.
-    let workers = futures_util::future::try_join_all(workers);
+    //
+    // The join starts each worker a growth hook grants. The first worker error
+    // (a terminal fault, or a store or wiring error) ends the join and drops
+    // every other worker.
+    let workers = async {
+        let mut running: futures_util::stream::FuturesUnordered<_> =
+            (0..lanes.len()).map(|lane| worker(lane, false)).collect();
+        loop {
+            running.extend(
+                growth
+                    .take_granted()
+                    .into_iter()
+                    .map(|lane| worker(lane, true)),
+            );
+            // Only a polled worker grants, so an empty set has no grant pending.
+            tokio::select! {
+                next = futures_util::StreamExt::next(&mut running) => match next {
+                    Some(Ok(())) => {}
+                    Some(Err(err)) => return Err(err),
+                    None => return Ok(()),
+                },
+                () = grow_wake.notified() => {}
+            }
+        }
+    };
     let outcome = drive_with_interval_flush(store, PRESENT_RECORD_FLUSH_INTERVAL, async move {
         tokio::select! {
             biased;
-            joined = workers => joined.map(|_| ()),
+            joined = workers => joined,
             stopped = stop => Err(stopped),
         }
     })
     .await;
+    growth.release_unstarted();
 
     // Single-writer flush point (spec §5.5): every worker has finished, so the
     // in-memory present set is final — persist the `.ranges` record once more,
@@ -1610,6 +2017,7 @@ mod tests {
             coverage,
             first_unit: None,
             lease: None,
+            widen: None,
         }
     }
 
@@ -1661,6 +2069,7 @@ mod tests {
                 coverage: full.clone(),
                 first_unit: None,
                 lease: None,
+                widen: None,
             },
             SourceLane {
                 source: &src_b,
@@ -1669,6 +2078,7 @@ mod tests {
                 coverage: full,
                 first_unit: Some(unit.clone()),
                 lease: None,
+                widen: None,
             },
         ];
         multi_source_fetch(
@@ -2496,6 +2906,305 @@ mod tests {
         Ok(())
     }
 
+    /// Counts what a [`super::LaneWiden`] granted and got back.
+    #[derive(Default)]
+    struct WidenCount {
+        granted: std::sync::atomic::AtomicUsize,
+        released: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WidenCount {
+        fn granted(&self) -> usize {
+            self.granted.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn released(&self) -> usize {
+            self.released.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A lane's widen hooks over `room` stream permits, like a caller's
+    /// permit grant: `grow` hands out only what is free now, and `release`
+    /// frees one again.
+    fn counting_widen(room: usize) -> (super::LaneWiden, Arc<WidenCount>) {
+        use std::sync::atomic::Ordering;
+        let count = Arc::new(WidenCount::default());
+        let (on_grow, on_release) = (Arc::clone(&count), Arc::clone(&count));
+        let widen = super::LaneWiden::new(
+            move |most| {
+                let held = on_grow.granted().saturating_sub(on_grow.released());
+                let give = most.min(room.saturating_sub(held));
+                on_grow.granted.fetch_add(give, Ordering::SeqCst);
+                give
+            },
+            move || {
+                on_release.released.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        (widen, count)
+    }
+
+    /// A two-lane fetch of `src_a`'s blob where lane b grows through `widen`,
+    /// ended early by a `stop` after `stop_after` when one is set. Returns the
+    /// fetch's result, the store it wrote, and the directory that holds it.
+    async fn two_lane_fetch(
+        src_a: &ScriptedSource,
+        src_b: &ScriptedSource,
+        (ledger_a, ledger_b): (&Arc<PoolLedger>, &Arc<PoolLedger>),
+        widen: &super::LaneWiden,
+        stop_after: Option<Duration>,
+    ) -> (anyhow::Result<()>, ClientRangedStore, tempfile::TempDir) {
+        let root = src_a.root();
+        let total = src_a.total_bytes();
+        let (store, dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+        let mut lanes = vec![
+            lane(src_a, Arc::clone(ledger_a), 0xA1),
+            lane(src_b, Arc::clone(ledger_b), 0xB2),
+        ];
+        if let Some(l) = lanes.get_mut(1) {
+            l.widen = Some(widen);
+        }
+        let stop = async move {
+            match stop_after {
+                Some(after) => tokio::time::sleep(after).await,
+                None => std::future::pending::<()>().await,
+            }
+            anyhow::anyhow!("stopped")
+        };
+        let fetched = multi_source_fetch_until(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                seller_reserve: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: Duration::from_secs(10),
+            },
+            None,
+            None,
+            None,
+            stop,
+        )
+        .await;
+        (fetched, store, dir)
+    }
+
+    /// Lane a faults after 1 MiB; lane b pauses once per leg after 1 MiB for
+    /// `stall`, so its own range is still in flight when lane a faults. `tweak`
+    /// scripts lane b further.
+    fn faulting_and_busy(
+        data: &[u8],
+        stall: Duration,
+        tweak: impl FnOnce(ScriptedSource) -> ScriptedSource,
+    ) -> anyhow::Result<(
+        ScriptedSource,
+        ScriptedSource,
+        Arc<PoolLedger>,
+        Arc<PoolLedger>,
+    )> {
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(data.to_vec())?
+            .with_fault_after(1024 * 1024, || anyhow::anyhow!("scripted fault"))
+            .paying(Arc::clone(&ledger_a));
+        let src_b = tweak(ScriptedSource::new(data.to_vec())?.stall_after(1024 * 1024, stall))
+            .paying(Arc::clone(&ledger_b));
+        Ok((src_a, src_b, ledger_a, ledger_b))
+    }
+
+    /// A faulted lane's remainder does not wait for a busy survivor to finish
+    /// its own range (#2230): the survivor's widen hook grants one more
+    /// worker, which opens a second concurrent leg to the same provider while
+    /// the first is still in flight. The extra worker gives its grant back as
+    /// it stops, and the blob assembles byte-identical.
+    #[tokio::test]
+    async fn a_faulted_lanes_remainder_grows_a_busy_survivor() -> anyhow::Result<()> {
+        let data = blob(32 * 1024 * 1024);
+        let (src_a, src_b, ledger_a, ledger_b) =
+            faulting_and_busy(&data, Duration::from_millis(1500), |s| s)?;
+        let (widen, count) = counting_widen(1);
+        let (fetched, store, dir) =
+            two_lane_fetch(&src_a, &src_b, (&ledger_a, &ledger_b), &widen, None).await;
+        fetched?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        assert_eq!(count.granted(), 1, "lane b grew one worker");
+        assert!(
+            src_b.peak_in_flight() >= 2,
+            "the remainder ran beside lane b's own range, not after it: peak {}",
+            src_b.peak_in_flight()
+        );
+        assert_eq!(count.released(), 1, "the extra worker gave its grant back");
+        Ok(())
+    }
+
+    /// An extra worker whose stream the node refuses does not retire its
+    /// lane: the range goes back to the queue, the lane's first worker takes
+    /// it once its own range ends, and the fetch completes.
+    #[tokio::test]
+    async fn a_refused_extra_stream_leaves_its_lane_live() -> anyhow::Result<()> {
+        let data = blob(32 * 1024 * 1024);
+        let (src_a, src_b, ledger_a, ledger_b) =
+            faulting_and_busy(&data, Duration::from_millis(1500), |s| {
+                // Lane b's second open is the extra stream.
+                s.refusing_open(1, || anyhow::anyhow!("scripted overload"))
+            })?;
+        let (widen, count) = counting_widen(1);
+        let (fetched, store, dir) =
+            two_lane_fetch(&src_a, &src_b, (&ledger_a, &ledger_b), &widen, None).await;
+        fetched?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        assert_eq!(count.granted(), 1, "one extra stream asked for");
+        assert_eq!(count.released(), 1, "the refused grant came back");
+        assert_eq!(
+            src_b.opened_ranges().len(),
+            3,
+            "its own range, the refused extra, then the first worker's take of the remainder"
+        );
+        Ok(())
+    }
+
+    /// A `stop` that ends the fetch while an extra worker is mid-leg gives
+    /// that worker's grant back.
+    #[tokio::test]
+    async fn a_stopped_fetch_releases_an_extra_workers_grant() -> anyhow::Result<()> {
+        let data = blob(32 * 1024 * 1024);
+        let (src_a, src_b, ledger_a, ledger_b) =
+            faulting_and_busy(&data, Duration::from_secs(5), |s| s)?;
+        let (widen, count) = counting_widen(1);
+        let (fetched, _store, _dir) = two_lane_fetch(
+            &src_a,
+            &src_b,
+            (&ledger_a, &ledger_b),
+            &widen,
+            Some(Duration::from_secs(1)),
+        )
+        .await;
+        assert!(fetched.is_err(), "the stop ends the fetch");
+        assert_eq!(count.granted(), 1, "lane b grew one worker before the stop");
+        assert_eq!(count.released(), 1, "the stopped extra gave its grant back");
+        Ok(())
+    }
+
+    /// A terminal fault on an extra stream ends the fetch with that typed
+    /// error, as on any lane: a shared-pool exhaustion no lane can fund. The
+    /// extra worker's grant still comes back.
+    #[tokio::test]
+    async fn a_terminal_fault_on_an_extra_stream_ends_the_fetch() -> anyhow::Result<()> {
+        let data = blob(32 * 1024 * 1024);
+        let (src_a, src_b, ledger_a, ledger_b) =
+            faulting_and_busy(&data, Duration::from_millis(1500), |s| {
+                s.refusing_open(1, || {
+                    anyhow::Error::new(PoolExhausted {
+                        gap_start: 0,
+                        gap_len: 1,
+                    })
+                })
+            })?;
+        let (widen, count) = counting_widen(1);
+        let (fetched, _store, _dir) =
+            two_lane_fetch(&src_a, &src_b, (&ledger_a, &ledger_b), &widen, None).await;
+        let err = fetched.expect_err("the exhaustion is terminal");
+        assert!(err.downcast_ref::<PoolExhausted>().is_some(), "{err:#}");
+        assert_eq!(count.granted(), 1);
+        assert_eq!(count.released(), 1, "the extra worker's grant came back");
+        Ok(())
+    }
+
+    /// A lane is asked to grow only for pending ranges no idle worker will
+    /// take, only while it is live, and only when it covers them.
+    #[test]
+    fn growth_is_wanted_only_for_ranges_no_idle_worker_takes() -> anyhow::Result<()> {
+        use decdn_bao_range::align_range;
+
+        let total = 8 * DISCOVERY_BLOCK_BYTES;
+        let blocks = num_blocks(total);
+        let full = Coverage::full(blocks);
+        // Lane 3 holds only the last block, not the pending first one.
+        let last_only = Coverage::from_block_indices(blocks, std::iter::once(blocks - 1));
+        let coverage = vec![full.clone(), full.clone(), full, last_only];
+        let mut work = super::Work {
+            pending: [align_range(0, DISCOVERY_BLOCK_BYTES, total)?].into(),
+            first: vec![None; 4],
+            in_flight: vec![Some((DISCOVERY_BLOCK_BYTES, 1)), None, None, None],
+            cancel: (0..4)
+                .map(|_| Arc::new(super::CancelHandle::new()))
+                .collect(),
+            units: vec![0; 4],
+            alive: vec![true, false, true, true],
+            lane_of: (0..4).collect(),
+            retired: vec![false, true, false, false],
+            front_first: false,
+        };
+        // Lane 2's worker is live and idle: it takes the range, so nobody grows.
+        // Lane 3's idle worker does not count: it cannot serve the range.
+        assert_eq!(work.growth_wanted(&coverage, total, |_| true).1, 0);
+        // Once it holds a range, the live covering lanes with a hook may be
+        // asked, in lane order: not lane 1 (retired), not lane 3 (no cover).
+        if let Some(slot) = work.in_flight.get_mut(2) {
+            *slot = Some((2 * DISCOVERY_BLOCK_BYTES, 1));
+        }
+        assert_eq!(
+            work.growth_wanted(&coverage, total, |_| true),
+            (vec![0, 2], 1)
+        );
+        assert_eq!(
+            work.growth_wanted(&coverage, total, |lane| lane == 2),
+            (vec![2], 1)
+        );
+        assert_eq!(
+            work.growth_wanted(&coverage, total, |lane| lane == 1),
+            (vec![], 1)
+        );
+        Ok(())
+    }
+
+    /// A pending range only a retired lane covers is dropped once the last
+    /// worker of a live lane that covered it leaves, even while a worker of
+    /// the retired lane is still alive: a retired lane takes no new range.
+    #[test]
+    fn retire_drops_what_only_a_retired_lane_covers() -> anyhow::Result<()> {
+        use decdn_bao_range::align_range;
+
+        let total = 8 * DISCOVERY_BLOCK_BYTES;
+        let full = Coverage::full(num_blocks(total));
+        let coverage = vec![full.clone(), full];
+        // Slot 0 is lane 0's first worker; slots 1 and 2 are lane 1's, whose
+        // lane retired while its extra worker (slot 2) still runs.
+        let mut work = super::Work {
+            pending: [align_range(0, DISCOVERY_BLOCK_BYTES, total)?].into(),
+            first: vec![None; 3],
+            in_flight: vec![None, None, Some((DISCOVERY_BLOCK_BYTES, 1))],
+            cancel: (0..3)
+                .map(|_| Arc::new(super::CancelHandle::new()))
+                .collect(),
+            units: vec![0; 3],
+            alive: vec![true, false, true],
+            lane_of: vec![0, 1, 1],
+            retired: vec![false, true],
+            front_first: false,
+        };
+        assert!(work.lane_retired(1));
+        work.retire(0, &coverage, total);
+        assert!(
+            work.pending.is_empty(),
+            "no live lane is left to take it; the retired lane's worker does not count"
+        );
+        Ok(())
+    }
+
     /// Stamps the moment it drops, so a test can see when a lane let go of it.
     struct DropStamp(Arc<Mutex<Option<std::time::Instant>>>);
 
@@ -2680,6 +3389,8 @@ mod tests {
             cancel: vec![Arc::new(CancelHandle::new()), Arc::new(CancelHandle::new())],
             alive: vec![true, true],
             units: vec![0, 0],
+            lane_of: (0..2).collect(),
+            retired: vec![false; 2],
             front_first: false,
         };
 
@@ -2734,6 +3445,8 @@ mod tests {
             cancel: (0..3).map(|_| Arc::new(CancelHandle::new())).collect(),
             alive: vec![true, true, true],
             units: vec![1, 0, 0],
+            lane_of: (0..3).collect(),
+            retired: vec![false; 3],
             front_first: false,
         };
         let victim_flag = |w: &Work| {
@@ -3191,6 +3904,7 @@ mod tests {
                 coverage: full.clone(),
                 first_unit: None,
                 lease: None,
+                widen: None,
             },
             SourceLane {
                 source: &src_b,
@@ -3199,6 +3913,7 @@ mod tests {
                 coverage: full,
                 first_unit: None,
                 lease: None,
+                widen: None,
             },
         ];
         let result = tokio::time::timeout(
@@ -3337,6 +4052,7 @@ mod tests {
                 coverage: full.clone(),
                 first_unit: None,
                 lease: None,
+                widen: None,
             },
             SourceLane {
                 source: &src_b,
@@ -3345,6 +4061,7 @@ mod tests {
                 coverage: full,
                 first_unit: None,
                 lease: None,
+                widen: None,
             },
         ];
         let result = tokio::time::timeout(
@@ -3545,6 +4262,7 @@ mod tests {
                 coverage: full.clone(),
                 first_unit: None,
                 lease: None,
+                widen: None,
             },
             SourceLane {
                 source: &src_b,
@@ -3553,6 +4271,7 @@ mod tests {
                 coverage: full,
                 first_unit: None,
                 lease: None,
+                widen: None,
             },
         ];
         multi_source_fetch(
@@ -3681,6 +4400,7 @@ mod tests {
                 coverage: full.clone(),
                 first_unit: None,
                 lease: None,
+                widen: None,
             },
             SourceLane {
                 source: &src_b,
@@ -3689,6 +4409,7 @@ mod tests {
                 coverage: full,
                 first_unit: None,
                 lease: None,
+                widen: None,
             },
         ];
         let result = tokio::time::timeout(
@@ -4217,9 +4938,9 @@ mod tests {
     // ---- lane-set preconditions and failure reporting ----
 
     /// Two lanes on ONE provider are refused at the boundary. They would be two
-    /// concurrent voucher streams on one `(signer, provider)` watermark — the
-    /// hazard the one-unit-per-source rule exists to prevent — and the scheduler
-    /// checks its own premise rather than trusting the caller's admission policy.
+    /// ledgers for one `(signer, provider)` watermark, each signing cumulatives
+    /// the other never sees, and the scheduler checks its own premise rather
+    /// than trusting the caller's admission policy.
     #[tokio::test]
     async fn lanes_sharing_one_provider_are_refused() -> anyhow::Result<()> {
         let data = blob(1024 * 1024);
