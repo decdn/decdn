@@ -1860,13 +1860,15 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // records every lane's vouchers too.
         let on_drop = fetch::SettleOnDrop::new(|| sources.persist_watermarks());
         let result = async {
+            // The manifest's size is the entry's first claim; without one, the
+            // probe's hint or a header-only open gives it.
             let (total_bytes, holders) = if let Some(total) = total {
                 (total, holders)
             } else {
-                let size = sources
-                    .signed_size(hash, holders, &self.health, &self.stop)
+                let claim = sources
+                    .first_claim(hash, holders, &self.health, &self.stop)
                     .await?;
-                (size.total_bytes, size.holders)
+                (claim.total_bytes, claim.holders)
             };
             // `--max-sources` caps the lanes the entry stripes across at
             // once; every other holder waits as a reserve.

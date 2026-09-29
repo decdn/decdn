@@ -498,6 +498,7 @@ fn probe_shed(err: &anyhow::Error) -> bool {
 // classification plus the `tracing` diagnostics on the drop and fallback arms.
 #[expect(
     clippy::cognitive_complexity,
+    clippy::too_many_lines,
     reason = "flat per-candidate classification pass, not nested control flow"
 )]
 pub(crate) async fn probe_and_order(
@@ -598,6 +599,7 @@ pub(crate) async fn probe_and_order(
             holders.push(discovery::Probed {
                 candidate: cand.clone(),
                 rtt_ms,
+                total_bytes: resp_ext.total_bytes,
                 coverage: resp_ext.coverage.clone(),
             });
         } else {
@@ -633,6 +635,7 @@ pub(crate) async fn probe_and_order(
         );
     }
 
+    let size_hint = nearest_size_hint(&holders);
     let ordered = failover_order(holders, &non_holders, warming);
     if let Some((node_id, proxy_rtt, best_holder_rtt)) = ordered.warming_lead {
         tracing::info!(
@@ -646,7 +649,18 @@ pub(crate) async fn probe_and_order(
         coverage_by_node: ordered.coverage_by_node,
         probed_samples,
         pinned: false,
+        size_hint,
     })
+}
+
+/// The size hint of the nearest holder that gave one: the fetch's first size
+/// claim ([`ResolvedTargets::size_hint`]).
+fn nearest_size_hint(holders: &[discovery::Probed]) -> Option<u64> {
+    holders
+        .iter()
+        .filter(|h| h.total_bytes.is_some())
+        .min_by(|a, b| a.rtt_ms.total_cmp(&b.rtt_ms))
+        .and_then(|h| h.total_bytes)
 }
 
 /// The ordered provider-failover list plus, when a proxy leads it, that proxy's
@@ -937,6 +951,7 @@ fn store_fast_path(
         coverage_by_node: HashMap::new(),
         probed_samples: Vec::new(),
         pinned: false,
+        size_hint: None,
     })
 }
 
@@ -1129,6 +1144,7 @@ pub(crate) fn holders_or_none(
                 coverage_by_node: HashMap::new(),
                 probed_samples: Vec::new(),
                 pinned: false,
+                size_hint: None,
             })
         }
     }
@@ -1150,6 +1166,10 @@ pub(crate) struct ResolvedTargets {
     /// The one candidate is the `--node-id` the user pinned. It counts as a
     /// holder, as a probe-reported holder does.
     pub(crate) pinned: bool,
+    /// The blob size the nearest probed holder reported, an unsigned hint
+    /// ([`discovery::Probed::total_bytes`]). `None` when nothing was probed
+    /// (a pinned `--node-id`, the peer-store fast path) or no holder knew it.
+    pub(crate) size_hint: Option<u64>,
 }
 
 /// Resolve the holders to fetch from (#1174): the explicit `--node-id`
@@ -1197,6 +1217,8 @@ pub(crate) async fn resolve_target_node(
             // Nothing was probed on this path, so there is nothing to harvest.
             probed_samples: Vec::new(),
             pinned: true,
+            // Nothing was probed, so the first claim comes from a header.
+            size_hint: None,
         });
     }
 
@@ -1593,29 +1615,29 @@ async fn fetch_over(
     // A fetch dropped by Ctrl-C records every lane's vouchers too.
     let on_drop = SettleOnDrop::new(|| sources.persist_watermarks());
     let result = async {
+        // The first size claim: the probe's hint, or a header-only open.
+        let claim = sources.first_claim(hash, holders, &health, &stop).await?;
         if wants_stdout(&args.output) {
-            let size = sources.signed_size(hash, holders, &health, &stop).await?;
             return stream_to_stdout(
                 &deps,
                 &sources,
-                size.holders,
+                claim.holders,
                 health,
                 hash,
-                size.total_bytes,
+                claim.total_bytes,
                 stop,
                 common.max_sources,
             )
             .await;
         }
-        let size = sources.signed_size(hash, holders, &health, &stop).await?;
         download_to_file(
             &deps,
             &sources,
-            size.holders,
+            claim.holders,
             Arc::clone(&health),
             DownloadTarget {
                 hash,
-                total_bytes: size.total_bytes,
+                total_bytes: claim.total_bytes,
                 dest: &args.output,
                 ranges: None,
             },
@@ -4484,6 +4506,7 @@ pub(crate) mod tests_support {
                 multiaddrs: Bytes::new(),
             },
             rtt_ms,
+            total_bytes: Some(128 * 1024 * 1024),
             coverage: decdn_protocol::Coverage::empty(),
         }
     }
@@ -4511,6 +4534,7 @@ pub(crate) mod tests_support {
             coverage_by_node: ordered.coverage_by_node,
             probed_samples,
             pinned: false,
+            size_hint: Some(128 * 1024 * 1024),
         };
         (targets, node_a, node_b)
     }

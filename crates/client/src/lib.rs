@@ -40,9 +40,11 @@
 //!    ([`discovery::select_candidates`]), and probe each one
 //!    ([`probe::probe_once`]). Verify every answer
 //!    ([`probe::verify_probe_response`]) before it counts, and drop an answer
-//!    whose `has_blob` and coverage disagree. The blob's size comes from a
-//!    source's signed stream header, never from a probe answer: open one pull
-//!    and read it ([`first_open()`] does this with recovery).
+//!    whose `has_blob` and coverage disagree. A probe answer's size
+//!    ([`discovery::Probed::total_bytes`]) is an unsigned hint: pass it as the
+//!    fetch's first size claim, which the fetch grows or shrinks as verified
+//!    bytes land. Without one, open one pull and read its header
+//!    ([`first_open()`] does this with recovery).
 //! 5. **Build one lane per holder.** Pin a [`PoolContext`] to the holder's
 //!    provider address with [`buyer_pool::self_owned_lane_ctx`], resuming at
 //!    what the lane has already paid. Create its ledger with

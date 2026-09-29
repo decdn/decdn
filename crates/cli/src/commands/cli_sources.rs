@@ -26,12 +26,37 @@ use iroh::RelayUrl;
 use super::bundle_pull::LaneStreamCap;
 use super::fetch::{self, CliFunder, DriveFetchDeps, FaceLaneHandle, ResolvedTargets};
 
-/// A blob's size as one holder signed it ([`CliSources::signed_size`]).
-pub(crate) struct SignedSize {
-    /// The signed size.
+/// A fetch's first size claim ([`CliSources::first_claim`]): a hint the fetch
+/// grows or shrinks as verified bytes land.
+pub(crate) struct FirstClaim {
+    /// The claimed size.
     pub(crate) total_bytes: u64,
-    /// Every holder the first open knows.
+    /// Every holder known when the claim was made.
     pub(crate) holders: Vec<Holder>,
+}
+
+/// `hint` as the first claim over `holders`, or, with no hint, what `open`
+/// learns from a header-only open. A hint needs no open.
+///
+/// # Errors
+///
+/// The error `open` ends with.
+async fn first_claim_or_open<F, Fut>(
+    hint: Option<u64>,
+    holders: Vec<Holder>,
+    open: F,
+) -> anyhow::Result<FirstClaim>
+where
+    F: FnOnce(Vec<Holder>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<FirstClaim>>,
+{
+    match hint {
+        Some(total_bytes) => Ok(FirstClaim {
+            total_bytes,
+            holders,
+        }),
+        None => open(holders).await,
+    }
 }
 
 /// The [`SourceProvider`] a CLI fetch runs its acquire loop over.
@@ -62,6 +87,9 @@ pub(crate) struct CliSources<'a, P> {
     parked: Mutex<HashMap<Address, StreamCandidate<PeerSource<'a>>>>,
     /// The pool the first built lane pays from.
     pool_id: OnceLock<PoolId>,
+    /// The size hint of the last probe that gave one
+    /// ([`ResolvedTargets::size_hint`]): the fetch's first claim.
+    size_hint: Mutex<Option<u64>>,
 }
 
 impl<'a, P> CliSources<'a, P>
@@ -96,11 +124,19 @@ where
             handles: Mutex::new(Vec::new()),
             parked: Mutex::new(HashMap::new()),
             pool_id: OnceLock::new(),
+            size_hint: Mutex::new(None),
         }
     }
 
     /// The holders `targets` names, indexing each one's node for `connect`.
+    /// A probe's size hint is kept for [`Self::first_claim`].
     pub(crate) fn holders_from(&self, targets: &ResolvedTargets) -> Vec<Holder> {
+        if let Some(hint) = targets.size_hint {
+            *self
+                .size_hint
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(hint);
+        }
         holders_from(targets, &mut self.lock_nodes())
     }
 
@@ -119,25 +155,47 @@ where
         }
     }
 
-    /// The blob's signed size, from a header-only open of one of `holders`
+    /// The fetch's first size claim (#2218): the probe's size hint when a
+    /// probe gave one ([`Self::holders_from`]), with no open at all. Without a
+    /// hint (a pinned `--node-id`, the peer-store fast path), a header-only
+    /// open of one of `holders` learns the size one holder signs
     /// ([`first_open`]), with the acquire loop's recovery: a holder that
     /// faults cools and another is tried until one answers, a fault only the
     /// user can fix ends it, and `stop` gives up. The open's pull is dropped
     /// once its header is read. The lane that answered is parked for the
     /// fetch's `connect`, so the fetch reuses it; every other lane the open
-    /// built drops, and with it any stream permit it held. Returns the size and
-    /// every holder the open knows, those its discovery found included.
+    /// built drops, and with it any stream permit it held. Returns the claim
+    /// and every holder known, those the open's discovery found included.
     ///
     /// # Errors
     ///
     /// Any error [`first_open`] returns.
-    pub(crate) async fn signed_size(
+    pub(crate) async fn first_claim(
         &self,
         hash: [u8; 32],
         holders: Vec<Holder>,
         health: &Arc<PeerHealth>,
         stop: &StopPolicy,
-    ) -> anyhow::Result<SignedSize> {
+    ) -> anyhow::Result<FirstClaim> {
+        let hint = *self
+            .size_hint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        first_claim_or_open(hint, holders, |holders| {
+            self.open_for_header(hash, holders, health, stop)
+        })
+        .await
+    }
+
+    /// The size one of `holders` signs, from a header-only open
+    /// ([`Self::first_claim`]).
+    async fn open_for_header(
+        &self,
+        hash: [u8; 32],
+        holders: Vec<Holder>,
+        health: &Arc<PeerHealth>,
+        stop: &StopPolicy,
+    ) -> anyhow::Result<FirstClaim> {
         let mut set = SourceSet::new(self, hash, Arc::clone(health), holders);
         let opened = first_open(&mut set, stop, |lane| async move {
             let (header, _whole) = lane.source.open_whole(hash).await?;
@@ -158,7 +216,7 @@ where
                 .insert(provider, lane);
         }
         let holders = set.holders().to_vec();
-        opened.map(|(_signer, total_bytes)| SignedSize {
+        opened.map(|(_signer, total_bytes)| FirstClaim {
             total_bytes,
             holders,
         })
@@ -511,6 +569,7 @@ mod tests {
             coverage_by_node: std::collections::HashMap::new(),
             probed_samples: Vec::new(),
             pinned: false,
+            size_hint: None,
         };
         let mut nodes = std::collections::HashMap::new();
         let holders = holders_from(&targets, &mut nodes);
@@ -566,6 +625,7 @@ mod tests {
                 coverage_by_node: std::collections::HashMap::new(),
                 probed_samples: Vec::new(),
                 pinned: false,
+                size_hint: None,
             };
         let mut nodes = std::collections::HashMap::new();
         holders_from(&targets(node(1)), &mut nodes);
@@ -574,6 +634,53 @@ mod tests {
             nodes.get(&Address::repeat_byte(0xAA)).map(|n| n.node_id),
             Some(node(2).node_id)
         );
+    }
+
+    /// The first claim of `targets`, counting the header-only opens it makes.
+    async fn claim_of(
+        targets: &crate::commands::fetch::ResolvedTargets,
+    ) -> anyhow::Result<(u64, usize)> {
+        let opens = std::sync::atomic::AtomicUsize::new(0);
+        let mut nodes = std::collections::HashMap::new();
+        let holders = holders_from(targets, &mut nodes);
+        let claim = super::first_claim_or_open(targets.size_hint, holders, |holders| {
+            opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                Ok(super::FirstClaim {
+                    total_bytes: 7,
+                    holders,
+                })
+            }
+        })
+        .await?;
+        Ok((
+            claim.total_bytes,
+            opens.load(std::sync::atomic::Ordering::SeqCst),
+        ))
+    }
+
+    /// Holders whose probe gave a size hint take it as the first claim, with
+    /// no whole-blob open for the header (#2218).
+    #[tokio::test]
+    async fn the_first_claim_comes_from_the_probe_hint_without_a_whole_blob_open()
+    -> anyhow::Result<()> {
+        let (targets, _, _) = crate::commands::fetch::tests_support::two_holder_targets();
+        let hint = targets
+            .size_hint
+            .ok_or_else(|| anyhow::anyhow!("the fixture's probe gives a hint"))?;
+        assert_eq!(claim_of(&targets).await?, (hint, 0));
+        Ok(())
+    }
+
+    /// A pinned `--node-id` was never probed, so it has no hint and opens one
+    /// pull for the header's size.
+    #[tokio::test]
+    async fn a_pinned_node_without_a_hint_opens_for_the_header() -> anyhow::Result<()> {
+        let (mut targets, _, _) = crate::commands::fetch::tests_support::two_holder_targets();
+        targets.pinned = true;
+        targets.size_hint = None;
+        assert_eq!(claim_of(&targets).await?, (7, 1));
+        Ok(())
     }
 
     /// A pinned `--node-id` counts as a holder: its `NotFound` never marks it
