@@ -2407,7 +2407,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             Ok(paid) => paid,
             Err(e) => {
                 // `pull_entry` (whole-file or dedup) leaves the `<hex>.partial` +
-                // `.ranges` record in place on error — they are what the
+                // `.ranges` record in place on error: they are what the
                 // next run resumes from rather than re-paying for bytes already landed
                 // (same contract as `fetch`'s `<output>.partial` store).
                 return GroupRun::fetch_failed(slots, e);
@@ -2683,7 +2683,7 @@ async fn reassemble_dedup(
     if !plan.drive.is_empty() {
         driver.drive(&plan.drive).await?;
         // A resumed run may already hold every range in `.partial`, so this first
-        // drive can COMPLETE the store — `drive` then ran its whole-file hash
+        // drive can COMPLETE the store: `drive` then ran its whole-file hash
         // against `hash` and renamed `<hex>.partial` -> `<hex>`. The blob is
         // finalized and verified; splicing would open a `.partial` that no longer
         // exists. Register the donor chunks and return. No splice ran this run.

@@ -345,8 +345,6 @@ pub fn decdn_client::sink::NoCache::get(&self, [u8; 32], u64, u64) -> decdn_clie
 pub fn decdn_client::sink::NoCache::put(&self, [u8; 32], u64, bytes::bytes::Bytes) -> decdn_client::sink::SinkFuture<'_, ()>
 pub trait decdn_client::sink::StashedFault
 pub fn decdn_client::sink::StashedFault::take_fault(&mut self) -> core::option::Option<anyhow::Error>
-impl decdn_client::sink::StashedFault for bytes::bytes::Bytes
-pub fn bytes::bytes::Bytes::take_fault(&mut self) -> core::option::Option<anyhow::Error>
 impl decdn_client::sink::StashedFault for decdn_client::sink::PullReader
 pub fn decdn_client::sink::PullReader::take_fault(&mut self) -> core::option::Option<anyhow::Error>
 pub fn decdn_client::sink::content_paid_frontier(u64, u64, u64) -> u64

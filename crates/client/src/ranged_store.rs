@@ -1,5 +1,5 @@
 //! [`ClientRangedStore`]: the client-side [`RangedStore`](decdn_bao_range::RangedStore) backend
-//! (#1621) — a `.partial` data file positioned by offset plus a persisted
+//! (#1621): a `.partial` data file positioned by offset plus a persisted
 //! `.partial.ranges` record, built on `bao-tree` / `decdn-bao-range` only. No
 //! `iroh-blobs` dependency: `decdn-client` must stay iroh-blobs-free so the
 //! CLI's pull path links no blob store / AWS SDK (#578).
@@ -193,6 +193,16 @@ fn hash_prefix(file: &File, len: u64) -> io::Result<[u8; 32]> {
     Ok(*hasher.finalize().as_bytes())
 }
 
+/// Whether the first `len` bytes of `file` hash to `root`. A file shorter than
+/// `len` does not match.
+fn prefix_matches(file: &File, len: u64, root: [u8; 32]) -> io::Result<bool> {
+    match hash_prefix(file, len) {
+        Ok(hash) => Ok(hash == root),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Persist `state` to `path` via tempfile-plus-rename (atomic on the same
 /// filesystem), fsync'ing the temp file's contents before the rename. This
 /// makes the record update both atomic (a crash never leaves a half-written
@@ -231,16 +241,20 @@ fn write_record(path: &Path, state: &StoreState) -> io::Result<()> {
 
 /// Load a record written by [`write_record`], folding consecutive boundary
 /// pairs `[a, b)` into a fresh [`ChunkRanges`]. An odd-length or otherwise
-/// malformed record is corrupt data, not a missing file — surfaced as an
-/// `io::Error` rather than silently treated as empty.
+/// malformed record, or one in another format, is corrupt data rather than a
+/// missing file, and surfaces as an `io::Error` rather than as empty.
 fn read_record(path: &Path) -> io::Result<StoreState> {
     let bytes = std::fs::read(path)?;
     let Record {
         bound,
         proven,
         boundaries,
-    } = serde_json::from_slice(&bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    } = serde_json::from_slice(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unrecognised record format at {}: {e}", path.display()),
+        )
+    })?;
     if !boundaries.len().is_multiple_of(2) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -327,30 +341,33 @@ impl ClientRangedStore {
     /// present ranges in O(1): `open` trusts the record a prior write
     /// persisted and does not re-hash the data file.
     ///
-    /// If `finalize` already promoted this blob (the final, non-`.partial`
-    /// file exists), `open` reconstructs a complete store that serves from
-    /// the final file instead: the file's length is the proven size, and the
-    /// whole of it is present. `finalize` hashed it before the promote. This
-    /// also covers a crash between `finalize`'s rename and its (best-effort)
-    /// record cleanup — a leftover record is removed here.
+    /// If the final, non-`.partial` file exists and its BLAKE3 equals `root`,
+    /// `finalize` already promoted this blob: `open` reconstructs a complete
+    /// store that serves from the final file, with the file's length as the
+    /// proven size and the whole of it present. This also covers a crash
+    /// between `finalize`'s rename and its (best-effort) record cleanup: a
+    /// leftover record is removed here. A final file of another blob is left
+    /// alone, and `open` resumes this blob's `.partial` from its record.
     ///
     /// # Errors
     ///
-    /// Any I/O failure reading the record, including a corrupt (malformed)
-    /// record.
+    /// Any I/O failure hashing the final file or reading the record,
+    /// including a missing or corrupt (malformed) record.
     pub fn open(dir: &Path, stem: &str, root: [u8; 32]) -> io::Result<Self> {
         let (data_path, ranges_path) = sidecar_paths(dir, stem);
         let final_path = dir.join(stem);
 
         if final_path.exists() {
             let len = std::fs::metadata(&final_path)?.len();
-            let _ = std::fs::remove_file(&ranges_path);
-            let state = StoreState {
-                bound: len,
-                proven: Some(len),
-                present: whole(len),
-            };
-            return Ok(Self::with_state(root, final_path, ranges_path, state));
+            if prefix_matches(&File::open(&final_path)?, len, root)? {
+                let _ = std::fs::remove_file(&ranges_path);
+                let state = StoreState {
+                    bound: len,
+                    proven: Some(len),
+                    present: whole(len),
+                };
+                return Ok(Self::with_state(root, final_path, ranges_path, state));
+            }
         }
 
         let state = read_record(&ranges_path)?;
@@ -1175,12 +1192,13 @@ fn write_batch(data: &mut File, batch: &FlushBatch) -> anyhow::Result<()> {
 /// an in-progress [`ClientRangedStore::ingest_stream`] whose batches
 /// [`write_batch`] has written: fsync the data file, THEN union the
 /// corresponding chunk ranges into `present`. The fsync-before-union
-/// ordering is load-bearing — see the durability contract on
+/// ordering is load-bearing: see the durability contract on
 /// [`ClientRangedStore::ingest_stream`].
 ///
 /// A prefix that reaches `claim` holds the final chunk of the claimed tree,
 /// verified: the union also proves `claim`, setting `proven` and the bound to
-/// it.
+/// it. A verified final chunk outranks an earlier proven size, which only a
+/// record some other blob left can hold, so the new proof replaces it.
 ///
 /// `sync_data` (fdatasync) is enough: it persists the written blocks and
 /// every metadata change needed to read them back, including the block
@@ -1218,9 +1236,37 @@ fn sync_and_union(
     let mut state = store.lock().unwrap_or_else(PoisonError::into_inner);
     state.present |= received.chunk_ranges().clone();
     if received_end >= claim {
+        if let Some(earlier) = state.proven.filter(|&p| p != claim) {
+            tracing::warn!(
+                earlier_proven = earlier,
+                proven = claim,
+                "a verified final chunk proves another size than the store held"
+            );
+        }
         state.prove(claim);
     }
     Ok(())
+}
+
+/// The assembled bao body `admit` streams through the ingest loop. An
+/// in-memory buffer has no out-of-band failure mode: whatever the decoder says
+/// about it is the whole story.
+struct AdmitBody(Bytes);
+
+impl iroh_io::AsyncStreamReader for AdmitBody {
+    async fn read_bytes(&mut self, len: usize) -> io::Result<Bytes> {
+        self.0.read_bytes(len).await
+    }
+
+    async fn read<const L: usize>(&mut self) -> io::Result<[u8; L]> {
+        self.0.read::<L>().await
+    }
+}
+
+impl StashedFault for AdmitBody {
+    fn take_fault(&mut self) -> Option<anyhow::Error> {
+        None
+    }
 }
 
 impl RangedStore for ClientRangedStore {
@@ -1263,7 +1309,7 @@ impl RangedStore for ClientRangedStore {
             let claim = u64::from_le_bytes(header);
             let body = bao_bytes.slice(8..);
 
-            self.ingest_stream(&range, body, None, claim)
+            self.ingest_stream(&range, AdmitBody(body), None, claim)
                 .await
                 .map_err(|e| RangedStoreError::Backend(e.into()))?;
             self.write_record_blocking().await.map_err(backend)
@@ -1318,13 +1364,14 @@ impl RangedStore for ClientRangedStore {
     /// landed, so the hash is a whole-file defense against on-disk drift and
     /// against a partial some other blob left at this path.
     ///
-    /// On a mismatch it returns [`crate::HashMismatch`] and keeps the partial
-    /// file and its bound, but no longer claims any of it present or proven:
-    /// the hash cannot say which bytes are bad, so the next drive fetches the
-    /// blob again over them rather than wedging on a record that claims them.
+    /// On a mismatch, including a data file shorter than the proven size, it
+    /// returns [`crate::HashMismatch`] and keeps the partial file and its
+    /// bound, and claims none of it present or proven: the hash cannot say
+    /// which bytes are bad, so the next drive fetches the blob again over them
+    /// rather than wedging on a record that claims them.
     fn finalize(&self) -> RangedFuture<'_, ()> {
         Box::pin(async move {
-            // Already finalized — e.g. this store was reconstructed by
+            // Already finalized, e.g. this store was reconstructed by
             // `open()` from the promoted final file. Match the same
             // ".partial"-suffix check the promote below uses: no `.partial`
             // suffix on the current data path means there is nothing left to
@@ -1377,7 +1424,7 @@ impl RangedStore for ClientRangedStore {
                         .open(&current_path)
                         .map_err(backend)?;
 
-                    if hash_prefix(&data_file, proven).map_err(backend)? != root {
+                    if !prefix_matches(&data_file, proven, root).map_err(backend)? {
                         return Ok(false);
                     }
 
@@ -2671,6 +2718,104 @@ mod tests {
         assert_eq!(store.proven(), Some(500));
         store.finalize().await?;
         assert_eq!(store.read(0, 0).await?.as_ref(), data.as_slice());
+        Ok(())
+    }
+
+    /// Fetch `data` whole into a fresh store at `dir`/`stem` and finalize it,
+    /// leaving the promoted final file. Returns the blob's root.
+    async fn finalize_blob(dir: &Path, stem: &str, data: &[u8]) -> anyhow::Result<[u8; 32]> {
+        let source = crate::source::ScriptedSource::new(data.to_vec())?;
+        let total = u64::try_from(data.len())?;
+        let store = ClientRangedStore::create(dir, stem, source.root(), total)?;
+        let leg = decdn_bao_range::align_range(0, 0, total)?;
+        let (claim, reader) = open_leg(&source, &leg).await?;
+        store.ingest_stream(&leg, reader, None, claim).await?;
+        store.finalize().await?;
+        Ok(source.root())
+    }
+
+    /// A final file of blob A at the path blob B is fetched to is not B: with
+    /// B's partial on disk, `open` resumes the partial; with none,
+    /// `open_or_create` starts B fresh. A's file is untouched either way.
+    #[tokio::test]
+    async fn open_resumes_the_partial_when_the_final_file_is_another_blob() -> anyhow::Result<()> {
+        let a = blob(3 * usize::try_from(GROUP)?);
+        let mut b = blob(5 * usize::try_from(GROUP)?);
+        b.reverse();
+        let b_root = bao_root_and_outboard(&b).0;
+        let b_total = u64::try_from(b.len())?;
+
+        // B's interrupted partial beside A's final file.
+        let dir = tmp_dir();
+        finalize_blob(dir.path(), "out.bin", &a).await?;
+        ClientRangedStore::seed_checkpointed_prefix(dir.path(), "out.bin", &b, 2 * GROUP)?;
+        let store = ClientRangedStore::open(dir.path(), "out.bin", b_root)?;
+        assert!(!store.is_complete().await?, "A's file must not complete B");
+        assert_eq!(store.bound(), b_total);
+        assert_eq!(store.proven(), None);
+        assert_eq!(
+            &store.present_ranges().await?,
+            decdn_bao_range::align_range(0, 2 * GROUP, b_total)?.chunk_ranges()
+        );
+        assert!(dir.path().join("out.bin.partial.ranges").exists());
+        assert_eq!(std::fs::read(dir.path().join("out.bin"))?, a);
+
+        // No partial for B: a fresh store, A's file still untouched.
+        let dir = tmp_dir();
+        finalize_blob(dir.path(), "out.bin", &a).await?;
+        assert!(ClientRangedStore::open(dir.path(), "out.bin", b_root).is_err());
+        let store = ClientRangedStore::open_or_create(dir.path(), "out.bin", b_root, b_total)?;
+        assert!(store.present_ranges().await?.is_empty());
+        assert_eq!(store.proven(), None);
+        assert_eq!(store.bound(), b_total);
+        assert_eq!(std::fs::read(dir.path().join("out.bin"))?, a);
+        Ok(())
+    }
+
+    /// A final file that hashes to the root reopens complete, and `open`
+    /// removes the leftover record.
+    #[tokio::test]
+    async fn open_trusts_a_final_file_only_by_its_hash() -> anyhow::Result<()> {
+        let a = blob(3 * usize::try_from(GROUP)? + 7);
+        let dir = tmp_dir();
+        let root = finalize_blob(dir.path(), "out.bin", &a).await?;
+        let store = ClientRangedStore::open(dir.path(), "out.bin", root)?;
+        assert!(store.is_complete().await?);
+        assert_eq!(store.proven(), Some(u64::try_from(a.len())?));
+        Ok(())
+    }
+
+    /// A `.partial` cut short after ingest fails `finalize` as a mismatch, not
+    /// as an I/O error: the store drops its claim, and a re-fetch completes.
+    #[tokio::test]
+    async fn a_truncated_partial_heals_on_the_next_fetch() -> anyhow::Result<()> {
+        let total = 3 * GROUP + 99;
+        let data = blob(usize::try_from(total)?);
+        let source = crate::source::ScriptedSource::new(data.clone())?;
+        let dir = tmp_dir();
+        let store = ClientRangedStore::create(dir.path(), "blob", source.root(), total)?;
+        let whole = decdn_bao_range::align_range(0, 0, total)?;
+        let (claim, reader) = open_leg(&source, &whole).await?;
+        store.ingest_stream(&whole, reader, None, claim).await?;
+
+        let partial = dir.path().join("blob.partial");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&partial)?
+            .set_len(GROUP)?;
+        let err = store
+            .finalize()
+            .await
+            .expect_err("a truncated partial must not finalize");
+        assert!(matches!(err, RangedStoreError::Backend(_)), "{err:?}");
+        assert!(store.present_ranges().await?.is_empty());
+        assert_eq!(store.proven(), None);
+        assert!(partial.exists());
+
+        let (claim, reader) = open_leg(&source, &whole).await?;
+        store.ingest_stream(&whole, reader, None, claim).await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("blob"))?, data);
         Ok(())
     }
 }

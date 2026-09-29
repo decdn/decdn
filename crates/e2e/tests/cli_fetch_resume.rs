@@ -15,7 +15,7 @@
 //! [`ClientRangedStore`]'s two files beside `--output`, NOT from a raw
 //! `.partial`: a positioned `<stem>.partial` data file and a
 //! `<stem>.partial.ranges` JSON record of its bound, proven size and present
-//! ranges. The `.ranges` record is the resume signal — a raw
+//! ranges. The `.ranges` record is the resume signal: a raw
 //! `.partial` with no record is truncated and re-fetched from scratch. So these
 //! journeys construct a real *checkpointed* on-disk state with
 //! [`ClientRangedStore::seed_checkpointed_prefix`] (the `test-util` fixture seam)
@@ -33,7 +33,7 @@
 //!    without it the test would pass on an implementation that silently
 //!    re-downloaded everything.
 //! 3. **Corrupt checkpoint.** Seeded with a valid checkpoint whose `.partial` data
-//!    is then flipped a byte — the record still claims the group present.
+//!    is then flipped a byte, while the record still claims the group present.
 //!    `finalize`'s whole-file BLAKE3 of `[0, proven)` is the guarantee: a
 //!    corrupt group can never be silently promoted. The first run pulls the
 //!    missing suffix, the hash catches the drift, the record drops its claim to
@@ -136,7 +136,7 @@ fn make_aligned_blob() -> Vec<u8> {
 }
 
 /// Flip the first byte of a checkpoint's `.partial` data file in place, leaving
-/// its `.ranges` record untouched — so the record still claims the (now-corrupt)
+/// its `.ranges` record untouched, so the record still claims the (now-corrupt)
 /// group present. This is the "bit rot after a durable checkpoint" state
 /// `finalize`'s whole-file hash exists to catch.
 fn corrupt_partial_byte(partial: &std::path::Path) -> anyhow::Result<()> {
@@ -306,10 +306,10 @@ async fn run() -> anyhow::Result<()> {
     // Seed a valid checkpoint, then flip a byte in its `.partial` data while the
     // `.ranges` record still claims the group present. The client
     // trusts the record for what to SKIP, so the corrupt group is never re-pulled
-    // on its own — only `finalize`'s whole-file hash can catch it.
+    // on its own: only `finalize`'s whole-file hash can catch it.
     //
     // First run: `drive` pulls the missing suffix, `finalize` hashes, the hash
-    // does not match, and the record drops its claim to every byte — so the run
+    // does not match, and the record drops its claim to every byte. So the run
     // FAILS and writes no `--output` (a silently wrong output file is the exact
     // bug this guards). The store keeps the `.partial` and its record, so the
     // corruption is not promoted and not left to poison presence.
@@ -341,7 +341,7 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // Second run: the failed hash already dropped the record's claim, so the
-    // resume re-pulls the blob and promotes the correct one — the self-heal the
+    // resume re-pulls the blob and promotes the correct one: the self-heal the
     // client guarantees without ever emitting a wrong output.
     run_fetch_until_ready(client_dir.path(), &args).await?;
     let got = std::fs::read(&out).context("read output after corruption recovery")?;
@@ -362,7 +362,7 @@ async fn run() -> anyhow::Result<()> {
     // The trap journey 3 does not cover, and the two are driven by the same hash.
     // Seed a checkpoint from a FOREIGN blob's bytes at `--output`'s location. On
     // open against the real blob's root the record claims a prefix present, so
-    // `drive` pulls only the (real) suffix — but the foreign prefix fails
+    // `drive` pulls only the (real) suffix, but the foreign prefix fails
     // `finalize`'s whole-file hash and the claim is dropped. A subsequent run
     // re-pulls the blob from the node (overwriting the foreign bytes) and
     // promotes the correct blob. The command must recover, never wedge and never

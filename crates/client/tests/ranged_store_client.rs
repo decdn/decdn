@@ -5,7 +5,7 @@
 //! tests.
 //!
 //! `ClientRangedStore::open` reconstructs `present` from the persisted
-//! `.partial.ranges` record in O(1) — it does NOT re-hash the `.partial` data.
+//! `.partial.ranges` record in O(1): it does NOT re-hash the `.partial` data.
 //! That's the load-bearing shortcut documented on `ranged_store.rs::open`: the
 //! ONE whole-file check is `finalize`'s BLAKE3 of `[0, proven)`, already
 //! locked by the unit test `finalize_hashes_the_whole_file`. These tests prove
