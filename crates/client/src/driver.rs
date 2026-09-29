@@ -491,6 +491,41 @@ pub(crate) fn ranges_content_len(ranges: &ChunkRanges, total_bytes: u64) -> u64 
         .fold(0u64, u64::saturating_add)
 }
 
+/// The chunks of `[start, start + len)` the store misses, clipped to its
+/// bound, and that bound. A range at or past the bound misses nothing. A leg
+/// can prove a smaller size between the bound read and the query, so a query
+/// the store refuses as out of bounds reads the smaller bound again and clips
+/// to it. A proven size is final, so the retry ends.
+///
+/// # Errors
+///
+/// Any other store error, marked [`crate::LocalPullFault`]: a store that cannot
+/// answer is this process's fault, never a source's (#2213).
+pub(crate) async fn missing_below_bound<St>(
+    store: &St,
+    start: u64,
+    len: u64,
+) -> anyhow::Result<(ChunkRanges, u64)>
+where
+    St: RangedStore + ?Sized,
+{
+    loop {
+        let bound = store.total_bytes();
+        let end = start.saturating_add(len).min(bound);
+        if start >= end {
+            return Ok((ChunkRanges::empty(), bound));
+        }
+        match store.missing_ranges(start, end - start).await {
+            Ok(missing) => return Ok((missing, bound)),
+            Err(decdn_bao_range::RangedStoreError::Alignment(_)) if store.total_bytes() < bound => {
+                // A leg proved a smaller size after the bound read: read it
+                // again on the next pass.
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context(crate::LocalPullFault)),
+        }
+    }
+}
+
 /// Satisfy request `R = [offset, offset + len)` of blob `hash` by filling only its
 /// gaps, paying the minimum. `len == 0` means "to the end of the blob". Held
 /// ranges are read locally — never pulled, never paid.
@@ -821,23 +856,20 @@ where
     let asked_end = gap_start.saturating_add(gap_len);
 
     loop {
-        // The bound the planner works to now: a leg that proves a smaller size
-        // shrinks it, and the gap ends there.
-        let total_bytes = store.total_bytes();
+        // The store's DELIVERED frontier for this gap (contiguous from `gap_start`):
+        // where its present ranges end. Used only to re-anchor after a reseed and
+        // for the progress bar base — NOT for completion, which is payment-based.
+        // A store that cannot answer is this process's fault, not the
+        // source's (#2213). The bound it is clipped to is the bound the planner
+        // works to now: a leg that proves a smaller size shrinks it, and the gap
+        // ends there.
+        let (still_missing, total_bytes) =
+            missing_below_bound(store, gap_start, asked_end.saturating_sub(gap_start)).await?;
         let gap_end = asked_end.min(total_bytes);
         if gap_start >= gap_end {
             return Ok(());
         }
         let gap_len = gap_end - gap_start;
-        // The store's DELIVERED frontier for this gap (contiguous from `gap_start`):
-        // where its present ranges end. Used only to re-anchor after a reseed and
-        // for the progress bar base — NOT for completion, which is payment-based.
-        // A store that cannot answer is this process's fault, not the
-        // source's (#2213).
-        let still_missing = store
-            .missing_ranges(gap_start, gap_len)
-            .await
-            .map_err(|e| anyhow::Error::new(e).context(crate::LocalPullFault))?;
         let missing_bytes = ranges_content_len(&still_missing, total_bytes);
         let delivered_frontier = gap_end.saturating_sub(missing_bytes);
 

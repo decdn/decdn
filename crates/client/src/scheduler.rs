@@ -148,8 +148,10 @@ fn bytes_past(present: &ChunkRanges, from: u64, bound: u64) -> u64 {
 }
 
 /// The chunks of `[start, start+len)` the store misses, clipped to its
-/// current bound: a range at or past the bound misses nothing. A store error
-/// is this process's fault ([`crate::LocalPullFault`]), never a source's.
+/// current bound ([`crate::driver::missing_below_bound`]): a range at or past
+/// the bound misses nothing, and a bound that shrinks under the query clips
+/// it. A store error is this process's fault ([`crate::LocalPullFault`]),
+/// never a source's.
 ///
 /// # Errors
 ///
@@ -158,14 +160,9 @@ async fn store_missing<St>(store: &St, start: u64, len: u64) -> anyhow::Result<C
 where
     St: IngestStore,
 {
-    let end = start.saturating_add(len).min(store.total_bytes());
-    if start >= end {
-        return Ok(ChunkRanges::empty());
-    }
-    store
-        .missing_ranges(start, end - start)
+    crate::driver::missing_below_bound(store, start, len)
         .await
-        .map_err(|e| anyhow::Error::new(e).context(crate::LocalPullFault))
+        .map(|(missing, _bound)| missing)
 }
 
 /// What one [`acquire`] fills: byte ranges of one blob, in one store.
@@ -3633,6 +3630,55 @@ mod tests {
         Ok(())
     }
 
+    /// A node that signs a size of zero for a bounded open fails the wire
+    /// bound's alignment. The error is the node's, not ours: the node cools,
+    /// and the other source finishes the blob.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_size_signed_for_a_bounded_open_cools_only_that_node() -> anyhow::Result<()> {
+        let data = blob(8 * 1024 * 1024);
+        let total = data.len() as u64;
+        let ledger_liar = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_honest = Arc::new(PoolLedger::new(Cumulative::default()));
+        let liar = ScriptedSource::new(data.clone())?
+            .refusing_opens_from(0, || {
+                crate::aligned_wire_len(0, 16_384, 0)
+                    .err()
+                    .unwrap_or_else(|| anyhow::anyhow!("a zero size must not align"))
+            })
+            .paying(Arc::clone(&ledger_liar));
+        let honest = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_honest));
+        let root = honest.root();
+        let (store, dir) = fresh_store(root, total);
+        let provider = StaticSources::new(vec![
+            candidate(liar, ledger_liar, 0xA1, None),
+            candidate(honest, ledger_honest, 0xB2, None),
+        ])?;
+        let health: Arc<PeerHealth> = Arc::default();
+        run_acquire_with(
+            &store,
+            &provider,
+            root,
+            &BudgetPacer::new(),
+            &no_topups(),
+            Knobs {
+                health: Arc::clone(&health),
+                ..Knobs::lanes(2)
+            },
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        assert!(
+            !matches!(
+                health.health(Address::repeat_byte(0xA1)),
+                Health::Healthy { streak: 0 }
+            ),
+            "the node that signed zero cooled: {:?}",
+            health.health(Address::repeat_byte(0xA1))
+        );
+        Ok(())
+    }
+
     /// A fatal fault ends the whole acquire with THAT typed error and does NOT
     /// reassign the failed source's range to a peer. `src_terminal` (lane 0)
     /// owns the first segment and faults at byte 0 with a typed
@@ -5829,10 +5875,13 @@ mod tests {
     }
 
     /// A store that fails `missing_ranges` once `fail` is set: a local disk or
-    /// store fault in the middle of a unit.
+    /// store fault in the middle of a unit. A nonzero `shrink_to` moves the
+    /// bound down to it at the next `missing_ranges`, before the query runs: a
+    /// leg that proves a smaller size after the caller read the bound.
     struct FailingMissing {
         inner: ClientRangedStore,
         fail: std::sync::atomic::AtomicBool,
+        shrink_to: std::sync::atomic::AtomicU64,
     }
 
     impl RangedStore for FailingMissing {
@@ -5855,6 +5904,10 @@ mod tests {
                         "injected store read fault",
                     )))
                 });
+            }
+            let shrink = self.shrink_to.swap(0, std::sync::atomic::Ordering::SeqCst);
+            if shrink > 0 {
+                self.inner.set_bound(shrink);
             }
             self.inner.missing_ranges(byte_offset, byte_len)
         }
@@ -5928,6 +5981,7 @@ mod tests {
         let store = FailingMissing {
             inner,
             fail: std::sync::atomic::AtomicBool::new(false),
+            shrink_to: std::sync::atomic::AtomicU64::new(0),
         };
         let provider = StaticSources::new(vec![candidate(src, ledger, 0xA1, None)])?;
         let health: Arc<PeerHealth> = Arc::default();
@@ -5978,6 +6032,29 @@ mod tests {
             Health::Healthy { streak: 0 },
             "the source is not cooled for our fault"
         );
+        Ok(())
+    }
+
+    /// A leg proves a smaller size between a caller's bound read and its
+    /// missing-ranges query. The query clips to the smaller bound: a range past
+    /// it misses nothing, and a range across it misses only the bytes below it.
+    /// Neither is a store fault.
+    #[tokio::test]
+    async fn a_bound_that_shrinks_under_a_missing_query_clips_it() -> anyhow::Result<()> {
+        let (inner, _dir) = fresh_store([7; 32], 8 * MIB);
+        let store = FailingMissing {
+            inner,
+            fail: std::sync::atomic::AtomicBool::new(false),
+            shrink_to: std::sync::atomic::AtomicU64::new(2 * MIB),
+        };
+        let past = super::store_missing(&store, 4 * MIB, 2 * MIB).await?;
+        assert!(past.is_empty(), "a range past the new bound misses nothing");
+
+        store
+            .shrink_to
+            .store(MIB, std::sync::atomic::Ordering::SeqCst);
+        let across = super::store_missing(&store, 0, 4 * MIB).await?;
+        assert_eq!(ranges_content_len(&across, store.total_bytes()), MIB);
         Ok(())
     }
 }

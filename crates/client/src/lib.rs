@@ -691,8 +691,9 @@ pub struct BlobTooLarge {
     pub ceiling: u64,
 }
 
-/// The requested `byte_offset` is at or past the blob's end, so no resume can be
-/// served from it (#1120).
+/// The requested range starts at or past the end of the blob the node signed
+/// for, so no byte of it can be served (#1120). A node that signs a size of
+/// zero for a bounded open of `[0, len)` raises it too.
 ///
 /// Typed rather than a bare string because it is the ONE signal that proves a
 /// caller's partial download does not belong to this blob — a stale `.partial`
@@ -702,8 +703,11 @@ pub struct BlobTooLarge {
 /// ("any error that is not a voucher rejection") would sweep in ordinary stalls
 /// and resets and destroy a perfectly good prefix the user has already paid for.
 ///
-/// Note this is a statement about the *offset*, not about the peer: the node
-/// answered honestly. Callers must not score it against the provider.
+/// Note this is a statement about the *offset*, not about the peer: an honest
+/// node answers this way to a range cut from a wrong size. A node's reputation
+/// must not score it. The acquire loop classifies it as a
+/// [`Fault::Source`]: the source cools and its range
+/// moves to other sources.
 #[derive(Debug)]
 pub struct ResumeOffsetPastEnd {
     /// Whole-blob size the node signed for.
@@ -2665,15 +2669,33 @@ pub fn is_range_past_end(err: &anyhow::Error) -> bool {
 /// [`AlignedRange::wire_len`](decdn_bao_range::AlignedRange::wire_len)
 /// reproduce the same clamp the server applied, keeping the two sides in
 /// lock-step. The one site every pull derives its wire bound (and its
-/// received-byte ceiling) through. Only a `byte_offset` at or past a non-empty
-/// `total_bytes` still faults, as [`LocalPullFault`] (see [`is_range_past_end`]).
+/// received-byte ceiling) through. A range with no byte below `total_bytes`
+/// faults with [`RangeVerifyError::RangeOutOfBounds`] (see
+/// [`is_range_past_end`]). Every input but the offset comes from the peer's
+/// signed size or the caller's own cap, so the fault is never marked
+/// [`LocalPullFault`].
+///
+/// [`RangeVerifyError::RangeOutOfBounds`]: decdn_bao_range::RangeVerifyError::RangeOutOfBounds
 fn aligned_wire_len(byte_offset: u64, byte_len: u64, total_bytes: u64) -> anyhow::Result<u64> {
-    let aligned = align_range_clamped(byte_offset, byte_len, total_bytes).map_err(|e| {
-        anyhow::Error::new(e)
-            .context("range alignment")
-            .context(LocalPullFault)
-    })?;
+    let aligned = align_range_clamped(byte_offset, byte_len, total_bytes)
+        .map_err(|e| anyhow::Error::new(e).context("range alignment"))?;
     Ok(aligned.wire_len())
+}
+
+/// The wire bound of an open of `[byte_offset, byte_offset + byte_len)`
+/// (`byte_len == 0` meaning "to end") against the size `total_bytes` the peer
+/// signed ([`aligned_wire_len`]). A range that asks for bytes and starts at or
+/// past that size is refused first, with [`ResumeOffsetPastEnd`]: an offset
+/// past a resumed blob's end, or a size of zero signed for a bounded open. The
+/// open of the empty blob, `(0, 0)` against a size of zero, passes.
+fn served_wire_len(byte_offset: u64, byte_len: u64, total_bytes: u64) -> anyhow::Result<u64> {
+    if total_bytes <= byte_offset && (byte_offset > 0 || byte_len > 0) {
+        return Err(anyhow::Error::new(ResumeOffsetPastEnd {
+            total_bytes,
+            byte_offset,
+        }));
+    }
+    aligned_wire_len(byte_offset, byte_len, total_bytes)
 }
 
 /// How often the throughput floor samples the byte counter: a fraction of the window, so a
@@ -3084,24 +3106,12 @@ async fn open_progressive_pull_impl(
         if max_rate_per_mb > 0 && resp.body.rate_per_mb > max_rate_per_mb {
             return Err(RateAboveCeiling::over_ceiling(resp, max_rate_per_mb));
         }
-        // A resume offset the blob cannot satisfy. `<=` rather than `<`: an offset
-        // exactly AT the end has no chunk group to anchor either, and `align_range`
-        // would reject it a few lines later with an untyped fault — this way both
-        // land on the same typed sentinel. Guarded on `byte_offset > 0` so a 0-byte
-        // blob fetched from 0 (#1054) is untouched.
-        if resp.body.total_bytes <= byte_offset && byte_offset > 0 {
-            return Err(anyhow::Error::new(ResumeOffsetPastEnd {
-                total_bytes: resp.body.total_bytes,
-                byte_offset,
-            }));
-        }
-
         let rate_per_mb = resp.body.rate_per_mb;
-        // Wire-byte bound (bao-encoded size of the aligned range), not content bytes —
+        // Wire-byte bound (bao-encoded size of the aligned range), not content bytes:
         // the window path forwards this stream verbatim and pays the upstream in wire
         // bytes (ADR 038 §Payment metering).
         let total_bytes = resp.body.total_bytes;
-        let expected_wire_bytes = aligned_wire_len(byte_offset, byte_len, total_bytes)?;
+        let expected_wire_bytes = served_wire_len(byte_offset, byte_len, total_bytes)?;
         // Received-byte ceiling (#1895), expressed as a WIRE bound so `next_chunk` can
         // enforce it without decoding: the wire size of a ceiling-sized blob's content
         // from this offset. Enforced on the bytes that ACTUALLY arrive, never on the
@@ -4285,26 +4295,24 @@ mod tests {
         );
     }
 
+    /// Every input to `aligned_wire_len` but the offset is the peer's signed
+    /// size or our own cap, so a range it cannot align is a source fault, never
+    /// ours: one node that signs a bad size must not end the command.
     #[test]
-    fn the_range_helpers_mark_their_own_faults_as_local() {
-        // A 4 KiB blob cannot be resumed from byte 8192 — the offset itself is
-        // at or past the end, so `align_range_clamped` still errors rather than
-        // clamping (a start past the end has no chunk group to anchor), and the
-        // caller must own that as OURS. The assertion covers both halves at
-        // once: `None` here means the call wrongly SUCCEEDED, and a `Some`
-        // without the marker means it failed and blamed the peer.
-        let aligned = aligned_wire_len(8192, 0, 4096).err();
-        assert!(
-            aligned
-                .as_ref()
-                .is_some_and(|e| e.downcast_ref::<LocalPullFault>().is_some()),
-            "aligned_wire_len must reject an out-of-range offset and mark it OUR fault; \
-             without the marker it falls through every downcast to the catch-all and \
-             scores the peer as unreachable. Got: {aligned:?}"
-        );
-        // The same fault names a range past the blob's end, so a caller that cut
-        // the range from an unsigned size can tell it from any other failure.
-        assert!(aligned.as_ref().is_some_and(super::is_range_past_end));
+    fn a_range_the_signed_size_cannot_hold_is_a_source_fault() {
+        for (offset, len, total) in [(8192, 0, 4096), (0, 16_384, 0)] {
+            let aligned = aligned_wire_len(offset, len, total).err();
+            assert!(
+                aligned.as_ref().is_some_and(|e| {
+                    e.downcast_ref::<LocalPullFault>().is_none()
+                        && crate::classify(e) == crate::Fault::Source
+                }),
+                "({offset}, {len}) against a signed {total} is the source's fault: {aligned:?}"
+            );
+            // It names a range past the blob's end, so a caller that cut the
+            // range from an unsigned size can tell it from any other failure.
+            assert!(aligned.as_ref().is_some_and(super::is_range_past_end));
+        }
         assert!(super::is_range_past_end(&anyhow::Error::new(
             super::ResumeOffsetPastEnd {
                 total_bytes: 4096,
@@ -4317,6 +4325,35 @@ mod tests {
         assert!(!super::is_range_past_end(
             &anyhow::anyhow!("dial timed out").context(LocalPullFault)
         ));
+    }
+
+    /// A node that signs a size of zero for a bounded open is refused with the
+    /// typed `ResumeOffsetPastEnd`, a source fault. The open of the empty blob,
+    /// `(0, 0)` against zero, still passes.
+    #[test]
+    fn a_zero_size_signed_for_a_bounded_open_is_refused_as_the_sources_fault() {
+        let err = super::served_wire_len(0, 16_384, 0).err();
+        assert!(
+            err.as_ref().is_some_and(|e| {
+                e.downcast_ref::<super::ResumeOffsetPastEnd>().is_some()
+                    && crate::classify(e) == crate::Fault::Source
+            }),
+            "a zero size for a bounded open is the source's fault: {err:?}"
+        );
+        assert!(
+            super::served_wire_len(8192, 0, 4096)
+                .err()
+                .is_some_and(|e| e.downcast_ref::<super::ResumeOffsetPastEnd>().is_some()),
+            "an offset past the signed end is refused the same way"
+        );
+        assert!(
+            super::served_wire_len(0, 0, 0).is_ok(),
+            "the empty blob opens"
+        );
+        assert!(
+            super::served_wire_len(0, 16_384, 4096).is_ok(),
+            "an end past the size clamps"
+        );
     }
 
     /// A response header whose `total_bytes` is smaller than the requested end
