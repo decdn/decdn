@@ -5310,45 +5310,43 @@ mod tests {
 
     /// A mocked provider answering the preflight's reads in order:
     /// `eth_chainId`, `eth_getCode`, then (when reached) the `usdc()` call.
-    fn preflight_provider(responses: Vec<Result<serde_json::Value, ()>>) -> impl Provider + Clone {
+    /// `Some` answers with that value; `None` faults the call as a transient
+    /// RPC error does — the convention `payment_pool.rs`' `mocked` uses. The
+    /// values are JSON, not raw bytes, because `eth_chainId` answers with a
+    /// quantity.
+    fn preflight_provider(responses: Vec<Option<serde_json::Value>>) -> impl Provider + Clone {
         let asserter = alloy::providers::mock::Asserter::new();
         for response in responses {
             match response {
-                Ok(value) => asserter.push_success(&value),
-                Err(()) => asserter.push_failure_msg("transient rpc fault"),
+                Some(value) => asserter.push_success(&value),
+                None => asserter.push_failure_msg("transient rpc fault"),
             }
         }
         ProviderBuilder::new().connect_mocked_client(asserter)
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "feeds preflight_provider's response list beside Err(()) entries"
-    )]
-    fn chain_id_ok() -> Result<serde_json::Value, ()> {
-        Ok(serde_json::json!(alloy::primitives::U64::from(421_614u64)))
+    /// `eth_chainId` answering the configured chain.
+    fn chain_id_ok() -> serde_json::Value {
+        serde_json::json!(alloy::primitives::U64::from(421_614u64))
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "feeds preflight_provider's response list beside Err(()) entries"
-    )]
-    fn code_present() -> Result<serde_json::Value, ()> {
-        Ok(serde_json::json!(alloy::primitives::Bytes::from(vec![
-            0x60
-        ])))
+    /// `eth_getCode` answering one byte of code (`0x60`, `PUSH1`): the
+    /// preflight checks only that code is present, never what it is.
+    fn code_present() -> serde_json::Value {
+        serde_json::json!(alloy::primitives::Bytes::from(vec![0x60]))
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "feeds preflight_provider's response list beside Err(()) entries"
-    )]
-    fn usdc_answers() -> Result<serde_json::Value, ()> {
+    /// `usdc()` answering a token address, as every `PaymentPool` does.
+    fn usdc_answers() -> serde_json::Value {
         use alloy::sol_types::SolValue;
         let token = alloy::primitives::Address::repeat_byte(0x0c);
-        Ok(serde_json::json!(alloy::primitives::Bytes::from(
-            token.abi_encode()
-        )))
+        serde_json::json!(alloy::primitives::Bytes::from(token.abi_encode()))
+    }
+
+    /// An empty-bytes answer: no code at the address for `eth_getCode`, or no
+    /// return data for an `eth_call`.
+    fn empty_bytes() -> serde_json::Value {
+        serde_json::json!(alloy::primitives::Bytes::default())
     }
 
     fn preflight_retry_budget() -> BootRetry {
@@ -5361,7 +5359,11 @@ mod tests {
     /// The healthy path: matching chain id, code present, `usdc()` answers.
     #[tokio::test]
     async fn a_matching_deployment_passes_the_preflight() {
-        let provider = preflight_provider(vec![chain_id_ok(), code_present(), usdc_answers()]);
+        let provider = preflight_provider(vec![
+            Some(chain_id_ok()),
+            Some(code_present()),
+            Some(usdc_answers()),
+        ]);
         check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
             .await
             .expect("a matching deployment must pass");
@@ -5372,8 +5374,8 @@ mod tests {
     #[tokio::test]
     async fn a_chain_id_mismatch_aborts_the_preflight() {
         let provider = preflight_provider(vec![
-            Ok(serde_json::json!(alloy::primitives::U64::from(1u64))),
-            code_present(),
+            Some(serde_json::json!(alloy::primitives::U64::from(1u64))),
+            Some(code_present()),
         ]);
         let err = check_deployment_preflight(
             provider,
@@ -5392,10 +5394,7 @@ mod tests {
     /// A codeless address aborts: nothing is deployed there.
     #[tokio::test]
     async fn a_codeless_payment_pool_address_aborts_the_preflight() {
-        let provider = preflight_provider(vec![
-            chain_id_ok(),
-            Ok(serde_json::json!(alloy::primitives::Bytes::default())),
-        ]);
+        let provider = preflight_provider(vec![Some(chain_id_ok()), Some(empty_bytes())]);
         let err = check_deployment_preflight(
             provider,
             PREFLIGHT_DEPLOYMENT,
@@ -5419,10 +5418,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_non_payment_pool_contract_aborts_the_preflight() {
         let provider = preflight_provider(vec![
-            chain_id_ok(),
-            code_present(),
+            Some(chain_id_ok()),
+            Some(code_present()),
             // `usdc()` returns no data: the target hosts some other contract.
-            Ok(serde_json::json!(alloy::primitives::Bytes::default())),
+            Some(empty_bytes()),
         ]);
         let err =
             check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
@@ -5444,8 +5443,12 @@ mod tests {
     /// retry backoff sleep cost no real time.
     #[tokio::test(start_paused = true)]
     async fn a_transient_rpc_error_is_retried_by_the_preflight() {
-        let provider =
-            preflight_provider(vec![Err(()), chain_id_ok(), code_present(), usdc_answers()]);
+        let provider = preflight_provider(vec![
+            None,
+            Some(chain_id_ok()),
+            Some(code_present()),
+            Some(usdc_answers()),
+        ]);
         check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
             .await
             .expect("a transient fault must be retried to success");
