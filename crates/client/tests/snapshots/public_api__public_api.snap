@@ -50,7 +50,7 @@ pub mod decdn_client::connection
 pub struct decdn_client::connection::Connections
 impl decdn_client::connection::Connections
 pub async fn decdn_client::connection::Connections::get(&self, &iroh_base::endpoint_addr::EndpointAddr) -> anyhow::Result<alloc::sync::Arc<decdn_client::connection::WarmConnection>>
-pub fn decdn_client::connection::Connections::invalidate(&self, iroh_base::key::PublicKey)
+pub async fn decdn_client::connection::Connections::invalidate(&self, iroh_base::key::PublicKey, &alloc::sync::Arc<decdn_client::connection::WarmConnection>)
 pub fn decdn_client::connection::Connections::new(iroh::endpoint::Endpoint) -> Self
 pub struct decdn_client::connection::WarmConnection
 impl decdn_client::connection::WarmConnection
@@ -674,7 +674,7 @@ pub fn decdn_client::stop::ClockHold<'_>::drop(&mut self)
 pub struct decdn_client::Connections
 impl decdn_client::connection::Connections
 pub async fn decdn_client::connection::Connections::get(&self, &iroh_base::endpoint_addr::EndpointAddr) -> anyhow::Result<alloc::sync::Arc<decdn_client::connection::WarmConnection>>
-pub fn decdn_client::connection::Connections::invalidate(&self, iroh_base::key::PublicKey)
+pub async fn decdn_client::connection::Connections::invalidate(&self, iroh_base::key::PublicKey, &alloc::sync::Arc<decdn_client::connection::WarmConnection>)
 pub fn decdn_client::connection::Connections::new(iroh::endpoint::Endpoint) -> Self
 pub struct decdn_client::ConsumptionPacing<'a>
 pub decdn_client::ConsumptionPacing::downstream: &'a (dyn core::ops::function::Fn() -> decdn_client::pacer::DownstreamFrontier + core::marker::Send + core::marker::Sync)

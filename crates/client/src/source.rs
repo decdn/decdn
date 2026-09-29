@@ -428,10 +428,12 @@ impl<'a> PeerSource<'a> {
     /// one when the target has none. `deadlines.open` bounds the dial, and
     /// again the stream open that follows it.
     ///
-    /// A pull that fails on a connection that has closed (a transport fault:
-    /// a reset, a closed connection, an idle timeout) drops the connection
-    /// from the map, so the next open dials again. Any other failure (a
-    /// refusal, a bad response) leaves the connection for the next open.
+    /// The pull holds the connection while it runs. A transport fault on the
+    /// open or on a later read (a connection reset, a closed connection, an
+    /// idle timeout, an open or read that falls under its deadline) unpins
+    /// this connection from the map, so the next open dials again. Any other
+    /// failure (a refusal, a bad response, a hash mismatch) leaves the
+    /// connection pinned for the next open.
     async fn open_shared(
         &self,
         connections: &Connections,
@@ -444,8 +446,13 @@ impl<'a> PeerSource<'a> {
         let warm = tokio::time::timeout(open, connections.get(&self.target))
             .await
             .map_err(|_| anyhow::Error::new(crate::PullTimeout { after: open }))??;
-        let opened = crate::open_progressive_pull_on(
-            &warm,
+        let conn = warm.connection().clone();
+        crate::open_progressive_pull_on(
+            &conn,
+            crate::connection::ConnOwner::Shared {
+                warm,
+                map: connections.clone(),
+            },
             ctx,
             Arc::clone(&self.ledger),
             self.slash_domain,
@@ -459,11 +466,7 @@ impl<'a> PeerSource<'a> {
             self.deadlines,
             byte_len,
         )
-        .await;
-        if opened.is_err() && warm.is_closed() {
-            connections.invalidate(self.target.id);
-        }
-        opened
+        .await
     }
 }
 

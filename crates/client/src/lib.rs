@@ -2150,7 +2150,8 @@ async fn fetch_in_memory_once_on(
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Bytes> {
     let (header, pull) = open_progressive_pull_on(
-        warm,
+        warm.connection(),
+        connection::ConnOwner::Borrowed,
         ctx,
         ledger,
         slash_domain,
@@ -2787,10 +2788,10 @@ pub struct UpstreamPullHeader {
 /// indifferent to size and link speed, and frame-size-independent.
 pub struct UpstreamPull {
     conn: iroh::endpoint::Connection,
-    /// Whether this pull OWNS its connection (a one-shot dial, closed on the
-    /// pull's terminal method) or merely BORROWS a [`WarmConnection`]'s (left open
-    /// for the next hash, closed once by the warm connection's own `Drop`).
-    owns_conn: bool,
+    /// What this pull owns of its connection: a one-shot dial it closes on its
+    /// terminal method, a caller-owned [`WarmConnection`] it borrows, or a
+    /// [`Connections`] map's connection it holds and unpins on a transport fault.
+    owner: connection::ConnOwner,
     send: SendStream,
     recv: RecvStream,
     ctx: PoolContext,
@@ -2931,7 +2932,7 @@ pub async fn open_progressive_pull(
             runtime: dial_runtime,
         },
         // One-shot dial: the pull owns this connection and closes it on teardown.
-        true,
+        connection::ConnOwner::Owned,
         ctx,
         ledger,
         slash_domain,
@@ -2948,12 +2949,15 @@ pub async fn open_progressive_pull(
     .await
 }
 
-/// Like [`open_progressive_pull`], but opens the pull on a caller-owned
-/// [`WarmConnection`] instead of dialling a fresh connection (#1848). The warm
-/// connection is reused across many hashes — one dial, a fresh bi-stream per hash
-/// (one stream = one hash, no wire change) — and stays open when this pull ends,
-/// so the pull borrows the connection and never closes it. The [`WarmConnection`]
-/// closes it once, on its own `Drop`.
+/// Like [`open_progressive_pull`], but opens the pull on the warm connection
+/// `conn` instead of dialling a fresh one (#1848). `owner` names where `conn`
+/// comes from: a caller-owned [`WarmConnection`] or a [`Connections`] map's
+/// connection. The warm connection is reused across
+/// many hashes — one dial, a fresh bi-stream per hash (one stream = one hash, no
+/// wire change) — and stays open when this pull ends, so the pull never closes
+/// it. A map's connection is held by the pull while it runs, and a transport
+/// fault on the open or on a later read unpins it from the map
+/// ([`Connections::invalidate`]).
 ///
 /// Every other argument behaves exactly as on [`open_progressive_pull`]; see its
 /// docs. There is no `endpoint`/`target` pair — the warm connection already names
@@ -2966,7 +2970,7 @@ pub async fn open_progressive_pull(
         error = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
         otel.kind = "client",
-        peer = %warm.connection().remote_id(),
+        peer = %conn.remote_id(),
         hash = %decdn_protocol::ContentHash::from_bytes(hash),
         pool_id = %ctx.pool_id,
         byte_offset = byte_offset,
@@ -2974,7 +2978,8 @@ pub async fn open_progressive_pull(
     )
 )]
 pub(crate) async fn open_progressive_pull_on(
-    warm: &WarmConnection,
+    conn: &iroh::endpoint::Connection,
+    owner: connection::ConnOwner,
     ctx: &PoolContext,
     ledger: Arc<PoolLedger>,
     slash_domain: &Eip712Domain,
@@ -2988,10 +2993,10 @@ pub(crate) async fn open_progressive_pull_on(
     deadlines: PullDeadlines,
     byte_len: u64,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
-    open_progressive_pull_impl(
-        ConnSource::Reuse(warm.connection()),
-        // Borrowed warm connection: leave it open for the next hash.
-        false,
+    let opened = open_progressive_pull_impl(
+        ConnSource::Reuse(conn),
+        // A warm connection: leave it open for the next hash.
+        owner.clone(),
         ctx,
         ledger,
         slash_domain,
@@ -3005,18 +3010,22 @@ pub(crate) async fn open_progressive_pull_on(
         deadlines,
         byte_len,
     )
-    .await
+    .await;
+    if let Err(err) = &opened {
+        owner.unpin_on_fault(err).await;
+    }
+    opened
 }
 
 /// The shared body behind [`open_progressive_pull`] (dial) and
-/// [`open_progressive_pull_on`] (reuse). `owns_conn` records which one opened it,
-/// so the returned [`UpstreamPull`] knows whether its terminal method closes the
-/// connection (owned, one-shot) or leaves it open for the next hash (borrowed,
-/// warm).
+/// [`open_progressive_pull_on`] (reuse). `owner` records what the pull owns of
+/// its connection, so the returned [`UpstreamPull`] knows whether its terminal
+/// method closes the connection (owned, one-shot) or leaves it open for the
+/// next hash (warm), and whether a read fault unpins it from a map.
 #[allow(clippy::too_many_arguments)]
 async fn open_progressive_pull_impl(
     source: ConnSource<'_>,
-    owns_conn: bool,
+    owner: connection::ConnOwner,
     ctx: &PoolContext,
     ledger: Arc<PoolLedger>,
     slash_domain: &Eip712Domain,
@@ -3128,7 +3137,7 @@ async fn open_progressive_pull_impl(
             floor,
             sampler,
             conn,
-            owns_conn,
+            owner,
             send,
             recv,
             ctx: ctx.clone(),
@@ -3199,7 +3208,20 @@ impl UpstreamPull {
     /// the floor's sampling tick: a read slow enough to lose the race is judged, and a
     /// sub-floor window aborts with [`PullTimeout`] before the first byte (our own
     /// blob-size-dependent budget) or [`PullStalled`] after it — neither scores the peer.
+    ///
+    /// A transport fault on a [`Connections`] map's connection (either floor verdict,
+    /// or a connection that has closed under the read) unpins that connection from
+    /// the map, so the node's next leg dials again.
     async fn read_under_floor(&mut self) -> anyhow::Result<ClientMessage> {
+        let read = self.read_under_floor_once().await;
+        if let Err(err) = &read {
+            self.owner.unpin_on_fault(err).await;
+        }
+        read
+    }
+
+    /// [`Self::read_under_floor`] before a transport fault unpins the connection.
+    async fn read_under_floor_once(&mut self) -> anyhow::Result<ClientMessage> {
         let cumulative = self.cumulative;
         let window = self.window;
         let recv = &mut self.recv;
@@ -3596,16 +3618,17 @@ impl UpstreamPull {
     ///
     /// An OWNED connection (a one-shot dial) is closed, which ends the QUIC
     /// connection so the upstream's serve task stops and the paid stream does not
-    /// linger half-open. A BORROWED connection (a [`WarmConnection`] reused across
-    /// hashes) is left open for the next hash — only THIS stream is torn down: the
-    /// send half is finished (a clean FIN) and the recv half is stopped. The warm
-    /// connection's own `Drop` closes the connection once, later.
+    /// linger half-open. A WARM connection (a [`WarmConnection`] reused across
+    /// hashes, caller-owned or from a [`Connections`] map) is left open for the
+    /// next hash — only THIS stream is torn down: the send half is finished (a
+    /// clean FIN) and the recv half is stopped. The warm connection's own `Drop`
+    /// closes the connection once, later.
     ///
     /// `Connection::close`, `SendStream::finish`, and `RecvStream::stop` are all
     /// first-wins / idempotent, so an explicit terminal method (`finish`/`abort`)
     /// keeps its richer reason and the `Drop` safety net becomes a no-op.
     fn close_transport(&mut self, code: u32, reason: &[u8]) {
-        if self.owns_conn {
+        if self.owner.owns() {
             self.conn.close(code.into(), reason);
         } else {
             let _ = self.send.finish();

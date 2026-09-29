@@ -149,14 +149,16 @@ impl WarmConnection {
 ///
 /// A pull opens its own bi-stream on the node's connection and dials only when
 /// the node has no live connection. Concurrent callers for one node share one
-/// dial. A closed connection is dialled again on the next [`get`](Self::get),
-/// so a transport fault (a reset, a closed connection, an idle timeout) costs
-/// one redial. A protocol refusal or a hash mismatch ends only its own stream,
-/// and the connection stays. The connection carries no payment state: payment
-/// lanes stay per (signer, provider).
+/// dial. A pull that meets a transport fault (a connection reset, a closed
+/// connection, an idle timeout, an open or read that falls under its
+/// deadline) unpins its connection ([`invalidate`](Self::invalidate)), so the
+/// next [`get`](Self::get) dials again. A protocol refusal or a hash mismatch
+/// ends only its own stream, and the connection stays pinned. The connection
+/// carries no payment state: payment lanes stay per (signer, provider).
 ///
-/// Cloning is cheap: every clone shares one map. Each connection closes when
-/// the map drops it and no pull still holds it.
+/// Cloning is cheap: every clone shares one map. Each pull holds its
+/// connection, so each connection closes when the map drops it and no pull
+/// still holds it.
 ///
 /// **One long-lived runtime only (#1675).** A connection's QUIC driver lives on
 /// the runtime that dialled it, and the connection makes progress only while
@@ -229,11 +231,11 @@ impl Connections {
         Ok(warm)
     }
 
-    /// Drop `node`'s connection if it has closed, so its resources go at once
-    /// rather than at the next [`get`](Self::get). A live connection stays:
-    /// another caller may have dialled it after the fault, and its pulls run
-    /// on it.
-    pub fn invalidate(&self, node: PublicKey) {
+    /// Unpin `conn` from `node`'s slot, so the next [`get`](Self::get) dials
+    /// again. Only that instance is unpinned: when another caller has already
+    /// dialled a newer connection into the slot, the newer one stays. Pulls
+    /// that still hold `conn` keep it; it closes when the last of them ends.
+    pub async fn invalidate(&self, node: PublicKey, conn: &Arc<WarmConnection>) {
         let slot = self
             .inner
             .slots
@@ -241,11 +243,13 @@ impl Connections {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&node)
             .map(Arc::clone);
-        // A slot that is locked is mid-dial, and the dial replaces what it
-        // holds.
-        if let Some(slot) = slot
-            && let Ok(mut held) = slot.try_lock()
-            && held.as_ref().is_some_and(|warm| warm.is_closed())
+        let Some(slot) = slot else {
+            return;
+        };
+        let mut held = slot.lock().await;
+        if held
+            .as_ref()
+            .is_some_and(|pinned| Arc::ptr_eq(pinned, conn))
         {
             *held = None;
         }
@@ -256,6 +260,57 @@ impl Connections {
     #[must_use]
     pub fn dials(&self) -> u64 {
         self.inner.dials.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Whether `err` on a pull over `warm` is a transport fault: the connection
+/// has closed (a connection reset, a close by either side, an idle timeout, a
+/// lost connection under a read or an `open_bi`), or the open or a read fell
+/// under its deadline ([`PullTimeout`], [`PullStalled`](crate::PullStalled)).
+/// A refusal, a verify or hash fault, and a stream-level reset (a rate-limit
+/// shed of one stream) are not.
+pub(crate) fn is_transport_fault(err: &anyhow::Error, warm: &WarmConnection) -> bool {
+    warm.is_closed()
+        || err
+            .chain()
+            .any(|e| e.is::<PullTimeout>() || e.is::<crate::PullStalled>())
+}
+
+/// What a pull owns of its connection, which sets its teardown.
+#[derive(Debug, Clone)]
+pub(crate) enum ConnOwner {
+    /// A one-shot dial: the pull closes the connection on teardown.
+    Owned,
+    /// A caller-owned [`WarmConnection`]: the pull tears down only its own
+    /// stream, and the warm connection closes once, on its own `Drop`.
+    #[cfg(any(test, feature = "test-util"))]
+    Borrowed,
+    /// A connection from a [`Connections`] map: the pull tears down only its
+    /// own stream, holds the connection until it ends, and unpins it from
+    /// `map` on a transport fault.
+    Shared {
+        /// The connection, held for the pull's life.
+        warm: Arc<WarmConnection>,
+        /// The map it is pinned in.
+        map: Connections,
+    },
+}
+
+impl ConnOwner {
+    /// Whether the pull closes the connection on teardown.
+    pub(crate) const fn owns(&self) -> bool {
+        matches!(self, Self::Owned)
+    }
+
+    /// Unpin a shared connection from its map when `err` is a transport
+    /// fault ([`is_transport_fault`]). Any other owner, and any other error,
+    /// leaves the map as it is.
+    pub(crate) async fn unpin_on_fault(&self, err: &anyhow::Error) {
+        if let Self::Shared { warm, map } = self
+            && is_transport_fault(err, warm)
+        {
+            map.invalidate(warm.connection().remote_id(), warm).await;
+        }
     }
 }
 
@@ -493,8 +548,9 @@ mod tests {
         assert_accepted(&accepted, 1).await;
     }
 
-    /// A get after the node's connection closes dials again, and invalidate
-    /// drops only a closed connection.
+    /// A get after the node's connection closes dials again. Invalidating a
+    /// live connection unpins it too: the next get dials, and the unpinned
+    /// connection stays open for its holder.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_get_after_the_connection_closes_dials_again() {
         let (_peer, peer_addr, accepted) = holding_peer().await;
@@ -502,25 +558,149 @@ mod tests {
         let connections = super::Connections::new(ep.clone());
 
         let first = connections.get(&peer_addr).await.expect("first get");
-        connections.invalidate(peer_addr.id);
-        let kept = connections
-            .get(&peer_addr)
-            .await
-            .expect("get after invalidate");
-        assert!(
-            std::sync::Arc::ptr_eq(&first, &kept),
-            "invalidate keeps a live connection"
-        );
-        assert_eq!(connections.dials(), 1);
-
         first.connection().close(0u32.into(), b"test-closed");
         assert!(first.is_closed());
-        connections.invalidate(peer_addr.id);
         let second = connections.get(&peer_addr).await.expect("get after close");
         assert!(!std::sync::Arc::ptr_eq(&first, &second));
         assert!(!second.is_closed());
         assert_eq!(connections.dials(), 2, "a closed connection redials");
-        assert_accepted(&accepted, 2).await;
+
+        connections.invalidate(peer_addr.id, &second).await;
+        let third = connections
+            .get(&peer_addr)
+            .await
+            .expect("get after invalidate");
+        assert!(
+            !std::sync::Arc::ptr_eq(&second, &third),
+            "invalidate unpins a live connection"
+        );
+        assert!(
+            !second.is_closed(),
+            "its holder keeps the unpinned connection"
+        );
+        assert_eq!(connections.dials(), 3);
+        assert_accepted(&accepted, 3).await;
+    }
+
+    /// A stale invalidate leaves a newer connection pinned: leg A faults on
+    /// C1 and invalidates it after leg B already redialled C2.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_invalidate_keeps_the_newer_connection() {
+        let (_peer, peer_addr, _accepted) = holding_peer().await;
+        let (ep, _) = loopback_endpoint(Vec::new()).await;
+        let connections = super::Connections::new(ep.clone());
+
+        let c1 = connections.get(&peer_addr).await.expect("C1");
+        c1.connection().close(0u32.into(), b"test-closed");
+        let c2 = connections.get(&peer_addr).await.expect("B redials C2");
+        connections.invalidate(peer_addr.id, &c1).await;
+        let after = connections.get(&peer_addr).await.expect("get after A");
+        assert!(std::sync::Arc::ptr_eq(&c2, &after), "C2 stays pinned");
+        assert!(!c2.is_closed());
+        assert_eq!(connections.dials(), 2);
+    }
+
+    /// A peer that echoes every stream back.
+    async fn echo_peer() -> (Endpoint, EndpointAddr) {
+        let (peer, peer_addr) = loopback_endpoint(vec![ALPN_CLIENT.to_vec()]).await;
+        let accept_peer = peer.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = accept_peer.accept().await {
+                let Ok(connecting) = incoming.accept() else {
+                    continue;
+                };
+                let Ok(conn) = connecting.await else { continue };
+                tokio::spawn(async move {
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 64];
+                            while let Ok(Some(n)) = recv.read(&mut buf).await {
+                                let Some(bytes) = buf.get(..n) else { break };
+                                if send.write_all(bytes).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+        });
+        (peer, peer_addr)
+    }
+
+    /// A sibling leg still streaming on C1 keeps streaming after C1 is
+    /// unpinned, and after the map and the faulting leg drop their handles.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sibling_leg_keeps_streaming_on_an_unpinned_connection() {
+        let (_peer, peer_addr) = echo_peer().await;
+        let (ep, _) = loopback_endpoint(Vec::new()).await;
+        let connections = super::Connections::new(ep.clone());
+
+        let faulting = connections.get(&peer_addr).await.expect("leg A");
+        let sibling = connections.get(&peer_addr).await.expect("leg B");
+        let (mut send, mut recv) = sibling.connection().open_bi().await.expect("open_bi");
+        let mut echo = [0u8; 1];
+        send.write_all(b"a").await.expect("write before");
+        recv.read_exact(&mut echo).await.expect("read before");
+        assert_eq!(&echo, b"a");
+
+        connections.invalidate(peer_addr.id, &faulting).await;
+        drop(faulting);
+        let next = connections.get(&peer_addr).await.expect("next leg");
+        assert!(!std::sync::Arc::ptr_eq(&sibling, &next));
+
+        send.write_all(b"b").await.expect("write after");
+        recv.read_exact(&mut echo).await.expect("read after");
+        assert_eq!(&echo, b"b", "the sibling's stream still flows");
+        assert!(!sibling.is_closed());
+    }
+
+    /// A peer that takes the connection and never answers a stream: the leg's
+    /// open falls under its deadline, which unpins the connection, so the
+    /// next get dials a new one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_leg_that_times_out_unpins_its_connection() {
+        use alloy::primitives::{Address, U256};
+        use decdn_bao_range::align_range;
+
+        use crate::source::BlobSource as _;
+
+        let (_peer, peer_addr, _accepted) = holding_peer().await;
+        let (ep, _) = loopback_endpoint(Vec::new()).await;
+        let connections = super::Connections::new(ep.clone());
+        let ctx = crate::source::ctx_with(0xB0, U256::from(1_000_000u64));
+        let ledger = std::sync::Arc::new(ctx.new_ledger());
+        let slash = decdn_incentive::slash_judge_domain(1, Address::ZERO);
+        let source = crate::PeerSource::new(
+            &ep,
+            peer_addr.clone(),
+            std::sync::Arc::new(std::sync::Mutex::new(ctx)),
+            ledger,
+            &slash,
+            Address::repeat_byte(0xB0),
+            [0u8; 32],
+            0,
+            0,
+            crate::PullDeadlines::new(Duration::from_millis(500), Duration::from_secs(5), 0)
+                .expect("deadlines"),
+            Some(connections.clone()),
+        );
+
+        let pinned = connections.get(&peer_addr).await.expect("first get");
+        let err = source
+            .open([7u8; 32], align_range(0, 0, 1024).expect("range"))
+            .await
+            .expect_err("a peer that never answers must time out");
+        assert!(
+            err.downcast_ref::<crate::PullTimeout>().is_some(),
+            "expected a PullTimeout: {err:#}"
+        );
+        let next = connections
+            .get(&peer_addr)
+            .await
+            .expect("get after the fault");
+        assert!(!std::sync::Arc::ptr_eq(&pinned, &next));
+        assert_eq!(connections.dials(), 2);
     }
 
     /// The control: the same dial on the dropped runtime itself takes the

@@ -1325,7 +1325,7 @@ async fn pull_over(
         open_lock: tokio::sync::Mutex::new(()),
         jobs: args.jobs.max(1),
         gate: tokio::sync::Semaphore::new(args.jobs.max(1)),
-        lane_cap: LaneStreamCap::new(args.max_lane_streams),
+        lane_cap: LaneStreamCap::new(usize::from(args.max_lane_streams)),
         health: Arc::new(PeerHealth::default()),
         connections: Connections::new(endpoint.clone()),
         // One clock for the whole command: a stuck entry waits while another
