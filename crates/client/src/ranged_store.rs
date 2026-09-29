@@ -349,6 +349,9 @@ impl ClientRangedStore {
     /// leftover record is removed here. A final file of another blob is left
     /// alone, and `open` resumes this blob's `.partial` from its record.
     ///
+    /// When a final file is present, `open` hashes it once against the root, a
+    /// read of the whole file. Async callers run `open` on a blocking thread.
+    ///
     /// # Errors
     ///
     /// Any I/O failure hashing the final file or reading the record,
@@ -415,12 +418,11 @@ impl ClientRangedStore {
     /// discards none of its partial.
     ///
     /// Keyed on the `.ranges` record alone, NOT on the promoted final file:
-    /// once `finalize` promotes and deletes the sidecars, a re-fetch of the same
-    /// stem starts fresh (there is nothing left to resume from) — the same
-    /// behaviour the pre-#1608 CLI had, where `finalize`'s rename moved the
-    /// `.partial` away and a re-run re-downloaded. A stale non-sidecar `.partial`
-    /// (e.g. an old raw-format leftover at the same path) is discarded by
-    /// `create`'s `File::create` truncation.
+    /// once `finalize` promotes and deletes the record, a re-fetch of the same
+    /// stem starts fresh, since there is nothing left to resume from. A
+    /// `.partial` without a record is truncated by `create`'s `File::create`.
+    /// Resuming a record runs [`open`](Self::open), which hashes a final file
+    /// if one is present, so async callers run this on a blocking thread.
     ///
     /// # Errors
     ///
@@ -2773,15 +2775,22 @@ mod tests {
     }
 
     /// A final file that hashes to the root reopens complete, and `open`
-    /// removes the leftover record.
+    /// removes a stale record a crash left beside it (the positive path; the
+    /// foreign-file path is `open_resumes_the_partial_when_the_final_file_is_another_blob`).
     #[tokio::test]
-    async fn open_trusts_a_final_file_only_by_its_hash() -> anyhow::Result<()> {
+    async fn open_on_a_matching_final_file_is_complete_and_clears_the_record() -> anyhow::Result<()>
+    {
         let a = blob(3 * usize::try_from(GROUP)? + 7);
         let dir = tmp_dir();
         let root = finalize_blob(dir.path(), "out.bin", &a).await?;
+        let record = dir.path().join("out.bin.partial.ranges");
+        write_record(&record, &StoreState::empty(1))?;
+
         let store = ClientRangedStore::open(dir.path(), "out.bin", root)?;
+        assert!(!record.exists(), "the stale record is removed");
         assert!(store.is_complete().await?);
         assert_eq!(store.proven(), Some(u64::try_from(a.len())?));
+        assert_eq!(std::fs::read(dir.path().join("out.bin"))?, a);
         Ok(())
     }
 
@@ -2807,7 +2816,13 @@ mod tests {
             .finalize()
             .await
             .expect_err("a truncated partial must not finalize");
-        assert!(matches!(err, RangedStoreError::Backend(_)), "{err:?}");
+        let RangedStoreError::Backend(source_err) = &err else {
+            panic!("expected a backend error, got {err:?}");
+        };
+        assert!(
+            source_err.downcast_ref::<crate::HashMismatch>().is_some(),
+            "a short partial is a hash mismatch, not an I/O error: {err:?}"
+        );
         assert!(store.present_ranges().await?.is_empty());
         assert_eq!(store.proven(), None);
         assert!(partial.exists());

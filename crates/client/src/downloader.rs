@@ -276,11 +276,19 @@ where
             tokio::fs::create_dir_all(&dir)
                 .await
                 .map_err(|e| anyhow::anyhow!("create download dir {}: {e}", dir.display()))?;
-            let store =
-                ClientRangedStore::open_or_create(&dir, &stem, target.hash, target.total_bytes)
-                    .map_err(|e| {
-                        anyhow::anyhow!("open ranged store for {}: {e}", target.dest.display())
-                    })?;
+            // Off the runtime: opening a finalized blob hashes its final file.
+            let store = {
+                let (dir, stem) = (dir.clone(), stem.clone());
+                let (hash, total) = (target.hash, target.total_bytes);
+                tokio::task::spawn_blocking(move || {
+                    ClientRangedStore::open_or_create(&dir, &stem, hash, total)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("open ranged store task: {e}"))?
+                .map_err(|e| {
+                    anyhow::anyhow!("open ranged store for {}: {e}", target.dest.display())
+                })?
+            };
             let whole = [(0, target.total_bytes)];
             let ranges = target.ranges.unwrap_or(&whole);
             let mut sources = SourceSet::new(

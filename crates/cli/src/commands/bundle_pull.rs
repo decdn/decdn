@@ -2609,6 +2609,20 @@ impl<P: Provider + Clone> RangeDriver for AcquireRangeDriver<'_, P> {
 /// byte already spliced into it. A store that already has its record (a drive
 /// made it, or a resumed run) is reopened as is. The data file is then extended
 /// to `total`, sparsely, because the whole-file hash reads its full length.
+///
+/// It runs on the blocking pool: reopening a store can hash a final file.
+async fn ensure_partial_off_runtime(
+    staging: &Path,
+    hash: [u8; 32],
+    total: u64,
+) -> anyhow::Result<PathBuf> {
+    let staging = staging.to_path_buf();
+    tokio::task::spawn_blocking(move || ensure_partial(&staging, hash, total))
+        .await
+        .map_err(|e| anyhow!("ensure partial task: {e}"))?
+}
+
+/// [`ensure_partial_off_runtime`]'s body, on the blocking pool.
 fn ensure_partial(staging: &Path, hash: [u8; 32], total: u64) -> anyhow::Result<PathBuf> {
     let (dir, stem) = fetch::ranged_store_location(staging)?;
     ClientRangedStore::open_or_create(&dir, &stem, hash, total)
@@ -2694,7 +2708,7 @@ async fn reassemble_dedup(
         }
     }
 
-    let partial = ensure_partial(staging, hash, total)?;
+    let partial = ensure_partial_off_runtime(staging, hash, total).await?;
 
     // Verify + splice each initially-available donor range off the executor. A donor
     // whose chunk no longer hashes to its hint (a lying donor hint, or a short read)

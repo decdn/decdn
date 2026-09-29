@@ -140,7 +140,7 @@ impl StashedFault for PullReader {
 ///
 /// Test-only, and gated to say so: it exists purely so the streaming ingest
 /// loop can be driven from a fixed wire buffer. Note that a test using it
-/// exercises the `None` branch — the one this trait was invented to avoid — so
+/// exercises the `None` branch (the one this trait was invented to avoid), so
 /// it must not be the only coverage of the fault-precedence rule.
 #[cfg(test)]
 impl StashedFault for Bytes {

@@ -470,9 +470,16 @@ where
         }
 
         let stem = blake3::Hash::from_bytes(hash).to_hex();
-        let store =
-            ClientRangedStore::open_or_create(self.scratch, stem.as_str(), hash, total_bytes)
-                .map_err(|e| anyhow::anyhow!("open stream store for {stem}: {e}"))?;
+        // Off the runtime: opening a finalized blob hashes its final file.
+        let store = {
+            let (scratch, stem) = (self.scratch.to_path_buf(), stem.to_string());
+            tokio::task::spawn_blocking(move || {
+                ClientRangedStore::open_or_create(&scratch, &stem, hash, total_bytes)
+                    .map_err(|e| anyhow::anyhow!("open stream store for {stem}: {e}"))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("open stream store task: {e}"))??
+        };
         let state = Arc::new(StreamState {
             store,
             cursor: AtomicU64::new(0),
