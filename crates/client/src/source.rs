@@ -37,7 +37,8 @@ use iroh::{Endpoint, EndpointAddr};
 
 use crate::sink::{PullReader, StashedFault};
 use crate::{
-    PoolContext, PoolLedger, PullDeadlines, UpstreamPull, UpstreamPullHeader, VoucherProgress,
+    Connections, PoolContext, PoolLedger, PullDeadlines, UpstreamPull, UpstreamPullHeader,
+    VoucherProgress,
 };
 
 /// A boxed, `Send` future returned by the async trait methods in this module —
@@ -262,7 +263,8 @@ fn micros_now() -> u64 {
 /// path, and the pool's top-up lock ([`crate::SharedPool::topup_lock`]) makes
 /// it re-read the raised deposit instead of escrowing again.
 ///
-/// Every open dials its own connection.
+/// With a [`Connections`] map, every open takes a new stream on the target's
+/// shared connection. Without one, every open dials its own connection.
 pub struct PeerSource<'a> {
     endpoint: &'a Endpoint,
     target: EndpointAddr,
@@ -279,6 +281,8 @@ pub struct PeerSource<'a> {
     /// dials on the caller's runtime. See
     /// [`with_dial_runtime`](Self::with_dial_runtime).
     dial_runtime: Option<tokio::runtime::Handle>,
+    /// The command's shared connection per node, or `None` to dial per open.
+    connections: Option<Connections>,
 }
 
 impl std::fmt::Debug for PeerSource<'_> {
@@ -304,6 +308,12 @@ impl<'a> PeerSource<'a> {
     /// `max_blob_size_bytes` is the received-byte ceiling (#1895) the driver reads
     /// back via [`BlobSource::max_blob_size_bytes`] to abort a fill that crosses it;
     /// `0` = unlimited.
+    ///
+    /// `connections` is the command's map of one connection per node: with
+    /// `Some`, every open takes a new stream on `target`'s shared connection
+    /// and dials only when `target` has no live one. With `None`, every open
+    /// dials its own connection. Pass `Some` only from a single long-lived
+    /// runtime (see [`Connections`]).
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
@@ -317,6 +327,7 @@ impl<'a> PeerSource<'a> {
         max_blob_size_bytes: u64,
         max_rate_per_mb: u64,
         deadlines: PullDeadlines,
+        connections: Option<Connections>,
     ) -> Self {
         Self {
             endpoint,
@@ -330,6 +341,7 @@ impl<'a> PeerSource<'a> {
             max_rate_per_mb,
             deadlines,
             dial_runtime: None,
+            connections,
         }
     }
 
@@ -343,7 +355,9 @@ impl<'a> PeerSource<'a> {
     /// draining when the pull's runtime drops loses its driver, stays in the
     /// endpoint's active set, and `Endpoint::close` waits for it forever.
     /// The dial and the connection's driver move to `runtime`; the pull still
-    /// opens and polls its streams from the caller's runtime.
+    /// opens and polls its streams from the caller's runtime. A source with a
+    /// [`Connections`] map dials through the map instead, on the caller's
+    /// runtime.
     #[must_use]
     pub fn with_dial_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {
         self.dial_runtime = Some(runtime);
@@ -367,8 +381,9 @@ impl<'a> PeerSource<'a> {
         })
     }
 
-    /// Open `[byte_offset, +byte_len)` of `hash` (`byte_len == 0` = to end) on
-    /// a connection of its own.
+    /// Open `[byte_offset, +byte_len)` of `hash` (`byte_len == 0` = to end):
+    /// on the target's shared connection when the source has a
+    /// [`Connections`] map, else on a connection of its own.
     async fn open_pull(
         &self,
         hash: [u8; 32],
@@ -384,6 +399,11 @@ impl<'a> PeerSource<'a> {
                 .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
                 .clone()
         };
+        if let Some(connections) = &self.connections {
+            return self
+                .open_shared(connections, &ctx, hash, byte_offset, byte_len)
+                .await;
+        }
         crate::open_progressive_pull(
             self.endpoint,
             self.target.clone(),
@@ -402,6 +422,48 @@ impl<'a> PeerSource<'a> {
             self.dial_runtime.as_ref(),
         )
         .await
+    }
+
+    /// Open the pull on the target's connection in `connections`, dialling
+    /// one when the target has none. `deadlines.open` bounds the dial, and
+    /// again the stream open that follows it.
+    ///
+    /// A pull that fails on a connection that has closed (a transport fault:
+    /// a reset, a closed connection, an idle timeout) drops the connection
+    /// from the map, so the next open dials again. Any other failure (a
+    /// refusal, a bad response) leaves the connection for the next open.
+    async fn open_shared(
+        &self,
+        connections: &Connections,
+        ctx: &PoolContext,
+        hash: [u8; 32],
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
+        let open = self.deadlines.open;
+        let warm = tokio::time::timeout(open, connections.get(&self.target))
+            .await
+            .map_err(|_| anyhow::Error::new(crate::PullTimeout { after: open }))??;
+        let opened = crate::open_progressive_pull_on(
+            &warm,
+            ctx,
+            Arc::clone(&self.ledger),
+            self.slash_domain,
+            self.expected_signer,
+            hash,
+            self.namespace_id,
+            byte_offset,
+            micros_now(),
+            self.max_blob_size_bytes,
+            self.max_rate_per_mb,
+            self.deadlines,
+            byte_len,
+        )
+        .await;
+        if opened.is_err() && warm.is_closed() {
+            connections.invalidate(self.target.id);
+        }
+        opened
     }
 }
 

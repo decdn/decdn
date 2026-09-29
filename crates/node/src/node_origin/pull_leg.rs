@@ -744,6 +744,8 @@ impl NodeOrigin {
                 deps.config.max_blob_size_bytes,
                 rate_ceiling,
                 deadlines,
+                // Per-serve runtime: dial per leg (#1675).
+                None,
             )
             .with_dial_runtime(deps.dial_runtime.clone());
             let handshake = timed_open(
@@ -1369,6 +1371,8 @@ impl PeerRunSink<'_> {
             self.deps.config.max_blob_size_bytes,
             rate_ceiling,
             self.deadlines,
+            // Per-serve runtime: dial per leg (#1675).
+            None,
         )
         .with_dial_runtime(self.deps.dial_runtime.clone());
         let peer_source = PrimedSource::new(TimedSource::new(

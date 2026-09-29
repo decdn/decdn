@@ -44,10 +44,10 @@ use decdn_client::buyer_pool::{
 use decdn_client::driver::DriveConfig;
 use decdn_client::source::{Funder, SourceFuture};
 use decdn_client::{
-    Cumulative, DownloadTarget, Downloader, Holder, LaneHandle, LaneLedgers, NoAffordableSource,
-    NoCache, NoSourceHasBlob, PeerHealth, PeerSource, PoolContext, PoolLedger, ProgressClock,
-    PullConfig, PullDeadlines, StopPolicy, Streamer, UpstreamRefused, UpstreamVoucherRejected,
-    VoucherProgress, sign_client_binding,
+    Connections, Cumulative, DownloadTarget, Downloader, Holder, LaneHandle, LaneLedgers,
+    NoAffordableSource, NoCache, NoSourceHasBlob, PeerHealth, PeerSource, PoolContext, PoolLedger,
+    ProgressClock, PullConfig, PullDeadlines, StopPolicy, Streamer, UpstreamRefused,
+    UpstreamVoucherRejected, VoucherProgress, sign_client_binding,
 };
 
 use super::cli_sources::CliSources;
@@ -1584,6 +1584,9 @@ async fn fetch_over(
     // no overall wall-clock cap: it completes for any blob size as long as the
     // upstream keeps feeding it bytes.
     let deadlines = PullDeadlines::new(STALL_WINDOW, STALL_WINDOW, 0)?;
+    // One connection per node for the whole fetch: every lane and leg opens
+    // its streams on it.
+    let connections = Connections::new(endpoint.clone());
 
     // The shared pull/funding deps every lane borrows for the whole fetch.
     let deps = DriveFetchDeps {
@@ -1599,6 +1602,7 @@ async fn fetch_over(
         max_rate_per_mb: common.max_rate_per_mb,
         max_blob_bytes,
         deadlines,
+        connections: &connections,
     };
 
     let clock = Arc::new(ProgressClock::new());
@@ -1730,6 +1734,9 @@ pub(crate) struct DriveFetchDeps<'a, P> {
     pub(crate) max_rate_per_mb: u64,
     pub(crate) max_blob_bytes: u64,
     pub(crate) deadlines: PullDeadlines,
+    /// The command's one connection per node, shared by every lane of every
+    /// fetch the command runs.
+    pub(crate) connections: &'a Connections,
 }
 
 /// The lane's shared ledger + context: from the run registry when bundle pull
@@ -1889,17 +1896,12 @@ where
         },
         ctx,
     );
-    let source = PeerSource::new(
-        deps.endpoint,
+    let source = lane_source(
+        deps,
         target,
         Arc::clone(&ctx),
         Arc::clone(&ledger),
-        deps.slash_dom,
         provider,
-        deps.namespace_id,
-        deps.max_blob_bytes,
-        deps.max_rate_per_mb,
-        deps.deadlines,
     );
     Ok(MultiLane {
         provider,
@@ -1909,6 +1911,31 @@ where
         ledger,
         source,
     })
+}
+
+/// `provider`'s lane source at `target`, paying through `ctx` and `ledger`.
+/// Every open takes a stream on the command's connection to `target`
+/// ([`DriveFetchDeps::connections`]).
+fn lane_source<'a, P>(
+    deps: &DriveFetchDeps<'a, P>,
+    target: EndpointAddr,
+    ctx: Arc<Mutex<PoolContext>>,
+    ledger: Arc<PoolLedger>,
+    provider: Address,
+) -> PeerSource<'a> {
+    PeerSource::new(
+        deps.endpoint,
+        target,
+        ctx,
+        ledger,
+        deps.slash_dom,
+        provider,
+        deps.namespace_id,
+        deps.max_blob_bytes,
+        deps.max_rate_per_mb,
+        deps.deadlines,
+        Some(deps.connections.clone()),
+    )
 }
 
 /// One lane's watermark-persistence handle: what [`stream_lane_watermarks`]
@@ -4061,6 +4088,125 @@ mod tests {
             .get_by_pool_id(pool_id)?
             .and_then(|s| s.lane_progress(lane))
             .ok_or_else(|| anyhow::anyhow!("lane record missing"))
+    }
+
+    /// Two bundle entries on one provider share one connection: each entry
+    /// builds its own deps and lane, and both lanes open their streams on the
+    /// command's connection to the node.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture: a stream-dropping node, the lane deps, two entries"
+    )]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_entries_on_one_provider_share_one_connection() -> anyhow::Result<()> {
+        use decdn_client::source::BlobSource as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        async fn loopback(alpns: Vec<Vec<u8>>) -> anyhow::Result<(Endpoint, EndpointAddr)> {
+            let ep = Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .alpns(alpns)
+                .relay_mode(iroh::RelayMode::Disabled)
+                .bind_addr(std::net::SocketAddrV4::new(
+                    std::net::Ipv4Addr::LOCALHOST,
+                    0,
+                ))?
+                .bind()
+                .await?;
+            let socket = ep
+                .bound_sockets()
+                .into_iter()
+                .find(std::net::SocketAddr::is_ipv4)
+                .ok_or_else(|| anyhow::anyhow!("no IPv4 socket"))?;
+            let addr = EndpointAddr::new(ep.id()).with_ip_addr(socket);
+            Ok((ep, addr))
+        }
+
+        // A node that accepts every connection and drops every stream it is
+        // sent, so each open fails on a connection that stays up.
+        let (node, node_addr) = loopback(vec![decdn_protocol::ALPN_CLIENT.to_vec()]).await?;
+        let accepted = Arc::new(AtomicU64::new(0));
+        let (accept_node, count) = (node.clone(), Arc::clone(&accepted));
+        tokio::spawn(async move {
+            while let Some(incoming) = accept_node.accept().await {
+                let Ok(connecting) = incoming.accept() else {
+                    continue;
+                };
+                let Ok(conn) = connecting.await else { continue };
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    while let Ok((send, recv)) = conn.accept_bi().await {
+                        drop((send, recv));
+                    }
+                });
+            }
+        });
+
+        let (ep, _) = loopback(Vec::new()).await?;
+        let dir = tempfile::tempdir()?;
+        let store = RedbBuyerPoolStore::open(&dir.path().join("data"))?;
+        let rpc = alloy::providers::ProviderBuilder::new()
+            .connect_mocked_client(alloy::providers::mock::Asserter::new());
+        let contract = PaymentPool::new(Address::repeat_byte(0x33), rpc.clone());
+        let chain = resolve_chain(
+            &common(),
+            &config(
+                "[blockchain]\nrpc_url = \"http://config:8545\"\n\
+                 payment_pool_address = \"0x3333333333333333333333333333333333333333\"\n\
+                 slash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
+            ),
+        )?;
+        let slash_dom = decdn_incentive::slash_judge_domain(1, Address::repeat_byte(0x44));
+        let connections = Connections::new(ep.clone());
+        let entry_deps = || -> anyhow::Result<DriveFetchDeps<'_, _>> {
+            Ok(DriveFetchDeps {
+                endpoint: &ep,
+                store: &store,
+                contract: &contract,
+                rpc: &rpc,
+                slash_dom: &slash_dom,
+                self_address: Address::repeat_byte(0x0A),
+                token: Address::repeat_byte(0x22),
+                chain: &chain,
+                namespace_id: decdn_protocol::client::NO_NAMESPACE,
+                max_rate_per_mb: 0,
+                max_blob_bytes: 0,
+                deadlines: PullDeadlines::new(Duration::from_secs(5), Duration::from_secs(5), 0)?,
+                connections: &connections,
+            })
+        };
+        let provider = Address::repeat_byte(0xB0);
+        let ctx = PoolContext {
+            pool_id: B256::ZERO,
+            provider,
+            deposit: U256::from(1_000_000u64),
+            client_signer: Arc::new(PrivateKeySigner::random()),
+            voucher_domain: decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33)),
+            prior_bytes_delivered: U256::ZERO,
+            prior_amount: U256::ZERO,
+            client_binding: None,
+            capability: None,
+        };
+        let ledger = Arc::new(ctx.new_ledger());
+        let ctx = Arc::new(Mutex::new(ctx));
+        let range = decdn_bao_range::align_range(0, 0, 1024)?;
+        for entry in [[0x01u8; 32], [0x02u8; 32]] {
+            let deps = entry_deps()?;
+            let source = lane_source(
+                &deps,
+                node_addr.clone(),
+                Arc::clone(&ctx),
+                Arc::clone(&ledger),
+                provider,
+            );
+            assert!(
+                source.open(entry, range.clone()).await.is_err(),
+                "the node drops every stream"
+            );
+        }
+
+        assert_eq!(connections.dials(), 1, "both entries share one dial");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
     #[test]

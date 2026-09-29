@@ -1957,6 +1957,9 @@ async fn pull_from_candidate_in_span(
         deps.config.max_blob_size_bytes,
         rate_ceiling,
         deadlines,
+        // A pull leg runs on a per-serve runtime, so it dials per leg on the
+        // long-lived dial runtime and shares no connection map (#1675).
+        None,
     )
     .with_dial_runtime(deps.dial_runtime.clone());
     let handshake = timed_open(
@@ -2072,6 +2075,8 @@ async fn pull_from_candidate_in_span(
                 max_blob_size_bytes,
                 rate_ceiling,
                 deadlines,
+                // Per-serve runtime: dial per leg (#1675).
+                None,
             )
             .with_dial_runtime(dial_runtime);
             let source = PrimedSource::new(TimedSource::new(source, Arc::clone(&metrics)));

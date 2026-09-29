@@ -47,6 +47,11 @@ pub const fn decdn_client::config::PullConfig::new() -> Self
 impl core::default::Default for decdn_client::config::PullConfig
 pub fn decdn_client::config::PullConfig::default() -> Self
 pub mod decdn_client::connection
+pub struct decdn_client::connection::Connections
+impl decdn_client::connection::Connections
+pub async fn decdn_client::connection::Connections::get(&self, &iroh_base::endpoint_addr::EndpointAddr) -> anyhow::Result<alloc::sync::Arc<decdn_client::connection::WarmConnection>>
+pub fn decdn_client::connection::Connections::invalidate(&self, iroh_base::key::PublicKey)
+pub fn decdn_client::connection::Connections::new(iroh::endpoint::Endpoint) -> Self
 pub struct decdn_client::connection::WarmConnection
 impl decdn_client::connection::WarmConnection
 pub async fn decdn_client::connection::WarmConnection::connect(&iroh::endpoint::Endpoint, iroh_base::endpoint_addr::EndpointAddr, core::time::Duration, core::option::Option<&tokio::runtime::handle::Handle>) -> anyhow::Result<Self>
@@ -353,7 +358,7 @@ pub type decdn_client::sink::SinkFuture<'a, T> = core::pin::Pin<alloc::boxed::Bo
 pub mod decdn_client::source
 pub struct decdn_client::source::PeerSource<'a>
 impl<'a> decdn_client::source::PeerSource<'a>
-pub const fn decdn_client::source::PeerSource<'a>::new(&'a iroh::endpoint::Endpoint, iroh_base::endpoint_addr::EndpointAddr, alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, alloc::sync::Arc<decdn_client::PoolLedger>, &'a alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, [u8; 32], u64, u64, decdn_client::PullDeadlines) -> Self
+pub const fn decdn_client::source::PeerSource<'a>::new(&'a iroh::endpoint::Endpoint, iroh_base::endpoint_addr::EndpointAddr, alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, alloc::sync::Arc<decdn_client::PoolLedger>, &'a alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, [u8; 32], u64, u64, decdn_client::PullDeadlines, core::option::Option<decdn_client::connection::Connections>) -> Self
 pub fn decdn_client::source::PeerSource<'a>::open_whole(&self, [u8; 32]) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, decdn_client::sink::PullReader)>
 pub fn decdn_client::source::PeerSource<'a>::with_dial_runtime(self, tokio::runtime::handle::Handle) -> Self
 impl core::fmt::Debug for decdn_client::source::PeerSource<'_>
@@ -666,6 +671,11 @@ pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)
 pub struct decdn_client::ClockHold<'a>(_)
 impl core::ops::drop::Drop for decdn_client::stop::ClockHold<'_>
 pub fn decdn_client::stop::ClockHold<'_>::drop(&mut self)
+pub struct decdn_client::Connections
+impl decdn_client::connection::Connections
+pub async fn decdn_client::connection::Connections::get(&self, &iroh_base::endpoint_addr::EndpointAddr) -> anyhow::Result<alloc::sync::Arc<decdn_client::connection::WarmConnection>>
+pub fn decdn_client::connection::Connections::invalidate(&self, iroh_base::key::PublicKey)
+pub fn decdn_client::connection::Connections::new(iroh::endpoint::Endpoint) -> Self
 pub struct decdn_client::ConsumptionPacing<'a>
 pub decdn_client::ConsumptionPacing::downstream: &'a (dyn core::ops::function::Fn() -> decdn_client::pacer::DownstreamFrontier + core::marker::Send + core::marker::Sync)
 pub decdn_client::ConsumptionPacing::pacing_wait: &'a dyn decdn_client::driver::PacingWait
@@ -809,7 +819,7 @@ pub const fn decdn_client::peer_store::PeerRecord::identity_prunable(&self, u64,
 pub const fn decdn_client::peer_store::PeerRecord::selectable(&self, u64, &decdn_client::peer_store::StoreConfig) -> bool
 pub struct decdn_client::PeerSource<'a>
 impl<'a> decdn_client::source::PeerSource<'a>
-pub const fn decdn_client::source::PeerSource<'a>::new(&'a iroh::endpoint::Endpoint, iroh_base::endpoint_addr::EndpointAddr, alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, alloc::sync::Arc<decdn_client::PoolLedger>, &'a alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, [u8; 32], u64, u64, decdn_client::PullDeadlines) -> Self
+pub const fn decdn_client::source::PeerSource<'a>::new(&'a iroh::endpoint::Endpoint, iroh_base::endpoint_addr::EndpointAddr, alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, alloc::sync::Arc<decdn_client::PoolLedger>, &'a alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, [u8; 32], u64, u64, decdn_client::PullDeadlines, core::option::Option<decdn_client::connection::Connections>) -> Self
 pub fn decdn_client::source::PeerSource<'a>::open_whole(&self, [u8; 32]) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, decdn_client::sink::PullReader)>
 pub fn decdn_client::source::PeerSource<'a>::with_dial_runtime(self, tokio::runtime::handle::Handle) -> Self
 impl core::fmt::Debug for decdn_client::source::PeerSource<'_>

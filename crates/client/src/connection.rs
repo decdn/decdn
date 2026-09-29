@@ -11,11 +11,16 @@
 //! carries exactly one hash (`open_progressive_pull_on` opens the
 //! bi-stream); only the client-side teardown differs, because a per-hash pull
 //! leaves the connection open for the next one rather than closing it.
+//!
+//! [`Connections`] keeps one [`WarmConnection`] per node for a whole command,
+//! so every lane and every entry of that command dials each node once.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use iroh::endpoint::Connection;
-use iroh::{Endpoint, EndpointAddr};
+use iroh::{Endpoint, EndpointAddr, PublicKey};
 use tokio::runtime::Handle;
 use tracing::Instrument as _;
 
@@ -128,9 +133,129 @@ impl WarmConnection {
     }
 
     /// The live connection, for opening a per-hash bi-stream.
-    #[cfg(any(test, feature = "test-util"))]
     pub(crate) const fn connection(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Whether the connection has closed: by either side, by an idle timeout,
+    /// or by a transport fault. A closed connection opens no more streams.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.conn.close_reason().is_some()
+    }
+}
+
+/// One live `cdn/client/v1` connection per node, shared by every pull of one
+/// command.
+///
+/// A pull opens its own bi-stream on the node's connection and dials only when
+/// the node has no live connection. Concurrent callers for one node share one
+/// dial. A closed connection is dialled again on the next [`get`](Self::get),
+/// so a transport fault (a reset, a closed connection, an idle timeout) costs
+/// one redial. A protocol refusal or a hash mismatch ends only its own stream,
+/// and the connection stays. The connection carries no payment state: payment
+/// lanes stay per (signer, provider).
+///
+/// Cloning is cheap: every clone shares one map. Each connection closes when
+/// the map drops it and no pull still holds it.
+///
+/// **One long-lived runtime only (#1675).** A connection's QUIC driver lives on
+/// the runtime that dialled it, and the connection makes progress only while
+/// that driver runs. Share a map only between pulls on one runtime that
+/// outlives the map, such as the `decdn` CLI's. A caller that pulls on
+/// runtimes it throws away (`decdn-node`'s per-serve pull legs) dials per leg
+/// instead, on a long-lived dial runtime
+/// ([`PeerSource::with_dial_runtime`](crate::source::PeerSource::with_dial_runtime)).
+#[derive(Debug, Clone)]
+pub struct Connections {
+    inner: Arc<ConnectionsInner>,
+}
+
+/// A node's connection slot. The async lock makes concurrent callers for one
+/// node wait on one dial.
+type Slot = Arc<tokio::sync::Mutex<Option<Arc<WarmConnection>>>>;
+
+#[derive(Debug)]
+struct ConnectionsInner {
+    endpoint: Endpoint,
+    slots: Mutex<HashMap<PublicKey, Slot>>,
+    /// How many dials this map has made.
+    #[cfg(any(test, feature = "test-util"))]
+    dials: std::sync::atomic::AtomicU64,
+}
+
+impl Connections {
+    /// An empty map that dials from `endpoint`.
+    #[must_use]
+    pub fn new(endpoint: Endpoint) -> Self {
+        Self {
+            inner: Arc::new(ConnectionsInner {
+                endpoint,
+                slots: Mutex::new(HashMap::new()),
+                #[cfg(any(test, feature = "test-util"))]
+                dials: std::sync::atomic::AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// `target`'s live connection, dialled on the caller's runtime when the
+    /// node has none. A caller for a node another caller is dialling waits
+    /// for that dial and shares its connection. The dial has no deadline of
+    /// its own: the caller bounds it.
+    ///
+    /// # Errors
+    ///
+    /// A connect or transport fault from the dial, as
+    /// `connect failed: {err}` (a rate-limit shed keeps its typed sentinel).
+    pub async fn get(&self, target: &EndpointAddr) -> anyhow::Result<Arc<WarmConnection>> {
+        let slot = Arc::clone(
+            self.inner
+                .slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(target.id)
+                .or_default(),
+        );
+        let mut held = slot.lock().await;
+        if let Some(warm) = held.as_ref().filter(|warm| !warm.is_closed()) {
+            return Ok(Arc::clone(warm));
+        }
+        #[cfg(any(test, feature = "test-util"))]
+        self.inner
+            .dials
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let conn = dial(&self.inner.endpoint, target.clone(), None, "connect failed").await?;
+        let warm = Arc::new(WarmConnection { conn });
+        *held = Some(Arc::clone(&warm));
+        Ok(warm)
+    }
+
+    /// Drop `node`'s connection if it has closed, so its resources go at once
+    /// rather than at the next [`get`](Self::get). A live connection stays:
+    /// another caller may have dialled it after the fault, and its pulls run
+    /// on it.
+    pub fn invalidate(&self, node: PublicKey) {
+        let slot = self
+            .inner
+            .slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&node)
+            .map(Arc::clone);
+        // A slot that is locked is mid-dial, and the dial replaces what it
+        // holds.
+        if let Some(slot) = slot
+            && let Ok(mut held) = slot.try_lock()
+            && held.as_ref().is_some_and(|warm| warm.is_closed())
+        {
+            *held = None;
+        }
+    }
+
+    /// How many dials this map has made.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn dials(&self) -> u64 {
+        self.inner.dials.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -311,6 +436,91 @@ mod tests {
                 .is_err(),
             "the task must end by abort, never by sending"
         );
+    }
+
+    /// A peer that accepts every connection and holds each one open, counting
+    /// them. Returns its address and the count.
+    async fn holding_peer() -> (
+        Endpoint,
+        EndpointAddr,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let (peer, peer_addr) = loopback_endpoint(vec![ALPN_CLIENT.to_vec()]).await;
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (accept_peer, count) = (peer.clone(), std::sync::Arc::clone(&accepted));
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(incoming) = accept_peer.accept().await {
+                if let Ok(connecting) = incoming.accept()
+                    && let Ok(conn) = connecting.await
+                {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    held.push(conn);
+                }
+            }
+        });
+        (peer, peer_addr, accepted)
+    }
+
+    /// Wait until the peer has accepted `n` connections, then check it
+    /// accepts no more for a moment.
+    async fn assert_accepted(accepted: &std::sync::atomic::AtomicU64, n: u64) {
+        let load = || accepted.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while load() < n {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the peer accepts the dials");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(load(), n, "the peer accepts exactly {n} connections");
+    }
+
+    /// Two gets for one node dial once and share the connection, and two
+    /// concurrent gets share one dial.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_gets_for_one_node_dial_once() {
+        let (_peer, peer_addr, accepted) = holding_peer().await;
+        let (ep, _) = loopback_endpoint(Vec::new()).await;
+        let connections = super::Connections::new(ep.clone());
+
+        let (a, b) = tokio::join!(connections.get(&peer_addr), connections.get(&peer_addr));
+        let (a, b) = (a.expect("first get"), b.expect("second get"));
+        let c = connections.get(&peer_addr).await.expect("third get");
+        assert!(std::sync::Arc::ptr_eq(&a, &b) && std::sync::Arc::ptr_eq(&a, &c));
+        assert_eq!(connections.dials(), 1, "one dial for three gets");
+        assert_accepted(&accepted, 1).await;
+    }
+
+    /// A get after the node's connection closes dials again, and invalidate
+    /// drops only a closed connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_get_after_the_connection_closes_dials_again() {
+        let (_peer, peer_addr, accepted) = holding_peer().await;
+        let (ep, _) = loopback_endpoint(Vec::new()).await;
+        let connections = super::Connections::new(ep.clone());
+
+        let first = connections.get(&peer_addr).await.expect("first get");
+        connections.invalidate(peer_addr.id);
+        let kept = connections
+            .get(&peer_addr)
+            .await
+            .expect("get after invalidate");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &kept),
+            "invalidate keeps a live connection"
+        );
+        assert_eq!(connections.dials(), 1);
+
+        first.connection().close(0u32.into(), b"test-closed");
+        assert!(first.is_closed());
+        connections.invalidate(peer_addr.id);
+        let second = connections.get(&peer_addr).await.expect("get after close");
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+        assert!(!second.is_closed());
+        assert_eq!(connections.dials(), 2, "a closed connection redials");
+        assert_accepted(&accepted, 2).await;
     }
 
     /// The control: the same dial on the dropped runtime itself takes the

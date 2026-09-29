@@ -101,8 +101,8 @@ use decdn_client::driver::DriveConfig;
 use decdn_client::endpoint as client_endpoint;
 use decdn_client::provider;
 use decdn_client::{
-    ClientRangedStore, DownloadTarget, Downloader, LaneLedgers, PeerHealth, ProgressCallback,
-    ProgressClock, PullDeadlines, StopPolicy,
+    ClientRangedStore, Connections, DownloadTarget, Downloader, LaneLedgers, PeerHealth,
+    ProgressCallback, ProgressClock, PullDeadlines, StopPolicy,
 };
 
 use super::cli_sources::CliSources;
@@ -1327,6 +1327,7 @@ async fn pull_over(
         gate: tokio::sync::Semaphore::new(args.jobs.max(1)),
         lane_cap: LaneStreamCap::new(args.max_lane_streams),
         health: Arc::new(PeerHealth::default()),
+        connections: Connections::new(endpoint.clone()),
         // One clock for the whole command: a stuck entry waits while another
         // lands bytes.
         stop: StopPolicy::new(
@@ -1772,6 +1773,9 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// The command-wide holder health every entry's fetch records into, so a
     /// holder that faults one entry cools for every entry.
     health: Arc<PeerHealth>,
+    /// The command's one connection per node: every entry's lanes, the
+    /// range-dedup entries' included, open their streams on it.
+    connections: Connections,
     /// The command's stop policy. Its progress clock is shared by every entry
     /// and the manifest fetch, so the pull gives up only once no entry has
     /// landed a verified byte for the whole limit.
@@ -1809,6 +1813,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             // `drive` never consults one — so it completes for any blob size as long
             // as the upstream keeps feeding it bytes.
             deadlines: PullDeadlines::new(fetch::STALL_WINDOW, fetch::STALL_WINDOW, 0)?,
+            connections: &self.connections,
         })
     }
 

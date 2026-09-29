@@ -520,6 +520,150 @@ async fn two_hashes_reuse_one_warm_connection() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A [`PeerSource`](decdn_client::PeerSource) with a
+/// [`Connections`](decdn_client::Connections) map runs every leg to one node on
+/// one connection: two whole-blob drives dial once, and a `NotFound` refusal
+/// between them leaves the connection for the next leg.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fixture: a paid handler, a lane, two drives and a refusal"
+)]
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_source_legs_share_one_connection_across_a_refusal() -> anyhow::Result<()> {
+    use decdn_client::driver::{DriveConfig, drive};
+    use decdn_client::source::BlobSource as _;
+    use decdn_client::{BudgetPacer, ClientRangedStore, Connections, FakeFunder, PeerSource};
+
+    let payload_a = vec![0x31u8; 400_000];
+    let payload_b = vec![0x42u8; 500_000];
+    let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(50_000_000u64);
+    let pool_store = Arc::new(MemoryPoolStateStore::new());
+    pool_store.record(&LaneState::hydrate(
+        pool_id(),
+        client_signer.address(),
+        operator_addr(),
+        deposit,
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn PoolStateStore> = pool_store.clone();
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let (server_task, accepted) = spawn_server_counting(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ledger = Arc::new(ctx.new_ledger());
+    let ctx = Arc::new(std::sync::Mutex::new(ctx));
+    let slash = slash_domain();
+    let connections = Connections::new(client_ep.clone());
+    let source = PeerSource::new(
+        &client_ep,
+        target,
+        Arc::clone(&ctx),
+        Arc::clone(&ledger),
+        &slash,
+        server_eth.address(),
+        decdn_protocol::client::NO_NAMESPACE,
+        0,
+        u64::MAX,
+        PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
+        Some(connections.clone()),
+    );
+    let pacer = BudgetPacer::new();
+    let funder = FakeFunder::new(0, decdn_incentive::DepositOutcome::UnknownPool);
+    let config = DriveConfig::cli(U256::ZERO);
+    let store_dir = tempfile::tempdir()?;
+    let fetch = |name: &'static str, hash: Hash, len: usize| {
+        let (source, pacer, funder, ctx, ledger, config) =
+            (&source, &pacer, &funder, &ctx, &ledger, &config);
+        let dir = store_dir.path().to_path_buf();
+        async move {
+            let total = u64::try_from(len)?;
+            let store = ClientRangedStore::create(&dir, name, *hash.as_bytes(), total)?;
+            drive(
+                &store,
+                source,
+                pacer,
+                funder,
+                ctx,
+                ledger,
+                *hash.as_bytes(),
+                0,
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(std::fs::read(dir.join(name))?)
+        }
+    };
+
+    anyhow::ensure!(fetch("a", hash_a, payload_a.len()).await? == payload_a);
+    // A leg on a channel the node has never seen is refused with `NotFound`.
+    let known_pool = {
+        let mut ctx = ctx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::replace(&mut ctx.pool_id, B256::repeat_byte(0xEE))
+    };
+    let range = decdn_bao_range::align_range(0, 0, u64::try_from(payload_a.len())?)?;
+    let refused = source
+        .open(*hash_a.as_bytes(), range)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a leg on an unknown channel must be refused"))?;
+    ctx.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pool_id = known_pool;
+    anyhow::ensure!(
+        refused
+            .downcast_ref::<decdn_client::UpstreamRefused>()
+            .is_some_and(|r| *r.error() == StreamError::NotFound),
+        "expected a NotFound refusal, got: {refused:#}"
+    );
+    anyhow::ensure!(fetch("b", hash_b, payload_b.len()).await? == payload_b);
+
+    anyhow::ensure!(
+        connections.dials() == 1,
+        "every leg must share one dial, got {}",
+        connections.dials()
+    );
+    let served = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    anyhow::ensure!(
+        served == 1,
+        "the node must accept one connection, got {served}"
+    );
+
+    drop(source);
+    drop(connections);
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// Drive a scattered range set across four concurrent sibling stores, then the
 /// rest of the blob into one of them, through one `PeerSource` on one ledger
 /// against a live handler. The lane is seeded with a live chain from an
@@ -577,6 +721,7 @@ async fn drive_scattered_as_a_restarted_payer() -> anyhow::Result<()> {
         0,
         u64::MAX,
         PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
+        None,
     );
     // Four sibling fetches of the blob, one store each, on the one lane: the
     // shape of concurrent bundle entries that share a provider.
@@ -12754,6 +12899,7 @@ async fn drive_against_stop_send_server(
         0,
         u64::MAX,
         PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
+        None,
     );
     let pacer = BudgetPacer::new();
     let funder = FakeFunder::new(0, decdn_incentive::DepositOutcome::UnknownPool);
