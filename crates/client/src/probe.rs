@@ -30,7 +30,13 @@ use crate::rate_limited::transport_error;
 /// Run one probe round trip and return the decoded response together with
 /// the measured round-trip time in milliseconds.
 ///
-/// `timeout` bounds the whole connect+request+response exchange.
+/// The round-trip time is the smaller of the request/response exchange on the
+/// established connection and the estimate of the direct path hole punching
+/// selects within 500 ms after it. It never covers the connect:
+/// a cold dial pays handshake, relay, and hole-punch time that says nothing
+/// about the path the paid stream then uses, so timing it would rank a warm
+/// peer far ahead of an equally near cold one. `timeout` bounds the whole
+/// exchange, the grace included.
 ///
 /// The decoded [`ProbeResponse`] is returned without echoed-field
 /// correlation or `slash_sig` validation: the requester-side obligations —
@@ -55,23 +61,51 @@ pub async fn probe_once(
     timestamp_us: u64,
     timeout: Duration,
 ) -> anyhow::Result<(ProbeResponse, ProbeResponseExt, f64)> {
-    let started = Instant::now();
-
-    let (conn, resp) = tokio::time::timeout(timeout, async {
+    let (conn, resp, rtt) = tokio::time::timeout(timeout, async {
         let conn = endpoint
             .connect(target, ALPN_PROBE)
             .await
             .map_err(|e| transport_error("connect failed", e))?;
+        let started = Instant::now();
         let resp = exchange(&conn, hash, timestamp_us).await?;
-        Ok::<_, anyhow::Error>((conn, resp))
+        let exchanged = started.elapsed();
+        let rtt = direct_path_rtt(&conn)
+            .await
+            .map_or(exchanged, |direct| direct.min(exchanged));
+        Ok::<_, anyhow::Error>((conn, resp, rtt))
     })
     .await
     .map_err(|_| anyhow::anyhow!("probe timed out after {} ms", timeout.as_millis()))??;
 
-    let rtt_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let rtt_ms = rtt.as_secs_f64() * 1000.0;
     conn.close(0u32.into(), b"probe-done");
 
     Ok((resp.0, resp.1, rtt_ms))
+}
+
+/// How long [`probe_once`] waits after its exchange for hole punching to
+/// select a direct path.
+const DIRECT_PATH_GRACE: Duration = Duration::from_millis(500);
+
+/// The RTT estimate of the direct path `conn` selects within
+/// [`DIRECT_PATH_GRACE`], or `None` when it stays on the relay. A first
+/// exchange rides the relay until hole punching finishes, and the relay path
+/// says nothing about the direct path the paid stream then uses. A path is
+/// selected only once validated, so its estimate comes from real samples.
+async fn direct_path_rtt(conn: &Connection) -> Option<Duration> {
+    use futures_util::StreamExt as _;
+    let mut snapshots = conn.paths_stream();
+    tokio::time::timeout(DIRECT_PATH_GRACE, async {
+        while let Some(paths) = snapshots.next().await {
+            if let Some(path) = paths.iter().find(|path| path.is_ip() && path.is_selected()) {
+                return Some(path.rtt());
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Verify a [`ProbeResponse`] the way a requester must before acting on it
