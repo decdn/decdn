@@ -498,6 +498,38 @@ groups:
             pool events, or redeem vouchers. See docs/runbook.md § RPC
             unreachable.
 
+      - alert: DecdnRpcErrorRatioHigh
+        # Reachable is not the same as reliable: the watchdog's net_version
+        # probe can pass while a rate-limited or overloaded provider fails a
+        # large share of the node's real reads. The ratio counts every outcome
+        # but ok and reverted (a revert is the provider answering correctly).
+        # `sum without (method, outcome)` keeps the target labels for routing.
+        # The volume arm keeps a node that sent a handful of requests in the
+        # window from firing on one failure.
+        expr: >-
+          (
+            sum without (method, outcome) (rate(decdn_rpc_requests_total{outcome!~"ok|reverted"}[10m]))
+            /
+            sum without (method, outcome) (rate(decdn_rpc_requests_total[10m]))
+          ) > 0.1
+          and
+          sum without (method, outcome) (rate(decdn_rpc_requests_total[10m])) > 0.05
+        for: 15m
+        labels:
+          component: chain
+          severity: warning
+        annotations:
+          runbook_url: "https://github.com/decdn/decdn/blob/main/docs/runbook.md#rpc-unreachable"
+          summary: "Chain RPC failing {{ $value | humanizePercentage }} of requests on {{ $labels.instance }}"
+          description: |
+            More than 10% of the node's JSON-RPC requests failed over the last
+            10 minutes, for 15 minutes. Chain reads that fail make the watchers
+            lag head, and failed sends delay redemptions. The chain dashboard's
+            "RPC failures by outcome" panel names the cause: rate_limited means
+            the provider plan is too small for the node's poll cadence;
+            transport_error and timeout mean the provider is unreachable or
+            overloaded; rpc_error usually means an eth_getLogs range cap.
+
       - alert: DecdnConfigReloadFailed
         expr: increase(decdn_config_reload_failures_total[15m]) > 0
         for: 0m

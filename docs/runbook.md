@@ -93,6 +93,15 @@ becomes scrapeable once boot completes.
   so a watcher that never established at all fires too.
   `DecdnBlacklistWatcherStalled` is the one carrying slash risk; see
   [ContentBlacklist compliance](#contentblacklist-compliance).
+- `DecdnRpcErrorRatioHigh` fires when more than 10% of the node's JSON-RPC
+  requests fail for 15 minutes, which catches a provider that is reachable but
+  unreliable. `decdn_rpc_requests_total{method,outcome}` counts every request
+  the node's providers send, and the "Chain RPC provider" row in
+  `monitoring/dashboard-chain.json` plots the rate, the error ratio and the p95
+  latency by method, plus the failures by outcome. `rate_limited` means the
+  provider plan is too small for the node's poll cadence; `transport_error`
+  and `timeout` mean the provider is unreachable or overloaded; `rpc_error`
+  usually means an `eth_getLogs` range cap (see below).
 - Direct probe:
 
   ```bash

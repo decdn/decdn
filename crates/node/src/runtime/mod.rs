@@ -194,39 +194,62 @@ type HttpUrl = alloy::transports::http::reqwest::Url;
 /// provider instances for every consumer. The shared-head provider is the one
 /// deliberate exception to the poll override: it never creates pending
 /// transactions and therefore keeps Alloy's transport default.
-struct ProviderFactory;
+///
+/// Every provider sends through [`crate::rpc_metrics::metered_http_client`],
+/// so each JSON-RPC request the node makes counts on
+/// `decdn_rpc_requests_total`.
+#[derive(Clone)]
+struct ProviderFactory {
+    url: HttpUrl,
+    metrics: Arc<metrics::Metrics>,
+}
 
 impl ProviderFactory {
-    fn read_only(url: HttpUrl, interval: Duration) -> impl Provider + Clone {
-        with_poll_interval(ProviderBuilder::new().connect_http(url), interval)
+    const fn new(url: HttpUrl, metrics: Arc<metrics::Metrics>) -> Self {
+        Self { url, metrics }
     }
 
-    fn shared_head(url: HttpUrl) -> impl Provider + Clone {
-        ProviderBuilder::new().connect_http(url)
+    fn client(&self) -> alloy::rpc::client::RpcClient {
+        crate::rpc_metrics::metered_http_client(self.url.clone(), &self.metrics)
+    }
+
+    fn read_only(&self, interval: Duration) -> impl Provider + Clone + use<> {
+        with_poll_interval(
+            ProviderBuilder::new().connect_client(self.client()),
+            interval,
+        )
+    }
+
+    fn shared_head(&self) -> impl Provider + Clone + use<> {
+        ProviderBuilder::new().connect_client(self.client())
     }
 
     fn seller_wallet(
-        url: HttpUrl,
+        &self,
         signer: PrivateKeySigner,
         interval: Duration,
-    ) -> impl Provider + Clone {
-        Self::wallet(url, signer, interval)
+    ) -> impl Provider + Clone + use<> {
+        self.wallet(signer, interval)
     }
 
     fn buyer_wallet(
-        url: HttpUrl,
+        &self,
         signer: PrivateKeySigner,
         interval: Duration,
-    ) -> impl Provider + Clone {
-        Self::wallet(url, signer, interval)
+    ) -> impl Provider + Clone + use<> {
+        self.wallet(signer, interval)
     }
 
-    fn wallet(url: HttpUrl, signer: PrivateKeySigner, interval: Duration) -> impl Provider + Clone {
+    fn wallet(
+        &self,
+        signer: PrivateKeySigner,
+        interval: Duration,
+    ) -> impl Provider + Clone + use<> {
         with_poll_interval(
             ProviderBuilder::new()
                 .with_simple_nonce_management()
                 .wallet(EthereumWallet::from(signer))
-                .connect_http(url),
+                .connect_client(self.client()),
             interval,
         )
     }
@@ -455,7 +478,7 @@ async fn build_infra(
         .parse()
         .context("blockchain.rpc_url is not a valid URL (value redacted; check the config)")?;
     check_deployment_preflight(
-        ProviderFactory::shared_head(preflight_rpc_url),
+        ProviderFactory::new(preflight_rpc_url, Arc::clone(&node_metrics)).shared_head(),
         channel_store_deployment,
         &BootRetry::new(DEPLOYMENT_PREFLIGHT_BUDGET, Arc::clone(&node_metrics)),
     )
@@ -774,7 +797,7 @@ async fn serve_until_shutdown(
 /// threaded through [`PoolSettlementService`]); [`run`] infers `P` at the call
 /// site and hands it to [`ShutdownHandles`].
 struct ChainHandlers<P: Provider + Clone + 'static> {
-    rpc_url: HttpUrl,
+    providers: ProviderFactory,
     event_poll_interval: Duration,
     slash_domain: alloy::dyn_abi::Eip712Domain,
     bind_domain: alloy::dyn_abi::Eip712Domain,
@@ -907,15 +930,13 @@ async fn build_chain_and_handlers(
             .context("missing mandatory blockchain.content_blacklist_address")?,
         "blockchain.content_blacklist_address",
     )?;
-    // Retained for the blacklist watcher's read-only provider after `rpc_url`
-    // moves into the buyer wallet provider below.
-    let blacklist_rpc_url = rpc_url.clone();
+    let providers = ProviderFactory::new(rpc_url, Arc::clone(&infra.node_metrics));
     // One value, two consumers (#1011/#1106): the multiplexed poller's merged
     // `eth_getLogs` tick cadence, and — through `with_poll_interval` below — the
     // pending-tx receipt heartbeat, overriding alloy's 250 ms localhost default
     // that would hammer a dev anvil.
     let event_poll_interval = Duration::from_millis(cfg.blockchain.event_poll_interval_ms);
-    let chain_provider = ProviderFactory::read_only(rpc_url.clone(), event_poll_interval);
+    let chain_provider = providers.read_only(event_poll_interval);
     // One `eth_blockNumber` per TTL window for ALL watchers, instead of one per
     // watcher per tick. Plain read-only provider: a head read needs no wallet or
     // nonce filler, and coupling it to the signer stack would give every watcher's
@@ -923,7 +944,7 @@ async fn build_chain_and_handlers(
     // `with_poll_interval` — that only sets the pending-tx receipt heartbeat, and
     // this provider never builds a `PendingTransactionBuilder`.
     let head: Arc<dyn HeadSource> = Arc::new(SharedHead::new(
-        ProviderFactory::shared_head(rpc_url.clone()),
+        providers.shared_head(),
         event_poll_interval,
     ));
     // Every on-chain watcher registers a `Route` on ONE shared multiplexed
@@ -936,7 +957,7 @@ async fn build_chain_and_handlers(
     let mut poller_routes: Vec<crate::chain_events::multiplexed_poller::Route> = Vec::new();
     // One read-only provider for the poller's merged `get_logs` (each sink still
     // holds its own contract instance for its follow-up reads/writes).
-    let poller_provider = ProviderFactory::read_only(rpc_url.clone(), event_poll_interval);
+    let poller_provider = providers.read_only(event_poll_interval);
 
     // One boot deadline for the four fail-closed chain bootstraps below — the
     // registry, slash, `usdc()` self-check and blacklist reads (#2159). Each
@@ -981,7 +1002,7 @@ async fn build_chain_and_handlers(
     // the periodic resync heals drift, so detection is never disabled for the
     // daemon's lifetime.
     let (slash_store, slash_route) = crate::slash_watcher::bootstrap(
-        ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
+        providers.read_only(event_poll_interval),
         capacity_bond_addr,
         infra.eth_signer.address(),
         Arc::clone(&head),
@@ -1099,7 +1120,7 @@ async fn build_chain_and_handlers(
             let origin_assignment_addr =
                 parse_nonzero_address(origin_addr, "blockchain.origin_assignment_address")?;
             Arc::new(crate::dht::ChainOriginDirectory::new(
-                ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
+                providers.read_only(event_poll_interval),
                 origin_assignment_addr,
                 Arc::clone(&operator_to_node),
                 Arc::clone(&staker_set),
@@ -1150,7 +1171,7 @@ async fn build_chain_and_handlers(
         router: fee_router_addr,
         operator_bps: seed_operator_bps,
     } = crate::fee_shares::seed_from_chain(
-        ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
+        providers.read_only(event_poll_interval),
         payment_pool_addr,
         FEE_ROUTER_OPERATOR_BPS_FLOOR,
         &boot.capped(FEE_SHARE_BOOT_BUDGET),
@@ -1186,7 +1207,7 @@ async fn build_chain_and_handlers(
     // that refused to boot on a transient RPC failure could not be used to run
     // the rotation that repairs the binding. See `crate::binding_check`.
     let binding_report = crate::binding_check::check(
-        ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
+        providers.read_only(event_poll_interval),
         capacity_bond_addr,
         infra.eth_signer.address(),
         *infra.secret_key.public().as_bytes(),
@@ -1293,11 +1314,7 @@ async fn build_chain_and_handlers(
     // admission. The same provider is moved into the settlement service, which
     // builds its own binding from the same address; the buyer path builds its own
     // provider separately.
-    let wallet_provider = ProviderFactory::seller_wallet(
-        rpc_url.clone(),
-        (*infra.eth_signer).clone(),
-        event_poll_interval,
-    );
+    let wallet_provider = providers.seller_wallet((*infra.eth_signer).clone(), event_poll_interval);
     // Admit-path pool-view: reads the event-fed projection first and, on a miss
     // (a pool opened before the watcher's `ColdStart::Head` anchor), does ONE
     // `getPool` to confirm the pool is live and solvent before a serve is admitted
@@ -1420,7 +1437,7 @@ async fn build_chain_and_handlers(
     // teardown has no scan checkpoint to flush.
     let (blacklist_ready_tx, blacklist_ready_rx) = oneshot::channel();
     let blacklist_route = crate::blacklist_watcher::bootstrap(
-        ProviderFactory::read_only(blacklist_rpc_url, event_poll_interval),
+        providers.read_only(event_poll_interval),
         content_blacklist_addr,
         infra.eth_signer.address(),
         infra.cache.clone(),
@@ -1446,7 +1463,7 @@ async fn build_chain_and_handlers(
     // fell back to `FEE_ROUTER_OPERATOR_BPS_FLOOR`. Read-only, no durable cursor.
     if let Some(addr) = fee_router_addr {
         let fee_shares_route = crate::fee_shares_watcher::route(
-            ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
+            providers.read_only(event_poll_interval),
             addr,
             operator_shares.clone(),
             Duration::from_secs(cfg.blockchain.fee_shares_poll_interval_sec),
@@ -1507,7 +1524,7 @@ async fn build_chain_and_handlers(
         ));
 
     Ok(ChainHandlers {
-        rpc_url,
+        providers,
         event_poll_interval,
         slash_domain,
         bind_domain,
@@ -1564,8 +1581,9 @@ struct Background {
 
 /// Background-tasks phase of [`run`] (#1253): construct the buyer-side
 /// provider/stores, spawn every periodic GC / DHT / metrics / admin task, and
-/// emit the startup banner. Borrows [`Infra`] and [`ChainHandlers`]; `rpc_url`
-/// and the three EIP-712 domains are cloned out of the shared `ch` reference,
+/// emit the startup banner. Borrows [`Infra`] and [`ChainHandlers`]; the buyer
+/// provider is built from `ch.providers`, and the three EIP-712 domains are
+/// cloned out of the shared `ch` reference,
 /// and each clone is consumed exactly once. Returns the [`Background`] handles
 /// [`run`] threads into the serve call and [`ShutdownHandles`].
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
@@ -1603,11 +1621,9 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // on `SimpleNonceManager` re-reading the pending nonce each send (a transient
     // racing collision just gets a fresh nonce on the next attempt), not on the
     // sends being strictly serialized.
-    let buyer_wallet_provider = ProviderFactory::buyer_wallet(
-        ch.rpc_url.clone(),
-        (*infra.eth_signer).clone(),
-        ch.event_poll_interval,
-    );
+    let buyer_wallet_provider = ch
+        .providers
+        .buyer_wallet((*infra.eth_signer).clone(), ch.event_poll_interval);
     let buyer_channel_store: Arc<dyn decdn_incentive::BuyerPoolStore> = Arc::new(
         crate::channel_store::BuyerPoolStoreHandle::new(Arc::clone(&infra.concrete_channel_store)),
     );
@@ -3945,11 +3961,12 @@ mod tests {
         let url: HttpUrl = "http://localhost:8545".parse().expect("valid URL");
         let interval = Duration::from_secs(7);
 
-        let read = ProviderFactory::read_only(url.clone(), interval);
-        let head = ProviderFactory::shared_head(url.clone());
-        let seller =
-            ProviderFactory::seller_wallet(url.clone(), PrivateKeySigner::random(), interval);
-        let buyer = ProviderFactory::buyer_wallet(url, PrivateKeySigner::random(), interval);
+        let providers = ProviderFactory::new(url, Arc::new(metrics::Metrics::new()));
+
+        let read = providers.read_only(interval);
+        let head = providers.shared_head();
+        let seller = providers.seller_wallet(PrivateKeySigner::random(), interval);
+        let buyer = providers.buyer_wallet(PrivateKeySigner::random(), interval);
 
         assert_eq!(read.client().poll_interval(), interval);
         assert_eq!(head.client().poll_interval(), Duration::from_millis(250));
