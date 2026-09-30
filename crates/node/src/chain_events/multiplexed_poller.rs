@@ -114,6 +114,8 @@ use decdn_common::redact::sanitize_err_chain;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::rpc_metrics::is_rate_limit;
+
 use super::resumable_watcher::{CursorStart, LogSink, WatcherHandle, WatcherHook, fire};
 use super::shared_head::HeadSource;
 use super::{AbortOnDrop, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF};
@@ -751,7 +753,9 @@ const GET_LOGS_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// calls deterministic is not either: a revert, an invalid request, method or
 /// params response, an HTTP 4xx other than 408/429 (an expired API key, for
 /// example), or a local serialization or usage error. A rate limit
-/// ([`is_rate_limit`]) is not either: it goes to the loop's backoff.
+/// ([`is_rate_limit`]) is not either: the quota refills on the provider's
+/// schedule, not after [`GET_LOGS_WINDOW_RETRY_DELAY`], so it goes to the
+/// loop's backoff.
 /// Everything else is: a provider's "temporary internal error" or "request
 /// timeout" response, a head-lag error, a transport failure, and a `timed`
 /// timeout, which carries no typed cause.
@@ -762,29 +766,6 @@ fn is_transient_window_error(err: &anyhow::Error) -> bool {
             .find_map(|cause| cause.downcast_ref::<TransportError>())
             .is_none_or(|cause| !is_permanent_rpc_error(cause) && !is_rate_limit(cause))
 }
-
-/// Whether a failed call is the provider's rate limit: HTTP 429, an HTTP error
-/// that carries a `Retry-After` delay, or a JSON-RPC error response with code
-/// 429 or rate-limit wording (Infura `-32005 "project ID request rate
-/// exceeded"`). The quota refills on the provider's schedule, not after
-/// [`GET_LOGS_WINDOW_RETRY_DELAY`], so [`fetch_window_logs`] does not retry it.
-fn is_rate_limit(err: &TransportError) -> bool {
-    use alloy::transports::RpcError;
-    match err {
-        RpcError::Transport(kind) => {
-            kind.retry_after().is_some() || kind.as_http_error().is_some_and(|h| h.status == 429)
-        }
-        RpcError::ErrorResp(resp) => {
-            let message = resp.message.to_ascii_lowercase();
-            resp.code == 429 || RATE_LIMIT_WORDS.iter().any(|word| message.contains(word))
-        }
-        _ => false,
-    }
-}
-
-/// Words that mark a JSON-RPC error response as a rate limit. See
-/// [`is_rate_limit`].
-const RATE_LIMIT_WORDS: [&str; 3] = ["rate limit", "rate exceeded", "too many requests"];
 
 /// Handle a failed `get_logs` for the window `[start, end]`. A range rejection
 /// the poller recognises shrinks the span to half the window and returns

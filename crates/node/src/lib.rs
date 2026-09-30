@@ -32,6 +32,7 @@ pub mod pool_view;
 pub(crate) mod prune_guard;
 pub mod rate_limit;
 pub mod receipt_log;
+pub(crate) mod rpc_metrics;
 pub mod runtime;
 pub mod selection;
 pub mod serve_economics;

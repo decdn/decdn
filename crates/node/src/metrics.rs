@@ -46,6 +46,12 @@ const FIRST_BYTE_BUCKETS: [f64; 15] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
 ];
 
+/// Bucket upper bounds of `decdn_rpc_request_duration_seconds`. The top finite
+/// bucket is the node's per-call RPC deadline
+/// ([`crate::chain_events::DEFAULT_RPC_CALL_TIMEOUT`]): a request that reaches
+/// the deadline is dropped and counts as `timeout` without a duration sample.
+const RPC_REQUEST_BUCKETS: [f64; 10] = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+
 /// Cap concurrent `/metrics` connections. Prevents a trivial `DoS` where a
 /// peer opens many sockets to the operational-data endpoint and exhausts
 /// tasks.
@@ -204,6 +210,148 @@ struct ProbeHoldUnavailableLabels {
 )]
 struct NodeRegionLabels {
     node_region: String,
+}
+
+/// The `method` label on `decdn_rpc_requests_total` and
+/// `decdn_rpc_request_duration_seconds`: the JSON-RPC method of one request
+/// the node's alloy providers sent.
+///
+/// A closed set keeps the label's cardinality fixed. The variants are the
+/// methods the node's reads, fillers and settlement path call; any other
+/// method name counts as [`Self::Other`], so a request never mints a series
+/// from a string it did not choose. Values render as the JSON-RPC method name
+/// (`eth_getLogs`), not in `snake_case`.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RpcMethod {
+    EthBlockNumber,
+    EthCall,
+    EthChainId,
+    EthEstimateGas,
+    EthFeeHistory,
+    EthGasPrice,
+    EthGetBalance,
+    EthGetBlockByNumber,
+    EthGetCode,
+    EthGetLogs,
+    EthGetTransactionByHash,
+    EthGetTransactionCount,
+    EthGetTransactionReceipt,
+    EthMaxPriorityFeePerGas,
+    EthSendRawTransaction,
+    Other,
+}
+
+impl RpcMethod {
+    /// Every variant. [`Metrics::new`] materializes one child per entry, so
+    /// each series exports at zero from startup.
+    pub(crate) const ALL: [Self; 16] = [
+        Self::EthBlockNumber,
+        Self::EthCall,
+        Self::EthChainId,
+        Self::EthEstimateGas,
+        Self::EthFeeHistory,
+        Self::EthGasPrice,
+        Self::EthGetBalance,
+        Self::EthGetBlockByNumber,
+        Self::EthGetCode,
+        Self::EthGetLogs,
+        Self::EthGetTransactionByHash,
+        Self::EthGetTransactionCount,
+        Self::EthGetTransactionReceipt,
+        Self::EthMaxPriorityFeePerGas,
+        Self::EthSendRawTransaction,
+        Self::Other,
+    ];
+
+    /// The label value: the JSON-RPC method name, or `other`.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::EthBlockNumber => "eth_blockNumber",
+            Self::EthCall => "eth_call",
+            Self::EthChainId => "eth_chainId",
+            Self::EthEstimateGas => "eth_estimateGas",
+            Self::EthFeeHistory => "eth_feeHistory",
+            Self::EthGasPrice => "eth_gasPrice",
+            Self::EthGetBalance => "eth_getBalance",
+            Self::EthGetBlockByNumber => "eth_getBlockByNumber",
+            Self::EthGetCode => "eth_getCode",
+            Self::EthGetLogs => "eth_getLogs",
+            Self::EthGetTransactionByHash => "eth_getTransactionByHash",
+            Self::EthGetTransactionCount => "eth_getTransactionCount",
+            Self::EthGetTransactionReceipt => "eth_getTransactionReceipt",
+            Self::EthMaxPriorityFeePerGas => "eth_maxPriorityFeePerGas",
+            Self::EthSendRawTransaction => "eth_sendRawTransaction",
+            Self::Other => "other",
+        }
+    }
+
+    /// Map a request's method name onto the closed set. An unlisted name,
+    /// including the literal `other`, is [`Self::Other`].
+    pub(crate) fn from_name(name: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|method| *method != Self::Other && method.as_str() == name)
+            .unwrap_or(Self::Other)
+    }
+}
+
+impl EncodeLabelValue for RpcMethod {
+    fn encode_label_value(&self) -> iroh_metrics::LabelValue<'_> {
+        iroh_metrics::LabelValue::Str(std::borrow::Cow::Borrowed(self.as_str()))
+    }
+}
+
+/// The `outcome` label on `decdn_rpc_requests_total`: how one JSON-RPC
+/// request ended. Each request counts under exactly one value. The derive
+/// renders the variants in `snake_case`.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, EncodeLabelValue)]
+pub(crate) enum RpcOutcome {
+    /// The provider answered with a result.
+    Ok,
+    /// The provider answered with a revert: JSON-RPC error code `3`, or a
+    /// message that names a revert. The provider worked; the call itself
+    /// failed, so this is not a provider fault.
+    Reverted,
+    /// The provider answered with any other JSON-RPC error response, such as
+    /// invalid params, a range cap on `eth_getLogs`, or a provider-side
+    /// internal error.
+    RpcError,
+    /// The provider throttled the request: HTTP 429, an HTTP error with a
+    /// `Retry-After` delay, or a JSON-RPC error with code 429 or rate-limit
+    /// wording.
+    RateLimited,
+    /// No usable JSON-RPC reply arrived: a refused or reset connection, an HTTP
+    /// error without a JSON-RPC body, an unreadable body, or a batch reply
+    /// that left this request out.
+    TransportError,
+    /// The request did not resolve in time: the HTTP client timed out, or the
+    /// caller dropped the request before a reply arrived. In this node the
+    /// caller drops a request when its per-call deadline fires.
+    Timeout,
+}
+
+impl RpcOutcome {
+    /// Every variant. [`Metrics::new`] materializes one child per
+    /// `(method, outcome)` pair, so each series exports at zero from startup.
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Ok,
+        Self::Reverted,
+        Self::RpcError,
+        Self::RateLimited,
+        Self::TransportError,
+        Self::Timeout,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, EncodeLabelSet)]
+struct RpcRequestLabels {
+    method: RpcMethod,
+    outcome: RpcOutcome,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, EncodeLabelSet)]
+struct RpcMethodLabels {
+    method: RpcMethod,
 }
 
 /// Which buy-ceiling regime an ADR 041 serve-economics refusal was decided
@@ -2017,11 +2165,38 @@ pub struct DecdnMetrics {
     pub serve_stream_midstream_pool_exhausted: Counter,
 }
 
+/// Per-request JSON-RPC metrics for the node's chain provider, registered under
+/// the same `decdn` prefix as [`DecdnMetrics`].
+///
+/// A group of its own because a labelled histogram cannot deserialize, and
+/// [`DecdnMetrics`] derives `Deserialize`. The `crate::rpc_metrics` transport
+/// layer records into it for every request of every provider the runtime
+/// builds, so these are the denominator the provider's error ratio needs.
+#[derive(Debug, MetricsGroup)]
+#[metrics(default, name = "decdn")]
+struct RpcMetrics {
+    /// `decdn_rpc_requests_total{method,outcome}`: JSON-RPC requests the node's
+    /// providers sent, by method and by how each ended. Each request of a batch
+    /// counts once. Every `(method, outcome)` pair exports at zero from
+    /// startup.
+    ///
+    /// Labelled rather than split into sibling counters because every outcome
+    /// shares one aggregate: the error ratio is a sum over `outcome` divided by
+    /// the total. See [`RpcOutcome`] for each value.
+    rpc_requests: Family<RpcRequestLabels, Counter>,
+    /// `decdn_rpc_request_duration_seconds{method}`: time from sending one
+    /// JSON-RPC request to its reply or transport error. A request the caller
+    /// drops records no sample. Buckets: [`RPC_REQUEST_BUCKETS`].
+    #[default(Family::with_constructor(|| Histogram::new(RPC_REQUEST_BUCKETS.to_vec())))]
+    rpc_request_duration_seconds: Family<RpcMethodLabels, Histogram>,
+}
+
 /// Aggregated deCDN node metrics.
 #[derive(Debug)]
 pub struct Metrics {
     registry: Arc<RwLock<Registry>>,
     decdn: Arc<DecdnMetrics>,
+    rpc: Arc<RpcMetrics>,
     cache: Arc<CacheMetrics>,
     inbound_streams: Arc<Gauge>,
     outbound_streams: Arc<Gauge>,
@@ -2160,9 +2335,21 @@ impl Metrics {
                 .probe_hold_unavailable
                 .get_or_create(&ProbeHoldUnavailableLabels { reason })
         });
+        // Materialize every RPC child so each `(method, outcome)` series and
+        // each per-method histogram exports at zero from a fresh registry.
+        let rpc = Arc::new(RpcMetrics::default());
+        for method in RpcMethod::ALL {
+            for outcome in RpcOutcome::ALL {
+                rpc.rpc_requests
+                    .get_or_create(&RpcRequestLabels { method, outcome });
+            }
+            rpc.rpc_request_duration_seconds
+                .get_or_create(&RpcMethodLabels { method });
+        }
         let cache = Arc::new(CacheMetrics::default());
         let mut registry = Registry::default();
         registry.register(decdn.clone() as Arc<dyn MetricsGroup>);
+        registry.register(rpc.clone() as Arc<dyn MetricsGroup>);
         // Cache metrics live under the `decdn_cache` prefix so they
         // share the `decdn_*` family the rest of the metrics use.
         registry
@@ -2171,6 +2358,7 @@ impl Metrics {
         Self {
             registry: Arc::new(RwLock::new(registry)),
             decdn,
+            rpc,
             cache,
             inbound_streams,
             outbound_streams,
@@ -2354,6 +2542,29 @@ impl Metrics {
                 self.probe_hold_stake_lane_reserved.inc()
             }
         };
+    }
+
+    /// Record one JSON-RPC request on `decdn_rpc_requests_total{method,outcome}`
+    /// and, when it resolved, its round trip on
+    /// `decdn_rpc_request_duration_seconds{method}`. `elapsed` is `None` for a
+    /// request the caller dropped. The `crate::rpc_metrics` transport layer is
+    /// the one caller.
+    pub(crate) fn rpc_request(
+        &self,
+        method: RpcMethod,
+        outcome: RpcOutcome,
+        elapsed: Option<Duration>,
+    ) {
+        self.rpc
+            .rpc_requests
+            .get_or_create(&RpcRequestLabels { method, outcome })
+            .inc();
+        if let Some(elapsed) = elapsed {
+            self.rpc
+                .rpc_request_duration_seconds
+                .get_or_create(&RpcMethodLabels { method })
+                .observe(elapsed.as_secs_f64());
+        }
     }
 
     /// Publish the active-staker set size per region: one
@@ -3837,6 +4048,71 @@ mod tests {
                 "retired metric name {retired} must not be exported:\n{text}"
             );
         }
+    }
+
+    /// Every `(method, outcome)` child of `decdn_rpc_requests_total` and every
+    /// per-method duration histogram exports at zero from a fresh registry, so
+    /// an error-ratio panel has a series before the first failure. A recorded
+    /// request lands on its own child only, and a dropped one records no
+    /// duration sample.
+    #[test]
+    fn rpc_request_series_export_at_zero_and_record_per_label() {
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        for method in RpcMethod::ALL {
+            let method = method.as_str();
+            for outcome in [
+                "ok",
+                "reverted",
+                "rpc_error",
+                "rate_limited",
+                "transport_error",
+                "timeout",
+            ] {
+                let name = format!(
+                    "decdn_rpc_requests_total{{method=\"{method}\",outcome=\"{outcome}\"}}"
+                );
+                assert!(has_metric_line(&text, &name, 0), "{name} missing:\n{text}");
+            }
+            let count = format!("decdn_rpc_request_duration_seconds_count{{method=\"{method}\"}}");
+            assert!(has_metric_line(&text, &count, 0), "{count} missing");
+        }
+        assert_eq!(RpcOutcome::ALL.len(), 6, "extend the outcome list above");
+
+        metrics.rpc_request(
+            RpcMethod::EthGetLogs,
+            RpcOutcome::RateLimited,
+            Some(Duration::from_millis(40)),
+        );
+        metrics.rpc_request(RpcMethod::EthCall, RpcOutcome::Timeout, None);
+        let text = metrics.encode().unwrap();
+        let requests = |method: &str, outcome: &str| {
+            metric_value(
+                &text,
+                &format!("decdn_rpc_requests_total{{method=\"{method}\",outcome=\"{outcome}\"}}"),
+            )
+        };
+        assert_eq!(requests("eth_getLogs", "rate_limited"), Some(1));
+        assert_eq!(requests("eth_getLogs", "ok"), Some(0));
+        assert_eq!(requests("eth_call", "timeout"), Some(1));
+        assert!(has_metric_line(
+            &text,
+            "decdn_rpc_request_duration_seconds_bucket{method=\"eth_getLogs\",le=\"0.05\"}",
+            1
+        ));
+        assert!(has_metric_line(
+            &text,
+            "decdn_rpc_request_duration_seconds_count{method=\"eth_call\"}",
+            0
+        ));
+    }
+
+    /// A request slower than every finite bucket is one the per-call deadline
+    /// drops, so the top bucket reaches the deadline.
+    #[test]
+    fn rpc_request_buckets_reach_the_per_call_deadline() {
+        let top = RPC_REQUEST_BUCKETS.last().copied().unwrap_or_default();
+        assert!(top >= crate::chain_events::DEFAULT_RPC_CALL_TIMEOUT.as_secs_f64());
     }
 
     /// Every series name the encoder actually emits, label suffixes stripped.
