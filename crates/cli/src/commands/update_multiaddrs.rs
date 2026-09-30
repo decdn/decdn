@@ -156,7 +156,7 @@ async fn build_plan<P: Provider + Clone>(
         .call()
         .await
         .with_context(|| ctx("multiaddrUpdateCooldown"))?;
-    let head_timestamp = head_timestamp(bond.provider()).await?;
+    let head_timestamp = chain_ctx::head_timestamp(bond.provider()).await?;
 
     // Saturating rather than `try_into`: both are governance parameters bounded
     // far below `u64::MAX`, so a value past `u64` is unreachable — and failing
@@ -181,19 +181,6 @@ async fn build_plan<P: Provider + Clone>(
         ready_at,
         head_timestamp,
     })
-}
-
-/// Head block timestamp — the clock `updateMultiaddrs` compares its cooldown
-/// against. Read from the chain rather than the local clock so the pre-check
-/// uses the same clock the contract will (same rationale as `unbond`'s
-/// `head_timestamp`).
-async fn head_timestamp<P: Provider>(provider: &P) -> anyhow::Result<u64> {
-    let block = provider
-        .get_block(alloy::eips::BlockId::latest())
-        .await
-        .context("failed to read the latest block")?
-        .ok_or_else(|| anyhow::anyhow!("no latest block"))?;
-    Ok(block.header.timestamp)
 }
 
 /// Reject empty or whitespace-only multiaddrs. clap enforces "at least one

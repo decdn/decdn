@@ -141,7 +141,7 @@ async fn build_plan<P: Provider + Clone>(
         .call()
         .await
         .with_context(|| ctx("regionScopeData"))?;
-    let head_timestamp = head_timestamp(bond.provider()).await?;
+    let head_timestamp = chain_ctx::head_timestamp(bond.provider()).await?;
 
     // Saturating rather than `try_into`: the stability window is a governance
     // parameter bounded far below `u64::MAX`, so a value past `u64` is
@@ -163,19 +163,6 @@ async fn build_plan<P: Provider + Clone>(
         ready_at,
         head_timestamp,
     })
-}
-
-/// Head block timestamp — the clock `updateRegion` compares its cooldown
-/// against. Read from the chain rather than the local clock so the pre-check uses
-/// the same clock the contract will (same rationale as `update-multiaddrs`'s
-/// `head_timestamp`).
-async fn head_timestamp<P: Provider>(provider: &P) -> anyhow::Result<u64> {
-    let block = provider
-        .get_block(alloy::eips::BlockId::latest())
-        .await
-        .context("failed to read the latest block")?
-        .ok_or_else(|| anyhow::anyhow!("no latest block"))?;
-    Ok(block.header.timestamp)
 }
 
 /// Validate a region string as an ISO 3166-1 alpha-2 code and return the

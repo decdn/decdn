@@ -10,6 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use alloy::primitives::Address;
+use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_common::cli;
@@ -342,6 +343,22 @@ pub fn resolve_publish(
 /// [`decdn_incentive::tx::send`] for the `landed` contract, which callers must
 /// read carefully: an `Err` does **not** imply nothing landed.
 pub(crate) use decdn_incentive::tx::send;
+
+/// Head block timestamp: the clock a contract compares `block.timestamp`
+/// against. A pre-check that reads it, rather than the local clock, agrees
+/// with the contract even when this machine's clock drifts.
+///
+/// # Errors
+///
+/// Errors when the latest block cannot be read.
+pub(crate) async fn head_timestamp<P: Provider>(provider: &P) -> anyhow::Result<u64> {
+    let block = provider
+        .get_block(alloy::eips::BlockId::latest())
+        .await
+        .context("failed to read the latest block")?
+        .ok_or_else(|| anyhow::anyhow!("no latest block"))?;
+    Ok(block.header.timestamp)
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
