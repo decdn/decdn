@@ -93,9 +93,7 @@ use decdn_e2e::client::ClientFixture;
 use decdn_e2e::node::NodeFixture;
 use decdn_incentive::buyer_pool::BuyerPoolState;
 use decdn_incentive::payment_pool::PaymentPool;
-use decdn_incentive::{
-    Capability, SignedCapability, bind_node_id_domain, floor_micro, voucher_domain,
-};
+use decdn_incentive::{Capability, Deployment, SignedCapability, bind_node_id_domain, floor_micro};
 use decdn_protocol::client::{
     CHUNK_BYTES, ClientMessage, StreamError, StreamRequestExt, WireCapability,
 };
@@ -222,7 +220,11 @@ async fn run() -> anyhow::Result<()> {
     // pool) so this journey controls the exact deposit and shares one pool across
     // many distinct signers.
     let owner = ClientFixture::new(&chain).await?;
-    let voucher_dom = voucher_domain(chain.chain_id(), chain.addrs().payment_pool);
+    let deployment = Deployment {
+        chain_id: chain.chain_id(),
+        payment_pool: chain.addrs().payment_pool,
+    };
+    let voucher_dom = deployment.voucher_domain();
     let bind_domain = bind_node_id_domain(chain.chain_id(), chain.addrs().capacity_bond);
     let own_node_id = alloy::primitives::B256::from(*owner.endpoint().id().as_bytes());
 
@@ -234,7 +236,7 @@ async fn run() -> anyhow::Result<()> {
     let opened = open_pool(
         &contract,
         Arc::clone(owner.signer()),
-        &voucher_dom,
+        deployment,
         chain.usdc(),
         owner.address(),
         deposit,
@@ -258,7 +260,7 @@ async fn run() -> anyhow::Result<()> {
         let (signer, cap) = delegate_lane(owner.signer(), pool_id, delegate_expiry, &voucher_dom)?;
         contexts.push(delegate_context(
             pool_id,
-            chain.addrs().payment_pool,
+            deployment,
             owner.address(),
             chain.usdc(),
             deposit,
@@ -399,7 +401,7 @@ fn delegate_lane(
 #[allow(clippy::too_many_arguments)]
 fn delegate_context(
     pool_id: alloy::primitives::B256,
-    payment_pool: Address,
+    deployment: Deployment,
     owner_addr: Address,
     token: Address,
     deposit: U256,
@@ -411,7 +413,7 @@ fn delegate_context(
     voucher_dom: &alloy::dyn_abi::Eip712Domain,
 ) -> anyhow::Result<PoolContext> {
     let binding = sign_client_binding(&delegate, own_node_id, bind_domain)?;
-    let state = BuyerPoolState::new(pool_id, payment_pool, owner_addr, token, deposit);
+    let state = BuyerPoolState::new(pool_id, deployment, owner_addr, token, deposit);
     Ok(
         PoolContext::for_pool(&state, Arc::new(delegate), voucher_dom.clone())
             .with_provider(provider, U256::ZERO, U256::ZERO)

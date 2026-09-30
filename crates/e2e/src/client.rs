@@ -25,7 +25,7 @@ use decdn_client::{
 };
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{
-    BuyerPoolState, SignedCapability, bind_node_id_domain, slash_judge_domain, voucher_domain,
+    BuyerPoolState, Deployment, SignedCapability, bind_node_id_domain, slash_judge_domain,
 };
 use decdn_protocol::client::{ClientMessage, StreamError, StreamResponse, WireCapability};
 use decdn_protocol::{
@@ -611,7 +611,6 @@ impl ClientFixture {
     ) -> anyhow::Result<PoolSession> {
         let provider = chain.provider_for(&self.signer);
         let contract = PaymentPool::new(self.payment_pool, provider);
-        let voucher_dom = voucher_domain(chain.chain_id(), self.payment_pool);
         let deposit = U256::from(DEPOSIT_MICRO_USDC);
 
         // The shared open kernel escrows the deposit, decodes the authoritative
@@ -620,7 +619,7 @@ impl ClientFixture {
         let opened = open_pool(
             &contract,
             Arc::clone(&self.signer),
-            &voucher_dom,
+            self.deployment(chain),
             chain.usdc(),
             self.signer.address(),
             deposit,
@@ -830,6 +829,15 @@ impl ClientFixture {
         )
     }
 
+    /// The `PaymentPool` deployment this client buys on: `chain`'s id and the
+    /// client's configured `PaymentPool`.
+    const fn deployment(&self, chain: &ChainFixture) -> Deployment {
+        Deployment {
+            chain_id: chain.chain_id(),
+            payment_pool: self.payment_pool,
+        }
+    }
+
     /// A [`PoolContext`] bound to an existing `pool_id`, at a zero lane watermark
     /// and carrying this client's identity binding, the delivering provider, and
     /// the self-owned capability so the node can register the signer on a first
@@ -840,10 +848,11 @@ impl ClientFixture {
         node: &NodeFixture,
         pool_id: B256,
     ) -> anyhow::Result<PoolContext> {
-        let voucher_dom = voucher_domain(chain.chain_id(), self.payment_pool);
+        let deployment = self.deployment(chain);
+        let voucher_dom = deployment.voucher_domain();
         let state = BuyerPoolState::new(
             pool_id,
-            self.payment_pool,
+            deployment,
             self.signer.address(),
             chain.usdc(),
             U256::from(DEPOSIT_MICRO_USDC),

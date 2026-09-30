@@ -777,9 +777,7 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     rpc_url: HttpUrl,
     event_poll_interval: Duration,
     slash_domain: alloy::dyn_abi::Eip712Domain,
-    voucher_domain: alloy::dyn_abi::Eip712Domain,
     bind_domain: alloy::dyn_abi::Eip712Domain,
-    payment_pool_addr: alloy::primitives::Address,
     staker_set: Arc<dyn StakerSet>,
     /// The single multiplexed chain-event poller driving every registered
     /// watcher route — six with the fee-shares route, which registers only
@@ -1195,8 +1193,7 @@ async fn build_chain_and_handlers(
     )
     .await;
 
-    let voucher_domain =
-        decdn_incentive::voucher_domain(infra.payment_pool_deployment.chain_id, payment_pool_addr);
+    let voucher_domain = infra.payment_pool_deployment.voucher_domain();
     let bind_domain =
         decdn_incentive::bind_node_id_domain(cfg.blockchain.chain_id, capacity_bond_addr);
 
@@ -1513,9 +1510,7 @@ async fn build_chain_and_handlers(
         rpc_url,
         event_poll_interval,
         slash_domain,
-        voucher_domain,
         bind_domain,
-        payment_pool_addr,
         staker_set,
         poller,
         slash_store,
@@ -2034,7 +2029,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // Precompute every cfg/secret-derived value the task needs: the closure is
     // `'static` so it can't borrow `cfg`/`secret_key`, and those are used later.
     let (buyer_bootstrap_stop_tx, buyer_bootstrap_stop_rx) = oneshot::channel::<()>();
-    let buyer_voucher_domain = ch.voucher_domain.clone();
     let buyer_working_deposit = U256::from(cfg.blockchain.buyer_working_deposit_micro_usdc);
     let buyer_ensure_max_approval = cfg.blockchain.buyer_max_approve;
     let buyer_signer_address = infra.eth_signer.address();
@@ -2093,7 +2087,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let node_metrics_for_origin = Arc::clone(&infra.node_metrics);
     let node_origin_engine = infra.cache.clone();
     let mut buyer_bootstrap_stop_rx = buyer_bootstrap_stop_rx;
-    let payment_pool_addr_for_buyer = ch.payment_pool_addr;
+    let buyer_deployment = infra.payment_pool_deployment;
+    let payment_pool_addr_for_buyer = buyer_deployment.payment_pool;
     tasks.spawn(async move {
         let service = tokio::select! {
             biased;
@@ -2101,11 +2096,10 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             _ = &mut buyer_bootstrap_stop_rx => return,
             res = crate::buyer_channel::BuyerPoolService::bootstrap(
                 buyer_wallet_provider,
-                payment_pool_addr_for_buyer,
+                buyer_deployment,
                 buyer_signer_address,
                 buyer_channel_store,
                 eth_signer_for_buyer,
-                buyer_voucher_domain,
                 buyer_working_deposit,
                 buyer_ensure_max_approval,
                 node_metrics_for_buyer,

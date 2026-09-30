@@ -37,7 +37,8 @@ use anyhow::{Context, Result};
 use decdn_incentive::erc20::Erc20;
 use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools};
 use decdn_incentive::{
-    AdvanceOutcome, BuyerPoolState, BuyerPoolStore, LaneKey, PoolId, PoolOpenFailureReason,
+    AdvanceOutcome, BuyerPoolState, BuyerPoolStore, Deployment, LaneKey, PoolId,
+    PoolOpenFailureReason,
 };
 use futures_util::FutureExt;
 use tracing::{debug, error, info, warn};
@@ -562,6 +563,10 @@ pub struct BuyerPoolService<P: Provider + Clone + 'static> {
     contract: PaymentPool::PaymentPoolInstance<P>,
     store: Arc<dyn BuyerPoolStore>,
     signer: Arc<PrivateKeySigner>,
+    /// The chain and `PaymentPool` this service buys on. Every buyer row it opens
+    /// or adopts carries it, and every row it reuses must match it.
+    deployment: Deployment,
+    /// The voucher EIP-712 domain of [`Self::deployment`].
     voucher_domain: Eip712Domain,
     token: Address,
     owner: Address,
@@ -588,8 +593,10 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// token, issue the one-time USDC approval if requested, and spawn the
     /// reclaim sweep.
     ///
-    /// `working_deposit` is the deposit a fresh open escrows and the target a
-    /// reused pool's low-water refill tops it up toward.
+    /// `deployment` is the chain and `PaymentPool` the service buys on; the
+    /// voucher EIP-712 domain derives from it. `working_deposit` is the deposit a
+    /// fresh open escrows and the target a reused pool's low-water refill tops it
+    /// up toward.
     ///
     /// # Errors
     ///
@@ -601,15 +608,15 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     #[allow(clippy::too_many_arguments)]
     pub async fn bootstrap(
         provider: P,
-        payment_pool_addr: Address,
+        deployment: Deployment,
         owner: Address,
         store: Arc<dyn BuyerPoolStore>,
         signer: Arc<PrivateKeySigner>,
-        voucher_domain: Eip712Domain,
         working_deposit: U256,
         ensure_max_approval: bool,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
+        let payment_pool_addr = deployment.payment_pool;
         let contract = PaymentPool::new(payment_pool_addr, provider.clone());
 
         let token = contract
@@ -627,9 +634,11 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         let load = store.load_all().context("hydrate persisted buyer pools")?;
         metrics.buyer_pool_store_skipped_undecodable_records(load.skipped.len());
 
-        let adopted = reconcile_owned_pool(&contract, &store, owner, token, &metrics).await;
+        let adopted =
+            reconcile_owned_pool(&contract, deployment, &store, owner, token, &metrics).await;
         info!(
             %payment_pool_addr,
+            chain_id = deployment.chain_id,
             %token,
             %owner,
             tracked = load.pools.len(),
@@ -651,7 +660,8 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             contract,
             store,
             signer,
-            voucher_domain,
+            deployment,
+            voucher_domain: deployment.voucher_domain(),
             token,
             owner,
             working_deposit,
@@ -687,14 +697,16 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
                 .context(OpenReported)
                 .context(LocalPullFault)
         })?;
-        let configured = *self.contract.address();
+        let configured = self.deployment;
         Ok(row.filter(|state| {
             let ours = state.is_on(configured);
             if !ours {
                 warn!(
                     pool_id = %state.pool_id,
-                    foreign_payment_pool = %state.payment_pool,
-                    configured_payment_pool = %configured,
+                    foreign_payment_pool = %state.deployment.payment_pool,
+                    foreign_chain_id = state.deployment.chain_id,
+                    configured_payment_pool = %configured.payment_pool,
+                    configured_chain_id = configured.chain_id,
                     "ignoring a tracked buyer pool from another PaymentPool deployment; \
                      opening a fresh pool instead of paying against it"
                 );
@@ -1072,7 +1084,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         let contract = self.contract.clone();
         let store = Arc::clone(&self.store);
         let signer = Arc::clone(&self.signer);
-        let voucher_domain = self.voucher_domain.clone();
+        let deployment = self.deployment;
         let token = self.token;
         let owner = self.owner;
         // The shared pool is fully withdrawable, so open at the working deposit.
@@ -1084,14 +1096,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         let task = tokio::spawn(async move {
             let _guard = guard;
             run_open(
-                &contract,
-                &store,
-                signer,
-                &voucher_domain,
-                token,
-                owner,
-                deposit,
-                &metrics,
+                &contract, &store, signer, deployment, token, owner, deposit, &metrics,
             )
             .await
             .map_err(Arc::new)
@@ -1375,6 +1380,7 @@ impl<P: Provider + Clone + 'static> PoolOpener for BuyerPoolService<P> {
 /// disable buying for the life of the process the way a failed approval does.
 async fn reconcile_owned_pool<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
+    deployment: Deployment,
     store: &Arc<dyn BuyerPoolStore>,
     owner: Address,
     token: Address,
@@ -1389,15 +1395,14 @@ async fn reconcile_owned_pool<P: Provider + Clone>(
     // `Foreign` is matched ahead of `AlreadyTracked` by the guard on the arm,
     // not by position; swapping them would compile and silently restore the
     // collision.
-    let payment_pool = *contract.address();
-    let tracked: Option<PoolId> = match adoption_applies(store, owner, payment_pool) {
+    let tracked: Option<PoolId> = match adoption_applies(store, owner, deployment) {
         AdoptionCheck::Unknown => {
             metrics.buyer_pool_adoption_failure();
             return false;
         }
         AdoptionCheck::Applies => None,
         AdoptionCheck::Foreign { pool_id, was_on } => {
-            if !drop_foreign_row(store, owner, pool_id, was_on, payment_pool) {
+            if !drop_foreign_row(store, owner, pool_id, was_on, deployment) {
                 return false;
             }
             None
@@ -1421,13 +1426,7 @@ async fn reconcile_owned_pool<P: Provider + Clone>(
     let Some((pool_id, pool)) = candidate else {
         return false;
     };
-    let state = BuyerPoolState::new(
-        pool_id,
-        payment_pool,
-        owner,
-        token,
-        U256::from(pool.deposit),
-    );
+    let state = BuyerPoolState::new(pool_id, deployment, owner, token, U256::from(pool.deposit));
     if let Err(err) = store.record(&state) {
         metrics.buyer_pool_adoption_failure();
         warn!(
@@ -1566,13 +1565,15 @@ fn drop_foreign_row(
     store: &Arc<dyn BuyerPoolStore>,
     owner: Address,
     pool_id: PoolId,
-    was_on: Address,
-    configured: Address,
+    was_on: Deployment,
+    configured: Deployment,
 ) -> bool {
     warn!(
         %pool_id,
-        foreign_payment_pool = %was_on,
-        configured_payment_pool = %configured,
+        foreign_payment_pool = %was_on.payment_pool,
+        foreign_chain_id = was_on.chain_id,
+        configured_payment_pool = %configured.payment_pool,
+        configured_chain_id = configured.chain_id,
         "the tracked buyer pool belongs to a different PaymentPool deployment; dropping the \
          stale row. Its deposit, if any, is recoverable only against \
          `foreign_payment_pool`, which is the last record this node keeps of it"
@@ -1580,7 +1581,8 @@ fn drop_foreign_row(
     if let Err(err) = store.forget_if_pool(owner, pool_id) {
         warn!(
             %pool_id,
-            foreign_payment_pool = %was_on,
+            foreign_payment_pool = %was_on.payment_pool,
+            foreign_chain_id = was_on.chain_id,
             error = %format_args!("{err:#}"),
             "could not drop the foreign buyer pool row; this node keeps reusing a pool on a \
              contract that has never heard of it, and its vouchers fund nothing, until the \
@@ -1647,14 +1649,14 @@ enum AdoptionCheck {
     /// will eventually name an existing, unrelated pool here — carrying lane
     /// progress that priced bytes the live contract never saw.
     ///
-    /// Carries the contract the row was written against, because that is the
-    /// only address against which its deposit can be reclaimed, and it is not
-    /// recoverable from anywhere else once the row is dropped.
+    /// Carries the deployment the row was written against, because that is the
+    /// only chain and contract against which its deposit can be reclaimed, and
+    /// it is not recoverable from anywhere else once the row is dropped.
     Foreign {
         /// The tracked pool, as the foreign contract numbered it.
         pool_id: PoolId,
-        /// The `PaymentPool` the row was written against.
-        was_on: Address,
+        /// The chain and `PaymentPool` the row was written against.
+        was_on: Deployment,
     },
     /// The store already tracks this pool; there is nothing to adopt. The id
     /// rides along because the stranded set is "every other open pool", and
@@ -1672,13 +1674,13 @@ enum AdoptionCheck {
 fn adoption_applies(
     store: &Arc<dyn BuyerPoolStore>,
     owner: Address,
-    payment_pool: Address,
+    deployment: Deployment,
 ) -> AdoptionCheck {
     match store.get_by_owner(owner) {
         Ok(None) => AdoptionCheck::Applies,
-        Ok(Some(state)) if !state.is_on(payment_pool) => AdoptionCheck::Foreign {
+        Ok(Some(state)) if !state.is_on(deployment) => AdoptionCheck::Foreign {
             pool_id: state.pool_id,
-            was_on: state.payment_pool,
+            was_on: state.deployment,
         },
         Ok(Some(state)) => AdoptionCheck::AlreadyTracked(state.pool_id),
         Err(err) => {
@@ -1853,7 +1855,7 @@ async fn run_open<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn BuyerPoolStore>,
     signer: Arc<PrivateKeySigner>,
-    voucher_domain: &Eip712Domain,
+    deployment: Deployment,
     token: Address,
     owner: Address,
     deposit: U256,
@@ -1895,7 +1897,7 @@ async fn run_open<P: Provider + Clone>(
     // `ContractRevert` stays unmarked: it is deterministic on-chain state (a paused
     // contract, a future revert reason), it is metered by reason, and it does not say
     // this node is unable to pay — another candidate may still deliver.
-    let opened = match open_pool(contract, signer, voucher_domain, token, owner, deposit).await {
+    let opened = match open_pool(contract, signer, deployment, token, owner, deposit).await {
         Ok(opened) => opened,
         Err(err) => {
             error!(error = %format_args!("{err:#}"), "buyer pool open failed");
@@ -2091,6 +2093,26 @@ mod tests {
 
     use super::*;
 
+    /// The deployment the mocked contract ([`mocked_pool_contract`], at
+    /// `Address::ZERO`) belongs to, and the one every service here buys on.
+    const DEPLOYMENT: Deployment = Deployment {
+        chain_id: 421_614,
+        payment_pool: Address::ZERO,
+    };
+
+    /// The same `PaymentPool` address as [`DEPLOYMENT`] on another chain: a
+    /// different deployment that the contract address alone cannot tell apart.
+    const OTHER_CHAIN: Deployment = Deployment {
+        chain_id: 1,
+        payment_pool: Address::ZERO,
+    };
+
+    /// Another `PaymentPool` address on [`DEPLOYMENT`]'s chain.
+    const OTHER_CONTRACT: Deployment = Deployment {
+        chain_id: 421_614,
+        payment_pool: Address::repeat_byte(0xDE),
+    };
+
     fn signer() -> Arc<PrivateKeySigner> {
         Arc::new(PrivateKeySigner::random())
     }
@@ -2183,7 +2205,9 @@ mod tests {
         ]);
         let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
 
-        assert!(reconcile_owned_pool(&contract, &store, owner, token, &metrics()).await);
+        assert!(
+            reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await
+        );
         let adopted = store.get_by_owner(owner).unwrap().expect("row recorded");
         assert_eq!(adopted.pool_id, newer);
         assert_eq!(adopted.deposit, U256::from(10_000_000u64));
@@ -2204,20 +2228,34 @@ mod tests {
     /// lane progress that priced bytes it never delivered.
     #[tokio::test]
     async fn reconcile_drops_a_row_from_another_payment_pool_deployment() {
+        reconcile_drops_a_row_from(OTHER_CONTRACT).await;
+    }
+
+    /// The same drop for a row on the configured contract address but another
+    /// chain. The address alone does not name a deployment: the same deployer
+    /// nonce yields the same `PaymentPool` address on every chain, and the pool
+    /// ids repeat there too.
+    #[tokio::test]
+    async fn reconcile_drops_a_row_from_the_same_address_on_another_chain() {
+        reconcile_drops_a_row_from(OTHER_CHAIN).await;
+    }
+
+    /// Seed a row on `foreign`, reconcile against [`DEPLOYMENT`] whose contract
+    /// lists the same pool id, and check the row adopted in its place.
+    async fn reconcile_drops_a_row_from(foreign: Deployment) {
         use alloy::sol_types::SolValue;
 
         let owner = Address::repeat_byte(1);
         let token = Address::repeat_byte(2);
         // The id the stale row tracks — and the id this contract will hand out
-        // again, because the derivation omits the contract address.
+        // again, because the derivation omits the chain and the contract.
         let colliding = PoolId::from([0xAA; 32]);
 
         let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
         store
             .record(&BuyerPoolState::new(
                 colliding,
-                // NOT the mocked contract's address (`Address::ZERO`).
-                Address::repeat_byte(0xDE),
+                foreign,
                 owner,
                 token,
                 U256::from(10_000_000u64),
@@ -2233,13 +2271,14 @@ mod tests {
                 .into(),
         ]);
 
-        assert!(reconcile_owned_pool(&contract, &store, owner, token, &metrics()).await);
+        assert!(
+            reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await
+        );
 
         let row = store.get_by_owner(owner).unwrap().expect("row recorded");
         assert_eq!(
-            row.payment_pool,
-            Address::ZERO,
-            "the surviving row must belong to the contract this node is configured against"
+            row.deployment, DEPLOYMENT,
+            "the surviving row must belong to the deployment this node is configured against"
         );
         assert_eq!(
             row.deposit,
@@ -2260,6 +2299,19 @@ mod tests {
     /// unnoticed; here it cannot.
     #[tokio::test]
     async fn a_foreign_row_is_dropped_even_when_there_is_nothing_to_adopt() {
+        a_foreign_row_is_dropped_with_nothing_to_adopt(OTHER_CONTRACT).await;
+    }
+
+    /// The same standalone drop for a row on the configured contract address
+    /// but another chain.
+    #[tokio::test]
+    async fn a_row_from_another_chain_is_dropped_even_when_there_is_nothing_to_adopt() {
+        a_foreign_row_is_dropped_with_nothing_to_adopt(OTHER_CHAIN).await;
+    }
+
+    /// Seed a row with lane progress on `deployment`, reconcile against
+    /// [`DEPLOYMENT`] whose contract lists no pool, and check the row is gone.
+    async fn a_foreign_row_is_dropped_with_nothing_to_adopt(deployment: Deployment) {
         use alloy::sol_types::SolValue;
 
         let owner = Address::repeat_byte(1);
@@ -2267,7 +2319,7 @@ mod tests {
         let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
         let mut row = BuyerPoolState::new(
             foreign,
-            Address::repeat_byte(0xDE),
+            deployment,
             owner,
             Address::repeat_byte(2),
             U256::from(10_000_000u64),
@@ -2289,6 +2341,7 @@ mod tests {
         assert!(
             !reconcile_owned_pool(
                 &contract,
+                DEPLOYMENT,
                 &store,
                 owner,
                 Address::repeat_byte(2),
@@ -2304,9 +2357,9 @@ mod tests {
         );
     }
 
-    /// The foreign-row check keys on the contract address alone: a row on the
-    /// configured deployment is left to the ordinary reconciliation, whatever
-    /// its id."""
+    /// The foreign-row check keys on the whole deployment — chain id and
+    /// contract address: a row on the configured deployment is left to the
+    /// ordinary reconciliation, whatever its id.
     #[test]
     fn adoption_tracks_a_row_on_the_configured_deployment() {
         let owner = Address::repeat_byte(1);
@@ -2315,7 +2368,7 @@ mod tests {
         store
             .record(&BuyerPoolState::new(
                 pool_id,
-                Address::ZERO,
+                DEPLOYMENT,
                 owner,
                 Address::repeat_byte(2),
                 U256::from(10_000_000u64),
@@ -2323,9 +2376,37 @@ mod tests {
             .expect("seed the local row");
 
         assert_eq!(
-            adoption_applies(&store, owner, Address::ZERO),
+            adoption_applies(&store, owner, DEPLOYMENT),
             AdoptionCheck::AlreadyTracked(pool_id),
             "a row on the configured PaymentPool is tracked, never foreign"
+        );
+    }
+
+    /// A row on the configured contract address but another chain is foreign,
+    /// and the check carries the chain it came from: that deployment is the
+    /// only one its deposit can be reclaimed against.
+    #[test]
+    fn adoption_treats_a_row_on_the_same_address_on_another_chain_as_foreign() {
+        let owner = Address::repeat_byte(1);
+        let pool_id = PoolId::from([0xAA; 32]);
+        let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+        store
+            .record(&BuyerPoolState::new(
+                pool_id,
+                OTHER_CHAIN,
+                owner,
+                Address::repeat_byte(2),
+                U256::from(10_000_000u64),
+            ))
+            .expect("seed the local row");
+
+        assert_eq!(
+            adoption_applies(&store, owner, DEPLOYMENT),
+            AdoptionCheck::Foreign {
+                pool_id,
+                was_on: OTHER_CHAIN,
+            },
+            "the same PaymentPool address on another chain is another deployment"
         );
     }
 
@@ -2353,6 +2434,7 @@ mod tests {
         assert!(
             reconcile_owned_pool(
                 &contract,
+                DEPLOYMENT,
                 &store,
                 owner,
                 Address::repeat_byte(2),
@@ -2376,6 +2458,7 @@ mod tests {
         assert!(
             !reconcile_owned_pool(
                 &contract,
+                DEPLOYMENT,
                 &store,
                 owner,
                 Address::repeat_byte(2),
@@ -2423,14 +2506,16 @@ mod tests {
         store
             .record(&BuyerPoolState::new(
                 existing,
-                Address::ZERO,
+                DEPLOYMENT,
                 owner,
                 token,
                 U256::from(5_000u64),
             ))
             .unwrap();
 
-        assert!(!reconcile_owned_pool(&contract, &store, owner, token, &metrics()).await);
+        assert!(
+            !reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await
+        );
         assert_eq!(
             store.get_by_owner(owner).unwrap().unwrap().pool_id,
             existing
@@ -2527,7 +2612,7 @@ mod tests {
         store
             .record(&BuyerPoolState::new(
                 existing,
-                Address::ZERO,
+                DEPLOYMENT,
                 owner,
                 token,
                 U256::from(5_000u64),
@@ -2535,7 +2620,7 @@ mod tests {
             .unwrap();
 
         let metrics = metrics();
-        assert!(!reconcile_owned_pool(&contract, &store, owner, token, &metrics).await);
+        assert!(!reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics).await);
         // Nothing adopted: the tracked row is untouched.
         assert_eq!(
             store.get_by_owner(owner).unwrap().unwrap().pool_id,
@@ -2587,7 +2672,7 @@ mod tests {
         store
             .record(&BuyerPoolState::new(
                 closed,
-                Address::ZERO,
+                DEPLOYMENT,
                 owner,
                 token,
                 U256::from(5_000u64),
@@ -2595,7 +2680,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            reconcile_owned_pool(&contract, &store, owner, token, &metrics()).await,
+            reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await,
             "a stale row must not block adoption of a pool this owner really holds"
         );
         assert_eq!(
@@ -2638,14 +2723,16 @@ mod tests {
         store
             .record(&BuyerPoolState::new(
                 tracked,
-                Address::ZERO,
+                DEPLOYMENT,
                 owner,
                 token,
                 U256::from(5_000u64),
             ))
             .unwrap();
 
-        assert!(!reconcile_owned_pool(&contract, &store, owner, token, &metrics()).await);
+        assert!(
+            !reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await
+        );
         assert_eq!(
             store.get_by_owner(owner).unwrap().unwrap().pool_id,
             tracked,
@@ -2684,14 +2771,16 @@ mod tests {
         store
             .record(&BuyerPoolState::new(
                 tracked,
-                Address::ZERO,
+                DEPLOYMENT,
                 owner,
                 token,
                 U256::from(5_000u64),
             ))
             .unwrap();
 
-        assert!(!reconcile_owned_pool(&contract, &store, owner, token, &metrics()).await);
+        assert!(
+            !reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await
+        );
         assert_eq!(
             store.get_by_owner(owner).unwrap().unwrap().pool_id,
             tracked,
@@ -2721,14 +2810,16 @@ mod tests {
         store
             .record(&BuyerPoolState::new(
                 closed,
-                Address::ZERO,
+                DEPLOYMENT,
                 owner,
                 token,
                 U256::from(5_000u64),
             ))
             .unwrap();
 
-        assert!(!reconcile_owned_pool(&contract, &store, owner, token, &metrics()).await);
+        assert!(
+            !reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await
+        );
         assert!(
             store.get_by_owner(owner).unwrap().is_none(),
             "the row must be gone so the next miss opens a fresh pool"
@@ -2750,7 +2841,7 @@ mod tests {
         store
             .record(&BuyerPoolState::new(
                 existing,
-                Address::ZERO,
+                DEPLOYMENT,
                 owner,
                 token,
                 U256::from(5_000u64),
@@ -2758,7 +2849,7 @@ mod tests {
             .unwrap();
 
         let metrics = metrics();
-        assert!(!reconcile_owned_pool(&contract, &store, owner, token, &metrics).await);
+        assert!(!reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics).await);
         assert_eq!(
             adoption_failures(&metrics),
             0,
@@ -2784,6 +2875,7 @@ mod tests {
             contract: mocked_pool_contract(responses),
             store,
             signer,
+            deployment: DEPLOYMENT,
             voucher_domain: Eip712Domain::default(),
             token: Address::repeat_byte(2),
             owner,
@@ -2812,7 +2904,7 @@ mod tests {
         let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
         let mut state = BuyerPoolState::new(
             pool_id,
-            Address::ZERO,
+            DEPLOYMENT,
             owner,
             Address::repeat_byte(2),
             U256::from(10_000_000u64),
@@ -2869,13 +2961,25 @@ mod tests {
     /// a property of boot ordering.
     #[tokio::test]
     async fn the_pull_path_ignores_a_row_from_another_deployment() {
+        the_pull_path_ignores_a_row_on(OTHER_CONTRACT);
+    }
+
+    /// The same pull-path filter for a row on the configured contract address
+    /// but another chain.
+    #[tokio::test]
+    async fn the_pull_path_ignores_a_row_from_the_same_address_on_another_chain() {
+        the_pull_path_ignores_a_row_on(OTHER_CHAIN);
+    }
+
+    /// Seed a row on `foreign` and read it through the pull path of a service
+    /// that buys on [`DEPLOYMENT`]. Needs a Tokio runtime: the service spawns.
+    fn the_pull_path_ignores_a_row_on(foreign: Deployment) {
         let owner = Address::repeat_byte(1);
         let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
         store
             .record(&BuyerPoolState::new(
                 PoolId::from([0xAA; 32]),
-                // The mocked contract is at `Address::ZERO`; this is not it.
-                Address::repeat_byte(0xDE),
+                foreign,
                 owner,
                 Address::repeat_byte(2),
                 U256::from(10_000_000u64),
@@ -2900,7 +3004,7 @@ mod tests {
     }
 
     /// A lane this node has been paid on, but has no local record of, resumes
-    /// from the chain's watermark."""
+    /// from the chain's watermark.
     ///
     /// `PoolLedger` signs `prior + accrued`, so resuming from zero would put
     /// every cumulative at or below the contract's watermark, where
@@ -2918,7 +3022,7 @@ mod tests {
         let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
         let adopted = BuyerPoolState::new(
             pool_id,
-            Address::ZERO,
+            DEPLOYMENT,
             owner,
             Address::repeat_byte(2),
             U256::from(10_000_000u64),
@@ -3018,7 +3122,7 @@ mod tests {
         let signer = signer();
         let state = BuyerPoolState::new(
             PoolId::from([7u8; 32]),
-            Address::ZERO,
+            DEPLOYMENT,
             owner,
             Address::repeat_byte(2),
             U256::from(10_000_000u64),
@@ -3069,7 +3173,7 @@ mod tests {
         let signer = signer();
         let state = BuyerPoolState::new(
             PoolId::from([7u8; 32]),
-            Address::ZERO,
+            DEPLOYMENT,
             owner,
             Address::repeat_byte(2),
             U256::from(10_000_000u64),
@@ -3182,6 +3286,7 @@ mod tests {
         assert!(
             reconcile_owned_pool(
                 &contract,
+                DEPLOYMENT,
                 &store,
                 owner,
                 Address::repeat_byte(2),
@@ -3205,12 +3310,19 @@ mod tests {
         let contract = mocked_pool_contract(Vec::new());
 
         assert_eq!(
-            adoption_applies(&store, owner, *contract.address()),
+            adoption_applies(&store, owner, DEPLOYMENT),
             AdoptionCheck::Unknown
         );
         assert!(
-            !reconcile_owned_pool(&contract, &store, owner, Address::repeat_byte(2), &metrics)
-                .await
+            !reconcile_owned_pool(
+                &contract,
+                DEPLOYMENT,
+                &store,
+                owner,
+                Address::repeat_byte(2),
+                &metrics
+            )
+            .await
         );
         assert_eq!(
             adoption_failures(&metrics),
@@ -3362,7 +3474,7 @@ mod tests {
         inner
             .record(&BuyerPoolState::new(
                 foreign,
-                Address::repeat_byte(0xDE),
+                OTHER_CONTRACT,
                 owner,
                 Address::repeat_byte(2),
                 U256::from(10_000_000u64),
@@ -3375,8 +3487,15 @@ mod tests {
         let contract = mocked_pool_contract(Vec::new());
 
         assert!(
-            !reconcile_owned_pool(&contract, &store, owner, Address::repeat_byte(2), &metrics)
-                .await
+            !reconcile_owned_pool(
+                &contract,
+                DEPLOYMENT,
+                &store,
+                owner,
+                Address::repeat_byte(2),
+                &metrics
+            )
+            .await
         );
         assert_eq!(
             adoption_failures(&metrics),
@@ -3409,8 +3528,15 @@ mod tests {
         ]);
 
         assert!(
-            !reconcile_owned_pool(&contract, &store, owner, Address::repeat_byte(2), &metrics)
-                .await
+            !reconcile_owned_pool(
+                &contract,
+                DEPLOYMENT,
+                &store,
+                owner,
+                Address::repeat_byte(2),
+                &metrics
+            )
+            .await
         );
         assert_eq!(adoption_failures(&metrics), 1);
     }
@@ -3441,6 +3567,7 @@ mod tests {
         assert!(
             !reconcile_owned_pool(
                 &contract,
+                DEPLOYMENT,
                 &store,
                 owner,
                 Address::repeat_byte(2),
@@ -3460,7 +3587,7 @@ mod tests {
         let pool_id = decdn_incentive::PoolId::from([7u8; 32]);
         let mut state = BuyerPoolState::new(
             pool_id,
-            Address::ZERO,
+            DEPLOYMENT,
             Address::repeat_byte(1),
             Address::repeat_byte(2),
             U256::from(10_000u64),
@@ -3846,7 +3973,7 @@ mod tests {
         let provider = Address::repeat_byte(9);
         let state = BuyerPoolState::new(
             decdn_incentive::PoolId::from([7u8; 32]),
-            Address::ZERO,
+            DEPLOYMENT,
             Address::repeat_byte(1),
             Address::repeat_byte(2),
             U256::from(10_000u64),

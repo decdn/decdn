@@ -38,6 +38,26 @@ since project inception and will roll into the first tagged release.
   `(4 fetched, 0 linked, 12 skipped, 0 reused, 1 excluded, 0 failed)`.
   Scripts that read `deduped` must read `reused`.
 
+- **Buyer pool rows carry the chain id beside the `PaymentPool` address, and
+  both buyer tables move to `_v5` (#2198).** The row tag was the contract
+  address alone, but the same deployer nonce gives the same `PaymentPool`
+  address on every chain, and `poolId = keccak256(owner, ownerPoolNonce)`
+  repeats there too. A node or client repointed at another chain with its data
+  dir intact therefore reused a row from the other chain as its own.
+  `BuyerPoolState` now carries a `Deployment` (chain id and `PaymentPool`
+  address, the type the seller store is stamped with, now in
+  `decdn-incentive`), and every path that checks the tag compares both: node
+  bootstrap, the node's pull hot path, and `decdn fetch`. The bootstrap and
+  reuse WARNs add `foreign_chain_id` and `configured_chain_id`. **Existing
+  buyer rows are not read:** `buyer_pool_state_v4` / `buyer_pool_owner_index_v4`
+  become `_v5` (record schema 3), so on first boot the store reads as empty and
+  both a node and a client re-adopt the live pool from chain. A deposit held
+  by an orphaned row is recoverable only on the deployment it was opened on.
+  `decdn pool list --json` and `admin_v1_pools` gain `chain_id`.
+  `decdn_client::buyer_pool::open_pool` takes the `Deployment` in place of the
+  voucher EIP-712 domain, and `BuyerPoolService::bootstrap` takes it in place
+  of the `PaymentPool` address and the voucher domain.
+
 - **`decdn fetch` and `decdn bundle pull` recover through one acquire loop,
   and a blob's size is a hint (#2239; #2223, #2215, #2214, #2225, #2213,
   #2218, #2230).** Both commands drive every holder of a blob from one loop.

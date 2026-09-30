@@ -61,7 +61,8 @@ use decdn_incentive::payment_pool::{PaymentPool, newest_solvent_owned_pool};
 use anyhow::Context as _;
 use decdn_incentive::rate::min_payment;
 use decdn_incentive::{
-    CapabilityGrant, LaneKey, PoolId, bind_node_id_domain, slash_judge_domain, voucher_domain,
+    CapabilityGrant, Deployment, LaneKey, PoolId, bind_node_id_domain, slash_judge_domain,
+    voucher_domain,
 };
 use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
@@ -182,6 +183,17 @@ pub(crate) struct ResolvedChain {
     /// proactive refill restores toward once it has served verified bytes.
     pub(crate) working_deposit: U256,
     pub(crate) max_approve: bool,
+}
+
+impl ResolvedChain {
+    /// The `PaymentPool` deployment this buy runs against: the chain id and the
+    /// contract address. A buyer row is reused only on this deployment.
+    pub(crate) const fn deployment(&self) -> Deployment {
+        Deployment {
+            chain_id: self.chain_id,
+            payment_pool: self.payment_pool,
+        }
+    }
 }
 
 /// Parse `[client] region_allowlist` into [`decdn_protocol::Region`]s.
@@ -989,18 +1001,18 @@ fn identity_fresh_candidates(
 /// through to the on-chain read.
 ///
 /// "Immutable per contract" is the whole premise, so the row has to be on the
-/// contract being read: a row from another `PaymentPool` deployment caches that
-/// deployment's `usdc()`, and answering with it would approve and price against
-/// the wrong token. Such a row reads as absent and the caller pays the
+/// deployment being read: a row from another `PaymentPool` deployment caches
+/// that deployment's `usdc()`, and answering with it would approve and price
+/// against the wrong token. Such a row reads as absent and the caller pays the
 /// round-trip.
 fn cached_pool_token(
     store: &RedbBuyerPoolStore,
     self_address: Address,
-    payment_pool: Address,
+    deployment: Deployment,
 ) -> anyhow::Result<Option<Address>> {
     Ok(store
         .get_by_owner(self_address)?
-        .filter(|state| state.is_on(payment_pool))
+        .filter(|state| state.is_on(deployment))
         .map(|state| state.token))
 }
 
@@ -1562,7 +1574,7 @@ async fn fetch_over(
     // the eth_call; only a first-ever pool (no row) pays the `usdc()` round-trip.
     // The reuse branch of `open_or_reuse_pool` already trusts this same
     // `state.token`, so this only makes the top-level value consistent with it.
-    let token = match cached_pool_token(store, self_address, chain.payment_pool)? {
+    let token = match cached_pool_token(store, self_address, chain.deployment())? {
         Some(token) => token,
         None => contract
             .usdc()
@@ -2573,7 +2585,6 @@ where
             contract,
             rpc,
             signer,
-            voucher_dom,
             provider,
             self_address,
             chain,
@@ -2600,7 +2611,6 @@ async fn build_pool_ctx<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     rpc: &P,
     signer: &Arc<PrivateKeySigner>,
-    voucher_dom: &Eip712Domain,
     provider: Address,
     self_address: Address,
     chain: &ResolvedChain,
@@ -2614,10 +2624,9 @@ where
         contract,
         rpc,
         signer,
-        voucher_dom,
         provider,
         self_address,
-        chain.payment_pool,
+        chain.deployment(),
         chain.working_deposit,
         chain.max_approve,
         // The store this fetch writes was opened from `chain.data_dir`, and it
@@ -2717,7 +2726,7 @@ where
         .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
     let state = BuyerPoolState::new(
         pool_id,
-        *contract.address(),
+        chain.deployment(),
         pool.owner,
         token,
         U256::from(pool.deposit),
@@ -2752,7 +2761,7 @@ pub(crate) fn attach_client_binding(
     Ok(ctx.with_client_binding(sign_client_binding(signer, own_node_id, &bind_dom)?))
 }
 
-/// Adopt the live pool `owner` already holds on `payment_pool`, recording it in
+/// Adopt the live pool `owner` already holds on `deployment`, recording it in
 /// the client store, or return `None` if the chain lists no `Open` pool with
 /// deposit left to spend. The adopted row comes back with the pool's
 /// `totalRedeemed`, which the row itself does not carry.
@@ -2770,7 +2779,7 @@ async fn adopt_owned_pool<P>(
     store: &RedbBuyerPoolStore,
     contract: &PaymentPool::PaymentPoolInstance<P>,
     owner: Address,
-    payment_pool: Address,
+    deployment: Deployment,
 ) -> anyhow::Result<Option<(BuyerPoolState, U256)>>
 where
     P: alloy::providers::Provider + Clone,
@@ -2786,13 +2795,7 @@ where
         contract.usdc().call().await.with_context(|| {
             format!("read PaymentPool.usdc() while adopting live pool {pool_id}")
         })?;
-    let state = BuyerPoolState::new(
-        pool_id,
-        payment_pool,
-        owner,
-        token,
-        U256::from(pool.deposit),
-    );
+    let state = BuyerPoolState::new(pool_id, deployment, owner, token, U256::from(pool.deposit));
     store.record(&state).with_context(|| {
         format!(
             "found live pool {pool_id} on chain but could not record it in the local buyer \
@@ -2843,8 +2846,9 @@ where
 /// The pool this buy reuses, if any, and what that pool has already paid out
 /// beyond what its row's lanes account for.
 ///
-/// A tracked row is reused only if it is on `payment_pool`. A row from another
-/// deployment is not this contract's pool, whatever its id says: `pool_id` is
+/// A tracked row is reused only if it is on `deployment` — the same chain and
+/// the same `PaymentPool` address. A row from another deployment is not this
+/// contract's pool, whatever its id says: `pool_id` is
 /// `keccak256(owner, ownerPoolNonce)` and a redeploy restarts that nonce, so the
 /// id alone will eventually name an existing, unrelated pool here, and its lane
 /// progress would seed the first voucher at a cumulative this pool has never
@@ -2866,19 +2870,21 @@ async fn pool_to_reuse<P>(
     store: &RedbBuyerPoolStore,
     contract: &PaymentPool::PaymentPoolInstance<P>,
     self_address: Address,
-    payment_pool_addr: Address,
+    deployment: Deployment,
     adoption: ChainAdoption,
 ) -> anyhow::Result<(Option<BuyerPoolState>, U256)>
 where
     P: alloy::providers::Provider + Clone,
 {
     let tracked = match store.get_by_owner(self_address)? {
-        Some(state) if state.is_on(payment_pool_addr) => Some(state),
+        Some(state) if state.is_on(deployment) => Some(state),
         Some(state) => {
             tracing::warn!(
                 pool_id = %state.pool_id,
-                foreign_payment_pool = %state.payment_pool,
-                configured_payment_pool = %payment_pool_addr,
+                foreign_payment_pool = %state.deployment.payment_pool,
+                foreign_chain_id = state.deployment.chain_id,
+                configured_payment_pool = %deployment.payment_pool,
+                configured_chain_id = deployment.chain_id,
                 "ignoring a tracked buyer pool from another PaymentPool deployment; its deposit, \
                  if any, is recoverable only against `foreign_payment_pool`"
             );
@@ -2890,7 +2896,7 @@ where
         (Some(state), _) => (Some(state), U256::ZERO),
         (None, ChainAdoption::Refused) => (None, U256::ZERO),
         (None, ChainAdoption::Allowed) => {
-            match adopt_owned_pool(store, contract, self_address, payment_pool_addr).await? {
+            match adopt_owned_pool(store, contract, self_address, deployment).await? {
                 Some((state, redeemed)) => (Some(state), redeemed),
                 None => (None, U256::ZERO),
             }
@@ -2904,16 +2910,19 @@ where
 /// [`refill_amount`] for the policy. There is no pool expiry (ADR 003), so
 /// there is no replace-on-expiry branch: the same pool is reused for the
 /// caller's whole lifetime, across every provider.
+///
+/// `deployment` is the chain and `PaymentPool` that `contract` talks to: a
+/// tracked row is reused only on it, a new or adopted row carries it, and the
+/// voucher EIP-712 domain derives from it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn open_or_reuse_pool<P>(
     store: &RedbBuyerPoolStore,
     contract: &PaymentPool::PaymentPoolInstance<P>,
     rpc: &P,
     signer: &Arc<PrivateKeySigner>,
-    voucher_domain: &Eip712Domain,
     provider: Address,
     self_address: Address,
-    payment_pool_addr: Address,
+    deployment: Deployment,
     working_deposit: U256,
     max_approve: bool,
     adoption: ChainAdoption,
@@ -2921,8 +2930,9 @@ pub(crate) async fn open_or_reuse_pool<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
+    let payment_pool_addr = deployment.payment_pool;
     let (tracked, spent_elsewhere) =
-        pool_to_reuse(store, contract, self_address, payment_pool_addr, adoption).await?;
+        pool_to_reuse(store, contract, self_address, deployment, adoption).await?;
     if let Some(state) = tracked {
         let lane = LaneKey {
             pool_id: state.pool_id,
@@ -2993,7 +3003,7 @@ where
         return self_owned_lane_ctx(
             &state,
             signer,
-            voucher_domain,
+            &deployment.voucher_domain(),
             provider,
             prior_bytes,
             prior_amount,
@@ -3018,7 +3028,7 @@ where
     let opened = open_pool(
         contract,
         Arc::clone(signer),
-        voucher_domain,
+        deployment,
         token,
         self_address,
         deposit,
@@ -3372,15 +3382,18 @@ mod tests {
         let store = RedbBuyerPoolStore::open(&dir.path().join("data"))?;
         let owner = Address::repeat_byte(0x11);
         let token = Address::repeat_byte(0x22);
-        let payment_pool = Address::repeat_byte(0x9c);
+        let deployment = Deployment {
+            chain_id: 421_614,
+            payment_pool: Address::repeat_byte(0x9c),
+        };
 
         // No row yet -> None -> caller must read usdc() on the open path.
-        assert_eq!(cached_pool_token(&store, owner, payment_pool)?, None);
+        assert_eq!(cached_pool_token(&store, owner, deployment)?, None);
 
         // Persist a pool row for this owner.
         let state = BuyerPoolState::new(
             B256::repeat_byte(0xAB),
-            payment_pool,
+            deployment,
             owner,
             token,
             U256::from(1_000u64),
@@ -3388,19 +3401,32 @@ mod tests {
         store.record(&state)?;
 
         // Row present -> the immutable token comes back with no contract read.
-        assert_eq!(cached_pool_token(&store, owner, payment_pool)?, Some(token));
+        assert_eq!(cached_pool_token(&store, owner, deployment)?, Some(token));
         // A different owner has no row -> still None.
         assert_eq!(
-            cached_pool_token(&store, Address::repeat_byte(0x33), payment_pool)?,
+            cached_pool_token(&store, Address::repeat_byte(0x33), deployment)?,
             None
         );
         // The row is the same, but it names another deployment's `usdc()`.
-        // Answering with it would approve and price the wrong token.
-        assert_eq!(
-            cached_pool_token(&store, owner, Address::repeat_byte(0xDE))?,
-            None,
-            "a row from another PaymentPool deployment must not seed the token cache"
-        );
+        // Answering with it would approve and price the wrong token. The
+        // address alone does not name a deployment: the same address on
+        // another chain is another contract.
+        let other_address = Deployment {
+            payment_pool: Address::repeat_byte(0xDE),
+            ..deployment
+        };
+        let other_chain = Deployment {
+            chain_id: 1,
+            ..deployment
+        };
+        for foreign in [other_address, other_chain] {
+            assert_eq!(
+                cached_pool_token(&store, owner, foreign)?,
+                None,
+                "a row from another PaymentPool deployment must not seed the token cache \
+                 ({foreign:?})"
+            );
+        }
         Ok(())
     }
 
@@ -4067,7 +4093,10 @@ mod tests {
         };
         let mut state = BuyerPoolState::new(
             pool_id,
-            Address::repeat_byte(0x7B),
+            Deployment {
+                chain_id: 421_614,
+                payment_pool: Address::repeat_byte(0x7B),
+            },
             owner,
             Address::repeat_byte(0x7C),
             U256::from(1_000u64),
@@ -4420,6 +4449,11 @@ mod adoption_tests {
     use alloy::sol_types::SolValue;
 
     const PP: Address = Address::repeat_byte(0x9c);
+    /// The deployment every test buys on: chain 1, contract [`PP`].
+    const DEPLOYMENT: Deployment = Deployment {
+        chain_id: 1,
+        payment_pool: PP,
+    };
     const PROVIDER: Address = Address::repeat_byte(0x77);
     const TOKEN: Address = Address::repeat_byte(0x22);
     /// The client's working deposit: 10 USDC, so low water is 2 USDC.
@@ -4462,16 +4496,14 @@ mod adoption_tests {
         }
         let rpc = ProviderBuilder::new().connect_mocked_client(asserter);
         let contract = PaymentPool::new(PP, rpc.clone());
-        let domain = decdn_incentive::voucher_domain(1, PP);
         open_or_reuse_pool(
             store,
             &contract,
             &rpc,
             signer,
-            &domain,
             PROVIDER,
             signer.address(),
-            PP,
+            DEPLOYMENT,
             U256::from(WORKING),
             false,
             adoption,
@@ -4529,7 +4561,7 @@ mod adoption_tests {
             .unwrap()
             .expect("adopted row is recorded");
         assert_eq!(row.pool_id, older);
-        assert!(row.is_on(PP));
+        assert!(row.is_on(DEPLOYMENT));
     }
 
     /// A chain read that faults refuses the fetch. It must not fall through to
@@ -4565,7 +4597,7 @@ mod adoption_tests {
         store
             .record(&BuyerPoolState::new(
                 id,
-                PP,
+                DEPLOYMENT,
                 signer.address(),
                 TOKEN,
                 U256::from(WORKING),
@@ -4586,6 +4618,63 @@ mod adoption_tests {
             (ctx.prior_bytes_delivered, ctx.prior_amount),
             (U256::from(500_000u64), U256::from(500u64))
         );
+    }
+
+    /// A tracked row from another deployment is not reused, whether the
+    /// deployment differs in its contract address or only in its chain. The
+    /// pool id repeats across deployments, so reusing the row would resume lane
+    /// progress this pool never redeemed against.
+    ///
+    /// `ChainAdoption::Refused` keeps the chain out of it: the mocked provider
+    /// has no answers queued, so any read would fault the call.
+    #[tokio::test]
+    async fn a_row_from_another_deployment_is_not_reused() {
+        let signer = Arc::new(PrivateKeySigner::random());
+        let rpc = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let contract = PaymentPool::new(PP, rpc);
+        let other_address = Deployment {
+            payment_pool: Address::repeat_byte(0xDE),
+            ..DEPLOYMENT
+        };
+        let other_chain = Deployment {
+            chain_id: 421_614,
+            ..DEPLOYMENT
+        };
+        for (foreign, reused) in [
+            (other_address, false),
+            (other_chain, false),
+            (DEPLOYMENT, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = client_store(&dir);
+            let id = B256::repeat_byte(0xCC);
+            store
+                .record(&BuyerPoolState::new(
+                    id,
+                    foreign,
+                    signer.address(),
+                    TOKEN,
+                    U256::from(WORKING),
+                ))
+                .unwrap();
+
+            let (tracked, spent_elsewhere) = pool_to_reuse(
+                &store,
+                &contract,
+                signer.address(),
+                DEPLOYMENT,
+                ChainAdoption::Refused,
+            )
+            .await
+            .expect("a refused adoption reads nothing from the chain");
+
+            assert_eq!(
+                tracked.map(|state| state.pool_id),
+                reused.then_some(id),
+                "row on {foreign:?}, buying on {DEPLOYMENT:?}"
+            );
+            assert_eq!(spent_elsewhere, U256::ZERO);
+        }
     }
 
     /// A buy from a node's data dir never adopts, even though the chain would

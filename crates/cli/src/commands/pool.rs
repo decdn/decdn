@@ -28,7 +28,7 @@ use decdn_incentive::buyer_pool::{BuyerLoad, BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::buyer_pool_redb::{ReadOnlyBuyerPoolStore, RedbBuyerPoolStore};
 use decdn_incentive::eth_identity::{self, PasswordUse, load_signer};
 use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools};
-use decdn_incentive::{Capability, CapabilityGrant, PoolId, voucher_domain};
+use decdn_incentive::{Capability, CapabilityGrant, Deployment, PoolId, voucher_domain};
 use serde::Serialize;
 
 use decdn_client::provider;
@@ -170,7 +170,10 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
     let owner = signer.address();
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
     let contract = PaymentPool::new(chain.payment_pool, rpc.clone());
-    let domain = voucher_domain(chain.chain_id, chain.payment_pool);
+    let deployment = Deployment {
+        chain_id: chain.chain_id,
+        payment_pool: chain.payment_pool,
+    };
 
     let token = contract
         .usdc()
@@ -184,7 +187,7 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
     let opened = open_pool(
         &contract,
         Arc::clone(&signer),
-        &domain,
+        deployment,
         token,
         owner,
         deposit,
@@ -1990,6 +1993,7 @@ struct DaemonPoolListJson<'a> {
 #[derive(Serialize)]
 struct PoolJson {
     pool_id: String,
+    chain_id: u64,
     payment_pool: String,
     owner: String,
     token: String,
@@ -2009,7 +2013,8 @@ impl From<&BuyerPoolState> for PoolJson {
     fn from(p: &BuyerPoolState) -> Self {
         Self {
             pool_id: format!("{:#x}", p.pool_id),
-            payment_pool: format!("{:#x}", p.payment_pool),
+            chain_id: p.deployment.chain_id,
+            payment_pool: format!("{:#x}", p.deployment.payment_pool),
             owner: format!("{:#x}", p.owner),
             token: format!("{:#x}", p.token),
             deposit_usdc: format_usdc_u256(p.deposit),
@@ -2206,10 +2211,16 @@ mod tests {
         assert!(err.to_string().contains("not this keystore's address"));
     }
 
+    /// The deployment every fixture row lives on.
+    const DEPLOYMENT: Deployment = Deployment {
+        chain_id: 421_614,
+        payment_pool: Address::repeat_byte(0x9c),
+    };
+
     fn mk_state(byte: u8, deposit_micro: u64) -> BuyerPoolState {
         BuyerPoolState::new(
             B256::repeat_byte(byte),
-            Address::repeat_byte(0x9c),
+            DEPLOYMENT,
             Address::repeat_byte(byte),
             Address::repeat_byte(0xcd),
             U256::from(deposit_micro),
@@ -2336,6 +2347,7 @@ mod tests {
         let resp = BuyerPoolsResponse {
             pools: vec![decdn_common::admin::BuyerPoolSnapshot {
                 pool_id: format!("{decoded:#x}"),
+                chain_id: 421_614,
                 payment_pool: "0x00dd".to_string(),
                 owner: format!("{:?}", Address::repeat_byte(0x11)),
                 token: format!("{:?}", Address::repeat_byte(0xcd)),
@@ -2366,7 +2378,7 @@ mod tests {
     fn a_buyer_load_keeps_its_skipped_rows() {
         let state = BuyerPoolState::new(
             B256::repeat_byte(0x11),
-            Address::repeat_byte(0x9c),
+            DEPLOYMENT,
             Address::repeat_byte(0x11),
             Address::repeat_byte(0xcd),
             U256::from(1u64),
@@ -2439,6 +2451,7 @@ mod tests {
             &BuyerPoolsResponse {
                 pools: vec![decdn_common::admin::BuyerPoolSnapshot {
                     pool_id: "0xabcdef0123456789".to_string(),
+                    chain_id: 421_614,
                     payment_pool: "0x00dd".to_string(),
                     owner: "0x1111111111111111".to_string(),
                     token: "0x2222222222222222".to_string(),

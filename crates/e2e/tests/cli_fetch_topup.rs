@@ -46,7 +46,7 @@ use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity;
 use decdn_incentive::payment_pool::PaymentPool;
-use decdn_incentive::{LaneKey, voucher_domain};
+use decdn_incentive::{Deployment, LaneKey};
 // The denominator of `next_voucher`'s `ceil(bytes * rate / MB)` pricing, taken
 // from the protocol rather than re-spelled locally: a hand-copied 1024 * 1024
 // would keep passing if the protocol constant ever moved.
@@ -112,12 +112,15 @@ async fn run() -> anyhow::Result<()> {
     .context("approve PaymentPool")?;
 
     let deposit = U256::from(DEPOSIT_MICRO_USDC);
-    let voucher_dom = voucher_domain(chain.chain_id(), chain.addrs().payment_pool);
+    let deployment = Deployment {
+        chain_id: chain.chain_id(),
+        payment_pool: chain.addrs().payment_pool,
+    };
 
     let opened = open_pool(
         &pool,
         Arc::new(buyer_signer.clone()),
-        &voucher_dom,
+        deployment,
         chain.usdc(),
         buyer_addr,
         deposit,
@@ -470,7 +473,10 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     // measurement this test exists to take. Pre-clearing the race keeps this
     // test to exactly ONE `decdn fetch` invocation, so the reactive top-up
     // branch is the only thing that can move the byte offset.
-    let voucher_dom = voucher_domain(chain.chain_id(), chain.addrs().payment_pool);
+    let deployment = Deployment {
+        chain_id: chain.chain_id(),
+        payment_pool: chain.addrs().payment_pool,
+    };
     ensure_allowance(
         &chain.provider_for(&buyer),
         chain.usdc(),
@@ -487,7 +493,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     let opened = open_pool(
         &pool,
         Arc::new(buyer.clone()),
-        &voucher_dom,
+        deployment,
         chain.usdc(),
         buyer_addr,
         working_deposit,
@@ -776,7 +782,10 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
     // exactly ONE `decdn fetch` invocation, so the reactive top-up branch is the
     // only thing that can move the byte offset, and the settle measurement below
     // is not corrupted by a cross-invocation resume.
-    let voucher_dom = voucher_domain(chain.chain_id(), chain.addrs().payment_pool);
+    let deployment = Deployment {
+        chain_id: chain.chain_id(),
+        payment_pool: chain.addrs().payment_pool,
+    };
     ensure_allowance(
         &chain.provider_for(&buyer),
         chain.usdc(),
@@ -790,7 +799,7 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
     let opened = open_pool(
         &pool,
         Arc::new(buyer.clone()),
-        &voucher_dom,
+        deployment,
         chain.usdc(),
         buyer_addr,
         U256::from(DEPOSIT_SHORT_WORKING_MICRO_USDC),

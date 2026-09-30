@@ -947,7 +947,8 @@ fn build_buyer_pools_response(
             lanes.sort_by_key(|(lane, _)| (lane.signer, lane.provider));
             BuyerPoolSnapshot {
                 pool_id: format!("{:#x}", p.pool_id),
-                payment_pool: p.payment_pool.to_string(),
+                chain_id: p.deployment.chain_id,
+                payment_pool: p.deployment.payment_pool.to_string(),
                 owner: p.owner.to_string(),
                 token: p.token.to_string(),
                 deposit_micro_usdc: u64::try_from(p.deposit).unwrap_or(u64::MAX),
@@ -2241,11 +2242,17 @@ mod tests {
 
     // ---- admin_v1_pools (#2078) ----
 
+    /// The deployment every seeded buyer pool lives on.
+    const BUYER_DEPLOYMENT: decdn_incentive::Deployment = decdn_incentive::Deployment {
+        chain_id: 421_614,
+        payment_pool: Address::repeat_byte(0x9c),
+    };
+
     /// Seed one buyer pool with two lanes, deliberately out of sorted order.
     fn mk_buyer_pool(pool_byte: u8, deposit: u64) -> BuyerPoolState {
         BuyerPoolState::hydrate(
             B256::repeat_byte(pool_byte),
-            Address::repeat_byte(0x9c),
+            BUYER_DEPLOYMENT,
             Address::repeat_byte(0x11),
             Address::repeat_byte(0xcd),
             U256::from(deposit),
@@ -2310,6 +2317,11 @@ mod tests {
             "pools sort by pool_id, not store order"
         );
         assert_eq!(first.deposit_micro_usdc, 10_000_000);
+        assert_eq!(first.chain_id, BUYER_DEPLOYMENT.chain_id);
+        assert_eq!(
+            first.payment_pool,
+            BUYER_DEPLOYMENT.payment_pool.to_string()
+        );
         // Lanes sort by (signer, provider); 0xaa..aa precedes 0xbb..bb.
         let lane = first.lanes.first().expect("first lane");
         assert_eq!(lane.provider, Address::repeat_byte(0xaa).to_string());
@@ -2325,7 +2337,7 @@ mod tests {
     fn build_buyer_pools_response_saturates_oversized_deposit() {
         let pool = BuyerPoolState::new(
             B256::repeat_byte(0x01),
-            Address::repeat_byte(0x9c),
+            BUYER_DEPLOYMENT,
             Address::repeat_byte(0x11),
             Address::repeat_byte(0xcd),
             U256::MAX,
@@ -2374,7 +2386,7 @@ mod tests {
         let resp = build_buyer_pools_response(
             vec![BuyerPoolState::new(
                 tracked,
-                Address::repeat_byte(0x9c),
+                BUYER_DEPLOYMENT,
                 Address::repeat_byte(0x11),
                 Address::repeat_byte(0xcd),
                 U256::from(1u64),
