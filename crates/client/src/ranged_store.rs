@@ -499,6 +499,17 @@ impl ClientRangedStore {
         self.lock_state().proven
     }
 
+    /// The byte spans the store holds verified present, as sorted, disjoint
+    /// `(offset, len)` pairs with the last one clamped to the bound. Only
+    /// fetched bytes are present: a caller that writes the data file by other
+    /// means does not mark them. Read on a reopened store, these are the bytes
+    /// earlier runs fetched, which a resumed fetch does not fetch again.
+    #[must_use]
+    pub fn present_byte_ranges(&self) -> Vec<(u64, u64)> {
+        let state = self.snapshot();
+        crate::driver::contiguous_byte_ranges(&state.present, state.bound)
+    }
+
     /// Move the planner's bound to `bound`. The record picks it up at its next
     /// flush. A proven size is final: once a leg has proved one, the bound
     /// stays at it and this does nothing.
@@ -2801,6 +2812,30 @@ mod tests {
         assert_eq!(store.proven(), None);
         assert_eq!(store.bound(), b_total);
         assert_eq!(std::fs::read(dir.path().join("out.bin"))?, a);
+        Ok(())
+    }
+
+    /// A reopened store reports the byte spans its record holds, clamped to
+    /// the bound: the checkpointed prefix, and the ragged final chunk once a
+    /// fetch has it.
+    #[tokio::test]
+    async fn present_byte_ranges_reports_the_recorded_prefix() -> anyhow::Result<()> {
+        let data = blob(3 * usize::try_from(GROUP)? + 99);
+        let total = u64::try_from(data.len())?;
+        let root = bao_root_and_outboard(&data).0;
+        let dir = tmp_dir();
+        ClientRangedStore::seed_checkpointed_prefix(dir.path(), "blob", &data, GROUP)?;
+        let store = ClientRangedStore::open(dir.path(), "blob", root)?;
+        assert_eq!(store.present_byte_ranges(), vec![(0, GROUP)]);
+
+        let dir = tmp_dir();
+        ClientRangedStore::seed_checkpointed_prefix(dir.path(), "blob", &data, total)?;
+        let store = ClientRangedStore::open(dir.path(), "blob", root)?;
+        assert_eq!(store.present_byte_ranges(), vec![(0, total)]);
+
+        let dir = tmp_dir();
+        let store = ClientRangedStore::create(dir.path(), "blob", root, total)?;
+        assert!(store.present_byte_ranges().is_empty());
         Ok(())
     }
 

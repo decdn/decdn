@@ -312,6 +312,7 @@ pub fn decdn_client::ranged_store::ClientRangedStore::has_record(&std::path::Pat
 pub async fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<R>(&self, &decdn_bao_range::AlignedRange, R, core::option::Option<&(dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> anyhow::Result<R> where R: iroh_io::AsyncStreamReader + decdn_client::sink::StashedFault + core::marker::Send
 pub fn decdn_client::ranged_store::ClientRangedStore::open(&std::path::Path, &str, [u8; 32]) -> std::io::error::Result<Self>
 pub fn decdn_client::ranged_store::ClientRangedStore::open_or_create(&std::path::Path, &str, [u8; 32], u64) -> std::io::error::Result<Self>
+pub fn decdn_client::ranged_store::ClientRangedStore::present_byte_ranges(&self) -> alloc::vec::Vec<(u64, u64)>
 pub fn decdn_client::ranged_store::ClientRangedStore::proven(&self) -> core::option::Option<u64>
 pub const fn decdn_client::ranged_store::ClientRangedStore::root(&self) -> [u8; 32]
 pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)
@@ -652,6 +653,7 @@ pub fn decdn_client::ranged_store::ClientRangedStore::has_record(&std::path::Pat
 pub async fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<R>(&self, &decdn_bao_range::AlignedRange, R, core::option::Option<&(dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> anyhow::Result<R> where R: iroh_io::AsyncStreamReader + decdn_client::sink::StashedFault + core::marker::Send
 pub fn decdn_client::ranged_store::ClientRangedStore::open(&std::path::Path, &str, [u8; 32]) -> std::io::error::Result<Self>
 pub fn decdn_client::ranged_store::ClientRangedStore::open_or_create(&std::path::Path, &str, [u8; 32], u64) -> std::io::error::Result<Self>
+pub fn decdn_client::ranged_store::ClientRangedStore::present_byte_ranges(&self) -> alloc::vec::Vec<(u64, u64)>
 pub fn decdn_client::ranged_store::ClientRangedStore::proven(&self) -> core::option::Option<u64>
 pub const fn decdn_client::ranged_store::ClientRangedStore::root(&self) -> [u8; 32]
 pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)

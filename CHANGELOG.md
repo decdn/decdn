@@ -885,6 +885,17 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **`bundle pull` no longer counts a resumed `.partial` prefix as downloaded
+  (#2236).** A prefix that an earlier, interrupted pull fetched counted again
+  in the entry line's downloaded bytes and rate, and in the summary's
+  `downloaded`. On the testnet a re-pull that resumed a 1.46 GB prefix
+  reported 9.7 GB downloaded for about 8.3 GB moved. The entry reads its
+  resume record before it drives anything and reports the prefix apart
+  (`7.7 GiB downloaded at R, 1.4 GiB resumed, 3.7 GiB spliced from disk`); a
+  byte both resumed and spliced counts as spliced. The summary adds
+  `resumed N from earlier partials`, and `--json` gains `resumed_bytes`.
+  `decdn-client` exports `ClientRangedStore::present_byte_ranges`.
+
 - **A slow client leg phase is logged (#2230).** A leg phase (`unpolled`,
   `pay` or `read`) that runs past 5 s logs at debug, with the peer, hash,
   offset and unproved bytes, so a proof stall is named before the node's

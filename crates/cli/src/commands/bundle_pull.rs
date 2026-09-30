@@ -935,9 +935,9 @@ enum EntryOutcome {
 struct GroupRun {
     /// One outcome per entry in the group, in order.
     outcomes: Vec<EntryOutcome>,
-    /// The content bytes the group paid for, when its blob fetch landed
-    /// ([`PullCtx::pull_entry_untimed`]). `None` when it fetched nothing.
-    paid: Option<u64>,
+    /// The content bytes the group paid for and resumed, when its blob fetch
+    /// landed ([`PullCtx::pull_entry_untimed`]). `None` when it fetched nothing.
+    bytes: Option<EntryBytes>,
     /// The fault that ends the whole pull ([`ends_the_pull`]), when the
     /// group's blob fetch failed with one.
     stop: Option<anyhow::Error>,
@@ -948,17 +948,17 @@ impl GroupRun {
     const fn done(outcomes: Vec<EntryOutcome>) -> Self {
         Self {
             outcomes,
-            paid: None,
+            bytes: None,
             stop: None,
         }
     }
 
-    /// The group's blob fetch landed, paying for `paid` content bytes, and
-    /// `outcomes` is how each destination then materialized.
-    const fn landed(outcomes: Vec<EntryOutcome>, paid: u64) -> Self {
+    /// The group's blob fetch landed with `bytes`, and `outcomes` is how each
+    /// destination then materialized.
+    const fn landed(outcomes: Vec<EntryOutcome>, bytes: EntryBytes) -> Self {
         Self {
             outcomes,
-            paid: Some(paid),
+            bytes: Some(bytes),
             stop: None,
         }
     }
@@ -968,7 +968,7 @@ impl GroupRun {
     fn fetch_failed(slots: Vec<Slot<'_>>, err: anyhow::Error) -> Self {
         Self {
             outcomes: fail_all(slots, &err),
-            paid: None,
+            bytes: None,
             stop: ends_the_pull(&err).then_some(err),
         }
     }
@@ -995,14 +995,18 @@ fn ends_the_pull(err: &anyhow::Error) -> bool {
 }
 
 /// One-line `--json` summary. `fetched`/`linked`/`skipped`/`failed` are entry
-/// counts; `downloaded` is the content bytes paid for across the distinct blobs
-/// fetched (a blob shared across several paths counts once, #1306; a range-dedup
-/// blob counts only the bytes it did not splice from disk) and `reconstructed` is
-/// the total bytes written to disk this run — they diverge when one blob is
-/// materialized to several paths or when range-dedup spliced part of a blob.
-/// `downloaded` is a content-size tally, not an exact on-wire measurement: it
-/// excludes bao proof overhead, and it counts a `.partial` prefix resumed from an
-/// earlier run.
+/// counts; `downloaded` is the content bytes this run fetched and paid for across
+/// the distinct blobs fetched (a blob shared across several paths counts once,
+/// #1306; a range-dedup blob counts only the bytes it did not splice from disk)
+/// and `reconstructed` is the total bytes written to disk this run — they diverge
+/// when one blob is materialized to several paths or when range-dedup spliced part
+/// of a blob. `downloaded` is a content-size tally, not an exact on-wire
+/// measurement: it excludes bao proof overhead.
+///
+/// `resumed_bytes` is the content bytes of a `.partial` prefix that an earlier,
+/// interrupted run fetched and paid for, which this run resumed rather than
+/// fetched again. It is never part of `downloaded`. A byte that this run also
+/// spliced from disk counts only in `spliced_bytes`.
 ///
 /// `deduped` and `reused_bytes` report the whole-file dedup outcome, counted per
 /// distinct blob exactly as `fetched`/`downloaded` are (a blob reused at several
@@ -1030,6 +1034,9 @@ struct PullReport {
     reconstructed: u64,
     spliced_bytes: u64,
     hints_ignored: u64,
+    /// Content bytes of `.partial` prefixes that earlier runs fetched and this
+    /// run resumed; never part of `downloaded`.
+    resumed_bytes: u64,
     /// Count of distinct blobs materialized from an on-disk whole-file donor;
     /// extra destinations of the same blob are counted in `linked`.
     deduped: u64,
@@ -1047,16 +1054,35 @@ struct DedupSummary {
     hints_ignored: u64,
 }
 
-/// One dedup entry's range-dedup outcome, returned by [`reassemble_dedup`] and
-/// accumulated into [`PullCtx::dedup_stats`] by [`PullCtx::pull_entry`].
+/// One dedup entry's range-dedup outcome, returned by [`reassemble_dedup`].
+/// [`PullCtx::pull_entry_untimed`] accumulates its spliced bytes and ignored
+/// hints into [`PullCtx::dedup_stats`] and folds all of it into the entry's
+/// [`EntryBytes`].
 #[derive(Clone, Copy, Default, Debug)]
 struct DedupOutcome {
     /// Bytes this entry served from a local donor splice — never downloaded.
     spliced_bytes: u64,
+    /// Bytes this entry's ranged store held from an earlier run before this run
+    /// drove anything, less the bytes it spliced — neither downloaded nor
+    /// spliced here.
+    resumed_bytes: u64,
     /// Range-dedup hints this entry dropped by a fault (a donor that failed its
     /// verification re-hash or was unreadable, or a self-heal re-drive that
     /// discarded every already-spliced donor).
     hints_ignored: u64,
+}
+
+impl DedupOutcome {
+    /// The outcome of an entry of `total` bytes whose net spliced spans are
+    /// `spliced` and whose store held the `resumed` spans from an earlier run.
+    /// A byte in both counts as spliced, so no byte counts twice.
+    fn of(spliced: &[(u64, u64)], resumed: &[(u64, u64)], total: u64, hints_ignored: u64) -> Self {
+        Self {
+            spliced_bytes: span_bytes(spliced),
+            resumed_bytes: span_bytes(&uncovered_runs(resumed, spliced, total)),
+            hints_ignored,
+        }
+    }
 }
 
 /// Run-scoped range-dedup counters, shared by every concurrent entry via
@@ -1068,16 +1094,18 @@ struct DedupStats {
     hints_ignored: AtomicU64,
 }
 
-/// A pull's byte accounting: `downloaded` is the content bytes paid for across the
-/// distinct blobs fetched (a blob materialized to several paths counts once, #1306;
-/// a range-dedup blob counts only the bytes it did not splice from disk);
-/// `reconstructed` is the total bytes written to disk (every materialized copy).
-/// `downloaded` is content bytes, not exact on-wire bytes: it omits bao proof
-/// overhead and still counts a `.partial` prefix resumed from an earlier run.
-#[derive(Clone, Copy, Default)]
+/// A pull's byte accounting: `downloaded` is the content bytes this run fetched and
+/// paid for across the distinct blobs fetched (a blob materialized to several paths
+/// counts once, #1306; a range-dedup blob counts only the bytes it did not splice
+/// from disk); `reconstructed` is the total bytes written to disk (every
+/// materialized copy); `resumed` is the content bytes of `.partial` prefixes that
+/// earlier runs fetched and this run resumed. `downloaded` is content bytes, not
+/// exact on-wire bytes: it omits bao proof overhead.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct Transfer {
     downloaded: u64,
     reconstructed: u64,
+    resumed: u64,
 }
 
 impl Transfer {
@@ -1086,6 +1114,7 @@ impl Transfer {
         Transfer {
             downloaded: self.downloaded.saturating_add(other.downloaded),
             reconstructed: self.reconstructed.saturating_add(other.reconstructed),
+            resumed: self.resumed.saturating_add(other.resumed),
         }
     }
 }
@@ -1552,20 +1581,21 @@ fn settle_group_run(
         *slot = SettledGroup {
             outcomes: run.outcomes,
             warnings,
-            paid: run.paid,
+            bytes: run.bytes,
         };
     }
     run.stop
 }
 
 /// A hash-group's result, kept for the run summary: its per-entry outcomes
-/// and the content bytes its landed fetch paid for (see [`GroupRun::paid`]).
+/// and the content bytes its landed fetch paid for and resumed (see
+/// [`GroupRun::bytes`]).
 #[derive(Clone, Default)]
 struct SettledGroup {
     outcomes: Vec<EntryOutcome>,
     /// The group's size warnings ([`size_warnings`]).
     warnings: Vec<String>,
-    paid: Option<u64>,
+    bytes: Option<EntryBytes>,
 }
 
 /// Run `items` through `run` once, at most `jobs` at a time.
@@ -2163,7 +2193,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // so sum it before flattening away the group boundaries.
         let transfer = groups
             .iter()
-            .map(|g| group_transfer(&g.outcomes, g.paid))
+            .map(|g| group_transfer(&g.outcomes, g.bytes))
             .fold(Transfer::default(), Transfer::add);
         let warnings = groups
             .iter_mut()
@@ -2181,7 +2211,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
     /// Run [`Self::pull_entry_untimed`] and, when the entry lands, log one `-v`
     /// line with its size, the time the whole entry took, and its download rate
-    /// (#2120, #2189). Returns the content bytes the entry paid for (see
+    /// (#2120, #2189). Returns the entry's [`EntryBytes`] (see
     /// [`Self::pull_entry_untimed`]).
     #[allow(clippy::too_many_arguments)]
     async fn pull_entry(
@@ -2193,14 +2223,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         index: &ChunkIndex,
         fetch_plan: &FetchPlan,
         file: Option<&pull_progress::FileBar>,
-    ) -> anyhow::Result<u64> {
+    ) -> anyhow::Result<EntryBytes> {
         let started = std::time::Instant::now();
         self.pull_entry_untimed(hash, hints, total, staging, index, fetch_plan, file)
             .await
-            .map(|bytes| {
-                log_entry_done(hash, staging, bytes, started.elapsed());
-                bytes.paid
-            })
+            .inspect(|&bytes| log_entry_done(hash, staging, bytes, started.elapsed()))
     }
 
     /// Reconstruct one entry's blob into `staging` (the finalized per-hash staging
@@ -2222,11 +2249,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     ///   chunk) the whole blob is re-driven and re-verified before the entry fails.
     ///
     /// On success the entry's chunks are registered into `index` so later entries
-    /// can splice from this blob, and its [`EntryBytes`] are returned. The paid
-    /// count is the whole blob on the plain path, the blob less its spliced bytes
-    /// on the dedup path, and 0 for an already-finalized staging blob. It is a
-    /// content count — bao proof overhead is not in it, and a `.partial` prefix
-    /// resumed from an earlier run counts again.
+    /// can splice from this blob, and its [`EntryBytes`] are returned. Before
+    /// either path drives anything, the entry reads the bytes its ranged store
+    /// already holds from an earlier, interrupted run ([`resumed_spans`]); those
+    /// are resumed, not paid. The paid count is the whole blob less its resumed
+    /// bytes on the plain path, the blob less its spliced and resumed bytes on the
+    /// dedup path, and 0 for an already-finalized staging blob. It is a content
+    /// count: bao proof overhead is not in it.
     #[allow(clippy::too_many_arguments)]
     async fn pull_entry_untimed(
         &self,
@@ -2268,6 +2297,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             remove_staging_off_runtime(staging).await;
         }
 
+        // What earlier runs already fetched into this entry's `.partial`: read now,
+        // before any drive of this run adds to it. `staging` is absent here, so
+        // the read opens the record alone and never hashes a final file.
+        let resumed = resumed_spans_off_runtime(staging, hash).await;
+
         // Until the first byte lands, the entry is discovering holders — surfaced so
         // a slow or stalling probe (a blob no probed node answers for) does not look
         // like a frozen empty bar. The delivery callback switches the row to its
@@ -2302,8 +2336,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             self.fetch_to_staging(hash, staging, total, progress)
                 .await?;
             index.register(hints, staging);
-            let paid = tokio::fs::metadata(staging).await.map_or(0, |m| m.len());
-            return Ok(EntryBytes { paid, spliced: 0 });
+            let len = tokio::fs::metadata(staging).await.map_or(0, |m| m.len());
+            return Ok(EntryBytes::whole_blob(len, span_bytes(&resumed)));
         };
 
         // Dedup path. Hold one fetch permit across the complement drive, the donor
@@ -2343,6 +2377,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             &driver,
             &plan,
             total,
+            &resumed,
             hints,
             index,
             fetch_plan,
@@ -2356,10 +2391,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         self.dedup_stats
             .hints_ignored
             .fetch_add(outcome.hints_ignored, Ordering::Relaxed);
-        Ok(EntryBytes {
-            paid: total.saturating_sub(outcome.spliced_bytes),
-            spliced: outcome.spliced_bytes,
-        })
+        Ok(EntryBytes::dedup(total, outcome))
     }
 
     /// Fetch the blob shared by one hash-group and write it under `out_root` at
@@ -2490,8 +2522,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             )
             .await;
         file_bar.finish();
-        let paid = match fetched {
-            Ok(paid) => paid,
+        let bytes = match fetched {
+            Ok(bytes) => bytes,
             Err(e) => {
                 // `pull_entry` (whole-file or dedup) leaves the `<hex>.partial` +
                 // `.ranges` record in place on error: they are what the
@@ -2547,19 +2579,95 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             index.mark_retained(&staging);
         }
 
-        GroupRun::landed(outcomes, paid)
+        GroupRun::landed(outcomes, bytes)
     }
 }
 
-/// The content bytes one landed entry paid for and spliced from disk, as
-/// [`PullCtx::pull_entry_untimed`] counts them.
-#[derive(Clone, Copy, Debug, Default)]
+/// The content bytes one landed entry paid for, spliced from disk, and resumed
+/// from an earlier run, as [`PullCtx::pull_entry_untimed`] counts them. No byte
+/// counts in two of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct EntryBytes {
-    /// Content bytes the entry paid for (see [`PullCtx::pull_entry_untimed`]).
+    /// Content bytes this run fetched and paid for (see
+    /// [`PullCtx::pull_entry_untimed`]).
     paid: u64,
     /// Bytes the entry spliced from a local donor on disk rather than
     /// downloading them itself.
     spliced: u64,
+    /// Bytes an earlier, interrupted run fetched into the entry's `.partial`,
+    /// which this run resumed rather than fetched again.
+    resumed: u64,
+}
+
+impl EntryBytes {
+    /// A whole-blob fetch that landed a `len`-byte blob into a store that
+    /// already held `resumed` bytes of it.
+    fn whole_blob(len: u64, resumed: u64) -> Self {
+        let resumed = resumed.min(len);
+        Self {
+            paid: len.saturating_sub(resumed),
+            spliced: 0,
+            resumed,
+        }
+    }
+
+    /// A range-dedup entry of `total` bytes with `outcome`: every byte it did
+    /// not splice or resume, this run paid for.
+    const fn dedup(total: u64, outcome: DedupOutcome) -> Self {
+        Self {
+            paid: total
+                .saturating_sub(outcome.spliced_bytes)
+                .saturating_sub(outcome.resumed_bytes),
+            spliced: outcome.spliced_bytes,
+            resumed: outcome.resumed_bytes,
+        }
+    }
+}
+
+/// The byte spans of `staging`'s ranged store that earlier runs already
+/// fetched: the present set of its `.partial.ranges` record, as sorted,
+/// disjoint `(offset, len)` pairs. The store marks only fetched bytes present,
+/// never the donor bytes a splice writes, so these spans are bytes an earlier
+/// run paid for. No record (a fresh entry) gives no spans.
+///
+/// The caller reads this before it drives anything, with `staging` absent, so
+/// the read opens the record alone and never hashes a final file. The spans
+/// are for reporting only: a record it cannot read logs at `debug` and gives
+/// no spans, and the fetch that follows surfaces the fault.
+fn resumed_spans(staging: &Path, hash: [u8; 32]) -> Vec<(u64, u64)> {
+    let read = || -> anyhow::Result<Vec<(u64, u64)>> {
+        let (dir, stem) = fetch::ranged_store_location(staging)?;
+        if !ClientRangedStore::has_record(&dir, &stem)? {
+            return Ok(Vec::new());
+        }
+        Ok(ClientRangedStore::open(&dir, &stem, hash)?.present_byte_ranges())
+    };
+    read().unwrap_or_else(|e| {
+        tracing::debug!(
+            "could not read the resume record beside {}: {e:#}",
+            staging.display()
+        );
+        Vec::new()
+    })
+}
+
+/// [`resumed_spans`] on the blocking pool. A failed join gives no spans.
+async fn resumed_spans_off_runtime(staging: &Path, hash: [u8; 32]) -> Vec<(u64, u64)> {
+    let staging = staging.to_path_buf();
+    tokio::task::spawn_blocking(move || resumed_spans(&staging, hash))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::debug!("resume record task: {e}");
+            Vec::new()
+        })
+}
+
+/// The total length of `(offset, len)` spans, saturating. The caller passes
+/// disjoint spans, so no byte counts twice.
+fn span_bytes(spans: &[(u64, u64)]) -> u64 {
+    spans
+        .iter()
+        .fold(0u64, |acc, &(_, len)| acc.saturating_add(len))
 }
 
 /// Log a finished entry's line at `-v` (#2120), so a run's slow entries can be
@@ -2579,11 +2687,11 @@ fn log_entry_done(hash: [u8; 32], staging: &Path, bytes: EntryBytes, elapsed: st
     tracing::info!("{}", entry_done_line(hash, size, bytes, elapsed));
 }
 
-/// A finished entry's size, the time it took, and its rate over the bytes it
-/// paid for (see [`PullCtx::pull_entry_untimed`]). When the entry spliced bytes
-/// from disk, the line reports them apart from the paid bytes (#2189). The time
-/// covers the whole entry: probing, every drive, any splice and the whole-file
-/// check.
+/// A finished entry's size, the time it took, and its rate over the bytes this
+/// run paid for (see [`PullCtx::pull_entry_untimed`]). When the entry resumed
+/// bytes from an earlier run or spliced bytes from disk, the line reports each
+/// non-zero one apart from the paid bytes (#2189, #2236). The time covers the
+/// whole entry: probing, every drive, any splice and the whole-file check.
 fn entry_done_line(
     hash: [u8; 32],
     size: u64,
@@ -2596,14 +2704,23 @@ fn entry_done_line(
     } else {
         fetch::fmt_rate(0.0)
     };
-    let detail = if bytes.spliced > 0 {
-        format!(
-            "{} downloaded at {rate}, {} spliced from disk",
-            indicatif::HumanBytes(bytes.paid),
-            indicatif::HumanBytes(bytes.spliced),
-        )
-    } else {
+    let detail = if bytes.spliced == 0 && bytes.resumed == 0 {
         rate
+    } else {
+        let mut parts = vec![format!(
+            "{} downloaded at {rate}",
+            indicatif::HumanBytes(bytes.paid)
+        )];
+        if bytes.resumed > 0 {
+            parts.push(format!("{} resumed", indicatif::HumanBytes(bytes.resumed)));
+        }
+        if bytes.spliced > 0 {
+            parts.push(format!(
+                "{} spliced from disk",
+                indicatif::HumanBytes(bytes.spliced)
+            ));
+        }
+        parts.join(", ")
     };
     format!(
         "bundle pull: {}: {} in {secs:.1}s ({detail})",
@@ -2757,16 +2874,21 @@ fn ensure_partial(staging: &Path, hash: [u8; 32], total: u64) -> anyhow::Result<
 /// are spliced from disk and never flow through `drive`'s progress callback, so a
 /// mostly-spliced entry would otherwise leave its bars short.
 ///
-/// Returns the entry's [`DedupOutcome`] — bytes actually spliced from disk and hints
-/// dropped by a fault — for the run-level report. A resume that finalized on the
-/// first pay-now drive spliced nothing this run; a self-heal whole-blob re-drive
-/// discards every splice, so it reports zero spliced bytes and counts all its donors
-/// as ignored.
+/// `resumed` is the byte spans the entry's store held from an earlier run before
+/// this run drove anything ([`resumed_spans`]).
+///
+/// Returns the entry's [`DedupOutcome`] — bytes actually spliced from disk, bytes
+/// resumed from an earlier run, and hints dropped by a fault — for the run-level
+/// report. A byte both resumed and spliced counts as spliced. A resume that
+/// finalized on the first pay-now drive spliced nothing this run; a self-heal
+/// whole-blob re-drive discards every splice, so it reports zero spliced bytes and
+/// counts all its donors as ignored.
 #[allow(clippy::too_many_arguments)]
 async fn reassemble_dedup(
     driver: &dyn RangeDriver,
     plan: &ReassemblePlan,
     total: u64,
+    resumed: &[(u64, u64)],
     hints: Option<&[Hint]>,
     index: &ChunkIndex,
     fetch_plan: &FetchPlan,
@@ -2787,11 +2909,12 @@ async fn reassemble_dedup(
         // drive can COMPLETE the store: `drive` then ran its whole-file hash
         // against `hash` and renamed `<hex>.partial` -> `<hex>`. The blob is
         // finalized and verified; splicing would open a `.partial` that no longer
-        // exists. Register the donor chunks and return. No splice ran this run.
+        // exists. Register the donor chunks and return. No splice ran this run,
+        // so every resumed byte counts as resumed.
         if staging.try_exists()? {
             finish_progress();
             index.register(hints, staging);
-            return Ok(DedupOutcome::default());
+            return Ok(DedupOutcome::of(&[], resumed, total, 0));
         }
     }
 
@@ -2810,10 +2933,12 @@ async fn reassemble_dedup(
         if staging.try_exists()? {
             finish_progress();
             index.register(hints, staging);
-            return Ok(DedupOutcome {
-                spliced_bytes: ledger.spliced_bytes(total),
+            return Ok(DedupOutcome::of(
+                &ledger.spliced_spans(total),
+                resumed,
+                total,
                 hints_ignored,
-            });
+            ));
         }
     }
 
@@ -2832,14 +2957,11 @@ async fn reassemble_dedup(
     )
     .await?;
     hints_ignored = hints_ignored.saturating_add(tail_ignored);
-    let mut spliced_bytes = ledger.spliced_bytes(total);
+    let mut spliced = ledger.spliced_spans(total);
     if staging.try_exists()? {
         finish_progress();
         index.register(hints, staging);
-        return Ok(DedupOutcome {
-            spliced_bytes,
-            hints_ignored,
-        });
+        return Ok(DedupOutcome::of(&spliced, resumed, total, hints_ignored));
     }
 
     // The authoritative check: the whole reassembled blob must hash to `hash`. This
@@ -2858,8 +2980,9 @@ async fn reassemble_dedup(
         // spliced ranges by re-driving the whole blob (the ranged store fetches
         // exactly the bytes the splice wrote, bao-verified against `hash`) and
         // re-verify. Every donor is discarded, so nothing was saved and all of them
-        // count as ignored.
-        spliced_bytes = 0;
+        // count as ignored. The resumed bytes stay present in the store, so the
+        // re-drive does not fetch them again.
+        spliced = Vec::new();
         hints_ignored =
             u64::try_from(plan.donor.len().saturating_add(plan.deferred.len())).unwrap_or(u64::MAX);
         tracing::warn!(
@@ -2875,10 +2998,7 @@ async fn reassemble_dedup(
         if staging.try_exists()? {
             finish_progress();
             index.register(hints, staging);
-            return Ok(DedupOutcome {
-                spliced_bytes,
-                hints_ignored,
-            });
+            return Ok(DedupOutcome::of(&spliced, resumed, total, hints_ignored));
         }
         let partial_for_hash = partial.clone();
         let got = tokio::task::spawn_blocking(move || hash_partial(&partial_for_hash))
@@ -2903,10 +3023,7 @@ async fn reassemble_dedup(
     .map_err(|e| anyhow!("promote task: {e}"))??;
     finish_progress();
     index.register(hints, staging);
-    Ok(DedupOutcome {
-        spliced_bytes,
-        hints_ignored,
-    })
+    Ok(DedupOutcome::of(&spliced, resumed, total, hints_ignored))
 }
 
 /// Tail reconcile for one entry's deferred (sibling-assigned) chunks: splice each
@@ -3613,22 +3730,24 @@ struct SpliceLedger {
 }
 
 impl SpliceLedger {
-    /// Bytes served from a splice: the spliced spans less every driven span.
-    fn spliced_bytes(&self, total: u64) -> u64 {
-        net_spliced(&self.spliced, &self.driven, total)
+    /// The spans served from a splice: the spliced spans less every driven
+    /// span, as sorted, disjoint `(offset, len)` pairs.
+    fn spliced_spans(&self, total: u64) -> Vec<(u64, u64)> {
+        uncovered_runs(&self.spliced, &self.driven, total)
     }
 }
 
-/// The bytes of `spliced` that no `driven` span covers, over `[0, total)`. Both
-/// are `(offset, len)` spans, in any order, and may overlap.
-fn net_spliced(spliced: &[(u64, u64)], driven: &[(u64, u64)], total: u64) -> u64 {
-    let kept = complement_runs(driven, total);
+/// The parts of `spans` that no `cover` span covers, over `[0, total)`, as
+/// sorted, disjoint `(offset, len)` pairs. Both inputs are `(offset, len)`
+/// spans, in any order, and may overlap.
+fn uncovered_runs(spans: &[(u64, u64)], cover: &[(u64, u64)], total: u64) -> Vec<(u64, u64)> {
+    let kept = complement_runs(cover, total);
     let mut kept = kept
         .iter()
         .map(|&(offset, len)| (offset, offset.saturating_add(len)));
     let mut current = kept.next();
-    let mut bytes = 0u64;
-    for (start, end) in coalesce_runs(spliced, total) {
+    let mut out = Vec::new();
+    for (start, end) in coalesce_runs(spans, total) {
         while let Some((k_start, k_end)) = current {
             if k_end <= start {
                 current = kept.next();
@@ -3637,8 +3756,10 @@ fn net_spliced(spliced: &[(u64, u64)], driven: &[(u64, u64)], total: u64) -> u64
             if k_start >= end {
                 break;
             }
-            let overlap = end.min(k_end).saturating_sub(start.max(k_start));
-            bytes = bytes.saturating_add(overlap);
+            let (from, to) = (start.max(k_start), end.min(k_end));
+            if to > from {
+                out.push((from, to - from));
+            }
             if k_end <= end {
                 current = kept.next();
             } else {
@@ -3646,7 +3767,7 @@ fn net_spliced(spliced: &[(u64, u64)], driven: &[(u64, u64)], total: u64) -> u64
             }
         }
     }
-    bytes
+    out
 }
 
 /// Whether the `len` bytes at `offset` in `src` hash to `expected`. Any read
@@ -4286,6 +4407,7 @@ fn report(
         reconstructed: transfer.reconstructed,
         spliced_bytes: dedup.spliced_bytes,
         hints_ignored: dedup.hints_ignored,
+        resumed_bytes: transfer.resumed,
         deduped,
         reused_bytes,
     };
@@ -4301,6 +4423,14 @@ fn report(
         // `downloaded X → reconstructed Y` only when dedup made them differ;
         // otherwise a single `downloaded X`.
         println!("{}", transfer_line(transfer));
+        // The bytes earlier, interrupted runs fetched and this run resumed, shown
+        // only when a run resumed any: they are in neither total above.
+        if transfer.resumed > 0 {
+            println!(
+                "resumed {} from earlier partials",
+                human_bytes(transfer.resumed)
+            );
+        }
         // The whole-file dedup outcome, shown only when it mattered: a run that
         // materialized any destination from an on-disk donor instead of fetching.
         if deduped > 0 {
@@ -4367,14 +4497,15 @@ fn transfer_line(t: Transfer) -> String {
 }
 
 /// The [`Transfer`] for one whole-file hash-group: the blob is either paid for
-/// once (`downloaded` = `paid`, the content bytes its fetch paid for, else the
-/// size of the single `Fetched`) or reused from an on-disk donor with no download
+/// once (`downloaded` = the content bytes its fetch paid for this run, from
+/// `bytes`, else the size of the single `Fetched`; `resumed` = the bytes it
+/// resumed from an earlier run) or reused from an on-disk donor with no download
 /// (`Deduped`, contributing 0 to `downloaded`) — a group never mixes the two,
 /// since [`PullCtx::fetch_group`] takes one path or the other. Every materialized
 /// copy — the canonical (`Fetched` or `Deduped`) plus each `Linked` duplicate
 /// path — is a full file on disk (`reconstructed` = size × copies). A group with
 /// nothing written (all skipped or failed) contributes nothing.
-fn group_transfer(outcomes: &[EntryOutcome], paid: Option<u64>) -> Transfer {
+fn group_transfer(outcomes: &[EntryOutcome], bytes: Option<EntryBytes>) -> Transfer {
     let paid_size = outcomes.iter().find_map(|o| match o {
         EntryOutcome::Fetched(n) => Some(*n),
         _ => None,
@@ -4396,8 +4527,9 @@ fn group_transfer(outcomes: &[EntryOutcome], paid: Option<u64>) -> Transfer {
                 .count();
             let copies = u64::try_from(copies).unwrap_or(u64::MAX);
             Transfer {
-                downloaded: paid_size.map_or(0, |size| paid.unwrap_or(size)),
+                downloaded: paid_size.map_or(0, |size| bytes.map_or(size, |b| b.paid)),
                 reconstructed: n.saturating_mul(copies),
+                resumed: paid_size.and(bytes).map_or(0, |b| b.resumed),
             }
         }
         None => Transfer::default(),
@@ -5369,10 +5501,13 @@ mod tests {
         let index = ChunkIndex::default();
         let fetch_plan = FetchPlan::default();
 
+        // The store held the donor group from an earlier run.
+        let resumed = [(GROUP, GROUP)];
         let res = reassemble_dedup(
             &driver,
             &plan,
             2 * GROUP,
+            &resumed,
             None,
             &index,
             &fetch_plan,
@@ -5388,6 +5523,18 @@ mod tests {
         );
         assert_eq!(driver.drives.get(), 1, "only the pay-now drive ran");
         assert!(staging.try_exists().expect("stat staging"));
+        // No splice ran, so the resumed group counts as resumed, not paid (#2236).
+        let outcome = res.expect("checked above");
+        assert_eq!(outcome.spliced_bytes, 0);
+        assert_eq!(outcome.resumed_bytes, GROUP);
+        assert_eq!(
+            EntryBytes::dedup(2 * GROUP, outcome),
+            EntryBytes {
+                paid: GROUP,
+                spliced: 0,
+                resumed: GROUP,
+            }
+        );
     }
 
     /// A deferred chunk whose whole span is spliced: `dst` is the hint's span
@@ -5695,6 +5842,7 @@ mod tests {
             &driver,
             &plan,
             total,
+            &[],
             None,
             &index,
             &fetch_plan,
@@ -5710,6 +5858,143 @@ mod tests {
             "only the deferred half is paid for; no self-heal re-drive"
         );
         assert_eq!(outcome.spliced_bytes, 2 * GROUP);
+        assert_eq!(outcome.resumed_bytes, 0);
+    }
+
+    /// An entry resumed from an earlier run's `.partial` whose splice then
+    /// covers part of that prefix: the overlap counts once, as spliced, and only
+    /// the bytes neither resumed nor spliced count as paid (#2236).
+    #[tokio::test]
+    async fn a_splice_over_a_resumed_prefix_counts_the_overlap_as_spliced() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let total = 4 * GROUP;
+        let content: Vec<u8> = (0..total)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        let whole = *blake3::hash(&content).as_bytes();
+        let half = usize::try_from(2 * GROUP).expect("fits usize");
+
+        // An earlier, interrupted run fetched `[0, 3*GROUP)` into the store.
+        let staging = tmp.path().join("blob");
+        ClientRangedStore::seed_checkpointed_prefix(tmp.path(), "blob", &content, 3 * GROUP)
+            .expect("seed the resume record");
+        let resumed = resumed_spans(&staging, whole);
+        assert_eq!(resumed, vec![(0, 3 * GROUP)]);
+
+        // This run splices `[0, 2*GROUP)` from a donor and pays for the deferred
+        // `[2*GROUP, 4*GROUP)` when its sibling finishes without producing it.
+        let donor_path = tmp.path().join("donor");
+        std::fs::write(&donor_path, &content[..half]).expect("write donor");
+        let donor_hash = *blake3::hash(&content[..half]).as_bytes();
+        let deferred_hash = *blake3::hash(&content[half..]).as_bytes();
+        let driver = RecordingDriver {
+            hash: whole,
+            staging: staging.clone(),
+            content: content.clone(),
+            driven: std::sync::Mutex::new(Vec::new()),
+        };
+        let plan = ReassemblePlan {
+            donor: vec![DonorRange {
+                dst: (0, 2 * GROUP),
+                refetch: (0, 2 * GROUP),
+                source: donor_path,
+                src_offset: 0,
+                chunk_hash: donor_hash,
+                chunk_src_offset: 0,
+                chunk_len: 2 * GROUP,
+            }],
+            deferred: vec![whole_deferred(Hint {
+                hash: deferred_hash,
+                offset: 2 * GROUP,
+                len: 2 * GROUP,
+            })],
+            drive: Vec::new(),
+        };
+        let index = ChunkIndex::default();
+        let mut fetch_plan = FetchPlan::default();
+        fetch_plan.assigned.insert(deferred_hash, [0xaa; 32]);
+        index.mark_finished([0xaa; 32]);
+
+        let outcome = reassemble_dedup(
+            &driver,
+            &plan,
+            total,
+            &resumed,
+            None,
+            &index,
+            &fetch_plan,
+            None,
+            &|| {},
+        )
+        .await
+        .expect("reassembly must succeed");
+        assert_eq!(std::fs::read(&staging).expect("read staging"), content);
+        assert_eq!(
+            outcome.spliced_bytes,
+            2 * GROUP,
+            "the splice keeps priority"
+        );
+        assert_eq!(outcome.resumed_bytes, GROUP, "only the unspliced prefix");
+        assert_eq!(
+            EntryBytes::dedup(total, outcome),
+            EntryBytes {
+                paid: GROUP,
+                spliced: 2 * GROUP,
+                resumed: GROUP,
+            }
+        );
+    }
+
+    /// A self-heal whole-blob re-drive discards every splice, so the resumed
+    /// prefix counts whole: the store still holds it, and the re-drive does not
+    /// fetch it again.
+    #[test]
+    fn a_self_heal_outcome_counts_the_whole_resumed_prefix() {
+        let outcome = DedupOutcome::of(&[], &[(0, 3 * GROUP), (GROUP, GROUP)], 4 * GROUP, 2);
+        assert_eq!(outcome.spliced_bytes, 0);
+        assert_eq!(outcome.resumed_bytes, 3 * GROUP);
+        assert_eq!(EntryBytes::dedup(4 * GROUP, outcome).paid, GROUP);
+    }
+
+    /// The whole-blob path reads what an earlier run fetched from the resume
+    /// record and pays only for the rest (#2236). A fresh entry and an
+    /// unreadable record resume nothing.
+    #[test]
+    fn resumed_spans_read_the_record_an_earlier_run_left() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let content: Vec<u8> = (0..3 * GROUP + 99)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        let len = u64::try_from(content.len()).expect("fits u64");
+        let hash = *blake3::hash(&content).as_bytes();
+        let staging = tmp.path().join("blob");
+
+        assert!(
+            resumed_spans(&staging, hash).is_empty(),
+            "no record, no spans"
+        );
+
+        ClientRangedStore::seed_checkpointed_prefix(tmp.path(), "blob", &content, GROUP)
+            .expect("seed the resume record");
+        let resumed = resumed_spans(&staging, hash);
+        assert_eq!(resumed, vec![(0, GROUP)]);
+        assert_eq!(
+            EntryBytes::whole_blob(len, span_bytes(&resumed)),
+            EntryBytes {
+                paid: len - GROUP,
+                spliced: 0,
+                resumed: GROUP,
+            }
+        );
+        // A resumed count never exceeds the blob.
+        assert_eq!(EntryBytes::whole_blob(10, 20).paid, 0);
+        assert_eq!(EntryBytes::whole_blob(10, 20).resumed, 10);
+
+        std::fs::write(tmp.path().join("blob.partial.ranges"), b"not json").expect("corrupt");
+        assert!(
+            resumed_spans(&staging, hash).is_empty(),
+            "an unreadable record resumes nothing"
+        );
     }
 
     /// Two donor chunks of a blob, `[0, cut)` and `[cut, 4*GROUP)`, each written
@@ -5889,6 +6174,7 @@ mod tests {
             &driver,
             &plan,
             total,
+            &[],
             None,
             &ChunkIndex::default(),
             &FetchPlan::default(),
@@ -5931,6 +6217,7 @@ mod tests {
             &driver,
             &plan,
             total,
+            &[],
             None,
             &ChunkIndex::default(),
             &FetchPlan::default(),
@@ -5986,6 +6273,7 @@ mod tests {
             &driver,
             &plan,
             total,
+            &[],
             None,
             &index,
             &fetch_plan,
@@ -6041,6 +6329,7 @@ mod tests {
             &driver,
             &plan,
             total,
+            &[],
             None,
             &index,
             &fetch_plan,
@@ -6057,6 +6346,25 @@ mod tests {
         );
         assert_eq!(outcome.spliced_bytes, GROUP);
         assert_eq!(outcome.hints_ignored, 1);
+    }
+
+    /// The bytes of `spliced` that no `driven` span covers, over `[0, total)`.
+    fn net_spliced(spliced: &[(u64, u64)], driven: &[(u64, u64)], total: u64) -> u64 {
+        span_bytes(&uncovered_runs(spliced, driven, total))
+    }
+
+    #[test]
+    fn uncovered_runs_keeps_the_uncovered_parts_as_disjoint_spans() {
+        assert_eq!(
+            uncovered_runs(&[(300, 100), (0, 100)], &[(50, 100), (350, 10)], 1000),
+            vec![(0, 50), (300, 50), (360, 40)]
+        );
+        // Overlapping inputs coalesce, and the result clamps to `total`.
+        assert_eq!(
+            uncovered_runs(&[(0, 60), (40, 100)], &[], 100),
+            vec![(0, 100)]
+        );
+        assert!(uncovered_runs(&[(0, 100)], &[(0, 100)], 1000).is_empty());
     }
 
     #[test]
@@ -6142,6 +6450,7 @@ mod tests {
             &driver,
             &plan,
             total,
+            &[],
             None,
             &index,
             &fetch_plan,
@@ -6210,6 +6519,7 @@ mod tests {
             &driver,
             &plan,
             total,
+            &[],
             None,
             &index,
             &fetch_plan,
@@ -6594,6 +6904,7 @@ mod tests {
             transfer_line(Transfer {
                 downloaded: 27_600_000_000,
                 reconstructed: 27_600_000_000,
+                resumed: 0,
             }),
             "downloaded 27.6 GB"
         );
@@ -6602,6 +6913,7 @@ mod tests {
             transfer_line(Transfer {
                 downloaded: 13_800_000_000,
                 reconstructed: 27_600_000_000,
+                resumed: 0,
             }),
             "downloaded 13.8 GB → reconstructed 27.6 GB"
         );
@@ -6616,7 +6928,7 @@ mod tests {
             EntryOutcome::Linked,
             EntryOutcome::Linked,
         ];
-        let t = group_transfer(&outcomes, Some(100));
+        let t = group_transfer(&outcomes, Some(EntryBytes::whole_blob(100, 0)));
         assert_eq!(t.downloaded, 100);
         assert_eq!(t.reconstructed, 300);
     }
@@ -6627,14 +6939,46 @@ mod tests {
     #[test]
     fn group_transfer_downloads_only_the_paid_bytes_of_a_spliced_blob() {
         let outcomes = vec![EntryOutcome::Fetched(100), EntryOutcome::Linked];
-        let t = group_transfer(&outcomes, Some(30));
+        let spliced = EntryBytes {
+            paid: 30,
+            spliced: 70,
+            resumed: 0,
+        };
+        let t = group_transfer(&outcomes, Some(spliced));
         assert_eq!(t.downloaded, 30);
         assert_eq!(t.reconstructed, 200);
+        assert_eq!(t.resumed, 0);
 
         // A blob already finalized in staging by an earlier run pays nothing.
-        let t = group_transfer(&[EntryOutcome::Fetched(100)], Some(0));
+        let t = group_transfer(&[EntryOutcome::Fetched(100)], Some(EntryBytes::default()));
         assert_eq!(t.downloaded, 0);
         assert_eq!(t.reconstructed, 100);
+    }
+
+    /// A blob resumed from an earlier run's `.partial` downloads only what this
+    /// run fetched; the resumed prefix is tallied apart and counted once per
+    /// blob, however many paths it lands at (#2236).
+    #[test]
+    fn group_transfer_tallies_a_resumed_prefix_apart_from_the_download() {
+        let outcomes = vec![EntryOutcome::Fetched(100), EntryOutcome::Linked];
+        let t = group_transfer(&outcomes, Some(EntryBytes::whole_blob(100, 40)));
+        assert_eq!(
+            t,
+            Transfer {
+                downloaded: 60,
+                reconstructed: 200,
+                resumed: 40,
+            }
+        );
+
+        // A landed blob whose every destination failed writes nothing, and
+        // reports nothing resumed.
+        let failed = vec![EntryOutcome::Failed {
+            path: "x".into(),
+            err: "boom".into(),
+        }];
+        let t = group_transfer(&failed, Some(EntryBytes::whole_blob(100, 40)));
+        assert_eq!(t, Transfer::default());
     }
 
     #[test]
@@ -7643,7 +7987,7 @@ mod tests {
             groups[0].outcomes.as_slice(),
             [EntryOutcome::Failed { .. }]
         ));
-        assert_eq!(groups[0].paid, None, "a failed fetch paid for nothing");
+        assert_eq!(groups[0].bytes, None, "a failed fetch paid for nothing");
         assert!(rx.try_recv().is_err(), "nothing recorded, nothing flushed");
 
         let disk = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull))
@@ -7668,13 +8012,17 @@ mod tests {
                 chunks: None,
             },
         );
-        let landed = GroupRun::landed(vec![EntryOutcome::Fetched(3)], 2);
+        let landed = GroupRun::landed(vec![EntryOutcome::Fetched(3)], EntryBytes::whole_blob(3, 1));
         assert!(settle_group_run(&mut groups, &tx, 1, landed, updates, Vec::new()).is_none());
         assert!(matches!(
             groups[1].outcomes.as_slice(),
             [EntryOutcome::Fetched(3)]
         ));
-        assert_eq!(groups[1].paid, Some(2), "the landed paid tally is kept");
+        assert_eq!(
+            groups[1].bytes,
+            Some(EntryBytes::whole_blob(3, 1)),
+            "the landed paid and resumed tallies are kept"
+        );
         assert_eq!(rx.try_recv().expect("a flush batch").fetched_bytes, 3);
     }
 
@@ -7895,6 +8243,7 @@ mod tests {
             EntryBytes {
                 paid: 4 << 20,
                 spliced: 0,
+                resumed: 0,
             },
             std::time::Duration::from_secs(2),
         );
@@ -7911,6 +8260,7 @@ mod tests {
             EntryBytes {
                 paid: 2 << 20,
                 spliced: 10 << 20,
+                resumed: 0,
             },
             std::time::Duration::from_secs(2),
         );
@@ -7932,12 +8282,53 @@ mod tests {
             EntryBytes {
                 paid: 0,
                 spliced: 12 << 20,
+                resumed: 0,
             },
             std::time::Duration::from_secs(2),
         );
         assert!(
             line.ends_with(
                 ": 12.00 MiB in 2.0s (0 B downloaded at --, 12.00 MiB spliced from disk)"
+            ),
+            "{line}"
+        );
+    }
+
+    /// A resumed entry's rate counts only what this run downloaded, and its
+    /// resumed and spliced bytes are reported apart (#2236).
+    #[test]
+    fn entry_done_line_splits_a_resumed_entrys_bytes() {
+        let line = entry_done_line(
+            [1; 32],
+            12 << 20,
+            EntryBytes {
+                paid: 2 << 20,
+                spliced: 6 << 20,
+                resumed: 4 << 20,
+            },
+            std::time::Duration::from_secs(2),
+        );
+        assert!(
+            line.ends_with(
+                ": 12.00 MiB in 2.0s (2.00 MiB downloaded at 1.00 MiB/s, 4.00 MiB resumed, \
+                 6.00 MiB spliced from disk)"
+            ),
+            "{line}"
+        );
+
+        let line = entry_done_line(
+            [1; 32],
+            6 << 20,
+            EntryBytes {
+                paid: 2 << 20,
+                spliced: 0,
+                resumed: 4 << 20,
+            },
+            std::time::Duration::from_secs(2),
+        );
+        assert!(
+            line.ends_with(
+                ": 6.00 MiB in 2.0s (2.00 MiB downloaded at 1.00 MiB/s, 4.00 MiB resumed)"
             ),
             "{line}"
         );
@@ -7952,6 +8343,7 @@ mod tests {
             EntryBytes {
                 paid: 1 << 20,
                 spliced: 0,
+                resumed: 0,
             },
             std::time::Duration::ZERO,
         );
