@@ -377,7 +377,9 @@ struct Inner {
     /// per-probe: many peers probing the same hash share (and refresh) one
     /// entry, so the slot count is bounded by distinct held blobs, not
     /// probe volume. Expired entries are swept lazily on every hold
-    /// admission and every `eviction_candidates` call (no background task).
+    /// admission, every `eviction_candidates` call, and every
+    /// [`CacheEngine::probe_hold_slots_used`] read (no background task).
+    /// Expiries run on the tokio clock so a paused test clock drives them.
     ///
     /// Like [`Self::pinned`] this only blocks *LRU* eviction — an explicit
     /// operator [`CacheEngine::evict`] still wins (ADR 040 §Pinning, durable
@@ -386,7 +388,7 @@ struct Inner {
     /// because [`CacheEngine::try_probe_hold`] gates on [`CacheEngine::has`]
     /// which already
     /// honors the evicted set.
-    probe_holds: Mutex<HashMap<Hash, Instant>>,
+    probe_holds: Mutex<HashMap<Hash, tokio::time::Instant>>,
     /// Hold-budget cap (ADR 005 §Hold budget). `0` disables `has_blob: true`
     /// entirely. Set once from `cache.max_probe_holds` via
     /// [`CacheEngine::set_max_probe_holds`] at runtime bring-up — `cache.*`
@@ -3395,7 +3397,7 @@ impl CacheEngine {
         if max == 0 {
             return Ok(ProbeHoldOutcome::HoldsDisabled);
         }
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         // `Instant + Duration` panics on overflow; saturate instead to keep
         // the workspace anti-panic policy (clippy `unwrap_used`/`panic`).
         let expiry = now
@@ -3442,10 +3444,10 @@ impl CacheEngine {
 
     /// Number of currently-active (non-expired) probe holds, for the
     /// `probe_hold_slots_used` metric (ADR 005). Sweeps expired entries as
-    /// a side effect so the gauge reflects live holds even with no probe
-    /// traffic.
+    /// a side effect, so a caller that samples it on its own schedule (the
+    /// node's `/metrics` scrape) reads live holds even with no probe traffic.
     pub fn probe_hold_slots_used(&self) -> usize {
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         let mut guard = self
             .inner
             .probe_holds
@@ -4405,7 +4407,7 @@ impl CacheEngine {
         // already-evicted hash is never in this map to begin with.
         let denied = self.inner.denied.load();
         let chain_denied = self.inner.chain_denied.load();
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         let held: HashSet<Hash> = {
             let mut g = self
                 .inner
@@ -9325,16 +9327,16 @@ mod tests {
         engine.observe_hit(hash); // make it an LRU candidate
 
         // Inject an already-expired hold directly (the real 35s duration is
-        // impractical to sleep, and std `Instant` ignores tokio time pause).
+        // impractical to sleep on a real clock).
         {
             let mut g = engine
                 .inner
                 .probe_holds
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            let past = Instant::now()
+            let past = tokio::time::Instant::now()
                 .checked_sub(Duration::from_secs(1))
-                .unwrap_or_else(Instant::now);
+                .unwrap_or_else(tokio::time::Instant::now);
             g.insert(hash, past);
         }
 
