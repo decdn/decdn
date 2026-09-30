@@ -915,6 +915,16 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Node dials use registry multiaddrs, not only the relay.** A node
+  publishes only its relay URL through pkarr, so a dial by bare node id
+  opened over the relay even when the target registered its QUIC address.
+  The daemon's `CapacityBond` watcher now keeps each node's registry
+  `multiaddrs` in an iroh address lookup on the endpoint, so DHT RPCs and
+  upstream probes and pulls connect directly to a reachable node. The CLI
+  keeps the registry addresses on warming proxies and cold-order
+  pull-through targets, and `decdn node lookup` dials with them.
+  `decdn-client`'s `WarmingCandidate` gains `multiaddrs`.
+
 - **`bundle pull` no longer counts a resumed `.partial` prefix as downloaded
   (#2236).** A prefix that an earlier, interrupted pull fetched counted again
   in the entry line's downloaded bytes and rate, and in the summary's
