@@ -28,6 +28,16 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`bundle pull --json` renames `deduped` to `reused` and adds `excluded`
+  (#2190).** `deduped` counted whole-file reuse only, so beside a
+  `range-dedup: spliced 12.7 GB` line a `0 deduped` count read as a
+  contradiction. The field, the counts line and the `whole-file dedup` line
+  now say `reused`, which pairs with `reused_bytes`. `excluded` counts the
+  entries that `--include`/`--exclude` dropped or `--select` deselected, so
+  every manifest entry appears in one count:
+  `(4 fetched, 0 linked, 12 skipped, 0 reused, 1 excluded, 0 failed)`.
+  Scripts that read `deduped` must read `reused`.
+
 - **`decdn fetch` and `decdn bundle pull` recover through one acquire loop,
   and a blob's size is a hint (#2239; #2223, #2215, #2214, #2225, #2213,
   #2218, #2230).** Both commands drive every holder of a blob from one loop.
@@ -2737,6 +2747,17 @@ since project inception and will roll into the first tagged release.
   ownership only; no steady-state behavior change.
 
 ### Added
+
+- **`bundle pull` warns on a filter glob that matches no entry, and on
+  leftover partials (#2190).** Each `--include`/`--exclude` pattern that
+  matches no manifest entry prints one `warning:` line on stderr, in a real
+  pull and under `--dry-run`. A pattern matches the whole path from the bundle
+  root, so when its `**/` form would match, the warning names it:
+  `--exclude 'metal/*' matched no entries (… did you mean '**/metal/*'?)`. At
+  run end, staging files under `.decdn-partial/` for blobs the run did not
+  select (a partial an earlier run left for an entry this run excluded) print
+  one warning with their count and size. The pull keeps them for a later run
+  that selects the entry again.
 
 - **Paid-leg diagnostics at `debug` (#2211).** Each paid leg's open logs its
   peer, hash, `byte_offset` and `byte_len`. A throughput-floor trip logs the

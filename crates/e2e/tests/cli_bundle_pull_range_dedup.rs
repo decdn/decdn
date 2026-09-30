@@ -1580,7 +1580,7 @@ async fn run_delta_update() -> anyhow::Result<()> {
 /// unit test's `game1`/`game2` shape end to end over the real paid wire path.
 ///
 /// Asserts: `game2/lib/dup.bin` lands byte-identical to the source and hashes
-/// to the manifest hash; the second `PullReport` shows `deduped == 1`,
+/// to the manifest hash; the second `PullReport` shows `reused == 1`,
 /// `reused_bytes >= dup.bin`'s size, and `downloaded == 0`; and the lane bills
 /// EXACTLY zero bytes for the second pull — the shared file is materialized
 /// from the on-disk `game1` copy, never downloaded or paid for.
@@ -1735,7 +1735,7 @@ async fn run_cross_bundle_whole_file_dedup() -> anyhow::Result<()> {
 
     // (2) The report shows a whole-file dedup, not a download.
     anyhow::ensure!(
-        report2["deduped"].as_u64() == Some(1),
+        report2["reused"].as_u64() == Some(1),
         "second pull must dedup exactly one destination from the on-disk game1 copy: {report2}"
     );
     anyhow::ensure!(

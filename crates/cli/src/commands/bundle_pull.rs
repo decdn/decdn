@@ -535,6 +535,15 @@ struct Manifest {
     entries: Vec<ManifestEntry>,
 }
 
+/// A manifest cut down to the entries this run pulls, and how many entries
+/// the `--include`/`--exclude` filter and the `--select` editor dropped.
+#[derive(Debug)]
+struct Kept {
+    manifest: Manifest,
+    /// Entries the run does not pull: filtered out or deselected.
+    excluded: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct ManifestEntry {
     path: String,
@@ -664,13 +673,61 @@ fn download_bytes(entries: &[ManifestEntry], fetch_plan: &FetchPlan) -> Option<u
 /// include gate is open when no `--include` was given (every entry passes) and
 /// otherwise requires a match against at least one include pattern; `--exclude`
 /// always wins over `--include`.
+///
+/// Every pattern matches the whole path from the bundle root, so `metal/*`
+/// matches `metal/model.bin` but not `gpt/metal/model.bin`; `**/metal/*`
+/// matches both. A pattern that matches no entry is almost always this mistake,
+/// so [`Self::apply_and_warn`] names each one.
 #[derive(Debug)]
 struct EntryFilter {
     include: globset::GlobSet,
-    /// Whether any `--include` was given. False leaves the include gate open —
-    /// distinct from an empty [`globset::GlobSet`], which matches nothing.
-    has_include: bool,
+    /// The `--include` patterns as given, in the order [`build_glob_set`]
+    /// compiled them, so a [`globset::GlobSet::matches`] index names its
+    /// pattern.
+    include_patterns: Vec<String>,
     exclude: globset::GlobSet,
+    /// The `--exclude` patterns as given, indexed like `include_patterns`.
+    exclude_patterns: Vec<String>,
+}
+
+/// A `--include` or `--exclude` pattern that matched no entry of the manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Unmatched {
+    /// The flag the pattern came from: `--include` or `--exclude`.
+    flag: &'static str,
+    /// The pattern as given.
+    pattern: String,
+    /// The same pattern under a leading `**/`, when that form matches at least
+    /// one entry: the likely intent of a pattern written as if it matched at
+    /// any depth.
+    suggestion: Option<String>,
+}
+
+impl Unmatched {
+    /// The warning line for this pattern, without the `warning: ` prefix.
+    fn warning(&self) -> String {
+        let hint = self
+            .suggestion
+            .as_ref()
+            .map_or_else(String::new, |suggestion| {
+                format!(
+                    " (a pattern matches the whole path from the bundle root; did you mean \
+                     '{suggestion}'?)"
+                )
+            });
+        format!("{} '{}' matched no entries{hint}", self.flag, self.pattern)
+    }
+}
+
+/// What [`EntryFilter::apply_reporting`] hands back.
+#[derive(Debug)]
+struct FilterPass {
+    /// The entries the filter keeps, in manifest order.
+    kept: Vec<ManifestEntry>,
+    /// How many entries the filter dropped.
+    excluded: u64,
+    /// Each pattern that matched no entry, `--include` ones first.
+    unmatched: Vec<Unmatched>,
 }
 
 impl EntryFilter {
@@ -679,21 +736,108 @@ impl EntryFilter {
     fn compile(include: &[String], exclude: &[String]) -> anyhow::Result<Self> {
         Ok(Self {
             include: build_glob_set(include, "--include")?,
-            has_include: !include.is_empty(),
+            include_patterns: include.to_vec(),
             exclude: build_glob_set(exclude, "--exclude")?,
+            exclude_patterns: exclude.to_vec(),
         })
     }
 
-    /// Whether an entry at POSIX relative `path` survives the filter.
-    fn keep(&self, path: &str) -> bool {
-        let p = Path::new(path);
-        (!self.has_include || self.include.is_match(p)) && !self.exclude.is_match(p)
+    /// Retain only the entries the filter keeps, preserving manifest order, and
+    /// report the patterns that matched no entry. A pattern's hits are counted
+    /// over every entry of `entries`, before either gate drops any, so an
+    /// `--exclude` that matches only entries the include gate already dropped
+    /// still counts as a match.
+    fn apply_reporting(&self, entries: Vec<ManifestEntry>) -> FilterPass {
+        let mut include_hits = vec![false; self.include_patterns.len()];
+        let mut exclude_hits = vec![false; self.exclude_patterns.len()];
+        let keep: Vec<bool> = entries
+            .iter()
+            .map(|e| {
+                let p = Path::new(&e.path);
+                let included = mark_hits(&self.include, p, &mut include_hits);
+                let excluded = mark_hits(&self.exclude, p, &mut exclude_hits);
+                (self.include_patterns.is_empty() || included) && !excluded
+            })
+            .collect();
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        let unmatched = unmatched_patterns("--include", &self.include_patterns, &include_hits)
+            .chain(unmatched_patterns(
+                "--exclude",
+                &self.exclude_patterns,
+                &exclude_hits,
+            ))
+            .map(|mut u| {
+                u.suggestion = anywhere_suggestion(&u.pattern, &paths);
+                u
+            })
+            .collect();
+        let raw = entries.len();
+        let kept: Vec<ManifestEntry> = entries
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(e, keep)| keep.then_some(e))
+            .collect();
+        let excluded = u64::try_from(raw.saturating_sub(kept.len())).unwrap_or(u64::MAX);
+        FilterPass {
+            kept,
+            excluded,
+            unmatched,
+        }
     }
 
-    /// Retain only the entries the filter keeps, preserving manifest order.
-    fn apply(&self, entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
-        entries.into_iter().filter(|e| self.keep(&e.path)).collect()
+    /// [`Self::apply_reporting`], with one `warning:` line on stderr for each
+    /// pattern that matched no entry. Returns the kept entries and how many the
+    /// filter dropped.
+    fn apply_and_warn(&self, entries: Vec<ManifestEntry>) -> (Vec<ManifestEntry>, u64) {
+        let pass = self.apply_reporting(entries);
+        for u in &pass.unmatched {
+            eprintln!("warning: {}", u.warning());
+        }
+        (pass.kept, pass.excluded)
     }
+}
+
+/// Mark in `hits` every pattern of `set` that matches `path`, and return
+/// whether any did.
+fn mark_hits(set: &globset::GlobSet, path: &Path, hits: &mut [bool]) -> bool {
+    let matched = set.matches(path);
+    for i in &matched {
+        if let Some(hit) = hits.get_mut(*i) {
+            *hit = true;
+        }
+    }
+    !matched.is_empty()
+}
+
+/// The patterns of `flag` whose `hits` slot is unset, with no suggestion yet.
+fn unmatched_patterns<'a>(
+    flag: &'static str,
+    patterns: &'a [String],
+    hits: &'a [bool],
+) -> impl Iterator<Item = Unmatched> + 'a {
+    patterns
+        .iter()
+        .zip(hits)
+        .filter(|(_, hit)| !**hit)
+        .map(move |(pattern, _)| Unmatched {
+            flag,
+            pattern: pattern.clone(),
+            suggestion: None,
+        })
+}
+
+/// `**/<pattern>`, when `pattern` does not start with `**` or `/` and that form
+/// matches at least one of `paths`.
+fn anywhere_suggestion(pattern: &str, paths: &[&str]) -> Option<String> {
+    if pattern.starts_with("**") || pattern.starts_with('/') {
+        return None;
+    }
+    let anywhere = format!("**/{pattern}");
+    let set = build_glob_set(std::slice::from_ref(&anywhere), "suggestion").ok()?;
+    paths
+        .iter()
+        .any(|p| set.is_match(Path::new(p)))
+        .then_some(anywhere)
 }
 
 /// Header written above the file list in the `--select` editor buffer. Explains
@@ -792,17 +936,33 @@ fn parse_selection(
 }
 
 /// Apply the interactive `--select` step to a finalized manifest, or pass it
-/// through unchanged when `--select` is off. `Ok(None)` means the user deselected
-/// every file: [`report_nothing_to_fetch`] was already called, so the run is done.
-fn maybe_select(args: &BundlePullArgs, mut manifest: Manifest) -> anyhow::Result<Option<Manifest>> {
+/// through unchanged when `--select` is off. Each deselected entry adds to the
+/// excluded count. `Ok(None)` means the user deselected every file:
+/// [`report_nothing_to_fetch`] was already called, so the run is done.
+fn maybe_select(args: &BundlePullArgs, mut kept: Kept) -> anyhow::Result<Option<Kept>> {
     if args.select {
-        manifest.entries = select_entries(manifest.entries)?;
-        if manifest.entries.is_empty() {
+        kept = apply_selection(kept, select_entries)?;
+        if kept.manifest.entries.is_empty() {
             report_nothing_to_fetch(NothingReason::Deselected);
             return Ok(None);
         }
     }
-    Ok(Some(manifest))
+    Ok(Some(kept))
+}
+
+/// Replace `kept`'s entries with the ones `select` keeps, and add each entry it
+/// drops to the excluded count.
+fn apply_selection(
+    mut kept: Kept,
+    select: impl FnOnce(Vec<ManifestEntry>) -> anyhow::Result<Vec<ManifestEntry>>,
+) -> anyhow::Result<Kept> {
+    let offered = kept.manifest.entries.len();
+    kept.manifest.entries = select(kept.manifest.entries)?;
+    let dropped = offered.saturating_sub(kept.manifest.entries.len());
+    kept.excluded = kept
+        .excluded
+        .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
+    Ok(kept)
 }
 
 /// Reject a `--select` invocation that cannot work: it opens an editor, so it
@@ -1008,9 +1168,13 @@ fn ends_the_pull(err: &anyhow::Error) -> bool {
 /// fetched again. It is never part of `downloaded`. A byte that this run also
 /// spliced from disk counts only in `spliced_bytes`.
 ///
-/// `deduped` and `reused_bytes` report the whole-file dedup outcome, counted per
+/// `excluded` counts the manifest entries this run does not pull: the ones the
+/// `--include`/`--exclude` filter dropped and the ones deselected under
+/// `--select`.
+///
+/// `reused` and `reused_bytes` report the whole-file dedup outcome, counted per
 /// distinct blob exactly as `fetched`/`downloaded` are (a blob reused at several
-/// paths counts once here; its extra destinations are `linked`): `deduped` is the
+/// paths counts once here; its extra destinations are `linked`): `reused` is the
 /// count of distinct blobs materialized from an on-disk whole-file donor (verified
 /// by re-hash before use), and `reused_bytes` sums those blobs' sizes once each —
 /// bytes served from disk with no download and no payment.
@@ -1029,6 +1193,8 @@ struct PullReport {
     fetched: u64,
     linked: u64,
     skipped: u64,
+    /// Entries the filter or `--select` dropped.
+    excluded: u64,
     failed: u64,
     downloaded: u64,
     reconstructed: u64,
@@ -1039,7 +1205,7 @@ struct PullReport {
     resumed_bytes: u64,
     /// Count of distinct blobs materialized from an on-disk whole-file donor;
     /// extra destinations of the same blob are counted in `linked`.
-    deduped: u64,
+    reused: u64,
     /// Sum of those blobs' sizes (once per blob) — bytes materialized from a
     /// whole-file donor with no download or payment.
     reused_bytes: u64,
@@ -1247,12 +1413,16 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         Some(path) => {
             let mut m = read_local_manifest(path)?;
             let raw_empty = m.entries.is_empty();
-            m.entries = filter.apply(m.entries);
+            let (entries, excluded) = filter.apply_and_warn(m.entries);
+            m.entries = entries;
             if m.entries.is_empty() {
                 report_nothing_to_fetch(NothingReason::from_filter(filters_given, raw_empty));
                 return Ok(());
             }
-            Some(m)
+            Some(Kept {
+                manifest: m,
+                excluded,
+            })
         }
         None => None,
     };
@@ -1305,7 +1475,7 @@ async fn pull_over(
     endpoint: &Endpoint,
     relays: &[RelayUrl],
     (filter, filters_given): (&EntryFilter, bool),
-    local_manifest: Option<Manifest>,
+    local_manifest: Option<Kept>,
 ) -> anyhow::Result<()> {
     let common = &args.common;
     // Selection + the buyer signer, resolved per path (see `resolve_selection`).
@@ -1378,18 +1548,18 @@ async fn pull_manifest<P: Provider + Clone>(
     args: &BundlePullArgs,
     filter: &EntryFilter,
     filters_given: bool,
-    local_manifest: Option<Manifest>,
+    local_manifest: Option<Kept>,
 ) -> anyhow::Result<()> {
     // Obtain the manifest: the pre-read local one, or the `--hash` bundle blob
     // fetched and filtered here. `None` => filtered to empty (already reported).
-    let Some(manifest) = obtain_manifest(&ctx, args, filter, filters_given, local_manifest).await?
+    let Some(kept) = obtain_manifest(&ctx, args, filter, filters_given, local_manifest).await?
     else {
         return Ok(());
     };
 
     // `--select`: let the user trim the (already glob-filtered) list in their
     // editor. Everything deselected ends the run (reported) like an empty filter.
-    let Some(manifest) = maybe_select(args, manifest)? else {
+    let Some(Kept { manifest, excluded }) = maybe_select(args, kept)? else {
         return Ok(());
     };
 
@@ -1431,6 +1601,7 @@ async fn pull_manifest<P: Provider + Clone>(
         )
         .await;
     ctx.progress.finish();
+    warn_leftover_partials(&args.output, &manifest.entries, args.hash.as_deref());
 
     // Every entry has joined, so the shared dedup counters are now stable.
     let dedup = DedupSummary {
@@ -1442,6 +1613,7 @@ async fn pull_manifest<P: Provider + Clone>(
         &warnings,
         transfer,
         dedup,
+        excluded,
         &args.output,
         args.json,
     );
@@ -1510,8 +1682,8 @@ async fn obtain_manifest<P: Provider + Clone>(
     args: &BundlePullArgs,
     filter: &EntryFilter,
     filters_given: bool,
-    local_manifest: Option<Manifest>,
-) -> anyhow::Result<Option<Manifest>> {
+    local_manifest: Option<Kept>,
+) -> anyhow::Result<Option<Kept>> {
     if let Some(m) = local_manifest {
         return Ok(Some(m));
     }
@@ -1540,12 +1712,16 @@ async fn obtain_manifest<P: Provider + Clone>(
     };
     let mut m = parse_manifest(&bytes)?;
     let raw_empty = m.entries.is_empty();
-    m.entries = filter.apply(m.entries);
+    let (entries, excluded) = filter.apply_and_warn(m.entries);
+    m.entries = entries;
     if m.entries.is_empty() {
         report_nothing_to_fetch(NothingReason::from_filter(filters_given, raw_empty));
         return Ok(None);
     }
-    Ok(Some(m))
+    Ok(Some(Kept {
+        manifest: m,
+        excluded,
+    }))
 }
 
 /// Record one group's run in [`PullCtx::pull_plain`]: forward its recordable
@@ -4306,7 +4482,7 @@ fn dry_run(args: &BundlePullArgs, filter: &EntryFilter, filters_given: bool) -> 
         (Some(path), _) => {
             let mut manifest = read_local_manifest(path)?;
             let raw_empty = manifest.entries.is_empty();
-            manifest.entries = filter.apply(manifest.entries);
+            manifest.entries = filter.apply_and_warn(manifest.entries).0;
             if args.json {
                 // The `--json` plan stays machine-readable — an empty set is
                 // `count: 0` with an empty `entries` array, no prose line.
@@ -4360,66 +4536,36 @@ fn dry_run(args: &BundlePullArgs, filter: &EntryFilter, filters_given: bool) -> 
 
 /// Summarize outcomes; return an error if any entry failed (after reporting all).
 /// Each of `warnings` ([`size_warnings`]) prints one line on stderr and never
-/// changes the result.
+/// changes the result. `excluded` is the count of entries the run does not pull
+/// ([`PullReport`]).
 fn report(
     outcomes: &[EntryOutcome],
     warnings: &[String],
     transfer: Transfer,
     dedup: DedupSummary,
+    excluded: u64,
     output: &Path,
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut fetched = 0u64;
-    let mut linked = 0u64;
-    let mut skipped = 0u64;
-    let mut failed = 0u64;
-    let mut deduped = 0u64;
-    let mut reused_bytes = 0u64;
     for o in outcomes {
-        match o {
-            EntryOutcome::Fetched(_) => fetched += 1,
-            EntryOutcome::Linked => linked += 1,
-            EntryOutcome::Skipped => skipped += 1,
-            EntryOutcome::Deduped(n) => {
-                deduped += 1;
-                reused_bytes = reused_bytes.saturating_add(*n);
-            }
-            EntryOutcome::Failed { path, err } => {
-                failed += 1;
-                // A per-entry failure is a command result the user needs, not
-                // routing narration: keep it on stderr (unconditional, and clear
-                // of the `--json` report on stdout) rather than behind logging.
-                eprintln!("failed: {path}: {err}");
-            }
+        if let EntryOutcome::Failed { path, err } = o {
+            // A per-entry failure is a command result the user needs, not
+            // routing narration: keep it on stderr (unconditional, and clear
+            // of the `--json` report on stdout) rather than behind logging.
+            eprintln!("failed: {path}: {err}");
         }
     }
     for line in warnings {
         eprintln!("warning: {line}");
     }
 
-    let rep = PullReport {
-        output: output.display().to_string(),
-        fetched,
-        linked,
-        skipped,
-        failed,
-        downloaded: transfer.downloaded,
-        reconstructed: transfer.reconstructed,
-        spliced_bytes: dedup.spliced_bytes,
-        hints_ignored: dedup.hints_ignored,
-        resumed_bytes: transfer.resumed,
-        deduped,
-        reused_bytes,
-    };
+    let rep = pull_report(outcomes, transfer, dedup, excluded, output);
+    let (reused, reused_bytes, failed) = (rep.reused, rep.reused_bytes, rep.failed);
     if json {
         let line = serde_json::to_string(&rep).map_err(|e| anyhow!("serialize report: {e}"))?;
         println!("{line}");
     } else {
-        println!(
-            "pulled into {} ({fetched} fetched, {linked} linked, {skipped} skipped, \
-             {deduped} deduped, {failed} failed)",
-            output.display()
-        );
+        println!("{}", counts_line(&rep));
         // `downloaded X → reconstructed Y` only when dedup made them differ;
         // otherwise a single `downloaded X`.
         println!("{}", transfer_line(transfer));
@@ -4433,9 +4579,9 @@ fn report(
         }
         // The whole-file dedup outcome, shown only when it mattered: a run that
         // materialized any destination from an on-disk donor instead of fetching.
-        if deduped > 0 {
+        if reused > 0 {
             println!(
-                "whole-file dedup: reused {} from disk ({deduped} file(s))",
+                "whole-file dedup: reused {} from disk ({reused} file(s))",
                 human_bytes(reused_bytes)
             );
         }
@@ -4457,6 +4603,138 @@ fn report(
         bail!("{failed} entr(ies) failed to fetch");
     }
     Ok(())
+}
+
+/// The run's [`PullReport`]: the entry counts tallied from `outcomes`, beside
+/// the byte tallies and the `excluded` count the caller already holds.
+fn pull_report(
+    outcomes: &[EntryOutcome],
+    transfer: Transfer,
+    dedup: DedupSummary,
+    excluded: u64,
+    output: &Path,
+) -> PullReport {
+    let mut rep = PullReport {
+        output: output.display().to_string(),
+        fetched: 0,
+        linked: 0,
+        skipped: 0,
+        excluded,
+        failed: 0,
+        downloaded: transfer.downloaded,
+        reconstructed: transfer.reconstructed,
+        spliced_bytes: dedup.spliced_bytes,
+        hints_ignored: dedup.hints_ignored,
+        resumed_bytes: transfer.resumed,
+        reused: 0,
+        reused_bytes: 0,
+    };
+    for o in outcomes {
+        match o {
+            EntryOutcome::Fetched(_) => rep.fetched += 1,
+            EntryOutcome::Linked => rep.linked += 1,
+            EntryOutcome::Skipped => rep.skipped += 1,
+            EntryOutcome::Deduped(n) => {
+                rep.reused += 1;
+                rep.reused_bytes = rep.reused_bytes.saturating_add(*n);
+            }
+            EntryOutcome::Failed { .. } => rep.failed += 1,
+        }
+    }
+    rep
+}
+
+/// The summary's first line: where the run pulled to, and every entry count.
+fn counts_line(rep: &PullReport) -> String {
+    format!(
+        "pulled into {} ({} fetched, {} linked, {} skipped, {} reused, {} excluded, {} failed)",
+        rep.output, rep.fetched, rep.linked, rep.skipped, rep.reused, rep.excluded, rep.failed
+    )
+}
+
+/// Scan `<out_root>/.decdn-partial` for leftover per-hash staging files —
+/// `<hex>`, `<hex>.partial`, `<hex>.partial.ranges` — whose hash is not in
+/// `keep`, and total them per hash. Other names (a record's temporary file)
+/// are not counted. A missing or unreadable directory holds nothing.
+fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
+    let Ok(dir) = std::fs::read_dir(out_root.join(STAGING_DIR)) else {
+        return Leftovers::default();
+    };
+    let mut blobs: HashSet<[u8; 32]> = HashSet::new();
+    let mut bytes = 0u64;
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let stem = name
+            .strip_suffix(".partial.ranges")
+            .or_else(|| name.strip_suffix(".partial"))
+            .unwrap_or(name);
+        let Ok(hash) = blake3::Hash::from_hex(stem) else {
+            continue;
+        };
+        let hash = *hash.as_bytes();
+        if keep.contains(&hash) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_file() {
+            blobs.insert(hash);
+            bytes = bytes.saturating_add(meta.len());
+        }
+    }
+    Leftovers {
+        blobs: u64::try_from(blobs.len()).unwrap_or(u64::MAX),
+        bytes,
+    }
+}
+
+/// Resume state in the staging directory for blobs a run did not select: how
+/// many distinct blobs, and their files' total size on disk.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Leftovers {
+    blobs: u64,
+    bytes: u64,
+}
+
+/// The warning line for `leftovers` in `dir`, without the `warning: ` prefix,
+/// or `None` when there are none.
+fn leftover_warning(dir: &Path, leftovers: &Leftovers) -> Option<String> {
+    let size = human_bytes(leftovers.bytes);
+    let dir = dir.display();
+    match leftovers.blobs {
+        0 => None,
+        1 => Some(format!(
+            "1 partial download ({size}) of an entry this run did not select remains in \
+             {dir}; delete it to reclaim the space"
+        )),
+        n => Some(format!(
+            "{n} partial downloads ({size}) of entries this run did not select remain in \
+             {dir}; delete them to reclaim the space"
+        )),
+    }
+}
+
+/// Warn on stderr about leftover staging files of blobs this run did not
+/// select ([`leftover_partials`]): a partial of an entry an earlier run
+/// started, which this run's filter or selection left out. They stay for a
+/// later run that selects the entry again, so the warning only names them and
+/// never deletes them. `entries` are the run's selected entries, and
+/// `bundle_hash` is the `--hash` manifest blob, which is also this run's own.
+fn warn_leftover_partials(out_root: &Path, entries: &[ManifestEntry], bundle_hash: Option<&str>) {
+    let keep: HashSet<[u8; 32]> = entries
+        .iter()
+        .map(|e| e.hash.as_str())
+        .chain(bundle_hash)
+        .filter_map(|h| fetch::parse_hash(h).ok())
+        .collect();
+    let leftovers = leftover_partials(out_root, &keep);
+    if let Some(line) = leftover_warning(&out_root.join(STAGING_DIR), &leftovers) {
+        eprintln!("warning: {line}");
+    }
 }
 
 /// Format a byte count as a short decimal-unit label (`13.8 GB`). SI (1000-based)
@@ -6823,6 +7101,7 @@ mod tests {
             &[],
             Transfer::default(),
             DedupSummary::default(),
+            0,
             Path::new("/out"),
             true,
         )
@@ -6839,6 +7118,7 @@ mod tests {
                 &[],
                 Transfer::default(),
                 DedupSummary::default(),
+                0,
                 Path::new("/out"),
                 false
             )
@@ -6881,12 +7161,54 @@ mod tests {
                 &warnings,
                 Transfer::default(),
                 DedupSummary::default(),
+                0,
                 tmp.path(),
                 false
             )
             .is_ok(),
             "a size warning is not a failure"
         );
+    }
+
+    /// The summary counts every entry: a whole-file reuse reads `reused`, and
+    /// the entries the filter or `--select` dropped read `excluded` (#2190).
+    #[test]
+    fn the_summary_counts_reused_and_excluded_entries() {
+        let outcomes = vec![
+            EntryOutcome::Fetched(10),
+            EntryOutcome::Linked,
+            EntryOutcome::Skipped,
+            EntryOutcome::Deduped(7),
+            EntryOutcome::Failed {
+                path: "x".into(),
+                err: "boom".into(),
+            },
+        ];
+        let transfer = Transfer {
+            downloaded: 4,
+            reconstructed: 20,
+            resumed: 6,
+        };
+        let rep = pull_report(
+            &outcomes,
+            transfer,
+            DedupSummary::default(),
+            3,
+            Path::new("/out"),
+        );
+        assert_eq!(
+            counts_line(&rep),
+            "pulled into /out (1 fetched, 1 linked, 1 skipped, 1 reused, 3 excluded, 1 failed)"
+        );
+        assert_eq!(rep.reused_bytes, 7);
+
+        let json = serde_json::to_value(&rep).expect("serialize");
+        assert_eq!(json["reused"], 1);
+        assert_eq!(json["reused_bytes"], 7);
+        assert_eq!(json["excluded"], 3);
+        assert_eq!(json["resumed_bytes"], 6);
+        assert_eq!(json["downloaded"], 4);
+        assert!(json.get("deduped").is_none(), "{json}");
     }
 
     #[test]
@@ -7044,7 +7366,12 @@ mod tests {
         entries: Vec<ManifestEntry>,
     ) -> Vec<String> {
         let filter = EntryFilter::compile(&strs(include), &strs(exclude)).unwrap();
-        filter.apply(entries).into_iter().map(|e| e.path).collect()
+        filter
+            .apply_reporting(entries)
+            .kept
+            .into_iter()
+            .map(|e| e.path)
+            .collect()
     }
 
     fn sample() -> Vec<ManifestEntry> {
@@ -7143,6 +7470,170 @@ mod tests {
     #[test]
     fn entry_filter_can_empty_the_set() {
         assert!(filtered_paths(&["no/such/*"], &[], sample()).is_empty());
+    }
+
+    /// Each pattern that matches no entry is reported with its flag, and one
+    /// whose `**/` form would match gets that form as a hint: every pattern
+    /// matches from the bundle root (#2190).
+    #[test]
+    fn entry_filter_reports_each_pattern_that_matched_nothing() {
+        let mut entries = sample();
+        entries.push(entry("gpt/metal/model.bin", "b3:5"));
+        let filter = EntryFilter::compile(
+            &strs(&["models/*", "no/such/*"]),
+            &strs(&["metal/*", "**/*.md"]),
+        )
+        .unwrap();
+        let pass = filter.apply_reporting(entries);
+        assert_eq!(
+            pass.kept
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["models/a.bin", "models/b.txt"]
+        );
+        assert_eq!(pass.excluded, 3);
+        assert_eq!(
+            pass.unmatched,
+            vec![
+                Unmatched {
+                    flag: "--include",
+                    pattern: "no/such/*".into(),
+                    suggestion: None,
+                },
+                Unmatched {
+                    flag: "--exclude",
+                    pattern: "metal/*".into(),
+                    suggestion: Some("**/metal/*".into()),
+                },
+            ]
+        );
+        assert_eq!(
+            pass.unmatched[0].warning(),
+            "--include 'no/such/*' matched no entries"
+        );
+        assert_eq!(
+            pass.unmatched[1].warning(),
+            "--exclude 'metal/*' matched no entries (a pattern matches the whole path from the \
+             bundle root; did you mean '**/metal/*'?)"
+        );
+    }
+
+    /// A pattern with no `/` is anchored too: `*.txt` matches only a root-level
+    /// file, so a miss suggests `**/*.txt`. A pattern that already starts with
+    /// `**` gets no hint.
+    #[test]
+    fn entry_filter_hints_an_anchored_pattern_without_a_slash() {
+        let filter = EntryFilter::compile(&[], &strs(&["*.txt", "**/*.png"])).unwrap();
+        let pass = filter.apply_reporting(sample());
+        assert_eq!(pass.excluded, 0);
+        assert_eq!(
+            pass.unmatched
+                .iter()
+                .map(|u| (u.pattern.as_str(), u.suggestion.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("*.txt", Some("**/*.txt")), ("**/*.png", None)]
+        );
+    }
+
+    /// Patterns that each match an entry report nothing, even an `--exclude`
+    /// that matches only entries the include gate already dropped.
+    #[test]
+    fn entry_filter_reports_nothing_when_every_pattern_matches() {
+        let filter = EntryFilter::compile(&strs(&["models/*"]), &strs(&["docs/**"])).unwrap();
+        let pass = filter.apply_reporting(sample());
+        assert!(pass.unmatched.is_empty(), "{:?}", pass.unmatched);
+        assert_eq!(pass.excluded, 2);
+
+        let pass = EntryFilter::compile(&[], &[])
+            .unwrap()
+            .apply_reporting(sample());
+        assert!(pass.unmatched.is_empty());
+        assert_eq!(pass.excluded, 0);
+    }
+
+    /// `--select` adds each entry it drops to the filter's excluded count.
+    #[test]
+    fn a_selection_adds_its_dropped_entries_to_the_excluded_count() {
+        let kept = Kept {
+            manifest: Manifest {
+                version: 1,
+                entries: sample(),
+            },
+            excluded: 2,
+        };
+        let kept = apply_selection(kept, |entries| {
+            parse_selection("models/a.bin\ndocs/readme.md\n", entries)
+        })
+        .unwrap();
+        assert_eq!(kept.manifest.entries.len(), 2);
+        assert_eq!(kept.excluded, 4);
+    }
+
+    /// The run-end scan counts the staging files of blobs the run did not
+    /// select, once per blob, and ignores the run's own blobs, the manifest
+    /// blob, and names that are not a blob's staging file (#2190).
+    #[test]
+    fn leftover_partials_counts_only_unselected_blobs() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        assert_eq!(
+            leftover_partials(tmp.path(), &HashSet::new()),
+            Leftovers::default(),
+            "no staging dir, nothing left over"
+        );
+
+        let dir = tmp.path().join(STAGING_DIR);
+        std::fs::create_dir_all(&dir).expect("staging dir");
+        let hex = |b: u8| blake3::Hash::from_bytes([b; 32]).to_hex().to_string();
+        let write = |name: String, len: usize| {
+            std::fs::write(dir.join(name), vec![0u8; len]).expect("write");
+        };
+        // The run's selected entry and the manifest blob: kept for this run.
+        write(format!("{}.partial", hex(1)), 500);
+        write(format!("{}.partial.ranges", hex(1)), 5);
+        write(format!("{}.partial", hex(2)), 300);
+        // An orphan partial and its record, and a finalized orphan blob.
+        write(format!("{}.partial", hex(3)), 1000);
+        write(format!("{}.partial.ranges", hex(3)), 10);
+        write(hex(4), 200);
+        // A record's temporary file and a stray name.
+        write(".tmpAbC123".into(), 50);
+        write("notes.txt".into(), 50);
+
+        let keep: HashSet<[u8; 32]> = [[1; 32], [2; 32]].into_iter().collect();
+        let leftovers = leftover_partials(tmp.path(), &keep);
+        assert_eq!(
+            leftovers,
+            Leftovers {
+                blobs: 2,
+                bytes: 1210,
+            }
+        );
+        assert_eq!(
+            leftover_warning(Path::new("/out/.decdn-partial"), &leftovers).as_deref(),
+            Some(
+                "2 partial downloads (1.2 KB) of entries this run did not select remain in \
+                 /out/.decdn-partial; delete them to reclaim the space"
+            )
+        );
+        assert_eq!(
+            leftover_warning(
+                Path::new("/out/.decdn-partial"),
+                &Leftovers {
+                    blobs: 1,
+                    bytes: 1_500_000_000,
+                }
+            )
+            .as_deref(),
+            Some(
+                "1 partial download (1.5 GB) of an entry this run did not select remains in \
+                 /out/.decdn-partial; delete it to reclaim the space"
+            )
+        );
+        assert_eq!(
+            leftover_warning(Path::new("/out"), &Leftovers::default()),
+            None
+        );
     }
 
     /// A malformed glob is a hard error naming the flag it came from.
@@ -7890,6 +8381,7 @@ mod tests {
                 &[],
                 Transfer::default(),
                 DedupSummary::default(),
+                0,
                 Path::new("/out"),
                 false
             )
