@@ -93,12 +93,12 @@ This single transaction atomically:
 - Sets `active = true` in the registry.
 - Emits `TermsAccepted(nodeId, termsHash, timestamp)`.
 
-**Constructing `multiaddrs`:** The iroh `Endpoint` is not yet bound in Phase 2, so hole-punched addresses are unavailable at registration time:
+**Constructing `multiaddrs`:** The operator passes each address with `--multiaddr`. Without `--multiaddr`, `decdn setup` and `decdn node register` use the host's public addresses. For each address family, the CLI reads the source address of the default route. It keeps the address when it is a public IP, and registers `/ip4|ip6/<address>/udp/<network.bind_port>/quic-v1`. The CLI prints the address it chose.
 
-- **Direct-address nodes (known public IP/port):** provide the stable QUIC address.
-- **NAT'd nodes:** register with the iroh relay address as a placeholder (`quic-v1/relay/<relay-url>`). After Phase 3 binds the endpoint and iroh establishes relay connectivity, call `updateMultiaddrs` with the actual `Endpoint::direct_addresses()` values. The relay address keeps the node reachable in the interim.
+- **Hosts with a public IP** (dedicated and cloud servers): the default registers the public address.
+- **Hosts behind NAT** (home connections): the route source is a private address, so the default registers no address. Peers reach the node through the relay and hole-punching. An operator who forwards UDP `network.bind_port` passes the forwarded address with `--multiaddr`.
 
-See [NAT and Multiaddr Handling](#nat-and-multiaddr-handling) below for the full relay → direct address promotion flow.
+See [NAT and Multiaddr Handling](#nat-and-multiaddr-handling) below.
 
 **Constructing signatures:**
 
@@ -165,7 +165,7 @@ After Phase 3, the node can accept connections immediately, even before every pe
 | 2 | Rate floor loaded | Node has `deliveryFloor` in memory |
 | 3 | Blacklist synced | Local blacklist is at the current `blacklistVersion` |
 | 4 | QUIC listener open | `iroh::Endpoint` bound and listening on configured port(s) |
-| 5 | Multiaddrs synchronized | On-chain multiaddrs match `iroh::Endpoint::direct_addresses()` (or relay placeholder if direct addresses are not yet resolved) |
+| 5 | Reachability known | The bring-up reachability log line reports the public address as registered, or reports the node as behind NAT. `decdn_node_public_address` carries the same result. |
 
 A node satisfying all five criteria is ready to:
 
@@ -216,19 +216,16 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 **Address lifecycle:**
 
 1. On startup, the node binds `network.bind_port` on both address families: `0.0.0.0:PORT` and `[::]:PORT`. The IPv4 bind is required. The IPv6 bind is optional. A host without IPv6 starts on IPv4 only and logs a warning.
-2. iroh discovers external addresses via STUN and direct connection attempts, populating `Endpoint::direct_addresses()` — the addresses peers use to connect.
-3. If hole-punching fails, iroh uses a relay server as fallback. Relay addresses are in the iroh `NodeAddr` but not registered on-chain (not stable).
+2. iroh discovers the node's addresses. The node publishes its relay URL and its public IP addresses in its pkarr record ([ADR 001 § Node Discovery](001-network.md#node-discovery-registry)). iroh updates the record when an address changes.
+3. At bring-up, the node logs its reachability once and sets `decdn_node_public_address`. A node with a public address on its default route is public. A public node warns when its registry `multiaddrs` do not carry that address. A node without a public address is behind NAT, and relayed inbound is expected for it.
+4. If hole-punching fails, iroh uses a relay server as fallback. The relay URL is not registered on-chain.
 
-**Multiaddr registration:**
-
-- On initial registration (Phase 2, Step 2.3), if iroh has already bound its endpoint (possible if the binary generates registration parameters after starting iroh), include all known direct addresses in `multiaddrs`.
-- If registration precedes iroh startup (e.g., a separate setup tool), register with a placeholder or known static IP/port, then call `updateMultiaddrs` once direct addresses are established.
+**Multiaddr registration:** registration writes the addresses from [Constructing `multiaddrs`](#phase-2--on-chain-setup). The registry record needs no update on a stable host.
 
 **Multiaddr refresh:**
 
-- When `Endpoint::direct_addresses()` changes (iroh emits an event), call `CapacityBond.updateMultiaddrs(newMultiaddrs)` to keep the registry current.
-- **PoC:** No cooldown — updates can be submitted on any change (~$0.03/call).
-- **Production:** A governable cooldown prevents rapid address flipping by a compromised key ([ADR 003 § Multiaddr Update Policy](003-payments.md#multiaddr-update-policy)).
+- The operator runs `decdn node update-multiaddrs` when the host's public address changes, or when the bring-up line names a missing address. The node does not submit the update itself. The pkarr record carries the new address in the meantime.
+- A governable cooldown prevents rapid address flipping by a compromised key ([ADR 003 § Multiaddr Update Policy](003-payments.md#multiaddr-update-policy)).
 
 **Multiaddr encoding:** `multiaddrs` is a packed `bytes` field: a sequence of `(uint16 length, bytes data)` entries. Each entry is a QUIC multiaddr string (e.g., `/ip4/203.0.113.10/udp/4433/quic-v1`). A dual-stack node registers one entry per family on the same port (e.g., `/ip4/203.0.113.10/udp/4433/quic-v1` and `/ip6/2001:db8::10/udp/4433/quic-v1`). Maximum total size: 1,024 bytes (governable).
 

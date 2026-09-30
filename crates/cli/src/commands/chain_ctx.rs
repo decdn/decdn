@@ -19,14 +19,29 @@ use decdn_common::config::DEFAULT_CHAIN_ID;
 use decdn_incentive::eth_identity::{self, PasswordSource, PasswordUse, ResolvedPassword};
 use serde::Deserialize;
 
-/// Partial deserializer for the TOML config — only the `[blockchain]` and
-/// `[identity]` fields these commands need. Deliberately partial (like
-/// `node.rs`'s `AdminPortConfig`) so an operator's typo in an unrelated
-/// section can't block onboarding; serde-toml ignores unknown fields.
+/// Partial deserializer for the TOML config — only the `[blockchain]`,
+/// `[identity]`, and `network.bind_port` fields these commands need.
+/// Deliberately partial (like `node.rs`'s `AdminPortConfig`) so an operator's
+/// typo in an unrelated section can't block onboarding; serde-toml ignores
+/// unknown fields.
 #[derive(Debug, Default, Deserialize)]
 pub struct FileConfig {
     blockchain: Option<FileBlockchain>,
     identity: Option<FileIdentity>,
+    network: Option<FileNetwork>,
+}
+
+impl FileConfig {
+    /// The daemon's QUIC bind port, resolved as the daemon resolves it (see
+    /// [`decdn_common::config::configured_bind_port`]).
+    pub fn bind_port(&self) -> u16 {
+        decdn_common::config::configured_bind_port(self.network.as_ref().and_then(|n| n.bind_port))
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileNetwork {
+    bind_port: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -454,7 +469,14 @@ mod tests {
         FileConfig {
             blockchain: Some(bc),
             identity: None,
+            network: None,
         }
+    }
+
+    #[test]
+    fn bind_port_reads_the_network_section() {
+        let file: FileConfig = toml::from_str("[network]\nbind_port = 5000\n").unwrap();
+        assert_eq!(file.network.and_then(|n| n.bind_port), Some(5000));
     }
 
     #[test]

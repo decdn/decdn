@@ -1,11 +1,12 @@
 //! Ports group: probe bindability of the QUIC (UDP) and metrics/admin (TCP)
-//! ports. A port already in use while this node's daemon is running is
-//! expected, not a fault.
+//! ports, and report whether the host has a public address. A port already in
+//! use while this node's daemon is running is expected, not a fault.
 
 use std::io::ErrorKind;
-use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
 
 use decdn_common::config::ResolvedConfig;
+use decdn_common::net::{quic_multiaddr, route_public_ips};
 
 use super::{Finding, Report, Severity};
 
@@ -65,9 +66,45 @@ fn try_udp(port: u16) -> Result<(), ErrorKind> {
         .map_err(|e| e.kind())
 }
 
+/// Report whether the host takes direct inbound connections (ADR 001 § Node
+/// Discovery). Both outcomes pass: a host behind NAT is a supported setup whose
+/// inbound runs through the relay and hole-punching.
+pub(crate) fn classify_reachability(public: &[IpAddr], bind_port: u16) -> Finding {
+    if public.is_empty() {
+        Finding {
+            group: "Ports",
+            id: "port.reachability",
+            severity: Severity::Pass,
+            title: "behind NAT: inbound peers arrive through the relay".to_string(),
+            detail: Some("no public address on the default route".to_string()),
+            remediation: Some(format!(
+                "for direct inbound, forward UDP {bind_port} to this host and register the \
+                 forwarded address with `decdn node update-multiaddrs`"
+            )),
+        }
+    } else {
+        let addrs: Vec<String> = public
+            .iter()
+            .map(|ip| quic_multiaddr(*ip, bind_port))
+            .collect();
+        Finding {
+            group: "Ports",
+            id: "port.reachability",
+            severity: Severity::Pass,
+            title: format!("public address: peers dial {} directly", addrs.join(", ")),
+            detail: None,
+            remediation: None,
+        }
+    }
+}
+
 /// Push bindability findings for the QUIC, metrics, and (if configured)
-/// admin ports.
+/// admin ports, and the host's reachability.
 pub(crate) fn check_ports(report: &mut Report, cfg: &ResolvedConfig, daemon_running: bool) {
+    report.push(classify_reachability(
+        &route_public_ips(),
+        cfg.network.bind_port,
+    ));
     report.push(classify_bind(
         "quic bind",
         cfg.network.bind_port,
@@ -95,6 +132,18 @@ pub(crate) fn check_ports(report: &mut Report, cfg: &ResolvedConfig, daemon_runn
 mod tests {
     use super::*;
     use std::io::ErrorKind;
+
+    #[test]
+    fn reachability_passes_both_ways_and_guides_the_nat_case() {
+        let public = classify_reachability(&["8.8.8.8".parse().unwrap()], 4433);
+        assert_eq!(public.severity, Severity::Pass);
+        assert!(public.title.contains("/ip4/8.8.8.8/udp/4433/quic-v1"));
+        assert!(public.remediation.is_none());
+
+        let nat = classify_reachability(&[], 4433);
+        assert_eq!(nat.severity, Severity::Pass, "behind NAT is supported");
+        assert!(nat.remediation.unwrap().contains("UDP 4433"));
+    }
 
     #[test]
     fn free_port_passes() {

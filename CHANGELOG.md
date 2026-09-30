@@ -930,6 +930,19 @@ since project inception and will roll into the first tagged release.
   node id, on the n0 pkarr server and on an operator-configured
   `network.discovery.pkarr_url` alike.
 
+- **Node reachability is reported, and registration defaults `--multiaddr`.**
+  At bring-up the node logs whether its default route has a public address
+  (public) or not (behind NAT, where relayed inbound is expected), sets
+  `decdn_node_public_address`, and warns when a public address is missing
+  from its registry multiaddrs. New counters
+  `decdn_inbound_connections_direct_total` and
+  `decdn_inbound_connections_relayed_total` split inbound connections by
+  arrival path, with a "Reachability" row on the node dashboard and a
+  `DecdnPublicNodeInboundRelayed` alert scoped to public nodes. `decdn
+  doctor` reports the same reachability. `decdn setup` and `decdn node
+  register` without `--multiaddr` now register the host's public address on
+  `network.bind_port`, and register none behind NAT.
+
 - **`bundle pull` no longer counts a resumed `.partial` prefix as downloaded
   (#2236).** A prefix that an earlier, interrupted pull fetched counted again
   in the entry line's downloaded bytes and rate, and in the summary's

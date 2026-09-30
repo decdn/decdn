@@ -359,6 +359,14 @@ impl ConnectionLimiter {
     /// Shared implementation behind [`Self::acquire`] and
     /// [`Self::acquire_for_test`].
     fn acquire_inner(&self, peer_ip: Option<IpAddr>) -> Result<Permit, RejectReason> {
+        // Every inbound connection passes here once, admitted or not, so this
+        // is where its arrival path is counted (ADR 001 § Node Discovery).
+        if peer_ip.is_some() {
+            self.metrics.inbound_connection_direct();
+        } else {
+            self.metrics.inbound_connection_relayed();
+        }
+
         // Load the current semaphore. `None` means the global cap is
         // administratively disabled — skip the layer entirely.
         let sem_permit = match self.semaphore.load_full() {
@@ -575,6 +583,30 @@ mod tests {
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    /// Every inbound connection counts once by arrival path, rejected ones
+    /// included: a direct IP path or the relay.
+    #[test]
+    fn acquire_counts_inbound_connections_by_path() {
+        let metrics = Arc::new(Metrics::new());
+        let limiter = ConnectionLimiter::new(&strict_security(1), Arc::clone(&metrics));
+        let _held = limiter
+            .acquire_inner(Some(ip(192, 0, 2, 1)))
+            .expect("direct");
+        limiter
+            .acquire_inner(None)
+            .expect_err("global cap rejects the relayed one");
+
+        let text = metrics.encode().expect("encode");
+        assert!(
+            text.contains("decdn_inbound_connections_direct_total 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("decdn_inbound_connections_relayed_total 1"),
+            "{text}"
+        );
     }
 
     #[test]

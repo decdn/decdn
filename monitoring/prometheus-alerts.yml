@@ -557,6 +557,35 @@ groups:
             unaffected, but the audit log has gaps. Check disk space and
             permissions under identity.data_dir.
 
+      - alert: DecdnPublicNodeInboundRelayed
+        # Relayed inbound is expected behind NAT, so the alert is scoped to
+        # nodes that report a public address. The volume arm keeps a quiet
+        # node from firing on a handful of connections.
+        expr: >-
+          (
+            rate(decdn_inbound_connections_relayed_total[30m])
+            /
+            (rate(decdn_inbound_connections_relayed_total[30m]) + rate(decdn_inbound_connections_direct_total[30m]))
+          ) > 0.2
+          and
+          (rate(decdn_inbound_connections_relayed_total[30m]) + rate(decdn_inbound_connections_direct_total[30m])) > 0.01
+          and
+          decdn_node_public_address == 1
+        for: 30m
+        labels:
+          component: network
+          severity: warning
+        annotations:
+          summary: "Public node {{ $labels.instance }} takes {{ $value | humanizePercentage }} of inbound connections over the relay"
+          description: |
+            The node has a public address, yet more than 20% of its inbound
+            connections arrive over the relay. Dialers are not finding or
+            reaching the public address. Check the bring-up log line on
+            reachability: it names any public address missing from the
+            registry multiaddrs (fix with `decdn node update-multiaddrs`).
+            Otherwise check that the host firewall allows UDP on
+            network.bind_port.
+
       # NOTE: /health 503 detection requires an external prober (e.g.
       # blackbox_exporter) — it is not surfaced as a decdn_* metric. Add
       # an alert in your blackbox rules file along the lines of

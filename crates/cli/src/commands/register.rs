@@ -59,6 +59,7 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
     // `decdn node register` submits a single transaction and has no partial
     // report to print, so the slot is only consulted through the error message.
     let mut tx_slot = None;
+    let multiaddrs = registration_multiaddrs(&args.multiaddrs, &file);
     let outcome = submit_registration(
         &provider,
         &signer,
@@ -66,7 +67,7 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
         cb_addr,
         resolved.chain_id,
         &args.region,
-        &args.multiaddrs,
+        &multiaddrs,
         terms_hash,
         args.chain.common.dry_run,
         &mut tx_slot,
@@ -81,6 +82,44 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
     };
     write_outcome(&mut out, &outcome, args.chain.common.json).context(label)?;
     Ok(())
+}
+
+/// The multiaddrs to register (ADR 001 § Node Discovery): `explicit` when the
+/// operator passed any, else one `/ip{4,6}/<ip>/udp/<bind_port>/quic-v1` per
+/// public address on the host's default route. A host behind NAT gets none,
+/// since its route source is not dialable; its operator passes the forwarded
+/// address with `--multiaddr` instead. The chosen default is reported on
+/// stderr, so `--json` stdout stays machine-readable.
+pub(crate) fn registration_multiaddrs(
+    explicit: &[String],
+    file: &chain_ctx::FileConfig,
+) -> Vec<String> {
+    if !explicit.is_empty() {
+        return explicit.to_vec();
+    }
+    let bind_port = file.bind_port();
+    let chosen = default_multiaddrs(&decdn_common::net::route_public_ips(), bind_port);
+    if chosen.is_empty() {
+        eprintln!(
+            "note: no --multiaddr given and no public address on the default route (behind \
+             NAT); registering none. Peers reach the node through the relay and its pkarr \
+             record. If UDP {bind_port} is forwarded to this host, pass the forwarded address \
+             with --multiaddr."
+        );
+    } else {
+        eprintln!(
+            "note: no --multiaddr given; registering this host's public address: {}",
+            chosen.join(", ")
+        );
+    }
+    chosen
+}
+
+fn default_multiaddrs(public: &[std::net::IpAddr], bind_port: u16) -> Vec<String> {
+    public
+        .iter()
+        .map(|ip| decdn_common::net::quic_multiaddr(*ip, bind_port))
+        .collect()
 }
 
 /// Registration parameters + result, owned so the formatter and `decdn setup`
@@ -267,6 +306,28 @@ pub(crate) fn write_outcome(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_multiaddrs_win_over_the_default() {
+        let explicit = vec!["/ip4/198.51.100.7/udp/5000/quic-v1".to_string()];
+        assert_eq!(
+            registration_multiaddrs(&explicit, &chain_ctx::FileConfig::default()),
+            explicit
+        );
+    }
+
+    #[test]
+    fn default_multiaddrs_cover_each_public_address_on_the_bind_port() {
+        let public = ["8.8.8.8".parse().unwrap(), "2a01:4f8::1".parse().unwrap()];
+        assert_eq!(
+            default_multiaddrs(&public, 4433),
+            vec![
+                "/ip4/8.8.8.8/udp/4433/quic-v1".to_string(),
+                "/ip6/2a01:4f8::1/udp/4433/quic-v1".to_string(),
+            ]
+        );
+        assert!(default_multiaddrs(&[], 4433).is_empty(), "behind NAT: none");
+    }
 
     fn sample_outcome(tx: Option<B256>) -> RegisterOutcome {
         RegisterOutcome {

@@ -2,6 +2,7 @@
 
 mod addr_publish;
 pub mod eviction;
+mod reachability;
 pub mod reload;
 
 pub(crate) use reload::emit_config_notices;
@@ -995,13 +996,20 @@ async fn build_chain_and_handlers(
     let operator_to_node = Arc::clone(&registry.operator_to_node);
     // Registry multiaddrs as an endpoint address lookup (ADR 001 § Node
     // Discovery): every bare-`NodeId` dial resolves the node's registry
-    // addresses and connects directly when it is reachable, since pkarr carries
-    // only the relay URL. The same registry route keeps the lookup current.
+    // addresses alongside its pkarr record, so a peer stays directly dialable
+    // when the pkarr server is unreachable or its record is not yet published.
+    // The same registry route keeps the lookup current.
     infra
         .ep
         .address_lookup()
         .map_err(|e| anyhow::anyhow!("endpoint address lookup unavailable: {e}"))?
         .add(registry.dial_addrs.lookup());
+    let own_id = crate::dht::routing::NodeId::from_bytes(*infra.ep.id().as_bytes());
+    reachability::report(
+        &infra.node_metrics,
+        cfg.network.bind_port,
+        &registry.dial_addrs.get(&own_id).unwrap_or_default(),
+    );
     // The registry route MUST stay live through drain (its staker set gates DHT
     // admission), which forces the single poller stop to the LATE point below.
     poller_routes.push(registry.route);
