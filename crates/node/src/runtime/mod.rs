@@ -1,6 +1,8 @@
 //! Node runtime: owns the iroh endpoint, metrics server, and protocol router.
 
+mod addr_publish;
 pub mod eviction;
+mod reachability;
 pub mod reload;
 
 pub(crate) use reload::emit_config_notices;
@@ -24,6 +26,8 @@ use iroh::address_lookup::{DnsAddressLookup, MemoryLookup, PkarrPublisher};
 use iroh::endpoint::{BindOpts, IdleTimeout, QuicTransportConfig, VarInt, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey};
+
+use addr_publish::node_publish_filter;
 use noq_proto::congestion::Bbr3Config;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
@@ -990,6 +994,22 @@ async fn build_chain_and_handlers(
     // current by the same registry route. The lazy `ChainOriginDirectory`
     // resolves against it directly rather than maintaining its own binding cache.
     let operator_to_node = Arc::clone(&registry.operator_to_node);
+    // Registry multiaddrs as an endpoint address lookup (ADR 001 § Node
+    // Discovery): every bare-`NodeId` dial resolves the node's registry
+    // addresses alongside its pkarr record, so a peer stays directly dialable
+    // when the pkarr server is unreachable or its record is not yet published.
+    // The same registry route keeps the lookup current.
+    infra
+        .ep
+        .address_lookup()
+        .map_err(|e| anyhow::anyhow!("endpoint address lookup unavailable: {e}"))?
+        .add(registry.dial_addrs.lookup());
+    let own_id = crate::dht::routing::NodeId::from_bytes(*infra.ep.id().as_bytes());
+    reachability::report(
+        &infra.node_metrics,
+        cfg.network.bind_port,
+        &registry.dial_addrs.get(&own_id).unwrap_or_default(),
+    );
     // The registry route MUST stay live through drain (its staker set gates DHT
     // admission), which forces the single poller stop to the LATE point below.
     poller_routes.push(registry.route);
@@ -2891,25 +2911,25 @@ async fn build_endpoint(
     let bind_v4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, bind_port);
     let bind_v6 = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, bind_port, 0, 0);
 
-    // Base preset selection is the discovery-provider seam (#818, see
-    // adr/appendix-poc-production-seams.md): with no `network.discovery` keys we
-    // keep `presets::N0` (n0-hosted pkarr/DNS lookup + n0 relay defaults,
-    // unchanged back-compat); with operator discovery configured we drop to
-    // `presets::Minimal` (crypto provider only) and compose exactly the
-    // configured lookup legs. Discovery and relay are independent legs:
-    // `Minimal` sets NO relay mode, so when no custom relay map is configured we
-    // must restore the n0 relay default the `N0` preset would have applied —
-    // dropping the n0 *discovery* leg must not silently disable relays. A custom
-    // `network.relay_urls` map (if any) is applied for both bases below.
+    // Discovery selection is the discovery-provider seam (#818, see
+    // adr/appendix-poc-production-seams.md). Both branches start from
+    // `presets::Minimal` (crypto provider only) and compose the lookup legs
+    // explicitly, so the node's own pkarr publisher carries
+    // `node_publish_filter` (relay URL plus public IPs) rather than iroh's
+    // relay-only default (ADR 001 § Node Discovery). With no `network.discovery`
+    // keys the legs are the n0-hosted pkarr publisher and DNS lookup that
+    // `presets::N0` wires; with operator discovery configured they are exactly
+    // the configured legs. Discovery and relay are independent legs: `Minimal`
+    // sets NO relay mode, so the n0 relay default is restored here, and a custom
+    // `network.relay_urls` map (if any) replaces it below.
     let mut builder = if discovery.is_empty() {
-        Endpoint::builder(presets::N0)
+        Endpoint::builder(presets::Minimal)
+            .address_lookup(PkarrPublisher::n0_dns().addr_filter(node_publish_filter()))
+            .address_lookup(DnsAddressLookup::n0_dns())
     } else {
-        let mut b = add_discovery_lookups(Endpoint::builder(presets::Minimal), discovery)?;
-        if relay_urls.is_empty() {
-            b = b.relay_mode(RelayMode::Default);
-        }
-        b
+        add_discovery_lookups(Endpoint::builder(presets::Minimal), discovery)?
     };
+    builder = builder.relay_mode(RelayMode::Default);
 
     builder = builder
         .secret_key(secret_key.clone())
@@ -2984,8 +3004,8 @@ fn warn_if_no_ipv6_socket(bound: &[SocketAddr], bind_v6: SocketAddrV6) -> bool {
 /// where they become iroh providers.
 ///
 /// - `pkarr_url` + `dns_origin` wire a `PkarrPublisher` (this node publishes its
-///   signed address record) and a `DnsAddressLookup` (it resolves peers via DNS
-///   TXT). The endpoint builder pulls this node's secret key and TLS config into
+///   signed address record, filtered by `node_publish_filter`) and a
+///   `DnsAddressLookup` (it resolves peers via DNS TXT). The endpoint builder pulls this node's secret key and TLS config into
 ///   the publisher automatically, so we do not pass the key here.
 /// - `peers` seed a `MemoryLookup` static address book.
 ///
@@ -3010,7 +3030,8 @@ fn add_discovery_lookups(
                 redact_userinfo(pkarr)
             )
         })?;
-        builder = builder.address_lookup(PkarrPublisher::builder(url));
+        builder =
+            builder.address_lookup(PkarrPublisher::builder(url).addr_filter(node_publish_filter()));
     }
     if let Some(origin) = &discovery.dns_origin {
         builder = builder.address_lookup(DnsAddressLookup::builder(origin.clone()));
@@ -5108,8 +5129,8 @@ mod tests {
 
     #[tokio::test]
     async fn build_endpoint_uses_n0_when_discovery_empty() {
-        // Empty discovery keeps the `presets::N0` base (back-compat). The preset
-        // choice isn't introspectable, so assert bring-up still binds cleanly.
+        // Empty discovery composes the n0 pkarr publisher and DNS lookup. The
+        // lookup legs aren't introspectable, so assert bring-up binds cleanly.
         let sk = SecretKey::generate();
         let transport = quic_transport_config().unwrap();
         let ep = build_endpoint(&sk, 0, &[], &ResolvedDiscovery::default(), transport)

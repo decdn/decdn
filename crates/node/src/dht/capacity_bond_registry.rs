@@ -1,25 +1,29 @@
-//! One `CapacityBond` watcher feeding four registry projections.
+//! One `CapacityBond` watcher feeding five registry projections.
 //!
 //! [`ChainStakerSet`] (membership: `NodeId → active?`), [`ChainNodeAddressDirectory`]
 //! (bindings: `NodeId → operator address`), the region map (`NodeId → regionHint`),
-//! and the operator reverse map (`operator address → NodeId`) are all derived
-//! from the same `CapacityBond` contract. This module runs one enumeration and
-//! one `eth_getLogs` loop over the shared `CapacityBond` address, demuxing to
-//! all four projections; node-address's two topics are a strict *subset* of
-//! the route's seven. `RegionUpdated` feeds the region map alone.
+//! the operator reverse map (`operator address → NodeId`), and the
+//! [`DialAddrDirectory`] (`NodeId → registry multiaddrs`, as iroh direct-dial
+//! addresses) are all derived from the same `CapacityBond` contract. This module
+//! runs one enumeration and one `eth_getLogs` loop over the shared
+//! `CapacityBond` address, demuxing to all five projections; node-address's two
+//! topics are a strict *subset* of the route's eight. `RegionUpdated` feeds the
+//! region map alone, and `NodeMultiaddrUpdated` the dial-address directory alone.
 //!
 //! Bindings is gated on `cache.node_to_node_pull_through_enabled`: when
-//! pull-through is off, the bindings projection is not built at all. Regions
-//! and the operator reverse map are always built, regardless of pull-through —
-//! the ADR-030 selection penalty needs the region map unconditionally, and the
-//! chain-backed origin directory needs the reverse map to resolve operators
-//! locally with no `nodeIdOf` RPC.
+//! pull-through is off, the bindings projection is not built at all. Regions,
+//! the operator reverse map, and the dial-address directory are always built,
+//! regardless of pull-through — the ADR-030 selection penalty needs the region
+//! map unconditionally, the chain-backed origin directory needs the reverse map
+//! to resolve operators locally with no `nodeIdOf` RPC, and every node dial
+//! (DHT included) resolves direct addresses through the dial-address directory.
 //!
 //! # What actually differs between the projections
 //!
 //! Mostly the **enumeration**. The live event arms are close to a clean union:
 //! `NodeRegistered` inserts into active, bindings (if built), regions (if
-//! non-empty), and the reverse map, all unfiltered — staker-set's live arm
+//! non-empty), the reverse map, and the dial-address directory (if any address
+//! decodes), all unfiltered — staker-set's live arm
 //! applies no `isActive` check either (its filter is bootstrap-only). It is
 //! tempting to read "staker-set is the filtered view, the rest are the
 //! unfiltered ones" as a live-path difference and encode it in the sink; that
@@ -32,8 +36,9 @@
 //!   unbonding AND not ejected) alongside the `_registeredAddrs` page.
 //! - `bindings` applies no filter: an operator mid-unbonding has `isActive =
 //!   false` but is still payable, so its binding must survive.
-//! - `regions` and the reverse map are likewise unfiltered: liveness is applied
-//!   separately at read time via the shared `StakerSet`.
+//! - `regions`, the reverse map, and the dial-address directory are likewise
+//!   unfiltered: liveness is applied separately at read time via the shared
+//!   `StakerSet`, and an inactive node stays dialable for channel settlement.
 //!
 //! # Fatality
 //!
@@ -42,12 +47,13 @@
 //! fault or an exhausted budget propagates. The bindings projection (pull-through is
 //! opportunistic, so it would otherwise be non-fatal) has **no RPC of its own**:
 //! it is derived from page data already in hand and cannot fail independently.
-//! The same is true of regions and the reverse map. A node either boots with
-//! all four projections or fails at the one shared read, so pull-through is
+//! The same is true of regions, the reverse map, and the dial-address directory.
+//! A node either boots with all five projections or fails at the one shared read, so pull-through is
 //! never lost on its own.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -57,6 +63,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
+use decdn_incentive::node_register::decode_dial_addrs;
 use decdn_protocol::Region;
 use tracing::{debug, info, warn};
 
@@ -67,6 +74,7 @@ use crate::chain_events::shared_head::{HeadSource, snapshot_block};
 use crate::chain_events::timed;
 use crate::dht::chain_projection::{with_read, with_write};
 use crate::dht::chain_staker_set::{ChainStakerSet, StakerChange, apply_change};
+use crate::dht::dial_addrs::DialAddrDirectory;
 use crate::dht::node_address::{
     ChainNodeAddressDirectory, NodeAddressResolver, remove_binding, set_binding,
 };
@@ -106,6 +114,9 @@ pub struct RegistryHandles {
     /// the pull-through-gated `bindings`) so the chain-backed origin directory
     /// can resolve operators locally with no `nodeIdOf` RPC.
     pub operator_to_node: Arc<RwLock<HashMap<Address, NodeId>>>,
+    /// `NodeId → registry-published direct dial addresses`, always built. The
+    /// runtime adds its [`DialAddrDirectory::lookup`] to the node's endpoint.
+    pub dial_addrs: DialAddrDirectory,
     /// The membership/binding [`Route`] the runtime registers on the shared
     /// multiplexed poller. The poller stops *after* `router.shutdown` because
     /// this route's staker-set projection gates DHT admission during drain.
@@ -143,18 +154,22 @@ pub(crate) trait RegistryChainReads: Send + Sync {
     /// tick lost to RPC backoff advances nothing but is not replayed. Neither
     /// shows up as an error, so without a periodic authoritative re-read the
     /// only repair for a drifted set is a process restart.
-    #[allow(clippy::type_complexity)] // (active set, bindings, reverse map, regions) — the four projections
-    fn full_snapshot(
-        &self,
-        at: u64,
-    ) -> impl Future<
-        Output = Result<(
-            HashSet<NodeId>,
-            HashMap<NodeId, Address>,
-            HashMap<Address, NodeId>,
-            HashMap<NodeId, String>,
-        )>,
-    > + Send;
+    fn full_snapshot(&self, at: u64) -> impl Future<Output = Result<RegistrySnapshot>> + Send;
+}
+
+/// The five registry projections one `getRegisteredNodes` enumeration derives.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RegistrySnapshot {
+    /// `isActive`-filtered membership.
+    pub(crate) active: HashSet<NodeId>,
+    /// `NodeId → operator address`, unfiltered.
+    pub(crate) bindings: HashMap<NodeId, Address>,
+    /// `operator address → NodeId`, the inverse of `bindings`.
+    pub(crate) operator_to_node: HashMap<Address, NodeId>,
+    /// `NodeId → canonical regionHint`; an empty or invalid hint has no entry.
+    pub(crate) regions: HashMap<NodeId, String>,
+    /// `NodeId → decoded registry multiaddrs`; a node with none has no entry.
+    pub(crate) dial_addrs: HashMap<NodeId, Vec<SocketAddr>>,
 }
 
 /// Production [`RegistryChainReads`] over the live contract.
@@ -174,15 +189,7 @@ impl<P: Provider + Clone> RegistryChainReads for ContractReads<P> {
         .await
     }
 
-    async fn full_snapshot(
-        &self,
-        at: u64,
-    ) -> Result<(
-        HashSet<NodeId>,
-        HashMap<NodeId, Address>,
-        HashMap<Address, NodeId>,
-        HashMap<NodeId, String>,
-    )> {
+    async fn full_snapshot(&self, at: u64) -> Result<RegistrySnapshot> {
         bootstrap_registry(&self.registry, BlockId::number(at)).await
     }
 
@@ -225,6 +232,9 @@ pub(crate) struct RegistrySink<R> {
     /// operator keeps its reverse entry, since liveness is applied separately
     /// at read time via the shared `StakerSet`.
     pub(crate) operator_to_node: Arc<RwLock<HashMap<Address, NodeId>>>,
+    /// `NodeId → registry multiaddrs`. Always built and unfiltered, like
+    /// `regions`.
+    pub(crate) dial_addrs: DialAddrDirectory,
     pub(crate) metrics: Arc<Metrics>,
     /// How often [`RegistryChainReads::full_snapshot`] re-derives both
     /// projections. Deliberately a constant rather than a config knob: it is a
@@ -243,8 +253,15 @@ pub(crate) struct RegistrySink<R> {
 impl<R: RegistryChainReads> RegistrySink<R> {
     /// `NodeRegistered`: active insert (unfiltered — see the module doc) AND a
     /// binding insert.
-    fn on_registered(&self, node_id: NodeId, eth_address: Address, region: &str) {
+    fn on_registered(
+        &self,
+        node_id: NodeId,
+        eth_address: Address,
+        region: &str,
+        multiaddrs: &[u8],
+    ) {
         apply_change(&self.active, &self.metrics, StakerChange::Active(node_id));
+        self.dial_addrs.set(node_id, decode_dial_addrs(multiaddrs));
         if let Some(bindings) = &self.bindings {
             set_binding(bindings, &self.metrics, node_id, eth_address);
         }
@@ -258,11 +275,11 @@ impl<R: RegistryChainReads> RegistrySink<R> {
         }
     }
 
-    /// `NodeDeregistered`: the binding and region are cleared only here —
-    /// `registerNode` sets them, `deregisterNode` clears them, and
-    /// `updateRegion` replaces the region ([`Self::on_region_updated`]).
-    /// Bond/unbonding/ejection transitions flip `isActive` without touching
-    /// either.
+    /// `NodeDeregistered`: the binding, region, and dial addresses are cleared
+    /// only here — `registerNode` sets them, `deregisterNode` clears them,
+    /// `updateRegion` replaces the region ([`Self::on_region_updated`]), and
+    /// `updateMultiaddrs` replaces the dial addresses. Bond/unbonding/ejection
+    /// transitions flip `isActive` without touching any of them.
     fn on_deregistered(&self, node_id: NodeId) {
         apply_change(&self.active, &self.metrics, StakerChange::Inactive(node_id));
         if let Some(bindings) = &self.bindings {
@@ -277,6 +294,7 @@ impl<R: RegistryChainReads> RegistrySink<R> {
         with_write(&self.regions, "chain region directory", |m| {
             m.remove(&node_id);
         });
+        self.dial_addrs.remove(&node_id);
     }
 
     /// `RegionUpdated`: the region map follows the operator's new
@@ -356,42 +374,39 @@ impl<R: RegistryChainReads> RegistrySink<R> {
     /// already applied above it. Replacing the projections wholesale would roll
     /// those back until the next resync. A node changed above `at` keeps its
     /// current entry in every projection; every other node takes the snapshot's.
-    fn overlay_tail_changes(
-        &mut self,
-        at: u64,
-        active: &mut HashSet<NodeId>,
-        bindings: &mut HashMap<NodeId, Address>,
-        operator_to_node: &mut HashMap<Address, NodeId>,
-        regions: &mut HashMap<NodeId, String>,
-    ) {
+    fn overlay_tail_changes(&mut self, at: u64, snap: &mut RegistrySnapshot) {
         self.tail_changes.retain(|_, block| *block > at);
         for node_id in self.tail_changes.keys() {
             if with_read(&self.active, "chain staker set", |set| {
                 set.contains(node_id)
             }) {
-                active.insert(*node_id);
+                snap.active.insert(*node_id);
             } else {
-                active.remove(node_id);
+                snap.active.remove(node_id);
             }
             if let Some(current) = &self.bindings {
                 match with_read(current, "chain node-address directory", |m| {
                     m.get(node_id).copied()
                 }) {
-                    Some(addr) => bindings.insert(*node_id, addr),
-                    None => bindings.remove(node_id),
+                    Some(addr) => snap.bindings.insert(*node_id, addr),
+                    None => snap.bindings.remove(node_id),
                 };
             }
             match with_read(&self.regions, "chain region directory", |m| {
                 m.get(node_id).cloned()
             }) {
-                Some(region) => regions.insert(*node_id, region),
-                None => regions.remove(node_id),
+                Some(region) => snap.regions.insert(*node_id, region),
+                None => snap.regions.remove(node_id),
             };
-            operator_to_node.retain(|_, nid| nid != node_id);
+            match self.dial_addrs.get(node_id) {
+                Some(addrs) => snap.dial_addrs.insert(*node_id, addrs),
+                None => snap.dial_addrs.remove(node_id),
+            };
+            snap.operator_to_node.retain(|_, nid| nid != node_id);
             with_read(&self.operator_to_node, "chain operator reverse map", |m| {
                 for (addr, nid) in m {
                     if nid == node_id {
-                        operator_to_node.insert(*addr, *nid);
+                        snap.operator_to_node.insert(*addr, *nid);
                     }
                 }
             });
@@ -400,7 +415,7 @@ impl<R: RegistryChainReads> RegistrySink<R> {
 }
 
 impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
-    #[allow(clippy::cognitive_complexity)]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)] // one flat arm per event
     async fn apply(&mut self, log: Log) -> Result<()> {
         // A log without a block number never comes back from `eth_getLogs`; one
         // that did would count as the newest change, which a resync keeps.
@@ -410,7 +425,12 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
                 match CapacityBond::NodeRegistered::decode_log_data(&log.inner.data) {
                     Ok(event) => {
                         let node_id = NodeId::from_bytes(event.nodeId.0);
-                        self.on_registered(node_id, event.ethAddress, &event.regionHint);
+                        self.on_registered(
+                            node_id,
+                            event.ethAddress,
+                            &event.regionHint,
+                            &event.multiaddrs,
+                        );
                         Some(node_id)
                     }
                     Err(err) => {
@@ -494,6 +514,23 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
                     }
                 }
             }
+            // `updateMultiaddrs`: the dial-address directory follows the new
+            // record on the tick it lands. An empty or undecodable record is
+            // absence.
+            Some(sig) if sig == CapacityBond::NodeMultiaddrUpdated::SIGNATURE_HASH => {
+                match CapacityBond::NodeMultiaddrUpdated::decode_log_data(&log.inner.data) {
+                    Ok(event) => {
+                        let node_id = NodeId::from_bytes(event.nodeId.0);
+                        self.dial_addrs
+                            .set(node_id, decode_dial_addrs(&event.multiaddrs));
+                        Some(node_id)
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "skipping undecodable NodeMultiaddrUpdated log");
+                        None
+                    }
+                }
+            }
             _ => {
                 debug!(topic0 = ?log.topic0(), "unmatched CapacityBond event in subscribed OR-set");
                 None
@@ -562,7 +599,7 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
             let snapshot = self.reads.full_snapshot(at).await?;
             anyhow::Ok((at, snapshot))
         };
-        let (at, (mut active, mut bindings, mut operator_to_node, mut regions)) = match read.await {
+        let (at, mut snap) = match read.await {
             Ok(read) => read,
             Err(err) => {
                 // `Ok` upward, so the counter is the only thing that moves: an
@@ -574,13 +611,14 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
             }
         };
 
-        self.overlay_tail_changes(
-            at,
-            &mut active,
-            &mut bindings,
-            &mut operator_to_node,
-            &mut regions,
-        );
+        self.overlay_tail_changes(at, &mut snap);
+        let RegistrySnapshot {
+            active,
+            bindings,
+            operator_to_node,
+            regions,
+            dial_addrs,
+        } = snap;
         let active_len = active.len();
         let binding_len = bindings.len();
         with_write(&self.active, "chain staker set", |set| *set = active);
@@ -595,6 +633,7 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
         with_write(&self.regions, "chain region directory", |map| {
             *map = regions;
         });
+        self.dial_addrs.replace_all(dial_addrs);
         publish_region_counts(&self.active, &self.regions, &self.metrics);
         self.metrics.capacity_bond_registry_resync();
         debug!(
@@ -616,17 +655,17 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
 /// lose the only repair for a drifted set short of a process restart.
 const REGISTRY_RESYNC_INTERVAL: Duration = Duration::from_mins(15);
 
-/// One paginated `getRegisteredNodes` read feeding all four projections.
+/// One paginated `getRegisteredNodes` read feeding all five projections.
 ///
-/// Always returns all four maps and lets the caller drop the unwanted one — a
+/// Always returns all five maps and lets the caller drop the unwanted one — a
 /// `want_bindings: bool` parameter would be a boolean trap, and building the map
 /// is free while already iterating the page. See the module doc for why `active`
 /// is `isActive`-filtered and `bindings` is not: `getRegisteredNodes` computes
 /// `isActive` per entry on-chain and returns it as a parallel `active[]`, so a
 /// single call per page derives `active` and `bindings` with no per-entry
 /// round-trip. `operator_to_node` is the inverse of `bindings`, built from the
-/// same page with no chain call of its own; like `regions` it is unfiltered and
-/// always built.
+/// same page with no chain call of its own; like `regions` and `dial_addrs` it
+/// is unfiltered and always built.
 ///
 /// Every page reads at `at`, the snapshot block, so the pages agree with each
 /// other: a load-balanced provider cannot answer one page from a lagging
@@ -634,19 +673,11 @@ const REGISTRY_RESYNC_INTERVAL: Duration = Duration::from_mins(15);
 async fn bootstrap_registry<P>(
     registry: &CapacityBond::CapacityBondInstance<P>,
     at: BlockId,
-) -> Result<(
-    HashSet<NodeId>,
-    HashMap<NodeId, Address>,
-    HashMap<Address, NodeId>,
-    HashMap<NodeId, String>,
-)>
+) -> Result<RegistrySnapshot>
 where
     P: Provider + Clone,
 {
-    let mut active = HashSet::new();
-    let mut bindings = HashMap::new();
-    let mut operator_to_node = HashMap::new();
-    let mut regions = HashMap::new();
+    let mut snap = RegistrySnapshot::default();
     let mut offset = 0u64;
     loop {
         let resp = timed(
@@ -681,18 +712,22 @@ where
         // an operator mid-unbonding is inactive but still payable.
         for (node, &is_active) in resp.page.iter().zip(resp.active.iter()) {
             let node_id = NodeId::from_bytes(node.nodeId.0);
-            bindings.insert(node_id, node.ethAddress);
-            operator_to_node.insert(node.ethAddress, node_id);
+            snap.bindings.insert(node_id, node.ethAddress);
+            snap.operator_to_node.insert(node.ethAddress, node_id);
             if let Some(region) = canonical_region(&node.regionHint) {
-                regions.insert(node_id, region);
+                snap.regions.insert(node_id, region);
+            }
+            let dial = decode_dial_addrs(&node.multiaddrs);
+            if !dial.is_empty() {
+                snap.dial_addrs.insert(node_id, dial);
             }
             if is_active {
-                active.insert(node_id);
+                snap.active.insert(node_id);
             }
         }
         offset = offset.saturating_add(page_len);
     }
-    Ok((active, bindings, operator_to_node, regions))
+    Ok(snap)
 }
 
 /// Enumerate `CapacityBond` once, then spawn the single watcher that keeps both
@@ -728,7 +763,13 @@ where
     // head so every upstream behind a load-balanced RPC can serve the pages.
     let (
         snapshot_block,
-        (initial_active, initial_bindings, initial_operator_to_node, initial_regions),
+        RegistrySnapshot {
+            active: initial_active,
+            bindings: initial_bindings,
+            operator_to_node: initial_operator_to_node,
+            regions: initial_regions,
+            dial_addrs: initial_dial_addrs,
+        },
     ) = boot
         .run("CapacityBond registry snapshot", || async {
             let snapshot_block = reads
@@ -744,6 +785,7 @@ where
     info!(
         active_count = initial_active.len(),
         binding_count = initial_bindings.len(),
+        dial_addr_count = initial_dial_addrs.len(),
         track_node_addresses,
         snapshot_block,
         %registry_addr,
@@ -760,6 +802,8 @@ where
     let bindings = track_node_addresses.then(|| Arc::new(RwLock::new(initial_bindings)));
     let operator_to_node = Arc::new(RwLock::new(initial_operator_to_node));
     let regions = Arc::new(RwLock::new(initial_regions));
+    let dial_addrs = DialAddrDirectory::default();
+    dial_addrs.replace_all(initial_dial_addrs);
     publish_region_counts(&active, &regions, &metrics);
 
     // Bootstrap IS a successful re-enumeration — the same `getRegisteredNodes`
@@ -775,6 +819,7 @@ where
         bindings: bindings.clone(),
         operator_to_node: Arc::clone(&operator_to_node),
         regions: Arc::clone(&regions),
+        dial_addrs: dial_addrs.clone(),
         metrics: Arc::clone(&metrics),
         resync_interval: REGISTRY_RESYNC_INTERVAL,
         // The bootstrap enumeration just ran, so the first backstop resync is
@@ -816,6 +861,7 @@ where
         node_addresses,
         regions,
         operator_to_node,
+        dial_addrs,
         route,
     })
 }
@@ -872,7 +918,8 @@ pub(crate) fn region_of(
 }
 
 /// The registry route's demux key: every `CapacityBond` staker-membership
-/// event, plus `RegionUpdated` for the region map. Split out from [`bootstrap`] so the exact topic0 set is unit-testable
+/// event, plus `RegionUpdated` for the region map and `NodeMultiaddrUpdated`
+/// for the dial-address directory. Split out from [`bootstrap`] so the exact topic0 set is unit-testable
 /// without a provider.
 fn registry_route_topic0s() -> Vec<B256> {
     vec![
@@ -883,6 +930,7 @@ fn registry_route_topic0s() -> Vec<B256> {
         CapacityBond::UnbondingRequested::SIGNATURE_HASH,
         CapacityBond::EjectedByBlacklist::SIGNATURE_HASH,
         CapacityBond::RegionUpdated::SIGNATURE_HASH,
+        CapacityBond::NodeMultiaddrUpdated::SIGNATURE_HASH,
     ]
 }
 
@@ -906,7 +954,8 @@ mod tests {
     use alloy::primitives::{Bytes, LogData};
 
     /// The registry route watches exactly the six `CapacityBond`
-    /// staker-membership events — no more, no fewer.
+    /// staker-membership events plus the region and multiaddr updates — no
+    /// more, no fewer.
     ///
     /// `EjectedByBlacklist` is load-bearing and was absent until #1030: it is
     /// the only event that reports a blacklist ejection, `ejected` is a conjunct
@@ -924,6 +973,7 @@ mod tests {
                 CapacityBond::UnbondingRequested::SIGNATURE_HASH,
                 CapacityBond::EjectedByBlacklist::SIGNATURE_HASH,
                 CapacityBond::RegionUpdated::SIGNATURE_HASH,
+                CapacityBond::NodeMultiaddrUpdated::SIGNATURE_HASH,
             ]
         );
     }
@@ -1063,19 +1113,11 @@ mod tests {
         Address::from([byte; 20])
     }
 
-    /// The four registry projections, as `full_snapshot` returns them.
-    type Snapshot = (
-        HashSet<NodeId>,
-        HashMap<NodeId, Address>,
-        HashMap<Address, NodeId>,
-        HashMap<NodeId, String>,
-    );
-
     /// Scripted [`RegistryChainReads`]: no provider, no chain.
     struct StubReads {
         node_id: std::result::Result<Option<(NodeId, bool)>, &'static str>,
         /// What `full_snapshot` returns; `Err` models an unreadable chain.
-        snapshot: std::result::Result<Snapshot, &'static str>,
+        snapshot: std::result::Result<RegistrySnapshot, &'static str>,
         /// What `snapshot_block` returns.
         snapshot_block: u64,
     }
@@ -1084,17 +1126,15 @@ mod tests {
         fn new(node_id: std::result::Result<Option<(NodeId, bool)>, &'static str>) -> Self {
             Self {
                 node_id,
-                snapshot: Ok((
-                    HashSet::new(),
-                    HashMap::new(),
-                    HashMap::new(),
-                    HashMap::new(),
-                )),
+                snapshot: Ok(RegistrySnapshot::default()),
                 snapshot_block: 0,
             }
         }
 
-        fn with_snapshot(mut self, snapshot: std::result::Result<Snapshot, &'static str>) -> Self {
+        fn with_snapshot(
+            mut self,
+            snapshot: std::result::Result<RegistrySnapshot, &'static str>,
+        ) -> Self {
             self.snapshot = snapshot;
             self
         }
@@ -1112,15 +1152,7 @@ mod tests {
             }
         }
 
-        async fn full_snapshot(
-            &self,
-            _at: u64,
-        ) -> Result<(
-            HashSet<NodeId>,
-            HashMap<NodeId, Address>,
-            HashMap<Address, NodeId>,
-            HashMap<NodeId, String>,
-        )> {
+        async fn full_snapshot(&self, _at: u64) -> Result<RegistrySnapshot> {
             match &self.snapshot {
                 Ok(v) => Ok(v.clone()),
                 Err(msg) => Err(anyhow::anyhow!(*msg)),
@@ -1152,6 +1184,7 @@ mod tests {
             bindings: bindings.clone(),
             operator_to_node: Arc::clone(&operator_to_node),
             regions: Arc::clone(&regions),
+            dial_addrs: DialAddrDirectory::default(),
             metrics: Arc::clone(&metrics),
             resync_interval: REGISTRY_RESYNC_INTERVAL,
             last_resync: Some(Instant::now()),
@@ -1523,13 +1556,10 @@ mod tests {
     /// post-swap publish can export the snapshot's region.
     #[tokio::test]
     async fn resync_republishes_the_region_split() {
-        let (active, bindings, operator_to_node, _) = snapshot_of(&[2], &[2]);
-        let snapshot = (
-            active,
-            bindings,
-            operator_to_node,
-            HashMap::from([(nid(2), "JP".to_string())]),
-        );
+        let snapshot = RegistrySnapshot {
+            regions: HashMap::from([(nid(2), "JP".to_string())]),
+            ..snapshot_of(&[2], &[2])
+        };
         let reads = StubReads::new(Ok(None)).with_snapshot(Ok(snapshot));
         let (mut sink, _active, _bindings, _op, _regions, metrics) = sink(reads, true);
         sink.last_resync = None;
@@ -1673,28 +1703,141 @@ mod tests {
         );
     }
 
+    // ── Dial-address directory ──────────────────────────────────────────────
+
+    /// A registry id that is a valid ed25519 key, so the directory also
+    /// publishes it to the iroh lookup.
+    fn dialable(seed: u8) -> (NodeId, iroh::PublicKey) {
+        let pk = iroh::SecretKey::from_bytes(&[seed; 32]).public();
+        (NodeId::from_bytes(*pk.as_bytes()), pk)
+    }
+
+    fn packed(multiaddrs: &[&str]) -> Bytes {
+        let owned: Vec<String> = multiaddrs.iter().map(ToString::to_string).collect();
+        Bytes::from(decdn_incentive::node_register::pack_multiaddrs(&owned).unwrap())
+    }
+
+    fn sock(port: u16) -> SocketAddr {
+        SocketAddr::from(([203, 0, 113, 10], port))
+    }
+
+    fn registered_log_multiaddrs(id: NodeId, operator: Address, multiaddrs: Bytes) -> Log {
+        let event = CapacityBond::NodeRegistered {
+            nodeId: B256::from(*id.as_bytes()),
+            ethAddress: operator,
+            multiaddrs,
+            regionHint: String::new(),
+            bindingNonce: 1,
+            registrationNonce: 1,
+        };
+        log_from(event.encode_log_data())
+    }
+
+    fn multiaddr_updated_log(id: NodeId, multiaddrs: Bytes) -> Log {
+        let event = CapacityBond::NodeMultiaddrUpdated {
+            nodeId: B256::from(*id.as_bytes()),
+            multiaddrs,
+        };
+        log_from(event.encode_log_data())
+    }
+
+    /// The directory follows a node's registry record through its lifecycle:
+    /// `NodeRegistered` sets it, `NodeMultiaddrUpdated` replaces it (an empty
+    /// record clears it), and `NodeDeregistered` removes it. Each change reaches
+    /// the iroh lookup the endpoint resolves bare-id dials through.
+    #[tokio::test]
+    async fn dial_addrs_follow_register_update_and_deregister() {
+        let (mut s, _active, _bindings, _op, _regions, _m) = sink(ok_reads(), false);
+        let (id, pk) = dialable(1);
+        let in_lookup = |s: &RegistrySink<StubReads>| {
+            s.dial_addrs.lookup().get_endpoint_info(pk).map(|info| {
+                info.to_endpoint_addr()
+                    .ip_addrs()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        s.apply(registered_log_multiaddrs(
+            id,
+            addr(9),
+            packed(&["/ip4/203.0.113.10/udp/4433/quic-v1"]),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(s.dial_addrs.get(&id), Some(vec![sock(4433)]));
+        assert_eq!(in_lookup(&s), Some(vec![sock(4433)]));
+
+        s.apply(multiaddr_updated_log(
+            id,
+            packed(&["/ip4/203.0.113.10/udp/5000/quic-v1"]),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(in_lookup(&s), Some(vec![sock(5000)]), "update replaces");
+
+        s.apply(multiaddr_updated_log(id, Bytes::new()))
+            .await
+            .unwrap();
+        assert_eq!(s.dial_addrs.get(&id), None, "an empty record clears");
+        assert_eq!(in_lookup(&s), None);
+
+        s.apply(multiaddr_updated_log(
+            id,
+            packed(&["/ip4/203.0.113.10/udp/4433/quic-v1"]),
+        ))
+        .await
+        .unwrap();
+        s.apply(deregistered_log(id)).await.unwrap();
+        assert_eq!(s.dial_addrs.get(&id), None, "deregistration removes");
+        assert_eq!(in_lookup(&s), None);
+    }
+
+    /// A resync swaps the dial-address directory like every other projection:
+    /// a node the snapshot no longer lists leaves, one it lists arrives, and a
+    /// node the tail changed above the snapshot block keeps its current entry.
+    #[tokio::test]
+    async fn resync_replaces_dial_addrs_and_keeps_tail_changes() {
+        let (stale, _) = dialable(1);
+        let (listed, _) = dialable(2);
+        let (tail, _) = dialable(3);
+        let mut reads = StubReads::new(Ok(None)).with_snapshot(Ok(RegistrySnapshot {
+            dial_addrs: HashMap::from([(listed, vec![sock(2)])]),
+            ..RegistrySnapshot::default()
+        }));
+        reads.snapshot_block = 800;
+        let (mut s, _active, _bindings, _op, _regions, _m) = sink(reads, false);
+        s.dial_addrs.set(stale, vec![sock(1)]);
+        let mut log =
+            registered_log_multiaddrs(tail, addr(3), packed(&["/ip4/203.0.113.10/udp/3/quic-v1"]));
+        log.block_number = Some(900);
+        s.apply(log).await.unwrap();
+        s.last_resync = None;
+
+        s.on_tick_complete().await.unwrap();
+
+        assert_eq!(s.dial_addrs.get(&stale), None);
+        assert_eq!(s.dial_addrs.get(&listed), Some(vec![sock(2)]));
+        assert_eq!(
+            s.dial_addrs.get(&tail),
+            Some(vec![sock(3)]),
+            "a tail change above the snapshot block survives the resync"
+        );
+    }
+
     // ── Periodic re-enumeration ─────────────────────────────────────────────
     //
     // The self-healing leg. Every other input to these projections is an event,
     // and a missed or orphaned event never surfaces as an error — so without
     // this, a drifted set is only repaired by restarting the process.
 
-    #[allow(clippy::type_complexity)] // (active set, bindings, reverse map, regions) — the four projections
-    fn snapshot_of(
-        ids: &[u8],
-        addrs: &[u8],
-    ) -> (
-        HashSet<NodeId>,
-        HashMap<NodeId, Address>,
-        HashMap<Address, NodeId>,
-        HashMap<NodeId, String>,
-    ) {
-        let active: HashSet<NodeId> = ids.iter().map(|b| nid(*b)).collect();
-        let bindings: HashMap<NodeId, Address> =
-            addrs.iter().map(|b| (nid(*b), addr(*b))).collect();
-        let operator_to_node: HashMap<Address, NodeId> =
-            addrs.iter().map(|b| (addr(*b), nid(*b))).collect();
-        (active, bindings, operator_to_node, HashMap::new())
+    fn snapshot_of(ids: &[u8], addrs: &[u8]) -> RegistrySnapshot {
+        RegistrySnapshot {
+            active: ids.iter().map(|b| nid(*b)).collect(),
+            bindings: addrs.iter().map(|b| (nid(*b), addr(*b))).collect(),
+            operator_to_node: addrs.iter().map(|b| (addr(*b), nid(*b))).collect(),
+            ..RegistrySnapshot::default()
+        }
     }
 
     /// A due resync replaces both projections wholesale, so an entry the event
@@ -1714,7 +1857,7 @@ mod tests {
         let got = active.read().unwrap().clone();
         assert_eq!(
             got,
-            snapshot_of(&[2, 3], &[]).0,
+            snapshot_of(&[2, 3], &[]).active,
             "stale entry dropped, missing one restored"
         );
         let b = bindings.unwrap();

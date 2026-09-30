@@ -496,6 +496,19 @@ pub struct DecdnMetrics {
     /// applicable." Operator-visible name:
     /// `decdn_dispatch_per_source_skipped_no_addr_total`.
     pub dispatch_per_source_skipped_no_addr: Counter,
+    /// Inbound connections (all ALPNs) that arrived with a direct IP path.
+    /// Operator-visible name: `decdn_inbound_connections_direct_total`.
+    pub inbound_connections_direct: Counter,
+    /// Inbound connections (all ALPNs) that arrived over the relay only, with
+    /// no direct IP path at accept time. Expected on a node behind NAT; on a
+    /// node with a public address it means dialers did not find or reach that
+    /// address. Operator-visible name:
+    /// `decdn_inbound_connections_relayed_total`.
+    pub inbound_connections_relayed: Counter,
+    /// `1` when the host's default route has a public source address (ADR 001
+    /// § Node Discovery), `0` when the node is behind NAT. Sampled at
+    /// bring-up. Operator-visible name: `decdn_node_public_address`.
+    pub node_public_address: Gauge,
     /// `decdn_probe_hold_unavailable_total{reason}` per the canonical metric
     /// registry (`adr/appendix-observability.md` — the authoritative naming
     /// source, superseding informal ADR-005 references): a probe for a present
@@ -3334,6 +3347,15 @@ recorders! {
     /// layer was enabled but no peer IP could be resolved at accept
     /// time.
     dispatch_per_source_skipped_no_addr => dispatch_per_source_skipped_no_addr.inc();
+
+    /// Record an inbound connection that arrived with a direct IP path.
+    inbound_connection_direct => inbound_connections_direct.inc();
+
+    /// Record an inbound connection that arrived over the relay only.
+    inbound_connection_relayed => inbound_connections_relayed.inc();
+
+    /// Set whether the host has a public address on its default route.
+    node_public_address(public: bool) => node_public_address.set(i64::from(public));
 
     /// Record a `cdn/dht/v1` request rejected at the per-peer layer.
     dht_rate_limit_rejected_per_peer => dht_rate_limit_rejected_per_peer.inc();

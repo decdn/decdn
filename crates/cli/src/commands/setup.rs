@@ -249,7 +249,8 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                 .context("failed to write dry-run bond plan")?;
         }
         let readiness = read_readiness(&bond_contract, operator).await?;
-        emit_readiness(json, &readiness, &args.region, args.multiaddrs.len());
+        let multiaddr_count = register::registration_multiaddrs(&args.multiaddrs, &file).len();
+        emit_readiness(json, &readiness, &args.region, multiaddr_count);
         if json {
             println!(
                 "{}",
@@ -264,7 +265,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                     None,
                     None,
                     &args.region,
-                    args.multiaddrs.len(),
+                    multiaddr_count,
                 )
             );
         }
@@ -374,6 +375,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             if !json {
                 println!("register:");
             }
+            let multiaddrs = register::registration_multiaddrs(&args.multiaddrs, &file);
             let outcome = register::submit_registration(
                 &provider,
                 &signer,
@@ -381,7 +383,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                 cb_addr,
                 resolved.chain_id,
                 &args.region,
-                &args.multiaddrs,
+                &multiaddrs,
                 terms_hash,
                 false,
                 &mut register_tx,
@@ -405,6 +407,10 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     }
     .await;
 
+    // What registration actually submitted, defaulted multiaddrs included.
+    let multiaddr_count = register_outcome
+        .as_ref()
+        .map_or(args.multiaddrs.len(), |o| o.multiaddr_count);
     let summary = |readiness: Option<&Readiness>| {
         build_summary(
             &pf,
@@ -417,7 +423,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             Some(terms_hash.is_some()),
             register_tx,
             &args.region,
-            args.multiaddrs.len(),
+            multiaddr_count,
         )
     };
 
@@ -456,7 +462,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         }
     };
 
-    emit_readiness(json, &readiness, &args.region, args.multiaddrs.len());
+    emit_readiness(json, &readiness, &args.region, multiaddr_count);
     if json {
         println!("{}", summary(Some(&readiness)));
     }

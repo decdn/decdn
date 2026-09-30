@@ -30,6 +30,21 @@ pub use types::FileConfig;
 
 /// Default QUIC bind port.
 const DEFAULT_BIND_PORT: u16 = 4433;
+
+/// The daemon's QUIC bind port as a command without `RunArgs` resolves it:
+/// `DECDN_BIND_PORT`, then `file_bind_port` (the config file's
+/// `network.bind_port`), then the default. The same precedence
+/// [`resolve_config`] applies, minus the `--bind-port` flag that only
+/// `decdn-node run` takes. An unparseable env value falls through to the file,
+/// as the daemon would reject it at bring-up anyway.
+#[must_use]
+pub fn configured_bind_port(file_bind_port: Option<u16>) -> u16 {
+    std::env::var("DECDN_BIND_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .or(file_bind_port)
+        .unwrap_or(DEFAULT_BIND_PORT)
+}
 /// Default maximum cache size in megabytes (100 GB) — sized for the large-file
 /// (AI model) wedge, where a node holds many multi-GB shards.
 const DEFAULT_CACHE_SIZE_MB: u64 = 102_400;

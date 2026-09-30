@@ -19,4 +19,5 @@ pub mod config;
 pub mod data_dir;
 pub mod disk;
 pub mod identity;
+pub mod net;
 pub mod redact;

@@ -568,10 +568,11 @@ pub struct RegisterArgs {
     /// QUIC multiaddr to register, e.g.
     /// `/ip4/203.0.113.10/udp/4433/quic-v1`. Repeatable. The node listens on
     /// the same port over IPv4 and IPv6, so a dual-stack host also registers
-    /// `/ip6/2001:db8::10/udp/4433/quic-v1`. NAT'd nodes may
-    /// register a relay placeholder and promote direct addresses later via
-    /// `updateMultiaddrs`; omitting it entirely registers an empty set and
-    /// relies on `cdn/dht/v1` discovery (ADR 022) for reachability.
+    /// `/ip6/2001:db8::10/udp/4433/quic-v1`. Omitted, it defaults to the
+    /// host's public address on `network.bind_port` when the default route
+    /// has one. A host behind NAT registers none, and peers reach it through
+    /// the relay; pass the forwarded address here if UDP `network.bind_port`
+    /// is forwarded, or add it later with `decdn node update-multiaddrs`.
     #[arg(long = "multiaddr", value_name = "MA")]
     pub multiaddrs: Vec<String>,
 

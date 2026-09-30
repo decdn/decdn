@@ -915,6 +915,34 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Node dials use registry multiaddrs, not only the relay.** A node
+  publishes only its relay URL through pkarr, so a dial by bare node id
+  opened over the relay even when the target registered its QUIC address.
+  The daemon's `CapacityBond` watcher now keeps each node's registry
+  `multiaddrs` in an iroh address lookup on the endpoint, so DHT RPCs and
+  upstream probes and pulls connect directly to a reachable node. The CLI
+  keeps the registry addresses on warming proxies and cold-order
+  pull-through targets, and `decdn node lookup` dials with them.
+  `decdn-client`'s `WarmingCandidate` gains `multiaddrs`. A node's pkarr
+  record now carries its globally routable IP addresses next to the relay
+  URL (private, loopback, link-local and CGNAT addresses stay out), so a
+  node with no or stale registry multiaddrs is still dialable directly by
+  node id, on the n0 pkarr server and on an operator-configured
+  `network.discovery.pkarr_url` alike.
+
+- **Node reachability is reported, and registration defaults `--multiaddr`.**
+  At bring-up the node logs whether its default route has a public address
+  (public) or not (behind NAT, where relayed inbound is expected), sets
+  `decdn_node_public_address`, and warns when a public address is missing
+  from its registry multiaddrs. New counters
+  `decdn_inbound_connections_direct_total` and
+  `decdn_inbound_connections_relayed_total` split inbound connections by
+  arrival path, with a "Reachability" row on the node dashboard and a
+  `DecdnPublicNodeInboundRelayed` alert scoped to public nodes. `decdn
+  doctor` reports the same reachability. `decdn setup` and `decdn node
+  register` without `--multiaddr` now register the host's public address on
+  `network.bind_port`, and register none behind NAT.
+
 - **`bundle pull` no longer counts a resumed `.partial` prefix as downloaded
   (#2236).** A prefix that an earlier, interrupted pull fetched counted again
   in the entry line's downloaded bytes and rate, and in the summary's

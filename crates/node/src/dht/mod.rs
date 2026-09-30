@@ -13,6 +13,7 @@ pub mod chain_origin_directory;
 pub(crate) mod chain_projection;
 pub mod chain_staker_set;
 pub mod client;
+pub mod dial_addrs;
 pub mod lazy_origin_cache;
 pub mod lookup;
 pub mod negative_cache;
