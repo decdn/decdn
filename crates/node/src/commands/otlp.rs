@@ -28,9 +28,10 @@ const OTLP_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 /// hot-reloadable, and a `log_level = "warn"` must not silently stop every
 /// trace. A dependency's `WARN` or `ERROR` event — an alloy RPC failure, an
 /// iroh connection error — lands on the deCDN span it happened in. A
-/// dependency's own spans never export, whatever their level: iroh opens its
-/// periodic net-report spans at `WARN`, and those alone would outnumber every
-/// deCDN span. `debug_span!`s stay local to the logs.
+/// dependency's own spans never export, whatever their level, so a trace holds
+/// deCDN operations only and a library's periodic background work (iroh's
+/// net-report runs, for one) cannot outnumber them. `debug_span!`s stay local
+/// to the logs.
 const EXPORTED_TARGETS: &[&str] = &[
     "decdn_node",
     "decdn_cache",

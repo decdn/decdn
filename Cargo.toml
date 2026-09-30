@@ -73,7 +73,7 @@ decdn-node = { path = "crates/node", version = "0.0.0" }
 # Networking (iroh ecosystem, pinned per ADR 000). The committed Cargo.lock
 # is the true pin; these caret constraints just bound the major. Upgrades are
 # deliberate — bump Cargo.lock and record the new baseline in ADR 000.
-iroh = "1"
+iroh = "1.3"
 iroh-blobs = { version = "0.103", features = ["fs-store"] }
 iroh-metrics = "1"
 # `noq-proto` is iroh 1.x's QUIC protocol crate (its quinn-proto fork). The node
