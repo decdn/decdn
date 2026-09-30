@@ -923,7 +923,12 @@ since project inception and will roll into the first tagged release.
   upstream probes and pulls connect directly to a reachable node. The CLI
   keeps the registry addresses on warming proxies and cold-order
   pull-through targets, and `decdn node lookup` dials with them.
-  `decdn-client`'s `WarmingCandidate` gains `multiaddrs`.
+  `decdn-client`'s `WarmingCandidate` gains `multiaddrs`. A node's pkarr
+  record now carries its globally routable IP addresses next to the relay
+  URL (private, loopback, link-local and CGNAT addresses stay out), so a
+  node with no or stale registry multiaddrs is still dialable directly by
+  node id, on the n0 pkarr server and on an operator-configured
+  `network.discovery.pkarr_url` alike.
 
 - **`bundle pull` no longer counts a resumed `.partial` prefix as downloaded
   (#2236).** A prefix that an earlier, interrupted pull fetched counted again
