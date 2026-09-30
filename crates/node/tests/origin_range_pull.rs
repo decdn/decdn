@@ -3278,7 +3278,7 @@ async fn mid_blob_open_behind_a_paying_owners_frontier_attaches() -> anyhow::Res
         .mount(&server)
         .await;
     // Slow dynamic 206 responder: each draw takes 300 ms, so the owner's fill
-    // is mid-flight when the second open lands.
+    // is still mid-flight after its first voucher, when the second open lands.
     let blob_for_resp = blob.clone();
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
@@ -3390,9 +3390,23 @@ async fn mid_blob_open_behind_a_paying_owners_frontier_attaches() -> anyhow::Res
         )
         .await
     });
-    // Give the owner time to draw its first spans and clear its first voucher,
-    // then open a small range at one group in — far behind the paid frontier.
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    // Wait until the node accepts the owner's first voucher, then open a small
+    // range at one group in, far behind the paid frontier. That voucher pays a
+    // full `CHUNK_BYTES` interval, and the serve leg raises the fill's paid
+    // frontier past it with no await after `decdn_vouchers_received_total`
+    // ticks. So the counter is the signal that the frontier has cleared
+    // `req_off`. The owner is the only payer yet, so every accepted voucher is
+    // its own.
+    let first_voucher = async {
+        while counter_value(&metrics, "vouchers_received_total")? == 0 {
+            anyhow::ensure!(!a.is_finished(), "the owner ended before its first voucher");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        anyhow::Ok(())
+    };
+    tokio::time::timeout(Duration::from_secs(30), first_voucher)
+        .await
+        .map_err(|_| anyhow::anyhow!("the owner's first voucher never landed"))??;
     let (req_off, req_len) = (16 * 1024u64, 32 * 1024u64);
     let got_waiter = ranged_paid_pull(
         &waiter_ep,
