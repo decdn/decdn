@@ -68,7 +68,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal as _;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError};
 
 use alloy::dyn_abi::Eip712Domain;
@@ -944,6 +944,7 @@ fn maybe_select(args: &BundlePullArgs, mut kept: Kept) -> anyhow::Result<Option<
         kept = apply_selection(kept, select_entries)?;
         if kept.manifest.entries.is_empty() {
             report_nothing_to_fetch(NothingReason::Deselected);
+            warn_leftover_partials(&args.output, &[], args.hash.as_deref());
             return Ok(None);
         }
     }
@@ -1249,6 +1250,23 @@ impl DedupOutcome {
             hints_ignored,
         }
     }
+
+    /// This outcome, or, when a drive fetched the whole blob again after its
+    /// finalize failed the hash (`refetched`), one with nothing spliced or
+    /// resumed. That pass dropped every byte the store held and fetched the
+    /// blob in full, and it always ends the entry, so this run paid for all
+    /// of it.
+    const fn refetched_if(self, refetched: bool) -> Self {
+        if refetched {
+            Self {
+                spliced_bytes: 0,
+                resumed_bytes: 0,
+                hints_ignored: self.hints_ignored,
+            }
+        } else {
+            self
+        }
+    }
 }
 
 /// Run-scoped range-dedup counters, shared by every concurrent entry via
@@ -1417,6 +1435,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
             m.entries = entries;
             if m.entries.is_empty() {
                 report_nothing_to_fetch(NothingReason::from_filter(filters_given, raw_empty));
+                warn_leftover_partials(&args.output, &[], None);
                 return Ok(());
             }
             Some(Kept {
@@ -1716,6 +1735,7 @@ async fn obtain_manifest<P: Provider + Clone>(
     m.entries = entries;
     if m.entries.is_empty() {
         report_nothing_to_fetch(NothingReason::from_filter(filters_given, raw_empty));
+        warn_leftover_partials(&args.output, &[], args.hash.as_deref());
         return Ok(None);
     }
     Ok(Some(Kept {
@@ -2024,14 +2044,14 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
     /// Fetch one whole blob into `staging` through the acquire loop (ADR 039),
     /// across the entry's holders ([`Self::entry_targets`]). See
-    /// [`Self::acquire_entry`] for the fetch itself.
+    /// [`Self::acquire_entry`] for the fetch itself and what it returns.
     async fn fetch_to_staging(
         &self,
         hash: [u8; 32],
         staging: &Path,
         total: Option<u64>,
         progress: Option<&ProgressCallback>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let _permit = self
             .gate
             .acquire()
@@ -2100,6 +2120,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// ([`LaneStreamCap`]). Each lane's voucher watermark is persisted before
     /// the result returns, and the `.partial` beside `staging` stays for a
     /// resume.
+    ///
+    /// It returns `true` when the store's finalized file failed its hash and
+    /// the fetch dropped every byte the store held and fetched the blob again
+    /// ([`Downloader::refetched_targets`]). A prefix an earlier run left is
+    /// then fetched and paid again.
     async fn acquire_entry(
         &self,
         targets: &fetch::ResolvedTargets,
@@ -2108,7 +2133,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         total: Option<u64>,
         ranges: Option<&[(u64, u64)]>,
         progress: Option<&ProgressCallback>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
         let deps = self.drive_deps(max_blob_bytes)?;
         let sources = CliSources::new(
@@ -2160,7 +2185,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 &self.stop,
             ))
             .await
-            .map(|_paths| ())
+            .map(|_paths| downloader.refetched_targets() > 0)
         }
         .await;
         on_drop.disarm();
@@ -2509,11 +2534,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             // register its chunks so a *later* entry can dedup against it. The
             // manifest's `size`, when it gives one, is the entry's first size claim,
             // a hint; the paid count is the verified blob's length.
-            self.fetch_to_staging(hash, staging, total, progress)
+            let refetched = self
+                .fetch_to_staging(hash, staging, total, progress)
                 .await?;
             index.register(hints, staging);
             let len = tokio::fs::metadata(staging).await.map_or(0, |m| m.len());
-            return Ok(EntryBytes::whole_blob(len, span_bytes(&resumed)));
+            let resumed = if refetched { 0 } else { span_bytes(&resumed) };
+            return Ok(EntryBytes::whole_blob(len, resumed));
         };
 
         // Dedup path. Hold one fetch permit across the complement drive, the donor
@@ -2536,6 +2563,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             staging,
             total,
             progress,
+            refetched: AtomicBool::new(false),
         };
 
         // On any dedup-path success, true up the file + total progress bars to
@@ -2560,7 +2588,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             file,
             &finish_progress,
         )
-        .await?;
+        .await?
+        .refetched_if(driver.refetched.load(Ordering::Relaxed));
         self.dedup_stats
             .spliced_bytes
             .fetch_add(outcome.spliced_bytes, Ordering::Relaxed);
@@ -2951,6 +2980,9 @@ struct AcquireRangeDriver<'a, P: Provider + Clone> {
     /// The manifest's size: the entry's first size claim.
     total: u64,
     progress: Option<&'a ProgressCallback>,
+    /// Set once a drive's finalize failed its hash and the drive fetched the
+    /// whole blob again ([`PullCtx::acquire_entry`]).
+    refetched: AtomicBool,
 }
 
 impl<P: Provider + Clone> RangeDriver for AcquireRangeDriver<'_, P> {
@@ -2966,14 +2998,23 @@ impl<P: Provider + Clone> RangeDriver for AcquireRangeDriver<'_, P> {
         &'a self,
         ranges: &'a [(u64, u64)],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
-        Box::pin(self.ctx.acquire_entry(
-            self.targets,
-            self.hash,
-            self.staging,
-            Some(self.total),
-            Some(ranges),
-            self.progress,
-        ))
+        Box::pin(async move {
+            let refetched = self
+                .ctx
+                .acquire_entry(
+                    self.targets,
+                    self.hash,
+                    self.staging,
+                    Some(self.total),
+                    Some(ranges),
+                    self.progress,
+                )
+                .await?;
+            if refetched {
+                self.refetched.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        })
     }
 }
 
@@ -4654,8 +4695,9 @@ fn counts_line(rep: &PullReport) -> String {
 
 /// Scan `<out_root>/.decdn-partial` for leftover per-hash staging files —
 /// `<hex>`, `<hex>.partial`, `<hex>.partial.ranges` — whose hash is not in
-/// `keep`, and total them per hash. Other names (a record's temporary file)
-/// are not counted. A missing or unreadable directory holds nothing.
+/// `keep`, and total the disk space they take ([`allocated_bytes`]). Other
+/// names (a record's temporary file) are not counted. A missing or unreadable
+/// directory holds nothing.
 fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
     let Ok(dir) = std::fs::read_dir(out_root.join(STAGING_DIR)) else {
         return Leftovers::default();
@@ -4683,7 +4725,7 @@ fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
         };
         if meta.is_file() {
             blobs.insert(hash);
-            bytes = bytes.saturating_add(meta.len());
+            bytes = bytes.saturating_add(allocated_bytes(&meta));
         }
     }
     Leftovers {
@@ -4692,8 +4734,24 @@ fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
     }
 }
 
-/// Resume state in the staging directory for blobs a run did not select: how
-/// many distinct blobs, and their files' total size on disk.
+/// The disk space a file takes. A range-dedup `.partial` is sized to the whole
+/// blob before any byte lands, so its length can be far above the space that
+/// deleting it frees. On Unix the allocated blocks give that space; elsewhere
+/// the length is the best figure.
+fn allocated_bytes(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
+}
+
+/// Staging files in the staging directory that a run did not use: how many
+/// distinct blobs, and the disk space their files take.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Leftovers {
     blobs: u64,
@@ -4708,22 +4766,24 @@ fn leftover_warning(dir: &Path, leftovers: &Leftovers) -> Option<String> {
     match leftovers.blobs {
         0 => None,
         1 => Some(format!(
-            "1 partial download ({size}) of an entry this run did not select remains in \
+            "1 partial download ({size} on disk) that this run did not use remains in \
              {dir}; delete it to reclaim the space"
         )),
         n => Some(format!(
-            "{n} partial downloads ({size}) of entries this run did not select remain in \
+            "{n} partial downloads ({size} on disk) that this run did not use remain in \
              {dir}; delete them to reclaim the space"
         )),
     }
 }
 
-/// Warn on stderr about leftover staging files of blobs this run did not
-/// select ([`leftover_partials`]): a partial of an entry an earlier run
-/// started, which this run's filter or selection left out. They stay for a
-/// later run that selects the entry again, so the warning only names them and
-/// never deletes them. `entries` are the run's selected entries, and
-/// `bundle_hash` is the `--hash` manifest blob, which is also this run's own.
+/// Warn on stderr about leftover staging files of blobs this run did not use
+/// ([`leftover_partials`]): a partial of an entry an earlier run started,
+/// which this run's filter or selection left out, or one another bundle
+/// pulled into the same output directory left. They stay for a later run that
+/// selects the entry again, so the warning only names them and never deletes
+/// them. `entries` are the run's selected entries (none when the filter or
+/// `--select` emptied the run), and `bundle_hash` is the `--hash` manifest
+/// blob, which is also this run's own.
 fn warn_leftover_partials(out_root: &Path, entries: &[ManifestEntry], bundle_hash: Option<&str>) {
     let keep: HashSet<[u8; 32]> = entries
         .iter()
@@ -7571,8 +7631,9 @@ mod tests {
     }
 
     /// The run-end scan counts the staging files of blobs the run did not
-    /// select, once per blob, and ignores the run's own blobs, the manifest
-    /// blob, and names that are not a blob's staging file (#2190).
+    /// use, once per blob, totals the disk space they take, and ignores the
+    /// run's own blobs, the manifest blob, and names that are not a blob's
+    /// staging file (#2190).
     #[test]
     fn leftover_partials_counts_only_unselected_blobs() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -7601,18 +7662,30 @@ mod tests {
         write("notes.txt".into(), 50);
 
         let keep: HashSet<[u8; 32]> = [[1; 32], [2; 32]].into_iter().collect();
+        let on_disk =
+            |name: String| allocated_bytes(&std::fs::metadata(dir.join(name)).expect("metadata"));
+        let expected = on_disk(format!("{}.partial", hex(3)))
+            + on_disk(format!("{}.partial.ranges", hex(3)))
+            + on_disk(hex(4));
         let leftovers = leftover_partials(tmp.path(), &keep);
         assert_eq!(
             leftovers,
             Leftovers {
                 blobs: 2,
-                bytes: 1210,
+                bytes: expected,
             }
         );
         assert_eq!(
-            leftover_warning(Path::new("/out/.decdn-partial"), &leftovers).as_deref(),
+            leftover_warning(
+                Path::new("/out/.decdn-partial"),
+                &Leftovers {
+                    blobs: 2,
+                    bytes: 1210,
+                }
+            )
+            .as_deref(),
             Some(
-                "2 partial downloads (1.2 KB) of entries this run did not select remain in \
+                "2 partial downloads (1.2 KB on disk) that this run did not use remain in \
                  /out/.decdn-partial; delete them to reclaim the space"
             )
         );
@@ -7626,13 +7699,33 @@ mod tests {
             )
             .as_deref(),
             Some(
-                "1 partial download (1.5 GB) of an entry this run did not select remains in \
+                "1 partial download (1.5 GB on disk) that this run did not use remains in \
                  /out/.decdn-partial; delete it to reclaim the space"
             )
         );
         assert_eq!(
             leftover_warning(Path::new("/out"), &Leftovers::default()),
             None
+        );
+    }
+
+    /// A range-dedup `.partial` sized to the whole blob before its bytes land
+    /// counts only the space it takes, not its length (#2190).
+    #[cfg(unix)]
+    #[test]
+    fn leftover_partials_count_a_sparse_partial_by_its_allocated_space() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = tmp.path().join(STAGING_DIR);
+        std::fs::create_dir_all(&dir).expect("staging dir");
+        let hex = blake3::Hash::from_bytes([9; 32]).to_hex().to_string();
+        let file = std::fs::File::create(dir.join(format!("{hex}.partial"))).expect("create");
+        file.set_len(64 * 1024 * 1024).expect("size the partial");
+        let leftovers = leftover_partials(tmp.path(), &HashSet::new());
+        assert_eq!(leftovers.blobs, 1);
+        assert!(
+            leftovers.bytes < 1024 * 1024,
+            "a hole-only partial takes almost no space: {}",
+            leftovers.bytes
         );
     }
 
