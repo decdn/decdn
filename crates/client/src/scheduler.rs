@@ -1105,6 +1105,40 @@ impl Work {
     }
 }
 
+/// `coverage`'s covered discovery blocks as inclusive runs, `0-22,42-66`, for
+/// a log line; `none` when it covers no block.
+fn block_runs(coverage: &Coverage) -> String {
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for block in coverage.covered_blocks() {
+        match runs.last_mut() {
+            Some((_, end)) if end.checked_add(1) == Some(block) => *end = block,
+            _ => runs.push((block, block)),
+        }
+    }
+    if runs.is_empty() {
+        return "none".to_owned();
+    }
+    runs.iter()
+        .map(|&(start, end)| {
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Byte ranges as `offset+len` runs, `0+1543503872,2818572288+872415232`, for
+/// a log line.
+fn byte_runs(ranges: impl Iterator<Item = (u64, u64)>) -> String {
+    ranges
+        .map(|(start, len)| format!("{start}+{len}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Spread `missing` across lanes of `coverage` (client planner, #1506): each
 /// discovery block goes to one covering lane, rarest-cover-first, in lane order
 /// as rank. The runs are then split further ONLY to reach otherwise-idle lanes:
@@ -2339,6 +2373,13 @@ where
                     {
                         slots.insert(*provider, slot);
                     }
+                    tracing::debug!(
+                        hash = %blake3::Hash::from_bytes(hash).to_hex(),
+                        total_bytes,
+                        lanes = batch.len(),
+                        pending = %byte_runs(w.pending.iter().map(|s| (s.fetch_start(), s.fetch_len()))),
+                        "planned the missing ranges across the first lanes"
+                    );
                 }
                 for (provider, lane) in batch {
                     let slot = if let Some(&slot) = slots.get(&provider) {
@@ -2349,6 +2390,16 @@ where
                         slots.insert(provider, slot);
                         slot
                     };
+                    tracing::debug!(
+                        hash = %blake3::Hash::from_bytes(hash).to_hex(),
+                        %provider,
+                        slot,
+                        coverage = %lane.coverage.as_ref().map_or_else(
+                            || "whole blob".to_owned(),
+                            block_runs,
+                        ),
+                        "lane starts"
+                    );
                     if !started.0.iter().any(|l| Arc::ptr_eq(l, &lane)) {
                         join_pool(&lane, deposit, &pool_lanes);
                         started.0.push(Arc::clone(&lane));
@@ -3005,6 +3056,17 @@ mod tests {
     /// covered: the same shorthand `coverage_plan`'s own tests use.
     fn cov(n: u32, blocks: &[u32]) -> Coverage {
         Coverage::from_block_indices(n, blocks.iter().copied())
+    }
+
+    /// A lane's coverage logs as inclusive block runs, a lone block as itself.
+    #[test]
+    fn coverage_logs_as_block_runs() {
+        assert_eq!(
+            super::block_runs(&cov(70, &[0, 1, 2, 5, 42, 43, 67])),
+            "0-2,5,42-43,67"
+        );
+        assert_eq!(super::block_runs(&cov(4, &[])), "none");
+        assert_eq!(super::block_runs(&Coverage::full(3)), "0-2");
     }
 
     /// Disjoint coverage (#1506): source A holds only discovery block 0, source
