@@ -1862,13 +1862,16 @@ async fn run_open<P: Provider + Clone>(
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
     // Re-check under the slot: a previous open for this owner may have persisted
-    // between the caller's fast-path miss and our claiming the slot.
+    // between the caller's fast-path miss and our claiming the slot. Only a row on
+    // this deployment counts: a foreign row that bootstrap could not drop is
+    // invisible to the fast path too, so treating it as live would skip the open
+    // on every pull.
     match store.get_by_owner(owner) {
-        Ok(Some(_)) => {
+        Ok(Some(state)) if state.is_on(deployment) => {
             debug!("a live buyer pool appeared while claiming the open slot; not opening a second");
             return Ok(());
         }
-        Ok(None) => {}
+        Ok(_) => {}
         Err(err) => {
             error!(error = %err, "buyer pool store read failed under the open slot; cannot open a pool");
             metrics.node_pull_pool_open_failure();
@@ -3001,6 +3004,54 @@ mod tests {
             store.get_by_owner(owner).unwrap().is_some(),
             "the read is a filter, not a write: dropping the row is bootstrap's job"
         );
+    }
+
+    /// The re-check under the open slot suppresses the open only for a row on
+    /// this deployment. A foreign row that bootstrap could not drop already
+    /// reads as no row on the pull path; if the re-check counted it as live,
+    /// every pull would skip the open and find no pool again.
+    #[tokio::test]
+    async fn the_open_recheck_ignores_a_row_from_another_deployment() {
+        for (seeded, opens) in [
+            (OTHER_CHAIN, true),
+            (OTHER_CONTRACT, true),
+            (DEPLOYMENT, false),
+        ] {
+            let owner = Address::repeat_byte(1);
+            let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+            store
+                .record(&BuyerPoolState::new(
+                    PoolId::from([0xAA; 32]),
+                    seeded,
+                    owner,
+                    Address::repeat_byte(2),
+                    U256::from(10_000_000u64),
+                ))
+                .expect("seed the row");
+            // One faulting call: an open that goes ahead spends it and fails.
+            let (contract, asserter) = mocked_pool_contract_with(vec![MockCall::Err]);
+            let result = run_open(
+                &contract,
+                &store,
+                Arc::new(PrivateKeySigner::random()),
+                DEPLOYMENT,
+                Address::repeat_byte(2),
+                owner,
+                U256::from(10_000_000u64),
+                &Arc::new(Metrics::new()),
+            )
+            .await;
+            if opens {
+                assert!(
+                    result.is_err(),
+                    "a row on {seeded:?} must not suppress the open"
+                );
+                assert!(asserter.read_q().is_empty(), "the open reached the chain");
+            } else {
+                assert!(result.is_ok(), "a row on this deployment is the live pool");
+                assert_eq!(asserter.read_q().len(), 1, "no open was attempted");
+            }
+        }
     }
 
     /// A lane this node has been paid on, but has no local record of, resumes
