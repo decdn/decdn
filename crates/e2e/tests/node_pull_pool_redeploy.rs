@@ -28,21 +28,32 @@
 //!      deposit and no lanes; the #1 row, with the #1 deposit and its lane to
 //!      SEEDER #1, is gone.
 //!
-//! In both journeys the store assertions are what pin the guard. The #2 pull
+//!   3. **A redeploy served by the repointed seeder.** SEEDER #1 is repointed
+//!      at #2 with its data dir intact, and serves leg 2 itself. Its lane store
+//!      binds to one deployment, so it drops the #1 lane at boot and logs that
+//!      drop at WARN:
+//!
+//!      > dropping seller lane state, pending settles and watcher checkpoints
+//!      > written against another PaymentPool deployment
+//!
+//!      Leg 2 then reuses the exact leg-1 lane key — the same pool id, signer,
+//!      and provider on another deployment. Kept, the #1 frontier would reject
+//!      the SERVER's first #2 voucher, and the seeder would redeem #1 signatures
+//!      against #2.
+//!
+//! In every journey the store assertions are what pin the guard. The #2 pull
 //! then proves the repointed node buys and settles on #2 at the leg-2 price.
-//! That pull pays a different provider than leg 1, so it cannot show a #1
-//! cumulative carried onto a #2 lane; a same-provider check needs #2181.
 //!
 //! Topology: a pull-through SERVER that holds nothing buys each client miss from
-//! a SEEDER. Leg 1 runs on #1 through SEEDER #1. Leg 2 runs on #2 through a
-//! fresh SEEDER #2 that has only ever known #2. The fresh seeder is deliberate:
-//! the seller-side lane store is keyed without the deployment too (#2181), and
-//! a repointed SEEDER #1 would reject the SERVER's first #2 voucher against its
-//! #1 frontier. When #2181 lands, its acceptance variant repoints SEEDER #1
-//! instead. Each leg's blob lives in its own namespace, seated on its own
-//! seeder, so the directory never routes a leg-2 miss to SEEDER #1.
+//! a SEEDER. Leg 1 runs on #1 through SEEDER #1. In journeys 1 and 2, leg 2 runs
+//! on #2 through a fresh SEEDER #2 that has only ever known #2, so their
+//! buyer-side assertions stand apart from the seller side. Each leg's blob lives
+//! in its own namespace, seated on its own seeder, so the directory never routes
+//! a leg-2 miss to SEEDER #1. In journey 3, SEEDER #1 holds both blobs and seats
+//! both namespaces, and there is no SEEDER #2.
 //!
-//! The drop assertion reads the SERVER's captured log, so `DECDN_NODE_LOG` must
+//! The drop assertions read the SERVER's — and, in journey 3, SEEDER #1's —
+//! captured logs, so `DECDN_NODE_LOG` must
 //! keep `decdn_node` at `warn` or more verbose. Run with
 //! `DECDN_NODE_LOG="warn,decdn_node=debug"` to see the daemons' debug logs
 //! through the harness.
@@ -113,6 +124,11 @@ const FOREIGN_ROW_DROPPED: &str =
 const FOREIGN_ROW_IGNORED: &str =
     "ignoring a tracked buyer pool from another PaymentPool deployment";
 
+/// The WARN a seeder logs when its boot drops seller state another deployment
+/// wrote.
+const FOREIGN_LANES_DROPPED: &str = "dropping seller lane state, pending settles and watcher \
+                                     checkpoints written against another PaymentPool deployment";
+
 /// Deterministic pseudo-random blob spanning many chunk groups.
 fn make_blob(len: usize) -> Vec<u8> {
     let mut v = vec![0u8; len];
@@ -168,12 +184,24 @@ async fn a_node_repointed_at_a_redeploy_that_reissued_its_pool_id_adopts_it_with
     Ok(())
 }
 
+/// A seeder repointed at the redeploy with its data dir intact drops its #1
+/// lane and serves the SERVER's #2 pull on the same lane key, from zero.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_seeder_repointed_at_a_redeploy_drops_its_stale_lane_and_serves_the_reissued_pool()
+-> anyhow::Result<()> {
+    ensure_decdn_cli_built()?;
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_repointed_seeder()))
+        .await
+        .context("repointed-seeder e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
 async fn run_empty_redeploy() -> anyhow::Result<()> {
-    let r = stale_row_from_first_deployment().await?;
+    let r = stale_row_from_first_deployment(LegTwoSeeder::Fresh).await?;
     let pool2 = r.pool_on(r.pool2);
 
     r.server
-        .repoint_payment_pool(r.pool2, &[&r.seeder2])
+        .repoint_payment_pool(r.pool2, &[r.leg_two_seeder()])
         .await?;
     r.assert_foreign_row_dropped().await?;
     wait_buyer_bootstrap(&r.server).await?;
@@ -248,7 +276,7 @@ async fn run_empty_redeploy() -> anyhow::Result<()> {
 }
 
 async fn run_reissued_id() -> anyhow::Result<()> {
-    let r = stale_row_from_first_deployment().await?;
+    let r = stale_row_from_first_deployment(LegTwoSeeder::Fresh).await?;
     let pool2 = r.pool_on(r.pool2);
 
     // Open pools on #2 under the SERVER's own key, while its daemon is down,
@@ -303,7 +331,7 @@ async fn run_reissued_id() -> anyhow::Result<()> {
     let nonce_before_repoint = owner_pool_nonce(&pool2, r.owner).await?;
 
     r.server
-        .repoint_payment_pool(r.pool2, &[&r.seeder2])
+        .repoint_payment_pool(r.pool2, &[r.leg_two_seeder()])
         .await?;
     r.assert_foreign_row_dropped().await?;
     wait_buyer_bootstrap(&r.server).await?;
@@ -335,16 +363,82 @@ async fn run_reissued_id() -> anyhow::Result<()> {
     r.assert_no_foreign_row_reached_the_pull_path()
 }
 
-/// The state both journeys start from: a SERVER whose buyer store tracks a pool
+async fn run_repointed_seeder() -> anyhow::Result<()> {
+    let r = stale_row_from_first_deployment(LegTwoSeeder::RepointedFirst).await?;
+
+    // The operator's side of the redeploy, on the seller: same data dir, new
+    // `PaymentPool`. Its #1 lane — the leg-1 lane key, which leg 2 reissues —
+    // is dropped at boot, before the seeder reads it.
+    r.seeder1.repoint_payment_pool(r.pool2, &[]).await?;
+    let foreign = format!("foreign_payment_pool={}", r.pool1);
+    let configured = format!("configured_payment_pool={}", r.pool2);
+    r.seeder1
+        .wait_for_log_line(
+            &[
+                FOREIGN_LANES_DROPPED,
+                &foreign,
+                &configured,
+                "dropped_lanes=1",
+                // The lane decoded, so the forfeited sum is exact, not a
+                // lower bound.
+                "undecodable_lanes=0",
+            ],
+            SETTLE,
+        )
+        .await
+        .context("the repointed SEEDER #1 never logged dropping its #1 lane")?;
+    // The per-lane last-record line names the dropped lane. Its exact
+    // unredeemed value is not asserted here: it depends on whether the
+    // seeder's paid watermark flushed before the restart killed it, which
+    // races. The value math is pinned by the `forfeited_value` unit test.
+    anyhow::ensure!(
+        r.seeder1
+            .log_line(&["last record of its unredeemed claim", &foreign])
+            .is_some(),
+        "the repointed SEEDER #1 must log the per-lane last-record line"
+    );
+
+    r.server
+        .repoint_payment_pool(r.pool2, &[r.leg_two_seeder()])
+        .await?;
+    r.assert_foreign_row_dropped().await?;
+    wait_buyer_bootstrap(&r.server).await?;
+
+    r.pull_second().await?;
+
+    // The pull paid SEEDER #1 on #2 from zero: exactly the leg-2 price, in the
+    // SERVER's store and in the #2 watermark the seeder redeemed. A kept #1 lane
+    // would reject the first #2 voucher as a regression, or redeem the #1 claim
+    // against #2.
+    anyhow::ensure!(
+        enumerate_owned_pools(&r.pool_on(r.pool2), r.owner).await? == [r.tracked],
+        "the #2 pull must open the reissued tracked id {}",
+        r.tracked
+    );
+    r.assert_paid_for_second_only().await?;
+    r.assert_no_foreign_row_reached_the_pull_path()
+}
+
+/// Which seeder serves leg 2 on #2.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LegTwoSeeder {
+    /// A fresh SEEDER #2 that has only ever known #2.
+    Fresh,
+    /// SEEDER #1, repointed at #2 with its data dir intact.
+    RepointedFirst,
+}
+
+/// The state every journey starts from: a SERVER whose buyer store tracks a pool
 /// on #1 with lane progress to SEEDER #1, stopped, with #2 deployed beside it.
 struct Redeploy {
     chain: ChainFixture,
     pool1: Address,
     pool2: Address,
-    // Kept running so a leg-2 miss could reach it; the journey proves the
-    // directory never routes one there.
-    _seeder1: NodeFixture,
-    seeder2: NodeFixture,
+    // Kept running in the fresh-seeder journeys so a leg-2 miss could reach it;
+    // those journeys prove the directory never routes one there.
+    seeder1: NodeFixture,
+    // The fresh leg-2 seeder, when the journey has one.
+    seeder2: Option<NodeFixture>,
     server: NodeFixture,
     ns2: U256,
     second: Vec<u8>,
@@ -362,7 +456,7 @@ struct Redeploy {
               on-chain/daemon state, so decomposing it would thread state through helpers \
               without reducing its length or making it easier to follow"
 )]
-async fn stale_row_from_first_deployment() -> anyhow::Result<Redeploy> {
+async fn stale_row_from_first_deployment(leg_two: LegTwoSeeder) -> anyhow::Result<Redeploy> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .try_init();
@@ -372,17 +466,18 @@ async fn stale_row_from_first_deployment() -> anyhow::Result<Redeploy> {
     let pool2 = chain.redeploy_payment_pool().await?;
     anyhow::ensure!(pool2 != pool1, "the redeploy must land at a new address");
 
+    // `second` MUST price below `first`: journey 3's mutation detection rests
+    // on it. A seeder that wrongly kept its #1 lane holds a frontier at the
+    // leg-1 price, so the SERVER's first #2 voucher (the smaller leg-2
+    // cumulative) lands below it and fails as AmountRegression. A `second`
+    // priced above `first` would be accepted by the stale lane and only the
+    // weaker exact-watermark checks would catch the bug.
     let first = make_blob(6 * CHUNK_GROUP + 37);
     let second = make_blob(2 * CHUNK_GROUP + 11);
 
-    let (seeder1, first_hashes) = NodeFixture::launch_with_blobs(&chain, "US", &[&first]).await?;
-    let first_hash = *first_hashes.first().context("seeder #1 missing its hash")?;
-    let (seeder2, second_hashes) =
-        NodeFixture::launch_with_blobs_on_payment_pool(&chain, pool2, "US", &[&second]).await?;
-    let second_hash = *second_hashes
-        .first()
-        .context("seeder #2 missing its hash")?;
-    for seeder in [&seeder1, &seeder2] {
+    let (seeder1, seeder2, first_hash, second_hash) =
+        launch_seeders(&chain, pool2, leg_two, &first, &second).await?;
+    for seeder in std::iter::once(&seeder1).chain(seeder2.as_ref()) {
         seeder.set_rate_per_mb(RATE_PER_MB).await?;
         seeder
             .set_pool_min_remaining_deposit(POOL_MIN_REMAINING)
@@ -399,7 +494,11 @@ async fn stale_row_from_first_deployment() -> anyhow::Result<Redeploy> {
         .await?;
     let ns2 = chain.create_namespace(&publisher).await?;
     chain
-        .add_origin(&publisher, ns2, seeder2.operator_addr())
+        .add_origin(
+            &publisher,
+            ns2,
+            seeder2.as_ref().unwrap_or(&seeder1).operator_addr(),
+        )
         .await?;
 
     let server = NodeFixture::launch_pull_through_cache(&chain, "US", &[&seeder1]).await?;
@@ -472,7 +571,7 @@ async fn stale_row_from_first_deployment() -> anyhow::Result<Redeploy> {
         chain,
         pool1,
         pool2,
-        _seeder1: seeder1,
+        seeder1,
         seeder2,
         server,
         ns2,
@@ -483,7 +582,48 @@ async fn stale_row_from_first_deployment() -> anyhow::Result<Redeploy> {
     })
 }
 
+/// Launch SEEDER #1 on #1 and, for [`LegTwoSeeder::Fresh`], SEEDER #2 on
+/// `pool2`. Returns both seeders and the hashes of `first` and `second`.
+async fn launch_seeders(
+    chain: &ChainFixture,
+    pool2: Address,
+    leg_two: LegTwoSeeder,
+    first: &[u8],
+    second: &[u8],
+) -> anyhow::Result<(NodeFixture, Option<NodeFixture>, Hash, Hash)> {
+    Ok(match leg_two {
+        LegTwoSeeder::Fresh => {
+            let (seeder1, first_hashes) =
+                NodeFixture::launch_with_blobs(chain, "US", &[first]).await?;
+            let (seeder2, second_hashes) =
+                NodeFixture::launch_with_blobs_on_payment_pool(chain, pool2, "US", &[second])
+                    .await?;
+            (
+                seeder1,
+                Some(seeder2),
+                *first_hashes.first().context("seeder #1 missing its hash")?,
+                *second_hashes
+                    .first()
+                    .context("seeder #2 missing its hash")?,
+            )
+        }
+        LegTwoSeeder::RepointedFirst => {
+            let (seeder1, hashes) =
+                NodeFixture::launch_with_blobs(chain, "US", &[first, second]).await?;
+            let [first_hash, second_hash] = hashes.as_slice() else {
+                anyhow::bail!("seeder #1 must return two hashes, got {hashes:?}");
+            };
+            (seeder1, None, *first_hash, *second_hash)
+        }
+    })
+}
+
 impl Redeploy {
+    /// The seeder that serves leg 2 on #2.
+    fn leg_two_seeder(&self) -> &NodeFixture {
+        self.seeder2.as_ref().unwrap_or(&self.seeder1)
+    }
+
     /// A read handle on the `PaymentPool` at `at`.
     fn pool_on(&self, at: Address) -> PaymentPool::PaymentPoolInstance<DynProvider> {
         PaymentPool::new(at, self.chain.admin().clone())
@@ -530,7 +670,7 @@ impl Redeploy {
     }
 
     /// Leg 2: a fresh client on #2 fetches `second` through the SERVER, whose
-    /// miss is served only by SEEDER #2.
+    /// miss is served only by the leg-2 seeder.
     async fn pull_second(&self) -> anyhow::Result<()> {
         let client = ClientFixture::new_on_payment_pool(&self.chain, self.pool2).await?;
         let (_session, got) = client
@@ -541,15 +681,16 @@ impl Redeploy {
         Ok(())
     }
 
-    /// The repointed SERVER buys and settles on #2: its lane to SEEDER #2 — in
-    /// its own store and on chain — is metered at exactly the leg-2 wire price.
+    /// The repointed SERVER buys and settles on #2: its lane to the leg-2
+    /// seeder — in its own store and on chain — is metered at exactly the leg-2
+    /// wire price.
     async fn assert_paid_for_second_only(&self) -> anyhow::Result<()> {
         let bytes = wire_bytes(&self.second)?;
         let price = price_micro_usdc(bytes)?;
-        let seeder2 = self.seeder2.operator_addr();
+        let provider = self.leg_two_seeder().operator_addr();
 
-        let row = wait_lane(&self.server, self.pool2, seeder2, bytes).await?;
-        let lane = lane_to(&row, seeder2)?.context("leg-2 lane to SEEDER #2")?;
+        let row = wait_lane(&self.server, self.pool2, provider, bytes).await?;
+        let lane = lane_to(&row, provider)?.context("leg-2 lane to the leg-2 seeder")?;
         anyhow::ensure!(
             parse_b256(&row.pool_id)? == self.tracked
                 && lane.last_amount_micro_usdc == price
@@ -561,12 +702,12 @@ impl Redeploy {
             &self.pool_on(self.pool2),
             self.tracked,
             self.owner,
-            seeder2,
+            provider,
             price,
             bytes,
         )
         .await
-        .context("SEEDER #2 redeeming the SERVER's leg-2 voucher")
+        .context("the leg-2 seeder redeeming the SERVER's leg-2 voucher")
     }
 
     /// The pull path never met the #1 row: bootstrap's drop is what removed it,

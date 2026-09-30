@@ -897,6 +897,52 @@ identity rotation, host clock skew breaking TLS.
    `timedatectl status`). Skew greater than the QUIC handshake tolerance
    breaks every connection silently.
 
+## Repointing at a redeployed PaymentPool
+
+**Changing `blockchain.payment_pool_address` or `blockchain.chain_id` drops
+seller payment state.** The lane store binds to one `PaymentPool` deployment
+(ADR 003 § Off-chain voucher state persistence): on the first boot against a
+different deployment the node deletes its seller lane frontiers, both
+pending-settle sets, and the event-scan checkpoints, because their pool ids
+repeat on the new deployment. Unredeemed vouchers on the old deployment are
+forfeit after the drop.
+
+**Before repointing:**
+
+1. While the node still points at the old deployment, set
+   `blockchain.redeem_threshold_micro_usdc = 1` and restart it. The redeemer
+   submits a chunk only when the chunk's aggregate unredeemed total clears
+   this floor, and every redeem path uses it, graceful shutdown included. At
+   the default (1 USDC), a batch of small lanes can sit under the floor and
+   `decdn_unredeemed_usdc` may never reach 0. With the floor at 1 µUSDC, the
+   self-tick (`blockchain.redeem_interval_secs`) redeems every lane whose
+   pool can still pay — accepting that dust redeems at a gas loss.
+2. Wait at least two `redeem_interval_secs` after the restart (the gauge
+   shows its initial 0 until the first sweep runs), then wait for
+   `decdn_unredeemed_usdc` to read 0 — near-zero is enough on a node that is
+   still serving; the shutdown sweep is the final drain. Also check that
+   `decdn_redemption_skipped_insolvent_total` stays flat across a sweep:
+   lanes on a drained-but-`Open` pool are held, never enter the gauge, and
+   are only redeemable after the payer tops the pool up. The repoint
+   forfeits them — they surface only in step 3's `forfeited_micro_usdc` —
+   so decide about them before proceeding. Then stop the node gracefully
+   and confirm the log has no `shutdown redeem deadline elapsed` warning;
+   if it has one, start the node on the old config and stop it again.
+3. Update the config (new deployment, and restore
+   `redeem_threshold_micro_usdc`) and restart. The boot logs one WARN per dropped lane
+   with its `pool_id`, `signer`, `provider`, and unredeemed value — the last
+   record of each claim — plus a summary WARN with `dropped_lanes`,
+   `undecodable_lanes`, and `forfeited_micro_usdc`. Capture these lines if
+   you need an audit trail, and tally from the final boot's summary line:
+   the per-lane lines repeat if a boot crashes mid-drop.
+
+Startup also verifies the configured deployment before touching the store:
+`eth_chainId` must match `blockchain.chain_id`, and the configured address
+must hold code that answers `PaymentPool.usdc()`, so a typo — including a
+sibling contract pasted from the same deploy manifest — aborts boot instead
+of triggering the drop. Buyer pool rows are scoped per row and are not
+dropped by this path.
+
 ## Testnet faucet
 
 **⚠️ Testnet only.** `contracts/testnet/TestnetFaucet.sol` is **not** part of

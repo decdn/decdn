@@ -197,8 +197,14 @@ async fn list_with_data_dir_ignores_broken_config_env_expansion() {
 fn seed_stopped_daemon_store(data_dir: &std::path::Path) -> B256 {
     use decdn_node::channel_store::{BuyerPoolStoreHandle, PersistentPoolStateStore};
 
+    // The buyer table ignores the seller-side deployment stamp; any stamp does.
+    let deployment = decdn_node::channel_store::Deployment {
+        chain_id: 31_337,
+        payment_pool: Address::repeat_byte(0x9c),
+    };
+
     let pool_id = B256::repeat_byte(0x5a);
-    let store = std::sync::Arc::new(PersistentPoolStateStore::open(data_dir).unwrap());
+    let store = std::sync::Arc::new(PersistentPoolStateStore::open(data_dir, deployment).unwrap());
     let state = BuyerPoolState::new(
         pool_id,
         Address::repeat_byte(0x9c),
@@ -283,7 +289,14 @@ fn a_locked_store_says_the_admin_url_is_wrong_not_that_the_node_is_down() {
     let dir = data_dir();
     // Held for the duration of the command: the daemon is up, the admin port
     // in the flag is simply not its.
-    let _daemon = PersistentPoolStateStore::open(dir.path()).unwrap();
+    let _daemon = PersistentPoolStateStore::open(
+        dir.path(),
+        decdn_node::channel_store::Deployment {
+            chain_id: 31_337,
+            payment_pool: Address::repeat_byte(0x9c),
+        },
+    )
+    .unwrap();
 
     let output = common::decdn_command(dir.path())
         .args([

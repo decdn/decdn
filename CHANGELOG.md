@@ -1050,6 +1050,26 @@ since project inception and will roll into the first tagged release.
   eager `Store` on a cache event now goes out only for a hash that has not
   announced yet, and never with empty coverage. Later blocks widen the
   advertised coverage on the next republish cycle.
+
+- **A seller repointed at a redeployed `PaymentPool` drops the old
+  deployment's lane state (#2181).** `poolId` names neither the chain nor the
+  contract, so a returning buyer's first pool on the new deployment has the
+  same id as its pool on the old one. The seller kept the old lane for it: it
+  rejected the buyer's first voucher as `AmountRegression`, which suppressed
+  the provider, and it redeemed the old deployment's signatures against the
+  new contract. `lanes.redb` now records the deployment (chain id and
+  `PaymentPool` address) in a `deployment_v1` table. When the node starts
+  against another deployment, it drops the lane table, both pending-settle
+  sets and the watcher checkpoint before it reads them, and logs the drop at
+  WARN with the lane count. The dropped lanes' unredeemed vouchers are forfeit.
+  A store with no record yet takes the configured deployment and keeps its
+  rows — so a node that was repointed at a redeploy **before** this upgrade
+  still carries the colliding rows under the new record; delete its
+  `lanes.redb`, `settle.redb` and `checkpoint.redb` by hand to clear them,
+  and leave `buyer.redb` in place — its rows carry per-row deployment tags
+  and are handled individually.
+  `PersistentPoolStateStore::open` takes the configured `Deployment`.
+
 - **`decdn-node` no longer hangs until systemd's stop timeout after
   node-to-node pulls (#2185).** A serve-miss pull leg runs on its own
   current-thread runtime, which drops when the leg returns. An upstream dial

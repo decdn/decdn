@@ -360,6 +360,10 @@ struct Infra {
     node_metrics: Arc<metrics::Metrics>,
     secret_key: SecretKey,
     eth_signer: Arc<PrivateKeySigner>,
+    /// The `PaymentPool` deployment the lane store is stamped with. The voucher
+    /// EIP-712 domain is derived from this same value, so the stamp and the
+    /// signature domain can never disagree.
+    payment_pool_deployment: crate::channel_store::Deployment,
     concrete_channel_store: Arc<PersistentPoolStateStore>,
     channel_state_store: Arc<dyn PoolStateStore>,
     watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore>,
@@ -427,6 +431,35 @@ async fn build_infra(
     // Failure here MUST abort startup: continuing with a fresh in-memory
     // map silently reopens the replay window the store exists to close.
     let channel_store_data_dir = cfg.identity.data_dir.clone();
+    // The store binds to the configured `PaymentPool` deployment and drops the
+    // seller-side rows another deployment wrote: pool ids repeat across
+    // deployments, so a stale row would shadow a returning buyer's new pool.
+    let channel_store_deployment = crate::channel_store::Deployment {
+        chain_id: cfg.blockchain.chain_id,
+        payment_pool: parse_nonzero_address(
+            &cfg.blockchain.payment_pool_address,
+            "blockchain.payment_pool_address",
+        )?,
+    };
+    // Verify the configured deployment against the live chain BEFORE the store
+    // opens: `bind_deployment` drops the seller lane state when the stamp
+    // differs, so a typo'd chain id or contract address must abort bring-up
+    // here, while the store is untouched, rather than trigger an irreversible
+    // drop on a WARN.
+    // The URL is not echoed on a parse failure: it can embed a provider API
+    // key, and the reachability probe above has already reported unusable
+    // endpoints with a sanitized display.
+    let preflight_rpc_url: HttpUrl = cfg
+        .blockchain
+        .rpc_url
+        .parse()
+        .context("blockchain.rpc_url is not a valid URL (value redacted; check the config)")?;
+    check_deployment_preflight(
+        ProviderFactory::shared_head(preflight_rpc_url),
+        channel_store_deployment,
+        &BootRetry::new(DEPLOYMENT_PREFLIGHT_BUDGET, Arc::clone(&node_metrics)),
+    )
+    .await?;
     // Keep the concrete store `Arc` so it can back the seller
     // `ChannelStateStore` (channel_state_v1 table), the pending-settle store
     // (pending_settle_v1 table, PR #743 review), and the buyer
@@ -434,7 +467,7 @@ async fn build_infra(
     // second `Database` handle to the same file, so one shared store owns all.
     let concrete_channel_store: Arc<PersistentPoolStateStore> = Arc::new(
         tokio::task::spawn_blocking(move || {
-            PersistentPoolStateStore::open(&channel_store_data_dir)
+            PersistentPoolStateStore::open(&channel_store_data_dir, channel_store_deployment)
         })
         .await
         .context("channel state store open task panicked")?
@@ -631,6 +664,7 @@ async fn build_infra(
         node_metrics,
         secret_key,
         eth_signer,
+        payment_pool_deployment: channel_store_deployment,
         concrete_channel_store,
         channel_state_store,
         watcher_checkpoint_store,
@@ -1095,15 +1129,13 @@ async fn build_chain_and_handlers(
     let dht_routing = dht_handler.routing_table();
 
     // `cdn/client/v1` paid-delivery handler (#317). The voucher EIP-712 domain
-    // binds to the `PaymentPool` deployment; the ephemeral-binding
-    // domain to the `CapacityBond` deployment (== `capacity_bond_addr`,
-    // which holds the NodeId↔address mappings). The handler hydrates per-channel
-    // voucher state from `channel_state_store` so a restart cannot replay an
-    // already-accepted voucher (#527).
-    let payment_pool_addr = parse_nonzero_address(
-        &cfg.blockchain.payment_pool_address,
-        "blockchain.payment_pool_address",
-    )?;
+    // binds to the `PaymentPool` deployment the lane store is stamped with
+    // (`infra.payment_pool_deployment` — one parse, one source of truth); the
+    // ephemeral-binding domain to the `CapacityBond` deployment
+    // (== `capacity_bond_addr`, which holds the NodeId↔address mappings). The
+    // handler hydrates per-channel voucher state from `channel_state_store` so
+    // a restart cannot replay an already-accepted voucher (#527).
+    let payment_pool_addr = infra.payment_pool_deployment.payment_pool;
 
     // Live operator fee-share seed (ADR 041 / ADR 016 § Tunable Economics):
     // `PaymentPool.feeRouter()` resolves the router address, then
@@ -1164,7 +1196,7 @@ async fn build_chain_and_handlers(
     .await;
 
     let voucher_domain =
-        decdn_incentive::voucher_domain(cfg.blockchain.chain_id, payment_pool_addr);
+        decdn_incentive::voucher_domain(infra.payment_pool_deployment.chain_id, payment_pool_addr);
     let bind_domain =
         decdn_incentive::bind_node_id_domain(cfg.blockchain.chain_id, capacity_bond_addr);
 
@@ -3640,6 +3672,82 @@ enum RpcProbe {
     Fatal(String),
 }
 
+/// Retry budget for [`check_deployment_preflight`]'s chain reads. Its own
+/// [`BootRetry`] budget, independent of the shared boot deadline the chain
+/// bootstraps below share: the RPC endpoint has just passed
+/// [`check_rpc_reachability`], so a transient hiccup clears fast, and a real
+/// outage should not hold the lane store hostage for long.
+const DEPLOYMENT_PREFLIGHT_BUDGET: Duration = Duration::from_mins(1);
+
+/// Verify the configured `PaymentPool` deployment against the live chain:
+/// the RPC's `eth_chainId` must equal `blockchain.chain_id`, the configured
+/// address must have code, and that code must answer `PaymentPool.usdc()` —
+/// a code-presence check alone would pass a sibling contract pasted from the
+/// same deploy manifest (`CapacityBond`, `FeeRouter`, the USDC token), and that
+/// is the likeliest wrong-address typo. Runs BEFORE the lane store opens,
+/// because the store's deployment binding
+/// ([`crate::channel_store::Deployment`]) drops the seller lane state when
+/// the stamp differs — a typo in either field must abort bring-up while the
+/// store is untouched, not destroy unredeemed lane state on a WARN. The
+/// reads retry transient RPC errors on `retry`; the mismatch verdicts are
+/// deterministic and fail at once, and a non-`PaymentPool` target surfaces
+/// from `usdc()` as a permanent contract error, not a retry spin.
+async fn check_deployment_preflight<P: Provider + Clone>(
+    provider: P,
+    deployment: crate::channel_store::Deployment,
+    retry: &BootRetry,
+) -> anyhow::Result<()> {
+    let (rpc_chain_id, code_len) = retry
+        .run(
+            "deployment preflight (eth_chainId + PaymentPool code)",
+            || {
+                let provider = provider.clone();
+                async move {
+                    let chain_id = provider.get_chain_id().await.context("eth_chainId")?;
+                    let code = provider
+                        .get_code_at(deployment.payment_pool)
+                        .await
+                        .context("eth_getCode(payment_pool)")?;
+                    Ok((chain_id, code.len()))
+                }
+            },
+        )
+        .await?;
+    anyhow::ensure!(
+        rpc_chain_id == deployment.chain_id,
+        "blockchain.chain_id is {} but the RPC endpoint serves chain {rpc_chain_id}; a \
+         mismatched chain id would rebind the lane store and drop its seller state — fix \
+         blockchain.chain_id or blockchain.rpc_url",
+        deployment.chain_id,
+    );
+    anyhow::ensure!(
+        code_len > 0,
+        "blockchain.payment_pool_address {} has no code on chain {rpc_chain_id}; a wrong \
+         address would rebind the lane store and drop its seller state — fix \
+         blockchain.payment_pool_address",
+        deployment.payment_pool,
+    );
+    // Contract-identity probe: `usdc()` is a cheap immutable view every
+    // `PaymentPool` answers. A contract without it returns no data, which
+    // decodes as a permanent contract error and aborts at once.
+    let contract =
+        decdn_incentive::payment_pool::PaymentPool::new(deployment.payment_pool, provider);
+    retry
+        .run("deployment preflight (PaymentPool.usdc())", || async {
+            contract.usdc().call().await.with_context(|| {
+                format!(
+                    "blockchain.payment_pool_address {} does not answer PaymentPool.usdc() \
+                     on chain {rpc_chain_id}; the address hosts some other contract, and a \
+                     wrong address would rebind the lane store and drop its seller state — \
+                     fix blockchain.payment_pool_address",
+                    deployment.payment_pool,
+                )
+            })
+        })
+        .await?;
+    Ok(())
+}
+
 /// Number of preflight attempts before a persistent transient failure is treated
 /// as fatal (a real outage still aborts bring-up). Backoff caps at 8s, so the
 /// worst-case wait is bounded (~5×5s request timeouts + 1+2+4+8s backoff).
@@ -5189,5 +5297,170 @@ mod tests {
             close_router(&router, Duration::from_secs(10)).await,
             "a close with a driven connection must finish inside the deadline"
         );
+    }
+
+    // ---- deployment preflight (the guard for the irreversible lane-store drop) ----
+
+    /// The deployment every preflight test configures.
+    const PREFLIGHT_DEPLOYMENT: crate::channel_store::Deployment =
+        crate::channel_store::Deployment {
+            chain_id: 421_614,
+            payment_pool: alloy::primitives::Address::repeat_byte(0x77),
+        };
+
+    /// One queued answer for [`preflight_provider`]. The value is JSON, not
+    /// raw bytes (unlike `buyer_channel.rs`' `MockCall`), because
+    /// `eth_chainId` answers with a quantity.
+    enum MockAnswer {
+        /// Answer the call with this value.
+        Ok(serde_json::Value),
+        /// Fault the call as a transient RPC error does, so the preflight
+        /// retries it.
+        TransientError,
+    }
+
+    /// A mocked provider answering the preflight's reads in order:
+    /// `eth_chainId`, `eth_getCode`, then (when reached) the `usdc()` call.
+    fn preflight_provider(answers: Vec<MockAnswer>) -> impl Provider + Clone {
+        let asserter = alloy::providers::mock::Asserter::new();
+        for answer in answers {
+            match answer {
+                MockAnswer::Ok(value) => asserter.push_success(&value),
+                MockAnswer::TransientError => asserter.push_failure_msg("transient rpc fault"),
+            }
+        }
+        ProviderBuilder::new().connect_mocked_client(asserter)
+    }
+
+    /// `eth_chainId` answering the configured chain.
+    fn chain_id_ok() -> serde_json::Value {
+        serde_json::json!(alloy::primitives::U64::from(421_614u64))
+    }
+
+    /// `eth_getCode` answering one byte of code (`0x60`, `PUSH1`): the
+    /// preflight checks only that code is present, never what it is.
+    fn code_present() -> serde_json::Value {
+        serde_json::json!(alloy::primitives::Bytes::from(vec![0x60]))
+    }
+
+    /// `usdc()` answering a token address, as every `PaymentPool` does.
+    fn usdc_answers() -> serde_json::Value {
+        use alloy::sol_types::SolValue;
+        let token = alloy::primitives::Address::repeat_byte(0x0c);
+        serde_json::json!(alloy::primitives::Bytes::from(token.abi_encode()))
+    }
+
+    /// An empty-bytes answer: no code at the address for `eth_getCode`, or no
+    /// return data for an `eth_call`.
+    fn empty_bytes() -> serde_json::Value {
+        serde_json::json!(alloy::primitives::Bytes::default())
+    }
+
+    fn preflight_retry_budget() -> BootRetry {
+        BootRetry::new(
+            DEPLOYMENT_PREFLIGHT_BUDGET,
+            Arc::new(crate::metrics::Metrics::new()),
+        )
+    }
+
+    /// The healthy path: matching chain id, code present, `usdc()` answers.
+    #[tokio::test]
+    async fn a_matching_deployment_passes_the_preflight() {
+        let provider = preflight_provider(vec![
+            MockAnswer::Ok(chain_id_ok()),
+            MockAnswer::Ok(code_present()),
+            MockAnswer::Ok(usdc_answers()),
+        ]);
+        check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
+            .await
+            .expect("a matching deployment must pass");
+    }
+
+    /// A chain-id mismatch aborts at once with an error naming the config key
+    /// and the consequence — it must never be retried into the 60s budget.
+    #[tokio::test]
+    async fn a_chain_id_mismatch_aborts_the_preflight() {
+        let provider = preflight_provider(vec![
+            MockAnswer::Ok(serde_json::json!(alloy::primitives::U64::from(1u64))),
+            MockAnswer::Ok(code_present()),
+        ]);
+        let err = check_deployment_preflight(
+            provider,
+            PREFLIGHT_DEPLOYMENT,
+            &BootRetry::single_attempt(Arc::new(crate::metrics::Metrics::new())),
+        )
+        .await
+        .expect_err("a mismatched chain id must abort");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("blockchain.chain_id") && msg.contains("rebind the lane store"),
+            "the error must name the key and the consequence: {msg}"
+        );
+    }
+
+    /// A codeless address aborts: nothing is deployed there.
+    #[tokio::test]
+    async fn a_codeless_payment_pool_address_aborts_the_preflight() {
+        let provider = preflight_provider(vec![
+            MockAnswer::Ok(chain_id_ok()),
+            MockAnswer::Ok(empty_bytes()),
+        ]);
+        let err = check_deployment_preflight(
+            provider,
+            PREFLIGHT_DEPLOYMENT,
+            &BootRetry::single_attempt(Arc::new(crate::metrics::Metrics::new())),
+        )
+        .await
+        .expect_err("a codeless address must abort");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("has no code") && msg.contains("blockchain.payment_pool_address"),
+            "the error must name the key: {msg}"
+        );
+    }
+
+    /// A contract that does not answer `usdc()` — a sibling address pasted from
+    /// the same deploy manifest — aborts as a permanent contract error rather
+    /// than passing on code presence alone. Run on the full retry budget
+    /// (`start_paused`, so any sleep is free) to pin that the no-data decode
+    /// classifies PERMANENT: the "not retried" context proves the budget was
+    /// not spun on a deterministic misconfig.
+    #[tokio::test(start_paused = true)]
+    async fn a_non_payment_pool_contract_aborts_the_preflight() {
+        let provider = preflight_provider(vec![
+            MockAnswer::Ok(chain_id_ok()),
+            MockAnswer::Ok(code_present()),
+            // `usdc()` returns no data: the target hosts some other contract.
+            MockAnswer::Ok(empty_bytes()),
+        ]);
+        let err =
+            check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
+                .await
+                .expect_err("a non-PaymentPool target must abort");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not answer PaymentPool.usdc()"),
+            "the error must say the contract identity check failed: {msg}"
+        );
+        assert!(
+            msg.contains("not retried"),
+            "a wrong contract is deterministic and must not spin the retry budget: {msg}"
+        );
+    }
+
+    /// A transient RPC fault is retried and the preflight then passes — a
+    /// rate-limited endpoint must not brick boot. `start_paused` makes the
+    /// retry backoff sleep cost no real time.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_rpc_error_is_retried_by_the_preflight() {
+        let provider = preflight_provider(vec![
+            MockAnswer::TransientError,
+            MockAnswer::Ok(chain_id_ok()),
+            MockAnswer::Ok(code_present()),
+            MockAnswer::Ok(usdc_answers()),
+        ]);
+        check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
+            .await
+            .expect("a transient fault must be retried to success");
     }
 }
