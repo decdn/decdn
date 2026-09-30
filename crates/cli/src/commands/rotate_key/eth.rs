@@ -63,7 +63,6 @@ use std::path::Path;
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
-use alloy::rpc::types::BlockId;
 use anyhow::Context;
 use decdn_common::cli;
 use decdn_common::identity;
@@ -405,7 +404,7 @@ async fn select_phase<P: Provider + Clone, Q: Provider>(
     } else {
         // Head timestamp rather than the local clock, so the comparison uses
         // the same clock `unbond()` will.
-        let now = head_timestamp(provider).await?;
+        let now = chain_ctx::head_timestamp(provider).await?;
         let unlock_at = st.pending_unlock_at.saturating_to::<u64>();
         if U256::from(now) < st.pending_unlock_at {
             return Ok(Phase::Waiting {
@@ -478,18 +477,6 @@ async fn select_phase<P: Provider + Clone, Q: Provider>(
         region,
         multiaddrs,
     })
-}
-
-/// Head block timestamp, used to decide whether the window has matured. Read
-/// from the chain rather than the local clock so the comparison uses the same
-/// clock `unbond()` will.
-async fn head_timestamp<P: Provider>(provider: &P) -> anyhow::Result<u64> {
-    let block = provider
-        .get_block(BlockId::latest())
-        .await
-        .context("failed to read the latest block")?
-        .ok_or_else(|| anyhow::anyhow!("no latest block"))?;
-    Ok(block.header.timestamp)
 }
 
 /// Submit the phase's transactions.

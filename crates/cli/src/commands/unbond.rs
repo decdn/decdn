@@ -37,7 +37,6 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 
-use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use anyhow::Context;
@@ -240,7 +239,7 @@ pub(crate) async fn build_plan<P: Provider + Clone, Q: Provider>(
              `decdn node unbond` with no amount flag to withdraw it once it matures.",
             pending.amount,
         );
-        let now = head_timestamp(provider).await?;
+        let now = chain_ctx::head_timestamp(provider).await?;
         // Compare in U256 so the maturity decision doesn't depend on the
         // saturation constant of a narrowing conversion. `unlock_at` is narrowed
         // only afterwards, for display.
@@ -507,18 +506,6 @@ pub(crate) async fn execute<P: Provider + Clone>(
         ),
     }
     Ok(())
-}
-
-/// Head block timestamp, used to decide whether a request has matured. Read
-/// from the chain rather than the local clock so the comparison uses the same
-/// clock `unbond()` will.
-async fn head_timestamp<P: Provider>(provider: &P) -> anyhow::Result<u64> {
-    let block = provider
-        .get_block(BlockId::latest())
-        .await
-        .context("failed to read the latest block")?
-        .ok_or_else(|| anyhow::anyhow!("no latest block"))?;
-    Ok(block.header.timestamp)
 }
 
 /// What the confirmation gate decides, before any IO. Split from

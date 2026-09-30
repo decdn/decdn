@@ -184,8 +184,10 @@ pub struct PoolCloseArgs {
 #[derive(Args, Debug)]
 #[command(group(clap::ArgGroup::new("reclaim_target").required(true).args(["pool", "all"])))]
 pub struct PoolReclaimArgs {
-    /// The pool to reclaim (0x-prefixed 32-byte `poolId`). Mutually exclusive
-    /// with `--all`.
+    /// The pool to reclaim (0x-prefixed 32-byte `poolId`). Its status and
+    /// dispute deadline are checked on-chain before the keystore is unlocked;
+    /// a pool that is not reclaimable is refused with its cause. Mutually
+    /// exclusive with `--all`.
     #[arg(long, value_name = "0xHASH")]
     pub pool: Option<String>,
 
