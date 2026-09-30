@@ -28,6 +28,36 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`bundle pull --json` renames `deduped` to `reused` and adds `excluded`
+  (#2190).** `deduped` counted whole-file reuse only, so beside a
+  `range-dedup: spliced 12.7 GB` line a `0 deduped` count read as a
+  contradiction. The field, the counts line and the `whole-file dedup` line
+  now say `reused`, which pairs with `reused_bytes`. `excluded` counts the
+  entries that `--include`/`--exclude` dropped or `--select` deselected, so
+  every manifest entry appears in one count:
+  `(4 fetched, 0 linked, 12 skipped, 0 reused, 1 excluded, 0 failed)`.
+  Scripts that read `deduped` must read `reused`.
+
+- **Buyer pool rows carry the chain id beside the `PaymentPool` address, and
+  both buyer tables move to `_v5` (#2198).** The row tag was the contract
+  address alone, but the same deployer nonce gives the same `PaymentPool`
+  address on every chain, and `poolId = keccak256(owner, ownerPoolNonce)`
+  repeats there too. A node or client repointed at another chain with its data
+  dir intact therefore reused a row from the other chain as its own.
+  `BuyerPoolState` now carries a `Deployment` (chain id and `PaymentPool`
+  address, the type the seller store is stamped with, now in
+  `decdn-incentive`), and every path that checks the tag compares both: node
+  bootstrap, the node's pull hot path, and `decdn fetch`. The bootstrap and
+  reuse WARNs add `foreign_chain_id` and `configured_chain_id`. **Existing
+  buyer rows are not read:** `buyer_pool_state_v4` / `buyer_pool_owner_index_v4`
+  become `_v5` (record schema 3), so on first boot the store reads as empty and
+  both a node and a client re-adopt the live pool from chain. A deposit held
+  by an orphaned row is recoverable only on the deployment it was opened on.
+  `decdn pool list --json` and `admin_v1_pools` gain `chain_id`.
+  `decdn_client::buyer_pool::open_pool` takes the `Deployment` in place of the
+  voucher EIP-712 domain, and `BuyerPoolService::bootstrap` takes it in place
+  of the `PaymentPool` address and the voucher domain.
+
 - **`decdn fetch` and `decdn bundle pull` recover through one acquire loop,
   and a blob's size is a hint (#2239; #2223, #2215, #2214, #2225, #2213,
   #2218, #2230).** Both commands drive every holder of a blob from one loop.
@@ -884,6 +914,17 @@ since project inception and will roll into the first tagged release.
   explicit operator pinning ([ADR 022](adr/022-content-discovery.md)).
 
 ### Fixed
+
+- **`bundle pull` no longer counts a resumed `.partial` prefix as downloaded
+  (#2236).** A prefix that an earlier, interrupted pull fetched counted again
+  in the entry line's downloaded bytes and rate, and in the summary's
+  `downloaded`. On the testnet a re-pull that resumed a 1.46 GB prefix
+  reported 9.7 GB downloaded for about 8.3 GB moved. The entry reads its
+  resume record before it drives anything and reports the prefix apart
+  (`7.7 GiB downloaded at R, 1.4 GiB resumed, 3.7 GiB spliced from disk`); a
+  byte both resumed and spliced counts as spliced. The summary adds
+  `resumed N from earlier partials`, and `--json` gains `resumed_bytes`.
+  `decdn-client` exports `ClientRangedStore::present_byte_ranges`.
 
 - **A slow client leg phase is logged (#2230).** A leg phase (`unpolled`,
   `pay` or `read`) that runs past 5 s logs at debug, with the peer, hash,
@@ -2726,6 +2767,17 @@ since project inception and will roll into the first tagged release.
   ownership only; no steady-state behavior change.
 
 ### Added
+
+- **`bundle pull` warns on a filter glob that matches no entry, and on
+  leftover partials (#2190).** Each `--include`/`--exclude` pattern that
+  matches no manifest entry prints one `warning:` line on stderr, in a real
+  pull and under `--dry-run`. A pattern matches the whole path from the bundle
+  root, so when its `**/` form would match, the warning names it:
+  `--exclude 'metal/*' matched no entries (… did you mean '**/metal/*'?)`. At
+  run end, staging files under `.decdn-partial/` for blobs the run did not
+  select (a partial an earlier run left for an entry this run excluded) print
+  one warning with their count and size. The pull keeps them for a later run
+  that selects the entry again.
 
 - **Paid-leg diagnostics at `debug` (#2211).** Each paid leg's open logs its
   peer, hash, `byte_offset` and `byte_len`. A throughput-floor trip logs the

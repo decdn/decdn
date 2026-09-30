@@ -23,8 +23,8 @@ use anyhow::{Context, Result};
 use decdn_incentive::erc20::Erc20;
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::{
-    AdvanceOutcome, BuyerLaneProgress, BuyerPoolState, BuyerPoolStore, Capability, DepositOutcome,
-    LaneKey, PoolId, PoolOpenFailureReason, SignedCapability, StoreError,
+    AdvanceOutcome, BuyerLaneProgress, BuyerPoolState, BuyerPoolStore, Capability, Deployment,
+    DepositOutcome, LaneKey, PoolId, PoolOpenFailureReason, SignedCapability, StoreError,
 };
 use tracing::{debug, error, info, warn};
 
@@ -400,6 +400,11 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// Open a fresh `PaymentPool` deposit for `owner`, escrowing `deposit` USDC, and
 /// decode the authoritative `poolId` from the receipt's own `PoolOpened` event.
 ///
+/// `deployment` is the chain and `PaymentPool` that `contract` talks to. It tags
+/// the returned row and derives the voucher EIP-712 domain, so the row and every
+/// voucher signed on it name the same deployment. A `deployment` whose address
+/// is not `contract`'s is an error, before any transaction.
+///
 /// `openPool` names no provider and no signer — a pool is bound to no payee at
 /// open, and fans out to many `(signer, provider)` lanes off-chain (ADR 003).
 /// The returned [`OpenedPool`] carries a self-owned capability the buyer signs
@@ -441,11 +446,18 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 pub async fn open_pool<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     signer: Arc<PrivateKeySigner>,
-    voucher_domain: &Eip712Domain,
+    deployment: Deployment,
     token: Address,
     owner: Address,
     deposit: U256,
 ) -> Result<OpenedPool> {
+    anyhow::ensure!(
+        *contract.address() == deployment.payment_pool,
+        "openPool: contract {} is not the deployment's PaymentPool {}",
+        contract.address(),
+        deployment.payment_pool
+    );
+    let voucher_domain = deployment.voucher_domain();
     let pending = match contract
         .openPool(to_pool_u64(deposit, "deposit")?)
         .send()
@@ -509,7 +521,7 @@ pub async fn open_pool<P: Provider + Clone>(
     // that in `PoolOpened.deposit`, precisely so a fee-on-transfer token cannot
     // over-state a pool against the shared USDC balance.
     let credited = opened.deposit;
-    let state = BuyerPoolState::new(pool_id, *contract.address(), owner, token, credited);
+    let state = BuyerPoolState::new(pool_id, deployment, owner, token, credited);
     // A self-owned capability delegates spend to the owner's OWN key, so the cap
     // bounds nothing a delegated capability would: the pool deposit is already
     // the real spending bound (redemption pays min(desired, cap-spent,
@@ -521,9 +533,9 @@ pub async fn open_pool<P: Provider + Clone>(
         pool_id,
         SELF_CAPABILITY_CAP,
         SELF_CAPABILITY_EXPIRY,
-        voucher_domain,
+        &voucher_domain,
     )?;
-    let ctx = PoolContext::for_pool(&state, signer, voucher_domain.clone());
+    let ctx = PoolContext::for_pool(&state, signer, voucher_domain);
     info!(
         %owner,
         %pool_id,

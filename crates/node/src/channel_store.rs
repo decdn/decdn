@@ -25,8 +25,8 @@
 //! ([`Deployment`]). Pool ids repeat across deployments, so `open()` drops the
 //! lane rows, pending settles and watcher checkpoints a different deployment
 //! wrote before it reads any of them. The buyer pool table carries its own
-//! per-row deployment tag (the contract address alone — no chain id) and is
-//! not touched.
+//! per-row deployment tag (the same chain id and contract address) and is not
+//! touched.
 //!
 //! The lane table is buffered in memory: `open()`
 //! hydrates the working set from disk, `record`/`forget` mutate that working
@@ -85,6 +85,8 @@ use dashmap::mapref::entry::Entry;
 
 use alloy::primitives::{Address, B256, U256};
 use decdn_common::identity;
+/// The `PaymentPool` deployment the store's seller-side state is bound to.
+pub use decdn_incentive::Deployment;
 use decdn_incentive::buyer_pool_table::BuyerPoolTable;
 use decdn_incentive::store::{
     CheckpointKey, KeyedCheckpointStore, PendingSettle, PendingSettleStore, PoolStateStore,
@@ -182,66 +184,15 @@ const WATCHER_CHECKPOINT_TABLE: TableDefinition<'_, &str, u64> =
 /// [`WATCHER_CHECKPOINT_TABLE`] was written against. Lives in `lanes.redb`, so
 /// a restamp and the lane-table drop it forces commit in one transaction.
 ///
-/// One row, key [`DEPLOYMENT_KEY`], value `chain_id (8 bytes, big-endian) ‖
-/// payment_pool (20 bytes)`. A fixed-width value needs no postcard envelope.
+/// One row, key [`DEPLOYMENT_KEY`], value [`Deployment::to_bytes`]:
+/// `chain_id (8 bytes, big-endian) ‖ payment_pool (20 bytes)`. A fixed-width
+/// value needs no postcard envelope. A stamp that does not decode is
+/// [`StoreError::Corrupt`]: the stamp decides which rows survive the open, so a
+/// stamp this binary cannot read must stop bring-up.
 const DEPLOYMENT_TABLE: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("deployment_v1");
 
 /// The one key of [`DEPLOYMENT_TABLE`].
 const DEPLOYMENT_KEY: &str = "payment_pool";
-
-/// Byte width of an encoded [`Deployment`]: `8 + 20`.
-const DEPLOYMENT_LEN: usize = 28;
-
-/// The `PaymentPool` deployment a store's seller-side state belongs to: the
-/// chain and contract address that make up the voucher EIP-712 domain.
-///
-/// `poolId = keccak256(owner, ownerPoolNonce)` carries neither, and a redeploy
-/// restarts every owner's nonce, so a pool id repeats across deployments. A lane
-/// row, a pending settle, or a watcher checkpoint is only meaningful against the
-/// deployment that wrote it. [`PersistentPoolStateStore::open`] takes the
-/// configured deployment and drops every such row a different deployment wrote.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Deployment {
-    /// EIP-712 `chainId` of the voucher domain.
-    pub chain_id: u64,
-    /// The `PaymentPool` contract, the voucher domain's `verifyingContract`.
-    /// The nonzero check lives at the config boundary
-    /// ([`decdn_common::address::parse_nonzero_address`]); a new construction
-    /// site validates there, not here.
-    pub payment_pool: Address,
-}
-
-impl Deployment {
-    /// Encode as the [`DEPLOYMENT_TABLE`] value.
-    fn to_bytes(self) -> [u8; DEPLOYMENT_LEN] {
-        let mut out = [0u8; DEPLOYMENT_LEN];
-        out[..8].copy_from_slice(&self.chain_id.to_be_bytes());
-        out[8..].copy_from_slice(self.payment_pool.as_slice());
-        out
-    }
-
-    /// Decode a [`DEPLOYMENT_TABLE`] value. Any width other than
-    /// [`DEPLOYMENT_LEN`] is [`StoreError::Corrupt`]: the stamp decides which rows
-    /// survive the open, so a stamp this binary cannot read must stop bring-up.
-    fn from_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
-        let corrupt = || StoreError::Corrupt {
-            pool_id: None,
-            detail: format!(
-                "deployment stamp is {} bytes, expected {DEPLOYMENT_LEN}",
-                bytes.len()
-            ),
-        };
-        let bytes: &[u8; DEPLOYMENT_LEN] = bytes.try_into().map_err(|_| corrupt())?;
-        // Width is proven above; these splits re-prove it to the compiler
-        // without reaching for a panicking accessor.
-        let (chain, pool) = bytes.split_first_chunk::<8>().ok_or_else(corrupt)?;
-        let pool: &[u8; 20] = pool.try_into().map_err(|_| corrupt())?;
-        Ok(Self {
-            chain_id: u64::from_be_bytes(*chain),
-            payment_pool: Address::from(*pool),
-        })
-    }
-}
 
 /// Byte width of a `(pool_id, signer)` key on disk: `32 + 20`. The superseded
 /// owner-signed capability tables use this shape. The pool id leads, so every row
@@ -2472,7 +2423,7 @@ mod tests {
             let buyer = BuyerPoolStoreHandle::new(Arc::clone(&store));
             buyer.record(&BuyerPoolState::new(
                 pool_id,
-                DEPLOYMENT.payment_pool,
+                DEPLOYMENT,
                 Address::repeat_byte(0x0a),
                 Address::repeat_byte(0x0b),
                 U256::from(1_000_000u64),
@@ -2488,7 +2439,7 @@ mod tests {
             .get_by_pool_id(pool_id)?
             .ok_or_else(|| anyhow::anyhow!("buyer row gone after the seller-side drop"))?;
         anyhow::ensure!(
-            row.payment_pool == DEPLOYMENT.payment_pool,
+            row.deployment == DEPLOYMENT,
             "the buyer row keeps its own deployment tag"
         );
         Ok(())

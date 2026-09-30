@@ -32,6 +32,7 @@ use crate::buyer_pool::{
     AdvanceOutcome, BuyerLaneProgress, BuyerLoad, BuyerPoolState, BuyerProgressError,
     DepositOutcome,
 };
+use crate::deployment::Deployment;
 use crate::lane::{LaneKey, PoolId};
 use crate::store::StoreError;
 
@@ -48,9 +49,9 @@ use crate::store::StoreError;
 /// Callers supply the `Database` (the one thing they legitimately differ
 /// on) and nothing else.
 ///
-/// **`_v4`**: the primary key is `pool_id` (32 bytes); the value carries the
-/// `PaymentPool` address the pool lives on plus a variable-length per-lane
-/// progress table. A layout change that is not a trailing addition bumps this
+/// **`_v5`**: the primary key is `pool_id` (32 bytes); the value carries the
+/// [`Deployment`] the pool lives on (chain id and `PaymentPool` address) plus a
+/// variable-length per-lane progress table. A layout change that is not a trailing addition bumps this
 /// suffix.
 ///
 /// A file written under an older suffix holds no table of this name, so
@@ -62,7 +63,7 @@ use crate::store::StoreError;
 /// per table is a separate guard, and it fires on a type change, not on this
 /// rename: the key/value types here are unchanged.)
 const BUYER_POOL_TABLE: TableDefinition<'static, &'static [u8; 32], &'static [u8]> =
-    TableDefinition::new("buyer_pool_state_v4");
+    TableDefinition::new("buyer_pool_state_v5");
 
 /// Secondary index: `owner (20 bytes) → pool_id (32 bytes)`. Maintained
 /// alongside [`BUYER_POOL_TABLE`] on every `record`/`forget`/
@@ -75,7 +76,7 @@ const BUYER_POOL_TABLE: TableDefinition<'static, &'static [u8; 32], &'static [u8
 /// only visible via [`BuyerPoolTable::load_all`] (the reclaim sweep's path)
 /// — never via [`BuyerPoolTable::get_by_owner`].
 const BUYER_OWNER_INDEX_TABLE: TableDefinition<'static, &'static [u8; 20], &'static [u8; 32]> =
-    TableDefinition::new("buyer_pool_owner_index_v4");
+    TableDefinition::new("buyer_pool_owner_index_v5");
 
 /// The buyer-record `schema_version` this binary reads and writes.
 ///
@@ -83,7 +84,7 @@ const BUYER_OWNER_INDEX_TABLE: TableDefinition<'static, &'static [u8; 20], &'sta
 /// written under a different version does not decode into these fields — it
 /// decodes into the wrong ones, silently. Refusing anything that is not this
 /// exact layout is the only answer that cannot mis-map.
-const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 2;
+const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 3;
 
 /// Sanity ceiling on trailing bytes per record. Trailing bytes are tolerated
 /// (forward-compat with additive schema changes), but a `remainder.len()`
@@ -126,6 +127,8 @@ struct StoredLane {
 struct StoredBuyerPoolState {
     schema_version: u32,
     pool_id: [u8; 32],
+    /// [`Deployment::chain_id`], big-endian.
+    chain_id: [u8; 8],
     payment_pool: [u8; 20],
     owner: [u8; 20],
     token: [u8; 20],
@@ -150,7 +153,8 @@ impl From<&BuyerPoolState> for StoredBuyerPoolState {
         Self {
             schema_version: BUYER_SUPPORTED_SCHEMA_VERSION,
             pool_id: state.pool_id.into(),
-            payment_pool: state.payment_pool.into(),
+            chain_id: state.deployment.chain_id.to_be_bytes(),
+            payment_pool: state.deployment.payment_pool.into(),
             owner: state.owner.into(),
             token: state.token.into(),
             deposit: state.deposit.to_be_bytes(),
@@ -185,7 +189,10 @@ impl StoredBuyerPoolState {
             .collect();
         Ok(BuyerPoolState::hydrate(
             pool_id,
-            Address::from(self.payment_pool),
+            Deployment {
+                chain_id: u64::from_be_bytes(self.chain_id),
+                payment_pool: Address::from(self.payment_pool),
+            },
             Address::from(self.owner),
             Address::from(self.token),
             U256::from_be_bytes(self.deposit),
@@ -791,6 +798,12 @@ mod tests {
         Ok((dir, db))
     }
 
+    /// The deployment every fixture row lives on, unless a test names another.
+    const DEPLOYMENT: Deployment = Deployment {
+        chain_id: 421_614,
+        payment_pool: Address::repeat_byte(0x9c),
+    };
+
     fn tbl(db: &Database) -> BuyerPoolTable<'_> {
         BuyerPoolTable::new(db)
     }
@@ -820,7 +833,7 @@ mod tests {
         let pool_id = PoolId::from(id);
         let mut s = BuyerPoolState::new(
             pool_id,
-            Address::repeat_byte(0x9c),
+            DEPLOYMENT,
             owner,
             address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             U256::from(10_000_000u64),
@@ -865,7 +878,10 @@ mod tests {
         };
         let mut s = BuyerPoolState::new(
             pool_id,
-            Address::repeat_byte(0x9c),
+            Deployment {
+                chain_id: 0x5555_5555_5555_5555,
+                payment_pool: Address::repeat_byte(0x9c),
+            },
             owner,
             Address::repeat_byte(0x33),
             U256::from(0xAAAA_AAAA_AAAA_AAAAu64),
@@ -885,7 +901,7 @@ mod tests {
 
     use alloy::primitives::B256;
 
-    /// Postcard encoding of [`golden_state`] (schema v2). Two lanes, sorted
+    /// Postcard encoding of [`golden_state`] (schema v3). Two lanes, sorted
     /// by `(signer, provider)` for a deterministic encoding regardless of
     /// `HashMap` iteration order.
     ///
@@ -894,8 +910,9 @@ mod tests {
     /// `last_amount` already says which chain the lane resumes on — there is no
     /// counter here to keep, and none to get wrong.
     const GOLDEN_RECORD_HEX: &str = concat!(
-        "02",                                                               // schema_version (varint)
+        "03",                                                               // schema_version (varint)
         "1111111111111111111111111111111111111111111111111111111111111111", // pool_id
+        "5555555555555555",                                                 // chain_id (big-endian)
         "9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c",                         // payment_pool
         "2222222222222222222222222222222222222222",                         // owner
         "3333333333333333333333333333333333333333",                         // token
@@ -1070,17 +1087,17 @@ mod tests {
     /// An OLDER record is rejected, not decoded.
     ///
     /// This is why the version is matched exactly rather than as a ceiling. The
-    /// fields are positional and `payment_pool` sits third, so a v1 record —
-    /// which has no such field — would decode `owner` into `payment_pool`,
-    /// `token` into `owner`, and so on: every field after `pool_id` shifted by
-    /// one, with no error. A silently wrong deployment tag is the one outcome
-    /// this whole change exists to prevent, so the reader refuses it instead.
+    /// fields are positional and `chain_id` sits third, so a v2 record — which
+    /// has no such field — would decode the first 8 bytes of its `payment_pool`
+    /// into `chain_id`, and every field after it would shift, with no error. A
+    /// silently wrong deployment tag is the one outcome the tag exists to
+    /// prevent, so the reader refuses it instead.
     #[test]
     fn older_schema_version_is_rejected_not_misdecoded() -> anyhow::Result<()> {
         let (_d, db) = db()?;
         let s = state(1);
         let mut stored = StoredBuyerPoolState::from(&s);
-        stored.schema_version = 1;
+        stored.schema_version = 2;
         let encoded = postcard::to_allocvec(&stored)?;
         tbl(&db).insert_raw(s.pool_id, &encoded)?;
 
@@ -1098,7 +1115,7 @@ mod tests {
             matches!(
                 err,
                 StoreError::UnsupportedSchema { found, supported }
-                    if found == 1 && supported == BUYER_SUPPORTED_SCHEMA_VERSION
+                    if found == 2 && supported == BUYER_SUPPORTED_SCHEMA_VERSION
             ),
             "expected UnsupportedSchema for the older record, got {err:?}"
         );
@@ -1564,7 +1581,7 @@ mod tests {
         let db = std::sync::Arc::new(db);
         let mut base = BuyerPoolState::new(
             PoolId::repeat_byte(6),
-            Address::repeat_byte(0x9c),
+            DEPLOYMENT,
             Address::repeat_byte(6),
             address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             U256::from(1_000u64),

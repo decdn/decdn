@@ -7,14 +7,16 @@
 //! a byte-identical id on every deployment, so a buyer row the node wrote
 //! against deployment #1 names a pool that deployment #2 also mints.
 //!
-//! The node tags each buyer row with the `PaymentPool` it was written against.
+//! The node tags each buyer row with the deployment it was written against: the
+//! chain id and the `PaymentPool` address.
 //! At bootstrap it drops a row from another deployment before it enumerates the
 //! configured one, and it logs that drop at WARN:
 //!
 //! > the tracked buyer pool belongs to a different PaymentPool deployment;
 //! > dropping the stale row
 //!
-//! with `pool_id`, `foreign_payment_pool` and `configured_payment_pool` fields.
+//! with `pool_id`, `foreign_payment_pool`, `foreign_chain_id`,
+//! `configured_payment_pool` and `configured_chain_id` fields.
 //! The unit tests in `crates/node/src/buyer_channel.rs` cover that decision
 //! against a mocked transport. This file runs it against two real deployments of
 //! the same contract, so the `sol!` bindings, the config repoint, and the

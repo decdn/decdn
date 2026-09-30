@@ -33,7 +33,7 @@ pub async fn decdn_client::buyer_pool::ensure_allowance<P: alloy_provider::provi
 pub fn decdn_client::buyer_pool::escrowed_but_untracked(&str, alloy_primitives::aliases::TxHash, impl core::fmt::Display) -> anyhow::Error
 pub fn decdn_client::buyer_pool::grade_deposit_credit(anyhow::Result<decdn_incentive::buyer_pool::DepositOutcome, decdn_incentive::store::StoreError>, &str, alloy_primitives::aliases::TxHash) -> anyhow::Result<alloy_primitives::aliases::U256>
 pub fn decdn_client::buyer_pool::issue_self_capability(&alloy_signer_local::PrivateKeySigner, alloy_primitives::aliases::B256, u64, u64, &alloy_sol_types::eip712::Eip712Domain) -> anyhow::Result<decdn_incentive::capability::SignedCapability>
-pub async fn decdn_client::buyer_pool::open_pool<P: alloy_provider::provider::trait::Provider + core::clone::Clone>(&decdn_incentive::payment_pool::sol_types::PaymentPool::PaymentPoolInstance<P>, alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, &alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, alloy_primitives::bits::address::Address, alloy_primitives::aliases::U256) -> anyhow::Result<decdn_client::buyer_pool::OpenedPool>
+pub async fn decdn_client::buyer_pool::open_pool<P: alloy_provider::provider::trait::Provider + core::clone::Clone>(&decdn_incentive::payment_pool::sol_types::PaymentPool::PaymentPoolInstance<P>, alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::deployment::Deployment, alloy_primitives::bits::address::Address, alloy_primitives::bits::address::Address, alloy_primitives::aliases::U256) -> anyhow::Result<decdn_client::buyer_pool::OpenedPool>
 pub fn decdn_client::buyer_pool::refill_amount(alloy_primitives::aliases::U256, alloy_primitives::aliases::U256, alloy_primitives::aliases::U256, alloy_primitives::aliases::U256) -> alloy_primitives::aliases::U256
 pub fn decdn_client::buyer_pool::self_owned_lane_ctx(&decdn_incentive::buyer_pool::BuyerPoolState, &alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, &alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, alloy_primitives::aliases::U256, alloy_primitives::aliases::U256) -> anyhow::Result<decdn_client::PoolContext>
 pub async fn decdn_client::buyer_pool::top_up<P: alloy_provider::provider::trait::Provider + core::clone::Clone>(&decdn_incentive::payment_pool::sol_types::PaymentPool::PaymentPoolInstance<P>, alloy_primitives::aliases::B256, alloy_primitives::aliases::U256) -> anyhow::Result<decdn_client::buyer_pool::ToppedUpPool>
@@ -108,6 +108,7 @@ pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths_until(&s
 impl<P, F> decdn_client::downloader::Downloader<P, F>
 pub const fn decdn_client::downloader::Downloader<P, F>::max_blob_bytes(self, u64) -> Self
 pub const fn decdn_client::downloader::Downloader<P, F>::new(P, alloc::vec::Vec<decdn_client::source_set::Holder>, alloc::sync::Arc<decdn_client::health::PeerHealth>, F, decdn_client::driver::DriveConfig, usize) -> Self
+pub fn decdn_client::downloader::Downloader<P, F>::refetched_targets(&self) -> u64
 impl<P, F> core::fmt::Debug for decdn_client::downloader::Downloader<P, F>
 pub fn decdn_client::downloader::Downloader<P, F>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub mod decdn_client::driver
@@ -312,6 +313,7 @@ pub fn decdn_client::ranged_store::ClientRangedStore::has_record(&std::path::Pat
 pub async fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<R>(&self, &decdn_bao_range::AlignedRange, R, core::option::Option<&(dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> anyhow::Result<R> where R: iroh_io::AsyncStreamReader + decdn_client::sink::StashedFault + core::marker::Send
 pub fn decdn_client::ranged_store::ClientRangedStore::open(&std::path::Path, &str, [u8; 32]) -> std::io::error::Result<Self>
 pub fn decdn_client::ranged_store::ClientRangedStore::open_or_create(&std::path::Path, &str, [u8; 32], u64) -> std::io::error::Result<Self>
+pub fn decdn_client::ranged_store::ClientRangedStore::present_byte_ranges(&self) -> alloc::vec::Vec<(u64, u64)>
 pub fn decdn_client::ranged_store::ClientRangedStore::proven(&self) -> core::option::Option<u64>
 pub const fn decdn_client::ranged_store::ClientRangedStore::root(&self) -> [u8; 32]
 pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)
@@ -652,6 +654,7 @@ pub fn decdn_client::ranged_store::ClientRangedStore::has_record(&std::path::Pat
 pub async fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<R>(&self, &decdn_bao_range::AlignedRange, R, core::option::Option<&(dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> anyhow::Result<R> where R: iroh_io::AsyncStreamReader + decdn_client::sink::StashedFault + core::marker::Send
 pub fn decdn_client::ranged_store::ClientRangedStore::open(&std::path::Path, &str, [u8; 32]) -> std::io::error::Result<Self>
 pub fn decdn_client::ranged_store::ClientRangedStore::open_or_create(&std::path::Path, &str, [u8; 32], u64) -> std::io::error::Result<Self>
+pub fn decdn_client::ranged_store::ClientRangedStore::present_byte_ranges(&self) -> alloc::vec::Vec<(u64, u64)>
 pub fn decdn_client::ranged_store::ClientRangedStore::proven(&self) -> core::option::Option<u64>
 pub const fn decdn_client::ranged_store::ClientRangedStore::root(&self) -> [u8; 32]
 pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)
@@ -705,6 +708,7 @@ pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths_until(&s
 impl<P, F> decdn_client::downloader::Downloader<P, F>
 pub const fn decdn_client::downloader::Downloader<P, F>::max_blob_bytes(self, u64) -> Self
 pub const fn decdn_client::downloader::Downloader<P, F>::new(P, alloc::vec::Vec<decdn_client::source_set::Holder>, alloc::sync::Arc<decdn_client::health::PeerHealth>, F, decdn_client::driver::DriveConfig, usize) -> Self
+pub fn decdn_client::downloader::Downloader<P, F>::refetched_targets(&self) -> u64
 impl<P, F> core::fmt::Debug for decdn_client::downloader::Downloader<P, F>
 pub fn decdn_client::downloader::Downloader<P, F>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::DownstreamFrontier

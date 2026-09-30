@@ -303,17 +303,21 @@ async fn pools_round_trips_seeded_store() -> anyhow::Result<()> {
     use alloy::primitives::{Address, B256, U256};
 
     let store = Arc::new(MemoryBuyerPoolStore::new());
+    let deployment = decdn_incentive::Deployment {
+        chain_id: 421_614,
+        payment_pool: Address::repeat_byte(0x9c),
+    };
     // Two owners, so both rows survive the store's owner index.
     store.record(&BuyerPoolState::new(
         B256::repeat_byte(0xbb),
-        Address::repeat_byte(0x9c),
+        deployment,
         Address::repeat_byte(0x22),
         Address::repeat_byte(0xcd),
         U256::from(9_000_000u64),
     ))?;
     store.record(&BuyerPoolState::new(
         B256::repeat_byte(0xaa),
-        Address::repeat_byte(0x9c),
+        deployment,
         Address::repeat_byte(0x11),
         Address::repeat_byte(0xcd),
         U256::from(10_000_000u64),
@@ -341,6 +345,7 @@ async fn pools_round_trips_seeded_store() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("missing first pool"))?;
     assert_eq!(first.pool_id, format!("{:#x}", B256::repeat_byte(0xaa)));
     assert_eq!(first.deposit_micro_usdc, 10_000_000);
+    assert_eq!(first.chain_id, deployment.chain_id);
     assert!(first.owner.starts_with("0x"));
 
     let _ = stop_tx.send(());

@@ -64,7 +64,10 @@ fn seed(data_dir: &std::path::Path, owner_byte: u8) {
     let store = RedbBuyerPoolStore::open(data_dir).unwrap();
     let state = BuyerPoolState::new(
         B256::repeat_byte(owner_byte),
-        Address::repeat_byte(0x9c),
+        decdn_incentive::Deployment {
+            chain_id: 421_614,
+            payment_pool: Address::repeat_byte(0x9c),
+        },
         Address::repeat_byte(owner_byte),
         Address::repeat_byte(0xcd),
         U256::from(2_000_000u64),
@@ -197,7 +200,8 @@ async fn list_with_data_dir_ignores_broken_config_env_expansion() {
 fn seed_stopped_daemon_store(data_dir: &std::path::Path) -> B256 {
     use decdn_node::channel_store::{BuyerPoolStoreHandle, PersistentPoolStateStore};
 
-    // The buyer table ignores the seller-side deployment stamp; any stamp does.
+    // The buyer table ignores the seller-side deployment stamp: each buyer row
+    // carries its own tag. The row below reuses this deployment for both.
     let deployment = decdn_node::channel_store::Deployment {
         chain_id: 31_337,
         payment_pool: Address::repeat_byte(0x9c),
@@ -207,7 +211,7 @@ fn seed_stopped_daemon_store(data_dir: &std::path::Path) -> B256 {
     let store = std::sync::Arc::new(PersistentPoolStateStore::open(data_dir, deployment).unwrap());
     let state = BuyerPoolState::new(
         pool_id,
-        Address::repeat_byte(0x9c),
+        deployment,
         Address::repeat_byte(0x5a),
         Address::repeat_byte(0xcd),
         U256::from(7_000_000u64),
@@ -277,6 +281,13 @@ fn a_stopped_daemons_store_is_read_from_disk_and_labelled() {
     assert_eq!(v["source"], "node_store_offline");
     assert!(v["store"].as_str().unwrap().ends_with("buyer.redb"), "{v}");
     assert_eq!(v["pools"][0]["pool_id"], format!("{pool_id:#x}"));
+    // The row's deployment tag reaches the listing: the pool id alone repeats
+    // across deployments.
+    assert_eq!(v["pools"][0]["chain_id"], 31_337);
+    assert_eq!(
+        v["pools"][0]["payment_pool"],
+        format!("{:#x}", Address::repeat_byte(0x9c))
+    );
 }
 
 /// A refused admin port with the store still write-locked means a daemon IS

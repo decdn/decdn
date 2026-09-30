@@ -940,8 +940,9 @@ Startup also verifies the configured deployment before touching the store:
 `eth_chainId` must match `blockchain.chain_id`, and the configured address
 must hold code that answers `PaymentPool.usdc()`, so a typo — including a
 sibling contract pasted from the same deploy manifest — aborts boot instead
-of triggering the drop. Buyer pool rows are scoped per row and are not
-dropped by this path.
+of triggering the drop. Buyer pool rows are not dropped by this path. Each
+buyer row carries its own chain id and `PaymentPool` address, and the buyer
+ignores a row from another deployment.
 
 ## Testnet faucet
 

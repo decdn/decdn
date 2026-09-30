@@ -68,7 +68,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal as _;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError};
 
 use alloy::dyn_abi::Eip712Domain;
@@ -535,6 +535,15 @@ struct Manifest {
     entries: Vec<ManifestEntry>,
 }
 
+/// A manifest cut down to the entries this run pulls, and how many entries
+/// the `--include`/`--exclude` filter and the `--select` editor dropped.
+#[derive(Debug)]
+struct Kept {
+    manifest: Manifest,
+    /// Entries the run does not pull: filtered out or deselected.
+    excluded: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct ManifestEntry {
     path: String,
@@ -664,13 +673,61 @@ fn download_bytes(entries: &[ManifestEntry], fetch_plan: &FetchPlan) -> Option<u
 /// include gate is open when no `--include` was given (every entry passes) and
 /// otherwise requires a match against at least one include pattern; `--exclude`
 /// always wins over `--include`.
+///
+/// Every pattern matches the whole path from the bundle root, so `metal/*`
+/// matches `metal/model.bin` but not `gpt/metal/model.bin`; `**/metal/*`
+/// matches both. A pattern that matches no entry is almost always this mistake,
+/// so [`Self::apply_and_warn`] names each one.
 #[derive(Debug)]
 struct EntryFilter {
     include: globset::GlobSet,
-    /// Whether any `--include` was given. False leaves the include gate open —
-    /// distinct from an empty [`globset::GlobSet`], which matches nothing.
-    has_include: bool,
+    /// The `--include` patterns as given, in the order [`build_glob_set`]
+    /// compiled them, so a [`globset::GlobSet::matches`] index names its
+    /// pattern.
+    include_patterns: Vec<String>,
     exclude: globset::GlobSet,
+    /// The `--exclude` patterns as given, indexed like `include_patterns`.
+    exclude_patterns: Vec<String>,
+}
+
+/// A `--include` or `--exclude` pattern that matched no entry of the manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Unmatched {
+    /// The flag the pattern came from: `--include` or `--exclude`.
+    flag: &'static str,
+    /// The pattern as given.
+    pattern: String,
+    /// The same pattern under a leading `**/`, when that form matches at least
+    /// one entry: the likely intent of a pattern written as if it matched at
+    /// any depth.
+    suggestion: Option<String>,
+}
+
+impl Unmatched {
+    /// The warning line for this pattern, without the `warning: ` prefix.
+    fn warning(&self) -> String {
+        let hint = self
+            .suggestion
+            .as_ref()
+            .map_or_else(String::new, |suggestion| {
+                format!(
+                    " (a pattern matches the whole path from the bundle root; did you mean \
+                     '{suggestion}'?)"
+                )
+            });
+        format!("{} '{}' matched no entries{hint}", self.flag, self.pattern)
+    }
+}
+
+/// What [`EntryFilter::apply_reporting`] hands back.
+#[derive(Debug)]
+struct FilterPass {
+    /// The entries the filter keeps, in manifest order.
+    kept: Vec<ManifestEntry>,
+    /// How many entries the filter dropped.
+    excluded: u64,
+    /// Each pattern that matched no entry, `--include` ones first.
+    unmatched: Vec<Unmatched>,
 }
 
 impl EntryFilter {
@@ -679,21 +736,108 @@ impl EntryFilter {
     fn compile(include: &[String], exclude: &[String]) -> anyhow::Result<Self> {
         Ok(Self {
             include: build_glob_set(include, "--include")?,
-            has_include: !include.is_empty(),
+            include_patterns: include.to_vec(),
             exclude: build_glob_set(exclude, "--exclude")?,
+            exclude_patterns: exclude.to_vec(),
         })
     }
 
-    /// Whether an entry at POSIX relative `path` survives the filter.
-    fn keep(&self, path: &str) -> bool {
-        let p = Path::new(path);
-        (!self.has_include || self.include.is_match(p)) && !self.exclude.is_match(p)
+    /// Retain only the entries the filter keeps, preserving manifest order, and
+    /// report the patterns that matched no entry. A pattern's hits are counted
+    /// over every entry of `entries`, before either gate drops any, so an
+    /// `--exclude` that matches only entries the include gate already dropped
+    /// still counts as a match.
+    fn apply_reporting(&self, entries: Vec<ManifestEntry>) -> FilterPass {
+        let mut include_hits = vec![false; self.include_patterns.len()];
+        let mut exclude_hits = vec![false; self.exclude_patterns.len()];
+        let keep: Vec<bool> = entries
+            .iter()
+            .map(|e| {
+                let p = Path::new(&e.path);
+                let included = mark_hits(&self.include, p, &mut include_hits);
+                let excluded = mark_hits(&self.exclude, p, &mut exclude_hits);
+                (self.include_patterns.is_empty() || included) && !excluded
+            })
+            .collect();
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        let unmatched = unmatched_patterns("--include", &self.include_patterns, &include_hits)
+            .chain(unmatched_patterns(
+                "--exclude",
+                &self.exclude_patterns,
+                &exclude_hits,
+            ))
+            .map(|mut u| {
+                u.suggestion = anywhere_suggestion(&u.pattern, &paths);
+                u
+            })
+            .collect();
+        let raw = entries.len();
+        let kept: Vec<ManifestEntry> = entries
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(e, keep)| keep.then_some(e))
+            .collect();
+        let excluded = u64::try_from(raw.saturating_sub(kept.len())).unwrap_or(u64::MAX);
+        FilterPass {
+            kept,
+            excluded,
+            unmatched,
+        }
     }
 
-    /// Retain only the entries the filter keeps, preserving manifest order.
-    fn apply(&self, entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
-        entries.into_iter().filter(|e| self.keep(&e.path)).collect()
+    /// [`Self::apply_reporting`], with one `warning:` line on stderr for each
+    /// pattern that matched no entry. Returns the kept entries and how many the
+    /// filter dropped.
+    fn apply_and_warn(&self, entries: Vec<ManifestEntry>) -> (Vec<ManifestEntry>, u64) {
+        let pass = self.apply_reporting(entries);
+        for u in &pass.unmatched {
+            eprintln!("warning: {}", u.warning());
+        }
+        (pass.kept, pass.excluded)
     }
+}
+
+/// Mark in `hits` every pattern of `set` that matches `path`, and return
+/// whether any did.
+fn mark_hits(set: &globset::GlobSet, path: &Path, hits: &mut [bool]) -> bool {
+    let matched = set.matches(path);
+    for i in &matched {
+        if let Some(hit) = hits.get_mut(*i) {
+            *hit = true;
+        }
+    }
+    !matched.is_empty()
+}
+
+/// The patterns of `flag` whose `hits` slot is unset, with no suggestion yet.
+fn unmatched_patterns<'a>(
+    flag: &'static str,
+    patterns: &'a [String],
+    hits: &'a [bool],
+) -> impl Iterator<Item = Unmatched> + 'a {
+    patterns
+        .iter()
+        .zip(hits)
+        .filter(|(_, hit)| !**hit)
+        .map(move |(pattern, _)| Unmatched {
+            flag,
+            pattern: pattern.clone(),
+            suggestion: None,
+        })
+}
+
+/// `**/<pattern>`, when `pattern` does not start with `**` or `/` and that form
+/// matches at least one of `paths`.
+fn anywhere_suggestion(pattern: &str, paths: &[&str]) -> Option<String> {
+    if pattern.starts_with("**") || pattern.starts_with('/') {
+        return None;
+    }
+    let anywhere = format!("**/{pattern}");
+    let set = build_glob_set(std::slice::from_ref(&anywhere), "suggestion").ok()?;
+    paths
+        .iter()
+        .any(|p| set.is_match(Path::new(p)))
+        .then_some(anywhere)
 }
 
 /// Header written above the file list in the `--select` editor buffer. Explains
@@ -792,17 +936,34 @@ fn parse_selection(
 }
 
 /// Apply the interactive `--select` step to a finalized manifest, or pass it
-/// through unchanged when `--select` is off. `Ok(None)` means the user deselected
-/// every file: [`report_nothing_to_fetch`] was already called, so the run is done.
-fn maybe_select(args: &BundlePullArgs, mut manifest: Manifest) -> anyhow::Result<Option<Manifest>> {
+/// through unchanged when `--select` is off. Each deselected entry adds to the
+/// excluded count. `Ok(None)` means the user deselected every file:
+/// [`report_nothing_to_fetch`] was already called, so the run is done.
+fn maybe_select(args: &BundlePullArgs, mut kept: Kept) -> anyhow::Result<Option<Kept>> {
     if args.select {
-        manifest.entries = select_entries(manifest.entries)?;
-        if manifest.entries.is_empty() {
+        kept = apply_selection(kept, select_entries)?;
+        if kept.manifest.entries.is_empty() {
             report_nothing_to_fetch(NothingReason::Deselected);
+            warn_leftover_partials(&args.output, &[], args.hash.as_deref());
             return Ok(None);
         }
     }
-    Ok(Some(manifest))
+    Ok(Some(kept))
+}
+
+/// Replace `kept`'s entries with the ones `select` keeps, and add each entry it
+/// drops to the excluded count.
+fn apply_selection(
+    mut kept: Kept,
+    select: impl FnOnce(Vec<ManifestEntry>) -> anyhow::Result<Vec<ManifestEntry>>,
+) -> anyhow::Result<Kept> {
+    let offered = kept.manifest.entries.len();
+    kept.manifest.entries = select(kept.manifest.entries)?;
+    let dropped = offered.saturating_sub(kept.manifest.entries.len());
+    kept.excluded = kept
+        .excluded
+        .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
+    Ok(kept)
 }
 
 /// Reject a `--select` invocation that cannot work: it opens an editor, so it
@@ -935,9 +1096,9 @@ enum EntryOutcome {
 struct GroupRun {
     /// One outcome per entry in the group, in order.
     outcomes: Vec<EntryOutcome>,
-    /// The content bytes the group paid for, when its blob fetch landed
-    /// ([`PullCtx::pull_entry_untimed`]). `None` when it fetched nothing.
-    paid: Option<u64>,
+    /// The content bytes the group paid for and resumed, when its blob fetch
+    /// landed ([`PullCtx::pull_entry_untimed`]). `None` when it fetched nothing.
+    bytes: Option<EntryBytes>,
     /// The fault that ends the whole pull ([`ends_the_pull`]), when the
     /// group's blob fetch failed with one.
     stop: Option<anyhow::Error>,
@@ -948,17 +1109,17 @@ impl GroupRun {
     const fn done(outcomes: Vec<EntryOutcome>) -> Self {
         Self {
             outcomes,
-            paid: None,
+            bytes: None,
             stop: None,
         }
     }
 
-    /// The group's blob fetch landed, paying for `paid` content bytes, and
-    /// `outcomes` is how each destination then materialized.
-    const fn landed(outcomes: Vec<EntryOutcome>, paid: u64) -> Self {
+    /// The group's blob fetch landed with `bytes`, and `outcomes` is how each
+    /// destination then materialized.
+    const fn landed(outcomes: Vec<EntryOutcome>, bytes: EntryBytes) -> Self {
         Self {
             outcomes,
-            paid: Some(paid),
+            bytes: Some(bytes),
             stop: None,
         }
     }
@@ -968,7 +1129,7 @@ impl GroupRun {
     fn fetch_failed(slots: Vec<Slot<'_>>, err: anyhow::Error) -> Self {
         Self {
             outcomes: fail_all(slots, &err),
-            paid: None,
+            bytes: None,
             stop: ends_the_pull(&err).then_some(err),
         }
     }
@@ -995,18 +1156,26 @@ fn ends_the_pull(err: &anyhow::Error) -> bool {
 }
 
 /// One-line `--json` summary. `fetched`/`linked`/`skipped`/`failed` are entry
-/// counts; `downloaded` is the content bytes paid for across the distinct blobs
-/// fetched (a blob shared across several paths counts once, #1306; a range-dedup
-/// blob counts only the bytes it did not splice from disk) and `reconstructed` is
-/// the total bytes written to disk this run — they diverge when one blob is
-/// materialized to several paths or when range-dedup spliced part of a blob.
-/// `downloaded` is a content-size tally, not an exact on-wire measurement: it
-/// excludes bao proof overhead, and it counts a `.partial` prefix resumed from an
-/// earlier run.
+/// counts; `downloaded` is the content bytes this run fetched and paid for across
+/// the distinct blobs fetched (a blob shared across several paths counts once,
+/// #1306; a range-dedup blob counts only the bytes it did not splice from disk)
+/// and `reconstructed` is the total bytes written to disk this run — they diverge
+/// when one blob is materialized to several paths or when range-dedup spliced part
+/// of a blob. `downloaded` is a content-size tally, not an exact on-wire
+/// measurement: it excludes bao proof overhead.
 ///
-/// `deduped` and `reused_bytes` report the whole-file dedup outcome, counted per
+/// `resumed_bytes` is the content bytes of a `.partial` prefix that an earlier,
+/// interrupted run fetched and paid for, which this run resumed rather than
+/// fetched again. It is never part of `downloaded`. A byte that this run also
+/// spliced from disk counts only in `spliced_bytes`.
+///
+/// `excluded` counts the manifest entries this run does not pull: the ones the
+/// `--include`/`--exclude` filter dropped and the ones deselected under
+/// `--select`.
+///
+/// `reused` and `reused_bytes` report the whole-file dedup outcome, counted per
 /// distinct blob exactly as `fetched`/`downloaded` are (a blob reused at several
-/// paths counts once here; its extra destinations are `linked`): `deduped` is the
+/// paths counts once here; its extra destinations are `linked`): `reused` is the
 /// count of distinct blobs materialized from an on-disk whole-file donor (verified
 /// by re-hash before use), and `reused_bytes` sums those blobs' sizes once each —
 /// bytes served from disk with no download and no payment.
@@ -1025,14 +1194,19 @@ struct PullReport {
     fetched: u64,
     linked: u64,
     skipped: u64,
+    /// Entries the filter or `--select` dropped.
+    excluded: u64,
     failed: u64,
     downloaded: u64,
     reconstructed: u64,
     spliced_bytes: u64,
     hints_ignored: u64,
+    /// Content bytes of `.partial` prefixes that earlier runs fetched and this
+    /// run resumed; never part of `downloaded`.
+    resumed_bytes: u64,
     /// Count of distinct blobs materialized from an on-disk whole-file donor;
     /// extra destinations of the same blob are counted in `linked`.
-    deduped: u64,
+    reused: u64,
     /// Sum of those blobs' sizes (once per blob) — bytes materialized from a
     /// whole-file donor with no download or payment.
     reused_bytes: u64,
@@ -1047,16 +1221,52 @@ struct DedupSummary {
     hints_ignored: u64,
 }
 
-/// One dedup entry's range-dedup outcome, returned by [`reassemble_dedup`] and
-/// accumulated into [`PullCtx::dedup_stats`] by [`PullCtx::pull_entry`].
+/// One dedup entry's range-dedup outcome, returned by [`reassemble_dedup`].
+/// [`PullCtx::pull_entry_untimed`] accumulates its spliced bytes and ignored
+/// hints into [`PullCtx::dedup_stats`] and folds all of it into the entry's
+/// [`EntryBytes`].
 #[derive(Clone, Copy, Default, Debug)]
 struct DedupOutcome {
     /// Bytes this entry served from a local donor splice — never downloaded.
     spliced_bytes: u64,
+    /// Bytes this entry's ranged store held from an earlier run before this run
+    /// drove anything, less the bytes it spliced — neither downloaded nor
+    /// spliced here.
+    resumed_bytes: u64,
     /// Range-dedup hints this entry dropped by a fault (a donor that failed its
     /// verification re-hash or was unreadable, or a self-heal re-drive that
     /// discarded every already-spliced donor).
     hints_ignored: u64,
+}
+
+impl DedupOutcome {
+    /// The outcome of an entry of `total` bytes whose net spliced spans are
+    /// `spliced` and whose store held the `resumed` spans from an earlier run.
+    /// A byte in both counts as spliced, so no byte counts twice.
+    fn of(spliced: &[(u64, u64)], resumed: &[(u64, u64)], total: u64, hints_ignored: u64) -> Self {
+        Self {
+            spliced_bytes: span_bytes(spliced),
+            resumed_bytes: span_bytes(&uncovered_runs(resumed, spliced, total)),
+            hints_ignored,
+        }
+    }
+
+    /// This outcome, or, when a drive fetched the whole blob again after its
+    /// finalize failed the hash (`refetched`), one with nothing spliced or
+    /// resumed. That pass dropped every byte the store held and fetched the
+    /// blob in full, and it always ends the entry, so this run paid for all
+    /// of it.
+    const fn refetched_if(self, refetched: bool) -> Self {
+        if refetched {
+            Self {
+                spliced_bytes: 0,
+                resumed_bytes: 0,
+                hints_ignored: self.hints_ignored,
+            }
+        } else {
+            self
+        }
+    }
 }
 
 /// Run-scoped range-dedup counters, shared by every concurrent entry via
@@ -1068,16 +1278,18 @@ struct DedupStats {
     hints_ignored: AtomicU64,
 }
 
-/// A pull's byte accounting: `downloaded` is the content bytes paid for across the
-/// distinct blobs fetched (a blob materialized to several paths counts once, #1306;
-/// a range-dedup blob counts only the bytes it did not splice from disk);
-/// `reconstructed` is the total bytes written to disk (every materialized copy).
-/// `downloaded` is content bytes, not exact on-wire bytes: it omits bao proof
-/// overhead and still counts a `.partial` prefix resumed from an earlier run.
-#[derive(Clone, Copy, Default)]
+/// A pull's byte accounting: `downloaded` is the content bytes this run fetched and
+/// paid for across the distinct blobs fetched (a blob materialized to several paths
+/// counts once, #1306; a range-dedup blob counts only the bytes it did not splice
+/// from disk); `reconstructed` is the total bytes written to disk (every
+/// materialized copy); `resumed` is the content bytes of `.partial` prefixes that
+/// earlier runs fetched and this run resumed. `downloaded` is content bytes, not
+/// exact on-wire bytes: it omits bao proof overhead.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct Transfer {
     downloaded: u64,
     reconstructed: u64,
+    resumed: u64,
 }
 
 impl Transfer {
@@ -1086,6 +1298,7 @@ impl Transfer {
         Transfer {
             downloaded: self.downloaded.saturating_add(other.downloaded),
             reconstructed: self.reconstructed.saturating_add(other.reconstructed),
+            resumed: self.resumed.saturating_add(other.resumed),
         }
     }
 }
@@ -1218,12 +1431,17 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         Some(path) => {
             let mut m = read_local_manifest(path)?;
             let raw_empty = m.entries.is_empty();
-            m.entries = filter.apply(m.entries);
+            let (entries, excluded) = filter.apply_and_warn(m.entries);
+            m.entries = entries;
             if m.entries.is_empty() {
                 report_nothing_to_fetch(NothingReason::from_filter(filters_given, raw_empty));
+                warn_leftover_partials(&args.output, &[], None);
                 return Ok(());
             }
-            Some(m)
+            Some(Kept {
+                manifest: m,
+                excluded,
+            })
         }
         None => None,
     };
@@ -1276,7 +1494,7 @@ async fn pull_over(
     endpoint: &Endpoint,
     relays: &[RelayUrl],
     (filter, filters_given): (&EntryFilter, bool),
-    local_manifest: Option<Manifest>,
+    local_manifest: Option<Kept>,
 ) -> anyhow::Result<()> {
     let common = &args.common;
     // Selection + the buyer signer, resolved per path (see `resolve_selection`).
@@ -1349,18 +1567,18 @@ async fn pull_manifest<P: Provider + Clone>(
     args: &BundlePullArgs,
     filter: &EntryFilter,
     filters_given: bool,
-    local_manifest: Option<Manifest>,
+    local_manifest: Option<Kept>,
 ) -> anyhow::Result<()> {
     // Obtain the manifest: the pre-read local one, or the `--hash` bundle blob
     // fetched and filtered here. `None` => filtered to empty (already reported).
-    let Some(manifest) = obtain_manifest(&ctx, args, filter, filters_given, local_manifest).await?
+    let Some(kept) = obtain_manifest(&ctx, args, filter, filters_given, local_manifest).await?
     else {
         return Ok(());
     };
 
     // `--select`: let the user trim the (already glob-filtered) list in their
     // editor. Everything deselected ends the run (reported) like an empty filter.
-    let Some(manifest) = maybe_select(args, manifest)? else {
+    let Some(Kept { manifest, excluded }) = maybe_select(args, kept)? else {
         return Ok(());
     };
 
@@ -1402,6 +1620,7 @@ async fn pull_manifest<P: Provider + Clone>(
         )
         .await;
     ctx.progress.finish();
+    warn_leftover_partials(&args.output, &manifest.entries, args.hash.as_deref());
 
     // Every entry has joined, so the shared dedup counters are now stable.
     let dedup = DedupSummary {
@@ -1413,6 +1632,7 @@ async fn pull_manifest<P: Provider + Clone>(
         &warnings,
         transfer,
         dedup,
+        excluded,
         &args.output,
         args.json,
     );
@@ -1481,8 +1701,8 @@ async fn obtain_manifest<P: Provider + Clone>(
     args: &BundlePullArgs,
     filter: &EntryFilter,
     filters_given: bool,
-    local_manifest: Option<Manifest>,
-) -> anyhow::Result<Option<Manifest>> {
+    local_manifest: Option<Kept>,
+) -> anyhow::Result<Option<Kept>> {
     if let Some(m) = local_manifest {
         return Ok(Some(m));
     }
@@ -1511,12 +1731,17 @@ async fn obtain_manifest<P: Provider + Clone>(
     };
     let mut m = parse_manifest(&bytes)?;
     let raw_empty = m.entries.is_empty();
-    m.entries = filter.apply(m.entries);
+    let (entries, excluded) = filter.apply_and_warn(m.entries);
+    m.entries = entries;
     if m.entries.is_empty() {
         report_nothing_to_fetch(NothingReason::from_filter(filters_given, raw_empty));
+        warn_leftover_partials(&args.output, &[], args.hash.as_deref());
         return Ok(None);
     }
-    Ok(Some(m))
+    Ok(Some(Kept {
+        manifest: m,
+        excluded,
+    }))
 }
 
 /// Record one group's run in [`PullCtx::pull_plain`]: forward its recordable
@@ -1552,20 +1777,21 @@ fn settle_group_run(
         *slot = SettledGroup {
             outcomes: run.outcomes,
             warnings,
-            paid: run.paid,
+            bytes: run.bytes,
         };
     }
     run.stop
 }
 
 /// A hash-group's result, kept for the run summary: its per-entry outcomes
-/// and the content bytes its landed fetch paid for (see [`GroupRun::paid`]).
+/// and the content bytes its landed fetch paid for and resumed (see
+/// [`GroupRun::bytes`]).
 #[derive(Clone, Default)]
 struct SettledGroup {
     outcomes: Vec<EntryOutcome>,
     /// The group's size warnings ([`size_warnings`]).
     warnings: Vec<String>,
-    paid: Option<u64>,
+    bytes: Option<EntryBytes>,
 }
 
 /// Run `items` through `run` once, at most `jobs` at a time.
@@ -1818,14 +2044,14 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
     /// Fetch one whole blob into `staging` through the acquire loop (ADR 039),
     /// across the entry's holders ([`Self::entry_targets`]). See
-    /// [`Self::acquire_entry`] for the fetch itself.
+    /// [`Self::acquire_entry`] for the fetch itself and what it returns.
     async fn fetch_to_staging(
         &self,
         hash: [u8; 32],
         staging: &Path,
         total: Option<u64>,
         progress: Option<&ProgressCallback>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let _permit = self
             .gate
             .acquire()
@@ -1894,6 +2120,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// ([`LaneStreamCap`]). Each lane's voucher watermark is persisted before
     /// the result returns, and the `.partial` beside `staging` stays for a
     /// resume.
+    ///
+    /// It returns `true` when the store's finalized file failed its hash and
+    /// the fetch dropped every byte the store held and fetched the blob again
+    /// ([`Downloader::refetched_targets`]). A prefix an earlier run left is
+    /// then fetched and paid again.
     async fn acquire_entry(
         &self,
         targets: &fetch::ResolvedTargets,
@@ -1902,7 +2133,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         total: Option<u64>,
         ranges: Option<&[(u64, u64)]>,
         progress: Option<&ProgressCallback>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
         let deps = self.drive_deps(max_blob_bytes)?;
         let sources = CliSources::new(
@@ -1954,7 +2185,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 &self.stop,
             ))
             .await
-            .map(|_paths| ())
+            .map(|_paths| downloader.refetched_targets() > 0)
         }
         .await;
         on_drop.disarm();
@@ -2163,7 +2394,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // so sum it before flattening away the group boundaries.
         let transfer = groups
             .iter()
-            .map(|g| group_transfer(&g.outcomes, g.paid))
+            .map(|g| group_transfer(&g.outcomes, g.bytes))
             .fold(Transfer::default(), Transfer::add);
         let warnings = groups
             .iter_mut()
@@ -2181,7 +2412,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
     /// Run [`Self::pull_entry_untimed`] and, when the entry lands, log one `-v`
     /// line with its size, the time the whole entry took, and its download rate
-    /// (#2120, #2189). Returns the content bytes the entry paid for (see
+    /// (#2120, #2189). Returns the entry's [`EntryBytes`] (see
     /// [`Self::pull_entry_untimed`]).
     #[allow(clippy::too_many_arguments)]
     async fn pull_entry(
@@ -2193,14 +2424,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         index: &ChunkIndex,
         fetch_plan: &FetchPlan,
         file: Option<&pull_progress::FileBar>,
-    ) -> anyhow::Result<u64> {
+    ) -> anyhow::Result<EntryBytes> {
         let started = std::time::Instant::now();
         self.pull_entry_untimed(hash, hints, total, staging, index, fetch_plan, file)
             .await
-            .map(|bytes| {
-                log_entry_done(hash, staging, bytes, started.elapsed());
-                bytes.paid
-            })
+            .inspect(|&bytes| log_entry_done(hash, staging, bytes, started.elapsed()))
     }
 
     /// Reconstruct one entry's blob into `staging` (the finalized per-hash staging
@@ -2222,11 +2450,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     ///   chunk) the whole blob is re-driven and re-verified before the entry fails.
     ///
     /// On success the entry's chunks are registered into `index` so later entries
-    /// can splice from this blob, and its [`EntryBytes`] are returned. The paid
-    /// count is the whole blob on the plain path, the blob less its spliced bytes
-    /// on the dedup path, and 0 for an already-finalized staging blob. It is a
-    /// content count — bao proof overhead is not in it, and a `.partial` prefix
-    /// resumed from an earlier run counts again.
+    /// can splice from this blob, and its [`EntryBytes`] are returned. Before
+    /// either path drives anything, the entry reads the bytes its ranged store
+    /// already holds from an earlier, interrupted run ([`resumed_spans`]); those
+    /// are resumed, not paid. The paid count is the whole blob less its resumed
+    /// bytes on the plain path, the blob less its spliced and resumed bytes on the
+    /// dedup path, and 0 for an already-finalized staging blob. It is a content
+    /// count: bao proof overhead is not in it.
     #[allow(clippy::too_many_arguments)]
     async fn pull_entry_untimed(
         &self,
@@ -2268,6 +2498,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             remove_staging_off_runtime(staging).await;
         }
 
+        // What earlier runs already fetched into this entry's `.partial`: read now,
+        // before any drive of this run adds to it. `staging` is absent here, so
+        // the read opens the record alone and never hashes a final file.
+        let resumed = resumed_spans_off_runtime(staging, hash).await;
+
         // Until the first byte lands, the entry is discovering holders — surfaced so
         // a slow or stalling probe (a blob no probed node answers for) does not look
         // like a frozen empty bar. The delivery callback switches the row to its
@@ -2299,11 +2534,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             // register its chunks so a *later* entry can dedup against it. The
             // manifest's `size`, when it gives one, is the entry's first size claim,
             // a hint; the paid count is the verified blob's length.
-            self.fetch_to_staging(hash, staging, total, progress)
+            let refetched = self
+                .fetch_to_staging(hash, staging, total, progress)
                 .await?;
             index.register(hints, staging);
-            let paid = tokio::fs::metadata(staging).await.map_or(0, |m| m.len());
-            return Ok(EntryBytes { paid, spliced: 0 });
+            let len = tokio::fs::metadata(staging).await.map_or(0, |m| m.len());
+            let resumed = if refetched { 0 } else { span_bytes(&resumed) };
+            return Ok(EntryBytes::whole_blob(len, resumed));
         };
 
         // Dedup path. Hold one fetch permit across the complement drive, the donor
@@ -2326,6 +2563,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             staging,
             total,
             progress,
+            refetched: AtomicBool::new(false),
         };
 
         // On any dedup-path success, true up the file + total progress bars to
@@ -2343,23 +2581,22 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             &driver,
             &plan,
             total,
+            &resumed,
             hints,
             index,
             fetch_plan,
             file,
             &finish_progress,
         )
-        .await?;
+        .await?
+        .refetched_if(driver.refetched.load(Ordering::Relaxed));
         self.dedup_stats
             .spliced_bytes
             .fetch_add(outcome.spliced_bytes, Ordering::Relaxed);
         self.dedup_stats
             .hints_ignored
             .fetch_add(outcome.hints_ignored, Ordering::Relaxed);
-        Ok(EntryBytes {
-            paid: total.saturating_sub(outcome.spliced_bytes),
-            spliced: outcome.spliced_bytes,
-        })
+        Ok(EntryBytes::dedup(total, outcome))
     }
 
     /// Fetch the blob shared by one hash-group and write it under `out_root` at
@@ -2490,8 +2727,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             )
             .await;
         file_bar.finish();
-        let paid = match fetched {
-            Ok(paid) => paid,
+        let bytes = match fetched {
+            Ok(bytes) => bytes,
             Err(e) => {
                 // `pull_entry` (whole-file or dedup) leaves the `<hex>.partial` +
                 // `.ranges` record in place on error: they are what the
@@ -2547,19 +2784,95 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             index.mark_retained(&staging);
         }
 
-        GroupRun::landed(outcomes, paid)
+        GroupRun::landed(outcomes, bytes)
     }
 }
 
-/// The content bytes one landed entry paid for and spliced from disk, as
-/// [`PullCtx::pull_entry_untimed`] counts them.
-#[derive(Clone, Copy, Debug, Default)]
+/// The content bytes one landed entry paid for, spliced from disk, and resumed
+/// from an earlier run, as [`PullCtx::pull_entry_untimed`] counts them. No byte
+/// counts in two of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct EntryBytes {
-    /// Content bytes the entry paid for (see [`PullCtx::pull_entry_untimed`]).
+    /// Content bytes this run fetched and paid for (see
+    /// [`PullCtx::pull_entry_untimed`]).
     paid: u64,
     /// Bytes the entry spliced from a local donor on disk rather than
     /// downloading them itself.
     spliced: u64,
+    /// Bytes an earlier, interrupted run fetched into the entry's `.partial`,
+    /// which this run resumed rather than fetched again.
+    resumed: u64,
+}
+
+impl EntryBytes {
+    /// A whole-blob fetch that landed a `len`-byte blob into a store that
+    /// already held `resumed` bytes of it.
+    fn whole_blob(len: u64, resumed: u64) -> Self {
+        let resumed = resumed.min(len);
+        Self {
+            paid: len.saturating_sub(resumed),
+            spliced: 0,
+            resumed,
+        }
+    }
+
+    /// A range-dedup entry of `total` bytes with `outcome`: every byte it did
+    /// not splice or resume, this run paid for.
+    const fn dedup(total: u64, outcome: DedupOutcome) -> Self {
+        Self {
+            paid: total
+                .saturating_sub(outcome.spliced_bytes)
+                .saturating_sub(outcome.resumed_bytes),
+            spliced: outcome.spliced_bytes,
+            resumed: outcome.resumed_bytes,
+        }
+    }
+}
+
+/// The byte spans of `staging`'s ranged store that earlier runs already
+/// fetched: the present set of its `.partial.ranges` record, as sorted,
+/// disjoint `(offset, len)` pairs. The store marks only fetched bytes present,
+/// never the donor bytes a splice writes, so these spans are bytes an earlier
+/// run paid for. No record (a fresh entry) gives no spans.
+///
+/// The caller reads this before it drives anything, with `staging` absent, so
+/// the read opens the record alone and never hashes a final file. The spans
+/// are for reporting only: a record it cannot read logs at `debug` and gives
+/// no spans, and the fetch that follows surfaces the fault.
+fn resumed_spans(staging: &Path, hash: [u8; 32]) -> Vec<(u64, u64)> {
+    let read = || -> anyhow::Result<Vec<(u64, u64)>> {
+        let (dir, stem) = fetch::ranged_store_location(staging)?;
+        if !ClientRangedStore::has_record(&dir, &stem)? {
+            return Ok(Vec::new());
+        }
+        Ok(ClientRangedStore::open(&dir, &stem, hash)?.present_byte_ranges())
+    };
+    read().unwrap_or_else(|e| {
+        tracing::debug!(
+            "could not read the resume record beside {}: {e:#}",
+            staging.display()
+        );
+        Vec::new()
+    })
+}
+
+/// [`resumed_spans`] on the blocking pool. A failed join gives no spans.
+async fn resumed_spans_off_runtime(staging: &Path, hash: [u8; 32]) -> Vec<(u64, u64)> {
+    let staging = staging.to_path_buf();
+    tokio::task::spawn_blocking(move || resumed_spans(&staging, hash))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::debug!("resume record task: {e}");
+            Vec::new()
+        })
+}
+
+/// The total length of `(offset, len)` spans, saturating. The caller passes
+/// disjoint spans, so no byte counts twice.
+fn span_bytes(spans: &[(u64, u64)]) -> u64 {
+    spans
+        .iter()
+        .fold(0u64, |acc, &(_, len)| acc.saturating_add(len))
 }
 
 /// Log a finished entry's line at `-v` (#2120), so a run's slow entries can be
@@ -2579,11 +2892,11 @@ fn log_entry_done(hash: [u8; 32], staging: &Path, bytes: EntryBytes, elapsed: st
     tracing::info!("{}", entry_done_line(hash, size, bytes, elapsed));
 }
 
-/// A finished entry's size, the time it took, and its rate over the bytes it
-/// paid for (see [`PullCtx::pull_entry_untimed`]). When the entry spliced bytes
-/// from disk, the line reports them apart from the paid bytes (#2189). The time
-/// covers the whole entry: probing, every drive, any splice and the whole-file
-/// check.
+/// A finished entry's size, the time it took, and its rate over the bytes this
+/// run paid for (see [`PullCtx::pull_entry_untimed`]). When the entry resumed
+/// bytes from an earlier run or spliced bytes from disk, the line reports each
+/// non-zero one apart from the paid bytes (#2189, #2236). The time covers the
+/// whole entry: probing, every drive, any splice and the whole-file check.
 fn entry_done_line(
     hash: [u8; 32],
     size: u64,
@@ -2596,14 +2909,23 @@ fn entry_done_line(
     } else {
         fetch::fmt_rate(0.0)
     };
-    let detail = if bytes.spliced > 0 {
-        format!(
-            "{} downloaded at {rate}, {} spliced from disk",
-            indicatif::HumanBytes(bytes.paid),
-            indicatif::HumanBytes(bytes.spliced),
-        )
-    } else {
+    let detail = if bytes.spliced == 0 && bytes.resumed == 0 {
         rate
+    } else {
+        let mut parts = vec![format!(
+            "{} downloaded at {rate}",
+            indicatif::HumanBytes(bytes.paid)
+        )];
+        if bytes.resumed > 0 {
+            parts.push(format!("{} resumed", indicatif::HumanBytes(bytes.resumed)));
+        }
+        if bytes.spliced > 0 {
+            parts.push(format!(
+                "{} spliced from disk",
+                indicatif::HumanBytes(bytes.spliced)
+            ));
+        }
+        parts.join(", ")
     };
     format!(
         "bundle pull: {}: {} in {secs:.1}s ({detail})",
@@ -2658,6 +2980,9 @@ struct AcquireRangeDriver<'a, P: Provider + Clone> {
     /// The manifest's size: the entry's first size claim.
     total: u64,
     progress: Option<&'a ProgressCallback>,
+    /// Set once a drive's finalize failed its hash and the drive fetched the
+    /// whole blob again ([`PullCtx::acquire_entry`]).
+    refetched: AtomicBool,
 }
 
 impl<P: Provider + Clone> RangeDriver for AcquireRangeDriver<'_, P> {
@@ -2673,14 +2998,23 @@ impl<P: Provider + Clone> RangeDriver for AcquireRangeDriver<'_, P> {
         &'a self,
         ranges: &'a [(u64, u64)],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
-        Box::pin(self.ctx.acquire_entry(
-            self.targets,
-            self.hash,
-            self.staging,
-            Some(self.total),
-            Some(ranges),
-            self.progress,
-        ))
+        Box::pin(async move {
+            let refetched = self
+                .ctx
+                .acquire_entry(
+                    self.targets,
+                    self.hash,
+                    self.staging,
+                    Some(self.total),
+                    Some(ranges),
+                    self.progress,
+                )
+                .await?;
+            if refetched {
+                self.refetched.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        })
     }
 }
 
@@ -2757,16 +3091,21 @@ fn ensure_partial(staging: &Path, hash: [u8; 32], total: u64) -> anyhow::Result<
 /// are spliced from disk and never flow through `drive`'s progress callback, so a
 /// mostly-spliced entry would otherwise leave its bars short.
 ///
-/// Returns the entry's [`DedupOutcome`] — bytes actually spliced from disk and hints
-/// dropped by a fault — for the run-level report. A resume that finalized on the
-/// first pay-now drive spliced nothing this run; a self-heal whole-blob re-drive
-/// discards every splice, so it reports zero spliced bytes and counts all its donors
-/// as ignored.
+/// `resumed` is the byte spans the entry's store held from an earlier run before
+/// this run drove anything ([`resumed_spans`]).
+///
+/// Returns the entry's [`DedupOutcome`] — bytes actually spliced from disk, bytes
+/// resumed from an earlier run, and hints dropped by a fault — for the run-level
+/// report. A byte both resumed and spliced counts as spliced. A resume that
+/// finalized on the first pay-now drive spliced nothing this run; a self-heal
+/// whole-blob re-drive discards every splice, so it reports zero spliced bytes and
+/// counts all its donors as ignored.
 #[allow(clippy::too_many_arguments)]
 async fn reassemble_dedup(
     driver: &dyn RangeDriver,
     plan: &ReassemblePlan,
     total: u64,
+    resumed: &[(u64, u64)],
     hints: Option<&[Hint]>,
     index: &ChunkIndex,
     fetch_plan: &FetchPlan,
@@ -2787,11 +3126,12 @@ async fn reassemble_dedup(
         // drive can COMPLETE the store: `drive` then ran its whole-file hash
         // against `hash` and renamed `<hex>.partial` -> `<hex>`. The blob is
         // finalized and verified; splicing would open a `.partial` that no longer
-        // exists. Register the donor chunks and return. No splice ran this run.
+        // exists. Register the donor chunks and return. No splice ran this run,
+        // so every resumed byte counts as resumed.
         if staging.try_exists()? {
             finish_progress();
             index.register(hints, staging);
-            return Ok(DedupOutcome::default());
+            return Ok(DedupOutcome::of(&[], resumed, total, 0));
         }
     }
 
@@ -2810,10 +3150,12 @@ async fn reassemble_dedup(
         if staging.try_exists()? {
             finish_progress();
             index.register(hints, staging);
-            return Ok(DedupOutcome {
-                spliced_bytes: ledger.spliced_bytes(total),
+            return Ok(DedupOutcome::of(
+                &ledger.spliced_spans(total),
+                resumed,
+                total,
                 hints_ignored,
-            });
+            ));
         }
     }
 
@@ -2832,14 +3174,11 @@ async fn reassemble_dedup(
     )
     .await?;
     hints_ignored = hints_ignored.saturating_add(tail_ignored);
-    let mut spliced_bytes = ledger.spliced_bytes(total);
+    let mut spliced = ledger.spliced_spans(total);
     if staging.try_exists()? {
         finish_progress();
         index.register(hints, staging);
-        return Ok(DedupOutcome {
-            spliced_bytes,
-            hints_ignored,
-        });
+        return Ok(DedupOutcome::of(&spliced, resumed, total, hints_ignored));
     }
 
     // The authoritative check: the whole reassembled blob must hash to `hash`. This
@@ -2858,8 +3197,9 @@ async fn reassemble_dedup(
         // spliced ranges by re-driving the whole blob (the ranged store fetches
         // exactly the bytes the splice wrote, bao-verified against `hash`) and
         // re-verify. Every donor is discarded, so nothing was saved and all of them
-        // count as ignored.
-        spliced_bytes = 0;
+        // count as ignored. The resumed bytes stay present in the store, so the
+        // re-drive does not fetch them again.
+        spliced = Vec::new();
         hints_ignored =
             u64::try_from(plan.donor.len().saturating_add(plan.deferred.len())).unwrap_or(u64::MAX);
         tracing::warn!(
@@ -2875,10 +3215,7 @@ async fn reassemble_dedup(
         if staging.try_exists()? {
             finish_progress();
             index.register(hints, staging);
-            return Ok(DedupOutcome {
-                spliced_bytes,
-                hints_ignored,
-            });
+            return Ok(DedupOutcome::of(&spliced, resumed, total, hints_ignored));
         }
         let partial_for_hash = partial.clone();
         let got = tokio::task::spawn_blocking(move || hash_partial(&partial_for_hash))
@@ -2903,10 +3240,7 @@ async fn reassemble_dedup(
     .map_err(|e| anyhow!("promote task: {e}"))??;
     finish_progress();
     index.register(hints, staging);
-    Ok(DedupOutcome {
-        spliced_bytes,
-        hints_ignored,
-    })
+    Ok(DedupOutcome::of(&spliced, resumed, total, hints_ignored))
 }
 
 /// Tail reconcile for one entry's deferred (sibling-assigned) chunks: splice each
@@ -3613,22 +3947,24 @@ struct SpliceLedger {
 }
 
 impl SpliceLedger {
-    /// Bytes served from a splice: the spliced spans less every driven span.
-    fn spliced_bytes(&self, total: u64) -> u64 {
-        net_spliced(&self.spliced, &self.driven, total)
+    /// The spans served from a splice: the spliced spans less every driven
+    /// span, as sorted, disjoint `(offset, len)` pairs.
+    fn spliced_spans(&self, total: u64) -> Vec<(u64, u64)> {
+        uncovered_runs(&self.spliced, &self.driven, total)
     }
 }
 
-/// The bytes of `spliced` that no `driven` span covers, over `[0, total)`. Both
-/// are `(offset, len)` spans, in any order, and may overlap.
-fn net_spliced(spliced: &[(u64, u64)], driven: &[(u64, u64)], total: u64) -> u64 {
-    let kept = complement_runs(driven, total);
+/// The parts of `spans` that no `cover` span covers, over `[0, total)`, as
+/// sorted, disjoint `(offset, len)` pairs. Both inputs are `(offset, len)`
+/// spans, in any order, and may overlap.
+fn uncovered_runs(spans: &[(u64, u64)], cover: &[(u64, u64)], total: u64) -> Vec<(u64, u64)> {
+    let kept = complement_runs(cover, total);
     let mut kept = kept
         .iter()
         .map(|&(offset, len)| (offset, offset.saturating_add(len)));
     let mut current = kept.next();
-    let mut bytes = 0u64;
-    for (start, end) in coalesce_runs(spliced, total) {
+    let mut out = Vec::new();
+    for (start, end) in coalesce_runs(spans, total) {
         while let Some((k_start, k_end)) = current {
             if k_end <= start {
                 current = kept.next();
@@ -3637,8 +3973,10 @@ fn net_spliced(spliced: &[(u64, u64)], driven: &[(u64, u64)], total: u64) -> u64
             if k_start >= end {
                 break;
             }
-            let overlap = end.min(k_end).saturating_sub(start.max(k_start));
-            bytes = bytes.saturating_add(overlap);
+            let (from, to) = (start.max(k_start), end.min(k_end));
+            if to > from {
+                out.push((from, to - from));
+            }
             if k_end <= end {
                 current = kept.next();
             } else {
@@ -3646,7 +3984,7 @@ fn net_spliced(spliced: &[(u64, u64)], driven: &[(u64, u64)], total: u64) -> u64
             }
         }
     }
-    bytes
+    out
 }
 
 /// Whether the `len` bytes at `offset` in `src` hash to `expected`. Any read
@@ -4185,7 +4523,7 @@ fn dry_run(args: &BundlePullArgs, filter: &EntryFilter, filters_given: bool) -> 
         (Some(path), _) => {
             let mut manifest = read_local_manifest(path)?;
             let raw_empty = manifest.entries.is_empty();
-            manifest.entries = filter.apply(manifest.entries);
+            manifest.entries = filter.apply_and_warn(manifest.entries).0;
             if args.json {
                 // The `--json` plan stays machine-readable — an empty set is
                 // `count: 0` with an empty `entries` array, no prose line.
@@ -4239,73 +4577,52 @@ fn dry_run(args: &BundlePullArgs, filter: &EntryFilter, filters_given: bool) -> 
 
 /// Summarize outcomes; return an error if any entry failed (after reporting all).
 /// Each of `warnings` ([`size_warnings`]) prints one line on stderr and never
-/// changes the result.
+/// changes the result. `excluded` is the count of entries the run does not pull
+/// ([`PullReport`]).
 fn report(
     outcomes: &[EntryOutcome],
     warnings: &[String],
     transfer: Transfer,
     dedup: DedupSummary,
+    excluded: u64,
     output: &Path,
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut fetched = 0u64;
-    let mut linked = 0u64;
-    let mut skipped = 0u64;
-    let mut failed = 0u64;
-    let mut deduped = 0u64;
-    let mut reused_bytes = 0u64;
     for o in outcomes {
-        match o {
-            EntryOutcome::Fetched(_) => fetched += 1,
-            EntryOutcome::Linked => linked += 1,
-            EntryOutcome::Skipped => skipped += 1,
-            EntryOutcome::Deduped(n) => {
-                deduped += 1;
-                reused_bytes = reused_bytes.saturating_add(*n);
-            }
-            EntryOutcome::Failed { path, err } => {
-                failed += 1;
-                // A per-entry failure is a command result the user needs, not
-                // routing narration: keep it on stderr (unconditional, and clear
-                // of the `--json` report on stdout) rather than behind logging.
-                eprintln!("failed: {path}: {err}");
-            }
+        if let EntryOutcome::Failed { path, err } = o {
+            // A per-entry failure is a command result the user needs, not
+            // routing narration: keep it on stderr (unconditional, and clear
+            // of the `--json` report on stdout) rather than behind logging.
+            eprintln!("failed: {path}: {err}");
         }
     }
     for line in warnings {
         eprintln!("warning: {line}");
     }
 
-    let rep = PullReport {
-        output: output.display().to_string(),
-        fetched,
-        linked,
-        skipped,
-        failed,
-        downloaded: transfer.downloaded,
-        reconstructed: transfer.reconstructed,
-        spliced_bytes: dedup.spliced_bytes,
-        hints_ignored: dedup.hints_ignored,
-        deduped,
-        reused_bytes,
-    };
+    let rep = pull_report(outcomes, transfer, dedup, excluded, output);
+    let (reused, reused_bytes, failed) = (rep.reused, rep.reused_bytes, rep.failed);
     if json {
         let line = serde_json::to_string(&rep).map_err(|e| anyhow!("serialize report: {e}"))?;
         println!("{line}");
     } else {
-        println!(
-            "pulled into {} ({fetched} fetched, {linked} linked, {skipped} skipped, \
-             {deduped} deduped, {failed} failed)",
-            output.display()
-        );
+        println!("{}", counts_line(&rep));
         // `downloaded X → reconstructed Y` only when dedup made them differ;
         // otherwise a single `downloaded X`.
         println!("{}", transfer_line(transfer));
+        // The bytes earlier, interrupted runs fetched and this run resumed, shown
+        // only when a run resumed any: they are in neither total above.
+        if transfer.resumed > 0 {
+            println!(
+                "resumed {} from earlier partials",
+                human_bytes(transfer.resumed)
+            );
+        }
         // The whole-file dedup outcome, shown only when it mattered: a run that
         // materialized any destination from an on-disk donor instead of fetching.
-        if deduped > 0 {
+        if reused > 0 {
             println!(
-                "whole-file dedup: reused {} from disk ({deduped} file(s))",
+                "whole-file dedup: reused {} from disk ({reused} file(s))",
                 human_bytes(reused_bytes)
             );
         }
@@ -4327,6 +4644,157 @@ fn report(
         bail!("{failed} entr(ies) failed to fetch");
     }
     Ok(())
+}
+
+/// The run's [`PullReport`]: the entry counts tallied from `outcomes`, beside
+/// the byte tallies and the `excluded` count the caller already holds.
+fn pull_report(
+    outcomes: &[EntryOutcome],
+    transfer: Transfer,
+    dedup: DedupSummary,
+    excluded: u64,
+    output: &Path,
+) -> PullReport {
+    let mut rep = PullReport {
+        output: output.display().to_string(),
+        fetched: 0,
+        linked: 0,
+        skipped: 0,
+        excluded,
+        failed: 0,
+        downloaded: transfer.downloaded,
+        reconstructed: transfer.reconstructed,
+        spliced_bytes: dedup.spliced_bytes,
+        hints_ignored: dedup.hints_ignored,
+        resumed_bytes: transfer.resumed,
+        reused: 0,
+        reused_bytes: 0,
+    };
+    for o in outcomes {
+        match o {
+            EntryOutcome::Fetched(_) => rep.fetched += 1,
+            EntryOutcome::Linked => rep.linked += 1,
+            EntryOutcome::Skipped => rep.skipped += 1,
+            EntryOutcome::Deduped(n) => {
+                rep.reused += 1;
+                rep.reused_bytes = rep.reused_bytes.saturating_add(*n);
+            }
+            EntryOutcome::Failed { .. } => rep.failed += 1,
+        }
+    }
+    rep
+}
+
+/// The summary's first line: where the run pulled to, and every entry count.
+fn counts_line(rep: &PullReport) -> String {
+    format!(
+        "pulled into {} ({} fetched, {} linked, {} skipped, {} reused, {} excluded, {} failed)",
+        rep.output, rep.fetched, rep.linked, rep.skipped, rep.reused, rep.excluded, rep.failed
+    )
+}
+
+/// Scan `<out_root>/.decdn-partial` for leftover per-hash staging files —
+/// `<hex>`, `<hex>.partial`, `<hex>.partial.ranges` — whose hash is not in
+/// `keep`, and total the disk space they take ([`allocated_bytes`]). Other
+/// names (a record's temporary file) are not counted. A missing or unreadable
+/// directory holds nothing.
+fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
+    let Ok(dir) = std::fs::read_dir(out_root.join(STAGING_DIR)) else {
+        return Leftovers::default();
+    };
+    let mut blobs: HashSet<[u8; 32]> = HashSet::new();
+    let mut bytes = 0u64;
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let stem = name
+            .strip_suffix(".partial.ranges")
+            .or_else(|| name.strip_suffix(".partial"))
+            .unwrap_or(name);
+        let Ok(hash) = blake3::Hash::from_hex(stem) else {
+            continue;
+        };
+        let hash = *hash.as_bytes();
+        if keep.contains(&hash) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_file() {
+            blobs.insert(hash);
+            bytes = bytes.saturating_add(allocated_bytes(&meta));
+        }
+    }
+    Leftovers {
+        blobs: u64::try_from(blobs.len()).unwrap_or(u64::MAX),
+        bytes,
+    }
+}
+
+/// The disk space a file takes. A range-dedup `.partial` is sized to the whole
+/// blob before any byte lands, so its length can be far above the space that
+/// deleting it frees. On Unix the allocated blocks give that space; elsewhere
+/// the length is the best figure.
+fn allocated_bytes(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
+}
+
+/// Staging files in the staging directory that a run did not use: how many
+/// distinct blobs, and the disk space their files take.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Leftovers {
+    blobs: u64,
+    bytes: u64,
+}
+
+/// The warning line for `leftovers` in `dir`, without the `warning: ` prefix,
+/// or `None` when there are none.
+fn leftover_warning(dir: &Path, leftovers: &Leftovers) -> Option<String> {
+    let size = human_bytes(leftovers.bytes);
+    let dir = dir.display();
+    match leftovers.blobs {
+        0 => None,
+        1 => Some(format!(
+            "1 partial download ({size} on disk) that this run did not use remains in \
+             {dir}; delete it to reclaim the space"
+        )),
+        n => Some(format!(
+            "{n} partial downloads ({size} on disk) that this run did not use remain in \
+             {dir}; delete them to reclaim the space"
+        )),
+    }
+}
+
+/// Warn on stderr about leftover staging files of blobs this run did not use
+/// ([`leftover_partials`]): a partial of an entry an earlier run started,
+/// which this run's filter or selection left out, or one another bundle
+/// pulled into the same output directory left. They stay for a later run that
+/// selects the entry again, so the warning only names them and never deletes
+/// them. `entries` are the run's selected entries (none when the filter or
+/// `--select` emptied the run), and `bundle_hash` is the `--hash` manifest
+/// blob, which is also this run's own.
+fn warn_leftover_partials(out_root: &Path, entries: &[ManifestEntry], bundle_hash: Option<&str>) {
+    let keep: HashSet<[u8; 32]> = entries
+        .iter()
+        .map(|e| e.hash.as_str())
+        .chain(bundle_hash)
+        .filter_map(|h| fetch::parse_hash(h).ok())
+        .collect();
+    let leftovers = leftover_partials(out_root, &keep);
+    if let Some(line) = leftover_warning(&out_root.join(STAGING_DIR), &leftovers) {
+        eprintln!("warning: {line}");
+    }
 }
 
 /// Format a byte count as a short decimal-unit label (`13.8 GB`). SI (1000-based)
@@ -4367,14 +4835,15 @@ fn transfer_line(t: Transfer) -> String {
 }
 
 /// The [`Transfer`] for one whole-file hash-group: the blob is either paid for
-/// once (`downloaded` = `paid`, the content bytes its fetch paid for, else the
-/// size of the single `Fetched`) or reused from an on-disk donor with no download
+/// once (`downloaded` = the content bytes its fetch paid for this run, from
+/// `bytes`, else the size of the single `Fetched`; `resumed` = the bytes it
+/// resumed from an earlier run) or reused from an on-disk donor with no download
 /// (`Deduped`, contributing 0 to `downloaded`) — a group never mixes the two,
 /// since [`PullCtx::fetch_group`] takes one path or the other. Every materialized
 /// copy — the canonical (`Fetched` or `Deduped`) plus each `Linked` duplicate
 /// path — is a full file on disk (`reconstructed` = size × copies). A group with
 /// nothing written (all skipped or failed) contributes nothing.
-fn group_transfer(outcomes: &[EntryOutcome], paid: Option<u64>) -> Transfer {
+fn group_transfer(outcomes: &[EntryOutcome], bytes: Option<EntryBytes>) -> Transfer {
     let paid_size = outcomes.iter().find_map(|o| match o {
         EntryOutcome::Fetched(n) => Some(*n),
         _ => None,
@@ -4396,8 +4865,9 @@ fn group_transfer(outcomes: &[EntryOutcome], paid: Option<u64>) -> Transfer {
                 .count();
             let copies = u64::try_from(copies).unwrap_or(u64::MAX);
             Transfer {
-                downloaded: paid_size.map_or(0, |size| paid.unwrap_or(size)),
+                downloaded: paid_size.map_or(0, |size| bytes.map_or(size, |b| b.paid)),
                 reconstructed: n.saturating_mul(copies),
+                resumed: paid_size.and(bytes).map_or(0, |b| b.resumed),
             }
         }
         None => Transfer::default(),
@@ -5369,10 +5839,13 @@ mod tests {
         let index = ChunkIndex::default();
         let fetch_plan = FetchPlan::default();
 
+        // The store held the donor group from an earlier run.
+        let resumed = [(GROUP, GROUP)];
         let res = reassemble_dedup(
             &driver,
             &plan,
             2 * GROUP,
+            &resumed,
             None,
             &index,
             &fetch_plan,
@@ -5388,6 +5861,18 @@ mod tests {
         );
         assert_eq!(driver.drives.get(), 1, "only the pay-now drive ran");
         assert!(staging.try_exists().expect("stat staging"));
+        // No splice ran, so the resumed group counts as resumed, not paid (#2236).
+        let outcome = res.expect("checked above");
+        assert_eq!(outcome.spliced_bytes, 0);
+        assert_eq!(outcome.resumed_bytes, GROUP);
+        assert_eq!(
+            EntryBytes::dedup(2 * GROUP, outcome),
+            EntryBytes {
+                paid: GROUP,
+                spliced: 0,
+                resumed: GROUP,
+            }
+        );
     }
 
     /// A deferred chunk whose whole span is spliced: `dst` is the hint's span
@@ -5695,6 +6180,7 @@ mod tests {
             &driver,
             &plan,
             total,
+            &[],
             None,
             &index,
             &fetch_plan,
@@ -5710,6 +6196,143 @@ mod tests {
             "only the deferred half is paid for; no self-heal re-drive"
         );
         assert_eq!(outcome.spliced_bytes, 2 * GROUP);
+        assert_eq!(outcome.resumed_bytes, 0);
+    }
+
+    /// An entry resumed from an earlier run's `.partial` whose splice then
+    /// covers part of that prefix: the overlap counts once, as spliced, and only
+    /// the bytes neither resumed nor spliced count as paid (#2236).
+    #[tokio::test]
+    async fn a_splice_over_a_resumed_prefix_counts_the_overlap_as_spliced() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let total = 4 * GROUP;
+        let content: Vec<u8> = (0..total)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        let whole = *blake3::hash(&content).as_bytes();
+        let half = usize::try_from(2 * GROUP).expect("fits usize");
+
+        // An earlier, interrupted run fetched `[0, 3*GROUP)` into the store.
+        let staging = tmp.path().join("blob");
+        ClientRangedStore::seed_checkpointed_prefix(tmp.path(), "blob", &content, 3 * GROUP)
+            .expect("seed the resume record");
+        let resumed = resumed_spans(&staging, whole);
+        assert_eq!(resumed, vec![(0, 3 * GROUP)]);
+
+        // This run splices `[0, 2*GROUP)` from a donor and pays for the deferred
+        // `[2*GROUP, 4*GROUP)` when its sibling finishes without producing it.
+        let donor_path = tmp.path().join("donor");
+        std::fs::write(&donor_path, &content[..half]).expect("write donor");
+        let donor_hash = *blake3::hash(&content[..half]).as_bytes();
+        let deferred_hash = *blake3::hash(&content[half..]).as_bytes();
+        let driver = RecordingDriver {
+            hash: whole,
+            staging: staging.clone(),
+            content: content.clone(),
+            driven: std::sync::Mutex::new(Vec::new()),
+        };
+        let plan = ReassemblePlan {
+            donor: vec![DonorRange {
+                dst: (0, 2 * GROUP),
+                refetch: (0, 2 * GROUP),
+                source: donor_path,
+                src_offset: 0,
+                chunk_hash: donor_hash,
+                chunk_src_offset: 0,
+                chunk_len: 2 * GROUP,
+            }],
+            deferred: vec![whole_deferred(Hint {
+                hash: deferred_hash,
+                offset: 2 * GROUP,
+                len: 2 * GROUP,
+            })],
+            drive: Vec::new(),
+        };
+        let index = ChunkIndex::default();
+        let mut fetch_plan = FetchPlan::default();
+        fetch_plan.assigned.insert(deferred_hash, [0xaa; 32]);
+        index.mark_finished([0xaa; 32]);
+
+        let outcome = reassemble_dedup(
+            &driver,
+            &plan,
+            total,
+            &resumed,
+            None,
+            &index,
+            &fetch_plan,
+            None,
+            &|| {},
+        )
+        .await
+        .expect("reassembly must succeed");
+        assert_eq!(std::fs::read(&staging).expect("read staging"), content);
+        assert_eq!(
+            outcome.spliced_bytes,
+            2 * GROUP,
+            "the splice keeps priority"
+        );
+        assert_eq!(outcome.resumed_bytes, GROUP, "only the unspliced prefix");
+        assert_eq!(
+            EntryBytes::dedup(total, outcome),
+            EntryBytes {
+                paid: GROUP,
+                spliced: 2 * GROUP,
+                resumed: GROUP,
+            }
+        );
+    }
+
+    /// A self-heal whole-blob re-drive discards every splice, so the resumed
+    /// prefix counts whole: the store still holds it, and the re-drive does not
+    /// fetch it again.
+    #[test]
+    fn a_self_heal_outcome_counts_the_whole_resumed_prefix() {
+        let outcome = DedupOutcome::of(&[], &[(0, 3 * GROUP), (GROUP, GROUP)], 4 * GROUP, 2);
+        assert_eq!(outcome.spliced_bytes, 0);
+        assert_eq!(outcome.resumed_bytes, 3 * GROUP);
+        assert_eq!(EntryBytes::dedup(4 * GROUP, outcome).paid, GROUP);
+    }
+
+    /// The whole-blob path reads what an earlier run fetched from the resume
+    /// record and pays only for the rest (#2236). A fresh entry and an
+    /// unreadable record resume nothing.
+    #[test]
+    fn resumed_spans_read_the_record_an_earlier_run_left() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let content: Vec<u8> = (0..3 * GROUP + 99)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        let len = u64::try_from(content.len()).expect("fits u64");
+        let hash = *blake3::hash(&content).as_bytes();
+        let staging = tmp.path().join("blob");
+
+        assert!(
+            resumed_spans(&staging, hash).is_empty(),
+            "no record, no spans"
+        );
+
+        ClientRangedStore::seed_checkpointed_prefix(tmp.path(), "blob", &content, GROUP)
+            .expect("seed the resume record");
+        let resumed = resumed_spans(&staging, hash);
+        assert_eq!(resumed, vec![(0, GROUP)]);
+        assert_eq!(
+            EntryBytes::whole_blob(len, span_bytes(&resumed)),
+            EntryBytes {
+                paid: len - GROUP,
+                spliced: 0,
+                resumed: GROUP,
+            }
+        );
+        // A resumed count never exceeds the blob.
+        assert_eq!(EntryBytes::whole_blob(10, 20).paid, 0);
+        assert_eq!(EntryBytes::whole_blob(10, 20).resumed, 10);
+
+        std::fs::write(tmp.path().join("blob.partial.ranges"), b"not json").expect("corrupt");
+        assert!(
+            resumed_spans(&staging, hash).is_empty(),
+            "an unreadable record resumes nothing"
+        );
     }
 
     /// Two donor chunks of a blob, `[0, cut)` and `[cut, 4*GROUP)`, each written
@@ -5889,6 +6512,7 @@ mod tests {
             &driver,
             &plan,
             total,
+            &[],
             None,
             &ChunkIndex::default(),
             &FetchPlan::default(),
@@ -5931,6 +6555,7 @@ mod tests {
             &driver,
             &plan,
             total,
+            &[],
             None,
             &ChunkIndex::default(),
             &FetchPlan::default(),
@@ -5986,6 +6611,7 @@ mod tests {
             &driver,
             &plan,
             total,
+            &[],
             None,
             &index,
             &fetch_plan,
@@ -6041,6 +6667,7 @@ mod tests {
             &driver,
             &plan,
             total,
+            &[],
             None,
             &index,
             &fetch_plan,
@@ -6057,6 +6684,25 @@ mod tests {
         );
         assert_eq!(outcome.spliced_bytes, GROUP);
         assert_eq!(outcome.hints_ignored, 1);
+    }
+
+    /// The bytes of `spliced` that no `driven` span covers, over `[0, total)`.
+    fn net_spliced(spliced: &[(u64, u64)], driven: &[(u64, u64)], total: u64) -> u64 {
+        span_bytes(&uncovered_runs(spliced, driven, total))
+    }
+
+    #[test]
+    fn uncovered_runs_keeps_the_uncovered_parts_as_disjoint_spans() {
+        assert_eq!(
+            uncovered_runs(&[(300, 100), (0, 100)], &[(50, 100), (350, 10)], 1000),
+            vec![(0, 50), (300, 50), (360, 40)]
+        );
+        // Overlapping inputs coalesce, and the result clamps to `total`.
+        assert_eq!(
+            uncovered_runs(&[(0, 60), (40, 100)], &[], 100),
+            vec![(0, 100)]
+        );
+        assert!(uncovered_runs(&[(0, 100)], &[(0, 100)], 1000).is_empty());
     }
 
     #[test]
@@ -6142,6 +6788,7 @@ mod tests {
             &driver,
             &plan,
             total,
+            &[],
             None,
             &index,
             &fetch_plan,
@@ -6210,6 +6857,7 @@ mod tests {
             &driver,
             &plan,
             total,
+            &[],
             None,
             &index,
             &fetch_plan,
@@ -6513,6 +7161,7 @@ mod tests {
             &[],
             Transfer::default(),
             DedupSummary::default(),
+            0,
             Path::new("/out"),
             true,
         )
@@ -6529,6 +7178,7 @@ mod tests {
                 &[],
                 Transfer::default(),
                 DedupSummary::default(),
+                0,
                 Path::new("/out"),
                 false
             )
@@ -6571,12 +7221,54 @@ mod tests {
                 &warnings,
                 Transfer::default(),
                 DedupSummary::default(),
+                0,
                 tmp.path(),
                 false
             )
             .is_ok(),
             "a size warning is not a failure"
         );
+    }
+
+    /// The summary counts every entry: a whole-file reuse reads `reused`, and
+    /// the entries the filter or `--select` dropped read `excluded` (#2190).
+    #[test]
+    fn the_summary_counts_reused_and_excluded_entries() {
+        let outcomes = vec![
+            EntryOutcome::Fetched(10),
+            EntryOutcome::Linked,
+            EntryOutcome::Skipped,
+            EntryOutcome::Deduped(7),
+            EntryOutcome::Failed {
+                path: "x".into(),
+                err: "boom".into(),
+            },
+        ];
+        let transfer = Transfer {
+            downloaded: 4,
+            reconstructed: 20,
+            resumed: 6,
+        };
+        let rep = pull_report(
+            &outcomes,
+            transfer,
+            DedupSummary::default(),
+            3,
+            Path::new("/out"),
+        );
+        assert_eq!(
+            counts_line(&rep),
+            "pulled into /out (1 fetched, 1 linked, 1 skipped, 1 reused, 3 excluded, 1 failed)"
+        );
+        assert_eq!(rep.reused_bytes, 7);
+
+        let json = serde_json::to_value(&rep).expect("serialize");
+        assert_eq!(json["reused"], 1);
+        assert_eq!(json["reused_bytes"], 7);
+        assert_eq!(json["excluded"], 3);
+        assert_eq!(json["resumed_bytes"], 6);
+        assert_eq!(json["downloaded"], 4);
+        assert!(json.get("deduped").is_none(), "{json}");
     }
 
     #[test]
@@ -6594,6 +7286,7 @@ mod tests {
             transfer_line(Transfer {
                 downloaded: 27_600_000_000,
                 reconstructed: 27_600_000_000,
+                resumed: 0,
             }),
             "downloaded 27.6 GB"
         );
@@ -6602,6 +7295,7 @@ mod tests {
             transfer_line(Transfer {
                 downloaded: 13_800_000_000,
                 reconstructed: 27_600_000_000,
+                resumed: 0,
             }),
             "downloaded 13.8 GB → reconstructed 27.6 GB"
         );
@@ -6616,7 +7310,7 @@ mod tests {
             EntryOutcome::Linked,
             EntryOutcome::Linked,
         ];
-        let t = group_transfer(&outcomes, Some(100));
+        let t = group_transfer(&outcomes, Some(EntryBytes::whole_blob(100, 0)));
         assert_eq!(t.downloaded, 100);
         assert_eq!(t.reconstructed, 300);
     }
@@ -6627,14 +7321,46 @@ mod tests {
     #[test]
     fn group_transfer_downloads_only_the_paid_bytes_of_a_spliced_blob() {
         let outcomes = vec![EntryOutcome::Fetched(100), EntryOutcome::Linked];
-        let t = group_transfer(&outcomes, Some(30));
+        let spliced = EntryBytes {
+            paid: 30,
+            spliced: 70,
+            resumed: 0,
+        };
+        let t = group_transfer(&outcomes, Some(spliced));
         assert_eq!(t.downloaded, 30);
         assert_eq!(t.reconstructed, 200);
+        assert_eq!(t.resumed, 0);
 
         // A blob already finalized in staging by an earlier run pays nothing.
-        let t = group_transfer(&[EntryOutcome::Fetched(100)], Some(0));
+        let t = group_transfer(&[EntryOutcome::Fetched(100)], Some(EntryBytes::default()));
         assert_eq!(t.downloaded, 0);
         assert_eq!(t.reconstructed, 100);
+    }
+
+    /// A blob resumed from an earlier run's `.partial` downloads only what this
+    /// run fetched; the resumed prefix is tallied apart and counted once per
+    /// blob, however many paths it lands at (#2236).
+    #[test]
+    fn group_transfer_tallies_a_resumed_prefix_apart_from_the_download() {
+        let outcomes = vec![EntryOutcome::Fetched(100), EntryOutcome::Linked];
+        let t = group_transfer(&outcomes, Some(EntryBytes::whole_blob(100, 40)));
+        assert_eq!(
+            t,
+            Transfer {
+                downloaded: 60,
+                reconstructed: 200,
+                resumed: 40,
+            }
+        );
+
+        // A landed blob whose every destination failed writes nothing, and
+        // reports nothing resumed.
+        let failed = vec![EntryOutcome::Failed {
+            path: "x".into(),
+            err: "boom".into(),
+        }];
+        let t = group_transfer(&failed, Some(EntryBytes::whole_blob(100, 40)));
+        assert_eq!(t, Transfer::default());
     }
 
     #[test]
@@ -6700,7 +7426,12 @@ mod tests {
         entries: Vec<ManifestEntry>,
     ) -> Vec<String> {
         let filter = EntryFilter::compile(&strs(include), &strs(exclude)).unwrap();
-        filter.apply(entries).into_iter().map(|e| e.path).collect()
+        filter
+            .apply_reporting(entries)
+            .kept
+            .into_iter()
+            .map(|e| e.path)
+            .collect()
     }
 
     fn sample() -> Vec<ManifestEntry> {
@@ -6799,6 +7530,203 @@ mod tests {
     #[test]
     fn entry_filter_can_empty_the_set() {
         assert!(filtered_paths(&["no/such/*"], &[], sample()).is_empty());
+    }
+
+    /// Each pattern that matches no entry is reported with its flag, and one
+    /// whose `**/` form would match gets that form as a hint: every pattern
+    /// matches from the bundle root (#2190).
+    #[test]
+    fn entry_filter_reports_each_pattern_that_matched_nothing() {
+        let mut entries = sample();
+        entries.push(entry("gpt/metal/model.bin", "b3:5"));
+        let filter = EntryFilter::compile(
+            &strs(&["models/*", "no/such/*"]),
+            &strs(&["metal/*", "**/*.md"]),
+        )
+        .unwrap();
+        let pass = filter.apply_reporting(entries);
+        assert_eq!(
+            pass.kept
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["models/a.bin", "models/b.txt"]
+        );
+        assert_eq!(pass.excluded, 3);
+        assert_eq!(
+            pass.unmatched,
+            vec![
+                Unmatched {
+                    flag: "--include",
+                    pattern: "no/such/*".into(),
+                    suggestion: None,
+                },
+                Unmatched {
+                    flag: "--exclude",
+                    pattern: "metal/*".into(),
+                    suggestion: Some("**/metal/*".into()),
+                },
+            ]
+        );
+        assert_eq!(
+            pass.unmatched[0].warning(),
+            "--include 'no/such/*' matched no entries"
+        );
+        assert_eq!(
+            pass.unmatched[1].warning(),
+            "--exclude 'metal/*' matched no entries (a pattern matches the whole path from the \
+             bundle root; did you mean '**/metal/*'?)"
+        );
+    }
+
+    /// A pattern with no `/` is anchored too: `*.txt` matches only a root-level
+    /// file, so a miss suggests `**/*.txt`. A pattern that already starts with
+    /// `**` gets no hint.
+    #[test]
+    fn entry_filter_hints_an_anchored_pattern_without_a_slash() {
+        let filter = EntryFilter::compile(&[], &strs(&["*.txt", "**/*.png"])).unwrap();
+        let pass = filter.apply_reporting(sample());
+        assert_eq!(pass.excluded, 0);
+        assert_eq!(
+            pass.unmatched
+                .iter()
+                .map(|u| (u.pattern.as_str(), u.suggestion.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("*.txt", Some("**/*.txt")), ("**/*.png", None)]
+        );
+    }
+
+    /// Patterns that each match an entry report nothing, even an `--exclude`
+    /// that matches only entries the include gate already dropped.
+    #[test]
+    fn entry_filter_reports_nothing_when_every_pattern_matches() {
+        let filter = EntryFilter::compile(&strs(&["models/*"]), &strs(&["docs/**"])).unwrap();
+        let pass = filter.apply_reporting(sample());
+        assert!(pass.unmatched.is_empty(), "{:?}", pass.unmatched);
+        assert_eq!(pass.excluded, 2);
+
+        let pass = EntryFilter::compile(&[], &[])
+            .unwrap()
+            .apply_reporting(sample());
+        assert!(pass.unmatched.is_empty());
+        assert_eq!(pass.excluded, 0);
+    }
+
+    /// `--select` adds each entry it drops to the filter's excluded count.
+    #[test]
+    fn a_selection_adds_its_dropped_entries_to_the_excluded_count() {
+        let kept = Kept {
+            manifest: Manifest {
+                version: 1,
+                entries: sample(),
+            },
+            excluded: 2,
+        };
+        let kept = apply_selection(kept, |entries| {
+            parse_selection("models/a.bin\ndocs/readme.md\n", entries)
+        })
+        .unwrap();
+        assert_eq!(kept.manifest.entries.len(), 2);
+        assert_eq!(kept.excluded, 4);
+    }
+
+    /// The run-end scan counts the staging files of blobs the run did not
+    /// use, once per blob, totals the disk space they take, and ignores the
+    /// run's own blobs, the manifest blob, and names that are not a blob's
+    /// staging file (#2190).
+    #[test]
+    fn leftover_partials_counts_only_unselected_blobs() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        assert_eq!(
+            leftover_partials(tmp.path(), &HashSet::new()),
+            Leftovers::default(),
+            "no staging dir, nothing left over"
+        );
+
+        let dir = tmp.path().join(STAGING_DIR);
+        std::fs::create_dir_all(&dir).expect("staging dir");
+        let hex = |b: u8| blake3::Hash::from_bytes([b; 32]).to_hex().to_string();
+        let write = |name: String, len: usize| {
+            std::fs::write(dir.join(name), vec![0u8; len]).expect("write");
+        };
+        // The run's selected entry and the manifest blob: kept for this run.
+        write(format!("{}.partial", hex(1)), 500);
+        write(format!("{}.partial.ranges", hex(1)), 5);
+        write(format!("{}.partial", hex(2)), 300);
+        // An orphan partial and its record, and a finalized orphan blob.
+        write(format!("{}.partial", hex(3)), 1000);
+        write(format!("{}.partial.ranges", hex(3)), 10);
+        write(hex(4), 200);
+        // A record's temporary file and a stray name.
+        write(".tmpAbC123".into(), 50);
+        write("notes.txt".into(), 50);
+
+        let keep: HashSet<[u8; 32]> = [[1; 32], [2; 32]].into_iter().collect();
+        let on_disk =
+            |name: String| allocated_bytes(&std::fs::metadata(dir.join(name)).expect("metadata"));
+        let expected = on_disk(format!("{}.partial", hex(3)))
+            + on_disk(format!("{}.partial.ranges", hex(3)))
+            + on_disk(hex(4));
+        let leftovers = leftover_partials(tmp.path(), &keep);
+        assert_eq!(
+            leftovers,
+            Leftovers {
+                blobs: 2,
+                bytes: expected,
+            }
+        );
+        assert_eq!(
+            leftover_warning(
+                Path::new("/out/.decdn-partial"),
+                &Leftovers {
+                    blobs: 2,
+                    bytes: 1210,
+                }
+            )
+            .as_deref(),
+            Some(
+                "2 partial downloads (1.2 KB on disk) that this run did not use remain in \
+                 /out/.decdn-partial; delete them to reclaim the space"
+            )
+        );
+        assert_eq!(
+            leftover_warning(
+                Path::new("/out/.decdn-partial"),
+                &Leftovers {
+                    blobs: 1,
+                    bytes: 1_500_000_000,
+                }
+            )
+            .as_deref(),
+            Some(
+                "1 partial download (1.5 GB on disk) that this run did not use remains in \
+                 /out/.decdn-partial; delete it to reclaim the space"
+            )
+        );
+        assert_eq!(
+            leftover_warning(Path::new("/out"), &Leftovers::default()),
+            None
+        );
+    }
+
+    /// A range-dedup `.partial` sized to the whole blob before its bytes land
+    /// counts only the space it takes, not its length (#2190).
+    #[cfg(unix)]
+    #[test]
+    fn leftover_partials_count_a_sparse_partial_by_its_allocated_space() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = tmp.path().join(STAGING_DIR);
+        std::fs::create_dir_all(&dir).expect("staging dir");
+        let hex = blake3::Hash::from_bytes([9; 32]).to_hex().to_string();
+        let file = std::fs::File::create(dir.join(format!("{hex}.partial"))).expect("create");
+        file.set_len(64 * 1024 * 1024).expect("size the partial");
+        let leftovers = leftover_partials(tmp.path(), &HashSet::new());
+        assert_eq!(leftovers.blobs, 1);
+        assert!(
+            leftovers.bytes < 1024 * 1024,
+            "a hole-only partial takes almost no space: {}",
+            leftovers.bytes
+        );
     }
 
     /// A malformed glob is a hard error naming the flag it came from.
@@ -7546,6 +8474,7 @@ mod tests {
                 &[],
                 Transfer::default(),
                 DedupSummary::default(),
+                0,
                 Path::new("/out"),
                 false
             )
@@ -7643,7 +8572,7 @@ mod tests {
             groups[0].outcomes.as_slice(),
             [EntryOutcome::Failed { .. }]
         ));
-        assert_eq!(groups[0].paid, None, "a failed fetch paid for nothing");
+        assert_eq!(groups[0].bytes, None, "a failed fetch paid for nothing");
         assert!(rx.try_recv().is_err(), "nothing recorded, nothing flushed");
 
         let disk = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull))
@@ -7668,13 +8597,17 @@ mod tests {
                 chunks: None,
             },
         );
-        let landed = GroupRun::landed(vec![EntryOutcome::Fetched(3)], 2);
+        let landed = GroupRun::landed(vec![EntryOutcome::Fetched(3)], EntryBytes::whole_blob(3, 1));
         assert!(settle_group_run(&mut groups, &tx, 1, landed, updates, Vec::new()).is_none());
         assert!(matches!(
             groups[1].outcomes.as_slice(),
             [EntryOutcome::Fetched(3)]
         ));
-        assert_eq!(groups[1].paid, Some(2), "the landed paid tally is kept");
+        assert_eq!(
+            groups[1].bytes,
+            Some(EntryBytes::whole_blob(3, 1)),
+            "the landed paid and resumed tallies are kept"
+        );
         assert_eq!(rx.try_recv().expect("a flush batch").fetched_bytes, 3);
     }
 
@@ -7895,6 +8828,7 @@ mod tests {
             EntryBytes {
                 paid: 4 << 20,
                 spliced: 0,
+                resumed: 0,
             },
             std::time::Duration::from_secs(2),
         );
@@ -7911,6 +8845,7 @@ mod tests {
             EntryBytes {
                 paid: 2 << 20,
                 spliced: 10 << 20,
+                resumed: 0,
             },
             std::time::Duration::from_secs(2),
         );
@@ -7932,12 +8867,53 @@ mod tests {
             EntryBytes {
                 paid: 0,
                 spliced: 12 << 20,
+                resumed: 0,
             },
             std::time::Duration::from_secs(2),
         );
         assert!(
             line.ends_with(
                 ": 12.00 MiB in 2.0s (0 B downloaded at --, 12.00 MiB spliced from disk)"
+            ),
+            "{line}"
+        );
+    }
+
+    /// A resumed entry's rate counts only what this run downloaded, and its
+    /// resumed and spliced bytes are reported apart (#2236).
+    #[test]
+    fn entry_done_line_splits_a_resumed_entrys_bytes() {
+        let line = entry_done_line(
+            [1; 32],
+            12 << 20,
+            EntryBytes {
+                paid: 2 << 20,
+                spliced: 6 << 20,
+                resumed: 4 << 20,
+            },
+            std::time::Duration::from_secs(2),
+        );
+        assert!(
+            line.ends_with(
+                ": 12.00 MiB in 2.0s (2.00 MiB downloaded at 1.00 MiB/s, 4.00 MiB resumed, \
+                 6.00 MiB spliced from disk)"
+            ),
+            "{line}"
+        );
+
+        let line = entry_done_line(
+            [1; 32],
+            6 << 20,
+            EntryBytes {
+                paid: 2 << 20,
+                spliced: 0,
+                resumed: 4 << 20,
+            },
+            std::time::Duration::from_secs(2),
+        );
+        assert!(
+            line.ends_with(
+                ": 6.00 MiB in 2.0s (2.00 MiB downloaded at 1.00 MiB/s, 4.00 MiB resumed)"
             ),
             "{line}"
         );
@@ -7952,6 +8928,7 @@ mod tests {
             EntryBytes {
                 paid: 1 << 20,
                 spliced: 0,
+                resumed: 0,
             },
             std::time::Duration::ZERO,
         );

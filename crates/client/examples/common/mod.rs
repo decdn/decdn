@@ -24,7 +24,7 @@ use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity::load_signer;
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{
-    BuyerPoolState, BuyerPoolStore, DepositOutcome, LaneKey, slash_judge_domain, voucher_domain,
+    BuyerPoolState, BuyerPoolStore, Deployment, DepositOutcome, LaneKey, slash_judge_domain,
 };
 use decdn_protocol::Coverage;
 use iroh::{Endpoint, EndpointAddr};
@@ -97,13 +97,21 @@ impl Buyer {
         let owner = signer.address();
         let rpc = provider::build_provider(&env.rpc_url, &signer)?;
         let contract = PaymentPool::new(env.payment_pool, rpc.clone());
-        let voucher_domain = voucher_domain(env.chain_id, env.payment_pool);
+        let deployment = Deployment {
+            chain_id: env.chain_id,
+            payment_pool: env.payment_pool,
+        };
+        let voucher_domain = deployment.voucher_domain();
         let slash_domain = slash_judge_domain(env.chain_id, env.slash_judge);
 
         // The store is the buyer's only record of its pool and of what each lane
         // has paid. Keep it for the life of the pool.
         let store = RedbBuyerPoolStore::open(&env.data_dir)?;
-        let pool = if let Some(pool) = store.get_by_owner(owner)? {
+        // A row from another deployment names a pool this contract never saw.
+        let reusable = store
+            .get_by_owner(owner)?
+            .filter(|pool| pool.is_on(deployment));
+        let pool = if let Some(pool) = reusable {
             pool
         } else {
             let token = contract.usdc().call().await?;
@@ -111,7 +119,7 @@ impl Buyer {
             let opened = open_pool(
                 &contract,
                 Arc::clone(&signer),
-                &voucher_domain,
+                deployment,
                 token,
                 owner,
                 env.deposit,

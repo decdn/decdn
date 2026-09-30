@@ -497,16 +497,19 @@ pub struct BuyerLaneSnapshot {
 pub struct BuyerPoolSnapshot {
     /// The on-chain pool id, `0x`-prefixed 32-byte hex.
     ///
-    /// Unique only within one `payment_pool`: the contract derives it as
-    /// `keccak256(owner, ownerPoolNonce)` and a fresh deployment restarts that
-    /// nonce, so two deployments' Nth pools share an id. Read it alongside
-    /// `payment_pool`, never alone.
+    /// Unique only within one deployment (`chain_id` and `payment_pool`): the
+    /// contract derives it as `keccak256(owner, ownerPoolNonce)` and a fresh
+    /// deployment restarts that nonce, so two deployments' Nth pools share an
+    /// id. Read it alongside `chain_id` and `payment_pool`, never alone.
     pub pool_id: String,
+    /// The EIP-712 chain id of the deployment the row was written against.
+    pub chain_id: u64,
     /// The `PaymentPool` the row was written against, EIP-55 checksummed hex.
     ///
-    /// The only field that tells a live pool from a same-id pool on a contract
-    /// the node is not configured against — which is what makes it the field to
-    /// check when a tracked id and an on-chain enumeration appear to agree.
+    /// With `chain_id`, the only fields that tell a live pool from a same-id
+    /// pool on a deployment the node is not configured against — which is what
+    /// makes them the fields to check when a tracked id and an on-chain
+    /// enumeration appear to agree.
     pub payment_pool: String,
     /// The deposit owner — this node's operator address, EIP-55 checksummed hex.
     pub owner: String,
@@ -900,6 +903,7 @@ mod tests {
         let resp = BuyerPoolsResponse {
             pools: vec![BuyerPoolSnapshot {
                 pool_id: "0xabcd".to_string(),
+                chain_id: 421_614,
                 payment_pool: "0x00dd".to_string(),
                 owner: "0x52908400098527886E0F7030069857D2E4169EE7".to_string(),
                 token: "0x00cc".to_string(),
@@ -918,6 +922,7 @@ mod tests {
             serde_json::from_str(&json).expect("deserialize BuyerPoolsResponse");
         let pool = back.pools.first().expect("one pool");
         assert_eq!(pool.pool_id, "0xabcd");
+        assert_eq!(pool.chain_id, 421_614);
         assert_eq!(pool.deposit_micro_usdc, 10_000_000);
         let lane = pool.lanes.first().expect("one lane");
         assert_eq!(lane.provider, "0x00bb");

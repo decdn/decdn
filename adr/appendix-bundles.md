@@ -354,13 +354,20 @@ Range-dedup holds within one pull. Reuse across separate pulls — v2 of a
 model skipping the ranges it already fetched for v1 — needs a persistent
 range-addressed cache and is a follow-up.
 
-At the end of a pull the report states the distinct content bytes fetched
-and the bytes written to disk — `downloaded X → reconstructed Y` — whenever
-dedup made them differ, which happens only when one blob is materialized
-to several paths. Range-dedup savings from spliced chunk hints do not
-show up in `downloaded`; they are reported separately as `spliced_bytes`.
-When `downloaded` equals `reconstructed` the report shows a single
-`downloaded X`. `downloaded` sums content lengths, not exact on-wire bytes.
+At the end of a pull, the report states two totals. `downloaded` is the
+content bytes that this pull fetched and paid for. `reconstructed` is the
+bytes that this pull wrote to disk. The totals differ when one blob goes to
+several paths, or when range-dedup splices part of a blob from disk. Then
+the report shows `downloaded X → reconstructed Y`. When the totals are
+equal, the report shows one `downloaded X`. The report states the spliced
+bytes separately, as `spliced_bytes`.
+
+A pull can resume a `.partial` prefix that an earlier, interrupted pull
+fetched. The earlier pull paid for those bytes, so they are not in
+`downloaded`. The report states them separately, as `resumed_bytes`. A
+byte that the pull also splices counts only in `spliced_bytes`.
+`downloaded` is a sum of content lengths. It is not an exact count of
+on-wire bytes.
 
 ### Deferred
 

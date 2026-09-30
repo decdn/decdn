@@ -36,6 +36,7 @@ use std::sync::Mutex;
 
 use alloy::primitives::{Address, U256};
 
+use crate::deployment::Deployment;
 use crate::lane::{LaneKey, PoolId};
 use crate::store::StoreError;
 
@@ -64,13 +65,14 @@ pub struct BuyerLaneProgress {
 /// `ownerPoolNonce` at zero — so the same owner's Nth pool carries the same
 /// `pool_id` in every deployment.
 ///
-/// `payment_pool` is the **deployment tag** that tells two such pools apart. It
-/// is not part of the store key: a [`BuyerPoolStore`] is keyed by `pool_id`
+/// `deployment` — the chain id and the `PaymentPool` address — is the
+/// **deployment tag** that tells two such pools apart. It is not part of the
+/// store key: a [`BuyerPoolStore`] is keyed by `pool_id`
 /// alone, so it cannot hold rows for two deployments under one id — recording
 /// the second overwrites the first. What the tag buys is detection, and every
 /// path that reuses a persisted row owes it a check (see [`Self::is_on`]).
 ///
-/// A row on a contract the node is not configured against carries two numbers
+/// A row from a deployment the node is not configured against carries two numbers
 /// that are wrong here, in opposite directions. Its lane progress would seed
 /// the first voucher at a cumulative the live pool has never redeemed against,
 /// so the provider collects the whole of it for bytes it never delivered here.
@@ -93,14 +95,15 @@ pub struct BuyerPoolState {
     /// On-chain `poolId` (`keccak256(owner, ownerPoolNonce)`) — learned by
     /// decoding the `PoolOpened` event from the open tx receipt (atomic with
     /// the open; no follow-up `getPool` read). The store's key, and unique
-    /// only within one `payment_pool` — see the field invariant.
+    /// only within one `deployment` — see the field invariant.
     pub pool_id: PoolId,
-    /// The `PaymentPool` contract this pool lives on — the deployment tag, not
-    /// part of the store key (see the field invariant above). `pool_id` repeats
-    /// across deployments, so this is the only field that distinguishes a live
-    /// pool from a same-id pool on a contract the node is not configured
-    /// against.
-    pub payment_pool: Address,
+    /// The chain and `PaymentPool` contract this pool lives on — the deployment
+    /// tag, not part of the store key (see the field invariant above).
+    /// `pool_id` repeats across deployments, so this is the only field that
+    /// distinguishes a live pool from a same-id pool on a deployment the node
+    /// is not configured against. The contract address alone is not enough:
+    /// the same deployer nonce yields the same address on every chain.
+    pub deployment: Deployment,
     /// The on-chain pool owner: put up the deposit, receives the refund, and
     /// the only address `topUp`/`closePool`/`reclaim` accept. Equals the
     /// local key for a self-funded pool. The reuse index in
@@ -122,14 +125,14 @@ impl BuyerPoolState {
     #[must_use]
     pub fn new(
         pool_id: PoolId,
-        payment_pool: Address,
+        deployment: Deployment,
         owner: Address,
         token: Address,
         deposit: U256,
     ) -> Self {
         Self {
             pool_id,
-            payment_pool,
+            deployment,
             owner,
             token,
             deposit,
@@ -137,15 +140,16 @@ impl BuyerPoolState {
         }
     }
 
-    /// Whether this row describes a pool on `payment_pool`.
+    /// Whether this row describes a pool on `deployment`: the same chain and
+    /// the same `PaymentPool` contract.
     ///
     /// Every path that reuses a persisted row must check this first, and treat
     /// a `false` as "no row": it means the row was written against a different
     /// `PaymentPool` deployment, and its `pool_id` may nonetheless name an
     /// existing, unrelated pool here (see the field invariant).
     #[must_use]
-    pub fn is_on(&self, payment_pool: Address) -> bool {
-        self.payment_pool == payment_pool
+    pub fn is_on(&self, deployment: Deployment) -> bool {
+        self.deployment == deployment
     }
 
     /// Reconstruct pool state from a trusted persistent store — the one
@@ -154,7 +158,7 @@ impl BuyerPoolState {
     #[must_use]
     pub fn hydrate(
         pool_id: PoolId,
-        payment_pool: Address,
+        deployment: Deployment,
         owner: Address,
         token: Address,
         deposit: U256,
@@ -162,7 +166,7 @@ impl BuyerPoolState {
     ) -> Self {
         Self {
             pool_id,
-            payment_pool,
+            deployment,
             owner,
             token,
             deposit,
@@ -670,6 +674,11 @@ mod tests {
     use super::*;
     use alloy::primitives::{address, b256};
 
+    const DEPLOYMENT: Deployment = Deployment {
+        chain_id: 421_614,
+        payment_pool: Address::repeat_byte(0x9c),
+    };
+
     /// Every `owner_byte` gets a **distinct** `pool_id` too (derived from the
     /// same byte): `pool_id` is the store's primary key, so two samples
     /// sharing one `pool_id` would collide in the primary table instead of
@@ -682,7 +691,7 @@ mod tests {
         let owner = Address::from(obytes);
         let mut state = BuyerPoolState::new(
             PoolId::from(idbytes),
-            Address::repeat_byte(0x9c),
+            DEPLOYMENT,
             owner,
             address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             U256::from(10_000_000u64),
@@ -706,6 +715,23 @@ mod tests {
             },
             |(k, _)| k,
         )
+    }
+
+    /// A row is on a deployment only when both the chain and the contract
+    /// match. The same `PaymentPool` address on another chain is another
+    /// deployment, and pool ids repeat there too.
+    #[test]
+    fn is_on_compares_the_chain_and_the_contract() {
+        let row = sample(1);
+        assert!(row.is_on(DEPLOYMENT));
+        assert!(!row.is_on(Deployment {
+            chain_id: 1,
+            ..DEPLOYMENT
+        }));
+        assert!(!row.is_on(Deployment {
+            payment_pool: Address::repeat_byte(0xDE),
+            ..DEPLOYMENT
+        }));
     }
 
     #[test]
@@ -754,7 +780,7 @@ mod tests {
     fn advance_lane_accepts_monotonic_and_equal() -> anyhow::Result<()> {
         let mut s = BuyerPoolState::new(
             b256!("11111111111111111111111111111111111111111111111111111111111111ab"),
-            Address::repeat_byte(0x9c),
+            DEPLOYMENT,
             address!("00000000000000000000000000000000000000a1"),
             address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             U256::ZERO,
@@ -846,7 +872,7 @@ mod tests {
         let store = MemoryBuyerPoolStore::new();
         let s = BuyerPoolState::new(
             b256!("22222222222222222222222222222222222222222222222222222222222222ab"),
-            Address::repeat_byte(0x9c),
+            DEPLOYMENT,
             address!("00000000000000000000000000000000000000a3"),
             address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             U256::from(10_000_000u64),

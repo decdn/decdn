@@ -23,6 +23,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::driver::DriveConfig;
 use crate::health::PeerHealth;
@@ -122,6 +123,9 @@ pub struct Downloader<P, F> {
     /// The largest blob accepted, in bytes, or `0` for no cap
     /// ([`Self::max_blob_bytes`]).
     max_blob_bytes: u64,
+    /// Targets fetched again from scratch after a finalize hash mismatch
+    /// ([`Self::refetched_targets`]).
+    refetched: AtomicU64,
 }
 
 impl<P, F> std::fmt::Debug for Downloader<P, F> {
@@ -156,7 +160,18 @@ impl<P, F> Downloader<P, F> {
             drive_config,
             max_lanes,
             max_blob_bytes: 0,
+            refetched: AtomicU64::new(0),
         }
+    }
+
+    /// How many targets this downloader fetched again from scratch because
+    /// their finalized file did not match its hash. Such a pass drops every
+    /// byte the store held, including a prefix an earlier run resumed, so a
+    /// caller that counts resumed bytes apart from fetched ones reads this to
+    /// know the prefix was fetched again.
+    #[must_use]
+    pub fn refetched_targets(&self) -> u64 {
+        self.refetched.load(Ordering::Relaxed)
     }
 
     /// Cap every target at `max_blob_bytes` (`0` for no cap). A target's size
@@ -361,6 +376,7 @@ where
                         break;
                     }
                     Err(err) if passes_left > 0 && is_hash_mismatch(&err) => {
+                        self.refetched.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
                             hash = %blake3::Hash::from_bytes(target.hash).to_hex(),
                             dest = %target.dest.display(),
@@ -925,13 +941,27 @@ mod tests {
         }
         ClientRangedStore::seed_checkpointed_prefix(dir.path(), "model.bin", &drifted, total)?;
 
-        let (probe, paths) = fetch_ranges(&blob, &dest, total, None).await?;
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
+        let probe = source.clone();
+        let downloader = downloader(vec![candidate(source, ledger, 0xA1)])?;
+        let target = DownloadTarget {
+            hash: probe.root(),
+            total_bytes: total,
+            dest: &dest,
+            ranges: None,
+        };
+        let paths = downloader.fetch_to_paths(&[target], None, None).await?;
         anyhow::ensure!(paths == vec![dest.clone()], "the fetch promotes");
         anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
         anyhow::ensure!(
             probe.opened_bytes() >= total,
             "the second pass fetched the blob again: {}",
             probe.opened_bytes()
+        );
+        anyhow::ensure!(
+            downloader.refetched_targets() == 1,
+            "the downloader reports the target it fetched again"
         );
         Ok(())
     }
