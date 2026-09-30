@@ -707,7 +707,7 @@ impl ProtocolHandler for DhtHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         self.serve(connection)
             .await
-            .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))
+            .map_err(|e| AcceptError::from_boxed(e.into()))
     }
 }
 

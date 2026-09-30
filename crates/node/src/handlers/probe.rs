@@ -652,9 +652,10 @@ impl ProbeHandler {
             Ok(sig) => sig.as_bytes().to_vec(),
             Err(e) => {
                 // Operator-actionable infra fault (key locked, remote/HSM
-                // signer offline). The bare iroh `AcceptError` carries no
-                // context, so log it explicitly before failing the handler
-                // (we must NOT emit an unsigned response — ADR 014 §1).
+                // signer offline). iroh logs a failed handler at warn level
+                // with only the top-level message, so log it at error level
+                // here before failing the handler (we must NOT emit an
+                // unsigned response, ADR 014 §1).
                 tracing::error!(
                     error = %e,
                     "probe slash_sig signing failed (eth signer unavailable?); \
@@ -696,7 +697,7 @@ impl ProtocolHandler for ProbeHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         self.serve(connection)
             .await
-            .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))
+            .map_err(|e| AcceptError::from_boxed(e.into()))
     }
 }
 
