@@ -81,10 +81,9 @@ pub struct NetworkConfig {
     /// on IPv6 too.
     pub bind_port: Option<u16>,
     /// iroh relay URLs for NAT traversal. Multiple entries give relay
-    /// redundancy/failover. Reachability is probed at bring-up and logged but
-    /// never fatal: if every probeable relay is unreachable the node warns and
-    /// proceeds (iroh retries in the background); entries with no derivable
-    /// host/port are skipped.
+    /// redundancy/failover. Relay connectivity is logged after bring-up but
+    /// never fatal: when no relay connects the node warns with each relay's
+    /// last error and proceeds (iroh retries in the background).
     pub relay_urls: Option<Vec<String>>,
     /// Operator-configurable address discovery (#818 scope 1). Absent => the
     /// node uses the n0-hosted pkarr/DNS discovery (`presets::N0`, unchanged).

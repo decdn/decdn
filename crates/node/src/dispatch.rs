@@ -3,9 +3,10 @@
 //! # Problem
 //!
 //! iroh's `Router` spawns one task per accepted QUIC connection with no
-//! concurrency cap and no per-source throttle. A single attacker can exhaust
-//! the node's task capacity by flooding connections faster than the idle
-//! timeout reaps them.
+//! concurrency cap. Its `incoming_filter` hook can refuse a connection before
+//! the handshake, but it carries no rate state of its own. A single attacker
+//! can exhaust the node's task capacity by flooding connections faster than
+//! the idle timeout reaps them.
 //!
 //! # Solution
 //!

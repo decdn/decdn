@@ -916,8 +916,8 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [network]
 # bind_port = 4433
-# Multiple relays give redundancy/failover; reachability is probed at bring-up
-# and logged but never fatal (the node proceeds and iroh retries in the background).
+# Multiple relays give redundancy/failover; the node logs whether a relay connected
+# after bring-up but never fails on it (iroh retries in the background).
 # relay_urls = ["https://relay-a.example.", "https://relay-b.example."]
 # Operator-configurable address discovery (#818). Absent => n0-hosted pkarr/DNS.
 # Present => the node drops the n0 discovery leg and uses only what is set here.

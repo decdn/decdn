@@ -28,9 +28,9 @@ pub struct ResolvedNetwork {
     pub bind_port: u16,
     /// iroh relay URLs for NAT traversal. Empty => use the n0 default relays;
     /// non-empty => swap in these self-hosted relays (`RelayMode::Custom`).
-    /// Reachability is probed at bring-up and logged but never fatal: an
-    /// all-unreachable set warns and proceeds (iroh retries in the background);
-    /// entries with no derivable host/port are skipped.
+    /// Relay connectivity is logged after bring-up but never fatal: when no
+    /// relay connects the node warns and proceeds (iroh retries in the
+    /// background).
     pub relay_urls: Vec<String>,
     /// Operator-configurable address discovery (#818 scope 1). Empty
     /// ([`ResolvedDiscovery::is_empty`]) => the node keeps the n0-hosted
