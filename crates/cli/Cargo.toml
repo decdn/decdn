@@ -113,6 +113,8 @@ futures-util = { workspace = true }
 zeroize = { workspace = true }
 [dev-dependencies]
 decdn-incentive = { workspace = true, features = ["redb", "test-util"] }
+# `ScriptedSource` and `StaticSources` drive the acquire loop in unit tests.
+decdn-client = { workspace = true, features = ["test-util"] }
 # Integration tests in `tests/admin_rpc.rs` exercise the loopback admin
 # RPC end-to-end against a real `AdminState` spawned from the daemon
 # crate, so the daemon's surface is a dev-dependency here. `decdn-cache`

@@ -520,43 +520,38 @@ async fn two_hashes_reuse_one_warm_connection() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Drive a scattered range set, then the rest of the blob, through one
-/// `PeerSource` against a live handler, and return how many connections the
-/// server accepted. `warm` builds the source with a warm connection (#2119).
-/// `restarted` seeds the lane with a live chain from an earlier payer process
-/// ([`lane_with_proved_reveals`]), so the fresh ledger trails the node's
-/// watermark and every leg's first proof is stale.
+/// A [`PeerSource`](decdn_client::PeerSource) with a
+/// [`Connections`](decdn_client::Connections) map runs every leg to one node on
+/// one connection: two whole-blob drives dial once, and a `NotFound` refusal
+/// between them leaves the connection for the next leg.
 #[allow(
     clippy::too_many_lines,
-    reason = "one fixture: a paid handler, a lane, and the two drives it serves"
+    reason = "one fixture: a paid handler, a lane, two drives and a refusal"
 )]
-async fn drive_scattered_through_peer_source(warm: bool, restarted: bool) -> anyhow::Result<usize> {
-    use decdn_client::driver::{DriveConfig, drive_range_set};
-    use decdn_client::{BudgetPacer, ClientRangedStore, FakeFunder, PeerSource, SharedPool};
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_source_legs_share_one_connection_across_a_refusal() -> anyhow::Result<()> {
+    use decdn_client::driver::{DriveConfig, drive};
+    use decdn_client::source::BlobSource as _;
+    use decdn_client::{BudgetPacer, ClientRangedStore, Connections, FakeFunder, PeerSource};
 
-    const GROUP: u64 = 16 * 1024;
-    let payload: Vec<u8> = (0..32 * GROUP).map(|i| (i % 251) as u8).collect();
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let total = u64::try_from(payload.len())?;
+    let payload_a = vec![0x31u8; 400_000];
+    let payload_b = vec![0x42u8; 500_000];
+    let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
 
     let client_signer = Arc::new(PrivateKeySigner::random());
-    let deposit = U256::from(1_000_000_000u64);
+    let deposit = U256::from(50_000_000u64);
     let pool_store = Arc::new(MemoryPoolStateStore::new());
-    pool_store.record(&if restarted {
-        lane_with_proved_reveals(&client_signer, deposit)?
-    } else {
-        LaneState::hydrate(
-            pool_id(),
-            client_signer.address(),
-            operator_addr(),
-            deposit,
-            0,
-            U256::ZERO,
-            U256::ZERO,
-            None,
-            decdn_incentive::LaneChain::NONE,
-        )
-    })?;
+    pool_store.record(&LaneState::hydrate(
+        pool_id(),
+        client_signer.address(),
+        operator_addr(),
+        deposit,
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = operator_signer();
@@ -581,6 +576,7 @@ async fn drive_scattered_through_peer_source(warm: bool, restarted: bool) -> any
     let ledger = Arc::new(ctx.new_ledger());
     let ctx = Arc::new(std::sync::Mutex::new(ctx));
     let slash = slash_domain();
+    let connections = Connections::new(client_ep.clone());
     let source = PeerSource::new(
         &client_ep,
         target,
@@ -592,14 +588,154 @@ async fn drive_scattered_through_peer_source(warm: bool, restarted: bool) -> any
         0,
         u64::MAX,
         PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
+        Some(connections.clone()),
     );
-    let source = if warm {
-        source.with_warm_connection()
-    } else {
-        source
-    };
+    let pacer = BudgetPacer::new();
+    let funder = FakeFunder::new(0, decdn_incentive::DepositOutcome::UnknownPool);
+    let config = DriveConfig::cli(U256::ZERO);
     let store_dir = tempfile::tempdir()?;
-    let store = ClientRangedStore::create(store_dir.path(), "blob", *hash.as_bytes(), total)?;
+    let fetch = |name: &'static str, hash: Hash, len: usize| {
+        let (source, pacer, funder, ctx, ledger, config) =
+            (&source, &pacer, &funder, &ctx, &ledger, &config);
+        let dir = store_dir.path().to_path_buf();
+        async move {
+            let total = u64::try_from(len)?;
+            let store = ClientRangedStore::create(&dir, name, *hash.as_bytes(), total)?;
+            drive(
+                &store,
+                source,
+                pacer,
+                funder,
+                ctx,
+                ledger,
+                *hash.as_bytes(),
+                0,
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(std::fs::read(dir.join(name))?)
+        }
+    };
+
+    anyhow::ensure!(fetch("a", hash_a, payload_a.len()).await? == payload_a);
+    // A leg on a channel the node has never seen is refused with `NotFound`.
+    let known_pool = {
+        let mut ctx = ctx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::replace(&mut ctx.pool_id, B256::repeat_byte(0xEE))
+    };
+    let range = decdn_bao_range::align_range(0, 0, u64::try_from(payload_a.len())?)?;
+    let refused = source
+        .open(*hash_a.as_bytes(), range)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a leg on an unknown channel must be refused"))?;
+    ctx.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pool_id = known_pool;
+    anyhow::ensure!(
+        refused
+            .downcast_ref::<decdn_client::UpstreamRefused>()
+            .is_some_and(|r| *r.error() == StreamError::NotFound),
+        "expected a NotFound refusal, got: {refused:#}"
+    );
+    anyhow::ensure!(fetch("b", hash_b, payload_b.len()).await? == payload_b);
+
+    anyhow::ensure!(
+        connections.dials() == 1,
+        "every leg must share one dial, got {}",
+        connections.dials()
+    );
+    let served = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    anyhow::ensure!(
+        served == 1,
+        "the node must accept one connection, got {served}"
+    );
+
+    drop(source);
+    drop(connections);
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// Drive a scattered range set across four concurrent sibling stores, then the
+/// rest of the blob into one of them, through one `PeerSource` on one ledger
+/// against a live handler. The lane is seeded with a live chain from an
+/// earlier payer process ([`lane_with_proved_reveals`]), so the fresh ledger
+/// trails the node's watermark and every leg's first proof is stale.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fixture: a paid handler, a lane, and the two drives it serves"
+)]
+async fn drive_scattered_as_a_restarted_payer() -> anyhow::Result<()> {
+    use decdn_client::driver::{DriveConfig, drive};
+    use decdn_client::{BudgetPacer, ClientRangedStore, FakeFunder, PeerSource, SharedPool};
+
+    const GROUP: u64 = 16 * 1024;
+    let payload: Vec<u8> = (0..32 * GROUP).map(|i| (i % 251) as u8).collect();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let total = u64::try_from(payload.len())?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(1_000_000_000u64);
+    let pool_store = Arc::new(MemoryPoolStateStore::new());
+    pool_store.record(&lane_with_proved_reveals(&client_signer, deposit)?)?;
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn PoolStateStore> = pool_store.clone();
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let (server_task, _accepted) = spawn_server_counting(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ledger = Arc::new(ctx.new_ledger());
+    let ctx = Arc::new(std::sync::Mutex::new(ctx));
+    let slash = slash_domain();
+    let source = PeerSource::new(
+        &client_ep,
+        target,
+        Arc::clone(&ctx),
+        Arc::clone(&ledger),
+        &slash,
+        server_eth.address(),
+        decdn_protocol::client::NO_NAMESPACE,
+        0,
+        u64::MAX,
+        PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
+        None,
+    );
+    // Four sibling fetches of the blob, one store each, on the one lane: the
+    // shape of concurrent bundle entries that share a provider.
+    let store_dir = tempfile::tempdir()?;
+    let stores = (0..4)
+        .map(|i| {
+            ClientRangedStore::create(
+                store_dir.path(),
+                &format!("blob{i}"),
+                *hash.as_bytes(),
+                total,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let spent_ledger = Arc::clone(&ledger);
     let spent = move || spent_ledger.committed().amount;
@@ -615,48 +751,51 @@ async fn drive_scattered_through_peer_source(warm: bool, restarted: bool) -> any
     let funder = FakeFunder::new(0, decdn_incentive::DepositOutcome::UnknownPool);
     let config = DriveConfig::cli(U256::ZERO);
     let scattered: Vec<(u64, u64)> = (0..32).step_by(2).map(|g| (g * GROUP, GROUP)).collect();
-    for ranges in [scattered.as_slice(), &[(0, 0)]] {
-        drive_range_set(
-            &store,
+    let pacer = BudgetPacer::new();
+    let range = |store, (offset, len): (u64, u64)| {
+        drive(
+            store,
             &source,
-            &BudgetPacer::new(),
+            &pacer,
             &funder,
             &ctx,
             &ledger,
             *hash.as_bytes(),
-            ranges,
-            std::num::NonZeroUsize::MIN.saturating_add(3),
+            offset,
+            len,
             &config,
             None,
+            None,
+            None,
             Some(&pool),
-            std::future::pending(),
         )
-        .await?;
+    };
+    // Each sibling drives every fourth range of the set, all four at once.
+    let siblings = stores.iter().enumerate().map(|(i, store)| {
+        let mine: Vec<(u64, u64)> = scattered.iter().copied().skip(i).step_by(4).collect();
+        async move {
+            for r in mine {
+                range(store, r).await?;
+            }
+            anyhow::Ok(())
+        }
+    });
+    for driven in futures_util::future::join_all(siblings).await {
+        driven?;
     }
+    // Then the first sibling drives the rest of the blob.
+    let first = stores.first().ok_or_else(|| anyhow::anyhow!("no store"))?;
+    range(first, (0, 0)).await?;
     anyhow::ensure!(
-        std::fs::read(store_dir.path().join("blob"))? == payload,
+        std::fs::read(store_dir.path().join("blob0"))? == payload,
         "the range set and the rest assemble the blob byte-exact"
     );
     drop(source);
-    let dialed = accepted.load(std::sync::atomic::Ordering::SeqCst);
     shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(dialed)
-}
-
-/// A warm `PeerSource` drives a whole scattered range set, four gaps at a time,
-/// and then the rest of the blob, on ONE connection: concurrent first opens
-/// share one dial, and later drives reuse it (#2119). Without the warm
-/// connection every leg dials its own.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_warm_peer_source_drives_a_range_set_on_one_connection() -> anyhow::Result<()> {
-    let warm = Box::pin(drive_scattered_through_peer_source(true, false)).await?;
-    anyhow::ensure!(warm == 1, "a warm source dials once, dialled {warm}");
-    let cold = Box::pin(drive_scattered_through_peer_source(false, false)).await?;
-    anyhow::ensure!(cold > 1, "a cold source dials per leg, dialled {cold}");
     Ok(())
 }
 
-/// A restarted payer drives a scattered range set, four gaps at a time on one
+/// A restarted payer drives a scattered range set, four legs at a time on one
 /// ledger, against a lane whose watermark it lost (#2173). Each 16 KiB leg's
 /// only proof is a sealed closing voucher at or below the node's signed anchor, and
 /// lane headroom cannot pay it, so the node rejects it with the watermark
@@ -665,8 +804,7 @@ async fn a_warm_peer_source_drives_a_range_set_on_one_connection() -> anyhow::Re
 /// set must still assemble.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_payer_heals_a_concurrent_range_set() -> anyhow::Result<()> {
-    Box::pin(drive_scattered_through_peer_source(true, true)).await?;
-    Ok(())
+    Box::pin(drive_scattered_as_a_restarted_payer()).await
 }
 
 /// A restarted payer's sub-chunk transfer (#1946): the node's lane sits two
@@ -12761,6 +12899,7 @@ async fn drive_against_stop_send_server(
         0,
         u64::MAX,
         PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
+        None,
     );
     let pacer = BudgetPacer::new();
     let funder = FakeFunder::new(0, decdn_incentive::DepositOutcome::UnknownPool);

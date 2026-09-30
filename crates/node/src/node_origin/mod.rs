@@ -1957,6 +1957,9 @@ async fn pull_from_candidate_in_span(
         deps.config.max_blob_size_bytes,
         rate_ceiling,
         deadlines,
+        // A pull leg runs on a per-serve runtime, so it dials per leg on the
+        // long-lived dial runtime and shares no connection map (#1675).
+        None,
     )
     .with_dial_runtime(deps.dial_runtime.clone());
     let handshake = timed_open(
@@ -2072,6 +2075,8 @@ async fn pull_from_candidate_in_span(
                 max_blob_size_bytes,
                 rate_ceiling,
                 deadlines,
+                // Per-serve runtime: dial per leg (#1675).
+                None,
             )
             .with_dial_runtime(dial_runtime);
             let source = PrimedSource::new(TimedSource::new(source, Arc::clone(&metrics)));
@@ -3677,13 +3682,10 @@ mod tests {
     /// by construction, unfailable, and green even with every marker stripped from the crate.
     ///
     /// The wiring is guarded where the wiring lives:
-    /// - `the_range_helpers_mark_their_own_faults_as_local` (in `decdn-client`) drives
-    ///   the REAL `aligned_wire_len` into its REAL error and asserts the marker is on it,
-    ///   never attaching it itself.
-    /// - `node_origin_an_unverifiable_voucher_is_a_local_fault_not_a_payment_one` drives a
-    ///   real pull whose signature the upstream cannot verify — the production shape of "our
-    ///   buyer key is broken" — and asserts `node_pull_local_fault_total` moves while the
-    ///   peer is left unscored.
+    /// `node_origin_an_unverifiable_voucher_is_a_local_fault_not_a_payment_one` drives a
+    /// real pull whose signature the upstream cannot verify (the production shape of "our
+    /// buyer key is broken") and asserts `node_pull_local_fault_total` moves while the
+    /// peer is left unscored.
     #[test]
     fn a_local_fault_outranks_every_arm_that_blames_the_peer() {
         // Marker under the context layers the real call stack adds on the way out — the

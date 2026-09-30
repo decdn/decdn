@@ -2,39 +2,42 @@
 //! blobs — a bundle, or a single blob — to files in a directory.
 //!
 //! A `Downloader` is an OUTPUT + SCHEDULING adapter over the ONE shared
-//! multi-source core, not a second engine: each entry opens a
-//! [`ClientRangedStore`] beside its file and fetches its missing ranges across
-//! the candidate set through `multi_source_fetch` — bao-verifying every byte,
-//! striping across every holder at full throughput, and failing over between
-//! them — then finalizes, promoting the `.partial` to the final file. So a
-//! resumed download re-pulls only what it lacks, and a bundle layer above can
-//! pre-seed held ranges (its chunk-hint dedup) into the `.partial` and the same
-//! fetch fills only the complement.
+//! acquire loop, not a second engine: each entry opens a [`ClientRangedStore`]
+//! beside its file and fills its missing ranges through [`crate::acquire`]
+//! across a [`SourceSet`] of the blob's holders — bao-verifying every byte and
+//! striping across every holder at full throughput. A source that faults cools
+//! and returns; the fetch ends on done, a fatal fault, or the stop policy. It
+//! then finalizes, promoting the `.partial` to the final file. So a resumed
+//! download re-pulls only what it lacks, and a bundle layer above can pre-seed
+//! held ranges (its chunk-hint dedup) into the `.partial` and the same fetch
+//! fills only the complement.
 //!
-//! It is the download half of the same core the `Streamer` (the consumption-paced
-//! single-blob face) uses — the Downloader just uncaps the fan-out and drops the
-//! consumer pacing. Bundles are the main scenario: a bundle is a set of blobs, so
-//! both entry points take a slice and write one file per blob. `fetch_to_paths`
-//! writes each blob to a caller-chosen destination (a bundle's manifest paths, or
-//! a single `decdn fetch -o` target); `fetch_to_dir` is the convenience over it
-//! that names each file by its content-address hex under a directory. A single
-//! blob is a bundle of one.
+//! It is the download half of the same loop the `Streamer` (the
+//! consumption-paced single-blob face) uses — the Downloader just uncaps the
+//! lanes and drops the consumer pacing. Bundles are the main scenario: a bundle
+//! is a set of blobs, so both entry points take a slice and write one file per
+//! blob. `fetch_to_paths` writes each blob to a caller-chosen destination (a
+//! bundle's manifest paths, or a single `decdn fetch -o` target); `fetch_to_dir`
+//! is the convenience over it that names each file by its content-address hex
+//! under a directory. A single blob is a bundle of one.
 
 use std::path::{Path, PathBuf};
-
-use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, align_range};
+use std::sync::Arc;
 
 use crate::driver::DriveConfig;
+use crate::health::PeerHealth;
 use crate::ledgers::LaneLedgers;
 use crate::pacer::BudgetPacer;
-use crate::scheduler::{MultiSourceConfig, multi_source_fetch_until};
-use crate::source::{BlobSource, Funder};
-use crate::streamer::{StreamCandidate, source_lanes};
-use crate::{ClientRangedStore, PullConfig, RangedStore};
+use crate::scheduler::{AcquireEnv, AcquireTarget, acquire};
+use crate::source::Funder;
+use crate::source_set::{Holder, SourceProvider, SourceSet};
+use crate::stop::{ProgressClock, StopPolicy};
+use crate::{ClientRangedStore, RangedStore};
 
 /// One blob to fetch and where to write it: the content `hash` (the bao root),
 /// its `total_bytes` (authoritative for keying the store and sizing the fetch),
-/// and the caller-chosen `dest` path the `.partial` and final file are keyed by.
+/// the caller-chosen `dest` path the `.partial` and final file are keyed by,
+/// and the byte ranges to fill.
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadTarget<'a> {
     /// The blob's BLAKE3 content address (its bao root); every ingested byte is
@@ -45,20 +48,30 @@ pub struct DownloadTarget<'a> {
     /// Where to write the finished blob. The `.partial` store and the promoted
     /// final file are keyed by this path, so the finished file IS `dest`.
     pub dest: &'a Path,
+    /// The `(offset, len)` byte ranges to fill, or `None` for the whole blob.
+    /// The fetch promotes the blob only when every byte is present, so a
+    /// caller that writes the bytes outside them itself (a bundle entry's
+    /// donor splice) finds them in the `.partial` beside `dest`.
+    pub ranges: Option<&'a [(u64, u64)]>,
 }
 
 /// Fetch content-addressed blobs — a bundle, or a single blob — to files in a
-/// directory, reusing the shared multi-source core (`multi_source_fetch` +
+/// directory, through the shared acquire loop ([`crate::acquire`] +
 /// [`ClientRangedStore`]) at full throughput.
 ///
-/// A `Downloader` is the download face over the same engine the [`crate::Streamer`]
-/// uses: it fetches across the injected [`StreamCandidate`] set with the fan-out
-/// UNCAPPED (every candidate) and no consumption pacing, then promotes each
-/// finished blob to its file. One candidate set — one dial and one payment
-/// channel per provider — serves a whole bundle (each [`BlobSource::open`] takes
-/// the hash). A candidate that faults is failed over to another (shared-pool
-/// failover, #1174); a resumed download (an existing `.partial`, e.g. a bundle
-/// layer's chunk-hint dedup) re-pulls only its missing ranges.
+/// A `Downloader` is the download face over the same loop the
+/// [`crate::Streamer`] uses: it fetches across a [`SourceSet`] of the injected
+/// `holders`, built through the [`SourceProvider`], with up to `max_lanes`
+/// lanes and no consumption pacing, then promotes each finished blob to its
+/// file. A
+/// source that faults cools (in the command-wide [`PeerHealth`]) and returns;
+/// its ranges move to the other sources meanwhile. A resumed download (an
+/// existing `.partial`, e.g. a bundle layer's chunk-hint dedup) re-pulls only
+/// its missing ranges.
+///
+/// Each target gets a fresh [`SourceSet`], so the provider builds each
+/// holder's lane once per target. A [`crate::StaticSources`] hands each lane
+/// out once, so a `Downloader` over one fetches one target.
 ///
 /// The faces do not write the buyer store: record each lane's payment after the
 /// fetch, whatever its outcome (see the crate docs, and the `download` example
@@ -69,7 +82,7 @@ pub struct DownloadTarget<'a> {
 ///
 /// use decdn_client::driver::DriveConfig;
 /// use decdn_client::source::{BlobSource, Funder};
-/// use decdn_client::{DownloadTarget, Downloader, PullConfig, StreamCandidate};
+/// use decdn_client::{DownloadTarget, Downloader, StaticSources, StreamCandidate};
 ///
 /// async fn download<S: BlobSource, F: Funder>(
 ///     candidates: Vec<StreamCandidate<S>>,
@@ -78,121 +91,109 @@ pub struct DownloadTarget<'a> {
 ///     total_bytes: u64,
 ///     dest: &Path,
 /// ) -> anyhow::Result<()> {
-///     let downloader = Downloader::new(candidates, funder, DriveConfig::cli(Default::default()));
-///     let target = DownloadTarget { hash, total_bytes, dest };
+///     let sources = StaticSources::new(candidates)?;
+///     let holders = sources.holders();
+///     let lanes = holders.len();
+///     let drive = DriveConfig::cli(Default::default());
+///     let downloader =
+///         Downloader::new(sources, holders, Default::default(), funder, drive, lanes);
+///     let target = DownloadTarget { hash, total_bytes, dest, ranges: None };
 ///     downloader
-///         .fetch_to_paths(&[target], &PullConfig::new(), None, None)
+///         .fetch_to_paths(&[target], None, None)
 ///         .await?;
 ///     Ok(())
 /// }
 /// ```
-pub struct Downloader<S, F> {
-    /// The provider candidates every entry is fetched across.
-    candidates: Vec<StreamCandidate<S>>,
+pub struct Downloader<P, F> {
+    /// Where the fetch finds holders and builds their lanes.
+    provider: P,
+    /// The holders every target starts from.
+    holders: Vec<Holder>,
+    /// The command-wide health every target's sources record into.
+    health: Arc<PeerHealth>,
     /// The top-up seam a mid-fetch cap exhaustion funds through.
     funder: F,
     /// The driver's funding/settle policy.
     drive_config: DriveConfig,
+    /// The most lanes that stream at once, for every target. Holders past it
+    /// wait as reserves, and a holder discovery adds later can use a free
+    /// lane.
+    max_lanes: usize,
+    /// The largest blob accepted, in bytes, or `0` for no cap
+    /// ([`Self::max_blob_bytes`]).
+    max_blob_bytes: u64,
 }
 
-impl<S, F> std::fmt::Debug for Downloader<S, F> {
+impl<P, F> std::fmt::Debug for Downloader<P, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Downloader")
-            .field("candidates", &self.candidates.len())
+            .field("holders", &self.holders.len())
             .field("drive_config", &self.drive_config)
             .finish_non_exhaustive()
     }
 }
 
-/// The range a [`Downloader`] of a fresh `total_bytes`-byte blob across
-/// `lanes` candidates opens first on the lane that holds it: offset 0, one
-/// even share of the blob, rounded up to whole chunk groups.
-///
-/// A caller that opens a pull before the download (to read the signed
-/// `total_bytes`, or to learn whether the peer serves) opens exactly this range
-/// and parks the pull in a [`crate::PrimedSource`], and sets it as that
-/// candidate's [`StreamCandidate::first_unit`]; the lane's first open then
-/// adopts the pull (#2063). The download's pacer draws a whole unit, so the
-/// unit is the lane's first leg.
-/// An empty blob yields the empty range, which no scheduler reserves, so a
-/// pull primed at it is never adopted.
-///
-/// # Errors
-///
-/// [`align_range`]'s bounds check. It does not fire: the unit starts at 0 and
-/// ends inside the blob.
-pub fn download_first_unit(total_bytes: u64, lanes: usize) -> anyhow::Result<AlignedRange> {
-    let share = total_bytes.div_ceil(u64::try_from(lanes.max(1)).unwrap_or(u64::MAX));
-    let share = share
-        .div_ceil(CHUNK_GROUP_BYTES)
-        .saturating_mul(CHUNK_GROUP_BYTES);
-    Ok(align_range(0, share.min(total_bytes), total_bytes)?)
-}
-
-impl<S, F> Downloader<S, F> {
-    /// Build a downloader over the injected provider candidates. The same set
-    /// serves every entry a later `fetch_to_dir` fetches; each candidate must name
-    /// a distinct on-chain provider.
+impl<P, F> Downloader<P, F> {
+    /// Build a downloader over `holders`, whose lanes `provider` builds. The
+    /// same holders start every target a later `fetch_to_dir` fetches, and
+    /// `health` is shared across all of them. With no holder, each target
+    /// starts by discovering them. At most `max_lanes` holders (at least one)
+    /// stream at once.
     #[must_use]
     pub const fn new(
-        candidates: Vec<StreamCandidate<S>>,
+        provider: P,
+        holders: Vec<Holder>,
+        health: Arc<PeerHealth>,
         funder: F,
         drive_config: DriveConfig,
+        max_lanes: usize,
     ) -> Self {
         Self {
-            candidates,
+            provider,
+            holders,
+            health,
             funder,
             drive_config,
+            max_lanes,
+            max_blob_bytes: 0,
         }
+    }
+
+    /// Cap every target at `max_blob_bytes` (`0` for no cap). A target's size
+    /// claim above the cap is clamped to it before its store is sized, and a
+    /// blob that holds bytes past the cap fails with [`crate::BlobTooLarge`]
+    /// ([`crate::AcquireEnv::max_blob_bytes`]).
+    #[must_use]
+    pub const fn max_blob_bytes(mut self, max_blob_bytes: u64) -> Self {
+        self.max_blob_bytes = max_blob_bytes;
+        self
     }
 }
 
-impl<S, F> Downloader<S, F>
+impl<P, F> Downloader<P, F>
 where
-    S: BlobSource,
+    P: SourceProvider,
     F: Funder,
 {
     /// Fetch every `(hash, total_bytes)` entry to a file named by its
     /// content-address hex inside `dir`, returning the written paths in entry
-    /// order.
+    /// order. See [`Self::fetch_to_paths`].
     ///
-    /// Each entry opens a [`ClientRangedStore`] beside its file and drives only
-    /// its missing ranges across the candidate set through `multi_source_fetch`
-    /// (bao-verifying every byte, failing over between candidates), then finalizes
-    /// — promoting `.partial` to the final file. Writes land at their absolute
-    /// offsets, so out-of-order and multi-source fills assemble correctly; a
-    /// resumed download (or a bundle layer's chunk-hint dedup, pre-seeded into the
-    /// `.partial`) re-pulls only what it lacks. The whole blob is fetched at full
-    /// throughput — `config`'s read-ahead bound is a `Streamer` tunable and does
-    /// not apply here.
-    ///
-    /// `total_bytes` is authoritative for keying the store, and the entry `hash`
-    /// is the bao root every ingested byte is verified against: a wrong size or
-    /// hash surfaces as a verification failure, never as silent corruption.
-    ///
-    /// `on_progress`, when set, is called with the core's verified CONTENT
-    /// progress for the entry CURRENTLY fetching — `(position, total_bytes)`, both
-    /// in content bytes, resetting to that entry's own total at each new entry. A
-    /// multi-entry caller drawing one bar accumulates the completed entries' totals
-    /// itself; a single-entry download can use it directly.
+    /// `on_progress`, when set, is called with the verified CONTENT progress for
+    /// the entry CURRENTLY fetching — `(position, total_bytes)`, both in content
+    /// bytes, resetting to that entry's own total at each new entry. A
+    /// multi-entry caller drawing one bar accumulates the completed entries'
+    /// totals itself; a single-entry download can use it directly.
     ///
     /// # Errors
     ///
-    /// A store open/create/finalize I/O error, or any fault `multi_source_fetch`
-    /// raises for an entry once every candidate is exhausted (a refused or
-    /// underfunded pull, a stalled peer, a verification failure). The first
-    /// failing entry aborts the batch; entries already written stay on disk (and
-    /// any `.partial` a failed entry left is the resume prefix a retry inherits).
+    /// Any error [`Self::fetch_to_paths`] returns.
     pub async fn fetch_to_dir(
         &self,
         entries: &[([u8; 32], u64)],
         dir: &Path,
-        config: &PullConfig,
         on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
     ) -> anyhow::Result<Vec<PathBuf>> {
-        // Name each blob's destination by its content-address hex under `dir`,
-        // then fetch to those explicit paths. A caller that wants its own names
-        // (a bundle's manifest paths) uses [`Self::fetch_to_paths`] directly.
         let dests: Vec<PathBuf> = entries
             .iter()
             .map(|&(hash, _)| dir.join(blake3::Hash::from_bytes(hash).to_hex().as_str()))
@@ -204,92 +205,81 @@ where
                 hash,
                 total_bytes,
                 dest,
+                ranges: None,
             })
             .collect();
-        self.fetch_to_paths(&targets, config, None, on_progress)
+        self.fetch_to_paths(&targets, None, on_progress).await
+    }
+
+    /// [`Self::fetch_to_paths_until`] under a stop policy with no limit: the
+    /// fetch waits for its sources until the caller drops it.
+    ///
+    /// # Errors
+    ///
+    /// Any error [`Self::fetch_to_paths_until`] returns except a give-up.
+    pub async fn fetch_to_paths(
+        &self,
+        targets: &[DownloadTarget<'_>],
+        ledgers: Option<&LaneLedgers>,
+        on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let stop = StopPolicy::new(true, None, Arc::new(ProgressClock::new()));
+        self.fetch_to_paths_until(targets, ledgers, on_progress, &stop)
             .await
     }
 
     /// Fetch every [`DownloadTarget`] to its own `dest` path, returning the
-    /// written paths in target order. Each blob's `.partial` and final file are
+    /// `dest` of each target it promoted, in target order. A target without
+    /// explicit ranges is always promoted, so a whole-blob batch returns every
+    /// `dest`; a ranged target that leaves bytes missing is not in the result,
+    /// because no file exists at its `dest`. Each blob's `.partial` and final file are
     /// keyed by `dest` (its parent directory and file name), so a resumed
     /// download re-pulls only what it lacks and the promoted file IS `dest` — no
     /// post-finalize rename. The parent directory of each `dest` is created if
     /// missing.
     ///
-    /// Each target opens a [`ClientRangedStore`] beside its file and drives only
-    /// its missing ranges across the candidate set through `multi_source_fetch`
-    /// (bao-verifying every byte, failing over between candidates), then finalizes
-    /// — promoting `.partial` to `dest`. Writes land at their absolute offsets, so
-    /// out-of-order and multi-source fills assemble correctly; a resumed download
-    /// (or a bundle layer's chunk-hint dedup, pre-seeded into the `.partial`)
-    /// re-pulls only what it lacks. The whole blob is fetched at full throughput,
-    /// with `config.download_unit_deadline` the per-lane stall watchdog.
+    /// Each target opens a [`ClientRangedStore`] beside its file and fills its
+    /// ranges through [`crate::acquire`] across a fresh [`SourceSet`] of the
+    /// holders, then finalizes — promoting `.partial` to `dest`. A target with
+    /// explicit [`DownloadTarget::ranges`] that leave bytes missing is not
+    /// finalized: its landed ranges stay in the `.partial`. Writes land at
+    /// their absolute offsets, so out-of-order and multi-source fills assemble
+    /// correctly. The whole blob is fetched at full throughput, with no
+    /// read-ahead bound.
     ///
-    /// `total_bytes` is authoritative for keying the store, and the target `hash`
-    /// is the bao root every ingested byte is verified against: a wrong size or
-    /// hash surfaces as a verification failure, never as silent corruption.
-    ///
-    /// `on_progress`, when set, is called with the core's verified CONTENT
-    /// progress for the target CURRENTLY fetching — `(position, total_bytes)`,
-    /// both content bytes, resetting to that target's own total at each new one.
+    /// `total_bytes` is the first size claim, a hint: a resumed store's bound
+    /// wins over it, and a leg that verifies the final chunk proves the size.
+    /// The target `hash` is the bao root every ingested byte is verified
+    /// against: a wrong hash surfaces as a verification failure, never as
+    /// silent corruption. A finalize whose whole-file hash does not match
+    /// (bytes that drifted on disk after they verified) fetches the target
+    /// once more.
     ///
     /// `ledgers`, when set, is a shared voucher-ledger registry (a bundle run's
-    /// `LaneLedgers`): the core reads and credits EVERY lane registered across the
-    /// run for its deposit-solvency view, so concurrent entries sharing one
+    /// `LaneLedgers`): the loop reads and credits EVERY lane registered across
+    /// the run for its deposit-solvency view, so concurrent entries sharing one
     /// on-chain pool cannot jointly over-draw it. `None` folds only this fetch's
     /// own lanes, the right view for a solo download.
     ///
-    /// # Errors
-    ///
-    /// A `dest` with no file name, a store open/create/finalize I/O error, or any
-    /// fault `multi_source_fetch` raises for a target once every candidate is
-    /// exhausted. The first failing target aborts the batch; targets already
-    /// written stay on disk (and any `.partial` a failed target left is the resume
-    /// prefix a retry inherits).
-    pub async fn fetch_to_paths(
-        &self,
-        targets: &[DownloadTarget<'_>],
-        config: &PullConfig,
-        ledgers: Option<&LaneLedgers>,
-        on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
-    ) -> anyhow::Result<Vec<PathBuf>> {
-        self.fetch_to_paths_until(
-            targets,
-            config,
-            ledgers,
-            on_progress,
-            std::future::pending(),
-        )
-        .await
-    }
-
-    /// [`Self::fetch_to_paths`] under a caller's `stop`. When `stop` resolves
-    /// while a target is fetching, the fetch ends with `stop`'s error through
-    /// [`crate::multi_source_fetch_until`]. That target's landed bytes stay
-    /// recorded in its `.partial` for a resume, and the target is not
-    /// finalized. `stop` does not race a finalize, so the local verify of a
-    /// complete blob is never cut off.
+    /// `stop` decides when a target that makes no verified progress gives up.
+    /// A target that gives up or fails keeps its landed bytes recorded in its
+    /// `.partial` for a resume, and is not finalized.
     ///
     /// # Errors
     ///
-    /// `stop`'s error when it resolves during a fetch, or any error
-    /// [`Self::fetch_to_paths`] returns.
+    /// A `dest` with no file name, a store
+    /// open/create/finalize I/O error, a second [`crate::HashMismatch`] at
+    /// finalize, or the error [`crate::acquire`] ends a target with: a fatal
+    /// fault, a unanimous verdict of the sources, or [`crate::GaveUp`]. The
+    /// first failing target aborts the batch; targets already written stay on
+    /// disk.
     pub async fn fetch_to_paths_until(
         &self,
         targets: &[DownloadTarget<'_>],
-        config: &PullConfig,
         ledgers: Option<&LaneLedgers>,
         on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
-        stop: impl Future<Output = anyhow::Error>,
+        stop: &StopPolicy,
     ) -> anyhow::Result<Vec<PathBuf>> {
-        tokio::pin!(stop);
-        // Fail early and clearly on an empty candidate set, rather than deep inside
-        // `multi_source_fetch` on the first target with a less obvious message.
-        anyhow::ensure!(
-            !self.candidates.is_empty(),
-            "a Downloader needs at least one provider candidate to fetch from"
-        );
         let pacer = BudgetPacer::new();
         let mut written = Vec::with_capacity(targets.len());
         for target in targets {
@@ -297,51 +287,100 @@ where
             tokio::fs::create_dir_all(&dir)
                 .await
                 .map_err(|e| anyhow::anyhow!("create download dir {}: {e}", dir.display()))?;
-            let store =
-                ClientRangedStore::open_or_create(&dir, &stem, target.hash, target.total_bytes)
-                    .map_err(|e| {
-                        anyhow::anyhow!("open ranged store for {}: {e}", target.dest.display())
-                    })?;
-            // One lane per provider, each carrying its candidate's measured
-            // coverage (a `None` candidate is a full holder), so a partial holder
-            // (#1506) is never assigned a range it does not hold. For a multi-blob
-            // download, a candidate that does not fully cover every target must be
-            // fetched per blob with per-blob coverage.
-            let lanes = source_lanes(&self.candidates, target.total_bytes);
-            let ms = MultiSourceConfig {
-                // Uncapped fan-out — a download wants every holder striping in
-                // parallel, unlike the Streamer's small bounded front.
-                max_sources: self.candidates.len().max(1),
-                unit_deadline: config.download_unit_deadline,
+            // Off the runtime: opening a finalized blob hashes its final file.
+            let store = {
+                let (dir, stem) = (dir.clone(), stem.clone());
+                let (hash, total) = (target.hash, target.total_bytes);
+                // A claim above the cap never sizes the store.
+                let total = if self.max_blob_bytes > 0 {
+                    total.min(self.max_blob_bytes)
+                } else {
+                    total
+                };
+                tokio::task::spawn_blocking(move || {
+                    ClientRangedStore::open_or_create(&dir, &stem, hash, total)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("open ranged store task: {e}"))?
+                .map_err(|e| {
+                    anyhow::anyhow!("open ranged store for {}: {e}", target.dest.display())
+                })?
             };
-            // A dropped download still records the ranges that landed.
-            let flush_on_drop = store.flush_on_drop();
-            let fetched = multi_source_fetch_until(
-                &store,
-                &lanes,
-                &pacer,
-                &self.funder,
+            let whole = [(0, target.total_bytes)];
+            let ranges = target.ranges.unwrap_or(&whole);
+            let mut sources = SourceSet::new(
+                &self.provider,
                 target.hash,
-                0,
-                target.total_bytes,
-                &self.drive_config,
-                &ms,
+                Arc::clone(&self.health),
+                self.holders.clone(),
+            );
+            let env = AcquireEnv {
+                pacer: &pacer,
+                funder: &self.funder,
+                drive: &self.drive_config,
+                max_lanes: self.max_lanes.max(1),
+                stop,
                 on_progress,
                 ledgers,
                 // No consumption pacing: a download runs at full throughput.
-                None,
-                stop.as_mut(),
-            )
-            .await;
-            flush_on_drop.disarm();
-            fetched?;
-            // `multi_source_fetch` flushes the present record but does not promote;
-            // a download keeps the file, so finalize (verify + promote `.partial`).
-            store.finalize().await?;
-            written.push(target.dest.to_path_buf());
+                pacing: None,
+                max_blob_bytes: self.max_blob_bytes,
+            };
+            // A finalize whose hash does not match clears every claim and
+            // keeps the file, so one more pass fetches the blob again. A
+            // second mismatch is a local fault and ends the target.
+            let mut passes_left = 2u8;
+            loop {
+                passes_left = passes_left.saturating_sub(1);
+                // A dropped download still records the ranges that landed.
+                let flush_on_drop = store.flush_on_drop();
+                let fetched = acquire(
+                    AcquireTarget {
+                        store: &store,
+                        hash: target.hash,
+                        total_bytes: target.total_bytes,
+                        ranges,
+                    },
+                    &mut sources,
+                    &env,
+                )
+                .await;
+                flush_on_drop.disarm();
+                fetched?;
+                // `acquire` flushes the present record but does not promote; a
+                // download keeps the file, so finalize (verify + promote
+                // `.partial`) once every byte is present. Explicit ranges can
+                // leave bytes to another writer, and the `.partial` then stays
+                // for that writer.
+                if target.ranges.is_some() && !store.is_complete().await? {
+                    break;
+                }
+                match store.finalize().await {
+                    Ok(()) => {
+                        written.push(target.dest.to_path_buf());
+                        break;
+                    }
+                    Err(err) if passes_left > 0 && is_hash_mismatch(&err) => {
+                        tracing::warn!(
+                            hash = %blake3::Hash::from_bytes(target.hash).to_hex(),
+                            dest = %target.dest.display(),
+                            "the finalized file does not match its hash; fetching it once more"
+                        );
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
         }
         Ok(written)
     }
+}
+
+/// Whether a finalize failed its whole-file hash ([`crate::HashMismatch`]).
+fn is_hash_mismatch(err: &decdn_bao_range::RangedStoreError) -> bool {
+    matches!(
+        err,
+        decdn_bao_range::RangedStoreError::Backend(inner) if inner.is::<crate::HashMismatch>()
+    )
 }
 
 /// The directory and stem a [`DownloadTarget`]'s `.partial` store lives under, so
@@ -372,9 +411,10 @@ mod tests {
     use super::DownloadTarget;
     use super::Downloader;
     use crate::driver::DriveConfig;
-    use crate::source::{FakeFunder, ScriptedSource};
+    use crate::source::{BlobSource, FakeFunder, ScriptedSource};
     use crate::{
-        ClientRangedStore, Cumulative, PoolContext, PoolLedger, PullConfig, StreamCandidate,
+        ClientRangedStore, Cumulative, GaveUp, PoolContext, PoolLedger, ProgressClock,
+        StaticSources, StopPolicy, StreamCandidate,
     };
 
     /// A buyer context with a huge deposit so funding never gates the fetch,
@@ -400,7 +440,6 @@ mod tests {
             ctx: Arc::new(Mutex::new(ctx_for(provider))),
             ledger,
             coverage: None,
-            first_unit: None,
             lease: crate::LaneLease::default(),
             widen: None,
         }
@@ -417,6 +456,61 @@ mod tests {
             max_settle_waits: 2,
             settle_backoff: Duration::ZERO,
         }
+    }
+
+    /// A downloader over the static lanes `candidates`.
+    fn downloader<S: BlobSource>(
+        candidates: Vec<StreamCandidate<S>>,
+    ) -> anyhow::Result<Downloader<StaticSources<S>, FakeFunder>> {
+        let sources = StaticSources::new(candidates)?;
+        let holders = sources.holders();
+        let lanes = holders.len();
+        Ok(Downloader::new(
+            sources,
+            holders,
+            Arc::default(),
+            funder(),
+            drive_config(),
+            lanes,
+        ))
+    }
+
+    /// The lane cap is the caller's, not the holder count: two holders under
+    /// a cap of one stream through one lane, and the other waits as a
+    /// reserve.
+    #[tokio::test]
+    async fn a_downloader_streams_at_most_max_lanes() -> anyhow::Result<()> {
+        let blob = payload(4 * 1024 * 1024);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger_b));
+        let (root, total) = (src_a.root(), src_a.total_bytes());
+        let (probe_a, probe_b) = (src_a.clone(), src_b.clone());
+        let sources = StaticSources::new(vec![
+            candidate(src_a, ledger_a, 0xA1),
+            candidate(src_b, ledger_b, 0xB2),
+        ])?;
+        let holders = sources.holders();
+        let downloader = Downloader::new(
+            sources,
+            holders,
+            Arc::default(),
+            funder(),
+            drive_config(),
+            1,
+        );
+        let dir = tempfile::tempdir()?;
+        downloader
+            .fetch_to_dir(&[(root, total)], dir.path(), None)
+            .await?;
+        anyhow::ensure!(
+            (probe_a.delivered_bytes() > 0) != (probe_b.delivered_bytes() > 0),
+            "exactly one lane streamed (a={}, b={})",
+            probe_a.delivered_bytes(),
+            probe_b.delivered_bytes()
+        );
+        Ok(())
     }
 
     /// A deterministic payload spanning several chunk groups and one voucher
@@ -444,14 +538,10 @@ mod tests {
         let root = source.root();
         let total = u64::try_from(blob.len())?;
 
-        let downloader = Downloader::new(
-            vec![candidate(source, ledger, 0xA1)],
-            funder(),
-            drive_config(),
-        );
+        let downloader = downloader(vec![candidate(source, ledger, 0xA1)])?;
         let dir = tempfile::tempdir()?;
         let paths = downloader
-            .fetch_to_dir(&[(root, total)], dir.path(), &PullConfig::default(), None)
+            .fetch_to_dir(&[(root, total)], dir.path(), None)
             .await?;
 
         anyhow::ensure!(
@@ -480,7 +570,7 @@ mod tests {
         Ok(())
     }
 
-    /// `fetch_to_dir` forwards the core's per-blob content progress to the
+    /// `fetch_to_dir` forwards the loop's per-blob content progress to the
     /// caller's callback, and the final report reaches the blob's total — the
     /// signal a CLI draws its download bar from.
     #[tokio::test]
@@ -491,11 +581,7 @@ mod tests {
         let root = source.root();
         let total = u64::try_from(blob.len())?;
 
-        let downloader = Downloader::new(
-            vec![candidate(source, ledger, 0xA1)],
-            funder(),
-            drive_config(),
-        );
+        let downloader = downloader(vec![candidate(source, ledger, 0xA1)])?;
         let dir = tempfile::tempdir()?;
 
         let max_pos = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -510,12 +596,7 @@ mod tests {
         };
 
         downloader
-            .fetch_to_dir(
-                &[(root, total)],
-                dir.path(),
-                &PullConfig::default(),
-                Some(&on_progress),
-            )
+            .fetch_to_dir(&[(root, total)], dir.path(), Some(&on_progress))
             .await?;
 
         anyhow::ensure!(
@@ -540,11 +621,7 @@ mod tests {
         let root = source.root();
         let total = u64::try_from(blob.len())?;
 
-        let downloader = Downloader::new(
-            vec![candidate(source, ledger, 0xA1)],
-            funder(),
-            drive_config(),
-        );
+        let downloader = downloader(vec![candidate(source, ledger, 0xA1)])?;
         let dir = tempfile::tempdir()?;
         let dest = dir.path().join("my-model.safetensors");
 
@@ -554,8 +631,8 @@ mod tests {
                     hash: root,
                     total_bytes: total,
                     dest: &dest,
+                    ranges: None,
                 }],
-                &PullConfig::default(),
                 None,
                 None,
             )
@@ -574,10 +651,65 @@ mod tests {
         Ok(())
     }
 
+    /// A ranged target whose ranges complete the store is promoted: its `dest`
+    /// exists and is in the result. A ranged target that leaves bytes missing
+    /// stays a `.partial` and is not in the result.
+    #[tokio::test]
+    async fn a_ranged_target_is_promoted_only_when_its_store_completes() -> anyhow::Result<()> {
+        let blob = payload(1_500_000);
+        let total = u64::try_from(blob.len())?;
+        let dir = tempfile::tempdir()?;
+
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
+        let root = source.root();
+        let part = dir.path().join("part.bin");
+        let half = [(0, total / 2)];
+        let paths = downloader(vec![candidate(source, ledger, 0xA1)])?
+            .fetch_to_paths(
+                &[DownloadTarget {
+                    hash: root,
+                    total_bytes: total,
+                    dest: &part,
+                    ranges: Some(&half),
+                }],
+                None,
+                None,
+            )
+            .await?;
+        anyhow::ensure!(paths.is_empty(), "an incomplete target is not returned");
+        anyhow::ensure!(!part.exists(), "an incomplete target is not promoted");
+
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
+        let whole = dir.path().join("whole.bin");
+        let all = [(0, total)];
+        let paths = downloader(vec![candidate(source, ledger, 0xA1)])?
+            .fetch_to_paths(
+                &[DownloadTarget {
+                    hash: root,
+                    total_bytes: total,
+                    dest: &whole,
+                    ranges: Some(&all),
+                }],
+                None,
+                None,
+            )
+            .await?;
+        anyhow::ensure!(
+            paths == vec![whole.clone()],
+            "the promoted dest is returned"
+        );
+        anyhow::ensure!(
+            std::fs::read(&whole)? == blob,
+            "the promoted file is the blob"
+        );
+        Ok(())
+    }
+
     /// `fetch_to_paths` threads a shared `LaneLedgers` registry (a bundle run's
-    /// pool-wide committed view) into the core and still fetches byte-identically
-    /// (#1848 4a). The registry lets concurrent entries share one solvency view
-    /// of the deposit; here it just proves the parameter is wired through.
+    /// pool-wide committed view) into the loop and still fetches byte-identically
+    /// (#1848 4a).
     #[tokio::test]
     async fn fetch_to_paths_threads_a_shared_ledger_registry() -> anyhow::Result<()> {
         let blob = payload(1_500_000);
@@ -586,11 +718,7 @@ mod tests {
         let root = source.root();
         let total = u64::try_from(blob.len())?;
 
-        let downloader = Downloader::new(
-            vec![candidate(source, ledger, 0xA1)],
-            funder(),
-            drive_config(),
-        );
+        let downloader = downloader(vec![candidate(source, ledger, 0xA1)])?;
         let dir = tempfile::tempdir()?;
         let dest = dir.path().join("shared-ledger.bin");
         let registry = crate::LaneLedgers::new();
@@ -601,8 +729,8 @@ mod tests {
                     hash: root,
                     total_bytes: total,
                     dest: &dest,
+                    ranges: None,
                 }],
-                &PullConfig::default(),
                 Some(&registry),
                 None,
             )
@@ -613,10 +741,10 @@ mod tests {
         Ok(())
     }
 
-    /// Two candidates stripe one blob in parallel: the promoted file is
-    /// BLAKE3-identical and both holders contributed (the multi-source fan-out).
+    /// Two holders stripe one blob in parallel: the promoted file is
+    /// BLAKE3-identical and both holders contributed.
     #[tokio::test]
-    async fn two_candidates_stripe_a_blake3_identical_file() -> anyhow::Result<()> {
+    async fn two_holders_stripe_a_blake3_identical_file() -> anyhow::Result<()> {
         let blob = payload(4 * 1024 * 1024);
         let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
         let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
@@ -627,17 +755,13 @@ mod tests {
         let probe_a = src_a.clone();
         let probe_b = src_b.clone();
 
-        let downloader = Downloader::new(
-            vec![
-                candidate(src_a, ledger_a, 0xA1),
-                candidate(src_b, ledger_b, 0xB2),
-            ],
-            funder(),
-            drive_config(),
-        );
+        let downloader = downloader(vec![
+            candidate(src_a, ledger_a, 0xA1),
+            candidate(src_b, ledger_b, 0xB2),
+        ])?;
         let dir = tempfile::tempdir()?;
         let paths = downloader
-            .fetch_to_dir(&[(root, total)], dir.path(), &PullConfig::default(), None)
+            .fetch_to_dir(&[(root, total)], dir.path(), None)
             .await?;
 
         let path = paths
@@ -649,77 +773,9 @@ mod tests {
         );
         anyhow::ensure!(
             probe_a.delivered_bytes() > 0 && probe_b.delivered_bytes() > 0,
-            "both candidates must have contributed (a={}, b={})",
+            "both holders must have contributed (a={}, b={})",
             probe_a.delivered_bytes(),
             probe_b.delivered_bytes()
-        );
-        Ok(())
-    }
-
-    /// `download_first_unit` is the range the Downloader opens first on the
-    /// lane that holds it: a pull primed at it is adopted, so only the priming
-    /// open ever starts there (#2063).
-    #[tokio::test]
-    async fn a_primed_first_unit_is_adopted() -> anyhow::Result<()> {
-        use crate::PrimedSource;
-        use crate::source::BlobSource as _;
-
-        let blob = payload(4 * 1024 * 1024);
-        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
-        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
-        let src_a = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger_a));
-        let src_b = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger_b));
-        let root = src_a.root();
-        let total = src_a.total_bytes();
-        let probe_a = src_a.clone();
-        let probe_b = src_b.clone();
-
-        let unit = super::download_first_unit(total, 2)?;
-        let primed_b = PrimedSource::new(src_b);
-        let (header, reader) = primed_b.inner().open(root, unit.clone()).await?;
-        primed_b.prime(
-            root,
-            unit.clone(),
-            header,
-            reader,
-            tokio::time::Instant::now(),
-        );
-        let mut cand_b = candidate(primed_b, ledger_b, 0xB2);
-        cand_b.first_unit = Some(unit.clone());
-
-        let downloader = Downloader::new(
-            vec![candidate(PrimedSource::new(src_a), ledger_a, 0xA1), cand_b],
-            funder(),
-            drive_config(),
-        );
-        let dir = tempfile::tempdir()?;
-        let dest = dir.path().join("blob");
-        downloader
-            .fetch_to_paths(
-                &[DownloadTarget {
-                    hash: root,
-                    total_bytes: total,
-                    dest: &dest,
-                }],
-                &PullConfig::default(),
-                None,
-                None,
-            )
-            .await?;
-        anyhow::ensure!(std::fs::read(&dest)? == blob, "the file must be identical");
-
-        let opens: Vec<(u64, u64)> = probe_a
-            .opened_ranges()
-            .into_iter()
-            .chain(probe_b.opened_ranges())
-            .collect();
-        anyhow::ensure!(
-            opens
-                .iter()
-                .filter(|&&(start, _)| start == unit.fetch_start())
-                .count()
-                == 1,
-            "only the priming open starts at the unit: {opens:?}"
         );
         Ok(())
     }
@@ -747,13 +803,9 @@ mod tests {
             seeded_prefix,
         )?;
 
-        let downloader = Downloader::new(
-            vec![candidate(source, ledger, 0xA1)],
-            funder(),
-            drive_config(),
-        );
+        let downloader = downloader(vec![candidate(source, ledger, 0xA1)])?;
         let paths = downloader
-            .fetch_to_dir(&[(root, total)], dir.path(), &PullConfig::default(), None)
+            .fetch_to_dir(&[(root, total)], dir.path(), None)
             .await?;
 
         let path = paths
@@ -763,9 +815,6 @@ mod tests {
             std::fs::read(path)? == blob,
             "resumed file must be identical"
         );
-        // Only the complement was fetched — never the seeded prefix. Every opened
-        // range starts at or after the seeded frontier, and the total opened is
-        // strictly less than the whole blob.
         let opened = probe.opened_ranges();
         anyhow::ensure!(
             opened.iter().all(|&(start, _)| start >= seeded_prefix),
@@ -779,11 +828,118 @@ mod tests {
         Ok(())
     }
 
-    /// A `stop` that fires mid-fetch ends the download with its own error. The
-    /// target is not promoted, and the bytes that landed stay recorded beside
-    /// `dest` for a resume.
+    /// Fetch `ranges` of `blob` to `dest` under a first claim of `claim`,
+    /// from one fresh source. Returns the source, so the test can read what it
+    /// opened, and the promoted paths.
+    async fn fetch_ranges(
+        blob: &[u8],
+        dest: &std::path::Path,
+        claim: u64,
+        ranges: Option<&[(u64, u64)]>,
+    ) -> anyhow::Result<(ScriptedSource, Vec<std::path::PathBuf>)> {
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(blob.to_vec())?.paying(Arc::clone(&ledger));
+        let probe = source.clone();
+        let paths = downloader(vec![candidate(source, ledger, 0xA1)])?
+            .fetch_to_paths(
+                &[DownloadTarget {
+                    hash: probe.root(),
+                    total_bytes: claim,
+                    dest,
+                    ranges,
+                }],
+                None,
+                None,
+            )
+            .await?;
+        Ok((probe, paths))
+    }
+
+    /// A resumed record whose bound is past the first claim finishes: the
+    /// whole-blob target reaches the record's bound, the file is the blob, and
+    /// no byte the record holds is opened again.
+    #[tokio::test]
+    async fn a_resumed_record_with_a_bound_past_the_claim_finishes() -> anyhow::Result<()> {
+        let blob = payload(3 * 1024 * 1024);
+        let total = u64::try_from(blob.len())?;
+        let held = 1024 * 1024;
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("model.bin");
+        // A first run under the true size lands `[0, held)` and proves nothing.
+        let (_, paths) = fetch_ranges(&blob, &dest, total, Some(&[(0, held)])).await?;
+        anyhow::ensure!(paths.is_empty(), "the first run leaves a partial");
+
+        // The rerun claims only `held` bytes: the record's bound wins.
+        let (probe, paths) = fetch_ranges(&blob, &dest, held, None).await?;
+        anyhow::ensure!(paths == vec![dest.clone()], "the rerun promotes");
+        anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
+        let opened = probe.opened_ranges();
+        anyhow::ensure!(
+            opened.iter().all(|&(start, _)| start >= held),
+            "no held byte is opened again: {opened:?}"
+        );
+        Ok(())
+    }
+
+    /// A resumed record whose proven size is past the first claim finishes
+    /// the same way, and opens only the bytes the record lacks.
+    #[tokio::test]
+    async fn a_resumed_record_with_a_proven_size_past_the_claim_finishes() -> anyhow::Result<()> {
+        let blob = payload(3 * 1024 * 1024);
+        let total = u64::try_from(blob.len())?;
+        let held = 1024 * 1024;
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("model.bin");
+        // A first run lands the head and the final group, which proves the size.
+        let first = [(0, held), (total - group, group)];
+        let (_, paths) = fetch_ranges(&blob, &dest, total, Some(&first)).await?;
+        anyhow::ensure!(paths.is_empty(), "the first run leaves a partial");
+
+        let (probe, paths) = fetch_ranges(&blob, &dest, held, None).await?;
+        anyhow::ensure!(paths == vec![dest.clone()], "the rerun promotes");
+        anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
+        let opened = probe.opened_ranges();
+        anyhow::ensure!(
+            opened
+                .iter()
+                .all(|&(start, len)| start >= held && start + len <= total - group),
+            "only the missing middle is opened: {opened:?}"
+        );
+        Ok(())
+    }
+
+    /// Bytes that drift on disk after they verified fail the finalize hash.
+    /// The same fetch runs once more over the blob and completes.
+    #[tokio::test]
+    async fn a_finalize_hash_mismatch_fetches_again_and_completes() -> anyhow::Result<()> {
+        let blob = payload(2 * 1024 * 1024);
+        let total = u64::try_from(blob.len())?;
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("model.bin");
+        // A record that claims and proves every byte over a data file with one
+        // flipped byte: the drift the finalize hash exists to catch.
+        let mut drifted = blob.clone();
+        if let Some(b) = drifted.get_mut(1000) {
+            *b ^= 0xFF;
+        }
+        ClientRangedStore::seed_checkpointed_prefix(dir.path(), "model.bin", &drifted, total)?;
+
+        let (probe, paths) = fetch_ranges(&blob, &dest, total, None).await?;
+        anyhow::ensure!(paths == vec![dest.clone()], "the fetch promotes");
+        anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
+        anyhow::ensure!(
+            probe.opened_bytes() >= total,
+            "the second pass fetched the blob again: {}",
+            probe.opened_bytes()
+        );
+        Ok(())
+    }
+
+    /// A lone source that stalls mid-blob trips the lane watchdog, cools, and
+    /// comes back to finish the blob from the gap: one holder recovers.
     #[tokio::test(start_paused = true)]
-    async fn a_stop_leaves_the_partial_for_a_resume() -> anyhow::Result<()> {
+    async fn a_lone_stalled_source_recovers_after_it_cools() -> anyhow::Result<()> {
         let blob = payload(12 * 1024 * 1024);
         let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
         let source = ScriptedSource::new(blob.clone())?
@@ -792,49 +948,66 @@ mod tests {
         let root = source.root();
         let total = u64::try_from(blob.len())?;
 
-        let downloader = Downloader::new(
-            vec![candidate(source, ledger, 0xA1)],
-            funder(),
-            drive_config(),
-        );
+        let downloader = downloader(vec![candidate(source, ledger, 0xA1)])?;
         let dir = tempfile::tempdir()?;
         let dest = dir.path().join("model.bin");
-        let config = PullConfig {
-            download_unit_deadline: Duration::ZERO,
-            ..PullConfig::default()
-        };
-        let stop = async {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            anyhow::anyhow!("stopped by the floor")
-        };
+        let stop = StopPolicy::new(false, None, Arc::new(ProgressClock::new()));
+        downloader
+            .fetch_to_paths_until(
+                &[DownloadTarget {
+                    hash: root,
+                    total_bytes: total,
+                    dest: &dest,
+                    ranges: None,
+                }],
+                None,
+                None,
+                &stop,
+            )
+            .await?;
+        anyhow::ensure!(std::fs::read(&dest)? == blob, "the file must be identical");
+        Ok(())
+    }
+
+    /// A download whose lone source never delivers gives up once the stop
+    /// policy's limit passes without a verified byte, and the target is not
+    /// promoted.
+    #[tokio::test(start_paused = true)]
+    async fn a_download_with_no_progress_gives_up() -> anyhow::Result<()> {
+        let blob = payload(2 * 1024 * 1024);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(blob.clone())?
+            .paying(Arc::clone(&ledger))
+            .with_fault_after(0, || anyhow::anyhow!("connection reset"));
+        let root = source.root();
+        let total = u64::try_from(blob.len())?;
+
+        let downloader = downloader(vec![candidate(source, ledger, 0xA1)])?;
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("model.bin");
+        let limit = Duration::from_secs(30);
+        let stop = StopPolicy::new(false, Some(limit), Arc::new(ProgressClock::new()));
         let fetched = downloader
             .fetch_to_paths_until(
                 &[DownloadTarget {
                     hash: root,
                     total_bytes: total,
                     dest: &dest,
+                    ranges: None,
                 }],
-                &config,
                 None,
                 None,
-                stop,
+                &stop,
             )
             .await;
         let Err(err) = fetched else {
-            anyhow::bail!("the stop must end the download");
+            anyhow::bail!("a download with no progress must give up");
         };
-        anyhow::ensure!(format!("{err:#}") == "stopped by the floor", "{err:#}");
-        anyhow::ensure!(!dest.exists(), "a stopped target is not promoted");
-
-        let partial = ClientRangedStore::open(dir.path(), "model.bin", root, total)?;
-        let recorded = crate::driver::ranges_content_len(
-            &decdn_bao_range::RangedStore::present_ranges(&partial).await?,
-            total,
-        );
         anyhow::ensure!(
-            recorded >= 4 * 1024 * 1024 && recorded < total,
-            "the landed prefix is recorded for a resume: {recorded}"
+            err.downcast_ref::<GaveUp>() == Some(&GaveUp { idle: limit }),
+            "{err:#}"
         );
+        anyhow::ensure!(!dest.exists(), "a stopped target is not promoted");
         Ok(())
     }
 
@@ -851,26 +1024,19 @@ mod tests {
         let root = source.root();
         let total = u64::try_from(blob.len())?;
 
-        let downloader = Downloader::new(
-            vec![candidate(source, ledger, 0xA1)],
-            funder(),
-            drive_config(),
-        );
+        let downloader = downloader(vec![candidate(source, ledger, 0xA1)])?;
         let dir = tempfile::tempdir()?;
         let dest = dir.path().join("model.bin");
-        let config = PullConfig {
-            download_unit_deadline: Duration::ZERO,
-            ..PullConfig::default()
-        };
         let targets = [DownloadTarget {
             hash: root,
             total_bytes: total,
             dest: &dest,
+            ranges: None,
         }];
         // Well inside the first periodic flush, so only the drop can record.
         let dropped = tokio::time::timeout(
             crate::driver::PRESENT_RECORD_FLUSH_INTERVAL / 5,
-            downloader.fetch_to_paths(&targets, &config, None, None),
+            downloader.fetch_to_paths(&targets, None, None),
         )
         .await;
         anyhow::ensure!(
@@ -878,7 +1044,7 @@ mod tests {
             "the stalled download must still be running"
         );
 
-        let partial = ClientRangedStore::open(dir.path(), "model.bin", root, total)?;
+        let partial = ClientRangedStore::open(dir.path(), "model.bin", root)?;
         let recorded = crate::driver::ranges_content_len(
             &decdn_bao_range::RangedStore::present_ranges(&partial).await?,
             total,
@@ -890,23 +1056,45 @@ mod tests {
         Ok(())
     }
 
-    /// An empty candidate set fails early with a clear message, not deep inside the
-    /// scheduler.
+    /// Static sources with no candidate fail early with a clear message: their
+    /// discovery could never find a holder.
     #[tokio::test]
-    async fn an_empty_candidate_set_is_a_clear_error() -> anyhow::Result<()> {
-        let downloader =
-            Downloader::<ScriptedSource, FakeFunder>::new(Vec::new(), funder(), drive_config());
-        let dir = tempfile::tempdir()?;
-        let Err(err) = downloader
-            .fetch_to_dir(&[([0u8; 32], 1)], dir.path(), &PullConfig::default(), None)
-            .await
-        else {
-            anyhow::bail!("an empty candidate set must be rejected");
+    async fn empty_static_sources_are_a_clear_error() -> anyhow::Result<()> {
+        let Err(err) = downloader::<ScriptedSource>(Vec::new()) else {
+            anyhow::bail!("empty static sources must be rejected");
         };
         anyhow::ensure!(
-            err.to_string().contains("at least one provider candidate"),
+            err.to_string().contains("at least one candidate"),
             "the error must name the empty candidate set, got: {err}"
         );
+        Ok(())
+    }
+
+    /// A downloader that starts with no holder discovers them and fetches.
+    #[tokio::test(start_paused = true)]
+    async fn a_downloader_with_no_holder_discovers_them() -> anyhow::Result<()> {
+        let blob = payload(1_500_000);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
+        let root = source.root();
+        let total = u64::try_from(blob.len())?;
+        let sources = StaticSources::new(vec![candidate(source, ledger, 0xA1)])?;
+        let downloader = Downloader::new(
+            sources,
+            Vec::new(),
+            Arc::default(),
+            funder(),
+            drive_config(),
+            1,
+        );
+        let dir = tempfile::tempdir()?;
+        let paths = downloader
+            .fetch_to_dir(&[(root, total)], dir.path(), None)
+            .await?;
+        let path = paths
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no path returned"))?;
+        anyhow::ensure!(std::fs::read(path)? == blob);
         Ok(())
     }
 }

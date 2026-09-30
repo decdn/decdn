@@ -87,10 +87,15 @@ impl RangedStore for NodeRangedStore {
         byte_len: u64,
     ) -> RangedFuture<'_, bao_tree::ChunkRanges> {
         Box::pin(async move {
-            // Validate + align locally so an out-of-bounds request is a typed
-            // `Alignment` error, not an opaque backend fault (a bad range is an
-            // argument error, and the client backend classifies it the same way).
-            let aligned = decdn_bao_range::align_range(byte_offset, byte_len, self.total_bytes)?;
+            // Validate + align locally so a start at or past the blob end is a
+            // typed `Alignment` error, not an opaque backend fault (a bad start is
+            // an argument error, and the client backend classifies it the same
+            // way). An end past the blob clamps to it rather than erroring: the caller here is a pull leg driving a request whose
+            // claimed size can grow, so its gap computation must clamp exactly as
+            // the serve tiers do, or a signed `ok: true` response then faults
+            // fetching its own pull range.
+            let aligned =
+                decdn_bao_range::align_range_clamped(byte_offset, byte_len, self.total_bytes)?;
             let present = self
                 .engine
                 .present_ranges(self.hash)
@@ -111,12 +116,27 @@ impl RangedStore for NodeRangedStore {
 
     fn read(&self, byte_offset: u64, byte_len: u64) -> RangedFuture<'_, Bytes> {
         Box::pin(async move {
-            // Reject an out-of-bounds span as a typed `Alignment` error before
-            // touching the store; the aligned widening is discarded — `read` is
-            // byte-exact and forwards the original offset/len.
-            decdn_bao_range::align_range(byte_offset, byte_len, self.total_bytes)?;
+            // Reject a start at or past the blob end as a typed `Alignment` error
+            // before touching the store. An end past the blob clamps instead of
+            // erroring; `read` is byte-exact, so the clamped content length, not
+            // the raw, possibly-overshooting `byte_len`, is what gets forwarded
+            // to the backend.
+            let aligned =
+                decdn_bao_range::align_range_clamped(byte_offset, byte_len, self.total_bytes)?;
+            // `byte_len == 0` keeps its "to end" meaning: `export_range` resolves
+            // that dynamically against the store's own reported size, which a
+            // partial blob may not have yet. Only a non-zero, explicit `byte_len`
+            // clamps to the blob's end here.
+            let clamped_len = if byte_len == 0 {
+                0
+            } else {
+                aligned
+                    .blob_size()
+                    .saturating_sub(byte_offset)
+                    .min(byte_len)
+            };
             self.engine
-                .export_range(self.hash, byte_offset, byte_len)
+                .export_range(self.hash, byte_offset, clamped_len)
                 .await
                 .map_err(backend)
         })

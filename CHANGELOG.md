@@ -28,22 +28,53 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
-- **`decdn-client` lanes grow for a faulted lane's remainder (#2230).**
-  `SourceLane` gains `widen: Option<&LaneWiden>` and `StreamCandidate` gains
-  `widen: Option<LaneWiden>`; `LaneWiden` (new) pairs a non-waiting `grow`
-  hook with a `release` hook. When a lane faults and no idle worker can take
-  the range it re-queues, the multi-source scheduler asks the live lanes that
-  cover it, in lane order, for one more stream each until the range has a
-  taker, so it runs beside the survivor's own range instead of after it.
-  `drive_range_lanes` asks its lanes the same way when a faulted lane puts a
-  gap back. A fault on such an additional stream stops only that stream: it
-  does not retire the lane, and `RangeSetOutcome::lane_extra_fault` (new)
-  reports it apart from `lane_fault`. `bundle pull` grants the additional
-  streams from the provider's free `--max-lane-streams` permits. A caller
-  that builds these structs sets the new fields (`None`). Each lane fault now
-  logs a warning where it happens, with provider, hash, range and bytes
-  landed; a remainder no lane can grow for logs at info; and a leg phase
-  (`unpolled`, `pay` or `read`) that runs past 5 s logs at debug.
+- **`decdn fetch` and `decdn bundle pull` recover through one acquire loop,
+  and a blob's size is a hint (#2239; #2223, #2215, #2214, #2225, #2213,
+  #2218, #2230).** Both commands drive every holder of a blob from one loop.
+  A node that faults cools (2 s, doubling to 60 s) and returns when its
+  cooldown ends or it delivers a verified byte, so a holder that restarts
+  mid-fetch still finishes the fetch. The manifest fetch of a bundle shares the
+  same holder table and progress clock. A fetch stops on a fault only the user
+  can fix (a voucher rejection, an origin blacklist, no affordable holder, a
+  local disk fault), or when no verified byte arrives for the give-up window.
+  A terminal has no window; a script gives up after 10 minutes. The give-up
+  exits with code 75. A blob over `--max-blob-mb` ends only its own item. The
+  new `--give-up-after-secs` sets the window. Config-breaking, removed with no
+  alias: `--stall-timeout-ms`, `--unit-deadline-ms`, `--min-throughput-bps`,
+  `--multi-source-min-bytes`, `--multi-source` / `--no-multi-source` and
+  `--entry-retries`. A lane's fixed 10 s watchdog replaces the stall and
+  throughput floors. The size of a blob is now a hint. The first claim comes
+  from the nearest probe answer (or one holder's header, or the manifest
+  `size` of a bundle entry), every claim is clamped to `--max-blob-mb`, and
+  each leg verifies under the size its sender signs. A verified final chunk
+  proves the size. Until then the bound grows by `max(bound + 64 MiB, first
+  claim + 2 * verified bytes past it)` and shrinks when a leg proves less. A
+  disagreeing size no longer ends a fetch, and the client's size-consensus
+  rule is removed. A bundle entry whose blob differs from its manifest `size`
+  succeeds and prints `<path>: manifest says X bytes, the blob is Y bytes`.
+  Wire-visible: a node serves a range up to the blob's end and refuses
+  (`RangeNotSatisfiable`) only a start at or past the end, on every serve tier.
+  The client's ranged store is keyed by offset, not by size, so a partial
+  written under one claim resumes under another. A finalize whose whole-file
+  hash does not match fetches the blob once more before the item fails. One
+  command keeps one connection per node for all of its entries and lanes. When
+  a lane faults and no idle lane covers its remainder, a busy lane that covers
+  it takes one extra stream for it (#2231). Config-breaking:
+  `--max-lane-streams` takes 1 to 64; 0 and values above 64 are refused.
+  `decdn-client` SDK breaks: `PeerSource::new` and
+  `IngestStore::ingest_stream` take new parameters, `IngestStore` gains
+  `proven` and `set_bound`, `SourceSet::record_fault` takes the faulted
+  `LaneRange`, `ClientRangedStore::open` takes no size and
+  `ClientRangedStore::create` takes a bound hint. Removed:
+  `SignedSizeMismatch`, `NoSourceAgreesOnSize`, `DownloadTarget::size_signer`,
+  `Fault::WrongSize`, `SourceSet::mark_wrong_size`,
+  `SourceSet::set_size_signer`, `ClientRangedStore::discard` and
+  `ClientRangedStore::tree`. Added: `Connections`, `LaneWiden`, `LaneRange`,
+  `StreamCandidate::widen`, `Probed::total_bytes`,
+  `ClientRangedStore::{bound, proven, set_bound}`, `AcquireEnv::max_blob_bytes`
+  and the `Downloader::max_blob_bytes` and `Streamer::max_blob_bytes`
+  builders. ADR 039, ADR 005, ADR 037 and the bundles appendix describe the
+  behavior.
 - **`decdn-client` lanes carry what they hold while they stream (#2208).**
   `RangeLane` gains `release: Option<LaneRelease>`, which the range driver
   calls as each gap worker stops. `StreamCandidate` gains `lease: LaneLease`
@@ -853,6 +884,11 @@ since project inception and will roll into the first tagged release.
   explicit operator pinning ([ADR 022](adr/022-content-discovery.md)).
 
 ### Fixed
+
+- **A slow client leg phase is logged (#2230).** A leg phase (`unpolled`,
+  `pay` or `read`) that runs past 5 s logs at debug, with the peer, hash,
+  offset and unproved bytes, so a proof stall is named before the node's
+  10 s proof timeout stops the stream.
 
 - **Partial holders no longer pull a blob from each other in a loop (#2227).**
   A serve-miss read the blob size by opening the whole blob at its

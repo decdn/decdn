@@ -163,4 +163,34 @@ mod tests {
         use clap::CommandFactory;
         Cli::command().debug_assert();
     }
+
+    /// `--max-lane-streams` takes 1 to 64: one connection per node carries
+    /// every stream of the command, so the bound stays below the node's
+    /// per-connection stream limit.
+    #[test]
+    fn max_lane_streams_is_bounded_to_1_through_64() {
+        let parse = |n: &str| {
+            Cli::try_parse_from([
+                "decdn",
+                "bundle",
+                "pull",
+                "-i",
+                "m.json",
+                "-o",
+                "out",
+                "--max-lane-streams",
+                n,
+            ])
+        };
+        let lanes = |cli: Cli| match cli.command {
+            Command::Bundle(BundleArgs {
+                cmd: BundleCommand::Pull(args),
+            }) => Some(args.max_lane_streams),
+            _ => None,
+        };
+        assert_eq!(parse("64").ok().and_then(lanes), Some(64));
+        assert_eq!(parse("1").ok().and_then(lanes), Some(1));
+        assert!(parse("65").is_err(), "65 is above the bound");
+        assert!(parse("0").is_err(), "0 is below the bound");
+    }
 }

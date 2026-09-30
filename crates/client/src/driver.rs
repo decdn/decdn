@@ -11,11 +11,8 @@
 //!
 //! A whole-tail pull streams one advancing `byte_offset` to the end of the blob;
 //! `drive` instead drives the same money-relevant branches per gap — it draws,
-//! funds, and resumes one missing range at a time. [`drive_range_lanes`] runs
-//! the same per-gap loop over a set of ranges, several gaps at once across one
-//! or more providers' lanes, and [`drive_range_set`] is its one-lane case; the
-//! CLI's `decdn fetch` and `bundle pull` run it as their fetch core (via
-//! `drive_fetch` and `drive_stripe` in `crates/cli/src/commands/fetch.rs`). The
+//! funds, and resumes one missing range at a time. The acquire loop
+//! ([`crate::acquire`]) runs the same per-gap loop on each of its lanes. The
 //! branches are:
 //!
 //! - **Draw** (the happy path): open the gap's [`AlignedRange`](decdn_bao_range::AlignedRange), stream it through
@@ -65,15 +62,13 @@
 //!
 //! The store is generic over [`crate::source::IngestStore`] (`RangedStore` +
 //! `ingest_stream`), not the concrete `&ClientRangedStore` — [`crate::ClientRangedStore`]
-//! is one implementer (the CLI/client backend, writing `.partial`/`.obao4`); a
+//! is one implementer (the CLI/client backend, writing `.partial`/`.ranges`); a
 //! node backend admits to the cache and tees to its downstream client
 //! through the same seam.
 
-use std::collections::VecDeque;
 use std::future::Future;
-use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -94,14 +89,11 @@ use crate::{
 /// the next voucher's cost and reactive top-up is disabled or exhausted (the
 /// pacer returned [`PaceDecision::Refuse`]).
 ///
-/// Typed rather than a bare string so the failover classifier
-/// ([`crate::retry_disposition`]) can `downcast_ref` and rule it **terminal** for
-/// BOTH fetch paths: the pool is the same deposit against every provider (ADR
-/// 003), so reassigning the range to another lane — or failing over to another
-/// candidate — cannot fund it. The single-source path already ended the fetch on
-/// a refuse; the multi-source scheduler needs the typed shape to abort promptly
-/// instead of dropping every lane one by one and masking it as "all sources
-/// failed".
+/// Typed rather than a bare string so the fault classifier
+/// ([`crate::classify`]) can `downcast_ref` it and rule it
+/// [`crate::Fault::Unaffordable`]: the pool is the same deposit against every
+/// provider (ADR 003), so moving the range to another lane cannot fund it. The
+/// source waits for the deposit to rise instead of cooling.
 #[derive(Debug)]
 pub struct PoolExhausted {
     /// Start of the gap that could not be funded.
@@ -135,10 +127,10 @@ impl std::error::Error for PoolExhausted {}
 /// taking the leg's final proof. It never means a slow peer: a stalled leg ends
 /// with a stall error, not a clean finish. Opening the same range again would
 /// pay for the same bytes to the same effect, so the gap-fill loop behind
-/// [`drive`], [`drive_range_set`] and [`drive_range_lanes`] ends the gap with
-/// this error instead (#2194).
+/// [`drive`] and [`crate::acquire`] ends the gap with this error instead
+/// (#2194).
 ///
-/// [`crate::retry_disposition`] rules it `RetryElsewhere`. The cause may be the
+/// [`crate::classify`] rules it [`crate::Fault::Source`]. The cause may be the
 /// source, and each further source costs at most one more leg before it ends the
 /// same way.
 #[derive(Debug)]
@@ -499,6 +491,41 @@ pub(crate) fn ranges_content_len(ranges: &ChunkRanges, total_bytes: u64) -> u64 
         .fold(0u64, u64::saturating_add)
 }
 
+/// The chunks of `[start, start + len)` the store misses, clipped to its
+/// bound, and that bound. A range at or past the bound misses nothing. A leg
+/// can prove a smaller size between the bound read and the query, so a query
+/// the store refuses as out of bounds reads the smaller bound again and clips
+/// to it. A proven size is final, so the retry ends.
+///
+/// # Errors
+///
+/// Any other store error, marked [`crate::LocalPullFault`]: a store that cannot
+/// answer is this process's fault, never a source's (#2213).
+pub(crate) async fn missing_below_bound<St>(
+    store: &St,
+    start: u64,
+    len: u64,
+) -> anyhow::Result<(ChunkRanges, u64)>
+where
+    St: RangedStore + ?Sized,
+{
+    loop {
+        let bound = store.total_bytes();
+        let end = start.saturating_add(len).min(bound);
+        if start >= end {
+            return Ok((ChunkRanges::empty(), bound));
+        }
+        match store.missing_ranges(start, end - start).await {
+            Ok(missing) => return Ok((missing, bound)),
+            Err(decdn_bao_range::RangedStoreError::Alignment(_)) if store.total_bytes() < bound => {
+                // A leg proved a smaller size after the bound read: read it
+                // again on the next pass.
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context(crate::LocalPullFault)),
+        }
+    }
+}
+
 /// Satisfy request `R = [offset, offset + len)` of blob `hash` by filling only its
 /// gaps, paying the minimum. `len == 0` means "to the end of the blob". Held
 /// ranges are read locally — never pulled, never paid.
@@ -582,7 +609,7 @@ where
     let gaps = contiguous_byte_ranges(&missing, total_bytes);
 
     // Fill every gap while a single periodic tick flushes the `.ranges` present
-    // record (spec §5.5, single-writer flush point). The ranged store's ingest
+    // record (the single-writer flush point). The ranged store's ingest
     // `checkpoint` never persists the record, so without this interval flush
     // a crash mid-fetch would leave `.ranges` at pre-session state and re-download
     // (and re-pay for) the whole in-flight range on resume; the interval bounds
@@ -601,7 +628,6 @@ where
                 hash,
                 gap_start,
                 gap_len,
-                total_bytes,
                 config,
                 &mut counters,
                 on_progress,
@@ -693,110 +719,6 @@ async fn range_set_gaps<St: RangedStore + ?Sized>(
     Ok(contiguous_byte_ranges(&missing, store.total_bytes()))
 }
 
-/// Of two gap failures in one range set, the one that decides more for the
-/// caller's failover. The other is logged at debug: each gap fault is already
-/// logged where it happened. A terminal fault outranks a pool
-/// exhaustion, which outranks any other fault; between equals the earlier one
-/// stays.
-fn keep_decisive(kept: anyhow::Error, new: anyhow::Error) -> anyhow::Error {
-    let rank = |e: &anyhow::Error| {
-        (
-            crate::retry_disposition(e) == crate::RetryDisposition::Terminal,
-            e.downcast_ref::<PoolExhausted>().is_some(),
-        )
-    };
-    let (keep, drop) = if rank(&new) > rank(&kept) {
-        (new, kept)
-    } else {
-        (kept, new)
-    };
-    tracing::debug!("a concurrent gap of the same range set also failed: {drop:#}");
-    keep
-}
-
-/// Bytes of the gap `[gap_start, gap_start+gap_len)` present in `store`, or
-/// `None` when the store cannot say.
-async fn gap_landed<St: RangedStore + ?Sized>(
-    store: &St,
-    gap_start: u64,
-    gap_len: u64,
-) -> Option<u64> {
-    let missing = store.missing_ranges(gap_start, gap_len).await.ok()?;
-    let rest = contiguous_byte_ranges(&missing, store.total_bytes());
-    Some(landed_bytes(gap_len, &rest))
-}
-
-/// Bytes of a `gap_len`-byte gap present, given `rest`, the `(start, len)`
-/// byte ranges of it still missing.
-fn landed_bytes(gap_len: u64, rest: &[(u64, u64)]) -> u64 {
-    let left = rest.iter().map(|(_, l)| *l).fold(0, u64::saturating_add);
-    gap_len.saturating_sub(left)
-}
-
-/// `lane`'s payee, read for a log line. A poisoned lock still holds a valid
-/// address.
-fn lane_provider<S>(lane: &RangeLane<'_, S>) -> alloy::primitives::Address {
-    lane.ctx
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .provider
-}
-
-/// Warn, where it happens, that `lane` faulted on the gap `[offset,
-/// offset+len)` of `hash` with `landed` bytes of it present. A drive that
-/// recovers reports the fault only through [`RangeSetOutcome::lane_fault`],
-/// so this line is the operator's record of it.
-fn warn_gap_fault<S>(
-    lane: &RangeLane<'_, S>,
-    hash: [u8; 32],
-    (offset, len, landed): (u64, u64, Option<u64>),
-    err: &anyhow::Error,
-) {
-    tracing::warn!(
-        provider = %lane_provider(lane),
-        hash = %blake3::Hash::from_bytes(hash).to_hex(),
-        offset,
-        len,
-        landed = ?landed,
-        error = %format_args!("{err:#}"),
-        "a lane faulted mid-drive; putting its gap's rest back for the other lanes"
-    );
-}
-
-/// Log that a worker of `lane` that the lane's growth hook granted faulted on
-/// the gap `[offset, offset+len)` of `hash`. Most such faults are a refusal of
-/// the additional stream, which is routine, so the line is at debug when
-/// nothing landed and at warn otherwise.
-fn log_extra_fault<S>(
-    lane: &RangeLane<'_, S>,
-    hash: [u8; 32],
-    (offset, len, landed): (u64, u64, Option<u64>),
-    err: &anyhow::Error,
-) {
-    let provider = lane_provider(lane);
-    let hash = blake3::Hash::from_bytes(hash).to_hex();
-    if landed.is_some_and(|n| n > 0) {
-        tracing::warn!(
-            %provider,
-            %hash,
-            offset,
-            len,
-            landed = ?landed,
-            error = %format_args!("{err:#}"),
-            "an additional stream of a lane faulted mid-drive; putting its gap's rest back"
-        );
-    } else {
-        tracing::debug!(
-            %provider,
-            %hash,
-            offset,
-            len,
-            error = %format_args!("{err:#}"),
-            "an additional stream of a lane faulted before any byte landed; putting its gap back"
-        );
-    }
-}
-
 /// The aligned range a drive of `ranges` over `store` opens first, or `None`
 /// when every byte of them is already present.
 ///
@@ -804,7 +726,7 @@ fn log_extra_fault<S>(
 /// `total_bytes`, or to learn whether the peer will serve) opens exactly this
 /// range and hands the live pull to the drive through a [`crate::PrimedSource`],
 /// so the first open is also the drive's first leg (#2063). It is the range
-/// [`drive`] and [`drive_range_set`] open for their first gap when the pacer's
+/// [`drive`] opens for its first gap when the pacer's
 /// first decision is `Draw { up_to_bytes }`: a fresh drive's paid frontier
 /// starts at the gap start, so the leg is the gap cut to `up_to_bytes`. A
 /// [`crate::BudgetPacer`] draws the whole unpaid gap, so pass `u64::MAX` for it.
@@ -834,760 +756,13 @@ pub async fn first_leg<St: RangedStore + ?Sized>(
     .map(Some)
 }
 
-/// The whole-blob position a drive of `ranges` over `store` reaches once it
-/// completes: the content already present plus every missing gap of `ranges`.
-/// The drive's progress callback still reports against `total_bytes`. A caller
-/// that wants a done-mark for this range set, such as a `-v` line or an ETA,
-/// reads it here. It is the whole blob for `(0, 0)`, and less for a range set
-/// that leaves bytes to another writer, such as the donor ranges a range-dedup
-/// entry splices from disk.
-///
-/// # Errors
-///
-/// A store query failure, or a range that does not align against the blob.
-pub async fn range_set_reach<St: RangedStore + ?Sized>(
-    store: &St,
-    ranges: &[(u64, u64)],
-) -> anyhow::Result<u64> {
-    let total_bytes = store.total_bytes();
-    let present = ranges_content_len(&store.present_ranges().await?, total_bytes);
-    Ok(range_set_gaps(store, ranges)
-        .await?
-        .iter()
-        .map(|(_, len)| *len)
-        .fold(present, u64::saturating_add))
-}
-
-/// Satisfy every range in `ranges` of blob `hash`, filling their gaps up to
-/// `concurrency` at a time (#2119). Each range is `(offset, len)`, and
-/// `len == 0` means "to the end of the blob".
-///
-/// A range-dedup entry pays for many small, scattered ranges: one chunk group
-/// at each boundary its donors cannot cover. One [`drive`] per range runs them
-/// strictly one after another, each with its own flush and completion check.
-/// This drives the whole set as one fetch instead: the missing gaps of every
-/// range are merged, so concurrent gaps never overlap, and they are filled
-/// through the one `source` (which can hold one warm connection for all of
-/// them) while one interval flush owns the present record.
-///
-/// It is [`drive_range_lanes`] over one lane that takes the first gap. See
-/// there for concurrency, `pool`, `stop` and failure handling.
-///
-/// # Errors
-///
-/// The decisive gap fault, `stop`'s error, a flush failure, or a `finalize`
-/// failure ([`RangeSetOutcome::into_result`]).
-#[allow(clippy::too_many_arguments)]
-pub async fn drive_range_set<St, S, P, F>(
-    store: &St,
-    source: &S,
-    pacer: &P,
-    funder: &F,
-    ctx: &Arc<Mutex<PoolContext>>,
-    ledger: &Arc<PoolLedger>,
-    hash: [u8; 32],
-    ranges: &[(u64, u64)],
-    concurrency: NonZeroUsize,
-    config: &DriveConfig,
-    on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
-    pool: Option<&SharedPool<'_>>,
-    stop: impl Future<Output = anyhow::Error>,
-) -> anyhow::Result<()>
-where
-    St: IngestStore,
-    S: BlobSource,
-    P: Pacer,
-    F: Funder,
-{
-    let lane = RangeLane {
-        source,
-        ctx,
-        ledger,
-        width: concurrency,
-        takes_first: true,
-        grow: None,
-        release: None,
-    };
-    // Boxed: the lane drive's future is large, and this keeps callers' small.
-    Box::pin(drive_range_lanes(
-        store,
-        std::slice::from_ref(&lane),
-        pacer,
-        funder,
-        hash,
-        ranges,
-        config,
-        on_progress,
-        pool,
-        stop,
-    ))
-    .await
-    .into_result()
-}
-
-/// One provider's lane in a [`drive_range_lanes`] drive: the source that
-/// pulls from it, the pool context and voucher ledger that pay it, and how
-/// many of its gaps may run at once.
-#[derive(Debug)]
-pub struct RangeLane<'a, S> {
-    /// The provider's source. It can hold one warm connection for every gap
-    /// the lane fills.
-    pub source: &'a S,
-    /// The lane's pool context, which its source signs against.
-    pub ctx: &'a Arc<Mutex<PoolContext>>,
-    /// The lane's voucher ledger. A gap's legs all pay through it, because the
-    /// paid frontier of a gap is a fact of one ledger.
-    pub ledger: &'a Arc<PoolLedger>,
-    /// How many gaps the lane fills at once.
-    pub width: NonZeroUsize,
-    /// The lane takes the first gap. A caller that primed this lane's source
-    /// with the drive's [`first_leg`] sets it on that lane only, so the primed
-    /// pull is the leg that fills the gap and no other lane opens it again.
-    pub takes_first: bool,
-    /// How the lane grows past `width` while the drive runs, or `None` to stay
-    /// at `width`.
-    pub grow: Option<LaneGrowth<'a>>,
-    /// What the lane gives back as each of its gap workers stops, or `None`.
-    pub release: Option<LaneRelease<'a>>,
-}
-
-/// A lane's growth hook in a [`drive_range_lanes`] drive.
-///
-/// Each time a gap worker of the lane takes a gap and more gaps still wait,
-/// the drive calls the hook with the number of gaps that wait, and it adds one
-/// worker to the lane for each unit the hook returns, up to that number. When a
-/// lane faults and puts its gap's rest back, the drive also asks the live
-/// lanes, in lane order, for one more worker each until every waiting gap has
-/// a taker, so the rest does not wait for a busy lane to finish a whole gap.
-/// The hook must not wait: it grants only what it can grant now, such as
-/// stream permits that another fetch has released since the drive started.
-/// The caller holds one unit for each worker until that worker stops
-/// ([`LaneRelease`]), or until the drive returns when the lane has no release
-/// hook or a `stop` ends the drive. A lane that starts narrow because a
-/// sibling fetch holds its provider's streams thus widens when that sibling
-/// finishes.
-#[derive(Clone, Copy)]
-pub struct LaneGrowth<'a>(pub &'a (dyn Fn(usize) -> usize + Send + Sync + 'a));
-
-impl std::fmt::Debug for LaneGrowth<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("LaneGrowth")
-    }
-}
-
-/// A lane's release hook in a [`drive_range_lanes`] drive.
-///
-/// The drive calls it once as each gap worker of the lane stops: when its lane
-/// retires on a fault, when the drive halts or drains, or when no gap is left
-/// for it while other gaps still run. The last case applies only to a lane
-/// that also has a [`LaneGrowth`] hook: it keeps one idle worker for gaps a
-/// faulted lane puts back, and grows again through that hook when it takes one
-/// while more wait. A worker that a `stop` drops unfinished is not released;
-/// the caller reclaims its unit when the drive returns.
-/// A lane runs `width` workers plus one for each unit its [`LaneGrowth`]
-/// grants, so a caller that holds one stream permit per worker gives one back
-/// on each call, and a lane that dies holds nothing for the rest of the drive.
-#[derive(Clone, Copy)]
-pub struct LaneRelease<'a>(pub &'a (dyn Fn() + Send + Sync + 'a));
-
-impl std::fmt::Debug for LaneRelease<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("LaneRelease")
-    }
-}
-
-/// How a [`drive_range_lanes`] drive ended: each lane's fault, if it had one,
-/// and the drive's own outcome.
-///
-/// A lane that faults retires, and the other lanes fill what it left, so a
-/// drive can succeed with faulted lanes. A caller reads the lane faults
-/// ([`Self::lane_fault`]) to settle and score each provider, then takes the
-/// drive's result ([`Self::into_result`]).
-#[derive(Debug)]
-#[must_use]
-pub struct RangeSetOutcome {
-    /// Each lane's decisive fault, in lane order. A lane with one retired.
-    faults: Vec<Option<anyhow::Error>>,
-    /// Each lane's decisive fault of a worker its growth hook granted, in lane
-    /// order. Such a fault leaves the lane live.
-    extra_faults: Vec<Option<anyhow::Error>>,
-    /// A failure of the drive itself: `stop`'s error, a store query, a flush
-    /// or a finalize.
-    error: Option<anyhow::Error>,
-    /// The lanes did not serve the range set: a gap stayed missing (every lane
-    /// retired, or a terminal fault stopped the drive), or every lane faulted.
-    /// A drive whose every lane faulted fails even when the bytes landed: a
-    /// fault after the last byte, in the closing voucher exchange, can leave a
-    /// voucher armed, and the caller must settle it as a failure. `stop` does
-    /// not set it; `error` holds the stop.
-    failed: bool,
-}
-
-impl RangeSetOutcome {
-    /// Lane `lane`'s fault, which retired it, or `None` when the lane stayed
-    /// live to the end of the drive.
-    #[must_use]
-    pub fn lane_fault(&self, lane: usize) -> Option<&anyhow::Error> {
-        self.faults.get(lane).and_then(Option::as_ref)
-    }
-
-    /// The fault of a worker lane `lane`'s growth hook granted
-    /// ([`LaneGrowth`]), or `None`. It is most often a refusal of the
-    /// additional stream, so it did not retire the lane and does not count
-    /// toward [`Self::into_result`]. A leg that faulted can still leave a
-    /// voucher armed, so a caller settles such a lane as it settles a faulted
-    /// one.
-    #[must_use]
-    pub fn lane_extra_fault(&self, lane: usize) -> Option<&anyhow::Error> {
-        self.extra_faults.get(lane).and_then(Option::as_ref)
-    }
-
-    /// The failure of the drive itself, not of one lane: `stop`'s error, a
-    /// store query, a flush or a finalize.
-    #[must_use]
-    pub const fn drive_error(&self) -> Option<&anyhow::Error> {
-        self.error.as_ref()
-    }
-
-    /// Whether [`Self::into_result`] is `Ok`: every gap was filled and the drive
-    /// itself did not fail.
-    #[must_use]
-    pub const fn succeeded(&self) -> bool {
-        self.error.is_none() && !self.failed
-    }
-
-    /// The drive's result.
-    ///
-    /// # Errors
-    ///
-    /// A failure of the drive itself (`stop`'s error, a store query, a flush or
-    /// a finalize) first; the lane faults are then not part of the error, so a
-    /// caller reads them with [`Self::lane_fault`] first. Otherwise, when the
-    /// lanes did not serve the set (a gap stayed missing, or every lane
-    /// faulted), the decisive lane fault: a terminal fault
-    /// ([`crate::retry_disposition`]) first, then a [`PoolExhausted`], then the
-    /// fault of the earliest lane. The others are logged.
-    pub fn into_result(self) -> anyhow::Result<()> {
-        if let Some(err) = self.error {
-            return Err(err);
-        }
-        if !self.failed {
-            return Ok(());
-        }
-        let decisive = self.faults.into_iter().flatten().reduce(keep_decisive);
-        Err(decisive.unwrap_or_else(|| anyhow::anyhow!("the range set failed with no lane fault")))
-    }
-}
-
-/// The gaps a [`drive_range_lanes`] drive has not handed to a lane yet.
-struct GapQueue {
-    /// Gaps waiting for a lane, in blob order. A retired lane's unfilled rest
-    /// goes back to the front.
-    waiting: VecDeque<(u64, u64)>,
-    /// The first gap, held for the lane that takes it.
-    first: Option<(u64, u64)>,
-    /// Gaps a lane is filling now. A worker with nothing to take waits while
-    /// any are in flight, since a fault can put work back, and while `first`
-    /// waits for its lane.
-    in_flight: usize,
-}
-
-/// Satisfy every range in `ranges` of blob `hash` across `lanes`, one lane per
-/// provider (#2123). Each range is `(offset, len)`, and `len == 0` means "to the
-/// end of the blob".
-///
-/// The missing gaps of every range are merged, so no two gaps overlap, and
-/// each lane takes gaps from one shared queue, up to its
-/// [`RangeLane::width`] at a time, so the gaps spread over every lane. Every leg
-/// of a gap runs on the lane that took it, because a gap's paid frontier is a
-/// fact of one ledger. Every lane writes into the one `store`, whose present
-/// record one interval flush owns.
-///
-/// A lane that faults retires: its other gaps in flight finish, it takes no new
-/// one, and what its failed gap left missing goes back to the front of the
-/// queue for the other lanes, which grow for it ([`LaneGrowth`]) when no idle
-/// worker will take it. A worker the growth hook granted stops at a fault that
-/// is not terminal, but does not retire its lane, because such a fault is most
-/// often a refusal of the additional stream: the drive keeps it apart
-/// ([`RangeSetOutcome::lane_extra_fault`]) and asks for no growth in its place.
-/// A terminal fault ([`crate::retry_disposition`])
-/// stops every lane from taking a new gap. The drive ends when the queue is
-/// empty and no gap is in flight, or when no lane can take the rest. At most
-/// one lane takes the first gap ([`RangeLane::takes_first`]).
-///
-/// Concurrent gaps need a [`SharedPool`]: the top-up budget and the spend are
-/// facts of the pool, and each concurrent gap keeps its own per-gap counters.
-/// With `pool == None` the first lane fills the gaps one at a time over one
-/// set of counters, exactly as [`drive`] runs them, and a second lane is an
-/// error.
-///
-/// `stop` ends the gap work early with its error: a caller's own abort, such as
-/// a drive-level throughput floor. It races only the gaps, so the interval flush
-/// in flight lands before the final flush, and a blob that is already complete
-/// is never cut off in its local verify. Pass [`std::future::pending`] for none.
-/// As in [`drive`], whatever landed is flushed on every path, and the blob is
-/// finalized only when the whole of it is present.
-#[allow(clippy::too_many_arguments)]
-// Set-up, the serial path, the lane workers, then one flush and finalize.
-#[allow(clippy::too_many_lines)]
-pub async fn drive_range_lanes<St, S, P, F>(
-    store: &St,
-    lanes: &[RangeLane<'_, S>],
-    pacer: &P,
-    funder: &F,
-    hash: [u8; 32],
-    ranges: &[(u64, u64)],
-    config: &DriveConfig,
-    on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
-    pool: Option<&SharedPool<'_>>,
-    stop: impl Future<Output = anyhow::Error>,
-) -> RangeSetOutcome
-where
-    St: IngestStore,
-    S: BlobSource,
-    P: Pacer,
-    F: Funder,
-{
-    let faults: Vec<Mutex<Option<anyhow::Error>>> =
-        lanes.iter().map(|_| Mutex::new(None)).collect();
-    let extra_faults: Vec<Mutex<Option<anyhow::Error>>> =
-        lanes.iter().map(|_| Mutex::new(None)).collect();
-    let failed = AtomicBool::new(false);
-    let into_inner = |slots: Vec<Mutex<Option<anyhow::Error>>>| -> Vec<Option<anyhow::Error>> {
-        slots
-            .into_iter()
-            .map(|f| {
-                f.into_inner()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-            })
-            .collect()
-    };
-    let finish =
-        |error: Option<anyhow::Error>,
-         faults: Vec<Mutex<Option<anyhow::Error>>>,
-         extra_faults: Vec<Mutex<Option<anyhow::Error>>>| RangeSetOutcome {
-            faults: into_inner(faults),
-            extra_faults: into_inner(extra_faults),
-            error,
-            failed: failed.load(Ordering::Acquire),
-        };
-    let total_bytes = store.total_bytes();
-    let setup = async {
-        anyhow::ensure!(
-            !lanes.is_empty(),
-            "a range-set drive needs at least one lane"
-        );
-        anyhow::ensure!(
-            pool.is_some() || lanes.len() == 1,
-            "a range-set drive over several lanes needs a shared pool"
-        );
-        anyhow::ensure!(
-            lanes.iter().filter(|l| l.takes_first).count() <= 1,
-            "at most one lane of a range-set drive takes the first gap"
-        );
-        reject_empty_claim_for_nonempty_root(total_bytes, hash)?;
-        let base_present = ranges_content_len(&store.present_ranges().await?, total_bytes);
-        let gaps = range_set_gaps(store, ranges).await?;
-        Ok((base_present, gaps))
-    };
-    let (base_present, gaps) = match setup.await {
-        Ok(ready) => ready,
-        Err(err) => return finish(Some(err), faults, extra_faults),
-    };
-    if let Some(cb) = on_progress {
-        cb(base_present, total_bytes);
-    }
-
-    let gap_work = async {
-        let Some(lead) = lanes.first() else {
-            return Ok(());
-        };
-        if pool.is_none() {
-            let mut counters = DriveCounters::new();
-            for (gap_start, gap_len) in gaps {
-                let filled = fill_gap(
-                    store,
-                    lead.source,
-                    pacer,
-                    funder,
-                    lead.ctx,
-                    lead.ledger,
-                    hash,
-                    gap_start,
-                    gap_len,
-                    total_bytes,
-                    config,
-                    &mut counters,
-                    on_progress,
-                    None,
-                    None,
-                    None,
-                    None,
-                    pool,
-                )
-                .await;
-                if let Err(err) = filled {
-                    failed.store(true, Ordering::Release);
-                    let landed = gap_landed(store, gap_start, gap_len).await;
-                    warn_gap_fault(lead, hash, (gap_start, gap_len, landed), &err);
-                    if let Some(slot) = faults.first() {
-                        *slot
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(err);
-                    }
-                    break;
-                }
-            }
-            return Ok(());
-        }
-        // Concurrent gaps fold their legs into one whole-blob position, seeded
-        // with what was already present, so the bar never runs backwards as
-        // legs interleave.
-        let delivered = AtomicU64::new(base_present);
-        let mut waiting: VecDeque<(u64, u64)> = gaps.into();
-        let first = if lanes.iter().any(|l| l.takes_first) {
-            waiting.pop_front()
-        } else {
-            None
-        };
-        let queue = Mutex::new(GapQueue {
-            waiting,
-            first,
-            in_flight: 0,
-        });
-        let wake = tokio::sync::Notify::new();
-        let halted = AtomicBool::new(false);
-        let retired: Vec<AtomicBool> = lanes.iter().map(|_| AtomicBool::new(false)).collect();
-        let lock = || {
-            queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        };
-        // Workers a lane's growth hook granted, by lane index, for the join loop
-        // below to start. `notify_one` keeps a wake that lands before the loop
-        // waits.
-        let grown: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-        let grow_wake = tokio::sync::Notify::new();
-        // Each lane's running gap workers. A lane with release and growth
-        // hooks keeps one idle worker for gaps a faulted lane puts back, lets
-        // the others stop and give their permits back, and grows again when
-        // gaps come back.
-        let live: Vec<AtomicUsize> = lanes.iter().map(|_| AtomicUsize::new(0)).collect();
-        // Each lane's workers that hold a gap now. `live` minus `busy` is the
-        // lane's idle workers, which take a gap put back on their next wake.
-        let busy: Vec<AtomicUsize> = lanes.iter().map(|_| AtomicUsize::new(0)).collect();
-        // Ask lane `index`'s growth hook for up to `want` more workers, and
-        // record each grant for the join loop below. Returns how many it
-        // granted.
-        let grow_lane = |index: usize, want: usize| -> usize {
-            let Some(LaneGrowth(grow)) = lanes.get(index).and_then(|l| l.grow) else {
-                return 0;
-            };
-            if want == 0 {
-                return 0;
-            }
-            let extra = grow(want).min(want);
-            if extra > 0 {
-                grown
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .extend(std::iter::repeat_n(index, extra));
-                grow_wake.notify_one();
-            }
-            extra
-        };
-        // After a lane's own fault put gaps back, `waiting` gaps wait for a
-        // whole busy gap unless a live lane has an idle worker or grows one for
-        // them: ask the live lanes for one more stream each, in lane order,
-        // until every waiting gap has a taker.
-        let grow_for_waiting = |waiting: usize| {
-            let is_live = |j: usize| {
-                !halted.load(Ordering::Acquire)
-                    && retired.get(j).is_some_and(|r| !r.load(Ordering::Acquire))
-            };
-            let idle = (0..lanes.len())
-                .filter(|&j| is_live(j))
-                .map(|j| {
-                    let running = live.get(j).map_or(0, |n| n.load(Ordering::Acquire));
-                    let taken = busy.get(j).map_or(0, |n| n.load(Ordering::Acquire));
-                    running.saturating_sub(taken)
-                })
-                .fold(0, usize::saturating_add);
-            let mut left = waiting.saturating_sub(idle);
-            for j in (0..lanes.len()).filter(|&j| is_live(j)) {
-                if left == 0 {
-                    break;
-                }
-                left = left.saturating_sub(grow_lane(j, 1));
-            }
-            if left > 0 {
-                tracing::info!(
-                    hash = %blake3::Hash::from_bytes(hash).to_hex(),
-                    waiting = left,
-                    "a faulted lane's gaps wait for a busy lane: no live lane could take one \
-                     more stream"
-                );
-            }
-        };
-
-        // Lane `index`'s worker. A `granted` worker is one the lane's growth
-        // hook granted while the drive ran.
-        let worker = |index: usize, granted: bool| {
-            let (delivered, halted, retired, wake) = (&delivered, &halted, &retired, &wake);
-            let (faults, extra_faults, lock) = (&faults, &extra_faults, &lock);
-            let (grow_lane, grow_for_waiting) = (&grow_lane, &grow_for_waiting);
-            let (lives, busy) = (&live, &busy);
-            async move {
-                let (Some(lane), Some(live), Some(my_busy)) =
-                    (lanes.get(index), lives.get(index), busy.get(index))
-                else {
-                    return Ok(());
-                };
-                live.fetch_add(1, Ordering::AcqRel);
-                // `Ok(true)`: the worker left its lane (idle, or on an extra
-                // fault) and already counted itself out of `live`.
-                let stopped: anyhow::Result<bool> = async {
-                    loop {
-                        let notified = wake.notified();
-                        tokio::pin!(notified);
-                        notified.as_mut().enable();
-                        let lane_retired =
-                            retired.get(index).is_none_or(|r| r.load(Ordering::Acquire));
-                        if halted.load(Ordering::Acquire) || lane_retired {
-                            return Ok::<bool, anyhow::Error>(false);
-                        }
-                        let taken = {
-                            let mut q = lock();
-                            // Checked again under the lock a faulting sibling
-                            // retires the lane under.
-                            if retired.get(index).is_none_or(|r| r.load(Ordering::Acquire)) {
-                                return Ok(false);
-                            }
-                            // The first gap waits for its lane, unless every lane
-                            // that takes it has retired.
-                            let first_is_free = lane.takes_first
-                                || lanes
-                                    .iter()
-                                    .zip(retired.iter())
-                                    .all(|(l, r)| !l.takes_first || r.load(Ordering::Acquire));
-                            let next = if first_is_free && q.first.is_some() {
-                                q.first.take()
-                            } else {
-                                q.waiting.pop_front()
-                            };
-                            match next {
-                                Some(gap) => {
-                                    q.in_flight = q.in_flight.saturating_add(1);
-                                    my_busy.fetch_add(1, Ordering::AcqRel);
-                                    Some((gap, q.waiting.len()))
-                                }
-                                None if q.in_flight == 0 && q.first.is_none() => {
-                                    return Ok(false);
-                                }
-                                // No gap for this worker while other gaps run.
-                                // Under the queue lock, so two idle workers of
-                                // one lane cannot both leave it.
-                                None if lane.release.is_some()
-                                    && lane.grow.is_some()
-                                    && live.load(Ordering::Acquire) > 1 =>
-                                {
-                                    live.fetch_sub(1, Ordering::AcqRel);
-                                    return Ok(true);
-                                }
-                                None => None,
-                            }
-                        };
-                        let Some(((gap_start, gap_len), waiting)) = taken else {
-                            notified.await;
-                            continue;
-                        };
-                        grow_lane(index, waiting);
-                        let mut counters = DriveCounters::new();
-                        let filled = fill_gap(
-                            store,
-                            lane.source,
-                            pacer,
-                            funder,
-                            lane.ctx,
-                            lane.ledger,
-                            hash,
-                            gap_start,
-                            gap_len,
-                            total_bytes,
-                            config,
-                            &mut counters,
-                            on_progress,
-                            Some(delivered),
-                            None,
-                            None,
-                            None,
-                            pool,
-                        )
-                        .await;
-                        // A granted worker's fault that is not terminal is most
-                        // often a refusal of the additional stream, not a fault
-                        // of the lane: it goes to `extra_faults`, the lane stays
-                        // live, and this worker stops.
-                        // Put back what a failed gap left missing, for the other
-                        // workers. A store error here is the drive's own.
-                        let (fault, rest) = match filled {
-                            Ok(()) => (None, None),
-                            Err(err) => {
-                                let rest = store
-                                    .missing_ranges(gap_start, gap_len)
-                                    .await
-                                    .map(|m| contiguous_byte_ranges(&m, total_bytes));
-                                (Some(err), Some(rest))
-                            }
-                        };
-                        let terminal = fault.as_ref().is_some_and(|err| {
-                            crate::retry_disposition(err) == crate::RetryDisposition::Terminal
-                        });
-                        if terminal {
-                            halted.store(true, Ordering::Release);
-                        }
-                        // A granted worker's fault that is not terminal is most
-                        // often a refusal of the additional stream, not a fault
-                        // of the lane: it goes to `extra_faults`, the lane stays
-                        // live, and this worker stops. Decided under the queue
-                        // lock, where an idle worker leaves its lane, and only
-                        // while another worker of the lane stays live: the
-                        // lane's last worker faults for the lane.
-                        let (waiting, extra_fault) = {
-                            let mut q = lock();
-                            let extra_fault = fault.is_some()
-                                && granted
-                                && !terminal
-                                && live.load(Ordering::Acquire) > 1;
-                            if extra_fault {
-                                live.fetch_sub(1, Ordering::AcqRel);
-                            } else if fault.is_some()
-                                && let Some(r) = retired.get(index)
-                            {
-                                // Retired before the rest goes back, under the
-                                // lock a sibling worker takes a gap under, so
-                                // no worker of this lane takes the rest.
-                                r.store(true, Ordering::Release);
-                            }
-                            if let Some(Ok(rest)) = &rest {
-                                for gap in rest.iter().rev() {
-                                    q.waiting.push_front(*gap);
-                                }
-                            }
-                            q.in_flight = q.in_flight.saturating_sub(1);
-                            my_busy.fetch_sub(1, Ordering::AcqRel);
-                            (q.waiting.len(), extra_fault)
-                        };
-                        if let Some(err) = fault {
-                            let landed = rest
-                                .as_ref()
-                                .and_then(|r| r.as_ref().ok())
-                                .map(|rest| landed_bytes(gap_len, rest));
-                            if extra_fault {
-                                log_extra_fault(lane, hash, (gap_start, gap_len, landed), &err);
-                            } else {
-                                warn_gap_fault(lane, hash, (gap_start, gap_len, landed), &err);
-                            }
-                            let slots = if extra_fault { extra_faults } else { faults };
-                            if let Some(slot) = slots.get(index) {
-                                let mut slot = slot
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                *slot = Some(match slot.take() {
-                                    None => err,
-                                    Some(kept) => keep_decisive(kept, err),
-                                });
-                            }
-                        }
-                        // A granted worker's fault asks for no growth: it could
-                        // grant the refused stream again. Nor does a halt.
-                        if !extra_fault && !terminal && matches!(rest, Some(Ok(_))) {
-                            grow_for_waiting(waiting);
-                        }
-                        wake.notify_waiters();
-                        if let Some(Err(err)) = rest {
-                            halted.store(true, Ordering::Release);
-                            wake.notify_waiters();
-                            return Err(err.into());
-                        }
-                        if extra_fault {
-                            // Counted out of `live` above, under the queue lock.
-                            return Ok(true);
-                        }
-                    }
-                }
-                .await;
-                if !matches!(stopped, Ok(true)) {
-                    live.fetch_sub(1, Ordering::AcqRel);
-                }
-                if let Some(LaneRelease(release)) = lane.release {
-                    release();
-                }
-                stopped.map(|_| ())
-            }
-        };
-        let mut running: futures_util::stream::FuturesUnordered<_> = lanes
-            .iter()
-            .enumerate()
-            .flat_map(|(index, lane)| (0..lane.width.get()).map(move |_| worker(index, false)))
-            .collect();
-        let mut joined = Vec::new();
-        loop {
-            let granted = std::mem::take(
-                &mut *grown
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
-            running.extend(granted.into_iter().map(|index| worker(index, true)));
-            // Only a polled worker grants, so an empty set has no grant pending.
-            tokio::select! {
-                next = futures_util::StreamExt::next(&mut running) => match next {
-                    Some(ended) => joined.push(ended),
-                    None => break,
-                },
-                () = grow_wake.notified() => {}
-            }
-        }
-        let left = lock();
-        let every_lane_faulted = faults.iter().all(|f| {
-            f.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some()
-        });
-        if !left.waiting.is_empty() || left.first.is_some() || every_lane_faulted {
-            failed.store(true, Ordering::Release);
-        }
-        joined
-            .into_iter()
-            .filter_map(Result::err)
-            .reduce(keep_decisive)
-            .map_or(Ok(()), Err)
-    };
-    let outcome = drive_with_interval_flush(store, PRESENT_RECORD_FLUSH_INTERVAL, async {
-        tokio::select! {
-            biased;
-            filled = gap_work => filled,
-            stopped = stop => Err(stopped),
-        }
-    })
-    .await;
-
-    let flushed = store.flush_present_record().await;
-    let finalized = async {
-        outcome?;
-        flushed?;
-        if !failed.load(Ordering::Acquire) && store.is_complete().await? {
-            store.finalize().await?;
-        }
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-    finish(finalized.err(), faults, extra_faults)
-}
-
 /// The per-gap resume/pay loop. Fills the contiguous content span
 /// `[gap_start, gap_start + gap_len)` — a single gap of `missing_ranges` — driving
 /// the [`Pacer`] until it is fully present. `counters` persist across gaps.
+///
+/// Each pass reads the store's current bound ([`RangedStore::total_bytes`]) and
+/// clips the gap to it, so a gap past a size a leg has just proved ends at
+/// that size. Progress reports `(position, bound)`.
 #[allow(clippy::too_many_arguments)]
 // One sequential decide -> act -> classify loop. The five `PaceDecision` arms and
 // the four-way fault classification each justify a money-relevant decision inline
@@ -1605,7 +780,6 @@ pub(crate) async fn fill_gap<St, S, P, F>(
     hash: [u8; 32],
     gap_start: u64,
     gap_len: u64,
-    total_bytes: u64,
     config: &DriveConfig,
     counters: &mut DriveCounters,
     on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
@@ -1679,13 +853,23 @@ where
     // that opened it read them. The next pass must see one of them move (#2194).
     let mut clean_leg: Option<CleanLeg> = None;
 
-    let gap_end = gap_start.saturating_add(gap_len);
+    let asked_end = gap_start.saturating_add(gap_len);
 
     loop {
         // The store's DELIVERED frontier for this gap (contiguous from `gap_start`):
         // where its present ranges end. Used only to re-anchor after a reseed and
         // for the progress bar base — NOT for completion, which is payment-based.
-        let still_missing = store.missing_ranges(gap_start, gap_len).await?;
+        // A store that cannot answer is this process's fault, not the
+        // source's (#2213). The bound it is clipped to is the bound the planner
+        // works to now: a leg that proves a smaller size shrinks it, and the gap
+        // ends there.
+        let (still_missing, total_bytes) =
+            missing_below_bound(store, gap_start, asked_end.saturating_sub(gap_start)).await?;
+        let gap_end = asked_end.min(total_bytes);
+        if gap_start >= gap_end {
+            return Ok(());
+        }
+        let gap_len = gap_end - gap_start;
         let missing_bytes = ranges_content_len(&still_missing, total_bytes);
         let delivered_frontier = gap_end.saturating_sub(missing_bytes);
 
@@ -1917,8 +1101,13 @@ where
                 // Whole-blob content already present, so `ingest_stream`'s
                 // per-range progress can be offset into overall progress: the bar
                 // reports `base + received` against `total_bytes`.
-                let base_present =
-                    ranges_content_len(&(store.present_ranges().await?), total_bytes);
+                let base_present = ranges_content_len(
+                    &(store
+                        .present_ranges()
+                        .await
+                        .map_err(|e| anyhow::Error::new(e).context(crate::LocalPullFault))?),
+                    total_bytes,
+                );
                 // This leg's own previously-reported cumulative, so the multi-source
                 // aggregator folds in DELTAS (`received` is monotonic per leg, and
                 // resets to 0 on each new open — hence a fresh counter per leg).
@@ -1951,15 +1140,6 @@ where
                 // One paid leg: open -> stream into the store -> drain the pull.
                 let generation_at_open = ledger.generation();
                 let leg: anyhow::Result<()> = match source.open(hash, aligned.clone()).await {
-                    // The store is keyed by the blob's size, so a leg whose signed
-                    // size disagrees would verify against the wrong tree. Refuse
-                    // it before a byte is read or paid for.
-                    Ok((header, _)) if header.total_bytes != total_bytes => {
-                        Err(anyhow::Error::new(crate::SignedSizeMismatch {
-                            signed: header.total_bytes,
-                            expected: total_bytes,
-                        }))
-                    }
                     Ok((header, reader)) => {
                         counters.next_voucher_cost = voucher_cost(&header);
                         // A new leg has opened: re-anchor the paid-frontier baseline
@@ -1969,7 +1149,12 @@ where
                         // pre-#1608 CLI loop re-anchored `fetch_start_offset` /
                         // `fetch_start_committed_bytes` identically on every open).
                         leg_anchor = Some((resume_start, ledger.committed().bytes));
-                        match store.ingest_stream(&aligned, reader, Some(&reporter)).await {
+                        // The store is keyed by offset: the leg verifies under
+                        // the size its own sender signs, whatever the bound.
+                        match store
+                            .ingest_stream(&aligned, reader, Some(&reporter), header.total_bytes)
+                            .await
+                        {
                             Ok(reader) => {
                                 // Drain to stream end and recover the acked voucher
                                 // watermark. It lives in the ledger the caller owns
@@ -2130,7 +1315,6 @@ where
     clippy::cast_possible_truncation
 )] // tests
 mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     use alloy::primitives::{Address, B256, U256};
@@ -2142,12 +1326,9 @@ mod tests {
     };
     use decdn_incentive::DepositOutcome;
 
-    use std::num::NonZeroUsize;
-
     use super::{
-        DriveConfig, LaneGrowth, LaneRelease, LegNoProgress, PoolExhausted, RangeLane,
-        RangeSetOutcome, SharedPool, contiguous_byte_ranges, drive, drive_range_lanes,
-        drive_range_set, first_leg, range_set_reach, ranges_content_len,
+        DriveConfig, LegNoProgress, SharedPool, contiguous_byte_ranges, drive, first_leg,
+        ranges_content_len,
     };
     use crate::ProgressCallback;
     use crate::pacer::{BudgetPacer, PaceDecision, PaceState};
@@ -2330,353 +1511,6 @@ mod tests {
         );
     }
 
-    /// Drive `ranges` as one set over a fresh store at `concurrency`, with or
-    /// without a shared pool, and hand back the source and store to inspect.
-    async fn drive_set(
-        total: u64,
-        ranges: &[(u64, u64)],
-        concurrency: usize,
-        shared_pool: bool,
-        tweak: impl FnOnce(ScriptedSource) -> ScriptedSource,
-    ) -> (
-        anyhow::Result<()>,
-        ScriptedSource,
-        ClientRangedStore,
-        Vec<u8>,
-    ) {
-        let (root, _, _) = synth_blob(total as usize);
-        drive_set_into(
-            fresh_store(root, total),
-            ranges,
-            concurrency,
-            shared_pool,
-            tweak,
-            None,
-            std::future::pending(),
-        )
-        .await
-    }
-
-    /// [`drive_set`] into a given store, with a progress callback and a `stop`.
-    async fn drive_set_into(
-        store: ClientRangedStore,
-        ranges: &[(u64, u64)],
-        concurrency: usize,
-        shared_pool: bool,
-        tweak: impl FnOnce(ScriptedSource) -> ScriptedSource,
-        on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
-        stop: impl std::future::Future<Output = anyhow::Error>,
-    ) -> (
-        anyhow::Result<()>,
-        ScriptedSource,
-        ClientRangedStore,
-        Vec<u8>,
-    ) {
-        let total = store.total_bytes();
-        let (root, plaintext, _outboard) = synth_blob(total as usize);
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-        let source = tweak(
-            ScriptedSource::new(plaintext.clone())
-                .expect("source")
-                .paying(Arc::clone(&ledger)),
-        );
-        let ctx = Arc::new(Mutex::new(healthy_ctx()));
-        let spent_ledger = Arc::clone(&ledger);
-        let spent = move || spent_ledger.committed().amount;
-        let credit = |_: U256| Ok(());
-        let topups = std::sync::atomic::AtomicU32::new(0);
-        let topup_lock = tokio::sync::Mutex::new(());
-        let pool = SharedPool {
-            spent: &spent,
-            topups_used: &topups,
-            credit: &credit,
-            topup_lock: &topup_lock,
-        };
-        let result = drive_range_set(
-            &store,
-            &source,
-            &BudgetPacer::new(),
-            &healthy_funder(),
-            &ctx,
-            &ledger,
-            root,
-            ranges,
-            NonZeroUsize::new(concurrency).expect("non-zero"),
-            &config(),
-            on_progress,
-            shared_pool.then_some(&pool),
-            stop,
-        )
-        .await;
-        (result, source, store, plaintext)
-    }
-
-    /// Every other group of a 64-group blob: 32 disjoint ranges.
-    fn scattered(total: u64) -> Vec<(u64, u64)> {
-        (0..total / GROUP)
-            .step_by(2)
-            .map(|g| (g * GROUP, GROUP))
-            .collect()
-    }
-
-    /// A range set runs its gaps concurrently, opens each gap once and only
-    /// its gap, and leaves a partial blob unfinalized; driving the rest then
-    /// finalizes it byte-exact (#2119).
-    #[tokio::test]
-    async fn a_range_set_fills_each_gap_once_and_concurrently() {
-        let total = 64 * GROUP;
-        let ranges = scattered(total);
-        let (result, source, store, plaintext) = drive_set(total, &ranges, 4, true, |s| s).await;
-        result.expect("drive the range set");
-
-        let mut opened = source.opened_ranges();
-        opened.sort_unstable();
-        assert_eq!(opened, ranges, "each range opened once, nothing else");
-        let peak = source.peak_in_flight();
-        assert!(
-            peak > 1 && peak <= 4,
-            "legs overlap up to the width: {peak}"
-        );
-        assert!(!store.is_complete().await.expect("is_complete"));
-        for &(off, len) in &ranges {
-            let got = store.read(off, len).await.expect("read range");
-            assert_eq!(got.as_ref(), &plaintext[off as usize..(off + len) as usize]);
-        }
-
-        // The rest of the blob as a second set completes and finalizes it.
-        let root = store.root();
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-        let rest = ScriptedSource::new(plaintext.clone())
-            .expect("source")
-            .paying(Arc::clone(&ledger));
-        drive_range_set(
-            &store,
-            &rest,
-            &BudgetPacer::new(),
-            &healthy_funder(),
-            &Arc::new(Mutex::new(healthy_ctx())),
-            &ledger,
-            root,
-            &[(0, 0)],
-            NonZeroUsize::MIN,
-            &config(),
-            None,
-            None,
-            std::future::pending(),
-        )
-        .await
-        .expect("drive the rest");
-        assert_eq!(rest.opened_ranges().len(), ranges.len(), "only the holes");
-        assert!(store.is_complete().await.expect("is_complete"));
-        let whole = store.read(0, 0).await.expect("read whole blob");
-        assert_eq!(whole.as_ref(), plaintext.as_slice());
-    }
-
-    /// Overlapping and adjacent ranges merge into one gap, so concurrent legs
-    /// never cover the same bytes.
-    #[tokio::test]
-    async fn overlapping_ranges_merge_into_one_gap() {
-        let total = 8 * GROUP;
-        let ranges = [
-            (0, GROUP),
-            (GROUP, GROUP),
-            (GROUP / 2, GROUP),
-            (4 * GROUP, GROUP),
-        ];
-        let (result, source, _store, _) = drive_set(total, &ranges, 4, true, |s| s).await;
-        result.expect("drive");
-        let mut opened = source.opened_ranges();
-        opened.sort_unstable();
-        assert_eq!(opened, vec![(0, 2 * GROUP), (4 * GROUP, GROUP)]);
-    }
-
-    /// Without a shared pool the top-up budget lives in one lane's counters, so
-    /// the set runs one gap at a time whatever width is asked for.
-    #[tokio::test]
-    async fn without_a_shared_pool_a_range_set_runs_serially() {
-        let total = 16 * GROUP;
-        let (result, source, _store, _) =
-            drive_set(total, &scattered(total), 4, false, |s| s).await;
-        result.expect("drive");
-        assert_eq!(source.peak_in_flight(), 1);
-    }
-
-    /// After the first failed gap no new gap opens; the first error returns.
-    #[tokio::test]
-    async fn a_failed_gap_stops_new_gaps_from_opening() {
-        let total = 32 * GROUP;
-        let (result, source, _store, _) = drive_set(total, &scattered(total), 2, true, |s| {
-            s.with_fault_after(64, || anyhow::anyhow!("scripted reset"))
-        })
-        .await;
-        let err = result.expect_err("every leg faults");
-        assert!(format!("{err:#}").contains("scripted reset"), "{err:#}");
-        assert_eq!(
-            source.opened_ranges().len(),
-            2,
-            "only the two legs already in flight opened"
-        );
-    }
-
-    /// A `stop` that fires mid-drive ends the drive with its error, and every
-    /// byte that landed before it is in the durable present record: the final
-    /// flush runs after the stop, not only on a clean finish.
-    #[tokio::test(start_paused = true)]
-    async fn a_stop_mid_drive_keeps_the_landed_bytes_recorded() {
-        // Past one 4 MiB ingest checkpoint, so landed bytes reach the present
-        // set before the source wedges.
-        let total = 12 * 1024 * 1024;
-        let (root, _, _) = synth_blob(total as usize);
-        let dir = tmp_dir();
-        let store = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
-        let stop = async {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            anyhow::anyhow!("stopped by the floor")
-        };
-        let (result, _source, store, _) = drive_set_into(
-            store,
-            &[(0, 0)],
-            1,
-            false,
-            |s| s.stall_after(6 * 1024 * 1024, std::time::Duration::from_hours(1)),
-            None,
-            stop,
-        )
-        .await;
-        let err = result.expect_err("the stop ends the drive");
-        assert_eq!(format!("{err}"), "stopped by the floor");
-        drop(store);
-
-        let reopened = ClientRangedStore::open(dir.path(), "blob", root, total).expect("reopen");
-        let recorded =
-            ranges_content_len(&reopened.present_ranges().await.expect("present"), total);
-        assert!(
-            recorded >= 4 * 1024 * 1024,
-            "landed bytes are recorded: {recorded}"
-        );
-        assert!(recorded < total);
-    }
-
-    /// Concurrent gaps report one non-decreasing whole-blob position that starts
-    /// at the present base and ends at the bytes present, which is the set's
-    /// [`range_set_reach`], so a drive-level floor watching it sees steady
-    /// progress toward a known mark.
-    #[tokio::test]
-    async fn a_concurrent_range_set_reports_one_rising_position() {
-        let total = 32 * GROUP;
-        let (root, plaintext, outboard) = synth_blob(total as usize);
-        let store = fresh_store(root, total);
-        preadmit(
-            &store,
-            &plaintext,
-            &outboard,
-            &align_range(0, GROUP, total).expect("align"),
-        )
-        .await;
-        let seen = Mutex::new(Vec::new());
-        let record = |position: u64, _: u64| seen.lock().expect("lock").push(position);
-        let ranges: Vec<(u64, u64)> = (1..32).step_by(2).map(|g| (g * GROUP, GROUP)).collect();
-        let reach = range_set_reach(&store, &ranges).await.expect("reach");
-        assert!(
-            reach < total,
-            "the set leaves the even groups to another writer"
-        );
-        let (result, source, store, _) = drive_set_into(
-            store,
-            &ranges,
-            4,
-            true,
-            |s| s,
-            Some(&record),
-            std::future::pending(),
-        )
-        .await;
-        result.expect("drive");
-        assert!(source.peak_in_flight() > 1);
-        let seen = seen.into_inner().expect("lock");
-        assert_eq!(
-            seen.first().copied(),
-            Some(GROUP),
-            "starts at the present base"
-        );
-        assert!(
-            seen.windows(2).all(|w| w[0] <= w[1]),
-            "never runs backwards: {seen:?}"
-        );
-        let present = ranges_content_len(&store.present_ranges().await.expect("present"), total);
-        assert_eq!(seen.last().copied(), Some(present));
-        assert_eq!(present, reach, "the drive ends at the set's reach");
-    }
-
-    /// A primed first leg is adopted even when the rest of the set runs
-    /// concurrently: the wrapped source never opens that range itself.
-    #[tokio::test]
-    async fn a_primed_first_leg_is_adopted_in_a_concurrent_range_set() {
-        let total = 32 * GROUP;
-        let (root, plaintext, _) = synth_blob(total as usize);
-        let store = fresh_store(root, total);
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-        let primed = PrimedSource::new(
-            ScriptedSource::new(plaintext)
-                .expect("source")
-                .paying(Arc::clone(&ledger)),
-        );
-        let ranges: Vec<(u64, u64)> = (0..32).step_by(2).map(|g| (g * GROUP, GROUP)).collect();
-        let leg = first_leg(&store, &ranges, u64::MAX, 0)
-            .await
-            .expect("leg")
-            .expect("a gap");
-        let (header, reader) = primed.inner().open(root, leg.clone()).await.expect("prime");
-        primed.prime(
-            root,
-            leg.clone(),
-            header,
-            reader,
-            tokio::time::Instant::now(),
-        );
-
-        let spent_ledger = Arc::clone(&ledger);
-        let spent = move || spent_ledger.committed().amount;
-        let credit = |_: U256| Ok(());
-        let topups = std::sync::atomic::AtomicU32::new(0);
-        let topup_lock = tokio::sync::Mutex::new(());
-        let pool = SharedPool {
-            spent: &spent,
-            topups_used: &topups,
-            credit: &credit,
-            topup_lock: &topup_lock,
-        };
-        drive_range_set(
-            &store,
-            &primed,
-            &BudgetPacer::new(),
-            &healthy_funder(),
-            &Arc::new(Mutex::new(healthy_ctx())),
-            &ledger,
-            root,
-            &ranges,
-            NonZeroUsize::new(4).expect("non-zero"),
-            &config(),
-            None,
-            Some(&pool),
-            std::future::pending(),
-        )
-        .await
-        .expect("drive");
-        let opened = primed.inner().opened_ranges();
-        assert_eq!(
-            opened.len(),
-            ranges.len(),
-            "one open per gap, the priming one included"
-        );
-        let primed_range = (leg.fetch_start(), leg.fetch_len());
-        assert_eq!(
-            opened.iter().filter(|r| **r == primed_range).count(),
-            1,
-            "the primed range was opened once, to prime it"
-        );
-    }
-
     /// Two gaps that reach the pool's floor together top up once: the second
     /// waits on the lock, sees the deposit the first one raised, and decides
     /// again instead of escrowing a second shortfall.
@@ -2714,7 +1548,9 @@ mod tests {
 
         let total = 8 * GROUP;
         let (root, plaintext, _) = synth_blob(total as usize);
-        let store = fresh_store(root, total);
+        // Two concurrent drives on one pool, one gap each: sibling fetches
+        // that share a lane.
+        let (store_a, store_b) = (fresh_store(root, total), fresh_store(root, total));
         let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
         let source = ScriptedSource::new(plaintext)
             .expect("source")
@@ -2738,941 +1574,80 @@ mod tests {
             topup_lock: &topup_lock,
         };
         let funder = SlowFunder(std::sync::atomic::AtomicU32::new(0));
-        drive_range_set(
-            &store,
-            &source,
-            &TopUpUntilFunded,
-            &funder,
-            &ctx,
-            &ledger,
-            root,
-            &[(0, GROUP), (4 * GROUP, GROUP)],
-            NonZeroUsize::new(2).expect("non-zero"),
-            &config(),
-            None,
-            Some(&pool),
-            std::future::pending(),
-        )
-        .await
-        .expect("drive");
+        let drive_config = config();
+        let gap = |store, offset| {
+            drive(
+                store,
+                &source,
+                &TopUpUntilFunded,
+                &funder,
+                &ctx,
+                &ledger,
+                root,
+                offset,
+                GROUP,
+                &drive_config,
+                None,
+                None,
+                None,
+                Some(&pool),
+            )
+        };
+        let (a, b) = tokio::join!(gap(&store_a, 0), gap(&store_b, 4 * GROUP));
+        a.expect("drive a");
+        b.expect("drive b");
         assert_eq!(funder.0.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(source.opened_ranges().len(), 2);
     }
 
-    /// Of several gap failures, the one returned decides the most: a terminal
-    /// fault over a pool exhaustion over anything else.
-    #[test]
-    fn keep_decisive_prefers_terminal_then_exhaustion() {
-        let reset = || anyhow::anyhow!("stream reset");
-        let exhausted = || {
-            anyhow::Error::new(PoolExhausted {
-                gap_start: 0,
-                gap_len: 1,
-            })
-        };
-        let terminal = || {
-            anyhow::Error::new(crate::BlobTooLarge {
-                received: 2,
-                ceiling: 1,
-            })
-        };
-        let kept = super::keep_decisive(reset(), exhausted());
-        assert!(kept.downcast_ref::<PoolExhausted>().is_some());
-        let kept = super::keep_decisive(kept, terminal());
-        assert!(kept.downcast_ref::<crate::BlobTooLarge>().is_some());
-        let kept = super::keep_decisive(kept, exhausted());
-        assert!(
-            kept.downcast_ref::<crate::BlobTooLarge>().is_some(),
-            "terminal stays"
-        );
-        let kept = super::keep_decisive(reset(), anyhow::anyhow!("later reset"));
-        assert_eq!(
-            format!("{kept}"),
-            "stream reset",
-            "the earlier of equals stays"
-        );
-    }
-
-    /// One lane of a [`lanes_drive`] test: its width, whether it takes the
-    /// first gap, and how its source is scripted.
-    struct LaneSpec {
-        width: usize,
-        takes_first: bool,
-        tweak: fn(ScriptedSource) -> ScriptedSource,
-        grow: Option<LaneGrowth<'static>>,
-        release: Option<LaneRelease<'static>>,
-    }
-
-    impl LaneSpec {
-        fn healthy(width: usize) -> Self {
-            Self {
-                width,
-                takes_first: false,
-                tweak: |s| s,
-                grow: None,
-                release: None,
-            }
-        }
-    }
-
-    /// A lane that starts at width 1 widens while gaps still wait, by what its
-    /// growth hook grants, and still opens each gap once (#2168).
+    /// A leg whose signed size differs from the store's bound verifies under its
+    /// own claim: the planner's bound is too small, the leg's range lies inside
+    /// both sizes, and its bytes land at their offsets.
     #[tokio::test]
-    async fn a_lane_grows_past_its_width_by_what_its_hook_grants() {
-        let total = 64 * GROUP;
-        let ranges = scattered(total);
-        let granted: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
-        let hook: &'static (dyn Fn(usize) -> usize + Send + Sync) =
-            Box::leak(Box::new(move |_| {
-                // Two extra workers in all, one per call.
-                usize::from(
-                    granted
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                            (n < 2).then_some(n + 1)
-                        })
-                        .is_ok(),
-                )
-            }));
-        let released: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
-        let release: &'static (dyn Fn() + Send + Sync) = Box::leak(Box::new(move || {
-            released.fetch_add(1, Ordering::Relaxed);
-        }));
-        let spec = LaneSpec {
-            grow: Some(LaneGrowth(hook)),
-            release: Some(LaneRelease(release)),
-            ..LaneSpec::healthy(1)
-        };
-        let (outcome, sources, store, plaintext) = lanes_drive(total, &ranges, &[spec]).await;
-        outcome.into_result().expect("drive the range set");
-        assert_eq!(
-            released.load(Ordering::Relaxed),
-            3,
-            "the base worker and both grown workers each release once"
-        );
-
-        let source = sources.first().expect("one lane");
-        let mut opened = source.opened_ranges();
-        opened.sort_unstable();
-        assert_eq!(opened, ranges, "each range opened once, nothing else");
-        assert_eq!(granted.load(Ordering::Relaxed), 2);
-        let peak = source.peak_in_flight();
-        assert!(
-            peak > 1 && peak <= 3,
-            "the lane widened to its grants: {peak}"
-        );
-        for &(off, len) in &ranges {
-            let got = store.read(off, len).await.expect("read range");
-            assert_eq!(got.as_ref(), &plaintext[off as usize..(off + len) as usize]);
-        }
-    }
-
-    /// With no growth hook a width-1 lane runs its gaps one at a time.
-    #[tokio::test]
-    async fn a_lane_without_a_hook_stays_at_its_width() {
-        let total = 64 * GROUP;
-        let ranges = scattered(total);
-        let (outcome, sources, _store, _plaintext) =
-            lanes_drive(total, &ranges, &[LaneSpec::healthy(1)]).await;
-        outcome.into_result().expect("drive the range set");
-        assert_eq!(sources.first().expect("one lane").peak_in_flight(), 1);
-    }
-
-    /// Drive `ranges` of a fresh `total`-byte blob across one scripted lane per
-    /// spec, each on its own provider, ledger and context, all on one shared
-    /// pool.
-    async fn lanes_drive(
-        total: u64,
-        ranges: &[(u64, u64)],
-        specs: &[LaneSpec],
-    ) -> (
-        RangeSetOutcome,
-        Vec<ScriptedSource>,
-        ClientRangedStore,
-        Vec<u8>,
-    ) {
-        let (root, plaintext, _) = synth_blob(total as usize);
-        let store = fresh_store(root, total);
-        let ledgers: Vec<Arc<PoolLedger>> = specs
-            .iter()
-            .map(|_| Arc::new(PoolLedger::new(Cumulative::default())))
-            .collect();
-        let sources: Vec<ScriptedSource> = specs
-            .iter()
-            .zip(&ledgers)
-            .map(|(spec, ledger)| {
-                (spec.tweak)(
-                    ScriptedSource::new(plaintext.clone())
-                        .expect("source")
-                        .paying(Arc::clone(ledger)),
-                )
-            })
-            .collect();
-        let ctxs: Vec<Arc<Mutex<PoolContext>>> = (0..specs.len())
-            .map(|i| {
-                let mut ctx = healthy_ctx();
-                ctx.provider = Address::repeat_byte(0xA0 + u8::try_from(i).expect("few lanes"));
-                Arc::new(Mutex::new(ctx))
-            })
-            .collect();
-        let lanes: Vec<RangeLane<'_, ScriptedSource>> = specs
-            .iter()
-            .enumerate()
-            .map(|(i, spec)| RangeLane {
-                source: &sources[i],
-                ctx: &ctxs[i],
-                ledger: &ledgers[i],
-                width: NonZeroUsize::new(spec.width).expect("non-zero"),
-                takes_first: spec.takes_first,
-                grow: spec.grow,
-                release: spec.release,
-            })
-            .collect();
-        let spent_ledgers = ledgers.clone();
-        let spent = move || {
-            spent_ledgers
-                .iter()
-                .fold(U256::ZERO, |sum, l| sum + l.committed().amount)
-        };
-        let credit = |_: U256| Ok(());
-        let topups = std::sync::atomic::AtomicU32::new(0);
-        let topup_lock = tokio::sync::Mutex::new(());
-        let pool = SharedPool {
-            spent: &spent,
-            topups_used: &topups,
-            credit: &credit,
-            topup_lock: &topup_lock,
-        };
-        let outcome = drive_range_lanes(
-            &store,
-            &lanes,
-            &BudgetPacer::new(),
-            &healthy_funder(),
-            root,
-            ranges,
-            &config(),
-            None,
-            Some(&pool),
-            std::future::pending(),
-        )
-        .await;
-        drop(lanes);
-        (outcome, sources, store, plaintext)
-    }
-
-    /// Assert that every byte of `ranges` in `store` matches `plaintext`.
-    async fn assert_ranges_present(
-        store: &ClientRangedStore,
-        plaintext: &[u8],
-        ranges: &[(u64, u64)],
-    ) {
-        for &(off, len) in ranges {
-            let got = store.read(off, len).await.expect("read range");
-            assert_eq!(got.as_ref(), &plaintext[off as usize..(off + len) as usize]);
-        }
-    }
-
-    /// A range set driven over three lanes spreads its gaps over all of them,
-    /// opens each gap once across the set, and lands every byte (#2123).
-    #[tokio::test]
-    async fn a_range_set_spreads_its_gaps_across_lanes() {
-        let total = 64 * GROUP;
-        let ranges = scattered(total);
-        let specs = [
-            LaneSpec::healthy(2),
-            LaneSpec::healthy(2),
-            LaneSpec::healthy(2),
-        ];
-        let (outcome, sources, store, plaintext) = lanes_drive(total, &ranges, &specs).await;
-        for lane in 0..specs.len() {
-            assert!(outcome.lane_fault(lane).is_none(), "lane {lane} served");
-        }
-        outcome.into_result().expect("drive the range set");
-
-        let mut opened = Vec::new();
-        for (lane, source) in sources.iter().enumerate() {
-            let mine = source.opened_ranges();
-            assert!(!mine.is_empty(), "lane {lane} took at least one gap");
-            opened.extend(mine);
-        }
-        opened.sort_unstable();
-        assert_eq!(opened, ranges, "each gap opened once across the lanes");
-        assert_ranges_present(&store, &plaintext, &ranges).await;
-    }
-
-    /// A lane that faults releases each of its workers as it stops, so a
-    /// caller's per-worker permits free when the lane dies.
-    #[tokio::test]
-    async fn a_faulted_lane_releases_each_of_its_workers() {
-        let total = 64 * GROUP;
-        let ranges = scattered(total);
-        let released: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
-        let release: &'static (dyn Fn() + Send + Sync) = Box::leak(Box::new(move || {
-            released.fetch_add(1, Ordering::Relaxed);
-        }));
-        let specs = [
-            LaneSpec {
-                width: 2,
-                grow: None,
-                release: Some(LaneRelease(release)),
-                takes_first: true,
-                tweak: |s| s.with_fault_after(512, || anyhow::anyhow!("stream reset")),
-            },
-            LaneSpec {
-                width: 1,
-                grow: None,
-                release: None,
-                takes_first: false,
-                tweak: |s| s,
-            },
-        ];
-        let (outcome, _sources, _store, _plaintext) = lanes_drive(total, &ranges, &specs).await;
-        assert!(outcome.lane_fault(0).is_some(), "lane 0 faulted");
-        outcome
-            .into_result()
-            .expect("the healthy lane finishes the set");
-        assert_eq!(
-            released.load(Ordering::Relaxed),
-            2,
-            "each worker of the faulted lane released once"
-        );
-    }
-
-    /// Drive two ranges over two lanes: lane 0 takes the first gap and faults
-    /// at once, and lane 1, scripted by `tweak`, has a growth hook that grants
-    /// one worker in all. Returns the outcome, the sources, how many workers the
-    /// hook granted, and whether every byte of both ranges landed.
-    async fn faulted_rest_drive(
-        tweak: fn(ScriptedSource) -> ScriptedSource,
-    ) -> (RangeSetOutcome, Vec<ScriptedSource>, u32, bool) {
-        let total = 64 * GROUP;
-        let ranges = [(0, 16 * GROUP), (32 * GROUP, 16 * GROUP)];
-        // Room for two grants, so a second request would be seen.
-        let granted: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
-        let hook: &'static (dyn Fn(usize) -> usize + Send + Sync) =
-            Box::leak(Box::new(move |_| {
-                usize::from(
-                    granted
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                            (n < 2).then_some(n + 1)
-                        })
-                        .is_ok(),
-                )
-            }));
-        let specs = [
-            LaneSpec {
-                takes_first: true,
-                tweak: |s| s.with_fault_after(512, || anyhow::anyhow!("stream reset")),
-                ..LaneSpec::healthy(1)
-            },
-            LaneSpec {
-                grow: Some(LaneGrowth(hook)),
-                tweak,
-                ..LaneSpec::healthy(1)
-            },
-        ];
-        let (outcome, sources, store, plaintext) = lanes_drive(total, &ranges, &specs).await;
-        let mut present = true;
-        for &(off, len) in &ranges {
-            present &= store
-                .read(off, len)
-                .await
-                .is_ok_and(|got| got.as_ref() == &plaintext[off as usize..(off + len) as usize]);
-        }
-        (outcome, sources, granted.load(Ordering::Relaxed), present)
-    }
-
-    /// A faulted lane's gap rest does not wait for a busy lane to finish its
-    /// own gap (#2230): the busy lane's growth hook is asked, and the rest runs
-    /// on a second concurrent leg beside the gap it already fills.
-    #[tokio::test]
-    async fn a_faulted_lanes_rest_grows_a_busy_lane() {
-        // Lane 1 is busy on its own gap when lane 0 faults.
-        let (outcome, sources, granted, present) =
-            faulted_rest_drive(|s| s.stall_after(GROUP, std::time::Duration::from_millis(1500)))
-                .await;
-        assert!(outcome.lane_fault(0).is_some(), "lane 0 faulted");
-        outcome
-            .into_result()
-            .expect("the busy lane finishes the set");
-        assert_eq!(granted, 1, "lane 1 grew one worker");
-        let peak = sources.get(1).expect("two lanes").peak_in_flight();
-        assert!(
-            peak >= 2,
-            "the rest ran beside lane 1's own gap, not after it: {peak}"
-        );
-        assert!(present, "every byte landed");
-    }
-
-    /// A granted worker whose stream the node refuses does not retire its
-    /// lane or fail the drive: its fault is the lane's extra fault, and the
-    /// lane still fills the rest.
-    #[tokio::test]
-    async fn a_refused_granted_stream_leaves_its_lane_live() {
-        let (outcome, _sources, granted, present) = faulted_rest_drive(|s| {
-            s.stall_after(GROUP, std::time::Duration::from_millis(1500))
-                .refusing_open(1, || anyhow::anyhow!("overloaded"))
-        })
-        .await;
-        assert_eq!(granted, 1, "lane 1 grew one worker");
-        assert!(outcome.lane_fault(1).is_none(), "the lane did not retire");
-        assert!(outcome.lane_extra_fault(1).is_some(), "the refusal is kept");
-        assert!(present, "every byte landed");
-        outcome
-            .into_result()
-            .expect("a refused extra stream fails nothing");
-    }
-
-    /// A granted worker stops at its first fault. Over a node that refuses
-    /// every further stream it opens once, not again and again, and the drive
-    /// asks for no growth in its place.
-    #[tokio::test]
-    async fn a_granted_worker_stops_at_its_first_fault() {
-        let (_outcome, sources, granted, _present) = faulted_rest_drive(|s| {
-            s.stall_after(GROUP, std::time::Duration::from_millis(1500))
-                .refusing_opens_from(1, || anyhow::anyhow!("overloaded"))
-        })
-        .await;
-        assert_eq!(granted, 1, "the refusal asks for no second grant");
-        assert_eq!(
-            sources.get(1).expect("two lanes").opened_ranges().len(),
-            3,
-            "its own gap, the one refused extra, then the first worker's refused take"
-        );
-    }
-
-    /// A granted worker that is its lane's last live worker faults for the
-    /// lane: the first worker has already left the idle lane, so an extra
-    /// fault would leave the drive failed with no lane fault to name.
-    #[tokio::test]
-    async fn a_lanes_last_worker_faults_for_the_lane() {
-        let total = 64 * GROUP;
-        // A one-group gap for the first worker, and a long one for the worker
-        // the lane grows when it takes the first while the second waits.
-        let ranges = [(0, GROUP), (32 * GROUP, 16 * GROUP)];
-        let granted: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
-        let hook: &'static (dyn Fn(usize) -> usize + Send + Sync) =
-            Box::leak(Box::new(move |_| {
-                usize::from(
-                    granted
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                            (n < 1).then_some(n + 1)
-                        })
-                        .is_ok(),
-                )
-            }));
-        let release: &'static (dyn Fn() + Send + Sync) = &|| {};
-        let spec = LaneSpec {
-            grow: Some(LaneGrowth(hook)),
-            release: Some(LaneRelease(release)),
-            // Faults only the long gap, well after the short one is done.
-            tweak: |s| s.with_fault_after(4 * GROUP as usize, || anyhow::anyhow!("stream reset")),
-            ..LaneSpec::healthy(1)
-        };
-        let (outcome, _sources, _store, _plaintext) = lanes_drive(total, &ranges, &[spec]).await;
-        assert_eq!(
-            granted.load(Ordering::Relaxed),
-            1,
-            "the lane grew one worker"
-        );
-        assert!(
-            outcome.lane_fault(0).is_some(),
-            "the last worker's fault is the lane's, so the failed drive names it"
-        );
-        assert!(
-            outcome.into_result().is_err(),
-            "the long gap stayed missing"
-        );
-    }
-
-    /// A lane with release and growth hooks that runs out of gaps while
-    /// another lane still fills one keeps a single idle worker and lets the
-    /// others stop, so their permits come back before the drive ends. The slow
-    /// lane's gap finishes only once two workers of the fast lane release, and
-    /// the third worker releases only after that gap. A lane that keeps its
-    /// surplus workers hangs the drive and the timeout fails the test; a lane
-    /// that lets its last worker go while the gate is shut fails the kept-worker
-    /// assertion.
-    #[tokio::test]
-    async fn an_idle_lane_releases_its_surplus_workers_before_the_drive_ends() {
-        static GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
-        let total = 64 * GROUP;
-        let ranges = scattered(total);
-        let released: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
-        let third_after_gate: &'static std::sync::atomic::AtomicBool =
-            Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
-        let release: &'static (dyn Fn() + Send + Sync) = Box::leak(Box::new(move || {
-            match released.fetch_add(1, Ordering::AcqRel) + 1 {
-                // The gate opens a while after the second release, so the third
-                // worker has gone idle while the slow gap is still held.
-                2 => {
-                    tokio::spawn(async {
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                        GATE.add_permits(1);
-                    });
-                }
-                3 => third_after_gate.store(GATE.available_permits() > 0, Ordering::Release),
-                _ => {}
-            }
-        }));
-        let no_growth: &'static (dyn Fn(usize) -> usize + Send + Sync) = &|_| 0;
-        let specs = [
-            LaneSpec {
-                grow: Some(LaneGrowth(no_growth)),
-                release: Some(LaneRelease(release)),
-                ..LaneSpec::healthy(3)
-            },
-            LaneSpec {
-                width: 1,
-                grow: None,
-                release: None,
-                takes_first: false,
-                tweak: |s| s.gated_finish(&GATE),
-            },
-        ];
-        let (outcome, sources, _store, _plaintext) = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            lanes_drive(total, &ranges, &specs),
-        )
-        .await
-        .expect("the drive ends: two surplus workers stop and open the slow lane's gate");
-        assert!(
-            outcome.lane_fault(0).is_none(),
-            "the fast lane's workers release from idleness, not a fault"
-        );
-        outcome.into_result().expect("drive the range set");
-        assert_eq!(
-            sources.get(1).expect("two lanes").opened_ranges().len(),
-            1,
-            "the slow lane took one gap, so its finish waited on the gate"
-        );
-        assert_eq!(
-            released.load(Ordering::Acquire),
-            3,
-            "each worker of the fast lane released once"
-        );
-        assert!(
-            third_after_gate.load(Ordering::Acquire),
-            "the lane keeps one idle worker while the slow lane holds its gap"
-        );
-    }
-
-    /// A lane that faults retires, and the other lanes fill what it left: the
-    /// drive succeeds, and the fault is reported on the faulted lane only.
-    #[tokio::test]
-    async fn a_faulted_lane_retires_and_the_others_fill_its_gaps() {
-        let total = 64 * GROUP;
-        let ranges = scattered(total);
-        let specs = [
-            LaneSpec {
-                width: 1,
-                grow: None,
-                release: None,
-                takes_first: true,
-                tweak: |s| s.with_fault_after(512, || anyhow::anyhow!("stream reset")),
-            },
-            LaneSpec::healthy(2),
-        ];
-        let (outcome, sources, store, plaintext) = lanes_drive(total, &ranges, &specs).await;
-        let fault = outcome.lane_fault(0).expect("lane 0 faulted");
-        assert_eq!(format!("{fault}"), "stream reset");
-        assert!(outcome.lane_fault(1).is_none());
-        outcome
-            .into_result()
-            .expect("the healthy lane finishes the set");
-
-        assert_eq!(
-            sources[0].opened_ranges(),
-            vec![ranges[0]],
-            "the faulted lane takes no gap after its first"
-        );
-        assert_ranges_present(&store, &plaintext, &ranges).await;
-    }
-
-    /// A terminal fault stops every lane from taking a new gap, and the drive
-    /// returns it.
-    #[tokio::test]
-    async fn a_terminal_fault_stops_every_lane() {
-        let total = 64 * GROUP;
-        let ranges = scattered(total);
-        let specs = [
-            LaneSpec {
-                width: 1,
-                grow: None,
-                release: None,
-                takes_first: true,
-                tweak: |s| {
-                    s.with_fault_after(512, || {
-                        anyhow::Error::new(crate::BlobTooLarge {
-                            received: 2,
-                            ceiling: 1,
-                        })
-                    })
-                    .slow_to_start(std::time::Duration::from_millis(50))
-                },
-            },
-            LaneSpec {
-                width: 1,
-                grow: None,
-                release: None,
-                takes_first: false,
-                tweak: |s| s.slow_finish(std::time::Duration::from_millis(200)),
-            },
-        ];
-        let (outcome, sources, _store, _) = lanes_drive(total, &ranges, &specs).await;
-        let err = outcome
-            .into_result()
-            .expect_err("the terminal fault ends the drive");
-        assert!(
-            err.downcast_ref::<crate::BlobTooLarge>().is_some(),
-            "{err:#}"
-        );
-        assert_eq!(
-            sources[1].opened_ranges().len(),
-            1,
-            "the other lane starts no gap after the terminal fault"
-        );
-    }
-
-    /// When every lane retires, the gaps they left stay missing and the drive
-    /// returns the decisive fault.
-    #[tokio::test]
-    async fn a_set_every_lane_fails_is_left_unfinished() {
-        let total = 64 * GROUP;
-        let ranges = scattered(total);
-        let reset: fn(ScriptedSource) -> ScriptedSource =
-            |s| s.with_fault_after(512, || anyhow::anyhow!("stream reset"));
-        let specs = [
-            LaneSpec {
-                width: 1,
-                grow: None,
-                release: None,
-                takes_first: true,
-                tweak: reset,
-            },
-            LaneSpec {
-                width: 1,
-                grow: None,
-                release: None,
-                takes_first: false,
-                tweak: reset,
-            },
-        ];
-        let (outcome, sources, store, _) = lanes_drive(total, &ranges, &specs).await;
-        assert!(outcome.lane_fault(0).is_some() && outcome.lane_fault(1).is_some());
-        let err = outcome
-            .into_result()
-            .expect_err("nothing can finish the set");
-        assert_eq!(format!("{err}"), "stream reset");
-        let opens: usize = sources.iter().map(|s| s.opened_ranges().len()).sum();
-        assert_eq!(opens, 2, "each lane retires on its first fault");
-        assert!(!store.is_complete().await.expect("is_complete"));
-    }
-
-    /// The first gap goes to the lane that takes it, so a pull primed on that
-    /// lane is the leg that fills it and no other lane opens it.
-    #[tokio::test]
-    async fn only_the_lane_that_takes_the_first_gap_opens_it() {
-        let total = 64 * GROUP;
-        let ranges = scattered(total);
-        let specs = [
-            LaneSpec::healthy(2),
-            LaneSpec {
-                width: 1,
-                grow: None,
-                release: None,
-                takes_first: true,
-                tweak: |s| s.slow_to_start(std::time::Duration::from_millis(20)),
-            },
-        ];
-        let (outcome, sources, _store, _) = lanes_drive(total, &ranges, &specs).await;
-        outcome.into_result().expect("drive the range set");
-        assert!(sources[1].opened_ranges().contains(&ranges[0]));
-        assert!(!sources[0].opened_ranges().contains(&ranges[0]));
-    }
-
-    /// A source that serves `inner`'s blob but signs `signed` as its size.
-    struct ResignedSize {
-        inner: ScriptedSource,
-        signed: u64,
-    }
-
-    impl BlobSource for ResignedSize {
-        type Reader = <ScriptedSource as BlobSource>::Reader;
-
-        fn open(
-            &self,
-            hash: [u8; 32],
-            range: AlignedRange,
-        ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
-            Box::pin(async move {
-                let (mut header, reader) = self.inner.open(hash, range).await?;
-                header.total_bytes = self.signed;
-                Ok((header, reader))
-            })
-        }
-
-        fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
-            self.inner.finish(reader)
-        }
-    }
-
-    /// A source that serves `inner`'s blob but faults in the closing exchange
-    /// of every leg, after every byte of it landed.
-    struct FaultOnFinish {
-        inner: ScriptedSource,
-    }
-
-    impl BlobSource for FaultOnFinish {
-        type Reader = <ScriptedSource as BlobSource>::Reader;
-
-        fn open(
-            &self,
-            hash: [u8; 32],
-            range: AlignedRange,
-        ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
-            self.inner.open(hash, range)
-        }
-
-        fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
-            Box::pin(async move {
-                self.inner.finish(reader).await?;
-                anyhow::bail!("reset in the closing voucher exchange")
-            })
-        }
-    }
-
-    /// A one-lane drive on a shared pool whose leg faults after its last byte
-    /// fails: the bytes landed, but the closing exchange can leave a voucher
-    /// armed, so the caller must settle the drive as a failure. The blob is
-    /// not finalized.
-    #[tokio::test]
-    async fn a_fault_after_the_last_byte_fails_a_pooled_one_lane_drive() {
-        let total = 8 * GROUP;
-        let (root, plaintext, _) = synth_blob(total as usize);
-        let dir = tmp_dir();
-        let store = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
+    async fn a_leg_whose_claim_differs_from_the_bound_is_ingested_under_its_claim() {
+        let truth = 8 * GROUP;
+        let bound = 6 * GROUP;
+        let (root, plaintext, _) = synth_blob(truth as usize);
+        let store = fresh_store(root, bound);
         let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-        let source = FaultOnFinish {
-            inner: ScriptedSource::new(plaintext)
-                .expect("source")
-                .paying(Arc::clone(&ledger)),
-        };
-        let ctx = Arc::new(Mutex::new(healthy_ctx()));
-        let spent_ledger = Arc::clone(&ledger);
-        let spent = move || spent_ledger.committed().amount;
-        let credit = |_: U256| Ok(());
-        let topups = std::sync::atomic::AtomicU32::new(0);
-        let topup_lock = tokio::sync::Mutex::new(());
-        let pool = SharedPool {
-            spent: &spent,
-            topups_used: &topups,
-            credit: &credit,
-            topup_lock: &topup_lock,
-        };
-        let err = drive_range_set(
-            &store,
-            &source,
-            &BudgetPacer::new(),
-            &healthy_funder(),
-            &ctx,
-            &ledger,
-            root,
-            &[(0, 0)],
-            NonZeroUsize::MIN,
-            &config(),
-            None,
-            Some(&pool),
-            std::future::pending(),
-        )
-        .await
-        .expect_err("the lane faulted");
-        assert!(
-            format!("{err:#}").contains("closing voucher exchange"),
-            "{err:#}"
-        );
-        assert!(
-            !dir.path().join("blob").exists(),
-            "a failed drive does not finalize the blob"
-        );
-    }
-
-    /// A healthy lane that has run out of gaps waits while another lane's gap
-    /// is in flight, and wakes to fill what that lane's fault puts back.
-    #[tokio::test]
-    async fn a_parked_lane_wakes_to_fill_a_faulted_lanes_gap() {
-        let total = 64 * GROUP;
-        let ranges = scattered(total);
-        let specs = [
-            LaneSpec {
-                width: 1,
-                grow: None,
-                release: None,
-                takes_first: true,
-                tweak: |s| {
-                    s.slow_to_start(std::time::Duration::from_millis(300))
-                        .with_fault_after(512, || anyhow::anyhow!("stream reset"))
-                },
-            },
-            LaneSpec::healthy(1),
-        ];
-        let (outcome, sources, store, plaintext) = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            lanes_drive(total, &ranges, &specs),
-        )
-        .await
-        .expect("the parked lane wakes; the drive does not hang");
-        assert!(outcome.lane_fault(0).is_some());
-        outcome
-            .into_result()
-            .expect("the healthy lane fills the rest");
-        assert!(
-            sources[1].opened_ranges().contains(&ranges[0]),
-            "the healthy lane took the faulted lane's first gap after it parked"
-        );
-        assert_ranges_present(&store, &plaintext, &ranges).await;
-    }
-
-    /// A leg whose signed size disagrees with the store's is refused before a
-    /// byte is read: the store would verify it against the wrong tree.
-    #[tokio::test]
-    async fn a_leg_whose_signed_size_disagrees_with_the_store_is_refused() {
-        let total = 8 * GROUP;
-        let (root, plaintext, _) = synth_blob(total as usize);
-        let store = fresh_store(root, total);
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-        let source = ResignedSize {
-            inner: ScriptedSource::new(plaintext)
-                .expect("source")
-                .paying(Arc::clone(&ledger)),
-            signed: total + GROUP,
-        };
-        let ctx = Arc::new(Mutex::new(healthy_ctx()));
-        let err = drive_range_set(
-            &store,
-            &source,
-            &BudgetPacer::new(),
-            &healthy_funder(),
-            &ctx,
-            &ledger,
-            root,
-            &[(0, GROUP)],
-            NonZeroUsize::MIN,
-            &config(),
-            None,
-            None,
-            std::future::pending(),
-        )
-        .await
-        .expect_err("refused");
-        let mismatch = err
-            .downcast_ref::<crate::SignedSizeMismatch>()
-            .unwrap_or_else(|| panic!("typed size mismatch, got {err:#}"));
-        assert_eq!((mismatch.signed, mismatch.expected), (total + GROUP, total));
-        assert_eq!(source.inner.delivered_bytes(), 0, "no byte was read");
-        assert_eq!(
-            ledger.committed(),
-            Cumulative::default(),
-            "nothing was paid"
-        );
-    }
-
-    /// Several lanes need a shared pool: without one there is no pool-wide
-    /// spend or top-up budget to share.
-    #[tokio::test]
-    async fn several_lanes_without_a_shared_pool_is_an_error() {
-        let total = 4 * GROUP;
-        let (root, plaintext, _) = synth_blob(total as usize);
-        let store = fresh_store(root, total);
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-        let source = ScriptedSource::new(plaintext)
+        let source = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .paying(Arc::clone(&ledger));
         let ctx = Arc::new(Mutex::new(healthy_ctx()));
-        let lane = || RangeLane {
-            source: &source,
-            ctx: &ctx,
-            ledger: &ledger,
-            width: NonZeroUsize::MIN,
-            takes_first: false,
-            grow: None,
-            release: None,
-        };
-        let err = drive_range_lanes(
+        drive(
             &store,
-            &[lane(), lane()],
+            &source,
             &BudgetPacer::new(),
             &healthy_funder(),
+            &ctx,
+            &ledger,
             root,
-            &[(0, 0)],
+            4 * GROUP,
+            2 * GROUP,
             &config(),
             None,
             None,
-            std::future::pending(),
+            None,
+            None,
         )
         .await
-        .into_result()
-        .expect_err("refused");
-        assert!(format!("{err}").contains("shared pool"), "{err}");
-        assert!(source.opened_ranges().is_empty());
-    }
+        .expect("the leg verifies under its own claim");
 
-    /// `range_set_reach` counts what is present plus what the ranges still
-    /// miss, never a byte the ranges leave to another writer (#2189).
-    #[tokio::test]
-    async fn range_set_reach_counts_present_plus_the_ranges_gaps() {
-        let total = 4 * GROUP;
-        let (root, plaintext, outboard) = synth_blob(total as usize);
-
-        let fresh = fresh_store(root, total);
-        let reach =
-            |store, ranges| async move { range_set_reach(store, ranges).await.expect("reach") };
-        assert_eq!(reach(&fresh, &[(0, 0)]).await, total);
-        assert_eq!(reach(&fresh, &[(GROUP, GROUP)]).await, GROUP);
+        let leg = align_range(4 * GROUP, 2 * GROUP, truth).expect("align");
         assert_eq!(
-            reach(&fresh, &[(0, GROUP), (0, 2 * GROUP)]).await,
-            2 * GROUP
+            &store.present_ranges().await.expect("present"),
+            leg.chunk_ranges()
         );
-
-        let resumed = fresh_store(root, total);
-        preadmit(
-            &resumed,
-            &plaintext,
-            &outboard,
-            &align_range(0, GROUP, total).expect("align"),
-        )
-        .await;
-        assert_eq!(reach(&resumed, &[(2 * GROUP, GROUP)]).await, 2 * GROUP);
-        assert_eq!(reach(&resumed, &[(0, 2 * GROUP)]).await, 2 * GROUP);
-        assert_eq!(reach(&resumed, &[(0, 0)]).await, total);
-
-        // A partial last group counts at its real length, in both the gaps and
-        // the present content, never padded to a whole group.
-        let ragged = 4 * GROUP + 37;
-        let (root, plaintext, outboard) = synth_blob(ragged as usize);
-        let fresh = fresh_store(root, ragged);
-        assert_eq!(reach(&fresh, &[(0, 0)]).await, ragged);
-        assert_eq!(reach(&fresh, &[(4 * GROUP, 37)]).await, 37);
-
-        let resumed = fresh_store(root, ragged);
-        preadmit(
-            &resumed,
-            &plaintext,
-            &outboard,
-            &align_range(0, GROUP, ragged).expect("align"),
-        )
-        .await;
-        assert_eq!(reach(&resumed, &[(4 * GROUP, 37)]).await, GROUP + 37);
-
-        let tail_held = fresh_store(root, ragged);
-        preadmit(
-            &tail_held,
-            &plaintext,
-            &outboard,
-            &align_range(4 * GROUP, 37, ragged).expect("align"),
-        )
-        .await;
-        assert_eq!(reach(&tail_held, &[(0, GROUP)]).await, GROUP + 37);
-        assert_eq!(reach(&tail_held, &[(0, 0)]).await, ragged);
+        assert_eq!(
+            store
+                .read(4 * GROUP, 2 * GROUP)
+                .await
+                .expect("read")
+                .as_ref(),
+            &plaintext[(4 * GROUP) as usize..(6 * GROUP) as usize]
+        );
+        assert_eq!(store.proven(), None, "a non-final leg proves no size");
+        assert_eq!(store.bound(), bound);
     }
 
     /// `first_leg` is exactly the range the drive opens first, both on a fresh
@@ -5557,11 +3532,15 @@ mod tests {
             range: &'a AlignedRange,
             reader: R,
             on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+            claimed_total: u64,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
         where
             R: crate::source::BaoRangeReader + 'a,
         {
-            Box::pin(self.inner.ingest_stream(range, reader, on_progress))
+            Box::pin(
+                self.inner
+                    .ingest_stream(range, reader, on_progress, claimed_total),
+            )
         }
 
         fn flush_present_record(&self) -> crate::source::SourceFuture<'_, ()> {
@@ -5577,7 +3556,7 @@ mod tests {
     }
 
     /// The interval flush persists resume progress MID-fetch, not only at
-    /// completion (spec §5.5): `drive_with_interval_flush` is raced against a
+    /// completion: `drive_with_interval_flush` is raced against a
     /// work future that stays pending for several short intervals, and the
     /// store's `flush_present_record` must fire ONCE PER ELAPSED INTERVAL before
     /// the work resolves — so a crash between the last flush and completion loses
@@ -5602,7 +3581,7 @@ mod tests {
         let inner = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
         // Durably checkpoint a real, verified 4 MiB prefix into the store — the
         // resume progress the interval flush must persist — without yet writing
-        // the `.ranges` record (checkpoint never does, spec §5.5).
+        // the `.ranges` record (checkpoint never does).
         let prefix = align_range(0, 4 * 1024 * 1024, total).expect("align prefix");
         preadmit(&inner, &plaintext, &outboard, &prefix).await;
 
@@ -5639,7 +3618,7 @@ mod tests {
         // The interval flush is a REAL persist: reopening the store from disk
         // recovers exactly the checkpointed 4 MiB prefix — a crash right here
         // would resume from it, not refetch from zero.
-        let reopened = ClientRangedStore::open(dir.path(), "blob", root, total).expect("reopen");
+        let reopened = ClientRangedStore::open(dir.path(), "blob", root).expect("reopen");
         let present = reopened.present_ranges().await.expect("present");
         assert_eq!(
             present,
@@ -5834,11 +3813,15 @@ mod tests {
             range: &'a AlignedRange,
             reader: R,
             on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+            claimed_total: u64,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
         where
             R: crate::source::BaoRangeReader + 'a,
         {
-            Box::pin(self.sink.ingest_stream(range, reader, on_progress))
+            Box::pin(
+                self.sink
+                    .ingest_stream(range, reader, on_progress, claimed_total),
+            )
         }
 
         fn flush_present_record(&self) -> crate::source::SourceFuture<'_, ()> {
@@ -5960,8 +3943,8 @@ mod tests {
             "one open, no repeat"
         );
         assert_eq!(
-            crate::retry_disposition(&err),
-            crate::RetryDisposition::RetryElsewhere,
+            crate::classify(&err),
+            crate::Fault::Source,
             "another source may still fill the gap"
         );
     }

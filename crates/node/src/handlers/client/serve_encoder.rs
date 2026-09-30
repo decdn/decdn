@@ -615,7 +615,7 @@ mod tests {
     use decdn_cache::{CacheEngine, FillClaim, FillError, FillSession, Hash, NodeRangedStore};
     use iroh_io::AsyncStreamReader;
 
-    use super::CoherentFrameProducer;
+    use super::{CoherentFrameProducer, encoded_ranges, serve_end};
 
     /// One chunk group — the alignment granularity the registry and encoder snap to.
     const G: u64 = decdn_cache::CHUNK_GROUP_BYTES;
@@ -697,6 +697,47 @@ mod tests {
             .await
             .map_err(|(_reader, e)| e)
             .expect("admit range");
+    }
+
+    /// `serve_end` + `encoded_ranges` (the encoder's own two-step resolution: clamp
+    /// the end, then align) must agree with `align_range_clamped` (the single-call
+    /// primitive the node's bounds gate and the client both use) over the same
+    /// edges `decdn_bao_range`'s own `align_range_clamped` table covers: a 1-byte
+    /// blob, an end exactly at the size, a start/end that both sit mid-group, an
+    /// end past the blob, and an offset paired with `u64::MAX`. If the two ever
+    /// disagreed, the encoder would serve a different span than the one the node
+    /// billed and the client priced.
+    #[test]
+    fn encoded_ranges_agrees_with_align_range_clamped_over_the_edges() {
+        const G: u64 = decdn_cache::CHUNK_GROUP_BYTES;
+        let group_total = 5 * G + 123;
+        let cases: &[(u64, u64, u64)] = &[
+            // A 1-byte blob, whole request.
+            (0, 0, 1),
+            // A 1-byte blob, an overflowing end clamps to the 1 byte.
+            (0, u64::MAX, 1),
+            // An end landing exactly at the size (in bounds, no clamp needed).
+            (0, group_total, group_total),
+            // A start and end that both sit mid-group, fully in bounds.
+            (G / 2, G, group_total),
+            // An end past the blob clamps to it.
+            (0, group_total + G, group_total),
+            // An offset paired with the widest possible overflowing end.
+            (1, u64::MAX, group_total),
+        ];
+        for &(offset, len, total) in cases {
+            let end = serve_end(offset, len, total);
+            let via_encoder = encoded_ranges(offset, end, total)
+                .unwrap_or_else(|e| panic!("encoded_ranges({offset}, {end}, {total}): {e}"));
+            let via_clamped = decdn_bao_range::align_range_clamped(offset, len, total)
+                .unwrap_or_else(|e| panic!("align_range_clamped({offset}, {len}, {total}): {e}"));
+            assert_eq!(
+                via_encoder,
+                *via_clamped.chunk_ranges(),
+                "offset={offset} len={len} total={total}: encoded_ranges disagrees with \
+                 align_range_clamped"
+            );
+        }
     }
 
     /// Drain a producer's frames to one byte vector.

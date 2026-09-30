@@ -6826,8 +6826,10 @@ async fn leaf_ranged_paid_pull(
     anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
     let total = resp.body.total_bytes;
     // The paid/closing boundary is the bao-encoded WIRE size of the aligned
-    // superset (ADR 038), not the requested content length.
-    let aligned = decdn_cache::range_pull::align_range(byte_offset, byte_len, total)
+    // superset (ADR 038), not the requested content length. `align_range_clamped`,
+    // because `byte_len` may run past `total`: the server serves and bills that
+    // clamped to the blob's end rather than refusing it.
+    let aligned = decdn_cache::range_pull::align_range_clamped(byte_offset, byte_len, total)
         .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
     let expected_wire = decdn_cache::range_pull::bao_encoded_size(total, aligned.chunk_ranges());
     let interval_bytes = CHUNK_BYTES;
@@ -6897,7 +6899,9 @@ async fn leaf_ranged_paid_pull(
     let want = if byte_len == 0 {
         plaintext.len().saturating_sub(lead)
     } else {
-        usize::try_from(byte_len).map_err(|e| anyhow::anyhow!("len: {e}"))?
+        // An end past `total` clamps to the blob's end, same as the server.
+        let end = byte_offset.saturating_add(byte_len).min(total);
+        usize::try_from(end.saturating_sub(byte_offset)).map_err(|e| anyhow::anyhow!("len: {e}"))?
     };
     let end = lead.saturating_add(want);
     plaintext
@@ -6994,15 +6998,47 @@ async fn leaf_paced_pull(
         hash,
         rate,
         mode,
+        0,
     )
     .await
 }
 
-/// [`leaf_paced_pull`] with an explicit [`LeafMode`]. In
-/// [`LeafMode::StopPayingAfter`] the leaf keeps reading after its last voucher
-/// until `hold` elapses, then closes and reports the WIRE bytes it received. A
-/// stream error or read failure during the hold is an error, and a `StreamEnd`
-/// completes the pull.
+/// [`leaf_paced_pull`], but the request's `byte_len` is `byte_len` instead of
+/// the whole-blob `0`: for a test that must ask for a specific (possibly
+/// end-past-the-blob) span rather than the whole thing. `byte_offset` stays 0.
+#[allow(clippy::too_many_arguments)]
+async fn leaf_paced_pull_ranged(
+    leaf_ep: &iroh::Endpoint,
+    target: EndpointAddr,
+    leaf_node_id: B256,
+    leaf_eth: &Arc<PrivateKeySigner>,
+    provider: Address,
+    pool_id: B256,
+    hash: Hash,
+    rate: u64,
+    byte_len: u64,
+) -> Result<LeafOutcome> {
+    leaf_paced_pull_mode(
+        leaf_ep,
+        target,
+        leaf_node_id,
+        leaf_eth,
+        provider,
+        pool_id,
+        hash,
+        rate,
+        LeafMode::PayAll,
+        byte_len,
+    )
+    .await
+}
+
+/// [`leaf_paced_pull`] with an explicit [`LeafMode`] and request `byte_len`
+/// (`0` = whole blob, the shape every caller but [`leaf_paced_pull_ranged`]
+/// uses). In [`LeafMode::StopPayingAfter`] the leaf keeps reading after its
+/// last voucher until `hold` elapses, then closes and reports the WIRE bytes it
+/// received. A stream error or read failure during the hold is an error, and a
+/// `StreamEnd` completes the pull.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn leaf_paced_pull_mode(
     leaf_ep: &iroh::Endpoint,
@@ -7014,6 +7050,7 @@ async fn leaf_paced_pull_mode(
     hash: Hash,
     rate: u64,
     mode: LeafMode,
+    byte_len: u64,
 ) -> Result<LeafOutcome> {
     use alloy::signers::SignerSync;
 
@@ -7040,7 +7077,7 @@ async fn leaf_paced_pull_mode(
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
         pool_id: pool_id.into(),
         byte_offset: 0,
-        byte_len: 0,
+        byte_len,
         timestamp_us: 0x9001,
     };
     let payload =
@@ -8851,6 +8888,92 @@ async fn window_pull_through_resumed_offset_is_served_by_the_fused_path() -> Res
     Ok(())
 }
 
+/// The peer-relay twin of `end_past_the_blob_own_origin_cold_miss_serves_clamped_tail`
+/// (`origin_range_pull.rs`): a cold cache-miss request through the fused window
+/// path whose end runs past the blob (an explicit `byte_len` far larger than the
+/// blob, not the `byte_len == 0` "to end" convention) is served clamped to the
+/// blob's end rather than refused. B relays leaf → A with no cached bytes of its
+/// own, so this exercises `NodeRangedStore::missing_ranges`'s clamp on the actual
+/// pull-leg gap computation, not just the pre-flight bounds gate.
+///
+/// The drained, byte-exact delivery alone does not pin the clamp: `assemble`'s
+/// `plan_over` step independently clips demand against `total_bytes`, so a
+/// `missing_ranges` that never shrinks toward empty (an unclamped one) can let
+/// ONE run complete before the no-progress guard on round two ends the
+/// assembly `Unavailable(NoProgress)`, which the leaf sees as a mid-stream
+/// fault, not necessarily as a wrong answer the byte comparison
+/// above would catch on its own. The relay's own outbound metrics are the load-
+/// bearing assertion: with the clamp, B's upstream pull leg ends Complete and B
+/// counts one completed (not failed) outbound stream; without it, round two
+/// fails no-progress and `streams_failed_total{direction="outbound"}` is 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_end_past_the_blob_is_served_by_the_fused_path_clamped() -> Result<()> {
+    let payload = vec![0x7Eu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total = u64::try_from(PAYLOAD_LEN)?;
+
+    let ab_channel_id = B256::repeat_byte(0xA6);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x76);
+    let (handler_b, b_target, ep_b, _recorded, _cache_b, b_metrics, _local_rep, b_operator) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+
+    // Resume from one interval in, with an explicit `byte_len` (the whole blob's
+    // size) that runs the requested end well past the true blob end. Drained
+    // delivery is the proof of correctness; `assert_relay_counted` below is the
+    // proof the pull leg actually ended Complete rather than Unavailable.
+    let req_off = MB_BYTES;
+    let got = leaf_ranged_paid_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        b_operator,
+        leaf_channel_id,
+        hash,
+        req_off,
+        total,
+        RATE,
+    )
+    .await?;
+    let want = payload
+        .get(usize::try_from(req_off)?..)
+        .ok_or_else(|| anyhow::anyhow!("tail out of bounds"))?;
+    anyhow::ensure!(
+        got.as_slice() == want,
+        "an end past the blob must serve clamped to the blob's end through the \
+         fused window path, byte-exact"
+    );
+    // The load-bearing assertion (see the doc comment above): B's upstream pull
+    // leg for the clamped tail ended Complete, not Unavailable. One completed
+    // (not failed) outbound stream, over one upstream leg.
+    assert_relay_counted(&b_metrics, total - req_off, 1).await?;
+
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<()> {
     // The #856 attack: a leaf that owns a channel requests a large blob, takes
@@ -9005,6 +9128,7 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
                 acks: 3,
                 hold: Duration::from_secs(2),
             },
+            0,
         ),
     )
     .await
@@ -15275,8 +15399,15 @@ impl DiscoveryCase {
 /// S either assembles the blob with O's help or refuses before `ok: true`, never
 /// a truncated stream. The probe-round count pins whether the origin supplement
 /// ran, independent of how the live probe RTT ranks P and O.
+///
+/// `byte_len` is the leaf's requested `byte_len` (`0` = whole blob, the shape
+/// every case but the end-past-the-blob one below uses). A `byte_len` that
+/// runs the requested end past the blob exercises the SAME coverage gate
+/// (`pull_range_uncovered`) with a range that aligns only by clamping; an
+/// unclamped alignment errors there, and a gate that failed open on the error
+/// would report the (genuinely uncovered) range as covered.
 #[allow(clippy::too_many_lines)]
-async fn serve_miss_discovery_case(case: DiscoveryCase) -> Result<()> {
+async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result<()> {
     let (_block_guard, payload, hash) = two_block_blob()?;
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let partial = Coverage::from_block_indices(2, [0].into_iter());
@@ -15377,18 +15508,33 @@ async fn serve_miss_discovery_case(case: DiscoveryCase) -> Result<()> {
     let leaf_sk = fresh_key();
     let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
     let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
-    let pulled = leaf_paced_pull(
-        &leaf_ep,
-        s_target,
-        leaf_node_id,
-        &leaf_eth,
-        s_operator,
-        leaf_channel_id,
-        hash,
-        RATE,
-        None,
-    )
-    .await;
+    let pulled = if byte_len == 0 {
+        leaf_paced_pull(
+            &leaf_ep,
+            s_target,
+            leaf_node_id,
+            &leaf_eth,
+            s_operator,
+            leaf_channel_id,
+            hash,
+            RATE,
+            None,
+        )
+        .await
+    } else {
+        leaf_paced_pull_ranged(
+            &leaf_ep,
+            s_target,
+            leaf_node_id,
+            &leaf_eth,
+            s_operator,
+            leaf_channel_id,
+            hash,
+            RATE,
+            byte_len,
+        )
+        .await
+    };
 
     if case == DiscoveryCase::NoCoveringCandidate {
         // No candidate covers block 1, so S refuses with a signed miss before
@@ -15468,32 +15614,50 @@ async fn serve_miss_discovery_case(case: DiscoveryCase) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dht_answer_of_partial_holders_only_pulls_in_the_directory_origin() -> Result<()> {
-    serve_miss_discovery_case(DiscoveryCase::DhtPartial).await
+    serve_miss_discovery_case(DiscoveryCase::DhtPartial, 0).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_partial_only_probe_cache_hit_falls_through_to_the_directory_origin() -> Result<()> {
-    serve_miss_discovery_case(DiscoveryCase::CachedPartial).await
+    serve_miss_discovery_case(DiscoveryCase::CachedPartial, 0).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_spanning_probe_cache_hit_serves_without_probing() -> Result<()> {
-    serve_miss_discovery_case(DiscoveryCase::CachedSpanning).await
+    serve_miss_discovery_case(DiscoveryCase::CachedSpanning, 0).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn spanning_dht_holders_skip_the_origin_supplement() -> Result<()> {
-    serve_miss_discovery_case(DiscoveryCase::DhtSpanning).await
+    serve_miss_discovery_case(DiscoveryCase::DhtSpanning, 0).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_directory_origin_past_the_probe_fanout_is_probed() -> Result<()> {
-    serve_miss_discovery_case(DiscoveryCase::DirectoryPastFanout).await
+    serve_miss_discovery_case(DiscoveryCase::DirectoryPastFanout, 0).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn no_covering_candidate_refuses_before_commit() -> Result<()> {
-    serve_miss_discovery_case(DiscoveryCase::NoCoveringCandidate).await
+    serve_miss_discovery_case(DiscoveryCase::NoCoveringCandidate, 0).await
+}
+
+/// The end-past-the-blob twin of `no_covering_candidate_refuses_before_commit`:
+/// the identical no-covering-candidate discovery (P covers block 0 only, D is
+/// unreachable, no origin), but the leaf's requested end runs past the blob.
+/// `pull_range_uncovered`'s coverage gate refuses before `ok: true` here too.
+/// Its `missing_ranges` call clamps the end; an unclamped call errors on it,
+/// and a gate that read the error as "not uncovered" would let a genuinely
+/// uncovered range through into a signed `ok: true` that then truncates
+/// instead of a clean refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_covering_candidate_with_end_past_the_blob_refuses_before_commit() -> Result<()> {
+    // `two_block_blob`'s fixed 16 KiB discovery-block override always yields a
+    // 32 KiB blob; `serve_miss_discovery_case` builds its own copy (and its own
+    // guard) from the same override, so this only needs the byte count, not a
+    // second guard.
+    let total_bytes: u64 = 2 * 16 * 1024;
+    serve_miss_discovery_case(DiscoveryCase::NoCoveringCandidate, total_bytes + 4096).await
 }
 
 /// The holders a serve-miss discovers before it pulls, and what serving node S

@@ -43,15 +43,18 @@ and present only for a chunked file. When a key is present it holds this
 order — field declaration order is load-bearing, see
 [Determinism](#determinism).
 
-- `path` — relative POSIX path (`/` separator on every platform), UTF-8.
+- `path`: relative POSIX path (`/` separator on every platform), UTF-8.
   `..`, absolute paths, root prefixes, and non-UTF-8 components are
   rejected at create time.
-- `hash` — `b3:` followed by the 64-character lowercase hex of the
+- `hash`: `b3:` followed by the 64-character lowercase hex of the
   file's BLAKE3. See [Hash format](#hash-format).
-- `size` — file size in bytes, unsigned 64-bit integer. Optional and
-  informational on the read side: `bundle pull` uses it for the dry-run
-  plan and size hints, and fetches without it.
-- `chunks` — optional ordered list of range-dedup hints over the file's
+- `size`: file size in bytes, unsigned 64-bit integer. Optional and a
+  hint on the read side. `bundle pull` uses it for the dry-run plan and as
+  the first size claim of the entry, and fetches without it. The fetch
+  proves the true size ([ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)).
+  When the proven size differs from `size`, the entry succeeds and the
+  pull prints `<path>: manifest says X bytes, the blob is Y bytes`.
+- `chunks`: optional ordered list of range-dedup hints over the file's
   bytes. See [Chunked files](#chunked-files). When absent, the file is
   one blob addressed by `hash`.
 
@@ -261,50 +264,49 @@ as `decdn fetch`):
   ledger keeps voucher issuance monotonic across concurrent streams on a
   lane. The serving node credits each stream's delivered bytes from the
   lane's one cumulative watermark, so a fast stream does not starve a slow
-  co-stream. Distinct lanes proceed in parallel. A range-dedup entry pays for
-  its ranges through one session per provider. A session opens one
-  connection and reuses it for every range of the entry. The entry stripes
-  its ranges across its admitted full holders: one holder per operator, at
-  most `--max-sources`, with multi-source on. A partial holder and a
-  proxy-warming non-holder do not join the stripe. Each lane takes ranges
-  from one shared queue and fills up to `--max-lane-streams` of them at once,
-  within the lane permits that are free. A lane holds one permit for each
-  stream it runs, and gives the permit back when that stream stops. A lane
-  that has no range left keeps one permit for one idle stream slot until the
-  drive ends. An entry holds no permit while it waits on a sibling entry. A lane of a fan-out holds
-  one permit until the lane stops. A lane that faults leaves the stripe,
-  and the other lanes fill the ranges it left. A drive stall is a fault of
-  every lane, so all striped lanes leave the stripe. When no striped lane is
-  left, the entry fails over to its other candidates one at a time. All lanes
-  write into one ranged store. Concurrent ranges top up the one deposit one at
-  a time, from one top-up budget for the entry. A blob that clears
-  the multi-source gate fans out to its admitted holders per
-  [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1).
-- **Failover and retry.** Each entry tries its probed candidates in order. A
-  retryable failure moves to the next candidate. A terminal failure stops
-  the entry. A stall is a retryable failure. A stream stalls when it stays
-  below `--min-throughput-bps` for `--stall-timeout-ms`. A drive stalls when
-  its delivered bytes, counted across all of its legs and the waits between
-  them, stay below the same floor for `--stall-timeout-ms`. A multi-source
-  fetch counts its delivered bytes across all of its sources. The drive's clock
-  stops while the entry waits on its own top-up. The clock does not run
-  during the local check of a complete blob. When the last candidate fails,
-  the entry's error says that every candidate failed. After the first pass
-  over the bundle, `--entry-retries N` (default 2) gives each entry that
-  failed retryably up to N more rounds. Before each round the pull waits:
-  2 s, then double the last wait, to a maximum of 30 s. Each round probes the
-  holders again, so a provider that failed before is a candidate again. Each
-  round continues from the entry's `.partial`, so no byte is paid for twice.
-  A pool exhaustion moves to the next candidate in a pass, but it does not
-  start a new round: every provider refuses the same deposit. A size that
-  disagrees with the manifest and a local disk fault do not start a new
-  round either.
+  co-stream. Distinct lanes proceed in parallel. Every entry runs the
+  acquire loop of
+  [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)
+  over its probed holders. A whole-file entry fetches the whole blob. A
+  range-dedup entry fetches only the ranges that no donor supplies, through
+  the same loop. The entry probes its holders once and uses them for each
+  fetch of its ranges. A lane of a range-dedup entry can go to a
+  proxy-warming non-holder, as for a whole-file entry, and `--max-sources`
+  counts such a node as one of its sources. The loop admits one node per
+  operator. Each lane holds one permit of its provider while it
+  runs. A lane takes a permit only when a permit is free. When no permit is
+  free, the lane build backs off and tries again. An entry holds no lane
+  permit while it waits on a sibling entry. All lanes of an entry write into
+  one ranged store. The entry does not mark its donor ranges present in that
+  store, so the store promotes the blob only when the loop fetched every
+  byte. Concurrent lanes top up the one deposit one at a time.
+- **Failover and retry.** All entries of a pull share one holder health
+  table and one progress clock. The manifest fetch uses the same table and
+  the same clock. When a holder faults, the holder cools, and the loop gives
+  its ranges to the other holders. When the cooldown ends, the holder comes
+  back into the same loop. A holder that faults for one entry also cools for
+  every other entry. A failed entry does not retry in rounds. The size in
+  the manifest is the first size claim of the entry. It is a hint. A holder
+  that signs a different size stays a holder of the entry. An entry
+  whose proven size differs from its manifest size succeeds with a warning
+  line. A blob over the client's size cap fails only its entry.
+  A fault that only the user can fix stops all entries: a voucher rejection,
+  an origin blacklist, no affordable holder, or a local disk fault. The pull
+  then starts no new entry, stops the entries that run, and exits with
+  code 1. The clock measures the time since the last verified byte of any
+  entry, so a stuck entry waits while other entries make progress. A pull in
+  a terminal has no limit. A pull in a script stops after 10 minutes with no
+  verified byte. `--give-up-after-secs` overrides both limits. When the limit
+  expires, the pull stops all entries and exits with code 75. Each entry
+  keeps its `.partial`, so a rerun pays for no byte twice.
 - **Output** files are written under `-o <dir>` at each entry's relative
   path, resolved with the § Path-safety rules above (`..`, absolute, and
   escaping paths rejected). Writes are atomic (temp-then-rename after the
   BLAKE3 check the fetch path already performs), so a present file is
   verified-good: pull **skips existing files** by default (re-runs
-  resume), and `--overwrite` forces a re-fetch.
+  resume), and `--overwrite` forces a re-fetch. The skip check accepts a
+  file by its hash. A saved record whose size and mtime match is a fast
+  path. Without a match, the pull hashes the file against the manifest.
 - **`--dry-run`** reports the plan without any network/chain activity
   (entries are only enumerable for the `-i` form; `--hash` cannot list
   them without first fetching the manifest).

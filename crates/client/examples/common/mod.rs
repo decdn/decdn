@@ -244,6 +244,7 @@ impl Buyer {
                 // probe answer. `0` would set no ceiling at all.
                 effective_rate_ceiling(holder.rate_per_mb, 0),
                 deadlines,
+                None,
             );
             lanes.push(Lane {
                 key: lane,
@@ -255,7 +256,6 @@ impl Buyer {
                 ctx,
                 ledger,
                 coverage: Some(holder.coverage),
-                first_unit: None,
                 lease: decdn_client::LaneLease::default(),
                 widen: None,
             });

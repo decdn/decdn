@@ -55,7 +55,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError, Weak};
 
 use bao_tree::io::fsm::Outboard;
 use bao_tree::{BaoTree, BlockSize, ChunkRanges, TreeNode, blake3};
-use decdn_bao_range::align_range;
+use decdn_bao_range::align_range_clamped;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -1288,8 +1288,11 @@ impl FillRegistry {
     /// holds the lock across the whole decision, so exactly one of two racing
     /// identical claims registers an owner and the other attaches.
     ///
-    /// `R = align_range(offset, len, total)`. On an align error or empty `R`, the
-    /// caller takes the Owner path (its own fetch surfaces any out-of-bounds error).
+    /// `R = align_range_clamped(offset, len, total)`: an end past `total` clamps to
+    /// it, so a request whose claimed size grows still coalesces
+    /// with a live fill instead of always falling to Owner. On an align error (a
+    /// start at or past `total`) or empty `R`, the caller takes the Owner path (its
+    /// own fetch surfaces any out-of-bounds error).
     /// Otherwise, over LIVE sessions **whose paid frontier reaches `R`'s aligned
     /// fetch start** (a session behind that frontier is excluded — attaching to it
     /// would park this request on a pull that advances only as the OTHER client
@@ -1320,9 +1323,10 @@ impl FillRegistry {
     ) -> FillClaim {
         let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
 
-        // R = the chunk ranges the request spans. An align error (out-of-bounds) or
-        // an empty R has no coalescable range, so fall straight to the Owner path.
-        let (r, fetch_start) = match align_range(offset, len, total) {
+        // R = the chunk ranges the request spans. An align error (a start at or
+        // past the blob end) or an empty R has no coalescable range, so fall
+        // straight to the Owner path. An end past the blob clamps instead.
+        let (r, fetch_start) = match align_range_clamped(offset, len, total) {
             Ok(aligned) => (aligned.chunk_ranges().clone(), aligned.fetch_start()),
             Err(_) => (ChunkRanges::empty(), 0),
         };

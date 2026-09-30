@@ -12,7 +12,7 @@
 //! |---|---|
 //! | Save one blob, or a set of blobs, to files as fast as possible, and resume a partial download | [`Downloader`] |
 //! | Read one blob in order, and pay only for what your reader reaches | [`Streamer`] |
-//! | Drive the pull loop yourself (a node, or a custom scheduler) | [`driver::drive`], [`multi_source_fetch`], [`open_progressive_pull`] |
+//! | Drive the pull loop yourself (a node, or a custom scheduler) | [`driver::drive`], [`acquire`], [`first_open()`], [`open_progressive_pull`] |
 //!
 //! Most callers want one of the two faces. The [`Downloader`] stripes a blob
 //! across every holder at once, and writes each verified range at its offset in
@@ -40,15 +40,19 @@
 //!    ([`discovery::select_candidates`]), and probe each one
 //!    ([`probe::probe_once`]). Verify every answer
 //!    ([`probe::verify_probe_response`]) before it counts, and drop an answer
-//!    whose `has_blob` and coverage disagree. A verified answer also gives the
-//!    blob's size.
+//!    whose `has_blob` and coverage disagree. A probe answer's size
+//!    ([`discovery::Probed::total_bytes`]) is an unsigned hint: pass it as the
+//!    fetch's first size claim, which the fetch grows or shrinks as verified
+//!    bytes land. Without one, open one pull and read its header
+//!    ([`first_open()`] does this with recovery).
 //! 5. **Build one lane per holder.** Pin a [`PoolContext`] to the holder's
 //!    provider address with [`buyer_pool::self_owned_lane_ctx`], resuming at
 //!    what the lane has already paid. Create its ledger with
 //!    [`PoolContext::new_ledger`], and wrap both in a [`PeerSource`] inside a
 //!    [`StreamCandidate`]. Cap the lane's rate at the rate the node signed in
 //!    its probe answer ([`effective_rate_ceiling`]).
-//! 6. **Fetch** with [`Downloader::fetch_to_paths`] or [`Streamer::open`].
+//! 6. **Fetch** with [`Downloader::fetch_to_paths`] or [`Streamer::open`], over
+//!    a [`StaticSources`] of the lanes and its [`StaticSources::holders`].
 //! 7. **Record what each lane paid**, whatever the outcome: build a
 //!    [`VoucherProgress`] from the ledger's settlement, and apply the
 //!    [`buyer_pool::ProgressWrite`] it calls for to the buyer store.
@@ -66,9 +70,10 @@
 //! - **Quotes are checked against your ceiling.** A stream response whose
 //!   signed rate exceeds the `max_rate_per_mb` given to [`PeerSource::new`] is
 //!   refused before any payment ([`RateAboveCeiling`]).
-//! - **Failover is free.** Every lane draws on one shared pool, so a holder that
-//!   stalls or refuses is dropped and its range goes to another holder. No
-//!   delivered byte is fetched or paid for twice.
+//! - **Recovery is free.** Every lane draws on one shared pool. A source that
+//!   faults cools and returns, and its range goes to another holder meanwhile.
+//!   [`acquire`] ends on done, a fatal fault, or the stop policy
+//!   ([`StopPolicy`]). No delivered byte is fetched or paid for twice.
 //!
 //! # What stays yours
 //!
@@ -77,8 +82,9 @@
 //!   from a stale watermark next time, and its provider rejects the vouchers.
 //! - **Funding policy.** A [`source::Funder`] decides whether a fetch that runs
 //!   the pool low tops it up. One whose [`max_topups`](source::Funder::max_topups)
-//!   is `0` never does. The fetch then fails with a [`PoolExhausted`], and
-//!   [`shared_pool_disposition`] classifies that as terminal.
+//!   is `0` never does. A source whose next voucher the deposit cannot cover
+//!   then waits for the deposit to rise, and once every known source waits
+//!   the fetch fails with a [`NoAffordableSource`].
 //! - **Which holders to use.** Discovery gives candidates; ordering and
 //!   admission ([`discovery::admit_sources`]) are the caller's choice.
 //!
@@ -127,7 +133,9 @@ pub mod buyer_pool;
 pub mod config;
 /// A caller-owned QUIC connection kept warm across many hash fetches
 /// ([`connection::WarmConnection`]): one dial amortized over every hash, one
-/// bi-stream per hash (no wire change), closed once on the handle's own `Drop`.
+/// bi-stream per hash (no wire change), closed once on the handle's own `Drop`;
+/// and the command-wide map of one such connection per node
+/// ([`connection::Connections`]).
 pub mod connection;
 /// Range-keyed discovery coverage-map primitive plus the two
 /// objective-specific planners over it (#1506): [`coverage_plan::plan_covered_runs`]
@@ -150,6 +158,15 @@ pub mod driver;
 /// One-shot client `Endpoint` construction: relay + discovery resolution for
 /// the `cdn/client/v1` and `cdn/probe/v1` dial paths (#935/#936).
 pub mod endpoint;
+/// What a failed lane, lane build, or discovery means for the acquire loop
+/// (ADR 039 § Failure handling: reassign-only tail): a pure classifier over
+/// `anyhow::Error`.
+pub mod fault;
+mod first_open;
+/// Command-wide health of each provider (ADR 039 § Failure handling:
+/// reassign-only tail): cooling backoff on a delivery fault, parking on an
+/// unaffordable price.
+pub mod health;
 mod ledger;
 /// Run-scoped registry of live per-lane voucher ledgers:
 /// [`ledgers::LaneLedgers`] maps each `(pool_id, signer, provider)` lane to
@@ -175,14 +192,13 @@ pub mod ranged_store;
 /// The `APP_ERR_RATE_LIMITED` (`0x10`) transport shed, typed for the pull
 /// orchestrator (ADR 013 §Application Error Codes).
 pub(crate) mod rate_limited;
-/// Failover classification (#1174, ADR 037 § Fallback): decide whether a fetch
-/// failure is terminal or worth retrying against another provider/lane. Shared by
-/// the CLI single-source loop and the multi-source scheduler.
-pub mod retry;
 mod scheduler;
 /// Pure segmentation and tail-steal helpers for the multi-source scheduler
-/// (spec §5.3): no I/O, no async.
+/// (ADR 039 § Dynamic segmentation and tail-stealing): no I/O, no async.
 mod segment;
+/// When a command gives up (ADR 039 § Failure handling: reassign-only tail):
+/// the progress clock and the stop policy that watches it.
+pub mod stop;
 /// The `Streamer` consumption face (#1848): stream one blob's verified,
 /// contiguous front to a consumer as it arrives, paced by consumption and bounded
 /// to one read-ahead window ahead of the read cursor. A fetch-like single-blob
@@ -197,16 +213,23 @@ pub mod sink;
 /// (raw-bao byte source for a range) and [`source::Funder`] (injected top-up
 /// seam), plus scripted test doubles.
 pub mod source;
+/// The sources of one blob (ADR 039 § Source set and selection):
+/// [`source_set::SourceSet`] tracks
+/// each holder's health, lane, and retry timing behind the injected
+/// [`source_set::SourceProvider`] seam.
+pub mod source_set;
 
 pub use config::PullConfig;
-pub use connection::WarmConnection;
+pub use connection::{Connections, WarmConnection};
 pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
 pub use decdn_bao_range::RangedStore;
-pub use downloader::{DownloadTarget, Downloader, download_first_unit};
+pub use downloader::{DownloadTarget, Downloader};
 pub use driver::{
-    LaneGrowth, LaneRelease, LegNoProgress, PacingWait, PoolExhausted, RangeLane, RangeSetOutcome,
-    SharedPool, WaitReason, drive, drive_range_lanes, drive_range_set, first_leg, range_set_reach,
+    LegNoProgress, PacingWait, PoolExhausted, SharedPool, WaitReason, drive, first_leg,
 };
+pub use fault::{FatalScope, Fault, LaneBuildFault, classify};
+pub use first_open::first_open;
+pub use health::{Health, PeerHealth};
 pub use ledger::{ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released};
 pub use ledgers::{LaneHandle, LaneLedgers};
 pub use pacer::{
@@ -214,22 +237,22 @@ pub use pacer::{
     Pacer, RampPacer, WindowPacer,
 };
 pub use peer_store::{PeerRecord, PeerStore, StoreConfig};
-pub use progress::throughput_watchdog;
 pub use ranged_store::ClientRangedStore;
 pub use rate_limited::UpstreamRateLimited;
-pub use retry::{RetryDisposition, retry_disposition, shared_pool_disposition};
 pub use scheduler::{
-    ConsumptionPacing, LaneLease, LaneWiden, MultiSourceConfig, SourceLane, multi_source_fetch,
-    multi_source_fetch_until,
+    AcquireEnv, AcquireTarget, ConsumptionPacing, LANE_WATCHDOG, LaneLease, LaneWiden, acquire,
 };
 pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{
     BaoRangeReader, BlobSource, Funder, IngestStore, PRIMED_MAX_IDLE, PeerSource, PrimedSource,
     SourceFuture,
 };
-pub use streamer::{
-    LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader, stream_first_unit,
+pub use source_set::{
+    Holder, LaneRange, NoAffordableSource, NoSourceHasBlob, SourceProvider, SourceSet,
+    StaticSources,
 };
+pub use stop::{ClockHold, GaveUp, ProgressClock, SCRIPT_GIVE_UP, StopPolicy};
+pub use streamer::{LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader};
 
 pub(crate) use ledger::StreamProof;
 
@@ -250,7 +273,9 @@ use bao_tree::io::BaoContentItem;
 #[cfg(any(test, feature = "test-util"))]
 use bao_tree::io::fsm::{ResponseDecoder, ResponseDecoderNext};
 use bytes::Bytes;
+#[cfg(any(test, feature = "test-util"))]
 use decdn_bao_range::align_range;
+use decdn_bao_range::align_range_clamped;
 #[cfg(any(test, feature = "test-util"))]
 use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE};
 use decdn_incentive::{
@@ -650,8 +675,11 @@ pub(crate) fn reject_empty_claim_for_nonempty_root(
 /// wire size of a ceiling-sized blob. The gap-driven driver (`fill_gap`) meters
 /// CONTENT bytes (the store's delivered frontier) and the resume-offset guard in
 /// [`open_progressive_pull`] meters a CONTENT offset, both against the configured
-/// `max_blob_size_bytes` directly. Every one is a faithful "the byte position
-/// crossed the ceiling" report.
+/// `max_blob_size_bytes` directly. [`acquire`] meters CONTENT bytes against
+/// [`AcquireEnv::max_blob_bytes`]: it clamps a size claim to the cap and
+/// reports a blob whose bytes run past it once every byte below the cap is
+/// present and no leg proved a size within it. Every one is a faithful "the
+/// byte position crossed the ceiling" report.
 #[derive(Debug)]
 pub struct BlobTooLarge {
     /// The byte position that crossed `ceiling` — wire bytes taken off the stream
@@ -663,36 +691,9 @@ pub struct BlobTooLarge {
     pub ceiling: u64,
 }
 
-/// A pull's signed `total_bytes` disagrees with the size the caller's store is
-/// keyed by.
-///
-/// The size is fixed by the content under the hash, so every honest provider
-/// signs the same one. A leg that disagrees would verify against the wrong
-/// tree, so the driver refuses it before it reads a byte. When the caller took
-/// the size from an unsigned source (a bundle manifest), that source is the
-/// likelier fault, and the driver refuses every provider's leg the same way.
-#[derive(Debug)]
-pub struct SignedSizeMismatch {
-    /// The size the provider signed.
-    pub signed: u64,
-    /// The size the store is keyed by.
-    pub expected: u64,
-}
-
-impl std::fmt::Display for SignedSizeMismatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the provider signs a size of {} bytes, but the store is keyed by {}",
-            self.signed, self.expected
-        )
-    }
-}
-
-impl std::error::Error for SignedSizeMismatch {}
-
-/// The requested `byte_offset` is at or past the blob's end, so no resume can be
-/// served from it (#1120).
+/// The requested range starts at or past the end of the blob the node signed
+/// for, so no byte of it can be served (#1120). A node that signs a size of
+/// zero for a bounded open of `[0, len)` raises it too.
 ///
 /// Typed rather than a bare string because it is the ONE signal that proves a
 /// caller's partial download does not belong to this blob — a stale `.partial`
@@ -702,8 +703,11 @@ impl std::error::Error for SignedSizeMismatch {}
 /// ("any error that is not a voucher rejection") would sweep in ordinary stalls
 /// and resets and destroy a perfectly good prefix the user has already paid for.
 ///
-/// Note this is a statement about the *offset*, not about the peer: the node
-/// answered honestly. Callers must not score it against the provider.
+/// Note this is a statement about the *offset*, not about the peer: an honest
+/// node answers this way to a range cut from a wrong size. A node's reputation
+/// must not score it. The acquire loop classifies it as a
+/// [`Fault::Source`]: the source cools and its range
+/// moves to other sources.
 #[derive(Debug)]
 pub struct ResumeOffsetPastEnd {
     /// Whole-blob size the node signed for.
@@ -983,10 +987,12 @@ impl std::error::Error for UpstreamVoucherRejected {}
 /// keeps the only paths to a value the two constructors, so the "present response
 /// ⇒ open-stage, verified" invariant is a property of the type rather than a
 /// convention.
+#[derive(Clone)]
 pub struct UpstreamRefused {
     kind: Kind,
 }
 
+#[derive(Clone)]
 enum Kind {
     /// Open-stage refusal: the upstream signed a [`StreamResponse`] with
     /// `body.ok == false`, already verified against `expected_signer` by
@@ -1626,7 +1632,7 @@ pub async fn stream_fetch_tracked(
 /// bar. Both slots are **content** bytes: `received` is the content position the
 /// verifying decoder has reached and `expected` is the blob's content
 /// `total_bytes`, constant across the pull — so a bar keyed on the two fills to
-/// exactly 100%. `drive` / `multi_source_fetch` (the resumable [`crate::driver`]
+/// exactly 100%. `drive` / `acquire` (the resumable [`crate::driver`]
 /// path the CLI `fetch` and `bundle pull` use) additionally emit the
 /// already-present resume base (`base_present`) once before streaming begins; the
 /// `test-util` `stream_fetch_tracked_with_progress` wrapper reports the same
@@ -2148,7 +2154,8 @@ async fn fetch_in_memory_once_on(
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Bytes> {
     let (header, pull) = open_progressive_pull_on(
-        warm,
+        warm.connection(),
+        connection::ConnOwner::Borrowed,
         ctx,
         ledger,
         slash_domain,
@@ -2623,8 +2630,10 @@ pub fn is_insufficient_deposit(err: &anyhow::Error) -> bool {
         })
 }
 
-/// Whether a failed open of a bounded range could mean only that the range runs
-/// past the blob's end: the size it was cut from was wrong.
+/// Whether a failed open of a bounded range could mean only that the range's
+/// START is past the blob's end: the size it was cut from was wrong. An end
+/// past the blob clamps and serves rather than failing, so this fires only on
+/// a start with no bytes to serve.
 ///
 /// A holder refuses such a range before it signs (`RangeNotSatisfiable`, which
 /// reaches the wire as [`StreamError::NotFound`]). A relay signs its own size
@@ -2654,17 +2663,39 @@ pub fn is_range_past_end(err: &anyhow::Error) -> bool {
 /// (`byte_len == 0` meaning "to end") of a `total_bytes` blob: the bao-encoded
 /// size of the chunk-group-aligned range (content plus interleaved proof, ADR
 /// 038 §Payment metering), exactly the byte count the server emits. The server
-/// widens the request to enclosing 16 KiB groups; [`align_range`] /
+/// widens the request to enclosing 16 KiB groups and clamps an end past the
+/// blob to the blob's end (a claimed size is a hint); `total_bytes` here is the response
+/// header's signed size, so [`align_range_clamped`] /
 /// [`AlignedRange::wire_len`](decdn_bao_range::AlignedRange::wire_len)
-/// reproduce that, keeping encoder and receiver in lock-step. The one site every
-/// pull derives its wire bound (and its received-byte ceiling) through.
+/// reproduce the same clamp the server applied, keeping the two sides in
+/// lock-step. The one site every pull derives its wire bound (and its
+/// received-byte ceiling) through. A range with no byte below `total_bytes`
+/// faults with [`RangeVerifyError::RangeOutOfBounds`] (see
+/// [`is_range_past_end`]). Every input but the offset comes from the peer's
+/// signed size or the caller's own cap, so the fault is never marked
+/// [`LocalPullFault`].
+///
+/// [`RangeVerifyError::RangeOutOfBounds`]: decdn_bao_range::RangeVerifyError::RangeOutOfBounds
 fn aligned_wire_len(byte_offset: u64, byte_len: u64, total_bytes: u64) -> anyhow::Result<u64> {
-    let aligned = align_range(byte_offset, byte_len, total_bytes).map_err(|e| {
-        anyhow::Error::new(e)
-            .context("range alignment")
-            .context(LocalPullFault)
-    })?;
+    let aligned = align_range_clamped(byte_offset, byte_len, total_bytes)
+        .map_err(|e| anyhow::Error::new(e).context("range alignment"))?;
     Ok(aligned.wire_len())
+}
+
+/// The wire bound of an open of `[byte_offset, byte_offset + byte_len)`
+/// (`byte_len == 0` meaning "to end") against the size `total_bytes` the peer
+/// signed ([`aligned_wire_len`]). A range that asks for bytes and starts at or
+/// past that size is refused first, with [`ResumeOffsetPastEnd`]: an offset
+/// past a resumed blob's end, or a size of zero signed for a bounded open. The
+/// open of the empty blob, `(0, 0)` against a size of zero, passes.
+fn served_wire_len(byte_offset: u64, byte_len: u64, total_bytes: u64) -> anyhow::Result<u64> {
+    if total_bytes <= byte_offset && (byte_offset > 0 || byte_len > 0) {
+        return Err(anyhow::Error::new(ResumeOffsetPastEnd {
+            total_bytes,
+            byte_offset,
+        }));
+    }
+    aligned_wire_len(byte_offset, byte_len, total_bytes)
 }
 
 /// How often the throughput floor samples the byte counter: a fraction of the window, so a
@@ -2779,10 +2810,10 @@ pub struct UpstreamPullHeader {
 /// indifferent to size and link speed, and frame-size-independent.
 pub struct UpstreamPull {
     conn: iroh::endpoint::Connection,
-    /// Whether this pull OWNS its connection (a one-shot dial, closed on the
-    /// pull's terminal method) or merely BORROWS a [`WarmConnection`]'s (left open
-    /// for the next hash, closed once by the warm connection's own `Drop`).
-    owns_conn: bool,
+    /// What this pull owns of its connection: a one-shot dial it closes on its
+    /// terminal method, a caller-owned [`WarmConnection`] it borrows, or a
+    /// [`Connections`] map's connection it holds and unpins on a transport fault.
+    owner: connection::ConnOwner,
     send: SendStream,
     recv: RecvStream,
     ctx: PoolContext,
@@ -2923,7 +2954,7 @@ pub async fn open_progressive_pull(
             runtime: dial_runtime,
         },
         // One-shot dial: the pull owns this connection and closes it on teardown.
-        true,
+        connection::ConnOwner::Owned,
         ctx,
         ledger,
         slash_domain,
@@ -2940,12 +2971,15 @@ pub async fn open_progressive_pull(
     .await
 }
 
-/// Like [`open_progressive_pull`], but opens the pull on a caller-owned
-/// [`WarmConnection`] instead of dialling a fresh connection (#1848). The warm
-/// connection is reused across many hashes — one dial, a fresh bi-stream per hash
-/// (one stream = one hash, no wire change) — and stays open when this pull ends,
-/// so the pull borrows the connection and never closes it. The [`WarmConnection`]
-/// closes it once, on its own `Drop`.
+/// Like [`open_progressive_pull`], but opens the pull on the warm connection
+/// `conn` instead of dialling a fresh one (#1848). `owner` names where `conn`
+/// comes from: a caller-owned [`WarmConnection`] or a [`Connections`] map's
+/// connection. The warm connection is reused across
+/// many hashes (one dial, a fresh bi-stream per hash: one stream = one hash, no
+/// wire change) and stays open when this pull ends, so the pull never closes
+/// it. A map's connection is held by the pull while it runs, and a transport
+/// fault on the open or on a later read unpins it from the map
+/// ([`Connections::invalidate`]).
 ///
 /// Every other argument behaves exactly as on [`open_progressive_pull`]; see its
 /// docs. There is no `endpoint`/`target` pair — the warm connection already names
@@ -2958,7 +2992,7 @@ pub async fn open_progressive_pull(
         error = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
         otel.kind = "client",
-        peer = %warm.connection().remote_id(),
+        peer = %conn.remote_id(),
         hash = %decdn_protocol::ContentHash::from_bytes(hash),
         pool_id = %ctx.pool_id,
         byte_offset = byte_offset,
@@ -2966,7 +3000,8 @@ pub async fn open_progressive_pull(
     )
 )]
 pub(crate) async fn open_progressive_pull_on(
-    warm: &WarmConnection,
+    conn: &iroh::endpoint::Connection,
+    owner: connection::ConnOwner,
     ctx: &PoolContext,
     ledger: Arc<PoolLedger>,
     slash_domain: &Eip712Domain,
@@ -2980,10 +3015,10 @@ pub(crate) async fn open_progressive_pull_on(
     deadlines: PullDeadlines,
     byte_len: u64,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
-    open_progressive_pull_impl(
-        ConnSource::Reuse(warm.connection()),
-        // Borrowed warm connection: leave it open for the next hash.
-        false,
+    let opened = open_progressive_pull_impl(
+        ConnSource::Reuse(conn),
+        // A warm connection: leave it open for the next hash.
+        owner.clone(),
         ctx,
         ledger,
         slash_domain,
@@ -2997,18 +3032,22 @@ pub(crate) async fn open_progressive_pull_on(
         deadlines,
         byte_len,
     )
-    .await
+    .await;
+    if let Err(err) = &opened {
+        owner.unpin_on_fault(err).await;
+    }
+    opened
 }
 
 /// The shared body behind [`open_progressive_pull`] (dial) and
-/// [`open_progressive_pull_on`] (reuse). `owns_conn` records which one opened it,
-/// so the returned [`UpstreamPull`] knows whether its terminal method closes the
-/// connection (owned, one-shot) or leaves it open for the next hash (borrowed,
-/// warm).
+/// [`open_progressive_pull_on`] (reuse). `owner` records what the pull owns of
+/// its connection, so the returned [`UpstreamPull`] knows whether its terminal
+/// method closes the connection (owned, one-shot) or leaves it open for the
+/// next hash (warm), and whether a read fault unpins it from a map.
 #[allow(clippy::too_many_arguments)]
 async fn open_progressive_pull_impl(
     source: ConnSource<'_>,
-    owns_conn: bool,
+    owner: connection::ConnOwner,
     ctx: &PoolContext,
     ledger: Arc<PoolLedger>,
     slash_domain: &Eip712Domain,
@@ -3067,24 +3106,12 @@ async fn open_progressive_pull_impl(
         if max_rate_per_mb > 0 && resp.body.rate_per_mb > max_rate_per_mb {
             return Err(RateAboveCeiling::over_ceiling(resp, max_rate_per_mb));
         }
-        // A resume offset the blob cannot satisfy. `<=` rather than `<`: an offset
-        // exactly AT the end has no chunk group to anchor either, and `align_range`
-        // would reject it a few lines later with an untyped fault — this way both
-        // land on the same typed sentinel. Guarded on `byte_offset > 0` so a 0-byte
-        // blob fetched from 0 (#1054) is untouched.
-        if resp.body.total_bytes <= byte_offset && byte_offset > 0 {
-            return Err(anyhow::Error::new(ResumeOffsetPastEnd {
-                total_bytes: resp.body.total_bytes,
-                byte_offset,
-            }));
-        }
-
         let rate_per_mb = resp.body.rate_per_mb;
-        // Wire-byte bound (bao-encoded size of the aligned range), not content bytes —
+        // Wire-byte bound (bao-encoded size of the aligned range), not content bytes:
         // the window path forwards this stream verbatim and pays the upstream in wire
         // bytes (ADR 038 §Payment metering).
         let total_bytes = resp.body.total_bytes;
-        let expected_wire_bytes = aligned_wire_len(byte_offset, byte_len, total_bytes)?;
+        let expected_wire_bytes = served_wire_len(byte_offset, byte_len, total_bytes)?;
         // Received-byte ceiling (#1895), expressed as a WIRE bound so `next_chunk` can
         // enforce it without decoding: the wire size of a ceiling-sized blob's content
         // from this offset. Enforced on the bytes that ACTUALLY arrive, never on the
@@ -3120,7 +3147,7 @@ async fn open_progressive_pull_impl(
             floor,
             sampler,
             conn,
-            owns_conn,
+            owner,
             send,
             recv,
             ctx: ctx.clone(),
@@ -3191,7 +3218,20 @@ impl UpstreamPull {
     /// the floor's sampling tick: a read slow enough to lose the race is judged, and a
     /// sub-floor window aborts with [`PullTimeout`] before the first byte (our own
     /// blob-size-dependent budget) or [`PullStalled`] after it — neither scores the peer.
+    ///
+    /// A transport fault on a [`Connections`] map's connection (either floor verdict,
+    /// or a connection that has closed under the read) unpins that connection from
+    /// the map, so the node's next leg dials again.
     async fn read_under_floor(&mut self) -> anyhow::Result<ClientMessage> {
+        let read = self.read_under_floor_once().await;
+        if let Err(err) = &read {
+            self.owner.unpin_on_fault(err).await;
+        }
+        read
+    }
+
+    /// [`Self::read_under_floor`] before a transport fault unpins the connection.
+    async fn read_under_floor_once(&mut self) -> anyhow::Result<ClientMessage> {
         let cumulative = self.cumulative;
         let window = self.window;
         let recv = &mut self.recv;
@@ -3588,16 +3628,17 @@ impl UpstreamPull {
     ///
     /// An OWNED connection (a one-shot dial) is closed, which ends the QUIC
     /// connection so the upstream's serve task stops and the paid stream does not
-    /// linger half-open. A BORROWED connection (a [`WarmConnection`] reused across
-    /// hashes) is left open for the next hash — only THIS stream is torn down: the
-    /// send half is finished (a clean FIN) and the recv half is stopped. The warm
-    /// connection's own `Drop` closes the connection once, later.
+    /// linger half-open. A WARM connection (a [`WarmConnection`] reused across
+    /// hashes, caller-owned or from a [`Connections`] map) is left open for the
+    /// next hash, and only THIS stream is torn down: the send half is finished (a
+    /// clean FIN) and the recv half is stopped. The warm connection's own `Drop`
+    /// closes the connection once, later.
     ///
     /// `Connection::close`, `SendStream::finish`, and `RecvStream::stop` are all
     /// first-wins / idempotent, so an explicit terminal method (`finish`/`abort`)
     /// keeps its richer reason and the `Drop` safety net becomes a no-op.
     fn close_transport(&mut self, code: u32, reason: &[u8]) {
-        if self.owns_conn {
+        if self.owner.owns() {
             self.conn.close(code.into(), reason);
         } else {
             let _ = self.send.finish();
@@ -4254,24 +4295,24 @@ mod tests {
         );
     }
 
+    /// Every input to `aligned_wire_len` but the offset is the peer's signed
+    /// size or our own cap, so a range it cannot align is a source fault, never
+    /// ours: one node that signs a bad size must not end the command.
     #[test]
-    fn the_range_helpers_mark_their_own_faults_as_local() {
-        // A 4 KiB blob cannot be resumed from byte 8192 — `align_range` errors rather than
-        // clamping (ADR 005), and the caller must own that as OURS. The assertion covers
-        // both halves at once: `None` here means the call wrongly SUCCEEDED, and a `Some`
-        // without the marker means it failed and blamed the peer.
-        let aligned = aligned_wire_len(8192, 0, 4096).err();
-        assert!(
-            aligned
-                .as_ref()
-                .is_some_and(|e| e.downcast_ref::<LocalPullFault>().is_some()),
-            "aligned_wire_len must reject an out-of-range offset and mark it OUR fault; \
-             without the marker it falls through every downcast to the catch-all and \
-             scores the peer as unreachable. Got: {aligned:?}"
-        );
-        // The same fault names a range past the blob's end, so a caller that cut
-        // the range from an unsigned size can tell it from any other failure.
-        assert!(aligned.as_ref().is_some_and(super::is_range_past_end));
+    fn a_range_the_signed_size_cannot_hold_is_a_source_fault() {
+        for (offset, len, total) in [(8192, 0, 4096), (0, 16_384, 0)] {
+            let aligned = aligned_wire_len(offset, len, total).err();
+            assert!(
+                aligned.as_ref().is_some_and(|e| {
+                    e.downcast_ref::<LocalPullFault>().is_none()
+                        && crate::classify(e) == crate::Fault::Source
+                }),
+                "({offset}, {len}) against a signed {total} is the source's fault: {aligned:?}"
+            );
+            // It names a range past the blob's end, so a caller that cut the
+            // range from an unsigned size can tell it from any other failure.
+            assert!(aligned.as_ref().is_some_and(super::is_range_past_end));
+        }
         assert!(super::is_range_past_end(&anyhow::Error::new(
             super::ResumeOffsetPastEnd {
                 total_bytes: 4096,
@@ -4284,6 +4325,59 @@ mod tests {
         assert!(!super::is_range_past_end(
             &anyhow::anyhow!("dial timed out").context(LocalPullFault)
         ));
+    }
+
+    /// A node that signs a size of zero for a bounded open is refused with the
+    /// typed `ResumeOffsetPastEnd`, a source fault. The open of the empty blob,
+    /// `(0, 0)` against zero, still passes.
+    #[test]
+    fn a_zero_size_signed_for_a_bounded_open_is_refused_as_the_sources_fault() {
+        let err = super::served_wire_len(0, 16_384, 0).err();
+        assert!(
+            err.as_ref().is_some_and(|e| {
+                e.downcast_ref::<super::ResumeOffsetPastEnd>().is_some()
+                    && crate::classify(e) == crate::Fault::Source
+            }),
+            "a zero size for a bounded open is the source's fault: {err:?}"
+        );
+        assert!(
+            super::served_wire_len(8192, 0, 4096)
+                .err()
+                .is_some_and(|e| e.downcast_ref::<super::ResumeOffsetPastEnd>().is_some()),
+            "an offset past the signed end is refused the same way"
+        );
+        assert!(
+            super::served_wire_len(0, 0, 0).is_ok(),
+            "the empty blob opens"
+        );
+        assert!(
+            super::served_wire_len(0, 16_384, 4096).is_ok(),
+            "an end past the size clamps"
+        );
+    }
+
+    /// A response header whose `total_bytes` is smaller than the requested end
+    /// is served, and priced, up to the blob's end. `aligned_wire_len` must
+    /// clamp rather than wrap the clamp in `LocalPullFault`, and the clamped
+    /// wire length must equal the whole blob's.
+    #[test]
+    fn aligned_wire_len_clamps_when_the_response_total_is_smaller_than_the_requested_end()
+    -> anyhow::Result<()> {
+        let total = 4096;
+        let requested_end_past_total = total + 8192;
+        let clamped = aligned_wire_len(0, requested_end_past_total, total);
+        assert!(
+            !clamped
+                .as_ref()
+                .is_err_and(|e| e.downcast_ref::<LocalPullFault>().is_some()),
+            "a clamped end must never be marked LocalPullFault: {clamped:?}"
+        );
+        let whole = aligned_wire_len(0, 0, total)?;
+        assert_eq!(
+            clamped?, whole,
+            "the clamped wire length must equal the whole blob's"
+        );
+        Ok(())
     }
 
     /// `client_binding_ext` maps an unbound context to `None` (so

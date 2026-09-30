@@ -1,16 +1,15 @@
 //! Live anvil-backed e2e for `decdn bundle pull`'s **multi-source parallel
 //! fetch** path (ADR 039, #1774): a bundle whose large blob is held by TWO
-//! nodes pulls that blob fanned out across both, while small entries in the
-//! same bundle stay single-source.
+//! nodes pulls that blob fanned out across both, while each small entry in the
+//! same bundle pulls from its one holder.
 //!
 //! Shape: two independently-bonded nodes ("holder A" and "holder B") are each
 //! pre-warmed with the SAME large blob; A additionally holds `small-a.bin` and
 //! B `small-b.bin`. A local three-entry manifest is pulled with `--jobs 3` and
-//! no `--node-id`, so every entry auto-discovers its holders. The large blob
-//! clears the (test-lowered) `--multi-source-min-bytes` floor with two
-//! admissible holders, so it engages the ordered lock-set + per-lane fan-out;
-//! each small blob has exactly ONE holder, so its gate declines and it pulls
-//! single-source.
+//! no `--node-id`, so every entry auto-discovers its holders. Every entry runs
+//! the same acquire loop: the large blob has two admissible holders, so its
+//! loop runs a lane on each; each small blob has exactly ONE holder, so its
+//! loop runs one lane.
 //!
 //! What this test asserts:
 //!   1. All three outputs are byte-identical to their source blobs.
@@ -68,16 +67,8 @@ const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 /// chunk-log 4 == 16 KiB chunk groups).
 const CHUNK_GROUP: usize = 16 * 1024;
 
-/// Multi-source engagement floor for this journey (`--multi-source-min-bytes`),
-/// lowered far below the production 64 MiB default so the large blob clears it
-/// while the small blobs stay below it. The gate logic (`should_multi_source`)
-/// is size-relative, not size-absolute, so a lowered floor exercises the exact
-/// same gate the production default guards.
-const MULTI_SOURCE_MIN_BYTES: u64 = 200_000;
-
-/// Deterministic pseudo-random blob comfortably above
-/// [`MULTI_SOURCE_MIN_BYTES`] (~640 KiB), spanning many chunk groups plus a
-/// ragged final group.
+/// Deterministic pseudo-random blob (~640 KiB), spanning many chunk groups plus
+/// a ragged final group.
 fn make_large_blob() -> Vec<u8> {
     let mut v = vec![0u8; 40 * CHUNK_GROUP + 777];
     let mut x: u32 = 0xC0FF_EE11;
@@ -90,9 +81,8 @@ fn make_large_blob() -> Vec<u8> {
     v
 }
 
-/// A small blob comfortably BELOW [`MULTI_SOURCE_MIN_BYTES`], so its entry's
-/// engagement gate declines on size (it also has only one admissible holder,
-/// which declines independently).
+/// A small blob that only one holder carries, so its entry's engagement gate
+/// declines.
 fn make_small_blob(seed: u8) -> Vec<u8> {
     let mut v = vec![seed; 6 * CHUNK_GROUP + 111];
     let mut x: u32 = u32::from(seed) << 16 | 0x5EED;
@@ -134,11 +124,6 @@ async fn run() -> anyhow::Result<()> {
     let large_hash = Hash::new(&large);
     let small_a_hash = Hash::new(&small_a);
     let small_b_hash = Hash::new(&small_b);
-    anyhow::ensure!(
-        (small_a.len() as u64) < MULTI_SOURCE_MIN_BYTES
-            && (small_b.len() as u64) < MULTI_SOURCE_MIN_BYTES,
-        "small blobs must stay below the engagement floor"
-    );
 
     // BOTH holders carry the large blob (two admissible sources for it); each
     // small blob lives on exactly one, so its entry cannot fan out.
@@ -414,9 +399,8 @@ async fn run_pull_until_large_blob_splits(
 /// on the auto-discovered candidate set. `--capacity-bond-address` is what
 /// discovery enumerates the active registry from (and the EIP-712
 /// `verifyingContract` the buyer signs its ADR 005 client identity binding
-/// against). Carries the lowered `--multi-source-min-bytes` floor and an
-/// explicit `--max-sources`/`--jobs` so the journey's intent is visible in the
-/// argv rather than relying on defaults.
+/// against). Carries an explicit `--max-sources`/`--jobs` so the journey's
+/// intent is visible in the argv rather than relying on defaults.
 fn bundle_pull_argv(
     chain: &ChainFixture,
     manifest: &std::path::Path,
@@ -447,10 +431,7 @@ fn bundle_pull_argv(
         keystore.display().to_string(),
         "--working-deposit-micro-usdc".into(),
         DEPOSIT_MICRO_USDC.to_string(),
-        "--multi-source".into(),
         "--max-sources".into(),
         "4".into(),
-        "--multi-source-min-bytes".into(),
-        MULTI_SOURCE_MIN_BYTES.to_string(),
     ]
 }

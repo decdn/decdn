@@ -52,9 +52,9 @@ use decdn_client::driver::DriveConfig;
 use decdn_client::sink::PullReader;
 use decdn_client::source::{BlobSource as _, Funder, SourceFuture};
 use decdn_client::{
-    CoveredRun, DownstreamFrontier, HashMismatch as ClientPullHashMismatch, LegNoProgress,
-    PacingWait, PeerSource, PoolLedger, PrimedSource, RampPacer, RetryDisposition, SharedPool,
-    UpstreamPullHeader, WaitReason, drive, first_leg, shared_pool_disposition,
+    CoveredRun, DownstreamFrontier, Fault, HashMismatch as ClientPullHashMismatch, LegNoProgress,
+    PacingWait, PeerSource, PoolExhausted, PoolLedger, PrimedSource, RampPacer, SharedPool,
+    UpstreamPullHeader, WaitReason, classify, drive, first_leg,
 };
 use decdn_incentive::DepositOutcome;
 
@@ -197,8 +197,12 @@ impl PrimeLeg {
         let request_end = if self.len == 0 {
             total_bytes
         } else {
+            // `saturating_add`, not `checked_add`: an overflowing end (a grown
+            // size claim can widen `self.len` toward `u64::MAX`) primes a
+            // first leg too; the `.min(total_bytes)` below clamps it back down
+            // regardless of how far the raw sum overshot.
             self.offset
-                .checked_add(self.len)?
+                .saturating_add(self.len)
                 .div_ceil(CHUNK_GROUP_BYTES)
                 .saturating_mul(CHUNK_GROUP_BYTES)
                 .min(total_bytes)
@@ -740,6 +744,8 @@ impl NodeOrigin {
                 deps.config.max_blob_size_bytes,
                 rate_ceiling,
                 deadlines,
+                // Per-serve runtime: dial per leg (#1675).
+                None,
             )
             .with_dial_runtime(deps.dial_runtime.clone());
             let handshake = timed_open(
@@ -798,7 +804,7 @@ impl NodeOrigin {
         }
 
         // The header handshake: open a range to read the committed `total_bytes`,
-        // then abort — no `next_chunk`, so no bytes are pulled and no voucher is
+        // then abort: no `next_chunk`, so no bytes are pulled and no voucher is
         // paid, and the ledger watermark is unchanged. The actual range-minimized
         // pull re-opens per gap via `PeerSource` on this same (now cached) channel.
         // The range lies in a block the candidate advertised, so a partial holder
@@ -889,12 +895,13 @@ fn handshake_verdict(
 /// paid frontier, not on the run, and a later run's lane still `Wait`s on the same
 /// frontier the earlier one did.
 ///
-/// A run whose `drive` returns a NON-terminal fault ([`decdn_client::retry_disposition`]
-/// `== RetryElsewhere`) drops that source and re-plans the still-missing remainder
-/// against the survivors — the loop-level reassign-only tail. The store keeps the
-/// verified bytes, so the replacement lane resumes at the gap and re-pays nothing
-/// (#1682). A TERMINAL fault (a shared-pool voucher rejection, an origin blacklist,
-/// an over-cap blob) ends the whole assembly. The assembly also ends `Unavailable`
+/// A run whose `drive` returns a fault that does not end the assembly
+/// ([`ends_the_assembly`]) drops that source and re-plans the still-missing
+/// remainder against the survivors — the loop-level reassign-only tail. The
+/// store keeps the verified bytes, so the replacement lane resumes at the gap
+/// and re-pays nothing (#1682). A fatal fault or a dry shared pool (a voucher
+/// rejection, an origin blacklist, an over-cap blob, [`PoolExhausted`]) ends
+/// the whole assembly. The assembly also ends `Unavailable`
 /// when every covering candidate faulted, when a round made no progress, when the
 /// reassign budget ran out, or when no surviving candidate covers a still-missing
 /// range ([`super::ranged_pull::UnavailableCause`]). The serve leg refuses before
@@ -1364,6 +1371,8 @@ impl PeerRunSink<'_> {
             self.deps.config.max_blob_size_bytes,
             rate_ceiling,
             self.deadlines,
+            // Per-serve runtime: dial per leg (#1675).
+            None,
         )
         .with_dial_runtime(self.deps.dial_runtime.clone());
         let peer_source = PrimedSource::new(TimedSource::new(
@@ -1510,17 +1519,31 @@ impl PeerRunSink<'_> {
                         &err,
                     );
                 }
-                // A terminal fault (shared-pool voucher rejection or exhaustion,
-                // origin blacklist, over-cap blob) cannot be fixed by another lane;
-                // anything else is a property of THIS source's delivery — drop it
-                // and re-plan.
-                if shared_pool_disposition(&err) == RetryDisposition::Terminal {
+                if ends_the_assembly(&err) {
                     RunOutcome::Terminal(FillError::new(format!("{err:#}")))
                 } else {
                     RunOutcome::Reassign
                 }
             }
         }
+    }
+}
+
+/// Whether a run's fault ends the whole assembly rather than moving its range
+/// to another holder.
+///
+/// A fatal fault ([`classify`]: a voucher rejection, an origin blacklist, an
+/// over-cap blob, a local fault) cannot be fixed by another lane. Nor can the
+/// pacer's [`PoolExhausted`]: the node's one shared pool funds every holder, so
+/// once it is dry no holder can be paid. An open-time `InsufficientDeposit` is
+/// this holder's reservation floor outrunning the pool, and a different holder
+/// may reserve a smaller one, so it moves on. Anything else is a property of
+/// this source's delivery.
+fn ends_the_assembly(err: &anyhow::Error) -> bool {
+    match classify(err) {
+        Fault::Fatal(_) => true,
+        Fault::Unaffordable => err.downcast_ref::<PoolExhausted>().is_some(),
+        Fault::Source | Fault::Transient => false,
     }
 }
 
@@ -2445,6 +2468,24 @@ mod prime_tests {
             prime.predicted_leg(total, &full, 0),
             align_range(0, PULL_WINDOW_FLOOR, total).ok()
         );
+        // A nonzero offset paired with `len == u64::MAX` genuinely overflows
+        // `offset + len` (unlike offset 0, which does not). A grown size claim
+        // can widen `len` this far, and `saturating_add` plus the
+        // `.min(total_bytes)` clamp right after it primes a leg (the same one a
+        // `byte_len == 0` "to end" request from the same offset would) rather
+        // than losing the first leg to `None`.
+        assert_eq!(
+            PrimeLeg::new(
+                CHUNK_GROUP_BYTES,
+                u64::MAX,
+                2,
+                PULL_WINDOW_FLOOR,
+                64 * MIB,
+                0
+            )
+            .predicted_leg(total, &full, 0),
+            align_range(CHUNK_GROUP_BYTES, PULL_WINDOW_FLOOR, total).ok()
+        );
         // A mid-group start rounds down to its group; a short request is cut
         // to its own end.
         let short = PrimeLeg::new(
@@ -2618,5 +2659,40 @@ mod backpressure_backoff_tests {
             .map(backpressure_backoff)
             .sum();
         assert_eq!(total, Duration::from_millis(11_750));
+    }
+}
+
+#[cfg(test)]
+mod assembly_fault_tests {
+    use decdn_client::{PoolExhausted, UpstreamRefused, UpstreamVoucherRejected};
+    use decdn_protocol::client::{StreamError, VoucherRejectReason};
+
+    use super::ends_the_assembly;
+
+    fn refusal(error: StreamError) -> anyhow::Error {
+        anyhow::Error::new(UpstreamRefused::mid_stream(error))
+    }
+
+    /// A holder's reservation floor above the pool moves the range to another
+    /// holder, which may reserve less; a dry pool and a fatal fault end it.
+    #[test]
+    fn insufficient_deposit_reassigns_and_a_dry_pool_ends_the_assembly() {
+        assert!(!ends_the_assembly(&refusal(
+            StreamError::InsufficientDeposit
+        )));
+        assert!(ends_the_assembly(&anyhow::Error::new(PoolExhausted {
+            gap_start: 0,
+            gap_len: 1 << 20,
+        })));
+        assert!(ends_the_assembly(&anyhow::Error::new(
+            UpstreamVoucherRejected {
+                reason: VoucherRejectReason::AmountRegression,
+                bundle: None,
+                proof_generation: None,
+            }
+        )));
+        assert!(ends_the_assembly(&refusal(StreamError::OriginBlacklisted)));
+        assert!(!ends_the_assembly(&refusal(StreamError::NotFound)));
+        assert!(!ends_the_assembly(&anyhow::anyhow!("connection reset")));
     }
 }

@@ -11,8 +11,8 @@
 //! canonical block size — a protocol-contract change under ADR 038 — fails here.
 
 pub use decdn_bao_range::{
-    AlignedRange, IROH_BLOCK_SIZE, RangeVerifyError, align_range, bao_encoded_size,
-    encode_verified_range,
+    AlignedRange, IROH_BLOCK_SIZE, RangeVerifyError, align_range, align_range_clamped,
+    bao_encoded_size, encode_verified_range,
 };
 
 #[cfg(test)]

@@ -5,11 +5,10 @@
 //! tests.
 //!
 //! `ClientRangedStore::open` reconstructs `present` from the persisted
-//! `.partial.ranges` record in O(1) — it does NOT re-hash the `.partial` data
-//! against the outboard. That's the load-bearing shortcut documented on
-//! `ranged_store.rs::open`: the ONE verify pass is `finalize`'s `valid_ranges`
-//! sweep, already locked by the unit test
-//! `finalize_shrinks_to_valid_set_on_post_admit_corruption`. These tests prove
+//! `.partial.ranges` record in O(1): it does NOT re-hash the `.partial` data.
+//! That's the load-bearing shortcut documented on `ranged_store.rs::open`: the
+//! ONE whole-file check is `finalize`'s BLAKE3 of `[0, proven)`, already
+//! locked by the unit test `finalize_hashes_the_whole_file`. These tests prove
 //! the other half — that `open` trusts the record rather than re-deriving it,
 //! and that resume continues from the persisted frontier without re-listing
 //! (and so without re-fetching/re-paying for) the held prefix.
@@ -71,8 +70,8 @@ async fn resume_trusts_record_without_rehashing() {
 
     // Corrupt the already-recorded `[0, K)` prefix directly on disk, leaving
     // the `.partial.ranges` record untouched (it still claims `[0, K)`
-    // present). If `open` re-hashed the data against the outboard it would
-    // discover this and drop the prefix from `present`.
+    // present). If `open` re-hashed the data it would discover this and drop
+    // the prefix from `present`.
     let partial_path = dir.path().join("blob.partial");
     {
         use std::io::{Seek, SeekFrom, Write};
@@ -86,7 +85,7 @@ async fn resume_trusts_record_without_rehashing() {
     }
 
     let reopened =
-        ClientRangedStore::open(dir.path(), "blob", root, total).expect("open after corruption");
+        ClientRangedStore::open(dir.path(), "blob", root).expect("open after corruption");
 
     // Presence is unchanged by the on-disk corruption: `open` trusted the
     // record instead of re-deriving it from (now-corrupt) data.
@@ -108,10 +107,10 @@ async fn resume_trusts_record_without_rehashing() {
         - &expected_prefix;
     assert_eq!(missing, expected_missing);
 
-    // The safety net: `finalize`'s one verify pass DOES catch the corruption,
+    // The safety net: `finalize`'s whole-file hash DOES catch the corruption,
     // once the record claims completeness. Admit the remaining bytes (over
     // the still-corrupt-on-disk prefix) so `is_complete` is true, then let
-    // `finalize`'s sweep discover the drift.
+    // `finalize`'s hash discover the drift. It keeps the partial.
     let rest_aligned = decdn_bao_range::align_range(k, total - k, total).expect("align rest");
     let rest_bao = bao_for(root, &plaintext, outboard, &rest_aligned);
     reopened
@@ -126,8 +125,12 @@ async fn resume_trusts_record_without_rehashing() {
     let err = reopened
         .finalize()
         .await
-        .expect_err("finalize's verify sweep must catch the corrupted prefix");
-    assert!(matches!(err, decdn_bao_range::RangedStoreError::Incomplete));
+        .expect_err("finalize's whole-file hash must catch the corrupted prefix");
+    assert!(
+        matches!(err, decdn_bao_range::RangedStoreError::Backend(_)),
+        "{err:?}"
+    );
+    assert!(partial_path.exists(), "a failed finalize keeps the partial");
 }
 
 #[tokio::test]
@@ -144,7 +147,7 @@ async fn resume_continues_from_record_without_refetching_prefix() {
         store.admit(aligned, bao_bytes).await.expect("admit prefix");
     }
 
-    let reopened = ClientRangedStore::open(dir.path(), "blob", root, total).expect("open");
+    let reopened = ClientRangedStore::open(dir.path(), "blob", root).expect("open");
 
     // The held prefix must NOT be re-listed as missing: a resumed fetch
     // driven by `missing_ranges` would skip it entirely, so it's never

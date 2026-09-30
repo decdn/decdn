@@ -85,19 +85,17 @@ pub struct BundlePullArgs {
     /// same-lane concurrency is safe and this only bounds how many streams touch
     /// one provider at once. Cross-lane parallelism (distinct providers) is
     /// bounded by `--jobs` regardless.
-    #[arg(long, value_name = "N", default_value_t = 4)]
-    pub max_lane_streams: usize,
-
-    /// Give each entry whose fetch failed in a way another round can fix up to
-    /// N more rounds after the first pass over the bundle. Each round probes the
-    /// holders again, so a provider that failed earlier is a candidate again,
-    /// and resumes from the entry's `.partial`, so no byte already paid for is
-    /// paid again. The rounds back off (2 s, doubling, capped at 30 s). A
-    /// failure every provider repeats (a rejected voucher, a blacklisted funder,
-    /// an oversized blob, a spent pool, a manifest size no provider signs) and a
-    /// local disk fault are never re-run. `0` turns the retry off.
-    #[arg(long, value_name = "N", default_value_t = 2)]
-    pub entry_retries: u32,
+    ///
+    /// One connection per node carries every stream of the command, so the
+    /// bound (1 to 64) stays below the node's limit of concurrent streams on
+    /// one connection.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 4,
+        value_parser = clap::value_parser!(u16).range(1..=64)
+    )]
+    pub max_lane_streams: u16,
 
     /// Only pull entries whose POSIX relative path matches one of these globs
     /// (`models/*.bin`), matched against the manifest's `path` field, never the

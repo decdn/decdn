@@ -159,6 +159,19 @@ pub(crate) fn covers_byte_range(
     (first_block..=last_block).all(|b| coverage.covers(b))
 }
 
+/// The chunks of `chunks` that lie in discovery blocks `coverage` holds.
+pub(crate) fn covered_part(
+    coverage: &Coverage,
+    chunks: &ChunkRanges,
+    total_bytes: u64,
+) -> ChunkRanges {
+    let mut held = ChunkRanges::empty();
+    for block in (0..num_blocks(total_bytes)).filter(|&b| coverage.covers(b)) {
+        held |= block_chunks(block);
+    }
+    chunks & &held
+}
+
 /// The best-`rank`ed source index whose coverage includes `block`, or `None`
 /// if no source in `rank` covers it.
 ///

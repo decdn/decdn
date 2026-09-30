@@ -436,7 +436,8 @@ mod tests {
         let tmp2 = tempfile::tempdir()?;
         let engine2 = CacheEngine::open(tmp2.path(), vec![], 64).await?;
         let store = NodeAdmitStore::new(engine2.clone(), hash, total, None);
-        let mut drained = IngestStore::ingest_stream(&store, &aligned, reader, None).await?;
+        let mut drained =
+            IngestStore::ingest_stream(&store, &aligned, reader, None, aligned.blob_size()).await?;
         assert_eq!(
             drained.read_bytes(1).await?.len(),
             0,
@@ -490,7 +491,7 @@ mod tests {
         let tmp2 = tempfile::tempdir()?;
         let engine2 = CacheEngine::open(tmp2.path(), vec![], 64).await?;
         let store = NodeAdmitStore::new(engine2, hash, total, None);
-        let err = IngestStore::ingest_stream(&store, &aligned, reader, None)
+        let err = IngestStore::ingest_stream(&store, &aligned, reader, None, aligned.blob_size())
             .await
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected VerifyFailed, got Ok"))?;
@@ -591,7 +592,14 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let engine = CacheEngine::open(tmp.path(), vec![], 64).await?;
         let store = NodeAdmitStore::new(engine.clone(), hash, total, None);
-        IngestStore::ingest_stream(&store, &aligned, reader_over(items), None).await?;
+        IngestStore::ingest_stream(
+            &store,
+            &aligned,
+            reader_over(items),
+            None,
+            aligned.blob_size(),
+        )
+        .await?;
         assert!(RangedStore::is_complete(&store).await?);
         assert_eq!(engine.get(hash).await?.as_ref(), data.as_slice());
         Ok(())

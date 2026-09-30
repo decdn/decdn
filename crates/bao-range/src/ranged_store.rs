@@ -30,7 +30,10 @@ pub enum RangedStoreError {
 /// client (`.partial` sidecar) backends implement it and pass one shared
 /// conformance suite.
 pub trait RangedStore: Send + Sync {
-    /// Total blob length in bytes (known at construction).
+    /// The blob length in bytes the store currently works to. A backend keyed
+    /// by size fixes it at construction. A backend keyed by offset reports its
+    /// current bound, which becomes the proven size once a verified final
+    /// chunk proves one.
     fn total_bytes(&self) -> u64;
     /// Chunk ranges that verify right now.
     fn present_ranges(&self) -> RangedFuture<'_, bao_tree::ChunkRanges>;
