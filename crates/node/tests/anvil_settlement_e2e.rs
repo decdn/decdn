@@ -1212,11 +1212,13 @@ async fn run_e2e() -> anyhow::Result<()> {
     let buyer_store_dyn: Arc<dyn BuyerPoolStore> = buyer_store.clone();
     let buyer_service = BuyerPoolService::bootstrap(
         buyer_provider.clone(),
-        payment_pool,
+        Deployment {
+            chain_id: CHAIN_ID,
+            payment_pool,
+        },
         buyer_addr,
         buyer_store_dyn,
         Arc::clone(&buyer_signer),
-        voucher_dom.clone(),
         U256::from(DEPOSIT_MICRO_USDC), // working_deposit
         true, // fresh buyer identity → issue the one-time max USDC approval
         Arc::new(Metrics::new()),
