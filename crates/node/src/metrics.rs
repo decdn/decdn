@@ -6,12 +6,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use alloy::primitives::U256;
 use bytes::Bytes;
-use decdn_cache::CacheMetrics;
+use decdn_cache::{CacheEngine, CacheMetrics};
 use decdn_incentive::PoolOpenFailureReason;
 use decdn_protocol::Region;
 use http_body_util::Full;
@@ -392,8 +392,9 @@ pub struct DecdnMetrics {
     probe_hold_unavailable: Family<ProbeHoldUnavailableLabels, Counter>,
     /// `decdn_probe_hold_slots_used` (registry): current active
     /// probe-triggered eviction holds (distinct held blobs), ADR 005
-    /// §Probe-triggered eviction hold. Sampled from the cache engine on
-    /// each probe; pair with `probe_hold_slots_max` for a saturation ratio.
+    /// §Probe-triggered eviction hold. Sampled from the cache engine at
+    /// scrape time, so it tracks hold expiry with no probe traffic; pair
+    /// with `probe_hold_slots_max` for a saturation ratio.
     pub probe_hold_slots_used: Gauge,
     /// `decdn_probe_hold_slots_max` (registry, mandatory): the configured
     /// `max_probe_holds` budget. Set once at startup. Pairs with
@@ -2074,6 +2075,11 @@ pub struct Metrics {
     /// `fee_shares_watcher_down_seconds` gauge. Mirrors
     /// `staker_set_watcher_down_since`.
     fee_shares_watcher_down_since: Mutex<Option<Instant>>,
+    /// Cache engine whose live probe-hold count backs the
+    /// `probe_hold_slots_used` gauge, sampled once per scrape in
+    /// [`Self::encode`]. Unset until runtime bring-up attaches the cache
+    /// through [`Self::attach_probe_holds`]; the gauge then reads `0`.
+    probe_holds: OnceLock<CacheEngine>,
 }
 
 impl Default for Metrics {
@@ -2182,7 +2188,19 @@ impl Metrics {
             blacklist_watcher_down_since: Mutex::new(None),
             settlement_watcher_down_since: Mutex::new(None),
             fee_shares_watcher_down_since: Mutex::new(None),
+            probe_holds: OnceLock::new(),
         }
+    }
+
+    /// Attach the cache engine whose probe holds back
+    /// `decdn_probe_hold_slots_used`. Each scrape samples
+    /// [`CacheEngine::probe_hold_slots_used`], which sweeps expired holds, so
+    /// the gauge falls back to `0` once holds lapse even with no probe
+    /// traffic. Only the first attach takes effect.
+    pub(crate) fn attach_probe_holds(&self, cache: CacheEngine) {
+        // A second attach is a no-op: the runtime builds one cache per
+        // process, so the first engine is the live one.
+        let _ = self.probe_holds.set(cache);
     }
 
     /// Shared `Arc<CacheMetrics>` for wiring into [`decdn_cache::CacheEngine`].
@@ -2470,6 +2488,12 @@ impl Metrics {
         // poisoned-lock semantics.
         self.refresh_watcher_down_seconds();
 
+        if let Some(cache) = self.probe_holds.get() {
+            self.decdn
+                .probe_hold_slots_used
+                .set(sat(cache.probe_hold_slots_used()));
+        }
+
         let reg = self
             .registry
             .read()
@@ -2614,9 +2638,6 @@ macro_rules! watcher_downtime_recorders {
 recorders! {
     /// A `cdn/probe/v1` request was served.
     probe_request => probe_requests.inc();
-
-    /// Publish the current count of active probe holds (ADR 005).
-    probe_hold_slots(used: usize) => probe_hold_slots_used.set(sat(used));
 
     /// Publish the configured `max_probe_holds` budget (registry-mandatory
     /// `decdn_probe_hold_slots_max`). Called once at runtime bring-up.
@@ -5144,49 +5165,96 @@ mod tests {
         }
     }
 
+    /// Minimal in-memory origin: returns the prearranged payload for its
+    /// hash, `NotFound` otherwise. Mirrors the `StubOrigin` used in
+    /// crates/cache tests but is local to these tests so the cache crate's
+    /// test fixtures stay private.
+    #[derive(Debug)]
+    struct StubOrigin {
+        data: bytes::Bytes,
+        hash: iroh_blobs::Hash,
+    }
+
+    impl decdn_cache::Origin for StubOrigin {
+        fn kind(&self) -> decdn_cache::OriginKind {
+            decdn_cache::OriginKind::Http
+        }
+        fn fetch(
+            &self,
+            hash: iroh_blobs::Hash,
+            _max_bytes: u64,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            let result = if hash == self.hash {
+                Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
+            } else {
+                Ok(decdn_cache::OriginFetch::NotFound)
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    /// `decdn_probe_hold_slots_used` tracks hold expiry with no probe
+    /// traffic: a hold taken once reads `1` at the next scrape and `0` at a
+    /// scrape after `PROBE_HOLD_DURATION` lapses, with nothing but the clock
+    /// in between.
+    #[tokio::test(start_paused = true)]
+    async fn probe_hold_slots_used_drops_to_zero_after_hold_expires() {
+        use std::sync::Arc;
+
+        use decdn_cache::{CacheEngine, PROBE_HOLD_DURATION, ProbeHoldOutcome};
+
+        let payload = b"probe hold gauge".to_vec();
+        let hash = iroh_blobs::Hash::new(&payload);
+        let stub = StubOrigin {
+            data: bytes::Bytes::from(payload),
+            hash,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(
+            tmp.path(),
+            vec![Arc::new(stub) as Arc<dyn decdn_cache::Origin>],
+            10,
+        )
+        .await
+        .unwrap();
+        let _ = engine.get(hash).await.unwrap();
+
+        let metrics = Metrics::new();
+        metrics.attach_probe_holds(engine.clone());
+        assert_eq!(
+            engine.try_probe_hold(hash).await.unwrap(),
+            ProbeHoldOutcome::Held
+        );
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_probe_hold_slots_used", 1),
+            "a live hold must read 1:\n{text}"
+        );
+
+        tokio::time::advance(PROBE_HOLD_DURATION + Duration::from_secs(1)).await;
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_probe_hold_slots_used", 0),
+            "an expired hold must read 0 with no further probe:\n{text}"
+        );
+    }
+
     #[tokio::test]
     async fn engine_bumps_surface_in_openmetrics_output() {
         use std::sync::Arc;
 
         use bytes::Bytes;
-        use decdn_cache::{
-            CacheEngine, Origin, OriginFetch, OriginKind, OriginPullError, PinnedHashes,
-            RetryPolicy,
-        };
+        use decdn_cache::{CacheEngine, PinnedHashes, RetryPolicy};
         use iroh_blobs::Hash;
-
-        // Minimal in-memory origin: returns the prearranged payload for
-        // its hash, NotFound otherwise. Mirrors the StubOrigin used in
-        // crates/cache tests but is local to this integration test so
-        // we don't need to expose the cache crate's test fixtures.
-        #[derive(Debug)]
-        struct StubOrigin {
-            data: Bytes,
-            hash: Hash,
-        }
-        impl Origin for StubOrigin {
-            fn kind(&self) -> OriginKind {
-                OriginKind::Http
-            }
-            fn fetch(
-                &self,
-                hash: Hash,
-                _max_bytes: u64,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Result<OriginFetch, OriginPullError>>
-                        + Send
-                        + '_,
-                >,
-            > {
-                let result = if hash == self.hash {
-                    Ok(OriginFetch::found_one_shot(self.data.clone()))
-                } else {
-                    Ok(OriginFetch::NotFound)
-                };
-                Box::pin(async move { result })
-            }
-        }
 
         let payload = b"hello /metrics integration".to_vec();
         let hash = Hash::new(&payload);

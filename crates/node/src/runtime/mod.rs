@@ -612,6 +612,8 @@ async fn build_infra(
     // `build_cache` succeeds so a SIGHUP delivered during the rest of
     // startup will still find a target.
     reload_state.attach_cache(Some(cache.clone()));
+    // `decdn_probe_hold_slots_used` samples this cache on every scrape.
+    node_metrics.attach_probe_holds(cache.clone());
 
     // Admission/eviction policy selection (ADR 040) plus the ADR 041 estimator
     // decoupling (see `wire_cache_policies`).

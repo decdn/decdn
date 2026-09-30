@@ -361,15 +361,9 @@ impl ProbeHandler {
         // the slots-used read races a concurrent hold, which is acceptable
         // for a priority heuristic (admission is implementation-defined per
         // ADR 003) and never a safety property.
-        // Sample `slots_used` once here and reuse it for the slots gauge
-        // below: on the shed path no hold is attempted, so the sampled value
-        // stays current and a second lock+sweep is pure waste on exactly the
-        // loaded path this gate fires under (#757 review).
-        let mut slots_used = None;
         let stake_lane_reserved = match self.stake_lane.as_ref() {
             Some(policy) => {
                 let used = self.cache.probe_hold_slots_used();
-                slots_used = Some(used);
                 // `is_stake_lane` is resolved lazily: `stake_lane_reserved_out`
                 // calls it only after the cheap ceiling guards pass, so the
                 // uncongested common path skips the staker-set lookup (an
@@ -631,16 +625,6 @@ impl ProbeHandler {
             !coverage.is_empty(),
             "has_blob must be the coverage biconditional by construction"
         );
-
-        // On the shed path no hold was attempted, so the value sampled for
-        // the gate is still current — reuse it instead of re-acquiring the
-        // lock and sweeping again. Off that path a hold may have been taken,
-        // so re-sample for an accurate gauge (#757 review).
-        self.metrics.probe_hold_slots(if stake_lane_reserved {
-            slots_used.unwrap_or_else(|| self.cache.probe_hold_slots_used())
-        } else {
-            self.cache.probe_hold_slots_used()
-        });
 
         // The node advertises its configured rate verbatim. The delivery floor
         // is not a quote gate: a rate below the floor still sells and settles,
