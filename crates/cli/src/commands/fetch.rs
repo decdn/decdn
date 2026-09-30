@@ -620,6 +620,7 @@ pub(crate) async fn probe_and_order(
                 node_id: cand.node_id,
                 eth_address: cand.eth_address,
                 rtt_ms,
+                multiaddrs: cand.multiaddrs.clone(),
             });
         }
     }
@@ -734,10 +735,9 @@ fn failover_order(
                 // As for a proxy lead: `region_hint` never rides along on a
                 // candidate the client assembled from probe RTTs alone.
                 region_hint: None,
-                // A warming candidate carries no registry addresses (the probe
-                // RTT path does not thread them), so it dials via iroh
-                // discovery — the pre-multiaddr behavior, unchanged.
-                multiaddrs: Bytes::new(),
+                // Registry addresses ride along so a cold-order target dials
+                // directly (ADR 001 § Node Discovery).
+                multiaddrs: c.multiaddrs.clone(),
             })
             .collect();
         return FailoverOrder {
@@ -779,10 +779,9 @@ fn failover_order(
         // pre-probe shortlist and operator logging. Leaving it unset keeps a
         // spoofed region from riding along.
         region_hint: None,
-        // Warming proxies dial via iroh discovery: `WarmingCandidate` carries no
-        // registry addresses, so no direct-dial hint is available here. A
-        // follow-up could thread them through for relay-free warming.
-        multiaddrs: Bytes::new(),
+        // Registry addresses ride along so a warming proxy dials directly
+        // (ADR 001 § Node Discovery).
+        multiaddrs: proxy.multiaddrs.clone(),
     });
     let order = proxies
         .chain(holders.iter().map(|h| h.candidate.clone()))
@@ -3729,16 +3728,19 @@ mod tests {
                 node_id: node_key(21),
                 eth_address: Address::repeat_byte(21),
                 rtt_ms: 90.0,
+                multiaddrs: Bytes::new(),
             },
             discovery::WarmingCandidate {
                 node_id: node_key(22),
                 eth_address: Address::repeat_byte(22),
                 rtt_ms: 150.0,
+                multiaddrs: Bytes::new(),
             },
             discovery::WarmingCandidate {
                 node_id: node_key(23),
                 eth_address: Address::repeat_byte(23),
                 rtt_ms: 190.0,
+                multiaddrs: Bytes::new(),
             },
         ];
         let out = super::failover_order(holders, &warming_pool, warming_params(true));
@@ -3773,6 +3775,7 @@ mod tests {
             node_id: node_key(21),
             eth_address: Address::repeat_byte(21),
             rtt_ms: 190.0,
+            multiaddrs: Bytes::new(),
         }];
         let out = super::failover_order(holders, &warming_pool, warming_params(true));
         assert!(out.warming_lead.is_none());
@@ -3793,11 +3796,13 @@ mod tests {
                 node_id: node_key(31),
                 eth_address: Address::repeat_byte(31),
                 rtt_ms: 300.0,
+                multiaddrs: Bytes::new(),
             },
             discovery::WarmingCandidate {
                 node_id: node_key(32),
                 eth_address: Address::repeat_byte(32),
                 rtt_ms: 100.0,
+                multiaddrs: Bytes::new(),
             },
         ];
         let out = super::failover_order(Vec::new(), &non_holders, warming_params(false));
@@ -3817,6 +3822,38 @@ mod tests {
             out.order.iter().all(|c| c.region_hint.is_none()),
             "pull-through candidates carry no region hint (spoof-proofing, ADR 037)"
         );
+    }
+
+    /// Registry multiaddrs survive into both rebuilt-candidate branches of
+    /// `failover_order` — the warming proxies and the cold-order non-holders —
+    /// so those lanes dial the node directly rather than through a relay.
+    #[test]
+    fn failover_order_carries_registry_multiaddrs() -> anyhow::Result<()> {
+        let packed = Bytes::from(decdn_incentive::node_register::pack_multiaddrs(&[
+            "/ip4/203.0.113.10/udp/4433/quic-v1".to_string(),
+        ])?);
+        let pool = vec![discovery::WarmingCandidate {
+            node_id: node_key(21),
+            eth_address: Address::repeat_byte(21),
+            rtt_ms: 90.0,
+            multiaddrs: packed.clone(),
+        }];
+
+        let warm = super::failover_order(vec![holder(10, 200.0)], &pool, warming_params(true));
+        let proxy = warm.order.first().context("proxy leads the order")?;
+        assert_eq!(proxy.node_id, node_key(21));
+        assert_eq!(
+            proxy.multiaddrs, packed,
+            "warming proxy keeps its addresses"
+        );
+
+        let cold = super::failover_order(Vec::new(), &pool, warming_params(false));
+        let target = cold
+            .order
+            .first()
+            .context("non-holder is the cold target")?;
+        assert_eq!(target.multiaddrs, packed, "cold target keeps its addresses");
+        Ok(())
     }
 
     /// With neither a holder nor a reachable non-holder, the order is empty —

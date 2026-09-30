@@ -83,6 +83,7 @@ pub decdn_client::discovery::Probed::rtt_ms: f64
 pub decdn_client::discovery::Probed::total_bytes: core::option::Option<u64>
 pub struct decdn_client::discovery::WarmingCandidate
 pub decdn_client::discovery::WarmingCandidate::eth_address: alloy_primitives::bits::address::Address
+pub decdn_client::discovery::WarmingCandidate::multiaddrs: alloy_primitives::bytes_::Bytes
 pub decdn_client::discovery::WarmingCandidate::node_id: iroh_base::key::PublicKey
 pub decdn_client::discovery::WarmingCandidate::rtt_ms: f64
 pub const decdn_client::discovery::BOOTSTRAP_UNREACHABLE: &str

@@ -132,9 +132,8 @@ pub struct NodeCandidate {
 impl NodeCandidate {
     /// Registry-published direct dial addresses, decoded leniently from the
     /// packed on-chain `multiaddrs` field for use as iroh direct-address hints
-    /// (ADR 001 § Node Discovery). Empty when the node published none, the field
-    /// is malformed, or the candidate came from the peer store rather than a
-    /// live registry read. A returned address is only ever one dial path among
+    /// (ADR 001 § Node Discovery). Empty when the node published none or the
+    /// field is malformed. A returned address is only ever one dial path among
     /// discovery and the relay fallback, so a stale entry loses the path race
     /// but never fails the connection.
     #[must_use]
@@ -718,6 +717,10 @@ pub struct WarmingCandidate {
     /// only from nodes this request actually probed (`has_blob: false`
     /// responses), not from the full peer store minus holders.
     pub rtt_ms: f64,
+    /// The candidate's registry-published, packed `multiaddrs` field, carried
+    /// from its [`NodeCandidate`] so a warming lane dials the proxy directly
+    /// (see [`NodeCandidate::multiaddrs`]). Never read by ranking.
+    pub multiaddrs: Bytes,
 }
 
 /// ADR 037 § Client selection policy: the ordered list of nearby non-holders to
@@ -1754,6 +1757,7 @@ mod tests {
             node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
             eth_address: Address::repeat_byte(seed),
             rtt_ms,
+            multiaddrs: Bytes::new(),
         }
     }
 

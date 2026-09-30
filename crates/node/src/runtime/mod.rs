@@ -990,6 +990,15 @@ async fn build_chain_and_handlers(
     // current by the same registry route. The lazy `ChainOriginDirectory`
     // resolves against it directly rather than maintaining its own binding cache.
     let operator_to_node = Arc::clone(&registry.operator_to_node);
+    // Registry multiaddrs as an endpoint address lookup (ADR 001 § Node
+    // Discovery): every bare-`NodeId` dial resolves the node's registry
+    // addresses and connects directly when it is reachable, since pkarr carries
+    // only the relay URL. The same registry route keeps the lookup current.
+    infra
+        .ep
+        .address_lookup()
+        .map_err(|e| anyhow::anyhow!("endpoint address lookup unavailable: {e}"))?
+        .add(registry.dial_addrs.lookup());
     // The registry route MUST stay live through drain (its staker set gates DHT
     // admission), which forces the single poller stop to the LATE point below.
     poller_routes.push(registry.route);

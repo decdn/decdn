@@ -1276,6 +1276,7 @@ async fn probe_and_rank(
         if let Some(url) = relays.first() {
             target = target.with_relay_url(url.clone());
         }
+        let target = discovery::with_dial_addrs(target, &c);
         let timestamp_us = wall_clock_us();
         match probe_once(&endpoint, target, hash, timestamp_us, timeout).await {
             Ok((_, _, rtt_ms)) => rows.push(LookupRow {
