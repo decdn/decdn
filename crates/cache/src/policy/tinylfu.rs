@@ -89,7 +89,9 @@ impl AdmissionPolicy for ProbationAdmission {
 }
 
 /// Ranks eviction candidates least-frequent-first, reading frequency from a
-/// shared estimator; ties break oldest-access-first (LRFU). Also owns the
+/// shared estimator; ties break oldest-access-first (LRFU), then largest
+/// first, so blobs sharing the open-time recency seed release in the order that
+/// reaches the target in the fewest releases. Also owns the
 /// probation lifecycle at sweep time: promotes probation members whose
 /// buffered frequency has reached `promotion_threshold`, and caps probation's
 /// footprint to `probation_target_pct` of `cache_bytes` by evicting the
@@ -121,6 +123,7 @@ impl TinyLfuEviction {
 
 impl EvictionPolicy for TinyLfuEviction {
     fn plan(&self, ctx: &EvictionContext<'_>) -> EvictionPlan {
+        let size = |h: &Hash| ctx.sizes.get(h).copied().unwrap_or(0);
         // 1. Promote: probation members whose buffered frequency now clears
         // the threshold graduate to Main. They're excluded from the
         // probation-cap eviction below (and from the global loop, since a
@@ -157,8 +160,12 @@ impl EvictionPolicy for TinyLfuEviction {
             .map(|(h, _, _)| ctx.sizes.get(h).copied().unwrap_or(0))
             .sum();
         if probation_footprint > probation_limit {
-            // Least frequent first; tie-break oldest access first.
-            probation_members.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+            // Least frequent first; tie-break oldest access first, then largest.
+            probation_members.sort_by(|a, b| {
+                a.1.cmp(&b.1)
+                    .then(a.2.cmp(&b.2))
+                    .then_with(|| size(&b.0).cmp(&size(&a.0)))
+            });
             let mut remaining = probation_footprint;
             for (h, _, _) in probation_members {
                 if remaining <= probation_limit {
@@ -184,7 +191,11 @@ impl EvictionPolicy for TinyLfuEviction {
             .filter(|(h, _)| !evicted.contains(*h) && !promoted.contains(*h))
             .map(|(h, t)| (*h, self.freq.estimate(*h), *t))
             .collect();
-        scored.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+        scored.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then(a.2.cmp(&b.2))
+                .then_with(|| size(&b.0).cmp(&size(&a.0)))
+        });
         for (h, _, _) in scored {
             if ctx.total_bytes.saturating_sub(freed) <= ctx.target_bytes {
                 break;
@@ -255,6 +266,33 @@ mod tests {
             "least-frequent must go first"
         );
         assert!(plan.promote.is_empty());
+    }
+
+    /// Blobs with equal frequency and one shared recency — the open-time seed —
+    /// release largest first.
+    #[test]
+    fn tinylfu_breaks_equal_frequency_and_recency_largest_first() {
+        let freq: std::sync::Arc<dyn FrequencyEstimator> =
+            std::sync::Arc::new(TinyLfuEstimator::new(4096));
+        let seed = std::time::Instant::now();
+        let mut map = std::collections::HashMap::new();
+        let mut sizes = std::collections::HashMap::new();
+        for (i, size) in [(1u32, 10u64), (2, 300), (3, 50)] {
+            map.insert(h(i), seed);
+            sizes.insert(h(i), size);
+        }
+        let candidates = crate::EvictionCandidates::from_map_for_test(map);
+        let segments = std::collections::HashMap::new();
+        let plan = TinyLfuEviction::new(freq, 2, 10).plan(&EvictionContext {
+            candidates: &candidates,
+            sizes: &sizes,
+            segments: &segments,
+            total_bytes: 360,
+            target_bytes: 0,
+            budget: 100,
+            cache_bytes: 0,
+        });
+        assert_eq!(plan.evict, vec![h(2), h(3), h(1)]);
     }
 
     #[test]

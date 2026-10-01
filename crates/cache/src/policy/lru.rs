@@ -5,16 +5,22 @@ use super::{
 };
 use crate::Hash;
 
-/// Evicts strictly by last access, oldest first, until the sweep reaches
+/// Evicts by last access, oldest first, until the sweep reaches
 /// `target_bytes` or spends its budget. Promotes nothing.
+///
+/// Equal recencies — every blob that carries the open-time recency seed shares
+/// one instant — release largest first, so the sweep reaches its target in
+/// fewer releases.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LruEviction;
 
 impl EvictionPolicy for LruEviction {
     fn plan(&self, ctx: &EvictionContext<'_>) -> EvictionPlan {
+        let size = |h: &Hash| ctx.sizes.get(h).copied().unwrap_or(0);
         let mut ordered: Vec<(Hash, std::time::Instant)> =
             ctx.candidates.iter().map(|(h, t)| (*h, *t)).collect();
-        ordered.sort_by_key(|(_, last)| *last); // oldest access first
+        // Oldest access first; equal recencies largest first.
+        ordered.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| size(&b.0).cmp(&size(&a.0))));
         let mut evict = Vec::new();
         let mut freed = 0u64;
         for (h, _) in ordered {
@@ -99,6 +105,25 @@ mod tests {
         let plan = LruEviction.plan(&ctx(&candidates, &sizes, &segments, 1, 0, 100));
         assert_eq!(plan.evict, vec![h(2), h(3), h(1)]);
         assert!(plan.promote.is_empty());
+    }
+
+    /// Blobs sharing one recency — the open-time seed — release largest first,
+    /// so the sweep reaches its target in fewer releases.
+    #[test]
+    fn lru_breaks_equal_recency_largest_first() {
+        let seed = Instant::now();
+        let mut map = HashMap::new();
+        map.insert(h(1), seed);
+        map.insert(h(2), seed);
+        map.insert(h(3), seed);
+        let candidates = EvictionCandidates::from_map_for_test(map);
+        let mut sizes = HashMap::new();
+        sizes.insert(h(1), 10u64);
+        sizes.insert(h(2), 300u64);
+        sizes.insert(h(3), 50u64);
+        let segments = HashMap::new();
+        let plan = LruEviction.plan(&ctx(&candidates, &sizes, &segments, 360, 0, 100));
+        assert_eq!(plan.evict, vec![h(2), h(3), h(1)]);
     }
 
     #[test]

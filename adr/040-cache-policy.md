@@ -391,8 +391,8 @@ retention.
 - Range-aware eviction is not achievable until an upstream `iroh-blobs`
   range-forget primitive exists. Whole-blob reclaim ships in its place.
 - W-TinyLFU state is not durable. After a restart, eviction cannot tell hot
-  blobs from cold blobs among those that traffic has not touched again. It
-  releases them in arbitrary order.
+  blobs from cold blobs among those that traffic has not touched again. Both
+  policies release those blobs largest first.
 - Probationary admission still writes first-hit bytes; it is not a
   pass-through. Write amplification stays bounded by paid demand.
 

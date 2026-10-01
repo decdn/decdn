@@ -89,8 +89,8 @@ const RESCAN_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// which is later. So both eviction policies see an unaccessed pre-open blob as
 /// older than anything touched since open: [`crate::policy::LruEviction`]
 /// releases it first, and [`crate::policy::TinyLfuEviction`] releases it first
-/// among blobs of equal frequency. The pre-open blobs tie, so their release
-/// order among themselves is arbitrary.
+/// among blobs of equal frequency. The pre-open blobs tie on recency, and both
+/// policies break that tie largest first.
 const COLD_SEED_AGE: Duration = Duration::from_secs(1);
 
 /// The origin-held index and what the rescan that built it could not resolve.
@@ -4548,6 +4548,15 @@ impl CacheEngine {
         }
     }
 
+    /// Mark `hash` as in use now — recency only, no frequency observe. A serve
+    /// calls this when it starts, so a blob carrying the open-time recency seed
+    /// does not rank oldest, and first in line for eviction, while its bytes are
+    /// on the wire. The serve's one frequency sighting still comes from
+    /// [`Self::observe_hit`] at clean completion.
+    pub fn touch_recency(&self, hash: Hash) {
+        self.record_access(hash);
+    }
+
     /// Record an access for `hash` at the current instant — LRU recency only, no
     /// frequency observe. The fill paths use this so the blob becomes an eviction
     /// candidate without counting as a hit sighting; the paired serve emits the
@@ -8594,6 +8603,83 @@ mod tests {
         anyhow::ensure!(
             candidates.contains_key(&free),
             "an unpinned pre-open blob must still be an eviction candidate"
+        );
+        Ok(())
+    }
+
+    /// Under `TinyLfuEviction`, a blob touched after open ranks after an untouched
+    /// pre-open blob of equal frequency: the seed is older than any post-open
+    /// access.
+    #[tokio::test]
+    async fn tinylfu_ranks_a_touched_blob_after_an_untouched_pre_open_blob() -> anyhow::Result<()> {
+        use crate::policy::{EvictionContext, EvictionPolicy, TinyLfuEstimator, TinyLfuEviction};
+
+        let tmp = tempfile::tempdir()?;
+        let cold_payload: &[u8] = b"tinylfu: untouched after restart";
+        let hot_payload: &[u8] = b"tinylfu: touched after restart";
+        let cold = Hash::new(cold_payload);
+        let hot = Hash::new(hot_payload);
+        commit_then_close(tmp.path(), &[cold_payload, hot_payload]).await?;
+
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
+        let freq: Arc<dyn crate::policy::FrequencyEstimator> =
+            Arc::new(TinyLfuEstimator::new(4096));
+        engine.set_frequency_estimator(Arc::clone(&freq));
+        // Recency only, so both blobs stay at frequency 0 and age alone decides.
+        engine.touch_recency(hot);
+
+        let candidates = engine.eviction_candidates();
+        let sizes = HashMap::new();
+        let segments = HashMap::new();
+        let plan = TinyLfuEviction::new(freq, 2, 10).plan(&EvictionContext {
+            candidates: &candidates,
+            sizes: &sizes,
+            segments: &segments,
+            total_bytes: 1,
+            target_bytes: 0,
+            budget: 1,
+            cache_bytes: 0,
+        });
+        anyhow::ensure!(
+            plan.evict == vec![cold],
+            "TinyLFU must release the untouched pre-open blob first, got {:?}",
+            plan.evict
+        );
+        Ok(())
+    }
+
+    /// A partial blob on disk at open is seeded like a complete one: it is an
+    /// eviction candidate with no traffic, and its protecting tag survives the
+    /// reopen so the driver can release it.
+    #[tokio::test]
+    async fn a_partial_blob_on_disk_before_open_is_an_eviction_candidate() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?);
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, group, group, total);
+        {
+            let engine = CacheEngine::open(tmp.path(), Vec::new(), 16).await?;
+            engine.admit_bao(hash, ranges, bao).await?;
+            anyhow::ensure!(
+                !engine.present_ranges(hash).await?.is_complete(),
+                "the admitted blob must be partial"
+            );
+            engine.shutdown().await?;
+        }
+
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 16).await?;
+        anyhow::ensure!(
+            engine.eviction_candidates().contains_key(&hash),
+            "a pre-open partial must be an eviction candidate without a touch"
+        );
+        anyhow::ensure!(
+            engine.last_accessed(hash).is_none(),
+            "a seeded partial must not read as accessed"
+        );
+        anyhow::ensure!(
+            engine.release_for_eviction(hash).await? > 0,
+            "a seeded pre-open partial must be releasable"
         );
         Ok(())
     }

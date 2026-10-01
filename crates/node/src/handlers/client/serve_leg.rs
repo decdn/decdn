@@ -124,6 +124,10 @@ impl ClientHandler {
         // `?` included, passes through the one `PaidProgress` tag: the dispatch
         // sink splits a peer that left into declined or abandoned by it.
         let mut paid: u64 = 0;
+        // Refresh recency before the first byte goes out, so the blob does not
+        // rank oldest for eviction while it streams. Recency only: the frequency
+        // sighting waits for `StreamEnd`.
+        self.cache.touch_recency(hash);
         self.serve_leg_loop(
             send,
             recv,
