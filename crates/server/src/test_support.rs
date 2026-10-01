@@ -6,6 +6,7 @@
     clippy::indexing_slicing
 )]
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -23,18 +24,21 @@ use sponsord::state::AppState;
 use sponsord::store::Store;
 use sponsord::treasury::Treasury;
 
-/// In-memory pool treasury: fixed owner, a mutable remaining balance.
+/// In-memory pool treasury: fixed owner, a mutable remaining balance, and
+/// the set of signers registered on-chain.
 pub struct FakeTreasury {
     owner: Address,
     remaining: Mutex<u64>,
+    registered: Mutex<HashSet<Address>>,
 }
 
 impl FakeTreasury {
     #[must_use]
-    pub fn new(owner: Address, remaining: u64) -> Self {
+    pub fn new(owner: Address, remaining: u64, registered: HashSet<Address>) -> Self {
         Self {
             owner,
             remaining: Mutex::new(remaining),
+            registered: Mutex::new(registered),
         }
     }
 }
@@ -62,6 +66,13 @@ impl Treasury for FakeTreasury {
     async fn pool_owner(&self, _pool_id: B256) -> anyhow::Result<Address> {
         Ok(self.owner)
     }
+    async fn signer_registered(&self, _pool_id: B256, signer: Address) -> anyhow::Result<bool> {
+        let r = self
+            .registered
+            .lock()
+            .map_err(|_| anyhow::anyhow!("poisoned"))?;
+        Ok(r.contains(&signer))
+    }
 }
 
 pub struct FakeCaptcha {
@@ -85,12 +96,15 @@ impl CaptchaVerifier for FakeCaptcha {
 pub struct FakeOptions {
     pub captcha_passes: bool,
     pub capability_cap: MicroUsdc,
+    /// Signers the fake pool reports as registered on-chain.
+    pub registered_signers: HashSet<Address>,
 }
 impl Default for FakeOptions {
     fn default() -> Self {
         Self {
             captcha_passes: true,
             capability_cap: MicroUsdc(10_000_000),
+            registered_signers: HashSet::new(),
         }
     }
 }
@@ -117,7 +131,11 @@ pub fn app_state_with_options(opts: FakeOptions) -> AppState {
         2_592_000,
     ));
 
-    let treasury: Arc<dyn Treasury> = Arc::new(FakeTreasury::new(owner, 100_000_000));
+    let treasury: Arc<dyn Treasury> = Arc::new(FakeTreasury::new(
+        owner,
+        100_000_000,
+        opts.registered_signers,
+    ));
     let turnstile: Arc<dyn CaptchaVerifier> = Arc::new(FakeCaptcha::new(opts.captcha_passes));
 
     let cfg = ServerConfig {

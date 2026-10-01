@@ -39,6 +39,11 @@ fn now() -> u64 {
         .as_secs()
 }
 
+/// Expiry of a freshly issued capability: the gateway's 30-day default TTL.
+fn fresh_expiry() -> u64 {
+    now() + 30 * 86_400
+}
+
 /// A stub `decdn` that appends its argv to `<dir>/calls` and exits `code`.
 #[cfg(unix)]
 fn stub_decdn(dir: &Path, code: i32) -> PathBuf {
@@ -107,7 +112,7 @@ async fn gateway_with_capability(expiry: u64, expected_calls: u64) -> MockServer
 async fn success_runs_bundle_pull_and_discards_state() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("sponsored");
-    let gateway = gateway_with_capability(now() + 3600, 1).await;
+    let gateway = gateway_with_capability(fresh_expiry(), 1).await;
     let cfg = config(&gateway.uri(), &stub_decdn(tmp.path(), 0), &data);
 
     flow::pull(
@@ -131,7 +136,7 @@ async fn success_runs_bundle_pull_and_discards_state() {
 async fn failure_keeps_state_and_rerun_reuses_capability() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("sponsored");
-    let gateway = gateway_with_capability(now() + 3600, 1).await;
+    let gateway = gateway_with_capability(fresh_expiry(), 1).await;
 
     let failing = config(&gateway.uri(), &stub_decdn(tmp.path(), 1), &data);
     let err = flow::pull(HASH, &tmp.path().join("out"), None, &failing)
@@ -166,7 +171,30 @@ async fn expired_capability_rotates_to_a_fresh_key() {
     let old_key = std::fs::read(state_dir(&data).join("keystore.json")).unwrap();
 
     // Second run must throw the old key away and fetch a new capability.
-    let fresh = gateway_with_capability(now() + 3600, 1).await;
+    let fresh = gateway_with_capability(fresh_expiry(), 1).await;
+    let failing_again = config(&fresh.uri(), &stub_decdn(tmp.path(), 1), &data);
+    flow::pull(HASH, &tmp.path().join("out"), None, &failing_again)
+        .await
+        .unwrap_err();
+    let new_key = std::fs::read(state_dir(&data).join("keystore.json")).unwrap();
+    assert_ne!(old_key, new_key);
+}
+
+#[tokio::test]
+async fn capability_inside_node_margin_rotates_to_a_fresh_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("sponsored");
+
+    // Still unexpired, but a default node already refuses vouchers under it.
+    let near = gateway_with_capability(now() + flow::NODE_EXPIRY_MARGIN_SECS - 60, 1).await;
+    let failing = config(&near.uri(), &stub_decdn(tmp.path(), 1), &data);
+    flow::pull(HASH, &tmp.path().join("out"), None, &failing)
+        .await
+        .unwrap_err();
+    let old_key = std::fs::read(state_dir(&data).join("keystore.json")).unwrap();
+
+    // The re-run must not reuse it: a new key asks the gateway again.
+    let fresh = gateway_with_capability(fresh_expiry(), 1).await;
     let failing_again = config(&fresh.uri(), &stub_decdn(tmp.path(), 1), &data);
     flow::pull(HASH, &tmp.path().join("out"), None, &failing_again)
         .await

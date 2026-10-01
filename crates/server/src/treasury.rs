@@ -1,6 +1,7 @@
 //! `Treasury`: the on-chain `PaymentPool` operations the sponsor needs — read
-//! the pool's remaining balance, top it up from the hot wallet, and read its
-//! owner (a boot-time sanity check). Mocked by `FakeTreasury` in the HTTP
+//! the pool's remaining balance, top it up from the hot wallet, read its
+//! owner (a boot-time sanity check), and read whether a signer is already
+//! registered. Mocked by `FakeTreasury` in the HTTP
 //! contract tests; backed by `DecdnTreasury` in production.
 
 use alloy::primitives::{Address, B256, U256};
@@ -28,6 +29,10 @@ pub trait Treasury: Send + Sync {
     /// The pool's on-chain `owner` (used once at boot to confirm this wallet
     /// owns the configured pool).
     async fn pool_owner(&self, pool_id: B256) -> anyhow::Result<Address>;
+
+    /// Whether `signer` holds an on-chain authorization in the pool. Its cap
+    /// and expiry are written once, at its first redemption, and never change.
+    async fn signer_registered(&self, pool_id: B256, signer: Address) -> anyhow::Result<bool>;
 }
 
 #[derive(Clone, Debug)]
@@ -108,5 +113,15 @@ impl<P: Provider + Clone + 'static> Treasury for DecdnTreasury<P> {
             .await
             .map_err(|e| anyhow::anyhow!("getPool({pool_id}): {e}"))?;
         Ok(pool.owner)
+    }
+
+    async fn signer_registered(&self, pool_id: B256, signer: Address) -> anyhow::Result<bool> {
+        let auth = self
+            .contract
+            .getAuthorization(pool_id, signer)
+            .call()
+            .await
+            .map_err(|e| anyhow::anyhow!("getAuthorization({pool_id}, {signer}): {e}"))?;
+        Ok(auth.cap != 0 || auth.expiry != 0)
     }
 }

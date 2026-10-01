@@ -166,7 +166,7 @@ async fn fund_page_embeds_sitekey_and_client_and_rejects_non_hex() {
 }
 
 #[tokio::test]
-async fn expired_grant_is_treated_as_absent_and_reissued() {
+async fn expired_grant_for_unregistered_signer_is_reissued() {
     use alloy::primitives::Address;
     use sponsord::money::MicroUsdc;
     use sponsord::store::GrantRecord;
@@ -216,6 +216,46 @@ async fn expired_grant_is_treated_as_absent_and_reissued() {
         .to_string();
     assert_ne!(token, "dcap1:STALE");
     assert!(token.starts_with("dcap1:"));
+}
+
+#[tokio::test]
+async fn expired_grant_for_registered_signer_is_refused_409() {
+    use alloy::primitives::Address;
+    use sponsord::store::GrantRecord;
+    use std::str::FromStr;
+
+    let signer = Address::from_str(CLIENT).expect("addr");
+    let state = app_state_with_options(FakeOptions {
+        registered_signers: [signer].into(),
+        ..FakeOptions::default()
+    });
+    let stale = GrantRecord {
+        spending_cap: 10_000_000,
+        expiry: 1_000_000,
+        issued_unix: 0,
+        token: "dcap1:STALE".to_string(),
+    };
+    state.store.put_grant(signer, &stale).expect("seed grant");
+    let store = state.store.clone();
+
+    let app = sponsord::http::router(state);
+    let resp = app
+        .oneshot(
+            Request::post("/fund")
+                .header("content-type", "application/json")
+                .body(Body::from(fund_body()))
+                .expect("req"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(resp).await["error"].as_str(),
+        Some("signer_registered")
+    );
+    // Nothing was signed: the stored grant is untouched.
+    let kept = store.get_grant(signer).expect("get").expect("grant");
+    assert_eq!(kept.token, "dcap1:STALE");
 }
 
 #[tokio::test]

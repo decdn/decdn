@@ -31,6 +31,11 @@
       .then((resp) => {
         if (resp.ok) {
           document.getElementById("done").style.display = "block";
+        } else if (resp.status === 409) {
+          const error = document.getElementById("error");
+          error.textContent =
+            "This key's allowance has expired and cannot be renewed. Start the download again with a fresh key.";
+          error.style.display = "block";
         } else {
           document.getElementById("error").style.display = "block";
         }

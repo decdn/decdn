@@ -19,9 +19,10 @@ Capabilities are node-agnostic: issuance doesn't involve a content hash or
 node discovery, only an allowance against the shared pool. Registration of a
 signer against the pool is set-once on-chain — once a key first redeems, its
 cap and expiry are frozen for that key, which is why `decdn-sponsored` uses
-one key per download. Anti-abuse is bounded by the captcha on `/fund`, the
-per-capability cap (`SPONSOR_CAPABILITY_CAP_MICRO_USDC`), and the shared
-pool's own balance — there's no per-signer monthly accumulator.
+one key per download, and why `/fund` answers `409 signer_registered` instead
+of renewing an expired capability for a key that has already redeemed.
+Anti-abuse is bounded by the captcha on `/fund`, the per-capability cap
+(`SPONSOR_CAPABILITY_CAP_MICRO_USDC`), and the shared pool's own balance — there's no per-signer monthly accumulator.
 
 ## Crates
 

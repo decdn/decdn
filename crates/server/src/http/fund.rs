@@ -58,22 +58,32 @@ pub async fn submit(State(state): State<AppState>, Json(req): Json<FundRequest>)
     let now = now_unix();
 
     // Idempotent: a signer that already holds a still-valid capability gets
-    // the same token back. If the stored grant has expired, fall through
-    // and re-issue — an un-redeemed capability is not frozen on-chain, so
-    // this is safe, and it's the only way a signer who never fetched within
-    // the TTL can get unstuck (`/fund` and `/capability` would otherwise
-    // keep handing back a token the wrapper can never use again).
+    // the same token back. A signer whose stored grant has expired gets a
+    // fresh capability only while it is unregistered on-chain. `PaymentPool`
+    // writes a signer's cap and expiry once, at its first redemption, and
+    // ignores every later capability for it, so a re-issued token for a
+    // redeemed signer would carry an expiry nodes accept but the contract
+    // never honors: vouchers under it redeem to 0. A registered signer gets
+    // `409 signer_registered` and must come back with a fresh key.
     //
-    // Note: two concurrent `POST /fund` for the same signer can both miss
-    // this lookup and both sign below. That's benign — both tokens are
-    // validly signed for the same signer+pool, `put_grant` is
-    // last-writer-wins, and the client just reads back whatever
-    // `GET /capability` returns.
+    // Two concurrent `POST /fund` for the same signer can both miss this
+    // lookup and both sign below. Both tokens are validly signed for the
+    // same signer and pool, `put_grant` is last-writer-wins, and the client
+    // reads back whatever `GET /capability` returns.
     match state.store.get_grant(client) {
         Ok(Some(rec)) if now < rec.expiry => {
             return Json(json!({ "token": rec.token })).into_response();
         }
-        Ok(_) => {}
+        Ok(Some(_)) => match state
+            .treasury
+            .signer_registered(state.cfg.pool_id, client)
+            .await
+        {
+            Ok(false) => {}
+            Ok(true) => return err_json(StatusCode::CONFLICT, "signer_registered"),
+            Err(_) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        },
+        Ok(None) => {}
         Err(_) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     }
 

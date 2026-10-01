@@ -16,8 +16,16 @@ use crate::session::{self, Session};
 /// How long to wait for the browser captcha flow to produce a capability.
 const CAPABILITY_POLL_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// A default decdn node's capability-expiry margin: it refuses vouchers once
+/// `now + margin` reaches the capability's expiry. The node derives it as one
+/// 300 s redeem interval plus 120 s for the redeem transaction to land.
+pub const NODE_EXPIRY_MARGIN_SECS: u64 = 420;
+
+/// Runway the download itself needs on top of the node's refusal window.
+const DOWNLOAD_SLACK_SECS: u64 = 3600;
+
 /// A saved capability this close to expiry is replaced before pulling.
-const EXPIRY_MARGIN_SECS: u64 = 300;
+const EXPIRY_MARGIN_SECS: u64 = NODE_EXPIRY_MARGIN_SECS + DOWNLOAD_SLACK_SECS;
 
 /// # Errors
 /// Invalid hash, state dir or key failure, sponsor unreachable / no
@@ -38,7 +46,7 @@ pub async fn pull(
         .is_some_and(|grant| grant.expiry <= now.saturating_add(EXPIRY_MARGIN_SECS))
     {
         // A key's cap and expiry are frozen on-chain at its first
-        // redemption, so an expired capability means a fresh key.
+        // redemption, so a capability near expiry means a fresh key.
         session.discard()?;
         session = Session::open(&cfg.data_dir, &hash)?;
     }
