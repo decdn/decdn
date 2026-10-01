@@ -1342,6 +1342,98 @@ mod doubles {
     }
 }
 
+/// A store double for the record-flush tests of the driver and the scheduler.
+#[cfg(test)]
+mod flush_double {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use decdn_bao_range::{AlignedRange, RangedFuture, RangedStore};
+
+    use super::{BaoRangeReader, IngestStore, SourceFuture};
+    use crate::ClientRangedStore;
+
+    /// An [`IngestStore`] wrapper that counts `flush_present_record` calls and
+    /// delegates every real operation to an inner [`ClientRangedStore`]. It lets
+    /// a test observe the interval flush firing during a still-running fetch.
+    /// `flush_delay` makes each flush take that long before it writes, to model
+    /// a record fsync under writeback pressure.
+    pub(crate) struct FlushCountingStore {
+        pub(crate) inner: ClientRangedStore,
+        pub(crate) flushes: Arc<AtomicUsize>,
+        pub(crate) flush_delay: Duration,
+    }
+
+    impl RangedStore for FlushCountingStore {
+        fn total_bytes(&self) -> u64 {
+            self.inner.total_bytes()
+        }
+        fn present_ranges(&self) -> RangedFuture<'_, bao_tree::ChunkRanges> {
+            self.inner.present_ranges()
+        }
+        fn missing_ranges(
+            &self,
+            byte_offset: u64,
+            byte_len: u64,
+        ) -> RangedFuture<'_, bao_tree::ChunkRanges> {
+            self.inner.missing_ranges(byte_offset, byte_len)
+        }
+        fn admit(&self, range: AlignedRange, bao_bytes: Bytes) -> RangedFuture<'_, ()> {
+            self.inner.admit(range, bao_bytes)
+        }
+        fn read(&self, byte_offset: u64, byte_len: u64) -> RangedFuture<'_, Bytes> {
+            self.inner.read(byte_offset, byte_len)
+        }
+        fn is_complete(&self) -> RangedFuture<'_, bool> {
+            self.inner.is_complete()
+        }
+        fn finalize(&self) -> RangedFuture<'_, ()> {
+            self.inner.finalize()
+        }
+    }
+
+    impl IngestStore for FlushCountingStore {
+        fn ingest_stream<'a, R>(
+            &'a self,
+            range: &'a AlignedRange,
+            reader: R,
+            on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+            claimed_total: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
+        where
+            R: BaoRangeReader + 'a,
+        {
+            Box::pin(
+                self.inner
+                    .ingest_stream(range, reader, on_progress, claimed_total),
+            )
+        }
+
+        fn flush_present_record(&self) -> SourceFuture<'_, ()> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            let write = IngestStore::flush_present_record(&self.inner);
+            let delay = self.flush_delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                write.await
+            })
+        }
+
+        fn proven(&self) -> Option<u64> {
+            IngestStore::proven(&self.inner)
+        }
+
+        fn set_bound(&self, bound: u64) {
+            IngestStore::set_bound(&self.inner, bound);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) use flush_double::FlushCountingStore;
+
 #[cfg(any(test, feature = "test-util"))]
 pub use doubles::{FakeFunder, ScriptedReader, ScriptedSource};
 

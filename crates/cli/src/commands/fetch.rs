@@ -1506,7 +1506,12 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // The buyer-pool store, opened once and recorded into by open-or-reuse.
     // The guard runs here, before the keystore password prompt: the answer
     // depends only on the data dir, and a refusal must not cost a prompt first.
-    let store = open_client_store_for_buy(&chain.data_dir, chain.data_dir_source, "fetch")?;
+    // Shared, so a lane's watermark write runs off the runtime thread.
+    let store = Arc::new(open_client_store_for_buy(
+        &chain.data_dir,
+        chain.data_dir_source,
+        "fetch",
+    )?);
 
     // One discovery-enabled endpoint, reused for probing and the delivery dial.
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
@@ -1543,7 +1548,7 @@ async fn fetch_over(
     relays: &[RelayUrl],
     chain: &ResolvedChain,
     grant: Option<CapabilityGrant>,
-    store: &RedbBuyerPoolStore,
+    store: &Arc<RedbBuyerPoolStore>,
     endpoint: &Endpoint,
 ) -> anyhow::Result<()> {
     let common = &args.common;
@@ -1643,7 +1648,7 @@ async fn fetch_over(
     );
     let holders = sources.holders_from(&resolved);
     // A fetch dropped by Ctrl-C records every lane's vouchers too.
-    let on_drop = SettleOnDrop::new(|| sources.persist_watermarks());
+    let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
     let result = async {
         // The first size claim: the probe's hint, or a header-only open.
         let claim = sources.first_claim(hash, holders, &health, &stop).await?;
@@ -1678,7 +1683,7 @@ async fn fetch_over(
     }
     .await;
     on_drop.disarm();
-    sources.persist_watermarks();
+    sources.persist_watermarks().await;
     result.map_err(|err| sources.annotate(err))
 }
 
@@ -1735,7 +1740,9 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
 /// lanes. Every field is a borrow or a `Copy` scalar.
 pub(crate) struct DriveFetchDeps<'a, P> {
     pub(crate) endpoint: &'a Endpoint,
-    pub(crate) store: &'a RedbBuyerPoolStore,
+    /// Shared, so a lane's watermark write runs on the blocking pool
+    /// ([`persist_face_watermarks`]).
+    pub(crate) store: &'a Arc<RedbBuyerPoolStore>,
     pub(crate) contract: &'a PaymentPool::PaymentPoolInstance<P>,
     pub(crate) rpc: &'a P,
     pub(crate) slash_dom: &'a Eip712Domain,
@@ -1970,9 +1977,21 @@ pub(crate) struct FaceLaneHandle {
 /// The per-lane [`LaneWatermark`]s to persist after a face fetch, read from the
 /// retained [`FaceLaneHandle`]s — the same settle-at-armed-cumulative rule
 /// [`multi_lane_watermarks`] then keys for persistence.
+///
+/// One watermark per ledger: a lane rebuilt on the run's shared ledger leaves a
+/// second handle on it, and the first handle's read already takes the ledger's
+/// unsaved rebase, so a second write for it would only repeat the first.
 fn stream_lane_watermarks(lanes: &[FaceLaneHandle]) -> Vec<LaneWatermark> {
+    let mut seen: Vec<&Arc<PoolLedger>> = Vec::new();
     lanes
         .iter()
+        .filter(|l| {
+            let first = !seen.iter().any(|s| Arc::ptr_eq(s, &l.ledger));
+            if first {
+                seen.push(&l.ledger);
+            }
+            first
+        })
         .map(|l| LaneWatermark {
             pool_id: l.pool_id,
             provider: l.provider,
@@ -2027,17 +2046,71 @@ where
     Ok(drained)
 }
 
-/// Persist every face lane's voucher watermark from the retained handles — the
-/// same settle-at-armed-cumulative rule the file path applies. The faces do not
-/// persist, so the thin CLI layer does it after the fetch, before surfacing any
-/// error: the bytes each lane delivered are paid for whatever the outcome.
-pub(crate) fn persist_face_watermarks(
-    store: &RedbBuyerPoolStore,
+/// One lane's buyer-store watermark write: the lane and the progress to record.
+pub(crate) type LaneWrite = (LaneKey, VoucherProgress);
+
+/// The watermark write every face lane calls for, read from the retained
+/// handles now — the same settle-at-armed-cumulative rule the file path
+/// applies, one write per lane ledger.
+pub(crate) fn face_watermark_writes(
     self_address: Address,
     handles: &[FaceLaneHandle],
-) {
-    for (lane, vprogress) in multi_lane_watermarks(self_address, &stream_lane_watermarks(handles)) {
+) -> Vec<LaneWrite> {
+    multi_lane_watermarks(self_address, &stream_lane_watermarks(handles))
+}
+
+/// Apply every write in `writes`. Blocking: each one is a redb commit.
+fn write_watermarks(store: &RedbBuyerPoolStore, self_address: Address, writes: Vec<LaneWrite>) {
+    for (lane, vprogress) in writes {
         persist_watermark(store, self_address, lane.pool_id, lane, &vprogress);
+    }
+}
+
+/// Persist every face lane's voucher watermark ([`face_watermark_writes`]) on
+/// the blocking pool, and return once the writes land. The faces do not
+/// persist, so the thin CLI layer does it after the fetch, before surfacing any
+/// error: the bytes each lane delivered are paid for whatever the outcome.
+///
+/// Each write is a durable redb commit, and a `bundle pull`'s lanes share the
+/// caller's task, so a commit inline would stop every lane of the run while it
+/// syncs (#2211).
+pub(crate) async fn persist_face_watermarks(
+    store: &Arc<RedbBuyerPoolStore>,
+    self_address: Address,
+    writes: Vec<LaneWrite>,
+) {
+    if writes.is_empty() {
+        return;
+    }
+    let store = Arc::clone(store);
+    let written =
+        tokio::task::spawn_blocking(move || write_watermarks(&store, self_address, writes)).await;
+    if let Err(e) = written {
+        tracing::warn!(
+            "the voucher watermark write did not finish: {e}; the next reuse may re-sign a \
+             stale watermark, which its provider rejects"
+        );
+    }
+}
+
+/// [`persist_face_watermarks`] for a drop guard, which cannot wait: the writes
+/// run on the blocking pool and land after the caller returns. The runtime
+/// waits for blocking tasks as it shuts down, so a Ctrl-C still records them.
+/// Outside a runtime the writes run here.
+pub(crate) fn persist_face_watermarks_detached(
+    store: &Arc<RedbBuyerPoolStore>,
+    self_address: Address,
+    writes: Vec<LaneWrite>,
+) {
+    if writes.is_empty() {
+        return;
+    }
+    let store = Arc::clone(store);
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            drop(runtime.spawn_blocking(move || write_watermarks(&store, self_address, writes)));
+        }
+        Err(_) => write_watermarks(&store, self_address, writes),
     }
 }
 
@@ -4212,7 +4285,7 @@ mod tests {
 
         let (ep, _) = loopback(Vec::new()).await?;
         let dir = tempfile::tempdir()?;
-        let store = RedbBuyerPoolStore::open(&dir.path().join("data"))?;
+        let store = Arc::new(RedbBuyerPoolStore::open(&dir.path().join("data"))?);
         let rpc = alloy::providers::ProviderBuilder::new()
             .connect_mocked_client(alloy::providers::mock::Asserter::new());
         let contract = PaymentPool::new(Address::repeat_byte(0x33), rpc.clone());
@@ -4324,6 +4397,38 @@ mod tests {
             "without an anchor the persist is monotone"
         );
         Ok(())
+    }
+
+    /// A lane built twice on one shared ledger commits once per entry; a lane
+    /// on its own ledger keeps its own write.
+    #[test]
+    fn duplicate_lane_handles_commit_once() {
+        let handle = |ledger: &Arc<PoolLedger>, provider: u8| FaceLaneHandle {
+            pool_id: PoolId::repeat_byte(1),
+            provider: Address::repeat_byte(provider),
+            prior_amount: U256::ZERO,
+            ledger: Arc::clone(ledger),
+            ctx: Arc::new(Mutex::new(ctx_with(None))),
+        };
+        let shared = Arc::new(PoolLedger::new(Cumulative {
+            bytes: U256::from(100u64),
+            amount: U256::from(70u64),
+        }));
+        let other = Arc::new(PoolLedger::new(Cumulative {
+            bytes: U256::from(10u64),
+            amount: U256::from(7u64),
+        }));
+        let handles = [
+            handle(&shared, 0xA1),
+            handle(&other, 0xB2),
+            handle(&shared, 0xA1),
+        ];
+        let writes = face_watermark_writes(Address::repeat_byte(0x5E), &handles);
+        let providers: Vec<Address> = writes.iter().map(|(lane, _)| lane.provider).collect();
+        assert_eq!(
+            providers,
+            [Address::repeat_byte(0xA1), Address::repeat_byte(0xB2)]
+        );
     }
 
     /// The multi-source path carries each lane's own rebase anchor.

@@ -2362,6 +2362,11 @@ where
         Instant::now() + PRESENT_RECORD_FLUSH_INTERVAL,
         PRESENT_RECORD_FLUSH_INTERVAL,
     );
+    // The record write in flight, if any. It runs beside the workers, never
+    // instead of them: awaited inline, a slow record fsync would leave every
+    // lane unpolled for as long as it takes (#2211). A tick that finds a write
+    // still in flight skips, which keeps this loop the single record writer.
+    let mut record: Option<SourceFuture<'_, ()>> = None;
     let result: anyhow::Result<()> = async {
         loop {
             let bound = store.total_bytes();
@@ -2389,6 +2394,11 @@ where
                     return Err(anyhow::Error::new(too_large));
                 }
                 if store.proven().is_some() || !want.tail {
+                    // Land the write in flight first, so it cannot rename an
+                    // older snapshot over the final one.
+                    if let Some(pending) = record.take() {
+                        pending.await?;
+                    }
                     store.flush_present_record().await?;
                     return Ok(());
                 }
@@ -2665,8 +2675,14 @@ where
                 Ok(()) = deposit_rx.changed() => {}
                 // A leg proved a size: the loop top clips the work to it.
                 () = bound_moved.notified() => {}
+                flushed = poll_opt(&mut record), if record.is_some() => {
+                    record = None;
+                    flushed?;
+                }
                 _ = flush.tick() => {
-                    store.flush_present_record().await?;
+                    if record.is_none() {
+                        record = Some(store.flush_present_record());
+                    }
                 }
                 gave_up = env.stop.expired() => {
                     return Err(anyhow::Error::new(gave_up));
@@ -2678,6 +2694,13 @@ where
     // Stop every lane first, so no paid leg sits open while the builds drain.
     drop(workers);
     drop(discovering);
+    // An error exit can leave a record write in flight: land it before the
+    // flush below, so it cannot rename an older snapshot over that one.
+    if let Some(pending) = record.take()
+        && let Err(err) = pending.await
+    {
+        tracing::warn!("flushing the present record failed: {err:#}");
+    }
     // Every error exit keeps the bytes that landed recorded for a resume.
     let result = match result {
         Err(err) => Err(flushed(store, err).await),
@@ -4806,6 +4829,72 @@ mod tests {
         let err = super::watchdog(&store, 0, 64 * 1024 * 1024, LANE_WATCHDOG, &silent).await;
         assert!(err.is_none(), "a trip, not a store error");
         assert_eq!(start.elapsed(), super::FIRST_BYTE_GRACE);
+    }
+
+    /// A record write slower than the lane watchdog never pauses the lanes
+    /// (#2211): the write runs beside the workers. The first record tick falls
+    /// while the lane waits for its first byte, and its write takes 30 s. The
+    /// lane still lands the blob on its first open, 8 s in; awaited inline,
+    /// the write would leave it unpolled past its first-byte grace.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_record_write_does_not_pause_the_lanes() -> anyhow::Result<()> {
+        let data = blob(1024 * 1024);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let a = ScriptedSource::new(data.clone())?
+            .paying(Arc::clone(&la))
+            .slow_to_start(Duration::from_secs(8));
+        let (root, total) = (a.root(), a.total_bytes());
+        let (inner, dir) = fresh_store(root, total);
+        let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = crate::source::FlushCountingStore {
+            inner,
+            flushes: Arc::clone(&flushes),
+            flush_delay: Duration::from_secs(30),
+        };
+        assert!(store.flush_delay > LANE_WATCHDOG);
+        let provider = StaticSources::new(vec![candidate(a.clone(), la, 0xA1, None)])?;
+        let mut set = SourceSet::new(&provider, root, Arc::default(), provider.holders());
+        let stop = StopPolicy::new(false, Some(Duration::from_mins(5)), Arc::default());
+        let drive = drive_config();
+        acquire(
+            AcquireTarget {
+                store: &store,
+                hash: root,
+                total_bytes: total,
+                ranges: &[(0, total)],
+            },
+            &mut set,
+            &AcquireEnv {
+                pacer: &BudgetPacer::new(),
+                funder: &no_topups(),
+                drive: &drive,
+                max_lanes: 1,
+                stop: &stop,
+                on_progress: None,
+                ledgers: None,
+                pacing: None,
+                max_blob_bytes: 0,
+            },
+        )
+        .await?;
+
+        assert_eq!(a.opened_ranges().len(), 1, "{:?}", a.opened_ranges());
+        let (_, opened, finished) = a
+            .timeline()
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("the lane opened its range"))?;
+        let finished = finished.ok_or_else(|| anyhow::anyhow!("the leg finished"))?;
+        assert!(
+            finished.duration_since(opened) < LANE_WATCHDOG,
+            "the leg waited on the record write: it took {:?}",
+            finished.duration_since(opened)
+        );
+        // The tick's write and the final one.
+        assert_eq!(flushes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        store.inner.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        Ok(())
     }
 
     /// End-to-end: a source whose first byte takes 20 s serves the whole

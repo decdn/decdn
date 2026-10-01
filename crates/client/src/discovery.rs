@@ -539,7 +539,12 @@ pub async fn bootstrap_nodes(
                 REGISTRY_RETRY_BACKOFF.iter().sum::<Duration>().as_secs(),
             )),
         };
-    resolve_bootstrap(registry, data_dir)
+    // Off the runtime: a live read writes and fsyncs one peer record per
+    // registered node, and a caller's lanes share this task (#2211).
+    let data_dir = data_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || resolve_bootstrap(registry, &data_dir))
+        .await
+        .map_err(|e| anyhow::anyhow!("peer store bootstrap task: {e}"))?
 }
 
 /// Candidates probed before ranking (decision 3): shuffle, order region-first,

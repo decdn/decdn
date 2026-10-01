@@ -1462,7 +1462,12 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     // Same guard as `decdn fetch`, for the same reason and before the same
     // password prompt: a node's data dir is a buy target only when the
     // operator named it (#2082).
-    let store = open_client_store_for_buy(&chain.data_dir, chain.data_dir_source, "pull")?;
+    // Shared, so a lane's watermark write runs off the runtime thread.
+    let store = Arc::new(open_client_store_for_buy(
+        &chain.data_dir,
+        chain.data_dir_source,
+        "pull",
+    )?);
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
     // The body runs in `pull_over`, so the endpoint closes on every exit —
     // success, an early return, or an error — and its open connections end
@@ -1490,7 +1495,7 @@ async fn pull_over(
     args: &BundlePullArgs,
     chain: &fetch::ResolvedChain,
     grant: Option<decdn_incentive::CapabilityGrant>,
-    store: &RedbBuyerPoolStore,
+    store: &Arc<RedbBuyerPoolStore>,
     endpoint: &Endpoint,
     relays: &[RelayUrl],
     (filter, filters_given): (&EntryFilter, bool),
@@ -1647,13 +1652,21 @@ async fn pull_manifest<P: Provider + Clone>(
     reported
 }
 
+/// How often the pull's poll watch ([`warn_when_unpolled`]) ticks.
+const POLL_WATCH_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How late a poll-watch tick may fire before the pull logs that its task was
+/// not polled.
+const POLL_WATCH_LATE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Run `drive` beside `flush` until both finish, or until the first Ctrl-C.
 /// Returns whether a Ctrl-C stopped it.
 ///
 /// The Ctrl-C drops `drive`: every in-flight fetch stops where it is (its drop
 /// guard records what it paid, and its `.partial` is the next run's resume
 /// prefix). The flush channel's sender drops with `drive`, so `flush` still
-/// writes every group that settled before it returns.
+/// writes every group that settled before it returns. A poll watch
+/// ([`warn_when_unpolled`]) runs beside `drive` until it ends.
 async fn drive_until_interrupted(
     drive: impl std::future::Future<Output = ()>,
     flush: impl std::future::Future<Output = ()>,
@@ -1663,9 +1676,32 @@ async fn drive_until_interrupted(
         tokio::select! {
             () = drive => false,
             () = interrupt.wait() => true,
+            never = warn_when_unpolled() => match never {},
         }
     };
     tokio::join!(drive, flush).0
+}
+
+/// Log a WARN each time the task that polls this future was not polled for
+/// longer than [`POLL_WATCH_LATE`]. Never returns.
+///
+/// Every entry and lane of a pull runs on one task, so anything that blocks
+/// that task stops every lane at once, and the nodes see the lanes' streams
+/// go quiet together (#2211). A tick that fires late measures exactly that
+/// freeze.
+async fn warn_when_unpolled() -> std::convert::Infallible {
+    let mut tick = tokio::time::interval(POLL_WATCH_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let due = tick.tick().await;
+        let late = due.elapsed();
+        if late > POLL_WATCH_LATE {
+            tracing::warn!(
+                late_ms = late.as_millis(),
+                "the bundle task was not polled for {late:?}"
+            );
+        }
+    }
 }
 
 /// What [`PullCtx::pull_all`] hands back: every settled entry's outcome, the
@@ -1936,7 +1972,7 @@ impl ExtraPermits {
 /// polls in one task.
 struct PullCtx<'a, P: Provider + Clone> {
     endpoint: &'a Endpoint,
-    store: &'a RedbBuyerPoolStore,
+    store: &'a Arc<RedbBuyerPoolStore>,
     contract: &'a PaymentPool::PaymentPoolInstance<P>,
     rpc: &'a P,
     signer: &'a Arc<PrivateKeySigner>,
@@ -2150,7 +2186,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let holders = sources.holders_from(targets);
         // A fetch dropped by Ctrl-C, or by a sibling's command-wide fault,
         // records every lane's vouchers too.
-        let on_drop = fetch::SettleOnDrop::new(|| sources.persist_watermarks());
+        let on_drop = fetch::SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
             // The manifest's size is the entry's first claim; without one, the
             // probe's hint or a header-only open gives it.
@@ -2189,7 +2225,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         }
         .await;
         on_drop.disarm();
-        sources.persist_watermarks();
+        sources.persist_watermarks().await;
         result.map_err(|err| sources.annotate(err))
     }
 
