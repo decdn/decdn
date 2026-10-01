@@ -2652,7 +2652,7 @@ where
                                 seed_deposit(&deposit_tx, &lane);
                                 ready.push((provider, lane));
                             }
-                            Err(err) => tracing::debug!(%provider, "lane build failed: {err:#}"),
+                            Err(err) => tracing::debug!(%provider, error = %decdn_common::redact::sanitize_err_chain(&err), "lane build failed"),
                         }
                     }
                 }
@@ -2701,7 +2701,11 @@ async fn drain_builds<S>(connecting: &mut FuturesUnordered<Connecting<'_, S>>) {
     let drained = tokio::time::timeout(BUILD_DRAIN, async {
         while let Some((provider, built)) = connecting.next().await {
             if let Err(err) = built {
-                tracing::debug!(%provider, "a lane build that ended after the fetch failed: {err:#}");
+                tracing::debug!(
+                    %provider,
+                    error = %decdn_common::redact::sanitize_err_chain(&err),
+                    "a lane build that ended after the fetch failed"
+                );
             }
         }
     })

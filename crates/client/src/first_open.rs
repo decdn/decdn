@@ -148,7 +148,7 @@ where
                         deposit = deposit.max(lane_deposit(&lane));
                         opening = Some((provider, Box::pin(open(lane))));
                     }
-                    Err(err) => tracing::debug!(%provider, "lane build failed: {err:#}"),
+                    Err(err) => tracing::debug!(%provider, error = %decdn_common::redact::sanitize_err_chain(&err), "lane build failed"),
                 }
             }
             answer = poll_some(opening.as_mut().map(|(_, fut)| fut)), if opening.is_some() => {

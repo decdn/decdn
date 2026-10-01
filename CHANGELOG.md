@@ -915,6 +915,13 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Chain-read logs no longer carry the RPC URL (#2264).** The node's
+  binding check, buyer lane seed, owned-pool walk, top-up, pool open and
+  reclaim sweep log their RPC errors through the URL-stripping redactor, so a
+  provider API key in `blockchain.rpc_url` does not reach the node logs. The
+  client's lane-build and discovery debug lines and the CLI's "no holder
+  resolved yet" warning do the same.
+
 - **A partial holder is not asked again for chunks it cannot pull through
   (#2262).** A probed holder that refuses a chunk outside its advertised
   coverage with `NotFound` now counts toward the same three-refusal limit as
