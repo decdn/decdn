@@ -65,6 +65,7 @@ const MAX_METRICS_CONNECTIONS: usize = 32;
 /// scrape never sees a failure before its reason.
 pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_rejected_bad_binding_total",
+    "decdn_serve_stream_rejected_blob_too_large_total",
     "decdn_serve_stream_rejected_cache_miss_total",
     "decdn_serve_stream_rejected_chain_hash_denied_total",
     "decdn_serve_stream_rejected_chain_stale_total",
@@ -810,13 +811,25 @@ pub struct DecdnMetrics {
     pub redemption_failures: Counter,
     /// Lanes the redeemer held or dropped for the pool's chain-observed
     /// solvency (`pool_is_redeemable`, ADR 003): a drained `Open` pool is held
-    /// for a top-up, a drained or past-deadline `Closing` pool is dropped.
+    /// for a top-up, and a drained `Closing` pool, or one whose close deadline
+    /// falls within the redeemer's landing slack, is dropped.
     /// Counted once per skipped lane per planning pass. A sustained non-zero
     /// rate means real unredeemed value is stuck behind pools this node can no
     /// longer collect from — worth checking against `pool_deposit_usdc` for
     /// which pools are dry. Operator-visible name:
     /// `decdn_redemption_skipped_insolvent_total`.
     pub redemption_skipped_insolvent: Counter,
+    /// Lanes with value owed that the redeemer skipped because the signer's
+    /// capability has expired, or expires within the redeemer's landing slack
+    /// (ADR 003 §Revocation). The contract pays 0 for an expired capability, so
+    /// the redemption would only spend gas. Counted once per skipped lane per
+    /// planning pass. A lane with nothing owed is not counted. The serve path
+    /// stops accepting vouchers one redeem interval plus that slack before
+    /// expiry, so a sustained rate means a lane earned near its capability's
+    /// expiry and no sweep redeemed it in time: check for failed or
+    /// floor-deferred redemptions. Operator-visible name:
+    /// `decdn_redemption_skipped_expired_total`.
+    pub redemption_skipped_expired: Counter,
     /// Lanes dropped from a redeem batch by the pre-submit on-chain watermark
     /// reconciliation because the chain already shows them settled to their
     /// claim value — a `redeemMany` the contract would silently no-op, caught
@@ -1165,12 +1178,13 @@ pub struct DecdnMetrics {
     /// with the two reverting counters above to tell "operator under-funded the
     /// wallet" from "the RPC endpoint is flaky".
     pub pool_open_failures_rpc_error: Counter,
-    /// `decdn_node_pull_too_large_total` (#840): a selected upstream claimed a
-    /// `total_bytes` above this node's `max_blob_size` ceiling, so the buyer
-    /// rejected it before buffering. Like a channel-open failure this is a
-    /// buyer-side policy decision, NOT necessarily provider misbehavior (the
-    /// provider may legitimately serve larger blobs to nodes with a higher
-    /// ceiling), so it does not tar the provider's reputation. A sustained rate
+    /// `decdn_node_pull_too_large_total` (#840): the bytes received from a
+    /// selected upstream crossed this node's `max_blob_size` ceiling, so the buyer
+    /// aborted the pull (#1895). The upstream's `total_bytes` claim plays no part.
+    /// Like a channel-open failure this is a buyer-side policy decision, NOT
+    /// necessarily provider misbehavior (the provider may legitimately serve
+    /// larger blobs to nodes with a higher ceiling), so it does not tar the
+    /// provider's reputation. A sustained rate
     /// means this node's ceiling is below the content it is trying to warm.
     pub node_pull_too_large: Counter,
     /// `decdn_node_pull_rate_above_ceiling_total` (#1375): a selected upstream
@@ -1718,6 +1732,13 @@ pub struct DecdnMetrics {
     /// ranges. Visible name:
     /// `decdn_serve_stream_rejected_range_not_satisfiable_total`.
     pub serve_stream_rejected_range_not_satisfiable: Counter,
+    /// Delivery refused because a pull-through request starts at or past this
+    /// node's `max_blob_size` ceiling (ADR 005 §`BlobTooLarge` enforcement).
+    /// The node refuses before it commits to the stream, so no byte is bought
+    /// upstream. Signed as `BlobTooLarge`. A rising value means clients ask
+    /// this node for blobs above its ceiling. Visible name:
+    /// `decdn_serve_stream_rejected_blob_too_large_total`.
+    pub serve_stream_rejected_blob_too_large: Counter,
     /// Delivery refused because the blob is on this operator's local denylist
     /// (ADR 011 §Local Denylist). Signed as `HashBlacklisted`. Deliberately
     /// counts ONLY the local list; the governance blacklist has its own
@@ -2903,6 +2924,11 @@ recorders! {
     /// chain-observed solvency ruled it out this pass (ADR 003).
     redemption_skipped_insolvent => redemption_skipped_insolvent.inc();
 
+    /// A lane with value owed was skipped this pass because its signer's
+    /// capability has expired, or expires within the redeemer's landing slack
+    /// (ADR 003 §Revocation).
+    redemption_skipped_expired => redemption_skipped_expired.inc();
+
     /// `n` lanes were held or dropped by `pool_is_redeemable` in one planning
     /// pass (ADR 003); the batched form of `redemption_skipped_insolvent`.
     redemption_skipped_insolvent_by(n: u64) => redemption_skipped_insolvent.inc_by(n);
@@ -3103,6 +3129,11 @@ recorders! {
     /// range is out of bounds for the blob (ADR 005 §Bounded byte ranges).
     serve_stream_rejected_range_not_satisfiable
         => serve_stream_rejected_range_not_satisfiable.inc();
+
+    /// Record a `serve_stream` pull-through refused because the requested range
+    /// starts at or past the node's `max_blob_size` ceiling (ADR 005
+    /// §`BlobTooLarge` enforcement).
+    serve_stream_rejected_blob_too_large => serve_stream_rejected_blob_too_large.inc();
 
     /// Record a `serve_stream` delivery refused because the blob is on the
     /// operator's local denylist (ADR 011 §Local Denylist).
@@ -4783,6 +4814,7 @@ mod tests {
             // assertion pinning it, so a rename could have silently broken a
             // dashboard without failing this test.
             "decdn_serve_stream_rejected_range_not_satisfiable_total",
+            "decdn_serve_stream_rejected_blob_too_large_total",
             "decdn_serve_stream_rejected_hash_denied_total",
             "decdn_serve_stream_rejected_chain_hash_denied_total",
             "decdn_serve_stream_rejected_origin_denied_total",
@@ -4808,6 +4840,7 @@ mod tests {
         metrics.serve_stream_midstream_signer_cap_exhausted();
         metrics.serve_stream_rejected_signer_floor_at_cap();
         metrics.serve_stream_rejected_range_not_satisfiable();
+        metrics.serve_stream_rejected_blob_too_large();
         metrics.serve_stream_rejected_hash_denied();
         metrics.serve_stream_rejected_chain_hash_denied();
         metrics.serve_stream_rejected_origin_denied();

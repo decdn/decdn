@@ -49,6 +49,25 @@ impl std::fmt::Display for LaneBuildFault {
 
 impl std::error::Error for LaneBuildFault {}
 
+/// A voucher rejection whose watermark healed the lane ledger after the lane
+/// spent its resume budget ([`crate::MAX_RESUME_ATTEMPTS`]). The ledger and
+/// this source agree again, but the source kept rejecting after each heal, so
+/// the source cools and its range moves to another source.
+///
+/// It is a marker on the rejection, so it composes:
+/// `.context(HealExhausted)` keeps the [`UpstreamVoucherRejected`] in the
+/// chain. A bare rejection, which no heal took, ends the command.
+#[derive(Debug)]
+pub struct HealExhausted;
+
+impl std::fmt::Display for HealExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the lane ledger healed, but this source spent its resume budget")
+    }
+}
+
+impl std::error::Error for HealExhausted {}
+
 /// Classify `err` for the acquire loop.
 #[must_use]
 pub fn classify(err: &anyhow::Error) -> Fault {
@@ -64,10 +83,13 @@ pub fn classify(err: &anyhow::Error) -> Fault {
     {
         return Fault::Fatal(FatalScope::Item);
     }
-    if err.downcast_ref::<UpstreamVoucherRejected>().is_some()
-        || err.downcast_ref::<LocalPullFault>().is_some()
-        || is_local_disk_fault(err)
-    {
+    if err.downcast_ref::<HealExhausted>().is_some() {
+        return Fault::Source;
+    }
+    if err.downcast_ref::<UpstreamVoucherRejected>().is_some() {
+        return Fault::Fatal(FatalScope::Command);
+    }
+    if err.downcast_ref::<LocalPullFault>().is_some() || is_local_disk_fault(err) {
         return Fault::Fatal(FatalScope::Command);
     }
     if err.downcast_ref::<BlobTooLarge>().is_some() {
@@ -126,7 +148,7 @@ fn is_local_disk_fault(err: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{FatalScope, Fault, LaneBuildFault, classify};
+    use super::{FatalScope, Fault, HealExhausted, LaneBuildFault, classify};
     use crate::driver::PoolExhausted;
     use crate::{BlobTooLarge, LocalPullFault, UpstreamRefused, UpstreamVoucherRejected};
     use decdn_protocol::client::{StreamError, VoucherRejectReason};
@@ -135,20 +157,72 @@ mod tests {
         anyhow::Error::new(UpstreamRefused::mid_stream(error))
     }
 
-    #[test]
-    fn payment_and_blacklist_faults_end_the_command() {
-        let rejected = anyhow::Error::new(UpstreamVoucherRejected {
-            reason: VoucherRejectReason::AmountRegression,
+    fn rejected(reason: VoucherRejectReason) -> anyhow::Error {
+        anyhow::Error::new(UpstreamVoucherRejected {
+            reason,
             bundle: None,
             proof_generation: None,
-        });
-        assert_eq!(classify(&rejected), Fault::Fatal(FatalScope::Command));
+        })
+    }
+
+    #[test]
+    fn payment_and_blacklist_faults_end_the_command() {
+        for reason in [
+            VoucherRejectReason::SpendingCapExhausted,
+            VoucherRejectReason::CapabilityExpired,
+            VoucherRejectReason::BadSignature,
+            VoucherRejectReason::WrongSigner,
+        ] {
+            assert_eq!(
+                classify(&rejected(reason)),
+                Fault::Fatal(FatalScope::Command),
+                "{reason:?}"
+            );
+        }
         assert_eq!(
             classify(&refusal(StreamError::OriginBlacklisted)),
             Fault::Fatal(FatalScope::Command)
         );
         let local = anyhow::anyhow!("store write").context(LocalPullFault);
         assert_eq!(classify(&local), Fault::Fatal(FatalScope::Command));
+    }
+
+    /// A watermark rejection that healed the lane ledger after the lane spent
+    /// its resume budget (#2257) is this source's, so the range moves on and
+    /// the rest of the bundle continues.
+    #[test]
+    fn a_rejection_healed_past_the_resume_budget_is_the_sources() {
+        for reason in [
+            VoucherRejectReason::UnderFold,
+            VoucherRejectReason::AmountRegression,
+            VoucherRejectReason::Underpaid,
+        ] {
+            let err = rejected(reason).context(HealExhausted);
+            assert_eq!(classify(&err), Fault::Source, "{reason:?}");
+            assert!(
+                err.downcast_ref::<UpstreamVoucherRejected>().is_some(),
+                "the marker keeps the rejection in the chain"
+            );
+        }
+    }
+
+    /// A watermark rejection that no heal took ends the command, as ADR 005
+    /// says: a `BytesRegression` is a single-signer fault, and an `Underpaid`
+    /// or a trailing proof that no bundle heals has nothing to retry from.
+    #[test]
+    fn a_rejection_no_heal_took_ends_the_command() {
+        for reason in [
+            VoucherRejectReason::BytesRegression,
+            VoucherRejectReason::Underpaid,
+            VoucherRejectReason::UnderFold,
+            VoucherRejectReason::AmountRegression,
+        ] {
+            assert_eq!(
+                classify(&rejected(reason)),
+                Fault::Fatal(FatalScope::Command),
+                "{reason:?}"
+            );
+        }
     }
 
     #[test]
@@ -161,7 +235,7 @@ mod tests {
     #[test]
     fn an_over_cap_blob_ends_only_its_item() {
         let err = anyhow::Error::new(BlobTooLarge {
-            received: 1 << 40,
+            reached: 1 << 40,
             ceiling: 1 << 20,
         });
         assert_eq!(classify(&err), Fault::Fatal(FatalScope::Item));

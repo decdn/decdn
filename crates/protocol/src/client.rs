@@ -515,8 +515,9 @@ pub struct StreamResponseBody {
     /// Quoted rate in token base units per MB. Bounded by [`MAX_RATE_PER_MB`].
     #[serde(deserialize_with = "crate::message::deserialize_rate_per_mb")]
     pub rate_per_mb: u64,
-    /// Total blob size in bytes (used for `BlobTooLarge` enforcement on
-    /// cache-miss pulls — ADR 005 §`BlobTooLarge` enforcement).
+    /// Total blob size in bytes, as the signing node claims it. A pulling node
+    /// does not enforce its `max_blob_size` against this claim: it enforces the
+    /// ceiling on the bytes it receives (ADR 005 §`BlobTooLarge` enforcement).
     pub total_bytes: u64,
     /// `pool_id` echoed from the [`StreamRequest`] (signed, so a node cannot
     /// silently re-bind the response to a different pool).
@@ -1218,9 +1219,13 @@ pub enum VoucherRejectReason {
     /// Recovery: the pool **owner** raises this signer's cap or delegates a new
     /// capability. `PoolError::CapExceeded`.
     SpendingCapExhausted,
-    /// The signer's capability has passed its `expiry`. The node's serve-side check
-    /// compares its LOCAL wall clock (`unix_now`, operator-settable) against `expiry`
-    /// and stops serving the lane; on-chain settlement separately gates redemption on
+    /// The signer's capability has passed its `expiry`, or lies within the node's
+    /// expiry margin of it. The node's serve-side check compares its LOCAL wall
+    /// clock (`unix_now`, operator-settable) plus that margin against `expiry` and
+    /// stops serving the lane. The margin is one redeem interval plus a landing
+    /// slack, so each voucher the node accepts meets at least one redeem sweep
+    /// before the expiry (ADR 003 §Revocation). A lane below the redemption
+    /// floor can still wait past it. On-chain settlement separately gates redemption on
     /// `block.timestamp`. Already-earned vouchers stay redeemable until expiry at
     /// settlement. Recovery: the owner mints a **fresh capability** with a new expiry —
     /// a watermark resync or top-up does not help. Emitted directly by the

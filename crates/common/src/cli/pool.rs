@@ -108,8 +108,9 @@ pub struct PoolAssignArgs {
     pub cap_micro_usdc: u64,
 
     /// Capability lifetime in seconds from now — the absolute Unix expiry is
-    /// `now + this`. Mutually exclusive with `--expiry-at`; exactly one is
-    /// required.
+    /// `now + this`. `now` is the chain head's time, or the local clock when
+    /// the RPC cannot be read. Mutually exclusive with `--expiry-at`; exactly
+    /// one is required.
     #[arg(long, value_name = "SECS", conflicts_with = "expiry_at")]
     pub expiry_secs: Option<u64>,
 

@@ -372,12 +372,22 @@ impl ClientHandler {
         // or under it is stale: the lane already holds its payment.
         let prior_last_amount = guard.state.last_amount();
 
-        // Capability-expiry gate (ADR 003 §Capability delegation). `expiry == 0`
-        // means "not tracked" and never expires. An expired grant surfaces as
-        // `CapabilityExpired` — distinct from a cap-exhausted `SpendingCapExhausted`,
-        // since the fix is a fresh capability, not a cap raise.
+        // Capability-expiry gate (ADR 003 §Revocation). `expiry == 0` means "not
+        // tracked" and never expires. The node stops accepting vouchers a margin
+        // BEFORE the expiry: one redeem interval plus the redeemer's landing
+        // slack. A voucher accepted at the edge then still meets one self-tick
+        // sweep and lands before the contract stops paying the capability. A
+        // grant inside the margin surfaces as `CapabilityExpired` — distinct from
+        // a cap-exhausted `SpendingCapExhausted`, since the fix is a fresh
+        // capability, not a cap raise.
         let expiry = guard.state.expiry;
-        if expiry != 0 && self.coarse_clock.unix_seconds() >= expiry {
+        if expiry != 0
+            && self
+                .coarse_clock
+                .unix_seconds()
+                .saturating_add(self.capability_expiry_margin_secs)
+                >= expiry
+        {
             drop(guard);
             self.write_reject(send, VoucherRejectReason::CapabilityExpired, None)
                 .await?;

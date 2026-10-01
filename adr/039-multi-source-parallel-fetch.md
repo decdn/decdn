@@ -75,11 +75,13 @@ An item is one blob that the command fetches. In a bundle pull, each entry is on
 
 Five faults end the fetch, because only the user can fix them:
 
-- a voucher rejection,
+- a voucher rejection that the client cannot heal,
 - an origin blacklist,
 - the client's size cap, for this item only,
 - no affordable holder: every known holder has refused on price after the client spends its top-up budget,
 - a local disk fault.
+
+A voucher rejection for the watermark of one lane can carry a bundle that heals the lane ledger. The client heals the ledger and retries the source, within a retry budget. A lane-watermark rejection that the client heals but cannot resume within the retry budget cools that source, and its range moves to another source. Each other lane keeps its own watermark. A rejection that no bundle can heal ends the fetch, as [ADR 005 § Error Handling and Retry Semantics](005-protocol.md#error-handling-and-retry-semantics) says.
 
 On the wire, `NotFound` also means load shed, a per-signer cap, or a pool that the node cannot confirm yet. So a `NotFound` from a holder that the probe reported, or from a node that the user pinned, only cools that holder. A pull-through target that answers `NotFound` three times, with no verified byte between the answers, is absent. The item also ends when every known source is absent, and a fresh discovery finds no new holder. No other fault ends the fetch. The loop keeps trying.
 

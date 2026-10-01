@@ -10761,6 +10761,190 @@ async fn window_pull_through_oversized_upstream_aborts_on_received_bytes() -> Re
     Ok(())
 }
 
+/// What a leaf's bounded pull through B's fused window path left behind, for the
+/// size-ceiling gate tests (#2256).
+struct CeilingRun {
+    /// The leaf's decoded span, or the error it saw.
+    leaf: Result<Vec<u8>>,
+    /// B's metrics.
+    b_metrics: Arc<Metrics>,
+    /// A's metrics: A serves every paid stream B opens upstream.
+    a_metrics: Arc<Metrics>,
+    /// B's upstream voucher watermarks.
+    upstream: Vec<ProgressEntry>,
+}
+
+/// Run one leaf pull of `[byte_offset, +byte_len)` for `payload` through a B whose
+/// buyer-side size ceiling is `ceiling`, then shut every node down.
+async fn ranged_pull_under_ceiling(
+    payload: &[u8],
+    ceiling: u64,
+    byte_offset: u64,
+    byte_len: u64,
+) -> Result<CeilingRun> {
+    let hash = Hash::new(payload);
+    let ab_channel_id = B256::repeat_byte(0xC7);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a, a_metrics) =
+        spawn_node_a_metered(payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x7C);
+    let (handler_b, b_target, ep_b, recorded, _cache_b, b_metrics, _local_rep, b_operator) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            ceiling,
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let leaf = leaf_ranged_paid_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        b_operator,
+        leaf_channel_id,
+        hash,
+        byte_offset,
+        byte_len,
+        RATE,
+    )
+    .await;
+
+    shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
+    let upstream = progress_log(&recorded)?;
+    Ok(CeilingRun {
+        leaf,
+        b_metrics,
+        a_metrics,
+        upstream,
+    })
+}
+
+/// Assert `run` is a `BlobTooLarge` refusal the leaf read before any byte, metered
+/// once on its own reason and never on the received-byte abort.
+async fn assert_refused_too_large(run: &CeilingRun) -> Result<()> {
+    let err = match &run.leaf {
+        Ok(got) => anyhow::bail!(
+            "an over-ceiling range must be refused, got {} bytes",
+            got.len()
+        ),
+        Err(e) => format!("{e:#}"),
+    };
+    anyhow::ensure!(
+        err.contains("delivery refused: Some(BlobTooLarge)"),
+        "the leaf must read a signed BlobTooLarge refusal, got: {err}"
+    );
+    assert_counter(
+        &run.b_metrics,
+        "serve_stream_rejected_blob_too_large_total",
+        1,
+    )?;
+    assert_counter(&run.b_metrics, "node_pull_too_large_total", 0)?;
+    support::assert_inbound_failures_attributed(&run.b_metrics, 1).await?;
+    anyhow::ensure!(
+        run.upstream.iter().all(|(_, amount, _)| amount.is_zero()),
+        "B must pay the upstream nothing for a range it refuses: {:?}",
+        run.upstream
+    );
+    Ok(())
+}
+
+/// A request that starts at B's size ceiling is refused with `BlobTooLarge`
+/// before B commits (#2256). The gate reads the request's own offset, so B skips
+/// discovery and the upstream handshake: A serves no stream and B pays nothing.
+/// A start exactly AT the ceiling is already past it, as the client's resume
+/// guard draws the line.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_offset_at_the_ceiling_is_refused_before_commit() -> Result<()> {
+    let payload = vec![0xC1u8; 256 * 1024];
+    let ceiling = 64 * 1024;
+    let run = ranged_pull_under_ceiling(&payload, ceiling, ceiling, 16 * 1024).await?;
+    assert_refused_too_large(&run).await?;
+    let a_served = counter_value(&run.a_metrics, "serve_cache_hit_total")?;
+    anyhow::ensure!(
+        a_served == 0,
+        "B must refuse before it opens any upstream stream: A served {a_served}"
+    );
+    Ok(())
+}
+
+/// A bounded request that starts below B's size ceiling and ends past it is not
+/// refused on its end: only the upstream's unverified total says where the blob
+/// ends, and #1895 forbids refusing on that. B commits, and the received-byte
+/// ceiling aborts the pull once it crosses (#2256).
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_end_past_the_ceiling_commits_and_aborts_on_received_bytes()
+-> Result<()> {
+    let payload = vec![0xC2u8; 256 * 1024];
+    let ceiling = 64 * 1024;
+    let run = ranged_pull_under_ceiling(&payload, ceiling, 32 * 1024, 64 * 1024).await?;
+    let err = match &run.leaf {
+        Ok(got) => anyhow::bail!(
+            "a range past the ceiling cannot complete, got {} bytes",
+            got.len()
+        ),
+        Err(e) => format!("{e:#}"),
+    };
+    anyhow::ensure!(
+        !err.contains("delivery refused"),
+        "B must commit to a range that starts below its ceiling, got: {err}"
+    );
+    assert_counter(
+        &run.b_metrics,
+        "serve_stream_rejected_blob_too_large_total",
+        0,
+    )?;
+    let aborts = counter_value(&run.b_metrics, "node_pull_too_large_total")?;
+    anyhow::ensure!(
+        aborts >= 1,
+        "the received-byte ceiling must abort the pull, counted {aborts}"
+    );
+    Ok(())
+}
+
+/// B has no gate on a request's end, so a blob that fits B's ceiling is served
+/// even when the request's `byte_len` runs far past both. A blob of exactly the
+/// ceiling's size fits, so the boundary is served too (#2256).
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_over_long_range_on_a_blob_within_the_ceiling_is_served() -> Result<()>
+{
+    let payload: Vec<u8> = (0..128 * 1024usize)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let total = u64::try_from(payload.len())?;
+    let offset = 16 * 1024u64;
+    let run = ranged_pull_under_ceiling(&payload, total, offset, total * 8).await?;
+    let got = run
+        .leaf
+        .map_err(|e| anyhow::anyhow!("a blob within the ceiling must be served: {e:#}"))?;
+    let want = payload
+        .get(usize::try_from(offset)?..)
+        .ok_or_else(|| anyhow::anyhow!("offset out of bounds"))?;
+    anyhow::ensure!(
+        got.as_slice() == want,
+        "the over-long range must clamp to the blob's end, byte-exact"
+    );
+    assert_counter(
+        &run.b_metrics,
+        "serve_stream_rejected_blob_too_large_total",
+        0,
+    )?;
+    Ok(())
+}
+
 /// Two concurrent misses to ONE provider must both be delivered — the contract
 /// `stream_fetch_shared` documents, and which both node pull paths broke by building a
 /// fresh `PoolLedger` per pull (#1145 review).

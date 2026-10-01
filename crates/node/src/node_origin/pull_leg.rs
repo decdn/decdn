@@ -1532,13 +1532,16 @@ impl PeerRunSink<'_> {
 /// Whether a run's fault ends the whole assembly rather than moving its range
 /// to another holder.
 ///
-/// A fatal fault ([`classify`]: a voucher rejection, an origin blacklist, an
-/// over-cap blob, a local fault) cannot be fixed by another lane. Nor can the
+/// A fatal fault ([`classify`]: a voucher rejection that no heal took, an
+/// origin blacklist, an over-cap blob, a local fault) cannot be fixed by
+/// another lane. Nor can the
 /// pacer's [`PoolExhausted`]: the node's one shared pool funds every holder, so
 /// once it is dry no holder can be paid. An open-time `InsufficientDeposit` is
 /// this holder's reservation floor outrunning the pool, and a different holder
-/// may reserve a smaller one, so it moves on. Anything else is a property of
-/// this source's delivery.
+/// may reserve a smaller one, so it moves on. So does a rejection that healed
+/// the lane ledger after the lane spent its resume budget
+/// ([`decdn_client::HealExhausted`]). Anything else is a property of this
+/// source's delivery.
 fn ends_the_assembly(err: &anyhow::Error) -> bool {
     match classify(err) {
         Fault::Fatal(_) => true,
@@ -2664,7 +2667,7 @@ mod backpressure_backoff_tests {
 
 #[cfg(test)]
 mod assembly_fault_tests {
-    use decdn_client::{PoolExhausted, UpstreamRefused, UpstreamVoucherRejected};
+    use decdn_client::{HealExhausted, PoolExhausted, UpstreamRefused, UpstreamVoucherRejected};
     use decdn_protocol::client::{StreamError, VoucherRejectReason};
 
     use super::ends_the_assembly;
@@ -2674,7 +2677,9 @@ mod assembly_fault_tests {
     }
 
     /// A holder's reservation floor above the pool moves the range to another
-    /// holder, which may reserve less; a dry pool and a fatal fault end it.
+    /// holder, which may reserve less, and so does a rejection healed past the
+    /// resume budget; a dry pool, a fatal fault, and a rejection no heal took
+    /// end it.
     #[test]
     fn insufficient_deposit_reassigns_and_a_dry_pool_ends_the_assembly() {
         assert!(!ends_the_assembly(&refusal(
@@ -2684,13 +2689,20 @@ mod assembly_fault_tests {
             gap_start: 0,
             gap_len: 1 << 20,
         })));
-        assert!(ends_the_assembly(&anyhow::Error::new(
-            UpstreamVoucherRejected {
-                reason: VoucherRejectReason::AmountRegression,
+        let rejected = |reason| {
+            anyhow::Error::new(UpstreamVoucherRejected {
+                reason,
                 bundle: None,
                 proof_generation: None,
-            }
+            })
+        };
+        assert!(ends_the_assembly(&rejected(
+            VoucherRejectReason::CapabilityExpired
         )));
+        assert!(ends_the_assembly(&rejected(VoucherRejectReason::UnderFold)));
+        assert!(!ends_the_assembly(
+            &rejected(VoucherRejectReason::UnderFold).context(HealExhausted)
+        ));
         assert!(ends_the_assembly(&refusal(StreamError::OriginBlacklisted)));
         assert!(!ends_the_assembly(&refusal(StreamError::NotFound)));
         assert!(!ends_the_assembly(&anyhow::anyhow!("connection reset")));

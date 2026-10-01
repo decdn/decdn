@@ -726,6 +726,11 @@ mod doubles {
         /// a node that refuses one more stream while it serves the others. A
         /// refused open is still recorded in `opened`.
         refuse_open: Option<(std::ops::Range<usize>, FaultFn)>,
+        /// Refuse every open whose range touches one of these discovery
+        /// blocks, with the fault its `FaultFn` produces, before any byte
+        /// flows: a partial holder asked for a block it does not hold. A
+        /// refused open is still recorded in `opened`.
+        refuse_blocks: Option<(Vec<u32>, FaultFn)>,
         /// Hold the fault of the open with each 0-based index (in call order)
         /// until its gate reads `true`: a refusal waits inside `open`, and a
         /// parked mid-range fault waits once the reader has delivered every
@@ -812,6 +817,7 @@ mod doubles {
                 faults_left: None,
                 signed_size: None,
                 refuse_open: None,
+                refuse_blocks: None,
                 fault_gates: Vec::new(),
                 timeline: Arc::new(Mutex::new(Vec::new())),
                 opened: Arc::new(Mutex::new(Vec::new())),
@@ -951,6 +957,20 @@ mod doubles {
         }
 
         #[cfg(test)]
+        /// Refuse every open whose range touches one of the discovery
+        /// `blocks`, with the fault `make` produces: a partial holder that
+        /// cannot serve those blocks by pull-through.
+        #[must_use]
+        pub(crate) fn refusing_blocks(
+            mut self,
+            blocks: &[u32],
+            make: impl Fn() -> anyhow::Error + Send + Sync + 'static,
+        ) -> Self {
+            self.refuse_blocks = Some((blocks.to_vec(), Arc::new(make)));
+            self
+        }
+
+        #[cfg(test)]
         /// Each leg's `(fetch_start, opened_at, finished_at)`, in open order
         /// (see `timeline`).
         #[must_use]
@@ -1069,6 +1089,17 @@ mod doubles {
                         let _ = gate.wait_for(|open| *open).await;
                     }
                     return Err(make());
+                }
+                if let Some((blocks, make)) = &self.refuse_blocks {
+                    let block_bytes = decdn_protocol::discovery_block_bytes();
+                    let first = range.fetch_start() / block_bytes;
+                    let last = range.fetch_end().saturating_sub(1) / block_bytes;
+                    if blocks
+                        .iter()
+                        .any(|&b| (first..=last).contains(&u64::from(b)))
+                    {
+                        return Err(make());
+                    }
                 }
                 // Serve the request clamped to this blob's end, as a node
                 // does: the requester's range may be aligned under another

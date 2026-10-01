@@ -915,6 +915,51 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **A partial holder is not asked again for chunks it cannot pull through
+  (#2262).** A probed holder that refuses a chunk outside its advertised
+  coverage with `NotFound` now counts toward the same three-refusal limit as
+  a non-holder. At the limit the client stops sending it uncovered chunks of
+  that blob for one minute, and keeps sending it the chunks it covers. A node
+  also answers `NotFound` when it sheds miss load, so when the minute ends the
+  holder takes one uncovered chunk again as a probe, and three more refusals
+  bar it again. A rediscovery that reports wider coverage, or a byte the
+  holder verifies on an uncovered chunk after its last refusal, lifts the bar
+  at once. When only uncovered work is left and every source is absent or
+  barred again after its probe, the item ends as a unanimous `NotFound` does.
+
+- **A proxy over its size ceiling refuses before commit, and the client
+  drops it for that blob (#2256).** On a pull-through miss the node refuses a
+  request whose start reaches its `max_blob_size` with
+  `StreamError::BlobTooLarge` before it signs the stream. A request that
+  starts below the ceiling still binds on received bytes: the node does not
+  gate a request's end, because only the upstream's unverified size says
+  where the blob ends.
+  New counter: `decdn_serve_stream_rejected_blob_too_large_total`. The client
+  excludes a proxy or whole holder that refuses as too large for the rest of
+  the blob; a partial holder loses only pull-through. `decdn_client::BlobTooLarge`
+  renames its `received` field to `reached`, and its message names the byte
+  position it reached, not a received count.
+
+- **An under-fold heal after a payer crash no longer loops, and a healed
+  lane fault does not end the pull (#2257).** When a trailing-proof
+  rejection's bundle is at or behind the ledger, the client retires the
+  in-process chain root the node never adopted and folds the ledger to its
+  settlement value, as a fresh process does. A watermark rejection that the
+  client heals but cannot resume within the retry budget now cools that
+  source instead of ending the command. A rejection that no bundle heals,
+  and a spending-cap rejection, still end the command. The heal branch and
+  each healed retry log at `info`.
+
+- **Expiry and close deadlines hold a safety margin (#2242).** A node
+  refuses a voucher with `CapabilityExpired` once the capability expires
+  within one redeem interval plus 120 s, so every voucher it accepts meets at
+  least one redeem sweep before expiry. The redeemer skips a `Closing` pool within 120 s of its
+  dispute deadline, and a lane with value owed whose capability has expired
+  (new counter `decdn_redemption_skipped_expired_total`). `decdn pool assign`
+  checks expiry against the chain head timestamp when an RPC is configured,
+  falls back to the local clock with a warning, and warns when the expiry
+  falls inside the default node margin.
+
 - **Node dials use registry multiaddrs, not only the relay.** A node
   publishes only its relay URL through pkarr, so a dial by bare node id
   opened over the relay even when the target registered its QUIC address.

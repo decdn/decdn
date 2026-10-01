@@ -124,7 +124,7 @@ where
         let attempting = connecting.is_some() || opening.is_some();
         if !attempting
             && discovering.is_none()
-            && let Some(err) = sources.exhausted(deposit, false)
+            && let Some(err) = sources.exhausted(deposit, false, false)
         {
             return Err(err);
         }
@@ -199,7 +199,7 @@ mod tests {
     use crate::stop::{ProgressClock, StopPolicy};
     use crate::streamer::StreamCandidate;
     use crate::{
-        Cumulative, GaveUp, LaneLease, NoSourceHasBlob, PoolLedger, UpstreamRefused,
+        Cumulative, GaveUp, HealExhausted, LaneLease, NoSourceHasBlob, PoolLedger, UpstreamRefused,
         UpstreamVoucherRejected,
     };
 
@@ -346,21 +346,49 @@ mod tests {
         Ok(())
     }
 
+    fn rejected(reason: VoucherRejectReason) -> anyhow::Error {
+        anyhow::Error::new(UpstreamVoucherRejected {
+            reason,
+            bundle: None,
+            proof_generation: None,
+        })
+    }
+
+    /// A capability rejection, and a watermark rejection that no heal took,
+    /// end the open.
     #[tokio::test(start_paused = true)]
     async fn a_fatal_fault_ends_the_open() -> anyhow::Result<()> {
+        for reason in [
+            VoucherRejectReason::CapabilityExpired,
+            VoucherRejectReason::AmountRegression,
+        ] {
+            let sources = StaticSources::new(vec![lane(0xA1), lane(0xB2)])?;
+            let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
+            let err = first_open(&mut set, &policy(None), |_lane| async move {
+                Err::<(), _>(rejected(reason))
+            })
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("{reason:?} must end the open"))?;
+            assert!(err.downcast_ref::<UpstreamVoucherRejected>().is_some());
+        }
+        Ok(())
+    }
+
+    /// A rejection that healed the lane ledger past the resume budget cools
+    /// only its source, so the open moves to the next one.
+    #[tokio::test(start_paused = true)]
+    async fn a_rejection_healed_past_the_budget_moves_the_open() -> anyhow::Result<()> {
         let sources = StaticSources::new(vec![lane(0xA1), lane(0xB2)])?;
         let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
-        let err = first_open(&mut set, &policy(None), |_lane| async {
-            Err::<(), _>(anyhow::Error::new(UpstreamVoucherRejected {
-                reason: VoucherRejectReason::AmountRegression,
-                bundle: None,
-                proof_generation: None,
-            }))
+        let (provider, ()) = first_open(&mut set, &policy(None), |lane| async move {
+            if provider_of(&lane) == A {
+                return Err(rejected(VoucherRejectReason::UnderFold).context(HealExhausted));
+            }
+            Ok(())
         })
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("a fatal fault must end the open"))?;
-        assert!(err.downcast_ref::<UpstreamVoucherRejected>().is_some());
+        .await?;
+        assert_eq!(provider, B);
         Ok(())
     }
 

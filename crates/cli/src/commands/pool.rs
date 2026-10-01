@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::signers::local::PrivateKeySigner;
@@ -22,7 +22,10 @@ use decdn_client::buyer_pool::{
 };
 use decdn_common::admin::{AdminRpcClient as _, BuyerPoolsResponse};
 use decdn_common::cli::{self, common::expand_tilde};
-use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
+use decdn_common::config::{
+    DEFAULT_CHAIN_ID, DEFAULT_REDEEM_INTERVAL_SECS, FileConfig, capability_expiry_margin_secs,
+    load_file_config,
+};
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::buyer_pool::{BuyerLoad, BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::buyer_pool_redb::{ReadOnlyBuyerPoolStore, RedbBuyerPoolStore};
@@ -888,8 +891,8 @@ where
 /// Resolve the capability's absolute Unix-seconds expiry from the mutually
 /// exclusive `--expiry-secs` (relative to now) / `--expiry-at` (absolute)
 /// flags. Exactly one is required, and the result must lie in the future — a
-/// capability that expires at or before now is dead on arrival (the node stops
-/// accepting its vouchers immediately).
+/// capability that expires at or before now is dead on arrival (a node stops
+/// accepting its vouchers a margin before expiry, ADR 003 §Revocation).
 fn resolve_expiry(
     now: u64,
     expiry_secs: Option<u64>,
@@ -911,6 +914,18 @@ fn resolve_expiry(
     Ok(expiry)
 }
 
+/// The capability-expiry margin of a node at the default redeem interval.
+const DEFAULT_NODE_EXPIRY_MARGIN_SECS: u64 =
+    capability_expiry_margin_secs(DEFAULT_REDEEM_INTERVAL_SECS);
+
+/// Whether a capability's remaining lifetime at `now` lies within the
+/// capability-expiry margin of a node at the default redeem interval. Such a node
+/// refuses every voucher under it from the start (ADR 003 §Revocation). A node's
+/// actual interval is unknown here, so `assign` only warns.
+const fn expires_within_default_node_margin(expiry: u64, now: u64) -> bool {
+    expiry.saturating_sub(now) <= DEFAULT_NODE_EXPIRY_MARGIN_SECS
+}
+
 /// Current Unix time in whole seconds.
 ///
 /// # Errors
@@ -923,6 +938,43 @@ fn unix_now() -> anyhow::Result<u64> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .map_err(|e| anyhow::anyhow!("the system clock is before the Unix epoch: {e}"))
+}
+
+/// How long `assign` waits for the chain head before it falls back to the
+/// local clock.
+const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The clock `assign` checks a capability's expiry against: the chain head's
+/// timestamp, which is the clock the contract applies at redemption. A local
+/// clock that drifts would otherwise let `assign` print a token the chain
+/// already treats as expired.
+///
+/// The read needs no keystore, so it runs before the unlock. Offline issuance
+/// stays valid: when the head cannot be read within `timeout`, `assign` warns
+/// and falls back to the local clock, so an endpoint that accepts and never
+/// answers cannot stall it.
+///
+/// # Errors
+///
+/// Errors only on that fallback, when the system clock is before the Unix epoch.
+async fn issuance_now(rpc_url: &str, timeout: Duration) -> anyhow::Result<u64> {
+    let head = match provider::build_read_provider(rpc_url) {
+        Ok(reader) => tokio::time::timeout(timeout, chain_ctx::head_timestamp(&reader))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("no answer within {timeout:?}"))),
+        Err(e) => Err(e),
+    };
+    match head {
+        Ok(now) => Ok(now),
+        Err(e) => {
+            eprintln!(
+                "warning: could not read the chain head time ({}); checking the capability \
+                 expiry against the local clock instead",
+                decdn_common::redact::sanitize_err_chain(&e)
+            );
+            unix_now()
+        }
+    }
 }
 
 /// Render an absolute Unix-seconds expiry as `"<ts> (in Nd Nh Nm)"` relative to
@@ -954,8 +1006,16 @@ async fn assign(args: &cli::PoolAssignArgs, config_path: Option<&Path>) -> anyho
     let pool_id = parse_pool_id(&args.pool)?;
     let signer_addr = super::chain_ctx::parse_nonzero_address(&args.signer, "--signer")?;
 
-    let now = unix_now()?;
+    let now = issuance_now(&chain.rpc_url, HEAD_READ_TIMEOUT).await?;
     let expiry = resolve_expiry(now, args.expiry_secs, args.expiry_at)?;
+    if expires_within_default_node_margin(expiry, now) {
+        eprintln!(
+            "warning: the capability expires in {}s; a node with the default redeem interval \
+             refuses vouchers within {DEFAULT_NODE_EXPIRY_MARGIN_SECS}s of a capability's \
+             expiry, so such a node serves this delegate nothing",
+            expiry.saturating_sub(now)
+        );
+    }
 
     let owner_signer = load_buyer_signer(&chain)?;
     let owner = owner_signer.address();
@@ -2074,6 +2134,63 @@ mod tests {
         // An absolute expiry at/behind now is dead on arrival.
         let past = resolve_expiry(now, None, Some(now)).unwrap_err();
         assert!(past.to_string().contains("not in the future"), "{past}");
+    }
+
+    /// `assign` warns on a lifetime at or under the default node margin, and not
+    /// on a longer one.
+    #[test]
+    fn expires_within_default_node_margin_matches_the_node_margin() {
+        let now = 1_000_000u64;
+        let margin = DEFAULT_REDEEM_INTERVAL_SECS + decdn_common::config::REDEEM_LANDING_SLACK_SECS;
+        assert_eq!(DEFAULT_NODE_EXPIRY_MARGIN_SECS, margin);
+        assert!(expires_within_default_node_margin(now + 1, now));
+        assert!(expires_within_default_node_margin(now + margin, now));
+        assert!(!expires_within_default_node_margin(now + margin + 1, now));
+        assert!(
+            expires_within_default_node_margin(now - 1, now),
+            "a past expiry saturates to 0 s left"
+        );
+    }
+
+    /// An RPC that cannot be read leaves `assign` on the local clock rather than
+    /// failing: offline issuance stays valid.
+    #[tokio::test]
+    async fn issuance_now_falls_back_to_the_local_clock() {
+        let before = unix_now().unwrap();
+        let now = issuance_now("not a url", HEAD_READ_TIMEOUT).await.unwrap();
+        let after = unix_now().unwrap();
+        assert!(
+            (before..=after).contains(&now),
+            "{before} <= {now} <= {after}"
+        );
+    }
+
+    /// An RPC endpoint that accepts the connection and never answers leaves
+    /// `assign` on the local clock once the head read times out.
+    #[tokio::test]
+    async fn issuance_now_falls_back_when_the_rpc_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = listener.accept().await {
+                held.push(conn);
+            }
+        });
+        let before = unix_now().unwrap();
+        let now = tokio::time::timeout(
+            Duration::from_secs(10),
+            issuance_now(&format!("http://{addr}"), Duration::from_millis(200)),
+        )
+        .await
+        .expect("the head read must time out, not hang")
+        .unwrap();
+        let after = unix_now().unwrap();
+        silent.abort();
+        assert!(
+            (before..=after).contains(&now),
+            "{before} <= {now} <= {after}"
+        );
     }
 
     #[test]

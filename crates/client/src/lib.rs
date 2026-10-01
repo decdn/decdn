@@ -227,7 +227,7 @@ pub use downloader::{DownloadTarget, Downloader};
 pub use driver::{
     LegNoProgress, PacingWait, PoolExhausted, SharedPool, WaitReason, drive, first_leg,
 };
-pub use fault::{FatalScope, Fault, LaneBuildFault, classify};
+pub use fault::{FatalScope, Fault, HealExhausted, LaneBuildFault, classify};
 pub use first_open::first_open;
 pub use health::{Health, PeerHealth};
 pub use ledger::{ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released};
@@ -667,7 +667,7 @@ pub(crate) fn reject_empty_claim_for_nonempty_root(
 /// peer — rather than mis-attributing it to the provider's reputation. `Display`
 /// carries `BlobTooLarge` so logs and the requester tests can match on it.
 ///
-/// **Units.** `received` and `ceiling` are ALWAYS the same unit within one error —
+/// **Units.** `reached` and `ceiling` are ALWAYS the same unit within one error —
 /// the comparison at each enforcement site is apples-to-apples — but that unit
 /// differs by site, so neither field is a raw `max_blob_size_bytes` config value
 /// across all call sites. The receive loop ([`UpstreamPull::next_chunk`]) meters bao
@@ -686,8 +686,8 @@ pub struct BlobTooLarge {
     /// (receive loop), the store's content frontier (gap-driven driver), or a
     /// content resume offset already past it. Same unit as `ceiling` (see the
     /// type's **Units** note).
-    pub received: u64,
-    /// The ceiling `received` crossed, in the same unit as `received`.
+    pub reached: u64,
+    /// The ceiling `reached` crossed, in the same unit as `reached`.
     pub ceiling: u64,
 }
 
@@ -732,8 +732,8 @@ impl std::fmt::Display for BlobTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "received {} bytes, crossing the {}-byte size ceiling (BlobTooLarge)",
-            self.received, self.ceiling
+            "reached byte {}, crossing the {}-byte size ceiling (BlobTooLarge)",
+            self.reached, self.ceiling
         )
     }
 }
@@ -2357,10 +2357,12 @@ pub(crate) enum Healed {
     /// An `Underpaid` bundle was BEHIND our committed watermark: we hold vouchers
     /// the node never accepted. [`PoolLedger::rebase`] moved us down to it.
     Rebased,
-    /// The ledger has already healed past this rejection: an `Underpaid` for a
-    /// voucher signed before the latest rebase, or an `UnderFold` or
-    /// `AmountRegression` whose bundle a sibling stream already reseeded to.
-    /// Nothing moved, and the pull retries from the healed anchor.
+    /// The ledger already covers this rejection's watermark: an `Underpaid` for
+    /// a voucher signed before the latest rebase, or an `UnderFold` or
+    /// `AmountRegression` whose bundle the ledger has reached. The watermark
+    /// did not move, and the pull retries from the ledger. An `UnderFold` that
+    /// no heal has taken yet also retires the live chain the node refused
+    /// ([`PoolLedger::retire_unadopted_chain`]), so the retry opens a fresh one.
     Stale,
 }
 
@@ -2386,19 +2388,20 @@ pub(crate) fn rejection_watermark(err: &anyhow::Error, ctx: &PoolContext) -> Opt
 ///
 /// An `UnderFold` or `AmountRegression` whose folded bundle does not advance our
 /// amount splits two ways. Both reasons say a proof trailed the node's
-/// watermark. When our ledger already covers the bundle on both axes, the ledger
-/// moved past the rejected proof after it went out — usually a sibling stream
-/// took the same rejection and reseeded first — so the stream retries
-/// ([`Healed::Stale`]). When it covers the amount but not the bytes, the ledger
-/// paid the node's whole claim but signed fewer bytes than the node holds. No
-/// bundle can heal that; it is terminal and logged at `warn!`.
+/// watermark. When our ledger already covers the bundle on both axes, the
+/// stream retries ([`Healed::Stale`]): either a sibling stream took the same
+/// rejection and healed first, or the ledger metered reveals under a root the
+/// node refused, which an `UnderFold` retires. When it covers the amount but
+/// not the bytes, the ledger paid the node's whole claim but signed fewer bytes
+/// than the node holds. No bundle can heal that; it is terminal and logged at
+/// `warn!`.
 pub(crate) async fn heal_watermark_desync(
     err: &anyhow::Error,
     watermark: Cumulative,
     ledger: &PoolLedger,
 ) -> Option<Healed> {
     if ledger.reseed(watermark) {
-        tracing::debug!(
+        tracing::info!(
             amount = %watermark.amount,
             bytes = %watermark.bytes,
             "voucher rejection carried a watermark ahead of ours; reseeded"
@@ -2410,7 +2413,7 @@ pub(crate) async fn heal_watermark_desync(
         rejected.reason,
         VoucherRejectReason::UnderFold | VoucherRejectReason::AmountRegression
     ) {
-        return already_covered(watermark, ledger);
+        return already_covered(rejected.reason, watermark, ledger).await;
     }
     if rejected.reason != VoucherRejectReason::Underpaid {
         return None;
@@ -2421,42 +2424,73 @@ pub(crate) async fn heal_watermark_desync(
 
 /// Resolve a trailing-proof rejection (`UnderFold` or `AmountRegression`) whose
 /// folded bundle does not advance our amount. When our ledger covers its bytes
-/// too, the ledger moved past the rejected proof, and the stream retries. A
-/// ledger exactly at the bundle is the common case: a sibling stream reseeded
-/// to the same bundle first. A ledger past it has advanced since, or holds
-/// vouchers the node never accepted; the retry then either proceeds or draws
-/// the reason that says which. Otherwise the ledger covers the amount but not
-/// the bytes, which no bundle can heal.
-fn already_covered(watermark: Cumulative, ledger: &PoolLedger) -> Option<Healed> {
+/// too, the stream retries. Otherwise the ledger covers the amount but not the
+/// bytes, which no bundle can heal.
+///
+/// A covering ledger is in one of two states. Either a sibling stream took the
+/// same rejection and healed the lane first, or the ledger meters a root the
+/// node refused to adopt. The second state follows an `UnderFold` on a fresh
+/// root: the stream released reveals under it before the rejection landed, and
+/// only the last one rewound. A retry would re-anchor under that root and draw
+/// the same rejection, so an `UnderFold` retires it
+/// ([`PoolLedger::retire_unadopted_chain`]), unless a heal has already taken
+/// this bundle.
+async fn already_covered(
+    reason: VoucherRejectReason,
+    watermark: Cumulative,
+    ledger: &PoolLedger,
+) -> Option<Healed> {
     let committed = ledger.committed();
-    if committed.bytes >= watermark.bytes {
-        if committed == watermark {
-            tracing::debug!(
-                amount = %watermark.amount,
-                bytes = %watermark.bytes,
-                "trailing-proof rejection already healed by a sibling stream; retrying"
-            );
-        } else {
-            tracing::debug!(
-                bundle_amount = %watermark.amount,
-                bundle_bytes = %watermark.bytes,
-                committed_amount = %committed.amount,
-                committed_bytes = %committed.bytes,
-                "trailing-proof rejection carried a watermark our ledger is already past; \
-                 retrying from the ledger"
-            );
-        }
-        return Some(Healed::Stale);
+    if committed.bytes < watermark.bytes {
+        tracing::warn!(
+            bundle_amount = %watermark.amount,
+            bundle_bytes = %watermark.bytes,
+            committed_amount = %committed.amount,
+            committed_bytes = %committed.bytes,
+            "trailing-proof rejection carried a watermark our amount covers but our bytes \
+             do not; the ledger paid the amount but not the bytes"
+        );
+        return None;
     }
-    tracing::warn!(
-        bundle_amount = %watermark.amount,
-        bundle_bytes = %watermark.bytes,
-        committed_amount = %committed.amount,
-        committed_bytes = %committed.bytes,
-        "trailing-proof rejection carried a watermark our amount covers but our bytes \
-         do not; the ledger paid the amount but not the bytes"
-    );
-    None
+    let retired = if reason == VoucherRejectReason::UnderFold {
+        ledger.retire_unadopted_chain(watermark).await
+    } else {
+        None
+    };
+    log_covered(watermark, committed, retired);
+    Some(Healed::Stale)
+}
+
+/// Log how [`already_covered`] resolved a rejection whose watermark our
+/// `committed` ledger covers, and the root it `retired`, if any.
+fn log_covered(watermark: Cumulative, committed: Cumulative, retired: Option<B256>) {
+    if let Some(root) = retired {
+        tracing::info!(
+            retired_root = %root,
+            bundle_amount = %watermark.amount,
+            bundle_bytes = %watermark.bytes,
+            committed_amount = %committed.amount,
+            committed_bytes = %committed.bytes,
+            "under-fold rejection: the node never adopted our live chain, and our ledger \
+             already covers its watermark; folded the ledger and retired the chain, so the \
+             retry opens a fresh one"
+        );
+    } else if committed == watermark {
+        tracing::debug!(
+            amount = %watermark.amount,
+            bytes = %watermark.bytes,
+            "trailing-proof rejection already healed by a sibling stream; retrying"
+        );
+    } else {
+        tracing::debug!(
+            bundle_amount = %watermark.amount,
+            bundle_bytes = %watermark.bytes,
+            committed_amount = %committed.amount,
+            committed_bytes = %committed.bytes,
+            "trailing-proof rejection carried a watermark our ledger is already past; \
+             retrying from the ledger"
+        );
+    }
 }
 
 /// Log what a [`PoolLedger::rebase`] did and say how the heal resolved.
@@ -3122,7 +3156,7 @@ async fn open_progressive_pull_impl(
             0
         } else if byte_offset >= max_blob_size_bytes {
             return Err(anyhow::Error::new(BlobTooLarge {
-                received: byte_offset,
+                reached: byte_offset,
                 ceiling: max_blob_size_bytes,
             }));
         } else {
@@ -3367,7 +3401,7 @@ impl UpstreamPull {
                     // `0` = unlimited.
                     if self.max_received_wire > 0 && self.cumulative > self.max_received_wire {
                         return Err(anyhow::Error::new(BlobTooLarge {
-                            received: self.cumulative,
+                            reached: self.cumulative,
                             ceiling: self.max_received_wire,
                         }));
                     }
@@ -3498,7 +3532,7 @@ impl UpstreamPull {
                         }
                         if self.max_received_wire > 0 && seen > self.max_received_wire {
                             return Err(anyhow::Error::new(BlobTooLarge {
-                                received: seen,
+                                reached: seen,
                                 ceiling: self.max_received_wire,
                             }));
                         }

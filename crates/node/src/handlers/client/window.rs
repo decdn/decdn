@@ -206,6 +206,20 @@ impl ClientHandler {
                 .await;
         }
 
+        // Size-ceiling gate on the request's start (ADR 005 §`BlobTooLarge`
+        // enforcement). A start at or past this node's buyer-side ceiling cannot
+        // deliver a byte below it, so the node refuses before discovery and the
+        // upstream handshake. The gate reads only the requester's own offset. The
+        // client's resume guard draws the same line: a start AT the ceiling is
+        // already past it. `0` is unlimited.
+        let ceiling = origin.max_blob_size_bytes();
+        if ceiling > 0 && req.byte_offset >= ceiling {
+            release_reservation_unspent(floor_reservation.as_ref());
+            return self
+                .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
+                .await;
+        }
+
         // (3) Learn the blob geometry. PEEK the in-flight fill registry first: if a
         // live pull for this hash already runs, it already knows `total_bytes` from
         // its own header handshake, so this miss can coalesce onto it and SKIP the
@@ -296,6 +310,13 @@ impl ClientHandler {
         // once received bytes cross it. A lie is inert (it cannot produce bytes that
         // verify against the true root); an honest giant is streamed and paid for only
         // up to one ceiling before the fill aborts and the serve fails a gap.
+        //
+        // The request's end has no gate either. A request's `byte_len` may run past
+        // the blob, and only the claimed total says where the blob ends, so an end
+        // gate would again let an inflated claim refuse a small blob. A request that
+        // starts below the ceiling and ends past it commits. The received-byte abort
+        // stops it near the ceiling, and a remainder that starts past the ceiling
+        // meets the start gate above.
 
         // (5) The signed `StreamResponse` commits to `total_bytes` (now known). It is
         // deferred to step (7), AFTER the fill is claimed — so a peeked geometry that
