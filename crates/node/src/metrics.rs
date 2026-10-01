@@ -819,10 +819,11 @@ pub struct DecdnMetrics {
     /// which pools are dry. Operator-visible name:
     /// `decdn_redemption_skipped_insolvent_total`.
     pub redemption_skipped_insolvent: Counter,
-    /// Lanes the redeemer skipped because the signer's capability has expired, or
-    /// expires within the redeemer's landing slack (ADR 003 §Revocation). The
-    /// contract pays 0 for an expired capability, so the redemption would only
-    /// spend gas. Counted once per skipped lane per planning pass. The serve path
+    /// Lanes with value owed that the redeemer skipped because the signer's
+    /// capability has expired, or expires within the redeemer's landing slack
+    /// (ADR 003 §Revocation). The contract pays 0 for an expired capability, so
+    /// the redemption would only spend gas. Counted once per skipped lane per
+    /// planning pass. A lane with nothing owed is not counted. The serve path
     /// stops accepting vouchers one redeem interval plus that slack before
     /// expiry, so a sustained rate means a lane earned near its capability's
     /// expiry and no sweep redeemed it in time: check for failed or
@@ -2924,8 +2925,9 @@ recorders! {
     /// chain-observed solvency ruled it out this pass (ADR 003).
     redemption_skipped_insolvent => redemption_skipped_insolvent.inc();
 
-    /// A lane was skipped this pass because its signer's capability has expired,
-    /// or expires within the redeemer's landing slack (ADR 003 §Revocation).
+    /// A lane with value owed was skipped this pass because its signer's
+    /// capability has expired, or expires within the redeemer's landing slack
+    /// (ADR 003 §Revocation).
     redemption_skipped_expired => redemption_skipped_expired.inc();
 
     /// `n` lanes were held or dropped by `pool_is_redeemable` in one planning

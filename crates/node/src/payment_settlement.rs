@@ -69,6 +69,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
+use decdn_common::config::REDEEM_LANDING_SLACK_SECS;
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::sig_canon::is_high_s;
@@ -93,21 +94,6 @@ use crate::pool_view::{Lifecycle, PoolProjection, PoolStatus};
 /// channel that drops on overflow is acceptable — sized for a burst of concurrent
 /// lanes without backpressuring the voucher-accept path.
 pub const REDEEM_HINT_CAPACITY: usize = 256;
-
-/// Time the redeemer allows a `redeemMany` to land on chain: 120 s. The planner
-/// skips a lane whose capability expires, or whose pool's close deadline falls,
-/// within this slack of now: a transaction that lands past the expiry pays 0, and
-/// one that lands past the deadline reverts `PoolClosed` for its whole batch.
-pub const REDEEM_LANDING_SLACK_SECS: u64 = 120;
-
-/// The serve path's capability-expiry margin in seconds: one redeem interval plus
-/// [`REDEEM_LANDING_SLACK_SECS`] (ADR 003 §Revocation). The node rejects a voucher
-/// once `now + margin` reaches its capability's expiry, so a voucher accepted at
-/// the edge still meets one self-tick sweep with landing time to spare.
-#[must_use]
-pub const fn capability_expiry_margin_secs(redeem_interval_secs: u64) -> u64 {
-    redeem_interval_secs.saturating_add(REDEEM_LANDING_SLACK_SECS)
-}
 
 /// How long the admit-path `getPool` suppresses a repeat call for a pool it
 /// just found not-servable (nonexistent / `Closed`) or that errored. A
@@ -1433,9 +1419,10 @@ fn plan_lane(
 /// a signer another provider already registered, and the first landed redemption
 /// persists `registered_until` so later passes skip the reg.
 ///
-/// A lane whose capability expires within [`REDEEM_LANDING_SLACK_SECS`] of `now`
-/// is skipped: the contract pays 0 for an expired capability, so its redemption
-/// would only spend gas.
+/// A lane with value owed whose capability expires within
+/// [`REDEEM_LANDING_SLACK_SECS`] of `now` is skipped and metered: the contract
+/// pays 0 for an expired capability, so its redemption would only spend gas. A
+/// lane with nothing owed is dropped silently, expired or not.
 #[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
 fn plan_lanes(
     paid: &PaidWatermarks,
@@ -1463,16 +1450,6 @@ fn plan_lanes(
         if st.provider != self_address {
             continue;
         }
-        if capability_expired(st.expiry, now) {
-            metrics.redemption_skipped_expired();
-            debug!(
-                pool_id = %st.pool_id,
-                signer = %st.signer,
-                expiry = st.expiry,
-                "redeemer: skipping a lane whose capability has expired"
-            );
-            continue;
-        }
         // Registered iff this node has already landed the signer's registration
         // (persisted `registered_until` still live); otherwise attach a
         // `CapabilityReg` from the held `owner_sig` ([`plan_lane`]).
@@ -1482,6 +1459,18 @@ fn plan_lanes(
             RegistrationStatus::Unregistered
         };
         match plan_lane(st, paid, self_address, &reg_status) {
+            // The expiry check follows `plan_lane`, which drops a lane with
+            // nothing unredeemed. A fully redeemed lane stays in the store until
+            // its pool is reclaimed, so only a skip that strands value is metered.
+            Ok(Some(_)) if capability_expired(st.expiry, now) => {
+                metrics.redemption_skipped_expired();
+                debug!(
+                    pool_id = %st.pool_id,
+                    signer = %st.signer,
+                    expiry = st.expiry,
+                    "redeemer: skipping a lane with value owed whose capability has expired"
+                );
+            }
             Ok(Some(lane)) => plans.push(lane),
             Ok(None) => {}
             Err(err) => {
@@ -3646,17 +3635,6 @@ mod tests {
         );
     }
 
-    /// The serve margin is one redeem interval plus the landing slack, and
-    /// saturates instead of overflowing.
-    #[test]
-    fn capability_expiry_margin_is_one_interval_plus_the_slack() {
-        assert_eq!(
-            capability_expiry_margin_secs(300),
-            300 + REDEEM_LANDING_SLACK_SECS
-        );
-        assert_eq!(capability_expiry_margin_secs(u64::MAX), u64::MAX);
-    }
-
     /// `decdn_redemption_skipped_expired_total` as the scrape reads it.
     fn skipped_expired(metrics: &Metrics) -> u64 {
         let text = metrics.encode().unwrap_or_default();
@@ -3666,9 +3644,9 @@ mod tests {
             .unwrap_or(u64::MAX)
     }
 
-    /// The planner skips a lane whose capability expires within the landing
-    /// slack, and meters it on its own counter. The same lane plans while its
-    /// expiry lies further ahead.
+    /// The planner skips a lane with value owed whose capability expires within
+    /// the landing slack, and meters it on its own counter. The same lane plans
+    /// while its expiry lies further ahead.
     #[test]
     fn plan_lanes_skips_an_expired_capability() {
         let me = Address::from([20u8; 20]);
@@ -3691,6 +3669,33 @@ mod tests {
             "an expiring capability pays 0 and is skipped"
         );
         assert_eq!(skipped_expired(&metrics), 1);
+    }
+
+    /// A fully redeemed lane stays in the store until its pool is reclaimed, so
+    /// every sweep sees it. Once its capability expires, the planner drops it
+    /// without metering: no value is stranded.
+    #[test]
+    fn plan_lanes_drops_an_expired_lane_with_nothing_owed_silently() {
+        let me = Address::from([20u8; 20]);
+        let st = signed_lane_state(1, 10, 20, Some(sig_with_v(1)));
+        let late_now = st.expiry - REDEEM_LANDING_SLACK_SECS;
+        let paid = PaidWatermarks::default();
+        paid.set(st.key(), st.owed());
+        let projection = PoolProjection::new();
+        let metrics = Arc::new(Metrics::new());
+
+        for _ in 0..3 {
+            let plans = plan_lanes(&paid, me, vec![st.clone()], &metrics, &projection, late_now);
+            assert!(
+                plans.is_empty(),
+                "a fully redeemed lane has nothing to plan"
+            );
+        }
+        assert_eq!(
+            skipped_expired(&metrics),
+            0,
+            "a lane with nothing owed strands no value"
+        );
     }
 
     #[test]

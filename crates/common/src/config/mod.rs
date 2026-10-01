@@ -130,9 +130,24 @@ const DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX: u64 = 300;
 /// hourly expiry sweep so accrued earnings are withdrawn promptly without
 /// leaning on the advisory per-voucher hints (#327, #751).
 ///
-/// `pub` so a `decdn-node` client handler built without config takes the same
-/// interval for its capability-expiry margin.
+/// `pub` so a `decdn-node` client handler built without config, and `decdn pool
+/// assign`, take the same interval for the capability-expiry margin.
 pub const DEFAULT_REDEEM_INTERVAL_SECS: u64 = 300;
+/// Time the node's redeemer allows a `redeemMany` to land on chain: 120 s. The
+/// redeemer skips a lane whose capability expires, or whose pool's close deadline
+/// falls, within this slack of now: a transaction that lands past the expiry pays
+/// 0, and one that lands past the deadline reverts `PoolClosed` for its whole
+/// batch.
+pub const REDEEM_LANDING_SLACK_SECS: u64 = 120;
+/// The node's capability-expiry margin in seconds for a redeem interval: one
+/// interval plus [`REDEEM_LANDING_SLACK_SECS`] (ADR 003 §Revocation). The node
+/// rejects a voucher once `now + margin` reaches its capability's expiry, so a
+/// voucher accepted at the edge still meets one self-tick sweep with landing time
+/// to spare.
+#[must_use]
+pub const fn capability_expiry_margin_secs(redeem_interval_secs: u64) -> u64 {
+    redeem_interval_secs.saturating_add(REDEEM_LANDING_SLACK_SECS)
+}
 /// Upper bound on the redeemer self-tick interval: 6h (`21_600s`). The sweep is the
 /// node's only defense against an owner's grace-window close — it must run several
 /// times inside the 48h grace floor so accrued vouchers redeem before the owner
@@ -3743,6 +3758,17 @@ mod tests {
     use super::*;
     use crate::cli::run::BlockchainArgs;
     use tempfile::TempDir;
+
+    /// The capability-expiry margin is one redeem interval plus the landing
+    /// slack, and saturates instead of overflowing.
+    #[test]
+    fn capability_expiry_margin_is_one_interval_plus_the_slack() {
+        assert_eq!(
+            capability_expiry_margin_secs(300),
+            300 + REDEEM_LANDING_SLACK_SECS
+        );
+        assert_eq!(capability_expiry_margin_secs(u64::MAX), u64::MAX);
+    }
 
     #[test]
     fn normalize_region_accepts_and_uppercases() -> anyhow::Result<()> {

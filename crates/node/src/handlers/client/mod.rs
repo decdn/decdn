@@ -1030,7 +1030,7 @@ pub struct ClientHandlerDeps {
     /// The redeemer's self-tick interval in seconds
     /// (`blockchain.redeem_interval_secs`). The voucher-accept path stops
     /// accepting vouchers this interval plus the redeemer's landing slack before
-    /// a capability expires ([`crate::payment_settlement::capability_expiry_margin_secs`],
+    /// a capability expires ([`decdn_common::config::capability_expiry_margin_secs`],
     /// ADR 003 §Revocation). Defaults to the config default.
     pub redeem_interval_secs: u64,
 }
@@ -1405,7 +1405,7 @@ pub struct ClientHandler {
     coarse_clock: Arc<crate::coarse_clock::CoarseClock>,
     /// How long before a capability's expiry the voucher-accept path stops
     /// accepting vouchers, in seconds: one redeem interval plus the redeemer's
-    /// landing slack ([`crate::payment_settlement::capability_expiry_margin_secs`]).
+    /// landing slack ([`decdn_common::config::capability_expiry_margin_secs`]).
     capability_expiry_margin_secs: u64,
 }
 
@@ -1500,7 +1500,7 @@ impl ClientHandler {
             coarse_clock: deps
                 .coarse_clock
                 .unwrap_or_else(|| Arc::new(crate::coarse_clock::CoarseClock::new())),
-            capability_expiry_margin_secs: crate::payment_settlement::capability_expiry_margin_secs(
+            capability_expiry_margin_secs: decdn_common::config::capability_expiry_margin_secs(
                 deps.redeem_interval_secs,
             ),
         })

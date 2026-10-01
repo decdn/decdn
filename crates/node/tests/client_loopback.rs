@@ -5922,7 +5922,7 @@ async fn fetch_on_a_lane_expiring_at(expiry: u64) -> anyhow::Result<Option<Strin
 }
 
 /// The node's capability-expiry margin at the default redeem interval.
-const DEFAULT_EXPIRY_MARGIN: u64 = decdn_node::payment_settlement::capability_expiry_margin_secs(
+const DEFAULT_EXPIRY_MARGIN: u64 = decdn_common::config::capability_expiry_margin_secs(
     decdn_common::config::DEFAULT_REDEEM_INTERVAL_SECS,
 );
 

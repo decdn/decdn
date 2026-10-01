@@ -22,7 +22,10 @@ use decdn_client::buyer_pool::{
 };
 use decdn_common::admin::{AdminRpcClient as _, BuyerPoolsResponse};
 use decdn_common::cli::{self, common::expand_tilde};
-use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
+use decdn_common::config::{
+    DEFAULT_CHAIN_ID, DEFAULT_REDEEM_INTERVAL_SECS, FileConfig, capability_expiry_margin_secs,
+    load_file_config,
+};
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::buyer_pool::{BuyerLoad, BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::buyer_pool_redb::{ReadOnlyBuyerPoolStore, RedbBuyerPoolStore};
@@ -911,6 +914,18 @@ fn resolve_expiry(
     Ok(expiry)
 }
 
+/// The capability-expiry margin of a node at the default redeem interval.
+const DEFAULT_NODE_EXPIRY_MARGIN_SECS: u64 =
+    capability_expiry_margin_secs(DEFAULT_REDEEM_INTERVAL_SECS);
+
+/// Whether a capability's remaining lifetime at `now` lies within the
+/// capability-expiry margin of a node at the default redeem interval. Such a node
+/// refuses every voucher under it from the start (ADR 003 §Revocation). A node's
+/// actual interval is unknown here, so `assign` only warns.
+const fn expires_within_default_node_margin(expiry: u64, now: u64) -> bool {
+    expiry.saturating_sub(now) <= DEFAULT_NODE_EXPIRY_MARGIN_SECS
+}
+
 /// Current Unix time in whole seconds.
 ///
 /// # Errors
@@ -986,6 +1001,14 @@ async fn assign(args: &cli::PoolAssignArgs, config_path: Option<&Path>) -> anyho
 
     let now = issuance_now(&chain.rpc_url).await?;
     let expiry = resolve_expiry(now, args.expiry_secs, args.expiry_at)?;
+    if expires_within_default_node_margin(expiry, now) {
+        eprintln!(
+            "warning: the capability expires in {}s; a node with the default redeem interval \
+             refuses vouchers within {DEFAULT_NODE_EXPIRY_MARGIN_SECS}s of a capability's \
+             expiry, so such a node serves this delegate nothing",
+            expiry.saturating_sub(now)
+        );
+    }
 
     let owner_signer = load_buyer_signer(&chain)?;
     let owner = owner_signer.address();
@@ -2104,6 +2127,22 @@ mod tests {
         // An absolute expiry at/behind now is dead on arrival.
         let past = resolve_expiry(now, None, Some(now)).unwrap_err();
         assert!(past.to_string().contains("not in the future"), "{past}");
+    }
+
+    /// `assign` warns on a lifetime at or under the default node margin, and not
+    /// on a longer one.
+    #[test]
+    fn expires_within_default_node_margin_matches_the_node_margin() {
+        let now = 1_000_000u64;
+        let margin = DEFAULT_REDEEM_INTERVAL_SECS + decdn_common::config::REDEEM_LANDING_SLACK_SECS;
+        assert_eq!(DEFAULT_NODE_EXPIRY_MARGIN_SECS, margin);
+        assert!(expires_within_default_node_margin(now + 1, now));
+        assert!(expires_within_default_node_margin(now + margin, now));
+        assert!(!expires_within_default_node_margin(now + margin + 1, now));
+        assert!(
+            expires_within_default_node_margin(now - 1, now),
+            "a past expiry saturates to 0 s left"
+        );
     }
 
     /// An RPC that cannot be read leaves `assign` on the local clock rather than
