@@ -191,7 +191,10 @@ const fn reconcile(state: &mut DriverState, raw: u64) -> u64 {
 ///
 /// Emits `evictions_starved` when there is nothing left to evict while still
 /// over target — either because the candidate set is empty (everything pinned,
-/// operator-evicted, or probe-held) or because a whole pass released nothing.
+/// operator-evicted, or probe-held, or the open-time recency seed failed so
+/// blobs from before the restart are not candidates; see
+/// `decdn_cache_recency_seed_failures_total`) or because a whole pass released
+/// nothing.
 #[allow(clippy::too_many_arguments)]
 async fn sweep(
     cache: &CacheEngine,
@@ -800,6 +803,76 @@ mod tests {
         assert!(
             state.disk_clamped,
             "state must record that the disk clamp is the binding ceiling"
+        );
+        Ok(())
+    }
+
+    /// A node restarted above its size limit releases blobs from before the
+    /// restart on its first tick, with no traffic, instead of starving (#2221).
+    #[tokio::test]
+    async fn restarted_over_limit_cache_evicts_without_traffic() -> anyhow::Result<()> {
+        let origin_dir = tempfile::tempdir()?;
+        let cache_dir = tempfile::tempdir()?;
+
+        let mut hashes = Vec::new();
+        for i in 0..4u32 {
+            let payload = format!("restart eviction test: blob #{i}").into_bytes();
+            hashes.push(write_origin_blob(origin_dir.path(), &payload)?);
+        }
+        {
+            let origin =
+                std::sync::Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+            let cache = CacheEngine::open(
+                cache_dir.path(),
+                vec![origin as std::sync::Arc<dyn decdn_cache::Origin>],
+                16,
+            )
+            .await?;
+            for hash in &hashes {
+                let _ = cache.get(*hash).await?;
+            }
+            cache.shutdown().await?;
+        }
+
+        // Reopen with no origin and serve nothing: every blob is from before
+        // the restart.
+        let cache = CacheEngine::open(cache_dir.path(), Vec::new(), 16).await?;
+        let metrics = CacheMetrics::default();
+        let policy: Arc<dyn decdn_cache::EvictionPolicy> = Arc::new(decdn_cache::LruEviction);
+        let warming = Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0));
+        let mut state = DriverState::default();
+
+        // A 1-byte budget puts the reopened cache over high water. free_bytes =
+        // u64::MAX disables the disk clamp, so only the config limit binds.
+        let ceiling = Ceiling {
+            config_limit_bytes: 1,
+            headroom_bytes: 0,
+            high_water_pct: 90,
+            target_pct: 80,
+        };
+        tick(
+            &cache,
+            &metrics,
+            ceiling,
+            u64::MAX,
+            16,
+            &mut state,
+            &policy,
+            &warming,
+        )
+        .await;
+
+        anyhow::ensure!(
+            metrics.evictions.get() > 0,
+            "the first tick after a restart must release pre-restart blobs"
+        );
+        anyhow::ensure!(
+            metrics.evictions_starved.get() == 0,
+            "a restarted over-limit cache must not starve"
+        );
+        anyhow::ensure!(
+            cache.eviction_candidates().len() < hashes.len(),
+            "released blobs must leave the candidate set"
         );
         Ok(())
     }
