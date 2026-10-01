@@ -76,6 +76,7 @@ use alloy::primitives::U256;
 use bao_tree::ChunkRanges;
 use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, RangedStore, align_range};
 use decdn_incentive::DepositOutcome;
+use decdn_protocol::VoucherRejectReason;
 
 use crate::fault::HealExhausted;
 use crate::pacer::{DownstreamFrontier, PaceDecision, PaceState};
@@ -482,6 +483,14 @@ fn log_healed_retry(
 
 /// Price the next voucher from an upstream header, the exact formula
 /// [`PoolLedger`]'s own `next_voucher` and the CLI's reactive branch use.
+/// True when `err` is a `SpendingCapExhausted` voucher rejection. The cap is
+/// the pool's, one deposit behind every lane, so a heal past the resume budget
+/// never scopes it to the source: the exhaustion check judges it instead.
+fn is_spending_cap_rejection(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<UpstreamVoucherRejected>()
+        .is_some_and(|r| r.reason == VoucherRejectReason::SpendingCapExhausted)
+}
+
 fn voucher_cost(header: &UpstreamPullHeader) -> U256 {
     U256::from(header.interval_bytes)
         .saturating_mul(U256::from(header.rate_per_mb))
@@ -1252,15 +1261,18 @@ where
                     //    node holds it, but this source kept rejecting after each
                     //    heal: mark the rejection `HealExhausted`, so the source
                     //    cools rather than the command ending. A rejection that
-                    //    no heal takes stays bare and falls through to step 4.
+                    //    no heal takes stays bare and falls through to step 4. A
+                    //    spending-cap rejection is the pool's, not this source's,
+                    //    so it is never marked and reaches step 3's check.
                     let healed = match watermark {
                         Some(watermark) => heal_watermark_desync(&err, watermark, ledger).await,
                         None => None,
                     };
-                    if healed.is_some() && counters.resume_attempts >= MAX_RESUME_ATTEMPTS {
+                    let past_budget = counters.resume_attempts >= MAX_RESUME_ATTEMPTS;
+                    if healed.is_some() && past_budget && !is_spending_cap_rejection(&err) {
                         return Err(err.context(HealExhausted));
                     }
-                    let desync = healed.is_some();
+                    let desync = healed.is_some() && !past_budget;
 
                     // 3. Genuine exhaustion (corroborated against our OWN
                     //    ledger): let the pacer fund it on the next pass. The
@@ -2542,6 +2554,47 @@ mod tests {
             "a healed rejection past the budget carries the marker: {err:#}"
         );
         assert_eq!(crate::classify(&err), crate::Fault::Source);
+        let budget = usize::try_from(crate::MAX_RESUME_ATTEMPTS).unwrap_or(usize::MAX);
+        assert_eq!(
+            opens,
+            budget + 1,
+            "one open per resume attempt, plus the first"
+        );
+    }
+
+    /// A spending-cap rejection whose bundle keeps reseeding the ledger is
+    /// healed within the resume budget, and past it ends the command bare: the
+    /// cap is the pool's, so it never carries the marker that scopes a fault to
+    /// one source.
+    #[tokio::test]
+    async fn a_spending_cap_rejection_past_the_budget_is_never_scoped_to_the_source() {
+        let ledger = ledger_ahead_of_the_node();
+        let (result, _store, opens) = drive_through_faults(healthy_ctx(), &ledger, |ctx| {
+            (0..8u64)
+                .map(|i| {
+                    let mut err = underpaid(ctx, (100_000 + i * 1_000, 50_000 + i * 1_000), None);
+                    if let Some(rejected) = err.downcast_mut::<UpstreamVoucherRejected>() {
+                        rejected.reason = VoucherRejectReason::SpendingCapExhausted;
+                    }
+                    err
+                })
+                .collect()
+        })
+        .await;
+        let err = result.expect_err("an endless stream of rejections must end the fetch");
+        assert!(
+            err.downcast_ref::<UpstreamVoucherRejected>()
+                .is_some_and(|r| r.reason == VoucherRejectReason::SpendingCapExhausted),
+            "the terminal error is the rejection itself: {err:#}"
+        );
+        assert!(
+            err.downcast_ref::<crate::HealExhausted>().is_none(),
+            "a spending-cap rejection never carries the marker: {err:#}"
+        );
+        assert_eq!(
+            crate::classify(&err),
+            crate::Fault::Fatal(crate::FatalScope::Command)
+        );
         let budget = usize::try_from(crate::MAX_RESUME_ATTEMPTS).unwrap_or(usize::MAX);
         assert_eq!(
             opens,
