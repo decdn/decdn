@@ -931,6 +931,15 @@ since project inception and will roll into the first tagged release.
   `decdn_serve_stream_rejected_signer_cap_exhausted_total` counts only signers
   whose on-chain cap cannot pay a floor.
 
+- **Partial holders no longer pull a blob from each other in a loop of three
+  or more (#2224).** While a node's own upstream open for a blob is in
+  progress, it refuses a whole-blob request for that blob from an active
+  staker with `NotFound` (counted in
+  `decdn_serve_stream_rejected_cache_miss_total`), so the requester tries its
+  next candidate. Ranged requests and client requests are not refused for
+  this reason. A node also drops its own entry from the origin directory's
+  candidates, as the DHT lookup already does.
+
 - **A partial holder is not asked again for chunks it cannot pull through
   (#2262).** A probed holder that refuses a chunk outside its advertised
   coverage with `NotFound` now counts toward the same three-refusal limit as

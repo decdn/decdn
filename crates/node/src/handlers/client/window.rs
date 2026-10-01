@@ -254,7 +254,32 @@ impl ClientHandler {
             )
         };
         let mut target: Option<PullLegTarget> = None;
-        let total_bytes = match self.cache.in_flight_total(hash) {
+        let in_flight = self.cache.in_flight_total(hash);
+        // A whole-blob request from another node while this node's own
+        // upstream open for the hash runs would close a pull-through loop
+        // among partial holders (#2224): refuse it as a miss, so the
+        // requester tries its next candidate.
+        if in_flight.is_none()
+            && req.byte_offset == 0
+            && req.byte_len == 0
+            && origin.refuses_whole_blob(hash, client_node_id.0)
+        {
+            tracing::debug!(
+                %hash,
+                "refusing a whole-blob request from a node while this node's own \
+                 upstream open for the blob is in progress"
+            );
+            release_reservation_unspent(floor_reservation.as_ref());
+            return self
+                .respond_error(
+                    &mut send,
+                    req,
+                    FillOutcome::miss_reason(fault_seen),
+                    rate_per_mb,
+                )
+                .await;
+        }
+        let total_bytes = match in_flight {
             Some(total) => total,
             None => {
                 // No live fill to coalesce onto — handshake upstream to learn the
