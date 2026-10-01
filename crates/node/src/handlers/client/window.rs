@@ -10,9 +10,9 @@ use crate::metrics::FirstByteClock;
 use crate::node_origin::{PrimeLeg, PullLegTarget};
 
 use super::{
-    Arc, B256, CHUNK_BYTES, ClientHandler, FillOutcome, FloorReservation, Hash, LaneDeliveryState,
-    LaneKey, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason, StreamRequest,
-    StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
+    Arc, B256, CHUNK_BYTES, ClientHandler, Connection, FillOutcome, FloorReservation, Hash,
+    LaneDeliveryState, LaneKey, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason,
+    StreamRequest, StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
 };
 
 /// Release a miss leg's floor reservation on a refusal taken BEFORE the serve
@@ -125,6 +125,7 @@ impl ClientHandler {
     )]
     pub(super) async fn serve_via_window_pull_through(
         &self,
+        conn: &Connection,
         mut send: SendStream,
         mut recv: RecvStream,
         req: &StreamRequest,
@@ -579,6 +580,7 @@ impl ClientHandler {
         // scope end.
         let serve_result = self
             .serve_leg(
+                conn,
                 &mut send,
                 &mut recv,
                 serve_store,
@@ -660,6 +662,7 @@ impl ClientHandler {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) async fn serve_via_backend_origin(
         &self,
+        conn: &Connection,
         mut send: SendStream,
         mut recv: RecvStream,
         req: &StreamRequest,
@@ -928,6 +931,7 @@ impl ClientHandler {
         // scope end.
         let serve_result = self
             .serve_leg(
+                conn,
                 &mut send,
                 &mut recv,
                 serve_store,

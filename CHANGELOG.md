@@ -915,6 +915,18 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **The node no longer faults a paying client whose bytes are still in
+  flight (#2230).** A write returns once the transport buffers it, so the
+  node's wait for a proof can start while several chunks are still on the
+  way to the client. The wait now faults only after 10 s with no proof and no
+  new STREAM frame sent on the connection, and in every case after 30 s. A
+  client that stops reading still faults at 10 s. The fault names the
+  connection's selected path (relay or direct, IPv4 or IPv6) with its RTT,
+  congestion window, lost packets, congestion events and black holes
+  detected: `no proof and no transport progress for 10s (selected path …)`
+  or `proof wait passed 30s (selected path …)`. It replaces `proof read
+  timed out after 10s` in the `serve_stream` failure span.
+
 - **Chain-read logs no longer carry the RPC URL (#2264).** The node's
   binding check, buyer lane seed, owned-pool walk, top-up, pool open and
   reclaim sweep log their RPC errors through the URL-stripping redactor, so a

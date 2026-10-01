@@ -9181,8 +9181,9 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
     let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
     // Three paid intervals put `paid / DEFAULT_CREDIT_RAMP_DIVISOR` above
     // `PULL_WINDOW_FLOOR`, so the pull window has ramped. The 2 s hold is shorter
-    // than B's 10 s `VOUCHER_READ_TIMEOUT`, so B does not end the stream while
-    // the leaf holds it open.
+    // than B's proof-wait backstop (10 s with no transport progress,
+    // `VOUCHER_READ_TIMEOUT`), so B does not end the stream while the leaf holds
+    // it open.
     let outcome = tokio::time::timeout(
         Duration::from_mins(1),
         leaf_paced_pull_mode(

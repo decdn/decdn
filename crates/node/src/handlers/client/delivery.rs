@@ -13,9 +13,9 @@ use super::ramp::RampCarry;
 use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked};
 use super::wire::{FrameAccountingFault, FrameChunks, FrameQueue};
 use super::{
-    Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, FloorReservation,
-    Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256, VoucherRejectReason,
-    VoucherStop,
+    Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, Connection,
+    FloorReservation, Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256,
+    VoucherRejectReason, VoucherStop,
 };
 use crate::metrics::FirstByteClock;
 
@@ -200,6 +200,7 @@ impl ClientHandler {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn deliver(
         &self,
+        conn: &Connection,
         send: &mut SendStream,
         recv: &mut RecvStream,
         hash: Hash,
@@ -226,6 +227,7 @@ impl ClientHandler {
         // paid.
         let carry = self.take_ramp_carry(lane).await;
         self.deliver_loop(
+            conn,
             send,
             recv,
             hash,
@@ -256,6 +258,7 @@ impl ClientHandler {
     )]
     async fn deliver_loop(
         &self,
+        conn: &Connection,
         send: &mut SendStream,
         recv: &mut RecvStream,
         hash: Hash,
@@ -463,6 +466,7 @@ impl ClientHandler {
                     attempts = attempts.saturating_add(1);
                     let stop = self
                         .commit_one_proof(
+                            conn,
                             send,
                             recv,
                             &mut reader,

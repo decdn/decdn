@@ -388,8 +388,8 @@ impl std::error::Error for FrameAccountingFault {}
 /// The attach sites are the peer-attributable arms of the wire writes
 /// ([`ClientHandler::write_payload`], [`ClientHandler::write_chunk_bufs`]), the
 /// proof reads ([`BufferedProofReader::read`](super::BufferedProofReader::read)
-/// and its gather timeout), and the voucher read timeout in
-/// [`ClientHandler::commit_one_proof`]. A write or read fault this node caused —
+/// and its gather timeout), and the proof wait's faults in
+/// [`proof_wait`](super::proof_wait). A write or read fault this node caused —
 /// an oversized frame it encoded, a write after its own `finish`/`reset` — stays
 /// unmarked and reaches `error!`.
 #[derive(Debug)]

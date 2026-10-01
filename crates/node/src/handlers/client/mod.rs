@@ -71,6 +71,7 @@ mod delivery;
 mod dispatch;
 mod fill;
 mod outcome;
+mod proof_wait;
 mod ramp;
 mod serve_encoder;
 mod serve_leg;
@@ -86,6 +87,9 @@ pub const MAX_CLIENT_STREAMS: usize = 100;
 
 // Per-stage timeouts so a stalled peer cannot pin a stream task indefinitely.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the serve loop waits for a proof while the connection sends no new
+/// STREAM frame. The wait for one proof never passes
+/// [`proof_wait::PROOF_WAIT_CEILING`] (see [`proof_wait`]).
 const VOUCHER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 /// After a clean `StreamEnd`, how long the serve waits for the client's FIN while
@@ -2586,8 +2590,8 @@ pub(super) enum Proof {
 
 /// Cancellation-safe, buffered reader for `cdn/client/v1` payment-proof frames. Owns
 /// a byte buffer that PERSISTS across [`Self::read`] calls, so a `read` future
-/// cancelled by the outer [`VOUCHER_READ_TIMEOUT`] loses no bytes: any partial
-/// frame stays buffered for the next call.
+/// dropped mid-frame loses no bytes: any partial frame stays buffered for the
+/// next call.
 ///
 /// [`read_frame`] is built on `read_exact` and is NOT cancellation-safe — a
 /// `timeout` firing mid-frame would drop already-consumed bytes and desync the
