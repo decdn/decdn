@@ -512,9 +512,9 @@ struct WorkerEnd {
     end: LaneEnd,
     /// Whether the worker verified any byte.
     delivered: bool,
-    /// Whether the worker verified a byte of a range outside its coverage:
+    /// When the worker last verified a byte of a range outside its coverage:
     /// its node serves such ranges by pull-through.
-    pulled_through: bool,
+    pulled_through: Option<Instant>,
     /// Whether it was an extra worker ([`Work::add_extra`]): its end touches
     /// neither the lane's running state nor its source's health.
     extra: bool,
@@ -1465,7 +1465,7 @@ where
         }
     };
     let mut delivered = false;
-    let mut pulled_through = false;
+    let mut pulled_through = None;
     // Per-worker resume/quote state. The reactive-top-up budget is NOT in here:
     // it is a property of the one shared pool and lives in `pool`.
     let mut counters = DriveCounters::new();
@@ -1671,7 +1671,9 @@ where
             landed = landed.saturating_add(gap_landed);
             if gap_landed > 0 {
                 delivered = true;
-                pulled_through |= uncovered;
+                if uncovered {
+                    pulled_through = Some(Instant::now());
+                }
                 health.record_progress(provider);
             }
             match outcome {
@@ -2582,8 +2584,8 @@ where
                         sources.record_progress(provider);
                         charged.remove(&provider);
                     }
-                    if pulled_through {
-                        sources.record_pull_through(provider);
+                    if let Some(at) = pulled_through {
+                        sources.record_pull_through(provider, at);
                     }
                     if let LaneEnd::Faulted {
                         err,

@@ -1,5 +1,6 @@
 ---
 source: crates/client/tests/public_api.rs
+assertion_line: 42
 expression: public_api.to_string()
 ---
 pub mod decdn_client
