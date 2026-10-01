@@ -623,7 +623,8 @@ enum ServeRejectReason {
     /// operator can tell a chain/RPC problem from real deposit exhaustion.
     PoolUnconfirmed,
     /// The request's voucher signer is registered on-chain with `cap − spent` below
-    /// a serve floor, or its authorization could not be confirmed. A signer's `cap`
+    /// a serve floor or with an expired registration, or its authorization could
+    /// not be confirmed. A signer's `cap`
     /// is shared across every provider (ADR 003 §Pool solvency), so a "spent"
     /// capability — one whose signer has already drawn its full `cap` at other nodes
     /// — is uncashable here: the node would serve for vouchers it could never
@@ -1799,6 +1800,41 @@ impl ClientHandler {
             self.tune_lane_gauge(1);
         }
         Ok(())
+    }
+
+    /// Clamp a live lane to its signer's on-chain registration (ADR 003
+    /// §Capability delegation): the lane holds `min(held, registered)` for `cap`
+    /// and `expiry` and records the registered expiry as `registered_until`. On-chain
+    /// registration is write-once, so the clamp is final for this `(pool, signer)`
+    /// and the lane store persists it with the lane. A change is recorded to the
+    /// buffered store under the per-lane lock, the same path as a voucher advance.
+    /// A store fault is logged and leaves the in-memory clamp in place: the live
+    /// lane is what the voucher path reads.
+    async fn clamp_lane_to_registration(
+        &self,
+        lane: &Arc<Mutex<LaneDeliveryState>>,
+        cap: u64,
+        expiry: u64,
+    ) {
+        let mut guard = lane.lock().await;
+        if !guard.state.clamp_to_registration(cap, expiry) {
+            return;
+        }
+        tracing::debug!(
+            pool_id = %guard.state.pool_id,
+            signer = %guard.state.signer,
+            held_cap = %guard.state.cap,
+            held_expiry = guard.state.expiry,
+            "lane clamped to the signer's on-chain registration"
+        );
+        if let Err(error) = self.channel_state_store.record(&guard.state) {
+            tracing::warn!(
+                pool_id = %guard.state.pool_id,
+                signer = %guard.state.signer,
+                %error,
+                "failed to record a lane clamped to its signer's registration"
+            );
+        }
     }
 
     /// Drop a settled lane from the live map and the lane store, where the removal
@@ -4225,6 +4261,48 @@ mod tests {
             newPaidCumulative: cumulative,
             bytesPaid: 0,
         }
+    }
+
+    /// A live lane registered from a wider capability narrows to the signer's
+    /// on-chain registration, and the store persists the clamped terms (#2265).
+    #[tokio::test]
+    async fn clamp_lane_to_registration_narrows_the_live_lane_and_persists() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _projection, _dir) = handler_with_projection_view(&metrics).await;
+        let lane = LaneState::hydrate(
+            B256::repeat_byte(0x61),
+            Address::new([0xa2; 20]),
+            handler.eth_signer.address(),
+            U256::from(5_000_000u64),
+            2_000_000_000,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+            decdn_incentive::LaneChain::NONE,
+        );
+        let key = lane.key();
+        handler.register_lane(lane)?;
+        let live = handler
+            .lanes
+            .get(&key)
+            .map(|e| Arc::clone(e.value()))
+            .ok_or_else(|| anyhow::anyhow!("the lane is live"))?;
+
+        handler
+            .clamp_lane_to_registration(&live, 40, 1_900_000_000)
+            .await;
+
+        let held = live.lock().await.state.clone();
+        assert_eq!(held.cap, U256::from(40u64));
+        assert_eq!(held.expiry, 1_900_000_000);
+        assert_eq!(held.registered_until, 1_900_000_000);
+        let stored = handler
+            .channel_state_store
+            .get(key)?
+            .ok_or_else(|| anyhow::anyhow!("the lane row exists"))?;
+        assert_eq!((stored.cap, stored.expiry), (held.cap, held.expiry));
+        assert_eq!(stored.registered_until, 1_900_000_000);
+        Ok(())
     }
 
     /// The mid-stream signer cap-headroom re-check stops a live stream once the
