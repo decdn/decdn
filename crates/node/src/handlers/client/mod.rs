@@ -616,7 +616,7 @@ enum ServeRejectReason {
     /// A wired `PoolView` could not confirm the request's pool on-chain: the pool
     /// has no on-chain record, is closed/reclaimed, or the admit-path `getPool`
     /// faulted; or the admit-path `getAuthorization` faulted for a signer the node
-    /// has never read. The node refuses rather than serve a pool it cannot confirm
+    /// holds no registered read of. The node refuses rather than serve a pool it cannot confirm
     /// is live and solvent (ADR 003 §Pool solvency). Collapses to `NotFound` on the wire
     /// (see [`Self::wire_error`]) — unlike [`Self::InsufficientDeposit`], this
     /// refusal can precede any lane-ownership proof, so it must stay a plain miss:

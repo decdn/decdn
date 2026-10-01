@@ -546,8 +546,9 @@ impl ClientHandler {
         // floor: a "spent" capability sprayed to a fresh node is refused, not served
         // for vouchers this node can never redeem. The registered terms are kept to
         // clamp the lane below. Unregistered signer or no chain wired -> admit on the
-        // presented capability. A getAuthorization fault with no earlier read of the
-        // signer -> None -> refuse as unconfirmed, never as an exhausted cap.
+        // presented capability. A getAuthorization fault with no earlier registered
+        // read of the signer -> None -> refuse as unconfirmed, never as an
+        // exhausted cap.
         let mut registered_terms: Option<(u64, u64)> = None;
         if let (Some(view), Some(signer)) = (self.pool_view.as_ref(), verified_client) {
             let floor_micro =
@@ -1435,7 +1436,7 @@ pub(super) fn range_out_of_bounds(byte_offset: u64, byte_len: u64, total_bytes: 
 
 /// The admit-gate verdict on a signer's on-chain authorization (ADR 003
 /// §Capability delegation). `None` from the view means the read faulted with no
-/// earlier read of the signer, which is a chain problem and refuses as
+/// earlier registered read of the signer, which is a chain problem and refuses as
 /// [`ServeRejectReason::PoolUnconfirmed`]. A read whose terms cannot pay
 /// `floor_micro` at `now` refuses as [`ServeRejectReason::SignerCapExhausted`].
 /// `None` from this function admits.
