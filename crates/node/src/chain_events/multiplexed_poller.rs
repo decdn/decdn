@@ -37,8 +37,8 @@
 //! independently (routes fail independently), and the loop's `Err` arm only
 //! sleeps the backoff — it never fires a hook itself. The one exception is a
 //! failure in the shared, pre-route-loop work (the head read, or a route's
-//! checkpoint-load floor derivation, or a merged `get_logs` call that is not
-//! retried or has spent its in-tick retries): those fail the *whole* tick
+//! checkpoint-load floor derivation, a merged `get_logs` call that is not
+//! retried, or a stall past [`GET_LOGS_STALL_BUDGET`]): those fail the *whole* tick
 //! before any route-specific step runs, so [`fail_whole_tick`] fires
 //! `on_backoff` for every route directly at the failure site — every route is
 //! equally down, as five independent watchers that each read the shared head
@@ -56,8 +56,8 @@
 //! tick. [`run_tick`] sets the window span to half the rejected window's length
 //! and retries the same start block at once; no route hook fires. The span
 //! doubles back after a run of accepted windows ([`WindowSpan`]), so a
-//! transient rejection does not cost throughput until restart. Only a rejected one-block
-//! window, or any other `get_logs` failure that survives the retries below, goes
+//! transient rejection does not cost throughput until restart. A rejected one-block
+//! window, and any other `get_logs` failure that is not retried below, goes
 //! through [`fail_whole_tick`].
 //!
 //! # Transient window failures
@@ -82,7 +82,25 @@
 //!
 //! The retries lengthen a failing window. A provider that hangs costs each
 //! window `GET_LOGS_WINDOW_RETRIES + 1` per-call timeouts plus the retry
-//! sleeps (34 s at the 10 s default timeout) before the tick fails.
+//! sleeps (34 s at the 10 s default timeout) before the window is deferred.
+//!
+//! # Deferred windows
+//!
+//! A provider's transient failures cluster in time, so a window that fails
+//! every retry often fails again a few seconds later. Failing the tick then
+//! would mark every route down and count a watcher restart for an outage that
+//! loses no event. So [`run_tick`] defers such a window instead: it ends the
+//! tick there, keeps the progress of the windows before it, and the next tick
+//! resumes at the deferred window's start. Each deferral logs its cause at
+//! `info` and fires the `on_window_deferred` hook (the
+//! `decdn_chain_get_logs_deferred_total` counter).
+//!
+//! A deferred tick that completed a window is a success that ended early: it
+//! reconciles and fires every route's hooks. A deferred tick that completed no
+//! window fires no hook, so no tick gauge or freshness stamp moves. The tick
+//! fails through [`fail_whole_tick`] only when no window has completed for
+//! [`GET_LOGS_STALL_BUDGET`]. Any tick that completes a window or reaches head
+//! clears the stall clock.
 //!
 //! The runtime registers each `eth_getLogs` watcher's [`Route`] on one
 //! poller in `build_chain_and_handlers` and spawns it once — one merged loop in
@@ -286,6 +304,14 @@ pub struct MultiplexedPoller {
     /// Called on every in-tick retry of a transiently failed `get_logs`
     /// window (see the module doc's "Transient window failures").
     on_window_retry: Option<WatcherHook>,
+    /// Called each time a window fails every retry and the tick defers it to
+    /// the next tick (see the module doc's "Deferred windows").
+    on_window_deferred: Option<WatcherHook>,
+    /// When the poller last stopped making progress: set by the first deferred
+    /// tick that completes no window, cleared by any tick that completes a
+    /// window or reaches head. A stall older than [`GET_LOGS_STALL_BUDGET`]
+    /// fails the tick.
+    stalled_since: Option<tokio::time::Instant>,
     initial_backoff: Duration,
     /// Ceiling for the shared loop's backoff. One loop serves every route, so
     /// no route carries its own tighter cap — [`WATCHER_MAX_BACKOFF`] (60s)
@@ -320,6 +346,7 @@ pub struct MultiplexedPollerBuilder {
     on_span_change: Option<SpanHook>,
     on_range_rejection: Option<WatcherHook>,
     on_window_retry: Option<WatcherHook>,
+    on_window_deferred: Option<WatcherHook>,
     initial_backoff: Duration,
     max_backoff: Duration,
     rpc_call_timeout: Option<Duration>,
@@ -349,6 +376,7 @@ impl MultiplexedPollerBuilder {
             on_span_change: None,
             on_range_rejection: None,
             on_window_retry: None,
+            on_window_deferred: None,
             initial_backoff: WATCHER_INITIAL_BACKOFF,
             max_backoff: WATCHER_MAX_BACKOFF,
             rpc_call_timeout: None,
@@ -397,6 +425,14 @@ impl MultiplexedPollerBuilder {
     #[must_use]
     pub(crate) fn on_window_retry(mut self, hook: WatcherHook) -> Self {
         self.on_window_retry = Some(hook);
+        self
+    }
+
+    /// Observe every `get_logs` window the poller defers to the next tick
+    /// after it fails every in-tick retry.
+    #[must_use]
+    pub(crate) fn on_window_deferred(mut self, hook: WatcherHook) -> Self {
+        self.on_window_deferred = Some(hook);
         self
     }
 
@@ -474,6 +510,8 @@ impl MultiplexedPollerBuilder {
             on_span_change: self.on_span_change,
             on_range_rejection: self.on_range_rejection,
             on_window_retry: self.on_window_retry,
+            on_window_deferred: self.on_window_deferred,
+            stalled_since: None,
             initial_backoff: self.initial_backoff,
             max_backoff: self.max_backoff,
             rpc_call_timeout: self.rpc_call_timeout,
@@ -486,7 +524,8 @@ impl MultiplexedPollerBuilder {
 /// same edge suppression a successful tick applies) and clear every
 /// route's `established` flag, then hand back `err` unchanged. Used only at
 /// the shared, pre-route-loop failure points (head read, a route's floor
-/// derivation, a merged `get_logs` call that fails for good): a failure there
+/// derivation, a merged `get_logs` call that is not retried, a stall past
+/// [`GET_LOGS_STALL_BUDGET`]): a failure there
 /// aborts the whole tick before any route-specific step has run, so no single
 /// route's `errored` flag would otherwise capture it, and every route is
 /// equally "down".
@@ -738,8 +777,8 @@ const LIMIT_WORDS: [&str; 10] = [
 ];
 
 /// How many times [`run_tick`] retries a transiently failed `get_logs` window
-/// before it fails the tick. At an independent per-call failure rate of
-/// 20 %, all three attempts fail together 0.8 % of the time.
+/// before it defers the window to the next tick. At an independent per-call
+/// failure rate of 20 %, all three attempts fail together 0.8 % of the time.
 const GET_LOGS_WINDOW_RETRIES: u32 = 2;
 
 /// The sleep before each in-tick retry of a failed `get_logs` window. A
@@ -747,6 +786,14 @@ const GET_LOGS_WINDOW_RETRIES: u32 = 2;
 /// until the backend catches up, so an immediate retry often fails again.
 const GET_LOGS_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
 
+/// How long the poller may defer windows without completing one before a tick
+/// fails (see the module doc's "Deferred windows"). It is a duration, not a
+/// tick count, because a deferred tick lasts from about 11 s (the poll interval
+/// plus the retry sleeps) to about 41 s (three call timeouts plus the sleeps).
+/// It stays below the 180 s after which the `*WatcherStalled` alerts fire on a
+/// tick gauge that no deferred tick stamps, so a real stall enters backoff
+/// before those alerts fire.
+const GET_LOGS_STALL_BUDGET: Duration = Duration::from_mins(2);
 /// Whether a failed `get_logs` window is worth a retry on the same block
 /// range inside the tick. A range rejection is not: it takes the shrink path
 /// ([`shrink_on_range_rejection`]). An error that [`is_permanent_rpc_error`]
@@ -834,6 +881,14 @@ impl MultiplexedPoller {
     pub(crate) fn fire_window_retry_for_test(&self) {
         fire(self.on_window_retry.as_ref());
     }
+
+    /// Fire the window-deferred hook once, as [`run_tick`] does on each
+    /// deferred window. Lets the runtime test the hook's metric wiring without
+    /// scripting a provider.
+    #[cfg(test)]
+    pub(crate) fn fire_window_deferred_for_test(&self) {
+        fire(self.on_window_deferred.as_ref());
+    }
 }
 
 /// Hand the new window span to the `on_span_change` hook, if any.
@@ -843,11 +898,21 @@ fn report_span(poller: &MultiplexedPoller, span: u64) {
     }
 }
 
+/// What [`fetch_window_logs`] got for one window.
+enum WindowFetch {
+    /// The window's logs.
+    Logs(Vec<Log>),
+    /// A transient error that survived every in-tick retry. The tick defers
+    /// the window to the next tick.
+    Exhausted(anyhow::Error),
+    /// An error that is not retried in place: a range rejection, a permanent
+    /// error or a rate limit.
+    Failed(anyhow::Error),
+}
+
 /// Fetch the logs of the window `[start, end]`, retrying a transient failure
 /// on the same range (see the module doc's "Transient window failures").
-/// Returns `None` when `shutdown` is cancelled during a retry sleep, and
-/// otherwise the logs or the error the caller hands to the range-rejection
-/// and whole-tick paths.
+/// Returns `None` when `shutdown` is cancelled during a retry sleep.
 ///
 /// Takes the poller's parts rather than `&MultiplexedPoller`: the poller is
 /// not `Sync`, so a shared borrow of it cannot live across the awaits here.
@@ -859,7 +924,7 @@ async fn fetch_window_logs<P: Provider + Clone>(
     start: u64,
     end: u64,
     shutdown: &CancellationToken,
-) -> Option<Result<Vec<Log>>> {
+) -> Option<WindowFetch> {
     let filter = base_filter.clone().from_block(start).to_block(end);
     let mut retries = 0;
     loop {
@@ -867,14 +932,14 @@ async fn fetch_window_logs<P: Provider + Clone>(
             .await
             .with_context(|| format!("multiplexed get_logs [{start}, {end}]"))
         {
-            Ok(logs) => return Some(Ok(logs)),
+            Ok(logs) => return Some(WindowFetch::Logs(logs)),
             Err(err) => err,
         };
         if !is_transient_window_error(&err) {
-            return Some(Err(err));
+            return Some(WindowFetch::Failed(err));
         }
         if retries == GET_LOGS_WINDOW_RETRIES {
-            return Some(Err(err.context(format!(
+            return Some(WindowFetch::Exhausted(err.context(format!(
                 "gave up after {GET_LOGS_WINDOW_RETRIES} in-tick retries"
             ))));
         }
@@ -902,8 +967,10 @@ async fn fetch_window_logs<P: Provider + Clone>(
 /// provider range rejection retries the window at half its length instead of
 /// failing (see the module doc's "Provider range caps"), and a transient
 /// `get_logs` failure retries the same window (see "Transient window
-/// failures"). Returns `Err` if the shared head/floor reads fail, if a
-/// `get_logs` window still fails after its retries, or if any route errored
+/// failures"). A window that fails every retry ends the tick early (see
+/// "Deferred windows"). Returns `Err` if the shared head/floor reads fail, if a
+/// `get_logs` window fails in a way that is not retried, if no window has
+/// completed for [`GET_LOGS_STALL_BUDGET`], or if any route errored
 /// applying a log or reconciling — either way the *loop* backs off, but a
 /// route that itself succeeded this tick has already advanced and persisted.
 async fn run_tick<P: Provider + Clone>(
@@ -925,6 +992,8 @@ async fn run_tick<P: Provider + Clone>(
     // `get_logs`, but the reconcile below still runs every route's
     // `on_tick_complete`.
     let mut start = from;
+    let mut progressed = false;
+    let mut deferred: Option<anyhow::Error> = None;
     while start <= to {
         // Yield between windows so a large merged backfill does not block
         // graceful shutdown (mirrors the per-window shutdown check).
@@ -947,8 +1016,19 @@ async fn run_tick<P: Provider + Clone>(
             return Ok(());
         };
         let logs = match fetched {
-            Ok(logs) => logs,
-            Err(err) => match shrink_on_range_rejection(poller, start, end, err) {
+            WindowFetch::Logs(logs) => logs,
+            WindowFetch::Exhausted(err) => {
+                fire(poller.on_window_deferred.as_ref());
+                info!(
+                    error = %sanitize_err_chain(&err),
+                    start,
+                    end,
+                    "eth_getLogs window failed on every retry; deferring it to the next tick"
+                );
+                deferred = Some(err);
+                break;
+            }
+            WindowFetch::Failed(err) => match shrink_on_range_rejection(poller, start, end, err) {
                 // Retry the same start block with the smaller window.
                 None => continue,
                 Some(err) => return Err(fail_whole_tick(poller, shutdown, err)),
@@ -956,6 +1036,7 @@ async fn run_tick<P: Provider + Clone>(
         };
         demux_window_logs(poller, logs).await;
         advance_routes(poller, end);
+        progressed = true;
         if let Some(span) = poller.span.record_success() {
             debug!(
                 span,
@@ -968,6 +1049,26 @@ async fn run_tick<P: Provider + Clone>(
         }
         start = end + 1;
     }
+
+    // A deferred tick that completed no window fires no hook: nothing moved, so
+    // no tick gauge or freshness stamp is earned. It fails only once the stall
+    // outlasts its budget.
+    if let Some(err) = deferred
+        && !progressed
+    {
+        let since = *poller
+            .stalled_since
+            .get_or_insert_with(tokio::time::Instant::now);
+        if since.elapsed() >= GET_LOGS_STALL_BUDGET {
+            let err = err.context(format!(
+                "no eth_getLogs window succeeded for {} s",
+                GET_LOGS_STALL_BUDGET.as_secs()
+            ));
+            return Err(fail_whole_tick(poller, shutdown, err));
+        }
+        return Ok(());
+    }
+    poller.stalled_since = None;
 
     notify_recovered_routes(poller, shutdown);
     reconcile_routes(poller).await;
@@ -2922,12 +3023,14 @@ mod tests {
     // --- Transient window failures: the window retries inside the tick -------
 
     /// A poller over one checkpoint route resuming at block 1, with the route's
-    /// `on_backoff` and the poller's `on_window_retry` and `on_range_rejection`
-    /// counted.
+    /// `on_backoff` and `on_tick_success` and the poller's `on_window_retry`,
+    /// `on_window_deferred` and `on_range_rejection` counted.
     struct RetryPoller {
         poller: MultiplexedPoller,
         backoff: Arc<AtomicUsize>,
+        ticks: Arc<AtomicUsize>,
         retries: Arc<AtomicUsize>,
+        deferred: Arc<AtomicUsize>,
         rejections: Arc<AtomicUsize>,
         store: Arc<MemoryCheckpointStore>,
     }
@@ -2942,19 +3045,25 @@ mod tests {
     fn retry_poller<P: Provider + Clone + 'static>(provider: P, span: u64) -> Option<RetryPoller> {
         let (mut route, _sink, store) = checkpoint_route(1);
         let backoff = Arc::new(AtomicUsize::new(0));
+        let ticks = Arc::new(AtomicUsize::new(0));
         let retries = Arc::new(AtomicUsize::new(0));
+        let deferred = Arc::new(AtomicUsize::new(0));
         let rejections = Arc::new(AtomicUsize::new(0));
         route.on_backoff = Some(counting_hook(&backoff));
+        route.on_tick_success = Some(counting_hook(&ticks));
         let built = MultiplexedPollerBuilder::new(shared_head(provider), Duration::from_secs(1))
             .max_backfill_span(span)
             .on_window_retry(counting_hook(&retries))
+            .on_window_deferred(counting_hook(&deferred))
             .on_range_rejection(counting_hook(&rejections))
             .route(route)
             .build();
         assert_built(built).ok().map(|poller| RetryPoller {
             poller,
             backoff,
+            ticks,
             retries,
+            deferred,
             rejections,
             store,
         })
@@ -3088,16 +3197,21 @@ mod tests {
         );
     }
 
-    /// A window that fails on every attempt fails the tick after
-    /// `GET_LOGS_WINDOW_RETRIES` retries, and the error says so.
+    /// A window that fails on every attempt is deferred after
+    /// `GET_LOGS_WINDOW_RETRIES` retries: the tick ends without an error, the
+    /// cursor holds at the window's start, and no route goes down or earns a
+    /// tick stamp.
     #[tokio::test(start_paused = true)]
-    async fn a_window_that_keeps_failing_fails_the_tick_after_the_retries() {
+    async fn a_window_that_keeps_failing_defers_the_tick() {
         let asserter = alloy::providers::mock::Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         let Some(RetryPoller {
             mut poller,
             backoff,
+            ticks,
             retries,
+            deferred,
+            store,
             ..
         }) = retry_poller(provider.clone(), DEFAULT_GET_LOGS_MAX_BLOCK_SPAN)
         else {
@@ -3110,18 +3224,123 @@ mod tests {
         }
 
         let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
-        let err = result.err().map(|e| format!("{e:#}"));
         assert!(
-            err.as_ref().is_some_and(|e| e.contains("in-tick retries")),
-            "the exhausted window fails the tick and names the retries: {err:?}"
+            result.is_ok(),
+            "a deferred window does not fail the tick: {result:?}"
         );
         assert_eq!(retries.load(Ordering::SeqCst), 2);
-        assert_eq!(backoff.load(Ordering::SeqCst), 1);
+        assert_eq!(deferred.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            backoff.load(Ordering::SeqCst),
+            0,
+            "a deferral is not downtime"
+        );
+        assert_eq!(ticks.load(Ordering::SeqCst), 0, "no window completed");
         assert_eq!(
             poller.routes.first().and_then(|r| r.cursor),
             Some(1),
-            "the cursor holds at the failed window's start"
+            "the cursor holds at the deferred window's start"
         );
+        assert_eq!(
+            store
+                .load_checkpoint(CheckpointKey::PoolOpened)
+                .ok()
+                .flatten(),
+            Some(1),
+            "the checkpoint holds where it was"
+        );
+        assert!(
+            poller.routes.iter().all(|r| !r.recovering),
+            "no route is marked down"
+        );
+        assert!(poller.stalled_since.is_some(), "the stall clock starts");
+    }
+
+    /// Deferred ticks that complete no window for `GET_LOGS_STALL_BUDGET` fail
+    /// the tick: the error names the stall, and every route backs off.
+    #[tokio::test(start_paused = true)]
+    async fn a_stall_past_the_budget_fails_the_tick() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let Some(RetryPoller {
+            mut poller,
+            backoff,
+            deferred,
+            ..
+        }) = retry_poller(provider.clone(), DEFAULT_GET_LOGS_MAX_BLOCK_SPAN)
+        else {
+            return;
+        };
+
+        for _ in 0..2 {
+            asserter.push_success(&U64::from(20));
+            for _ in 0..3 {
+                push_rpc_failure(&asserter, 19, "Temporary internal error. Please retry");
+            }
+        }
+
+        let first = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(first.is_ok(), "the first stalled tick defers: {first:?}");
+        tokio::time::advance(GET_LOGS_STALL_BUDGET).await;
+        let second = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        let err = second.err().map(|e| format!("{e:#}"));
+        assert!(
+            err.as_ref()
+                .is_some_and(|e| e.contains("no eth_getLogs window succeeded")),
+            "a stall past the budget fails the tick: {err:?}"
+        );
+        assert_eq!(deferred.load(Ordering::SeqCst), 2);
+        assert_eq!(backoff.load(Ordering::SeqCst), 1);
+        assert_eq!(poller.routes.first().and_then(|r| r.cursor), Some(1));
+        assert!(
+            poller.routes.iter().all(|r| r.recovering),
+            "every route is marked down"
+        );
+    }
+
+    /// A tick that completes a window clears the stall clock, so a later
+    /// deferral starts a fresh budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_completed_window_restarts_the_stall_clock() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let Some(RetryPoller {
+            mut poller,
+            backoff,
+            deferred,
+            ..
+        }) = retry_poller(provider.clone(), DEFAULT_GET_LOGS_MAX_BLOCK_SPAN)
+        else {
+            return;
+        };
+
+        // Tick 1 defers [1, 20]; tick 2 completes it; tick 3 defers [21, 40].
+        asserter.push_success(&U64::from(20));
+        for _ in 0..3 {
+            push_rpc_failure(&asserter, 19, "Temporary internal error. Please retry");
+        }
+        asserter.push_success(&U64::from(20));
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&U64::from(40));
+        for _ in 0..3 {
+            push_rpc_failure(&asserter, 19, "Temporary internal error. Please retry");
+        }
+
+        let first = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(first.is_ok(), "tick 1 defers: {first:?}");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let second = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(second.is_ok(), "tick 2 completes: {second:?}");
+        assert_eq!(poller.routes.first().and_then(|r| r.cursor), Some(21));
+        assert!(
+            poller.stalled_since.is_none(),
+            "progress clears the stall clock"
+        );
+        tokio::time::advance(GET_LOGS_STALL_BUDGET).await;
+        let third = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(third.is_ok(), "tick 3 starts a fresh budget: {third:?}");
+        assert_eq!(deferred.load(Ordering::SeqCst), 2);
+        assert_eq!(backoff.load(Ordering::SeqCst), 0);
     }
 
     /// A deterministic JSON-RPC error fails the tick at once.
@@ -3253,16 +3472,19 @@ mod tests {
         assert_eq!(poller.routes.first().and_then(|r| r.cursor), Some(21));
     }
 
-    /// A later window that spends its retries fails the tick, and the earlier
-    /// window keeps its progress.
+    /// A later window that spends its retries is deferred, and the earlier
+    /// window keeps its progress. The tick still counts as a success, because
+    /// a window completed.
     #[tokio::test(start_paused = true)]
-    async fn a_later_window_that_spends_its_retries_keeps_earlier_progress() {
+    async fn a_later_window_that_spends_its_retries_defers_and_keeps_earlier_progress() {
         let asserter = alloy::providers::mock::Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         let Some(RetryPoller {
             mut poller,
             backoff,
+            ticks,
             retries,
+            deferred,
             store,
             ..
         }) = retry_poller(provider.clone(), 10)
@@ -3280,13 +3502,30 @@ mod tests {
         }
 
         let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
-        assert!(result.is_err(), "the exhausted window fails the tick");
+        assert!(
+            result.is_ok(),
+            "the exhausted window is deferred: {result:?}"
+        );
         assert_eq!(retries.load(Ordering::SeqCst), 4);
-        assert_eq!(backoff.load(Ordering::SeqCst), 1);
+        assert_eq!(deferred.load(Ordering::SeqCst), 1);
+        assert_eq!(backoff.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            1,
+            "a completed window earns the stamp"
+        );
+        assert!(
+            poller.stalled_since.is_none(),
+            "progress leaves no stall clock"
+        );
+        assert!(
+            poller.routes.iter().all(|r| r.established),
+            "the route stays established"
+        );
         assert_eq!(
             poller.routes.first().and_then(|r| r.cursor),
             Some(11),
-            "the cursor holds at the failed window's start"
+            "the cursor holds at the deferred window's start"
         );
         assert_eq!(
             store

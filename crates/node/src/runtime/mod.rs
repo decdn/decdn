@@ -881,6 +881,10 @@ fn chain_poller_builder(
             node_metrics,
             metrics::Metrics::chain_get_logs_retried,
         ))
+        .on_window_deferred(metrics::metric_hook(
+            node_metrics,
+            metrics::Metrics::chain_get_logs_deferred,
+        ))
 }
 
 /// Middle phase of [`run`] (#1253): parse the chain contract addresses and
@@ -5063,6 +5067,7 @@ mod tests {
         let Ok(poller) = built else { return };
         poller.fire_range_rejection_for_test();
         poller.fire_window_retry_for_test();
+        poller.fire_window_deferred_for_test();
         let provider = alloy::providers::ProviderBuilder::new()
             .connect_mocked_client(alloy::providers::mock::Asserter::new());
         let shutdown = CancellationToken::new();
@@ -5084,6 +5089,12 @@ mod tests {
                 .lines()
                 .any(|l| l == "decdn_chain_get_logs_retries_total 1"),
             "window-retry counter not wired"
+        );
+        assert!(
+            scrape
+                .lines()
+                .any(|l| l == "decdn_chain_get_logs_deferred_total 1"),
+            "window-deferred counter not wired"
         );
     }
 

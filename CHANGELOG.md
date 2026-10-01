@@ -940,6 +940,16 @@ since project inception and will roll into the first tagged release.
   this reason. A node also drops its own entry from the origin directory's
   candidates, as the DHT lookup already does.
 
+- **Clustered `eth_getLogs` failures no longer flap every chain watcher
+  (#2253).** A window that fails every in-tick retry no longer fails the
+  tick. The poller ends the tick there, keeps the progress of the windows
+  before it, and the next tick resumes at the deferred window. The tick fails
+  (backoff, `*_watcher_restarts_total`, `*_watcher_down_seconds`) only when no
+  window completes for 2 minutes. A deferred tick that completes no window
+  does not stamp the watchers' tick gauges. New counter:
+  `decdn_chain_get_logs_deferred_total`, plotted on the chain dashboard's
+  "eth_getLogs window span" panel.
+
 - **A partial holder is not asked again for chunks it cannot pull through
   (#2262).** A probed holder that refuses a chunk outside its advertised
   coverage with `NotFound` now counts toward the same three-refusal limit as
