@@ -82,6 +82,17 @@ impl Drop for RescanSlotGuard<'_> {
 /// process lifetime.
 const RESCAN_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How far before [`CacheEngine::open`] the open-time recency seed sits.
+///
+/// Every blob the open-time store walk finds enters `access_times` at
+/// `open - COLD_SEED_AGE`. Every access after open records `Instant::now()`,
+/// which is later. So both eviction policies see an unaccessed pre-open blob as
+/// older than anything touched since open: [`crate::policy::LruEviction`]
+/// releases it first, and [`crate::policy::TinyLfuEviction`] releases it first
+/// among blobs of equal frequency. The pre-open blobs tie on recency, and both
+/// policies break that tie largest first.
+const COLD_SEED_AGE: Duration = Duration::from_secs(1);
+
 /// The origin-held index and what the rescan that built it could not resolve.
 ///
 /// One `ArcSwap` payload rather than an index plus separate counters: a reader
@@ -192,7 +203,13 @@ struct Inner {
     /// `breakers` and the `NoOrigin` short-circuit never reaches them.
     breakers: Vec<OriginBreaker>,
     max_blob_bytes: u64,
-    /// Per-hash last-access timestamps for LRU eviction ordering.
+    /// Per-hash recency for eviction ordering: the instant of the last access,
+    /// or the open-time seed.
+    ///
+    /// Holds every blob the open-time store walk finds, seeded at
+    /// [`Inner::cold_seed_at`], plus every access since open at the instant of
+    /// that access. The seed makes a
+    /// blob from before a restart an eviction candidate without traffic.
     ///
     /// Sharded. A serve completion's [`CacheEngine::record_access`] takes one
     /// shard's lock, so its cost is independent of the cached-blob count and it
@@ -206,6 +223,11 @@ struct Inner {
     /// its result. Recency is advisory input to eviction ordering, and a hash
     /// missed by one sweep is seen by the next.
     access_times: DashMap<Hash, Instant>,
+    /// The single instant the open-time seed writes into `access_times`
+    /// ([`COLD_SEED_AGE`] before open). An entry that still holds this value has
+    /// had no access since open, so [`CacheEngine::last_accessed`] reports none
+    /// for it.
+    cold_seed_at: Instant,
     /// Hashes whose `decdn-partial-` protecting tag this process has already
     /// written and not observed dropped. A partial's protection only needs the
     /// tag to EXIST, and the name is deterministic per hash, so re-admitting more
@@ -722,11 +744,11 @@ pub struct EvictionPreview {
     /// the blob's total and the probe path advertises it, and
     /// [`CacheEngine::size_snapshot`] is the on-disk measure.
     pub size_bytes: Option<u64>,
-    /// Microseconds elapsed since the blob was last served via
-    /// [`CacheEngine::get`]. `None` when no access has been recorded —
-    /// typical for a hash that was just inserted but never re-served,
-    /// or for one that has been logically evicted (eviction clears the
-    /// access entry).
+    /// Microseconds elapsed since the last recorded access to the blob: a
+    /// serve, a hit, or a fill. `None` when the blob has had no access since
+    /// open — including a blob on disk at open that nothing has touched since
+    /// (its open-time recency seed is not an access) — or when eviction or
+    /// quarantine has cleared its entry.
     pub last_accessed_us_ago: Option<u64>,
     /// Whether the hash is in the operator-pinned set (#276). Pinning
     /// protects against LRU eviction but **not** against an explicit
@@ -1522,13 +1544,20 @@ impl CacheEngine {
             .collect::<Vec<_>>();
         let origin_range_confirmed = origins.iter().map(|_| AtomicBool::new(false)).collect();
 
-        Ok(Self {
+        // `checked_sub` fails only within `COLD_SEED_AGE` of the monotonic
+        // clock's origin (near boot). Seeding at `opened` then still sorts at or
+        // before every later access.
+        let opened = Instant::now();
+        let cold_seed_at = opened.checked_sub(COLD_SEED_AGE).unwrap_or(opened);
+
+        let engine = Self {
             inner: Arc::new(Inner {
                 store,
                 origins,
                 breakers,
                 max_blob_bytes,
                 access_times: DashMap::new(),
+                cold_seed_at,
                 partial_protected: DashMap::new(),
                 partial_sizes,
                 inflight: Mutex::new(HashMap::new()),
@@ -1575,7 +1604,48 @@ impl CacheEngine {
                 origin_read_head_start_ms: AtomicU64::new(0),
                 origin_read_min_bps: AtomicU64::new(0),
             }),
-        })
+        };
+        engine.seed_access_times_from_store().await;
+        Ok(engine)
+    }
+
+    /// Enter every blob already on disk into `access_times` at
+    /// [`Inner::cold_seed_at`], so eviction can release content from before a
+    /// restart without waiting for traffic to touch it.
+    ///
+    /// The seed runs before `open` returns the engine, so no access can land
+    /// first; `or_insert` is defensive. The walk is [`Self::iter_hashes`], which
+    /// skips refused hashes. At open only the durable evicted set is populated,
+    /// so operator-evicted hashes stay out and every other stored blob enters
+    /// the map. [`Self::eviction_candidates`] then filters pinned and probe-held
+    /// hashes as for any other entry.
+    ///
+    /// A failed walk logs a WARN, increments `recency_seed_failures`, and leaves
+    /// the map unseeded. Open still succeeds and the cache still serves every
+    /// blob, but until the next restart eviction sees only blobs accessed after
+    /// open.
+    async fn seed_access_times_from_store(&self) {
+        let hashes = match self.iter_hashes().await {
+            Ok(hashes) => hashes,
+            Err(err) => {
+                if let Some(m) = &self.inner.metrics {
+                    m.recency_seed_failures.inc();
+                }
+                tracing::warn!(
+                    error = %err,
+                    "cache open: store walk failed; blobs from before this start are not \
+                     eviction candidates until accessed, until the next restart \
+                     (alert on decdn_cache_recency_seed_failures_total)"
+                );
+                return;
+            }
+        };
+        let seeded = hashes.len();
+        let seed = self.inner.cold_seed_at;
+        for hash in hashes {
+            self.inner.access_times.entry(hash).or_insert(seed);
+        }
+        tracing::info!(seeded, "cache open: seeded eviction recency from the store");
     }
 
     /// Peek the in-flight fill registry for a LIVE fill of `hash`, returning its
@@ -4270,13 +4340,21 @@ impl CacheEngine {
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))
     }
 
-    /// Return the last access time for `hash`, or `None` if the hash has
-    /// never been accessed through [`Self::get`].
+    /// Return the last access time for `hash`, or `None` if the hash has had
+    /// no access since open.
+    ///
+    /// A blob that was on disk at open and has had no access since holds the
+    /// open-time recency seed in `access_times`. The seed is not an access, so
+    /// this returns `None` for it.
     pub fn last_accessed(&self, hash: Hash) -> Option<Instant> {
-        self.inner.access_times.get(&hash).map(|e| *e.value())
+        self.inner
+            .access_times
+            .get(&hash)
+            .map(|e| *e.value())
+            .filter(|t| *t != self.inner.cold_seed_at)
     }
 
-    /// Collect every recorded access time. Eviction logic can sort by value to
+    /// Collect every recency entry. Eviction logic can sort by value to
     /// determine LRU ordering.
     ///
     /// Not a point-in-time snapshot: the map is sharded and this walks it shard
@@ -4284,11 +4362,12 @@ impl CacheEngine {
     /// `access_times` field docs). Recency is advisory input to eviction
     /// ordering, so a hash missed by one walk is seen by the next.
     ///
-    /// **Note:** this snapshot is the *raw* access map and includes pinned
-    /// hashes. Eviction implementations should use
-    /// [`Self::eviction_candidates`] instead, which filters pinned hashes
-    /// out so they survive LRU pressure (#276). The raw snapshot is still
-    /// exposed because tests and observability paths sometimes want the
+    /// **Note:** this snapshot is the *raw* access map. It includes the
+    /// open-time recency seed of every blob on disk at open that has had no
+    /// access since, and it includes pinned hashes. Eviction implementations
+    /// should use [`Self::eviction_candidates`] instead, which filters pinned
+    /// hashes out so they survive LRU pressure (#276). The raw snapshot is
+    /// still exposed because tests and observability paths sometimes want the
     /// unfiltered view.
     pub fn access_times_snapshot(&self) -> HashMap<Hash, Instant> {
         self.inner
@@ -4317,11 +4396,10 @@ impl CacheEngine {
     /// coverage instead, one hash at a time across the jittered window, and
     /// drops a partial that covers no block.
     ///
-    /// Unlike [`Self::access_times_snapshot`], this accessor reflects on-disk
-    /// state and is non-empty on cold start. `access_times` maps `Hash →
-    /// Instant` and is initialised empty on every [`Self::open`] — only
-    /// hashes touched since process start appear there — so it is the wrong
-    /// input for the cold-start seed.
+    /// This reads on-disk state. [`Self::open`] calls it to seed
+    /// `access_times`, so every blob it returns at open is an eviction
+    /// candidate. Boot therefore pays this walk twice: once for that seed and
+    /// once for the DHT republish seed.
     ///
     /// Returns a [`Vec`] rather than an async stream because the consumer
     /// drains the input strictly into a hash set, so streaming saves nothing
@@ -4382,6 +4460,10 @@ impl CacheEngine {
     /// cannot fabricate one. This makes "pinned-already-excluded" a
     /// type-level invariant rather than a documentation claim.
     ///
+    /// Every blob the open-time store walk finds is a candidate from open.
+    /// Until it is accessed, it ranks older than every blob accessed since
+    /// open.
+    ///
     /// The pinned set is loaded once at the start of the call so a
     /// concurrent `set_pinned` swap doesn't change which hashes get
     /// filtered mid-iteration — the snapshot is consistent against
@@ -4404,7 +4486,8 @@ impl CacheEngine {
         // lock-free deny halves of `refuses`; `is_evicted` is deliberately NOT
         // consulted — it would take a mutex per candidate during the shard walk
         // below for nothing, since `evict` removes the `access_times` entry, so an
-        // already-evicted hash is never in this map to begin with.
+        // already-evicted hash is never in this map to begin with, and the
+        // open-time seed skips evicted hashes via `iter_hashes`.
         let denied = self.inner.denied.load();
         let chain_denied = self.inner.chain_denied.load();
         let now = tokio::time::Instant::now();
@@ -4465,6 +4548,15 @@ impl CacheEngine {
         }
     }
 
+    /// Mark `hash` as in use now — recency only, no frequency observe. A serve
+    /// calls this when it starts, so a blob carrying the open-time recency seed
+    /// does not rank oldest, and first in line for eviction, while its bytes are
+    /// on the wire. The serve's one frequency sighting still comes from
+    /// [`Self::observe_hit`] at clean completion.
+    pub fn touch_recency(&self, hash: Hash) {
+        self.record_access(hash);
+    }
+
     /// Record an access for `hash` at the current instant — LRU recency only, no
     /// frequency observe. The fill paths use this so the blob becomes an eviction
     /// candidate without counting as a hit sighting; the paired serve emits the
@@ -4478,10 +4570,9 @@ impl CacheEngine {
     /// bytes), the public form of the internal
     /// `snapshot_blob_sizes` helper. This is the authoritative disk-usage
     /// input for the capacity-eviction driver (#1173): unlike
-    /// [`Self::eviction_candidates`] — which sees only hashes *touched since
-    /// process start* — this walks the store, so a node that boots with a
-    /// disk already full measures the real usage rather than an empty
-    /// access map.
+    /// [`Self::eviction_candidates`] — which drops pinned and probe-held hashes
+    /// and carries no sizes — this walks the store, so it counts every on-disk
+    /// byte, including bytes released but not yet reclaimed by GC.
     ///
     /// Cost scales with the total blob set: one `status()` per blob, plus one
     /// `observe()` per partial blob whose memoized count is older than 30 s
@@ -8323,6 +8414,272 @@ mod tests {
         anyhow::ensure!(
             !engine2.has(hash).await?,
             "has() should report absent after restart"
+        );
+        Ok(())
+    }
+
+    /// Commit every payload into a cache at `dir`, then shut the engine down so
+    /// the next `open` sees them as blobs already on disk.
+    async fn commit_then_close(dir: &Path, payloads: &[&[u8]]) -> anyhow::Result<()> {
+        let origin = Arc::new(MultiStubOrigin::new(payloads)) as Arc<dyn Origin>;
+        let engine = CacheEngine::open(dir, vec![origin], 10).await?;
+        for payload in payloads {
+            let _ = engine.get(Hash::new(payload)).await?;
+        }
+        engine.shutdown().await?;
+        Ok(())
+    }
+
+    /// A blob on disk before a restart is an eviction candidate right after
+    /// `open`, with no traffic. Otherwise a node restarted above its size limit
+    /// can release only the working set it serves after the restart.
+    #[tokio::test]
+    async fn a_blob_on_disk_before_open_is_an_eviction_candidate() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload: &[u8] = b"cold before restart";
+        let hash = Hash::new(payload);
+        commit_then_close(tmp.path(), &[payload]).await?;
+
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
+        anyhow::ensure!(
+            engine.eviction_candidates().contains_key(&hash),
+            "a pre-open blob must be an eviction candidate without a touch"
+        );
+        // The seeded hash's protecting tag survives the reopen, so the driver
+        // can actually release it.
+        anyhow::ensure!(
+            engine.release_for_eviction(hash).await? > 0,
+            "a seeded pre-open blob must be releasable"
+        );
+        anyhow::ensure!(
+            !engine.eviction_candidates().contains_key(&hash),
+            "a released blob must leave the candidate set"
+        );
+        Ok(())
+    }
+
+    /// An operator eviction survives a restart: the open-time seed walks only
+    /// non-refused hashes, so an evicted blob whose bytes are still on disk does
+    /// not come back as an eviction candidate.
+    #[tokio::test]
+    async fn an_evicted_pre_open_blob_is_not_seeded() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let evicted_payload: &[u8] = b"evicted before restart";
+        let kept_payload: &[u8] = b"kept across restart";
+        let evicted = Hash::new(evicted_payload);
+        let kept = Hash::new(kept_payload);
+        {
+            let origin =
+                Arc::new(MultiStubOrigin::new(&[evicted_payload, kept_payload])) as Arc<dyn Origin>;
+            let engine = CacheEngine::open(tmp.path(), vec![origin], 10).await?;
+            let _ = engine.get(evicted).await?;
+            let _ = engine.get(kept).await?;
+            engine.evict(evicted).await?;
+            engine.shutdown().await?;
+        }
+
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
+        // `eviction_candidates` never consults `is_evicted`, so only the raw map
+        // can show an evicted hash re-entering through the seed.
+        anyhow::ensure!(
+            !engine.access_times_snapshot().contains_key(&evicted),
+            "an evicted hash must not enter access_times through the seed"
+        );
+        let candidates = engine.eviction_candidates();
+        anyhow::ensure!(
+            !candidates.contains_key(&evicted),
+            "an evicted hash must not be a candidate"
+        );
+        anyhow::ensure!(
+            candidates.contains_key(&kept),
+            "a kept hash must still be seeded"
+        );
+        Ok(())
+    }
+
+    /// The open-time seed ranks every pre-open blob behind anything accessed
+    /// after open, so the LRU driver releases cold content first.
+    #[tokio::test]
+    async fn a_touched_blob_ranks_after_an_untouched_pre_open_blob() -> anyhow::Result<()> {
+        use crate::policy::{EvictionContext, EvictionPolicy, LruEviction};
+
+        let tmp = tempfile::tempdir()?;
+        let cold_payload: &[u8] = b"untouched after restart";
+        let hot_payload: &[u8] = b"touched after restart";
+        let cold = Hash::new(cold_payload);
+        let hot = Hash::new(hot_payload);
+        commit_then_close(tmp.path(), &[cold_payload, hot_payload]).await?;
+
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
+        engine.observe_hit(hot);
+
+        let candidates = engine.eviction_candidates();
+        let cold_at = candidates
+            .iter()
+            .find_map(|(h, t)| (*h == cold).then_some(*t))
+            .ok_or_else(|| anyhow::anyhow!("cold blob missing from candidates"))?;
+        let hot_at = candidates
+            .iter()
+            .find_map(|(h, t)| (*h == hot).then_some(*t))
+            .ok_or_else(|| anyhow::anyhow!("hot blob missing from candidates"))?;
+        anyhow::ensure!(
+            cold_at < hot_at,
+            "the untouched pre-open blob must rank older than the touched one"
+        );
+
+        let sizes = HashMap::new();
+        let segments = HashMap::new();
+        let plan = LruEviction.plan(&EvictionContext {
+            candidates: &candidates,
+            sizes: &sizes,
+            segments: &segments,
+            total_bytes: 1,
+            target_bytes: 0,
+            budget: 1,
+            cache_bytes: 0,
+        });
+        anyhow::ensure!(
+            plan.evict == vec![cold],
+            "LRU must release the untouched pre-open blob first, got {:?}",
+            plan.evict
+        );
+        Ok(())
+    }
+
+    /// The open-time seed is not an access: the operator preview reports no
+    /// last access for a pre-open blob until something touches it.
+    #[tokio::test]
+    async fn a_seeded_blob_reports_no_last_access() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload: &[u8] = b"seeded, not accessed";
+        let hash = Hash::new(payload);
+        commit_then_close(tmp.path(), &[payload]).await?;
+
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
+        anyhow::ensure!(
+            engine.last_accessed(hash).is_none(),
+            "a seeded entry must not read as an access"
+        );
+        anyhow::ensure!(
+            engine.inspect(hash).await?.last_accessed_us_ago.is_none(),
+            "the preview must not report the seed as an access"
+        );
+
+        engine.observe_hit(hash);
+        anyhow::ensure!(
+            engine.last_accessed(hash).is_some(),
+            "a touch after open must read as an access"
+        );
+        anyhow::ensure!(
+            engine.inspect(hash).await?.last_accessed_us_ago.is_some(),
+            "the preview must report a touch after open"
+        );
+        Ok(())
+    }
+
+    /// Seeding does not bypass pinning: a pinned blob from before the restart
+    /// stays out of the candidate set.
+    #[tokio::test]
+    async fn a_pinned_pre_open_blob_is_not_a_candidate() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pinned_payload: &[u8] = b"pinned across restart";
+        let free_payload: &[u8] = b"unpinned across restart";
+        let pinned = Hash::new(pinned_payload);
+        let free = Hash::new(free_payload);
+        commit_then_close(tmp.path(), &[pinned_payload, free_payload]).await?;
+
+        let engine = CacheEngine::open_with_pinned(
+            tmp.path(),
+            Vec::new(),
+            10,
+            crate::PinnedHashes::new([from_store_hash(pinned)].into_iter().collect()),
+        )
+        .await?;
+        let candidates = engine.eviction_candidates();
+        anyhow::ensure!(
+            !candidates.contains_key(&pinned),
+            "a pinned pre-open blob must not be an eviction candidate"
+        );
+        anyhow::ensure!(
+            candidates.contains_key(&free),
+            "an unpinned pre-open blob must still be an eviction candidate"
+        );
+        Ok(())
+    }
+
+    /// Under `TinyLfuEviction`, a blob touched after open ranks after an untouched
+    /// pre-open blob of equal frequency: the seed is older than any post-open
+    /// access.
+    #[tokio::test]
+    async fn tinylfu_ranks_a_touched_blob_after_an_untouched_pre_open_blob() -> anyhow::Result<()> {
+        use crate::policy::{EvictionContext, EvictionPolicy, TinyLfuEstimator, TinyLfuEviction};
+
+        let tmp = tempfile::tempdir()?;
+        let cold_payload: &[u8] = b"tinylfu: untouched after restart";
+        let hot_payload: &[u8] = b"tinylfu: touched after restart";
+        let cold = Hash::new(cold_payload);
+        let hot = Hash::new(hot_payload);
+        commit_then_close(tmp.path(), &[cold_payload, hot_payload]).await?;
+
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
+        let freq: Arc<dyn crate::policy::FrequencyEstimator> =
+            Arc::new(TinyLfuEstimator::new(4096));
+        engine.set_frequency_estimator(Arc::clone(&freq));
+        // Recency only, so both blobs stay at frequency 0 and age alone decides.
+        engine.touch_recency(hot);
+
+        let candidates = engine.eviction_candidates();
+        let sizes = HashMap::new();
+        let segments = HashMap::new();
+        let plan = TinyLfuEviction::new(freq, 2, 10).plan(&EvictionContext {
+            candidates: &candidates,
+            sizes: &sizes,
+            segments: &segments,
+            total_bytes: 1,
+            target_bytes: 0,
+            budget: 1,
+            cache_bytes: 0,
+        });
+        anyhow::ensure!(
+            plan.evict == vec![cold],
+            "TinyLFU must release the untouched pre-open blob first, got {:?}",
+            plan.evict
+        );
+        Ok(())
+    }
+
+    /// A partial blob on disk at open is seeded like a complete one: it is an
+    /// eviction candidate with no traffic, and its protecting tag survives the
+    /// reopen so the driver can release it.
+    #[tokio::test]
+    async fn a_partial_blob_on_disk_before_open_is_an_eviction_candidate() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?);
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, group, group, total);
+        {
+            let engine = CacheEngine::open(tmp.path(), Vec::new(), 16).await?;
+            engine.admit_bao(hash, ranges, bao).await?;
+            anyhow::ensure!(
+                !engine.present_ranges(hash).await?.is_complete(),
+                "the admitted blob must be partial"
+            );
+            engine.shutdown().await?;
+        }
+
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 16).await?;
+        anyhow::ensure!(
+            engine.eviction_candidates().contains_key(&hash),
+            "a pre-open partial must be an eviction candidate without a touch"
+        );
+        anyhow::ensure!(
+            engine.last_accessed(hash).is_none(),
+            "a seeded partial must not read as accessed"
+        );
+        anyhow::ensure!(
+            engine.release_for_eviction(hash).await? > 0,
+            "a seeded pre-open partial must be releasable"
         );
         Ok(())
     }

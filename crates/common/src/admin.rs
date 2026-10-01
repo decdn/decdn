@@ -182,10 +182,10 @@ pub struct EvictPreview {
     /// the whole blob's validated size once its last chunk has arrived, and
     /// `None` before — not the bytes it holds on disk.
     pub size_bytes: Option<u64>,
-    /// Microseconds elapsed since the last `get()` against this hash.
-    /// `None` when no access has been recorded — typical for a hash
-    /// that was just inserted but never re-served, or one that has
-    /// been logically evicted (eviction clears the access entry).
+    /// Microseconds elapsed since the last recorded access to this hash: a
+    /// serve, a hit, or a fill. `None` when the hash has had no access since
+    /// the node started — including a blob on disk at start that nothing has
+    /// touched since — or when eviction or quarantine has cleared its entry.
     pub last_accessed_us_ago: Option<u64>,
     /// Whether the hash is in the operator-pinned set (#276).
     /// Pinning protects against LRU eviction but **not** against an

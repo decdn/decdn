@@ -114,8 +114,9 @@ buffered frequency signal.
 The shipped estimator is W-TinyLFU, implemented in-tree with no external
 dependency: a count-min sketch that ages by halving its counters, sized to a
 fixed in-process memory budget (`sketch_bytes`). It is not durable. State is
-lost on restart, matching the empty-on-boot behavior of `lru` recency
-tracking.
+lost on restart. `lru` recency is not durable either. At open, the engine
+gives every blob that its store walk finds one shared recency. That recency is
+older than any access after open.
 
 The sketch keys on the content hash. Cache keys are already BLAKE3 hashes, so
 the sketch derives its row indices from disjoint slices of the 32-byte key
@@ -389,8 +390,9 @@ retention.
 
 - Range-aware eviction is not achievable until an upstream `iroh-blobs`
   range-forget primitive exists. Whole-blob reclaim ships in its place.
-- W-TinyLFU state is not durable. Cold-start starvation on a full disk with
-  no warmed signal persists under `lru`'s recency-only design too.
+- W-TinyLFU state is not durable. After a restart, eviction cannot tell hot
+  blobs from cold blobs among those that traffic has not touched again. Both
+  policies release those blobs largest first.
 - Probationary admission still writes first-hit bytes; it is not a
   pass-through. Write amplification stays bounded by paid demand.
 
@@ -406,9 +408,6 @@ retention.
 - Segment membership lives in memory only. A restart loses it, so every
   cached blob returns to an uncapped state until traffic re-observes it and
   the estimator rebuilds its signal.
-- The probation cap measures its footprint over the eviction candidates —
-  blobs touched since process start — so a probation blob not yet touched
-  since boot is excluded from the cap's overage math until it is observed.
 
 ## Acceptance Criteria
 

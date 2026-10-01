@@ -217,6 +217,10 @@ impl ClientHandler {
         // `?` included, passes through the one `PaidProgress` tag: the dispatch
         // sink splits a peer that left into declined or abandoned by it.
         let mut paid: u64 = 0;
+        // Refresh recency before the first byte goes out, so a blob still
+        // carrying the open-time seed does not rank oldest for eviction while it
+        // streams. Recency only: the frequency sighting waits for `StreamEnd`.
+        self.cache.touch_recency(hash);
         // The lane's banked ramp credit, taken once for this stream (ADR 003
         // §Credit window). The loop returns it only when the stream ends fully
         // paid.

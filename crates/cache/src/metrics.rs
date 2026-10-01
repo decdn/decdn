@@ -325,10 +325,10 @@ pub struct CacheMetrics {
     /// - [`crate::CacheEngine::eviction_candidates`] returned empty. That set is
     ///   filtered on pinned + probe-held, so the remedy is to raise
     ///   `cache.cache_size_mb`, lower `max_probe_holds`, or trim the pinned set.
-    ///   **But** the candidate map is in-memory and populated only by `touch()`
-    ///   since process start, so a node that restarted with a full disk also
-    ///   starts empty and starves every tick until traffic re-populates it —
-    ///   there the remedy is simply to wait for traffic, not to retune.
+    ///   The set is also short when the open-time store walk failed
+    ///   ([`Self::recency_seed_failures`]): blobs from before the restart are
+    ///   not candidates until accessed. There the remedy is to restart once the
+    ///   store is healthy.
     /// - The pass had candidates but released none (all pinned, untagged, or
     ///   erroring).
     ///
@@ -347,6 +347,16 @@ pub struct CacheMetrics {
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_size_measure_failures_total`.
     pub size_measure_failures: Counter,
+    /// Failed store walks while seeding eviction recency at cache open
+    /// (`decdn_cache_recency_seed_failures_total`). Open still succeeds, but
+    /// until the next restart blobs from before the restart are not eviction
+    /// candidates until accessed. Over the size limit the driver then releases
+    /// only blobs accessed since open, or starves (`evictions_starved`) if
+    /// there are none. Nonzero is the alarm; restart once the store is healthy.
+    ///
+    /// Field name omits `_total`: the emitted name is
+    /// `decdn_cache_recency_seed_failures_total`.
+    pub recency_seed_failures: Counter,
     /// Partial blobs whose `observe()` failed during a cache-size walk
     /// (`decdn_cache_partial_size_observe_failures_total`). The walk counts
     /// such a blob at its last known present bytes, else at `status()`'s size,

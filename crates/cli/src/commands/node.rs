@@ -232,8 +232,9 @@ fn write_dry_run_human(w: &mut impl io::Write, hash: &str, resp: &EvictResponse)
     match resp.preview.last_accessed_us_ago {
         Some(us) => writeln!(w, "last_accessed={}", format_age(us))?,
         // Distinct from "<1s ago"; operators want to know the
-        // engine has *no* access record vs a very recent one.
-        None => writeln!(w, "last_accessed=never")?,
+        // engine has *no* access record since the node started vs a very
+        // recent one. A blob hot before a restart also reads this way.
+        None => writeln!(w, "last_accessed=none_since_start")?,
     }
     // Origin egress-cost cue (#439). Distinct from omitting the line
     // when the engine has no origins: operators evaluating disk-reclaim
@@ -2265,7 +2266,7 @@ mod tests {
     }
 
     /// Sentinels for the "no information available" cases:
-    /// `size_bytes=not_stored` and `last_accessed=never`. Distinct from
+    /// `size_bytes=not_stored` and `last_accessed=none_since_start`. Distinct from
     /// "0" / "<1s ago" so an operator can tell "the engine has no
     /// record" from "the record is at the floor".
     #[test]
@@ -2297,8 +2298,8 @@ mod tests {
             "expected origin_kinds=none sentinel for cache-only mode, got: {s}"
         );
         assert!(
-            s.contains("last_accessed=never"),
-            "expected never sentinel, got: {s}"
+            s.contains("last_accessed=none_since_start"),
+            "expected none_since_start sentinel, got: {s}"
         );
         Ok(())
     }
