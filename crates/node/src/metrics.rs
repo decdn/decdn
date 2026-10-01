@@ -811,13 +811,24 @@ pub struct DecdnMetrics {
     pub redemption_failures: Counter,
     /// Lanes the redeemer held or dropped for the pool's chain-observed
     /// solvency (`pool_is_redeemable`, ADR 003): a drained `Open` pool is held
-    /// for a top-up, a drained or past-deadline `Closing` pool is dropped.
+    /// for a top-up, and a drained `Closing` pool, or one whose close deadline
+    /// falls within the redeemer's landing slack, is dropped.
     /// Counted once per skipped lane per planning pass. A sustained non-zero
     /// rate means real unredeemed value is stuck behind pools this node can no
     /// longer collect from — worth checking against `pool_deposit_usdc` for
     /// which pools are dry. Operator-visible name:
     /// `decdn_redemption_skipped_insolvent_total`.
     pub redemption_skipped_insolvent: Counter,
+    /// Lanes the redeemer skipped because the signer's capability has expired, or
+    /// expires within the redeemer's landing slack (ADR 003 §Revocation). The
+    /// contract pays 0 for an expired capability, so the redemption would only
+    /// spend gas. Counted once per skipped lane per planning pass. The serve path
+    /// stops accepting vouchers one redeem interval plus that slack before
+    /// expiry, so a sustained rate means a lane earned near its capability's
+    /// expiry and no sweep redeemed it in time: check for failed or
+    /// floor-deferred redemptions. Operator-visible name:
+    /// `decdn_redemption_skipped_expired_total`.
+    pub redemption_skipped_expired: Counter,
     /// Lanes dropped from a redeem batch by the pre-submit on-chain watermark
     /// reconciliation because the chain already shows them settled to their
     /// claim value — a `redeemMany` the contract would silently no-op, caught
@@ -2912,6 +2923,10 @@ recorders! {
     /// A lane was held or dropped by `pool_is_redeemable` because its pool's
     /// chain-observed solvency ruled it out this pass (ADR 003).
     redemption_skipped_insolvent => redemption_skipped_insolvent.inc();
+
+    /// A lane was skipped this pass because its signer's capability has expired,
+    /// or expires within the redeemer's landing slack (ADR 003 §Revocation).
+    redemption_skipped_expired => redemption_skipped_expired.inc();
 
     /// `n` lanes were held or dropped by `pool_is_redeemable` in one planning
     /// pass (ADR 003); the batched form of `redemption_skipped_insolvent`.

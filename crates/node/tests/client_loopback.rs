@@ -5855,22 +5855,17 @@ async fn client_store_record_failure_aborts_the_stream() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A lane whose capability `expiry` is already in the past is refused in-band and
-/// the stream finishes cleanly (no QUIC reset) — the client reads an actionable
-/// reason instead of an opaque drop (#751). An expired grant surfaces as
-/// `VoucherRejected { CapabilityExpired }`, distinct from a cap-exhausted
-/// `SpendingCapExhausted` — the fix is a fresh capability, not a cap raise.
-#[tokio::test(flavor = "multi_thread")]
-async fn client_expired_channel_is_rejected_with_expired() -> anyhow::Result<()> {
+/// Fetch a small blob over a lane whose capability expires at `expiry`, from a
+/// handler built with the default redeem interval. Returns the fetch error, or
+/// `None` when the fetch completed.
+async fn fetch_on_a_lane_expiring_at(expiry: u64) -> anyhow::Result<Option<String>> {
     let payload = vec![0x5Au8; 4096];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
     let client_signer = Arc::new(PrivateKeySigner::random());
     let deposit = U256::from(10_000_000u64);
     let store = Arc::new(MemoryPoolStateStore::new());
-    // Seed a channel whose on-chain expiry is already in the past (Unix second
-    // `1`), so the serve-gate refuses the first voucher.
-    let mut expired = LaneState::hydrate(
+    let mut lane = LaneState::hydrate(
         pool_id(),
         client_signer.address(),
         operator_addr(),
@@ -5881,8 +5876,8 @@ async fn client_expired_channel_is_rejected_with_expired() -> anyhow::Result<()>
         None,
         decdn_incentive::LaneChain::NONE,
     );
-    expired.expiry = 1;
-    store.record(&expired)?;
+    lane.expiry = expiry;
+    store.record(&lane)?;
     let store_dyn: Arc<dyn PoolStateStore> = store;
 
     let server_sk = fresh_key();
@@ -5920,13 +5915,73 @@ async fn client_expired_channel_is_rejected_with_expired() -> anyhow::Result<()>
     )
     .await
     .err()
-    .ok_or_else(|| anyhow::anyhow!("expired channel must reject the voucher"))?;
-    anyhow::ensure!(
-        err.to_string().contains("CapabilityExpired"),
-        "error should surface the expired grant as CapabilityExpired: {err}"
-    );
+    .map(|e| e.to_string());
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(err)
+}
+
+/// The node's capability-expiry margin at the default redeem interval.
+const DEFAULT_EXPIRY_MARGIN: u64 = decdn_node::payment_settlement::capability_expiry_margin_secs(
+    decdn_common::config::DEFAULT_REDEEM_INTERVAL_SECS,
+);
+
+/// The current Unix second.
+fn unix_now() -> anyhow::Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs())
+}
+
+/// A lane whose capability `expiry` is already in the past is refused in-band and
+/// the stream finishes cleanly (no QUIC reset) — the client reads an actionable
+/// reason instead of an opaque drop (#751). An expired grant surfaces as
+/// `VoucherRejected { CapabilityExpired }`, distinct from a cap-exhausted
+/// `SpendingCapExhausted` — the fix is a fresh capability, not a cap raise.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_expired_channel_is_rejected_with_expired() -> anyhow::Result<()> {
+    // Unix second `1`: long past, so the serve gate refuses the first voucher.
+    let err = fetch_on_a_lane_expiring_at(1)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("expired channel must reject the voucher"))?;
+    anyhow::ensure!(
+        err.contains("CapabilityExpired"),
+        "error should surface the expired grant as CapabilityExpired: {err}"
+    );
+    Ok(())
+}
+
+/// A capability that has not yet expired, but expires within the node's margin
+/// (one redeem interval plus the redeemer's landing slack), is refused with
+/// `CapabilityExpired` (#2242). A voucher accepted that close to expiry could miss
+/// the next sweep and redeem for 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_capability_inside_the_expiry_margin_is_rejected_with_expired() -> anyhow::Result<()>
+{
+    let expiry = unix_now()?
+        .saturating_add(DEFAULT_EXPIRY_MARGIN)
+        .saturating_sub(1);
+    let err = fetch_on_a_lane_expiring_at(expiry)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("a capability inside the margin must be rejected"))?;
+    anyhow::ensure!(
+        err.contains("CapabilityExpired"),
+        "a capability inside the margin should surface as CapabilityExpired: {err}"
+    );
+    Ok(())
+}
+
+/// A capability whose expiry lies beyond the node's margin is served (#2242).
+#[tokio::test(flavor = "multi_thread")]
+async fn client_capability_beyond_the_expiry_margin_is_served() -> anyhow::Result<()> {
+    let expiry = unix_now()?
+        .saturating_add(DEFAULT_EXPIRY_MARGIN)
+        .saturating_add(60);
+    let err = fetch_on_a_lane_expiring_at(expiry).await?;
+    anyhow::ensure!(
+        err.is_none(),
+        "a capability beyond the margin must be served: {err:?}"
+    );
     Ok(())
 }
 

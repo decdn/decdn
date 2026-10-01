@@ -1027,6 +1027,12 @@ pub struct ClientHandlerDeps {
     /// relaxed atomic load instead of a `SystemTime::now()` syscall in the
     /// critical section.
     pub coarse_clock: Option<Arc<crate::coarse_clock::CoarseClock>>,
+    /// The redeemer's self-tick interval in seconds
+    /// (`blockchain.redeem_interval_secs`). The voucher-accept path stops
+    /// accepting vouchers this interval plus the redeemer's landing slack before
+    /// a capability expires ([`crate::payment_settlement::capability_expiry_margin_secs`],
+    /// ADR 003 §Revocation). Defaults to the config default.
+    pub redeem_interval_secs: u64,
 }
 
 impl std::fmt::Debug for ClientHandlerDeps {
@@ -1093,6 +1099,7 @@ impl ClientHandlerDeps {
             operator_shares: crate::fee_shares::OperatorShares::new(0),
             relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
             coarse_clock: None,
+            redeem_interval_secs: decdn_common::config::DEFAULT_REDEEM_INTERVAL_SECS,
         }
     }
 }
@@ -1396,6 +1403,10 @@ pub struct ClientHandler {
     /// that reads the live wall clock on every call, so behavior is unchanged
     /// there.
     coarse_clock: Arc<crate::coarse_clock::CoarseClock>,
+    /// How long before a capability's expiry the voucher-accept path stops
+    /// accepting vouchers, in seconds: one redeem interval plus the redeemer's
+    /// landing slack ([`crate::payment_settlement::capability_expiry_margin_secs`]).
+    capability_expiry_margin_secs: u64,
 }
 
 impl std::fmt::Debug for ClientHandler {
@@ -1489,6 +1500,9 @@ impl ClientHandler {
             coarse_clock: deps
                 .coarse_clock
                 .unwrap_or_else(|| Arc::new(crate::coarse_clock::CoarseClock::new())),
+            capability_expiry_margin_secs: crate::payment_settlement::capability_expiry_margin_secs(
+                deps.redeem_interval_secs,
+            ),
         })
     }
 

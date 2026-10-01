@@ -888,8 +888,8 @@ where
 /// Resolve the capability's absolute Unix-seconds expiry from the mutually
 /// exclusive `--expiry-secs` (relative to now) / `--expiry-at` (absolute)
 /// flags. Exactly one is required, and the result must lie in the future — a
-/// capability that expires at or before now is dead on arrival (the node stops
-/// accepting its vouchers immediately).
+/// capability that expires at or before now is dead on arrival (a node stops
+/// accepting its vouchers a margin before expiry, ADR 003 §Revocation).
 fn resolve_expiry(
     now: u64,
     expiry_secs: Option<u64>,
@@ -925,6 +925,36 @@ fn unix_now() -> anyhow::Result<u64> {
         .map_err(|e| anyhow::anyhow!("the system clock is before the Unix epoch: {e}"))
 }
 
+/// The clock `assign` checks a capability's expiry against: the chain head's
+/// timestamp, which is the clock the contract applies at redemption. A local
+/// clock that drifts would otherwise let `assign` print a token the chain
+/// already treats as expired.
+///
+/// The read needs no keystore, so it runs before the unlock. Offline issuance
+/// stays valid: when the head cannot be read, `assign` warns and falls back to
+/// the local clock.
+///
+/// # Errors
+///
+/// Errors only on that fallback, when the system clock is before the Unix epoch.
+async fn issuance_now(rpc_url: &str) -> anyhow::Result<u64> {
+    let head = match provider::build_read_provider(rpc_url) {
+        Ok(reader) => chain_ctx::head_timestamp(&reader).await,
+        Err(e) => Err(e),
+    };
+    match head {
+        Ok(now) => Ok(now),
+        Err(e) => {
+            eprintln!(
+                "warning: could not read the chain head time ({}); checking the capability \
+                 expiry against the local clock instead",
+                decdn_common::redact::sanitize_err_chain(&e)
+            );
+            unix_now()
+        }
+    }
+}
+
 /// Render an absolute Unix-seconds expiry as `"<ts> (in Nd Nh Nm)"` relative to
 /// `now`. The relative tail is what an operator actually reasons about; the raw
 /// timestamp is kept for an exact, timezone-free reference.
@@ -954,7 +984,7 @@ async fn assign(args: &cli::PoolAssignArgs, config_path: Option<&Path>) -> anyho
     let pool_id = parse_pool_id(&args.pool)?;
     let signer_addr = super::chain_ctx::parse_nonzero_address(&args.signer, "--signer")?;
 
-    let now = unix_now()?;
+    let now = issuance_now(&chain.rpc_url).await?;
     let expiry = resolve_expiry(now, args.expiry_secs, args.expiry_at)?;
 
     let owner_signer = load_buyer_signer(&chain)?;
@@ -2074,6 +2104,19 @@ mod tests {
         // An absolute expiry at/behind now is dead on arrival.
         let past = resolve_expiry(now, None, Some(now)).unwrap_err();
         assert!(past.to_string().contains("not in the future"), "{past}");
+    }
+
+    /// An RPC that cannot be read leaves `assign` on the local clock rather than
+    /// failing: offline issuance stays valid.
+    #[tokio::test]
+    async fn issuance_now_falls_back_to_the_local_clock() {
+        let before = unix_now().unwrap();
+        let now = issuance_now("not a url").await.unwrap();
+        let after = unix_now().unwrap();
+        assert!(
+            (before..=after).contains(&now),
+            "{before} <= {now} <= {after}"
+        );
     }
 
     #[test]

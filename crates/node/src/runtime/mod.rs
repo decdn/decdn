@@ -1404,6 +1404,8 @@ async fn build_chain_and_handlers(
         // Origin-only policy (#1759): backend-authoritative own/foreign decision.
         relay_foreign_namespaces: cfg.cache.relay_foreign_namespaces,
         coarse_clock: Some(coarse_clock),
+        // The capability-expiry margin covers one sweep of the redeemer below.
+        redeem_interval_secs: cfg.blockchain.redeem_interval_secs,
     };
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 

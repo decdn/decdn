@@ -50,8 +50,8 @@
 //!   forfeits its unredeemed vouchers, a node-ops failure, not a protocol gap.
 //!   The sink does fold `PoolCloseInitiated` into the projection (marking the pool
 //!   `Closing` with its deadline) so the redeemer's solvency gate drops a drained
-//!   or past-deadline lane instead of submitting a `redeemMany` that reverts
-//!   `PoolClosed`.
+//!   lane, or one whose deadline falls within the landing slack, instead of
+//!   submitting a `redeemMany` that reverts `PoolClosed`.
 //!
 //! Buyer-side `openPool`/`topUp`/`reclaim` (node→node cache-miss pulls) is out of
 //! scope here. The paid-watermark watcher is a [`Route`] the runtime registers on
@@ -93,6 +93,21 @@ use crate::pool_view::{Lifecycle, PoolProjection, PoolStatus};
 /// channel that drops on overflow is acceptable — sized for a burst of concurrent
 /// lanes without backpressuring the voucher-accept path.
 pub const REDEEM_HINT_CAPACITY: usize = 256;
+
+/// Time the redeemer allows a `redeemMany` to land on chain: 120 s. The planner
+/// skips a lane whose capability expires, or whose pool's close deadline falls,
+/// within this slack of now: a transaction that lands past the expiry pays 0, and
+/// one that lands past the deadline reverts `PoolClosed` for its whole batch.
+pub const REDEEM_LANDING_SLACK_SECS: u64 = 120;
+
+/// The serve path's capability-expiry margin in seconds: one redeem interval plus
+/// [`REDEEM_LANDING_SLACK_SECS`] (ADR 003 §Revocation). The node rejects a voucher
+/// once `now + margin` reaches its capability's expiry, so a voucher accepted at
+/// the edge still meets one self-tick sweep with landing time to spare.
+#[must_use]
+pub const fn capability_expiry_margin_secs(redeem_interval_secs: u64) -> u64 {
+    redeem_interval_secs.saturating_add(REDEEM_LANDING_SLACK_SECS)
+}
 
 /// How long the admit-path `getPool` suppresses a repeat call for a pool it
 /// just found not-servable (nonexistent / `Closed`) or that errored. A
@@ -1192,8 +1207,9 @@ fn chunk_redemptions(
 /// money; only a positive zero-`remaining` holds. A drained `Open` pool is held
 /// (a top-up re-drives it); a drained `Closing` pool is dropped (it cannot be
 /// topped up, so `remaining == 0` is irreversible); a funded `Closing` pool is
-/// redeemable only before its deadline, past which `redeemMany` reverts
-/// `PoolClosed`.
+/// redeemable only while its deadline lies more than [`REDEEM_LANDING_SLACK_SECS`]
+/// ahead. Past the deadline `redeemMany` reverts `PoolClosed`, and that revert
+/// takes the whole batch down with it.
 fn pool_is_redeemable(status: Option<PoolStatus>, now: u64) -> bool {
     match status {
         None => true,
@@ -1203,7 +1219,9 @@ fn pool_is_redeemable(status: Option<PoolStatus>, now: u64) -> bool {
             }
             match s.lifecycle {
                 Lifecycle::Open => true,
-                Lifecycle::Closing { deadline } => now < deadline,
+                Lifecycle::Closing { deadline } => {
+                    now.saturating_add(REDEEM_LANDING_SLACK_SECS) < deadline
+                }
             }
         }
     }
@@ -1228,6 +1246,14 @@ fn partition_redeemable(
         }
     }
     (kept, skipped)
+}
+
+/// Whether a capability `expiry` has passed, or falls within
+/// [`REDEEM_LANDING_SLACK_SECS`] of `now`, so a redemption planned now would land
+/// on an expired capability and pay 0. `0` means no tracked expiry and never
+/// expires.
+const fn capability_expired(expiry: u64, now: u64) -> bool {
+    expiry != 0 && now.saturating_add(REDEEM_LANDING_SLACK_SECS) >= expiry
 }
 
 /// Whether a lane's observed registration is still live at `now`. `0`
@@ -1406,6 +1432,10 @@ fn plan_lane(
 /// ([`plan_lane`]); on-chain registration is idempotent, so this is safe even for
 /// a signer another provider already registered, and the first landed redemption
 /// persists `registered_until` so later passes skip the reg.
+///
+/// A lane whose capability expires within [`REDEEM_LANDING_SLACK_SECS`] of `now`
+/// is skipped: the contract pays 0 for an expired capability, so its redemption
+/// would only spend gas.
 #[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
 fn plan_lanes(
     paid: &PaidWatermarks,
@@ -1413,8 +1443,8 @@ fn plan_lanes(
     states: Vec<LaneState>,
     metrics: &Arc<Metrics>,
     pool_view: &PoolProjection,
+    now: u64,
 ) -> Vec<PlannedLane> {
-    let now = unix_now();
     // The redeemer's only on-chain-derived gate: hold/drop lanes whose pool cannot
     // pay, read from the event-fed projection. Fail open on an unknown pool. A
     // lane's signer-registration status is resolved locally below — no chain read.
@@ -1431,6 +1461,16 @@ fn plan_lanes(
     let mut plans: Vec<PlannedLane> = Vec::new();
     for st in &states {
         if st.provider != self_address {
+            continue;
+        }
+        if capability_expired(st.expiry, now) {
+            metrics.redemption_skipped_expired();
+            debug!(
+                pool_id = %st.pool_id,
+                signer = %st.signer,
+                expiry = st.expiry,
+                "redeemer: skipping a lane whose capability has expired"
+            );
             continue;
         }
         // Registered iff this node has already landed the signer's registration
@@ -1477,7 +1517,7 @@ async fn redeem_one<P: Provider + Clone>(
             return;
         }
     };
-    let plans = plan_lanes(paid, self_address, vec![st], metrics, pool_view);
+    let plans = plan_lanes(paid, self_address, vec![st], metrics, pool_view, unix_now());
     // Hint path: require the durability floor and skip the submit on a failed
     // flush (`strict_flush`); the lane defers to the next sweep.
     redeem_planned_lanes(contract, store, plans, floor, max_vouchers, true, metrics).await;
@@ -1507,7 +1547,7 @@ async fn redeem_sweep<P: Provider + Clone>(
             return;
         }
     };
-    let plans = plan_lanes(paid, self_address, states, metrics, pool_view);
+    let plans = plan_lanes(paid, self_address, states, metrics, pool_view, unix_now());
     // Publish the pending-redemption total once per sweep. This is the whole
     // planned set, before the per-chunk floor defers any dust — a lane below the
     // floor is still owed and rides a later sweep, so counting it here is what
@@ -2620,11 +2660,36 @@ mod tests {
         ));
     }
 
+    /// A funded `Closing` pool stays redeemable while its deadline lies more than
+    /// the landing slack ahead.
     #[test]
-    fn closing_funded_before_deadline_is_redeemable() {
+    fn closing_funded_before_the_landing_slack_is_redeemable() {
         assert!(pool_is_redeemable(
             Some(status(500, Lifecycle::Closing { deadline: 2_000 })),
+            2_000 - REDEEM_LANDING_SLACK_SECS - 1
+        ));
+    }
+
+    /// A funded `Closing` pool whose deadline falls within the landing slack is
+    /// dropped: the batch could land past the deadline and revert `PoolClosed`.
+    #[test]
+    fn closing_funded_within_the_landing_slack_is_dropped() {
+        assert!(!pool_is_redeemable(
+            Some(status(500, Lifecycle::Closing { deadline: 2_000 })),
+            2_000 - REDEEM_LANDING_SLACK_SECS
+        ));
+        assert!(!pool_is_redeemable(
+            Some(status(500, Lifecycle::Closing { deadline: 2_000 })),
             1_999
+        ));
+    }
+
+    /// A `Closing` deadline near `u64::MAX` saturates rather than wraps.
+    #[test]
+    fn closing_slack_saturates_at_the_top_of_the_clock() {
+        assert!(!pool_is_redeemable(
+            Some(status(500, Lifecycle::Closing { deadline: u64::MAX })),
+            u64::MAX - 1
         ));
     }
 
@@ -3558,6 +3623,74 @@ mod tests {
                 unreachable!("expected FromCheckpoint, got HeadMinusWindow")
             }
         }
+    }
+
+    /// The redeemer's expiry check: `0` never expires, and a capability counts
+    /// as expired from the landing slack before its expiry onward.
+    #[test]
+    fn capability_expired_holds_the_landing_slack() {
+        let expiry = 10_000;
+        assert!(!super::capability_expired(0, u64::MAX), "0 = not tracked");
+        assert!(!super::capability_expired(
+            expiry,
+            expiry - REDEEM_LANDING_SLACK_SECS - 1
+        ));
+        assert!(super::capability_expired(
+            expiry,
+            expiry - REDEEM_LANDING_SLACK_SECS
+        ));
+        assert!(super::capability_expired(expiry, expiry + 1));
+        assert!(
+            super::capability_expired(u64::MAX, u64::MAX - 1),
+            "saturates"
+        );
+    }
+
+    /// The serve margin is one redeem interval plus the landing slack, and
+    /// saturates instead of overflowing.
+    #[test]
+    fn capability_expiry_margin_is_one_interval_plus_the_slack() {
+        assert_eq!(
+            capability_expiry_margin_secs(300),
+            300 + REDEEM_LANDING_SLACK_SECS
+        );
+        assert_eq!(capability_expiry_margin_secs(u64::MAX), u64::MAX);
+    }
+
+    /// `decdn_redemption_skipped_expired_total` as the scrape reads it.
+    fn skipped_expired(metrics: &Metrics) -> u64 {
+        let text = metrics.encode().unwrap_or_default();
+        text.lines()
+            .find_map(|l| l.strip_prefix("decdn_redemption_skipped_expired_total "))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(u64::MAX)
+    }
+
+    /// The planner skips a lane whose capability expires within the landing
+    /// slack, and meters it on its own counter. The same lane plans while its
+    /// expiry lies further ahead.
+    #[test]
+    fn plan_lanes_skips_an_expired_capability() {
+        let me = Address::from([20u8; 20]);
+        // Held registration material, so the unregistered lane plans when live.
+        let st = signed_lane_state(1, 10, 20, Some(sig_with_v(1)));
+        let expiry = st.expiry;
+        let paid = PaidWatermarks::default();
+        let projection = PoolProjection::new();
+
+        let metrics = Arc::new(Metrics::new());
+        let live_now = expiry - REDEEM_LANDING_SLACK_SECS - 1;
+        let plans = plan_lanes(&paid, me, vec![st.clone()], &metrics, &projection, live_now);
+        assert_eq!(plans.len(), 1, "a live capability plans");
+        assert_eq!(skipped_expired(&metrics), 0);
+
+        let late_now = expiry - REDEEM_LANDING_SLACK_SECS;
+        let plans = plan_lanes(&paid, me, vec![st], &metrics, &projection, late_now);
+        assert!(
+            plans.is_empty(),
+            "an expiring capability pays 0 and is skipped"
+        );
+        assert_eq!(skipped_expired(&metrics), 1);
     }
 
     #[test]

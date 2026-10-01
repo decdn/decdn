@@ -129,7 +129,10 @@ const DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX: u64 = 300;
 /// Default redeemer self-tick interval: 300s (5 min). Kept well below the
 /// hourly expiry sweep so accrued earnings are withdrawn promptly without
 /// leaning on the advisory per-voucher hints (#327, #751).
-const DEFAULT_REDEEM_INTERVAL_SECS: u64 = 300;
+///
+/// `pub` so a `decdn-node` client handler built without config takes the same
+/// interval for its capability-expiry margin.
+pub const DEFAULT_REDEEM_INTERVAL_SECS: u64 = 300;
 /// Upper bound on the redeemer self-tick interval: 6h (`21_600s`). The sweep is the
 /// node's only defense against an owner's grace-window close — it must run several
 /// times inside the 48h grace floor so accrued vouchers redeem before the owner

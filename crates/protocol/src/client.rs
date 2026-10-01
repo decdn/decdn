@@ -1216,9 +1216,12 @@ pub enum VoucherRejectReason {
     /// Recovery: the pool **owner** raises this signer's cap or delegates a new
     /// capability. `PoolError::CapExceeded`.
     SpendingCapExhausted,
-    /// The signer's capability has passed its `expiry`. The node's serve-side check
-    /// compares its LOCAL wall clock (`unix_now`, operator-settable) against `expiry`
-    /// and stops serving the lane; on-chain settlement separately gates redemption on
+    /// The signer's capability has passed its `expiry`, or lies within the node's
+    /// expiry margin of it. The node's serve-side check compares its LOCAL wall
+    /// clock (`unix_now`, operator-settable) plus that margin against `expiry` and
+    /// stops serving the lane. The margin is one redeem interval plus a landing
+    /// slack, so the node redeems every voucher it accepts before the expiry (ADR
+    /// 003 §Revocation). On-chain settlement separately gates redemption on
     /// `block.timestamp`. Already-earned vouchers stay redeemable until expiry at
     /// settlement. Recovery: the owner mints a **fresh capability** with a new expiry —
     /// a watermark resync or top-up does not help. Emitted directly by the
