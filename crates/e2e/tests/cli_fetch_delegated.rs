@@ -55,6 +55,7 @@ use alloy::rpc::types::eth::Filter;
 use alloy::sol_types::SolEvent;
 use anyhow::Context;
 use decdn_cache::Hash;
+use decdn_common::admin::AdminRpcClient;
 use decdn_e2e::assert as e2e_assert;
 use decdn_e2e::bindings::PaymentPool;
 use decdn_e2e::chain::ChainFixture;
@@ -564,4 +565,255 @@ fn delegate_fetch_argv(
         "--keystore".into(),
         keystore.display().to_string(),
     ]
+}
+
+/// The registered capability A's cap: 40 µUSDC, four 1 MiB voucher intervals at
+/// the fixture node's 10 µUSDC/MiB. Enough to admit a stream, far below what the
+/// 16 MiB blob costs.
+const REGISTERED_CAP_MICRO_USDC: u64 = 40;
+/// The presented capability B's cap: 5 USDC, far above the blob's cost.
+const PRESENTED_CAP_MICRO_USDC: u64 = 5_000_000;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn presented_capability_is_clamped_to_the_signers_registered_terms() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_clamp()))
+        .await
+        .context("capability-clamp e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
+/// The largest voucher cumulative the node has accepted on any lane of
+/// `pool_id`, in micro-USDC, from its admin `lanes()` surface. `0` before any.
+async fn accepted_on_pool(node: &NodeFixture, pool_id: B256) -> anyhow::Result<u64> {
+    let wanted = format!("{pool_id}");
+    let resp = node.admin_client()?.lanes().await.context("admin lanes")?;
+    Ok(resp
+        .lanes
+        .iter()
+        .filter(|l| l.pool_id.eq_ignore_ascii_case(&wanted))
+        .map(|l| l.outstanding_micro_usdc)
+        .max()
+        .unwrap_or(0))
+}
+
+/// A fresh 0o700 keystore directory for one role, returning the directory, the
+/// keystore path, and the key's address.
+fn new_keystore(role: &str) -> anyhow::Result<(tempfile::TempDir, std::path::PathBuf, Address)> {
+    let dir = tempfile::tempdir().with_context(|| format!("{role} tempdir"))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .with_context(|| format!("chmod {role} dir 0o700"))?;
+    eth_identity::generate_and_persist(dir.path(), KEYSTORE_PASSWORD, false)
+        .with_context(|| format!("generate {role} keystore"))?;
+    let keystore = eth_identity::keystore_path(dir.path());
+    let addr = eth_identity::load_signer(&keystore, KEYSTORE_PASSWORD)
+        .with_context(|| format!("load {role} signer"))?
+        .address();
+    Ok((dir, keystore, addr))
+}
+
+/// On-chain registration is write-once per `(pool, signer)` (ADR 003 §Capability
+/// delegation). The owner registers the delegate with a small capability A, then
+/// signs a second capability B for the same delegate with a far larger cap and a
+/// later expiry. The delegate presents B to a node. The node must hold the
+/// registered terms, not B's: every voucher it accepts must redeem on-chain.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential end-to-end journey; each step depends on the previous step's \
+              pool / registration / delivery state"
+)]
+async fn run_clamp() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    ensure_decdn_cli_built()?;
+    let chain = ChainFixture::launch().await?;
+
+    // 16 MiB at 10 µUSDC/MiB costs ~160 µUSDC: four times the registered cap.
+    let blob = vec![0xC1u8; 16 * MIB];
+    let blob_hash = Hash::new(&blob);
+    let (node, hash) = NodeFixture::launch(&chain, "US", &blob).await?;
+    anyhow::ensure!(hash == blob_hash, "seeded blob hash mismatch");
+    let operator = node.operator_addr();
+    let payment_pool = chain.addrs().payment_pool;
+
+    let (owner_dir, owner_keystore, owner_addr) = new_keystore("owner")?;
+    chain.fund_eth(owner_addr, 100).await?;
+    chain
+        .mint_usdc(
+            owner_addr,
+            U256::from(DEPOSIT_MICRO_USDC) * U256::from(4u64),
+        )
+        .await
+        .context("mint owner USDC")?;
+    let (delegate_dir, delegate_keystore, delegate_addr) = new_keystore("delegate")?;
+
+    let open_out = run_cli_capture(
+        owner_dir.path(),
+        &pool_open_argv(
+            &chain,
+            DEPOSIT_MICRO_USDC,
+            &owner_keystore,
+            owner_dir.path(),
+        ),
+        "decdn pool open",
+    )
+    .await?;
+    let pool_id = parse_pool_id(&open_out).context("parse poolId from `pool open` output")?;
+
+    let assign = |cap: u64, expiry_secs: u64| {
+        pool_assign_argv(
+            &chain,
+            pool_id,
+            delegate_addr,
+            cap,
+            expiry_secs,
+            &owner_keystore,
+            owner_dir.path(),
+        )
+    };
+    let token_a = extract_dcap1_token(
+        &run_cli_capture(
+            owner_dir.path(),
+            &assign(REGISTERED_CAP_MICRO_USDC, EXPIRY_SECS),
+            "decdn pool assign (A)",
+        )
+        .await?,
+    )?;
+    let token_b = extract_dcap1_token(
+        &run_cli_capture(
+            owner_dir.path(),
+            &assign(PRESENTED_CAP_MICRO_USDC, 2 * EXPIRY_SECS),
+            "decdn pool assign (B)",
+        )
+        .await?,
+    )?;
+    let grant_a = CapabilityGrant::from_token(&token_a).context("decode token A")?;
+    let grant_b = CapabilityGrant::from_token(&token_b).context("decode token B")?;
+    anyhow::ensure!(
+        grant_b.spending_cap > grant_a.spending_cap && grant_b.expiry > grant_a.expiry,
+        "capability B must carry a higher cap and a later expiry than A"
+    );
+
+    // Register the delegate with capability A. `redeemMany` is permissionless and
+    // a batch with a capability and no vouchers only registers, so the admin key
+    // stands in for whichever provider landed the delegate's first redemption.
+    let pool_contract = PaymentPool::new(payment_pool, chain.admin());
+    let receipt = pool_contract
+        .redeemMany(vec![PaymentPool::PoolBatch {
+            poolId: pool_id,
+            capabilities: vec![PaymentPool::CapabilityReg {
+                signer: delegate_addr,
+                spendingCap: grant_a.spending_cap,
+                expiry: grant_a.expiry,
+                ownerSig: grant_a.owner_signature.clone().into(),
+            }],
+            vouchers: vec![],
+        }])
+        .send()
+        .await
+        .context("send redeemMany registering capability A")?
+        .get_receipt()
+        .await
+        .context("redeemMany receipt")?;
+    decdn_e2e::ensure_mined(&receipt, "redeemMany registering capability A")?;
+    let registered =
+        e2e_assert::read_authorization(chain.admin(), payment_pool, pool_id, delegate_addr).await?;
+    anyhow::ensure!(
+        registered.cap == grant_a.spending_cap && registered.expiry == grant_a.expiry,
+        "the delegate must be registered with capability A's terms"
+    );
+
+    // The delegate fetches presenting capability B. The fetch may fail once the
+    // node stops at the registered cap; what matters is what the node accepted.
+    let out = delegate_dir.path().join("blob.bin");
+    let fetch_args = delegate_fetch_argv(
+        &chain,
+        &node,
+        &blob_hash,
+        &token_b,
+        delegate_dir.path(),
+        &delegate_keystore,
+        &out,
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let fetched = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::from(decdn_command(delegate_dir.path(), KEYSTORE_PASSWORD)?)
+                .arg("fetch")
+                .args(&fetch_args)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        let succeeded = matches!(&fetched, Ok(Ok(o)) if o.status.success());
+        // Retry only while the node has served nothing on the pool: a fetch that
+        // ran before the node saw the fresh pool. Once the node accepted a
+        // voucher, the outcome stands.
+        if succeeded || accepted_on_pool(&node, pool_id).await? > 0 {
+            break;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the delegate fetch never reached the node's paid path: {fetched:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(750)).await;
+    }
+
+    // The node redeems what it accepted. Wait for that redemption to land, then
+    // compare the node's accepted claim against what the chain pays.
+    let accepted = accepted_on_pool(&node, pool_id).await?;
+    let paid = poll(Duration::from_secs(90), || async {
+        let lane = e2e_assert::read_watermark(
+            chain.admin(),
+            payment_pool,
+            pool_id,
+            delegate_addr,
+            operator,
+        )
+        .await?;
+        Ok((lane.amount > 0).then_some(lane.amount))
+    })
+    .await?
+    .context("the node never redeemed the delegate's lane")?;
+    anyhow::ensure!(
+        accepted <= registered.cap,
+        "the node accepted {accepted} µUSDC of vouchers under capability B, past the delegate's \
+         registered cap of {} µUSDC; the chain pays {paid} µUSDC and the remaining {} µUSDC \
+         redeems to 0",
+        registered.cap,
+        accepted.saturating_sub(paid)
+    );
+    let settled = poll(Duration::from_secs(90), || async {
+        let lane = e2e_assert::read_watermark(
+            chain.admin(),
+            payment_pool,
+            pool_id,
+            delegate_addr,
+            operator,
+        )
+        .await?;
+        Ok((lane.amount >= accepted).then_some(lane.amount))
+    })
+    .await?;
+    anyhow::ensure!(
+        settled.is_some(),
+        "every voucher the node accepted ({accepted} µUSDC) must redeem on-chain"
+    );
+
+    // The registration is write-once: B changed nothing on-chain.
+    let after =
+        e2e_assert::read_authorization(chain.admin(), payment_pool, pool_id, delegate_addr).await?;
+    anyhow::ensure!(
+        after.cap == grant_a.spending_cap && after.expiry == grant_a.expiry,
+        "the registered terms must stay capability A's"
+    );
+
+    drop(node);
+    Ok(())
 }
