@@ -509,7 +509,11 @@ impl AdminState {
 /// can name the underlying failure mode (`NotFound`, `OriginError`, etc.)
 /// rather than a generic "cache failed".
 fn cache_error_to_rpc(err: &CacheError) -> ErrorObjectOwned {
-    ErrorObjectOwned::owned(CACHE_ERROR_CODE, err.to_string(), None::<()>)
+    ErrorObjectOwned::owned(
+        CACHE_ERROR_CODE,
+        err.display_chain().to_string(),
+        None::<()>,
+    )
 }
 
 /// Lock a DHT-subsystem `std::sync::Mutex` for `admin_v1_status`,

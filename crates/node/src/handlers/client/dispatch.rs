@@ -675,7 +675,7 @@ impl ClientHandler {
             Err(e) => {
                 tracing::warn!(
                     %hash,
-                    error = %e,
+                    error = %e.display_chain(),
                     "cache `serve_audit` lookup failed on delivery path"
                 );
                 return self
@@ -1031,7 +1031,7 @@ impl ClientHandler {
                                 // then fall through — another source may still serve.
                                 Err(e) => {
                                     self.metrics.node_pull_through_error();
-                                    tracing::warn!(%hash, error = %format_args!("{e:#}"), "own-origin range probe faulted; falling through");
+                                    tracing::warn!(%hash, error = %e.display_chain(), "own-origin range probe faulted; falling through");
                                     fault_seen = true;
                                 }
                             }
@@ -1045,7 +1045,7 @@ impl ClientHandler {
                         // later-tier miss reports InternalError not NotFound.
                         Err(e) => {
                             self.metrics.node_pull_through_error();
-                            tracing::warn!(%hash, error = %e, "own-origin size probe faulted; falling through");
+                            tracing::warn!(%hash, error = %e.display_chain(), "own-origin size probe faulted; falling through");
                             fault_seen = true;
                         }
                     }
@@ -1175,7 +1175,7 @@ impl ClientHandler {
             let size = match self.cache.inspect(hash).await {
                 Ok(preview) => preview.size_bytes,
                 Err(e) => {
-                    tracing::warn!(%hash, error = %e, "cache `inspect` failed on delivery path");
+                    tracing::warn!(%hash, error = %e.display_chain(), "cache `inspect` failed on delivery path");
                     return self
                         .respond_error(
                             &mut send,

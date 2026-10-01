@@ -1171,7 +1171,7 @@ async fn gc_protect_inner(
     {
         Ok(snap) => snap,
         Err(err) => {
-            tracing::warn!(error = %err, "gc snapshot failed; skipping reclaim attribution this cycle");
+            tracing::warn!(error = %err.display_chain(), "gc snapshot failed; skipping reclaim attribution this cycle");
             return;
         }
     };
@@ -1309,7 +1309,7 @@ async fn partial_size(
             let fallback = cached.map_or_else(|| status_size.unwrap_or(0), |(bytes, _)| bytes);
             tracing::warn!(
                 %hash,
-                error = %err,
+                error = %err.display_chain(),
                 fallback,
                 "partial blob size: observe failed; using the last count or the status() size"
             );
@@ -1632,7 +1632,7 @@ impl CacheEngine {
                     m.recency_seed_failures.inc();
                 }
                 tracing::warn!(
-                    error = %err,
+                    error = %err.display_chain(),
                     "cache open: store walk failed; blobs from before this start are not \
                      eviction candidates until accessed, until the next restart \
                      (alert on decdn_cache_recency_seed_failures_total)"
@@ -2579,7 +2579,7 @@ impl CacheEngine {
             Err(err) => {
                 tracing::warn!(
                     %hash,
-                    error = %err,
+                    error = %err.display_chain(),
                     "admit: coverage query failed; announcing the hash so the republisher \
                      decides from its own coverage read"
                 );
@@ -2748,7 +2748,7 @@ impl CacheEngine {
                 }
                 tracing::warn!(
                     %hash,
-                    error = %err,
+                    error = %err.display_chain(),
                     "evict: failed to drop protecting tags; bytes stay GC-protected (not auto-retried)",
                 );
             }
@@ -3004,7 +3004,7 @@ impl CacheEngine {
                 }
                 tracing::warn!(
                     %hash,
-                    error = %err,
+                    error = %err.display_chain(),
                     "quarantine: dropping the protecting tags failed; the corrupt bytes stay on \
                      disk until the next origin rescan retries"
                 );
@@ -3254,7 +3254,7 @@ impl CacheEngine {
         .and_then(|r| {
             r.map_err(|e| CacheError::OriginError {
                 hash,
-                cause: e.into_inner(),
+                source: e.into_inner(),
             })
         });
         let ob = match fetched {
@@ -3266,7 +3266,7 @@ impl CacheEngine {
                 tracing::warn!(
                     %hash,
                     kind = ?origin.kind(),
-                    error = %e,
+                    error = %e.display_chain(),
                     "origin outboard fetch failed; trying next origin",
                 );
                 return Err(e);
@@ -4036,7 +4036,7 @@ impl CacheEngine {
                     tracing::warn!(
                         %hash,
                         kind = ?origin.kind(),
-                        error = %e,
+                        error = %e.display_chain(),
                         "own origin range open failed; trying next origin",
                     );
                     last_err = Some(e);
@@ -4315,7 +4315,7 @@ impl CacheEngine {
                     );
                     last_err = Some(CacheError::OriginError {
                         hash,
-                        cause: e.into_inner(),
+                        source: e.into_inner(),
                     });
                 }
             }
@@ -5243,7 +5243,7 @@ impl CacheEngine {
             if let Some(e) = last_err {
                 Err(CacheError::OriginError {
                     hash,
-                    cause: e.into_inner(),
+                    source: e.into_inner(),
                 })
             } else if any_short_circuit {
                 // Every origin that wasn't a definitive NotFound was
@@ -5256,7 +5256,7 @@ impl CacheEngine {
                 // spurious 404, *without* having incurred any backoff.
                 Err(CacheError::OriginError {
                     hash,
-                    cause: anyhow::anyhow!(
+                    source: anyhow::anyhow!(
                         "origin circuit-breaker open: all eligible origins are \
                          fast-failing during a sustained outage (#963)"
                     ),
@@ -5444,9 +5444,11 @@ impl CacheEngine {
                     FillMode::ReturnBytes => match self.read_local(hash).await {
                         Ok(bytes) => Ok(PullThroughOutcome::Bytes(bytes)),
                         Err(CacheError::Store(err)) => Ok(PullThroughOutcome::Store(err)),
-                        Err(other) => Ok(PullThroughOutcome::Store(anyhow::Error::msg(format!(
-                            "read_local returned unexpected variant after AlreadyAdmitted: {other}"
-                        )))),
+                        Err(other) => Ok(PullThroughOutcome::Store(
+                            anyhow::Error::from(other).context(
+                                "read_local returned unexpected variant after AlreadyAdmitted",
+                            ),
+                        )),
                     },
                 };
             }
@@ -5506,9 +5508,11 @@ impl CacheEngine {
                     // logic regression. Map to `Store` so the outer
                     // `pull_through` still surfaces a coherent error; the inner
                     // anyhow chain preserves the cause.
-                    Ok(PullThroughOutcome::Store(anyhow::Error::msg(format!(
-                        "read_local returned unexpected variant after successful commit: {other}"
-                    ))))
+                    Ok(PullThroughOutcome::Store(
+                        anyhow::Error::from(other).context(
+                            "read_local returned unexpected variant after successful commit",
+                        ),
+                    ))
                 }
             },
             StreamCommitOutcome::HashMismatch { actual } => {
@@ -5920,7 +5924,7 @@ fn record_origin_pull<T>(span: &tracing::Span, result: &CacheResult<T>) {
         }
         Err(e) => {
             span.record("outcome", "failed");
-            span.record("error", tracing::field::display(e));
+            span.record("error", tracing::field::display(e.display_chain()));
             span.record("otel.status_code", "ERROR");
         }
     }
@@ -10718,8 +10722,8 @@ mod tests {
         engine.set_origin_read_budget(Duration::from_millis(50), u64::MAX);
         let err = engine.origin_fetch_outboard_bytes(hash, total).await.err();
         anyhow::ensure!(
-            matches!(&err, Some(CacheError::OriginError { cause, .. })
-                if cause.to_string().contains("budget")),
+            matches!(&err, Some(CacheError::OriginError { source, .. })
+                if source.to_string().contains("budget")),
             "a lone stuck origin is a timeout fault, got {err:?}"
         );
         Ok(())
@@ -10798,8 +10802,8 @@ mod tests {
         };
         let (_, fault) = tokio::time::timeout(Duration::from_secs(10), drain_wire(wire)).await?;
         anyhow::ensure!(
-            matches!(&fault, Some(CacheError::OriginError { cause, .. })
-                if cause.to_string().contains("budget")),
+            matches!(&fault, Some(CacheError::OriginError { source, .. })
+                if source.to_string().contains("budget")),
             "a stuck window must end on a timeout OriginError, got {fault:?}"
         );
         Ok(())

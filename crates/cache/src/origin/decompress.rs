@@ -81,9 +81,9 @@ pub(crate) fn resolve_encoding(
 /// inner to recover the typed variant and surfaces it as
 /// `OriginPullError::Permanent` (`CacheError::origin_error_kind`
 /// finds it on the chain walk).
-fn typed_decoder_error(encoding: SupportedEncoding, cause: std::io::Error) -> std::io::Error {
-    let kind = cause.kind();
-    let typed = OriginError::DecompressionFailed { encoding, cause };
+fn typed_decoder_error(encoding: SupportedEncoding, source: std::io::Error) -> std::io::Error {
+    let kind = source.kind();
+    let typed = OriginError::DecompressionFailed { encoding, source };
     std::io::Error::new(kind, typed)
 }
 
