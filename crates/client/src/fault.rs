@@ -6,7 +6,7 @@
 //! chain side of building a lane. The acquire loop acts on the class; it never
 //! inspects the error further.
 
-use decdn_protocol::client::StreamError;
+use decdn_protocol::client::{StreamError, VoucherRejectReason};
 
 use crate::driver::PoolExhausted;
 use crate::{BlobTooLarge, LocalPullFault, UpstreamRefused, UpstreamVoucherRejected};
@@ -64,10 +64,14 @@ pub fn classify(err: &anyhow::Error) -> Fault {
     {
         return Fault::Fatal(FatalScope::Item);
     }
-    if err.downcast_ref::<UpstreamVoucherRejected>().is_some()
-        || err.downcast_ref::<LocalPullFault>().is_some()
-        || is_local_disk_fault(err)
-    {
+    if let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() {
+        return if is_lane_desync(rejected.reason) {
+            Fault::Source
+        } else {
+            Fault::Fatal(FatalScope::Command)
+        };
+    }
+    if err.downcast_ref::<LocalPullFault>().is_some() || is_local_disk_fault(err) {
         return Fault::Fatal(FatalScope::Command);
     }
     if err.downcast_ref::<BlobTooLarge>().is_some() {
@@ -106,6 +110,17 @@ pub fn says_absent(err: &anyhow::Error) -> bool {
         })
 }
 
+/// Whether a voucher rejection that outlived the lane's heals says only that
+/// this lane's ledger and this one source disagree on the watermark. Every
+/// other lane keeps its own watermark, so the range can move on.
+///
+/// A cap exhaustion is watermark-gated too, but it is the pool's: every lane
+/// draws on one deposit, so every source would refuse the same way. It stays
+/// with the capability and signer faults, which no source can serve past.
+fn is_lane_desync(reason: VoucherRejectReason) -> bool {
+    reason.is_watermark_gated() && reason != VoucherRejectReason::SpendingCapExhausted
+}
+
 /// Whether `err`'s chain holds an I/O error only this machine can fix.
 fn is_local_disk_fault(err: &anyhow::Error) -> bool {
     use std::io::ErrorKind;
@@ -135,20 +150,49 @@ mod tests {
         anyhow::Error::new(UpstreamRefused::mid_stream(error))
     }
 
-    #[test]
-    fn payment_and_blacklist_faults_end_the_command() {
-        let rejected = anyhow::Error::new(UpstreamVoucherRejected {
-            reason: VoucherRejectReason::AmountRegression,
+    fn rejected(reason: VoucherRejectReason) -> anyhow::Error {
+        anyhow::Error::new(UpstreamVoucherRejected {
+            reason,
             bundle: None,
             proof_generation: None,
-        });
-        assert_eq!(classify(&rejected), Fault::Fatal(FatalScope::Command));
+        })
+    }
+
+    #[test]
+    fn payment_and_blacklist_faults_end_the_command() {
+        for reason in [
+            VoucherRejectReason::SpendingCapExhausted,
+            VoucherRejectReason::CapabilityExpired,
+            VoucherRejectReason::BadSignature,
+            VoucherRejectReason::WrongSigner,
+        ] {
+            assert_eq!(
+                classify(&rejected(reason)),
+                Fault::Fatal(FatalScope::Command),
+                "{reason:?}"
+            );
+        }
         assert_eq!(
             classify(&refusal(StreamError::OriginBlacklisted)),
             Fault::Fatal(FatalScope::Command)
         );
         let local = anyhow::anyhow!("store write").context(LocalPullFault);
         assert_eq!(classify(&local), Fault::Fatal(FatalScope::Command));
+    }
+
+    /// A watermark-gated rejection that outlived the lane's heals (#2257) is a
+    /// desync between one lane's ledger and one source, so the range moves on
+    /// and the rest of the bundle continues.
+    #[test]
+    fn a_watermark_desync_is_the_sources() {
+        for reason in [
+            VoucherRejectReason::UnderFold,
+            VoucherRejectReason::AmountRegression,
+            VoucherRejectReason::BytesRegression,
+            VoucherRejectReason::Underpaid,
+        ] {
+            assert_eq!(classify(&rejected(reason)), Fault::Source, "{reason:?}");
+        }
     }
 
     #[test]

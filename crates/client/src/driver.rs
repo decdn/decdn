@@ -80,9 +80,9 @@ use decdn_incentive::DepositOutcome;
 use crate::pacer::{DownstreamFrontier, PaceDecision, PaceState};
 use crate::source::{BlobSource, Funder, IngestStore, SourceFuture};
 use crate::{
-    MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger, UpstreamPullHeader, genuine_exhaustion,
-    heal_watermark_desync, is_insufficient_deposit, reject_empty_claim_for_nonempty_root,
-    rejection_watermark, resume_may_be_stale,
+    MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger, UpstreamPullHeader,
+    UpstreamVoucherRejected, genuine_exhaustion, heal_watermark_desync, is_insufficient_deposit,
+    reject_empty_claim_for_nonempty_root, rejection_watermark, resume_may_be_stale,
 };
 
 /// The shared pool cannot fund the next voucher: its remaining deposit is below
@@ -455,6 +455,28 @@ impl DriveCounters {
             next_voucher_cost: U256::ZERO,
         }
     }
+}
+
+/// Say at `info!` that a voucher rejection on the leg at `offset` healed the
+/// lane ledger and the leg reopens, so `-v` shows why a retry happened.
+fn log_healed_retry(
+    hash: [u8; 32],
+    offset: u64,
+    attempt: u32,
+    err: &anyhow::Error,
+    healed: Option<crate::Healed>,
+) {
+    tracing::info!(
+        hash = %blake3::Hash::from_bytes(hash).to_hex(),
+        offset,
+        attempt,
+        max_attempts = MAX_RESUME_ATTEMPTS,
+        reason = ?err
+            .downcast_ref::<UpstreamVoucherRejected>()
+            .map(|rejected| rejected.reason),
+        ?healed,
+        "voucher rejection healed the lane ledger; reopening the leg"
+    );
 }
 
 /// Price the next voucher from an upstream header, the exact formula
@@ -1225,14 +1247,13 @@ where
                     //    watermark means the node holds a voucher we lost, and
                     //    an `Underpaid` bundle BEHIND it means we hold vouchers
                     //    the node never took — heal the ledger and retry.
-                    let desync = match watermark {
+                    let healed = match watermark {
                         Some(watermark) if counters.resume_attempts < MAX_RESUME_ATTEMPTS => {
-                            heal_watermark_desync(&err, watermark, ledger)
-                                .await
-                                .is_some()
+                            heal_watermark_desync(&err, watermark, ledger).await
                         }
-                        _ => false,
+                        _ => None,
                     };
+                    let desync = healed.is_some();
 
                     // 3. Genuine exhaustion (corroborated against our OWN
                     //    ledger): let the pacer fund it on the next pass. The
@@ -1255,6 +1276,13 @@ where
 
                     if classify.0 {
                         counters.resume_attempts = counters.resume_attempts.saturating_add(1);
+                        log_healed_retry(
+                            hash,
+                            resume_start,
+                            counters.resume_attempts,
+                            &err,
+                            healed,
+                        );
                         // A reseed means the node HOLDS vouchers for content it
                         // already delivered that our record had lost — so the
                         // delivered frontier is paid. A rebase means the node took

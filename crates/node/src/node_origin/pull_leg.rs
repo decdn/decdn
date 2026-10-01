@@ -1532,8 +1532,9 @@ impl PeerRunSink<'_> {
 /// Whether a run's fault ends the whole assembly rather than moving its range
 /// to another holder.
 ///
-/// A fatal fault ([`classify`]: a voucher rejection, an origin blacklist, an
-/// over-cap blob, a local fault) cannot be fixed by another lane. Nor can the
+/// A fatal fault ([`classify`]: a capability or signer voucher rejection, an
+/// origin blacklist, an over-cap blob, a local fault) cannot be fixed by
+/// another lane. Nor can the
 /// pacer's [`PoolExhausted`]: the node's one shared pool funds every holder, so
 /// once it is dry no holder can be paid. An open-time `InsufficientDeposit` is
 /// this holder's reservation floor outrunning the pool, and a different holder
@@ -2674,7 +2675,8 @@ mod assembly_fault_tests {
     }
 
     /// A holder's reservation floor above the pool moves the range to another
-    /// holder, which may reserve less; a dry pool and a fatal fault end it.
+    /// holder, which may reserve less, and so does one lane's watermark desync;
+    /// a dry pool and a fatal fault end it.
     #[test]
     fn insufficient_deposit_reassigns_and_a_dry_pool_ends_the_assembly() {
         assert!(!ends_the_assembly(&refusal(
@@ -2684,12 +2686,18 @@ mod assembly_fault_tests {
             gap_start: 0,
             gap_len: 1 << 20,
         })));
-        assert!(ends_the_assembly(&anyhow::Error::new(
-            UpstreamVoucherRejected {
-                reason: VoucherRejectReason::AmountRegression,
+        let rejected = |reason| {
+            anyhow::Error::new(UpstreamVoucherRejected {
+                reason,
                 bundle: None,
                 proof_generation: None,
-            }
+            })
+        };
+        assert!(ends_the_assembly(&rejected(
+            VoucherRejectReason::CapabilityExpired
+        )));
+        assert!(!ends_the_assembly(&rejected(
+            VoucherRejectReason::UnderFold
         )));
         assert!(ends_the_assembly(&refusal(StreamError::OriginBlacklisted)));
         assert!(!ends_the_assembly(&refusal(StreamError::NotFound)));

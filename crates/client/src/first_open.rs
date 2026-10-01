@@ -352,7 +352,7 @@ mod tests {
         let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
         let err = first_open(&mut set, &policy(None), |_lane| async {
             Err::<(), _>(anyhow::Error::new(UpstreamVoucherRejected {
-                reason: VoucherRejectReason::AmountRegression,
+                reason: VoucherRejectReason::CapabilityExpired,
                 bundle: None,
                 proof_generation: None,
             }))

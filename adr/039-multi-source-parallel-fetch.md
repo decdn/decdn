@@ -75,11 +75,13 @@ An item is one blob that the command fetches. In a bundle pull, each entry is on
 
 Five faults end the fetch, because only the user can fix them:
 
-- a voucher rejection,
+- a voucher rejection for the capability, the signer, or the pool deposit,
 - an origin blacklist,
 - the client's size cap, for this item only,
 - no affordable holder: every known holder has refused on price after the client spends its top-up budget,
 - a local disk fault.
+
+A voucher rejection for the watermark of one lane (`AmountRegression`, `BytesRegression`, `Underpaid`, or `UnderFold`) does not end the fetch. The client heals the lane ledger from the bundle that the rejection carries, and retries. If the source still rejects after the retries, the source cools and its range moves to another source. Each other lane keeps its own watermark.
 
 On the wire, `NotFound` also means load shed, a per-signer cap, or a pool that the node cannot confirm yet. So a `NotFound` from a holder that the probe reported, or from a node that the user pinned, only cools that holder. A pull-through target that answers `NotFound` three times, with no verified byte between the answers, is absent. The item also ends when every known source is absent, and a fresh discovery finds no new holder. No other fault ends the fetch. The loop keeps trying.
 

@@ -237,6 +237,13 @@ struct Pipeline {
     /// advance refuses a lower watermark, so the next persist overwrites the
     /// lane record with this anchor once, then advances from it.
     unsaved_rebase: Option<Cumulative>,
+    /// The node watermark the latest heal acted on: the bundle a
+    /// [`PoolLedger::reseed`], [`PoolLedger::rebase`], or
+    /// [`PoolLedger::retire_unadopted_chain`] took. Sibling streams on one lane
+    /// take the same rejection with the same bundle. The first heals the lane,
+    /// and this lets the rest see that it did, so they leave alone the chain
+    /// the healed lane opened next.
+    healed_from: Option<Cumulative>,
 }
 
 impl Pipeline {
@@ -250,6 +257,16 @@ impl Pipeline {
         self.prev_accrued = Cumulative::default();
         self.armed = None;
         self.last_proof = None;
+    }
+
+    /// What the lane owes, reported high: the anchor plus the accrual, or the
+    /// armed voucher when it claims more. See [`PoolLedger::settlement`].
+    fn settlement(&self) -> Cumulative {
+        let owed = self.committed.plus(self.accrued);
+        match self.armed {
+            Some(armed) if armed.voucher.amount > owed.amount => armed.voucher,
+            _ => owed,
+        }
     }
 }
 
@@ -506,6 +523,7 @@ impl PoolLedger {
                 last_proof: None,
                 generation: 0,
                 unsaved_rebase: None,
+                healed_from: None,
             }),
             epoch: std::sync::Mutex::new(None),
             retired: std::sync::Mutex::new(Displaced::Nothing),
@@ -576,12 +594,7 @@ impl PoolLedger {
     /// cannot inflate our cumulative for bytes the upstream declined.
     #[must_use]
     pub fn settlement(&self) -> Cumulative {
-        let pipeline = self.pipeline();
-        let owed = pipeline.committed.plus(pipeline.accrued);
-        match pipeline.armed {
-            Some(armed) if armed.voucher.amount > owed.amount => armed.voucher,
-            _ => owed,
-        }
+        self.pipeline().settlement()
     }
 
     /// Issue one voucher for `delta_bytes` newly delivered since the last voucher
@@ -644,12 +657,7 @@ impl PoolLedger {
         // cumulative the upstream may hold.
         let (frontier, accrued) = {
             let pipeline = self.pipeline();
-            let owed = pipeline.committed.plus(pipeline.accrued);
-            let frontier = match pipeline.armed {
-                Some(armed) if armed.voucher.amount > owed.amount => armed.voucher,
-                _ => owed,
-            };
-            (frontier, pipeline.accrued)
+            (pipeline.settlement(), pipeline.accrued)
         };
 
         // **A voucher that folds must also roll.** Signing the accrued frontier
@@ -963,6 +971,7 @@ impl PoolLedger {
                 return false;
             }
             pipeline.overwrite(cum);
+            pipeline.healed_from = Some(cum);
         }
         self.retire_chain();
         true
@@ -1019,6 +1028,7 @@ impl PoolLedger {
             pipeline.overwrite(cum);
             pipeline.generation = pipeline.generation.saturating_add(1);
             pipeline.unsaved_rebase = Some(cum);
+            pipeline.healed_from = Some(cum);
             from
         };
         self.retire_chain();
@@ -1039,6 +1049,56 @@ impl PoolLedger {
     #[must_use]
     pub fn take_unsaved_rebase(&self) -> Option<Cumulative> {
         self.pipeline().unsaved_rebase.take()
+    }
+
+    /// Retire a live chain the node refused to adopt, after an `UnderFold`
+    /// rejection whose `bundle` our ledger already covers on both axes. Returns
+    /// the retired root, or `None` when nothing moved.
+    ///
+    /// A payer that resumes below the node's live claim opens a fresh root, and
+    /// the node refuses it `UnderFold`. The rejection lands after the stream has
+    /// released reveals under that root, and it rewinds only the last one. So
+    /// the ledger can cover the bundle and still meter the refused root. A
+    /// reseed does not apply, because the bundle does not advance the ledger. A
+    /// retry would re-anchor under the same root and draw the same rejection.
+    ///
+    /// This folds the pipeline to [`Self::settlement`] and drops the chain, so
+    /// the next stream opens a fresh root over the whole fold. A new process
+    /// does the same thing: it starts from the persisted settlement with no
+    /// chain. The node adopts that voucher, because it folds at least the
+    /// bundle's claim. The fold leaves [`Self::settlement`] where it was, so
+    /// the persisted watermark advances as usual and needs no
+    /// [`Self::take_unsaved_rebase`].
+    ///
+    /// Nothing moves when a heal has already taken this bundle or a later one.
+    /// A sibling stream that took the same rejection first has healed the lane,
+    /// and the live chain is then one the healed lane opened since. Nothing
+    /// moves on a lane that meters no chain either.
+    ///
+    /// A chain retired this way may be one the node did adopt. That costs one
+    /// more opening voucher and is otherwise safe. The fold is the frontier the
+    /// payer reached, so it covers every reveal the node can hold under the
+    /// retired root. A sibling anchored to that root opens a fresh one before
+    /// its next reveal, as after a reseed.
+    ///
+    /// Holds the issuance lock, so no proof is mid-send across the fold.
+    pub(crate) async fn retire_unadopted_chain(&self, bundle: Cumulative) -> Option<B256> {
+        let _issuing = self.issuance.lock().await;
+        let root = self.chain_root()?;
+        {
+            let mut pipeline = self.pipeline();
+            if pipeline
+                .healed_from
+                .is_some_and(|h| h.amount >= bundle.amount && h.bytes >= bundle.bytes)
+            {
+                return None;
+            }
+            let settlement = pipeline.settlement();
+            pipeline.overwrite(settlement);
+            pipeline.healed_from = Some(bundle);
+        }
+        self.retire_chain();
+        Some(root)
     }
 
     /// Drop the live chain after an overwrite of the committed watermark.
@@ -1825,6 +1885,133 @@ mod tests {
             .issue(0, 10, EpochAction::Open, |_n, _c| async { Ok(()) })
             .await?;
         assert_ne!(ledger.chain_root(), Some(opened));
+        Ok(())
+    }
+
+    /// A new process's stale-root state (#2257): it opens a fresh root at the
+    /// signed anchor and releases `reveals` under it before the node's
+    /// `UnderFold` lands, and the rejection rewinds only the last reveal. The
+    /// node's bundle states the anchor plus `frontier` proved chunks. Returns the
+    /// ledger, the refused root, the bundle, and the ledger's settlement after
+    /// the rewind.
+    async fn refused_root_state(
+        reveals: u8,
+        frontier: u8,
+    ) -> anyhow::Result<(PoolLedger, B256, Cumulative, Cumulative)> {
+        let anchor = Cumulative {
+            bytes: U256::from(3 * CHUNK_BYTES),
+            amount: U256::from(300u64),
+        };
+        let ledger = metered_ledger(anchor);
+        ledger
+            .issue(0, 10, EpochAction::Open, |_n, _c| async { Ok(()) })
+            .await?;
+        let refused = ledger
+            .chain_root()
+            .ok_or_else(|| anyhow::anyhow!("Open draws a chain"))?;
+        let mut last = None;
+        for _ in 0..reveals {
+            last = Some(ledger.meter(Some(refused), |_r| async { Ok(()) }).await?);
+        }
+        let chunk = ledger
+            .committed()
+            .minus(anchor)
+            .amount
+            .checked_div(U256::from(reveals))
+            .ok_or_else(|| anyhow::anyhow!("at least one reveal"))?;
+        let last = last.ok_or_else(|| anyhow::anyhow!("at least one reveal"))?;
+        assert!(ledger.resolve_reject(reveal_proof(last)?));
+        let bundle = Cumulative {
+            bytes: anchor.bytes + U256::from(u64::from(frontier) * CHUNK_BYTES),
+            amount: anchor.amount + chunk * U256::from(frontier),
+        };
+        let settled = ledger.settlement();
+        Ok((ledger, refused, bundle, settled))
+    }
+
+    fn under_fold() -> anyhow::Error {
+        anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::UnderFold,
+            bundle: None,
+            proof_generation: None,
+        })
+    }
+
+    /// The stale-root state heals in one step (#2257). The ledger already covers
+    /// the bundle, so a reseed refuses it, and a retry that re-anchors under the
+    /// refused root draws the same `UnderFold`. The heal folds the ledger and
+    /// retires the root instead, and the next voucher is an Open over a fresh
+    /// root that folds at least the node's claim — the voucher a new process
+    /// would send. A sibling stream's echo of the same rejection then leaves
+    /// the fresh chain alone.
+    #[tokio::test]
+    async fn an_under_fold_the_ledger_covers_retires_the_refused_root() -> anyhow::Result<()> {
+        let (ledger, refused, bundle, settled) = refused_root_state(4, 2).await?;
+        assert!(
+            settled.amount > bundle.amount,
+            "the ledger is past the bundle"
+        );
+        assert!(!ledger.reseed(bundle), "a covered bundle does not reseed");
+
+        let err = under_fold();
+        assert_eq!(
+            crate::heal_watermark_desync(&err, bundle, &ledger).await,
+            Some(crate::Healed::Stale)
+        );
+        assert_eq!(ledger.chain_root(), None, "the refused root is retired");
+        assert_eq!(ledger.settlement(), settled, "the fold moves no money");
+
+        let mut commit = None;
+        let opened = ledger
+            .issue(0, 10, EpochAction::Open, |_n, c| {
+                commit = Some(c);
+                async { Ok(()) }
+            })
+            .await?;
+        let commit = commit.ok_or_else(|| anyhow::anyhow!("issue never reached the send"))?;
+        assert!(opened.amount >= bundle.amount && opened.bytes >= bundle.bytes);
+        assert_eq!(opened, settled, "the Open signs the whole fold");
+        assert_ne!(commit.chain_root, refused, "the Open names a fresh root");
+        assert_ne!(commit.chain_root, B256::ZERO, "the Open is not sealed");
+
+        let fresh = ledger.chain_root();
+        assert_eq!(
+            crate::heal_watermark_desync(&err, bundle, &ledger).await,
+            Some(crate::Healed::Stale)
+        );
+        assert_eq!(
+            ledger.chain_root(),
+            fresh,
+            "a sibling's echo of a healed bundle keeps the fresh chain"
+        );
+        Ok(())
+    }
+
+    /// The same heal when the reveals that survive the rewind exactly match the
+    /// node's frontier: the ledger then sits at the bundle, as it does after a
+    /// sibling's reseed. No heal has taken this bundle, so the root still
+    /// retires. A reseed that took it first would leave the chain alone.
+    #[tokio::test]
+    async fn an_under_fold_at_the_ledger_retires_the_refused_root_once() -> anyhow::Result<()> {
+        let (ledger, _refused, bundle, settled) = refused_root_state(3, 2).await?;
+        assert_eq!(settled, bundle, "the ledger sits exactly at the bundle");
+        assert_eq!(
+            crate::heal_watermark_desync(&under_fold(), bundle, &ledger).await,
+            Some(crate::Healed::Stale)
+        );
+        assert_eq!(ledger.chain_root(), None);
+
+        let reseeded = metered_ledger(Cumulative::default());
+        assert!(reseeded.reseed(bundle));
+        reseeded
+            .issue(0, 10, EpochAction::Open, |_n, _c| async { Ok(()) })
+            .await?;
+        let fresh = reseeded.chain_root();
+        assert_eq!(
+            crate::heal_watermark_desync(&under_fold(), bundle, &reseeded).await,
+            Some(crate::Healed::Stale)
+        );
+        assert_eq!(reseeded.chain_root(), fresh, "the reseed already healed it");
         Ok(())
     }
 

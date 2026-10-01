@@ -4632,6 +4632,16 @@ async fn a_restarted_payer_beside_a_live_sibling_heals_below_the_anchor() -> any
 /// lane counts that whole claim as credited (#2171), so none of it is headroom
 /// a stream whose reveals fold nothing could draw on.
 fn lane_with_proved_reveals(signer: &PrivateKeySigner, deposit: U256) -> anyhow::Result<LaneState> {
+    lane_with_proved_frontier(signer, deposit, 5)
+}
+
+/// [`lane_with_proved_reveals`] with `verified_index` reveals proved on top of
+/// the anchor.
+fn lane_with_proved_frontier(
+    signer: &PrivateKeySigner,
+    deposit: U256,
+    verified_index: u8,
+) -> anyhow::Result<LaneState> {
     use decdn_incentive::chain::{CHUNK_BYTES, preimage_at, root_from_seed};
 
     let price = decdn_incentive::min_payment(CHUNK_BYTES, RATE_PER_MB);
@@ -4641,8 +4651,8 @@ fn lane_with_proved_reveals(signer: &PrivateKeySigner, deposit: U256) -> anyhow:
     let chain = decdn_incentive::LaneChain {
         chain_root: root_from_seed(chain_seed),
         chunk_price: price,
-        verified_index: 5,
-        tip: preimage_at(chain_seed, 5),
+        verified_index,
+        tip: preimage_at(chain_seed, verified_index),
     };
     let anchor = decdn_incentive::Voucher {
         pool_id: pool_id(),
@@ -4745,6 +4755,91 @@ async fn resume_under_a_live_chain(above_anchor: u64) -> anyhow::Result<()> {
     anyhow::ensure!(
         counter(&metrics, "decdn_serve_stream_client_declined_total")? == 0,
         "no stream may stall on a proof the client never sends"
+    );
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_voucher_rejected_total")? == 1,
+        "the heal costs exactly one rejected voucher"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// #2257: a new process resumes at the signed anchor under a lane whose live
+/// claim is one chunk past it, and the node opens the whole credit window at
+/// once. The stream's opening voucher names a fresh root and under-folds, but
+/// the node delivers ahead of reading it, so the stream releases several reveals
+/// under that root before the rejection lands. Only the last reveal rewinds, so
+/// the ledger already covers the bundle and has nothing to reseed. The heal
+/// must retire the root the node never adopted: a retry that re-anchors under
+/// it repeats the same under-fold until the resume budget runs out.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unadopted_chain_past_the_bundle_is_retired_and_the_pull_completes() -> anyhow::Result<()>
+{
+    let payload: Vec<u8> = (0..8 * 1024 * 1024u32).map(|i| (i % 239) as u8).collect();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(1_000_000_000u64);
+    let lane = lane_with_proved_frontier(&client_signer, deposit, 1)?;
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&lane)?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    // A zero ramp divisor opens the full ceiling at once, so the node streams
+    // the whole blob before it has read the opening voucher.
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        |deps| deps.credit_ramp_divisor = 0,
+    )?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let mut ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    ctx.prior_amount = lane.last_amount();
+    ctx.prior_bytes_delivered = lane.last_bytes_delivered();
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x2257,
+        Duration::from_secs(8),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("resumed fetch: {e:#}"))?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "the resumed fetch must recover the full blob, got {} of {} bytes",
+        got.len(),
+        payload.len()
+    );
+    let healed = store
+        .load_all()?
+        .first()
+        .map(LaneState::owed)
+        .ok_or_else(|| anyhow::anyhow!("no persisted lane"))?;
+    anyhow::ensure!(
+        healed > lane.owed(),
+        "the healed stream must pay past the live claim: {} -> {healed}",
+        lane.owed()
     );
     anyhow::ensure!(
         counter(&metrics, "decdn_serve_stream_voucher_rejected_total")? == 1,
