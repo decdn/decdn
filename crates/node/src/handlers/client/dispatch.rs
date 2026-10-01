@@ -19,6 +19,7 @@ use tracing::Instrument as _;
 use super::outcome::{ErrEnd, ResetCause, ServeEnd};
 use crate::load_shed::RequestClass;
 use crate::metrics::FirstByteClock;
+use crate::pool_view::SignerAuthorization;
 
 /// The root span for one inbound serve stream.
 ///
@@ -537,20 +538,27 @@ impl ClientHandler {
                 .await;
         }
 
-        // Signer cap-headroom confirm (ADR 003 §Pool solvency): a capability whose
-        // signer has already drawn its shared `cap` at other nodes is uncashable here.
-        // Confirm the signer's on-chain `cap - spent` covers a floor before admitting,
-        // so a "spent" capability sprayed to a fresh node is refused, not served for
-        // vouchers this node can never redeem. Unregistered signer or no chain wired ->
-        // u64::MAX (never refuse); a getAuthorization fault -> None -> refuse.
+        // Signer authorization confirm (ADR 003 §Capability delegation, §Pool
+        // solvency). On-chain registration is write-once per `(pool, signer)`, so a
+        // registered signer's `cap` and `expiry` bound every voucher this node can
+        // redeem, whatever capability the client presents. Refuse a registered signer
+        // whose registration has expired or whose `cap - spent` no longer covers a
+        // floor: a "spent" capability sprayed to a fresh node is refused, not served
+        // for vouchers this node can never redeem. The registered terms are kept to
+        // clamp the lane below. Unregistered signer or no chain wired -> admit on the
+        // presented capability; a getAuthorization fault -> None -> refuse.
+        let mut registered_terms: Option<(u64, u64)> = None;
         if let (Some(view), Some(signer)) = (self.pool_view.as_ref(), verified_client) {
             let floor_micro =
                 decdn_incentive::min_payment(self.credit_window(CHUNK_BYTES, 0), rate_per_mb);
-            let headroom_ok = view
-                .signer_cap_headroom_micro(B256::from(req.pool_id), signer)
-                .await
-                .is_some_and(|h| U256::from(h) >= floor_micro);
-            if !headroom_ok {
+            let auth = view
+                .signer_authorization(B256::from(req.pool_id), signer)
+                .await;
+            if let Some(SignerAuthorization::Registered { cap, expiry, .. }) = auth {
+                registered_terms = Some((cap, expiry));
+            }
+            let now = self.coarse_clock.unix_seconds();
+            if !auth.is_some_and(|a| a.covers(floor_micro, now)) {
                 return self
                     .respond_error(
                         &mut send,
@@ -609,6 +617,15 @@ impl ClientHandler {
             Some(key) => self.lanes.get(&key).map(|e| Arc::clone(e.value())),
             None => None,
         };
+
+        // Hold the signer's registered terms on the lane (ADR 003 §Capability
+        // delegation): the voucher path refuses past the lane's `cap` and `expiry`,
+        // and the mid-stream signer re-check reads the lane's `cap`. A lane first
+        // registered from a wider capability, or from one presented before the
+        // signer's registration landed elsewhere, narrows here on its next stream.
+        if let (Some(lane), Some((cap, expiry))) = (known_lane.as_ref(), registered_terms) {
+            self.clamp_lane_to_registration(lane, cap, expiry).await;
+        }
 
         // Per-pool cumulative floor-credit admission reservation (ADR 003 §Pool
         // solvency, stateful-B). It sums floor credit across ALL distinct lanes on

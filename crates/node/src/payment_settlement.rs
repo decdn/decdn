@@ -86,7 +86,7 @@ use crate::chain_events::{REORG_MARGIN_BLOCKS, timed};
 use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, metric_hook};
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
-use crate::pool_view::{Lifecycle, PoolProjection, PoolStatus};
+use crate::pool_view::{Lifecycle, PoolProjection, PoolStatus, SignerAuthorization};
 
 /// Capacity of the redeem-hint channel. Hints are advisory (a missed hint only
 /// delays a redemption until the next voucher or self-tick sweep), so a bounded
@@ -110,9 +110,10 @@ const RESOLVE_NEGATIVE_TTL: Duration = Duration::from_mins(1);
 /// `getPool` per admit rather than growing the cache without limit.
 const RESOLVE_NEGATIVE_CACHE_MAX: usize = 4096;
 
-/// How long an admit-path `getAuthorization` headroom read stays fresh in the
-/// signer-auth cache. A cached headroom may go stale as the signer spends its
-/// shared `cap` at other nodes, so within the window a stale-OK entry admits
+/// How long an admit-path `getAuthorization` read stays fresh in the signer-auth
+/// cache. A registration's `cap` and `expiry` are write-once and never go stale;
+/// its `spent` grows as the signer spends its shared `cap` at other nodes, so
+/// within the window a stale-OK entry admits
 /// however many streams that signer opens against a cap it has since drained — a
 /// TTL-bounded over-admission, not a per-stream one. The exposure is bounded anyway
 /// by the on-chain `redeemMany`, which pays `min(desired, cap − spent)` and never
@@ -816,12 +817,12 @@ pub struct ResolvingPoolView<P: Provider + Clone> {
     /// that errored. The guard is held only to read/insert one entry, never across
     /// the `getPool` await.
     negative: Mutex<HashMap<B256, Instant>>,
-    /// `(pool_id, signer)` → (last-observed `cap − spent` headroom in micro-USDC,
-    /// observed-at instant), for the admit-path signer confirm. An entry younger
-    /// than [`SIGNER_AUTH_TTL`] is served without a `getAuthorization`. The guard is
+    /// `(pool_id, signer)` → (last-observed authorization, observed-at instant),
+    /// for the admit-path signer confirm. An entry younger than
+    /// [`SIGNER_AUTH_TTL`] is served without a `getAuthorization`. The guard is
     /// held only to read/insert one entry, never across the `getAuthorization`
     /// await.
-    auth_cache: Mutex<HashMap<(B256, Address), (u64, Instant)>>,
+    auth_cache: Mutex<HashMap<(B256, Address), (SignerAuthorization, Instant)>>,
 }
 
 impl<P: Provider + Clone> std::fmt::Debug for ResolvingPoolView<P> {
@@ -916,17 +917,21 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
         Some(self.projection.signer_spent(pool_id, signer))
     }
 
-    async fn signer_cap_headroom_micro(&self, pool_id: B256, signer: Address) -> Option<u64> {
-        // Fast path: a fresh cached headroom needs no `getAuthorization`.
+    async fn signer_authorization(
+        &self,
+        pool_id: B256,
+        signer: Address,
+    ) -> Option<SignerAuthorization> {
+        // Fast path: a fresh cached read needs no `getAuthorization`.
         {
             let guard = self
                 .auth_cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((headroom, at)) = guard.get(&(pool_id, signer))
+            if let Some((auth, at)) = guard.get(&(pool_id, signer))
                 && at.elapsed() < SIGNER_AUTH_TTL
             {
-                return Some(*headroom);
+                return Some(*auth);
             }
         }
         let auth = match self.contract.getAuthorization(pool_id, signer).call().await {
@@ -941,18 +946,7 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
                 return None;
             }
         };
-        // An UNREGISTERED signer reads as the all-zero authorization
-        // (`cap == 0 && expiry == 0`): it has spent nothing on-chain and holds its
-        // full off-chain capability budget, so it is unconstrained here. A
-        // REGISTERED signer has real headroom `cap − spent` — including one whose
-        // owner registered it with a zero `spendingCap` (`cap == 0` but
-        // `expiry != 0`), whose headroom is `0`, so it is refused rather than
-        // misread as unconstrained.
-        let headroom = if auth.cap == 0 && auth.expiry == 0 {
-            u64::MAX
-        } else {
-            auth.cap.saturating_sub(auth.spent)
-        };
+        let auth = SignerAuthorization::from_onchain(&auth);
         {
             let mut guard = self
                 .auth_cache
@@ -966,10 +960,10 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
                 guard.retain(|_, (_, at)| at.elapsed() < SIGNER_AUTH_TTL);
             }
             if guard.len() < AUTH_CACHE_MAX {
-                guard.insert((pool_id, signer), (headroom, Instant::now()));
+                guard.insert((pool_id, signer), (auth, Instant::now()));
             }
         }
-        Some(headroom)
+        Some(auth)
     }
 }
 
@@ -1587,7 +1581,7 @@ async fn submit_chunk<P: Provider + Clone>(
                 tx = %receipt.transaction_hash,
                 "batched lane redemption landed (redeemMany)"
             );
-            record_landed_chunk(store, &lanes, metrics);
+            record_landed_chunk(contract, store, &lanes, metrics).await;
         }
         TxOutcome::SendErr(err)
             if lanes.len() >= 2
@@ -1650,16 +1644,71 @@ const fn is_redemption_failure(outcome: &TxOutcome) -> bool {
 }
 
 /// Record a landed `redeemMany` chunk: count its vouchers into
-/// `pool_redemptions` and persist `registered_until` for every lane whose
+/// `pool_redemptions`, then persist `registered_until` for every lane whose
 /// `CapabilityReg` rode in the chunk, so the next sweep does not register it
 /// again.
-fn record_landed_chunk(store: &Arc<dyn PoolStateStore>, lanes: &[PlannedLane], metrics: &Metrics) {
+///
+/// The persisted value is the expiry the chain registered, read back with one
+/// batched `getAuthorizations`, not the attached `CapabilityReg`'s expiry.
+/// On-chain registration is write-once: when another provider landed a
+/// different capability for the signer first, the attached one was a no-op and
+/// its expiry is not the signer's. A failed or short read persists nothing for
+/// the unread lanes; the next sweep attaches their `CapabilityReg` again (a
+/// no-op on-chain) and re-reads.
+async fn record_landed_chunk<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    store: &Arc<dyn PoolStateStore>,
+    lanes: &[PlannedLane],
+    metrics: &Metrics,
+) {
     metrics.pool_redemptions(u64::try_from(lanes.len()).unwrap_or(u64::MAX));
-    for lane in lanes {
-        if let Some(reg) = &lane.register
-            && let Err(err) = store.set_registered_until(lane.key, reg.expiry)
-        {
-            warn!(error = %err, pool_id = %lane.pool_id, signer = %reg.signer,
+    let registering: Vec<LaneKey> = lanes
+        .iter()
+        .filter(|lane| lane.register.is_some())
+        .map(|lane| lane.key)
+        .collect();
+    for chunk in registering.chunks(WATERMARK_READ_BATCH_MAX) {
+        let pool_ids = chunk.iter().map(|key| key.pool_id).collect();
+        let signers = chunk.iter().map(|key| key.signer).collect();
+        let builder = contract.getAuthorizations(pool_ids, signers);
+        match timed(None, "post-redeem getAuthorizations", builder.call()).await {
+            Ok(auths) => persist_registered_expiries(store, chunk, &auths),
+            Err(err) => {
+                warn!(
+                    error = %sanitize_rpc_display(err),
+                    lanes = chunk.len(),
+                    "post-redeem registration read failed; the next sweep re-registers and re-reads"
+                );
+                break;
+            }
+        }
+    }
+}
+
+/// Persist each lane's registered expiry as its `registered_until`. `auths` is
+/// the `getAuthorizations` result for `keys`, in the same order; a short result
+/// is a positionally sound prefix and the unread tail is skipped. A signer the
+/// chain still reports unregistered persists nothing.
+fn persist_registered_expiries(
+    store: &Arc<dyn PoolStateStore>,
+    keys: &[LaneKey],
+    auths: &[PaymentPool::Authorization],
+) {
+    if auths.len() != keys.len() {
+        warn!(
+            expected = keys.len(),
+            got = auths.len(),
+            "post-redeem registration read returned a mismatched count"
+        );
+    }
+    for (key, auth) in keys.iter().zip(auths) {
+        let SignerAuthorization::Registered { expiry, .. } =
+            SignerAuthorization::from_onchain(auth)
+        else {
+            continue;
+        };
+        if let Err(err) = store.set_registered_until(*key, expiry) {
+            warn!(error = %err, pool_id = %key.pool_id, signer = %key.signer,
                 "failed to persist registered_until after a landed registration");
         }
     }
@@ -2424,10 +2473,22 @@ mod tests {
         Ok(())
     }
 
+    const AUTH_EXPIRY: u64 = 1_900_000_000;
+
+    /// A registered authorization (`expiry` non-zero), or the unregistered
+    /// all-zero struct when `cap == 0`.
     fn authz(cap: u64, spent: u64) -> PaymentPool::Authorization {
         PaymentPool::Authorization {
             cap,
-            expiry: 0,
+            expiry: if cap == 0 { 0 } else { AUTH_EXPIRY },
+            spent,
+        }
+    }
+
+    const fn registered(cap: u64, spent: u64) -> SignerAuthorization {
+        SignerAuthorization::Registered {
+            cap,
+            expiry: AUTH_EXPIRY,
             spent,
         }
     }
@@ -2456,38 +2517,58 @@ mod tests {
         (view, asserter)
     }
 
-    /// A registered signer with headroom reports `cap − spent` in micro-USDC.
+    /// A registered signer reports its registered terms and `spent`; the admit
+    /// gate covers a floor up to `cap − spent`.
     #[tokio::test]
-    async fn signer_headroom_reports_cap_minus_spent() -> Result<()> {
+    async fn registered_signer_reports_terms_and_spent() -> Result<()> {
         use crate::pool_view::PoolView;
 
         let (view, _asserter) = mocked_getauth_view(&[authz(1_000, 300)]);
-        let headroom = view
-            .signer_cap_headroom_micro(B256::repeat_byte(0x11), Address::from([2u8; 20]))
+        let auth = view
+            .signer_authorization(B256::repeat_byte(0x11), Address::from([2u8; 20]))
             .await
-            .ok_or_else(|| anyhow::anyhow!("a registered signer reports headroom"))?;
-        assert_eq!(headroom, 700, "cap 1000 − spent 300");
+            .ok_or_else(|| anyhow::anyhow!("a registered signer reports its authorization"))?;
+        assert_eq!(auth, registered(1_000, 300));
+        assert!(
+            auth.covers(U256::from(700u64), AUTH_EXPIRY - 1),
+            "cap 1000 − spent 300"
+        );
+        assert!(!auth.covers(U256::from(701u64), AUTH_EXPIRY - 1));
         Ok(())
     }
 
-    /// A signer that has spent its full `cap` reports zero headroom — the floor
-    /// gate in the dispatch path then refuses it, but the view reports the truth.
+    /// A signer that has spent its full `cap` covers no floor — the dispatch gate
+    /// then refuses it, but the view reports the truth.
     #[tokio::test]
-    async fn exhausted_signer_reports_zero_headroom() -> Result<()> {
+    async fn exhausted_signer_covers_no_floor() -> Result<()> {
         use crate::pool_view::PoolView;
 
         let (view, _asserter) = mocked_getauth_view(&[authz(1_000, 1_000)]);
-        let headroom = view
-            .signer_cap_headroom_micro(B256::repeat_byte(0x22), Address::from([3u8; 20]))
+        let auth = view
+            .signer_authorization(B256::repeat_byte(0x22), Address::from([3u8; 20]))
             .await
             .ok_or_else(|| anyhow::anyhow!("an exhausted signer still reports a value"))?;
-        assert_eq!(headroom, 0, "spent == cap");
+        assert_eq!(auth, registered(1_000, 1_000));
+        assert!(
+            !auth.covers(U256::from(1u64), AUTH_EXPIRY - 1),
+            "spent == cap"
+        );
         Ok(())
     }
 
-    /// An unregistered signer (`cap == 0`) reports `u64::MAX` — it has spent
-    /// nothing on-chain and admits on its off-chain capability — and a second call
-    /// within the TTL is served from cache with no further `getAuthorization`.
+    /// A registered signer whose registration has expired covers no floor, even
+    /// with headroom left: the chain redeems nothing at or past the expiry.
+    #[test]
+    fn expired_registration_covers_no_floor() {
+        let auth = registered(1_000, 0);
+        assert!(auth.covers(U256::from(1u64), AUTH_EXPIRY - 1));
+        assert!(!auth.covers(U256::from(1u64), AUTH_EXPIRY));
+    }
+
+    /// An unregistered signer (`cap == 0 && expiry == 0`) is unconstrained — it
+    /// has spent nothing on-chain and admits on its presented capability — and a
+    /// second call within the TTL is served from cache with no further
+    /// `getAuthorization`.
     #[tokio::test]
     async fn unregistered_signer_is_unconstrained_and_cached() -> Result<()> {
         use crate::pool_view::PoolView;
@@ -2498,10 +2579,11 @@ mod tests {
         let signer = Address::from([4u8; 20]);
 
         let first = view
-            .signer_cap_headroom_micro(pool_id, signer)
+            .signer_authorization(pool_id, signer)
             .await
             .ok_or_else(|| anyhow::anyhow!("an unregistered signer is unconstrained"))?;
-        assert_eq!(first, u64::MAX, "cap == 0 → no on-chain constraint");
+        assert_eq!(first, SignerAuthorization::Unregistered);
+        assert!(first.covers(U256::MAX, u64::MAX), "no on-chain constraint");
         assert_eq!(
             asserter.read_q().len(),
             0,
@@ -2509,13 +2591,13 @@ mod tests {
         );
 
         let second = view
-            .signer_cap_headroom_micro(pool_id, signer)
+            .signer_authorization(pool_id, signer)
             .await
             .ok_or_else(|| anyhow::anyhow!("a fresh cache entry serves the second call"))?;
         assert_eq!(
             second,
-            u64::MAX,
-            "the cached headroom is returned unchanged"
+            SignerAuthorization::Unregistered,
+            "the cached read is returned unchanged"
         );
         assert_eq!(
             asserter.read_q().len(),
@@ -2526,28 +2608,29 @@ mod tests {
     }
 
     /// A REGISTERED signer with a zero `spendingCap` (`cap == 0` but `expiry != 0`)
-    /// is NOT the all-zero unregistered struct: its headroom is `0`, so it reports
-    /// `Some(0)` and the dispatch gate refuses it — it is not misread as
-    /// unconstrained (`u64::MAX`), which would fail open and admit an uncashable
-    /// signer.
+    /// is NOT the all-zero unregistered struct: it is registered with no headroom,
+    /// so the dispatch gate refuses it — it is not misread as unconstrained, which
+    /// would fail open and admit an uncashable signer.
     #[tokio::test]
     async fn registered_zero_cap_signer_is_refused_not_unconstrained() -> Result<()> {
         use crate::pool_view::PoolView;
 
         let auth = PaymentPool::Authorization {
             cap: 0,
-            expiry: 1_900_000_000,
+            expiry: AUTH_EXPIRY,
             spent: 0,
         };
         let (view, _asserter) = mocked_getauth_view(&[auth]);
-        let headroom = view
-            .signer_cap_headroom_micro(B256::repeat_byte(0x44), Address::from([5u8; 20]))
+        let auth = view
+            .signer_authorization(B256::repeat_byte(0x44), Address::from([5u8; 20]))
             .await
             .ok_or_else(|| anyhow::anyhow!("a registered zero-cap signer reports a value"))?;
         assert_eq!(
-            headroom, 0,
+            auth,
+            registered(0, 0),
             "cap == 0 with expiry != 0 is a registered zero-cap signer, not unregistered"
         );
+        assert!(!auth.covers(U256::from(1u64), AUTH_EXPIRY - 1));
         Ok(())
     }
 
@@ -2560,7 +2643,7 @@ mod tests {
         // No response queued: the mocked eth_call errors.
         let (view, _asserter) = mocked_getauth_view(&[]);
         assert!(
-            view.signer_cap_headroom_micro(B256::repeat_byte(0x44), Address::from([5u8; 20]))
+            view.signer_authorization(B256::repeat_byte(0x44), Address::from([5u8; 20]))
                 .await
                 .is_none(),
             "a getAuthorization fault refuses the signer"
@@ -2572,7 +2655,7 @@ mod tests {
     /// further `getAuthorization` (proven by the single queued response and a
     /// `Some` result on the second call).
     #[tokio::test]
-    async fn signer_headroom_second_call_hits_cache() -> Result<()> {
+    async fn signer_authorization_second_call_hits_cache() -> Result<()> {
         use crate::pool_view::PoolView;
 
         let (view, asserter) = mocked_getauth_view(&[authz(1_000, 200)]);
@@ -2580,17 +2663,21 @@ mod tests {
         let signer = Address::from([6u8; 20]);
 
         let first = view
-            .signer_cap_headroom_micro(pool_id, signer)
+            .signer_authorization(pool_id, signer)
             .await
             .ok_or_else(|| anyhow::anyhow!("the first call resolves on-chain"))?;
-        assert_eq!(first, 800);
+        assert_eq!(first, registered(1_000, 200));
         assert_eq!(asserter.read_q().len(), 0, "one getAuthorization consumed");
 
         let second = view
-            .signer_cap_headroom_micro(pool_id, signer)
+            .signer_authorization(pool_id, signer)
             .await
             .ok_or_else(|| anyhow::anyhow!("the second call is served from cache"))?;
-        assert_eq!(second, 800, "the cached headroom is returned");
+        assert_eq!(
+            second,
+            registered(1_000, 200),
+            "the cached read is returned"
+        );
         assert_eq!(
             asserter.read_q().len(),
             0,
@@ -2821,12 +2908,33 @@ mod tests {
         }
     }
 
+    /// A mocked `PaymentPool` whose `eth_call` queue answers one
+    /// `getAuthorizations` per entry of `responses`.
+    fn mocked_getauthorizations_pool(
+        responses: &[Vec<PaymentPool::Authorization>],
+    ) -> PaymentPool::PaymentPoolInstance<impl Provider + Clone + 'static> {
+        use alloy::providers::ProviderBuilder;
+        use alloy::providers::mock::Asserter;
+        use alloy::sol_types::SolCall;
+
+        let asserter = Asserter::new();
+        for auths in responses {
+            asserter.push_success(&Bytes::from(
+                PaymentPool::getAuthorizationsCall::abi_encode_returns(auths),
+            ));
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        PaymentPool::new(Address::ZERO, provider)
+    }
+
     /// A landed chunk counts every lane into `pool_redemptions` and persists
     /// `registered_until` for the lane whose `CapabilityReg` rode in it (#2154).
-    /// A failed receipt wait whose receipt a by-hash fetch found takes this path
-    /// too.
-    #[test]
-    fn landed_chunk_counts_redemptions_and_persists_registration() -> Result<()> {
+    /// The persisted value is the chain's registered expiry, not the attached
+    /// `CapabilityReg`'s: another provider may have registered a different
+    /// capability for the signer first (#2265). A failed receipt wait whose
+    /// receipt a by-hash fetch found takes this path too.
+    #[tokio::test]
+    async fn landed_chunk_counts_redemptions_and_persists_registration() -> Result<()> {
         use decdn_incentive::MemoryPoolStateStore;
 
         let store: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
@@ -2835,19 +2943,27 @@ mod tests {
         store.record(&registering)?;
         store.record(&registered)?;
         let mut with_reg = planned(7, 50, 100, true);
-        let expiry = 1_900_000_000;
         if let Some(reg) = with_reg.register.as_mut() {
-            reg.expiry = expiry;
+            reg.expiry = 1_900_000_000;
         }
+        let chain_expiry = 1_800_000_000;
+        let contract = mocked_getauthorizations_pool(&[vec![PaymentPool::Authorization {
+            cap: 40,
+            expiry: chain_expiry,
+            spent: 40,
+        }]]);
         let lanes = vec![with_reg, planned(7, 51, 100, false)];
         let metrics = Metrics::new();
 
-        record_landed_chunk(&store, &lanes, &metrics);
+        record_landed_chunk(&contract, &store, &lanes, &metrics).await;
 
         let persisted = store
             .get(registering.key())?
             .ok_or_else(|| anyhow::anyhow!("the registering lane's row exists"))?;
-        assert_eq!(persisted.registered_until, expiry);
+        assert_eq!(
+            persisted.registered_until, chain_expiry,
+            "the chain's registered expiry, not the attached CapabilityReg's"
+        );
         let untouched = store
             .get(registered.key())?
             .ok_or_else(|| anyhow::anyhow!("the second lane's row exists"))?;
@@ -2857,6 +2973,32 @@ mod tests {
             text.lines().any(|l| l == "decdn_pool_redemptions_total 2"),
             "{text}"
         );
+        Ok(())
+    }
+
+    /// A failed post-redeem registration read persists nothing, so the next
+    /// sweep attaches the `CapabilityReg` again and re-reads.
+    #[tokio::test]
+    async fn landed_chunk_read_failure_persists_no_registration() -> Result<()> {
+        use decdn_incentive::MemoryPoolStateStore;
+
+        let store: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
+        let registering = signed_lane_state(7, 50, 0xEE, None);
+        store.record(&registering)?;
+        let contract = mocked_getauthorizations_pool(&[]);
+
+        record_landed_chunk(
+            &contract,
+            &store,
+            &[planned(7, 50, 100, true)],
+            &Metrics::new(),
+        )
+        .await;
+
+        let persisted = store
+            .get(registering.key())?
+            .ok_or_else(|| anyhow::anyhow!("the registering lane's row exists"))?;
+        assert_eq!(persisted.registered_until, 0);
         Ok(())
     }
 

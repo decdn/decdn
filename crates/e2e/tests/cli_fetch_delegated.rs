@@ -567,9 +567,9 @@ fn delegate_fetch_argv(
     ]
 }
 
-/// The registered capability A's cap: 40 µUSDC, four 1 MiB voucher intervals at
-/// the fixture node's 10 µUSDC/MiB. Enough to admit a stream, far below what the
-/// 16 MiB blob costs.
+/// The registered capability A's cap in micro-USDC: four one-MiB voucher
+/// intervals at the fixture node's rate of 10 per MiB. Enough to admit a stream,
+/// far below what the 16 MiB blob costs.
 const REGISTERED_CAP_MICRO_USDC: u64 = 40;
 /// The presented capability B's cap: 5 USDC, far above the blob's cost.
 const PRESENTED_CAP_MICRO_USDC: u64 = 5_000_000;
