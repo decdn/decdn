@@ -606,7 +606,10 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
                 // `Err` marks the route errored, which stalls event pickup and
                 // also skips the next resync entirely.
                 self.metrics.capacity_bond_registry_resync_failure();
-                warn!(error = %err, "capacity-bond registry resync failed; keeping current projections");
+                warn!(
+                    error = %sanitize_err_chain(&err),
+                    "capacity-bond registry resync failed; keeping current projections"
+                );
                 return Ok(());
             }
         };
@@ -1152,10 +1155,14 @@ mod tests {
             }
         }
 
+        /// An `Err` carries the same page context the real reader adds, so the
+        /// cause sits one level below the outermost message.
         async fn full_snapshot(&self, _at: u64) -> Result<RegistrySnapshot> {
             match &self.snapshot {
                 Ok(v) => Ok(v.clone()),
-                Err(msg) => Err(anyhow::anyhow!(*msg)),
+                Err(msg) => {
+                    Err(anyhow::anyhow!(*msg).context("getRegisteredNodes(offset=0, limit=100)"))
+                }
             }
         }
     }
@@ -2042,6 +2049,59 @@ mod tests {
             text.lines()
                 .any(|l| l == "decdn_capacity_bond_registry_last_resync_timestamp_seconds 0"),
             "a failed resync must not stamp the liveness gauge:\n{text}"
+        );
+    }
+
+    /// Shared in-memory sink for the captured tracing output.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The resync warning carries the whole error chain. The outermost
+    /// context names only the page; the RPC cause sits below it, and an
+    /// operator reading the log needs both.
+    #[tokio::test]
+    async fn resync_failure_logs_the_full_error_chain() {
+        let reads = StubReads::new(Ok(None)).with_snapshot(Err("timed out after 10s"));
+        let (mut sink, _active, _bindings, _op, _regions, _m) = sink(reads, true);
+        sink.last_resync = None;
+
+        let log = CapturedLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        sink.on_tick_complete().await.unwrap();
+
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let line = text
+            .lines()
+            .find(|l| l.contains("capacity-bond registry resync failed"))
+            .unwrap_or_else(|| panic!("no resync warning logged:\n{text}"));
+        assert!(line.contains("WARN"), "{line}");
+        assert!(
+            line.contains("getRegisteredNodes(offset=0, limit=100)"),
+            "the warning must keep the page context: {line}"
+        );
+        assert!(
+            line.contains("timed out after 10s"),
+            "the warning must keep the RPC cause: {line}"
         );
     }
 
