@@ -11,12 +11,13 @@
 //! after the store open would still exit nonzero, but only after the drop.
 //!
 //! The journey seeds a seller lane, then repoints the node at a codeless
-//! address and at two sibling contracts from the same deployment: the
-//! `FeeRouter`, which shares the `usdc()` view with `PaymentPool`, and the
-//! TOKEN. Each boot exits nonzero with the matching verdict, and no boot logs
-//! the lane drop. With the
-//! config reverted, the same lane serves another blob and redeems past its
-//! earlier watermark.
+//! address and at every other contract in the deploy manifest. Each boot exits
+//! nonzero with the matching verdict, and no boot logs a lane drop. The sweep
+//! also pins that the identity probe tells `PaymentPool` apart from every
+//! sibling, including those that share one of its views: the `FeeRouter`
+//! answers `usdc()` and the `DecdnGovernor` answers `feeRouter()`. With the
+//! config reverted, the node boots on the original deployment and the same
+//! pool session pays for and redeems another blob.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and a built `decdn-node` binary:
@@ -44,7 +45,7 @@ use anyhow::Context;
 use decdn_e2e::assert as e2e_assert;
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::client::ClientFixture;
-use decdn_e2e::node::NodeFixture;
+use decdn_e2e::node::{FOREIGN_LANE_DROPPED, FOREIGN_LANES_DROPPED, NodeFixture};
 use decdn_e2e::poll;
 
 const MIB: usize = 1024 * 1024;
@@ -55,18 +56,13 @@ const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 /// How long a boot with a bad deployment gets to exit. The preflight verdict is
 /// terminal, so the expected exit is near-immediate. The ceiling sits above the
-/// daemon's one-minute preflight retry budget, so a verdict that is retried by
-/// mistake still exits here and fails on its message.
+/// daemon's preflight retry budget (`DEPLOYMENT_PREFLIGHT_BUDGET`, one minute),
+/// so a verdict that is retried by mistake still exits here, and then fails the
+/// "not retried" needle.
 const PREFLIGHT_EXIT: Duration = Duration::from_secs(90);
 
 /// How long the node gets to redeem a voucher on chain.
 const REDEEM: Duration = Duration::from_secs(90);
-
-/// The WARN the lane store logs when it opens against another deployment and
-/// drops the seller state. `node_pull_pool_redeploy.rs` asserts that a real
-/// redeploy logs it, so its absence here is a real signal.
-const FOREIGN_LANES_DROPPED: &str = "dropping seller lane state, pending settles and watcher \
-                                     checkpoints written against another PaymentPool deployment";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn deployment_preflight_aborts_before_the_lane_store_opens() -> anyhow::Result<()> {
@@ -133,13 +129,22 @@ async fn run() -> anyhow::Result<()> {
     node.log_line(&["has no code on chain"])
         .context("the codeless boot never logged the no-code verdict")?;
 
-    // ---- Sibling contracts: each has code but does not answer
-    // `PaymentPool.feeRouter()`, so the preflight aborts on the identity probe.
-    // The `FeeRouter` answers `usdc()` like a `PaymentPool` does, so it pins
-    // that the probe tells the two apart.
+    // ---- Every sibling contract in the manifest: each has code but does not
+    // answer `PaymentPool.getRateBounds()`, so the preflight aborts on the
+    // identity probe without retrying it.
+    let addrs = chain.addrs();
     for (name, sibling) in [
-        ("FeeRouter", chain.addrs().fee_router),
-        ("TOKEN", chain.addrs().token),
+        ("CapacityBond", addrs.capacity_bond),
+        ("FeeRouter", addrs.fee_router),
+        ("TOKEN", addrs.token),
+        ("SlashJudge", addrs.slash_judge),
+        ("SlashAppeal", addrs.slash_appeal),
+        ("DecdnGovernor", addrs.governor),
+        ("TimelockController", addrs.timelock),
+        ("PublisherRegistry", addrs.publisher_registry),
+        ("OriginAssignment", addrs.origin_assignment),
+        ("ManualVettingPolicy", addrs.manual_vetting_policy),
+        ("ContentBlacklist", addrs.content_blacklist),
     ] {
         node.set_payment_pool_address(sibling)?;
         let status = node
@@ -151,19 +156,20 @@ async fn run() -> anyhow::Result<()> {
             "a boot against the {name} as a PaymentPool must exit nonzero (got {status})"
         );
         // The address in the needle ties the verdict to this boot.
-        let verdict = format!("{sibling} does not answer PaymentPool.feeRouter()");
-        node.log_line(&[&verdict])
-            .with_context(|| format!("the {name} boot never logged the feeRouter() verdict"))?;
+        let verdict = format!("{sibling} does not answer PaymentPool.getRateBounds()");
+        node.log_line(&[&verdict, "not retried"]).with_context(|| {
+            format!("the {name} boot never logged the unretried getRateBounds() verdict")
+        })?;
     }
 
-    // ---- No bad boot opened the lane store, so none dropped the lane.
-    anyhow::ensure!(
-        node.log_line(&[FOREIGN_LANES_DROPPED]).is_none(),
-        "a boot that failed the deployment preflight dropped the seller lane state"
-    );
+    // ---- No bad boot opened the lane store, so none dropped a lane.
+    assert_no_lane_dropped(&node, "a boot that failed the deployment preflight")?;
 
     // ---- Revert the config. The node boots on the original deployment, and the
-    // same lane serves blob B and redeems past its earlier watermark.
+    // same pool session pays for blob B and redeems past its earlier
+    // watermark. A dropped lane would pass this too, because the buyer's
+    // cumulative voucher re-creates it: the drop WARNs' absence is the proof
+    // that the lane survived, and this is the proof the node still serves.
     node.set_payment_pool_address(payment_pool)?;
     node.restart()
         .await
@@ -186,9 +192,17 @@ async fn run() -> anyhow::Result<()> {
     .await?
     .context("the original lane never redeemed past its watermark after the revert")?;
 
-    anyhow::ensure!(
-        node.log_line(&[FOREIGN_LANES_DROPPED]).is_none(),
-        "some boot of this node dropped the seller lane state"
-    );
+    assert_no_lane_dropped(&node, "a boot of this node")
+}
+
+/// Fail if any spawn of `node` logged either seller-lane drop WARN.
+/// `node_pull_pool_redeploy.rs` asserts that a real redeploy logs both, so
+/// their absence here is a real signal.
+fn assert_no_lane_dropped(node: &NodeFixture, who: &str) -> anyhow::Result<()> {
+    for needle in [FOREIGN_LANES_DROPPED, FOREIGN_LANE_DROPPED] {
+        if let Some(line) = node.log_line(&[needle]) {
+            anyhow::bail!("{who} dropped the seller lane state: {line}");
+        }
+    }
     Ok(())
 }

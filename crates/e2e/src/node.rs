@@ -33,6 +33,18 @@ use crate::chain::{ChainFixture, ContractAddrs};
 /// via `DECDN_KEYSTORE_PASSWORD` (#1032).
 pub const KEYSTORE_PASSWORD: &str = "decdn-e2e-test-password";
 
+/// The summary WARN a daemon logs when its lane store opens against another
+/// `PaymentPool` deployment and drops the seller lane state, the pending
+/// settles and the watcher checkpoints. Shared so a journey that asserts the
+/// drop and one that asserts its absence match the same text.
+pub const FOREIGN_LANES_DROPPED: &str = "dropping seller lane state, pending settles and watcher \
+                                         checkpoints written against another PaymentPool \
+                                         deployment";
+
+/// The per-lane WARN a daemon logs for each decodable seller lane that a
+/// deployment rebind drops, before the [`FOREIGN_LANES_DROPPED`] summary.
+pub const FOREIGN_LANE_DROPPED: &str = "dropping this seller lane with the deployment rebind";
+
 /// Kills the spawned `decdn-node` on drop so a panicking assertion never leaks
 /// the daemon process. The `Child` is behind a `Mutex` so [`NodeFixture::wait_healthy`]
 /// can `try_wait` it through a shared `&self` reference.
@@ -619,19 +631,7 @@ impl NodeFixture {
     /// `Mutex`, so the swap needs no exclusive borrow. A daemon halted by
     /// [`Self::stop`] is respawned.
     pub async fn restart(&self) -> anyhow::Result<()> {
-        // Kill the old process and swap in the new one, holding the guard lock
-        // only briefly (never across an await). `wait()` reaps the old process
-        // so it has released its ports before the replacement binds them.
-        {
-            let mut child = self
-                .child
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _ = child.kill();
-            let _ = child.wait();
-            *child = spawn_daemon(&self.config_path, self.data_dir.path(), &self.log)?;
-        }
+        self.respawn_child()?;
         self.wait_healthy(Duration::from_secs(30))
             .await
             .context("node never became healthy after restart")
@@ -673,39 +673,12 @@ impl NodeFixture {
             let child = self.child.0.lock().unwrap_or_else(PoisonError::into_inner);
             i32::try_from(child.id()).context("decdn-node pid does not fit a pid_t")?
         };
-        let started = tokio::time::Instant::now();
         nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid),
             nix::sys::signal::Signal::SIGTERM,
         )
         .context("send SIGTERM to decdn-node")?;
-        loop {
-            // The guard lock is held only for the non-blocking `try_wait`, never
-            // across the sleep.
-            let exited = {
-                let mut child = self.child.0.lock().unwrap_or_else(PoisonError::into_inner);
-                child.try_wait().context("poll decdn-node for exit")?
-            };
-            if let Some(status) = exited {
-                let took = started.elapsed();
-                anyhow::ensure!(
-                    self.log.drained(LOG_DRAIN_TIMEOUT).await,
-                    "decdn-node exited ({status}) but its log capture did not reach EOF \
-                     within {LOG_DRAIN_TIMEOUT:?}, so its last lines may be missing"
-                );
-                return Ok((status, took));
-            }
-            if started.elapsed() >= timeout {
-                self.stop()
-                    .context("kill decdn-node after its SIGTERM timed out")?;
-                anyhow::bail!(
-                    "decdn-node did not exit within {timeout:?} of SIGTERM; its last \
-                     {LOG_TAIL_LINES} lines:\n{}",
-                    self.log.tail(LOG_TAIL_LINES)
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        self.wait_for_exit(timeout, "SIGTERM").await
     }
 
     /// Point the daemon at the `PaymentPool` at `payment_pool` and at
@@ -749,20 +722,42 @@ impl NodeFixture {
     /// daemon still running at `timeout` is killed and reaped, and the call
     /// fails with the daemon's last log lines.
     ///
-    /// It returns only once the log capture has read both pipes to EOF, so a
-    /// [`Self::log_line`] after it sees every line the failed bring-up wrote.
+    /// It returns `Ok` only once the log capture has read both pipes to EOF, so
+    /// a [`Self::log_line`] after it sees every line the failed bring-up wrote.
     pub async fn respawn_expecting_exit(
         &self,
         timeout: Duration,
     ) -> anyhow::Result<std::process::ExitStatus> {
-        // `wait()` reaps the old process so it has released its ports before the
-        // replacement binds them.
-        {
-            let mut child = self.child.0.lock().unwrap_or_else(PoisonError::into_inner);
-            let _ = child.kill();
-            let _ = child.wait();
-            *child = spawn_daemon(&self.config_path, self.data_dir.path(), &self.log)?;
-        }
+        self.respawn_child()?;
+        let (status, _) = self.wait_for_exit(timeout, "its respawn").await?;
+        Ok(status)
+    }
+
+    /// Kill and reap the current daemon, then spawn a new one against the same
+    /// config and data dir. The guard lock is held only for this swap, never
+    /// across an await. Reaping first means the old process has released its
+    /// ports before the replacement binds them; a stopped daemon is already
+    /// reaped, and `kill` and `wait` both answer `Ok` for it.
+    fn respawn_child(&self) -> anyhow::Result<()> {
+        let mut child = self.child.0.lock().unwrap_or_else(PoisonError::into_inner);
+        child.kill().context("kill decdn-node before its respawn")?;
+        child.wait().context("reap decdn-node before its respawn")?;
+        *child = spawn_daemon(&self.config_path, self.data_dir.path(), &self.log)?;
+        Ok(())
+    }
+
+    /// Poll the daemon until it exits, up to `timeout` after `event` (named in
+    /// the timeout error), and return its exit status and how long it took.
+    ///
+    /// On exit it requires the log capture to read both pipes to EOF. A daemon
+    /// still running at `timeout` is killed and reaped, its log drained, and
+    /// the call fails with its last log lines; a failed kill is added to that
+    /// error, not reported instead of it.
+    async fn wait_for_exit(
+        &self,
+        timeout: Duration,
+        event: &str,
+    ) -> anyhow::Result<(std::process::ExitStatus, Duration)> {
         let started = tokio::time::Instant::now();
         loop {
             // The guard lock is held only for the non-blocking `try_wait`, never
@@ -772,21 +767,31 @@ impl NodeFixture {
                 child.try_wait().context("poll decdn-node for exit")?
             };
             if let Some(status) = exited {
+                let took = started.elapsed();
                 anyhow::ensure!(
                     self.log.drained(LOG_DRAIN_TIMEOUT).await,
                     "decdn-node exited ({status}) but its log capture did not reach EOF \
                      within {LOG_DRAIN_TIMEOUT:?}, so its last lines may be missing"
                 );
-                return Ok(status);
+                return Ok((status, took));
             }
             if started.elapsed() >= timeout {
-                self.stop()
-                    .context("kill decdn-node after it outlived its expected exit")?;
-                anyhow::bail!(
-                    "decdn-node did not exit within {timeout:?} of its respawn; its last \
-                     {LOG_TAIL_LINES} lines:\n{}",
+                let stopped = self.stop();
+                let drained = self.log.drained(LOG_DRAIN_TIMEOUT).await;
+                let mut message = format!(
+                    "decdn-node did not exit within {timeout:?} of {event}; its last \
+                     {LOG_TAIL_LINES} lines{}:\n{}",
+                    if drained {
+                        ""
+                    } else {
+                        " (log capture not drained)"
+                    },
                     self.log.tail(LOG_TAIL_LINES)
                 );
+                if let Err(err) = stopped {
+                    let _ = write!(message, "\nkilling it afterwards also failed: {err:#}");
+                }
+                anyhow::bail!(message);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

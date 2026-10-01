@@ -915,14 +915,15 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
-- **The deployment preflight rejects a `FeeRouter` or `BuybackBurner`
-  address (#2279).** Startup identified `blockchain.payment_pool_address` by
-  calling `usdc()`, which `FeeRouter` and `BuybackBurner` also answer. A node
-  pointed at either one passed the preflight, then dropped its seller lane
-  state and forfeited the unredeemed vouchers. The probe is now
-  `PaymentPool.feeRouter()`, which no sibling contract has, so the node exits
-  before the lane store opens. The startup error now names
-  `PaymentPool.feeRouter()`.
+- **The deployment preflight rejects every sibling contract of the
+  `PaymentPool` (#2279).** Startup identified `blockchain.payment_pool_address`
+  by calling `usdc()`, which `FeeRouter` and `BuybackBurner` also answer. A
+  node pointed at either one passed the preflight, then dropped its seller
+  lane state and forfeited the unredeemed vouchers. The probe is now
+  `PaymentPool.getRateBounds()`, which only `PaymentPool` declares
+  (`feeRouter()` would not do: `DecdnGovernor` answers it too), so the node
+  exits before the lane store opens. The startup error now names
+  `PaymentPool.getRateBounds()`.
 
 - **Chain-read logs no longer carry the RPC URL (#2264).** The node's
   binding check, buyer lane seed, owned-pool walk, top-up, pool open and
