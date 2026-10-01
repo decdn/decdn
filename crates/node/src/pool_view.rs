@@ -90,6 +90,58 @@ pub struct PoolStatus {
     pub lifecycle: Lifecycle,
 }
 
+/// A voucher signer's on-chain authorization in one pool, as the admit path reads
+/// it from `getAuthorization` (ADR 003 §Capability delegation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignerAuthorization {
+    /// The signer holds no registration (the all-zero `Authorization`). Its first
+    /// redemption registers whichever owner-signed capability lands first.
+    Unregistered,
+    /// The signer is registered. `cap` and `expiry` are write-once on-chain, so
+    /// they never change for this `(pool, signer)`; `spent` only grows.
+    Registered {
+        /// The registered spending cap, in micro-USDC.
+        cap: u64,
+        /// The registered expiry, in Unix seconds. The chain treats a voucher at
+        /// or past it as unredeemable.
+        expiry: u64,
+        /// What the signer has redeemed across every provider, in micro-USDC.
+        spent: u64,
+    },
+}
+
+impl SignerAuthorization {
+    /// Classify a raw `getAuthorization` result. The contract marks a signer
+    /// registered when `cap != 0 || expiry != 0`, so a registration with a zero
+    /// `cap` but a non-zero `expiry` is registered with no headroom.
+    #[must_use]
+    pub const fn from_onchain(auth: &PaymentPool::Authorization) -> Self {
+        if auth.cap == 0 && auth.expiry == 0 {
+            Self::Unregistered
+        } else {
+            Self::Registered {
+                cap: auth.cap,
+                expiry: auth.expiry,
+                spent: auth.spent,
+            }
+        }
+    }
+
+    /// Whether the signer can still pay at least `floor_micro` at Unix time `now`.
+    /// An unregistered signer always can: it admits on its presented capability.
+    /// A registered signer needs a live registration and `cap − spent` headroom
+    /// of at least `floor_micro`.
+    #[must_use]
+    pub fn covers(self, floor_micro: U256, now: u64) -> bool {
+        match self {
+            Self::Unregistered => true,
+            Self::Registered { cap, expiry, spent } => {
+                now < expiry && U256::from(cap.saturating_sub(spent)) >= floor_micro
+            }
+        }
+    }
+}
+
 /// A per-request source of [`PoolStatus`]. Trait so the handler holds it behind an
 /// `Arc<dyn PoolView>` and tests pass a fake (or `None`) without a chain.
 #[async_trait::async_trait]
@@ -113,26 +165,31 @@ pub trait PoolView: Send + Sync + std::fmt::Debug {
     }
 
     /// The admit-path signer confirm: the request's voucher `signer` on-chain
-    /// `cap − spent` headroom, in micro-USDC. A signer's `cap` is shared across
-    /// every provider (ADR 003 §Deposit Economics), so a signer that has drawn its
-    /// full `cap` at other nodes is uncashable here and must be refused before a
-    /// serve is admitted.
+    /// authorization in `pool_id` (ADR 003 §Capability delegation, §Pool
+    /// solvency). A signer's `cap` is shared across every provider, so a signer
+    /// that has drawn its full `cap` at other nodes is uncashable here. Its
+    /// registered `cap` and `expiry` are write-once, so they bound every voucher
+    /// whatever capability the client presents.
     ///
-    /// - `Some(u64::MAX)` — no on-chain constraint. An unregistered signer (it has
-    ///   spent nothing on-chain, so it admits on its off-chain capability budget)
-    ///   or no chain wired. Never refuse.
-    /// - `Some(h)` — a registered signer's remaining headroom `cap − spent`.
+    /// - `Some(SignerAuthorization::Unregistered)` — no on-chain constraint. An
+    ///   unregistered signer (it has spent nothing on-chain, so it admits on its
+    ///   presented capability) or no chain wired.
+    /// - `Some(SignerAuthorization::Registered { .. })` — the registered terms and
+    ///   the signer's current `spent`.
     /// - `None` — the on-chain read could not confirm the signer (a
     ///   `getAuthorization` fault). The caller refuses rather than fail open.
     ///
-    /// The default never refuses: the bare [`PoolProjection`] and test doubles hold
-    /// no chain, so the admit path treats every signer as unconstrained. The
-    /// production wrapper
+    /// The default reports every signer unregistered: the bare [`PoolProjection`]
+    /// and test doubles hold no chain. The production wrapper
     /// ([`crate::payment_settlement::ResolvingPoolView`]) overrides it with one
     /// briefly-cached `getAuthorization`.
-    async fn signer_cap_headroom_micro(&self, pool_id: B256, signer: Address) -> Option<u64> {
+    async fn signer_authorization(
+        &self,
+        pool_id: B256,
+        signer: Address,
+    ) -> Option<SignerAuthorization> {
         let _ = (pool_id, signer);
-        Some(u64::MAX)
+        Some(SignerAuthorization::Unregistered)
     }
 
     /// The mid-stream signer-drain read: a `signer`'s total on-chain `spent` across

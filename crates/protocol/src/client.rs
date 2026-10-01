@@ -1179,20 +1179,23 @@ impl StreamError {
 
 /// Why a [`Voucher`] was rejected (ADR 005 §`VoucherRejected` semantics).
 ///
-/// The first seven variants and [`Self::UnderFold`] mirror
-/// `decdn_incentive::PoolError` ∪ `VoucherError` one-to-one; the handler-side
-/// conversion `voucher_reject_reason` matches those exhaustively so a new
-/// `PoolError` variant fails to compile until this enum is extended (ADR 005
-/// §Mirror obligation). The other variants are emitted directly by the
+/// The first seven variants, [`Self::BadPreimage`], and [`Self::UnderFold`]
+/// mirror `decdn_incentive::PoolError` ∪ `VoucherError` one-to-one; the
+/// handler-side conversion `voucher_reject_reason` matches those exhaustively
+/// so a new `PoolError` variant fails to compile until this enum is extended
+/// (ADR 005 §Mirror obligation). The other variants are emitted directly by the
 /// `cdn/client/v1` handler: [`Self::CapabilityExpired`] fires when the signer's
 /// capability has passed its expiry; [`Self::PoolExhausted`] fires when the
-/// pool's remaining deposit can no longer fund further credit; and the four
-/// hash-chain reasons ([`Self::BadPreimage`], [`Self::ChainIndexZero`],
-/// [`Self::UnanchoredPreimage`], [`Self::ChunkPriceMismatch`]) are raised where
-/// the handler holds the per-stream chain anchor a validation enum cannot see;
+/// pool's remaining deposit can no longer fund further credit;
+/// [`Self::SignerCapExhausted`] fires when the signer's shared cap headroom can
+/// no longer cover a serve floor; the three remaining hash-chain reasons
+/// ([`Self::ChainIndexZero`], [`Self::UnanchoredPreimage`],
+/// [`Self::ChunkPriceMismatch`]) are raised where the handler holds the
+/// per-stream chain anchor or quoted rate a validation enum cannot see; and
 /// [`Self::Underpaid`] fires when the span a voucher adds over the lane's
 /// accepted watermark pays below the quoted `rate_per_mb`.
-/// Variant order is frozen — new reasons append at the end.
+/// Variant order is the postcard wire discriminant, so a reorder is a
+/// wire-breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoucherRejectReason {
     /// Signature malformed (corrupted bytes, non-canonical `s`, invalid

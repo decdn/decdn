@@ -75,20 +75,23 @@ pub struct LaneState {
     /// The provider node these vouchers pay. A voucher naming a different
     /// provider is rejected — a capability voucher is scoped to one node.
     pub provider: Address,
-    /// The capability's cumulative spending cap (token base units). Vouchers
-    /// MUST NOT exceed this value.
+    /// The cumulative spending cap the node holds (token base units): the
+    /// presented capability's cap, clamped to the signer's on-chain registration
+    /// once the node reads one ([`Self::clamp_to_registration`]). Vouchers MUST
+    /// NOT exceed this value.
     pub cap: U256,
-    /// Capability expiry (Unix seconds). The node handler holds the clock and
-    /// refuses vouchers at or past this; `0` means "unknown / not tracked".
+    /// The capability expiry the node holds (Unix seconds), clamped like
+    /// [`Self::cap`]. The node handler holds the clock and refuses vouchers at or
+    /// past this; `0` means "unknown / not tracked".
     pub expiry: u64,
     /// The observed on-chain capability expiry for this lane's signer
     /// (`authorized[pool_id][signer].expiry`), in Unix seconds; `0` means
     /// "unknown / not yet registered". The seller redeemer reads it to skip a
-    /// per-lane `getAuthorization` when the registration is already known and
-    /// still live. Not replay-critical (it gates no amount/bytes monotonicity),
-    /// so it is `pub` like `cap`/`expiry` rather than a private `last_*` field.
+    /// `CapabilityReg` when the registration is already known and still live.
+    /// Not replay-critical (it gates no amount/bytes monotonicity), so it is
+    /// `pub` like `cap`/`expiry` rather than a private `last_*` field.
     pub registered_until: u64,
-    /// The owner's EIP-712 signature over this lane's `Capability` (`r‖s‖v`,
+    /// The owner's EIP-712 signature over the presented `Capability` (`r‖s‖v`,
     /// exactly 65 bytes), which the seller redeemer submits as the `ownerSig` of
     /// a `PaymentPool.redeemMany` `CapabilityReg` to register the signer on its
     /// first on-chain redemption (ADR 003 §Capability delegation). `None` until
@@ -297,6 +300,34 @@ impl LaneState {
             last_signature,
             chain,
         }
+    }
+
+    /// Hold the lower of this lane's terms and its signer's on-chain registration
+    /// (ADR 003 §Capability delegation). On-chain registration is write-once per
+    /// `(pool, signer)`, so a voucher past the registered `cap` or `expiry`
+    /// redeems to nothing whatever capability the client presented. `cap` and
+    /// `expiry` are the registered `authorized[pool_id][signer]` terms; the lane
+    /// keeps `min(held, registered)` for each and records the registered expiry
+    /// as `registered_until`. Returns whether any field changed.
+    ///
+    /// The chain reads a registered `expiry` of `0` as already expired, while a
+    /// lane `expiry` of `0` means "not tracked". The clamp therefore holds such a
+    /// registration as expiry `1`, a moment that is always past.
+    ///
+    /// A clamped lane holds terms its `owner_sig` does not cover. That is sound:
+    /// the clamp runs only for a registered signer, and on-chain registration
+    /// returns before it checks the signature of a registered signer.
+    pub fn clamp_to_registration(&mut self, cap: u64, expiry: u64) -> bool {
+        let before = (self.cap, self.expiry, self.registered_until);
+        self.cap = self.cap.min(U256::from(cap));
+        let held_expiry = expiry.max(1);
+        self.expiry = if self.expiry == 0 {
+            held_expiry
+        } else {
+            self.expiry.min(held_expiry)
+        };
+        self.registered_until = self.registered_until.max(expiry);
+        before != (self.cap, self.expiry, self.registered_until)
     }
 
     /// This lane's persistence key.
@@ -1108,6 +1139,60 @@ mod tests {
         // stage_voucher clones self; the clone must carry registered_until forward.
         let cloned = with_reg.clone();
         assert_eq!(cloned.registered_until, 1_800_000_000);
+    }
+
+    fn lane_with_terms(cap: u64, expiry: u64) -> LaneState {
+        LaneState::hydrate(
+            B256::ZERO,
+            Address::ZERO,
+            Address::ZERO,
+            U256::from(cap),
+            expiry,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+            LaneChain::NONE,
+        )
+    }
+
+    /// A presented capability wider than the registration holds the registered
+    /// terms; one narrower keeps its own (#2265).
+    #[test]
+    fn clamp_to_registration_holds_the_lower_terms() {
+        let mut wider = lane_with_terms(5_000_000, 2_000);
+        assert!(wider.clamp_to_registration(40, 1_000));
+        assert_eq!(wider.cap, U256::from(40u64));
+        assert_eq!(wider.expiry, 1_000);
+        assert_eq!(wider.registered_until, 1_000);
+
+        let mut narrower = lane_with_terms(10, 500);
+        assert!(narrower.clamp_to_registration(40, 1_000));
+        assert_eq!(narrower.cap, U256::from(10u64));
+        assert_eq!(narrower.expiry, 500);
+        assert_eq!(
+            narrower.registered_until, 1_000,
+            "the registration is recorded"
+        );
+
+        assert!(
+            !narrower.clamp_to_registration(40, 1_000),
+            "the same registration again changes nothing"
+        );
+    }
+
+    /// A lane expiry of `0` means untracked; the clamp takes the registered
+    /// expiry. A registered expiry of `0` is already expired on-chain, so the
+    /// lane holds a past expiry rather than the untracked `0`.
+    #[test]
+    fn clamp_to_registration_maps_the_zero_expiries() {
+        let mut untracked = lane_with_terms(100, 0);
+        untracked.clamp_to_registration(100, 1_000);
+        assert_eq!(untracked.expiry, 1_000);
+
+        let mut expired = lane_with_terms(100, 0);
+        expired.clamp_to_registration(100, 0);
+        assert_eq!(expired.expiry, 1, "a zero registered expiry holds as past");
+        assert_eq!(expired.registered_until, 0);
     }
 
     /// `PoolStateStore` whose `record` always errors. Proves the
