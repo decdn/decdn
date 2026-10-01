@@ -2020,8 +2020,8 @@ pub struct DecdnMetrics {
     /// `decdn_chain_get_logs_deferred_total` (#2253): `eth_getLogs` windows
     /// that failed every in-tick retry, so the poller ended the tick there and
     /// resumed the window on the next tick. A deferral is not watcher downtime;
-    /// the tick fails, and the watchers go down, only when no window succeeds
-    /// for the stall budget (2 min).
+    /// the tick fails, and the watchers go down, only when no tick has reached
+    /// head for the stall budget (2 min).
     pub chain_get_logs_deferred: Counter,
     /// `decdn_chain_boot_read_retries_total` (#2159): retries of a boot-time
     /// chain read (the registry, slash, `usdc()` self-check and blacklist

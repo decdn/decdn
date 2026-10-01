@@ -97,10 +97,11 @@
 //!
 //! A deferred tick that completed a window is a success that ended early: it
 //! reconciles and fires every route's hooks. A deferred tick that completed no
-//! window fires no hook, so no tick gauge or freshness stamp moves. The tick
-//! fails through [`fail_whole_tick`] only when no window has completed for
-//! [`GET_LOGS_STALL_BUDGET`]. Any tick that completes a window or reaches head
-//! clears the stall clock.
+//! window fires no hook, so no tick gauge or freshness stamp moves. A stall
+//! clock starts at the first deferred tick and clears only when a tick reaches
+//! head, so progress that keeps falling behind head cannot hide behind the
+//! early successes. A deferred tick fails through [`fail_whole_tick`] once no
+//! tick has reached head for [`GET_LOGS_STALL_BUDGET`].
 //!
 //! The runtime registers each `eth_getLogs` watcher's [`Route`] on one
 //! poller in `build_chain_and_handlers` and spawns it once — one merged loop in
@@ -307,10 +308,9 @@ pub struct MultiplexedPoller {
     /// Called each time a window fails every retry and the tick defers it to
     /// the next tick (see the module doc's "Deferred windows").
     on_window_deferred: Option<WatcherHook>,
-    /// When the poller last stopped making progress: set by the first deferred
-    /// tick that completes no window, cleared by any tick that completes a
-    /// window or reaches head. A stall older than [`GET_LOGS_STALL_BUDGET`]
-    /// fails the tick.
+    /// When the poller stopped reaching head: set by the first deferred tick,
+    /// cleared only by a tick that reaches head. A stall older than
+    /// [`GET_LOGS_STALL_BUDGET`] fails the tick.
     stalled_since: Option<tokio::time::Instant>,
     initial_backoff: Duration,
     /// Ceiling for the shared loop's backoff. One loop serves every route, so
@@ -786,13 +786,13 @@ const GET_LOGS_WINDOW_RETRIES: u32 = 2;
 /// until the backend catches up, so an immediate retry often fails again.
 const GET_LOGS_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-/// How long the poller may defer windows without completing one before a tick
-/// fails (see the module doc's "Deferred windows"). It is a duration, not a
-/// tick count, because a deferred tick lasts from about 11 s (the poll interval
-/// plus the retry sleeps) to about 41 s (three call timeouts plus the sleeps).
-/// It stays below the 180 s after which the `*WatcherStalled` alerts fire on a
-/// tick gauge that no deferred tick stamps, so a real stall enters backoff
-/// before those alerts fire.
+/// How long the poller may defer windows without a tick that reaches head
+/// before a tick fails (see the module doc's "Deferred windows"). It is a
+/// duration, not a tick count, because a deferred tick lasts from about 11 s
+/// (the poll interval plus the retry sleeps) to about 41 s (three call timeouts
+/// plus the sleeps). It stays below the 180 s after which the
+/// `*WatcherStalled` alerts fire on a stale tick gauge, so a poller that makes
+/// no progress enters backoff before those alerts fire.
 const GET_LOGS_STALL_BUDGET: Duration = Duration::from_mins(2);
 /// Whether a failed `get_logs` window is worth a retry on the same block
 /// range inside the tick. A range rejection is not: it takes the shrink path
@@ -969,8 +969,9 @@ async fn fetch_window_logs<P: Provider + Clone>(
 /// `get_logs` failure retries the same window (see "Transient window
 /// failures"). A window that fails every retry ends the tick early (see
 /// "Deferred windows"). Returns `Err` if the shared head/floor reads fail, if a
-/// `get_logs` window fails in a way that is not retried, if no window has
-/// completed for [`GET_LOGS_STALL_BUDGET`], or if any route errored
+/// `get_logs` window fails in a way that is not retried, if a window is
+/// deferred after no tick has reached head for [`GET_LOGS_STALL_BUDGET`], or
+/// if any route errored
 /// applying a log or reconciling — either way the *loop* backs off, but a
 /// route that itself succeeded this tick has already advanced and persisted.
 async fn run_tick<P: Provider + Clone>(
@@ -1050,25 +1051,29 @@ async fn run_tick<P: Provider + Clone>(
         start = end + 1;
     }
 
-    // A deferred tick that completed no window fires no hook: nothing moved, so
-    // no tick gauge or freshness stamp is earned. It fails only once the stall
-    // outlasts its budget.
-    if let Some(err) = deferred
-        && !progressed
-    {
+    // A deferred tick did not reach head. The stall clock runs from the first
+    // such tick and clears only when a tick reaches head, so sparse progress
+    // cannot hide a lag that keeps growing. Past the budget the tick fails,
+    // with the completed windows already persisted.
+    if let Some(err) = deferred {
         let since = *poller
             .stalled_since
             .get_or_insert_with(tokio::time::Instant::now);
         if since.elapsed() >= GET_LOGS_STALL_BUDGET {
             let err = err.context(format!(
-                "no eth_getLogs window succeeded for {} s",
+                "no poll tick reached head for {} s",
                 GET_LOGS_STALL_BUDGET.as_secs()
             ));
             return Err(fail_whole_tick(poller, shutdown, err));
         }
-        return Ok(());
+        // A deferred tick that completed no window fires no hook: nothing moved,
+        // so no tick gauge or freshness stamp is earned.
+        if !progressed {
+            return Ok(());
+        }
+    } else {
+        poller.stalled_since = None;
     }
-    poller.stalled_since = None;
 
     notify_recovered_routes(poller, shutdown);
     reconcile_routes(poller).await;
@@ -3256,7 +3261,7 @@ mod tests {
         assert!(poller.stalled_since.is_some(), "the stall clock starts");
     }
 
-    /// Deferred ticks that complete no window for `GET_LOGS_STALL_BUDGET` fail
+    /// Deferred ticks that do not reach head for `GET_LOGS_STALL_BUDGET` fail
     /// the tick: the error names the stall, and every route backs off.
     #[tokio::test(start_paused = true)]
     async fn a_stall_past_the_budget_fails_the_tick() {
@@ -3286,7 +3291,7 @@ mod tests {
         let err = second.err().map(|e| format!("{e:#}"));
         assert!(
             err.as_ref()
-                .is_some_and(|e| e.contains("no eth_getLogs window succeeded")),
+                .is_some_and(|e| e.contains("no poll tick reached head")),
             "a stall past the budget fails the tick: {err:?}"
         );
         assert_eq!(deferred.load(Ordering::SeqCst), 2);
@@ -3298,10 +3303,65 @@ mod tests {
         );
     }
 
-    /// A tick that completes a window clears the stall clock, so a later
-    /// deferral starts a fresh budget.
+    /// Ticks that each complete a window but stop short of head do not clear
+    /// the stall clock: past the budget the tick fails, with the completed
+    /// window already persisted. Sparse progress cannot hide a growing lag.
     #[tokio::test(start_paused = true)]
-    async fn a_completed_window_restarts_the_stall_clock() {
+    async fn progress_short_of_head_does_not_restart_the_stall_clock() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let Some(RetryPoller {
+            mut poller,
+            backoff,
+            store,
+            ..
+        }) = retry_poller(provider.clone(), 10)
+        else {
+            return;
+        };
+
+        // Tick 1: [1,10] completes, [11,20] is deferred. Tick 2, past the
+        // budget: [11,20] completes, [21,30] is deferred and the tick fails.
+        asserter.push_success(&U64::from(20));
+        asserter.push_success(&Vec::<Log>::new());
+        for _ in 0..3 {
+            push_rpc_failure(&asserter, 19, "Temporary internal error. Please retry");
+        }
+        asserter.push_success(&U64::from(40));
+        asserter.push_success(&Vec::<Log>::new());
+        for _ in 0..3 {
+            push_rpc_failure(&asserter, 19, "Temporary internal error. Please retry");
+        }
+
+        let first = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(first.is_ok(), "tick 1 defers after progress: {first:?}");
+        tokio::time::advance(GET_LOGS_STALL_BUDGET).await;
+        let second = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        let err = second.err().map(|e| format!("{e:#}"));
+        assert!(
+            err.as_ref()
+                .is_some_and(|e| e.contains("no poll tick reached head")),
+            "progress short of head still fails past the budget: {err:?}"
+        );
+        assert_eq!(backoff.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            poller.routes.first().and_then(|r| r.cursor),
+            Some(21),
+            "the window completed before the failure stays applied"
+        );
+        assert_eq!(
+            store
+                .load_checkpoint(CheckpointKey::PoolOpened)
+                .ok()
+                .flatten(),
+            Some(20)
+        );
+    }
+
+    /// A tick that reaches head clears the stall clock, so a later deferral
+    /// starts a fresh budget.
+    #[tokio::test(start_paused = true)]
+    async fn reaching_head_restarts_the_stall_clock() {
         let asserter = alloy::providers::mock::Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         let Some(RetryPoller {
@@ -3334,7 +3394,7 @@ mod tests {
         assert_eq!(poller.routes.first().and_then(|r| r.cursor), Some(21));
         assert!(
             poller.stalled_since.is_none(),
-            "progress clears the stall clock"
+            "reaching head clears the stall clock"
         );
         tokio::time::advance(GET_LOGS_STALL_BUDGET).await;
         let third = run_tick(&provider, &mut poller, &no_shutdown()).await;
@@ -3515,8 +3575,8 @@ mod tests {
             "a completed window earns the stamp"
         );
         assert!(
-            poller.stalled_since.is_none(),
-            "progress leaves no stall clock"
+            poller.stalled_since.is_some(),
+            "a tick that stops short of head starts the stall clock"
         );
         assert!(
             poller.routes.iter().all(|r| r.established),

@@ -196,7 +196,7 @@ groups:
             (decdn_chain_get_logs_retries_total). A window that fails every
             retry ends the tick early, and the next tick resumes there
             (decdn_chain_get_logs_deferred_total). Such failures fail the tick
-            only when no window succeeds for 2 minutes. A tick can also
+            only when no tick reaches head for 2 minutes. A tick can also
             fail on the head read, on a checkpoint load, on a rate limit or a
             permanent RPC error (neither is retried), or on a watcher's own
             apply or reconcile error.

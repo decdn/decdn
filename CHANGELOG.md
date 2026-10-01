@@ -924,9 +924,11 @@ since project inception and will roll into the first tagged release.
 
 - **A transient `getAuthorization` fault no longer refuses a paying signer as
   cap-exhausted (#2220).** When the admit-time read faults, the node answers
-  with the last authorization it read for that signer, whatever its age, with
-  `spent` raised to the settlement projection's fold. A signer the node has
-  never read is still refused, now as `pool_unconfirmed`
+  with the last registration it read for that signer, whatever its age, with
+  `spent` raised to the settlement projection's fold. A registration's cap and
+  expiry are write-once, so the old read stays true; an old "unregistered"
+  read is not trusted, because a registration can land at any time. A signer
+  with no registered read is still refused, now as `pool_unconfirmed`
   (`decdn_serve_stream_rejected_pool_unconfirmed_total`), so
   `decdn_serve_stream_rejected_signer_cap_exhausted_total` counts only signers
   whose on-chain cap cannot pay a floor.
@@ -945,8 +947,9 @@ since project inception and will roll into the first tagged release.
   tick. The poller ends the tick there, keeps the progress of the windows
   before it, and the next tick resumes at the deferred window. The tick fails
   (backoff, `*_watcher_restarts_total`, `*_watcher_down_seconds`) only when no
-  window completes for 2 minutes. A deferred tick that completes no window
-  does not stamp the watchers' tick gauges. New counter:
+  tick reaches head for 2 minutes, so ticks that progress but keep falling
+  behind head still surface. A deferred tick that completes no window does
+  not stamp the watchers' tick gauges. New counter:
   `decdn_chain_get_logs_deferred_total`, plotted on the chain dashboard's
   "eth_getLogs window span" panel.
 

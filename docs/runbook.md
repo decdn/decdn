@@ -154,8 +154,8 @@ becomes scrapeable once boot completes.
   progress before it, and resumes there on the next tick, logging
   `eth_getLogs window failed on every retry; deferring it to the next tick` at
   `info`. A deferral is not watcher downtime and loses no event. The tick
-  fails, and the watchers go down, only when no window succeeds for 2 minutes
-  (`no eth_getLogs window succeeded for 120 s`). A steady deferral rate with
+  fails, and the watchers go down, only when no tick reaches head for 2
+  minutes (`no poll tick reached head for 120 s`). A steady deferral rate with
   healthy watchers is a provider whose failures cluster: the watchers lag head
   by a few ticks but stay up.
 - `multiplexed poller tick error` `warn!` lines on `get_logs` while
@@ -175,8 +175,9 @@ becomes scrapeable once boot completes.
   the cause, check `decdn_chain_get_logs_range_rejections_total` for an
   `eth_getLogs` cap, and check `decdn_chain_get_logs_deferred_total` for a
   provider whose failures outlast the in-tick retries. A deferred window fails
-  the tick only after 2 minutes with no window completed, so flapping means
-  the provider fails every call for minutes at a time.
+  the tick only after 2 minutes with no tick reaching head, so flapping means
+  the provider fails often enough, for minutes at a time, that the watchers
+  cannot catch up to head.
 
 - `decdn_staker_set_watcher_down_seconds` climbing (with
   `decdn_staker_set_watcher_restarts_total` advancing) is the chain-side
