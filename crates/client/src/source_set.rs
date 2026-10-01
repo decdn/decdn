@@ -87,6 +87,12 @@ pub struct LaneRange {
 /// bars it from pull-through ([`SourceSet::no_pull_through`]).
 pub const ABSENT_AFTER_NOT_FOUND: u32 = 3;
 
+/// How long a bar from pull-through set by `NotFound` answers lasts. A node
+/// also answers `NotFound` when it sheds miss load or its chain view is stale,
+/// so the bar ends after the longest cooldown and the holder takes one
+/// uncovered range again as a probe.
+pub const PULL_THROUGH_BAR: Duration = crate::health::COOL_CAP;
+
 /// Where a [`SourceSet`] finds holders and builds their lanes.
 pub trait SourceProvider: Send + Sync {
     /// The paid source a built lane fetches from.
@@ -203,9 +209,16 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// cannot change the bar. A tie goes to the refusal.
     pull_through_served_at: HashMap<Address, Instant>,
     /// Probed partial holders that said `NotFound` to
-    /// [`ABSENT_AFTER_NOT_FOUND`] ranges outside their coverage. Each one
-    /// serves only the blocks it covers.
-    no_pull_through: HashSet<Address>,
+    /// [`ABSENT_AFTER_NOT_FOUND`] ranges outside their coverage, each with
+    /// the time its bar ends ([`PULL_THROUGH_BAR`] after the refusal that set
+    /// it). Each one serves only the blocks it covers until then.
+    no_pull_through: HashMap<Address, Instant>,
+    /// How many times in a row each probed partial holder has been barred
+    /// from pull-through. A first bar can come from transient refusals that
+    /// also read as `NotFound` (load shed, a stale chain view), so only a
+    /// holder barred again after its probe counts as one that cannot serve
+    /// the work left.
+    pull_through_bars: HashMap<Address, u32>,
     /// Probed partial holders that refused the blob as larger than their size
     /// ceiling. The ceiling is a stable node policy (ADR 005), so neither a
     /// verified byte nor a rediscovery lifts this bar. Each one serves only
@@ -265,7 +278,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             pull_through_not_found: HashMap::new(),
             pull_through_refused_at: HashMap::new(),
             pull_through_served_at: HashMap::new(),
-            no_pull_through: HashSet::new(),
+            no_pull_through: HashMap::new(),
+            pull_through_bars: HashMap::new(),
             too_large_pull_through: HashSet::new(),
             too_large: HashSet::new(),
             last_absent: None,
@@ -519,8 +533,30 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         if *count < ABSENT_AFTER_NOT_FOUND {
             return;
         }
-        let newly = self.no_pull_through.insert(provider);
+        let until = at.checked_add(PULL_THROUGH_BAR).unwrap_or(at);
+        let newly = self.no_pull_through.insert(provider, until).is_none();
+        if newly {
+            let bars = self.pull_through_bars.entry(provider).or_insert(0);
+            *bars = bars.saturating_add(1);
+        }
         self.marked(newly, refused);
+    }
+
+    /// Lift each `NotFound` bar from pull-through whose time ended by `now`,
+    /// and restart its holder's count of refusals. The holder takes one
+    /// uncovered range again as a probe; [`ABSENT_AFTER_NOT_FOUND`] more
+    /// refusals bar it again. A size-ceiling bar does not end.
+    pub fn expire_pull_through_bars(&mut self, now: Instant) {
+        let ended: Vec<Address> = self
+            .no_pull_through
+            .iter()
+            .filter(|&(_, until)| *until <= now)
+            .map(|(provider, _)| *provider)
+            .collect();
+        for provider in ended {
+            self.no_pull_through.remove(&provider);
+            self.pull_through_not_found.remove(&provider);
+        }
     }
 
     /// Record `refused` as the cause of a mark that excludes a source, and
@@ -559,17 +595,20 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         self.pull_through_not_found.remove(&provider);
         self.pull_through_refused_at.remove(&provider);
         self.no_pull_through.remove(&provider);
+        self.pull_through_bars.remove(&provider);
     }
 
     /// Whether `provider` is barred from pull-through: a probed partial
     /// holder that said `NotFound` to [`ABSENT_AFTER_NOT_FOUND`] ranges
-    /// outside its coverage with no such range served since, or that refused
-    /// the blob as too large. It still serves the blocks it covers and takes
-    /// no range outside them. A discovery that reports wider coverage for it
+    /// outside its coverage, with no such range served since and its bar not
+    /// yet ended ([`Self::expire_pull_through_bars`]), or that refused the
+    /// blob as too large. It still serves the blocks it covers and takes no
+    /// range outside them. A discovery that reports wider coverage for it
     /// clears a `NotFound` bar; a size-ceiling bar stays for the blob.
     #[must_use]
     pub fn no_pull_through(&self, provider: Address) -> bool {
-        self.no_pull_through.contains(&provider) || self.too_large_pull_through.contains(&provider)
+        self.no_pull_through.contains_key(&provider)
+            || self.too_large_pull_through.contains(&provider)
     }
 
     /// Whether a discovery should run now.
@@ -663,7 +702,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             .map(|b| b.next_at)
             .filter(|t| *t > now);
         let discovery = self.discovery.map(|b| b.next_at).filter(|t| *t > now);
-        cooling.chain(builds).chain(discovery).min()
+        let bars = self.no_pull_through.values().copied().filter(|t| *t > now);
+        cooling.chain(builds).chain(discovery).chain(bars).min()
     }
 
     /// The unanimous stop, if a discovery ran at this deposit and mark epoch and:
@@ -727,13 +767,20 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// Whether `provider` can serve none of the work left: it says the blob is
-    /// absent, it refused the blob as too large, or it is barred from
-    /// pull-through and `only_uncovered_left` says no work left lies inside
-    /// the coverage of a barred holder.
+    /// absent, it refused the blob as too large, or `only_uncovered_left` says
+    /// no work left lies inside the coverage of a barred holder and the holder
+    /// is barred for good: by a size-ceiling refusal, or by `NotFound` again
+    /// after the probe that followed its first bar.
     fn cannot_serve(&self, provider: Address, only_uncovered_left: bool) -> bool {
+        let barred_for_good = self.too_large_pull_through.contains(&provider)
+            || (self.no_pull_through.contains_key(&provider)
+                && self
+                    .pull_through_bars
+                    .get(&provider)
+                    .is_some_and(|bars| *bars >= 2));
         self.absent.contains(&provider)
             || self.too_large.contains(&provider)
-            || (only_uncovered_left && self.no_pull_through(provider))
+            || (only_uncovered_left && barred_for_good)
     }
 
     /// Whether `provider`'s health says it is priced out at `deposit`.
@@ -761,6 +808,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                     self.pull_through_not_found.remove(&holder.provider);
                     self.pull_through_refused_at.remove(&holder.provider);
                     self.no_pull_through.remove(&holder.provider);
+                    self.pull_through_bars.remove(&holder.provider);
                 }
             }
             match self
@@ -1287,6 +1335,45 @@ mod tests {
         assert!(set.no_pull_through(A), "refusals after the byte count");
     }
 
+    /// A `NotFound` bar ends [`super::PULL_THROUGH_BAR`] after the refusal
+    /// that set it, and the count restarts: the holder takes an uncovered
+    /// range again, and [`super::ABSENT_AFTER_NOT_FOUND`] more refusals bar it
+    /// again. The loop wakes when a bar ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_not_found_bar_ends_after_its_time_and_the_count_restarts() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![partial(A, 10.0, &[0])]);
+        let now = Instant::now();
+        say_not_found_in(
+            &mut set,
+            A,
+            block1(true),
+            super::ABSENT_AFTER_NOT_FOUND,
+            now,
+        );
+        let ends = now + super::PULL_THROUGH_BAR;
+        let just_before = now + super::PULL_THROUGH_BAR.saturating_sub(Duration::from_millis(1));
+        assert_eq!(
+            set.next_wake(just_before),
+            Some(ends),
+            "once its cooldown passes, the loop wakes when the bar ends"
+        );
+        set.expire_pull_through_bars(just_before);
+        assert!(set.no_pull_through(A), "not yet");
+        set.expire_pull_through_bars(ends);
+        assert!(!set.no_pull_through(A), "the bar ends");
+        say_not_found_in(
+            &mut set,
+            A,
+            block1(true),
+            super::ABSENT_AFTER_NOT_FOUND - 1,
+            ends,
+        );
+        assert!(!set.no_pull_through(A), "the count restarted");
+        say_not_found_in(&mut set, A, block1(true), 1, ends);
+        assert!(set.no_pull_through(A), "barred again");
+    }
+
     /// A size-ceiling bar on a partial holder stays for the blob: neither an
     /// uncovered byte nor a rediscovery with wider coverage lifts it.
     #[tokio::test(start_paused = true)]
@@ -1300,6 +1387,8 @@ mod tests {
         assert!(set.no_pull_through(A), "an uncovered byte keeps it");
         set.discovery_done(Ok(vec![partial(A, 10.0, &[0, 1])]), now, U256::ZERO);
         assert!(set.no_pull_through(A), "wider coverage keeps it");
+        set.expire_pull_through_bars(now + super::PULL_THROUGH_BAR * 10);
+        assert!(set.no_pull_through(A), "time does not end it");
     }
 
     /// A holder of the whole blob is never barred: no range lies outside its
@@ -1361,6 +1450,21 @@ mod tests {
             "no discovery since the bar"
         );
         set.discovery_done(Ok(vec![]), now, U256::ZERO);
+        assert!(
+            set.exhausted(U256::ZERO, true, true).is_none(),
+            "a first bar may come from load shed: the holder gets its probe"
+        );
+        let later = now + super::PULL_THROUGH_BAR;
+        set.expire_pull_through_bars(later);
+        assert!(!set.no_pull_through(A), "the bar ends");
+        say_not_found_in(
+            &mut set,
+            A,
+            block1(true),
+            super::ABSENT_AFTER_NOT_FOUND,
+            later,
+        );
+        set.discovery_done(Ok(vec![]), later, U256::ZERO);
         assert!(
             set.exhausted(U256::ZERO, true, false).is_none(),
             "work inside its coverage is left"

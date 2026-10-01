@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn an_over_cap_blob_ends_only_its_item() {
         let err = anyhow::Error::new(BlobTooLarge {
-            received: 1 << 40,
+            reached: 1 << 40,
             ceiling: 1 << 20,
         });
         assert_eq!(classify(&err), Fault::Fatal(FatalScope::Item));

@@ -4929,7 +4929,7 @@ mod tests {
     #[test]
     fn an_over_cap_blob_fails_only_its_entry() {
         let err = anyhow::Error::new(decdn_client::BlobTooLarge {
-            received: 2,
+            reached: 2,
             ceiling: 1,
         });
         assert_eq!(entry_scope(&err), decdn_client::FatalScope::Item);
@@ -5049,7 +5049,7 @@ mod tests {
             |i| async move {
                 if i == 1 {
                     Err(anyhow::Error::new(decdn_client::BlobTooLarge {
-                        received: 2,
+                        reached: 2,
                         ceiling: 1,
                     }))
                 } else {

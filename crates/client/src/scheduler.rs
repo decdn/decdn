@@ -2239,7 +2239,7 @@ where
     if cap > 0 && first_bound > cap {
         // Only a proven size is past the cap after the clamp above.
         return Err(anyhow::Error::new(crate::BlobTooLarge {
-            received: first_bound,
+            reached: first_bound,
             ceiling: cap,
         }));
     }
@@ -2383,7 +2383,7 @@ where
                     // A cap off the chunk-group grid lets a leg that ends at
                     // it prove a size up to one group past it.
                     let too_large = crate::BlobTooLarge {
-                        received: proven,
+                        reached: proven,
                         ceiling: cap,
                     };
                     return Err(anyhow::Error::new(too_large));
@@ -2398,7 +2398,7 @@ where
                 // means the blob holds bytes past it.
                 if cap > 0 && bound >= cap {
                     let too_large = crate::BlobTooLarge {
-                        received: bound.saturating_add(1),
+                        reached: bound.saturating_add(1),
                         ceiling: cap,
                     };
                     return Err(anyhow::Error::new(too_large));
@@ -2438,8 +2438,10 @@ where
             let room = max_lanes.saturating_sub(busy.len());
             let starts = {
                 let mut w = work.lock().await;
-                // A fault, a delivery or a discovery may have set or lifted a
-                // source's bar from pull-through since the last pass.
+                // A fault, a delivery, a discovery or the end of a bar's time
+                // may have set or lifted a source's bar from pull-through since
+                // the last pass.
+                sources.expire_pull_through_bars(now);
                 for (&provider, &slot) in &slots {
                     w.set_no_uncovered(slot, sources.no_pull_through(provider));
                 }
@@ -5329,9 +5331,9 @@ mod tests {
     }
 
     /// A partial holder that keeps refusing a block outside its coverage is
-    /// asked for it at most [`ABSENT_AFTER_NOT_FOUND`] times. Its node cannot
-    /// serve the block by pull-through, so it is barred from it, and the
-    /// whole holder serves the block once its lane builds.
+    /// asked for it at most [`ABSENT_AFTER_NOT_FOUND`] times while its bar
+    /// lasts. Its node cannot serve the block by pull-through, so it is barred
+    /// from it, and the whole holder serves the block once its lane builds.
     ///
     /// [`ABSENT_AFTER_NOT_FOUND`]: crate::source_set::ABSENT_AFTER_NOT_FOUND
     #[tokio::test(start_paused = true)]
@@ -5350,15 +5352,15 @@ mod tests {
         let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
         let root = src_a.root();
         let (store, dir) = fresh_store(root, total);
-        // B's lane takes five minutes to build: without the bar, A would be
-        // asked for block 1 again each time its cooldown ends.
+        // B's lane builds just inside the bar's time: without the bar, A
+        // would be asked for block 1 again each time its cooldown ends.
         let provider = SlowBuild {
             lanes: StaticSources::new(vec![
                 candidate(src_a.clone(), ledger_a, 0xA1, Some(cov(n, &[0]))),
                 candidate(src_b.clone(), ledger_b, 0xB2, None),
             ])?,
             slow: Address::repeat_byte(0xB2),
-            delay: Duration::from_mins(5),
+            delay: crate::source_set::PULL_THROUGH_BAR.saturating_sub(Duration::from_secs(5)),
             built: std::sync::atomic::AtomicBool::new(false),
         };
         let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
@@ -5407,8 +5409,10 @@ mod tests {
         Ok(())
     }
 
-    /// A sole partial holder barred from the only block left ends the item
-    /// once a discovery finds no one else, as a unanimous `NotFound` does.
+    /// A sole partial holder barred from the only block left gets one probe
+    /// once its bar ends, and ends the item when the probe draws the bar
+    /// again and a discovery finds no one else, as a unanimous `NotFound`
+    /// does.
     #[tokio::test(start_paused = true)]
     async fn a_sole_barred_partial_holder_ends_only_the_item() -> anyhow::Result<()> {
         let total = 2 * DISCOVERY_BLOCK_BYTES;
@@ -5447,7 +5451,11 @@ mod tests {
             .into_iter()
             .filter(|&(start, _)| start >= DISCOVERY_BLOCK_BYTES)
             .count();
-        assert_eq!(asked, 3, "asked for block 1 until barred");
+        assert_eq!(
+            asked,
+            2 * crate::source_set::ABSENT_AFTER_NOT_FOUND as usize,
+            "asked for block 1 until barred, then again after the bar ended"
+        );
         Ok(())
     }
 

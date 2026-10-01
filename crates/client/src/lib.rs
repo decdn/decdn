@@ -667,7 +667,7 @@ pub(crate) fn reject_empty_claim_for_nonempty_root(
 /// peer — rather than mis-attributing it to the provider's reputation. `Display`
 /// carries `BlobTooLarge` so logs and the requester tests can match on it.
 ///
-/// **Units.** `received` and `ceiling` are ALWAYS the same unit within one error —
+/// **Units.** `reached` and `ceiling` are ALWAYS the same unit within one error —
 /// the comparison at each enforcement site is apples-to-apples — but that unit
 /// differs by site, so neither field is a raw `max_blob_size_bytes` config value
 /// across all call sites. The receive loop ([`UpstreamPull::next_chunk`]) meters bao
@@ -686,8 +686,8 @@ pub struct BlobTooLarge {
     /// (receive loop), the store's content frontier (gap-driven driver), or a
     /// content resume offset already past it. Same unit as `ceiling` (see the
     /// type's **Units** note).
-    pub received: u64,
-    /// The ceiling `received` crossed, in the same unit as `received`.
+    pub reached: u64,
+    /// The ceiling `reached` crossed, in the same unit as `reached`.
     pub ceiling: u64,
 }
 
@@ -733,7 +733,7 @@ impl std::fmt::Display for BlobTooLarge {
         write!(
             f,
             "reached byte {}, crossing the {}-byte size ceiling (BlobTooLarge)",
-            self.received, self.ceiling
+            self.reached, self.ceiling
         )
     }
 }
@@ -3156,7 +3156,7 @@ async fn open_progressive_pull_impl(
             0
         } else if byte_offset >= max_blob_size_bytes {
             return Err(anyhow::Error::new(BlobTooLarge {
-                received: byte_offset,
+                reached: byte_offset,
                 ceiling: max_blob_size_bytes,
             }));
         } else {
@@ -3401,7 +3401,7 @@ impl UpstreamPull {
                     // `0` = unlimited.
                     if self.max_received_wire > 0 && self.cumulative > self.max_received_wire {
                         return Err(anyhow::Error::new(BlobTooLarge {
-                            received: self.cumulative,
+                            reached: self.cumulative,
                             ceiling: self.max_received_wire,
                         }));
                     }
@@ -3532,7 +3532,7 @@ impl UpstreamPull {
                         }
                         if self.max_received_wire > 0 && seen > self.max_received_wire {
                             return Err(anyhow::Error::new(BlobTooLarge {
-                                received: seen,
+                                reached: seen,
                                 ceiling: self.max_received_wire,
                             }));
                         }

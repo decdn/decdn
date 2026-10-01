@@ -447,6 +447,7 @@ impl<'p, P: decdn_client::source_set::SourceProvider> decdn_client::source_set::
 pub fn decdn_client::source_set::SourceSet<'p, P>::cached_lane(&self, alloy_primitives::bits::address::Address) -> core::option::Option<alloc::sync::Arc<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>>
 pub fn decdn_client::source_set::SourceSet<'p, P>::discovery_done(&mut self, anyhow::Result<alloc::vec::Vec<decdn_client::source_set::Holder>>, tokio::time::instant::Instant, alloy_primitives::aliases::U256)
 pub fn decdn_client::source_set::SourceSet<'p, P>::exhausted(&self, alloy_primitives::aliases::U256, bool, bool) -> core::option::Option<anyhow::Error>
+pub fn decdn_client::source_set::SourceSet<'p, P>::expire_pull_through_bars(&mut self, tokio::time::instant::Instant)
 pub const fn decdn_client::source_set::SourceSet<'p, P>::hash(&self) -> [u8; 32]
 pub const fn decdn_client::source_set::SourceSet<'p, P>::health(&self) -> &alloc::sync::Arc<decdn_client::health::PeerHealth>
 pub fn decdn_client::source_set::SourceSet<'p, P>::holder(&self, alloy_primitives::bits::address::Address) -> core::option::Option<&decdn_client::source_set::Holder>
@@ -480,6 +481,7 @@ pub const decdn_client::source_set::BUILD_RETRY_BASE: core::time::Duration
 pub const decdn_client::source_set::BUILD_RETRY_CAP: core::time::Duration
 pub const decdn_client::source_set::DISCOVERY_BASE: core::time::Duration
 pub const decdn_client::source_set::DISCOVERY_CAP: core::time::Duration
+pub const decdn_client::source_set::PULL_THROUGH_BAR: core::time::Duration
 pub trait decdn_client::source_set::SourceProvider: core::marker::Send + core::marker::Sync
 pub type decdn_client::source_set::SourceProvider::Source: decdn_client::source::BlobSource
 pub fn decdn_client::source_set::SourceProvider::connect<'a>(&'a self, &'a decdn_client::source_set::Holder) -> decdn_client::source::SourceFuture<'a, decdn_client::streamer::StreamCandidate<Self::Source>>
@@ -639,7 +641,7 @@ impl<St> core::fmt::Debug for decdn_client::AcquireTarget<'_, St>
 pub fn decdn_client::AcquireTarget<'_, St>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::BlobTooLarge
 pub decdn_client::BlobTooLarge::ceiling: u64
-pub decdn_client::BlobTooLarge::received: u64
+pub decdn_client::BlobTooLarge::reached: u64
 impl core::error::Error for decdn_client::BlobTooLarge
 impl core::fmt::Display for decdn_client::BlobTooLarge
 pub fn decdn_client::BlobTooLarge::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -985,6 +987,7 @@ impl<'p, P: decdn_client::source_set::SourceProvider> decdn_client::source_set::
 pub fn decdn_client::source_set::SourceSet<'p, P>::cached_lane(&self, alloy_primitives::bits::address::Address) -> core::option::Option<alloc::sync::Arc<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>>
 pub fn decdn_client::source_set::SourceSet<'p, P>::discovery_done(&mut self, anyhow::Result<alloc::vec::Vec<decdn_client::source_set::Holder>>, tokio::time::instant::Instant, alloy_primitives::aliases::U256)
 pub fn decdn_client::source_set::SourceSet<'p, P>::exhausted(&self, alloy_primitives::aliases::U256, bool, bool) -> core::option::Option<anyhow::Error>
+pub fn decdn_client::source_set::SourceSet<'p, P>::expire_pull_through_bars(&mut self, tokio::time::instant::Instant)
 pub const fn decdn_client::source_set::SourceSet<'p, P>::hash(&self) -> [u8; 32]
 pub const fn decdn_client::source_set::SourceSet<'p, P>::health(&self) -> &alloc::sync::Arc<decdn_client::health::PeerHealth>
 pub fn decdn_client::source_set::SourceSet<'p, P>::holder(&self, alloy_primitives::bits::address::Address) -> core::option::Option<&decdn_client::source_set::Holder>

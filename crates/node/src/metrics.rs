@@ -1733,9 +1733,10 @@ pub struct DecdnMetrics {
     /// `decdn_serve_stream_rejected_range_not_satisfiable_total`.
     pub serve_stream_rejected_range_not_satisfiable: Counter,
     /// Delivery refused because a pull-through request starts at or past this
-    /// node's `max_blob_size` ceiling (ADR 005 §`BlobTooLarge` enforcement). The node refuses before it commits to the stream, so no byte
-    /// is bought upstream. Signed as `BlobTooLarge`. A rising value means clients
-    /// ask this node for blobs above its ceiling. Visible name:
+    /// node's `max_blob_size` ceiling (ADR 005 §`BlobTooLarge` enforcement).
+    /// The node refuses before it commits to the stream, so no byte is bought
+    /// upstream. Signed as `BlobTooLarge`. A rising value means clients ask
+    /// this node for blobs above its ceiling. Visible name:
     /// `decdn_serve_stream_rejected_blob_too_large_total`.
     pub serve_stream_rejected_blob_too_large: Counter,
     /// Delivery refused because the blob is on this operator's local denylist
@@ -3130,8 +3131,8 @@ recorders! {
         => serve_stream_rejected_range_not_satisfiable.inc();
 
     /// Record a `serve_stream` pull-through refused because the requested range
-    /// crosses the node's `max_blob_size` ceiling (ADR 005 §`BlobTooLarge`
-    /// enforcement).
+    /// starts at or past the node's `max_blob_size` ceiling (ADR 005
+    /// §`BlobTooLarge` enforcement).
     serve_stream_rejected_blob_too_large => serve_stream_rejected_blob_too_large.inc();
 
     /// Record a `serve_stream` delivery refused because the blob is on the

@@ -927,7 +927,7 @@ where
         let max_blob_size_bytes = source.max_blob_size_bytes();
         if max_blob_size_bytes > 0 && delivered_frontier > max_blob_size_bytes {
             return Err(anyhow::Error::new(crate::BlobTooLarge {
-                received: delivered_frontier,
+                reached: delivered_frontier,
                 ceiling: max_blob_size_bytes,
             }));
         }

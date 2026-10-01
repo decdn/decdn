@@ -919,10 +919,13 @@ since project inception and will roll into the first tagged release.
   (#2262).** A probed holder that refuses a chunk outside its advertised
   coverage with `NotFound` now counts toward the same three-refusal limit as
   a non-holder. At the limit the client stops sending it uncovered chunks of
-  that blob and keeps sending it the chunks it covers. A rediscovery that
-  reports wider coverage, or a verified byte on an uncovered pick, lifts the
-  bar. When only uncovered work is left and every source is absent or barred,
-  the item ends as a unanimous `NotFound` does.
+  that blob for one minute, and keeps sending it the chunks it covers. A node
+  also answers `NotFound` when it sheds miss load, so when the minute ends the
+  holder takes one uncovered chunk again as a probe, and three more refusals
+  bar it again. A rediscovery that reports wider coverage, or a byte the
+  holder verifies on an uncovered chunk after its last refusal, lifts the bar
+  at once. When only uncovered work is left and every source is absent or
+  barred again after its probe, the item ends as a unanimous `NotFound` does.
 
 - **A proxy over its size ceiling refuses before commit, and the client
   drops it for that blob (#2256).** On a pull-through miss the node refuses a
@@ -933,8 +936,9 @@ since project inception and will roll into the first tagged release.
   where the blob ends.
   New counter: `decdn_serve_stream_rejected_blob_too_large_total`. The client
   excludes a proxy or whole holder that refuses as too large for the rest of
-  the blob; a partial holder loses only pull-through. The `BlobTooLarge`
-  message now names the byte position it reached, not a received count.
+  the blob; a partial holder loses only pull-through. `decdn_client::BlobTooLarge`
+  renames its `received` field to `reached`, and its message names the byte
+  position it reached, not a received count.
 
 - **An under-fold heal after a payer crash no longer loops, and a healed
   lane fault does not end the pull (#2257).** When a trailing-proof

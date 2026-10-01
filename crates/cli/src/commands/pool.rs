@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::signers::local::PrivateKeySigner;
@@ -940,21 +940,28 @@ fn unix_now() -> anyhow::Result<u64> {
         .map_err(|e| anyhow::anyhow!("the system clock is before the Unix epoch: {e}"))
 }
 
+/// How long `assign` waits for the chain head before it falls back to the
+/// local clock.
+const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The clock `assign` checks a capability's expiry against: the chain head's
 /// timestamp, which is the clock the contract applies at redemption. A local
 /// clock that drifts would otherwise let `assign` print a token the chain
 /// already treats as expired.
 ///
 /// The read needs no keystore, so it runs before the unlock. Offline issuance
-/// stays valid: when the head cannot be read, `assign` warns and falls back to
-/// the local clock.
+/// stays valid: when the head cannot be read within `timeout`, `assign` warns
+/// and falls back to the local clock, so an endpoint that accepts and never
+/// answers cannot stall it.
 ///
 /// # Errors
 ///
 /// Errors only on that fallback, when the system clock is before the Unix epoch.
-async fn issuance_now(rpc_url: &str) -> anyhow::Result<u64> {
+async fn issuance_now(rpc_url: &str, timeout: Duration) -> anyhow::Result<u64> {
     let head = match provider::build_read_provider(rpc_url) {
-        Ok(reader) => chain_ctx::head_timestamp(&reader).await,
+        Ok(reader) => tokio::time::timeout(timeout, chain_ctx::head_timestamp(&reader))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("no answer within {timeout:?}"))),
         Err(e) => Err(e),
     };
     match head {
@@ -999,7 +1006,7 @@ async fn assign(args: &cli::PoolAssignArgs, config_path: Option<&Path>) -> anyho
     let pool_id = parse_pool_id(&args.pool)?;
     let signer_addr = super::chain_ctx::parse_nonzero_address(&args.signer, "--signer")?;
 
-    let now = issuance_now(&chain.rpc_url).await?;
+    let now = issuance_now(&chain.rpc_url, HEAD_READ_TIMEOUT).await?;
     let expiry = resolve_expiry(now, args.expiry_secs, args.expiry_at)?;
     if expires_within_default_node_margin(expiry, now) {
         eprintln!(
@@ -2150,8 +2157,36 @@ mod tests {
     #[tokio::test]
     async fn issuance_now_falls_back_to_the_local_clock() {
         let before = unix_now().unwrap();
-        let now = issuance_now("not a url").await.unwrap();
+        let now = issuance_now("not a url", HEAD_READ_TIMEOUT).await.unwrap();
         let after = unix_now().unwrap();
+        assert!(
+            (before..=after).contains(&now),
+            "{before} <= {now} <= {after}"
+        );
+    }
+
+    /// An RPC endpoint that accepts the connection and never answers leaves
+    /// `assign` on the local clock once the head read times out.
+    #[tokio::test]
+    async fn issuance_now_falls_back_when_the_rpc_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = listener.accept().await {
+                held.push(conn);
+            }
+        });
+        let before = unix_now().unwrap();
+        let now = tokio::time::timeout(
+            Duration::from_secs(10),
+            issuance_now(&format!("http://{addr}"), Duration::from_millis(200)),
+        )
+        .await
+        .expect("the head read must time out, not hang")
+        .unwrap();
+        let after = unix_now().unwrap();
+        silent.abort();
         assert!(
             (before..=after).contains(&now),
             "{before} <= {now} <= {after}"
