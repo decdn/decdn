@@ -124,7 +124,7 @@ where
         let attempting = connecting.is_some() || opening.is_some();
         if !attempting
             && discovering.is_none()
-            && let Some(err) = sources.exhausted(deposit, false)
+            && let Some(err) = sources.exhausted(deposit, false, false)
         {
             return Err(err);
         }

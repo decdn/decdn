@@ -4,9 +4,11 @@
 //! for each, and when each may be tried again. It never drops a source: a
 //! delivery fault cools it (in the command-wide [`PeerHealth`]), a price
 //! refusal parks it until the deposit rises, and a lane-build or discovery
-//! error backs off and retries. It ends a fetch only on a unanimous verdict:
-//! every known source is priced out, or every one says it does not hold the
-//! blob, and a fresh discovery found nothing new.
+//! error backs off and retries. A partial holder that keeps refusing ranges
+//! outside its coverage is barred from pull-through and serves only the
+//! blocks it covers. It ends a fetch only on a unanimous verdict: every known
+//! source is priced out, or every one says it does not hold the blob or is
+//! barred from the only work left, and a fresh discovery found nothing new.
 //!
 //! The state is synchronous. The acquire loop runs the `connect` and `discover`
 //! futures itself, so lanes keep streaming while a lane builds or discovery
@@ -69,10 +71,17 @@ pub struct LaneRange {
     /// such a piece is an overshoot refusal: it cools the provider and never
     /// counts toward marking it absent ([`ABSENT_AFTER_NOT_FOUND`]).
     pub past_end: bool,
+    /// The range lies wholly outside the coverage of the lane that held it:
+    /// the lane took it for its node to serve by pull-through. A `NotFound`
+    /// for such a range from a probed partial holder counts toward barring
+    /// that holder from pull-through ([`SourceSet::no_pull_through`]).
+    pub uncovered: bool,
 }
 
 /// How many `NotFound` answers in a row, with no verified byte between them,
-/// mark a provider that is not a probed holder as absent.
+/// mark a provider that is not a probed holder as absent. The same count of
+/// `NotFound` answers for ranges outside a probed partial holder's coverage
+/// bars it from pull-through ([`SourceSet::no_pull_through`]).
 pub const ABSENT_AFTER_NOT_FOUND: u32 = 3;
 
 /// Where a [`SourceSet`] finds holders and builds their lanes.
@@ -177,11 +186,18 @@ pub struct SourceSet<'p, P: SourceProvider> {
     absent: HashSet<Address>,
     /// Each non-holder's `NotFound` answers since its last verified byte.
     not_found: HashMap<Address, u32>,
-    /// The refusal that last marked a source absent: the cause the
-    /// [`NoSourceHasBlob`] stop carries.
+    /// Each probed partial holder's `NotFound` answers for ranges outside its
+    /// coverage since it last served such a range.
+    pull_through_not_found: HashMap<Address, u32>,
+    /// Probed partial holders that said `NotFound` to
+    /// [`ABSENT_AFTER_NOT_FOUND`] ranges outside their coverage. Each one
+    /// serves only the blocks it covers.
+    no_pull_through: HashSet<Address>,
+    /// The refusal that last marked a source absent or barred it from
+    /// pull-through: the cause the [`NoSourceHasBlob`] stop carries.
     last_absent: Option<UpstreamRefused>,
     discovery: Option<Backoff>,
-    /// Bumped each time a source newly joins `absent`.
+    /// Bumped each time a source newly joins `absent` or `no_pull_through`.
     mark_epoch: u64,
     /// The deposit and mark epoch of the last successful discovery. A
     /// unanimous stop needs a discovery at the current pair.
@@ -219,6 +235,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             build_retry: HashMap::new(),
             absent: HashSet::new(),
             not_found: HashMap::new(),
+            pull_through_not_found: HashMap::new(),
+            no_pull_through: HashSet::new(),
             last_absent: None,
             discovery: None,
             mark_epoch: 0,
@@ -346,6 +364,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             len,
             landed,
             past_end,
+            uncovered,
         }) = range
         {
             tracing::info!(
@@ -355,6 +374,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 len,
                 landed,
                 past_end,
+                uncovered,
                 ?fault,
                 error = %format_args!("{err:#}"),
                 "a lane faulted; its remainder goes to the other lanes"
@@ -374,7 +394,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                     && !range.is_some_and(|r| r.past_end)
                     && let Some(refused) = err.downcast_ref::<UpstreamRefused>()
                 {
-                    self.record_not_found(provider, refused);
+                    let uncovered = range.is_some_and(|r| r.uncovered);
+                    self.record_not_found(provider, refused, uncovered);
                 }
                 if let Some(holder) = self.holder(provider) {
                     self.provider.on_source_fault(holder);
@@ -387,11 +408,20 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// Count a `NotFound` from `provider` for a piece below the end the fetch
-    /// knows ([`LaneRange::past_end`]). A probed holder is never marked
-    /// absent. Any other provider is marked absent once its count reaches
-    /// [`ABSENT_AFTER_NOT_FOUND`].
-    fn record_not_found(&mut self, provider: Address, refused: &UpstreamRefused) {
-        if self.holder(provider).is_none_or(|h| h.probed_holder) {
+    /// knows ([`LaneRange::past_end`]). A provider that is not a probed
+    /// holder is marked absent once its count reaches
+    /// [`ABSENT_AFTER_NOT_FOUND`]. A probed holder is never marked absent.
+    /// Inside its coverage the answer is a delivery fault only. For a range
+    /// outside the coverage of a partial holder (`uncovered`), the answer
+    /// counts toward barring it from pull-through.
+    fn record_not_found(&mut self, provider: Address, refused: &UpstreamRefused, uncovered: bool) {
+        let Some(holder) = self.holder(provider) else {
+            return;
+        };
+        if holder.probed_holder {
+            if uncovered && holder.coverage.is_some() {
+                self.record_pull_through_refusal(provider, refused);
+            }
             return;
         }
         let count = self.not_found.entry(provider).or_insert(0);
@@ -405,11 +435,46 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         }
     }
 
+    /// Count a `NotFound` from probed partial holder `provider` for a range
+    /// outside its coverage. At [`ABSENT_AFTER_NOT_FOUND`] answers the holder
+    /// is barred from pull-through.
+    fn record_pull_through_refusal(&mut self, provider: Address, refused: &UpstreamRefused) {
+        let count = self.pull_through_not_found.entry(provider).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count < ABSENT_AFTER_NOT_FOUND {
+            return;
+        }
+        self.last_absent = Some(refused.clone());
+        if self.no_pull_through.insert(provider) {
+            self.mark_epoch = self.mark_epoch.saturating_add(1);
+        }
+    }
+
     /// Record a verified byte from `provider`: it holds the blob after all.
+    /// A bar from pull-through stays: a partial holder serves the blocks it
+    /// covers whether or not it serves the others.
     pub fn record_progress(&mut self, provider: Address) {
         self.absent.remove(&provider);
         self.not_found.remove(&provider);
         self.health.record_progress(provider);
+    }
+
+    /// Record a verified byte from `provider` on a range outside its
+    /// coverage: it serves such ranges by pull-through after all, so its
+    /// count of `NotFound` answers for them clears, and so does its bar.
+    pub fn record_pull_through(&mut self, provider: Address) {
+        self.pull_through_not_found.remove(&provider);
+        self.no_pull_through.remove(&provider);
+    }
+
+    /// Whether `provider` is barred from pull-through: a probed partial
+    /// holder that said `NotFound` to [`ABSENT_AFTER_NOT_FOUND`] ranges
+    /// outside its coverage, with no such range served since. It still serves
+    /// the blocks it covers and takes no range outside them. A discovery that
+    /// reports wider coverage for it clears the bar.
+    #[must_use]
+    pub fn no_pull_through(&self, provider: Address) -> bool {
+        self.no_pull_through.contains(&provider)
     }
 
     /// Whether a discovery should run now.
@@ -432,7 +497,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         running: usize,
         uncovered: bool,
     ) -> bool {
-        let unanimous = self.all_excluded(deposit) || self.all_item_marked();
+        let unanimous = self.all_excluded(deposit, false) || self.all_item_marked(false);
         if unanimous {
             if self.looked_at != Some((deposit, self.mark_epoch)) {
                 return true;
@@ -507,49 +572,70 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// The unanimous stop, if a discovery ran at this deposit and mark epoch and:
-    /// every known source says the blob is absent (the item ends), or every
-    /// known source is priced out or says the blob is absent, with at least one
-    /// priced out, and the top-up budget cannot change that (the command ends).
+    /// every known source can serve none of the work left (the item ends), or
+    /// every known source is priced out or can serve none of it, with at least
+    /// one priced out, and the top-up budget cannot change that (the command
+    /// ends).
+    ///
+    /// A source can serve none of the work left when it says the blob is
+    /// absent, or when it is barred from pull-through
+    /// ([`Self::no_pull_through`]) and `only_uncovered_left` says no work left
+    /// lies inside the coverage of a barred holder.
     #[must_use]
-    pub fn exhausted(&self, deposit: U256, topups_left: bool) -> Option<anyhow::Error> {
+    pub fn exhausted(
+        &self,
+        deposit: U256,
+        topups_left: bool,
+        only_uncovered_left: bool,
+    ) -> Option<anyhow::Error> {
         if self.holders.is_empty() || self.discovered_at != Some((deposit, self.mark_epoch)) {
             return None;
         }
-        if self.all_item_marked() {
+        if self.all_item_marked(only_uncovered_left) {
             return Some(match &self.last_absent {
                 Some(refused) => anyhow::Error::new(refused.clone()).context(NoSourceHasBlob),
                 None => anyhow::Error::new(NoSourceHasBlob),
             });
         }
-        if !self.all_excluded(deposit) {
+        if !self.all_excluded(deposit, only_uncovered_left) {
             return None;
         }
         (!topups_left).then(|| anyhow::Error::new(NoAffordableSource { deposit }))
     }
 
-    /// Whether every known source says the blob is absent.
-    fn all_item_marked(&self) -> bool {
+    /// Whether every known source can serve none of the work left
+    /// ([`Self::cannot_serve`]).
+    fn all_item_marked(&self, only_uncovered_left: bool) -> bool {
         !self.holders.is_empty()
             && self
                 .holders
                 .iter()
-                .all(|h| self.absent.contains(&h.provider))
+                .all(|h| self.cannot_serve(h.provider, only_uncovered_left))
     }
 
-    /// Whether every known source is priced out at `deposit` or says the blob
-    /// is absent, with at least one actually priced out. A set that is
-    /// unanimous only on absence is handled by [`Self::all_item_marked`]
-    /// instead, so this is the affordability verdict even when it is mixed
-    /// with absence marks.
-    fn all_excluded(&self, deposit: U256) -> bool {
+    /// Whether every known source is priced out at `deposit` or can serve
+    /// none of the work left, with at least one actually priced out. A set
+    /// that is unanimous only on the latter is handled by
+    /// [`Self::all_item_marked`] instead, so this is the affordability verdict
+    /// even when it is mixed with absence marks.
+    fn all_excluded(&self, deposit: U256, only_uncovered_left: bool) -> bool {
         !self.holders.is_empty()
             && self
                 .holders
                 .iter()
                 .any(|h| self.is_unaffordable(h.provider, deposit))
             && self.holders.iter().all(|h| {
-                self.absent.contains(&h.provider) || self.is_unaffordable(h.provider, deposit)
+                self.cannot_serve(h.provider, only_uncovered_left)
+                    || self.is_unaffordable(h.provider, deposit)
             })
+    }
+
+    /// Whether `provider` can serve none of the work left: it says the blob is
+    /// absent, or it is barred from pull-through and `only_uncovered_left`
+    /// says no work left lies inside the coverage of a barred holder.
+    fn cannot_serve(&self, provider: Address, only_uncovered_left: bool) -> bool {
+        self.absent.contains(&provider)
+            || (only_uncovered_left && self.no_pull_through.contains(&provider))
     }
 
     /// Whether `provider`'s health says it is priced out at `deposit`.
@@ -561,12 +647,22 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// Add new holders and update known ones. A provider a probe now reports
-    /// as a holder loses its absent mark and its `NotFound` count.
+    /// as a holder loses its absent mark and its `NotFound` count. A probe
+    /// that reports a block the holder did not cover before also clears its
+    /// pull-through count and bar: the block it refused may be one it now
+    /// holds.
     fn merge(&mut self, holders: Vec<Holder>) {
         for holder in holders {
             if holder.probed_holder {
                 self.absent.remove(&holder.provider);
                 self.not_found.remove(&holder.provider);
+                let wider = self.holder(holder.provider).is_some_and(|known| {
+                    covers_more(holder.coverage.as_ref(), known.coverage.as_ref())
+                });
+                if wider {
+                    self.pull_through_not_found.remove(&holder.provider);
+                    self.no_pull_through.remove(&holder.provider);
+                }
             }
             match self
                 .holders
@@ -577,6 +673,16 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 None => self.holders.push(holder),
             }
         }
+    }
+}
+
+/// Whether coverage `new` holds a block `old` does not. `None` is the whole
+/// blob.
+fn covers_more(new: Option<&Coverage>, old: Option<&Coverage>) -> bool {
+    match (new, old) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(new), Some(old)) => new.covered_blocks().any(|block| !old.covers(block)),
     }
 }
 
@@ -885,17 +991,18 @@ mod tests {
         };
         set.record_fault(A, &dry(), None, now, dep);
         set.record_fault(B, &dry(), None, now, dep);
-        assert!(set.exhausted(dep, true).is_none(), "top-ups left");
+        assert!(set.exhausted(dep, true, false).is_none(), "top-ups left");
         assert!(
-            set.exhausted(dep, false).is_none(),
+            set.exhausted(dep, false, false).is_none(),
             "no discovery at this deposit yet"
         );
         assert!(set.wants_discovery(now, dep, 0, false));
         set.discovery_done(Ok(vec![]), now, dep);
-        let err = set.exhausted(dep, false);
+        let err = set.exhausted(dep, false, false);
         assert!(err.is_some_and(|e| e.downcast_ref::<NoAffordableSource>().is_some()));
         assert!(
-            set.exhausted(dep + U256::from(1u64), false).is_none(),
+            set.exhausted(dep + U256::from(1u64), false, false)
+                .is_none(),
             "a top-up revives"
         );
     }
@@ -930,12 +1037,12 @@ mod tests {
         let now = Instant::now();
         say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
         assert!(
-            set.exhausted(U256::ZERO, true).is_none(),
+            set.exhausted(U256::ZERO, true, false).is_none(),
             "B has not answered"
         );
         say_not_found(&mut set, B, super::ABSENT_AFTER_NOT_FOUND, now);
         assert!(
-            set.exhausted(U256::ZERO, true).is_none(),
+            set.exhausted(U256::ZERO, true, false).is_none(),
             "no discovery since the last mark"
         );
         assert!(
@@ -943,7 +1050,7 @@ mod tests {
             "unanimity skips the backoff"
         );
         set.discovery_done(Ok(vec![]), now, U256::ZERO);
-        let err = set.exhausted(U256::ZERO, true);
+        let err = set.exhausted(U256::ZERO, true, false);
         assert!(err.is_some_and(|e| e.downcast_ref::<super::NoSourceHasBlob>().is_some()));
     }
 
@@ -956,12 +1063,151 @@ mod tests {
         let now = Instant::now();
         say_not_found(&mut set, A, 10, now);
         set.discovery_done(Ok(vec![]), now, U256::ZERO);
-        assert!(set.exhausted(U256::ZERO, true).is_none());
+        assert!(set.exhausted(U256::ZERO, true, false).is_none());
         let cooled = set.health().cooling_until(A, now).is_some_and(|until| {
             set.next_to_start(until, U256::ZERO, &HashSet::new())
                 .is_some()
         });
         assert!(cooled, "the holder cools and comes back");
+    }
+
+    /// A probed holder of `blocks` of a four-block blob only.
+    fn partial(provider: Address, rtt_ms: f64, blocks: &[u32]) -> Holder {
+        Holder {
+            coverage: Some(decdn_protocol::Coverage::from_block_indices(
+                4,
+                blocks.iter().copied(),
+            )),
+            ..holder(provider, rtt_ms)
+        }
+    }
+
+    /// Record `times` `NotFound` answers from `provider` for `range`.
+    fn say_not_found_in<P: SourceProvider>(
+        set: &mut SourceSet<'_, P>,
+        provider: Address,
+        range: super::LaneRange,
+        times: u32,
+        now: Instant,
+    ) {
+        for _ in 0..times {
+            set.record_fault(provider, &not_found(), Some(range), now, U256::ZERO);
+        }
+    }
+
+    /// A range in discovery block 1, inside or outside the lane's coverage.
+    const fn block1(uncovered: bool) -> super::LaneRange {
+        super::LaneRange {
+            offset: 64 << 20,
+            len: 64 << 20,
+            landed: 0,
+            past_end: false,
+            uncovered,
+        }
+    }
+
+    /// A partial holder that says `NotFound` three times to ranges outside
+    /// its coverage is barred from pull-through. Refusals inside its coverage
+    /// never bar it, a verified byte inside its coverage keeps the bar, and a
+    /// verified byte outside it lifts the bar.
+    #[tokio::test(start_paused = true)]
+    async fn three_uncovered_refusals_bar_a_partial_holder_from_pull_through() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![partial(A, 10.0, &[0])]);
+        let now = Instant::now();
+        say_not_found_in(&mut set, A, block1(false), 10, now);
+        assert!(!set.no_pull_through(A), "refusals inside its coverage");
+        say_not_found_in(
+            &mut set,
+            A,
+            block1(true),
+            super::ABSENT_AFTER_NOT_FOUND - 1,
+            now,
+        );
+        assert!(!set.no_pull_through(A), "two answers are not enough");
+        say_not_found_in(&mut set, A, block1(true), 1, now);
+        assert!(set.no_pull_through(A));
+        set.record_progress(A);
+        assert!(set.no_pull_through(A), "a covered byte keeps the bar");
+        set.record_pull_through(A);
+        assert!(!set.no_pull_through(A), "an uncovered byte lifts the bar");
+    }
+
+    /// A holder of the whole blob is never barred: no range lies outside its
+    /// coverage.
+    #[tokio::test(start_paused = true)]
+    async fn a_whole_holder_is_never_barred_from_pull_through() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
+        let now = Instant::now();
+        say_not_found_in(&mut set, A, block1(true), 10, now);
+        assert!(!set.no_pull_through(A));
+    }
+
+    /// A discovery that reports a block the barred holder did not cover
+    /// before lifts the bar. One that reports the same coverage keeps it.
+    #[tokio::test(start_paused = true)]
+    async fn wider_coverage_from_discovery_lifts_the_bar() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![partial(A, 10.0, &[0])]);
+        let now = Instant::now();
+        say_not_found_in(
+            &mut set,
+            A,
+            block1(true),
+            super::ABSENT_AFTER_NOT_FOUND,
+            now,
+        );
+        set.discovery_done(Ok(vec![partial(A, 10.0, &[0])]), now, U256::ZERO);
+        assert!(set.no_pull_through(A), "the same coverage keeps the bar");
+        set.discovery_done(Ok(vec![partial(A, 10.0, &[0, 1])]), now, U256::ZERO);
+        assert!(!set.no_pull_through(A), "block 1 is new");
+        say_not_found_in(
+            &mut set,
+            A,
+            block1(true),
+            super::ABSENT_AFTER_NOT_FOUND - 1,
+            now,
+        );
+        assert!(!set.no_pull_through(A), "the count starts again");
+    }
+
+    /// A barred holder ends the item, with the refusal that barred it, only
+    /// once no work left lies inside its coverage and a discovery found no
+    /// one else.
+    #[tokio::test(start_paused = true)]
+    async fn a_barred_holder_with_only_uncovered_work_left_ends_the_item() -> anyhow::Result<()> {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![partial(A, 10.0, &[0])]);
+        let now = Instant::now();
+        say_not_found_in(
+            &mut set,
+            A,
+            block1(true),
+            super::ABSENT_AFTER_NOT_FOUND,
+            now,
+        );
+        assert!(
+            set.exhausted(U256::ZERO, true, true).is_none(),
+            "no discovery since the bar"
+        );
+        set.discovery_done(Ok(vec![]), now, U256::ZERO);
+        assert!(
+            set.exhausted(U256::ZERO, true, false).is_none(),
+            "work inside its coverage is left"
+        );
+        let err = set
+            .exhausted(U256::ZERO, true, true)
+            .ok_or_else(|| anyhow::anyhow!("only uncovered work is left"))?;
+        assert!(
+            err.downcast_ref::<super::NoSourceHasBlob>().is_some(),
+            "{err:#}"
+        );
+        assert!(
+            err.downcast_ref::<crate::UpstreamRefused>().is_some(),
+            "{err:#}"
+        );
+        Ok(())
     }
 
     /// A bound that overshoots the blob sends pieces past its true end, and an
@@ -978,6 +1224,7 @@ mod tests {
             len: 64 << 20,
             landed: 0,
             past_end: true,
+            uncovered: false,
         };
         for _ in 0..10 {
             let fault = set.record_fault(A, &not_found(), Some(overshoot), now, U256::ZERO);
@@ -985,7 +1232,7 @@ mod tests {
         }
         set.discovery_done(Ok(vec![]), now, U256::ZERO);
         assert!(
-            set.exhausted(U256::ZERO, true).is_none(),
+            set.exhausted(U256::ZERO, true, false).is_none(),
             "overshoot refusals never mark the node absent"
         );
         assert!(
@@ -1004,13 +1251,13 @@ mod tests {
         say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND - 1, now);
         set.discovery_done(Ok(vec![]), now, U256::ZERO);
         assert!(
-            set.exhausted(U256::ZERO, true).is_none(),
+            set.exhausted(U256::ZERO, true, false).is_none(),
             "two answers are not enough"
         );
         say_not_found(&mut set, A, 1, now);
         set.discovery_done(Ok(vec![]), now, U256::ZERO);
         let err = set
-            .exhausted(U256::ZERO, true)
+            .exhausted(U256::ZERO, true, false)
             .ok_or_else(|| anyhow::anyhow!("three answers end the item"))?;
         assert!(
             err.downcast_ref::<super::NoSourceHasBlob>().is_some(),
@@ -1037,7 +1284,7 @@ mod tests {
         set.record_progress(A);
         say_not_found(&mut set, A, 2, now);
         set.discovery_done(Ok(vec![]), now, U256::ZERO);
-        assert!(set.exhausted(U256::ZERO, true).is_none());
+        assert!(set.exhausted(U256::ZERO, true, false).is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1047,7 +1294,7 @@ mod tests {
         let now = Instant::now();
         say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
         set.discovery_done(Ok(vec![holder(B, 5.0)]), now, U256::ZERO);
-        assert!(set.exhausted(U256::ZERO, true).is_none());
+        assert!(set.exhausted(U256::ZERO, true, false).is_none());
     }
 
     /// A discovery whose probe now reports an absent provider as a holder
@@ -1059,7 +1306,7 @@ mod tests {
         let now = Instant::now();
         say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
         set.discovery_done(Ok(vec![holder(A, 10.0)]), now, U256::ZERO);
-        assert!(set.exhausted(U256::ZERO, true).is_none());
+        assert!(set.exhausted(U256::ZERO, true, false).is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1070,7 +1317,7 @@ mod tests {
         say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
         set.record_progress(A);
         set.discovery_done(Ok(vec![]), now, U256::ZERO);
-        assert!(set.exhausted(U256::ZERO, true).is_none());
+        assert!(set.exhausted(U256::ZERO, true, false).is_none());
     }
 
     /// A discovery that fails while the set is unanimous must still back off:
@@ -1148,8 +1395,8 @@ mod tests {
             set.record_fault(B, &not_found(), None, now, dep);
         }
         set.discovery_done(Ok(vec![]), now, dep);
-        assert!(set.exhausted(dep, true).is_none(), "top-ups left");
-        let err = set.exhausted(dep, false);
+        assert!(set.exhausted(dep, true, false).is_none(), "top-ups left");
+        let err = set.exhausted(dep, false, false);
         assert!(err.is_some_and(|e| e.downcast_ref::<NoAffordableSource>().is_some()));
     }
 

@@ -333,10 +333,13 @@ impl<S> Drop for ReleaseGrant<S> {
 
 /// A range [`Work::pick`] handed to a worker. `victim` is set when the range is
 /// a stolen tail: the peer it was taken from and that peer's unit number
-/// ([`Work::units`]) at the steal, for [`Work::cancel_victim`].
+/// ([`Work::units`]) at the steal, for [`Work::cancel_victim`]. `uncovered` is
+/// set when the range lies wholly outside the worker's coverage, for its node
+/// to serve by pull-through.
 struct Picked {
     range: AlignedRange,
     victim: Option<(usize, u64)>,
+    uncovered: bool,
 }
 
 /// Per-lane interrupt: an edge-triggered wakeup ([`Notify`]) plus a `flag`
@@ -509,6 +512,9 @@ struct WorkerEnd {
     end: LaneEnd,
     /// Whether the worker verified any byte.
     delivered: bool,
+    /// Whether the worker verified a byte of a range outside its coverage:
+    /// its node serves such ranges by pull-through.
+    pulled_through: bool,
     /// Whether it was an extra worker ([`Work::add_extra`]): its end touches
     /// neither the lane's running state nor its source's health.
     extra: bool,
@@ -561,6 +567,10 @@ struct Work {
     /// [`Work::set_provider`] when the loop starts a lane, and copied from
     /// the lane for an extra worker. Steal logs name both sides with it.
     providers: Vec<Option<Address>>,
+    /// `no_uncovered[lane]` is `true` while the lane's source is barred from
+    /// pull-through ([`SourceSet::no_pull_through`]): its workers take only
+    /// what the lane covers. The loop sets it ([`Work::set_no_uncovered`]).
+    no_uncovered: Vec<bool>,
     /// Pick the lowest-offset pending segment first, not the oldest. Set for a
     /// consumption-paced fetch ([`ConsumptionPacing`]): the consumer reads in
     /// offset order, so the earliest missing range is always the one it waits
@@ -583,6 +593,7 @@ impl Work {
             extra: Vec::new(),
             widened: Vec::new(),
             providers: Vec::new(),
+            no_uncovered: Vec::new(),
             front_first,
         }
     }
@@ -592,6 +603,24 @@ impl Work {
         if let Some(named) = self.providers.get_mut(slot) {
             *named = Some(provider);
         }
+    }
+
+    /// Bar lane `lane`'s workers from ranges outside its coverage, or lift
+    /// the bar.
+    fn set_no_uncovered(&mut self, lane: usize, barred: bool) {
+        if let Some(flag) = self.no_uncovered.get_mut(lane) {
+            *flag = barred;
+        }
+    }
+
+    /// Whether worker slot `i`'s lane is barred from ranges outside its
+    /// coverage.
+    fn barred(&self, i: usize) -> bool {
+        self.lane_of
+            .get(i)
+            .and_then(|&lane| self.no_uncovered.get(lane))
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Give a new lane a stable slot, alive and holding nothing. Returns the
@@ -610,6 +639,7 @@ impl Work {
         self.extra.push(false);
         self.widened.push(false);
         self.providers.push(None);
+        self.no_uncovered.push(false);
         slot
     }
 
@@ -634,6 +664,8 @@ impl Work {
         self.widened.push(false);
         self.providers
             .push(self.providers.get(lane).copied().flatten());
+        // An extra worker reads its lane's bar through `lane_of`.
+        self.no_uncovered.push(false);
         if let Some(widened) = self.widened.get_mut(lane) {
             *widened = true;
         }
@@ -657,7 +689,8 @@ impl Work {
     ///
     /// Ranges are matched to idle workers one to one, in queue order: an idle
     /// worker is an alive slot that holds no range, and it takes a range it
-    /// covers, or one no running lane covers (#2225), on its next pick. A lane
+    /// covers, or one no running lane covers (#2225) unless its lane is barred
+    /// from those ([`Work::barred`]), on its next pick. A lane
     /// may be asked for a range only while its own worker runs a range of its
     /// own, it has no extra worker yet, `can_grow` says it has a growth hook,
     /// and it covers part of that range.
@@ -676,7 +709,10 @@ impl Work {
         let mut wanted = Vec::new();
         for seg in &self.pending {
             let orphan = !self.uncovered_part(seg, total_bytes).is_empty();
-            if let Some(pos) = idle.iter().position(|&i| orphan || covers(i, seg)) {
+            if let Some(pos) = idle
+                .iter()
+                .position(|&i| (orphan && !self.barred(i)) || covers(i, seg))
+            {
                 idle.swap_remove(pos);
                 continue;
             }
@@ -784,13 +820,13 @@ impl Work {
 
     /// Whether a lane over `coverage` has anything to take: a pending entry it
     /// covers at least in part, a pending chunk no running lane covers (any
-    /// lane may take that one, #2225), or a range in flight it could steal
-    /// from.
-    fn has_work_for(&self, coverage: &Coverage, total_bytes: u64) -> bool {
+    /// lane may take that one, #2225, when `take_uncovered` allows it), or a
+    /// range in flight it could steal from.
+    fn has_work_for(&self, coverage: &Coverage, total_bytes: u64, take_uncovered: bool) -> bool {
         self.pending
             .iter()
             .any(|seg| !covered_part(coverage, seg.chunk_ranges(), total_bytes).is_empty())
-            || self.uncovered(total_bytes)
+            || (take_uncovered && self.uncovered(total_bytes))
             || self
                 .in_flight
                 .iter()
@@ -861,7 +897,8 @@ impl Work {
     /// Under the caller's lock, choose worker `i`'s next range. Pop the FIRST
     /// pending segment `coverage` includes (a worker prefers what it covers,
     /// #1506), else the first covered run of a pending entry, else the first
-    /// run of pending chunks no running lane covers (#2225); when none remain,
+    /// run of pending chunks no running lane covers (#2225), unless the
+    /// worker's lane is barred from those ([`Work::barred`]); when none remain,
     /// steal the aligned second half of the missing remainder of the COVERABLE
     /// range in flight that misses the most ([`steal_split`]), trimming the
     /// victim to end at that split so no other freed worker can re-steal the
@@ -923,6 +960,7 @@ impl Work {
                 return Ok(Some(Picked {
                     range: seg,
                     victim: None,
+                    uncovered: false,
                 }));
             }
         }
@@ -931,18 +969,24 @@ impl Work {
         // queued in its place.
         // Coverage is a preference (#2225): a pending chunk no running lane
         // covers goes to this worker, whose node serves it by pull-through,
-        // rather than waiting for a covering node to join.
+        // rather than waiting for a covering node to join. No pending entry
+        // holds a chunk this worker covers by then, so such a part lies wholly
+        // outside its coverage. A lane barred from pull-through takes none.
         let taken = match self.take_part(total_bytes, |_, seg| {
             covered_part(coverage, seg.chunk_ranges(), total_bytes)
         })? {
-            Some(part) => Some(part),
-            None => self.take_part(total_bytes, |w, seg| w.uncovered_part(seg, total_bytes))?,
+            Some(part) => Some((part, false)),
+            None if self.barred(i) => None,
+            None => self
+                .take_part(total_bytes, |w, seg| w.uncovered_part(seg, total_bytes))?
+                .map(|part| (part, true)),
         };
-        if let Some(picked) = taken {
+        if let Some((picked, uncovered)) = taken {
             *self.slot_mut(i)? = Some((picked.fetch_start(), picked.fetch_len()));
             return Ok(Some(Picked {
                 range: picked,
                 victim: None,
+                uncovered,
             }));
         }
         if !steal {
@@ -1011,6 +1055,7 @@ impl Work {
         Ok(Some(Picked {
             range: half,
             victim: Some((victim, unit)),
+            uncovered: false,
         }))
     }
 
@@ -1420,6 +1465,7 @@ where
         }
     };
     let mut delivered = false;
+    let mut pulled_through = false;
     // Per-worker resume/quote state. The reactive-top-up budget is NOT in here:
     // it is a property of the one shared pool and lives in `pool`.
     let mut counters = DriveCounters::new();
@@ -1449,6 +1495,7 @@ where
             provider,
             end: LaneEnd::Idle,
             delivered,
+            pulled_through,
             extra,
         };
         // The store's missing runs, which a steal splits by. Read off the
@@ -1472,7 +1519,12 @@ where
                 w.pick(i, total_bytes, &my_coverage, !extra, &missing)?
             }
         };
-        let Some(Picked { range, victim }) = picked else {
+        let Some(Picked {
+            range,
+            victim,
+            uncovered,
+        }) = picked
+        else {
             // Nothing to start right now. An extra worker ends here. A lane's
             // own worker ends only when no lane holds work; otherwise it
             // parks: a peer's range is still draining toward a requeue or a
@@ -1619,6 +1671,7 @@ where
             landed = landed.saturating_add(gap_landed);
             if gap_landed > 0 {
                 delivered = true;
+                pulled_through |= uncovered;
                 health.record_progress(provider);
             }
             match outcome {
@@ -1671,6 +1724,7 @@ where
                     landed,
                     // The loop knows the first claim; it sets this.
                     past_end: false,
+                    uncovered,
                 };
                 return Ok(WorkerEnd {
                     provider,
@@ -1680,6 +1734,7 @@ where
                         piece_at,
                     },
                     delivered,
+                    pulled_through,
                     extra,
                 });
             }
@@ -1692,6 +1747,7 @@ where
                 provider,
                 end: LaneEnd::Idle,
                 delivered,
+                pulled_through,
                 extra,
             });
         }
@@ -1738,6 +1794,7 @@ fn log_extra_fault(
         len,
         landed,
         past_end: _,
+        uncovered: _,
     } = range;
     if landed > 0 {
         tracing::info!(
@@ -1893,7 +1950,9 @@ fn join_pool<S>(lane: &StreamCandidate<S>, deposit: U256, pool_lanes: &Mutex<Poo
 }
 
 /// Up to `room` holders to start now, nearest first: usable at `now` and
-/// `deposit`, not in `busy`, and covering work still to do.
+/// `deposit`, not in `busy`, and with work still to do that each may take. A
+/// holder barred from pull-through ([`SourceSet::no_pull_through`]) may take
+/// only what it covers.
 fn lanes_to_start<P: SourceProvider>(
     sources: &SourceSet<'_, P>,
     work: &Work,
@@ -1909,15 +1968,41 @@ fn lanes_to_start<P: SourceProvider>(
             break;
         };
         busy.insert(holder.provider);
-        let coverage = holder
-            .coverage
-            .clone()
-            .unwrap_or_else(|| Coverage::full(num_blocks(total_bytes)));
-        if work.has_work_for(&coverage, total_bytes) {
+        let take_uncovered = !sources.no_pull_through(holder.provider);
+        if work.has_work_for(
+            &holder_coverage(&holder, total_bytes),
+            total_bytes,
+            take_uncovered,
+        ) {
             out.push(holder);
         }
     }
     out
+}
+
+/// `holder`'s coverage, or every block of a blob of `total_bytes` for a holder
+/// of the whole blob.
+fn holder_coverage(holder: &Holder, total_bytes: u64) -> Coverage {
+    holder
+        .coverage
+        .clone()
+        .unwrap_or_else(|| Coverage::full(num_blocks(total_bytes)))
+}
+
+/// Whether no work left lies inside the coverage of a holder barred from
+/// pull-through ([`SourceSet::no_pull_through`]): each such holder can serve
+/// none of it, so the item ends once the other sources can serve none of it
+/// either ([`SourceSet::exhausted`]).
+fn only_uncovered_left<P: SourceProvider>(
+    sources: &SourceSet<'_, P>,
+    work: &Work,
+    total_bytes: u64,
+) -> bool {
+    sources
+        .holders()
+        .iter()
+        .filter(|h| sources.no_pull_through(h.provider))
+        .all(|h| !work.has_work_for(&holder_coverage(h, total_bytes), total_bytes, false))
 }
 
 /// Whether every byte of `ranges` is present. With no lane running nothing is
@@ -2345,7 +2430,12 @@ where
                 .collect();
             let room = max_lanes.saturating_sub(busy.len());
             let starts = {
-                let w = work.lock().await;
+                let mut w = work.lock().await;
+                // A fault, a delivery or a discovery may have set or lifted a
+                // source's bar from pull-through since the last pass.
+                for (&provider, &slot) in &slots {
+                    w.set_no_uncovered(slot, sources.no_pull_through(provider));
+                }
                 lanes_to_start(sources, &w, total_bytes, now, deposit, busy, room)
             };
             for holder in starts {
@@ -2461,12 +2551,11 @@ where
 
             // A lane ends priced out only once its driver's own top-up path has
             // declined, so the top-up budget cannot revive a source at this deposit.
-            if running.is_empty()
-                && connecting.is_empty()
-                && discovering.is_none()
-                && let Some(err) = sources.exhausted(deposit, false)
-            {
-                return Err(err);
+            if running.is_empty() && connecting.is_empty() && discovering.is_none() {
+                let only_uncovered = only_uncovered_left(sources, &*work.lock().await, total_bytes);
+                if let Some(err) = sources.exhausted(deposit, false, only_uncovered) {
+                    return Err(err);
+                }
             }
             let uncovered = work.lock().await.uncovered(total_bytes);
             if discovering.is_none()
@@ -2480,7 +2569,7 @@ where
                 biased;
                 Some(end) = workers.next(), if !workers.is_empty() => {
                     // `Err` here is this process's fault (store I/O, a slot bug).
-                    let WorkerEnd { provider, end, delivered, extra } = match end {
+                    let WorkerEnd { provider, end, delivered, pulled_through, extra } = match end {
                         Ok(end) => end,
                         Err(err) => return Err(err),
                     };
@@ -2492,6 +2581,9 @@ where
                     if delivered {
                         sources.record_progress(provider);
                         charged.remove(&provider);
+                    }
+                    if pulled_through {
+                        sources.record_pull_through(provider);
                     }
                     if let LaneEnd::Faulted {
                         err,
@@ -3581,6 +3673,7 @@ mod tests {
             extra: vec![false; 3],
             widened: vec![false; 3],
             providers: vec![None; 3],
+            no_uncovered: vec![false; 3],
             front_first: false,
         };
         // Nothing is present: every byte in flight is missing.
@@ -5170,6 +5263,184 @@ mod tests {
         work.revive(b);
         work.park(a);
         assert!(work.uncovered(total), "block 0 has no running lane");
+        Ok(())
+    }
+
+    /// A lane barred from pull-through is never handed a range outside its
+    /// coverage, and still takes the ranges it covers. Lifting the bar hands
+    /// it the uncovered range again.
+    #[test]
+    fn a_barred_lane_takes_only_what_it_covers() -> anyhow::Result<()> {
+        use std::collections::VecDeque;
+
+        use decdn_bao_range::align_range;
+
+        use super::{Picked, Work};
+
+        let total = 2 * DISCOVERY_BLOCK_BYTES;
+        let in_block0 = align_range(0, DISCOVERY_BLOCK_BYTES, total)?;
+        let in_block1 = align_range(DISCOVERY_BLOCK_BYTES, DISCOVERY_BLOCK_BYTES, total)?;
+        let mut work = Work::new(VecDeque::from(vec![in_block1, in_block0]), false);
+        let a_cov = cov(2, &[0]);
+        let a = work.add_lane(Some(a_cov.clone()), total);
+        let b = work.add_lane(Some(cov(2, &[1])), total);
+        work.park(b);
+        work.set_no_uncovered(a, true);
+        let missing = [(0, total)];
+
+        assert!(work.has_work_for(&a_cov, total, false), "block 0 is a's");
+        let first = work.pick(a, total, &a_cov, true, &missing)?;
+        assert!(
+            first.is_some_and(|p| p.range.fetch_start() == 0 && !p.uncovered),
+            "a takes the block it covers"
+        );
+        work.clear(a)?;
+        assert!(
+            !work.has_work_for(&a_cov, total, false),
+            "only block 1 is left"
+        );
+        assert_eq!(
+            work.growth_wanted(total, |_| false).len(),
+            1,
+            "the idle barred lane does not take block 1"
+        );
+        assert!(
+            work.pick(a, total, &a_cov, true, &missing)?.is_none(),
+            "a barred lane takes no uncovered range"
+        );
+
+        work.set_no_uncovered(a, false);
+        let Some(Picked {
+            range, uncovered, ..
+        }) = work.pick(a, total, &a_cov, true, &missing)?
+        else {
+            anyhow::bail!("an unbarred lane takes the uncovered range");
+        };
+        assert_eq!(range.fetch_start(), DISCOVERY_BLOCK_BYTES);
+        assert!(uncovered);
+        Ok(())
+    }
+
+    /// A partial holder that keeps refusing a block outside its coverage is
+    /// asked for it at most [`ABSENT_AFTER_NOT_FOUND`] times. Its node cannot
+    /// serve the block by pull-through, so it is barred from it, and the
+    /// whole holder serves the block once its lane builds.
+    ///
+    /// [`ABSENT_AFTER_NOT_FOUND`]: crate::source_set::ABSENT_AFTER_NOT_FOUND
+    #[tokio::test(start_paused = true)]
+    async fn a_partial_holder_refusing_an_uncovered_block_is_barred_from_it() -> anyhow::Result<()>
+    {
+        let total = 2 * DISCOVERY_BLOCK_BYTES;
+        let data = blob(total as usize);
+        let n = num_blocks(total);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(data.clone())?
+            .paying(Arc::clone(&ledger_a))
+            .refusing_blocks(&[1], || {
+                anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::NotFound))
+            });
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let (store, dir) = fresh_store(root, total);
+        // B's lane takes five minutes to build: without the bar, A would be
+        // asked for block 1 again each time its cooldown ends.
+        let provider = SlowBuild {
+            lanes: StaticSources::new(vec![
+                candidate(src_a.clone(), ledger_a, 0xA1, Some(cov(n, &[0]))),
+                candidate(src_b.clone(), ledger_b, 0xB2, None),
+            ])?,
+            slow: Address::repeat_byte(0xB2),
+            delay: Duration::from_mins(5),
+            built: std::sync::atomic::AtomicBool::new(false),
+        };
+        let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
+        let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+        let drive = drive_config();
+        acquire(
+            AcquireTarget {
+                store: &store,
+                hash: root,
+                total_bytes: total,
+                ranges: &[(0, total)],
+            },
+            &mut set,
+            &AcquireEnv {
+                pacer: &BudgetPacer::new(),
+                funder: &no_topups(),
+                drive: &drive,
+                max_lanes: 2,
+                stop: &stop,
+                on_progress: None,
+                ledgers: None,
+                pacing: None,
+                max_blob_bytes: 0,
+            },
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+        let asked = src_a
+            .opened_ranges()
+            .into_iter()
+            .filter(|&(start, _)| start >= DISCOVERY_BLOCK_BYTES)
+            .count();
+        assert!(
+            (1..=3).contains(&asked),
+            "A was asked for block 1 {asked} times"
+        );
+        assert!(
+            src_b
+                .opened_ranges()
+                .iter()
+                .any(|&(start, _)| start >= DISCOVERY_BLOCK_BYTES),
+            "B serves block 1"
+        );
+        Ok(())
+    }
+
+    /// A sole partial holder barred from the only block left ends the item
+    /// once a discovery finds no one else, as a unanimous `NotFound` does.
+    #[tokio::test(start_paused = true)]
+    async fn a_sole_barred_partial_holder_ends_only_the_item() -> anyhow::Result<()> {
+        let total = 2 * DISCOVERY_BLOCK_BYTES;
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src = ScriptedSource::new(blob(total as usize))?
+            .paying(Arc::clone(&ledger))
+            .refusing_blocks(&[1], || {
+                anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::NotFound))
+            });
+        let root = src.root();
+        let (store, _dir) = fresh_store(root, total);
+        let provider = StaticSources::new(vec![candidate(
+            src.clone(),
+            ledger,
+            0xA1,
+            Some(cov(num_blocks(total), &[0])),
+        )])?;
+        let err = run_acquire(
+            &store,
+            &provider,
+            root,
+            total,
+            &BudgetPacer::new(),
+            &no_topups(),
+            1,
+            None,
+        )
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("must stop"))?;
+        assert!(err.downcast_ref::<NoSourceHasBlob>().is_some(), "{err:#}");
+        assert!(err.downcast_ref::<UpstreamRefused>().is_some(), "{err:#}");
+        assert_eq!(classify(&err), Fault::Fatal(FatalScope::Item));
+        let asked = src
+            .opened_ranges()
+            .into_iter()
+            .filter(|&(start, _)| start >= DISCOVERY_BLOCK_BYTES)
+            .count();
+        assert_eq!(asked, 3, "asked for block 1 until barred");
         Ok(())
     }
 
