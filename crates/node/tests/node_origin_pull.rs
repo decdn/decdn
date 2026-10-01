@@ -2403,6 +2403,41 @@ fn spawn_a_stalling_server(
     })
 }
 
+/// [`spawn_a_stalling_server`] that also counts the `cdn/client/v1` connections it
+/// accepts, so a test can see how many upstream opens reached it.
+fn spawn_a_counting_stalling_server(
+    ep: iroh::Endpoint,
+    s_eth: Arc<PrivateKeySigner>,
+    slash: Eip712Domain,
+    total_bytes: u64,
+    rate: u64,
+    streams: Arc<AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(incoming) = ep.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else { continue };
+            let eth = Arc::clone(&s_eth);
+            let dom = slash.clone();
+            if conn.alpn() == ALPN_PROBE {
+                tokio::spawn(async move {
+                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
+                });
+            } else {
+                streams.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    if let Ok((_send, mut recv)) = conn.accept_bi().await {
+                        let _ = read_frame(&mut recv).await;
+                        conn.closed().await;
+                    }
+                });
+            }
+        }
+    })
+}
+
 /// #859: when the best-ranked candidate *stalls* (answers the probe, then never
 /// serves bytes), the per-candidate `pull_timeout` must abandon it and the loop
 /// must fall through to the next ranked candidate, which delivers. This proves
@@ -2864,6 +2899,41 @@ async fn node_origin_no_providers_is_clean_miss() -> Result<()> {
     anyhow::ensure!(
         progress_log(&recorded)?.is_empty(),
         "no pull ⇒ no voucher acked ⇒ nothing to persist (#852 guard)"
+    );
+    assert_counter(&b_metrics, "node_pull_no_providers_total", 1)?;
+    shutdown([], [&ep_b]).await?;
+    Ok(())
+}
+
+/// The origin directory lists every active origin operator, this node included.
+/// A node never takes its own directory entry as a candidate: with only itself
+/// listed, the miss is a clean "no providers" (#2224).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_origin_directory_entry_for_this_node_is_not_a_candidate() -> Result<()> {
+    let hash = Hash::new(b"only-this-node-is-listed");
+    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let b_dht = DhtNodeId::from_bytes(*fresh_key().public().as_bytes());
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let b_metrics = Arc::new(Metrics::new());
+    let (origin, _engine, _recorded, _engine_tmp) = provisioned_origin(
+        &ep_b,
+        b_dht,
+        hash,
+        B256::repeat_byte(0xA1),
+        &Arc::new(PrivateKeySigner::random()),
+        &local_rep,
+        &b_metrics,
+        vec![b_dht],
+        HashMap::new(),
+    )
+    .await;
+
+    let got = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::NotFound),
+        "a directory listing only this node must yield NotFound"
     );
     assert_counter(&b_metrics, "node_pull_no_providers_total", 1)?;
     shutdown([], [&ep_b]).await?;
@@ -16016,6 +16086,182 @@ async fn a_serve_miss_never_pulls_from_its_requester() -> Result<()> {
         seen.refused_misses == 0,
         "the requester was sent a request it had to refuse"
     );
+    Ok(())
+}
+
+/// #2224: while S's own upstream open for a blob is in progress, S refuses a
+/// whole-blob request for that blob from another node (an active staker) at
+/// once, without opening a second upstream leg. A loop of partial holders closes
+/// through exactly that window, because the fill is claimed only after the open.
+/// A staker's request with no open in progress, a client's whole-blob request
+/// and a staker's ranged request are not refused for this reason.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_runs() -> Result<()> {
+    let (_block_guard, payload, hash) = two_block_blob()?;
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let ab_pool_id = B256::repeat_byte(0xA5);
+    let s_buyer = Arc::new(PrivateKeySigner::random());
+
+    // Upstream U answers probes, then holds every client stream open unanswered,
+    // so each of S's opens for the blob stays in progress for the whole test.
+    let u_sk = fresh_key();
+    let u_id = u_sk.public();
+    let u_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_u, addr_u) =
+        local_endpoint(u_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let u_streams = Arc::new(AtomicUsize::new(0));
+    let task_u = spawn_a_counting_stalling_server(
+        ep_u.clone(),
+        Arc::clone(&u_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+        Arc::clone(&u_streams),
+    );
+    let u_dht = DhtNodeId::from_bytes(*u_id.as_bytes());
+
+    // Four leaves, each on its own lane at S. Leaves 1, 2 and 4 are active
+    // stakers (nodes); leaf 3 is a client.
+    let leaves: Vec<(iroh::SecretKey, Arc<PrivateKeySigner>, B256)> = (0u8..4)
+        .map(|i| {
+            (
+                fresh_key(),
+                Arc::new(PrivateKeySigner::random()),
+                B256::repeat_byte(0x60 + i),
+            )
+        })
+        .collect();
+    let [
+        (sk1, eth1, ch1),
+        (sk2, eth2, ch2),
+        (sk3, eth3, ch3),
+        (sk4, eth4, ch4),
+    ] = <[_; 4]>::try_from(leaves).map_err(|_| anyhow::anyhow!("four leaves"))?;
+    let mut discovery = FixtureDiscovery::directory_only(vec![u_dht], U256::ZERO);
+    for sk in [&sk1, &sk2, &sk4] {
+        discovery
+            .stakers
+            .insert(DhtNodeId::from_bytes(*sk.public().as_bytes()));
+    }
+
+    let (handler_s, s_target, ep_s, _recorded, _cache_s, s_operator, s_metrics, _) =
+        build_serving_node(
+            hash,
+            ab_pool_id,
+            &s_buyer,
+            discovery,
+            PositiveProbeCache::new(),
+            HashMap::from([(u_dht, u_eth.address())]),
+            &[(u_id, addr_u)],
+            &[
+                (ch1, eth1.address()),
+                (ch2, eth2.address()),
+                (ch3, eth3.address()),
+                (ch4, eth4.address()),
+            ],
+            U256::from(DEPOSIT_MICRO_USDC),
+        )
+        .await?;
+    let task_s = spawn_server_concurrent(ep_s.clone(), handler_s);
+
+    let (ep1, _) = local_endpoint(sk1.clone(), vec![]).await?;
+    let (ep2, _) = local_endpoint(sk2.clone(), vec![]).await?;
+    let (ep3, _) = local_endpoint(sk3.clone(), vec![]).await?;
+    let (ep4, _) = local_endpoint(sk4.clone(), vec![]).await?;
+    let wait_for_opens = |n: usize, what: &'static str| {
+        let u_streams = Arc::clone(&u_streams);
+        async move {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while u_streams.load(Ordering::SeqCst) < n {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("{what}"))
+        }
+    };
+
+    // Leaf 1 (a staker) asks for the whole blob with no open in progress: not
+    // refused, so S starts its upstream open for the blob.
+    let first = {
+        let (ep, target, eth) = (ep1.clone(), s_target.clone(), Arc::clone(&eth1));
+        let id = B256::from(*sk1.public().as_bytes());
+        tokio::spawn(async move {
+            leaf_paced_pull(&ep, target, id, &eth, s_operator, ch1, hash, RATE, None).await
+        })
+    };
+    wait_for_opens(1, "a staker with no open in progress was refused").await?;
+
+    // Leaf 2 (a staker) asks for the whole blob while that open runs: refused at
+    // once.
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        leaf_paced_pull(
+            &ep2,
+            s_target.clone(),
+            B256::from(*sk2.public().as_bytes()),
+            &eth2,
+            s_operator,
+            ch2,
+            hash,
+            RATE,
+            None,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the node's whole-blob request was not answered at once"))?;
+    let err = refused
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("the node's whole-blob request was served"))?;
+    anyhow::ensure!(
+        format!("{err:#}").contains("NotFound"),
+        "the refusal is a miss on the wire: {err:#}"
+    );
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    anyhow::ensure!(
+        u_streams.load(Ordering::SeqCst) == 1,
+        "the refused request opened a second upstream leg"
+    );
+    anyhow::ensure!(
+        counter_value(&s_metrics, "serve_stream_rejected_pull_loop_guard_total")? == 1,
+        "the refusal counts on its own reason"
+    );
+    anyhow::ensure!(
+        counter_value(&s_metrics, "serve_stream_rejected_cache_miss_total")? == 0,
+        "the refusal is not counted as a cache miss"
+    );
+
+    // Leaf 3 (a client) asks for the whole blob too: not refused, so S opens a
+    // second upstream leg for it.
+    let third = {
+        let (ep, target, eth) = (ep3.clone(), s_target.clone(), Arc::clone(&eth3));
+        let id = B256::from(*sk3.public().as_bytes());
+        tokio::spawn(async move {
+            leaf_paced_pull(&ep, target, id, &eth, s_operator, ch3, hash, RATE, None).await
+        })
+    };
+    wait_for_opens(2, "the client's whole-blob request was refused").await?;
+
+    // Leaf 4 (a staker) asks for a range: not refused, so S opens a third leg.
+    let fourth = {
+        let (ep, target, eth) = (ep4.clone(), s_target.clone(), Arc::clone(&eth4));
+        let id = B256::from(*sk4.public().as_bytes());
+        let len = total_bytes / 2;
+        tokio::spawn(async move {
+            leaf_paced_pull_ranged(&ep, target, id, &eth, s_operator, ch4, hash, RATE, len).await
+        })
+    };
+    wait_for_opens(3, "the staker's ranged request was refused").await?;
+    anyhow::ensure!(
+        counter_value(&s_metrics, "serve_stream_rejected_pull_loop_guard_total")? == 1,
+        "only the one whole-blob request from a staker mid-open was refused"
+    );
+
+    first.abort();
+    third.abort();
+    fourth.abort();
+    shutdown([task_s, task_u], [&ep1, &ep2, &ep3, &ep4, &ep_s, &ep_u]).await?;
     Ok(())
 }
 

@@ -1150,7 +1150,10 @@ pub(crate) fn holders_or_none(
         Ok(targets) => Ok(targets),
         Err(err) if err.downcast_ref::<ResolveConfigFault>().is_some() => Err(err),
         Err(err) => {
-            tracing::warn!("no holder resolved yet; the fetch keeps looking: {err:#}");
+            tracing::warn!(
+                error = %decdn_common::redact::sanitize_err_chain(&err),
+                "no holder resolved yet; the fetch keeps looking"
+            );
             Ok(ResolvedTargets {
                 candidates: Vec::new(),
                 coverage_by_node: HashMap::new(),

@@ -139,8 +139,8 @@ becomes scrapeable once boot completes.
 - `decdn_chain_get_logs_retries_total` counts in-tick retries of `eth_getLogs`
   windows after a transient provider error (dRPC `Temporary internal error`,
   `Request timeout on the free plan`, a lagging backend, a per-call timeout).
-  Each window gets two retries, 2 s apart, before the tick fails, so one window
-  adds up to two. A retry that succeeds is not watcher downtime, so a steady
+  Each window gets two retries, 2 s apart, before the poller defers it to the
+  next tick, so one window adds up to two. A retry that succeeds is not watcher downtime, so a steady
   retry rate with healthy watchers is an unreliable provider that the poller
   absorbs. The "eth_getLogs window span" panel plots it beside the rejections.
   Each retry logs `eth_getLogs window failed; retrying the same window` at
@@ -149,23 +149,37 @@ becomes scrapeable once boot completes.
   out` means the windows are too wide (see below). A rate limit and a
   permanent error are not retried: they fail the tick into the backoff at
   once.
+- `decdn_chain_get_logs_deferred_total` counts `eth_getLogs` windows that
+  failed every retry. The poller ends the tick at such a window, keeps the
+  progress before it, and resumes there on the next tick, logging
+  `eth_getLogs window failed on every retry; deferring it to the next tick` at
+  `info`. A deferral is not watcher downtime and loses no event. The tick
+  fails, and the watchers go down, only when no tick reaches head for 2
+  minutes (`no poll tick reached head for 120 s`). A steady deferral rate with
+  healthy watchers is a provider whose failures cluster: the watchers lag head
+  by a few ticks but stay up.
 - `multiplexed poller tick error` `warn!` lines on `get_logs` while
   `decdn_rpc_healthy` stays 1 mean the watchers cannot read events although
   the endpoint answers. `rejects even a one-block eth_getLogs window` means the
   provider cannot serve the watchers at all: change provider. Repeated
   `get_logs` timeouts, or a range or size error the poller does not recognise
   (it logs no shrink line), mean the windows are too wide for this provider:
-  lower `blockchain.get_logs_max_block_span` and restart. A timed-out window
-  is retried on the same range, so it costs three per-call timeouts plus the
-  retry sleeps (34 s at the 10 s default) before the tick fails.
+  lower `blockchain.get_logs_max_block_span` and restart. Timeouts first show
+  in the `info` retry and `deferring it to the next tick` lines; they reach a
+  `multiplexed poller tick error` only after the 2-minute stall. A timed-out
+  window is retried on the same range, so it costs three per-call timeouts plus the
+  retry sleeps (34 s at the 10 s default) before the window is deferred.
 - `DecdnChainWatcherFlapping` means a node's chain watchers fail and recover
   again and again (four or more failure windows in 30 minutes, held for 45
   minutes; a single burst does not fire it). Each recovery resets the stalled
   alerts, so they stay quiet while the watchers lag head. Treat it as an
   unreliable RPC provider: read the `multiplexed poller tick error` lines for
   the cause, check `decdn_chain_get_logs_range_rejections_total` for an
-  `eth_getLogs` cap, and check `decdn_chain_get_logs_retries_total` for a
-  provider whose failures outlast the in-tick retries.
+  `eth_getLogs` cap, and check `decdn_chain_get_logs_deferred_total` for a
+  provider whose failures outlast the in-tick retries. A deferred window fails
+  the tick only after 2 minutes with no tick reaching head, so flapping means
+  the provider fails often enough, for minutes at a time, that the watchers
+  cannot catch up to head.
 
 - `decdn_staker_set_watcher_down_seconds` climbing (with
   `decdn_staker_set_watcher_restarts_total` advancing) is the chain-side

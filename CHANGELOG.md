@@ -915,6 +915,44 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Chain-read logs no longer carry the RPC URL (#2264).** The node's
+  binding check, buyer lane seed, owned-pool walk, top-up, pool open and
+  reclaim sweep log their RPC errors through the URL-stripping redactor, so a
+  provider API key in `blockchain.rpc_url` does not reach the node logs. The
+  client's lane-build and discovery debug lines and the CLI's "no holder
+  resolved yet" warning do the same.
+
+- **A transient `getAuthorization` fault no longer refuses a paying signer as
+  cap-exhausted (#2220).** When the admit-time read faults, the node answers
+  with the last registration it read for that signer, whatever its age, with
+  `spent` raised to the settlement projection's fold. A registration's cap and
+  expiry are write-once, so the old read stays true; an old "unregistered"
+  read is not trusted, because a registration can land at any time. A signer
+  with no registered read is still refused, now as `pool_unconfirmed`
+  (`decdn_serve_stream_rejected_pool_unconfirmed_total`), so
+  `decdn_serve_stream_rejected_signer_cap_exhausted_total` counts only signers
+  whose on-chain cap cannot pay a floor.
+
+- **Partial holders no longer pull a blob from each other in a loop of three
+  or more (#2224).** While a node's own upstream open for a blob is in
+  progress, it refuses a whole-blob request for that blob from an active
+  staker with `NotFound`, so the requester tries its next candidate. New
+  counter: `decdn_serve_stream_rejected_pull_loop_guard_total`, on the "Serve
+  refusals by reason" panels; the debug line names the requester. Ranged
+  requests and client requests are not refused for this reason. A node also drops its own entry from the origin directory's
+  candidates, as the DHT lookup already does.
+
+- **Clustered `eth_getLogs` failures no longer flap every chain watcher
+  (#2253).** A window that fails every in-tick retry no longer fails the
+  tick. The poller ends the tick there, keeps the progress of the windows
+  before it, and the next tick resumes at the deferred window. The tick fails
+  (backoff, `*_watcher_restarts_total`, `*_watcher_down_seconds`) only when no
+  tick reaches head for 2 minutes, so ticks that progress but keep falling
+  behind head still surface. A deferred tick that completes no window does
+  not stamp the watchers' tick gauges. New counter:
+  `decdn_chain_get_logs_deferred_total`, plotted on the chain dashboard's
+  "eth_getLogs window span" panel.
+
 - **A partial holder is not asked again for chunks it cannot pull through
   (#2262).** A probed holder that refuses a chunk outside its advertised
   coverage with `NotFound` now counts toward the same three-refusal limit as

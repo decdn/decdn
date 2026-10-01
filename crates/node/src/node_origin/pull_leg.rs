@@ -506,7 +506,9 @@ impl NodeOrigin {
     ///
     /// `requester` is the node the serve answers. It is never a candidate: pulling
     /// from it would hand it back its own bytes, and two nodes that each lack part
-    /// of the blob would pull from each other in a loop.
+    /// of the blob would pull from each other in a loop. While this open runs, the
+    /// serve path refuses a whole-blob request for `hash` from an active staker
+    /// ([`NodeOrigin::refuses_whole_blob`]), which stops longer loops.
     ///
     /// Shares the buffered [`decdn_cache::Origin::fetch`] path's cached-first discover → probe →
     /// rank pipeline and its open-time candidate fallback, but stops at channel-open +
@@ -525,6 +527,7 @@ impl NodeOrigin {
         requester: [u8; 32],
     ) -> Result<PullLegTarget, PullMiss> {
         let deps = self.deps.get().ok_or(PullMiss::Clean)?;
+        let _pending = self.enter_open(hash);
         let hash_bytes = *hash.as_bytes();
         let target = DhtHash::from_bytes(hash_bytes);
         let namespace_bytes = namespace_id.to_be_bytes::<32>();

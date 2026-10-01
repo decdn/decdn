@@ -670,11 +670,70 @@ fn prune_and_check_wedged(
     wedged.contains_key(peer)
 }
 
+/// The hashes this node has a pull-leg open ([`NodeOrigin::open_pull_leg`]) in
+/// progress for, each with the number of opens in flight. The buffered
+/// [`Origin::fetch`] path does not mark its pulls here. A whole-blob request
+/// from an active staker for one of these hashes would close a pull-through
+/// loop (#2224), so the serve path refuses it (see
+/// [`NodeOrigin::refuses_whole_blob`]).
+#[derive(Debug, Default)]
+struct PendingOpens(std::sync::Mutex<HashMap<[u8; 32], usize>>);
+
+impl PendingOpens {
+    fn contains(&self, hash: &[u8; 32]) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(hash)
+    }
+}
+
+/// Marks one upstream open for a hash as in progress until it drops. Bind it
+/// to a named local for the whole open: dropping it at once marks nothing.
+#[derive(Debug)]
+#[must_use = "an open is marked in progress only while its guard lives"]
+struct PendingOpen {
+    pending: Arc<PendingOpens>,
+    hash: [u8; 32],
+}
+
+impl PendingOpen {
+    fn enter(pending: &Arc<PendingOpens>, hash: [u8; 32]) -> Self {
+        let mut opens = pending
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = opens.entry(hash).or_insert(0);
+        *count = count.saturating_add(1);
+        Self {
+            pending: Arc::clone(pending),
+            hash,
+        }
+    }
+}
+
+impl Drop for PendingOpen {
+    fn drop(&mut self) {
+        let mut opens = self
+            .pending
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = opens.get_mut(&self.hash) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                opens.remove(&self.hash);
+            }
+        }
+    }
+}
+
 /// Node-to-node pull-through [`Origin`]. Cheap to clone via the shared inner
 /// [`Arc`]; the runtime holds one and injects its dependencies once.
 #[derive(Debug, Clone)]
 pub struct NodeOrigin {
     deps: Arc<OnceLock<NodeOriginDeps>>,
+    pending: Arc<PendingOpens>,
 }
 
 impl NodeOrigin {
@@ -684,6 +743,7 @@ impl NodeOrigin {
     pub fn new() -> Self {
         Self {
             deps: Arc::new(OnceLock::new()),
+            pending: Arc::new(PendingOpens::default()),
         }
     }
 
@@ -705,6 +765,29 @@ impl NodeOrigin {
     /// [`SettleOnDrop`] already carries across a drop.
     pub(crate) fn deps_arc(&self) -> Arc<OnceLock<NodeOriginDeps>> {
         Arc::clone(&self.deps)
+    }
+
+    /// Mark an upstream open for `hash` as in progress until the guard drops.
+    fn enter_open(&self, hash: Hash) -> PendingOpen {
+        PendingOpen::enter(&self.pending, *hash.as_bytes())
+    }
+
+    /// Whether the serve path refuses a whole-blob request for `hash` from
+    /// `requester` (#2224). It does while this node's own upstream open for
+    /// `hash` is in progress and `requester` is an active staker. A partial
+    /// holder that answers such a request opens its own whole-blob pull, and
+    /// three or more partial holders then pull the blob from each other in a
+    /// loop. The fill is claimed only after the open, so the open is the window
+    /// a loop closes through. A client is never an active staker, so a client's
+    /// whole-blob request is never refused for this reason, nor is a ranged
+    /// request: a loop of ranged handshakes asks each holder only for blocks it
+    /// advertises, so it starts no recursive whole-blob pull. `false` on an
+    /// unprovisioned origin.
+    pub(crate) fn refuses_whole_blob(&self, hash: Hash, requester: [u8; 32]) -> bool {
+        self.deps.get().is_some_and(|deps| {
+            self.pending.contains(hash.as_bytes())
+                && deps.staker_set.is_active(&DhtNodeId::from_bytes(requester))
+        })
     }
 
     /// The buyer-side blob-size ceiling in bytes
@@ -955,10 +1038,19 @@ async fn discover(
     .map(|(node, _coverage)| node)
     .collect();
     if providers.is_empty() {
-        deps.origin_directory.lookup_origins(namespace_id).await
+        directory_origins(deps, namespace_id).await
     } else {
         providers
     }
+}
+
+/// The origin directory's candidates for `namespace_id`, without this node. The
+/// DHT lookup drops this node by `self_id`; the directory lists every active
+/// origin operator, this node included, and a node never pulls from itself.
+async fn directory_origins(deps: &NodeOriginDeps, namespace_id: U256) -> Vec<DhtNodeId> {
+    let mut origins = deps.origin_directory.lookup_origins(namespace_id).await;
+    origins.retain(|origin| *origin != deps.self_id);
+    origins
 }
 
 /// Probe up to `probe_fanout` providers for rate + RTT, build a [`Candidate`]
@@ -982,7 +1074,7 @@ async fn probe_and_rank(
     let mut candidates: Vec<Candidate> = Vec::new();
     let probed = probe_round(deps, &providers, hash_bytes, gather, &mut candidates).await;
     if matches!(gather, ProbeGather::CoverageUnion) && !coverage_spans(&candidates) {
-        let directory = deps.origin_directory.lookup_origins(namespace_id).await;
+        let directory = directory_origins(deps, namespace_id).await;
         let listed = directory.len();
         let origins: Vec<DhtNodeId> = directory
             .into_iter()
@@ -3187,6 +3279,35 @@ fn now_micros() -> u64 {
 mod tests {
     use super::*;
     use decdn_protocol::{Coverage, VoucherRejectReason};
+
+    /// A hash stays pending while any open for it is in flight, and clears when
+    /// the last guard drops. Another hash is never pending (#2224).
+    #[test]
+    fn an_open_stays_pending_until_its_last_guard_drops() {
+        let pending = Arc::new(PendingOpens::default());
+        let (hash, other) = ([1u8; 32], [2u8; 32]);
+        let first = PendingOpen::enter(&pending, hash);
+        let second = PendingOpen::enter(&pending, hash);
+        assert!(pending.contains(&hash));
+        assert!(!pending.contains(&other));
+        drop(first);
+        assert!(pending.contains(&hash), "one open is still in flight");
+        drop(second);
+        assert!(!pending.contains(&hash), "the last guard clears the hash");
+        assert!(
+            pending.0.lock().unwrap().is_empty(),
+            "a cleared hash leaves no entry behind"
+        );
+    }
+
+    /// An unprovisioned origin refuses nothing, even with an open marked.
+    #[test]
+    fn an_unprovisioned_origin_refuses_no_whole_blob_request() {
+        let origin = NodeOrigin::new();
+        let hash = Hash::from_bytes([3u8; 32]);
+        let _open = origin.enter_open(hash);
+        assert!(!origin.refuses_whole_blob(hash, [4u8; 32]));
+    }
 
     /// The wedge is a FIXED [`WEDGED_PROVIDER_SUPPRESSION_SECS`] window measured from the
     /// rejection, not a channel deadline — the buyer pool is shared across every provider and

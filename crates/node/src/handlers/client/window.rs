@@ -92,9 +92,10 @@ impl ClientHandler {
     ///
     /// `fault_seen` carries whether an EARLIER tier (the reactive local-origin
     /// populate) hit a backend fault for this request (#1129). This path
-    /// is the last tier, so both of its MISS exits — no openable provider, and the
-    /// open deadline — refuse via [`FillOutcome::miss_reason`], reporting
-    /// `InternalError` when this node is degraded rather than merely empty.
+    /// is the last tier, so its MISS exits — no openable provider, the open
+    /// deadline, and the coverage gate — refuse via [`FillOutcome::miss_reason`],
+    /// reporting `InternalError` when this node is degraded rather than merely
+    /// empty. The pull-loop guard is not a miss and ignores `fault_seen`.
     ///
     /// The no-openable-provider exit adds a SECOND source of that fault: the pull's
     /// own [`PullMiss`](crate::node_origin::PullMiss), which says whether the
@@ -254,7 +255,35 @@ impl ClientHandler {
             )
         };
         let mut target: Option<PullLegTarget> = None;
-        let total_bytes = match self.cache.in_flight_total(hash) {
+        let in_flight = self.cache.in_flight_total(hash);
+        // A whole-blob request from an active staker, with no live fill to
+        // coalesce onto, while this node's own upstream open for the hash runs,
+        // would close a pull-through loop among partial holders (#2224). Refuse
+        // it as `PullLoopGuard` (wire `NotFound`), so the requester tries its
+        // next candidate. A live fill opens nothing upstream, so it never trips
+        // the guard.
+        if in_flight.is_none()
+            && req.byte_offset == 0
+            && req.byte_len == 0
+            && origin.refuses_whole_blob(hash, client_node_id.0)
+        {
+            tracing::debug!(
+                %hash,
+                requester = %client_node_id,
+                "refusing a whole-blob request from a node while this node's own \
+                 upstream open for the blob is in progress"
+            );
+            release_reservation_unspent(floor_reservation.as_ref());
+            return self
+                .respond_error(
+                    &mut send,
+                    req,
+                    ServeRejectReason::PullLoopGuard,
+                    rate_per_mb,
+                )
+                .await;
+        }
+        let total_bytes = match in_flight {
             Some(total) => total,
             None => {
                 // No live fill to coalesce onto — handshake upstream to learn the

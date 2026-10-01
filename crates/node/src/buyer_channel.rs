@@ -50,6 +50,7 @@ use decdn_client::buyer_pool::{
     open_pool, refill_amount, self_owned_lane_ctx, top_up as pool_top_up, topped_up_effect,
 };
 use decdn_client::{LocalPullFault, PoolContext};
+use decdn_common::redact::{sanitize_err_chain, sanitize_rpc_display};
 
 /// How often the reclaim sweep scans the node's pool for a completed close.
 /// Pool lifetimes are long, so an hourly scan is ample — it matches the seller
@@ -324,7 +325,7 @@ fn retryable_join_error(
     warn!(
         %pool_id,
         %requested,
-        error = %format_args!("{err:#}"),
+        error = %sanitize_err_chain(&err),
         "reactive top-up: the joined topUp failed; funding with our own topUp"
     );
     Ok(err)
@@ -458,7 +459,7 @@ async fn fund_pool<P: Provider + Clone + 'static>(
             warn!(
                 %pool_id,
                 %additional,
-                error = %format_args!("{err:#}"),
+                error = %sanitize_err_chain(&err),
                 "buyer top-up: topUp failed; pool not topped up"
             );
             handles.metrics.buyer_topup_failure();
@@ -838,7 +839,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             Err(err) => {
                 self.metrics.buyer_lane_seed_failure();
                 error!(
-                    pool_id = %state.pool_id, %provider_addr, error = %err,
+                    pool_id = %state.pool_id, %provider_addr, error = %sanitize_rpc_display(&err),
                     "could not read this lane's on-chain watermark; refusing the pull rather \
                      than resuming the lane from zero, which would strand it below the \
                      watermark permanently"
@@ -1470,7 +1471,7 @@ async fn enumerate_open_pools<P: Provider + Clone>(
         Err(err) if adopting => {
             metrics.buyer_pool_adoption_failure();
             warn!(
-                error = %format_args!("{err:#}"),
+                error = %sanitize_err_chain(&err),
                 "could not enumerate this node's on-chain pools; a pool it already owns \
                  stays unadopted and the next miss opens a fresh one"
             );
@@ -1478,7 +1479,7 @@ async fn enumerate_open_pools<P: Provider + Clone>(
         }
         Err(err) => {
             warn!(
-                error = %format_args!("{err:#}"),
+                error = %sanitize_err_chain(&err),
                 "could not enumerate this node's on-chain pools; a deposit stranded beside \
                  the pool it is using would go unreported this boot"
             );
@@ -1775,7 +1776,7 @@ impl OwnedPools {
                 Err(err) => {
                     warn!(
                         %pool_id,
-                        error = %err,
+                        error = %sanitize_rpc_display(&err),
                         "could not read an owned pool's state; this boot cannot say whether it \
                          is open, so it is neither adopted nor reported as stranded"
                     );
@@ -1903,7 +1904,7 @@ async fn run_open<P: Provider + Clone>(
     let opened = match open_pool(contract, signer, deployment, token, owner, deposit).await {
         Ok(opened) => opened,
         Err(err) => {
-            error!(error = %format_args!("{err:#}"), "buyer pool open failed");
+            error!(error = %sanitize_err_chain(&err), "buyer pool open failed");
             metrics.node_pull_pool_open_failure();
             let reason = err.downcast_ref::<PoolOpenFailureReason>().copied();
             if let Some(reason) = reason {
@@ -1984,7 +1985,7 @@ async fn publish_buyer_wallet_usdc<P: Provider>(
     match Erc20::new(token, provider).balanceOf(owner).call().await {
         Ok(balance) => metrics.set_buyer_wallet_usdc(balance),
         Err(err) => {
-            debug!(%token, %owner, error = %err, "could not read the buyer wallet's USDC balance");
+            debug!(%token, %owner, error = %sanitize_rpc_display(&err), "could not read the buyer wallet's USDC balance");
         }
     }
 }
@@ -2026,7 +2027,7 @@ async fn reclaim_once<P: Provider + Clone>(
     let pool = match contract.getPool(state.pool_id).call().await {
         Ok(pool) => pool,
         Err(err) => {
-            warn!(pool_id = %state.pool_id, error = %format_args!("{err:#}"), "reclaim sweep: getPool failed");
+            warn!(pool_id = %state.pool_id, error = %sanitize_rpc_display(&err), "reclaim sweep: getPool failed");
             metrics.buyer_reclaim_failure();
             return;
         }
@@ -2047,7 +2048,7 @@ async fn reclaim_once<P: Provider + Clone>(
         Ok(now) if now < pool.disputeDeadline => return,
         Ok(_) => {}
         Err(err) => {
-            debug!(pool_id = %state.pool_id, error = %format_args!("{err:#}"), "reclaim sweep: chain head read failed; attempting reclaim anyway");
+            debug!(pool_id = %state.pool_id, error = %sanitize_err_chain(&err), "reclaim sweep: chain head read failed; attempting reclaim anyway");
         }
     }
 
@@ -2072,12 +2073,12 @@ async fn reclaim_once<P: Provider + Clone>(
                 metrics.buyer_reclaim_failure();
             }
             Err(err) => {
-                warn!(pool_id = %state.pool_id, error = %format_args!("{err:#}"), "reclaim sweep: reclaim receipt failed");
+                warn!(pool_id = %state.pool_id, error = %sanitize_rpc_display(&err), "reclaim sweep: reclaim receipt failed");
                 metrics.buyer_reclaim_failure();
             }
         },
         Err(err) => {
-            warn!(pool_id = %state.pool_id, error = %format_args!("{err:#}"), "reclaim sweep: reclaim submit failed");
+            warn!(pool_id = %state.pool_id, error = %sanitize_rpc_display(&err), "reclaim sweep: reclaim submit failed");
             metrics.buyer_reclaim_failure();
         }
     }
@@ -2186,6 +2187,69 @@ mod tests {
             ),
             asserter,
         )
+    }
+
+    /// Collects a `fmt` subscriber's output so a test can read the logged text.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A provider error can carry the RPC URL, and the URL can carry the
+    /// provider's API key. The chain-read warning names the failure without the
+    /// key (#2264).
+    #[tokio::test]
+    async fn a_chain_read_warning_does_not_log_the_rpc_url() -> anyhow::Result<()> {
+        use alloy::providers::ProviderBuilder;
+        use alloy::providers::mock::Asserter;
+
+        let asserter = Asserter::new();
+        asserter.push_failure_msg(
+            "error sending request for url (https://rpc.example/v3/SECRETKEY): timed out",
+        );
+        let contract = PaymentPool::new(
+            Address::ZERO,
+            ProviderBuilder::new().connect_mocked_client(asserter),
+        );
+
+        let log = CapturedLog::default();
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        let walked = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            OwnedPools::walk(&contract, vec![PoolId::from([0xAA; 32])]).await
+        };
+        assert_eq!(walked.unreadable.len(), 1);
+
+        let text = String::from_utf8(
+            log.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )?;
+        assert!(
+            text.contains("could not read an owned pool's state"),
+            "the warning is logged: {text}"
+        );
+        assert!(!text.contains("SECRETKEY"), "the key is redacted: {text}");
+        assert!(!text.contains("rpc.example"), "the URL is redacted: {text}");
+        Ok(())
     }
 
     /// A node whose store was reset adopts the pool it already owns rather than

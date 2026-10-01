@@ -34,6 +34,7 @@
 use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
 use decdn_common::admin::BindingStatus;
+use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::capacity_bond::CapacityBond;
 
 /// Outcome of the bring-up binding check, as carried into `AdminState`.
@@ -103,7 +104,7 @@ pub async fn check<P: Provider>(
         Ok(bound) => bound,
         Err(err) => {
             tracing::warn!(
-                error = %err,
+                error = %sanitize_rpc_display(&err),
                 %operator,
                 %capacity_bond,
                 "could not read the on-chain node-id binding at startup; slashability of this \

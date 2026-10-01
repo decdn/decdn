@@ -77,6 +77,7 @@ const fn refusal_reason(reason: ServeRejectReason) -> &'static str {
         ServeRejectReason::PoolUnconfirmed => "pool_unconfirmed",
         ServeRejectReason::SignerCapExhausted => "signer_cap_exhausted",
         ServeRejectReason::SignerFloorAtCap => "signer_floor_at_cap",
+        ServeRejectReason::PullLoopGuard => "pull_loop_guard",
         ServeRejectReason::LoadShedHit => "load_shed_hit",
         ServeRejectReason::LoadShedMiss => "load_shed_miss",
         ServeRejectReason::RangeNotSatisfiable => "range_not_satisfiable",
@@ -199,6 +200,7 @@ fn meter_refusal(metrics: &Metrics, reason: ServeRejectReason) {
         ServeRejectReason::SignerFloorAtCap => {
             metrics.serve_stream_rejected_signer_floor_at_cap();
         }
+        ServeRejectReason::PullLoopGuard => metrics.serve_stream_rejected_pull_loop_guard(),
         ServeRejectReason::LoadShedHit => metrics.serve_stream_rejected_load_shed_hit(),
         ServeRejectReason::LoadShedMiss => metrics.serve_stream_rejected_load_shed_miss(),
         ServeRejectReason::RangeNotSatisfiable => {
@@ -415,6 +417,7 @@ mod tests {
             | ServeRejectReason::PoolUnconfirmed
             | ServeRejectReason::SignerCapExhausted
             | ServeRejectReason::SignerFloorAtCap
+            | ServeRejectReason::PullLoopGuard
             | ServeRejectReason::LoadShedHit
             | ServeRejectReason::LoadShedMiss
             | ServeRejectReason::RangeNotSatisfiable
@@ -443,6 +446,7 @@ mod tests {
             ServeRejectReason::PoolUnconfirmed,
             ServeRejectReason::SignerCapExhausted,
             ServeRejectReason::SignerFloorAtCap,
+            ServeRejectReason::PullLoopGuard,
             ServeRejectReason::LoadShedHit,
             ServeRejectReason::LoadShedMiss,
             ServeRejectReason::RangeNotSatisfiable,

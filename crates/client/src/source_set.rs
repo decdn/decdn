@@ -673,7 +673,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 };
             }
             Err(err) => {
-                tracing::debug!("discovery failed: {err:#}");
+                tracing::debug!(error = %decdn_common::redact::sanitize_err_chain(&err), "discovery failed");
                 self.discovery = Some(self.next_discovery_backoff(now));
             }
         }

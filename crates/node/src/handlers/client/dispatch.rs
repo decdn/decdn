@@ -546,7 +546,9 @@ impl ClientHandler {
         // floor: a "spent" capability sprayed to a fresh node is refused, not served
         // for vouchers this node can never redeem. The registered terms are kept to
         // clamp the lane below. Unregistered signer or no chain wired -> admit on the
-        // presented capability; a getAuthorization fault -> None -> refuse.
+        // presented capability. A getAuthorization fault with no earlier registered
+        // read of the signer -> None -> refuse as unconfirmed, never as an
+        // exhausted cap.
         let mut registered_terms: Option<(u64, u64)> = None;
         if let (Some(view), Some(signer)) = (self.pool_view.as_ref(), verified_client) {
             let floor_micro =
@@ -558,14 +560,9 @@ impl ClientHandler {
                 registered_terms = Some((cap, expiry));
             }
             let now = self.coarse_clock.unix_seconds();
-            if !auth.is_some_and(|a| a.covers(floor_micro, now)) {
+            if let Some(reason) = signer_refusal(auth, floor_micro, now) {
                 return self
-                    .respond_error(
-                        &mut send,
-                        &req,
-                        ServeRejectReason::SignerCapExhausted,
-                        rate_per_mb,
-                    )
+                    .respond_error(&mut send, &req, reason, rate_per_mb)
                     .await;
             }
         }
@@ -1435,6 +1432,60 @@ pub(super) fn aligned_span(byte_offset: u64, byte_len: u64, total_bytes: u64) ->
 /// refuses.
 pub(super) fn range_out_of_bounds(byte_offset: u64, byte_len: u64, total_bytes: u64) -> bool {
     decdn_bao_range::align_range_clamped(byte_offset, byte_len, total_bytes).is_err()
+}
+
+/// The admit-gate verdict on a signer's on-chain authorization (ADR 003
+/// §Capability delegation). `None` from the view means the read faulted with no
+/// earlier registered read of the signer, which is a chain problem and refuses as
+/// [`ServeRejectReason::PoolUnconfirmed`]. A read whose terms cannot pay
+/// `floor_micro` at `now` refuses as [`ServeRejectReason::SignerCapExhausted`].
+/// `None` from this function admits.
+fn signer_refusal(
+    auth: Option<SignerAuthorization>,
+    floor_micro: U256,
+    now: u64,
+) -> Option<ServeRejectReason> {
+    match auth {
+        None => Some(ServeRejectReason::PoolUnconfirmed),
+        Some(auth) if !auth.covers(floor_micro, now) => Some(ServeRejectReason::SignerCapExhausted),
+        Some(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod signer_refusal_tests {
+    use super::{ServeRejectReason, SignerAuthorization, U256, signer_refusal};
+
+    /// A `getAuthorization` fault with no earlier read refuses as an unconfirmed
+    /// pool, so `signer_cap_exhausted` counts only signers whose cap is spent
+    /// (#2220).
+    #[test]
+    fn an_unconfirmed_signer_is_not_counted_as_cap_exhausted() {
+        let floor = U256::from(1_000u64);
+        assert_eq!(
+            signer_refusal(None, floor, 0),
+            Some(ServeRejectReason::PoolUnconfirmed)
+        );
+        let spent = SignerAuthorization::Registered {
+            cap: 1_000,
+            expiry: u64::MAX,
+            spent: 500,
+        };
+        assert_eq!(
+            signer_refusal(Some(spent), floor, 0),
+            Some(ServeRejectReason::SignerCapExhausted)
+        );
+        let live = SignerAuthorization::Registered {
+            cap: 10_000,
+            expiry: u64::MAX,
+            spent: 500,
+        };
+        assert_eq!(signer_refusal(Some(live), floor, 0), None);
+        assert_eq!(
+            signer_refusal(Some(SignerAuthorization::Unregistered), floor, 0),
+            None
+        );
+    }
 }
 
 #[cfg(test)]
