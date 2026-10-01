@@ -67,9 +67,11 @@ pub struct EvictionPlan {
 Three boundary rules keep the split clean:
 
 - The engine owns every safety exemption: pins, probe-triggered holds, and
-  the deny/takedown set. Eviction candidates arrive to the policy already
-  filtered of them, and the engine refuses to act on a pinned, held, or
-  denied hash regardless of what a plan says.
+  the deny/takedown set. Eviction candidates arrive to the policy without
+  pinned or probe-held hashes. A deny-listed hash stays a candidate, even when
+  it is pinned: deny wins over pin. A probe-held hash stays out, even when it
+  is deny-listed. The engine refuses to release a pinned hash that is not
+  deny-listed, whatever a plan says.
 - The engine owns the store and reclaim path. It exposes generic segment
   primitives and assigns them no meaning of its own; it stores the label
   admission chose and moves it when a plan says to. Policies hold no store
@@ -406,8 +408,9 @@ retention.
   of the volume, but reactively: soft-evict plus GC lag means a heavy write
   burst can cross the margin briefly before the driver claws it back.
 - Segment membership lives in memory only. A restart loses it, so every
-  cached blob returns to an uncapped state until traffic re-observes it and
-  the estimator rebuilds its signal.
+  cached blob is `Main` after a restart. Only fill admission assigns a
+  segment, so a blob that a restart reset stays `Main` until it is evicted.
+  Traffic rebuilds the frequency estimator's signal, but not the segment.
 
 ## Acceptance Criteria
 
@@ -425,8 +428,9 @@ retention.
    set survives a cold scan.
 6. Shipped policies emit only whole-blob eviction targets. Range reclaim is
    documented as blocked on an upstream `iroh-blobs` primitive.
-7. Pins, probe-holds, and the deny set are never evicted, regardless of the
-   active policy; the engine enforces this independent of any plan.
+7. Pins and probe-holds are never evicted, regardless of the active policy.
+   A deny-listed hash is always evictable, even when it is pinned. The engine
+   enforces both rules independent of any plan.
 8. An unknown policy name is a config error at load, with no silent
    fallback.
 9. The workspace builds clean under the anti-panic clippy lints
