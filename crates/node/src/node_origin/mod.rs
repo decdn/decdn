@@ -67,6 +67,7 @@ use decdn_cache::origin::{Origin, OriginFetch};
 use decdn_cache::{Hash, OriginKind, OriginPullError};
 use decdn_client::driver::DriveConfig;
 use decdn_client::{BudgetPacer, PeerSource, PrimedSource, drive, first_leg};
+use decdn_common::redact::sanitize_err_chain;
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use timed_source::{TimedSource, timed_open};
@@ -302,7 +303,7 @@ fn record_pool_open_failure(
     if arm == PoolOpenArm::LocalFault {
         deps.metrics.node_pull_local_fault();
         warn!(
-            %provider_addr, error = %err,
+            %provider_addr, error = %sanitize_err_chain(err),
             "node-origin: LOCAL buyer-side fault opening a pool — this node cannot pay \
              any provider; exonerating the upstream and refusing rather than reporting a miss"
         );
@@ -344,7 +345,7 @@ fn record_pool_open_failure(
         warn!(
             %provider_addr,
             reason = reason.as_label(),
-            error = %err,
+            error = %sanitize_err_chain(err),
             "node-origin: buyer pool open/reuse failed on a classified chain fault \
              raised outside the open task"
         );
@@ -352,7 +353,7 @@ fn record_pool_open_failure(
         warn!(
             %provider_addr,
             reason = "unclassified",
-            error = %err,
+            error = %sanitize_err_chain(err),
             "node-origin: buyer pool open/reuse failed (raised outside the open task — \
              suspect this node's store or lock state, not the peer)"
         );
