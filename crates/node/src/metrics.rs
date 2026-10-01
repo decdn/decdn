@@ -79,6 +79,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_rejected_origin_denied_total",
     "decdn_serve_stream_rejected_owner_mismatch_total",
     "decdn_serve_stream_rejected_pool_unconfirmed_total",
+    "decdn_serve_stream_rejected_pull_loop_guard_total",
     "decdn_serve_stream_rejected_range_not_satisfiable_total",
     "decdn_serve_stream_rejected_signer_cap_exhausted_total",
     "decdn_serve_stream_rejected_signer_floor_at_cap_total",
@@ -1685,16 +1686,18 @@ pub struct DecdnMetrics {
     pub serve_stream_rejected_insufficient_deposit: Counter,
     /// Delivery refused at admission because a wired `PoolView` could not confirm
     /// the pool on-chain — the pool has no on-chain record, is closed/reclaimed, or
-    /// the admit-path `getPool` faulted. Wire-indistinguishable from a cache miss
+    /// the admit-path `getPool` faulted — or could not confirm the voucher signer:
+    /// the admit-path `getAuthorization` faulted and the node holds no cached
+    /// registered read of the signer. Wire-indistinguishable from a cache miss
     /// (signed as `NotFound`), so this counter is the only place the reason lives;
     /// kept distinct from `insufficient_deposit` so a real drained-pool refusal is
     /// not conflated with an unconfirmed or unreachable pool. Visible name:
     /// `decdn_serve_stream_rejected_pool_unconfirmed_total`.
     pub serve_stream_rejected_pool_unconfirmed: Counter,
     /// Delivery refused at admission because the request's voucher signer is
-    /// registered on-chain with `cap − spent` below a serve floor, or its
-    /// `getAuthorization` could not be confirmed — a "spent" capability the node
-    /// could never cash. Wire-indistinguishable from a cache miss (signed as
+    /// registered on-chain with `cap − spent` below a serve floor or with an
+    /// expired registration — a "spent" capability the node could never cash. A
+    /// `getAuthorization` fault never counts here (see `pool_unconfirmed`). Wire-indistinguishable from a cache miss (signed as
     /// `NotFound`), so this counter is the only place the reason lives; a rising
     /// value flags capabilities presented whose signer has drained its shared `cap`
     /// at other nodes. Visible name:
@@ -1723,6 +1726,14 @@ pub struct DecdnMetrics {
     /// top-up, a signer at its share does not. Visible name:
     /// `decdn_serve_stream_rejected_signer_floor_at_cap_total`.
     pub serve_stream_rejected_signer_floor_at_cap: Counter,
+    /// Whole-blob requests from an active staker refused while this node's own
+    /// upstream open for the blob was in progress (#2224): the guard that stops
+    /// partial holders pulling a blob from each other in a loop. Signed as
+    /// `NotFound`, so this counter is the only place the reason lives. A rate
+    /// that tracks node-to-node pulls of one blob shows the guard breaking loops;
+    /// the debug line `refusing a whole-blob request from a node` names the
+    /// requester. Visible name: `decdn_serve_stream_rejected_pull_loop_guard_total`.
+    pub serve_stream_rejected_pull_loop_guard: Counter,
     /// Delivery refused because the requested bounded range
     /// `[byte_offset, byte_offset + byte_len)` is out of bounds for the blob
     /// (ADR 005 §Bounded byte ranges: the node MUST reject an overflowing or
@@ -3113,13 +3124,14 @@ recorders! {
 
     /// Record a `serve_stream` admission refused because a wired `PoolView` could
     /// not confirm the pool on-chain (absent, closed, or the admit `getPool`
-    /// faulted) — kept distinct from a real deposit-exhaustion refusal.
+    /// faulted), or a `getAuthorization` fault left the signer with no cached
+    /// registered read — kept distinct from a real deposit-exhaustion refusal.
     serve_stream_rejected_pool_unconfirmed => serve_stream_rejected_pool_unconfirmed.inc();
 
     /// Record a `serve_stream` admission refused because the request's voucher
     /// signer has drained its shared on-chain `cap` (`cap − spent` below the serve
-    /// floor) or its authorization could not be confirmed — a capability this node
-    /// could never cash.
+    /// floor) or its registration has expired — a capability this node could never
+    /// cash.
     serve_stream_rejected_signer_cap_exhausted => serve_stream_rejected_signer_cap_exhausted.inc();
 
     /// Record a live serve stopped mid-stream because its voucher signer drained
@@ -3131,6 +3143,10 @@ recorders! {
     /// per-signer live concurrency cap of un-vouchered reservation, while the pool as a
     /// whole can still pay.
     serve_stream_rejected_signer_floor_at_cap => serve_stream_rejected_signer_floor_at_cap.inc();
+
+    /// Record a whole-blob request from an active staker refused while this
+    /// node's own upstream open for the blob was in progress (#2224).
+    serve_stream_rejected_pull_loop_guard => serve_stream_rejected_pull_loop_guard.inc();
 
     /// Record a `serve_stream` delivery refused because the requested bounded
     /// range is out of bounds for the blob (ADR 005 §Bounded byte ranges).
@@ -4818,6 +4834,7 @@ mod tests {
             "decdn_serve_stream_rejected_signer_cap_exhausted_total",
             "decdn_serve_stream_midstream_signer_cap_exhausted_total",
             "decdn_serve_stream_rejected_signer_floor_at_cap_total",
+            "decdn_serve_stream_rejected_pull_loop_guard_total",
             // Completed in #1520. These four always exported (the fields have
             // existed as long as their siblings) — what was missing was any
             // assertion pinning it, so a rename could have silently broken a
@@ -4848,6 +4865,7 @@ mod tests {
         metrics.serve_stream_rejected_signer_cap_exhausted();
         metrics.serve_stream_midstream_signer_cap_exhausted();
         metrics.serve_stream_rejected_signer_floor_at_cap();
+        metrics.serve_stream_rejected_pull_loop_guard();
         metrics.serve_stream_rejected_range_not_satisfiable();
         metrics.serve_stream_rejected_blob_too_large();
         metrics.serve_stream_rejected_hash_denied();

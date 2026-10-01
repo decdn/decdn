@@ -853,7 +853,9 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
     /// and `expiry` are write-once, so an old read of them stays true. An old
     /// `Unregistered` read does not: any provider's next redemption registers
     /// the signer, possibly with its cap already spent, so it answers `None`.
-    /// `None` too when this node holds no read for the pair.
+    /// `None` too when this node holds no read for the pair. The cache is
+    /// in-memory and drops entries older than `SIGNER_AUTH_TTL` when it fills
+    /// (`AUTH_CACHE_MAX`), so a restart or a full cache can leave no read.
     fn stale_authorization(&self, pool_id: B256, signer: Address) -> Option<SignerAuthorization> {
         let cached = self
             .auth_cache
@@ -967,7 +969,7 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
                 // observed registration, whatever its age: `cap` and `expiry` are
                 // write-once, and `spent` is raised to what the projection has
                 // folded since, as the mid-stream re-check reads it. Refuse a signer
-                // this node has never read as registered.
+                // this node holds no cached registered read of.
                 let stale = self.stale_authorization(pool_id, signer);
                 if stale.is_some() {
                     warn!(
@@ -2757,6 +2759,57 @@ mod tests {
             asserter.read_q().len(),
             0,
             "the second call did read the chain"
+        );
+        Ok(())
+    }
+
+    /// The stale fallback raises the cached `spent` to the projection's fold, so a
+    /// signer that drained its shared cap at other nodes after the cached read is
+    /// not admitted on the old headroom. A fold below the cached `spent` leaves the
+    /// cached value.
+    #[tokio::test]
+    async fn the_stale_fallback_takes_the_larger_of_cached_and_folded_spent() -> Result<()> {
+        use crate::pool_view::PoolView;
+
+        let pool_id = B256::repeat_byte(0x47);
+        let signer = Address::from([8u8; 20]);
+        let (view, _asserter) = mocked_getauth_view(&[authz(1_000_000, 200_000)]);
+        assert_eq!(
+            view.signer_authorization(pool_id, signer).await,
+            Some(registered(1_000_000, 200_000))
+        );
+        {
+            let mut guard = view
+                .auth_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = guard
+                .get_mut(&(pool_id, signer))
+                .ok_or_else(|| anyhow::anyhow!("the first read is cached"))?;
+            entry.1 = Instant::now()
+                .checked_sub(SIGNER_AUTH_TTL * 2)
+                .ok_or_else(|| anyhow::anyhow!("clock too close to its epoch"))?;
+        }
+        let lane = |paid: u64| PaymentPool::LaneSettled {
+            signer,
+            newPaidCumulative: paid,
+            bytesPaid: 0,
+        };
+        view.projection
+            .record_opened(pool_id, Address::from([1u8; 20]), U256::from(5_000_000u64));
+        view.projection
+            .record_redeemed(pool_id, Address::from([9u8; 20]), &[lane(100_000)]);
+        assert_eq!(
+            view.signer_authorization(pool_id, signer).await,
+            Some(registered(1_000_000, 200_000)),
+            "a fold below the cached spent keeps the cached value"
+        );
+        view.projection
+            .record_redeemed(pool_id, Address::from([10u8; 20]), &[lane(850_000)]);
+        assert_eq!(
+            view.signer_authorization(pool_id, signer).await,
+            Some(registered(1_000_000, 950_000)),
+            "a drain folded since the read raises spent"
         );
         Ok(())
     }

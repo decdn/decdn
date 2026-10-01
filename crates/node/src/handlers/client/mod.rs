@@ -616,8 +616,9 @@ enum ServeRejectReason {
     /// A wired `PoolView` could not confirm the request's pool on-chain: the pool
     /// has no on-chain record, is closed/reclaimed, or the admit-path `getPool`
     /// faulted; or the admit-path `getAuthorization` faulted for a signer the node
-    /// holds no registered read of. The node refuses rather than serve a pool it cannot confirm
-    /// is live and solvent (ADR 003 §Pool solvency). Collapses to `NotFound` on the wire
+    /// holds no cached registered read of. The node refuses rather than serve a
+    /// pool it cannot confirm is live and solvent, or a signer it cannot confirm
+    /// can pay (ADR 003 §Pool solvency). Collapses to `NotFound` on the wire
     /// (see [`Self::wire_error`]) — unlike [`Self::InsufficientDeposit`], this
     /// refusal can precede any lane-ownership proof, so it must stay a plain miss:
     /// a client cannot tell an unconfirmed pool from a drained one, while an
@@ -641,6 +642,14 @@ enum ServeRejectReason {
     /// concurrency stop, cleared by waiting rather than by a top-up, so unlike
     /// [`Self::InsufficientDeposit`] it names no owner-actionable pool state.
     SignerFloorAtCap,
+    /// A whole-blob request from an active staker, refused while this node's own
+    /// upstream open for the blob is in progress and no live fill exists to
+    /// coalesce onto (#2224). Answering it would let partial holders pull the
+    /// blob from each other in a loop. Collapses to `NotFound` on the wire (see
+    /// [`Self::wire_error`]) so the requester tries its next candidate and scores
+    /// no fault: the refusal is a loop guard, never a sign of a degraded node,
+    /// whatever an earlier tier of the request saw.
+    PullLoopGuard,
     /// A cache-HIT serve shed under node overload — egress saturation, or this
     /// client's fair-share cap while the node is pressured. Distinct from
     /// [`Self::LoadShedMiss`] for the per-reason metric ONLY — both collapse to
@@ -733,6 +742,7 @@ impl ServeRejectReason {
             | Self::PoolUnconfirmed
             | Self::SignerCapExhausted
             | Self::SignerFloorAtCap
+            | Self::PullLoopGuard
             | Self::LoadShedHit
             | Self::LoadShedMiss
             | Self::RangeNotSatisfiable

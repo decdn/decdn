@@ -936,10 +936,10 @@ since project inception and will roll into the first tagged release.
 - **Partial holders no longer pull a blob from each other in a loop of three
   or more (#2224).** While a node's own upstream open for a blob is in
   progress, it refuses a whole-blob request for that blob from an active
-  staker with `NotFound` (counted in
-  `decdn_serve_stream_rejected_cache_miss_total`), so the requester tries its
-  next candidate. Ranged requests and client requests are not refused for
-  this reason. A node also drops its own entry from the origin directory's
+  staker with `NotFound`, so the requester tries its next candidate. New
+  counter: `decdn_serve_stream_rejected_pull_loop_guard_total`, on the "Serve
+  refusals by reason" panels; the debug line names the requester. Ranged
+  requests and client requests are not refused for this reason. A node also drops its own entry from the origin directory's
   candidates, as the DHT lookup already does.
 
 - **Clustered `eth_getLogs` failures no longer flap every chain watcher

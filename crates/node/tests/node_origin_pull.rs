@@ -16093,7 +16093,8 @@ async fn a_serve_miss_never_pulls_from_its_requester() -> Result<()> {
 /// whole-blob request for that blob from another node (an active staker) at
 /// once, without opening a second upstream leg. A loop of partial holders closes
 /// through exactly that window, because the fill is claimed only after the open.
-/// A client's whole-blob request is not refused for this reason.
+/// A staker's request with no open in progress, a client's whole-blob request
+/// and a staker's ranged request are not refused for this reason.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_runs() -> Result<()> {
@@ -16103,7 +16104,7 @@ async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_run
     let s_buyer = Arc::new(PrivateKeySigner::random());
 
     // Upstream U answers probes, then holds every client stream open unanswered,
-    // so S's open for the blob stays in progress for the whole test.
+    // so each of S's opens for the blob stays in progress for the whole test.
     let u_sk = fresh_key();
     let u_id = u_sk.public();
     let u_eth = Arc::new(PrivateKeySigner::random());
@@ -16120,9 +16121,9 @@ async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_run
     );
     let u_dht = DhtNodeId::from_bytes(*u_id.as_bytes());
 
-    // Three leaves, each on its own lane at S. Leaf 2 is an active staker (a node);
-    // leaves 1 and 3 are clients.
-    let leaves: Vec<(iroh::SecretKey, Arc<PrivateKeySigner>, B256)> = (0u8..3)
+    // Four leaves, each on its own lane at S. Leaves 1, 2 and 4 are active
+    // stakers (nodes); leaf 3 is a client.
+    let leaves: Vec<(iroh::SecretKey, Arc<PrivateKeySigner>, B256)> = (0u8..4)
         .map(|i| {
             (
                 fresh_key(),
@@ -16131,11 +16132,18 @@ async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_run
             )
         })
         .collect();
-    let [(sk1, eth1, ch1), (sk2, eth2, ch2), (sk3, eth3, ch3)] =
-        <[_; 3]>::try_from(leaves).map_err(|_| anyhow::anyhow!("three leaves"))?;
-    let node_leaf_dht = DhtNodeId::from_bytes(*sk2.public().as_bytes());
+    let [
+        (sk1, eth1, ch1),
+        (sk2, eth2, ch2),
+        (sk3, eth3, ch3),
+        (sk4, eth4, ch4),
+    ] = <[_; 4]>::try_from(leaves).map_err(|_| anyhow::anyhow!("four leaves"))?;
     let mut discovery = FixtureDiscovery::directory_only(vec![u_dht], U256::ZERO);
-    discovery.stakers.insert(node_leaf_dht);
+    for sk in [&sk1, &sk2, &sk4] {
+        discovery
+            .stakers
+            .insert(DhtNodeId::from_bytes(*sk.public().as_bytes()));
+    }
 
     let (handler_s, s_target, ep_s, _recorded, _cache_s, s_operator, s_metrics, _) =
         build_serving_node(
@@ -16150,6 +16158,7 @@ async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_run
                 (ch1, eth1.address()),
                 (ch2, eth2.address()),
                 (ch3, eth3.address()),
+                (ch4, eth4.address()),
             ],
             U256::from(DEPOSIT_MICRO_USDC),
         )
@@ -16159,8 +16168,22 @@ async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_run
     let (ep1, _) = local_endpoint(sk1.clone(), vec![]).await?;
     let (ep2, _) = local_endpoint(sk2.clone(), vec![]).await?;
     let (ep3, _) = local_endpoint(sk3.clone(), vec![]).await?;
+    let (ep4, _) = local_endpoint(sk4.clone(), vec![]).await?;
+    let wait_for_opens = |n: usize, what: &'static str| {
+        let u_streams = Arc::clone(&u_streams);
+        async move {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while u_streams.load(Ordering::SeqCst) < n {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("{what}"))
+        }
+    };
 
-    // Leaf 1 (a client) starts S's upstream open for the blob.
+    // Leaf 1 (a staker) asks for the whole blob with no open in progress: not
+    // refused, so S starts its upstream open for the blob.
     let first = {
         let (ep, target, eth) = (ep1.clone(), s_target.clone(), Arc::clone(&eth1));
         let id = B256::from(*sk1.public().as_bytes());
@@ -16168,15 +16191,10 @@ async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_run
             leaf_paced_pull(&ep, target, id, &eth, s_operator, ch1, hash, RATE, None).await
         })
     };
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while u_streams.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("S never opened upstream for leaf 1"))?;
+    wait_for_opens(1, "a staker with no open in progress was refused").await?;
 
-    // Leaf 2 (a node) asks for the whole blob while that open runs: refused at once.
+    // Leaf 2 (a staker) asks for the whole blob while that open runs: refused at
+    // once.
     let refused = tokio::time::timeout(
         Duration::from_secs(5),
         leaf_paced_pull(
@@ -16198,7 +16216,7 @@ async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_run
         .ok_or_else(|| anyhow::anyhow!("the node's whole-blob request was served"))?;
     anyhow::ensure!(
         format!("{err:#}").contains("NotFound"),
-        "the refusal is a miss: {err:#}"
+        "the refusal is a miss on the wire: {err:#}"
     );
     tokio::time::sleep(Duration::from_millis(250)).await;
     anyhow::ensure!(
@@ -16206,8 +16224,12 @@ async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_run
         "the refused request opened a second upstream leg"
     );
     anyhow::ensure!(
-        counter_value(&s_metrics, "serve_stream_rejected_cache_miss_total")? == 1,
-        "the refusal is counted as a cache miss"
+        counter_value(&s_metrics, "serve_stream_rejected_pull_loop_guard_total")? == 1,
+        "the refusal counts on its own reason"
+    );
+    anyhow::ensure!(
+        counter_value(&s_metrics, "serve_stream_rejected_cache_miss_total")? == 0,
+        "the refusal is not counted as a cache miss"
     );
 
     // Leaf 3 (a client) asks for the whole blob too: not refused, so S opens a
@@ -16219,17 +16241,27 @@ async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_run
             leaf_paced_pull(&ep, target, id, &eth, s_operator, ch3, hash, RATE, None).await
         })
     };
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while u_streams.load(Ordering::SeqCst) < 2 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("the client's whole-blob request was refused"))?;
+    wait_for_opens(2, "the client's whole-blob request was refused").await?;
+
+    // Leaf 4 (a staker) asks for a range: not refused, so S opens a third leg.
+    let fourth = {
+        let (ep, target, eth) = (ep4.clone(), s_target.clone(), Arc::clone(&eth4));
+        let id = B256::from(*sk4.public().as_bytes());
+        let len = total_bytes / 2;
+        tokio::spawn(async move {
+            leaf_paced_pull_ranged(&ep, target, id, &eth, s_operator, ch4, hash, RATE, len).await
+        })
+    };
+    wait_for_opens(3, "the staker's ranged request was refused").await?;
+    anyhow::ensure!(
+        counter_value(&s_metrics, "serve_stream_rejected_pull_loop_guard_total")? == 1,
+        "only the one whole-blob request from a staker mid-open was refused"
+    );
 
     first.abort();
     third.abort();
-    shutdown([task_s, task_u], [&ep1, &ep2, &ep3, &ep_s, &ep_u]).await?;
+    fourth.abort();
+    shutdown([task_s, task_u], [&ep1, &ep2, &ep3, &ep4, &ep_s, &ep_u]).await?;
     Ok(())
 }
 

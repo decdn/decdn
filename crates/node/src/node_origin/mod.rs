@@ -670,10 +670,12 @@ fn prune_and_check_wedged(
     wedged.contains_key(peer)
 }
 
-/// The hashes this node has an upstream open in progress for, each with the
-/// number of opens in flight. A whole-blob request from another node for one of
-/// these hashes would close a pull-through loop (#2224), so the serve path
-/// refuses it (see [`NodeOrigin::refuses_whole_blob`]).
+/// The hashes this node has a pull-leg open ([`NodeOrigin::open_pull_leg`]) in
+/// progress for, each with the number of opens in flight. The buffered
+/// [`Origin::fetch`] path does not mark its pulls here. A whole-blob request
+/// from an active staker for one of these hashes would close a pull-through
+/// loop (#2224), so the serve path refuses it (see
+/// [`NodeOrigin::refuses_whole_blob`]).
 #[derive(Debug, Default)]
 struct PendingOpens(std::sync::Mutex<HashMap<[u8; 32], usize>>);
 
@@ -686,9 +688,11 @@ impl PendingOpens {
     }
 }
 
-/// Marks one upstream open for a hash as in progress until it drops.
+/// Marks one upstream open for a hash as in progress until it drops. Bind it
+/// to a named local for the whole open: dropping it at once marks nothing.
 #[derive(Debug)]
-pub(crate) struct PendingOpen {
+#[must_use = "an open is marked in progress only while its guard lives"]
+struct PendingOpen {
     pending: Arc<PendingOpens>,
     hash: [u8; 32],
 }
@@ -764,7 +768,7 @@ impl NodeOrigin {
     }
 
     /// Mark an upstream open for `hash` as in progress until the guard drops.
-    pub(crate) fn enter_open(&self, hash: Hash) -> PendingOpen {
+    fn enter_open(&self, hash: Hash) -> PendingOpen {
         PendingOpen::enter(&self.pending, *hash.as_bytes())
     }
 
@@ -775,7 +779,9 @@ impl NodeOrigin {
     /// three or more partial holders then pull the blob from each other in a
     /// loop. The fill is claimed only after the open, so the open is the window
     /// a loop closes through. A client is never an active staker, so a client's
-    /// whole-blob request is never refused for this reason. `false` on an
+    /// whole-blob request is never refused for this reason, nor is a ranged
+    /// request: a loop of ranged handshakes asks each holder only for blocks it
+    /// advertises, so it starts no recursive whole-blob pull. `false` on an
     /// unprovisioned origin.
     pub(crate) fn refuses_whole_blob(&self, hash: Hash, requester: [u8; 32]) -> bool {
         self.deps.get().is_some_and(|deps| {
