@@ -730,6 +730,68 @@ impl NodeFixture {
             .context("restart after PaymentPool repoint")
     }
 
+    /// Point the config at the `PaymentPool` at `payment_pool`, leaving every
+    /// other key — the discovery peers included — as it is. Only the config file
+    /// changes: the running daemon keeps its old deployment until a
+    /// [`Self::restart`] or [`Self::respawn_expecting_exit`] reads the new one.
+    pub fn set_payment_pool_address(&self, payment_pool: Address) -> anyhow::Result<()> {
+        let config = std::fs::read_to_string(&self.config_path).context("read node config")?;
+        let rewritten = rewrite_payment_pool_address(&config, payment_pool)?;
+        std::fs::write(&self.config_path, rewritten).context("write node config")
+    }
+
+    /// Kill the daemon, respawn it against the same config and data dir, and
+    /// wait up to `timeout` for the new process to exit, returning its exit
+    /// status.
+    ///
+    /// The daemon is expected to fail bring-up; a later [`Self::restart`]
+    /// respawns it. Unlike [`Self::restart`], this never waits for health. A
+    /// daemon still running at `timeout` is killed and reaped, and the call
+    /// fails with the daemon's last log lines.
+    ///
+    /// It returns only once the log capture has read both pipes to EOF, so a
+    /// [`Self::log_line`] after it sees every line the failed bring-up wrote.
+    pub async fn respawn_expecting_exit(
+        &self,
+        timeout: Duration,
+    ) -> anyhow::Result<std::process::ExitStatus> {
+        // `wait()` reaps the old process so it has released its ports before the
+        // replacement binds them.
+        {
+            let mut child = self.child.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = child.kill();
+            let _ = child.wait();
+            *child = spawn_daemon(&self.config_path, self.data_dir.path(), &self.log)?;
+        }
+        let started = tokio::time::Instant::now();
+        loop {
+            // The guard lock is held only for the non-blocking `try_wait`, never
+            // across the sleep.
+            let exited = {
+                let mut child = self.child.0.lock().unwrap_or_else(PoisonError::into_inner);
+                child.try_wait().context("poll decdn-node for exit")?
+            };
+            if let Some(status) = exited {
+                anyhow::ensure!(
+                    self.log.drained(LOG_DRAIN_TIMEOUT).await,
+                    "decdn-node exited ({status}) but its log capture did not reach EOF \
+                     within {LOG_DRAIN_TIMEOUT:?}, so its last lines may be missing"
+                );
+                return Ok(status);
+            }
+            if started.elapsed() >= timeout {
+                self.stop()
+                    .context("kill decdn-node after it outlived its expected exit")?;
+                anyhow::bail!(
+                    "decdn-node did not exit within {timeout:?} of its respawn; its last \
+                     {LOG_TAIL_LINES} lines:\n{}",
+                    self.log.tail(LOG_TAIL_LINES)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// The first line this daemon logged — across every spawn — that contains
     /// every one of `needles`, with ANSI styling removed. Requiring all needles
     /// on one line ties each field to the same event.
@@ -1084,17 +1146,11 @@ fn rewrite_pool_min_remaining_deposit(config: &str, micro_usdc: u64) -> anyhow::
     toml::to_string(&doc).context("render node config")
 }
 
-/// Rewrite `blockchain.payment_pool_address` and replace
-/// `[network.discovery.peers]` with `discovery_peers` in a node TOML config,
-/// preserving every other key. Separate from [`NodeFixture::repoint_payment_pool`]
-/// so its parse → mutate → `toml::to_string` round-trip is testable without a
-/// live daemon, mirroring [`rewrite_rate_per_mb`]. Peers take the
-/// `addrs = ["127.0.0.1:{port}"]` shape [`render_config`] writes.
-fn rewrite_payment_pool(
-    config: &str,
-    payment_pool: Address,
-    discovery_peers: &[(iroh::PublicKey, u16)],
-) -> anyhow::Result<String> {
+/// Rewrite `blockchain.payment_pool_address` in a node TOML config, preserving
+/// every other key. Separate from [`NodeFixture::set_payment_pool_address`] so
+/// its parse → mutate → `toml::to_string` round-trip is testable without a live
+/// daemon, mirroring [`rewrite_rate_per_mb`].
+fn rewrite_payment_pool_address(config: &str, payment_pool: Address) -> anyhow::Result<String> {
     let mut doc: toml::Table = config.parse().context("parse node config")?;
     let blockchain = doc
         .get_mut("blockchain")
@@ -1104,6 +1160,23 @@ fn rewrite_payment_pool(
         "payment_pool_address".to_string(),
         toml::Value::String(payment_pool.to_string()),
     );
+    toml::to_string(&doc).context("render node config")
+}
+
+/// Rewrite `blockchain.payment_pool_address` (through
+/// [`rewrite_payment_pool_address`]) and replace `[network.discovery.peers]`
+/// with `discovery_peers` in a node TOML config, preserving every other key.
+/// Separate from [`NodeFixture::repoint_payment_pool`] so its parse → mutate →
+/// `toml::to_string` round-trip is testable without a live daemon, mirroring
+/// [`rewrite_rate_per_mb`]. Peers take the `addrs = ["127.0.0.1:{port}"]` shape
+/// [`render_config`] writes.
+fn rewrite_payment_pool(
+    config: &str,
+    payment_pool: Address,
+    discovery_peers: &[(iroh::PublicKey, u16)],
+) -> anyhow::Result<String> {
+    let repointed = rewrite_payment_pool_address(config, payment_pool)?;
+    let mut doc: toml::Table = repointed.parse().context("parse node config")?;
     let network = doc
         .get_mut("network")
         .and_then(toml::Value::as_table_mut)
@@ -1132,9 +1205,10 @@ fn rewrite_payment_pool(
 /// reports.
 const LOG_TAIL_LINES: usize = 20;
 
-/// How long [`NodeFixture::terminate`] waits, after the daemon exits, for its log
-/// capture to read both pipes to EOF. A pipe closes the moment the process that
-/// holds it exits, so this only bounds the reader threads' last few reads.
+/// How long [`NodeFixture::terminate`] and [`NodeFixture::respawn_expecting_exit`]
+/// wait, after the daemon exits, for its log capture to read both pipes to EOF.
+/// A pipe closes the moment the process that holds it exits, so this only bounds
+/// the reader threads' last few reads.
 const LOG_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Everything every spawn of one daemon has written to stdout and stderr, line
@@ -1690,6 +1764,44 @@ mod tests {
         );
         // Everything around the mutation is intact.
         assert_eq!(doc["network"]["bind_port"].as_integer(), Some(4433));
+        assert_eq!(doc["blockchain"]["chain_id"].as_integer(), Some(31_337));
+        assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
+        assert_eq!(
+            doc["cache"]["node_to_node_pull_through_enabled"].as_bool(),
+            Some(true)
+        );
+    }
+
+    /// `set_payment_pool_address`'s parse → mutate → serialize step
+    /// (`rewrite_payment_pool_address`) sets only the address: the discovery
+    /// peers and the `[cache]` table survive the round-trip.
+    #[test]
+    fn rewrite_payment_pool_address_keeps_peers_and_cache() {
+        let peer = iroh::SecretKey::from_bytes(&[0xCC; 32]).public();
+        let with_peer = rewrite_payment_pool(
+            &sample_rendered_config(),
+            Address::from([0x22; 20]),
+            &[(peer, 4434)],
+        )
+        .expect("rewrite_payment_pool must succeed");
+        let codeless = Address::repeat_byte(0xC0);
+        let rewritten = rewrite_payment_pool_address(&with_peer, codeless)
+            .expect("rewrite_payment_pool_address must succeed");
+        let doc: toml::Value =
+            toml::from_str(&rewritten).expect("rewritten config must be valid TOML");
+
+        assert_eq!(
+            doc["blockchain"]["payment_pool_address"].as_str(),
+            Some(codeless.to_string().as_str())
+        );
+        let peers = doc["network"]["discovery"]["peers"]
+            .as_table()
+            .expect("discovery peers must be a table");
+        assert_eq!(peers.len(), 1, "peers are kept as they were: {peers:?}");
+        assert_eq!(
+            peers[&peer.to_string()]["addrs"][0].as_str(),
+            Some("127.0.0.1:4434")
+        );
         assert_eq!(doc["blockchain"]["chain_id"].as_integer(), Some(31_337));
         assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
         assert_eq!(

@@ -1,0 +1,183 @@
+//! Cross-layer proof that the deployment preflight aborts bring-up **before the
+//! seller lane store is touched**.
+//!
+//! The lane store binds to the configured `PaymentPool` deployment when it
+//! opens. On a stamp mismatch it drops the seller lane state, the pending
+//! settles and the watcher checkpoints, and the unredeemed vouchers in them are
+//! lost. A typo'd `blockchain.payment_pool_address` must therefore fail the
+//! preflight and stop the daemon while the store is still bound to the real
+//! deployment. Unit tests cover each preflight verdict against a mocked
+//! provider. Only a real daemon shows the call order: a preflight that ran
+//! after the store open would still exit nonzero, but only after the drop.
+//!
+//! The journey seeds a seller lane, then repoints the node at a codeless
+//! address and at the snapshot TOKEN, a contract with no `usdc()` view. Each boot exits
+//! nonzero with the matching verdict, and no boot logs the lane drop. With the
+//! config reverted, the same lane serves another blob and redeems past its
+//! earlier watermark.
+//!
+//! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
+//! `forge` on `PATH` and a built `decdn-node` binary:
+//!
+//! ```bash
+//! cargo build -p decdn-node
+//! cargo nextest run -p decdn-e2e --features anvil-e2e --test deployment_preflight_guard
+//! ```
+
+#![cfg(feature = "anvil-e2e")]
+// Test scaffolding legitimately uses unwrap/expect/panic; the workspace
+// anti-panic policy targets runtime code.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::duration_suboptimal_units
+)]
+
+use std::time::Duration;
+
+use alloy::primitives::{Address, U256};
+use anyhow::Context;
+use decdn_e2e::assert as e2e_assert;
+use decdn_e2e::chain::ChainFixture;
+use decdn_e2e::client::ClientFixture;
+use decdn_e2e::node::NodeFixture;
+use decdn_e2e::poll;
+
+const MIB: usize = 1024 * 1024;
+
+/// Overall ceiling: the standard journey tier. Cleanup (anvil kill, daemon kill)
+/// runs on drop even on timeout.
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
+
+/// How long a boot with a bad deployment gets to exit. The preflight verdict is
+/// terminal, so the expected exit is near-immediate. The ceiling sits above the
+/// daemon's one-minute preflight retry budget, so a verdict that is retried by
+/// mistake still exits here and fails on its message.
+const PREFLIGHT_EXIT: Duration = Duration::from_secs(90);
+
+/// How long the node gets to redeem a voucher on chain.
+const REDEEM: Duration = Duration::from_secs(90);
+
+/// The WARN the lane store logs when it opens against another deployment and
+/// drops the seller state. `node_pull_pool_redeploy.rs` asserts that a real
+/// redeploy logs it, so its absence here is a real signal.
+const FOREIGN_LANES_DROPPED: &str = "dropping seller lane state, pending settles and watcher \
+                                     checkpoints written against another PaymentPool deployment";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deployment_preflight_aborts_before_the_lane_store_opens() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))
+        .await
+        .context("deployment-preflight e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
+async fn run() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let chain = ChainFixture::launch().await?;
+    let payment_pool = chain.addrs().payment_pool;
+
+    // Two held blobs, each large enough (2 MiB @ 10 µUSDC/MiB → ~20 µUSDC) that
+    // one delivery clears the node's 10 µUSDC redeem threshold. Blob A seeds the
+    // lane before the bad boots; blob B proves the same lane after them.
+    let payload_a = vec![0xA5u8; 2 * MIB];
+    let payload_b = vec![0x5Au8; 2 * MIB];
+    let (node, hashes) =
+        NodeFixture::launch_with_blobs(&chain, "US", &[payload_a.as_slice(), payload_b.as_slice()])
+            .await?;
+    let hash_a = hashes.first().copied().context("no hash for blob A")?;
+    let hash_b = hashes.get(1).copied().context("no hash for blob B")?;
+
+    let client = ClientFixture::new(&chain).await?;
+    let signer = client.address();
+    let provider = node.operator_addr();
+
+    // ---- Seed a seller lane bound to the snapshot deployment, and wait until
+    // the node has redeemed it on chain, so the lane store holds a lane with a
+    // nonzero watermark.
+    let (mut session, warm) = client.open_session(&chain, &node, hash_a).await?;
+    anyhow::ensure!(
+        warm == payload_a,
+        "warm-up delivery must be blob A byte-exact"
+    );
+    let pool_id = session.pool_id();
+    let paid_before = poll(REDEEM, || async {
+        let paid =
+            e2e_assert::read_watermark(chain.admin(), payment_pool, pool_id, signer, provider)
+                .await?
+                .amount;
+        Ok((paid > 0).then_some(paid))
+    })
+    .await?
+    .context("the seeded lane was never redeemed on chain")?;
+
+    // ---- A codeless address: the preflight finds no code and aborts. The
+    // address is nonzero, so it passes config validation and reaches the
+    // preflight.
+    node.set_payment_pool_address(Address::repeat_byte(0xC0))?;
+    let status = node
+        .respawn_expecting_exit(PREFLIGHT_EXIT)
+        .await
+        .context("boot against a codeless PaymentPool address")?;
+    anyhow::ensure!(
+        !status.success(),
+        "a boot against a codeless PaymentPool address must exit nonzero (got {status})"
+    );
+    node.log_line(&["has no code on chain"])
+        .context("the codeless boot never logged the no-code verdict")?;
+
+    // ---- Another contract: the snapshot TOKEN has code but does not answer
+    // `PaymentPool.usdc()`, so the preflight aborts on the interface probe.
+    node.set_payment_pool_address(chain.addrs().token)?;
+    let status = node
+        .respawn_expecting_exit(PREFLIGHT_EXIT)
+        .await
+        .context("boot against the TOKEN as a PaymentPool")?;
+    anyhow::ensure!(
+        !status.success(),
+        "a boot against the TOKEN as a PaymentPool must exit nonzero (got {status})"
+    );
+    node.log_line(&["does not answer PaymentPool.usdc()"])
+        .context("the TOKEN boot never logged the usdc() verdict")?;
+
+    // ---- Neither bad boot opened the lane store, so neither dropped the lane.
+    anyhow::ensure!(
+        node.log_line(&[FOREIGN_LANES_DROPPED]).is_none(),
+        "a boot that failed the deployment preflight dropped the seller lane state"
+    );
+
+    // ---- Revert the config. The node boots on the original deployment, and the
+    // same lane serves blob B and redeems past its earlier watermark.
+    node.set_payment_pool_address(payment_pool)?;
+    node.restart()
+        .await
+        .context("restart on the original PaymentPool")?;
+    let bytes_b = client
+        .fetch_once(&mut session, hash_b, 0, U256::ZERO)
+        .await
+        .context("paid fetch on the original lane after the reverted config")?;
+    anyhow::ensure!(
+        bytes_b == payload_b,
+        "the delivery after the revert must be blob B byte-exact"
+    );
+    poll(REDEEM, || async {
+        let paid =
+            e2e_assert::read_watermark(chain.admin(), payment_pool, pool_id, signer, provider)
+                .await?
+                .amount;
+        Ok((paid > paid_before).then_some(paid))
+    })
+    .await?
+    .context("the original lane never redeemed past its watermark after the revert")?;
+
+    anyhow::ensure!(
+        node.log_line(&[FOREIGN_LANES_DROPPED]).is_none(),
+        "some boot of this node dropped the seller lane state"
+    );
+    Ok(())
+}
