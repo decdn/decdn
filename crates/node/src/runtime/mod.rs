@@ -3659,17 +3659,19 @@ const DEPLOYMENT_PREFLIGHT_BUDGET: Duration = Duration::from_mins(1);
 
 /// Verify the configured `PaymentPool` deployment against the live chain:
 /// the RPC's `eth_chainId` must equal `blockchain.chain_id`, the configured
-/// address must have code, and that code must answer `PaymentPool.usdc()` —
-/// a code-presence check alone would pass a sibling contract pasted from the
+/// address must have code, and that code must answer `PaymentPool.feeRouter()`
+/// — a code-presence check alone would pass a sibling contract pasted from the
 /// same deploy manifest (`CapacityBond`, `FeeRouter`, the USDC token), and that
-/// is the likeliest wrong-address typo. Runs BEFORE the lane store opens,
+/// is the likeliest wrong-address typo. `feeRouter()` is the probe because no
+/// sibling contract has it: `usdc()` is also a view on `FeeRouter` and
+/// `BuybackBurner`. Runs BEFORE the lane store opens,
 /// because the store's deployment binding
 /// ([`crate::channel_store::Deployment`]) drops the seller lane state when
 /// the stamp differs — a typo in either field must abort bring-up while the
 /// store is untouched, not destroy unredeemed lane state on a WARN. The
 /// reads retry transient RPC errors on `retry`; the mismatch verdicts are
 /// deterministic and fail at once, and a non-`PaymentPool` target surfaces
-/// from `usdc()` as a permanent contract error, not a retry spin.
+/// from `feeRouter()` as a permanent contract error, not a retry spin.
 async fn check_deployment_preflight<P: Provider + Clone>(
     provider: P,
     deployment: crate::channel_store::Deployment,
@@ -3705,19 +3707,20 @@ async fn check_deployment_preflight<P: Provider + Clone>(
          blockchain.payment_pool_address",
         deployment.payment_pool,
     );
-    // Contract-identity probe: `usdc()` is a cheap immutable view every
-    // `PaymentPool` answers. A contract without it returns no data, which
-    // decodes as a permanent contract error and aborts at once.
+    // Contract-identity probe: `feeRouter()` is a cheap immutable view every
+    // `PaymentPool` answers and no sibling contract has. A contract without it
+    // returns no data, which decodes as a permanent contract error and aborts
+    // at once.
     let contract =
         decdn_incentive::payment_pool::PaymentPool::new(deployment.payment_pool, provider);
     retry
-        .run("deployment preflight (PaymentPool.usdc())", || async {
-            contract.usdc().call().await.with_context(|| {
+        .run("deployment preflight (PaymentPool.feeRouter())", || async {
+            contract.feeRouter().call().await.with_context(|| {
                 format!(
-                    "blockchain.payment_pool_address {} does not answer PaymentPool.usdc() \
-                     on chain {rpc_chain_id}; the address hosts some other contract, and a \
-                     wrong address would rebind the lane store and drop its seller state — \
-                     fix blockchain.payment_pool_address",
+                    "blockchain.payment_pool_address {} does not answer \
+                     PaymentPool.feeRouter() on chain {rpc_chain_id}; the address hosts some \
+                     other contract, and a wrong address would rebind the lane store and drop \
+                     its seller state — fix blockchain.payment_pool_address",
                     deployment.payment_pool,
                 )
             })
@@ -5215,7 +5218,7 @@ mod tests {
     }
 
     /// A mocked provider answering the preflight's reads in order:
-    /// `eth_chainId`, `eth_getCode`, then (when reached) the `usdc()` call.
+    /// `eth_chainId`, `eth_getCode`, then (when reached) the `feeRouter()` call.
     fn preflight_provider(answers: Vec<MockAnswer>) -> impl Provider + Clone {
         let asserter = alloy::providers::mock::Asserter::new();
         for answer in answers {
@@ -5238,11 +5241,11 @@ mod tests {
         serde_json::json!(alloy::primitives::Bytes::from(vec![0x60]))
     }
 
-    /// `usdc()` answering a token address, as every `PaymentPool` does.
-    fn usdc_answers() -> serde_json::Value {
+    /// `feeRouter()` answering a router address, as every `PaymentPool` does.
+    fn fee_router_answers() -> serde_json::Value {
         use alloy::sol_types::SolValue;
-        let token = alloy::primitives::Address::repeat_byte(0x0c);
-        serde_json::json!(alloy::primitives::Bytes::from(token.abi_encode()))
+        let router = alloy::primitives::Address::repeat_byte(0x0f);
+        serde_json::json!(alloy::primitives::Bytes::from(router.abi_encode()))
     }
 
     /// An empty-bytes answer: no code at the address for `eth_getCode`, or no
@@ -5258,13 +5261,13 @@ mod tests {
         )
     }
 
-    /// The healthy path: matching chain id, code present, `usdc()` answers.
+    /// The healthy path: matching chain id, code present, `feeRouter()` answers.
     #[tokio::test]
     async fn a_matching_deployment_passes_the_preflight() {
         let provider = preflight_provider(vec![
             MockAnswer::Ok(chain_id_ok()),
             MockAnswer::Ok(code_present()),
-            MockAnswer::Ok(usdc_answers()),
+            MockAnswer::Ok(fee_router_answers()),
         ]);
         check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
             .await
@@ -5314,7 +5317,7 @@ mod tests {
         );
     }
 
-    /// A contract that does not answer `usdc()` — a sibling address pasted from
+    /// A contract that does not answer `feeRouter()` — a sibling address pasted from
     /// the same deploy manifest — aborts as a permanent contract error rather
     /// than passing on code presence alone. Run on the full retry budget
     /// (`start_paused`, so any sleep is free) to pin that the no-data decode
@@ -5325,7 +5328,7 @@ mod tests {
         let provider = preflight_provider(vec![
             MockAnswer::Ok(chain_id_ok()),
             MockAnswer::Ok(code_present()),
-            // `usdc()` returns no data: the target hosts some other contract.
+            // `feeRouter()` returns no data: the target hosts some other contract.
             MockAnswer::Ok(empty_bytes()),
         ]);
         let err =
@@ -5334,7 +5337,7 @@ mod tests {
                 .expect_err("a non-PaymentPool target must abort");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("does not answer PaymentPool.usdc()"),
+            msg.contains("does not answer PaymentPool.feeRouter()"),
             "the error must say the contract identity check failed: {msg}"
         );
         assert!(
@@ -5352,7 +5355,7 @@ mod tests {
             MockAnswer::TransientError,
             MockAnswer::Ok(chain_id_ok()),
             MockAnswer::Ok(code_present()),
-            MockAnswer::Ok(usdc_answers()),
+            MockAnswer::Ok(fee_router_answers()),
         ]);
         check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
             .await

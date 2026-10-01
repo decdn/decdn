@@ -11,8 +11,10 @@
 //! after the store open would still exit nonzero, but only after the drop.
 //!
 //! The journey seeds a seller lane, then repoints the node at a codeless
-//! address and at the snapshot TOKEN, a contract with no `usdc()` view. Each boot exits
-//! nonzero with the matching verdict, and no boot logs the lane drop. With the
+//! address and at two sibling contracts from the same deployment: the
+//! `FeeRouter`, which shares the `usdc()` view with `PaymentPool`, and the
+//! TOKEN. Each boot exits nonzero with the matching verdict, and no boot logs
+//! the lane drop. With the
 //! config reverted, the same lane serves another blob and redeems past its
 //! earlier watermark.
 //!
@@ -131,21 +133,30 @@ async fn run() -> anyhow::Result<()> {
     node.log_line(&["has no code on chain"])
         .context("the codeless boot never logged the no-code verdict")?;
 
-    // ---- Another contract: the snapshot TOKEN has code but does not answer
-    // `PaymentPool.usdc()`, so the preflight aborts on the interface probe.
-    node.set_payment_pool_address(chain.addrs().token)?;
-    let status = node
-        .respawn_expecting_exit(PREFLIGHT_EXIT)
-        .await
-        .context("boot against the TOKEN as a PaymentPool")?;
-    anyhow::ensure!(
-        !status.success(),
-        "a boot against the TOKEN as a PaymentPool must exit nonzero (got {status})"
-    );
-    node.log_line(&["does not answer PaymentPool.usdc()"])
-        .context("the TOKEN boot never logged the usdc() verdict")?;
+    // ---- Sibling contracts: each has code but does not answer
+    // `PaymentPool.feeRouter()`, so the preflight aborts on the identity probe.
+    // The `FeeRouter` answers `usdc()` like a `PaymentPool` does, so it pins
+    // that the probe tells the two apart.
+    for (name, sibling) in [
+        ("FeeRouter", chain.addrs().fee_router),
+        ("TOKEN", chain.addrs().token),
+    ] {
+        node.set_payment_pool_address(sibling)?;
+        let status = node
+            .respawn_expecting_exit(PREFLIGHT_EXIT)
+            .await
+            .with_context(|| format!("boot against the {name} as a PaymentPool"))?;
+        anyhow::ensure!(
+            !status.success(),
+            "a boot against the {name} as a PaymentPool must exit nonzero (got {status})"
+        );
+        // The address in the needle ties the verdict to this boot.
+        let verdict = format!("{sibling} does not answer PaymentPool.feeRouter()");
+        node.log_line(&[&verdict])
+            .with_context(|| format!("the {name} boot never logged the feeRouter() verdict"))?;
+    }
 
-    // ---- Neither bad boot opened the lane store, so neither dropped the lane.
+    // ---- No bad boot opened the lane store, so none dropped the lane.
     anyhow::ensure!(
         node.log_line(&[FOREIGN_LANES_DROPPED]).is_none(),
         "a boot that failed the deployment preflight dropped the seller lane state"
