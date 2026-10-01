@@ -1853,8 +1853,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // only once it is next polled cannot give that ordering.
     let republish_stop = CancellationToken::new();
     let cache_inserts_rx = infra.cache.subscribe_inserts();
-    // Walk the on-disk store (NOT `access_times_snapshot`, which maps `Hash →
-    // Instant` and is empty on every cold start) so every held (complete or
+    // Walk the on-disk store (NOT `access_times_snapshot`, which is
+    // eviction-recency state rather than the on-disk set) so every held (complete or
     // partial), non-evicted blob gets a `uniform(0, 40 min)` republish entry
     // per ADR 022 §Bootstrap AC 15. On a transient list-error we degrade: the
     // steady-state `subscribe_inserts` path catches only blobs newly fetched

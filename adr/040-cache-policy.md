@@ -406,9 +406,6 @@ retention.
 - Segment membership lives in memory only. A restart loses it, so every
   cached blob returns to an uncapped state until traffic re-observes it and
   the estimator rebuilds its signal.
-- The probation cap measures its footprint over the eviction candidates —
-  blobs touched since process start — so a probation blob not yet touched
-  since boot is excluded from the cap's overage math until it is observed.
 
 ## Acceptance Criteria
 

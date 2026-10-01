@@ -191,9 +191,7 @@ const fn reconcile(state: &mut DriverState, raw: u64) -> u64 {
 ///
 /// Emits `evictions_starved` when there is nothing left to evict while still
 /// over target — either because the candidate set is empty (everything pinned,
-/// operator-evicted, or probe-held, **or** a cold-started node whose in-memory
-/// access map has not been populated by traffic yet) or because a whole pass
-/// released nothing.
+/// operator-evicted, or probe-held) or because a whole pass released nothing.
 #[allow(clippy::too_many_arguments)]
 async fn sweep(
     cache: &CacheEngine,

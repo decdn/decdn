@@ -269,8 +269,8 @@ impl RepublishScheduler {
     /// cold-start jitter draw (uniform(0, 40 min) per hash, NOT a
     /// shared timestamp). Callers pass a `holder_snapshot` result,
     /// or `origin_held_snapshot` for the origin-only rescan — never
-    /// `access_times_snapshot`, which maps `Hash -> Instant` and is
-    /// empty on cold start; see the `iter_hashes` rustdoc.
+    /// `access_times_snapshot`, which is eviction-recency state rather
+    /// than the on-disk set; see the `iter_hashes` rustdoc.
     ///
     /// Seeding leaves an already-scheduled hash alone: it keeps its existing
     /// due time rather than being pulled earlier by a re-seed. The lag sweep

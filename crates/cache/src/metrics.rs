@@ -325,10 +325,6 @@ pub struct CacheMetrics {
     /// - [`crate::CacheEngine::eviction_candidates`] returned empty. That set is
     ///   filtered on pinned + probe-held, so the remedy is to raise
     ///   `cache.cache_size_mb`, lower `max_probe_holds`, or trim the pinned set.
-    ///   **But** the candidate map is in-memory and populated only by `touch()`
-    ///   since process start, so a node that restarted with a full disk also
-    ///   starts empty and starves every tick until traffic re-populates it —
-    ///   there the remedy is simply to wait for traffic, not to retune.
     /// - The pass had candidates but released none (all pinned, untagged, or
     ///   erroring).
     ///
