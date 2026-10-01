@@ -164,8 +164,10 @@ becomes scrapeable once boot completes.
   provider cannot serve the watchers at all: change provider. Repeated
   `get_logs` timeouts, or a range or size error the poller does not recognise
   (it logs no shrink line), mean the windows are too wide for this provider:
-  lower `blockchain.get_logs_max_block_span` and restart. A timed-out window
-  is retried on the same range, so it costs three per-call timeouts plus the
+  lower `blockchain.get_logs_max_block_span` and restart. Timeouts first show
+  in the `info` retry and `deferring it to the next tick` lines; they reach a
+  `multiplexed poller tick error` only after the 2-minute stall. A timed-out
+  window is retried on the same range, so it costs three per-call timeouts plus the
   retry sleeps (34 s at the 10 s default) before the window is deferred.
 - `DecdnChainWatcherFlapping` means a node's chain watchers fail and recover
   again and again (four or more failure windows in 30 minutes, held for 45

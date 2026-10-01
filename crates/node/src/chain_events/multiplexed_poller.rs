@@ -35,15 +35,16 @@
 //! A single-sink loop would fire `on_backoff`/`on_established` once per tick,
 //! because there is exactly one sink. Here the *tick* fires each route's hooks
 //! independently (routes fail independently), and the loop's `Err` arm only
-//! sleeps the backoff — it never fires a hook itself. The one exception is a
-//! failure in the shared, pre-route-loop work (the head read, or a route's
-//! checkpoint-load floor derivation, a merged `get_logs` call that is not
-//! retried, or a stall past [`GET_LOGS_STALL_BUDGET`]): those fail the *whole* tick
-//! before any route-specific step runs, so [`fail_whole_tick`] fires
-//! `on_backoff` for every route directly at the failure site — every route is
-//! equally down, as five independent watchers that each read the shared head
-//! through [`super::shared_head::SharedHead`] would all convoy into backoff
-//! together.
+//! sleeps the backoff — it never fires a hook itself. The exception is a
+//! failure in the shared window scan: the head read, a route's checkpoint-load
+//! floor derivation, or a merged `get_logs` call that is not retried, all
+//! before any route-specific step runs; or a stall past
+//! [`GET_LOGS_STALL_BUDGET`], after the tick's completed windows are applied
+//! and persisted but before the reconcile. Those fail the *whole* tick, so
+//! [`fail_whole_tick`] fires `on_backoff` for every route directly at the
+//! failure site — every route is equally down, as five independent watchers
+//! that each read the shared head through
+//! [`super::shared_head::SharedHead`] would all convoy into backoff together.
 //!
 //! The `on_established`/`on_backoff` *edges* are suppressed once `shutdown` is
 //! cancelled (a tick that only "succeeded" because a sink observed the cancel
@@ -62,10 +63,10 @@
 //!
 //! # Transient window failures
 //!
-//! A tick that is behind head scans several windows, and it succeeds only if
-//! every window does. A provider that fails a fraction of its calls therefore
-//! fails most long ticks, and each failed tick adds a backoff sleep that makes
-//! the next tick longer still. So [`run_tick`] retries a failed window in place:
+//! A tick that is behind head scans several windows, and it reaches head only
+//! if every window succeeds. A provider that fails a fraction of its calls
+//! would therefore stop most long ticks short of head. So [`run_tick`] retries a
+//! failed window in place:
 //! a `get_logs` error that [`is_transient_window_error`] accepts is retried on
 //! the same block range up to [`GET_LOGS_WINDOW_RETRIES`] times, after
 //! [`GET_LOGS_WINDOW_RETRY_DELAY`] each. A retry that succeeds is a plain
@@ -97,7 +98,8 @@
 //!
 //! A deferred tick that completed a window is a success that ended early: it
 //! reconciles and fires every route's hooks. A deferred tick that completed no
-//! window fires no hook, so no tick gauge or freshness stamp moves. A stall
+//! window fires no hook and skips the reconcile, so no tick gauge, freshness
+//! stamp or `on_tick_complete` backstop moves. A stall
 //! clock starts at the first deferred tick and clears only when a tick reaches
 //! head, so progress that keeps falling behind head cannot hide behind the
 //! early successes. A deferred tick fails through [`fail_whole_tick`] once no
@@ -523,12 +525,12 @@ impl MultiplexedPollerBuilder {
 /// Fire `on_backoff` for every route (unless `shutdown` is cancelled — the
 /// same edge suppression a successful tick applies) and clear every
 /// route's `established` flag, then hand back `err` unchanged. Used only at
-/// the shared, pre-route-loop failure points (head read, a route's floor
-/// derivation, a merged `get_logs` call that is not retried, a stall past
-/// [`GET_LOGS_STALL_BUDGET`]): a failure there
-/// aborts the whole tick before any route-specific step has run, so no single
-/// route's `errored` flag would otherwise capture it, and every route is
-/// equally "down".
+/// the shared window-scan failure points: the head read, a route's floor
+/// derivation, or a merged `get_logs` call that is not retried, all before any
+/// route-specific step has run; or a stall past [`GET_LOGS_STALL_BUDGET`],
+/// after the completed windows are applied but before the reconcile. No single
+/// route's `errored` flag would otherwise capture such a failure, and every
+/// route is equally "down".
 fn fail_whole_tick(
     poller: &mut MultiplexedPoller,
     shutdown: &CancellationToken,
@@ -788,11 +790,13 @@ const GET_LOGS_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// How long the poller may defer windows without a tick that reaches head
 /// before a tick fails (see the module doc's "Deferred windows"). It is a
-/// duration, not a tick count, because a deferred tick lasts from about 11 s
-/// (the poll interval plus the retry sleeps) to about 41 s (three call timeouts
-/// plus the sleeps). It stays below the 180 s after which the
-/// `*WatcherStalled` alerts fire on a stale tick gauge, so a poller that makes
-/// no progress enters backoff before those alerts fire.
+/// duration, not a tick count, because at the default 7 s poll interval a
+/// deferred tick lasts from about 11 s (the interval plus the retry sleeps) to
+/// about 41 s (three call timeouts plus the sleeps). The clock starts when the
+/// first deferred tick ends and is read when a later one ends, so a poller
+/// that makes no progress enters backoff about 130–165 s after its last tick
+/// stamp: under the 180 s at which the `*WatcherStalled` expressions turn true
+/// (they then hold for 5 m before they fire).
 const GET_LOGS_STALL_BUDGET: Duration = Duration::from_mins(2);
 /// Whether a failed `get_logs` window is worth a retry on the same block
 /// range inside the tick. A range rejection is not: it takes the shrink path
@@ -3262,7 +3266,9 @@ mod tests {
     }
 
     /// Deferred ticks that do not reach head for `GET_LOGS_STALL_BUDGET` fail
-    /// the tick: the error names the stall, and every route backs off.
+    /// the tick: the error names the stall, and every route backs off. A failed
+    /// tick does not restart the clock, so the next deferral fails at once, and
+    /// only a tick that reaches head clears the stall and recovers the routes.
     #[tokio::test(start_paused = true)]
     async fn a_stall_past_the_budget_fails_the_tick() {
         let asserter = alloy::providers::mock::Asserter::new();
@@ -3277,12 +3283,14 @@ mod tests {
             return;
         };
 
-        for _ in 0..2 {
+        for _ in 0..3 {
             asserter.push_success(&U64::from(20));
             for _ in 0..3 {
                 push_rpc_failure(&asserter, 19, "Temporary internal error. Please retry");
             }
         }
+        asserter.push_success(&U64::from(20));
+        asserter.push_success(&Vec::<Log>::new());
 
         let first = run_tick(&provider, &mut poller, &no_shutdown()).await;
         assert!(first.is_ok(), "the first stalled tick defers: {first:?}");
@@ -3300,6 +3308,27 @@ mod tests {
         assert!(
             poller.routes.iter().all(|r| r.recovering),
             "every route is marked down"
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let third = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(third.is_err(), "the next deferral fails at once: {third:?}");
+        assert_eq!(backoff.load(Ordering::SeqCst), 2);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let fourth = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(
+            fourth.is_ok(),
+            "a tick that reaches head succeeds: {fourth:?}"
+        );
+        assert!(
+            poller.stalled_since.is_none(),
+            "reaching head clears the stall"
+        );
+        assert_eq!(poller.routes.first().and_then(|r| r.cursor), Some(21));
+        assert!(
+            poller.routes.iter().all(|r| r.established && !r.recovering),
+            "every route recovers"
         );
     }
 
