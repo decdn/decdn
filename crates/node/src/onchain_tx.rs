@@ -30,7 +30,7 @@ use alloy::network::Ethereum;
 use alloy::primitives::TxHash;
 use alloy::providers::{PendingTransactionBuilder, PendingTransactionError, Provider};
 use alloy::rpc::types::TransactionReceipt;
-use decdn_common::redact::sanitize_rpc_display;
+use decdn_common::redact::sanitize_error_sources;
 use tracing::{debug, info};
 
 use crate::metrics::Metrics;
@@ -183,7 +183,7 @@ async fn classify_wait<P: Provider>(
         }
     };
     let wait = match &failure {
-        WaitFailure::Err(error) => sanitize_rpc_display(error),
+        WaitFailure::Err(error) => sanitize_error_sources(error),
         WaitFailure::Lapsed => "timed out".to_owned(),
     };
     info!(tx = %tx_hash, %wait, "receipt wait failed; found the receipt by hash");
@@ -217,7 +217,7 @@ async fn receipt_by_hash<P: Provider>(
         let miss = match tokio::time::timeout(RESOLVE_CALL_TIMEOUT, fetch).await {
             Ok(Ok(Some(receipt))) => return Ok(receipt),
             Ok(Ok(None)) => "no receipt yet".to_owned(),
-            Ok(Err(error)) => sanitize_rpc_display(&error),
+            Ok(Err(error)) => sanitize_error_sources(&error),
             Err(_elapsed) => "fetch timed out".to_owned(),
         };
         debug!(tx = %tx_hash, attempt, %miss, "receipt fetch by hash found nothing");

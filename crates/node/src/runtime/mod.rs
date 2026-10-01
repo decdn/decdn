@@ -50,7 +50,9 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_common::address::parse_nonzero_address;
 use decdn_common::config::ResolvedConfig;
-use decdn_common::redact::{redact_userinfo, sanitize_rpc_display};
+use decdn_common::redact::{
+    redact_userinfo, sanitize_err_chain, sanitize_error_sources, sanitize_rpc_display,
+};
 use decdn_incentive::PoolStateStore;
 use decdn_incentive::eth_identity;
 
@@ -2151,7 +2153,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                 Ok(service) => Arc::new(service),
                 Err(err) => {
                     tracing::warn!(
-                        error = %sanitize_rpc_display(&err),
+                        error = %sanitize_err_chain(&err),
                         payment_pool_addr = %payment_pool_addr_for_buyer,
                         "buyer-side PaymentPool bootstrap failed; node→node paid cache-miss \
                          pulls are DISABLED for this process (seller settlement is unaffected). \
@@ -3802,7 +3804,7 @@ async fn probe_rpc_classified(client: &reqwest::Client, rpc_url: &str) -> RpcPro
         Err(err) => {
             return RpcProbe::Transient(format!(
                 "is not reachable (timeout or connection error): {}",
-                sanitize_rpc_display(&err)
+                sanitize_error_sources(&err)
             ));
         }
     };
@@ -3881,7 +3883,7 @@ fn spawn_rpc_watchdog(
                         // Display embeds the full `rpc_url` (an API key may live
                         // in its path/query, not just userinfo). The transport
                         // failure class survives; the URL does not (issue #954).
-                        tracing::warn!(error = %sanitize_rpc_display(&err), "RPC endpoint unhealthy");
+                        tracing::warn!(error = %sanitize_err_chain(&err), "RPC endpoint unhealthy");
                     }
                     false
                 }

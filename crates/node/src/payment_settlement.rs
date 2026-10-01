@@ -70,7 +70,7 @@ use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use decdn_common::config::REDEEM_LANDING_SLACK_SECS;
-use decdn_common::redact::sanitize_rpc_display;
+use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::sig_canon::is_high_s;
 use decdn_incentive::{
@@ -797,7 +797,10 @@ impl PoolSettlementSink {
 /// Rather than fail open on that gap, [`status`](crate::pool_view::PoolView::status) does ONE `getPool` at
 /// admission — a read the admission path tolerates (it may block) — folds a
 /// servable pool into the projection, and refuses an absent, closed, or errored
-/// pool. The client re-sends its capability on its next request (the documented
+/// pool. Every admit-path chain read (`getPool` and the signer's
+/// `getAuthorization`) runs under `chain_events::timed`'s default bound, so a
+/// hung read times out and takes the fault path instead of stalling admission.
+/// The client re-sends its capability on its next request (the documented
 /// lane recovery path), and by then the folded owner registers the lane.
 ///
 /// The mid-stream re-check calls [`cached_status`](crate::pool_view::PoolView::cached_status), which reads the
@@ -894,11 +897,13 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
                 return None;
             }
         }
-        let pool = match self.contract.getPool(pool_id).call().await {
+        // Bounded: the alloy HTTP provider sets no timeout of its own, so a hung
+        // read times out here and takes the fault path below.
+        let pool = match timed(None, "admit getPool", self.contract.getPool(pool_id).call()).await {
             Ok(pool) => pool,
             Err(err) => {
                 warn!(
-                    error = %sanitize_rpc_display(&err),
+                    error = %sanitize_err_chain(&err),
                     %pool_id,
                     "admit getPool failed; refusing this pool"
                 );
@@ -962,25 +967,34 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
                 return Some(*auth);
             }
         }
-        let auth = match self.contract.getAuthorization(pool_id, signer).call().await {
+        // Bounded: a hung read times out here and takes the fault path below, so
+        // the cached-registration fallback still runs against a stalled RPC.
+        let auth = match timed(
+            None,
+            "admit getAuthorization",
+            self.contract.getAuthorization(pool_id, signer).call(),
+        )
+        .await
+        {
             Ok(auth) => auth,
             Err(err) => {
-                // A read fault is not a verdict on the signer. Fall back to the last
-                // observed registration, whatever its age: `cap` and `expiry` are
-                // write-once, and `spent` is raised to what the projection has
-                // folded since, as the mid-stream re-check reads it. Refuse a signer
-                // this node holds no cached registered read of.
+                // A read fault (an error or a timeout) is not a verdict on the
+                // signer. Fall back to the last observed registration, whatever
+                // its age: `cap` and `expiry` are write-once, and `spent` is
+                // raised to what the projection has folded since, as the
+                // mid-stream re-check reads it. Refuse a signer this node holds
+                // no cached registered read of.
                 let stale = self.stale_authorization(pool_id, signer);
                 if stale.is_some() {
                     warn!(
-                        error = %sanitize_rpc_display(&err),
+                        error = %sanitize_err_chain(&err),
                         %pool_id,
                         %signer,
                         "admit getAuthorization failed; using the last cached registration"
                     );
                 } else {
                     warn!(
-                        error = %sanitize_rpc_display(&err),
+                        error = %sanitize_err_chain(&err),
                         %pool_id,
                         %signer,
                         "admit getAuthorization failed; refusing this signer"
@@ -1511,7 +1525,7 @@ fn plan_lanes(
             Ok(None) => {}
             Err(err) => {
                 metrics.redemption_failure();
-                warn!(error = %sanitize_rpc_display(&err), pool_id = %st.pool_id, "redemption planning failed");
+                warn!(error = %sanitize_err_chain(&err), pool_id = %st.pool_id, "redemption planning failed");
             }
         }
     }
@@ -1677,7 +1691,7 @@ async fn submit_chunk<P: Provider + Clone>(
         }
         TxOutcome::SendErr(err) => {
             record_tx_failure(&span, "send_failed", None);
-            warn!(error = %sanitize_rpc_display(&err), voucher_count, "redeemMany send failed; leaving claims for retry");
+            warn!(error = %sanitize_error_sources(&err), voucher_count, "redeemMany send failed; leaving claims for retry");
         }
         TxOutcome::ReceiptErr {
             error,
@@ -1685,7 +1699,7 @@ async fn submit_chunk<P: Provider + Clone>(
             last_lookup,
         } => {
             record_tx_failure(&span, "receipt_failed", Some(tx_hash));
-            warn!(error = %sanitize_rpc_display(&error), %last_lookup, voucher_count, tx = %tx_hash, "redeemMany receipt wait failed and the by-hash lookup missed; unconfirmed, leaving claims for retry");
+            warn!(error = %sanitize_error_sources(&error), %last_lookup, voucher_count, tx = %tx_hash, "redeemMany receipt wait failed and the by-hash lookup missed; unconfirmed, leaving claims for retry");
         }
         TxOutcome::Timeout {
             tx_hash,
@@ -1746,7 +1760,7 @@ async fn record_landed_chunk<P: Provider + Clone>(
             Ok(auths) => persist_registered_expiries(store, chunk, &auths),
             Err(err) => {
                 warn!(
-                    error = %sanitize_rpc_display(err),
+                    error = %sanitize_err_chain(&err),
                     lanes = chunk.len(),
                     "post-redeem registration read failed; the next sweep re-registers and re-reads"
                 );
@@ -1878,7 +1892,7 @@ async fn reconcile_onchain_watermarks<P: Provider + Clone>(
             Err(err) => {
                 warn!(
                     stage = "reconcile",
-                    error = %sanitize_rpc_display(err),
+                    error = %sanitize_err_chain(&err),
                     lanes = chunk.len(),
                     "pre-redeem watermark reconciliation failed; submitting on the contract's own no-op guard"
                 );
@@ -2761,6 +2775,92 @@ mod tests {
             "the second call did read the chain"
         );
         Ok(())
+    }
+
+    /// A view whose every chain read hangs forever. Pair with
+    /// `#[tokio::test(start_paused = true)]` so the `timed` bound fires on
+    /// virtual time.
+    fn hanging_view() -> ResolvingPoolView<impl Provider + Clone + 'static> {
+        ResolvingPoolView::new(
+            PaymentPool::new(
+                Address::ZERO,
+                crate::chain_events::test_support::hanging_provider(),
+            ),
+            PoolProjection::new(),
+        )
+    }
+
+    /// A hung admit `getPool` times out and takes the fault path: the pool is
+    /// refused and negative-cached, so the next request does not wait again.
+    #[tokio::test(start_paused = true)]
+    async fn admit_getpool_hang_refuses_within_the_bound() {
+        use crate::chain_events::test_support::bounded;
+        use crate::pool_view::PoolView;
+
+        let view = hanging_view();
+        let pool_id = B256::repeat_byte(0x51);
+        assert!(
+            bounded("admit getPool", view.status(pool_id))
+                .await
+                .is_none()
+        );
+        let guard = view
+            .negative
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            guard.contains_key(&pool_id),
+            "the timed-out pool is negative-cached"
+        );
+    }
+
+    /// A hung admit `getAuthorization` past `SIGNER_AUTH_TTL` times out and falls
+    /// back to the cached registration, as an RPC error does (#2270).
+    #[tokio::test(start_paused = true)]
+    async fn admit_getauthorization_hang_falls_back_to_the_cached_registration() -> Result<()> {
+        use crate::chain_events::test_support::bounded;
+        use crate::pool_view::PoolView;
+
+        let view = hanging_view();
+        let pool_id = B256::repeat_byte(0x52);
+        let signer = Address::from([7u8; 20]);
+        let aged = Instant::now()
+            .checked_sub(SIGNER_AUTH_TTL * 2)
+            .ok_or_else(|| anyhow::anyhow!("clock too close to its epoch"))?;
+        view.auth_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((pool_id, signer), (registered(1_000_000, 200_000), aged));
+        assert_eq!(
+            bounded(
+                "admit getAuthorization",
+                view.signer_authorization(pool_id, signer)
+            )
+            .await,
+            Some(registered(1_000_000, 200_000)),
+            "the timeout falls back to the last cached registration"
+        );
+        Ok(())
+    }
+
+    /// A hung admit `getAuthorization` with no cached read times out and refuses
+    /// the signer.
+    #[tokio::test(start_paused = true)]
+    async fn admit_getauthorization_hang_with_no_cached_read_refuses() {
+        use crate::chain_events::test_support::bounded;
+        use crate::pool_view::PoolView;
+
+        let view = hanging_view();
+        let pool_id = B256::repeat_byte(0x53);
+        let signer = Address::from([8u8; 20]);
+        assert_eq!(
+            bounded(
+                "admit getAuthorization",
+                view.signer_authorization(pool_id, signer)
+            )
+            .await,
+            None
+        );
     }
 
     /// The stale fallback raises the cached `spent` to the projection's fold, so a
