@@ -50,11 +50,13 @@ pub trait AdmissionPolicy: Send + Sync + std::fmt::Debug {
 
 /// Everything a policy needs to plan one eviction sweep. The engine assembles
 /// it and never interprets the policy's semantics — `candidates` is already
-/// stripped of pins/holds/deny, and `segments` is the generic `hash -> Segment`
-/// membership the engine tracks with no meaning attached.
+/// stripped of pins and probe-holds (a deny-listed hash stays a candidate even
+/// when pinned: deny wins over pin), and `segments` is the generic
+/// `hash -> Segment` membership the engine tracks with no meaning attached.
 #[derive(Debug)]
 pub struct EvictionContext<'a> {
-    /// Eligible hashes with their last-access `Instant` (pin/hold/deny-filtered).
+    /// Eligible hashes with their last-access `Instant` (pin- and hold-filtered;
+    /// deny-listed hashes stay).
     pub candidates: &'a EvictionCandidates,
     /// Whole-store per-hash byte size.
     pub sizes: &'a HashMap<Hash, u64>,
@@ -85,7 +87,8 @@ pub trait EvictionPolicy: Send + Sync + std::fmt::Debug {
     /// The one sweep-time decision: what leaves, what graduates. A policy that
     /// ranks by frequency reads the shared [`FrequencyEstimator`] directly — the
     /// engine feeds that estimator on every serve. `candidates` is already
-    /// stripped of pins/holds/deny by the engine.
+    /// stripped of pins and probe-holds by the engine; a deny-listed hash stays
+    /// a candidate even when pinned (deny wins over pin).
     fn plan(&self, ctx: &EvictionContext<'_>) -> EvictionPlan;
 }
 
