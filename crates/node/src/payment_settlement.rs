@@ -3282,6 +3282,123 @@ mod tests {
         Ok(())
     }
 
+    /// A settlement service over `contract` and `store`, built without
+    /// `bootstrap`: no redemption task runs, so `shutdown` goes straight to
+    /// `final_redeem_sweep`.
+    fn shutdown_service<P: Provider + Clone + 'static>(
+        contract: PaymentPool::PaymentPoolInstance<P>,
+        store: Arc<dyn PoolStateStore>,
+        self_address: Address,
+        redeem_threshold: U256,
+        metrics: Arc<Metrics>,
+    ) -> PoolSettlementService<P> {
+        let (redeem_tx, _redeem_rx) = mpsc::channel(1);
+        PoolSettlementService {
+            contract,
+            redeem_tx,
+            store,
+            paid: PaidWatermarks::default(),
+            self_address,
+            redeem_threshold,
+            redeem_max_vouchers_per_tx: 300,
+            metrics,
+            pool_view: PoolProjection::new(),
+            redeemer: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// One registered lane that provider `[20; 20]` holds, persisted in a fresh
+    /// store. Returns the store, the provider address, and what the lane is owed.
+    fn store_with_one_owed_lane() -> Result<(Arc<dyn PoolStateStore>, Address, U256)> {
+        use decdn_incentive::MemoryPoolStateStore;
+
+        let store: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
+        let mut st = signed_lane_state(1, 10, 20, None);
+        st.registered_until = u64::MAX;
+        store.record(&st)?;
+        Ok((store, Address::from([20u8; 20]), st.owed()))
+    }
+
+    /// `final_redeem_sweep` applies the configured floor: a lane owed less than
+    /// `redeem_threshold` is left alone at shutdown. No `getWatermarks` read is
+    /// issued, so no `redeemMany` can follow.
+    #[tokio::test]
+    async fn shutdown_sweep_leaves_a_sub_floor_lane_unread() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let (store, me, owed) = store_with_one_owed_lane()?;
+        let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0)]]);
+        let svc = shutdown_service(
+            contract,
+            store,
+            me,
+            owed + U256::from(1u64),
+            Arc::clone(&metrics),
+        );
+
+        svc.shutdown(Duration::from_secs(5)).await;
+
+        assert_eq!(
+            asserter.read_q().len(),
+            1,
+            "the queued getWatermarks response is untouched by a sub-floor lane"
+        );
+        let text = metrics.encode()?;
+        for expected in [
+            "decdn_redemption_reconcile_ok_total 0",
+            "decdn_redemption_failures_total 0",
+        ] {
+            anyhow::ensure!(text.lines().any(|l| l == expected), "{expected}\n{text}");
+        }
+        Ok(())
+    }
+
+    /// `final_redeem_sweep` passes a lane owed exactly `redeem_threshold` on to
+    /// the pre-submit reconcile. The chain reports the lane settled, so nothing
+    /// reaches `redeemMany`.
+    #[tokio::test]
+    async fn shutdown_sweep_redeems_a_lane_that_clears_the_floor() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let (store, me, owed) = store_with_one_owed_lane()?;
+        let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(u64::try_from(owed)?)]]);
+        let svc = shutdown_service(contract, store, me, owed, Arc::clone(&metrics));
+
+        svc.shutdown(Duration::from_secs(5)).await;
+
+        assert_eq!(asserter.read_q().len(), 0, "the lane was read");
+        let text = metrics.encode()?;
+        for expected in [
+            "decdn_redemption_reconcile_ok_total 1",
+            "decdn_redemption_reconcile_failures_total 0",
+            "decdn_redemption_reconciled_skip_total 1",
+        ] {
+            anyhow::ensure!(text.lines().any(|l| l == expected), "{expected}\n{text}");
+        }
+        Ok(())
+    }
+
+    /// `final_redeem_sweep` submits a `redeemMany` for an unsettled lane that
+    /// clears the floor. The mocked provider has no response left for the send,
+    /// so the send fails and counts one redemption failure.
+    #[tokio::test]
+    async fn shutdown_sweep_submits_redeem_many_for_an_unsettled_lane() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let (store, me, owed) = store_with_one_owed_lane()?;
+        let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0)]]);
+        let svc = shutdown_service(contract, store, me, owed, Arc::clone(&metrics));
+
+        svc.shutdown(Duration::from_secs(5)).await;
+
+        assert_eq!(asserter.read_q().len(), 0, "the lane was read");
+        let text = metrics.encode()?;
+        for expected in [
+            "decdn_redemption_reconcile_ok_total 1",
+            "decdn_redemption_failures_total 1",
+        ] {
+            anyhow::ensure!(text.lines().any(|l| l == expected), "{expected}\n{text}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn chunk_redemptions_caps_vouchers_per_chunk() {
         // 5 lanes, cap 2 => 3 chunks (2 + 2 + 1). All above floor.
