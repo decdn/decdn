@@ -1160,9 +1160,8 @@ mod tests {
         async fn full_snapshot(&self, _at: u64) -> Result<RegistrySnapshot> {
             match &self.snapshot {
                 Ok(v) => Ok(v.clone()),
-                Err(msg) => {
-                    Err(anyhow::anyhow!(*msg).context("getRegisteredNodes(offset=0, limit=100)"))
-                }
+                Err(msg) => Err(anyhow::anyhow!(*msg)
+                    .context(format!("getRegisteredNodes(offset=0, limit={PAGE_SIZE})"))),
             }
         }
     }
@@ -2096,7 +2095,7 @@ mod tests {
             .unwrap_or_else(|| panic!("no resync warning logged:\n{text}"));
         assert!(line.contains("WARN"), "{line}");
         assert!(
-            line.contains("getRegisteredNodes(offset=0, limit=100)"),
+            line.contains(&format!("getRegisteredNodes(offset=0, limit={PAGE_SIZE})")),
             "the warning must keep the page context: {line}"
         );
         assert!(
