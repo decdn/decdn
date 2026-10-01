@@ -60,7 +60,8 @@ pub enum CacheError {
     },
 
     /// The origin backend failed (network error, non-200 status, etc).
-    #[error("origin error fetching {hash}: {source}")]
+    /// Display renders the whole cause chain on one line.
+    #[error("origin error fetching {hash}: {source:#}")]
     OriginError {
         /// The hash that was requested.
         hash: Hash,
@@ -70,13 +71,15 @@ pub enum CacheError {
     },
 
     /// The underlying iroh-blobs store failed.
-    #[error("store error: {0}")]
+    /// Display renders the whole cause chain on one line.
+    #[error("store error: {0:#}")]
     Store(#[source] anyhow::Error),
 
     /// A code bug in the cache: a broken internal invariant or a caught panic.
     /// Never an origin fault and never a store fault, so an operator reads it
     /// as a bug to report, not as a backend to check.
-    #[error("internal fault: {0}")]
+    /// Display renders the whole cause chain on one line.
+    #[error("internal fault: {0:#}")]
     Internal(#[source] anyhow::Error),
 
     /// The local evicted-hash set is full. Hard cap on the number of
@@ -245,5 +248,46 @@ impl OriginPullError {
             Self::Transient(e) => Self::Transient(f(e)),
             Self::Permanent(e) => Self::Permanent(f(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_display_carries_the_whole_chain() {
+        let e = CacheError::Store(anyhow::anyhow!("root").context("outer"));
+        let shown = e.to_string();
+        assert!(shown.starts_with("store error: "), "{shown}");
+        assert!(shown.contains("outer"), "{shown}");
+        assert!(shown.contains("root"), "{shown}");
+    }
+
+    #[test]
+    fn internal_display_carries_the_whole_chain() {
+        let e = CacheError::Internal(anyhow::anyhow!("root").context("outer"));
+        let shown = e.to_string();
+        assert!(shown.starts_with("internal fault: "), "{shown}");
+        assert!(shown.contains("outer"), "{shown}");
+        assert!(shown.contains("root"), "{shown}");
+    }
+
+    #[test]
+    fn origin_error_display_carries_the_whole_chain() {
+        let e = CacheError::OriginError {
+            hash: Hash::from_bytes([0; 32]),
+            source: anyhow::anyhow!("root").context("outer"),
+        };
+        let shown = e.to_string();
+        assert!(shown.starts_with("origin error fetching "), "{shown}");
+        assert!(shown.contains("outer"), "{shown}");
+        assert!(shown.contains("root"), "{shown}");
+    }
+
+    #[test]
+    fn source_chain_survives() {
+        let e = CacheError::Store(anyhow::anyhow!("root").context("outer"));
+        assert!(std::error::Error::source(&e).is_some());
     }
 }
