@@ -106,7 +106,7 @@ pub(crate) async fn within_origin_timeout<F: Future>(
         }
         CacheError::OriginError {
             hash,
-            source: anyhow::anyhow!(
+            cause: anyhow::anyhow!(
                 "origin {what} of {len} bytes took longer than its {limit:?} budget \
                  (cache.node_pull_stall_window_sec plus the size at \
                  cache.node_pull_min_throughput_bps)"
@@ -275,7 +275,7 @@ impl OriginRangeCursor {
         .await?
         .map_err(|e| CacheError::OriginError {
             hash: self.hash,
-            source: e.into_inner(),
+            cause: e.into_inner(),
         })? {
             OriginRangeFetch::Ranged { data } => data,
             OriginRangeFetch::Unsupported | OriginRangeFetch::NotFound => {
@@ -411,7 +411,7 @@ impl OriginWindowReader {
                 );
                 Err(self.fail(CacheError::OriginError {
                     hash,
-                    source: anyhow::anyhow!(
+                    cause: anyhow::anyhow!(
                         "origin stopped serving range [{start}, {end}) of {hash} mid-stream"
                     ),
                 }))
@@ -539,7 +539,7 @@ impl Drop for UnfinishedGuard {
                 &self.slot,
                 CacheError::OriginError {
                     hash: self.hash,
-                    source: anyhow::anyhow!(
+                    cause: anyhow::anyhow!(
                         "origin range encode for {} was cancelled, or panicked outside the encode, before completing",
                         self.hash
                     ),
@@ -680,14 +680,14 @@ impl OriginRangeWire {
                     &guard.slot,
                     CacheError::OriginError {
                         hash,
-                        source: anyhow::Error::new(e).context("origin range encode failed"),
+                        cause: anyhow::Error::new(e).context("origin range encode failed"),
                     },
                 ),
                 Err(other) => park_fault(
                     &guard.slot,
                     CacheError::OriginError {
                         hash,
-                        source: anyhow::anyhow!("origin range encode failed: {other}"),
+                        cause: anyhow::anyhow!("origin range encode failed: {other}"),
                     },
                 ),
             }

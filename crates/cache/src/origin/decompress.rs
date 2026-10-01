@@ -74,16 +74,16 @@ pub(crate) fn resolve_encoding(
     Ok(Some(supported))
 }
 
-/// Wrap a decoder `io::Error` into an `io::Error` whose source is a
+/// Wrap a decoder `io::Error` into an `io::Error` whose inner error is a
 /// typed [`OriginError::DecompressionFailed`]. The engine's
 /// `count_and_cap_stream` side-channel preserves the `io::Error`
 /// verbatim; `crate::retry::classify_io_error` then downcasts the
 /// inner to recover the typed variant and surfaces it as
 /// `OriginPullError::Permanent` (`CacheError::origin_error_kind`
 /// finds it on the chain walk).
-fn typed_decoder_error(encoding: SupportedEncoding, source: std::io::Error) -> std::io::Error {
-    let kind = source.kind();
-    let typed = OriginError::DecompressionFailed { encoding, source };
+fn typed_decoder_error(encoding: SupportedEncoding, cause: std::io::Error) -> std::io::Error {
+    let kind = cause.kind();
+    let typed = OriginError::DecompressionFailed { encoding, cause };
     std::io::Error::new(kind, typed)
 }
 

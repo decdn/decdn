@@ -6,6 +6,11 @@ use iroh_blobs::Hash;
 use thiserror::Error;
 
 /// Errors surfaced by [`crate::CacheEngine`].
+///
+/// A variant that wraps a cause renders the whole cause chain in its `Display`
+/// and returns no [`std::error::Error::source`]. A chain formatter (`{:#}` or
+/// `{:?}` on an `anyhow::Error` that wraps a `CacheError`) then names each
+/// cause once. Code that needs a typed cause reads the variant's field.
 #[derive(Debug, Error)]
 pub enum CacheError {
     /// The requested blob was not found locally and the configured origin
@@ -61,26 +66,25 @@ pub enum CacheError {
 
     /// The origin backend failed (network error, non-200 status, etc).
     /// Display renders the whole cause chain on one line.
-    #[error("origin error fetching {hash}: {source:#}")]
+    #[error("origin error fetching {hash}: {cause:#}")]
     OriginError {
         /// The hash that was requested.
         hash: Hash,
         /// Underlying error from the origin backend.
-        #[source]
-        source: anyhow::Error,
+        cause: anyhow::Error,
     },
 
     /// The underlying iroh-blobs store failed.
     /// Display renders the whole cause chain on one line.
     #[error("store error: {0:#}")]
-    Store(#[source] anyhow::Error),
+    Store(anyhow::Error),
 
     /// A code bug in the cache: a broken internal invariant or a caught panic.
     /// Never an origin fault and never a store fault, so an operator reads it
     /// as a bug to report, not as a backend to check.
     /// Display renders the whole cause chain on one line.
     #[error("internal fault: {0:#}")]
-    Internal(#[source] anyhow::Error),
+    Internal(anyhow::Error),
 
     /// The local evicted-hash set is full. Hard cap on the number of
     /// distinct hashes the operator may evict in a single cache lifetime
@@ -97,7 +101,7 @@ pub enum CacheError {
 }
 
 impl CacheError {
-    /// Walk the source chain of [`Self::OriginError`] looking for an
+    /// Walk the cause chain of [`Self::OriginError`] looking for an
     /// [`OriginError`]. Returns `Some` when the failure originated in
     /// the HTTP origin's encoding/decompression layer, even after
     /// [`anyhow::Context::with_context`] wrappers were stacked on top —
@@ -109,10 +113,10 @@ impl CacheError {
     /// strings. Returns `None` for non-origin failures or origin failures
     /// that didn't come from `HttpOrigin`'s decoder.
     pub fn origin_error_kind(&self) -> Option<&OriginError> {
-        let Self::OriginError { source, .. } = self else {
+        let Self::OriginError { cause, .. } = self else {
             return None;
         };
-        source
+        cause
             .chain()
             .find_map(|cause| cause.downcast_ref::<OriginError>())
     }
@@ -143,7 +147,7 @@ impl fmt::Display for SupportedEncoding {
 
 /// Errors raised by the [`crate::origin::HttpOrigin`] decompression layer.
 ///
-/// Surfaced to the engine through the `anyhow::Error` source on
+/// Surfaced to the engine through the `anyhow::Error` cause on
 /// [`CacheError::OriginError`] (the `Origin` trait returns `anyhow::Result`).
 /// Use [`CacheError::origin_error_kind`] to recover the typed variant —
 /// the chain walk works through any number of `with_context` wrappers.
@@ -179,13 +183,15 @@ pub enum OriginError {
     /// actually zstd). The `encoding` field is typed (closed set) so
     /// nonsense values are unrepresentable — this variant is reachable
     /// only from the gzip and zstd code paths.
-    #[error("failed to decompress {encoding} response body: {source}")]
+    ///
+    /// Display renders the decoder error and `source()` returns `None`, so a
+    /// chain formatter names the decoder error once.
+    #[error("failed to decompress {encoding} response body: {cause}")]
     DecompressionFailed {
         /// The supported encoding whose decoder rejected the body.
         encoding: SupportedEncoding,
         /// Underlying decoder error.
-        #[source]
-        source: std::io::Error,
+        cause: std::io::Error,
     },
 }
 
@@ -277,7 +283,7 @@ mod tests {
     fn origin_error_display_carries_the_whole_chain() {
         let e = CacheError::OriginError {
             hash: Hash::from_bytes([0; 32]),
-            source: anyhow::anyhow!("root").context("outer"),
+            cause: anyhow::anyhow!("root").context("outer"),
         };
         let shown = e.to_string();
         assert!(shown.starts_with("origin error fetching "), "{shown}");
@@ -285,9 +291,44 @@ mod tests {
         assert!(shown.contains("root"), "{shown}");
     }
 
+    /// Format `e` the way the node logs a cache fault it carries in an `anyhow`
+    /// chain (`error = %format_args!("{err:#}")`), plus the `Debug` form.
+    fn logged(e: CacheError) -> [String; 2] {
+        let err = anyhow::Error::from(e);
+        [format!("{err:#}"), format!("{err:?}")]
+    }
+
     #[test]
-    fn source_chain_survives() {
-        let e = CacheError::Store(anyhow::anyhow!("root").context("outer"));
-        assert!(std::error::Error::source(&e).is_some());
+    fn logged_chain_names_each_cause_once() {
+        let faults = [
+            CacheError::Store(anyhow::anyhow!("root").context("outer")),
+            CacheError::Internal(anyhow::anyhow!("root").context("outer")),
+            CacheError::OriginError {
+                hash: Hash::from_bytes([0; 32]),
+                cause: anyhow::anyhow!("root").context("outer"),
+            },
+        ];
+        for fault in faults {
+            for shown in logged(fault) {
+                assert_eq!(shown.matches("root").count(), 1, "{shown}");
+                assert_eq!(shown.matches("outer").count(), 1, "{shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn logged_decompression_failure_names_the_decoder_error_once() {
+        let typed = OriginError::DecompressionFailed {
+            encoding: SupportedEncoding::Gzip,
+            cause: std::io::Error::other("invalid gzip header"),
+        };
+        let e = CacheError::OriginError {
+            hash: Hash::from_bytes([0; 32]),
+            cause: anyhow::Error::from(typed).context("fetch body"),
+        };
+        for shown in logged(e) {
+            assert_eq!(shown.matches("invalid gzip header").count(), 1, "{shown}");
+            assert!(shown.contains("failed to decompress gzip"), "{shown}");
+        }
     }
 }

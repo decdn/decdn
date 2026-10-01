@@ -2139,7 +2139,7 @@ mod local_pull_leg_tests {
         );
         let origin = anyhow::Error::from(CacheError::OriginError {
             hash: Hash::from([1; 32]),
-            source: anyhow::anyhow!("origin stopped serving"),
+            cause: anyhow::anyhow!("origin stopped serving"),
         })
         .context("drive failed");
         assert!(!super::is_internal_fault(&origin));

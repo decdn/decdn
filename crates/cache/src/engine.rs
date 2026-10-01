@@ -3254,7 +3254,7 @@ impl CacheEngine {
         .and_then(|r| {
             r.map_err(|e| CacheError::OriginError {
                 hash,
-                source: e.into_inner(),
+                cause: e.into_inner(),
             })
         });
         let ob = match fetched {
@@ -4315,7 +4315,7 @@ impl CacheEngine {
                     );
                     last_err = Some(CacheError::OriginError {
                         hash,
-                        source: e.into_inner(),
+                        cause: e.into_inner(),
                     });
                 }
             }
@@ -5243,7 +5243,7 @@ impl CacheEngine {
             if let Some(e) = last_err {
                 Err(CacheError::OriginError {
                     hash,
-                    source: e.into_inner(),
+                    cause: e.into_inner(),
                 })
             } else if any_short_circuit {
                 // Every origin that wasn't a definitive NotFound was
@@ -5256,7 +5256,7 @@ impl CacheEngine {
                 // spurious 404, *without* having incurred any backoff.
                 Err(CacheError::OriginError {
                     hash,
-                    source: anyhow::anyhow!(
+                    cause: anyhow::anyhow!(
                         "origin circuit-breaker open: all eligible origins are \
                          fast-failing during a sustained outage (#963)"
                     ),
@@ -10718,8 +10718,8 @@ mod tests {
         engine.set_origin_read_budget(Duration::from_millis(50), u64::MAX);
         let err = engine.origin_fetch_outboard_bytes(hash, total).await.err();
         anyhow::ensure!(
-            matches!(&err, Some(CacheError::OriginError { source, .. })
-                if source.to_string().contains("budget")),
+            matches!(&err, Some(CacheError::OriginError { cause, .. })
+                if cause.to_string().contains("budget")),
             "a lone stuck origin is a timeout fault, got {err:?}"
         );
         Ok(())
@@ -10798,8 +10798,8 @@ mod tests {
         };
         let (_, fault) = tokio::time::timeout(Duration::from_secs(10), drain_wire(wire)).await?;
         anyhow::ensure!(
-            matches!(&fault, Some(CacheError::OriginError { source, .. })
-                if source.to_string().contains("budget")),
+            matches!(&fault, Some(CacheError::OriginError { cause, .. })
+                if cause.to_string().contains("budget")),
             "a stuck window must end on a timeout OriginError, got {fault:?}"
         );
         Ok(())
