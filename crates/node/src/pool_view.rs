@@ -176,8 +176,9 @@ pub trait PoolView: Send + Sync + std::fmt::Debug {
     ///   presented capability) or no chain wired.
     /// - `Some(SignerAuthorization::Registered { .. })` — the registered terms and
     ///   the signer's current `spent`.
-    /// - `None` — the on-chain read could not confirm the signer (a
-    ///   `getAuthorization` fault). The caller refuses rather than fail open.
+    /// - `None` — the on-chain read faulted and no earlier read of this signer
+    ///   is held. The caller refuses it as unconfirmed rather than fail open. A
+    ///   fault for a signer with an earlier read answers with that read.
     ///
     /// The default reports every signer unregistered: the bare [`PoolProjection`]
     /// and test doubles hold no chain. The production wrapper

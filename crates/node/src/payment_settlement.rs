@@ -847,6 +847,28 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
             auth_cache: Mutex::new(HashMap::new()),
         }
     }
+
+    /// The cached authorization for `(pool_id, signer)` whatever its age, with a
+    /// registered signer's `spent` raised to the projection's fold. `None` when
+    /// this node holds no read for the pair.
+    fn stale_authorization(&self, pool_id: B256, signer: Address) -> Option<SignerAuthorization> {
+        let cached = self
+            .auth_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(pool_id, signer))
+            .map(|(auth, _)| *auth)?;
+        Some(match cached {
+            SignerAuthorization::Unregistered => SignerAuthorization::Unregistered,
+            SignerAuthorization::Registered { cap, expiry, spent } => {
+                SignerAuthorization::Registered {
+                    cap,
+                    expiry,
+                    spent: spent.max(self.projection.signer_spent(pool_id, signer)),
+                }
+            }
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -938,13 +960,28 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
         let auth = match self.contract.getAuthorization(pool_id, signer).call().await {
             Ok(auth) => auth,
             Err(err) => {
-                warn!(
-                    error = %sanitize_rpc_display(&err),
-                    %pool_id,
-                    %signer,
-                    "admit getAuthorization failed; refusing this signer"
-                );
-                return None;
+                // A read fault is not a verdict on the signer. Fall back to the last
+                // observed authorization, whatever its age: `cap` and `expiry` are
+                // write-once, and `spent` is raised to what the projection has
+                // folded since, as the mid-stream re-check reads it. Refuse only a
+                // signer this node has never read.
+                let stale = self.stale_authorization(pool_id, signer);
+                if stale.is_some() {
+                    warn!(
+                        error = %sanitize_rpc_display(&err),
+                        %pool_id,
+                        %signer,
+                        "admit getAuthorization failed; using the last cached authorization"
+                    );
+                } else {
+                    warn!(
+                        error = %sanitize_rpc_display(&err),
+                        %pool_id,
+                        %signer,
+                        "admit getAuthorization failed; refusing this signer"
+                    );
+                }
+                return stale;
             }
         };
         let auth = SignerAuthorization::from_onchain(&auth);
@@ -2663,8 +2700,8 @@ mod tests {
         Ok(())
     }
 
-    /// A `getAuthorization` RPC fault refuses the signer (`None`) so the caller
-    /// does not fail open.
+    /// A `getAuthorization` RPC fault for a signer this node has never read
+    /// returns `None`, so the caller refuses rather than fail open.
     #[tokio::test]
     async fn getauthorization_fault_refuses_signer() -> Result<()> {
         use crate::pool_view::PoolView;
@@ -2675,7 +2712,48 @@ mod tests {
             view.signer_authorization(B256::repeat_byte(0x44), Address::from([5u8; 20]))
                 .await
                 .is_none(),
-            "a getAuthorization fault refuses the signer"
+            "a fault with no cached read refuses the signer"
+        );
+        Ok(())
+    }
+
+    /// A `getAuthorization` fault after the cached read has aged past
+    /// `SIGNER_AUTH_TTL` answers with that read rather than refusing a signer the
+    /// node has already seen (#2220): the fault says nothing about the signer.
+    #[tokio::test]
+    async fn an_expired_cache_entry_answers_a_getauthorization_fault() -> Result<()> {
+        use crate::pool_view::PoolView;
+
+        let pool_id = B256::repeat_byte(0x45);
+        let signer = Address::from([6u8; 20]);
+        // One response: the first call reads it, the second finds an empty queue.
+        let (view, asserter) = mocked_getauth_view(&[authz(1_000_000, 200_000)]);
+        assert_eq!(
+            view.signer_authorization(pool_id, signer).await,
+            Some(registered(1_000_000, 200_000))
+        );
+        // Age the entry past the TTL so the next call goes to the chain.
+        {
+            let mut guard = view
+                .auth_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = guard
+                .get_mut(&(pool_id, signer))
+                .ok_or_else(|| anyhow::anyhow!("the first read is cached"))?;
+            entry.1 = Instant::now()
+                .checked_sub(SIGNER_AUTH_TTL * 2)
+                .ok_or_else(|| anyhow::anyhow!("clock too close to its epoch"))?;
+        }
+        assert_eq!(
+            view.signer_authorization(pool_id, signer).await,
+            Some(registered(1_000_000, 200_000)),
+            "the fault falls back to the last cached authorization"
+        );
+        assert_eq!(
+            asserter.read_q().len(),
+            0,
+            "the second call did read the chain"
         );
         Ok(())
     }

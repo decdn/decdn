@@ -596,7 +596,7 @@ impl From<FloorRefusal> for ServeRejectReason {
 /// `CacheMiss`, `UnknownChannel`, and `OwnerMismatch` all ship as `NotFound` on
 /// the wire (to avoid leaking channel existence), but are distinct here so an
 /// operator can, e.g., isolate an unknown-channel abuse campaign.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeRejectReason {
     EvictedSinceProbe,
     CacheMiss,
@@ -615,16 +615,16 @@ enum ServeRejectReason {
     InsufficientDeposit,
     /// A wired `PoolView` could not confirm the request's pool on-chain: the pool
     /// has no on-chain record, is closed/reclaimed, or the admit-path `getPool`
-    /// faulted. The node refuses rather than serve a pool it cannot confirm is live
-    /// and solvent (ADR 003 §Pool solvency). Collapses to `NotFound` on the wire
+    /// faulted; or the admit-path `getAuthorization` faulted for a signer the node
+    /// has never read. The node refuses rather than serve a pool it cannot confirm
+    /// is live and solvent (ADR 003 §Pool solvency). Collapses to `NotFound` on the wire
     /// (see [`Self::wire_error`]) — unlike [`Self::InsufficientDeposit`], this
     /// refusal can precede any lane-ownership proof, so it must stay a plain miss:
     /// a client cannot tell an unconfirmed pool from a drained one, while an
     /// operator can tell a chain/RPC problem from real deposit exhaustion.
     PoolUnconfirmed,
     /// The request's voucher signer is registered on-chain with `cap − spent` below
-    /// a serve floor or with an expired registration, or its authorization could
-    /// not be confirmed. A signer's `cap`
+    /// a serve floor or with an expired registration. A signer's `cap`
     /// is shared across every provider (ADR 003 §Pool solvency), so a "spent"
     /// capability — one whose signer has already drawn its full `cap` at other nodes
     /// — is uncashable here: the node would serve for vouchers it could never

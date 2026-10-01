@@ -922,6 +922,15 @@ since project inception and will roll into the first tagged release.
   client's lane-build and discovery debug lines and the CLI's "no holder
   resolved yet" warning do the same.
 
+- **A transient `getAuthorization` fault no longer refuses a paying signer as
+  cap-exhausted (#2220).** When the admit-time read faults, the node answers
+  with the last authorization it read for that signer, whatever its age, with
+  `spent` raised to the settlement projection's fold. A signer the node has
+  never read is still refused, now as `pool_unconfirmed`
+  (`decdn_serve_stream_rejected_pool_unconfirmed_total`), so
+  `decdn_serve_stream_rejected_signer_cap_exhausted_total` counts only signers
+  whose on-chain cap cannot pay a floor.
+
 - **A partial holder is not asked again for chunks it cannot pull through
   (#2262).** A probed holder that refuses a chunk outside its advertised
   coverage with `NotFound` now counts toward the same three-refusal limit as
