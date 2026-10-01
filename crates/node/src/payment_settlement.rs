@@ -3284,7 +3284,8 @@ mod tests {
 
     /// A settlement service over `contract` and `store`, built without
     /// `bootstrap`: no redemption task runs, so `shutdown` goes straight to
-    /// `final_redeem_sweep`.
+    /// `final_redeem_sweep`. The paid cache and pool projection start empty, so
+    /// planning treats the whole claim as unredeemed and fails open on the pool.
     fn shutdown_service<P: Provider + Clone + 'static>(
         contract: PaymentPool::PaymentPoolInstance<P>,
         store: Arc<dyn PoolStateStore>,
@@ -3307,21 +3308,53 @@ mod tests {
         }
     }
 
-    /// One registered lane that provider `[20; 20]` holds, persisted in a fresh
-    /// store. Returns the store, the provider address, and what the lane is owed.
-    fn store_with_one_owed_lane() -> Result<(Arc<dyn PoolStateStore>, Address, U256)> {
-        use decdn_incentive::MemoryPoolStateStore;
-
-        let store: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
+    /// Persist one lane that provider `[20; 20]` holds. The lane is registered
+    /// (`registered_until = u64::MAX`), so its plan carries no `CapabilityReg`
+    /// and needs no `owner_sig`. Returns the provider address and what the lane
+    /// is owed.
+    fn seed_one_owed_lane(store: &dyn PoolStateStore) -> Result<(Address, U256)> {
         let mut st = signed_lane_state(1, 10, 20, None);
         st.registered_until = u64::MAX;
         store.record(&st)?;
-        Ok((store, Address::from([20u8; 20]), st.owed()))
+        Ok((Address::from([20u8; 20]), st.owed()))
     }
 
-    /// `final_redeem_sweep` applies the configured floor: a lane owed less than
-    /// `redeem_threshold` is left alone at shutdown. No `getWatermarks` read is
-    /// issued, so no `redeemMany` can follow.
+    /// A fresh in-memory store holding the lane from [`seed_one_owed_lane`].
+    fn store_with_one_owed_lane() -> Result<(Arc<dyn PoolStateStore>, Address, U256)> {
+        let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+        let (me, owed) = seed_one_owed_lane(store.as_ref())?;
+        Ok((store, me, owed))
+    }
+
+    /// An in-memory lane store whose `flush` always fails.
+    struct FailingFlushStore(decdn_incentive::MemoryPoolStateStore);
+
+    impl PoolStateStore for FailingFlushStore {
+        fn load_all(&self) -> Result<Vec<LaneState>, StoreError> {
+            self.0.load_all()
+        }
+
+        fn record(&self, state: &LaneState) -> Result<(), StoreError> {
+            self.0.record(state)
+        }
+
+        fn forget(&self, key: LaneKey) -> Result<(), StoreError> {
+            self.0.forget(key)
+        }
+
+        fn get(&self, key: LaneKey) -> Result<Option<LaneState>, StoreError> {
+            self.0.get(key)
+        }
+
+        fn flush(&self) -> Result<(), StoreError> {
+            Err(StoreError::Backend("flush refused".into()))
+        }
+    }
+
+    /// `final_redeem_sweep` applies the configured floor: a lane whose
+    /// unredeemed value is below `redeem_threshold` is left alone at shutdown.
+    /// The floor gate returns before the pre-submit `getWatermarks` read, so the
+    /// queued response stays unconsumed and no `redeemMany` is built.
     #[tokio::test]
     async fn shutdown_sweep_leaves_a_sub_floor_lane_unread() -> Result<()> {
         let metrics = Arc::new(Metrics::new());
@@ -3344,8 +3377,9 @@ mod tests {
         );
         let text = metrics.encode()?;
         for expected in [
-            "decdn_redemption_reconcile_ok_total 0",
-            "decdn_redemption_failures_total 0",
+            format!("decdn_unredeemed_usdc {owed}"),
+            "decdn_redemption_reconcile_ok_total 0".to_owned(),
+            "decdn_redemption_failures_total 0".to_owned(),
         ] {
             anyhow::ensure!(text.lines().any(|l| l == expected), "{expected}\n{text}");
         }
@@ -3356,7 +3390,7 @@ mod tests {
     /// the pre-submit reconcile. The chain reports the lane settled, so nothing
     /// reaches `redeemMany`.
     #[tokio::test]
-    async fn shutdown_sweep_redeems_a_lane_that_clears_the_floor() -> Result<()> {
+    async fn shutdown_sweep_reconciles_a_lane_at_the_floor() -> Result<()> {
         let metrics = Arc::new(Metrics::new());
         let (store, me, owed) = store_with_one_owed_lane()?;
         let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(u64::try_from(owed)?)]]);
@@ -3370,28 +3404,69 @@ mod tests {
             "decdn_redemption_reconcile_ok_total 1",
             "decdn_redemption_reconcile_failures_total 0",
             "decdn_redemption_reconciled_skip_total 1",
+            "decdn_onchain_tx_send_failed_total 0",
+            "decdn_redemption_failures_total 0",
         ] {
             anyhow::ensure!(text.lines().any(|l| l == expected), "{expected}\n{text}");
         }
         Ok(())
     }
 
-    /// `final_redeem_sweep` submits a `redeemMany` for an unsettled lane that
-    /// clears the floor. The mocked provider has no response left for the send,
-    /// so the send fails and counts one redemption failure.
+    /// `final_redeem_sweep` submits a `redeemMany` for an unsettled lane at the
+    /// floor. The first RPC call the send makes fails, so the send counts one
+    /// refused send and one redemption failure.
     #[tokio::test]
     async fn shutdown_sweep_submits_redeem_many_for_an_unsettled_lane() -> Result<()> {
         let metrics = Arc::new(Metrics::new());
         let (store, me, owed) = store_with_one_owed_lane()?;
         let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0)]]);
+        asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
         let svc = shutdown_service(contract, store, me, owed, Arc::clone(&metrics));
 
         svc.shutdown(Duration::from_secs(5)).await;
 
-        assert_eq!(asserter.read_q().len(), 0, "the lane was read");
+        assert_eq!(
+            asserter.read_q().len(),
+            0,
+            "the lane was read and the send tried"
+        );
         let text = metrics.encode()?;
         for expected in [
             "decdn_redemption_reconcile_ok_total 1",
+            "decdn_lane_flush_failures_total 0",
+            "decdn_onchain_tx_send_failed_total 1",
+            "decdn_redemption_failures_total 1",
+        ] {
+            anyhow::ensure!(text.lines().any(|l| l == expected), "{expected}\n{text}");
+        }
+        Ok(())
+    }
+
+    /// `final_redeem_sweep` does not let a failed lane-store flush stop the
+    /// submit: the shutdown sweep still sends `redeemMany` for an unsettled lane
+    /// at the floor.
+    #[tokio::test]
+    async fn shutdown_sweep_redeems_despite_a_failed_flush() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store: Arc<dyn PoolStateStore> = Arc::new(FailingFlushStore(
+            decdn_incentive::MemoryPoolStateStore::new(),
+        ));
+        let (me, owed) = seed_one_owed_lane(store.as_ref())?;
+        let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0)]]);
+        asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
+        let svc = shutdown_service(contract, store, me, owed, Arc::clone(&metrics));
+
+        svc.shutdown(Duration::from_secs(5)).await;
+
+        assert_eq!(
+            asserter.read_q().len(),
+            0,
+            "the lane was read and the send tried"
+        );
+        let text = metrics.encode()?;
+        for expected in [
+            "decdn_lane_flush_failures_total 1",
+            "decdn_onchain_tx_send_failed_total 1",
             "decdn_redemption_failures_total 1",
         ] {
             anyhow::ensure!(text.lines().any(|l| l == expected), "{expected}\n{text}");
