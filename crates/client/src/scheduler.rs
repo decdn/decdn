@@ -41,9 +41,14 @@
 //! lane's remainder (#2231): when no idle worker will take it, a busy lane that
 //! covers it takes it on ONE extra worker, granted by the lane's
 //! [`LaneWiden`], so the remainder does not wait behind the busy lane's whole
-//! range. The extra worker shares the lane's `(ctx, ledger)`: several streams
-//! on one `(signer, provider)` lane share its one voucher ledger, which
-//! serializes their issuance (ADR 003 § Concurrent Streams). It takes one
+//! range. A remainder no running lane covers goes to any busy lane not barred
+//! from pull-through. The loop asks again as workers end, and, while a `grow`
+//! granted nothing, every `GROWTH_RETRY` (#2230). A lane with a [`LaneWiden`]
+//! gives its [`LaneLease`] back when its own worker ends and starts again only
+//! on a stream `grow` grants. The extra worker shares the lane's
+//! `(ctx, ledger)`: several streams on one `(signer, provider)` lane share its
+//! one voucher ledger, which serializes their issuance (ADR 003 § Concurrent
+//! Streams). It takes one
 //! piece, never steals, and gives its grant back when it stops. A fault on it
 //! stops only that stream and does not cool the node while the lane's own
 //! worker runs; once that worker has stopped, the extra is the lane's last
@@ -122,6 +127,12 @@ pub const LANE_WATCHDOG: Duration = Duration::from_secs(10);
 /// first, so its first byte can take longer than [`LANE_WATCHDOG`]. It equals
 /// the per-stream idle window a paid leg allows before its first byte.
 const FIRST_BYTE_GRACE: Duration = Duration::from_secs(30);
+
+/// How long [`acquire`] waits to ask for growth again after a lane's
+/// [`LaneWiden`] granted nothing while a queued range had no taker. A stream
+/// that a sibling fetch gives back wakes nothing in the loop, so the loop
+/// looks again on this clock until the range has a taker.
+const GROWTH_RETRY: Duration = Duration::from_secs(1);
 
 /// The unit the planner grows a size claim by. A claim is a hint: when every
 /// byte below the bound is present and no leg has proved the size, the bound
@@ -244,10 +255,12 @@ impl<Pc, F> std::fmt::Debug for AcquireEnv<'_, Pc, F> {
 }
 
 /// A resource one source lane holds while it takes part in an acquire, such as
-/// the caller's stream permit for the lane's provider. [`acquire`] releases it
-/// when it returns or is dropped, including for a lane that cooled mid-fetch.
-/// A lease is released once: a lane that takes part in a later acquire holds
-/// nothing.
+/// the caller's stream permit for the lane's provider. For a lane with a
+/// [`LaneWiden`], [`acquire`] releases it when the lane's own worker ends, and
+/// the lane starts again in that acquire only on a stream `grow` grants. For
+/// any other lane, it releases it when it returns or is dropped, including for
+/// a lane that cooled mid-fetch. A lease is released once: a lane that takes
+/// part in a later acquire holds nothing.
 #[derive(Default)]
 pub struct LaneLease(Mutex<Option<Box<dyn Send + Sync>>>);
 
@@ -273,7 +286,8 @@ impl std::fmt::Debug for LaneLease {
 
 /// How one lane adds a concurrent stream while an [`acquire`] runs
 /// ([`StreamCandidate::widen`]): a `grow` hook that grants extra streams and a
-/// `release` hook that gives one back.
+/// `release` hook that gives one back. `grow` also grants the stream a lane
+/// starts again on after its own worker ended and gave its [`LaneLease`] back.
 ///
 /// The acquire relies on three rules. `grow` never waits: it grants only what
 /// it can grant now, such as a stream permit that is free. `grow` never grants
@@ -695,8 +709,11 @@ impl Work {
     /// covers, or one no running lane covers (#2225) unless its lane is barred
     /// from those ([`Work::barred`]), on its next pick. A lane
     /// may be asked for a range only while its own worker runs a range of its
-    /// own, it has no extra worker yet, `can_grow` says it has a growth hook,
-    /// and it covers part of that range.
+    /// own, it has no extra worker yet, and `can_grow` says it has a growth
+    /// hook. It must also cover part of that range, or, for a range that holds
+    /// a chunk no running lane covers, not be barred from pull-through: the
+    /// same rule as for an idle worker, so a remainder only the faulted lane
+    /// covered still finds a taker (#2230).
     fn growth_wanted(&self, total_bytes: u64, can_grow: impl Fn(usize) -> bool) -> Vec<Vec<usize>> {
         let covers = |slot: usize, seg: &AlignedRange| {
             self.coverage
@@ -727,7 +744,7 @@ impl Work {
                             && self.in_flight.get(lane).is_some_and(Option::is_some)
                             && self.widened.get(lane) == Some(&false)
                             && can_grow(lane)
-                            && covers(lane, seg)
+                            && ((orphan && !self.barred(lane)) || covers(lane, seg))
                     })
                     .collect(),
             );
@@ -1762,15 +1779,18 @@ where
     }
 }
 
-/// One worker's future: [`run_worker`], holding `grant` for an extra worker.
-/// The grant moves into the future when it is built, so it is given back when
-/// the worker ends, and also when the future is dropped, polled or not.
+/// One worker's future: [`run_worker`], holding `grant`, the stream a
+/// [`LaneWiden`] granted it: an `extra` worker's stream, or the stream a lane
+/// starts again on once it gave its lease back. The grant moves into the
+/// future when it is built, so it is given back when the worker ends, and also
+/// when the future is dropped, polled or not.
 async fn worker<St, S, Pc, F>(
     engine: &Engine<'_, St, Pc, F>,
     i: usize,
     lane: Arc<StreamCandidate<S>>,
     provider: Address,
     health: &PeerHealth,
+    extra: bool,
     grant: Option<ReleaseGrant<S>>,
 ) -> anyhow::Result<WorkerEnd>
 where
@@ -1779,7 +1799,6 @@ where
     Pc: Pacer,
     F: Funder,
 {
-    let extra = grant.is_some();
     let _grant = grant;
     run_worker(engine, i, lane, provider, health, extra).await
 }
@@ -1923,7 +1942,8 @@ impl Want {
 }
 
 /// Releases every started lane's [`LaneLease`] when [`acquire`] returns or is
-/// dropped.
+/// dropped: the lease of a lane without a [`LaneWiden`], and of a lane whose
+/// own worker still runs.
 struct ReleaseLeases<S>(Vec<Arc<StreamCandidate<S>>>);
 
 impl<S> Drop for ReleaseLeases<S> {
@@ -2349,10 +2369,15 @@ where
     let mut slots: HashMap<Address, usize> = HashMap::new();
     // Each lane slot's provider and lane, for a growth request (#2231).
     let mut lane_at: LaneAt<P::Source> = HashMap::new();
-    // Extra workers still running, and whether a lane fault wants a growth
-    // request once this pass has started its lanes.
+    // Extra workers still running, and whether a worker end or a lane build
+    // wants a growth request once this pass has started its lanes.
     let mut extras_running = 0usize;
     let mut want_growth = false;
+    // How many queued ranges the last growth request left without a taker,
+    // and when to ask again after a lane's `grow` granted nothing: a stream
+    // that a sibling fetch frees wakes nothing in this loop (#2230).
+    let mut growth_waiting = 0usize;
+    let mut growth_retry_at: Option<Instant> = None;
     // Providers charged a fault since their last verified byte: a lane's
     // outage is charged once, however many of its workers fault in it.
     let mut charged: HashSet<Address> = HashSet::new();
@@ -2481,6 +2506,26 @@ where
                     );
                 }
                 for (provider, lane) in batch {
+                    // A lane with a `LaneWiden` gave its lease back when its
+                    // own worker ended, so it starts again only on a stream
+                    // `grow` grants now. Without one, its start backs off like
+                    // a build that found every stream permit taken (#2230).
+                    let restart = started.0.iter().any(|l| Arc::ptr_eq(l, &lane));
+                    let grant = match lane.widen.as_ref() {
+                        Some(widen) if restart => {
+                            if widen.grow(1) == 0 {
+                                sources.start_refused(provider, Instant::now());
+                                tracing::debug!(
+                                    %provider,
+                                    "a lane cannot start again: its provider has no free stream"
+                                );
+                                continue;
+                            }
+                            sources.start_taken(provider);
+                            Some(ReleaseGrant(Arc::clone(&lane)))
+                        }
+                        _ => None,
+                    };
                     let slot = if let Some(&slot) = slots.get(&provider) {
                         w.revive(slot);
                         slot
@@ -2506,24 +2551,29 @@ where
                     running.insert(provider);
                     w.set_provider(slot, provider);
                     lane_at.insert(slot, (provider, Arc::clone(&lane)));
-                    workers.push(worker(&engine, slot, lane, provider, &health, None));
+                    workers.push(worker(&engine, slot, lane, provider, &health, false, grant));
                 }
             }
 
             // A lane faulted and put its remainder back: when no idle worker
-            // will take a range, a busy lane that covers it takes it on one
-            // extra stream, so it does not wait for that lane's whole range
-            // (#2231). Asked after this pass started its lanes, so a lane
-            // that just started counts as a taker.
-            if std::mem::take(&mut want_growth) {
+            // will take a range, a busy lane takes it on one extra stream, so
+            // it does not wait for that lane's whole range (#2231). The lane
+            // covers the range, or, for a range no running lane covers, is
+            // not barred from pull-through. Asked after this pass started its
+            // lanes, so a lane that just started counts as a taker. A request
+            // that a `grow` refused is asked again after `GROWTH_RETRY`.
+            if std::mem::take(&mut want_growth)
+                || growth_retry_at.is_some_and(|at| now >= at)
+            {
                 let mut w = work.lock().await;
                 let wanted = w.growth_wanted(total_bytes, |lane| {
                     lane_at.get(&lane).is_some_and(|(_, l)| l.widen.is_some())
                 });
                 let mut asked: HashSet<usize> = HashSet::new();
                 let mut waiting = 0usize;
+                let mut refused = false;
                 for candidates in wanted {
-                    // Ask each covering lane once per request, in lane order,
+                    // Ask each candidate lane once per request, in lane order,
                     // until one grants a stream. `grow` never waits.
                     let taker = candidates.into_iter().find_map(|lane| {
                         if !asked.insert(lane) {
@@ -2531,6 +2581,7 @@ where
                         }
                         let (provider, l) = lane_at.get(&lane)?;
                         let granted = l.widen.as_ref().is_some_and(|widen| widen.grow(1) > 0);
+                        refused |= !granted;
                         granted.then(|| (lane, *provider, Arc::clone(l)))
                     });
                     let Some((lane, provider, l)) = taker else {
@@ -2541,14 +2592,15 @@ where
                     // so it is given back however the worker ends.
                     let grant = ReleaseGrant(Arc::clone(&l));
                     let slot = w.add_extra(lane);
-                    workers.push(worker(&engine, slot, l, provider, &health, Some(grant)));
+                    workers.push(worker(&engine, slot, l, provider, &health, true, Some(grant)));
                     extras_running = extras_running.saturating_add(1);
                     tracing::debug!(
                         %provider,
                         "a busy lane takes one extra stream for a faulted lane's remainder"
                     );
                 }
-                if waiting > 0 {
+                // Logged when the count changes, so the retry does not repeat it.
+                if waiting > 0 && waiting != growth_waiting {
                     tracing::info!(
                         hash = %blake3::Hash::from_bytes(hash).to_hex(),
                         waiting,
@@ -2556,6 +2608,8 @@ where
                          could take one more stream"
                     );
                 }
+                growth_waiting = waiting;
+                growth_retry_at = (waiting > 0 && refused).then(|| now + GROWTH_RETRY);
             }
 
             // A lane ends priced out only once its driver's own top-up path has
@@ -2572,7 +2626,10 @@ where
             {
                 discovering = Some(sources.provider().discover(sources.hash()));
             }
-            let wake = sources.next_wake(now);
+            let wake = match (sources.next_wake(now), growth_retry_at) {
+                (Some(at), Some(retry)) => Some(at.min(retry)),
+                (at, retry) => at.or(retry),
+            };
 
             tokio::select! {
                 biased;
@@ -2586,7 +2643,20 @@ where
                         extras_running = extras_running.saturating_sub(1);
                     } else {
                         running.remove(&provider);
+                        // A lane that can take a stream again through its
+                        // `LaneWiden` gives its lease back as its own worker
+                        // ends, so a sibling fetch can use it (#2230).
+                        if let Some((_, lane)) = slots.get(&provider).and_then(|s| lane_at.get(s))
+                            && lane.widen.is_some()
+                        {
+                            lane.lease.release();
+                        }
                     }
+                    // Every end can free a stream or a taker for a queued
+                    // range, so growth is asked for again; a fault on an
+                    // extra stream that the lane outlives is the exception
+                    // below.
+                    want_growth = true;
                     if delivered {
                         sources.record_progress(provider);
                         charged.remove(&provider);
@@ -2610,8 +2680,9 @@ where
                         };
                         // A fault on an extra stream stops only that stream: it
                         // is most often a refusal of the additional stream, so
-                        // it neither cools the node nor asks for more growth
-                        // while the lane's own worker still runs. A lane's last
+                        // it neither cools the node nor asks for more growth at
+                        // once while the lane's own worker still runs; the
+                        // retry asks again after `GROWTH_RETRY`. A lane's last
                         // live worker faults for the lane, so once the own
                         // worker has stopped, the extra's fault is recorded
                         // like the lane's own, unless the node is already
@@ -2625,6 +2696,8 @@ where
                                 return Err(err);
                             }
                             log_extra_fault(provider, hash, range, &err);
+                            want_growth = false;
+                            growth_retry_at = Some(Instant::now() + GROWTH_RETRY);
                         } else {
                             let deposit = pool_deposit(&deposit_rx, &started.0);
                             charged.insert(provider);
@@ -2633,7 +2706,6 @@ where
                             {
                                 return Err(err);
                             }
-                            want_growth = true;
                         }
                     }
                     progress_wake.notify_waiters();
@@ -2651,6 +2723,8 @@ where
                             Ok(lane) => {
                                 seed_deposit(&deposit_tx, &lane);
                                 ready.push((provider, lane));
+                                // A new lane changes who takes a queued range.
+                                want_growth = true;
                             }
                             Err(err) => tracing::debug!(%provider, error = %decdn_common::redact::sanitize_err_chain(&err), "lane build failed"),
                         }
@@ -3518,7 +3592,8 @@ mod tests {
     }
 
     /// Every started lane's lease, the faulted lane's included, is held until
-    /// the acquire returns and released by then.
+    /// the acquire returns and released by then, for lanes without a
+    /// [`super::LaneWiden`]: such a lane has no way to take a stream back.
     #[tokio::test(start_paused = true)]
     async fn every_lease_is_released_when_acquire_returns() -> anyhow::Result<()> {
         let data = blob(16 * 1024 * 1024);
@@ -5334,6 +5409,77 @@ mod tests {
         Ok(())
     }
 
+    /// A faulted lane's remainder that only that lane covered (#2230): once
+    /// the lane has stopped, no running lane covers it, so a busy lane not
+    /// barred from pull-through may grow for it, and its extra worker takes
+    /// it as an uncovered range. A barred busy lane is not asked, and its
+    /// extra worker takes nothing outside its coverage.
+    #[test]
+    fn a_remainder_only_the_faulted_lane_covered_goes_to_a_busy_lanes_extra() -> anyhow::Result<()>
+    {
+        use std::collections::VecDeque;
+
+        use decdn_bao_range::align_range;
+
+        use super::{Picked, Work};
+
+        let total = 2 * DISCOVERY_BLOCK_BYTES;
+        let in_block0 = align_range(0, DISCOVERY_BLOCK_BYTES, total)?;
+        let in_block1 = align_range(DISCOVERY_BLOCK_BYTES, DISCOVERY_BLOCK_BYTES, total)?;
+        let mut work = Work::new(VecDeque::from(vec![in_block0, in_block1]), false);
+        let (a_cov, b_cov) = (cov(2, &[0]), cov(2, &[1]));
+        let a = work.add_lane(Some(a_cov.clone()), total);
+        let b = work.add_lane(Some(b_cov.clone()), total);
+        let missing = [(0, total)];
+        let a_took = work.pick(a, total, &a_cov, true, &missing)?;
+        assert!(a_took.is_some_and(|p| p.range.fetch_start() == 0));
+        let b_took = work.pick(b, total, &b_cov, true, &missing)?;
+        assert!(b_took.is_some_and(|p| p.range.fetch_start() == DISCOVERY_BLOCK_BYTES));
+
+        // Lane a faults 1 MiB in: its remainder goes back, and it stops.
+        let remainder = align_range(MIB, DISCOVERY_BLOCK_BYTES - MIB, total)?;
+        work.clear(a)?;
+        work.pending.push_back(remainder);
+        work.park(a);
+        assert!(
+            work.uncovered(total),
+            "no running lane covers the remainder"
+        );
+
+        work.set_no_uncovered(b, true);
+        assert_eq!(
+            work.growth_wanted(total, |_| true),
+            vec![Vec::<usize>::new()],
+            "a busy lane barred from pull-through is not asked"
+        );
+        work.set_no_uncovered(b, false);
+        assert_eq!(
+            work.growth_wanted(total, |_| true),
+            vec![vec![b]],
+            "the busy lane that does not cover the remainder is asked for it"
+        );
+
+        let extra = work.add_extra(b);
+        work.set_no_uncovered(b, true);
+        assert!(
+            work.pick(extra, total, &b_cov, false, &[])?.is_none(),
+            "the extra worker of a barred lane takes no uncovered range"
+        );
+        work.set_no_uncovered(b, false);
+        let Some(Picked {
+            range, uncovered, ..
+        }) = work.pick(extra, total, &b_cov, false, &[])?
+        else {
+            anyhow::bail!("the extra worker takes the remainder");
+        };
+        assert_eq!(
+            (range.fetch_start(), range.fetch_len()),
+            (MIB, DISCOVERY_BLOCK_BYTES - MIB)
+        );
+        assert!(uncovered, "its node serves the remainder by pull-through");
+        Ok(())
+    }
+
     /// A partial holder that keeps refusing a block outside its coverage is
     /// asked for it at most [`ABSENT_AFTER_NOT_FOUND`] times while its bar
     /// lasts. Its node cannot serve the block by pull-through, so it is barred
@@ -6554,6 +6700,165 @@ mod tests {
         assert!(count.granted() >= 1, "B grew an extra stream");
         assert_eq!(count.released(), count.granted());
         assert_eq!(faults_of(&provider, 0xB2), 1, "one outage, one charge");
+        Ok(())
+    }
+
+    // ---- growth retries, and a lane's lease ends with its worker (#2230) ----
+
+    /// A lane's widen hooks over `free`, stream permits it shares with
+    /// sibling fetches the test plays: `grow` takes only permits free now,
+    /// and `release` puts one back.
+    fn shared_widen(
+        free: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (super::LaneWiden, Arc<WidenCount>) {
+        use std::sync::atomic::Ordering;
+        let count = Arc::new(WidenCount::default());
+        let (on_grow, on_release) = (Arc::clone(&count), Arc::clone(&count));
+        let (take, give) = (Arc::clone(free), Arc::clone(free));
+        let widen = super::LaneWiden::new(
+            move |most| {
+                let taken = take
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                        Some(n.saturating_sub(most))
+                    })
+                    .map_or(0, |n| n.min(most));
+                on_grow.granted.fetch_add(taken, Ordering::SeqCst);
+                taken
+            },
+            move || {
+                give.fetch_add(1, Ordering::SeqCst);
+                on_release.released.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        (widen, count)
+    }
+
+    /// When a node dies, the busy lane has no free stream, and a sibling
+    /// fetch frees one later, the loop asks for growth again on its retry
+    /// clock: the remainder starts on an extra stream before the dead node
+    /// comes back from its cooldown to fault again.
+    #[tokio::test(start_paused = true)]
+    async fn growth_is_asked_again_once_a_stream_frees() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let data = blob(32 * MIB as usize);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let lb = Arc::new(PoolLedger::new(Cumulative::default()));
+        let a = dead_after_first_mib(&data, &la)?;
+        let b = busy(&data, &lb)?;
+        let free = Arc::new(AtomicUsize::new(0));
+        let (widen, count) = shared_widen(&free);
+        let mut cand_b = candidate(b.clone(), Arc::clone(&lb), 0xB2, None);
+        cand_b.widen = Some(widen);
+        let lanes = StaticSources::new(vec![candidate(a.clone(), la, 0xA1, None), cand_b])?;
+        let provider = FaultLog {
+            inner: &lanes,
+            faulted: Mutex::new(Vec::new()),
+        };
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, dir) = fresh_store(root, total);
+        // A sibling fetch gives its permit back a while after A's fault, when
+        // the growth request A's fault made has already found none.
+        let release = async {
+            while faults_of(&provider, 0xA1) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            free.fetch_add(1, Ordering::SeqCst);
+        };
+        acquire_gated(&store, &provider, root, release).await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+        let (dead_start, _, _) = a
+            .timeline()
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("A opened its range"))?;
+        let dead_end = dead_start + total / 2;
+        let extra_opened = b
+            .timeline()
+            .into_iter()
+            .skip(1)
+            .filter(|&(start, _, _)| start > dead_start && start < dead_end)
+            .map(|(_, opened, _)| opened)
+            .min()
+            .ok_or_else(|| anyhow::anyhow!("B took A's remainder"))?;
+        let (_, refault, _) = a
+            .timeline()
+            .get(1)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("A came back from its cooldown"))?;
+        assert!(
+            extra_opened < refault,
+            "the remainder started on the retry clock, before A came back to fault again"
+        );
+        assert!(count.granted() >= 1, "B grew an extra stream");
+        assert_eq!(count.released(), count.granted());
+        Ok(())
+    }
+
+    /// A lane with a [`super::LaneWiden`] gives its lease back when its own
+    /// worker faults, while the fetch still runs, so a sibling fetch can use
+    /// that stream. When the lane starts again in the same acquire, it does so
+    /// on a stream its `grow` grants, and gives that back too.
+    #[tokio::test(start_paused = true)]
+    async fn a_lanes_lease_is_released_when_its_own_worker_ends() -> anyhow::Result<()> {
+        let data = blob(32 * MIB as usize);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let lb = Arc::new(PoolLedger::new(Cumulative::default()));
+        // A faults once, 1 MiB in, and serves every later stream. B is busy
+        // long enough for A to come back from its cooldown.
+        let a = ScriptedSource::new(data.clone())?
+            .fault_once_after(MIB as usize, || anyhow::anyhow!("scripted reset"))
+            .paying(Arc::clone(&la));
+        let b = busy(&data, &lb)?;
+        let dropped_a = Arc::new(Mutex::new(None));
+        let (widen, count) = counting_widen(1);
+        let mut cand_a = candidate(a.clone(), la, 0xA1, None);
+        cand_a.lease = LaneLease::new(DropStamp(Arc::clone(&dropped_a)));
+        cand_a.widen = Some(widen);
+        let provider = StaticSources::new(vec![cand_a, candidate(b.clone(), lb, 0xB2, None)])?;
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, dir) = fresh_store(root, total);
+        let released_mid_fetch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let on_progress = {
+            let seen = Arc::clone(&released_mid_fetch);
+            let dropped_a = Arc::clone(&dropped_a);
+            move |_position: u64, _total: u64| {
+                if dropped_a.lock().is_ok_and(|at| at.is_some()) {
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        };
+        run_acquire_with(
+            &store,
+            &provider,
+            root,
+            &BudgetPacer::new(),
+            &no_topups(),
+            Knobs {
+                on_progress: Some(&on_progress),
+                ..Knobs::lanes(2)
+            },
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+        assert!(
+            released_mid_fetch.load(std::sync::atomic::Ordering::SeqCst),
+            "A's lease was released while the fetch still ran"
+        );
+        assert!(
+            a.timeline().len() >= 2,
+            "A started again after its cooldown"
+        );
+        assert!(
+            count.granted() >= 1,
+            "A started again on a stream its grow granted"
+        );
+        assert_eq!(count.released(), count.granted());
         Ok(())
     }
 

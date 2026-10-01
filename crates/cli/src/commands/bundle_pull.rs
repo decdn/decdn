@@ -1876,7 +1876,9 @@ impl LaneStreamCap {
     /// remainder ([`decdn_client::LaneWiden`]): `grow` takes only permits of
     /// `provider` that are free now and never waits, and `release` gives one
     /// back. The lane's own stream holds its permit as its lease, so the
-    /// extra streams fit in the rest of the cap.
+    /// extra streams fit in the rest of the cap. The acquire gives that lease
+    /// back when the lane's own worker ends, and the lane starts again only on
+    /// a permit `grow` takes.
     pub(crate) async fn widen(&self, provider: Address) -> decdn_client::LaneWiden {
         let extras = Arc::new(ExtraPermits::new(self.semaphore(provider).await));
         let released = Arc::clone(&extras);
@@ -1887,7 +1889,8 @@ impl LaneStreamCap {
     }
 }
 
-/// The extra stream permits one lane holds beside its lease
+/// The stream permits one lane holds beside its lease: its extra streams',
+/// and its own stream's once it starts again without the lease
 /// ([`LaneStreamCap::widen`]).
 struct ExtraPermits {
     /// The provider's per-lane stream semaphore.

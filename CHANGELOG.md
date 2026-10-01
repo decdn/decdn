@@ -929,6 +929,16 @@ since project inception and will roll into the first tagged release.
   It replaces `proof read timed out after 10s` in the `serve_stream` failure
   span.
 
+- **A faulted lane's remainder starts as soon as a stream frees (#2230).** In
+  `decdn bundle pull`, a lane gives its stream permit back when its own worker
+  ends, so a sibling entry can use it, and starts again only on a permit that
+  is free then, backing off like a build when none is. When no lane could take
+  one more stream for a queued range, the acquire asks again every second, so
+  a permit a sibling entry frees is used within a second. A range no running
+  lane covers can go to any busy lane not barred from pull-through. The
+  "a faulted lane's remainder waits" info line logs only when the count of
+  waiting ranges changes.
+
 - **Chain-read logs no longer carry the RPC URL (#2264).** The node's
   binding check, buyer lane seed, owned-pool walk, top-up, pool open and
   reclaim sweep log their RPC errors through the URL-stripping redactor, so a

@@ -379,15 +379,26 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 Ok(lane)
             }
             Err(err) => {
-                let prior = self.build_retry.get(&provider).copied().unwrap_or(Backoff {
-                    next_at: now,
-                    attempts: 0,
-                });
-                self.build_retry
-                    .insert(provider, prior.fail(now, BUILD_RETRY_BASE, BUILD_RETRY_CAP));
+                self.start_refused(provider, now);
                 Err(anyhow::Error::new(LaneBuildFault(err)))
             }
         }
+    }
+
+    /// Back `provider`'s next start off, as for a failed build: its built
+    /// lane could not take a stream now ([`crate::LaneWiden`]).
+    pub(crate) fn start_refused(&mut self, provider: Address, now: Instant) {
+        let prior = self.build_retry.get(&provider).copied().unwrap_or(Backoff {
+            next_at: now,
+            attempts: 0,
+        });
+        self.build_retry
+            .insert(provider, prior.fail(now, BUILD_RETRY_BASE, BUILD_RETRY_CAP));
+    }
+
+    /// Clear `provider`'s start backoff: its built lane took a stream.
+    pub(crate) fn start_taken(&mut self, provider: Address) {
+        self.build_retry.remove(&provider);
     }
 
     /// Record the fault `provider`'s lane ended with, and return its class.
