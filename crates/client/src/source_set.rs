@@ -6,9 +6,11 @@
 //! refusal parks it until the deposit rises, and a lane-build or discovery
 //! error backs off and retries. A partial holder that keeps refusing ranges
 //! outside its coverage is barred from pull-through and serves only the
-//! blocks it covers. It ends a fetch only on a unanimous verdict: every known
-//! source is priced out, or every one says it does not hold the blob or is
-//! barred from the only work left, and a fresh discovery found nothing new.
+//! blocks it covers. A source that refuses the blob as larger than its size
+//! ceiling is excluded for this blob. It ends a fetch only on a unanimous
+//! verdict: every known source is priced out, or every one says it does not
+//! hold the blob, refused it as too large, or is barred from the only work
+//! left, and a fresh discovery found nothing new.
 //!
 //! The state is synchronous. The acquire loop runs the `connect` and `discover`
 //! futures itself, so lanes keep streaming while a lane builds or discovery
@@ -19,6 +21,7 @@ use std::sync::Arc;
 
 use alloy::primitives::{Address, U256};
 use decdn_protocol::Coverage;
+use decdn_protocol::client::StreamError;
 use tokio::time::{Duration, Instant};
 
 use crate::UpstreamRefused;
@@ -193,11 +196,18 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// [`ABSENT_AFTER_NOT_FOUND`] ranges outside their coverage. Each one
     /// serves only the blocks it covers.
     no_pull_through: HashSet<Address>,
-    /// The refusal that last marked a source absent or barred it from
-    /// pull-through: the cause the [`NoSourceHasBlob`] stop carries.
+    /// Providers that refused the blob as larger than their size ceiling
+    /// (`StreamError::BlobTooLarge`). The ceiling is a stable node policy
+    /// (ADR 005), so none of them starts again for this blob, and a
+    /// rediscovery does not lift it.
+    too_large: HashSet<Address>,
+    /// The refusal that last marked a source absent, barred it from
+    /// pull-through or excluded it as too small for the blob: the cause the
+    /// [`NoSourceHasBlob`] stop carries.
     last_absent: Option<UpstreamRefused>,
     discovery: Option<Backoff>,
-    /// Bumped each time a source newly joins `absent` or `no_pull_through`.
+    /// Bumped each time a source newly joins `absent`, `no_pull_through` or
+    /// `too_large`.
     mark_epoch: u64,
     /// The deposit and mark epoch of the last successful discovery. A
     /// unanimous stop needs a discovery at the current pair.
@@ -237,6 +247,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             not_found: HashMap::new(),
             pull_through_not_found: HashMap::new(),
             no_pull_through: HashSet::new(),
+            too_large: HashSet::new(),
             last_absent: None,
             discovery: None,
             mark_epoch: 0,
@@ -278,7 +289,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         self.holders.iter().find(|h| h.provider == provider)
     }
 
-    /// The nearest source that may start now and is not already `running`.
+    /// The nearest source that may start now and is not already `running`. A
+    /// source that refused the blob as too large never starts again.
     #[must_use]
     pub fn next_to_start(
         &self,
@@ -289,6 +301,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         self.holders
             .iter()
             .filter(|h| !running.contains(&h.provider))
+            .filter(|h| !self.too_large.contains(&h.provider))
             .filter(|h| {
                 self.build_retry
                     .get(&h.provider)
@@ -397,6 +410,12 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                     let uncovered = range.is_some_and(|r| r.uncovered);
                     self.record_not_found(provider, refused, uncovered);
                 }
+                if let Some(refused) = err.downcast_ref::<UpstreamRefused>()
+                    && matches!(refused.error(), StreamError::BlobTooLarge)
+                {
+                    let newly = self.too_large.insert(provider);
+                    self.marked(newly, refused);
+                }
                 if let Some(holder) = self.holder(provider) {
                     self.provider.on_source_fault(holder);
                 }
@@ -429,10 +448,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         if *count < ABSENT_AFTER_NOT_FOUND {
             return;
         }
-        self.last_absent = Some(refused.clone());
-        if self.absent.insert(provider) {
-            self.mark_epoch = self.mark_epoch.saturating_add(1);
-        }
+        let newly = self.absent.insert(provider);
+        self.marked(newly, refused);
     }
 
     /// Count a `NotFound` from probed partial holder `provider` for a range
@@ -444,8 +461,15 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         if *count < ABSENT_AFTER_NOT_FOUND {
             return;
         }
+        let newly = self.no_pull_through.insert(provider);
+        self.marked(newly, refused);
+    }
+
+    /// Record `refused` as the cause of a mark that excludes a source, and
+    /// bump the mark epoch when the mark is `newly` set.
+    fn marked(&mut self, newly: bool, refused: &UpstreamRefused) {
         self.last_absent = Some(refused.clone());
-        if self.no_pull_through.insert(provider) {
+        if newly {
             self.mark_epoch = self.mark_epoch.saturating_add(1);
         }
     }
@@ -578,7 +602,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// ends).
     ///
     /// A source can serve none of the work left when it says the blob is
-    /// absent, or when it is barred from pull-through
+    /// absent, when it refused the blob as too large, or when it is barred
+    /// from pull-through
     /// ([`Self::no_pull_through`]) and `only_uncovered_left` says no work left
     /// lies inside the coverage of a barred holder.
     #[must_use]
@@ -631,10 +656,12 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// Whether `provider` can serve none of the work left: it says the blob is
-    /// absent, or it is barred from pull-through and `only_uncovered_left`
-    /// says no work left lies inside the coverage of a barred holder.
+    /// absent, it refused the blob as too large, or it is barred from
+    /// pull-through and `only_uncovered_left` says no work left lies inside
+    /// the coverage of a barred holder.
     fn cannot_serve(&self, provider: Address, only_uncovered_left: bool) -> bool {
         self.absent.contains(&provider)
+            || self.too_large.contains(&provider)
             || (only_uncovered_left && self.no_pull_through.contains(&provider))
     }
 
@@ -1205,6 +1232,70 @@ mod tests {
         );
         assert!(
             err.downcast_ref::<crate::UpstreamRefused>().is_some(),
+            "{err:#}"
+        );
+        Ok(())
+    }
+
+    fn too_large() -> anyhow::Error {
+        anyhow::Error::new(crate::UpstreamRefused::mid_stream(
+            decdn_protocol::client::StreamError::BlobTooLarge,
+        ))
+    }
+
+    /// A proxy that refuses the blob as larger than its size ceiling never
+    /// starts again for this blob, even once its cooldown ends and a
+    /// discovery reports it again, while the holder still starts. A set where
+    /// every source refused the blob as too large ends the item.
+    #[tokio::test(start_paused = true)]
+    async fn a_proxy_refusing_the_blob_as_too_large_is_excluded() -> anyhow::Result<()> {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(
+            &p,
+            [0; 32],
+            Arc::default(),
+            vec![non_holder(A, 10.0), holder(B, 20.0)],
+        );
+        let now = Instant::now();
+        let fault = set.record_fault(A, &too_large(), None, now, U256::ZERO);
+        assert_eq!(fault, Fault::Source);
+        set.discovery_done(
+            Ok(vec![non_holder(A, 10.0), holder(B, 20.0)]),
+            now,
+            U256::ZERO,
+        );
+        let later = now + super::DISCOVERY_CAP;
+        assert_eq!(
+            set.next_to_start(later, U256::ZERO, &HashSet::new())
+                .map(|h| h.provider),
+            Some(B),
+            "the holder starts and the proxy does not"
+        );
+        assert!(
+            set.next_to_start(later, U256::ZERO, &HashSet::from([B]))
+                .is_none(),
+            "the proxy never starts again"
+        );
+        assert!(
+            set.exhausted(U256::ZERO, true, false).is_none(),
+            "B is left"
+        );
+
+        set.record_fault(B, &too_large(), None, later, U256::ZERO);
+        set.discovery_done(Ok(vec![]), later, U256::ZERO);
+        let err = set
+            .exhausted(U256::ZERO, true, false)
+            .ok_or_else(|| anyhow::anyhow!("every source refused the blob as too large"))?;
+        assert!(
+            err.downcast_ref::<super::NoSourceHasBlob>().is_some(),
+            "{err:#}"
+        );
+        assert!(
+            err.downcast_ref::<crate::UpstreamRefused>()
+                .is_some_and(|r| matches!(
+                    r.error(),
+                    decdn_protocol::client::StreamError::BlobTooLarge
+                )),
             "{err:#}"
         );
         Ok(())
