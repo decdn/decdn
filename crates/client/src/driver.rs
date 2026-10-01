@@ -77,6 +77,7 @@ use bao_tree::ChunkRanges;
 use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, RangedStore, align_range};
 use decdn_incentive::DepositOutcome;
 
+use crate::fault::HealExhausted;
 use crate::pacer::{DownstreamFrontier, PaceDecision, PaceState};
 use crate::source::{BlobSource, Funder, IngestStore, SourceFuture};
 use crate::{
@@ -1246,13 +1247,19 @@ where
                     //    authenticated bundle that ADVANCES our committed
                     //    watermark means the node holds a voucher we lost, and
                     //    an `Underpaid` bundle BEHIND it means we hold vouchers
-                    //    the node never took — heal the ledger and retry.
+                    //    the node never took — heal the ledger and retry. A heal
+                    //    past the resume budget still leaves the ledger where the
+                    //    node holds it, but this source kept rejecting after each
+                    //    heal: mark the rejection `HealExhausted`, so the source
+                    //    cools rather than the command ending. A rejection that
+                    //    no heal takes stays bare and falls through to step 4.
                     let healed = match watermark {
-                        Some(watermark) if counters.resume_attempts < MAX_RESUME_ATTEMPTS => {
-                            heal_watermark_desync(&err, watermark, ledger).await
-                        }
-                        _ => None,
+                        Some(watermark) => heal_watermark_desync(&err, watermark, ledger).await,
+                        None => None,
                     };
+                    if healed.is_some() && counters.resume_attempts >= MAX_RESUME_ATTEMPTS {
+                        return Err(err.context(HealExhausted));
+                    }
                     let desync = healed.is_some();
 
                     // 3. Genuine exhaustion (corroborated against our OWN
@@ -1311,7 +1318,7 @@ where
                     }
 
                     // 4. Anything else — a stall, reset, hash mismatch, local I/O
-                    //    fault — is terminal.
+                    //    fault, a voucher rejection no heal takes — is terminal.
                     return Err(err);
                 }
 
@@ -2512,7 +2519,9 @@ mod tests {
     }
 
     /// Retrying stale `Underpaid` rejections is bounded by `MAX_RESUME_ATTEMPTS`:
-    /// the driver gives up with the rejection itself rather than spinning.
+    /// the driver gives up with the rejection itself rather than spinning. Each
+    /// rejection healed the ledger, so the last one carries [`crate::HealExhausted`]
+    /// and cools only this source.
     #[tokio::test]
     async fn repeated_underpaid_rejections_are_bounded() {
         let ledger = ledger_ahead_of_the_node();
@@ -2528,12 +2537,69 @@ mod tests {
                 .is_some_and(|r| r.reason == VoucherRejectReason::Underpaid),
             "the terminal error is the rejection itself: {err:#}"
         );
+        assert!(
+            err.downcast_ref::<crate::HealExhausted>().is_some(),
+            "a healed rejection past the budget carries the marker: {err:#}"
+        );
+        assert_eq!(crate::classify(&err), crate::Fault::Source);
         let budget = usize::try_from(crate::MAX_RESUME_ATTEMPTS).unwrap_or(usize::MAX);
         assert_eq!(
             opens,
             budget + 1,
             "one open per resume attempt, plus the first"
         );
+    }
+
+    /// A voucher rejection that no heal takes ends the drive on the first open
+    /// and stays fatal for the command (ADR 005): an `Underpaid` with no bundle
+    /// has no watermark to rebase to, a `BytesRegression` is a single-signer
+    /// fault, and a trailing proof whose bundle the ledger covers on amount but
+    /// not on bytes cannot heal.
+    #[tokio::test]
+    async fn a_rejection_no_heal_takes_ends_the_command() {
+        fn bare(reason: VoucherRejectReason) -> anyhow::Error {
+            anyhow::Error::new(UpstreamVoucherRejected {
+                reason,
+                bundle: None,
+                proof_generation: None,
+            })
+        }
+        type MakeFault = fn(&PoolContext) -> anyhow::Error;
+        let cases: [(&str, MakeFault); 3] = [
+            ("underpaid without a bundle", |_| {
+                bare(VoucherRejectReason::Underpaid)
+            }),
+            ("bytes regression", |_| {
+                bare(VoucherRejectReason::BytesRegression)
+            }),
+            ("under-fold the ledger covers on amount only", |ctx| {
+                let mut err = underpaid(ctx, (90, 9_500), None);
+                if let Some(rejected) = err.downcast_mut::<UpstreamVoucherRejected>() {
+                    rejected.reason = VoucherRejectReason::UnderFold;
+                }
+                err
+            }),
+        ];
+        for (name, fault) in cases {
+            let ledger = ledger_ahead_of_the_node();
+            let (result, _store, opens) =
+                drive_through_faults(healthy_ctx(), &ledger, |ctx| vec![fault(ctx)]).await;
+            let err = result.expect_err(name);
+            assert!(
+                err.downcast_ref::<UpstreamVoucherRejected>().is_some(),
+                "{name}: the terminal error is the rejection: {err:#}"
+            );
+            assert!(
+                err.downcast_ref::<crate::HealExhausted>().is_none(),
+                "{name}: no heal took the rejection: {err:#}"
+            );
+            assert_eq!(
+                crate::classify(&err),
+                crate::Fault::Fatal(crate::FatalScope::Command),
+                "{name}"
+            );
+            assert_eq!(opens, 1, "{name}: no retry");
+        }
     }
 
     #[tokio::test(start_paused = true)]

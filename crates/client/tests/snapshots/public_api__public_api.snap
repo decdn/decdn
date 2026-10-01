@@ -163,6 +163,10 @@ pub decdn_client::fault::Fault::Fatal(decdn_client::fault::FatalScope)
 pub decdn_client::fault::Fault::Source
 pub decdn_client::fault::Fault::Transient
 pub decdn_client::fault::Fault::Unaffordable
+pub struct decdn_client::fault::HealExhausted
+impl core::error::Error for decdn_client::fault::HealExhausted
+impl core::fmt::Display for decdn_client::fault::HealExhausted
+pub fn decdn_client::fault::HealExhausted::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::fault::LaneBuildFault(pub anyhow::Error)
 impl core::error::Error for decdn_client::fault::LaneBuildFault
 impl core::fmt::Display for decdn_client::fault::LaneBuildFault
@@ -727,6 +731,10 @@ pub struct decdn_client::HashMismatch
 impl core::error::Error for decdn_client::HashMismatch
 impl core::fmt::Display for decdn_client::HashMismatch
 pub fn decdn_client::HashMismatch::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::HealExhausted
+impl core::error::Error for decdn_client::fault::HealExhausted
+impl core::fmt::Display for decdn_client::fault::HealExhausted
+pub fn decdn_client::fault::HealExhausted::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::Holder
 pub decdn_client::Holder::coverage: core::option::Option<decdn_protocol::coverage::Coverage>
 pub decdn_client::Holder::probed_holder: bool

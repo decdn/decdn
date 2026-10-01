@@ -227,7 +227,7 @@ pub use downloader::{DownloadTarget, Downloader};
 pub use driver::{
     LegNoProgress, PacingWait, PoolExhausted, SharedPool, WaitReason, drive, first_leg,
 };
-pub use fault::{FatalScope, Fault, LaneBuildFault, classify};
+pub use fault::{FatalScope, Fault, HealExhausted, LaneBuildFault, classify};
 pub use first_open::first_open;
 pub use health::{Health, PeerHealth};
 pub use ledger::{ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released};

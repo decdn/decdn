@@ -193,13 +193,16 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// coverage since it last served such a range.
     pull_through_not_found: HashMap<Address, u32>,
     /// Probed partial holders that said `NotFound` to
-    /// [`ABSENT_AFTER_NOT_FOUND`] ranges outside their coverage. Each one
-    /// serves only the blocks it covers.
+    /// [`ABSENT_AFTER_NOT_FOUND`] ranges outside their coverage, or that
+    /// refused the blob as too large. Each one serves only the blocks it
+    /// covers.
     no_pull_through: HashSet<Address>,
-    /// Providers that refused the blob as larger than their size ceiling
-    /// (`StreamError::BlobTooLarge`). The ceiling is a stable node policy
-    /// (ADR 005), so none of them starts again for this blob, and a
-    /// rediscovery does not lift it.
+    /// Providers other than partial holders that refused the blob as larger
+    /// than their size ceiling (`StreamError::BlobTooLarge`). The ceiling is a
+    /// stable node policy (ADR 005), so none of them starts again for this
+    /// blob, and a rediscovery does not lift it. A node applies the ceiling
+    /// only to a pull-through, so the same refusal from a partial holder bars
+    /// only its pull-through ([`Self::no_pull_through`]).
     too_large: HashSet<Address>,
     /// The refusal that last marked a source absent, barred it from
     /// pull-through or excluded it as too small for the blob: the cause the
@@ -413,8 +416,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 if let Some(refused) = err.downcast_ref::<UpstreamRefused>()
                     && matches!(refused.error(), StreamError::BlobTooLarge)
                 {
-                    let newly = self.too_large.insert(provider);
-                    self.marked(newly, refused);
+                    self.record_too_large(provider, refused);
                 }
                 if let Some(holder) = self.holder(provider) {
                     self.provider.on_source_fault(holder);
@@ -449,6 +451,23 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             return;
         }
         let newly = self.absent.insert(provider);
+        self.marked(newly, refused);
+    }
+
+    /// Record that `provider` refused the blob as larger than its size
+    /// ceiling. A node applies the ceiling only when it pulls the blob
+    /// through, and serves the blocks it holds without it. So a partial
+    /// holder is barred from pull-through only, and keeps the blocks it
+    /// covers. Any other source never starts again for this blob.
+    fn record_too_large(&mut self, provider: Address, refused: &UpstreamRefused) {
+        let partial = self
+            .holder(provider)
+            .is_some_and(|holder| holder.coverage.is_some());
+        let newly = if partial {
+            self.no_pull_through.insert(provider)
+        } else {
+            self.too_large.insert(provider)
+        };
         self.marked(newly, refused);
     }
 
@@ -493,9 +512,10 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
 
     /// Whether `provider` is barred from pull-through: a probed partial
     /// holder that said `NotFound` to [`ABSENT_AFTER_NOT_FOUND`] ranges
-    /// outside its coverage, with no such range served since. It still serves
-    /// the blocks it covers and takes no range outside them. A discovery that
-    /// reports wider coverage for it clears the bar.
+    /// outside its coverage, or refused the blob as too large, with no such
+    /// range served since. It still serves the blocks it covers and takes no
+    /// range outside them. A discovery that reports wider coverage for it
+    /// clears the bar.
     #[must_use]
     pub fn no_pull_through(&self, provider: Address) -> bool {
         self.no_pull_through.contains(&provider)
@@ -1299,6 +1319,47 @@ mod tests {
             "{err:#}"
         );
         Ok(())
+    }
+
+    /// A node applies its size ceiling only to a pull-through. So a partial
+    /// holder that refuses the blob as too large is barred from pull-through
+    /// only: once its cooldown ends it starts again for the blocks it covers.
+    /// A whole holder that refuses it never starts again.
+    #[tokio::test(start_paused = true)]
+    async fn a_partial_holder_refusing_the_blob_as_too_large_loses_only_pull_through() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(
+            &p,
+            [0; 32],
+            Arc::default(),
+            vec![partial(A, 10.0, &[0]), holder(B, 20.0)],
+        );
+        let now = Instant::now();
+        let fault = set.record_fault(A, &too_large(), Some(block1(true)), now, U256::ZERO);
+        assert_eq!(fault, Fault::Source);
+        assert!(set.no_pull_through(A), "one refusal bars its pull-through");
+
+        let later = now + crate::health::COOL_CAP;
+        assert_eq!(
+            set.next_to_start(later, U256::ZERO, &HashSet::new())
+                .map(|h| h.provider),
+            Some(A),
+            "the partial holder still starts for the blocks it covers"
+        );
+        set.discovery_done(Ok(vec![]), later, U256::ZERO);
+        assert!(
+            set.exhausted(U256::ZERO, true, false).is_none(),
+            "work inside its coverage is left"
+        );
+
+        set.record_fault(B, &too_large(), None, later, U256::ZERO);
+        assert!(!set.no_pull_through(B), "a whole holder has no bar");
+        let latest = later + crate::health::COOL_CAP;
+        assert!(
+            set.next_to_start(latest, U256::ZERO, &HashSet::from([A]))
+                .is_none(),
+            "the whole holder never starts again"
+        );
     }
 
     /// A bound that overshoots the blob sends pieces past its true end, and an
