@@ -429,8 +429,10 @@ retention.
 6. Shipped policies emit only whole-blob eviction targets. Range reclaim is
    documented as blocked on an upstream `iroh-blobs` primitive.
 7. Pins and probe-holds are never evicted, regardless of the active policy.
-   A deny-listed hash is always evictable, even when it is pinned. The engine
-   enforces both rules independent of any plan.
+   A deny-listed hash is always evictable, even when it is pinned. A probe-hold
+   is the one exception: it keeps a hash out of cache-pressure eviction until
+   the hold expires, and `CacheEngine::evict` reclaims a denied hash regardless.
+   The engine enforces these rules independent of any plan.
 8. An unknown policy name is a config error at load, with no silent
    fallback.
 9. The workspace builds clean under the anti-panic clippy lints
