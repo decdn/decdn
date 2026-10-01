@@ -1220,8 +1220,9 @@ pub enum VoucherRejectReason {
     /// expiry margin of it. The node's serve-side check compares its LOCAL wall
     /// clock (`unix_now`, operator-settable) plus that margin against `expiry` and
     /// stops serving the lane. The margin is one redeem interval plus a landing
-    /// slack, so the node redeems every voucher it accepts before the expiry (ADR
-    /// 003 §Revocation). On-chain settlement separately gates redemption on
+    /// slack, so each voucher the node accepts meets at least one redeem sweep
+    /// before the expiry (ADR 003 §Revocation). A lane below the redemption
+    /// floor can still wait past it. On-chain settlement separately gates redemption on
     /// `block.timestamp`. Already-earned vouchers stay redeemable until expiry at
     /// settlement. Recovery: the owner mints a **fresh capability** with a new expiry —
     /// a watermark resync or top-up does not help. Emitted directly by the

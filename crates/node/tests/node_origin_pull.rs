@@ -10881,20 +10881,43 @@ async fn window_pull_through_offset_at_the_ceiling_is_refused_before_commit() ->
     Ok(())
 }
 
-/// A bounded request that starts below B's size ceiling but ends past it is
-/// refused with `BlobTooLarge` before B commits (#2256), not committed and then
-/// cut off as a bare stream fault the client would retry against B.
+/// A bounded request that starts below B's size ceiling and ends past it is not
+/// refused on its end: only the upstream's unverified total says where the blob
+/// ends, and #1895 forbids refusing on that. B commits, and the received-byte
+/// ceiling aborts the pull once it crosses (#2256).
 #[tokio::test(flavor = "multi_thread")]
-async fn window_pull_through_end_past_the_ceiling_is_refused_before_commit() -> Result<()> {
+async fn window_pull_through_end_past_the_ceiling_commits_and_aborts_on_received_bytes()
+-> Result<()> {
     let payload = vec![0xC2u8; 256 * 1024];
     let ceiling = 64 * 1024;
     let run = ranged_pull_under_ceiling(&payload, ceiling, 32 * 1024, 64 * 1024).await?;
-    assert_refused_too_large(&run).await
+    let err = match &run.leaf {
+        Ok(got) => anyhow::bail!(
+            "a range past the ceiling cannot complete, got {} bytes",
+            got.len()
+        ),
+        Err(e) => format!("{e:#}"),
+    };
+    anyhow::ensure!(
+        !err.contains("delivery refused"),
+        "B must commit to a range that starts below its ceiling, got: {err}"
+    );
+    assert_counter(
+        &run.b_metrics,
+        "serve_stream_rejected_blob_too_large_total",
+        0,
+    )?;
+    let aborts = counter_value(&run.b_metrics, "node_pull_too_large_total")?;
+    anyhow::ensure!(
+        aborts >= 1,
+        "the received-byte ceiling must abort the pull, counted {aborts}"
+    );
+    Ok(())
 }
 
-/// The end gate clips the request to the blob: a blob that fits B's ceiling is
-/// served even when the request's `byte_len` runs far past both. A blob of
-/// exactly the ceiling's size fits, so the boundary is served too (#2256).
+/// B has no gate on a request's end, so a blob that fits B's ceiling is served
+/// even when the request's `byte_len` runs far past both. A blob of exactly the
+/// ceiling's size fits, so the boundary is served too (#2256).
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_over_long_range_on_a_blob_within_the_ceiling_is_served() -> Result<()>
 {

@@ -1732,10 +1732,8 @@ pub struct DecdnMetrics {
     /// ranges. Visible name:
     /// `decdn_serve_stream_rejected_range_not_satisfiable_total`.
     pub serve_stream_rejected_range_not_satisfiable: Counter,
-    /// Delivery refused because a pull-through request's own range crosses this
-    /// node's `max_blob_size` ceiling: its start sits at or past the ceiling, or
-    /// its end, bounded by the blob, sits past it (ADR 005 §`BlobTooLarge`
-    /// enforcement). The node refuses before it commits to the stream, so no byte
+    /// Delivery refused because a pull-through request starts at or past this
+    /// node's `max_blob_size` ceiling (ADR 005 §`BlobTooLarge` enforcement). The node refuses before it commits to the stream, so no byte
     /// is bought upstream. Signed as `BlobTooLarge`. A rising value means clients
     /// ask this node for blobs above its ceiling. Visible name:
     /// `decdn_serve_stream_rejected_blob_too_large_total`.

@@ -651,12 +651,11 @@ enum ServeRejectReason {
     /// per-client fairness, or egress saturation. See [`Self::LoadShedHit`].
     LoadShedMiss,
     RangeNotSatisfiable,
-    /// A pull-through request whose own range crosses this node's buyer-side
-    /// `max_blob_size` ceiling (ADR 005 §`BlobTooLarge` enforcement): its start
-    /// sits at or past the ceiling, or its end, bounded by the blob, sits past it.
-    /// The gate reads only the requester's values, never the upstream's unverified
-    /// `total_bytes` claim (#1895), and fires before the node commits to the
-    /// stream. Ships the true wire [`StreamError::BlobTooLarge`] (see
+    /// A pull-through request whose start sits at or past this node's
+    /// buyer-side `max_blob_size` ceiling (ADR 005 §`BlobTooLarge` enforcement).
+    /// The gate reads only the requester's `byte_offset`, never the upstream's
+    /// unverified `total_bytes` claim (#1895), and fires before the node commits
+    /// to the stream. Ships the true wire [`StreamError::BlobTooLarge`] (see
     /// [`Self::wire_error`]), so the requester drops this node for the blob.
     BlobTooLarge,
     /// The blob is on this operator's local denylist (ADR 011 §Local Denylist).

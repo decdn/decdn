@@ -197,6 +197,11 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// count and bar only when it lands after this, so a worker that ends
     /// late cannot lift a bar set after its byte.
     pull_through_refused_at: HashMap<Address, Instant>,
+    /// When each probed partial holder last served a verified byte outside its
+    /// coverage. A `NotFound` for such a range that came before this is stale
+    /// and does not count, so the order in which the loop takes worker ends
+    /// cannot change the bar. A tie goes to the refusal.
+    pull_through_served_at: HashMap<Address, Instant>,
     /// Probed partial holders that said `NotFound` to
     /// [`ABSENT_AFTER_NOT_FOUND`] ranges outside their coverage. Each one
     /// serves only the blocks it covers.
@@ -259,6 +264,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             not_found: HashMap::new(),
             pull_through_not_found: HashMap::new(),
             pull_through_refused_at: HashMap::new(),
+            pull_through_served_at: HashMap::new(),
             no_pull_through: HashSet::new(),
             too_large_pull_through: HashSet::new(),
             too_large: HashSet::new(),
@@ -489,15 +495,25 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// Count a `NotFound` from probed partial holder `provider` for a range
-    /// outside its coverage. At [`ABSENT_AFTER_NOT_FOUND`] answers the holder
-    /// is barred from pull-through.
+    /// outside its coverage, given at `at`. At [`ABSENT_AFTER_NOT_FOUND`]
+    /// answers the holder is barred from pull-through. An answer older than
+    /// the holder's last verified byte outside its coverage is stale and does
+    /// not count.
     fn record_pull_through_refusal(
         &mut self,
         provider: Address,
         refused: &UpstreamRefused,
-        now: Instant,
+        at: Instant,
     ) {
-        self.pull_through_refused_at.insert(provider, now);
+        if self
+            .pull_through_served_at
+            .get(&provider)
+            .is_some_and(|served_at| *served_at > at)
+        {
+            return;
+        }
+        let refused_at = self.pull_through_refused_at.entry(provider).or_insert(at);
+        *refused_at = (*refused_at).max(at);
         let count = self.pull_through_not_found.entry(provider).or_insert(0);
         *count = count.saturating_add(1);
         if *count < ABSENT_AFTER_NOT_FOUND {
@@ -531,6 +547,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// set. A byte verified no later than its last such answer changes
     /// nothing. A bar from a size-ceiling refusal stays.
     pub fn record_pull_through(&mut self, provider: Address, at: Instant) {
+        let served_at = self.pull_through_served_at.entry(provider).or_insert(at);
+        *served_at = (*served_at).max(at);
         if self
             .pull_through_refused_at
             .get(&provider)
@@ -1236,6 +1254,37 @@ mod tests {
         assert!(set.no_pull_through(A), "a byte at the same instant");
         set.record_pull_through(A, refused_at + Duration::from_millis(1));
         assert!(!set.no_pull_through(A), "a byte after the bar");
+    }
+
+    /// The loop can take a worker's end after a sibling's: a refusal older
+    /// than an uncovered byte the loop already took is stale and does not
+    /// count, so the bar does not depend on which end the loop takes first.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_older_than_a_taken_byte_does_not_count() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![partial(A, 10.0, &[0])]);
+        let refused_at = Instant::now();
+        let served_at = refused_at + Duration::from_millis(5);
+        set.record_pull_through(A, served_at);
+        say_not_found_in(
+            &mut set,
+            A,
+            block1(true),
+            super::ABSENT_AFTER_NOT_FOUND,
+            refused_at,
+        );
+        assert!(
+            !set.no_pull_through(A),
+            "refusals before the byte are stale"
+        );
+        say_not_found_in(
+            &mut set,
+            A,
+            block1(true),
+            super::ABSENT_AFTER_NOT_FOUND,
+            served_at + Duration::from_millis(1),
+        );
+        assert!(set.no_pull_through(A), "refusals after the byte count");
     }
 
     /// A size-ceiling bar on a partial holder stays for the blob: neither an

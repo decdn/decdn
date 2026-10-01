@@ -926,9 +926,11 @@ since project inception and will roll into the first tagged release.
 
 - **A proxy over its size ceiling refuses before commit, and the client
   drops it for that blob (#2256).** On a pull-through miss the node refuses a
-  request whose start reaches its `max_blob_size`, or whose end (bounded by
-  the blob) crosses it, with `StreamError::BlobTooLarge` before it signs the
-  stream. The ceiling still binds on received bytes for a whole-blob request.
+  request whose start reaches its `max_blob_size` with
+  `StreamError::BlobTooLarge` before it signs the stream. A request that
+  starts below the ceiling still binds on received bytes: the node does not
+  gate a request's end, because only the upstream's unverified size says
+  where the blob ends.
   New counter: `decdn_serve_stream_rejected_blob_too_large_total`. The client
   excludes a proxy or whole holder that refuses as too large for the rest of
   the blob; a partial holder loses only pull-through. The `BlobTooLarge`
@@ -946,8 +948,8 @@ since project inception and will roll into the first tagged release.
 
 - **Expiry and close deadlines hold a safety margin (#2242).** A node
   refuses a voucher with `CapabilityExpired` once the capability expires
-  within one redeem interval plus 120 s, so every voucher it accepts is swept
-  before expiry. The redeemer skips a `Closing` pool within 120 s of its
+  within one redeem interval plus 120 s, so every voucher it accepts meets at
+  least one redeem sweep before expiry. The redeemer skips a `Closing` pool within 120 s of its
   dispute deadline, and a lane with value owed whose capability has expired
   (new counter `decdn_redemption_skipped_expired_total`). `decdn pool assign`
   checks expiry against the chain head timestamp when an RPC is configured,

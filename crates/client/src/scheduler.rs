@@ -495,12 +495,15 @@ enum LaneEnd {
     /// The worker found nothing it could take: for a lane's own worker, with
     /// no peer holding work; for an extra worker, once its one piece ended.
     Idle,
-    /// The worker faulted on `range`, in the piece that starts at `piece_at`:
-    /// `err` is `Some(e)` for a `fill_gap` error, `None` for a watchdog trip.
+    /// The worker faulted on `range`, in the piece that starts at `piece_at`,
+    /// at `at`: `err` is `Some(e)` for a `fill_gap` error, `None` for a
+    /// watchdog trip. The loop records the fault at `at`, not at the time it
+    /// takes the end, so a sibling's byte verified in between orders after it.
     Faulted {
         err: Option<anyhow::Error>,
         range: crate::source_set::LaneRange,
         piece_at: u64,
+        at: Instant,
     },
 }
 
@@ -1710,6 +1713,7 @@ where
             }
             // Stalled/faulted: re-queue the remainder and end the worker.
             Some(UnitOutcome::Faulted(err)) => {
+                let faulted_at = Instant::now();
                 requeue_missing(store, work, i).await?;
                 {
                     let mut w = work.lock().await;
@@ -1734,6 +1738,7 @@ where
                         err,
                         range,
                         piece_at,
+                        at: faulted_at,
                     },
                     delivered,
                     pulled_through,
@@ -2591,6 +2596,7 @@ where
                         err,
                         range,
                         piece_at,
+                        at,
                     } = end
                     {
                         let err = err.unwrap_or_else(|| {
@@ -2619,10 +2625,9 @@ where
                             log_extra_fault(provider, hash, range, &err);
                         } else {
                             let deposit = pool_deposit(&deposit_rx, &started.0);
-                            let now = Instant::now();
                             charged.insert(provider);
                             if let Fault::Fatal(_) =
-                                sources.record_fault(provider, &err, Some(range), now, deposit)
+                                sources.record_fault(provider, &err, Some(range), at, deposit)
                             {
                                 return Err(err);
                             }

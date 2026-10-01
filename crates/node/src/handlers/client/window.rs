@@ -311,27 +311,12 @@ impl ClientHandler {
         // verify against the true root); an honest giant is streamed and paid for only
         // up to one ceiling before the fill aborts and the serve fails a gap.
         //
-        // The request's OWN end is a different matter. A bounded request whose end,
-        // clipped to the blob, sits past the ceiling can never complete here, so the
-        // node refuses it before it commits. The end comes from the requester's
-        // `byte_offset + byte_len`. The claimed total can only pull that end DOWN, so
-        // an over-long `byte_len` on a small blob is still served, and an inflated
-        // claim cannot push a request over the ceiling. An open-ended request
-        // (`byte_len == 0`) has no end of its own: it commits, and the received-byte
-        // abort above bounds it.
-        if ceiling > 0
-            && req.byte_len > 0
-            && req
-                .byte_offset
-                .saturating_add(req.byte_len)
-                .min(total_bytes)
-                > ceiling
-        {
-            release_reservation_unspent(floor_reservation.as_ref());
-            return self
-                .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
-                .await;
-        }
+        // The request's end has no gate either. A request's `byte_len` may run past
+        // the blob, and only the claimed total says where the blob ends, so an end
+        // gate would again let an inflated claim refuse a small blob. A request that
+        // starts below the ceiling and ends past it commits. The received-byte abort
+        // stops it near the ceiling, and a remainder that starts past the ceiling
+        // meets the start gate above.
 
         // (5) The signed `StreamResponse` commits to `total_bytes` (now known). It is
         // deferred to step (7), AFTER the fill is claimed — so a peeked geometry that
