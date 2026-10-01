@@ -65,6 +65,7 @@ const MAX_METRICS_CONNECTIONS: usize = 32;
 /// scrape never sees a failure before its reason.
 pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_rejected_bad_binding_total",
+    "decdn_serve_stream_rejected_blob_too_large_total",
     "decdn_serve_stream_rejected_cache_miss_total",
     "decdn_serve_stream_rejected_chain_hash_denied_total",
     "decdn_serve_stream_rejected_chain_stale_total",
@@ -1165,12 +1166,13 @@ pub struct DecdnMetrics {
     /// with the two reverting counters above to tell "operator under-funded the
     /// wallet" from "the RPC endpoint is flaky".
     pub pool_open_failures_rpc_error: Counter,
-    /// `decdn_node_pull_too_large_total` (#840): a selected upstream claimed a
-    /// `total_bytes` above this node's `max_blob_size` ceiling, so the buyer
-    /// rejected it before buffering. Like a channel-open failure this is a
-    /// buyer-side policy decision, NOT necessarily provider misbehavior (the
-    /// provider may legitimately serve larger blobs to nodes with a higher
-    /// ceiling), so it does not tar the provider's reputation. A sustained rate
+    /// `decdn_node_pull_too_large_total` (#840): the bytes received from a
+    /// selected upstream crossed this node's `max_blob_size` ceiling, so the buyer
+    /// aborted the pull (#1895). The upstream's `total_bytes` claim plays no part.
+    /// Like a channel-open failure this is a buyer-side policy decision, NOT
+    /// necessarily provider misbehavior (the provider may legitimately serve
+    /// larger blobs to nodes with a higher ceiling), so it does not tar the
+    /// provider's reputation. A sustained rate
     /// means this node's ceiling is below the content it is trying to warm.
     pub node_pull_too_large: Counter,
     /// `decdn_node_pull_rate_above_ceiling_total` (#1375): a selected upstream
@@ -1718,6 +1720,14 @@ pub struct DecdnMetrics {
     /// ranges. Visible name:
     /// `decdn_serve_stream_rejected_range_not_satisfiable_total`.
     pub serve_stream_rejected_range_not_satisfiable: Counter,
+    /// Delivery refused because a pull-through request's own range crosses this
+    /// node's `max_blob_size` ceiling: its start sits at or past the ceiling, or
+    /// its end, bounded by the blob, sits past it (ADR 005 §`BlobTooLarge`
+    /// enforcement). The node refuses before it commits to the stream, so no byte
+    /// is bought upstream. Signed as `BlobTooLarge`. A rising value means clients
+    /// ask this node for blobs above its ceiling. Visible name:
+    /// `decdn_serve_stream_rejected_blob_too_large_total`.
+    pub serve_stream_rejected_blob_too_large: Counter,
     /// Delivery refused because the blob is on this operator's local denylist
     /// (ADR 011 §Local Denylist). Signed as `HashBlacklisted`. Deliberately
     /// counts ONLY the local list; the governance blacklist has its own
@@ -3103,6 +3113,11 @@ recorders! {
     /// range is out of bounds for the blob (ADR 005 §Bounded byte ranges).
     serve_stream_rejected_range_not_satisfiable
         => serve_stream_rejected_range_not_satisfiable.inc();
+
+    /// Record a `serve_stream` pull-through refused because the requested range
+    /// crosses the node's `max_blob_size` ceiling (ADR 005 §`BlobTooLarge`
+    /// enforcement).
+    serve_stream_rejected_blob_too_large => serve_stream_rejected_blob_too_large.inc();
 
     /// Record a `serve_stream` delivery refused because the blob is on the
     /// operator's local denylist (ADR 011 §Local Denylist).
@@ -4783,6 +4798,7 @@ mod tests {
             // assertion pinning it, so a rename could have silently broken a
             // dashboard without failing this test.
             "decdn_serve_stream_rejected_range_not_satisfiable_total",
+            "decdn_serve_stream_rejected_blob_too_large_total",
             "decdn_serve_stream_rejected_hash_denied_total",
             "decdn_serve_stream_rejected_chain_hash_denied_total",
             "decdn_serve_stream_rejected_origin_denied_total",
@@ -4808,6 +4824,7 @@ mod tests {
         metrics.serve_stream_midstream_signer_cap_exhausted();
         metrics.serve_stream_rejected_signer_floor_at_cap();
         metrics.serve_stream_rejected_range_not_satisfiable();
+        metrics.serve_stream_rejected_blob_too_large();
         metrics.serve_stream_rejected_hash_denied();
         metrics.serve_stream_rejected_chain_hash_denied();
         metrics.serve_stream_rejected_origin_denied();

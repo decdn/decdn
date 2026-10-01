@@ -732,7 +732,7 @@ impl std::fmt::Display for BlobTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "received {} bytes, crossing the {}-byte size ceiling (BlobTooLarge)",
+            "reached byte {}, crossing the {}-byte size ceiling (BlobTooLarge)",
             self.received, self.ceiling
         )
     }

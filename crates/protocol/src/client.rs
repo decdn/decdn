@@ -515,8 +515,9 @@ pub struct StreamResponseBody {
     /// Quoted rate in token base units per MB. Bounded by [`MAX_RATE_PER_MB`].
     #[serde(deserialize_with = "crate::message::deserialize_rate_per_mb")]
     pub rate_per_mb: u64,
-    /// Total blob size in bytes (used for `BlobTooLarge` enforcement on
-    /// cache-miss pulls — ADR 005 §`BlobTooLarge` enforcement).
+    /// Total blob size in bytes, as the signing node claims it. A pulling node
+    /// does not enforce its `max_blob_size` against this claim: it enforces the
+    /// ceiling on the bytes it receives (ADR 005 §`BlobTooLarge` enforcement).
     pub total_bytes: u64,
     /// `pool_id` echoed from the [`StreamRequest`] (signed, so a node cannot
     /// silently re-bind the response to a different pool).

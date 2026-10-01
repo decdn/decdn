@@ -80,6 +80,7 @@ const fn refusal_reason(reason: ServeRejectReason) -> &'static str {
         ServeRejectReason::LoadShedHit => "load_shed_hit",
         ServeRejectReason::LoadShedMiss => "load_shed_miss",
         ServeRejectReason::RangeNotSatisfiable => "range_not_satisfiable",
+        ServeRejectReason::BlobTooLarge => "blob_too_large",
         ServeRejectReason::HashDenied => "hash_denied",
         ServeRejectReason::ChainHashDenied => "chain_hash_denied",
         ServeRejectReason::OriginDenied => "origin_denied",
@@ -203,6 +204,7 @@ fn meter_refusal(metrics: &Metrics, reason: ServeRejectReason) {
         ServeRejectReason::RangeNotSatisfiable => {
             metrics.serve_stream_rejected_range_not_satisfiable();
         }
+        ServeRejectReason::BlobTooLarge => metrics.serve_stream_rejected_blob_too_large(),
         ServeRejectReason::HashDenied => metrics.serve_stream_rejected_hash_denied(),
         ServeRejectReason::ChainHashDenied => {
             metrics.serve_stream_rejected_chain_hash_denied();
@@ -416,6 +418,7 @@ mod tests {
             | ServeRejectReason::LoadShedHit
             | ServeRejectReason::LoadShedMiss
             | ServeRejectReason::RangeNotSatisfiable
+            | ServeRejectReason::BlobTooLarge
             | ServeRejectReason::HashDenied
             | ServeRejectReason::ChainHashDenied
             | ServeRejectReason::OriginDenied
@@ -443,6 +446,7 @@ mod tests {
             ServeRejectReason::LoadShedHit,
             ServeRejectReason::LoadShedMiss,
             ServeRejectReason::RangeNotSatisfiable,
+            ServeRejectReason::BlobTooLarge,
             ServeRejectReason::HashDenied,
             ServeRejectReason::ChainHashDenied,
             ServeRejectReason::OriginDenied,

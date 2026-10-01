@@ -707,6 +707,15 @@ impl NodeOrigin {
         Arc::clone(&self.deps)
     }
 
+    /// The buyer-side blob-size ceiling in bytes
+    /// ([`NodeOriginConfig::max_blob_size_bytes`]). `0` means unlimited, and an
+    /// unprovisioned origin reads as unlimited.
+    pub(crate) fn max_blob_size_bytes(&self) -> u64 {
+        self.deps
+            .get()
+            .map_or(0, |deps| deps.config.max_blob_size_bytes)
+    }
+
     /// Whether the negative cache currently suppresses `peer` for `hash`. `false`
     /// on an unprovisioned origin. Test-only: it lets a loopback test read the
     /// suppression a pull left behind.

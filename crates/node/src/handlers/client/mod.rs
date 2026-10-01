@@ -651,6 +651,14 @@ enum ServeRejectReason {
     /// per-client fairness, or egress saturation. See [`Self::LoadShedHit`].
     LoadShedMiss,
     RangeNotSatisfiable,
+    /// A pull-through request whose own range crosses this node's buyer-side
+    /// `max_blob_size` ceiling (ADR 005 §`BlobTooLarge` enforcement): its start
+    /// sits at or past the ceiling, or its end, bounded by the blob, sits past it.
+    /// The gate reads only the requester's values, never the upstream's unverified
+    /// `total_bytes` claim (#1895), and fires before the node commits to the
+    /// stream. Ships the true wire [`StreamError::BlobTooLarge`] (see
+    /// [`Self::wire_error`]), so the requester drops this node for the blob.
+    BlobTooLarge,
     /// The blob is on this operator's local denylist (ADR 011 §Local Denylist).
     HashDenied,
     /// The blob is on the governance blacklist (ADR 011 §On Blacklist Event).
@@ -732,6 +740,12 @@ impl ServeRejectReason {
             | Self::ChainStale => StreamError::NotFound,
             Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
             Self::InternalError => StreamError::InternalError,
+            // `BlobTooLarge` does not collapse to `NotFound`. ADR 005 gives it its
+            // own retry rule: the ceiling is a stable node policy, so the requester
+            // must not ask this node for the same blob again. A `NotFound` would
+            // send the requester back here for each range. The code reveals only
+            // this node's own ceiling, which is no secret.
+            Self::BlobTooLarge => StreamError::BlobTooLarge,
             // The two takedown refusals do NOT collapse to `NotFound`. ADR 011
             // §`StreamRequest` Response names distinct codes because the retry
             // advice differs and a miss-shaped answer would be actively
