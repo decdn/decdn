@@ -94,6 +94,7 @@ use super::chain_ctx;
 use super::fetch;
 use super::interrupt::{Interrupt, Interrupted};
 use super::manifest::build_glob_set;
+use super::ordered_writes::OrderedWrites;
 use super::pull_progress::{self, PullProgress};
 use decdn_bao_range::CHUNK_GROUP_BYTES;
 use decdn_client::discovery::{self, NodeCandidate};
@@ -1462,8 +1463,15 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     // Same guard as `decdn fetch`, for the same reason and before the same
     // password prompt: a node's data dir is a buy target only when the
     // operator named it (#2082).
-    let store = open_client_store_for_buy(&chain.data_dir, chain.data_dir_source, "pull")?;
+    // Shared, so a lane's watermark write runs off the runtime thread.
+    let store = Arc::new(open_client_store_for_buy(
+        &chain.data_dir,
+        chain.data_dir_source,
+        "pull",
+    )?);
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
+    // The command's peer-record and watermark writes, off the runtime thread.
+    let writes = OrderedWrites::default();
     // The body runs in `pull_over`, so the endpoint closes on every exit —
     // success, an early return, or an error — and its open connections end
     // cleanly instead of being aborted on drop.
@@ -1471,13 +1479,16 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         args,
         &chain,
         grant,
-        &store,
+        (&store, &writes),
         &endpoint,
         &relays,
         (&filter, filters_given),
         local_manifest,
     )
     .await;
+    // On every exit, a Ctrl-C's included: what the entries queued is durable
+    // before the command returns.
+    writes.settle().await;
     endpoint.close().await;
     result
 }
@@ -1490,7 +1501,7 @@ async fn pull_over(
     args: &BundlePullArgs,
     chain: &fetch::ResolvedChain,
     grant: Option<decdn_incentive::CapabilityGrant>,
-    store: &RedbBuyerPoolStore,
+    (store, writes): (&Arc<RedbBuyerPoolStore>, &OrderedWrites),
     endpoint: &Endpoint,
     relays: &[RelayUrl],
     (filter, filters_given): (&EntryFilter, bool),
@@ -1545,6 +1556,7 @@ async fn pull_over(
         lane_cap: LaneStreamCap::new(usize::from(args.max_lane_streams)),
         health: Arc::new(PeerHealth::default()),
         connections: Connections::new(endpoint.clone()),
+        writes,
         // One clock for the whole command: a stuck entry waits while another
         // lands bytes.
         stop: StopPolicy::new(
@@ -1647,13 +1659,22 @@ async fn pull_manifest<P: Provider + Clone>(
     reported
 }
 
+/// How often the pull's poll watch ([`warn_when_unpolled`]) ticks.
+const POLL_WATCH_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How late a poll-watch tick may fire before the pull logs that its task was
+/// not polled.
+const POLL_WATCH_LATE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Run `drive` beside `flush` until both finish, or until the first Ctrl-C.
 /// Returns whether a Ctrl-C stopped it.
 ///
 /// The Ctrl-C drops `drive`: every in-flight fetch stops where it is (its drop
-/// guard records what it paid, and its `.partial` is the next run's resume
-/// prefix). The flush channel's sender drops with `drive`, so `flush` still
-/// writes every group that settled before it returns.
+/// guard queues what it paid for recording, and its `.partial` is the next
+/// run's resume prefix). The flush channel's sender drops with `drive`, so
+/// `flush` still writes every group that settled before it returns. A poll
+/// watch ([`warn_when_unpolled`]) runs beside `drive` until `drive` ends or
+/// Ctrl-C stops it.
 async fn drive_until_interrupted(
     drive: impl std::future::Future<Output = ()>,
     flush: impl std::future::Future<Output = ()>,
@@ -1663,9 +1684,37 @@ async fn drive_until_interrupted(
         tokio::select! {
             () = drive => false,
             () = interrupt.wait() => true,
+            never = warn_when_unpolled() => match never {},
         }
     };
     tokio::join!(drive, flush).0
+}
+
+/// Log a WARN each time a tick fires more than [`POLL_WATCH_LATE`] late, that
+/// is, each time the task that polls this future was not polled for a while.
+/// Never returns.
+///
+/// Every entry and lane of a pull runs on one task, so anything that blocks
+/// that task stops every lane at once, and the nodes see the lanes' streams
+/// go quiet together (#2211). A tick's lateness is a lower bound on that
+/// freeze: a freeze that starts just after a tick misses up to one
+/// [`POLL_WATCH_TICK`], so only a freeze longer than about 3 s is sure to be
+/// logged. A system suspend shows up the same way.
+async fn warn_when_unpolled() -> std::convert::Infallible {
+    let mut tick = tokio::time::interval(POLL_WATCH_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let due = tick.tick().await;
+        let late = due.elapsed();
+        if late > POLL_WATCH_LATE {
+            tracing::warn!(
+                late_ms = late.as_millis(),
+                "the bundle task was not polled for at least {late:?}: a blocking call on the \
+                 pull task froze every lane (or the system was suspended); run with -vv to see \
+                 which"
+            );
+        }
+    }
 }
 
 /// What [`PullCtx::pull_all`] hands back: every settled entry's outcome, the
@@ -1954,12 +2003,14 @@ impl ExtraPermits {
 }
 
 /// Shared, by-reference state for the entry fetch loop. Borrowed by every
-/// in-flight entry future. `LaneLedgers` is `Sync`, so `PullCtx` is `Sync` and
-/// safe to share across `tokio::spawn` if needed; `buffer_unordered` currently
-/// polls in one task.
+/// in-flight entry future, and every entry must be polled on one task, as
+/// `buffer_unordered` does: each entry reads its lanes' ledgers and queues
+/// their watermark writes with no await between
+/// ([`fetch::queue_face_watermarks`]), and only one task keeps another entry's
+/// read from falling between them.
 struct PullCtx<'a, P: Provider + Clone> {
     endpoint: &'a Endpoint,
-    store: &'a RedbBuyerPoolStore,
+    store: &'a Arc<RedbBuyerPoolStore>,
     contract: &'a PaymentPool::PaymentPoolInstance<P>,
     rpc: &'a P,
     signer: &'a Arc<PrivateKeySigner>,
@@ -2024,6 +2075,9 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// The command's one connection per node: every entry's lanes, the
     /// range-dedup entries' included, open their streams on it.
     connections: Connections,
+    /// The command's blocking state writes, in queue order across every
+    /// entry ([`OrderedWrites`]).
+    writes: &'a OrderedWrites,
     /// The command's stop policy. Its progress clock is shared by every entry
     /// and the manifest fetch, so the pull gives up only once no entry has
     /// landed a verified byte for the whole limit.
@@ -2062,6 +2116,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             // as the upstream keeps feeding it bytes.
             deadlines: PullDeadlines::new(fetch::STALL_WINDOW, fetch::STALL_WINDOW, 0)?,
             connections: &self.connections,
+            writes: self.writes,
         })
     }
 
@@ -2172,8 +2227,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         );
         let holders = sources.holders_from(targets);
         // A fetch dropped by Ctrl-C, or by a sibling's command-wide fault,
-        // records every lane's vouchers too.
-        let on_drop = fetch::SettleOnDrop::new(|| sources.persist_watermarks());
+        // queues every lane's vouchers for recording too.
+        let on_drop = fetch::SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
             // The manifest's size is the entry's first claim; without one, the
             // probe's hint or a header-only open gives it.
@@ -2212,7 +2267,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         }
         .await;
         on_drop.disarm();
-        sources.persist_watermarks();
+        sources.persist_watermarks().await;
         result.map_err(|err| sources.annotate(err))
     }
 

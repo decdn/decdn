@@ -522,9 +522,9 @@ pub async fn bootstrap_nodes(
     registry_cap: Duration,
 ) -> anyhow::Result<Bootstrap> {
     // The deadline bounds the REGISTRY READ ONLY, not the whole bootstrap
-    // (#1349). Wrapping `bootstrap_nodes` from outside would cancel
-    // `resolve_bootstrap` along with it, and that is where the ADR 012
-    // § Bootstrap step 4 peer-store fallback lives — so a client with a
+    // (#1349). Wrapping `bootstrap_nodes` from outside would drop
+    // `resolve_bootstrap`'s result along with it, and that is where the ADR
+    // 012 § Bootstrap step 4 peer-store fallback lives — so a client with a
     // perfectly good peer store and a flaky RPC would get a hard failure
     // instead of a degraded-but-working fetch. Timing out is just another way
     // for the registry read to fail, so it is fed in as one and the existing
@@ -539,7 +539,16 @@ pub async fn bootstrap_nodes(
                 REGISTRY_RETRY_BACKOFF.iter().sum::<Duration>().as_secs(),
             )),
         };
-    resolve_bootstrap(registry, data_dir)
+    // Off the runtime: a live read writes and fsyncs one peer record per
+    // registered node, and a caller's lanes share this task (#2211). A panic
+    // in the store pass fails the bootstrap, and discards a registry read
+    // that succeeded along with it.
+    let data_dir = data_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || resolve_bootstrap(registry, &data_dir))
+        .await
+        .map_err(|e| {
+            anyhow::Error::new(e).context("the peer-store bootstrap task panicked or was cancelled")
+        })?
 }
 
 /// Candidates probed before ranking (decision 3): shuffle, order region-first,

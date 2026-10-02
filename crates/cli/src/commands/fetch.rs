@@ -75,6 +75,7 @@ use decdn_client::provider;
 
 use super::buyer_store::{ChainAdoption, DataDirSource, open_client_store_for_buy};
 use super::interrupt::{Interrupt, Interrupted};
+use super::ordered_writes::OrderedWrites;
 use super::tab_progress::TabProgress;
 
 /// Per-candidate probe timeout during auto-discovery (#936). The K probes run
@@ -1390,9 +1391,10 @@ pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext)
 ///
 /// A drive persists its lanes' voucher watermarks after it returns. A dropped
 /// drive never gets there, so this guard runs `settle` from its `Drop` instead:
-/// the lanes' paid bytes are recorded, at the armed (HIGH) settlement, and the
-/// next run's vouchers continue from them. A drive that returns calls
-/// [`Self::disarm`] and settles on its normal path.
+/// the lanes' paid bytes are queued for recording, at the armed (HIGH)
+/// settlement ([`queue_face_watermarks`]), and the next run's vouchers continue
+/// from them. A drive that returns calls [`Self::disarm`] and settles on its
+/// normal path.
 pub(crate) struct SettleOnDrop<F: FnOnce()> {
     /// The settle to run on drop; `None` once disarmed.
     settle: Option<F>,
@@ -1506,20 +1508,32 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // The buyer-pool store, opened once and recorded into by open-or-reuse.
     // The guard runs here, before the keystore password prompt: the answer
     // depends only on the data dir, and a refusal must not cost a prompt first.
-    let store = open_client_store_for_buy(&chain.data_dir, chain.data_dir_source, "fetch")?;
+    // Shared, so a lane's watermark write runs off the runtime thread.
+    let store = Arc::new(open_client_store_for_buy(
+        &chain.data_dir,
+        chain.data_dir_source,
+        "fetch",
+    )?);
 
     // One discovery-enabled endpoint, reused for probing and the delivery dial.
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
     // The body runs in `fetch_over`, so the endpoint closes on every exit —
     // success, an early return, an error, or a Ctrl-C — and its open connections
     // end cleanly instead of being aborted on drop. A Ctrl-C drops `fetch_over`
-    // mid-transfer: each drive's drop guard records what it paid, and the
-    // `.partial` is the next run's resume prefix.
+    // mid-transfer: each drive's drop guard queues what it paid for recording,
+    // and the `.partial` is the next run's resume prefix.
     let mut interrupt = Interrupt::watch();
+    // The command's peer-record and watermark writes, off the runtime thread.
+    let writes = OrderedWrites::default();
     let result = tokio::select! {
-        result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint) => result,
+        result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint, &writes) => {
+            result
+        }
         () = interrupt.wait() => Err(Interrupted.into()),
     };
+    // On every exit, a Ctrl-C's included: what the drives queued is durable
+    // before the command returns.
+    writes.settle().await;
     endpoint.close().await;
     result
 }
@@ -1536,15 +1550,16 @@ pub(crate) const STALL_WINDOW: Duration = Duration::from_secs(30);
 /// ends on done, a fault only the user can fix, or the stop policy: a
 /// terminal waits for Ctrl-C, a script gives up after 10 minutes
 /// without progress, and `--give-up-after-secs` overrides both.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn fetch_over(
     args: &cli::FetchArgs,
     hash: [u8; 32],
     relays: &[RelayUrl],
     chain: &ResolvedChain,
     grant: Option<CapabilityGrant>,
-    store: &RedbBuyerPoolStore,
+    store: &Arc<RedbBuyerPoolStore>,
     endpoint: &Endpoint,
+    writes: &OrderedWrites,
 ) -> anyhow::Result<()> {
     let common = &args.common;
     // The holders to start from: the explicit `--node-id`, or auto-discovery.
@@ -1617,6 +1632,7 @@ async fn fetch_over(
         max_blob_bytes,
         deadlines,
         connections: &connections,
+        writes,
     };
 
     let clock = Arc::new(ProgressClock::new());
@@ -1642,8 +1658,8 @@ async fn fetch_over(
         None,
     );
     let holders = sources.holders_from(&resolved);
-    // A fetch dropped by Ctrl-C records every lane's vouchers too.
-    let on_drop = SettleOnDrop::new(|| sources.persist_watermarks());
+    // A fetch dropped by Ctrl-C queues every lane's vouchers for recording too.
+    let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
     let result = async {
         // The first size claim: the probe's hint, or a header-only open.
         let claim = sources.first_claim(hash, holders, &health, &stop).await?;
@@ -1678,7 +1694,7 @@ async fn fetch_over(
     }
     .await;
     on_drop.disarm();
-    sources.persist_watermarks();
+    sources.persist_watermarks().await;
     result.map_err(|err| sources.annotate(err))
 }
 
@@ -1735,7 +1751,9 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
 /// lanes. Every field is a borrow or a `Copy` scalar.
 pub(crate) struct DriveFetchDeps<'a, P> {
     pub(crate) endpoint: &'a Endpoint,
-    pub(crate) store: &'a RedbBuyerPoolStore,
+    /// Shared, so a lane's watermark write runs on the blocking pool
+    /// ([`queue_face_watermarks`]).
+    pub(crate) store: &'a Arc<RedbBuyerPoolStore>,
     pub(crate) contract: &'a PaymentPool::PaymentPoolInstance<P>,
     pub(crate) rpc: &'a P,
     pub(crate) slash_dom: &'a Eip712Domain,
@@ -1751,6 +1769,10 @@ pub(crate) struct DriveFetchDeps<'a, P> {
     /// The command's one connection per node, shared by every lane of every
     /// fetch the command runs.
     pub(crate) connections: &'a Connections,
+    /// The command's peer-record and watermark writes, run off the runtime
+    /// thread in queue order across every fetch the command runs. Every
+    /// ordered state write of a fetch goes through it.
+    pub(crate) writes: &'a OrderedWrites,
 }
 
 /// The lane's shared ledger + context: from the run registry when bundle pull
@@ -1970,13 +1992,30 @@ pub(crate) struct FaceLaneHandle {
 /// The per-lane [`LaneWatermark`]s to persist after a face fetch, read from the
 /// retained [`FaceLaneHandle`]s — the same settle-at-armed-cumulative rule
 /// [`multi_lane_watermarks`] then keys for persistence.
+///
+/// One watermark per ledger: a lane rebuilt on the run's shared ledger leaves a
+/// second handle on it, and the first read takes the ledger's unsaved rebase,
+/// so a second write for it would only repeat the first. Each rebuild read its
+/// own baseline from the store, and a sibling entry's rebase can have moved
+/// that baseline down since the first build, so the watermark takes the lowest
+/// one: the advance past it still persists.
 fn stream_lane_watermarks(lanes: &[FaceLaneHandle]) -> Vec<LaneWatermark> {
-    lanes
-        .iter()
-        .map(|l| LaneWatermark {
+    let mut per_ledger: Vec<(&FaceLaneHandle, U256)> = Vec::new();
+    for l in lanes {
+        match per_ledger
+            .iter_mut()
+            .find(|(first, _)| Arc::ptr_eq(&first.ledger, &l.ledger))
+        {
+            Some((_, prior)) => *prior = (*prior).min(l.prior_amount),
+            None => per_ledger.push((l, l.prior_amount)),
+        }
+    }
+    per_ledger
+        .into_iter()
+        .map(|(l, prior_amount)| LaneWatermark {
             pool_id: l.pool_id,
             provider: l.provider,
-            prior_amount: l.prior_amount,
+            prior_amount,
             // Taken before the settlement read, so the settlement is at or above it.
             rebase_anchor: l.ledger.take_unsaved_rebase(),
             settlement: l.ledger.settlement(),
@@ -2027,18 +2066,69 @@ where
     Ok(drained)
 }
 
-/// Persist every face lane's voucher watermark from the retained handles — the
-/// same settle-at-armed-cumulative rule the file path applies. The faces do not
-/// persist, so the thin CLI layer does it after the fetch, before surfacing any
-/// error: the bytes each lane delivered are paid for whatever the outcome.
-pub(crate) fn persist_face_watermarks(
-    store: &RedbBuyerPoolStore,
-    self_address: Address,
-    handles: &[FaceLaneHandle],
-) {
-    for (lane, vprogress) in multi_lane_watermarks(self_address, &stream_lane_watermarks(handles)) {
+/// One lane's buyer-store watermark write: the lane and the progress to record.
+type LaneWrite = (LaneKey, VoucherProgress);
+
+/// The watermark write every face lane calls for, read from the retained
+/// handles now — the same settle-at-armed-cumulative rule the file path
+/// applies, one write per lane ledger.
+fn face_watermark_writes(self_address: Address, handles: &[FaceLaneHandle]) -> Vec<LaneWrite> {
+    multi_lane_watermarks(self_address, &stream_lane_watermarks(handles))
+}
+
+/// Apply every write in `writes`. Blocking: each write that moves the row is a
+/// redb commit.
+fn write_watermarks(store: &RedbBuyerPoolStore, self_address: Address, writes: Vec<LaneWrite>) {
+    for (lane, vprogress) in writes {
         persist_watermark(store, self_address, lane.pool_id, lane, &vprogress);
     }
+}
+
+/// Read every face lane's voucher watermark from its ledger now
+/// ([`face_watermark_writes`]), queue the writes on the command's ordered
+/// `writes`, and return a receiver that resolves once they land. The faces do
+/// not persist, so the thin CLI layer does it after the fetch, before surfacing
+/// any error: the bytes each lane delivered are paid for whatever the outcome.
+///
+/// Each write that moves the row is a durable redb commit, and a `bundle
+/// pull`'s lanes share the caller's task, so a commit inline would stop every
+/// lane of the run while it syncs (#2211). The queue keeps the writes in the
+/// order the ledgers were read, across every entry: a rebase replaces the lane
+/// row outright, so a rebase landing after a newer advance, or a stale advance
+/// landing after a rebase, would leave the next run signing from the wrong
+/// progress. The read and the queueing are one synchronous call for that
+/// reason, and the order holds only while every caller polls on one task, as
+/// a fetch and a `bundle pull` do.
+///
+/// A drop guard, which cannot wait, drops the receiver. The command then waits
+/// for the queue before it returns ([`OrderedWrites::settle`]), on a Ctrl-C
+/// too. A second Ctrl-C exits the process at once, and a write still queued or
+/// running then is lost; the next run may re-sign a stale watermark, which its
+/// provider rejects. A runtime that shuts down cancels blocking tasks that have
+/// not started, and the queue then drains on the shutting-down thread.
+pub(crate) fn queue_face_watermarks(
+    writes: &OrderedWrites,
+    store: &Arc<RedbBuyerPoolStore>,
+    self_address: Address,
+    handles: &[FaceLaneHandle],
+) -> tokio::sync::oneshot::Receiver<()> {
+    queue_watermark_writes(
+        writes,
+        store,
+        self_address,
+        face_watermark_writes(self_address, handles),
+    )
+}
+
+/// Queue `lane_writes` on `writes` ([`queue_face_watermarks`]).
+fn queue_watermark_writes(
+    writes: &OrderedWrites,
+    store: &Arc<RedbBuyerPoolStore>,
+    self_address: Address,
+    lane_writes: Vec<LaneWrite>,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let store = Arc::clone(store);
+    writes.queue_awaitable(move || write_watermarks(&store, self_address, lane_writes))
 }
 
 /// Stream `hash`'s verified bytes to STDOUT via the [`Streamer`] consumption face
@@ -4212,7 +4302,7 @@ mod tests {
 
         let (ep, _) = loopback(Vec::new()).await?;
         let dir = tempfile::tempdir()?;
-        let store = RedbBuyerPoolStore::open(&dir.path().join("data"))?;
+        let store = Arc::new(RedbBuyerPoolStore::open(&dir.path().join("data"))?);
         let rpc = alloy::providers::ProviderBuilder::new()
             .connect_mocked_client(alloy::providers::mock::Asserter::new());
         let contract = PaymentPool::new(Address::repeat_byte(0x33), rpc.clone());
@@ -4226,6 +4316,7 @@ mod tests {
         )?;
         let slash_dom = decdn_incentive::slash_judge_domain(1, Address::repeat_byte(0x44));
         let connections = Connections::new(ep.clone());
+        let writes = OrderedWrites::default();
         let entry_deps = || -> anyhow::Result<DriveFetchDeps<'_, _>> {
             Ok(DriveFetchDeps {
                 endpoint: &ep,
@@ -4241,6 +4332,7 @@ mod tests {
                 max_blob_bytes: 0,
                 deadlines: PullDeadlines::new(Duration::from_secs(5), Duration::from_secs(5), 0)?,
                 connections: &connections,
+                writes: &writes,
             })
         };
         let provider = Address::repeat_byte(0xB0);
@@ -4322,6 +4414,156 @@ mod tests {
             (got.last_bytes, got.last_amount),
             (totals.bytes, totals.amount),
             "without an anchor the persist is monotone"
+        );
+        Ok(())
+    }
+
+    /// A lane built twice on one shared ledger commits once per entry; a lane
+    /// on its own ledger keeps its own write. The one write takes the lowest
+    /// baseline of the ledger's handles: a sibling's rebase moved the store
+    /// from 90 to 70 between the two builds, and the ledger settled at 80, so
+    /// the advance from 70 to 80 still persists.
+    #[test]
+    fn duplicate_lane_handles_commit_once_from_the_lowest_baseline() {
+        let handle = |ledger: &Arc<PoolLedger>, provider: u8, prior: u64| FaceLaneHandle {
+            pool_id: PoolId::repeat_byte(1),
+            provider: Address::repeat_byte(provider),
+            prior_amount: U256::from(prior),
+            ledger: Arc::clone(ledger),
+            ctx: Arc::new(Mutex::new(ctx_with(None))),
+        };
+        let shared = Arc::new(PoolLedger::new(Cumulative {
+            bytes: U256::from(100u64),
+            amount: U256::from(80u64),
+        }));
+        let other = Arc::new(PoolLedger::new(Cumulative {
+            bytes: U256::from(10u64),
+            amount: U256::from(7u64),
+        }));
+        let handles = [
+            handle(&shared, 0xA1, 90),
+            handle(&other, 0xB2, 0),
+            handle(&shared, 0xA1, 70),
+        ];
+        let writes = face_watermark_writes(Address::repeat_byte(0x5E), &handles);
+        let providers: Vec<Address> = writes.iter().map(|(lane, _)| lane.provider).collect();
+        assert_eq!(
+            providers,
+            [Address::repeat_byte(0xA1), Address::repeat_byte(0xB2)]
+        );
+        assert_eq!(
+            writes[0].1.advanced(),
+            Some((U256::from(100u64), U256::from(80u64))),
+            "the shared lane advances past its lowest baseline"
+        );
+    }
+
+    /// Hold `writes` until the returned sender fires, so every write queued
+    /// meanwhile waits behind the hold.
+    fn hold(writes: &OrderedWrites) -> std::sync::mpsc::Sender<()> {
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        writes.queue(move || {
+            let _ = hold.recv();
+        });
+        release
+    }
+
+    /// One lane's write of `totals` over baseline `prior`, rebased to `anchor`.
+    fn lane_write(
+        lane: LaneKey,
+        totals: (u64, u64),
+        prior: u64,
+        anchor: Option<(u64, u64)>,
+    ) -> LaneWrite {
+        let cum = |(bytes, amount): (u64, u64)| Cumulative {
+            bytes: U256::from(bytes),
+            amount: U256::from(amount),
+        };
+        (
+            lane,
+            VoucherProgress::from_cumulative(cum(totals), U256::from(prior))
+                .with_rebase_anchor(anchor.map(cum)),
+        )
+    }
+
+    /// Two entries settle one lane: the first read takes the ledger's rebase
+    /// (down to 60, totals 70), the second a newer advance to 80. They land
+    /// in that order, so the rebase never replaces the newer row.
+    #[tokio::test]
+    async fn a_rebase_read_first_never_lands_over_a_newer_advance() -> anyhow::Result<()> {
+        let (_dir, store, owner, pool_id, lane) = rebase_store_fixture()?;
+        let store = Arc::new(store);
+        let writes = OrderedWrites::default();
+        let release = hold(&writes);
+        let rebase = lane_write(lane, (200, 70), 90, Some((100, 60)));
+        drop(queue_watermark_writes(&writes, &store, owner, vec![rebase]));
+        let advance = lane_write(lane, (300, 80), 70, None);
+        let landed = queue_watermark_writes(&writes, &store, owner, vec![advance]);
+        release.send(())?;
+        tokio::time::timeout(Duration::from_secs(10), landed).await??;
+        let got = lane_record(&store, pool_id, lane)?;
+        assert_eq!(
+            (got.last_bytes, got.last_amount),
+            (U256::from(300u64), U256::from(80u64))
+        );
+        Ok(())
+    }
+
+    /// Two entries settle one lane: the first read is an advance to 95 from
+    /// before the node refused it, the second the rebase down to 60 (totals
+    /// 70). They land in that order, so the refused watermark never returns.
+    #[tokio::test]
+    async fn a_stale_advance_read_first_never_lands_over_a_rebase() -> anyhow::Result<()> {
+        let (_dir, store, owner, pool_id, lane) = rebase_store_fixture()?;
+        let store = Arc::new(store);
+        let writes = OrderedWrites::default();
+        let release = hold(&writes);
+        let advance = lane_write(lane, (600, 95), 90, None);
+        drop(queue_watermark_writes(
+            &writes,
+            &store,
+            owner,
+            vec![advance],
+        ));
+        let rebase = lane_write(lane, (200, 70), 90, Some((100, 60)));
+        let landed = queue_watermark_writes(&writes, &store, owner, vec![rebase]);
+        release.send(())?;
+        tokio::time::timeout(Duration::from_secs(10), landed).await??;
+        let got = lane_record(&store, pool_id, lane)?;
+        assert_eq!(
+            (got.last_bytes, got.last_amount),
+            (U256::from(200u64), U256::from(70u64))
+        );
+        Ok(())
+    }
+
+    /// A drop guard's settle drops its receiver and returns. The write it
+    /// queued, behind a slow one, still lands before the runtime finishes
+    /// dropping: the runtime waits for the blocking pool as it shuts down.
+    #[test]
+    fn a_detached_settle_lands_by_runtime_shutdown() -> anyhow::Result<()> {
+        let (_dir, store, owner, pool_id, lane) = rebase_store_fixture()?;
+        let store = Arc::new(store);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()?;
+        runtime.block_on(async {
+            let writes = OrderedWrites::default();
+            writes.queue(|| std::thread::sleep(Duration::from_millis(100)));
+            let advance = lane_write(lane, (600, 95), 90, None);
+            drop(queue_watermark_writes(
+                &writes,
+                &store,
+                owner,
+                vec![advance],
+            ));
+        });
+        drop(runtime);
+        let got = lane_record(&store, pool_id, lane)?;
+        assert_eq!(
+            (got.last_bytes, got.last_amount),
+            (U256::from(600u64), U256::from(95u64))
         );
         Ok(())
     }
