@@ -138,7 +138,7 @@ impl ClientHandler {
         fault_seen: bool,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
-        first_byte: FirstByteClock,
+        mut first_byte: FirstByteClock,
     ) -> anyhow::Result<super::outcome::ServeEnd> {
         // The ADR 011 OPEN-TIME deny gates are already discharged on the only
         // path that reaches here: `serve_stream` refuses a denylisted hash
@@ -462,6 +462,7 @@ impl ClientHandler {
         let (resp, resp_ext) = self.sign_response(body, None)?;
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
+        first_byte.mark_responded();
 
         // Seed the shared per-hash outboard with proof for the held ranges inside
         // this serve's range, which no pull admits (`seed_held_outboard`;
@@ -674,7 +675,7 @@ impl ClientHandler {
         pool_remaining: Option<U256>,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
-        first_byte: FirstByteClock,
+        mut first_byte: FirstByteClock,
     ) -> anyhow::Result<super::outcome::ServeEnd> {
         // Mark that the own-origin serve-miss tier fired for this request, before
         // any admission guard below — the tier-selection signal (#1130), not a
@@ -781,6 +782,7 @@ impl ClientHandler {
         let (resp, resp_ext) = self.sign_response(body, None)?;
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
+        first_byte.mark_responded();
 
         // (5) The two decoupled legs (ADR 037). Identical coordination
         // shape to the peer twin: the SERVE leg runs HERE on the accept task (it must

@@ -464,6 +464,7 @@ where
                 self.deps.endpoint,
                 self.relays,
                 hash,
+                None,
             )
             .await?;
             Ok(self.holders_from(&targets))

@@ -1046,10 +1046,11 @@ mod tests {
     /// and pay for them again.
     #[tokio::test(start_paused = true)]
     async fn a_dropped_download_records_the_landed_prefix() -> anyhow::Result<()> {
+        const STALL: u64 = 6 * 1024 * 1024;
         let blob = payload(12 * 1024 * 1024);
         let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
         let source = ScriptedSource::new(blob.clone())?
-            .stall_after(6 * 1024 * 1024, Duration::from_hours(1))
+            .stall_after(STALL, Duration::from_hours(1))
             .paying(Arc::clone(&ledger));
         let root = source.root();
         let total = u64::try_from(blob.len())?;
@@ -1079,9 +1080,10 @@ mod tests {
             &decdn_bao_range::RangedStore::present_ranges(&partial).await?,
             total,
         );
+        let landed = ClientRangedStore::checkpointed_len(STALL);
         anyhow::ensure!(
-            recorded >= 4 * 1024 * 1024 && recorded < total,
-            "the landed prefix is recorded for a resume: {recorded}"
+            recorded >= landed && recorded < total,
+            "the landed prefix is recorded for a resume: {recorded}, want at least {landed}"
         );
         Ok(())
     }
