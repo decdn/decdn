@@ -1950,7 +1950,7 @@ impl CacheEngine {
                     enumerate_failures = enumerate_failures.saturating_add(1);
                     tracing::warn!(
                         origin = ?origin.kind(),
-                        error = %err,
+                        error = %format_args!("{err:#}"),
                         "rescan_origins: enumerate failed; every hash discoverable \
                          only through this origin leaves the announce set until a \
                          later rescan lists it"
@@ -2148,7 +2148,7 @@ impl CacheEngine {
                         tracing::debug!(
                             %hash,
                             kind = ?origin.kind(),
-                            error = %e,
+                            error = %format_args!("{e:#}"),
                             transient = e.is_transient(),
                             "origin-probe HEAD faulted; checking remaining origins",
                         );
@@ -4310,7 +4310,7 @@ impl CacheEngine {
                     tracing::debug!(
                         %hash,
                         kind = ?origin.kind(),
-                        error = %e,
+                        error = %format_args!("{e:#}"),
                         "origin size probe failed; trying next origin",
                     );
                     last_err = Some(CacheError::OriginError {
@@ -5331,7 +5331,7 @@ impl CacheEngine {
                 hash = %hash,
                 origin_index = idx,
                 origin_kind = ?origin_kind,
-                error = last_err.map(ToString::to_string).unwrap_or_default(),
+                error = last_err.map(|e| format!("{e:#}")).unwrap_or_default(),
                 "advancing to next origin in fallback chain (origin failed)",
             );
         } else {

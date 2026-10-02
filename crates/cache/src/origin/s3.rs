@@ -982,16 +982,28 @@ mod tests {
 
     #[test]
     fn body_stream_error_keeps_the_original_errors_causes() {
-        // A cause under the original error stays on the chain.
+        // The original error carries a typed payload whose own cause is not in
+        // its `Display`, so the cause can only reach the render through
+        // `source()`.
+        #[derive(Debug, thiserror::Error)]
+        #[error("tls handshake failed")]
+        struct Tls(#[source] std::io::Error);
+
         let raw = std::io::Error::new(
             std::io::ErrorKind::ConnectionReset,
-            std::io::Error::other("tls alert"),
+            Tls(std::io::Error::other("tls alert")),
         );
         let wrapped = prefix_body_stream_error("s3://decdn-blobs/ab/abcdef", raw);
         let chained = format!("{:#}", anyhow::Error::new(wrapped));
-        assert!(
-            chained.contains("tls alert"),
-            "lost a nested cause: {chained}"
+        assert_eq!(
+            chained.matches("tls handshake failed").count(),
+            1,
+            "original error not named once: {chained}"
+        );
+        assert_eq!(
+            chained.matches("tls alert").count(),
+            1,
+            "nested cause not named once: {chained}"
         );
     }
 

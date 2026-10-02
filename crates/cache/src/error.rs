@@ -9,8 +9,8 @@ use thiserror::Error;
 ///
 /// A variant that wraps a cause names only itself in `Display` and returns the
 /// cause from [`std::error::Error::source`]. A `.chain()` walk therefore reaches
-/// every cause under a `CacheError`, such as the local disk fault the client's
-/// fault classifier looks for, and a chain formatter (`{:#}` or `{:?}` on an
+/// every cause under a `CacheError`, such as a local disk fault that
+/// `decdn_client::classify` looks for, and a chain formatter (`{:#}` or `{:?}` on an
 /// `anyhow::Error`) names each cause once. Log a bare `CacheError` with
 /// [`CacheError::display_chain`], not with plain `Display`.
 #[derive(Debug, Error)]
@@ -200,15 +200,19 @@ pub enum OriginError {
     },
 }
 
-/// Renders an error and each [`std::error::Error::source`] under it on one
+/// Renders any error and each [`std::error::Error::source`] under it on one
 /// line, joined by `": "`. Built by [`CacheError::display_chain`], or by
-/// [`ErrorChain::new`] for an error that wraps a [`CacheError`].
+/// [`ErrorChain::new`] for any other error.
+///
+/// Each cause appears once only when every link leaves its `source()` out of
+/// its own `Display`, as [`CacheError`] does. A link that repeats its source in
+/// `Display` repeats that text here.
 #[derive(Debug, Clone, Copy)]
 pub struct ErrorChain<'a>(&'a (dyn std::error::Error + 'static));
 
 impl<'a> ErrorChain<'a> {
     /// Wrap `err` for one-line chain rendering.
-    pub fn new(err: &'a (dyn std::error::Error + 'static)) -> Self {
+    pub const fn new(err: &'a (dyn std::error::Error + 'static)) -> Self {
         Self(err)
     }
 }
@@ -298,16 +302,17 @@ mod tests {
         anyhow::anyhow!(ROOT).context(OUTER)
     }
 
-    fn faults() -> [(CacheError, &'static str); 3] {
+    fn faults() -> [(CacheError, String); 3] {
+        let hash = Hash::from_bytes([0; 32]);
         [
-            (CacheError::Store(chained()), "store error"),
-            (CacheError::Internal(chained()), "internal fault"),
+            (CacheError::Store(chained()), "store error".to_owned()),
+            (CacheError::Internal(chained()), "internal fault".to_owned()),
             (
                 CacheError::OriginError {
-                    hash: Hash::from_bytes([0; 32]),
+                    hash,
                     source: chained(),
                 },
-                "origin error fetching 0000000000000000000000000000000000000000000000000000000000000000",
+                format!("origin error fetching {hash}"),
             ),
         ]
     }
