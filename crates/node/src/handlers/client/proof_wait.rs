@@ -220,21 +220,27 @@ async fn wait_for_proof<T>(
     let mut ceiling = std::pin::pin!(ceiling);
     // A proof that is ready wins over both limits. A progress sample comes
     // before the ceiling, so a stall that lands on the ceiling's instant is
-    // reported as the stall, the more specific cause.
-    let kind = loop {
+    // reported as the stall, the more specific cause. The fault reports the
+    // sample that decided it, so a frame sent after the decision cannot make
+    // the report contradict it.
+    let (kind, now, since_progress) = loop {
         tokio::select! {
             biased;
             proof = &mut read => return proof,
             _ = poll.tick() => {
-                if is_stalled(clock.observe(stream_frames(), Instant::now())) {
-                    break ProofWaitKind::Stalled;
+                let now = Instant::now();
+                let since_progress = clock.observe(stream_frames(), now);
+                if is_stalled(since_progress) {
+                    break (ProofWaitKind::Stalled, now, since_progress);
                 }
             }
-            () = &mut ceiling => break ProofWaitKind::PastCeiling,
+            () = &mut ceiling => {
+                let now = Instant::now();
+                let since_progress = clock.observe(stream_frames(), now);
+                break (ProofWaitKind::PastCeiling, now, since_progress);
+            }
         }
     };
-    let now = Instant::now();
-    let since_progress = clock.observe(stream_frames(), now);
     let waited = now.saturating_duration_since(proofs.started);
     let frames = clock.frames_sent();
     let detail = match kind {
@@ -403,6 +409,35 @@ mod tests {
             text.contains("no transport progress for 10.0s")
                 && text.contains("this proof wait sent 0 STREAM frames")
                 && text.contains("a test path"),
+            "{text}"
+        );
+        Ok(())
+    }
+
+    /// A frame sent after the stall is decided does not change the report: it
+    /// gives the sample that decided the stall.
+    #[tokio::test(start_paused = true)]
+    async fn a_stall_reports_the_sample_that_decided_it() -> anyhow::Result<()> {
+        // The start sample and the ten 1s samples see no frame. Any later
+        // sample sees one.
+        let samples = Arc::new(AtomicU64::new(0));
+        let frames = {
+            let samples = Arc::clone(&samples);
+            move || u64::from(samples.fetch_add(1, Ordering::Relaxed) > 10)
+        };
+        let read = std::future::pending::<anyhow::Result<()>>();
+        let Err(e) = wait_for_proof(read, &ChunkProofs::start(), frames, String::new).await else {
+            anyhow::bail!("a wait with no proof must fault");
+        };
+        anyhow::ensure!(
+            e.downcast_ref::<ProofWaitFault>()
+                .is_some_and(|f| f.kind == ProofWaitKind::Stalled),
+            "{e:#}"
+        );
+        let text = format!("{e:#}");
+        anyhow::ensure!(
+            text.contains("no transport progress for 10.0s")
+                && text.contains("this proof wait sent 0 STREAM frames"),
             "{text}"
         );
         Ok(())
