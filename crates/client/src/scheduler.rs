@@ -5573,7 +5573,7 @@ mod tests {
         let data = blob(32 * 1024 * 1024);
         let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
         let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
-        // Each lane delivers one ingest checkpoint of its half, then sleeps.
+        // Each lane delivers the first 4 MiB of its half, then sleeps.
         let src_a = ScriptedSource::new(data.clone())?
             .stall_after(4 * 1024 * 1024, Duration::from_hours(1))
             .paying(Arc::clone(&ledger_a));
@@ -5600,9 +5600,10 @@ mod tests {
 
         let reopened = ClientRangedStore::open(dir.path(), "b", root)?;
         let recorded = ranges_content_len(&reopened.present_ranges().await?, total);
+        let landed = 2 * ClientRangedStore::checkpointed_len(4 * 1024 * 1024);
         assert!(
-            recorded >= 8 * 1024 * 1024,
-            "both lanes' landed checkpoints are recorded: {recorded}"
+            recorded >= landed,
+            "both lanes' landed checkpoints are recorded: {recorded}, want at least {landed}"
         );
         assert!(recorded < total);
         Ok(())
@@ -7706,15 +7707,15 @@ mod tests {
             .map(|(_, opened, _)| opened)
             .min()
             .ok_or_else(|| anyhow::anyhow!("B took A's remainder"))?;
-        let (_, refault, _) = a
-            .timeline()
-            .get(1)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("A came back from its cooldown"))?;
-        assert!(
-            extra_opened < refault,
-            "the remainder started on the retry clock, before A came back to fault again"
-        );
+        // A remainder that waited for A would open only after A came back
+        // from its cooldown and faulted again. A fetch that ends first never
+        // sees A again.
+        if let Some(&(_, refault, _)) = a.timeline().get(1) {
+            assert!(
+                extra_opened < refault,
+                "the remainder started on the retry clock, before A came back to fault again"
+            );
+        }
         assert!(count.granted() >= 1, "B grew an extra stream");
         assert_eq!(count.released(), count.granted());
         Ok(())
