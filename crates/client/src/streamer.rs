@@ -196,7 +196,7 @@ pub struct StreamCandidate<S> {
     /// first target's fetch releases it.
     pub lease: LaneLease,
     /// How this lane takes a stream beyond its `lease` ([`crate::LaneWiden`]),
-    /// or `None` to stay at one stream: one extra stream for a queued range
+    /// or `None` to stay at one stream: an extra stream for each queued range
     /// that no idle lane takes, and the stream the lane starts again on once
     /// it gave its `lease` back. Each granted stream is given back as its
     /// worker stops, so it serves every target of a [`crate::Downloader`]

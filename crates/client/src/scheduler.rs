@@ -38,10 +38,11 @@
 //! worker loop drives one `fill_gap` to completion before it picks the next
 //! range), and each source has at most one lane. A lane runs one worker, so
 //! parallelism comes from having many sources. The one exception (#2231,
-//! #2230): a queued range no idle worker takes, such as a faulted lane's
-//! remainder, goes to a busy lane on ONE extra worker, granted by the lane's
-//! [`LaneWiden`], so the range does not wait behind the busy lane's whole
-//! range. The busy lane covers part of the range; or, when part of the range
+//! #2230, #2252): a queued range no idle worker takes, such as a faulted
+//! lane's remainder or one of a queue of runs, goes to a busy lane on an
+//! extra worker, granted by the lane's [`LaneWiden`], so the range does not
+//! wait behind the busy lane's whole range. A lane runs as many extra
+//! workers as its `LaneWiden` grants, one per range. The busy lane covers part of the range; or, when part of the range
 //! has no running lane that covers it, it is any busy lane not barred from
 //! pull-through, and its node serves that part by pull-through. The loop asks
 //! as workers end and lanes build, and again after `GROWTH_RETRY` while a
@@ -659,11 +660,8 @@ struct Work {
     /// ([`Work::add_extra`]).
     lane_of: Vec<usize>,
     /// `extra[i]` is `true` when slot `i` is an extra worker: one more stream
-    /// a lane's [`LaneWiden`] granted for a faulted lane's remainder.
+    /// a lane's [`LaneWiden`] granted for a queued range no idle worker takes.
     extra: Vec<bool>,
-    /// `widened[lane]` is `true` while the lane runs an extra worker. A lane
-    /// runs at most one.
-    widened: Vec<bool>,
     /// `providers[i]` is the payee worker slot `i` fetches from: set by
     /// [`Work::set_provider`] when the loop starts a lane, and copied from
     /// the lane for an extra worker. Steal logs name both sides with it.
@@ -692,7 +690,6 @@ impl Work {
             measured: Vec::new(),
             lane_of: Vec::new(),
             extra: Vec::new(),
-            widened: Vec::new(),
             providers: Vec::new(),
             no_uncovered: Vec::new(),
             front_first,
@@ -738,17 +735,16 @@ impl Work {
             .push(coverage.unwrap_or_else(|| Coverage::full(num_blocks(total_bytes))));
         self.lane_of.push(slot);
         self.extra.push(false);
-        self.widened.push(false);
         self.providers.push(None);
         self.no_uncovered.push(false);
         slot
     }
 
-    /// Give lane `lane` an extra worker's slot, alive and holding nothing, and
-    /// mark the lane widened. Returns the slot. The slot of the lane's last
-    /// extra worker, which has ended, is used again, so a lane takes at most
-    /// one slot for its extra workers however often it grows. Its unit count
-    /// carries on, so a steal made against an earlier unit cannot cancel it.
+    /// Give lane `lane` an extra worker's slot, alive and holding nothing.
+    /// Returns the slot. A slot of an extra worker of the lane that has ended
+    /// is used again, so a lane holds only as many extra slots as it ran extra
+    /// workers at once. Its unit count carries on, so a steal made against an
+    /// earlier unit cannot cancel it.
     fn add_extra(&mut self, lane: usize) -> usize {
         let ended = (0..self.in_flight.len()).find(|&i| {
             self.extra.get(i) == Some(&true)
@@ -781,9 +777,6 @@ impl Work {
             if let Some(p) = self.providers.get_mut(slot) {
                 *p = provider;
             }
-            if let Some(widened) = self.widened.get_mut(lane) {
-                *widened = true;
-            }
             return slot;
         }
         let slot = self.in_flight.len();
@@ -801,30 +794,21 @@ impl Work {
         );
         self.lane_of.push(lane);
         self.extra.push(true);
-        self.widened.push(false);
         self.providers
             .push(self.providers.get(lane).copied().flatten());
         // An extra worker reads its lane's bar through `lane_of`.
         self.no_uncovered.push(false);
-        if let Some(widened) = self.widened.get_mut(lane) {
-            *widened = true;
-        }
         slot
     }
 
-    /// End extra worker slot `i`: it is gone for good, and its lane may be
-    /// widened again.
+    /// End extra worker slot `i`: it is gone for good, and
+    /// [`Work::add_extra`] may use the slot again.
     fn end_extra(&mut self, i: usize) {
         self.park(i);
-        if let Some(&lane) = self.lane_of.get(i)
-            && let Some(widened) = self.widened.get_mut(lane)
-        {
-            *widened = false;
-        }
     }
 
     /// Who can grow for each pending range no idle worker will take: per such
-    /// range, the range and the running lanes that may be asked for one extra
+    /// range, the range and the running lanes that may be asked for an extra
     /// worker for it, in lane order (#2231).
     ///
     /// Ranges are matched to idle workers one to one, in queue order: an idle
@@ -832,7 +816,8 @@ impl Work {
     /// covers, or one that holds a chunk no running lane covers (#2225) unless
     /// its lane is barred from those ([`Work::barred`]), on its next pick. A
     /// lane may be asked for a range only while its own worker runs a range of
-    /// its own, it has no extra worker yet, and `can_grow` allows it. It must
+    /// its own and `can_grow` allows it; its `LaneWiden` bounds how many extra
+    /// workers it runs. It must
     /// also cover part of that range, or, for a range that holds a chunk no
     /// running lane covers, not be barred from pull-through: the same rule as
     /// for an idle worker, so a remainder only the faulted lane covered still
@@ -868,7 +853,6 @@ impl Work {
                     self.extra.get(lane) == Some(&false)
                         && self.alive.get(lane) == Some(&true)
                         && self.in_flight.get(lane).is_some_and(Option::is_some)
-                        && self.widened.get(lane) == Some(&false)
                         && can_grow(lane)
                         && ((orphan && !self.barred(lane)) || covers(lane, seg))
                 })
@@ -2244,8 +2228,8 @@ struct Growth {
 struct GrowthPass {
     /// Each queued range without a taker, as `(start, len)`.
     waiting: Vec<(u64, u64)>,
-    /// How many of them had candidate lanes that all granted nothing or were
-    /// already asked in this pass.
+    /// How many of them had candidate lanes that all refused a stream in
+    /// this pass.
     refused: usize,
     /// How many of them had no candidate lane at all.
     no_candidate: usize,
@@ -2860,8 +2844,8 @@ where
             }
 
             // A queued range no idle worker takes, such as a faulted lane's
-            // remainder, goes to a busy lane on one extra stream, so it does
-            // not wait for that lane's whole range (#2231). The lane covers
+            // remainder, goes to a busy lane on an extra stream, so it does
+            // not wait for that lane's whole range (#2231, #2252). The lane covers
             // part of the range, or, when part of the range has no running
             // lane that covers it, is not barred from pull-through. Asked
             // after this pass started its lanes, so a lane that just started
@@ -2877,7 +2861,7 @@ where
                     growth.may_ask(lane, now)
                         && lane_at.get(&lane).is_some_and(|(_, l)| l.widen.is_some())
                 });
-                let mut asked: HashSet<usize> = HashSet::new();
+                let mut refused_lanes: HashSet<usize> = HashSet::new();
                 let mut pass = GrowthPass {
                     waiting: Vec::new(),
                     refused: 0,
@@ -2888,10 +2872,13 @@ where
                 };
                 for (range, candidates) in wanted {
                     let had_candidates = !candidates.is_empty();
-                    // Ask each candidate lane once per pass, in lane order,
-                    // until one grants a stream. `grow` never waits.
+                    // Ask the candidate lanes in lane order until one grants a
+                    // stream. `grow` never waits. A lane that grants may be
+                    // asked again for the next range, so one pass fills every
+                    // stream the lanes grant; a lane that refuses is not asked
+                    // again in this pass.
                     let taker = candidates.into_iter().find_map(|lane| {
-                        if !asked.insert(lane) {
+                        if refused_lanes.contains(&lane) {
                             return None;
                         }
                         let (provider, l) = lane_at.get(&lane)?;
@@ -2899,6 +2886,9 @@ where
                             .widen
                             .as_ref()
                             .is_some_and(|widen| widen.grow(GrowFor::Extra));
+                        if !granted {
+                            refused_lanes.insert(lane);
+                        }
                         granted.then(|| (lane, *provider, Arc::clone(l)))
                     });
                     let Some((lane, provider, l)) = taker else {
@@ -4121,7 +4111,6 @@ mod tests {
             measured: vec![true; 3],
             lane_of: (0..3).collect(),
             extra: vec![false; 3],
-            widened: vec![false; 3],
             providers: vec![None; 3],
             no_uncovered: vec![false; 3],
             front_first: false,
@@ -6104,13 +6093,13 @@ mod tests {
         );
         assert!(uncovered, "its node serves the remainder by pull-through");
 
-        // A lane runs at most one extra worker: a second orphan finds no
-        // candidate while the first extra runs.
+        // A lane with an extra worker running is asked again for a second
+        // orphan: its `LaneWiden` bounds its extra workers (#2252).
         work.pending.push_back(align_range(0, MIB, total)?);
         assert_eq!(
             candidates(&work),
-            vec![Vec::<usize>::new()],
-            "a widened lane is not asked for a second extra stream"
+            vec![vec![b]],
+            "a lane running an extra stream is asked for another"
         );
         // Once the extra ends, the lane may grow again, on the same slot.
         work.clear(extra)?;
@@ -7516,8 +7505,8 @@ mod tests {
     /// A lane's own worker drains every queued range in turn and never ends
     /// between them, so no worker end asks for growth. The first pass runs
     /// as the lane starts, before its worker holds a range, and finds no busy
-    /// lane to ask. The loop asks again on its retry clock, so the lane takes
-    /// an extra stream for the queue once its worker is busy (#2252).
+    /// lane to ask. The loop asks again on its retry clock, and that one pass
+    /// takes every stream the lane's hook grants for the queue (#2252).
     #[tokio::test(start_paused = true)]
     async fn a_queue_one_lane_drains_grows_an_extra_stream() -> anyhow::Result<()> {
         let data = blob(16 * MIB as usize);
@@ -7525,7 +7514,7 @@ mod tests {
         let a = ScriptedSource::new(data)?
             .slow_finish(Duration::from_secs(2))
             .paying(Arc::clone(&la));
-        let (widen, count) = counting_widen(1);
+        let (widen, count) = counting_widen(2);
         let mut cand_a = candidate(a.clone(), la, 0xA1, None);
         cand_a.widen = Some(widen);
         let provider = StaticSources::new(vec![cand_a])?;
@@ -7534,7 +7523,7 @@ mod tests {
         let mut set = SourceSet::new(&provider, root, Arc::default(), provider.holders());
         let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
         let drive = drive_config();
-        let runs = [(0, MIB), (4 * MIB, MIB), (8 * MIB, MIB), (12 * MIB, MIB)];
+        let runs: Vec<(u64, u64)> = (0..6).map(|i| (i * 2 * MIB, MIB)).collect();
         acquire(
             AcquireTarget {
                 store: &store,
@@ -7557,16 +7546,31 @@ mod tests {
         )
         .await?;
         let present = ranges_content_len(&store.present_ranges().await?, total);
-        assert_eq!(present, 4 * MIB, "every queued run landed");
+        assert_eq!(present, 6 * MIB, "every queued run landed");
 
         let legs = a.timeline();
-        let overlapped = legs.iter().enumerate().any(|(i, &(_, opened, _))| {
-            legs.iter()
-                .take(i)
-                .any(|&(_, _, finished)| finished.is_none_or(|at| opened < at))
-        });
-        assert!(overlapped, "a run opened while another ran: {legs:?}");
-        assert!(count.granted() >= 1, "the lane grew an extra stream");
+        let most_at_once = legs
+            .iter()
+            .map(|&(_, at, _)| {
+                legs.iter()
+                    .filter(|&&(_, opened, finished)| {
+                        opened <= at && finished.is_none_or(|end| at < end)
+                    })
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            most_at_once, 3,
+            "the own stream and both granted extras ran at once: {legs:?}"
+        );
+        let opened: Vec<_> = legs.iter().map(|&(_, at, _)| at).collect();
+        assert_eq!(
+            opened.get(1),
+            opened.get(2),
+            "one growth pass opened both extra streams: {legs:?}"
+        );
+        assert_eq!(count.peak(), 2, "the lane held both granted streams");
         assert!(
             count
                 .calls()
@@ -7811,11 +7815,12 @@ mod tests {
         Ok(())
     }
 
-    /// A lane runs at most one extra worker however many ranges wait: with
-    /// two dead lanes' remainders queued, the busy lane holds at most one
-    /// grant at a time though its hook would grant three.
-    #[tokio::test(start_paused = true)]
-    async fn a_busy_lane_runs_at_most_one_extra_stream() -> anyhow::Result<()> {
+    /// The most extra streams busy lane B holds at once while two dead lanes'
+    /// remainders wait, with a hook that grants up to `grants` streams at once,
+    /// as `(peak, granted, released)`.
+    async fn peak_extras_for_two_remainders(
+        grants: usize,
+    ) -> anyhow::Result<(usize, usize, usize)> {
         let data = blob(48 * MIB as usize);
         let la = Arc::new(PoolLedger::new(Cumulative::default()));
         let lc = Arc::new(PoolLedger::new(Cumulative::default()));
@@ -7823,7 +7828,7 @@ mod tests {
         let a = dead_after_first_mib(&data, &la)?;
         let c = dead_after_first_mib(&data, &lc)?;
         let b = busy(&data, &lb)?;
-        let (widen, count) = counting_widen(3);
+        let (widen, count) = counting_widen(grants);
         let mut cand_b = candidate(b.clone(), Arc::clone(&lb), 0xB2, None);
         cand_b.widen = Some(widen);
         let lanes = StaticSources::new(vec![
@@ -7836,10 +7841,29 @@ mod tests {
         acquire_over(&store, &lanes, lanes.holders(), root, 3).await?;
         store.finalize().await?;
         assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        Ok((count.peak(), count.granted(), count.released()))
+    }
 
-        assert!(count.granted() >= 1, "B grew an extra stream");
-        assert_eq!(count.peak(), 1, "B held at most one extra stream at a time");
-        assert_eq!(count.released(), count.granted());
+    /// A busy lane runs as many extra workers as its hook grants, one per
+    /// waiting range: with two dead lanes' remainders queued it holds more
+    /// than one extra stream at once, never more than the hook grants, and
+    /// with a hook that grants one it never holds more (#2252).
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_lane_runs_as_many_extra_streams_as_granted() -> anyhow::Result<()> {
+        let (peak, granted, released) = peak_extras_for_two_remainders(3).await?;
+        assert!(
+            (2..=3).contains(&peak),
+            "B held several extra streams at once, within its grant: {peak}"
+        );
+        assert_eq!(released, granted);
+
+        let (peak, granted, released) = peak_extras_for_two_remainders(1).await?;
+        assert!(granted >= 1, "B grew an extra stream");
+        assert_eq!(
+            peak, 1,
+            "B held no more extra streams than its hook granted"
+        );
+        assert_eq!(released, granted);
         Ok(())
     }
 
