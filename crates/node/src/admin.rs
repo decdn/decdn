@@ -505,11 +505,15 @@ impl AdminState {
 }
 
 /// Convert a [`CacheError`] into a JSON-RPC error suitable for
-/// `admin_v1_evict`. Distinguished mainly so the operator-facing message
-/// can name the underlying failure mode (`NotFound`, `OriginError`, etc.)
-/// rather than a generic "cache failed".
+/// `admin_v1_evict`. The operator-facing message names the failure and its
+/// whole cause chain (`store error: <context>: <root cause>`) rather than a
+/// generic "cache failed".
 fn cache_error_to_rpc(err: &CacheError) -> ErrorObjectOwned {
-    ErrorObjectOwned::owned(CACHE_ERROR_CODE, err.to_string(), None::<()>)
+    ErrorObjectOwned::owned(
+        CACHE_ERROR_CODE,
+        err.display_chain().to_string(),
+        None::<()>,
+    )
 }
 
 /// Lock a DHT-subsystem `std::sync::Mutex` for `admin_v1_status`,
@@ -1136,6 +1140,15 @@ pub async fn serve(
 mod tests {
     use super::*;
     use decdn_cache::{Hash, Origin};
+
+    /// The RPC message carries the store fault's whole cause chain, so an
+    /// operator running `decdn node evict` sees why the store failed.
+    #[test]
+    fn cache_error_rpc_message_carries_the_cause_chain() {
+        let err = CacheError::Store(anyhow::anyhow!("disk-root-7f3a").context("tag drop"));
+        let rpc = cache_error_to_rpc(&err);
+        assert_eq!(rpc.message(), "store error: tag drop: disk-root-7f3a");
+    }
 
     /// Build a throwaway tempdir-backed cache for tests. The health
     /// method doesn't touch it, but `AdminState::new` requires one —

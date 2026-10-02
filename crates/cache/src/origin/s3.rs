@@ -546,10 +546,9 @@ fn classify_head_object_error(
 ///   * preserves the original `ErrorKind` on the prefixed error, so the
 ///     transient/permanent routing of network faults (`UnexpectedEof`,
 ///     `ConnectionReset`, …) is unchanged; and
-///   * keeps the original error reachable as the `source()` of the returned
-///     error (via [`PrefixedBodyError`]) rather than flattening it into a
-///     formatted `String`, so downstream `.source()` walks and the
-///     payload-preserving intent of `classify_io_error` stay intact.
+///   * keeps the original error's message in `Display` and its own causes on
+///     the `source()` chain (via [`PrefixedBodyError`]), so a chain formatter
+///     names each cause once and nothing under the original error is lost.
 fn prefix_body_stream_error(log_target: &str, e: std::io::Error) -> std::io::Error {
     if e.get_ref()
         .is_some_and(|inner| inner.is::<BlobTooLargeMarker>() || inner.is::<OriginError>())
@@ -567,9 +566,9 @@ fn prefix_body_stream_error(log_target: &str, e: std::io::Error) -> std::io::Err
 }
 
 /// Error wrapper produced by [`prefix_body_stream_error`]. `Display` prepends
-/// the `s3://bucket/key` request context; `source()` returns the original
-/// `io::Error` so the error chain is preserved rather than flattened into a
-/// formatted string.
+/// the `s3://bucket/key` request context to the original `io::Error`'s message.
+/// `source()` continues from the original error's own source, because its
+/// message is already in `Display`: a chain formatter then names it once.
 #[derive(Debug)]
 struct PrefixedBodyError {
     prefix: String,
@@ -584,7 +583,7 @@ impl std::fmt::Display for PrefixedBodyError {
 
 impl std::error::Error for PrefixedBodyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.inner)
+        self.inner.source()
     }
 }
 
@@ -971,14 +970,40 @@ mod tests {
         );
         // Kind must survive so retry routing is unchanged.
         assert_eq!(wrapped.kind(), std::io::ErrorKind::ConnectionReset);
-        // The original error must stay reachable as `source()` rather than
-        // being flattened into the prefixed string.
-        let source = std::error::Error::source(&wrapped)
-            .expect("prefixed body error must expose the original error as source()");
+        // The original message sits in `Display`, so a chain formatter must
+        // not repeat it through `source()`.
+        let chained = format!("{:#}", anyhow::Error::new(wrapped));
         assert_eq!(
-            source.to_string(),
-            "connection reset",
-            "source() must be the un-prefixed original error"
+            chained.matches("connection reset").count(),
+            1,
+            "chain repeated the original error: {chained}"
+        );
+    }
+
+    #[test]
+    fn body_stream_error_keeps_the_original_errors_causes() {
+        // The original error carries a typed payload whose own cause is not in
+        // its `Display`, so the cause can only reach the render through
+        // `source()`.
+        #[derive(Debug, thiserror::Error)]
+        #[error("tls handshake failed")]
+        struct Tls(#[source] std::io::Error);
+
+        let raw = std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            Tls(std::io::Error::other("tls alert")),
+        );
+        let wrapped = prefix_body_stream_error("s3://decdn-blobs/ab/abcdef", raw);
+        let chained = format!("{:#}", anyhow::Error::new(wrapped));
+        assert_eq!(
+            chained.matches("tls handshake failed").count(),
+            1,
+            "original error not named once: {chained}"
+        );
+        assert_eq!(
+            chained.matches("tls alert").count(),
+            1,
+            "nested cause not named once: {chained}"
         );
     }
 

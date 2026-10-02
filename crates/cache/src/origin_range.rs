@@ -381,7 +381,7 @@ impl OriginWindowReader {
     }
 
     fn fail(&self, fault: CacheError) -> io::Error {
-        let msg = fault.to_string();
+        let msg = fault.display_chain().to_string();
         park_fault(&self.fault, fault);
         io::Error::other(msg)
     }
@@ -432,7 +432,7 @@ impl OriginWindowReader {
                 tracing::warn!(
                     %hash,
                     kind = ?self.cursor.origin_kind(),
-                    error = %e,
+                    error = %e.display_chain(),
                     "own origin range window fetch failed mid-stream",
                 );
                 Err(self.fail(e))
