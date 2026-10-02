@@ -1,11 +1,11 @@
 name: Release
 
 # A `vMAJOR.MINOR.PATCH` tag builds `decdn-sponsored` for every platform the
-# installers support and the `sponsord` server for Linux, then publishes them
-# with a SHA256SUMS manifest as a GitHub Release. The gateway's installers pin
-# a release by its tag and by the SHA-256 of that SHA256SUMS file
-# (`SPONSOR_WRAPPER_RELEASE` / `SPONSOR_WRAPPER_SUMS_SHA256`); the release notes
-# print both.
+# installers support and the `sponsord` daemon and `sponsord-onramp` frontend
+# for Linux, then publishes them with a SHA256SUMS manifest as a GitHub
+# Release. The onramp's installers pin a release by its tag and by the SHA-256
+# of that SHA256SUMS file (`ONRAMP_WRAPPER_RELEASE` /
+# `ONRAMP_WRAPPER_SUMS_SHA256`); the release notes print both.
 #
 # This workspace path-depends on `../decdn`. A release builds against the
 # commit pinned in `decdn.ref`, not against whatever `decdn` main is, so the
@@ -70,7 +70,10 @@ jobs:
           - { package: decdn-sponsored, binary: decdn-sponsored, target: x86_64-pc-windows-msvc, runner: windows-latest }
           # Cross-compiled on the x64 runner with the MSVC ARM64 toolchain.
           - { package: decdn-sponsored, binary: decdn-sponsored, target: aarch64-pc-windows-msvc, runner: windows-latest }
-          # The gateway itself, for devops to deploy.
+          # The onramp frontend, for devops to deploy.
+          - { package: sponsord-onramp, binary: sponsord-onramp, target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
+          - { package: sponsord-onramp, binary: sponsord-onramp, target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
+          # The signing and top-up daemon, for devops to deploy.
           - { package: sponsord, binary: sponsord, target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
           - { package: sponsord, binary: sponsord, target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
     steps:
@@ -137,7 +140,7 @@ jobs:
       - name: Checksum manifest
         working-directory: dist
         env:
-          EXPECTED_ARCHIVES: "8"
+          EXPECTED_ARCHIVES: "10"
         run: |
           shopt -s nullglob
           archives=( *.tar.gz *.zip )
@@ -157,11 +160,11 @@ jobs:
           {
             echo "Built against decdn/decdn@${DECDN_REF}."
             echo
-            echo "Pin this release in the gateway's installers with:"
+            echo "Pin this release in the onramp's installers with:"
             echo
             echo '```'
-            echo "SPONSOR_WRAPPER_RELEASE=${TAG}"
-            echo "SPONSOR_WRAPPER_SUMS_SHA256=${SUMS_SHA256}"
+            echo "ONRAMP_WRAPPER_RELEASE=${TAG}"
+            echo "ONRAMP_WRAPPER_SUMS_SHA256=${SUMS_SHA256}"
             echo '```'
           } > notes.md
           gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \

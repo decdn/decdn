@@ -1,6 +1,7 @@
-# decdn-sponsored installer for Windows - served by sponsord at GET /decdn.ps1,
-# with the placeholders below substituted server-side (see
-# crates/server/src/http/installer.rs) from ServerConfig. The POSIX twin is
+# decdn-sponsored installer for Windows - served by sponsord-onramp at
+# GET /decdn.ps1, with the placeholders below substituted server-side (see
+# crates/onramp/src/http/installer.rs) from OnrampConfig and the daemon's
+# /v1/info. The POSIX twin is
 # assets/decdn.sh; the two write the same profile.
 #
 # Install, then download:

@@ -1,13 +1,14 @@
-//! Low-water pool top-up sweep (replaces the channel reclaim sweep). Every
-//! tick, read the pool's remaining balance and, if it is below the low-water
-//! mark, top it up from the treasury by the configured refill amount.
+//! Low-water pool top-up sweep. Every tick, read the pool's remaining
+//! balance and, if it is below the low-water mark, top it up from the
+//! treasury by the configured refill amount.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::B256;
 
 use crate::money::MicroUsdc;
-use crate::state::AppState;
+use crate::treasury::Treasury;
 
 /// Whether `remaining` has dropped below `low_water`.
 #[must_use]
@@ -15,10 +16,10 @@ pub fn needs_refill(remaining: u64, low_water: u64) -> bool {
     remaining < low_water
 }
 
-/// Run the sweep forever on `interval`. Never panics the loop — a failed tick
+/// Run the sweep forever on `interval`. Never panics the loop: a failed tick
 /// is logged and retried next interval.
 pub async fn run(
-    state: AppState,
+    treasury: Arc<dyn Treasury>,
     interval: Duration,
     low_water: MicroUsdc,
     refill: MicroUsdc,
@@ -27,10 +28,10 @@ pub async fn run(
     let mut tick = tokio::time::interval(interval);
     loop {
         tick.tick().await;
-        match state.treasury.remaining(pool_id).await {
+        match treasury.remaining(pool_id).await {
             Ok(remaining) => {
                 if needs_refill(remaining.0, low_water.0) {
-                    match state.treasury.top_up(pool_id, refill).await {
+                    match treasury.top_up(pool_id, refill).await {
                         Ok(credited) => tracing::info!(
                             pool = %pool_id, remaining = remaining.0, credited = credited.0,
                             "pool topped up"

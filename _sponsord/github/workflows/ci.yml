@@ -51,8 +51,9 @@ jobs:
         run: cargo test --workspace
 
   # `decdn-sponsored` is the end-user CLI, installed by `decdn.sh` on macOS and
-  # Linux and by `decdn.ps1` on Windows x64 and ARM64. The server (`sponsord`)
-  # runs only on Linux, so these legs cover the client crate alone.
+  # Linux and by `decdn.ps1` on Windows x64 and ARM64. The servers (`sponsord`,
+  # `sponsord-onramp`) run only on Linux, so these legs cover the client crate
+  # alone.
   client:
     name: client (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}

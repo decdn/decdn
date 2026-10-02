@@ -1,0 +1,33 @@
+[package]
+name = "sponsord-onramp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+alloy.workspace = true
+redb = "4"
+reqwest = { version = "0.12", features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+async-trait = "0.1"
+axum = "0.8"
+thiserror = "2"
+
+[dev-dependencies]
+wiremock = "0.6"
+serial_test = "3"
+tower = { version = "0.5", features = ["util"] }
+# Used by `test_support.rs` (pulled into the integration-test binaries via
+# `#[path]`, not part of the shipped lib/bin) and by the store tests.
+tempfile = "3"
+sponsord = { path = "../daemon" }
+sponsord-core = { path = "../core", features = ["test-support"] }
+decdn-incentive.workspace = true

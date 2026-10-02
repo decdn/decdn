@@ -7,6 +7,7 @@
 <style>
   body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 4rem auto; padding: 0 1rem; }
   #done { display: none; }
+  #expired { display: none; }
   #error { display: none; color: #b00020; }
 </style>
 </head>
@@ -17,6 +18,7 @@
 <div class="cf-turnstile" data-sitekey="{{SITEKEY}}" data-callback="onTurnstileToken"></div>
 
 <p id="done">You can return to your terminal.</p>
+<p id="expired">This key's allowance has expired and cannot be renewed. Start the download again with a fresh key.</p>
 <p id="error">Something went wrong. Please refresh and try again.</p>
 
 <script>
@@ -32,10 +34,7 @@
         if (resp.ok) {
           document.getElementById("done").style.display = "block";
         } else if (resp.status === 409) {
-          const error = document.getElementById("error");
-          error.textContent =
-            "This key's allowance has expired and cannot be renewed. Start the download again with a fresh key.";
-          error.style.display = "block";
+          document.getElementById("expired").style.display = "block";
         } else {
           document.getElementById("error").style.display = "block";
         }

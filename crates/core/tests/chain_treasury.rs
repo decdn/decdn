@@ -1,11 +1,11 @@
-//! Anvil integration test for `sponsord::treasury::DecdnTreasury`.
+//! Anvil integration test for `sponsord_core::treasury::DecdnTreasury`.
 //!
 //! Launches the deploy fixture, funds a hot wallet with gas + mock USDC,
 //! opens a PaymentPool as that wallet, then drives the pool `Treasury`
 //! exactly as the sponsor would: confirm `pool_owner` is the wallet, read
 //! `remaining`, `top_up`, and confirm `remaining` grew by the credited amount.
 //!
-//! Requires `anvil` + `forge` on PATH: `cargo test -p sponsord --features anvil-e2e`.
+//! Requires `anvil` + `forge` on PATH: `cargo test -p sponsord-core --features anvil-e2e`.
 #![cfg(feature = "anvil-e2e")]
 #![allow(
     clippy::unwrap_used,
@@ -22,10 +22,10 @@ use decdn_client::buyer_pool::{ensure_allowance, open_pool};
 use decdn_e2e::chain::ChainFixture;
 use decdn_incentive::Deployment;
 use decdn_incentive::payment_pool::PaymentPool;
-use sponsord::money::MicroUsdc;
-use sponsord::treasury::{TreasuryConfig, connect};
+use sponsord_core::money::MicroUsdc;
+use sponsord_core::treasury::{TreasuryConfig, connect};
 
-/// Opening deposit, in USDC base units (6 decimals) — well above the top-up
+/// Opening deposit, in USDC base units (6 decimals), well above the top-up
 /// amount so `remaining` never risks going negative.
 const OPEN_DEPOSIT_MICRO_USDC: u64 = 50_000_000;
 /// Amount credited by the test's `top_up` call.
@@ -101,7 +101,12 @@ async fn remaining_grows_after_topup() {
     let after = treasury.remaining(pool_id).await.unwrap();
     assert_eq!(after.0, before.0 + credited.0);
 
-    // A signer that never redeemed holds no on-chain authorization.
-    let fresh = PrivateKeySigner::random().address();
-    assert!(!treasury.signer_registered(pool_id, fresh).await.unwrap());
+    // A signer that never redeemed is unregistered.
+    assert_eq!(
+        treasury
+            .authorization(pool_id, alloy::primitives::Address::repeat_byte(0x77))
+            .await
+            .unwrap(),
+        None
+    );
 }

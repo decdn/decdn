@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/server", "crates/wrapper"]
+members = ["crates/core", "crates/daemon", "crates/onramp", "crates/wrapper"]
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

@@ -1,8 +1,8 @@
 #!/bin/sh
-# decdn-sponsored installer for macOS/Linux - served by sponsord at
+# decdn-sponsored installer for macOS/Linux - served by sponsord-onramp at
 # GET /decdn.sh, with the placeholders below substituted server-side (see
-# crates/server/src/http/installer.rs) from ServerConfig, so nothing here
-# needs an environment variable to run. The Windows twin is assets/decdn.ps1;
+# crates/onramp/src/http/installer.rs) from OnrampConfig and the daemon's
+# /v1/info, so nothing here needs an environment variable to run. The Windows twin is assets/decdn.ps1;
 # the two write the same profile.
 #
 # Arguments, when given, are passed to decdn-sponsored after installing, so

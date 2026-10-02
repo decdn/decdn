@@ -1,0 +1,25 @@
+[package]
+name = "sponsord-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[lints]
+workspace = true
+
+[features]
+anvil-e2e = []
+test-support = []
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+alloy.workspace = true
+decdn-client.workspace = true
+decdn-incentive.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+thiserror = "2"
+
+[dev-dependencies]
+decdn-e2e = { path = "../../../decdn/crates/e2e", features = ["anvil-e2e"] }

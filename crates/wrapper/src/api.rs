@@ -1,12 +1,11 @@
 //! Typed HTTP client for the sponsor server's backend contract.
 //!
-//! The wrapper never calls `POST /fund` itself — a browser does that after
+//! The wrapper never calls `POST /fund` itself: a browser does that after
 //! the captcha challenge. This client talks to `GET /capability` (poll for
 //! a capability token the browser flow caused the server to issue) and
 //! builds the `GET /fund` link as a string for the operator to open in a
 //! browser. The JSON shape here MUST byte-match
-//! `crates/server/src/http/capability.rs` — see `.superpowers/sdd/` task
-//! briefs for the frozen contract.
+//! `crates/onramp/src/http/capability.rs`.
 
 use std::time::Duration;
 
