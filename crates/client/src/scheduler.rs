@@ -115,7 +115,7 @@ use crate::health::PeerHealth;
 use crate::ledgers::LaneLedgers;
 use crate::pacer::DownstreamFrontier;
 use crate::segment::{split_evenly, steal_split};
-use crate::source::{BlobSource, Funder, IngestStore, SourceFuture};
+use crate::source::{BlobSource, Funder, IngestStore, SourceFuture, SourceStream};
 use crate::source_set::{Holder, SourceProvider, SourceSet};
 use crate::stop::StopPolicy;
 use crate::streamer::StreamCandidate;
@@ -2259,6 +2259,15 @@ async fn poll_opt<T>(slot: &mut Option<SourceFuture<'_, T>>) -> anyhow::Result<T
     }
 }
 
+/// The next item of `slot`'s stream, or wait forever without one.
+async fn next_opt<T>(slot: &mut Option<SourceStream<'_, T>>) -> Option<T> {
+    use futures_util::StreamExt as _;
+    match slot.as_mut() {
+        Some(stream) => stream.next().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Sleep until `wake`, or forever without one.
 pub(crate) async fn sleep_until_opt(wake: Option<Instant>) {
     match wake {
@@ -2694,6 +2703,10 @@ where
     let mut connecting: FuturesUnordered<Connecting<'p, P::Source>> = FuturesUnordered::new();
     let mut connecting_set: HashSet<Address> = HashSet::new();
     let mut discovering: Option<SourceFuture<'p, Vec<Holder>>> = None;
+    // Holders the provider pushes after the start. While the stream is open
+    // the loop asks for no discovery: the pushed holders are the answer a
+    // discovery would wait for.
+    let mut arrivals: Option<SourceStream<'p, Holder>> = sources.provider().arrivals();
     let mut running: HashSet<Address> = HashSet::new();
     let mut slots: HashMap<Address, usize> = HashMap::new();
     // Each lane slot's provider and lane, for a growth request (#2231).
@@ -2988,6 +3001,7 @@ where
             }
             let uncovered = work.lock().await.uncovered(total_bytes);
             if discovering.is_none()
+                && arrivals.is_none()
                 && sources.wants_discovery(now, deposit, running.len(), uncovered)
             {
                 discovering = Some(sources.provider().discover(sources.hash()));
@@ -3130,6 +3144,21 @@ where
                     let deposit = pool_deposit(&deposit_rx, &started.0);
                     sources.discovery_done(found, Instant::now(), deposit);
                 }
+                arrived = next_opt(&mut arrivals), if arrivals.is_some() => {
+                    match arrived {
+                        Some(holder) => {
+                            tracing::debug!(
+                                provider = %holder.provider,
+                                rtt_ms = holder.rtt_ms,
+                                probed_holder = holder.probed_holder,
+                                "a late holder joined"
+                            );
+                            sources.holders_arrived(vec![holder]);
+                            growth.wanted = true;
+                        }
+                        None => arrivals = None,
+                    }
+                }
                 () = sleep_until_opt(wake) => {}
                 Ok(()) = deposit_rx.changed() => {}
                 // A leg proved a size: the loop top clips the work to it.
@@ -3159,6 +3188,7 @@ where
     // Stop every lane first, so no paid leg sits open while the builds drain.
     drop(workers);
     drop(discovering);
+    drop(arrivals);
     // An error exit can leave a record write in flight: land it before the
     // flush below, so it cannot rename an older snapshot over that one.
     if let Some(pending) = record.take()
@@ -7116,6 +7146,169 @@ mod tests {
                 f.push(holder.provider);
             }
         }
+    }
+
+    /// Static lanes plus holders pushed after the start, each after its own
+    /// delay, and a count of discovery calls. Discovery returns `found`.
+    struct Arriving<'a> {
+        inner: &'a StaticSources<ScriptedSource>,
+        late: Mutex<Option<Vec<(Duration, crate::Holder)>>>,
+        found: Vec<crate::Holder>,
+        discovers: std::sync::atomic::AtomicUsize,
+    }
+
+    impl<'a> Arriving<'a> {
+        fn new(
+            inner: &'a StaticSources<ScriptedSource>,
+            late: Vec<(Duration, crate::Holder)>,
+            found: Vec<crate::Holder>,
+        ) -> Self {
+            Self {
+                inner,
+                late: Mutex::new(Some(late)),
+                found,
+                discovers: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn discovers(&self) -> usize {
+            self.discovers.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::SourceProvider for Arriving<'_> {
+        type Source = ScriptedSource;
+
+        fn discover(&self, _hash: [u8; 32]) -> crate::SourceFuture<'_, Vec<crate::Holder>> {
+            self.discovers
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let found = self.found.clone();
+            Box::pin(async move { Ok(found) })
+        }
+
+        fn connect<'b>(
+            &'b self,
+            holder: &'b crate::Holder,
+        ) -> crate::SourceFuture<'b, StreamCandidate<ScriptedSource>> {
+            self.inner.connect(holder)
+        }
+
+        fn arrivals(&self) -> Option<crate::SourceStream<'_, crate::Holder>> {
+            use futures_util::StreamExt as _;
+            let late = self.late.lock().ok()?.take()?;
+            Some(Box::pin(futures_util::stream::iter(late).then(
+                |(after, holder)| async move {
+                    tokio::time::sleep(after).await;
+                    holder
+                },
+            )))
+        }
+    }
+
+    /// `provider`'s static holder for the lane built with `byte`.
+    fn holder_of(
+        provider: &StaticSources<ScriptedSource>,
+        byte: u8,
+    ) -> anyhow::Result<crate::Holder> {
+        provider
+            .holders()
+            .into_iter()
+            .find(|h| h.provider == Address::repeat_byte(byte))
+            .ok_or_else(|| anyhow::anyhow!("no holder {byte:#x}"))
+    }
+
+    /// A holder pushed one second in takes a free lane beside a busy one, and
+    /// both lanes deliver.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_holder_takes_a_free_lane() -> anyhow::Result<()> {
+        let data = blob(32 * MIB as usize);
+        let (la, lb) = (
+            Arc::new(PoolLedger::new(Cumulative::default())),
+            Arc::new(PoolLedger::new(Cumulative::default())),
+        );
+        let a = busy(&data, &la)?;
+        let b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&lb));
+        let (root, total) = (a.root(), a.total_bytes());
+        let lanes = StaticSources::new(vec![
+            candidate(a.clone(), la, 0xA1, None),
+            candidate(b.clone(), lb, 0xB2, None),
+        ])?;
+        let provider = Arriving::new(
+            &lanes,
+            vec![(Duration::from_secs(1), holder_of(&lanes, 0xB2)?)],
+            Vec::new(),
+        );
+        let (store, dir) = fresh_store(root, total);
+        acquire_over(&store, &provider, vec![holder_of(&lanes, 0xA1)?], root, 2).await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        assert!(a.delivered_bytes() > 0);
+        assert!(b.delivered_bytes() > 0, "the late holder delivered");
+        Ok(())
+    }
+
+    /// The only starting holder refuses every stream. With a holder still to
+    /// arrive, the loop asks for no discovery and completes from the arrival.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_holder_rescues_a_faulted_start() -> anyhow::Result<()> {
+        let data = blob(8 * MIB as usize);
+        let (la, lb) = (
+            Arc::new(PoolLedger::new(Cumulative::default())),
+            Arc::new(PoolLedger::new(Cumulative::default())),
+        );
+        let a = ScriptedSource::new(data.clone())?
+            .refusing_opens_from(0, || anyhow::anyhow!("scripted refusal"))
+            .paying(Arc::clone(&la));
+        let b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&lb));
+        let (root, total) = (a.root(), a.total_bytes());
+        let lanes = StaticSources::new(vec![
+            candidate(a, la, 0xA1, None),
+            candidate(b, lb, 0xB2, None),
+        ])?;
+        let provider = Arriving::new(
+            &lanes,
+            vec![(Duration::from_secs(2), holder_of(&lanes, 0xB2)?)],
+            Vec::new(),
+        );
+        let (store, dir) = fresh_store(root, total);
+        acquire_over(&store, &provider, vec![holder_of(&lanes, 0xA1)?], root, 1).await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        assert_eq!(
+            provider.discovers(),
+            0,
+            "no discovery while arrivals are open"
+        );
+        Ok(())
+    }
+
+    /// Arrivals that end with nothing hand the loop back to discovery.
+    #[tokio::test(start_paused = true)]
+    async fn discovery_resumes_once_arrivals_end() -> anyhow::Result<()> {
+        let data = blob(8 * MIB as usize);
+        let (la, lb) = (
+            Arc::new(PoolLedger::new(Cumulative::default())),
+            Arc::new(PoolLedger::new(Cumulative::default())),
+        );
+        let a = ScriptedSource::new(data.clone())?
+            .refusing_opens_from(0, || anyhow::anyhow!("scripted refusal"))
+            .paying(Arc::clone(&la));
+        let b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&lb));
+        let (root, total) = (a.root(), a.total_bytes());
+        let lanes = StaticSources::new(vec![
+            candidate(a, la, 0xA1, None),
+            candidate(b, lb, 0xB2, None),
+        ])?;
+        let provider = Arriving::new(&lanes, Vec::new(), vec![holder_of(&lanes, 0xB2)?]);
+        let (store, dir) = fresh_store(root, total);
+        acquire_over(&store, &provider, vec![holder_of(&lanes, 0xA1)?], root, 1).await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        assert!(
+            provider.discovers() >= 1,
+            "discovery ran once arrivals ended"
+        );
+        Ok(())
     }
 
     /// Acquire the whole blob into `store` over `provider`'s lanes, with the
