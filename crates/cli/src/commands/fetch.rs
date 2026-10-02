@@ -474,6 +474,232 @@ fn probe_shed(err: &anyhow::Error) -> bool {
     err.downcast_ref::<UpstreamRateLimited>().is_some()
 }
 
+/// How long a probe round keeps collecting answers after the first verified
+/// holder answers. A holder that answers later is either about 125 ms farther
+/// away or still connecting, and would not lead the order. One slow connect
+/// would otherwise hold the whole round for up to the probe timeout.
+const PROBE_SETTLE_AFTER_HOLDER: Duration = Duration::from_millis(250);
+
+/// Run `probes` concurrently and collect their outcomes until every probe has
+/// answered or `grace` has passed since the first outcome `is_holder` accepts.
+/// Returns the collected outcomes, in answer order, and how many probes were
+/// still pending and dropped. With no holder, the round waits for every probe.
+async fn settle_probes<T, F>(
+    probes: impl IntoIterator<Item = F>,
+    grace: Duration,
+    is_holder: impl Fn(&T) -> bool,
+) -> (Vec<T>, usize)
+where
+    F: std::future::Future<Output = T>,
+{
+    use futures_util::StreamExt as _;
+    let mut pending: futures_util::stream::FuturesUnordered<F> = probes.into_iter().collect();
+    let mut settled = Vec::with_capacity(pending.len());
+    let mut deadline: Option<tokio::time::Instant> = None;
+    loop {
+        let next = match deadline {
+            None => pending.next().await,
+            Some(at) => match tokio::time::timeout_at(at, pending.next()).await {
+                Ok(next) => next,
+                Err(_) => break,
+            },
+        };
+        let Some(outcome) = next else { break };
+        if deadline.is_none() && is_holder(&outcome) {
+            deadline = Some(tokio::time::Instant::now() + grace);
+        }
+        settled.push(outcome);
+    }
+    let dropped = pending.len();
+    if dropped > 0 {
+        tracing::debug!(
+            dropped,
+            "probe round settled after the first holder; dropped the pending probes"
+        );
+    }
+    (settled, dropped)
+}
+
+/// Log one probe's raw result at `debug`, with the time since the round started.
+fn log_probe_result(
+    cand: &NodeCandidate,
+    res: &anyhow::Result<(
+        decdn_protocol::message::ProbeResponse,
+        decdn_protocol::ProbeResponseExt,
+        f64,
+    )>,
+    started: std::time::Instant,
+) {
+    match res {
+        Ok((resp, _, rtt_ms)) => tracing::debug!(
+            node = %cand.node_id,
+            elapsed_ms = started.elapsed().as_millis(),
+            rtt_ms = *rtt_ms,
+            has_blob = resp.body.has_blob,
+            "probe answered"
+        ),
+        Err(error) => tracing::debug!(
+            node = %cand.node_id,
+            elapsed_ms = started.elapsed().as_millis(),
+            error = %format_args!("{error:#}"),
+            "probe failed"
+        ),
+    }
+}
+
+/// One probed candidate, verified and classified ([`classify_probe`]).
+enum ProbeOutcome {
+    /// A verified answer that holds the blob, with its peer-store sample.
+    Holder(discovery::Probed, (PublicKey, f64, u64)),
+    /// A verified answer that does not hold the blob, with its peer-store
+    /// sample.
+    NonHolder(discovery::WarmingCandidate, (PublicKey, f64, u64)),
+    /// No answer.
+    Unreachable,
+    /// The candidate kept shedding the probe.
+    RateLimited,
+    /// The answer's `slash_sig` did not recover to the candidate's operator.
+    Unverifiable,
+    /// The answer's `has_blob` and coverage disagree.
+    Unusable,
+}
+
+impl ProbeOutcome {
+    const fn is_holder(&self) -> bool {
+        matches!(self, Self::Holder(..))
+    }
+}
+
+/// A probe round's outcomes, split by what [`probe_and_order`] does with each.
+struct ProbeTally {
+    /// The verified holders.
+    holders: Vec<discovery::Probed>,
+    /// Probed bonded nodes that answered `has_blob:false` — reachable, with a
+    /// measured RTT, but not holding the blob in their cache store. They serve
+    /// two roles: the proxy-warming candidate pool (ADR 037 § Candidate pool)
+    /// when a holder exists but is distant, and — when NO holder answers — the
+    /// pull-through serve targets a cold blob's first fetch bootstraps from
+    /// (#1911), since `has_blob:false` from the cache store does not mean the
+    /// node cannot serve via its own origin. Always collected, because the
+    /// second role does not depend on warming being on.
+    non_holders: Vec<discovery::WarmingCandidate>,
+    /// `(node_id, rtt_ms, rate_per_mb)` for each verified responder, harvested
+    /// into the peer store off the critical path (`spawn_harvest`, called from
+    /// `discover_provider`).
+    probed_samples: Vec<(PublicKey, f64, u64)>,
+    /// The ways a candidate drops out, counted separately: the terminal error
+    /// has to name the one that actually happened. A wrong
+    /// `slash_judge_address` or `chain_id` makes EVERY honest node fail
+    /// verification, and reporting that as "nobody holds the blob" sends the
+    /// operator hunting for missing content instead of a local
+    /// misconfiguration; a node shedding this client's probe rate is
+    /// reachable, and reporting it as silent points at the network instead.
+    unreachable: usize,
+    rate_limited: usize,
+    unverifiable: usize,
+}
+
+impl ProbeTally {
+    fn of(outcomes: Vec<ProbeOutcome>) -> Self {
+        let mut tally = Self {
+            holders: Vec::new(),
+            non_holders: Vec::new(),
+            probed_samples: Vec::new(),
+            unreachable: 0,
+            rate_limited: 0,
+            unverifiable: 0,
+        };
+        for outcome in outcomes {
+            match outcome {
+                ProbeOutcome::Holder(holder, sample) => {
+                    tally.probed_samples.push(sample);
+                    tally.holders.push(holder);
+                }
+                ProbeOutcome::NonHolder(candidate, sample) => {
+                    tally.probed_samples.push(sample);
+                    tally.non_holders.push(candidate);
+                }
+                ProbeOutcome::Unreachable => tally.unreachable += 1,
+                ProbeOutcome::RateLimited => tally.rate_limited += 1,
+                ProbeOutcome::Unverifiable => tally.unverifiable += 1,
+                ProbeOutcome::Unusable => {}
+            }
+        }
+        tally
+    }
+}
+
+/// Verify `cand`'s probe result and classify it. Every response is verified
+/// before it can influence the order (ADR 014 §1). A failure is requester-local
+/// policy, with no reputation effect, because an unrecovered signature
+/// attributes nothing to anyone.
+fn classify_probe(
+    cand: &NodeCandidate,
+    res: anyhow::Result<(
+        decdn_protocol::message::ProbeResponse,
+        decdn_protocol::ProbeResponseExt,
+        f64,
+    )>,
+    hash: [u8; 32],
+    timestamp_us: u64,
+    slash_domain: &alloy::sol_types::Eip712Domain,
+) -> ProbeOutcome {
+    let (resp, resp_ext, rtt_ms) = match res {
+        Ok(answer) => answer,
+        Err(e) if probe_shed(&e) => return ProbeOutcome::RateLimited,
+        Err(_) => return ProbeOutcome::Unreachable,
+    };
+    if let Err(e) = decdn_client::probe::verify_probe_response(
+        &resp,
+        cand.eth_address,
+        slash_domain,
+        hash,
+        timestamp_us,
+    ) {
+        // A candidate silently vanishing from selection is exactly what the
+        // operator needs told, so log why at `warn`.
+        tracing::warn!(
+            "dropping an unverifiable probe response from {}: {e}",
+            cand.node_id
+        );
+        return ProbeOutcome::Unverifiable;
+    }
+    // #1506: `has_blob` and `coverage.is_empty()` are a biconditional by
+    // construction on an honest responder. Neither field is signed, and an
+    // inconsistency has no attributable author, so drop the candidate rather
+    // than score it.
+    if !resp_ext.consistent_with(resp.body.has_blob) {
+        tracing::warn!(
+            "dropping a probe response from {} with has_blob/coverage mismatch",
+            cand.node_id
+        );
+        return ProbeOutcome::Unusable;
+    }
+    // Every verified responder contributes a probe sample, holder or not.
+    let sample = (cand.node_id, rtt_ms, resp.body.rate_per_mb);
+    if resp.body.has_blob {
+        ProbeOutcome::Holder(
+            discovery::Probed {
+                candidate: cand.clone(),
+                rtt_ms,
+                total_bytes: resp_ext.total_bytes,
+                coverage: resp_ext.coverage,
+            },
+            sample,
+        )
+    } else {
+        ProbeOutcome::NonHolder(
+            discovery::WarmingCandidate {
+                node_id: cand.node_id,
+                eth_address: cand.eth_address,
+                rtt_ms,
+                multiaddrs: cand.multiaddrs.clone(),
+            },
+            sample,
+        )
+    }
+}
+
 /// Probe `candidates` for `hash` over `endpoint` and return the ordered
 /// provider-failover list (#1174, ADR 037 § Fallback): the sequence `fetch`
 /// tries in turn, each entry a fallback for the one before it, until one
@@ -500,6 +726,10 @@ fn probe_shed(err: &anyhow::Error) -> bool {
 /// every provider (ADR 003), so there is no per-provider "already funded"
 /// distinction to prefer.
 ///
+/// The round ends [`PROBE_SETTLE_AFTER_HOLDER`] after the first verified
+/// holder answers, or when every probe has answered. A holder the cutoff drops
+/// stays reachable through the fetch's later discovery.
+///
 /// The order is proxy-warming candidates first (nearest RTT first, ADR 037 §
 /// Client selection policy) when warming is enabled and engages, then the
 /// holders nearest RTT first. A caller that walks it therefore gets ADR 037's
@@ -510,14 +740,6 @@ fn probe_shed(err: &anyhow::Error) -> bool {
 /// When no candidate holds the blob, the order is instead the reachable
 /// non-holders, nearest RTT first, as pull-through serve targets — see
 /// [`failover_order`] for why an empty holder set bootstraps rather than fails.
-// One flat pass over the probe responses: verify, drop the inconsistent, split
-// holders from non-holders, then order. The branch count is that per-candidate
-// classification plus the `tracing` diagnostics on the drop and fallback arms.
-#[expect(
-    clippy::cognitive_complexity,
-    clippy::too_many_lines,
-    reason = "flat per-candidate classification pass, not nested control flow"
-)]
 pub(crate) async fn probe_and_order(
     endpoint: &Endpoint,
     candidates: &[NodeCandidate],
@@ -527,107 +749,31 @@ pub(crate) async fn probe_and_order(
     slash_domain: &alloy::sol_types::Eip712Domain,
 ) -> anyhow::Result<ResolvedTargets> {
     let timestamp_us = micros_now();
-    // Probe concurrently in one task. `probe_once`'s future is `Send`, so
-    // `tokio::spawn` would work too; `join_all` over a shared `&endpoint` is
-    // kept because it needs no per-probe clone. `probe_once`'s internal
-    // timeout bounds each leg; a candidate that sheds the probe is probed again
-    // after a short wait (`probe_candidate`).
+    // Probe concurrently in one task, over a shared `&endpoint`. `probe_once`'s
+    // internal timeout bounds each leg; a candidate that sheds the probe is
+    // probed again after a short wait (`probe_candidate`). Each probe verifies
+    // and classifies its own answer, so the round's cutoff starts only on a
+    // verified holder.
+    let started = std::time::Instant::now();
     let probes = candidates.iter().map(|cand| {
         let target = probe_target(cand, relay_hint.cloned());
         async move {
-            (
-                cand,
-                probe_candidate(endpoint, target, hash, timestamp_us).await,
-            )
+            let res = probe_candidate(endpoint, target, hash, timestamp_us).await;
+            log_probe_result(cand, &res, started);
+            classify_probe(cand, res, hash, timestamp_us, slash_domain)
         }
     });
-    let results = futures_util::future::join_all(probes).await;
+    let (outcomes, _dropped) =
+        settle_probes(probes, PROBE_SETTLE_AFTER_HOLDER, ProbeOutcome::is_holder).await;
 
-    let probe_count = results.len();
-    let mut holders = Vec::new();
-    // Probed bonded nodes that answered `has_blob:false` — reachable, with a
-    // measured RTT, but not holding the blob in their cache store. They serve
-    // two roles: the proxy-warming candidate pool (ADR 037 § Candidate pool)
-    // when a holder exists but is distant, and — when NO holder answers — the
-    // pull-through serve targets a cold blob's first fetch bootstraps from
-    // (#1911), since `has_blob:false` from the cache store does not mean the
-    // node cannot serve via its own origin. Always collected, because the second
-    // role does not depend on warming being on.
-    let mut non_holders: Vec<discovery::WarmingCandidate> = Vec::new();
-    // Four ways a candidate drops out, counted separately: the terminal error below
-    // has to name the one that actually happened. A wrong `slash_judge_address` or
-    // `chain_id` makes EVERY honest node fail verification, and reporting that as
-    // "nobody holds the blob" sends the operator hunting for missing content instead
-    // of a local misconfiguration; a node shedding this client's probe rate is
-    // reachable, and reporting it as silent points at the network instead.
-    let mut unreachable = 0usize;
-    let mut rate_limited = 0usize;
-    let mut unverifiable = 0usize;
-    // (node_id, rtt_ms, rate_per_mb) for each holder that answered a probe
-    // this fetch, harvested into the peer store off the critical path
-    // (spawn_harvest, called from discover_provider).
-    let mut probed_samples: Vec<(PublicKey, f64, u64)> = Vec::new();
-    for (cand, res) in results {
-        let (resp, resp_ext, rtt_ms) = match res {
-            Ok(answer) => answer,
-            Err(e) if probe_shed(&e) => {
-                rate_limited += 1;
-                continue;
-            }
-            Err(_) => {
-                unreachable += 1;
-                continue;
-            }
-        };
-        // Verify BEFORE the response can influence the order (ADR 014 §1). A
-        // failure is requester-local policy — drop it and move on, no reputation
-        // effect, because an unrecovered signature attributes nothing to anyone.
-        if let Err(e) = decdn_client::probe::verify_probe_response(
-            &resp,
-            cand.eth_address,
-            slash_domain,
-            hash,
-            timestamp_us,
-        ) {
-            // A candidate silently vanishing from selection is exactly what the
-            // operator needs told, so log why at `warn`.
-            unverifiable += 1;
-            tracing::warn!(
-                "dropping an unverifiable probe response from {}: {e}",
-                cand.node_id
-            );
-            continue;
-        }
-        // #1506: `has_blob` and `coverage.is_empty()` are a biconditional by
-        // construction on an honest responder — neither field is signed, and
-        // an inconsistency has no attributable author, so drop the candidate
-        // rather than score it (same reasoning as an unrecovered `slash_sig`
-        // above).
-        if !resp_ext.consistent_with(resp.body.has_blob) {
-            tracing::warn!(
-                "dropping a probe response from {} with has_blob/coverage mismatch",
-                cand.node_id
-            );
-            continue;
-        }
-        // Every verified responder contributes a probe sample, holder or not.
-        probed_samples.push((cand.node_id, rtt_ms, resp.body.rate_per_mb));
-        if resp.body.has_blob {
-            holders.push(discovery::Probed {
-                candidate: cand.clone(),
-                rtt_ms,
-                total_bytes: resp_ext.total_bytes,
-                coverage: resp_ext.coverage.clone(),
-            });
-        } else {
-            non_holders.push(discovery::WarmingCandidate {
-                node_id: cand.node_id,
-                eth_address: cand.eth_address,
-                rtt_ms,
-                multiaddrs: cand.multiaddrs.clone(),
-            });
-        }
-    }
+    let ProbeTally {
+        holders,
+        non_holders,
+        probed_samples,
+        unreachable,
+        rate_limited,
+        unverifiable,
+    } = ProbeTally::of(outcomes);
 
     // Terminal only when NOTHING can serve — no holder AND no reachable
     // non-holder to pull through. An empty holder set alone is not terminal: a
@@ -635,7 +781,7 @@ pub(crate) async fn probe_and_order(
     // state (#1911), so as long as one bonded node answered it is a serve target.
     if holders.is_empty() && non_holders.is_empty() {
         return Err(no_serve_target_error(
-            probe_count,
+            candidates.len(),
             unreachable,
             rate_limited,
             unverifiable,
@@ -3602,6 +3748,57 @@ mod tests {
         let msg = no_serve_target_error(3, 3, 0, 0).to_string();
         assert!(!msg.contains("rate-limited"), "{msg}");
         assert!(msg.contains("3 did not answer, 0 answered"), "{msg}");
+    }
+
+    /// A probe outcome after `ms` on the paused clock: `(id, holder)`.
+    async fn answer_after(ms: u64, id: u32, holder: bool) -> (u32, bool) {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        (id, holder)
+    }
+
+    /// Every probe that answers within the grace after the first holder is kept.
+    #[tokio::test(start_paused = true)]
+    async fn settle_keeps_every_answer_inside_the_grace() {
+        let grace = Duration::from_millis(250);
+        let probes = vec![
+            answer_after(20, 1, true),
+            answer_after(150, 2, false),
+            answer_after(260, 3, true),
+        ];
+        let (mut got, dropped) = settle_probes(probes, grace, |&(_, h)| h).await;
+        got.sort_unstable();
+        assert_eq!(got, vec![(1, true), (2, false), (3, true)]);
+        assert_eq!(dropped, 0);
+    }
+
+    /// A probe still pending at the first holder's answer plus the grace is
+    /// dropped, and the round ends at that moment.
+    #[tokio::test(start_paused = true)]
+    async fn settle_drops_a_straggler_past_the_grace() {
+        let grace = Duration::from_millis(250);
+        let started = tokio::time::Instant::now();
+        let probes = vec![
+            answer_after(25, 1, true),
+            answer_after(170, 2, false),
+            answer_after(1850, 3, true),
+        ];
+        let (mut got, dropped) = settle_probes(probes, grace, |&(_, h)| h).await;
+        got.sort_unstable();
+        assert_eq!(got, vec![(1, true), (2, false)]);
+        assert_eq!(dropped, 1);
+        assert_eq!(started.elapsed(), Duration::from_millis(275));
+    }
+
+    /// With no holder, the round waits for every probe.
+    #[tokio::test(start_paused = true)]
+    async fn settle_waits_for_every_probe_without_a_holder() {
+        let grace = Duration::from_millis(250);
+        let started = tokio::time::Instant::now();
+        let probes = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
+        let (got, dropped) = settle_probes(probes, grace, |&(_, h)| h).await;
+        assert_eq!(got.len(), 2);
+        assert_eq!(dropped, 0);
+        assert_eq!(started.elapsed(), Duration::from_millis(1850));
     }
 
     /// A loopback probe server that closes every connection with `code`, and
