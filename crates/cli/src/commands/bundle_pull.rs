@@ -1940,18 +1940,33 @@ impl LaneStreamCap {
     /// How a lane to `provider` takes a stream beyond its lease
     /// ([`decdn_client::LaneWiden`]): an extra stream for a queued range no
     /// idle lane takes, or the stream it starts again on. `grow` takes only
-    /// permits of `provider` that are free now and never waits, and `release`
+    /// a permit of `provider` that is free now and never waits, and `release`
     /// gives one back. The lane's first stream holds its permit as its lease,
-    /// so the extra streams fit in the rest of the cap. The acquire gives that
-    /// lease back when the lane's own worker ends, and the lane starts again
-    /// only on a permit `grow` takes.
+    /// so the extra streams fit in the rest of the cap. At a cap of 3 or more,
+    /// an extra stream never takes the provider's last free permit, so a
+    /// sibling entry's first stream to `provider` can still open; the extra
+    /// stream holds its permit for a whole range. A smaller cap has no room
+    /// for both, and an extra stream takes any free permit. The acquire gives
+    /// the lease back when the lane's own worker ends, and the lane starts
+    /// again only on a permit `grow` takes; that start may take the last
+    /// permit, as a first stream does.
     pub(crate) async fn widen(&self, provider: Address) -> decdn_client::LaneWiden {
-        let extras = Arc::new(ExtraPermits::new(self.semaphore(provider).await));
+        let extras = Arc::new(ExtraPermits::new(
+            self.semaphore(provider).await,
+            self.extra_keep(),
+        ));
         let released = Arc::clone(&extras);
         decdn_client::LaneWiden::new(
-            move |most| extras.grant(most),
+            move |kind| extras.grant(kind),
             move || released.release_one(),
         )
+    }
+
+    /// The free permits of a provider an extra stream leaves for a sibling
+    /// entry's first stream: one at a cap of 3 or more, where the lease, an
+    /// extra stream and the kept permit fit, and none below.
+    const fn extra_keep(&self) -> usize {
+        if self.n > 2 { 1 } else { 0 }
     }
 }
 
@@ -1961,41 +1976,51 @@ impl LaneStreamCap {
 struct ExtraPermits {
     /// The provider's per-lane stream semaphore.
     semaphore: Arc<tokio::sync::Semaphore>,
+    /// The free permits an extra stream leaves for a sibling entry's first
+    /// stream.
+    keep: usize,
     /// The permits granted and not yet given back.
     held: std::sync::Mutex<Vec<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 impl ExtraPermits {
-    const fn new(semaphore: Arc<tokio::sync::Semaphore>) -> Self {
+    const fn new(semaphore: Arc<tokio::sync::Semaphore>, keep: usize) -> Self {
         Self {
             semaphore,
+            keep,
             held: std::sync::Mutex::new(Vec::new()),
         }
     }
 
-    /// Take up to `most` permits that are free now, never waiting, and return
-    /// how many were taken.
-    fn grant(&self, most: usize) -> usize {
-        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut granted = 0;
-        while granted < most {
-            match Arc::clone(&self.semaphore).try_acquire_owned() {
-                Ok(permit) => {
-                    held.push(permit);
-                    granted += 1;
-                }
-                Err(tokio::sync::TryAcquireError::NoPermits) => break,
-                Err(tokio::sync::TryAcquireError::Closed) => {
-                    // Nothing closes the semaphore: a closed one grants no
-                    // stream, and says so.
-                    tracing::warn!(
-                        "a lane's stream semaphore is closed; it grants no extra stream"
-                    );
-                    break;
-                }
+    /// Take one permit if it is free now, never waiting, and return whether
+    /// one was taken. An extra stream leaves `keep` free permits for a
+    /// sibling entry's first stream; a restart may take the last one. Every
+    /// entry is polled on one task and this never awaits, so no sibling takes
+    /// a permit between the count and the take.
+    fn grant(&self, kind: decdn_client::GrowFor) -> bool {
+        let keep = match kind {
+            decdn_client::GrowFor::Restart => 0,
+            decdn_client::GrowFor::Extra => self.keep,
+        };
+        if self.semaphore.available_permits() <= keep {
+            return false;
+        }
+        match Arc::clone(&self.semaphore).try_acquire_owned() {
+            Ok(permit) => {
+                self.held
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(permit);
+                true
+            }
+            Err(tokio::sync::TryAcquireError::NoPermits) => false,
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                // Nothing closes the semaphore: a closed one grants no
+                // stream, and says so.
+                tracing::warn!("a lane's stream semaphore is closed; it grants no extra stream");
+                false
             }
         }
-        granted
     }
 
     /// Give back one held permit. The acquire gives back only what `grant`
@@ -8710,18 +8735,22 @@ mod tests {
     }
 
     /// A lane's widen hooks grant only the provider's permits that are free
-    /// now, beside the lane's own lease, and give each one back.
+    /// now, beside the lane's own lease, and give each one back. At a cap of
+    /// 3 or more, extra streams leave the last free permit for a sibling
+    /// entry's first stream; a restart takes it (#2252).
     #[tokio::test]
     async fn a_lane_widens_only_into_free_permits_and_gives_them_back() {
+        use decdn_client::GrowFor::{Extra, Restart};
         let p1 = Address::repeat_byte(1);
         let cap = LaneStreamCap::new(3);
         let lease = cap.try_permit(p1).await.expect("the lane's own permit");
-        let extras = ExtraPermits::new(cap.semaphore(p1).await);
-        assert_eq!(extras.grant(1), 1, "one extra stream");
-        assert_eq!(extras.grant(usize::MAX), 1, "the last free permit");
-        assert_eq!(extras.grant(1), 0, "the cap is full");
+        let extras = ExtraPermits::new(cap.semaphore(p1).await, cap.extra_keep());
+        assert!(extras.grant(Extra), "one extra stream");
+        assert!(!extras.grant(Extra), "the last free permit is kept back");
+        assert!(extras.grant(Restart), "a restart takes the last permit");
+        assert!(!extras.grant(Restart), "the cap is full");
         extras.release_one();
-        assert_eq!(extras.grant(1), 1, "a released permit is free again");
+        assert!(extras.grant(Restart), "a released permit is free again");
         extras.release_one();
         extras.release_one();
         drop(lease);
@@ -8731,6 +8760,23 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(all.len(), 3, "every permit came back");
+    }
+
+    /// At a cap of 2 the lease and one extra stream fill the cap, so an extra
+    /// stream takes the last free permit: keeping it back would leave a lane
+    /// no extra stream at all.
+    #[tokio::test]
+    async fn a_cap_of_two_still_grants_an_extra_stream() {
+        let p1 = Address::repeat_byte(1);
+        let cap = LaneStreamCap::new(2);
+        let _lease = cap.try_permit(p1).await.expect("the lane's own permit");
+        let extras = ExtraPermits::new(cap.semaphore(p1).await, cap.extra_keep());
+        assert!(
+            extras.grant(decdn_client::GrowFor::Extra),
+            "the extra stream"
+        );
+        assert!(cap.try_permit(p1).await.is_none(), "the cap is full");
+        extras.release_one();
     }
 
     #[tokio::test]

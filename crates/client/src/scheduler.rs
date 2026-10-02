@@ -45,7 +45,9 @@
 //! has no running lane that covers it, it is any busy lane not barred from
 //! pull-through, and its node serves that part by pull-through. The loop asks
 //! as workers end and lanes build, and again after `GROWTH_RETRY` while a
-//! `grow` grants nothing. A lane whose node refuses its extra stream waits,
+//! `grow` grants nothing, or while a range has no lane to ask and a running
+//! lane has a [`LaneWiden`]: a worker that takes its next range wakes no
+//! pass (#2252). A lane whose node refuses its extra stream waits,
 //! from `GROWTH_RETRY` and doubling, before it is asked again. A lane with a
 //! [`LaneWiden`] gives its [`LaneLease`] back when its own worker ends, and
 //! starts again only on a stream `grow` grants. The extra worker shares the
@@ -135,6 +137,9 @@ const FIRST_BYTE_GRACE: Duration = Duration::from_secs(30);
 /// [`LaneWiden`] granted nothing while a queued range had no taker. A stream
 /// that a sibling fetch gives back wakes nothing in the loop, so the loop
 /// looks again on this clock until the range has a taker. It is also the
+/// wait after a pass that found no lane to ask for a queued range while a
+/// running lane has a [`LaneWiden`]: an own worker that takes its next range
+/// wakes nothing, so the loop looks again on this clock. It is also the
 /// first wait before a lane is asked again after a node refused its extra
 /// stream ([`EXTRA_RETRY_CAP`]), and the wait before a lane that found no
 /// free stream tries to start again.
@@ -150,8 +155,8 @@ const EXTRA_RETRY_CAP: Duration = Duration::from_secs(30);
 /// them at info, once per run of refusals.
 const EXTRA_REFUSALS_LOGGED: u32 = 3;
 
-/// How often the loop logs again, at info, that the same queued ranges still
-/// wait for a stream.
+/// How often the loop logs, at info, that queued ranges still wait for a
+/// stream. A change between those lines logs at debug.
 const WAITING_RELOG: Duration = Duration::from_secs(30);
 
 /// The unit the planner grows a size claim by. A claim is a hint: when every
@@ -314,31 +319,43 @@ impl std::fmt::Debug for LaneLease {
     }
 }
 
+/// What a [`LaneWiden`] `grow` asks a stream for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrowFor {
+    /// The stream a lane starts again on after its own worker ended and gave
+    /// its [`LaneLease`] back. It stands in for the lane's first stream.
+    Restart,
+    /// An extra stream beside the lane's own, for a queued range no idle lane
+    /// takes. A caller may refuse it a stream that a sibling fetch's first
+    /// stream still needs, such as a provider's last free permit.
+    Extra,
+}
+
 /// How one lane adds a concurrent stream while an [`acquire`] runs
 /// ([`StreamCandidate::widen`]): a `grow` hook that grants streams and a
 /// `release` hook that gives one back. `grow` grants a lane's extra streams,
 /// and the stream a lane starts again on after its own worker ended and gave
-/// its [`LaneLease`] back.
+/// its [`LaneLease`] back; its [`GrowFor`] says which.
 ///
-/// The acquire relies on three rules. `grow` never waits: it grants only what
-/// it can grant now, such as a stream permit that is free. `grow` never grants
-/// more than it is asked for. And `release` is called exactly once for each
-/// stream `grow` granted, when that stream's worker stops for any reason.
+/// The acquire relies on two rules. `grow` never waits: it grants a stream
+/// only when it can grant one now, such as a stream permit that is free. And
+/// `release` is called exactly once for each stream `grow` granted, when that
+/// stream's worker stops for any reason.
 pub struct LaneWiden {
-    /// Grants up to the given number of streams now, extra streams or a
-    /// restart's stream, without waiting, and returns how many it granted.
-    grow: Box<dyn Fn(usize) -> usize + Send + Sync>,
+    /// Grants one stream of the given [`GrowFor`] now, without waiting, and
+    /// returns whether it did.
+    grow: Box<dyn Fn(GrowFor) -> bool + Send + Sync>,
     /// Gives back one granted stream's hold.
     release: Box<dyn Fn() + Send + Sync>,
 }
 
 impl LaneWiden {
-    /// A pair of `grow`, which grants up to the given number of streams now
-    /// (extra streams, or the stream a lane starts again on) and returns how
-    /// many, and `release`, which gives one back. See the type's rules for
-    /// both.
+    /// A pair of `grow`, which grants one stream of the given [`GrowFor`]
+    /// now (an extra stream, or the stream a lane starts again on) and returns
+    /// whether it did, and `release`, which gives one back. See the type's
+    /// rules for both.
     pub fn new(
-        grow: impl Fn(usize) -> usize + Send + Sync + 'static,
+        grow: impl Fn(GrowFor) -> bool + Send + Sync + 'static,
         release: impl Fn() + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -347,10 +364,10 @@ impl LaneWiden {
         }
     }
 
-    /// Ask for up to `most` streams, extra streams or a restart's stream;
-    /// returns how many were granted, at most `most`.
-    pub(crate) fn grow(&self, most: usize) -> usize {
-        (self.grow)(most).min(most)
+    /// Ask for one stream of kind `kind`: a restart's stream, or an extra
+    /// stream. Returns whether it was granted.
+    pub(crate) fn grow(&self, kind: GrowFor) -> bool {
+        (self.grow)(kind)
     }
 
     /// Give back one granted stream's hold.
@@ -2218,8 +2235,9 @@ struct Growth {
     waiting: Vec<(u64, u64)>,
     /// When `waiting` last changed.
     waiting_since: Instant,
-    /// When `waiting` was last logged.
-    logged_at: Instant,
+    /// When `waiting` was last logged at info, or `None` before the first
+    /// such line.
+    logged_at: Option<Instant>,
 }
 
 /// What one growth pass left waiting.
@@ -2231,6 +2249,10 @@ struct GrowthPass {
     refused: usize,
     /// How many of them had no candidate lane at all.
     no_candidate: usize,
+    /// Whether a running lane has a [`LaneWiden`]. A range with no lane to
+    /// ask now can find one once such a lane's own worker holds a range, and
+    /// that pick wakes no pass.
+    growable: bool,
 }
 
 impl Growth {
@@ -2241,7 +2263,7 @@ impl Growth {
             extra_backoff: HashMap::new(),
             waiting: Vec::new(),
             waiting_since: now,
-            logged_at: now,
+            logged_at: None,
         }
     }
 
@@ -2286,16 +2308,18 @@ impl Growth {
 
     /// Record what the pass at `now` left waiting, and when to run the next
     /// pass with no other trigger: after [`GROWTH_RETRY`] when a `grow`
-    /// granted nothing, and when a lane's wait after a refused extra stream
-    /// ends. Log the waiting ranges at info when they change, and every
-    /// [`WAITING_RELOG`] while they stay.
+    /// granted nothing or a range had no lane to ask while a running lane has
+    /// a [`LaneWiden`], and when a lane's wait after a refused extra stream
+    /// ends. Log the waiting ranges at info on the first wait and then at most
+    /// every [`WAITING_RELOG`] while ranges wait, and at debug when they
+    /// change between those lines.
     fn passed(&mut self, now: Instant, hash: [u8; 32], pass: GrowthPass) {
         self.retry_at = None;
         if pass.waiting.is_empty() {
             self.waiting.clear();
             return;
         }
-        if pass.refused > 0 {
+        if pass.refused > 0 || (pass.no_candidate > 0 && pass.growable) {
             self.retry_by(now + GROWTH_RETRY);
         }
         if let Some(ends) = self
@@ -2312,14 +2336,29 @@ impl Growth {
             self.waiting = pass.waiting;
             self.waiting_since = now;
         }
-        if changed || now.saturating_duration_since(self.logged_at) >= WAITING_RELOG {
-            self.logged_at = now;
+        let ranges = byte_runs(self.waiting.iter().copied());
+        let waited_secs = now.saturating_duration_since(self.waiting_since).as_secs();
+        if self
+            .logged_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= WAITING_RELOG)
+        {
+            self.logged_at = Some(now);
             tracing::info!(
                 hash = %blake3::Hash::from_bytes(hash).to_hex(),
-                ranges = %byte_runs(self.waiting.iter().copied()),
+                %ranges,
                 refused = pass.refused,
                 no_candidate = pass.no_candidate,
-                waited_secs = now.saturating_duration_since(self.waiting_since).as_secs(),
+                waited_secs,
+                "a queued range waits for a stream: no idle lane takes it, and no busy lane \
+                 could take one more stream for it"
+            );
+        } else if changed {
+            tracing::debug!(
+                hash = %blake3::Hash::from_bytes(hash).to_hex(),
+                %ranges,
+                refused = pass.refused,
+                no_candidate = pass.no_candidate,
+                waited_secs,
                 "a queued range waits for a stream: no idle lane takes it, and no busy lane \
                  could take one more stream for it"
             );
@@ -2771,7 +2810,7 @@ where
                     let grant = match lane.widen.as_ref() {
                         Some(widen) if restart && !lane.lease.is_held() => {
                             let at = Instant::now();
-                            if widen.grow(1) == 0 {
+                            if !widen.grow(GrowFor::Restart) {
                                 if sources.start_refused(provider, at + GROWTH_RETRY) {
                                     tracing::info!(
                                         %provider,
@@ -2828,7 +2867,10 @@ where
             // after this pass started its lanes, so a lane that just started
             // counts as a taker. A lane whose node refused its extra stream
             // waits before it is asked again; a pass that a `grow` refused
-            // runs again after `GROWTH_RETRY` (#2230).
+            // runs again after `GROWTH_RETRY` (#2230). So does a pass that
+            // found no lane to ask while a running lane has a `LaneWiden`: a
+            // worker that takes its next range wakes no pass, and an own
+            // worker drains a whole queue without ending (#2252).
             if growth.due(now) {
                 let mut w = work.lock().await;
                 let wanted = w.growth_wanted(total_bytes, |lane| {
@@ -2840,6 +2882,9 @@ where
                     waiting: Vec::new(),
                     refused: 0,
                     no_candidate: 0,
+                    growable: lane_at
+                        .values()
+                        .any(|(provider, l)| running.contains(provider) && l.widen.is_some()),
                 };
                 for (range, candidates) in wanted {
                     let had_candidates = !candidates.is_empty();
@@ -2850,7 +2895,10 @@ where
                             return None;
                         }
                         let (provider, l) = lane_at.get(&lane)?;
-                        let granted = l.widen.as_ref().is_some_and(|widen| widen.grow(1) > 0);
+                        let granted = l
+                            .widen
+                            .as_ref()
+                            .is_some_and(|widen| widen.grow(GrowFor::Extra));
                         granted.then(|| (lane, *provider, Arc::clone(l)))
                     });
                     let Some((lane, provider, l)) = taker else {
@@ -6934,10 +6982,10 @@ mod tests {
     struct WidenCount {
         granted: std::sync::atomic::AtomicUsize,
         released: std::sync::atomic::AtomicUsize,
-        /// Calls of `grow`.
-        asks: std::sync::atomic::AtomicUsize,
         /// The most grants held at once.
         peak: std::sync::atomic::AtomicUsize,
+        /// Each `grow` call's kind and whether it granted, in call order.
+        calls: Mutex<Vec<(super::GrowFor, bool)>>,
     }
 
     impl WidenCount {
@@ -6949,21 +6997,25 @@ mod tests {
             self.released.load(std::sync::atomic::Ordering::SeqCst)
         }
 
-        fn asks(&self) -> usize {
-            self.asks.load(std::sync::atomic::Ordering::SeqCst)
-        }
-
         fn peak(&self) -> usize {
             self.peak.load(std::sync::atomic::Ordering::SeqCst)
         }
 
-        /// Count one `grow` call that granted `give`.
-        fn grew(&self, give: usize) {
+        /// Each `grow` call's kind and whether it granted, in call order.
+        fn calls(&self) -> Vec<(super::GrowFor, bool)> {
+            self.calls.lock().map(|c| c.clone()).unwrap_or_default()
+        }
+
+        /// Count one `grow` call of `kind` that granted a stream or not.
+        fn grew(&self, kind: super::GrowFor, granted: bool) {
             use std::sync::atomic::Ordering;
-            self.asks.fetch_add(1, Ordering::SeqCst);
-            self.granted.fetch_add(give, Ordering::SeqCst);
+            self.granted
+                .fetch_add(usize::from(granted), Ordering::SeqCst);
             let held = self.granted().saturating_sub(self.released());
             self.peak.fetch_max(held, Ordering::SeqCst);
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push((kind, granted));
+            }
         }
     }
 
@@ -6974,10 +7026,10 @@ mod tests {
         let count = Arc::new(WidenCount::default());
         let (on_grow, on_release) = (Arc::clone(&count), Arc::clone(&count));
         let widen = super::LaneWiden::new(
-            move |most| {
+            move |kind| {
                 let held = on_grow.granted().saturating_sub(on_grow.released());
-                let give = most.min(room.saturating_sub(held));
-                on_grow.grew(give);
+                let give = held < room;
+                on_grow.grew(kind, give);
                 give
             },
             move || {
@@ -7326,22 +7378,29 @@ mod tests {
 
     /// A lane's widen hooks over `free`, stream permits it shares with
     /// sibling fetches the test plays: `grow` takes only permits free now,
-    /// and `release` puts one back.
+    /// and `release` puts one back. An extra stream leaves `keep` permits
+    /// free, as the CLI keeps one back for a sibling's first stream; a
+    /// restart may take the last one.
     fn shared_widen(
         free: &Arc<std::sync::atomic::AtomicUsize>,
+        keep: usize,
     ) -> (super::LaneWiden, Arc<WidenCount>) {
         use std::sync::atomic::Ordering;
         let count = Arc::new(WidenCount::default());
         let (on_grow, on_release) = (Arc::clone(&count), Arc::clone(&count));
         let (take, give) = (Arc::clone(free), Arc::clone(free));
         let widen = super::LaneWiden::new(
-            move |most| {
+            move |kind| {
+                let keep = match kind {
+                    super::GrowFor::Restart => 0,
+                    super::GrowFor::Extra => keep,
+                };
                 let taken = take
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                        Some(n.saturating_sub(most))
+                        (n > keep).then(|| n.saturating_sub(1))
                     })
-                    .map_or(0, |n| n.min(most));
-                on_grow.grew(taken);
+                    .is_ok();
+                on_grow.grew(kind, taken);
                 taken
             },
             move || {
@@ -7366,7 +7425,7 @@ mod tests {
         let a = dead_after_first_mib(&data, &la)?;
         let b = busy(&data, &lb)?;
         let free = Arc::new(AtomicUsize::new(0));
-        let (widen, count) = shared_widen(&free);
+        let (widen, count) = shared_widen(&free, 0);
         let mut cand_b = candidate(b.clone(), Arc::clone(&lb), 0xB2, None);
         cand_b.widen = Some(widen);
         let lanes = StaticSources::new(vec![candidate(a.clone(), la, 0xA1, None), cand_b])?;
@@ -7413,6 +7472,109 @@ mod tests {
             "the remainder started on the retry clock, before A came back to fault again"
         );
         assert!(count.granted() >= 1, "B grew an extra stream");
+        assert_eq!(count.released(), count.granted());
+        Ok(())
+    }
+
+    /// A pass arms the growth retry when a `grow` granted nothing, or when a
+    /// range had no lane to ask while a running lane has a [`LaneWiden`]. A
+    /// fetch with no `LaneWiden`, such as `decdn fetch`, arms none for a range
+    /// with no lane to ask, and a pass with nothing waiting clears the wait.
+    #[test]
+    fn a_pass_retries_while_a_lane_can_still_grow() {
+        use super::{GROWTH_RETRY, Growth, GrowthPass};
+        let pass = |refused, no_candidate, growable| GrowthPass {
+            waiting: vec![(0, MIB)],
+            refused,
+            no_candidate,
+            growable,
+        };
+        let now = super::Instant::now();
+        let cases = [
+            (pass(0, 1, false), None),
+            (pass(0, 1, true), Some(now + GROWTH_RETRY)),
+            (pass(1, 0, false), Some(now + GROWTH_RETRY)),
+        ];
+        for (p, want) in cases {
+            let mut growth = Growth::new(now);
+            growth.passed(now, [0; 32], p);
+            assert_eq!(growth.retry_at, want);
+        }
+        let mut growth = Growth::new(now);
+        growth.passed(now, [0; 32], pass(0, 1, true));
+        let empty = GrowthPass {
+            waiting: Vec::new(),
+            refused: 0,
+            no_candidate: 0,
+            growable: true,
+        };
+        growth.passed(now, [0; 32], empty);
+        assert_eq!(growth.retry_at, None);
+        assert!(growth.waiting.is_empty());
+    }
+
+    /// A lane's own worker drains every queued range in turn and never ends
+    /// between them, so no worker end asks for growth. The first pass runs
+    /// as the lane starts, before its worker holds a range, and finds no busy
+    /// lane to ask. The loop asks again on its retry clock, so the lane takes
+    /// an extra stream for the queue once its worker is busy (#2252).
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_one_lane_drains_grows_an_extra_stream() -> anyhow::Result<()> {
+        let data = blob(16 * MIB as usize);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let a = ScriptedSource::new(data)?
+            .slow_finish(Duration::from_secs(2))
+            .paying(Arc::clone(&la));
+        let (widen, count) = counting_widen(1);
+        let mut cand_a = candidate(a.clone(), la, 0xA1, None);
+        cand_a.widen = Some(widen);
+        let provider = StaticSources::new(vec![cand_a])?;
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, _dir) = fresh_store(root, total);
+        let mut set = SourceSet::new(&provider, root, Arc::default(), provider.holders());
+        let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+        let drive = drive_config();
+        let runs = [(0, MIB), (4 * MIB, MIB), (8 * MIB, MIB), (12 * MIB, MIB)];
+        acquire(
+            AcquireTarget {
+                store: &store,
+                hash: root,
+                total_bytes: total,
+                ranges: &runs,
+            },
+            &mut set,
+            &AcquireEnv {
+                pacer: &BudgetPacer::new(),
+                funder: &no_topups(),
+                drive: &drive,
+                max_lanes: 1,
+                stop: &stop,
+                on_progress: None,
+                ledgers: None,
+                pacing: None,
+                max_blob_bytes: 0,
+            },
+        )
+        .await?;
+        let present = ranges_content_len(&store.present_ranges().await?, total);
+        assert_eq!(present, 4 * MIB, "every queued run landed");
+
+        let legs = a.timeline();
+        let overlapped = legs.iter().enumerate().any(|(i, &(_, opened, _))| {
+            legs.iter()
+                .take(i)
+                .any(|&(_, _, finished)| finished.is_none_or(|at| opened < at))
+        });
+        assert!(overlapped, "a run opened while another ran: {legs:?}");
+        assert!(count.granted() >= 1, "the lane grew an extra stream");
+        assert!(
+            count
+                .calls()
+                .iter()
+                .all(|(kind, _)| *kind == super::GrowFor::Extra),
+            "a busy lane asks for extra streams: {:?}",
+            count.calls()
+        );
         assert_eq!(count.released(), count.granted());
         Ok(())
     }
@@ -7582,7 +7744,9 @@ mod tests {
 
     /// A lane that faults and finds no free stream to start again on tries
     /// again each `GROWTH_RETRY`, not on a growing build backoff, and starts
-    /// once a sibling fetch frees a stream. Every grant comes back.
+    /// once a sibling fetch frees a stream. The freed stream is the last free
+    /// one, which an extra stream may not take: the start asks for it as a
+    /// restart. Every grant comes back.
     #[tokio::test(start_paused = true)]
     async fn a_lane_refused_a_stream_starts_again_once_one_frees() -> anyhow::Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7593,7 +7757,7 @@ mod tests {
             .fault_once_after(MIB as usize, || anyhow::anyhow!("scripted reset"))
             .paying(Arc::clone(&la));
         let free = Arc::new(AtomicUsize::new(0));
-        let (widen, count) = shared_widen(&free);
+        let (widen, count) = shared_widen(&free, 1);
         let mut cand_a = candidate(a.clone(), la, 0xA1, None);
         cand_a.widen = Some(widen);
         let lanes = StaticSources::new(vec![cand_a])?;
@@ -7628,12 +7792,21 @@ mod tests {
             late <= super::GROWTH_RETRY,
             "A started again within a retry of the freed stream, {late:?} after"
         );
+        let calls = count.calls();
+        let restarts = calls
+            .iter()
+            .filter(|(kind, _)| *kind == super::GrowFor::Restart)
+            .count();
         assert!(
-            count.asks() <= 25,
-            "A asked for a stream about once a second: {}",
-            count.asks()
+            restarts <= 25,
+            "A asked for a stream to start again on about once a second: {restarts}"
         );
-        assert_eq!(count.granted(), 1);
+        let granted: Vec<_> = calls
+            .iter()
+            .filter(|(_, granted)| *granted)
+            .map(|(kind, _)| *kind)
+            .collect();
+        assert_eq!(granted, [super::GrowFor::Restart], "{calls:?}");
         assert_eq!(count.released(), count.granted());
         Ok(())
     }

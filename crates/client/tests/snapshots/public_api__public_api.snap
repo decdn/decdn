@@ -601,6 +601,9 @@ pub decdn_client::Fault::Fatal(decdn_client::fault::FatalScope)
 pub decdn_client::Fault::Source
 pub decdn_client::Fault::Transient
 pub decdn_client::Fault::Unaffordable
+pub enum decdn_client::GrowFor
+pub decdn_client::GrowFor::Extra
+pub decdn_client::GrowFor::Restart
 pub enum decdn_client::Health
 pub decdn_client::Health::Cooling
 pub decdn_client::Health::Cooling::streak: u32
@@ -787,7 +790,7 @@ pub decdn_client::LaneRange::past_end: bool
 pub decdn_client::LaneRange::uncovered: bool
 pub struct decdn_client::LaneWiden
 impl decdn_client::LaneWiden
-pub fn decdn_client::LaneWiden::new(impl core::ops::function::Fn(usize) -> usize + core::marker::Send + core::marker::Sync + 'static, impl core::ops::function::Fn() + core::marker::Send + core::marker::Sync + 'static) -> Self
+pub fn decdn_client::LaneWiden::new(impl core::ops::function::Fn(decdn_client::GrowFor) -> bool + core::marker::Send + core::marker::Sync + 'static, impl core::ops::function::Fn() + core::marker::Send + core::marker::Sync + 'static) -> Self
 impl core::fmt::Debug for decdn_client::LaneWiden
 pub fn decdn_client::LaneWiden::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::LegNoProgress

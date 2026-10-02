@@ -318,7 +318,9 @@ where
     /// ([`lane_lease`]), taken before the build and never waited for. Every
     /// lane it returns, the parked one included, takes an extra stream, or
     /// the stream it starts again on after its lease is given back, only
-    /// from the provider's permits that are free ([`LaneStreamCap::widen`]).
+    /// from the provider's permits that are free; at a cap of 3 or more an
+    /// extra stream leaves the last free one for a sibling entry
+    /// ([`LaneStreamCap::widen`]).
     async fn build(&self, holder: &Holder) -> anyhow::Result<StreamCandidate<PeerSource<'a>>> {
         let parked = self
             .parked
