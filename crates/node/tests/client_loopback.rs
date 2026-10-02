@@ -1208,6 +1208,48 @@ async fn expect_reject(recv: &mut RecvStream, expected: VoucherRejectReason) -> 
     }
 }
 
+/// A serve's first frame is small, so the first byte leaves after a few chunk
+/// groups rather than a whole interval. The frames after it still fill the
+/// interval exactly, and the node parks for its voucher at the same boundary.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_frame_is_small_and_the_interval_still_ends_on_its_boundary() -> anyhow::Result<()>
+{
+    const CREDIT_MAX: u64 = 64 * 1024 * 1024;
+    const FIRST_FRAME_MAX: u64 = 64 * 1024;
+    let payload = vec![0x45u8; 8 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+    let (target, _server_eth, server_ep, server_task, _metrics) =
+        spawn_pipelined_server_with_metrics(cache, Arc::clone(&store), CREDIT_MAX, 2).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+    let (_send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+
+    let first = tokio::time::timeout(Duration::from_secs(10), read_client_msg(&mut recv))
+        .await
+        .map_err(|_| anyhow::anyhow!("no first frame"))??;
+    let ClientMessage::ChunkData(first) = first else {
+        anyhow::bail!("expected ChunkData, got {first:?}");
+    };
+    let first_len = first.bytes().len() as u64;
+    anyhow::ensure!(
+        first_len <= FIRST_FRAME_MAX,
+        "the first frame carries {first_len} bytes, over {FIRST_FRAME_MAX}"
+    );
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES - first_len).await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// The whole `PayWord` tick, end to end: one signed voucher opens a chain, and
 /// from then on each delivered chunk is paid for by a single 33-byte reveal with
 /// no signature at all. The node credits the reveal exactly as it would a

@@ -353,14 +353,15 @@ impl ClientHandler {
         // live — that is where a mid-export store fault or the truncation refusal
         // surfaces, because the export streams (#1132).
         let mut chunks = ChunkFramer::new(data, hash);
-        // Nothing is delivered, paid, or vouchered yet, so the opening frame may run
-        // a whole interval against the whole opening window.
+        // The opening frame is small, so the first byte leaves after a few chunk
+        // groups of store read rather than a whole interval
+        // ([`ClientHandler::first_frame_target`]).
         // The first byte is about to go out: from here a stream that ends unpaid
         // forfeits its ramp credit (ADR 003 §Credit window).
         carry.start_delivery();
         let opening_window = self.credit_window(chunk_bytes, carry.ramp_paid(0));
         let mut next_chunk = chunks
-            .next_frame_chunks(self.frame_target(0, chunk_bytes, opening_window))
+            .next_frame_chunks(self.first_frame_target(chunk_bytes, opening_window))
             .await
             .map_err(|e| self.meter_frame_fault(e))?;
 
