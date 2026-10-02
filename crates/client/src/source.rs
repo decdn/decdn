@@ -47,6 +47,10 @@ use crate::{
 pub type SourceFuture<'a, T> =
     core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<T>> + Send + 'a>>;
 
+/// A boxed, `Send` stream returned by the streaming methods in this module,
+/// the stream sibling of [`SourceFuture`].
+pub type SourceStream<'a, T> = core::pin::Pin<Box<dyn futures_util::Stream<Item = T> + Send + 'a>>;
+
 /// A reader over the raw interleaved bao encoding of one range.
 ///
 /// The store's ingest decoder pulls bytes on demand through

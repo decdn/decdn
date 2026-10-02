@@ -246,7 +246,7 @@ pub use scheduler::{
 pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{
     BaoRangeReader, BlobSource, Funder, IngestStore, PRIMED_MAX_IDLE, PeerSource, PrimedSource,
-    SourceFuture,
+    SourceFuture, SourceStream,
 };
 pub use source_set::{
     Holder, LaneRange, NoAffordableSource, NoSourceHasBlob, SourceProvider, SourceSet,
