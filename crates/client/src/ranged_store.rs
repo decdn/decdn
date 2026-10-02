@@ -760,8 +760,10 @@ impl ClientRangedStore {
                     // A steal lowered the end to a split this prefix reached:
                     // stop here, so the bytes past it go to the stealer alone.
                     // A prefix that reached the range's end drains as usual.
+                    // `on_progress` above published this prefix before the
+                    // end is read, the order a steal relies on.
                     if received_end < range.fetch_end()
-                        && stop_at.is_some_and(|end| received_end >= end.load(Ordering::Acquire))
+                        && stop_at.is_some_and(|end| received_end >= end.load(Ordering::SeqCst))
                     {
                         let r = rest.finish();
                         flusher.finish(batch, received_end).await?;

@@ -1208,7 +1208,9 @@ where
                         verified.fetch_add(delta, Ordering::Relaxed);
                     }
                     if let Some(frontier) = frontier {
-                        frontier.fetch_max(leg_start.saturating_add(received), Ordering::Release);
+                        // `SeqCst`, against the steal that lowers `stop_at`
+                        // and then reads this frontier (`Work::steal`).
+                        frontier.fetch_max(leg_start.saturating_add(received), Ordering::SeqCst);
                     }
                     let Some(cb) = on_progress else { return };
                     let position = match progress_agg {

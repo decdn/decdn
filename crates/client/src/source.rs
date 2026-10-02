@@ -176,7 +176,12 @@ pub trait IngestStore: decdn_bao_range::RangedStore {
     ///
     /// `stop_at` is an end the caller can lower while the leg streams. Once
     /// the verified prefix reaches it, the ingest checkpoints that prefix and
-    /// returns [`IngestEnd::Stopped`] without reading further. A steal lowers
+    /// returns [`IngestEnd::Stopped`] without reading further. After each
+    /// verified group it reports the prefix through `on_progress` first, then
+    /// reads `stop_at` with `SeqCst`. A caller that records the prefix with
+    /// `SeqCst`, lowers `stop_at`, and then reads the recorded prefix with
+    /// `SeqCst` knows where the leg stops: at the lowered end when the prefix
+    /// read is short of it, and within one group past that prefix otherwise. A steal lowers
     /// it to the split, so the leg stops there on its open stream. A
     /// chunk-group-aligned end cuts the pre-order bao encoding of `range`
     /// between two items, so the stopped prefix verifies on its own.

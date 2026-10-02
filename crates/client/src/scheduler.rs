@@ -1281,7 +1281,7 @@ impl Work {
             .iter()
             .zip(&remaining)
             .filter_map(|(&owner, &(start, _))| {
-                let frontier = self.live.get(owner)?.frontier.load(Ordering::Acquire);
+                let frontier = self.live.get(owner)?.frontier.load(Ordering::SeqCst);
                 (frontier > start).then(|| (start, frontier - start))
             })
             .collect();
@@ -1322,14 +1322,21 @@ impl Work {
         // at most one lane owns any range, by construction, in the work-state.
         // Under the same lock, lower the victim's end to the split: its leg
         // stops there on its open stream, and the victim opens no new stream
-        // for the part it keeps. The split lies past the victim's received
-        // frontier, so the tail is fetched and paid for by this worker alone.
+        // for the part it keeps.
         //
         // Every branch that cannot complete that trim DECLINES the steal instead
         // of proceeding. Handing out `tail` with the victim untrimmed would leave
         // two workers owning overlapping ranges, and both would pay for the
         // overlap: the exact double-pay the trim exists to prevent.
-        let victim = owners.get(v).copied().and_then(|victim| {
+        let Some(victim_unit) = owners
+            .get(v)
+            .and_then(|&owner| self.live.get(owner))
+            .map(Arc::clone)
+        else {
+            *self.slot_mut(i)? = None;
+            return Ok(None);
+        };
+        let trimmed = owners.get(v).copied().and_then(|victim| {
             if victim == i {
                 return None;
             }
@@ -1337,30 +1344,52 @@ impl Work {
             if tail.fetch_start() <= *start {
                 return None;
             }
+            let end = start.saturating_add(*len);
             *len = tail.fetch_start() - *start;
-            Some(victim)
+            Some((victim, *start, end))
         });
-        let Some(victim) = victim else {
+        let Some((victim, victim_start, victim_end)) = trimmed else {
             *self.slot_mut(i)? = None;
             return Ok(None);
         };
-        let victim_unit = self.live.get(victim).map(Arc::clone);
-        if let Some(victim_unit) = &victim_unit {
-            victim_unit
-                .stop_at
-                .fetch_min(tail.fetch_start(), Ordering::AcqRel);
-        }
+        // Lower the end, then read the victim's frontier again. Both sides
+        // order their two accesses `SeqCst`: the victim publishes each
+        // verified group's end, then reads its own end (`fill_gap`). So
+        // either the victim sees the lowered end before it verifies past the
+        // split, or this read sees a frontier at or past the split.
+        victim_unit
+            .stop_at
+            .fetch_min(tail.fetch_start(), Ordering::SeqCst);
+        let frontier = victim_unit.frontier.load(Ordering::SeqCst);
+        let tail = if frontier < tail.fetch_start() {
+            tail
+        } else if frontier >= tail.fetch_end() {
+            // The victim received its whole range before it saw the lowered
+            // end, and its leg drains to the end: nothing is left to steal.
+            if let Some(Some((_, len))) = self.in_flight.get_mut(victim) {
+                *len = victim_end - victim_start;
+            }
+            *self.slot_mut(i)? = None;
+            return Ok(None);
+        } else {
+            // The victim verified past the split before it saw the lowered
+            // end. It stops at the frontier read here, or one chunk group
+            // past it: start the tail at that frontier, so the two overlap by
+            // at most one group and leave no byte unowned.
+            if let Some(Some((_, len))) = self.in_flight.get_mut(victim) {
+                *len = frontier - victim_start;
+            }
+            align_range(frontier, tail.fetch_end() - frontier, total_bytes)?
+        };
         tracing::debug!(
             stealer = ?self.providers.get(i).copied().flatten(),
             victim = ?self.providers.get(victim).copied().flatten(),
             split = tail.fetch_start(),
             stolen = tail.fetch_len(),
             victim_range = ?self.in_flight.get(victim).copied().flatten(),
-            victim_frontier = victim_unit
-                .as_ref()
-                .map(|u| u.frontier.load(Ordering::Acquire)),
+            victim_frontier = frontier,
             stealer_rate,
-            victim_rate = victim_unit.as_ref().and_then(|u| u.rate()),
+            victim_rate = victim_unit.rate(),
             "stole the tail of a lane's missing remainder"
         );
 

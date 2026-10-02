@@ -3678,9 +3678,10 @@ impl UpstreamPull {
     /// source and this one opens no new stream for the part it keeps.
     ///
     /// A rejection the node already sent waits behind the `ChunkData` it sent
-    /// first, so the stop first passes over what has arrived, without waiting:
-    /// a `VoucherRejected` there rewinds the rejected proof and surfaces as the
-    /// typed rejection, as it does at [`Self::finish`]. A rejection still in
+    /// first, so the stop first reads what has arrived, without waiting, and
+    /// counts those frames as received: a `VoucherRejected` there rewinds the
+    /// rejected proof and surfaces as the typed rejection, as it does at
+    /// [`Self::finish`]. A rejection still in
     /// flight reaches the lane's next leg instead. The closing voucher then
     /// settles the received residual, the send half is finished, and the
     /// transport is torn down (this stream, or the whole connection when the
@@ -3721,16 +3722,26 @@ impl UpstreamPull {
     }
 
     /// The typed rejection of a `StreamError` that has already arrived, read
-    /// without waiting past the `ChunkData` in front of it. The frames it
-    /// passes over stay under the request's promised wire length. `None` once
-    /// nothing more has arrived, on any other message, or on a read fault: the
-    /// caller closes the stream either way.
+    /// without waiting past the `ChunkData` in front of it. Every frame it
+    /// takes in counts as received, as in [`Self::next_chunk`], so the closing
+    /// voucher pays for it. A frame past the request's promised wire length
+    /// or past our received-byte ceiling ends the read unpaid: an honest node
+    /// sends neither. `None` once nothing more has arrived, on any other
+    /// message, or on a read fault: the caller closes the stream either way.
     fn arrived_rejection(&mut self) -> Option<anyhow::Error> {
-        let mut budget = self.expected_wire_bytes.saturating_sub(self.cumulative);
         loop {
             match futures_util::FutureExt::now_or_never(self.read_under_floor_once())? {
                 Ok(ClientMessage::ChunkData(chunk)) => {
-                    budget = budget.checked_sub(chunk.bytes().len() as u64)?;
+                    let seen = self.cumulative.saturating_add(chunk.bytes().len() as u64);
+                    if seen > self.expected_wire_bytes
+                        || (self.max_received_wire > 0 && seen > self.max_received_wire)
+                    {
+                        return None;
+                    }
+                    self.unproved = self
+                        .unproved
+                        .saturating_add(seen.saturating_sub(self.cumulative));
+                    self.cumulative = seen;
                 }
                 Ok(ClientMessage::StreamError(e)) => {
                     return Some(voucher_rejection(&self.ledger, &self.meter, e));

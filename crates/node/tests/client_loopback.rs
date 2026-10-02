@@ -7055,7 +7055,8 @@ async fn buyer_accepts_blob_at_exact_ceiling() -> anyhow::Result<()> {
 }
 
 /// A pull stopped before its promised end (a steal's split) pays for every
-/// wire byte it received and closes, and the lane stays healthy: the next leg
+/// wire byte it received, the frames it reads past the split looking for a
+/// rejection included, and closes. The lane stays healthy: the next leg
 /// on the same ledger opens, pays on from there, and completes with no
 /// voucher rejection, whether or not the node read the closing voucher.
 #[tokio::test(flavor = "multi_thread")]
@@ -7101,13 +7102,18 @@ async fn a_pull_stopped_at_a_split_pays_what_arrived_and_the_lane_pulls_on() -> 
             .ok_or_else(|| anyhow::anyhow!("the leg ended before the split"))?;
         received = received.saturating_add(u64::try_from(chunk.len())?);
     }
+    // Let the node's credit window queue frames the leg has not read yet:
+    // the stop reads them, without waiting, for a rejection behind them.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let promised = pull.expected_wire_bytes();
     let stopped = pull.stop().await?;
     let (stopped_bytes, _) = stopped
         .advanced()
         .ok_or_else(|| anyhow::anyhow!("the stopped leg must have paid"))?;
     anyhow::ensure!(
-        stopped_bytes == U256::from(received),
-        "the stopped leg pays exactly the wire that arrived: {stopped_bytes} of {received}"
+        stopped_bytes > U256::from(received) && stopped_bytes <= U256::from(promised),
+        "the stopped leg pays for every frame it read, the queued ones too: \
+         {stopped_bytes} past the {received} read before the stop, at most {promised}"
     );
 
     // The next leg on the same ledger pays on from the stopped one's
@@ -7122,9 +7128,8 @@ async fn a_pull_stopped_at_a_split_pays_what_arrived_and_the_lane_pulls_on() -> 
         .advanced()
         .ok_or_else(|| anyhow::anyhow!("the next leg must have paid"))?;
     anyhow::ensure!(
-        finished_bytes == U256::from(received + next),
-        "the next leg pays on from the stopped one: {finished_bytes} of {}",
-        received + next
+        finished_bytes == stopped_bytes + U256::from(next),
+        "the next leg pays on from the stopped one: {finished_bytes} of {stopped_bytes} + {next}"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
