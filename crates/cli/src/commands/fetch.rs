@@ -895,6 +895,11 @@ pub(crate) async fn probe_and_order(
 /// A streamed round's pending probes as its [`LateSlot`], with the best RTT
 /// among the `holders` it returned. Empty for a settled round or an empty
 /// tail.
+///
+/// A task drives the probes from here on, so they keep running and timing
+/// while the fetch unlocks its signer and opens its pool before anything reads
+/// the tail. Their answers wait in a channel. The task stops when the tail
+/// stream is dropped, so no probe outlives the fetch that adopted it.
 fn late_slot<F>(
     round: ProbeRound,
     tail: futures_util::stream::FuturesUnordered<F>,
@@ -904,6 +909,7 @@ fn late_slot<F>(
 where
     F: std::future::Future<Output = ProbeOutcome> + Send + 'static,
 {
+    use futures_util::StreamExt as _;
     if round != ProbeRound::Stream || tail.is_empty() {
         return LateSlot::default();
     }
@@ -911,11 +917,30 @@ where
         .iter()
         .map(|h| h.rtt_ms)
         .fold(f64::INFINITY, f64::min);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = AbortOnDrop(tokio::spawn(tail.for_each(move |outcome| {
+        // A send fails only once the tail stream is gone, which aborts this
+        // task too.
+        let _ = tx.send(outcome);
+        std::future::ready(())
+    })));
+    let answers = futures_util::stream::unfold((rx, task), |(mut rx, task)| async move {
+        rx.recv().await.map(|outcome| (outcome, (rx, task)))
+    });
     LateSlot::new(LateProbes {
-        tail: Box::pin(tail),
+        tail: Box::pin(answers),
         best_holder_rtt_ms,
         warming,
     })
+}
+
+/// A task that is aborted when this handle drops.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// The size hint of the nearest holder that gave one: the fetch's first size
@@ -3963,6 +3988,64 @@ mod tests {
         got.sort_unstable();
         assert_eq!(got, vec![(1, true), (2, false)]);
         assert_eq!(tail.len(), 1);
+    }
+
+    /// A late probe that records when it answers, then reports `Unreachable`.
+    fn recording_probe(
+        after: Duration,
+        answered: &Arc<std::sync::Mutex<Option<Duration>>>,
+    ) -> impl std::future::Future<Output = ProbeOutcome> + Send + 'static {
+        let answered = Arc::clone(answered);
+        let started = tokio::time::Instant::now();
+        async move {
+            tokio::time::sleep(after).await;
+            if let Ok(mut slot) = answered.lock() {
+                *slot = Some(started.elapsed());
+            }
+            ProbeOutcome::Unreachable
+        }
+    }
+
+    fn no_warming() -> ProxyWarmingParams {
+        ProxyWarmingParams {
+            enabled: false,
+            rtt_threshold_ms: 150.0,
+            margin_ms: 30.0,
+        }
+    }
+
+    /// A streamed round's pending probes keep running while nothing polls the
+    /// tail, so a slow unlock between the round and the fetch neither times
+    /// them out nor inflates their RTT. The answer waits in the tail.
+    #[tokio::test(start_paused = true)]
+    async fn late_probes_run_while_the_tail_is_not_polled() {
+        use futures_util::StreamExt as _;
+        let answered = Arc::new(std::sync::Mutex::new(None));
+        let tail: futures_util::stream::FuturesUnordered<_> =
+            std::iter::once(recording_probe(Duration::from_millis(100), &answered)).collect();
+        let slot = late_slot(ProbeRound::Stream, tail, &[], no_warming());
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(*answered.lock().unwrap(), Some(Duration::from_millis(100)));
+        let mut late = slot.take().expect("a streamed round keeps its tail");
+        assert!(matches!(
+            late.tail.next().await,
+            Some(ProbeOutcome::Unreachable)
+        ));
+        assert!(late.tail.next().await.is_none());
+    }
+
+    /// Dropping the late probes stops the ones still running.
+    #[tokio::test(start_paused = true)]
+    async fn late_probes_stop_when_dropped() {
+        let answered = Arc::new(std::sync::Mutex::new(None));
+        let tail: futures_util::stream::FuturesUnordered<_> =
+            std::iter::once(recording_probe(Duration::from_secs(1), &answered)).collect();
+        let slot = late_slot(ProbeRound::Stream, tail, &[], no_warming());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(slot);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(*answered.lock().unwrap(), None);
     }
 
     /// With no holder, a streamed round waits for every probe and leaves no

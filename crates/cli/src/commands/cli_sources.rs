@@ -153,41 +153,14 @@ where
         holders_from(targets, &mut self.lock_nodes())
     }
 
-    /// The [`Holder`] for a late `join`, its node indexed for `connect` as
-    /// [`Self::holders_from`] does. A holder carries its probed coverage; a
-    /// warming proxy carries none and is not a probed holder.
-    fn register_late(&self, join: LateJoin) -> Holder {
+    /// The [`Holder`] for a late `join` ([`admit_late`]), counted as joined.
+    /// `None` when the join's operator is already in the set.
+    fn register_late(&self, join: LateJoin) -> Option<Holder> {
+        let holder = admit_late(&mut self.lock_nodes(), join)?;
         if let Some(timings) = self.deps.timings {
             timings.holder_joined();
         }
-        let (candidate, holder) = match join {
-            LateJoin::Holder(probed) => {
-                let holder = Holder {
-                    provider: probed.candidate.eth_address,
-                    coverage: Some(probed.coverage),
-                    rtt_ms: probed.rtt_ms,
-                    probed_holder: true,
-                };
-                (probed.candidate, holder)
-            }
-            LateJoin::Proxy(proxy) => {
-                let holder = Holder {
-                    provider: proxy.eth_address,
-                    coverage: None,
-                    rtt_ms: proxy.rtt_ms,
-                    probed_holder: false,
-                };
-                let candidate = NodeCandidate {
-                    node_id: proxy.node_id,
-                    eth_address: proxy.eth_address,
-                    region_hint: None,
-                    multiaddrs: proxy.multiaddrs,
-                };
-                (candidate, holder)
-            }
-        };
-        self.lock_nodes().insert(candidate.eth_address, candidate);
-        holder
+        Some(holder)
     }
 
     /// The funder a fetch over these sources tops the pool up through: the
@@ -550,8 +523,9 @@ where
                         if let Some(sample) = outcome.sample() {
                             samples.push(sample);
                         }
-                        if let Some(join) = late_join(outcome, &mut best, warming) {
-                            let holder = self.register_late(join);
+                        if let Some(holder) = late_join(outcome, &mut best, warming)
+                            .and_then(|join| self.register_late(join))
+                        {
                             return Some((holder, (tail, best, samples)));
                         }
                     }
@@ -664,6 +638,48 @@ pub(crate) fn late_join(
         | ProbeOutcome::Unverifiable
         | ProbeOutcome::Unusable => None,
     }
+}
+
+/// The [`Holder`] for a late `join`, its node indexed in `nodes` for
+/// `connect`, or `None` when `nodes` already has a node of the join's
+/// operator: one node per operator, and the node the set already has answered
+/// first, as in [`holders_from`]. A holder carries its probed coverage; a
+/// warming proxy carries none and is not a probed holder.
+pub(crate) fn admit_late(
+    nodes: &mut HashMap<Address, NodeCandidate>,
+    join: LateJoin,
+) -> Option<Holder> {
+    let (candidate, holder) = match join {
+        LateJoin::Holder(probed) => {
+            let holder = Holder {
+                provider: probed.candidate.eth_address,
+                coverage: Some(probed.coverage),
+                rtt_ms: probed.rtt_ms,
+                probed_holder: true,
+            };
+            (probed.candidate, holder)
+        }
+        LateJoin::Proxy(proxy) => {
+            let holder = Holder {
+                provider: proxy.eth_address,
+                coverage: None,
+                rtt_ms: proxy.rtt_ms,
+                probed_holder: false,
+            };
+            let candidate = NodeCandidate {
+                node_id: proxy.node_id,
+                eth_address: proxy.eth_address,
+                region_hint: None,
+                multiaddrs: proxy.multiaddrs,
+            };
+            (candidate, holder)
+        }
+    };
+    if nodes.contains_key(&candidate.eth_address) {
+        return None;
+    }
+    nodes.insert(candidate.eth_address, candidate);
+    Some(holder)
 }
 
 /// The holders `targets` names, in its order, one per operator: a candidate
@@ -955,6 +971,40 @@ mod tests {
         ));
         assert!((best - 100.0).abs() < f64::EPSILON);
         assert!(late_join(late_non_holder(5, 120.0), &mut best, warming(true)).is_none());
+    }
+
+    /// A late node of an operator the set already has never replaces the
+    /// earlier node; a new operator's node joins and is indexed for
+    /// `connect`.
+    #[test]
+    fn a_late_node_joins_only_for_a_new_operator() -> anyhow::Result<()> {
+        use super::{LateJoin, admit_late};
+        let near = decdn_client::discovery::NodeCandidate {
+            node_id: iroh::SecretKey::from_bytes(&[9; 32]).public(),
+            eth_address: Address::repeat_byte(4),
+            region_hint: None,
+            multiaddrs: alloy::primitives::Bytes::new(),
+        };
+        let mut nodes = std::collections::HashMap::from([(near.eth_address, near.clone())]);
+        let mut best = 200.0_f64;
+
+        let Some(LateJoin::Holder(same_operator)) =
+            super::late_join(late_holder(4, 180.0), &mut best, warming(true))
+        else {
+            anyhow::bail!("a late holder joins");
+        };
+        assert!(admit_late(&mut nodes, LateJoin::Holder(same_operator)).is_none());
+        assert_eq!(nodes.get(&near.eth_address), Some(&near));
+
+        let Some(LateJoin::Holder(other)) =
+            super::late_join(late_holder(6, 180.0), &mut best, warming(true))
+        else {
+            anyhow::bail!("a late holder joins");
+        };
+        let holder = admit_late(&mut nodes, LateJoin::Holder(other));
+        assert!(holder.as_ref().is_some_and(|h| h.probed_holder));
+        assert!(nodes.contains_key(&Address::repeat_byte(6)));
+        Ok(())
     }
 
     /// Failed outcomes never join.
