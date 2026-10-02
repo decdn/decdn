@@ -585,7 +585,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "expr": "sum(rate(decdn_serve_stream_rejected_pull_loop_guard_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
-          "refId": "T",
+          "refId": "U",
           "legendFormat": "pull-loop guard (node asked for a blob mid-open)"
         }
       ],
@@ -1588,6 +1588,24 @@
           "expr": "sum(rate(decdn_node_pull_through_upstream_verify_failed_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "E",
           "legendFormat": "upstream verify failed"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_node_pull_through_min_draw_waits_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "F",
+          "legendFormat": "min-draw waits"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_cache_fill_not_coalesced_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "G",
+          "legendFormat": "fill not coalesced (duplicate pull)"
         }
       ],
       "fieldConfig": {
@@ -1663,7 +1681,8 @@
         "x": 0,
         "y": 50
       },
-      "id": 11
+      "id": 11,
+      "description": "Window paused and min-draw waits are benign pacing: the first is the credit window binding, the second batches a small window into fewer, larger upstream draws. Fill not coalesced is a serve-miss fill that started ahead of a live same-hash fill's paid frontier and opened its own pull; the overlap not yet stored is fetched twice. A sustained rate means clients habitually resume ahead of what payers have cleared."
     },
     {
       "datasource": {
@@ -1846,6 +1865,33 @@
           "expr": "sum(rate(decdn_node_region_latency_penalty_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "E",
           "legendFormat": "region latency penalty"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_node_pull_backpressure_backoffs_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "F",
+          "legendFormat": "backpressure backoffs"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_node_pull_backpressure_exhausted_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "G",
+          "legendFormat": "backpressure exhausted"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_node_pull_leg_no_progress_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "H",
+          "legendFormat": "leg no progress"
         }
       ],
       "fieldConfig": {
@@ -1921,7 +1967,8 @@
         "x": 16,
         "y": 50
       },
-      "id": 13
+      "id": 13,
+      "description": "A backpressure backoff is one wait on the sole holder of a missing range after it refused for backpressure; a sustained rate means an upstream's per-signer cap is too small for this node's concurrency. Backpressure exhausted (the holder kept refusing through the whole wait budget, truncating every attached serve stream) and leg no progress (a leg finished cleanly but moved neither the paid nor the delivered frontier) are zero on a healthy node."
     },
     {
       "datasource": {
@@ -2576,7 +2623,7 @@
       },
       "title": "Cache integrity \u2014 non-zero needs a human",
       "type": "timeseries",
-      "description": "A quarantined hash means disk rot or tampering. A tag-drop failure leaves bytes GC-protected and is not retried. A poisoned mutex is process-local and does not clear on its own \u2014 see the runbook before restarting.",
+      "description": "A quarantined hash means disk rot or tampering. A tag-drop failure leaves bytes GC-protected and is not retried. A poisoned mutex is process-local and does not clear on its own — see the runbook before restarting. A recency seed failure at cache open leaves pre-restart blobs out of eviction until accessed; restart once the store is healthy. A partial-size observe failure ticks once per partial-size TTL while a store entry stays broken.",
       "targets": [
         {
           "datasource": {
@@ -2622,6 +2669,24 @@
           "expr": "sum(rate(decdn_probe_post_eviction_failures_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "E",
           "legendFormat": "post-eviction failures"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_cache_recency_seed_failures_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "F",
+          "legendFormat": "recency seed failures"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_cache_partial_size_observe_failures_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "G",
+          "legendFormat": "partial-size observe failures"
         }
       ],
       "fieldConfig": {
@@ -2764,6 +2829,15 @@
           "expr": "sum(rate(decdn_cache_origin_enumerate_failures_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "E",
           "legendFormat": "enumerate failures"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_cache_origin_range_timeouts_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "F",
+          "legendFormat": "range-read timeouts"
         }
       ],
       "fieldConfig": {
@@ -2839,7 +2913,8 @@
         "x": 0,
         "y": 81
       },
-      "id": 22
+      "id": 22,
+      "description": "A range-read timeout is an origin read on the range-pull path that ran past its budget (stall window plus the read size at the throughput floor). Each one is also an origin transport fault. A nonzero rate means an origin that stalls or runs below the floor."
     },
     {
       "datasource": {

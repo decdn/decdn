@@ -517,15 +517,6 @@ fn refill_decision(deposit: U256, committed: U256, working_deposit: U256) -> U25
     refill_amount(deposit, committed, working_deposit, low_water)
 }
 
-/// The pool's cumulative vouchered amount across every `(signer, provider)` lane —
-/// what has been spent against the single shared deposit. Remaining spendable is
-/// `deposit - committed_amount(state)`.
-fn committed_amount(state: &BuyerPoolState) -> U256 {
-    state
-        .lanes()
-        .fold(U256::ZERO, |acc, (_, p)| acc.saturating_add(p.last_amount))
-}
-
 /// Build the [`PoolContext`] paying `provider_addr` from this pool's state,
 /// resuming the lane at its recorded cumulative totals ([`self_owned_lane_ctx`]).
 ///
@@ -985,8 +976,11 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// dropped, `fund_pool`'s `error!` and `buyer_topup_failure()` are all the
     /// operator gets.
     fn spawn_refill_if_low(&self, state: &BuyerPoolState) {
-        let additional =
-            refill_decision(state.deposit, committed_amount(state), self.working_deposit);
+        let additional = refill_decision(
+            state.deposit,
+            state.committed_amount(),
+            self.working_deposit,
+        );
         if additional.is_zero() {
             return; // still above the low-water mark
         }
@@ -4034,26 +4028,6 @@ mod tests {
             ),
             U256::from(9_900u64)
         );
-    }
-
-    #[test]
-    fn committed_amount_sums_every_lane() {
-        let s = signer();
-        let mut state = pool_with_lane(
-            s.address(),
-            Address::repeat_byte(3),
-            U256::from(10u64),
-            U256::from(40u64),
-        );
-        let lane2 = LaneKey {
-            pool_id: state.pool_id,
-            signer: s.address(),
-            provider: Address::repeat_byte(4),
-        };
-        state
-            .advance_lane(lane2, U256::from(5u64), U256::from(60u64))
-            .unwrap();
-        assert_eq!(committed_amount(&state), U256::from(100u64));
     }
 
     #[test]

@@ -213,11 +213,23 @@ pub trait Funder: Send + Sync {
     ///
     /// # Errors
     ///
-    /// If the on-chain `topUp` fails to submit, reverts, or its receipt is not
-    /// obtained — the funds did not move. Also if a mined `topUp` cannot be
-    /// credited locally, in which case the funds **are** escrowed and the error
-    /// names the tx (see `decdn_client::buyer_pool::escrowed_but_untracked`).
+    /// If the on-chain `topUp` fails to submit or reverts — the funds did not
+    /// move. If its receipt is not obtained, the funds may have moved and the
+    /// error carries [`crate::buyer_pool::TopUpUnconfirmed`]. If a mined `topUp`
+    /// cannot be credited locally, the funds **are** escrowed and the error
+    /// names the tx ([`crate::buyer_pool::escrowed_but_untracked`]).
     fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome>;
+
+    /// The funder's own view of what the pool has spent across every lane,
+    /// including lanes the acquire loop does not drive: vouchers to providers
+    /// outside the fetch (or the run). The deposit gate takes the larger of
+    /// this and the committed amounts of the loop's own lanes, so a pool shared
+    /// across many providers gates on its true remaining deposit.
+    ///
+    /// `None` by default: the funder has no view beyond the loop's lanes.
+    fn pool_spent(&self) -> Option<U256> {
+        None
+    }
 }
 
 /// Current unix time in microseconds (the requester-echoed
@@ -1305,6 +1317,7 @@ mod doubles {
         max_topups: u32,
         outcome: DepositOutcome,
         calls: Mutex<Vec<U256>>,
+        pool_spent: Option<U256>,
     }
 
     impl FakeFunder {
@@ -1315,7 +1328,16 @@ mod doubles {
                 max_topups,
                 outcome,
                 calls: Mutex::new(Vec::new()),
+                pool_spent: None,
             }
+        }
+
+        /// This funder, reporting `spent` as the pool's spend across every
+        /// lane ([`Funder::pool_spent`](super::Funder::pool_spent)).
+        #[must_use]
+        pub const fn with_pool_spent(mut self, spent: U256) -> Self {
+            self.pool_spent = Some(spent);
+            self
         }
 
         /// The `additional` amounts passed to [`Funder::top_up`](super::Funder::top_up),
@@ -1339,8 +1361,135 @@ mod doubles {
                 Ok(self.outcome)
             })
         }
+
+        fn pool_spent(&self) -> Option<U256> {
+            self.pool_spent
+        }
     }
 }
+
+/// A store double for the record-flush tests of the driver and the scheduler.
+#[cfg(test)]
+mod flush_double {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use decdn_bao_range::{AlignedRange, RangedFuture, RangedStore};
+
+    use super::{BaoRangeReader, IngestStore, SourceFuture};
+    use crate::ClientRangedStore;
+
+    /// An [`IngestStore`] wrapper that counts `flush_present_record` calls and
+    /// delegates every real operation to an inner [`ClientRangedStore`]. It lets
+    /// a test observe the interval flush firing during a still-running fetch.
+    ///
+    /// Each flush is numbered from 1 at its call, the snapshot it takes. The
+    /// first `slow_flushes` land `flush_delay` after their call, to model a
+    /// record fsync under writeback pressure; the rest land at once. A flush
+    /// lands on its own task, so it lands even when its caller drops the
+    /// returned future, as a real store's blocking write does; `last_landed`
+    /// then holds the number of the last flush to land.
+    pub(crate) struct FlushCountingStore {
+        pub(crate) inner: ClientRangedStore,
+        pub(crate) flushes: Arc<AtomicUsize>,
+        pub(crate) flush_delay: Duration,
+        pub(crate) slow_flushes: usize,
+        pub(crate) last_landed: Arc<AtomicUsize>,
+    }
+
+    impl FlushCountingStore {
+        /// Wrap `inner`, every flush taking `flush_delay`.
+        pub(crate) fn new(inner: ClientRangedStore, flush_delay: Duration) -> Self {
+            Self {
+                inner,
+                flushes: Arc::default(),
+                flush_delay,
+                slow_flushes: usize::MAX,
+                last_landed: Arc::default(),
+            }
+        }
+    }
+
+    impl RangedStore for FlushCountingStore {
+        fn total_bytes(&self) -> u64 {
+            self.inner.total_bytes()
+        }
+        fn present_ranges(&self) -> RangedFuture<'_, bao_tree::ChunkRanges> {
+            self.inner.present_ranges()
+        }
+        fn missing_ranges(
+            &self,
+            byte_offset: u64,
+            byte_len: u64,
+        ) -> RangedFuture<'_, bao_tree::ChunkRanges> {
+            self.inner.missing_ranges(byte_offset, byte_len)
+        }
+        fn admit(&self, range: AlignedRange, bao_bytes: Bytes) -> RangedFuture<'_, ()> {
+            self.inner.admit(range, bao_bytes)
+        }
+        fn read(&self, byte_offset: u64, byte_len: u64) -> RangedFuture<'_, Bytes> {
+            self.inner.read(byte_offset, byte_len)
+        }
+        fn is_complete(&self) -> RangedFuture<'_, bool> {
+            self.inner.is_complete()
+        }
+        fn finalize(&self) -> RangedFuture<'_, ()> {
+            self.inner.finalize()
+        }
+    }
+
+    impl IngestStore for FlushCountingStore {
+        fn ingest_stream<'a, R>(
+            &'a self,
+            range: &'a AlignedRange,
+            reader: R,
+            on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+            claimed_total: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
+        where
+            R: BaoRangeReader + 'a,
+        {
+            Box::pin(
+                self.inner
+                    .ingest_stream(range, reader, on_progress, claimed_total),
+            )
+        }
+
+        fn flush_present_record(&self) -> SourceFuture<'_, ()> {
+            let seq = self.flushes.fetch_add(1, Ordering::SeqCst) + 1;
+            let write = IngestStore::flush_present_record(&self.inner);
+            let delay = if seq <= self.slow_flushes {
+                self.flush_delay
+            } else {
+                Duration::ZERO
+            };
+            let last_landed = Arc::clone(&self.last_landed);
+            let landing = tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                last_landed.store(seq, Ordering::SeqCst);
+            });
+            Box::pin(async move {
+                write.await?;
+                landing
+                    .await
+                    .map_err(|e| anyhow::anyhow!("flush landing task: {e}"))
+            })
+        }
+
+        fn proven(&self) -> Option<u64> {
+            IngestStore::proven(&self.inner)
+        }
+
+        fn set_bound(&self, bound: u64) {
+            IngestStore::set_bound(&self.inner, bound);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) use flush_double::FlushCountingStore;
 
 #[cfg(any(test, feature = "test-util"))]
 pub use doubles::{FakeFunder, ScriptedReader, ScriptedSource};

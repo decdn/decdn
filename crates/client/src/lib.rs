@@ -2756,11 +2756,13 @@ const PROOF_STALL_DEBUG_AFTER: Duration = Duration::from_secs(5);
 /// [`PROOF_STALL_DEBUG_AFTER`]. Each phase names one place a leg can stall:
 /// `unpolled` (the caller did not read the stream, so a proof the node waits
 /// for was not sent), `pay` (waiting for the lane's ledger, signing and
-/// writing the proof), or `read` (the leg waited for bytes). A `read` stall
+/// writing the proof), `first_frame` (a fresh leg waited from its open for
+/// its first frame, any time before the caller's first read included), or
+/// `read` (the leg waited for bytes). A `read` stall
 /// with `unproved > 0` can be the node waiting for a proof this leg does not
 /// yet owe; with `unproved == 0` the leg owes nothing and the node is slow to
-/// send. `unpolled` and `pay` are logged when the phase ends; `read` is logged
-/// while the leg still waits.
+/// send. `unpolled` and `pay` are logged when the phase ends; `first_frame`
+/// and `read` are logged while the leg still waits.
 fn log_proof_stall(
     pull: (&dyn std::fmt::Display, [u8; 32], u64),
     cumulative: u64,
@@ -2895,6 +2897,9 @@ pub struct UpstreamPull {
     /// When `next_chunk` last returned a chunk, so the next call can tell how
     /// long the caller left the stream unread ([`log_proof_stall`]).
     returned_at: Option<tokio::time::Instant>,
+    /// When the open returned, so a fresh leg's wait for its first frame is
+    /// timed from there ([`log_proof_stall`]).
+    opened_at: tokio::time::Instant,
 }
 
 impl std::fmt::Debug for UpstreamPull {
@@ -3197,6 +3202,7 @@ async fn open_progressive_pull_impl(
             unproved: 0,
             ended: false,
             returned_at: None,
+            opened_at: tokio::time::Instant::now(),
         };
         Ok((header, pull))
     }
@@ -3273,12 +3279,19 @@ impl UpstreamPull {
         let floor = &mut self.floor;
         let (peer, hash, byte_offset) = (self.conn.remote_id(), self.hash, self.byte_offset);
         let unproved = self.unproved;
-        let read_started = tokio::time::Instant::now();
-        // The `read` stall line runs on its own timer, not on the sampler,
-        // whose period follows the configurable window and can be later than
-        // the node's proof timeout.
+        // A fresh leg's wait runs from its open, any time before the caller's
+        // first read included, so a first frame that never comes is named
+        // once, as `first_frame` (#2230).
+        let (phase, read_started) = if cumulative == 0 {
+            ("first_frame", self.opened_at)
+        } else {
+            ("read", tokio::time::Instant::now())
+        };
+        // The stall line runs on its own timer, not on the sampler, whose
+        // period follows the configurable window and can be later than the
+        // node's proof timeout.
         let read_stall_at = read_started + PROOF_STALL_DEBUG_AFTER;
-        let mut read_stall_logged = cumulative == 0;
+        let mut read_stall_logged = false;
         let mut reader = progress::ProgressReader::new(recv, Arc::clone(&self.progress_counter));
         // Pin ONE read future and poll it across ticks. `read_client_message` is not
         // cancellation-safe — `read_frame` fills a frame with `read_exact`, so dropping the
@@ -3320,13 +3333,13 @@ impl UpstreamPull {
                         });
                     }
                 }
-                // Once bytes have flowed, a long wait here is the leg waiting
-                // on the node while the node may wait on a proof.
+                // A long wait here is the leg waiting on the node, while the
+                // node may wait on a proof or still be sending its first frame.
                 () = tokio::time::sleep_until(read_stall_at), if !read_stall_logged => {
                     read_stall_logged = true;
                     let waited = read_started.elapsed();
                     let pull = (&peer as &dyn std::fmt::Display, hash, byte_offset);
-                    log_proof_stall(pull, cumulative, unproved, "read", waited);
+                    log_proof_stall(pull, cumulative, unproved, phase, waited);
                 }
             }
         }

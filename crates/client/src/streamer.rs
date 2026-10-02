@@ -189,14 +189,18 @@ pub struct StreamCandidate<S> {
     /// given several targets applies it to each of them: set it only on a
     /// single-target fetch.
     pub coverage: Option<Coverage>,
-    /// What this candidate's lane holds while the fetch runs, released when the
-    /// fetch returns ([`crate::LaneLease`]). Like `coverage`, set it only on a
-    /// single-target fetch: the first target's fetch releases it.
+    /// What this candidate's lane holds while the fetch runs
+    /// ([`crate::LaneLease`]). With `widen` set, it is released when the
+    /// lane's own worker ends; it is released at the latest when the fetch
+    /// returns. Like `coverage`, set it only on a single-target fetch: the
+    /// first target's fetch releases it.
     pub lease: LaneLease,
-    /// How this lane adds one concurrent stream for a faulted lane's
-    /// remainder that no idle lane can take ([`crate::LaneWiden`]), or `None`
-    /// to stay at one stream. Each granted stream is given back as its worker
-    /// stops, so it serves every target of a [`crate::Downloader`] alike.
+    /// How this lane takes a stream beyond its `lease` ([`crate::LaneWiden`]),
+    /// or `None` to stay at one stream: one extra stream for a queued range
+    /// that no idle lane takes, and the stream the lane starts again on once
+    /// it gave its `lease` back. Each granted stream is given back as its
+    /// worker stops, so it serves every target of a [`crate::Downloader`]
+    /// alike.
     pub widen: Option<crate::LaneWiden>,
 }
 

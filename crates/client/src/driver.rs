@@ -78,6 +78,7 @@ use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, RangedStore, align_range}
 use decdn_incentive::DepositOutcome;
 use decdn_protocol::VoucherRejectReason;
 
+use crate::buyer_pool::EscrowUntracked;
 use crate::fault::HealExhausted;
 use crate::pacer::{DownstreamFrontier, PaceDecision, PaceState};
 use crate::source::{BlobSource, Funder, IngestStore, SourceFuture};
@@ -116,6 +117,28 @@ impl std::fmt::Display for PoolExhausted {
 }
 
 impl std::error::Error for PoolExhausted {}
+
+/// Marker on a reactive top-up that failed: [`Funder::top_up`] returned an
+/// error, so the deposit did not rise. The failure is the buyer's funding,
+/// never the serving source's delivery, so the fault classifier
+/// ([`crate::classify`]) rules it [`crate::Fault::Transient`]: the source keeps
+/// its health and the loop retries. A funder that found the wallet short of
+/// USDC ([`crate::buyer_pool::WalletShortfall`]) makes it
+/// [`crate::Fault::Unaffordable`], like [`PoolExhausted`], and an error that may
+/// have escrowed USDC
+/// ([`crate::buyer_pool::TopUpUnconfirmed`],
+/// [`crate::buyer_pool::EscrowUntracked`]) stays fatal, whatever marker it
+/// carries.
+#[derive(Debug)]
+pub struct TopUpFailed;
+
+impl std::fmt::Display for TopUpFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the reactive pool top-up failed")
+    }
+}
+
+impl std::error::Error for TopUpFailed {}
 
 /// A leg of a gap opened, streamed and finished cleanly, yet left both the gap's
 /// paid frontier and the store's delivered frontier where they were.
@@ -1067,7 +1090,11 @@ where
                 if pool.is_some() && locked_deposit(ctx)? > deposit {
                     continue;
                 }
-                match funder.top_up(additional).await? {
+                match funder
+                    .top_up(additional)
+                    .await
+                    .map_err(|err| err.context(TopUpFailed))?
+                {
                     DepositOutcome::Added(new_deposit) => {
                         // Credit the new deposit through the shared handle so the
                         // source's next open (which clones the context) sees it.
@@ -1084,20 +1111,22 @@ where
                             }
                         }
                     }
+                    // Typed as an untracked escrow, so the acquire loop ends the
+                    // command rather than retrying into a second escrow.
                     DepositOutcome::UnknownPool => {
-                        anyhow::bail!(
+                        return Err(anyhow::Error::new(EscrowUntracked(format!(
                             "mid-fetch top-up of {additional} landed on-chain but no local \
                              record remains to credit it: the deposit is escrowed and \
                              untracked. Reconcile against the chain before retrying"
-                        );
+                        ))));
                     }
                     DepositOutcome::PoolMismatch => {
-                        anyhow::bail!(
+                        return Err(anyhow::Error::new(EscrowUntracked(format!(
                             "mid-fetch top-up of {additional} landed on-chain but the local \
                              record now tracks a different pool: the deposit is escrowed \
                              against the topped-up pool. Reconcile against the chain \
                              before retrying"
-                        );
+                        ))));
                     }
                 }
                 // Spend one unit of the top-up budget — the shared one when lanes
@@ -1393,7 +1422,7 @@ mod tests {
     use crate::pacer::{BudgetPacer, PaceDecision, PaceState};
     use crate::source::Funder;
     use crate::source::PrimedSource;
-    use crate::source::{BlobSource, FakeFunder, ScriptedSource, SourceFuture};
+    use crate::source::{BlobSource, FakeFunder, FlushCountingStore, ScriptedSource, SourceFuture};
     use crate::{
         ClientRangedStore, Cumulative, PoolContext, PoolLedger, UpstreamPullHeader,
         UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
@@ -3062,6 +3091,11 @@ mod tests {
                 msg.contains("escrowed"),
                 "the operator must learn the money moved: {msg}"
             );
+            assert_eq!(
+                crate::classify(&err),
+                crate::Fault::Fatal(crate::FatalScope::Command),
+                "{outcome:?}: a retry escrows again, so the acquire loop must end: {msg}"
+            );
             assert!(
                 !store.is_complete().await.expect("is_complete"),
                 "{outcome:?}: the fetch must not be reported complete"
@@ -3645,82 +3679,6 @@ mod tests {
         assert!(funder.calls().is_empty(), "no top-up was needed");
     }
 
-    /// An [`IngestStore`] wrapper that counts `flush_present_record` calls and
-    /// delegates every real operation to an inner [`ClientRangedStore`]. It lets
-    /// a test observe the interval flush firing during a still-running fetch.
-    /// `flush_delay` makes each flush take that long before it writes, to model
-    /// a record fsync under writeback pressure.
-    struct FlushCountingStore {
-        inner: ClientRangedStore,
-        flushes: Arc<std::sync::atomic::AtomicUsize>,
-        flush_delay: std::time::Duration,
-    }
-
-    impl RangedStore for FlushCountingStore {
-        fn total_bytes(&self) -> u64 {
-            self.inner.total_bytes()
-        }
-        fn present_ranges(&self) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
-            self.inner.present_ranges()
-        }
-        fn missing_ranges(
-            &self,
-            byte_offset: u64,
-            byte_len: u64,
-        ) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
-            self.inner.missing_ranges(byte_offset, byte_len)
-        }
-        fn admit(
-            &self,
-            range: AlignedRange,
-            bao_bytes: Bytes,
-        ) -> decdn_bao_range::RangedFuture<'_, ()> {
-            self.inner.admit(range, bao_bytes)
-        }
-        fn read(
-            &self,
-            byte_offset: u64,
-            byte_len: u64,
-        ) -> decdn_bao_range::RangedFuture<'_, Bytes> {
-            self.inner.read(byte_offset, byte_len)
-        }
-        fn is_complete(&self) -> decdn_bao_range::RangedFuture<'_, bool> {
-            self.inner.is_complete()
-        }
-        fn finalize(&self) -> decdn_bao_range::RangedFuture<'_, ()> {
-            self.inner.finalize()
-        }
-    }
-
-    impl crate::source::IngestStore for FlushCountingStore {
-        fn ingest_stream<'a, R>(
-            &'a self,
-            range: &'a AlignedRange,
-            reader: R,
-            on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
-            claimed_total: u64,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
-        where
-            R: crate::source::BaoRangeReader + 'a,
-        {
-            Box::pin(
-                self.inner
-                    .ingest_stream(range, reader, on_progress, claimed_total),
-            )
-        }
-
-        fn flush_present_record(&self) -> crate::source::SourceFuture<'_, ()> {
-            self.flushes
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let write = crate::source::IngestStore::flush_present_record(&self.inner);
-            let delay = self.flush_delay;
-            Box::pin(async move {
-                tokio::time::sleep(delay).await;
-                write.await
-            })
-        }
-    }
-
     /// The interval flush persists resume progress MID-fetch, not only at
     /// completion: `drive_with_interval_flush` is raced against a
     /// work future that stays pending for several short intervals, and the
@@ -3753,9 +3711,8 @@ mod tests {
 
         let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let store = FlushCountingStore {
-            inner,
             flushes: Arc::clone(&flushes),
-            flush_delay: std::time::Duration::ZERO,
+            ..FlushCountingStore::new(inner, std::time::Duration::ZERO)
         };
 
         // A work future that stays pending across several 20 ms intervals, so the
@@ -3807,9 +3764,8 @@ mod tests {
         let inner = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
         let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let store = FlushCountingStore {
-            inner,
             flushes: Arc::clone(&flushes),
-            flush_delay: std::time::Duration::from_millis(50),
+            ..FlushCountingStore::new(inner, std::time::Duration::from_millis(50))
         };
 
         let started = tokio::time::Instant::now();

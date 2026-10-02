@@ -15,7 +15,7 @@
 //! asymmetry is the point of the hash chain — signatures become O(1) per
 //! transfer plus one per rollover, rather than one per metering interval.
 
-use super::proof_wait::ChunkDeadline;
+use super::proof_wait::ChunkProofs;
 use super::{
     Arc, B256, BufferedProofReader, ClientHandler, Connection, DEFAULT_TOLERANCE_BPS, Hash,
     LaneDeliveryState, LaneKey, LaneState, Mutex, Ordering, Proof, RateError, RecvStream,
@@ -290,7 +290,7 @@ impl ClientHandler {
         client_node_id: B256,
         rate_per_mb: u64,
         owed: OwedChunk,
-        deadline: ChunkDeadline,
+        proofs: &ChunkProofs,
     ) -> anyhow::Result<VoucherStop> {
         // Unknown lane: `serve_stream` refuses one pre-serve, so this is a
         // defensive backstop matching the sole callers (which forward `Some`).
@@ -301,10 +301,10 @@ impl ClientHandler {
         };
 
         // (1) READ one proof (bounded by the proof wait, which counts `conn`'s
-        // transport progress and the owed chunk's `deadline`) WITHOUT holding the
-        // per-lane lock — a network read must not block same-lane streams. The
-        // reader is cancellation-safe.
-        let proof = super::proof_wait::await_proof(reader.read(recv), conn, deadline).await?;
+        // transport progress and the owed chunk's ceiling in `proofs`) WITHOUT
+        // holding the per-lane lock — a network read must not block same-lane
+        // streams. The reader is cancellation-safe.
+        let proof = super::proof_wait::await_proof(reader.read(recv), conn, proofs).await?;
 
         let wire = match proof {
             Proof::Voucher(wire) => wire,

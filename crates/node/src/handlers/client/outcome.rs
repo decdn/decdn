@@ -241,6 +241,13 @@ impl ErrEnd {
     /// Classify `e`. The node-fault test runs first, so a node fault that a serve
     /// loop tagged [`PaidProgress`] stays a node fault; a rate-check bail comes
     /// before the payment split, so it stays a rejected voucher after payment.
+    ///
+    /// Both proof-wait faults, the stall and the chunk's ceiling, carry
+    /// [`PeerFault`](super::wire::PeerFault) and take the declined or abandoned
+    /// split like any other peer that stops paying. The ceiling is not a node bug, so it does not
+    /// belong on the node-fault counter, and every end must count on exactly one
+    /// reason. Only the pull-through abandon counter, which is not a reason
+    /// counter, leaves the ceiling out (`serve_leg`).
     pub(super) fn of(e: &anyhow::Error) -> Self {
         if !is_peer_attributable(e) {
             Self::NodeFault

@@ -8,7 +8,8 @@
 
 use decdn_protocol::client::StreamError;
 
-use crate::driver::PoolExhausted;
+use crate::buyer_pool::{EscrowUntracked, TopUpUnconfirmed, WalletShortfall};
+use crate::driver::{PoolExhausted, TopUpFailed};
 use crate::{BlobTooLarge, LocalPullFault, UpstreamRefused, UpstreamVoucherRejected};
 
 /// What a failed lane, lane build, or discovery means for the acquire loop.
@@ -68,9 +69,20 @@ impl std::fmt::Display for HealExhausted {
 
 impl std::error::Error for HealExhausted {}
 
+/// Whether `err` reports a `topUp` that may have escrowed USDC no local record
+/// credits ([`EscrowUntracked`], [`TopUpUnconfirmed`]). A retry escrows again,
+/// so it is fatal to the command.
+fn escrow_untracked(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<EscrowUntracked>().is_some()
+        || err.downcast_ref::<TopUpUnconfirmed>().is_some()
+}
+
 /// Classify `err` for the acquire loop.
 #[must_use]
 pub fn classify(err: &anyhow::Error) -> Fault {
+    if escrow_untracked(err) {
+        return Fault::Fatal(FatalScope::Command);
+    }
     if err
         .downcast_ref::<crate::source_set::NoAffordableSource>()
         .is_some()
@@ -95,11 +107,22 @@ pub fn classify(err: &anyhow::Error) -> Fault {
     if err.downcast_ref::<BlobTooLarge>().is_some() {
         return Fault::Fatal(FatalScope::Item);
     }
-    if err.downcast_ref::<PoolExhausted>().is_some() {
+    if err.downcast_ref::<PoolExhausted>().is_some()
+        || err.downcast_ref::<WalletShortfall>().is_some()
+    {
         return Fault::Unaffordable;
     }
-    if err.downcast_ref::<LaneBuildFault>().is_some() {
+    if err.downcast_ref::<TopUpFailed>().is_some() {
         return Fault::Transient;
+    }
+    // A lane build is chain-side: it never blames the source, and it retries
+    // unless what failed it is fatal on its own (an escrow no record credits, a
+    // pool that cannot pay and cannot be funded, a full disk).
+    if let Some(LaneBuildFault(inner)) = err.downcast_ref::<LaneBuildFault>() {
+        return match classify(inner) {
+            Fault::Fatal(scope) => Fault::Fatal(scope),
+            Fault::Source | Fault::Unaffordable | Fault::Transient => Fault::Transient,
+        };
     }
     if let Some(refused) = err.downcast_ref::<UpstreamRefused>() {
         return match refused.error() {
@@ -258,6 +281,79 @@ mod tests {
     fn a_lane_build_error_is_transient() {
         let err = anyhow::Error::new(LaneBuildFault(anyhow::anyhow!("rpc timed out")));
         assert_eq!(classify(&err), Fault::Transient);
+    }
+
+    /// A failed reactive top-up is the buyer's funding, never the source's
+    /// delivery: it is transient, so the source keeps its health and the loop
+    /// retries. A wallet short of USDC is not fixed by a retry, so the source
+    /// waits for the deposit like a dry pool.
+    #[test]
+    fn a_failed_reactive_top_up_is_transient_unless_the_wallet_is_short() {
+        let failed =
+            || anyhow::anyhow!("submit topUp: rpc timed out").context(crate::driver::TopUpFailed);
+        assert_eq!(classify(&failed()), Fault::Transient);
+        let short = failed().context(crate::buyer_pool::WalletShortfall);
+        assert_eq!(classify(&short), Fault::Unaffordable);
+    }
+
+    /// A lane build never blames its source and retries, unless what failed
+    /// it is fatal on its own: a pool that cannot pay and cannot be funded.
+    #[test]
+    fn a_lane_build_takes_its_cause_only_when_fatal() {
+        let unaffordable = anyhow::Error::new(crate::source_set::NoAffordableSource {
+            deposit: alloy::primitives::U256::ZERO,
+        })
+        .context("buyer pool has no unspent deposit, and the wallet cannot fund a top-up");
+        assert_eq!(
+            classify(&anyhow::Error::new(LaneBuildFault(unaffordable))),
+            Fault::Fatal(FatalScope::Command)
+        );
+        let short = anyhow::anyhow!("no USDC").context(crate::buyer_pool::WalletShortfall);
+        assert_eq!(
+            classify(&anyhow::Error::new(LaneBuildFault(short))),
+            Fault::Transient
+        );
+    }
+
+    /// A `topUp` that may have escrowed USDC no record credits ends the
+    /// command, whether it surfaces from a lane build (which otherwise retries)
+    /// or from a reactive top-up (which is otherwise unaffordable): a retry
+    /// escrows again.
+    #[test]
+    fn a_possibly_escrowed_top_up_ends_the_command() {
+        let tx = alloy::primitives::TxHash::repeat_byte(0xab);
+        let untracked = || {
+            crate::buyer_pool::escrowed_but_untracked("pool 0x01 topped up by 5 µUSDC", tx, "disk")
+        };
+        let unconfirmed = || {
+            anyhow::anyhow!("receipt timed out").context(crate::buyer_pool::TopUpUnconfirmed { tx })
+        };
+        for (name, err) in [
+            ("untracked", untracked()),
+            ("unconfirmed", unconfirmed()),
+            (
+                "untracked lane build",
+                anyhow::Error::new(LaneBuildFault(untracked())),
+            ),
+            (
+                "unconfirmed lane build",
+                anyhow::Error::new(LaneBuildFault(unconfirmed())),
+            ),
+            (
+                "untracked reactive",
+                untracked().context(crate::driver::TopUpFailed),
+            ),
+            (
+                "unconfirmed reactive",
+                unconfirmed().context(crate::driver::TopUpFailed),
+            ),
+        ] {
+            assert_eq!(
+                classify(&err),
+                Fault::Fatal(FatalScope::Command),
+                "{name}: {err:#}"
+            );
+        }
     }
 
     #[test]

@@ -9,7 +9,7 @@ use futures_util::{Stream, StreamExt};
 
 use super::MAX_PROOFS_PER_CHUNK;
 use super::outcome::{ServeEnd, ServeStop};
-use super::proof_wait::ChunkDeadline;
+use super::proof_wait::ChunkProofs;
 use super::ramp::RampCarry;
 use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked};
 use super::wire::{FrameAccountingFault, FrameChunks, FrameQueue};
@@ -462,11 +462,11 @@ impl ClientHandler {
             // many proofs a payer may send without settling it.
             let collected_any = !pending.is_empty();
             while let Some(mut owed) = pending.pop_front() {
-                let mut attempts = 0u32;
-                // One proof-wait ceiling for every attempt at this chunk.
-                let deadline = ChunkDeadline::start();
+                // One proof budget and one proof-wait ceiling for every proof
+                // this chunk takes.
+                let mut proofs = ChunkProofs::start();
                 loop {
-                    attempts = attempts.saturating_add(1);
+                    let attempt = proofs.next_attempt();
                     let stop = self
                         .commit_one_proof(
                             conn,
@@ -480,12 +480,12 @@ impl ClientHandler {
                             client_node_id,
                             rate_per_mb,
                             owed,
-                            deadline,
+                            &proofs,
                         )
                         .await
                         .map_err(|e| {
                             e.context(format!(
-                                "proof {attempts} of at most {MAX_PROOFS_PER_CHUNK} for a {}-byte \
+                                "proof {attempt} of at most {MAX_PROOFS_PER_CHUNK} for a {}-byte \
                                  chunk ({} bytes owed, {} more queued)",
                                 owed.len(),
                                 owed.remaining(),
@@ -502,7 +502,8 @@ impl ClientHandler {
                             if owed.settle(credited_bytes)? {
                                 break;
                             }
-                            if attempts >= MAX_PROOFS_PER_CHUNK {
+                            if proofs.exhausted() {
+                                let attempts = proofs.attempts();
                                 // A payer that spends its per-chunk proof budget
                                 // without settling the chunk is at fault, not this
                                 // node, so the stream ends as a stop, not an error.

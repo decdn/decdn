@@ -1052,7 +1052,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "expr": "sum(rate(decdn_serve_stream_rejected_pull_loop_guard_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
-          "refId": "T",
+          "refId": "U",
           "legendFormat": "pull-loop guard (node asked for a blob mid-open)"
         }
       ],

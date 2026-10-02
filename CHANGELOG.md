@@ -925,19 +925,52 @@ since project inception and will roll into the first tagged release.
   exits before the lane store opens. The startup error now names
   `PaymentPool.getRateBounds()`.
 
+- **The client funds a buyer pool from its pool-wide spend, and a short
+  wallet no longer drops lanes (#2288, #2289).** The low-water refill
+  compares the deposit with the spend of every lane of the pool, not only
+  the lane being built, so a pool spent across many providers refills. The
+  reactive top-up and the check of a node's `SpendingCapExhausted` refusal
+  use the same pool-wide view. When the wallet holds too little USDC for a
+  refill, the fetch continues on the pool's remaining deposit, logs one WARN,
+  makes no further refill attempts that run, and ends with one
+  `warning: wallet … holds … µUSDC, less than the … µUSDC top-up …` line on
+  stderr, visible without `-v`. A pool with nothing left and a short wallet
+  ends the command with the top-up remedy. A `topUp` whose receipt cannot be
+  read, or that mined but could not be recorded locally, now ends the command
+  and names the tx instead of retrying, because a retry escrows again. A
+  failed reactive top-up retries without cooling the serving node.
+
 - **The node no longer faults a paying client whose bytes are still in
   flight (#2230).** A write returns once the transport buffers it, so the
   node's wait for a proof can start while several chunks are still on the
   way to the client. The wait now faults only after 10 s with no proof and no
   new STREAM frame sent on the connection. All the proofs for one owed chunk
   share a 30 s ceiling from the chunk's first wait, so proofs that credit
-  nothing cannot stretch it. A client that stops reading still faults at
-  10 s. The fault names the connection's selected path (relay or direct, IPv4
-  or IPv6) with its RTT, congestion window, lost packets, congestion events
-  and black holes detected: `no proof and no transport progress for 10s
-  (selected path …)` or `the chunk's proof wait passed 30s (selected path …)`.
-  It replaces `proof read timed out after 10s` in the `serve_stream` failure
-  span.
+  nothing cannot stretch it. A client that stops reading faults at 10 s when
+  its connection carries nothing else; traffic on sibling streams of the same
+  connection counts as progress and can hold the wait up to the 30 s ceiling.
+  A ceiling fault does not count on
+  `decdn_node_pull_through_client_abandoned_total`. The fault text gives the
+  measured times and the STREAM frames the wait saw, then the connection's
+  selected path (relay or direct, IPv4 or IPv6) with its RTT and congestion
+  window and the path's lifetime totals of lost packets, congestion events and
+  black holes detected: `no proof and no transport progress for 10.0s; …` or
+  `the chunk's proofs ran past their wait ceiling after 30.0s; …`. It replaces
+  `proof read timed out after 10s` in the `serve_stream` failure span.
+
+- **A faulted lane's remainder starts within a second of a stream freeing
+  (#2230).** In `decdn bundle pull`, a lane gives its stream permit back when
+  its own worker ends, so a sibling entry can use it. It starts again only on
+  a permit that is free then, and tries again each second while none is. A
+  queued range that no idle lane takes goes to a busy lane on one extra
+  stream; when part of the range has no running lane that covers it, any busy
+  lane not barred from pull-through can take it by pull-through. When a
+  provider has no free permit for that stream, the acquire asks again every
+  second. A node that refuses a lane's extra streams is asked again after
+  1 s, doubling to 30 s, and its `NotFound` refusals of uncovered ranges on
+  extra streams bar it from pull-through as on its own stream. The info line
+  `a queued range waits for a stream` names the waiting ranges and logs when
+  they change, and every 30 s while they stay.
 
 - **Chain-read logs no longer carry the RPC URL (#2264).** The node's
   binding check, buyer lane seed, owned-pool walk, top-up, pool open and
