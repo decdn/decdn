@@ -142,7 +142,7 @@ pub fn escrowed_but_untracked(
 /// loop classifies it as fatal to the command ([`crate::Fault::Fatal`]) instead
 /// of retrying the lane build.
 #[derive(Debug)]
-pub struct EscrowUntracked(String);
+pub struct EscrowUntracked(pub(crate) String);
 
 impl std::fmt::Display for EscrowUntracked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

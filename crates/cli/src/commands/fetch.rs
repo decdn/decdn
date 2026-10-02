@@ -3378,7 +3378,8 @@ where
     if remaining.is_zero() {
         return Err(cannot_pay(&state, &shortfall));
     }
-    tracing::warn!(
+    // `check_wallet` already logged the shortfall at WARN.
+    tracing::info!(
         pool_id = %state.pool_id,
         %remaining,
         "continuing on the pool's remaining deposit (µUSDC) without a top-up"

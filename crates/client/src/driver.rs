@@ -78,6 +78,7 @@ use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, RangedStore, align_range}
 use decdn_incentive::DepositOutcome;
 use decdn_protocol::VoucherRejectReason;
 
+use crate::buyer_pool::EscrowUntracked;
 use crate::fault::HealExhausted;
 use crate::pacer::{DownstreamFrontier, PaceDecision, PaceState};
 use crate::source::{BlobSource, Funder, IngestStore, SourceFuture};
@@ -1110,20 +1111,22 @@ where
                             }
                         }
                     }
+                    // Typed as an untracked escrow, so the acquire loop ends the
+                    // command rather than retrying into a second escrow.
                     DepositOutcome::UnknownPool => {
-                        anyhow::bail!(
+                        return Err(anyhow::Error::new(EscrowUntracked(format!(
                             "mid-fetch top-up of {additional} landed on-chain but no local \
                              record remains to credit it: the deposit is escrowed and \
                              untracked. Reconcile against the chain before retrying"
-                        );
+                        ))));
                     }
                     DepositOutcome::PoolMismatch => {
-                        anyhow::bail!(
+                        return Err(anyhow::Error::new(EscrowUntracked(format!(
                             "mid-fetch top-up of {additional} landed on-chain but the local \
                              record now tracks a different pool: the deposit is escrowed \
                              against the topped-up pool. Reconcile against the chain \
                              before retrying"
-                        );
+                        ))));
                     }
                 }
                 // Spend one unit of the top-up budget — the shared one when lanes
@@ -3087,6 +3090,11 @@ mod tests {
             assert!(
                 msg.contains("escrowed"),
                 "the operator must learn the money moved: {msg}"
+            );
+            assert_eq!(
+                crate::classify(&err),
+                crate::Fault::Fatal(crate::FatalScope::Command),
+                "{outcome:?}: a retry escrows again, so the acquire loop must end: {msg}"
             );
             assert!(
                 !store.is_complete().await.expect("is_complete"),
