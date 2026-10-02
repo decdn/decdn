@@ -50,7 +50,7 @@ use decdn_client::buyer_pool::{
     open_pool, refill_amount, self_owned_lane_ctx, top_up as pool_top_up, topped_up_effect,
 };
 use decdn_client::{LocalPullFault, PoolContext};
-use decdn_common::redact::{sanitize_err_chain, sanitize_rpc_display};
+use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 
 /// How often the reclaim sweep scans the node's pool for a completed close.
 /// Pool lifetimes are long, so an hourly scan is ample — it matches the seller
@@ -830,7 +830,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             Err(err) => {
                 self.metrics.buyer_lane_seed_failure();
                 error!(
-                    pool_id = %state.pool_id, %provider_addr, error = %sanitize_rpc_display(&err),
+                    pool_id = %state.pool_id, %provider_addr, error = %sanitize_error_sources(&err),
                     "could not read this lane's on-chain watermark; refusing the pull rather \
                      than resuming the lane from zero, which would strand it below the \
                      watermark permanently"
@@ -1770,7 +1770,7 @@ impl OwnedPools {
                 Err(err) => {
                     warn!(
                         %pool_id,
-                        error = %sanitize_rpc_display(&err),
+                        error = %sanitize_error_sources(&err),
                         "could not read an owned pool's state; this boot cannot say whether it \
                          is open, so it is neither adopted nor reported as stranded"
                     );
@@ -1979,7 +1979,7 @@ async fn publish_buyer_wallet_usdc<P: Provider>(
     match Erc20::new(token, provider).balanceOf(owner).call().await {
         Ok(balance) => metrics.set_buyer_wallet_usdc(balance),
         Err(err) => {
-            debug!(%token, %owner, error = %sanitize_rpc_display(&err), "could not read the buyer wallet's USDC balance");
+            debug!(%token, %owner, error = %sanitize_error_sources(&err), "could not read the buyer wallet's USDC balance");
         }
     }
 }
@@ -2021,7 +2021,7 @@ async fn reclaim_once<P: Provider + Clone>(
     let pool = match contract.getPool(state.pool_id).call().await {
         Ok(pool) => pool,
         Err(err) => {
-            warn!(pool_id = %state.pool_id, error = %sanitize_rpc_display(&err), "reclaim sweep: getPool failed");
+            warn!(pool_id = %state.pool_id, error = %sanitize_error_sources(&err), "reclaim sweep: getPool failed");
             metrics.buyer_reclaim_failure();
             return;
         }
@@ -2067,12 +2067,12 @@ async fn reclaim_once<P: Provider + Clone>(
                 metrics.buyer_reclaim_failure();
             }
             Err(err) => {
-                warn!(pool_id = %state.pool_id, error = %sanitize_rpc_display(&err), "reclaim sweep: reclaim receipt failed");
+                warn!(pool_id = %state.pool_id, error = %sanitize_error_sources(&err), "reclaim sweep: reclaim receipt failed");
                 metrics.buyer_reclaim_failure();
             }
         },
         Err(err) => {
-            warn!(pool_id = %state.pool_id, error = %sanitize_rpc_display(&err), "reclaim sweep: reclaim submit failed");
+            warn!(pool_id = %state.pool_id, error = %sanitize_error_sources(&err), "reclaim sweep: reclaim submit failed");
             metrics.buyer_reclaim_failure();
         }
     }

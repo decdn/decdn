@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use alloy::rpc::types::Log;
 use anyhow::{Context, Result};
-use decdn_common::redact::sanitize_rpc_display as n;
+use decdn_common::redact::sanitize_error_sources as n;
 use decdn_incentive::{CheckpointKey, KeyedCheckpointStore};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
