@@ -3670,7 +3670,9 @@ const DEPLOYMENT_PREFLIGHT_BUDGET: Duration = Duration::from_mins(1);
 /// may declare a function with the `getRateBounds()` selector, and
 /// `contracts/src/PaymentPool.sol` carries the same warning on the view. The
 /// `deployment_preflight_guard` e2e boots against every contract in the deploy
-/// manifest to catch a collision. Runs BEFORE the lane store opens, because
+/// manifest to catch a collision, and the `payment_pool_probe_selector` e2e
+/// fails if any contract in `contracts/src` other than `PaymentPool` exposes
+/// the selector, deployed or not. Runs BEFORE the lane store opens, because
 /// the store's deployment binding
 /// ([`crate::channel_store::Deployment`]) drops the seller lane state when
 /// the stamp differs — a typo in either field must abort bring-up while the
