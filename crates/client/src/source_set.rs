@@ -166,13 +166,25 @@ impl std::error::Error for NoSourceHasBlob {}
 
 /// A backoff that doubles from `base` to `cap`.
 #[derive(Debug, Clone, Copy)]
-struct Backoff {
-    next_at: Instant,
-    attempts: u32,
+pub(crate) struct Backoff {
+    /// When the next try may run.
+    pub(crate) next_at: Instant,
+    /// The failures in a row so far.
+    pub(crate) attempts: u32,
 }
 
 impl Backoff {
-    fn fail(self, now: Instant, base: Duration, cap: Duration) -> Self {
+    /// No failure yet: the next try may run at `now`.
+    pub(crate) const fn new(now: Instant) -> Self {
+        Self {
+            next_at: now,
+            attempts: 0,
+        }
+    }
+
+    /// One more failure at `now`: wait `base`, doubled for each earlier
+    /// failure in a row, at most `cap`.
+    pub(crate) fn fail(self, now: Instant, base: Duration, cap: Duration) -> Self {
         let attempts = self.attempts.saturating_add(1);
         let wait = base
             .saturating_mul(2u32.saturating_pow(attempts.saturating_sub(1)))
@@ -192,6 +204,9 @@ pub struct SourceSet<'p, P: SourceProvider> {
     holders: Vec<Holder>,
     lanes: HashMap<Address, Arc<StreamCandidate<P::Source>>>,
     build_retry: HashMap<Address, Backoff>,
+    /// When each built lane that found no free stream may start again
+    /// ([`Self::start_refused`]).
+    start_retry: HashMap<Address, Instant>,
     absent: HashSet<Address>,
     /// Each non-holder's `NotFound` answers since its last verified byte.
     not_found: HashMap<Address, u32>,
@@ -273,6 +288,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             holders: Vec::new(),
             lanes: HashMap::new(),
             build_retry: HashMap::new(),
+            start_retry: HashMap::new(),
             absent: HashSet::new(),
             not_found: HashMap::new(),
             pull_through_not_found: HashMap::new(),
@@ -341,6 +357,11 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                     .get(&h.provider)
                     .is_none_or(|b| now >= b.next_at)
             })
+            .filter(|h| {
+                self.start_retry
+                    .get(&h.provider)
+                    .is_none_or(|at| now >= *at)
+            })
             .filter(|h| self.health.usable(h.provider, now, deposit))
             .min_by(|a, b| a.rtt_ms.total_cmp(&b.rtt_ms))
             .cloned()
@@ -379,14 +400,53 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 Ok(lane)
             }
             Err(err) => {
-                let prior = self.build_retry.get(&provider).copied().unwrap_or(Backoff {
-                    next_at: now,
-                    attempts: 0,
-                });
+                let prior = self
+                    .build_retry
+                    .get(&provider)
+                    .copied()
+                    .unwrap_or(Backoff::new(now));
                 self.build_retry
                     .insert(provider, prior.fail(now, BUILD_RETRY_BASE, BUILD_RETRY_CAP));
                 Err(anyhow::Error::new(LaneBuildFault(err)))
             }
+        }
+    }
+
+    /// Hold `provider`'s built lane back until `until`: it found no free
+    /// stream to start again on ([`crate::LaneWiden`]). Unlike a failed
+    /// build, the wait does not grow, so the lane starts again soon after a
+    /// stream frees. Returns `true` for the first refusal since the lane last
+    /// started.
+    pub(crate) fn start_refused(&mut self, provider: Address, until: Instant) -> bool {
+        self.start_retry.insert(provider, until).is_none()
+    }
+
+    /// Clear `provider`'s start hold: its built lane took a stream.
+    pub(crate) fn start_taken(&mut self, provider: Address) {
+        self.start_retry.remove(&provider);
+    }
+
+    /// Record a refusal on an extra stream of `provider`'s lane
+    /// ([`crate::LaneWiden`]) for `range`, given at `at`, while the lane's own
+    /// worker runs or the node is already charged for this outage. The node
+    /// does not cool for it. A `NotFound` for a range outside the coverage of
+    /// a probed partial holder counts toward barring it from pull-through,
+    /// and a size-ceiling refusal bars it at once, as on its own stream.
+    pub(crate) fn record_extra_refusal(
+        &mut self,
+        provider: Address,
+        err: &anyhow::Error,
+        range: LaneRange,
+        at: Instant,
+    ) {
+        let Some(refused) = err.downcast_ref::<UpstreamRefused>() else {
+            return;
+        };
+        if crate::fault::says_absent(err) && !range.past_end {
+            self.record_not_found(provider, refused, range.uncovered, at);
+        }
+        if matches!(refused.error(), StreamError::BlobTooLarge) {
+            self.record_too_large(provider, refused);
         }
     }
 
@@ -700,6 +760,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             .build_retry
             .values()
             .map(|b| b.next_at)
+            .chain(self.start_retry.values().copied())
             .filter(|t| *t > now);
         let discovery = self.discovery.map(|b| b.next_at).filter(|t| *t > now);
         let bars = self.no_pull_through.values().copied().filter(|t| *t > now);
@@ -1085,6 +1146,32 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("cached"))?
         ));
         Ok(())
+    }
+
+    /// A built lane that finds no free stream waits until the time its
+    /// caller names, and no longer however often it is refused: the wait
+    /// does not grow like a build's. Only the first refusal since the lane
+    /// last started reports itself, and a start clears the wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_refused_a_stream_waits_a_flat_retry() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
+        let none_running = HashSet::new();
+        let retry = Duration::from_secs(1);
+        let mut now = Instant::now();
+        for refusal in 0..4 {
+            assert_eq!(set.start_refused(A, now + retry), refusal == 0);
+            assert!(set.next_to_start(now, U256::ZERO, &none_running).is_none());
+            assert_eq!(set.next_wake(now), Some(now + retry));
+            now += retry;
+            assert!(set.next_to_start(now, U256::ZERO, &none_running).is_some());
+        }
+        set.start_taken(A);
+        assert_eq!(set.next_wake(now), None);
+        assert!(
+            set.start_refused(A, now + retry),
+            "a refusal after a start is the first of a new run"
+        );
     }
 
     #[tokio::test(start_paused = true)]

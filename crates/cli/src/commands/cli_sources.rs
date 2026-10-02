@@ -75,8 +75,8 @@ pub(crate) struct CliSources<'a, P> {
     /// solo fetch.
     ledgers: Option<&'a LaneLedgers>,
     /// The run's per-provider stream cap (`bundle pull`): a lane, the first
-    /// open's included, holds one of its provider's permits while the fetch
-    /// runs.
+    /// open's included, holds one of its provider's permits while its own
+    /// worker runs, and takes a free one again to start again.
     lane_cap: Option<&'a LaneStreamCap>,
     /// Every holder's node, keyed by its on-chain provider address.
     nodes: Mutex<HashMap<Address, NodeCandidate>>,
@@ -270,9 +270,9 @@ where
     /// already holds, or a fresh build. When the run caps streams per
     /// provider, a fresh lane holds one of its provider's permits
     /// ([`lane_lease`]), taken before the build and never waited for. Every
-    /// lane it returns, the parked one included, can add a stream for a
-    /// faulted lane's remainder only from the provider's permits that are
-    /// free ([`LaneStreamCap::widen`]).
+    /// lane it returns, the parked one included, takes an extra stream, or
+    /// the stream it starts again on after its lease is given back, only
+    /// from the provider's permits that are free ([`LaneStreamCap::widen`]).
     async fn build(&self, holder: &Holder) -> anyhow::Result<StreamCandidate<PeerSource<'a>>> {
         let parked = self
             .parked
