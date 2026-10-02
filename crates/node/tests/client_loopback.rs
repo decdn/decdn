@@ -35,9 +35,9 @@
 //! rejected in band while the accepted watermark survives; the per-connection
 //! stream-cap sheds an over-cap stream with a bare QUIC reset and no signed
 //! `StreamResponse`; the buyer rejects a server that over-sends past the promised
-//! length or delivers hash-mismatched bytes; and the request-read and
-//! voucher-read timeouts each tear down a peer that opens a stream (or parks a
-//! paid delivery) and then goes silent.
+//! length or delivers hash-mismatched bytes; and the request-read timeout and
+//! the proof wait each tear down a peer that opens a stream (or parks a paid
+//! delivery) and then goes silent.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1632,7 +1632,7 @@ async fn a_below_frontier_reveal_is_credited_from_lane_headroom() -> anyhow::Res
 /// retired root: it folds nothing, and the node can only pay its stream from
 /// lane headroom. If the rollover voucher took that headroom for its own
 /// stream's outstanding chunk, the sibling would wait for a proof the payer
-/// never sends, and its stream would die on the proof-read timeout.
+/// never sends, and its stream would die when its proof wait faults.
 ///
 /// Stream X anchors the first chain and pays one chunk with index 1. Stream Y
 /// anchors the same chain. X then rolls to a second chain with a voucher that
@@ -1718,7 +1718,7 @@ async fn a_sibling_roll_does_not_take_a_retired_reveals_credit() -> anyhow::Resu
 
     // Y sends index 2 on the retired root. It folds nothing, but the rollover
     // already put its money on the lane, so the node must credit Y from that
-    // headroom at once — well inside the node's proof-read timeout.
+    // headroom at once — well inside the node's proof wait.
     release(&mut send_y, 2).await?;
     tokio::time::timeout(
         Duration::from_secs(3),
@@ -2338,9 +2338,11 @@ struct VoucherTotals {
 /// there. `expected_wire` bytes is the whole delivery, so with a payload well
 /// under one chunk the server has exactly one (closing) voucher left
 /// to collect and is now parked reading it — the stall is a protocol-level
-/// rendezvous, not a race, and it holds until the test pays. The client holds
-/// every byte, so the connection shows no transport progress and the hold lasts
-/// the handler's 10s `VOUCHER_READ_TIMEOUT`.
+/// rendezvous, not a race, and it holds until the test pays or the handler's
+/// proof wait ends it. The client holds every byte, so the stream adds no
+/// transport progress: the wait ends after 10s (`VOUCHER_READ_TIMEOUT`) when the
+/// connection carries nothing else, and up to 30s while sibling streams on it
+/// keep sending.
 async fn stall_delivery_at_closing_voucher(
     conn: &Connection,
     hash: [u8; 32],
@@ -2624,7 +2626,8 @@ async fn active_delivery_stream_defers_idle_close() -> anyhow::Result<()> {
 
     // The reaper is disabled while the stream is in flight: no close, however many
     // idle windows pass. `idle * 5` is well past the window yet far short of the
-    // 10s voucher-read timeout, so a pass is the gate holding, not the park expiring.
+    // 10s no-progress proof wait, so a pass is the gate holding, not the park
+    // expiring.
     let premature = tokio::time::timeout(idle * 5, conn.closed()).await;
     anyhow::ensure!(
         premature.is_err(),
@@ -6289,7 +6292,7 @@ async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()>
     // A: admit (reserves one floor), deliver its first interval, then leave it
     // PARKED reading a voucher we never send — it holds its live floor reservation
     // for the pool's whole `committed` while the test runs, well inside the 10s
-    // voucher-read timeout. `_send_a` is kept so the stream stays open.
+    // no-progress proof wait. `_send_a` is kept so the stream stays open.
     let (_send_a, mut recv_a) = open_paid_stream(&conn, *hash_a.as_bytes(), Some(&ext_a)).await?;
     read_exact_chunks(&mut recv_a, HARNESS_INTERVAL_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv_a).await?;
@@ -8328,8 +8331,9 @@ async fn honest_concurrent_rollovers_draw_no_voucher_rejection() -> anyhow::Resu
 /// voucher pay a closing partial. So after a stream's last reveal, or on a stream
 /// that makes none, the payer must send only the closing voucher: no open,
 /// re-anchor, or roll voucher. An anchor or re-anchor sent before a sub-chunk
-/// stream's closing voucher would be read while only the partial is owed. It would take lane headroom that belongs to a sibling's unread proof,
-/// and that sibling would then fail at the proof-read timeout. The payer anchors a
+/// stream's closing voucher would be read while only the partial is owed. It
+/// would take lane headroom that belongs to a sibling's unread proof, and that
+/// sibling would then fail when its proof wait faults. The payer anchors a
 /// stream only before its first reveal, and a sub-chunk stream makes none.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sub_chunk_stream_on_a_live_chain_sends_only_its_closing_voucher() -> anyhow::Result<()> {
@@ -12499,8 +12503,8 @@ async fn voucher_read_timeout_ends_a_parked_delivery() -> anyhow::Result<()> {
     // Under one credit-window floor, so the delivery parks at a single closing
     // voucher — the exact point `commit_one_proof` blocks under the timeout.
     let payload = vec![0x62u8; 64 * 1024];
-    // Idle window well past the 10s voucher-read timeout the test is waiting on,
-    // so the app-layer idle reaper never fires first.
+    // Idle window well past the 10s no-progress proof wait the test is waiting
+    // on, so the app-layer idle reaper never fires first.
     let fx = idle_fixture(&payload, Duration::from_secs(45)).await?;
     let blob = fx.blob(0)?;
 
@@ -12532,7 +12536,7 @@ async fn voucher_read_timeout_ends_a_parked_delivery() -> anyhow::Result<()> {
         }
         Ok(Ok(other)) => anyhow::bail!("expected the stream to end unpaid, got {other:?}"),
         Err(_elapsed) => {
-            anyhow::bail!("server never ended the parked delivery within the voucher-read timeout")
+            anyhow::bail!("server never ended the parked delivery within its proof wait")
         }
     }
 
@@ -12612,6 +12616,14 @@ async fn a_payer_that_stops_reading_faults_at_the_no_progress_timeout() -> anyho
         waited < Duration::from_secs(15),
         "the node held a payer with no transport progress for {waited:?}; it must fault \
          at the 10s no-progress timeout, not at the 30s ceiling"
+    );
+
+    // The stall is the payer's fault: it ends on exactly one inbound reason
+    // counter, and that counter is not the node-fault one.
+    support::assert_inbound_failures_attributed(&fx.metrics, 1).await?;
+    anyhow::ensure!(
+        counter(&fx.metrics, "decdn_serve_stream_node_fault_total")? == 0,
+        "a stalled payer must not count as a node fault"
     );
 
     // No proof was ever accepted, so the lane watermark stayed at zero.

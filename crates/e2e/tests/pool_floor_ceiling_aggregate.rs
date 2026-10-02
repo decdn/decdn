@@ -127,9 +127,10 @@ const FIRST_FRAME_BUDGET: Duration = Duration::from_secs(30);
 /// How long a held-open read waits for the NEXT frame of the credit window before
 /// deciding the node has parked awaiting the voucher we never send. Kept below the
 /// node's `VOUCHER_READ_TIMEOUT` (10s with no transport progress) so a park is
-/// observed as an idle gap, not a connection close. In the happy path the loop breaks on delivered ≥ floor before
-/// ever hitting this idle — the window's frames stream back-to-back — so it only
-/// bounds the failure case where a stream parks SHORT of its floor.
+/// observed as an idle gap, not a connection close. In the happy path the loop
+/// breaks on delivered ≥ floor before ever hitting this idle — the window's
+/// frames stream back-to-back — so it only bounds the failure case where a stream
+/// parks SHORT of its floor.
 const IDLE_BUDGET: Duration = Duration::from_secs(5);
 /// How long the first request against the freshly-opened pool rides out the
 /// node's pool-registration readiness window (its `getPool` view resolving the

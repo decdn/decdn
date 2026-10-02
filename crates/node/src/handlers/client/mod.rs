@@ -88,8 +88,10 @@ pub const MAX_CLIENT_STREAMS: usize = 100;
 // Per-stage timeouts so a stalled peer cannot pin a stream task indefinitely.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the serve loop waits for a proof while the connection sends no new
-/// STREAM frame. The wait for one proof never passes
-/// [`proof_wait::PROOF_WAIT_CEILING`] (see [`proof_wait`]).
+/// STREAM frame. The proofs of one owed chunk never wait past
+/// [`proof_wait::PROOF_WAIT_CEILING`] in total, from the chunk's first proof
+/// wait (see [`proof_wait`]). Traffic on sibling streams of the same
+/// connection counts as progress, so it can hold a wait up to that ceiling.
 const VOUCHER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 /// After a clean `StreamEnd`, how long the serve waits for the client's FIN while
@@ -2568,10 +2570,12 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
 /// indefinitely with a run of zero-credit vouchers, each one refreshing the
 /// no-progress timeout while the delivered-but-unpaid balance never moves — the
 /// same shape of stall the non-empty-`ChunkData` floor closes on the delivery
-/// side. Time is bounded apart from this count: every proof wait for one chunk
-/// counts [`proof_wait::PROOF_WAIT_CEILING`] from the chunk's first wait
-/// ([`proof_wait::ChunkDeadline`]), so the whole run of proofs for a chunk lasts
-/// at most that long. This budget bounds the number of proofs, not the time.
+/// side. This budget bounds the number of proofs for one owed chunk, not the
+/// time. [`proof_wait::ChunkProofs`] counts them, and it also holds the chunk's
+/// time bound: every proof wait for the chunk ends at
+/// [`proof_wait::PROOF_WAIT_CEILING`] after the chunk's first wait. So one owed
+/// chunk holds the stream for at most that long, however many proofs it takes.
+/// A stream that owes several chunks waits up to that long for each of them.
 const MAX_PROOFS_PER_CHUNK: u32 = 8;
 
 /// One payment proof off the wire: a signed voucher, or a released hash-chain
@@ -2615,9 +2619,9 @@ pub(super) struct BufferedProofReader {
 impl BufferedProofReader {
     /// Read one framed payment proof — a [`ClientMessage::Voucher`] or a
     /// [`ClientMessage::ChunkPreimage`] — filling the buffer incrementally.
-    /// **Cancellation-safe:** if the returned future is dropped (a gather
-    /// `timeout` elapsed), bytes already read stay in `self.buf` for the next
-    /// call — no frame is torn.
+    /// **Cancellation-safe:** if the returned future is dropped (the proof wait
+    /// faulted, or the stream is torn down), bytes already read stay in
+    /// `self.buf` for the next call — no frame is torn.
     ///
     /// These two variants are the entire payer→node vocabulary after the
     /// opening `StreamRequest`, so this is the one place every proof passes
@@ -2638,7 +2642,7 @@ impl BufferedProofReader {
             // iroh's inherent Quinn `read` shadows it) — it is documented
             // cancel-safe: a dropped future consumes nothing, and on `Ready(n)` we
             // append to `self.buf` before the next await, so no bytes are ever lost
-            // to a gather timeout. `0` is EOF.
+            // when the caller drops the read. `0` is EOF.
             let mut scratch = [0u8; 4096];
             let n = AsyncReadExt::read(recv, &mut scratch).await.map_err(|e| {
                 anyhow::Error::new(wire::PeerFault)
