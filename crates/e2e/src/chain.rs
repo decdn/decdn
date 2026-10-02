@@ -2032,6 +2032,15 @@ impl ChainFixture {
     }
 }
 
+/// Build the contracts with `forge build` (a warm no-op once they are built)
+/// and return the `contracts/` directory, whose `out/` then holds a current
+/// artifact for every contract. Requires `forge` on `PATH`.
+pub async fn build_contracts() -> anyhow::Result<PathBuf> {
+    let contracts = contracts_dir()?;
+    forge_build(&contracts).await?;
+    Ok(contracts)
+}
+
 /// `crates/e2e/ → ../../contracts`.
 fn contracts_dir() -> anyhow::Result<PathBuf> {
     Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -137,6 +137,7 @@ async fn run() -> anyhow::Result<()> {
     // probe without retrying it. A zero entry is a contract the deploy left
     // undeployed (the dormant `BuybackBurner`): there is no code to probe, and
     // config validation rejects a zero address before the preflight runs.
+    // `payment_pool_probe_selector` covers such a contract by its selectors.
     let mut siblings: Vec<(String, Address)> = chain
         .manifest_contracts()
         .iter()
