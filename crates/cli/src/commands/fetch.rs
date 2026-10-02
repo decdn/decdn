@@ -2685,10 +2685,11 @@ struct LaneWatermark {
 /// Every lane settles at its ARMED cumulative rather than branching on the
 /// fetch's outcome. The fetch result is ONE outcome shared by
 /// every lane, but "did this lane's last voucher land?" is a PER-LANE question,
-/// and on the multi-source path a successful fetch routinely leaves a lane
-/// armed-above-committed: a tail steal drops the victim's `fill_gap` future
-/// wherever it is parked, including inside the voucher exchange that `issue`
-/// deliberately arms before sending. Settling that lane at `committed` on the
+/// and on the multi-source path a successful fetch can leave a lane
+/// armed-above-committed: a cancelled or stalled leg drops its `fill_gap`
+/// future wherever it is parked, including inside the voucher exchange that
+/// `issue` deliberately arms before sending, and a leg stopped at a steal
+/// split keeps a closing voucher that failed to send armed. Settling that lane at `committed` on the
 /// fetch's `Ok` persists a cumulative BELOW what the node can redeem, and the
 /// next fetch on that lane signs a cumulative the upstream already holds —
 /// rejected as a regression.
@@ -5611,16 +5612,16 @@ mod tests {
     }
 
     /// A multi-source lane settles at its ARMED cumulative, never at `committed`.
-    /// A tail steal drops the victim's `fill_gap` future wherever it is parked —
-    /// including inside the voucher exchange `issue` deliberately arms before
-    /// sending — and that is a routine event on a SUCCESSFUL fetch. Settling that
+    /// A cancelled or stalled leg drops its `fill_gap` future wherever it is
+    /// parked — including inside the voucher exchange `issue` deliberately arms
+    /// before sending — and that can happen on a SUCCESSFUL fetch. Settling that
     /// lane low persists a cumulative below what the node can redeem, and the next
     /// fetch on the lane signs a value the upstream already holds: rejected as a
     /// regression.
     #[test]
     fn multi_lane_watermarks_settle_high_even_when_the_fetch_succeeded() {
         let signer = Address::repeat_byte(0x5E);
-        // The armed cumulative sits ABOVE what was acked — the steal-cancelled
+        // The armed cumulative sits ABOVE what was acked — the dropped-leg
         // shape. Settling at `committed` would persist the lower one.
         let lanes = [lane_wm(1, 0xA1, 0, 300, 400)];
         let out = super::multi_lane_watermarks(signer, &lanes);

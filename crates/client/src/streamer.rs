@@ -1554,5 +1554,9 @@ mod tests {
         fn finish(&self, _reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
             Box::pin(async { Ok(VoucherProgress::default()) })
         }
+
+        fn stop(&self, _reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            Box::pin(async { Ok(VoucherProgress::default()) })
+        }
     }
 }

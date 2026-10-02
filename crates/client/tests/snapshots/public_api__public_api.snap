@@ -351,7 +351,7 @@ pub fn decdn_client::ranged_store::ClientRangedStore::read(&self, u64, u64) -> d
 pub fn decdn_client::ranged_store::ClientRangedStore::total_bytes(&self) -> u64
 impl decdn_client::source::IngestStore for decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
-pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64, core::option::Option<&'a core::sync::atomic::AtomicU64>) -> decdn_client::source::IngestFuture<'a, R> where R: decdn_client::source::BaoRangeReader + 'a
 pub fn decdn_client::ranged_store::ClientRangedStore::proven(&self) -> core::option::Option<u64>
 pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)
 pub mod decdn_client::sink
@@ -381,6 +381,9 @@ pub fn decdn_client::sink::PullReader::take_fault(&mut self) -> core::option::Op
 pub fn decdn_client::sink::content_paid_frontier(u64, u64, u64) -> u64
 pub type decdn_client::sink::SinkFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>
 pub mod decdn_client::source
+pub enum decdn_client::source::IngestEnd
+pub decdn_client::source::IngestEnd::Drained
+pub decdn_client::source::IngestEnd::Stopped
 pub struct decdn_client::source::PeerSource<'a>
 impl<'a> decdn_client::source::PeerSource<'a>
 pub const fn decdn_client::source::PeerSource<'a>::new(&'a iroh::endpoint::Endpoint, iroh_base::endpoint_addr::EndpointAddr, alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, alloc::sync::Arc<decdn_client::PoolLedger>, &'a alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, [u8; 32], u64, u64, decdn_client::PullDeadlines, core::option::Option<decdn_client::connection::Connections>) -> Self
@@ -393,6 +396,7 @@ pub type decdn_client::source::PeerSource<'_>::Reader = decdn_client::sink::Pull
 pub fn decdn_client::source::PeerSource<'_>::finish(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 pub fn decdn_client::source::PeerSource<'_>::max_blob_size_bytes(&self) -> u64
 pub fn decdn_client::source::PeerSource<'_>::open(&self, [u8; 32], decdn_bao_range::AlignedRange) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, Self::Reader)>
+pub fn decdn_client::source::PeerSource<'_>::stop(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 pub struct decdn_client::source::PrimedSource<S: decdn_client::source::BlobSource>
 impl<S: decdn_client::source::BlobSource> decdn_client::source::PrimedSource<S>
 pub fn decdn_client::source::PrimedSource<S>::clear(&self)
@@ -406,6 +410,7 @@ pub type decdn_client::source::PrimedSource<S>::Reader = <S as decdn_client::sou
 pub fn decdn_client::source::PrimedSource<S>::finish(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 pub fn decdn_client::source::PrimedSource<S>::max_blob_size_bytes(&self) -> u64
 pub fn decdn_client::source::PrimedSource<S>::open(&self, [u8; 32], decdn_bao_range::AlignedRange) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, Self::Reader)>
+pub fn decdn_client::source::PrimedSource<S>::stop(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 pub const decdn_client::source::PRIMED_MAX_IDLE: core::time::Duration
 pub trait decdn_client::source::BaoRangeReader: iroh_io::AsyncStreamReader + decdn_client::sink::StashedFault + core::marker::Send
 impl<T> decdn_client::source::BaoRangeReader for T where T: iroh_io::AsyncStreamReader + decdn_client::sink::StashedFault + core::marker::Send
@@ -414,30 +419,34 @@ pub type decdn_client::source::BlobSource::Reader: decdn_client::source::BaoRang
 pub fn decdn_client::source::BlobSource::finish(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 pub fn decdn_client::source::BlobSource::max_blob_size_bytes(&self) -> u64
 pub fn decdn_client::source::BlobSource::open(&self, [u8; 32], decdn_bao_range::AlignedRange) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, Self::Reader)>
+pub fn decdn_client::source::BlobSource::stop(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 impl decdn_client::source::BlobSource for decdn_client::source::PeerSource<'_>
 pub type decdn_client::source::PeerSource<'_>::Reader = decdn_client::sink::PullReader
 pub fn decdn_client::source::PeerSource<'_>::finish(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 pub fn decdn_client::source::PeerSource<'_>::max_blob_size_bytes(&self) -> u64
 pub fn decdn_client::source::PeerSource<'_>::open(&self, [u8; 32], decdn_bao_range::AlignedRange) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, Self::Reader)>
+pub fn decdn_client::source::PeerSource<'_>::stop(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 impl<S: decdn_client::source::BlobSource> decdn_client::source::BlobSource for decdn_client::source::PrimedSource<S>
 pub type decdn_client::source::PrimedSource<S>::Reader = <S as decdn_client::source::BlobSource>::Reader
 pub fn decdn_client::source::PrimedSource<S>::finish(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 pub fn decdn_client::source::PrimedSource<S>::max_blob_size_bytes(&self) -> u64
 pub fn decdn_client::source::PrimedSource<S>::open(&self, [u8; 32], decdn_bao_range::AlignedRange) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, Self::Reader)>
+pub fn decdn_client::source::PrimedSource<S>::stop(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 pub trait decdn_client::source::Funder: core::marker::Send + core::marker::Sync
 pub fn decdn_client::source::Funder::max_topups(&self) -> u32
 pub fn decdn_client::source::Funder::pool_spent(&self) -> core::option::Option<alloy_primitives::aliases::U256>
 pub fn decdn_client::source::Funder::top_up(&self, alloy_primitives::aliases::U256) -> decdn_client::source::SourceFuture<'_, decdn_incentive::buyer_pool::DepositOutcome>
 pub trait decdn_client::source::IngestStore: decdn_bao_range::ranged_store::RangedStore
 pub fn decdn_client::source::IngestStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
-pub fn decdn_client::source::IngestStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::source::IngestStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64, core::option::Option<&'a core::sync::atomic::AtomicU64>) -> decdn_client::source::IngestFuture<'a, R> where R: decdn_client::source::BaoRangeReader + 'a
 pub fn decdn_client::source::IngestStore::proven(&self) -> core::option::Option<u64>
 pub fn decdn_client::source::IngestStore::set_bound(&self, u64)
 impl decdn_client::source::IngestStore for decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
-pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64, core::option::Option<&'a core::sync::atomic::AtomicU64>) -> decdn_client::source::IngestFuture<'a, R> where R: decdn_client::source::BaoRangeReader + 'a
 pub fn decdn_client::ranged_store::ClientRangedStore::proven(&self) -> core::option::Option<u64>
 pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)
+pub type decdn_client::source::IngestFuture<'a, R> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<(R, decdn_client::source::IngestEnd)>> + 'a)>>
 pub type decdn_client::source::SourceFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>
 pub type decdn_client::source::SourceStream<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn futures_core::stream::Stream<Item = T> + core::marker::Send + 'a)>>
 pub mod decdn_client::source_set
@@ -618,6 +627,9 @@ pub decdn_client::Health::Healthy
 pub decdn_client::Health::Healthy::streak: u32
 pub decdn_client::Health::Unaffordable
 pub decdn_client::Health::Unaffordable::at_deposit: alloy_primitives::aliases::U256
+pub enum decdn_client::IngestEnd
+pub decdn_client::IngestEnd::Drained
+pub decdn_client::IngestEnd::Stopped
 pub enum decdn_client::Metered
 pub decdn_client::Metered::Exhausted
 pub decdn_client::Metered::Moved
@@ -707,7 +719,7 @@ pub fn decdn_client::ranged_store::ClientRangedStore::read(&self, u64, u64) -> d
 pub fn decdn_client::ranged_store::ClientRangedStore::total_bytes(&self) -> u64
 impl decdn_client::source::IngestStore for decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
-pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64, core::option::Option<&'a core::sync::atomic::AtomicU64>) -> decdn_client::source::IngestFuture<'a, R> where R: decdn_client::source::BaoRangeReader + 'a
 pub fn decdn_client::ranged_store::ClientRangedStore::proven(&self) -> core::option::Option<u64>
 pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)
 pub struct decdn_client::ClockHold<'a>(_)
@@ -878,6 +890,7 @@ pub type decdn_client::source::PeerSource<'_>::Reader = decdn_client::sink::Pull
 pub fn decdn_client::source::PeerSource<'_>::finish(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 pub fn decdn_client::source::PeerSource<'_>::max_blob_size_bytes(&self) -> u64
 pub fn decdn_client::source::PeerSource<'_>::open(&self, [u8; 32], decdn_bao_range::AlignedRange) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, Self::Reader)>
+pub fn decdn_client::source::PeerSource<'_>::stop(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 pub struct decdn_client::PeerStore
 impl decdn_client::peer_store::PeerStore
 pub fn decdn_client::peer_store::PeerStore::get(&self, &iroh_base::key::PublicKey) -> core::option::Option<decdn_client::peer_store::PeerRecord>
@@ -938,6 +951,7 @@ pub type decdn_client::source::PrimedSource<S>::Reader = <S as decdn_client::sou
 pub fn decdn_client::source::PrimedSource<S>::finish(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 pub fn decdn_client::source::PrimedSource<S>::max_blob_size_bytes(&self) -> u64
 pub fn decdn_client::source::PrimedSource<S>::open(&self, [u8; 32], decdn_bao_range::AlignedRange) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, Self::Reader)>
+pub fn decdn_client::source::PrimedSource<S>::stop(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 pub struct decdn_client::ProgressClock
 impl decdn_client::stop::ProgressClock
 pub fn decdn_client::stop::ProgressClock::hold(&self) -> decdn_client::stop::ClockHold<'_>
@@ -1096,6 +1110,7 @@ pub const fn decdn_client::UpstreamPull::expected_wire_bytes(&self) -> u64
 pub async fn decdn_client::UpstreamPull::finish(self) -> anyhow::Result<decdn_client::VoucherProgress>
 pub async fn decdn_client::UpstreamPull::next_chunk(&mut self) -> anyhow::Result<core::option::Option<bytes::bytes::Bytes>>
 pub fn decdn_client::UpstreamPull::progress(&self) -> decdn_client::VoucherProgress
+pub async fn decdn_client::UpstreamPull::stop(self) -> anyhow::Result<decdn_client::VoucherProgress>
 impl core::fmt::Debug for decdn_client::UpstreamPull
 pub fn decdn_client::UpstreamPull::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::ops::drop::Drop for decdn_client::UpstreamPull
@@ -1166,28 +1181,31 @@ pub type decdn_client::BlobSource::Reader: decdn_client::source::BaoRangeReader
 pub fn decdn_client::BlobSource::finish(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 pub fn decdn_client::BlobSource::max_blob_size_bytes(&self) -> u64
 pub fn decdn_client::BlobSource::open(&self, [u8; 32], decdn_bao_range::AlignedRange) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, Self::Reader)>
+pub fn decdn_client::BlobSource::stop(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 impl decdn_client::source::BlobSource for decdn_client::source::PeerSource<'_>
 pub type decdn_client::source::PeerSource<'_>::Reader = decdn_client::sink::PullReader
 pub fn decdn_client::source::PeerSource<'_>::finish(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 pub fn decdn_client::source::PeerSource<'_>::max_blob_size_bytes(&self) -> u64
 pub fn decdn_client::source::PeerSource<'_>::open(&self, [u8; 32], decdn_bao_range::AlignedRange) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, Self::Reader)>
+pub fn decdn_client::source::PeerSource<'_>::stop(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 impl<S: decdn_client::source::BlobSource> decdn_client::source::BlobSource for decdn_client::source::PrimedSource<S>
 pub type decdn_client::source::PrimedSource<S>::Reader = <S as decdn_client::source::BlobSource>::Reader
 pub fn decdn_client::source::PrimedSource<S>::finish(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 pub fn decdn_client::source::PrimedSource<S>::max_blob_size_bytes(&self) -> u64
 pub fn decdn_client::source::PrimedSource<S>::open(&self, [u8; 32], decdn_bao_range::AlignedRange) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, Self::Reader)>
+pub fn decdn_client::source::PrimedSource<S>::stop(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
 pub trait decdn_client::Funder: core::marker::Send + core::marker::Sync
 pub fn decdn_client::Funder::max_topups(&self) -> u32
 pub fn decdn_client::Funder::pool_spent(&self) -> core::option::Option<alloy_primitives::aliases::U256>
 pub fn decdn_client::Funder::top_up(&self, alloy_primitives::aliases::U256) -> decdn_client::source::SourceFuture<'_, decdn_incentive::buyer_pool::DepositOutcome>
 pub trait decdn_client::IngestStore: decdn_bao_range::ranged_store::RangedStore
 pub fn decdn_client::IngestStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
-pub fn decdn_client::IngestStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::IngestStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64, core::option::Option<&'a core::sync::atomic::AtomicU64>) -> decdn_client::source::IngestFuture<'a, R> where R: decdn_client::source::BaoRangeReader + 'a
 pub fn decdn_client::IngestStore::proven(&self) -> core::option::Option<u64>
 pub fn decdn_client::IngestStore::set_bound(&self, u64)
 impl decdn_client::source::IngestStore for decdn_client::ranged_store::ClientRangedStore
 pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self) -> decdn_client::source::SourceFuture<'_, ()>
-pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<R>> + 'a)>> where R: decdn_client::source::BaoRangeReader + 'a
+pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64, core::option::Option<&'a core::sync::atomic::AtomicU64>) -> decdn_client::source::IngestFuture<'a, R> where R: decdn_client::source::BaoRangeReader + 'a
 pub fn decdn_client::ranged_store::ClientRangedStore::proven(&self) -> core::option::Option<u64>
 pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)
 pub trait decdn_client::Pacer: core::marker::Send + core::marker::Sync
@@ -1231,6 +1249,7 @@ pub async fn decdn_client::open_progressive_pull(&iroh::endpoint::Endpoint, iroh
 pub fn decdn_client::plan_covered_runs(&bao_tree::ChunkRanges, u64, &[decdn_client::SourceCoverage], &[usize]) -> (alloc::vec::Vec<decdn_client::CoveredRun>, bao_tree::ChunkRanges)
 pub fn decdn_client::resume_may_be_stale(&anyhow::Error) -> bool
 pub fn decdn_client::sign_client_binding(&alloy_signer_local::PrivateKeySigner, alloy_primitives::aliases::B256, &alloy_sol_types::eip712::Eip712Domain) -> anyhow::Result<decdn_protocol::client::ClientBinding>
+pub type decdn_client::IngestFuture<'a, R> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<(R, decdn_client::source::IngestEnd)>> + 'a)>>
 pub type decdn_client::ProgressCallback = (dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync)
 pub type decdn_client::SinkFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>
 pub type decdn_client::SourceFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>
