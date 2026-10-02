@@ -909,6 +909,10 @@ type PartialSizeMemo = Mutex<HashMap<Hash, (u64, Instant)>>;
 /// eviction — i.e. **pinned hashes are already excluded**. Returned by
 /// [`CacheEngine::eviction_candidates`].
 ///
+/// The one carve-out is a deny-listed hash: it stays a candidate even when
+/// pinned ("deny wins over pin"), so the space path reclaims an unservable
+/// blob instead of holding it on disk.
+///
 /// The newtype makes "pinned-already-excluded" a *type-level* property:
 /// any future eviction-policy implementation that takes
 /// `EvictionCandidates` is guaranteed by the compiler not to evict
@@ -4455,6 +4459,10 @@ impl CacheEngine {
     /// never appears here, so any candidate-picking sort or top-K query
     /// run against the result inherently respects the pinning policy.
     ///
+    /// The exception is a pinned hash that is deny-listed (local or
+    /// governance deny): it stays a candidate, because deny wins over pin.
+    /// The deny set itself never removes a hash from the snapshot.
+    ///
     /// The return type ([`EvictionCandidates`]) is a newtype with no
     /// public constructor — callers can iterate or `into_inner` but
     /// cannot fabricate one. This makes "pinned-already-excluded" a
@@ -4470,7 +4478,8 @@ impl CacheEngine {
     /// *some* pinned generation, just not necessarily the very latest.
     ///
     /// A third filter layer (after pinned, before the LRU sort) drops any
-    /// hash under an active probe-triggered eviction hold (#318, ADR 005
+    /// hash under an active probe-triggered eviction hold, even a deny-listed
+    /// one (#318, ADR 005
     /// §Probe-triggered eviction hold; ADR 040 §Pinning, durable operator-evict,
     /// and the probe-hold stay engine-enforced:
     /// "a held hash is invisible to the LRU driver until the hold
