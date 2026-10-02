@@ -921,13 +921,17 @@ since project inception and will roll into the first tagged release.
   way to the client. The wait now faults only after 10 s with no proof and no
   new STREAM frame sent on the connection. All the proofs for one owed chunk
   share a 30 s ceiling from the chunk's first wait, so proofs that credit
-  nothing cannot stretch it. A client that stops reading still faults at
-  10 s. The fault names the connection's selected path (relay or direct, IPv4
-  or IPv6) with its RTT, congestion window, lost packets, congestion events
-  and black holes detected: `no proof and no transport progress for 10s
-  (selected path …)` or `the chunk's proof wait passed 30s (selected path …)`.
-  It replaces `proof read timed out after 10s` in the `serve_stream` failure
-  span.
+  nothing cannot stretch it. A client that stops reading faults at 10 s when
+  its connection carries nothing else; traffic on sibling streams of the same
+  connection counts as progress and can hold the wait up to the 30 s ceiling.
+  A ceiling fault does not count on
+  `decdn_node_pull_through_client_abandoned_total`. The fault text gives the
+  measured times and the STREAM frames the wait saw, then the connection's
+  selected path (relay or direct, IPv4 or IPv6) with its RTT and congestion
+  window and the path's lifetime totals of lost packets, congestion events and
+  black holes detected: `no proof and no transport progress for 10.0s; …` or
+  `the chunk's proofs ran past their wait ceiling after 30.0s; …`. It replaces
+  `proof read timed out after 10s` in the `serve_stream` failure span.
 
 - **Chain-read logs no longer carry the RPC URL (#2264).** The node's
   binding check, buyer lane seed, owned-pool walk, top-up, pool open and

@@ -154,7 +154,7 @@ fn order_groups_smallest_first(mut groups: Vec<HashGroup<'_>>) -> Vec<HashGroup<
 /// Run blocking file work `f` on tokio's blocking pool and return its result.
 /// Every group of a bundle pull is a future polled by ONE task, so a blocking
 /// call on that task stops every other group's streams from reading or paying —
-/// a serving node then ends them at its voucher-read timeout. `what` names the
+/// a serving node then ends them when its proof wait faults. `what` names the
 /// work in a join error.
 async fn off_runtime<T, F>(what: &'static str, f: F) -> anyhow::Result<T>
 where

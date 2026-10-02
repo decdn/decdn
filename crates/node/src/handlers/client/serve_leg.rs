@@ -55,7 +55,7 @@ use crate::metrics::FirstByteClock;
 
 use super::MAX_PROOFS_PER_CHUNK;
 use super::outcome::{ServeEnd, ServeStop};
-use super::proof_wait::ChunkDeadline;
+use super::proof_wait::{ChunkProofs, ProofWaitFault};
 use super::ramp::RampCarry;
 use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked};
 use super::wire::chunk_frame_bufs;
@@ -395,11 +395,11 @@ impl ClientHandler {
             // full reasoning.
             let collected_any = !pending.is_empty();
             'chunk: while let Some(mut owed) = pending.pop_front() {
-                let mut attempts = 0u32;
-                // One proof-wait ceiling for every attempt at this chunk.
-                let deadline = ChunkDeadline::start();
+                // One proof budget and one proof-wait ceiling for every proof
+                // this chunk takes.
+                let mut proofs = ChunkProofs::start();
                 loop {
-                    attempts = attempts.saturating_add(1);
+                    let attempt = proofs.next_attempt();
                     let stop = match self
                         .commit_one_proof(
                             conn,
@@ -413,24 +413,31 @@ impl ClientHandler {
                             client_node_id,
                             rate_per_mb,
                             owed,
-                            deadline,
+                            &proofs,
                         )
                         .await
                     {
                         Ok(stop) => stop,
                         Err(e) => {
-                            // A peer-attributable error (a transport drop, a proof-read
-                            // timeout, a rate-check bail — #856/#857) meters the client
-                            // abandon. A node-side fault (a lane-store failure, a
-                            // broken invariant) carries neither `PeerFault` nor
-                            // `ClientPaymentFault`: the dispatch sink meters it on
-                            // `decdn_serve_stream_node_fault_total` instead. Either
-                            // way, propagate so the caller drops the pull leg.
-                            if super::wire::is_peer_attributable(&e) {
+                            // A peer-attributable error (a transport drop, a stalled
+                            // proof wait, a rate-check bail — #856/#857) meters the
+                            // client abandon. A chunk that passes its proof-wait
+                            // ceiling does not: its connection was still sending, so
+                            // a slow path or a busy sibling stream may be the cause
+                            // rather than a client that left. A node-side fault (a
+                            // lane-store failure, a broken invariant) carries neither
+                            // `PeerFault` nor `ClientPaymentFault`: the dispatch sink
+                            // meters it on `decdn_serve_stream_node_fault_total`
+                            // instead. Every case still ends on one inbound reason
+                            // counter in the dispatch sink. Either way, propagate so
+                            // the caller drops the pull leg.
+                            if super::wire::is_peer_attributable(&e)
+                                && !ProofWaitFault::is_past_ceiling(&e)
+                            {
                                 self.metrics.node_pull_through_client_abandoned();
                             }
                             return Err(e.context(format!(
-                                "proof {attempts} of at most {MAX_PROOFS_PER_CHUNK} for a {}-byte \
+                                "proof {attempt} of at most {MAX_PROOFS_PER_CHUNK} for a {}-byte \
                                  chunk ({} bytes owed, {} more queued)",
                                 owed.len(),
                                 owed.remaining(),
@@ -480,7 +487,8 @@ impl ClientHandler {
                             if owed.settle(credited_bytes)? {
                                 continue 'chunk;
                             }
-                            if attempts >= MAX_PROOFS_PER_CHUNK {
+                            if proofs.exhausted() {
+                                let attempts = proofs.attempts();
                                 self.metrics.node_pull_through_client_abandoned();
                                 // A payer that spends its per-chunk proof budget
                                 // without settling the chunk is at fault, not this
@@ -638,8 +646,8 @@ impl ClientHandler {
             // No-progress guard: an iteration that delivered no byte and credited
             // no byte cannot change what the next one sees, so it would repeat
             // forever — see the twin guard in `deliver`. A client that stops paying
-            // never reaches it: its voucher read times out or fails, and the recoup
-            // phase returns that error. Reaching it means the accounting broke, so
+            // never reaches it: its proof wait faults or its read fails, and the
+            // recoup phase returns that error. Reaching it means the accounting broke, so
             // the stream fails as a node fault. The caller then drops the pull leg,
             // which bounds the upstream spend.
             if delivered == delivered_at_iter_start && credited_this_iter == 0 {

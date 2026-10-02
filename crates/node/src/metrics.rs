@@ -1507,7 +1507,10 @@ pub struct DecdnMetrics {
     /// aborted the upstream pull and abandoned the partial fill. The per-request
     /// loss is bounded to the ramped credit window; a sustained rate flags a leech.
     /// A node-side fault on the serve leg is not an abandon: it counts on
-    /// `decdn_serve_stream_node_fault_total` only. Every abandon here also ends the
+    /// `decdn_serve_stream_node_fault_total` only. Nor is an owed chunk that passes
+    /// its proof-wait ceiling while its connection still sends: a slow path or a
+    /// busy sibling stream can cause that, and the stream ends on the declined or
+    /// abandoned serve reason counter only. Every abandon here also ends the
     /// inbound stream on one serve reason counter: a spent per-chunk proof budget
     /// on `decdn_serve_stream_proof_budget_exhausted_total`, a rejected voucher on
     /// `decdn_serve_stream_voucher_rejected_total`, and a client that drops on
