@@ -19,7 +19,7 @@ use std::sync::Arc;
 use alloy::primitives::{Address, U256};
 use tokio::time::Instant;
 
-use crate::fault::Fault;
+use crate::fault::{Fault, classify};
 use crate::scheduler::{Connecting, connect_future, sleep_until_opt};
 use crate::source::SourceFuture;
 use crate::source_set::{BUILD_RETRY_BASE, Holder, SourceProvider, SourceSet};
@@ -50,6 +50,8 @@ use crate::streamer::StreamCandidate;
 /// # Errors
 ///
 /// - a fatal fault ([`crate::Fault::Fatal`]) `open` returned, verbatim;
+/// - a fatal lane build, wrapped in [`crate::LaneBuildFault`]: one that may
+///   have escrowed USDC no record credits, which a retry would escrow again;
 /// - [`crate::NoAffordableSource`] or [`crate::NoSourceHasBlob`] on a
 ///   unanimous verdict of the sources;
 /// - [`crate::GaveUp`] once the stop policy's limit passes without an answer.
@@ -148,7 +150,15 @@ where
                         deposit = deposit.max(lane_deposit(&lane));
                         opening = Some((provider, Box::pin(open(lane))));
                     }
-                    Err(err) => tracing::debug!(%provider, error = %decdn_common::redact::sanitize_err_chain(&err), "lane build failed"),
+                    // A build fault is chain-side and retries with backoff,
+                    // unless it may have escrowed USDC no record credits: a
+                    // retry escrows again.
+                    Err(err) => {
+                        if let Fault::Fatal(_) = classify(&err) {
+                            return Err(err);
+                        }
+                        tracing::debug!(%provider, error = %decdn_common::redact::sanitize_err_chain(&err), "lane build failed");
+                    }
                 }
             }
             answer = poll_some(opening.as_mut().map(|(_, fut)| fut)), if opening.is_some() => {

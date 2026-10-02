@@ -915,6 +915,21 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **The client funds a buyer pool from its pool-wide spend, and a short
+  wallet no longer drops lanes (#2288, #2289).** The low-water refill
+  compares the deposit with the spend of every lane of the pool, not only
+  the lane being built, so a pool spent across many providers refills. The
+  reactive top-up and the check of a node's `SpendingCapExhausted` refusal
+  use the same pool-wide view. When the wallet holds too little USDC for a
+  refill, the fetch continues on the pool's remaining deposit, logs one WARN,
+  makes no further refill attempts that run, and ends with one
+  `warning: wallet … holds … µUSDC, less than the … µUSDC top-up …` line on
+  stderr, visible without `-v`. A pool with nothing left and a short wallet
+  ends the command with the top-up remedy. A `topUp` whose receipt cannot be
+  read, or that mined but could not be recorded locally, now ends the command
+  and names the tx instead of retrying, because a retry escrows again. A
+  failed reactive top-up retries without cooling the serving node.
+
 - **The node no longer faults a paying client whose bytes are still in
   flight (#2230).** A write returns once the transport buffers it, so the
   node's wait for a proof can start while several chunks are still on the

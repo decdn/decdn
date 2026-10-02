@@ -78,6 +78,7 @@ use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, RangedStore, align_range}
 use decdn_incentive::DepositOutcome;
 use decdn_protocol::VoucherRejectReason;
 
+use crate::buyer_pool::EscrowUntracked;
 use crate::fault::HealExhausted;
 use crate::pacer::{DownstreamFrontier, PaceDecision, PaceState};
 use crate::source::{BlobSource, Funder, IngestStore, SourceFuture};
@@ -116,6 +117,28 @@ impl std::fmt::Display for PoolExhausted {
 }
 
 impl std::error::Error for PoolExhausted {}
+
+/// Marker on a reactive top-up that failed: [`Funder::top_up`] returned an
+/// error, so the deposit did not rise. The failure is the buyer's funding,
+/// never the serving source's delivery, so the fault classifier
+/// ([`crate::classify`]) rules it [`crate::Fault::Transient`]: the source keeps
+/// its health and the loop retries. A funder that found the wallet short of
+/// USDC ([`crate::buyer_pool::WalletShortfall`]) makes it
+/// [`crate::Fault::Unaffordable`], like [`PoolExhausted`], and an error that may
+/// have escrowed USDC
+/// ([`crate::buyer_pool::TopUpUnconfirmed`],
+/// [`crate::buyer_pool::EscrowUntracked`]) stays fatal, whatever marker it
+/// carries.
+#[derive(Debug)]
+pub struct TopUpFailed;
+
+impl std::fmt::Display for TopUpFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the reactive pool top-up failed")
+    }
+}
+
+impl std::error::Error for TopUpFailed {}
 
 /// A leg of a gap opened, streamed and finished cleanly, yet left both the gap's
 /// paid frontier and the store's delivered frontier where they were.
@@ -1067,7 +1090,11 @@ where
                 if pool.is_some() && locked_deposit(ctx)? > deposit {
                     continue;
                 }
-                match funder.top_up(additional).await? {
+                match funder
+                    .top_up(additional)
+                    .await
+                    .map_err(|err| err.context(TopUpFailed))?
+                {
                     DepositOutcome::Added(new_deposit) => {
                         // Credit the new deposit through the shared handle so the
                         // source's next open (which clones the context) sees it.
@@ -1084,20 +1111,22 @@ where
                             }
                         }
                     }
+                    // Typed as an untracked escrow, so the acquire loop ends the
+                    // command rather than retrying into a second escrow.
                     DepositOutcome::UnknownPool => {
-                        anyhow::bail!(
+                        return Err(anyhow::Error::new(EscrowUntracked(format!(
                             "mid-fetch top-up of {additional} landed on-chain but no local \
                              record remains to credit it: the deposit is escrowed and \
                              untracked. Reconcile against the chain before retrying"
-                        );
+                        ))));
                     }
                     DepositOutcome::PoolMismatch => {
-                        anyhow::bail!(
+                        return Err(anyhow::Error::new(EscrowUntracked(format!(
                             "mid-fetch top-up of {additional} landed on-chain but the local \
                              record now tracks a different pool: the deposit is escrowed \
                              against the topped-up pool. Reconcile against the chain \
                              before retrying"
-                        );
+                        ))));
                     }
                 }
                 // Spend one unit of the top-up budget — the shared one when lanes
@@ -3061,6 +3090,11 @@ mod tests {
             assert!(
                 msg.contains("escrowed"),
                 "the operator must learn the money moved: {msg}"
+            );
+            assert_eq!(
+                crate::classify(&err),
+                crate::Fault::Fatal(crate::FatalScope::Command),
+                "{outcome:?}: a retry escrows again, so the acquire loop must end: {msg}"
             );
             assert!(
                 !store.is_complete().await.expect("is_complete"),

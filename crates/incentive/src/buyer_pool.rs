@@ -188,6 +188,18 @@ impl BuyerPoolState {
         self.lanes.iter().map(|(k, v)| (*k, *v))
     }
 
+    /// The cumulative amount vouchered across every `(signer, provider)` lane
+    /// this row tracks: the row's view of what the single shared deposit has
+    /// spent. A lane the row has no record of, such as every lane of a pool
+    /// adopted from chain, is not counted, so `deposit - committed_amount()` is
+    /// an upper bound on the remaining spendable deposit.
+    #[must_use]
+    pub fn committed_amount(&self) -> U256 {
+        self.lanes
+            .values()
+            .fold(U256::ZERO, |acc, p| acc.saturating_add(p.last_amount))
+    }
+
     /// Number of lanes with tracked progress.
     #[must_use]
     pub fn lane_count(&self) -> usize {
@@ -715,6 +727,35 @@ mod tests {
             },
             |(k, _)| k,
         )
+    }
+
+    /// The committed amount is the sum over every lane, not any one lane: the
+    /// lanes share one deposit.
+    #[test]
+    fn committed_amount_sums_every_lane() {
+        let mut state = sample(1);
+        let lane2 = LaneKey {
+            provider: address!("00000000000000000000000000000000000000b3"),
+            ..only_lane(&state)
+        };
+        assert!(
+            state
+                .advance_lane(lane2, U256::from(5u64), U256::from(66u64))
+                .is_ok()
+        );
+        assert_eq!(state.committed_amount(), U256::from(1_300u64));
+        assert_eq!(
+            BuyerPoolState::new(
+                state.pool_id,
+                DEPLOYMENT,
+                state.owner,
+                state.token,
+                U256::from(1u64),
+            )
+            .committed_amount(),
+            U256::ZERO,
+            "a pool with no lanes has committed nothing"
+        );
     }
 
     /// A row is on a deployment only when both the chain and the contract

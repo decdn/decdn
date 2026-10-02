@@ -2414,6 +2414,8 @@ fn seed_deposit<S>(deposit: &tokio::sync::watch::Sender<U256>, lane: &StreamCand
 /// `ledgers` picks which view: `None` subtracts the committed amount of every
 /// lane this acquire has started; `Some(reg)` subtracts `reg.total_committed()`,
 /// the sum over every lane a `bundle pull` run has registered. Either way the
+/// funder's view of the whole pool ([`crate::Funder::pool_spent`]) wins when it
+/// is larger, and the
 /// reactive-top-up budget is counted once for the acquire rather than once per
 /// lane, and a landed top-up is credited to every lane the view covers. The gate
 /// is evaluated at each `fill_gap` leg boundary; the hard backstop against a
@@ -2431,6 +2433,8 @@ fn seed_deposit<S>(deposit: &tokio::sync::watch::Sender<U256>, lane: &StreamCand
 /// # Errors
 ///
 /// - a fatal fault ([`crate::Fault::Fatal`]) a lane ended with, verbatim;
+/// - a fatal lane build, wrapped in [`crate::LaneBuildFault`]: one that may
+///   have escrowed USDC no record credits, which a retry would escrow again;
 /// - [`crate::GaveUp`] once the stop policy's limit passes without a verified
 ///   byte;
 /// - [`crate::NoAffordableSource`] or [`crate::NoSourceHasBlob`] on a
@@ -2513,10 +2517,15 @@ where
     // Every started lane's `(ctx, ledger)`: the pool-wide view when there is no
     // run registry.
     let pool_lanes: Mutex<PoolLanes> = Mutex::new(Vec::new());
-    let spent: Box<dyn Fn() -> U256 + Send + Sync + '_> = match env.ledgers {
+    // The pool's spend: what the loop's own lanes committed, or the funder's
+    // view of the whole pool when that is larger (it also counts lanes the
+    // loop does not drive).
+    let funder = env.funder;
+    let lanes = &pool_lanes;
+    let own: Box<dyn Fn() -> U256 + Send + Sync + '_> = match env.ledgers {
         Some(reg) => Box::new(move || reg.total_committed()),
-        None => Box::new(|| {
-            pool_lanes
+        None => Box::new(move || {
+            lanes
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .iter()
@@ -2524,6 +2533,7 @@ where
                 .fold(U256::ZERO, U256::saturating_add)
         }),
     };
+    let spent = move || own().max(funder.pool_spent().unwrap_or(U256::ZERO));
     let credit: Box<dyn Fn(U256) -> anyhow::Result<()> + Send + Sync + '_> = match env.ledgers {
         Some(reg) => Box::new(|new_deposit| {
             reg.credit_all(new_deposit);
@@ -2549,7 +2559,7 @@ where
     // they share the run's lock; a solo acquire serializes only its own lanes.
     let own_topup_lock = tokio::sync::Mutex::new(());
     let pool = SharedPool {
-        spent: &*spent,
+        spent: &spent,
         topups_used: &topups_used,
         credit: &*credit,
         topup_lock: env.ledgers.map_or(&own_topup_lock, LaneLedgers::topup_lock),
@@ -3003,7 +3013,15 @@ where
                                 // A new lane changes who takes a queued range.
                                 growth.wanted = true;
                             }
-                            Err(err) => tracing::debug!(%provider, error = %decdn_common::redact::sanitize_err_chain(&err), "lane build failed"),
+                            // A build fault is chain-side and retries with
+                            // backoff, unless it may have escrowed USDC no
+                            // record credits: a retry escrows again.
+                            Err(err) => {
+                                if let Fault::Fatal(_) = crate::fault::classify(&err) {
+                                    return Err(err);
+                                }
+                                tracing::debug!(%provider, error = %decdn_common::redact::sanitize_err_chain(&err), "lane build failed");
+                            }
                         }
                     }
                 }
@@ -5721,6 +5739,124 @@ mod tests {
         .ok_or_else(|| anyhow::anyhow!("must stop"))?;
         assert!(
             err.downcast_ref::<NoAffordableSource>().is_some(),
+            "{err:#}"
+        );
+        Ok(())
+    }
+
+    /// A node's `SpendingCapExhausted` refusal is genuine only when the pool's
+    /// own accounting agrees, and that accounting takes the funder's view of
+    /// the whole pool ([`Funder::pool_spent`]). With no spend beyond the loop's
+    /// lanes, they have touched almost none of the deposit, so the refusal is a
+    /// lie that ends the command. With the deposit spent outside
+    /// the loop, the refusal is genuine: with no top-up left, the acquire stops
+    /// with the top-up remedy.
+    #[tokio::test(start_paused = true)]
+    async fn a_cap_refusal_is_genuine_once_the_outside_spend_drains_the_deposit()
+    -> anyhow::Result<()> {
+        let deposit = U256::from(1_000_000_000u64);
+        for (outside, genuine) in [(U256::ZERO, false), (deposit, true)] {
+            let la = Arc::new(PoolLedger::new(Cumulative::default()));
+            let a = ScriptedSource::new(blob(1024 * 1024))?
+                .paying(Arc::clone(&la))
+                .with_fault_after(0, || {
+                    anyhow::Error::new(UpstreamVoucherRejected {
+                        reason: decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted,
+                        bundle: None,
+                        proof_generation: None,
+                    })
+                });
+            let (root, total) = (a.root(), a.total_bytes());
+            let (store, _dir) = fresh_store(root, total);
+            let ctx = Arc::new(Mutex::new(ctx_with(0xA1, deposit)));
+            let provider = StaticSources::new(vec![candidate_ctx(a, la, ctx, None)])?;
+            let funder = no_topups().with_pool_spent(outside);
+            let err = run_acquire(
+                &store,
+                &provider,
+                root,
+                total,
+                &BudgetPacer::new(),
+                &funder,
+                1,
+                None,
+            )
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("outside spend {outside}: must stop"))?;
+            assert_eq!(
+                err.downcast_ref::<NoAffordableSource>().is_some(),
+                genuine,
+                "outside spend {outside}: {err:#}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A lane build that may have escrowed USDC no record credits ends the
+    /// acquire at once. Any other build fault retries with backoff, and a retry
+    /// here would escrow again.
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_build_that_may_have_escrowed_ends_the_acquire() -> anyhow::Result<()> {
+        struct EscrowingBuild(StaticSources<ScriptedSource>);
+
+        impl crate::SourceProvider for EscrowingBuild {
+            type Source = ScriptedSource;
+
+            fn discover(&self, hash: [u8; 32]) -> crate::SourceFuture<'_, Vec<crate::Holder>> {
+                self.0.discover(hash)
+            }
+
+            fn connect<'a>(
+                &'a self,
+                _holder: &'a crate::Holder,
+            ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
+                Box::pin(async {
+                    Err(crate::buyer_pool::escrowed_but_untracked(
+                        "pool 0x01 topped up by 5 µUSDC",
+                        alloy::primitives::TxHash::repeat_byte(0xab),
+                        "disk full",
+                    ))
+                })
+            }
+        }
+
+        let data = blob(1024 * 1024);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let a = ScriptedSource::new(data)?.paying(Arc::clone(&la));
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, _dir) = fresh_store(root, total);
+        let provider = EscrowingBuild(StaticSources::new(vec![candidate(a, la, 0xA1, None)])?);
+        let mut set = SourceSet::new(&provider, root, Arc::default(), provider.0.holders());
+        // A retried build would run until this gives up instead.
+        let stop = StopPolicy::new(false, Some(Duration::from_mins(5)), Arc::default());
+        let drive = drive_config();
+        let err = acquire(
+            AcquireTarget {
+                store: &store,
+                hash: root,
+                total_bytes: total,
+                ranges: &[(0, total)],
+            },
+            &mut set,
+            &AcquireEnv {
+                pacer: &BudgetPacer::new(),
+                funder: &no_topups(),
+                drive: &drive,
+                max_lanes: 1,
+                stop: &stop,
+                on_progress: None,
+                ledgers: None,
+                pacing: None,
+                max_blob_bytes: 0,
+            },
+        )
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("must stop"))?;
+        assert_eq!(classify(&err), Fault::Fatal(FatalScope::Command), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("escrowed but untracked"),
             "{err:#}"
         );
         Ok(())

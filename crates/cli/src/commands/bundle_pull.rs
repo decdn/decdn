@@ -1549,6 +1549,7 @@ async fn pull_over(
         namespace_id,
         grant,
         ledgers: LaneLedgers::new(),
+        funding: fetch::RunFunding::default(),
         dedup_stats: DedupStats::default(),
         open_lock: tokio::sync::Mutex::new(()),
         jobs: args.jobs.max(1),
@@ -1572,6 +1573,14 @@ async fn pull_over(
     pull_manifest(ctx, args, filter, filters_given, local_manifest).await
 }
 
+/// Print the run's wallet-shortfall warning ([`fetch::RunFunding::shortfall`]),
+/// if it has one, for a run that ends before its summary.
+fn warn_shortfall<P: Provider + Clone>(ctx: &PullCtx<'_, P>) {
+    if let Some(shortfall) = ctx.funding.shortfall() {
+        eprintln!("warning: {shortfall}");
+    }
+}
+
 /// Obtain the bundle manifest through `ctx`, pull every kept entry, and print the
 /// run summary.
 async fn pull_manifest<P: Provider + Clone>(
@@ -1583,14 +1592,20 @@ async fn pull_manifest<P: Provider + Clone>(
 ) -> anyhow::Result<()> {
     // Obtain the manifest: the pre-read local one, or the `--hash` bundle blob
     // fetched and filtered here. `None` => filtered to empty (already reported).
-    let Some(kept) = obtain_manifest(&ctx, args, filter, filters_given, local_manifest).await?
-    else {
-        return Ok(());
-    };
-
     // `--select`: let the user trim the (already glob-filtered) list in their
     // editor. Everything deselected ends the run (reported) like an empty filter.
-    let Some(Kept { manifest, excluded }) = maybe_select(args, kept)? else {
+    let selected = async {
+        let Some(kept) = obtain_manifest(&ctx, args, filter, filters_given, local_manifest).await?
+        else {
+            return Ok(None);
+        };
+        maybe_select(args, kept)
+    }
+    .await;
+    // The `--hash` manifest fetch is paid, so a run that ends here still owes
+    // the wallet-shortfall warning the summary below prints otherwise.
+    let Some(Kept { manifest, excluded }) = selected.inspect_err(|_| warn_shortfall(&ctx))? else {
+        warn_shortfall(&ctx);
         return Ok(());
     };
 
@@ -1618,7 +1633,7 @@ async fn pull_manifest<P: Provider + Clone>(
     let mut interrupt = Interrupt::watch();
     let PullRun {
         outcomes,
-        warnings,
+        mut warnings,
         transfer,
         interrupted,
         stopped,
@@ -1633,6 +1648,7 @@ async fn pull_manifest<P: Provider + Clone>(
         .await;
     ctx.progress.finish();
     warn_leftover_partials(&args.output, &manifest.entries, args.hash.as_deref());
+    warnings.extend(ctx.funding.shortfall());
 
     // Every entry has joined, so the shared dedup counters are now stable.
     let dedup = DedupSummary {
@@ -2042,6 +2058,9 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// issuer, so concurrent same-lane fetches never race the cumulative
     /// watermark.
     ledgers: LaneLedgers,
+    /// The run's funding facts ([`fetch::RunFunding`]): the pool's spend
+    /// outside the run's lanes, and a wallet too short of USDC to top it up.
+    funding: fetch::RunFunding,
     /// Run-scoped range-dedup counters (bytes spliced from disk, hints dropped by
     /// a fault), accumulated by every entry and reported once the pull finishes.
     dedup_stats: DedupStats,
@@ -2117,6 +2136,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             deadlines: PullDeadlines::new(fetch::STALL_WINDOW, fetch::STALL_WINDOW, 0)?,
             connections: &self.connections,
             writes: self.writes,
+            funding: &self.funding,
         })
     }
 
