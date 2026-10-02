@@ -76,6 +76,7 @@ use decdn_client::probe::probe_once;
 use decdn_client::provider;
 
 use super::buyer_store::{ChainAdoption, DataDirSource, open_client_store_for_buy};
+use super::fetch_timings::{FetchTimings, Mark};
 use super::interrupt::{Interrupt, Interrupted};
 use super::ordered_writes::OrderedWrites;
 use super::tab_progress::TabProgress;
@@ -813,7 +814,13 @@ async fn discover_provider(
     // same `args`, so they travel as `args` rather than as two more positional
     // parameters (clippy caps this function at 7).
     args: &cli::ClientFetchArgs,
+    timings: Option<&FetchTimings>,
 ) -> anyhow::Result<ResolvedTargets> {
+    let mark_probe_start = || {
+        if let Some(timings) = timings {
+            timings.mark(Mark::ProbeStart);
+        }
+    };
     // Probe-less fast path: when the store already holds enough fresh,
     // unsuppressed candidates, skip the network probe round entirely and rank
     // by the store's own EWMA latency. Falls through to today's bootstrap +
@@ -846,6 +853,7 @@ async fn discover_provider(
         if selected.len() >= store_cfg.min_fresh_candidates {
             let warming = ProxyWarmingParams::from_args(args);
             let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+            mark_probe_start();
             let targets =
                 probe_and_order(endpoint, &selected, relay_hint, hash, warming, &slash_dom).await?;
             // Stats-only harvest, never identity — identity refreshes ONLY on a
@@ -893,6 +901,7 @@ async fn discover_provider(
     let selected = select_with_widening(all, chain.region.as_deref(), allow, &store_cfg);
     let warming = ProxyWarmingParams::from_args(args);
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+    mark_probe_start();
     let targets =
         probe_and_order(endpoint, &selected, relay_hint, hash, warming, &slash_dom).await?;
     // Identity is harvested ONLY against a live registry read, and
@@ -1218,13 +1227,15 @@ fn pinned_targets(node_id: PublicKey, provider: Address) -> ResolvedTargets {
 /// when `--node-id` is omitted (deriving each provider from its node's registry
 /// entry), nearest first. The acquire loop stripes across them; a set that goes
 /// stale is refreshed by a later discovery with `--rediscover` forced, which
-/// reads the registry rather than the peer store.
+/// reads the registry rather than the peer store. `timings`, when `Some`,
+/// records the start of the probe round.
 pub(crate) async fn resolve_target_node(
     args: &cli::ClientFetchArgs,
     chain: &ResolvedChain,
     endpoint: &Endpoint,
     relays: &[RelayUrl],
     hash: [u8; 32],
+    timings: Option<&FetchTimings>,
 ) -> anyhow::Result<ResolvedTargets> {
     if let Some(raw) = &args.node_id {
         // No reachability pre-check: the endpoint is discovery-enabled, so a
@@ -1262,8 +1273,16 @@ pub(crate) async fn resolve_target_node(
     // here also cancels the ADR 012 § Bootstrap step 4 peer-store fallback,
     // so a client with a usable peer store would be handed a hard failure
     // instead of the degraded-but-working fetch the store exists to provide.
-    let order =
-        discover_provider(endpoint, chain, capacity_bond, relays.first(), hash, args).await?;
+    let order = discover_provider(
+        endpoint,
+        chain,
+        capacity_bond,
+        relays.first(),
+        hash,
+        args,
+        timings,
+    )
+    .await?;
     if !order.candidates.is_empty() {
         // A header event, then one event per candidate — the log-side shape of
         // the previous per-line stderr listing.
@@ -1487,6 +1506,7 @@ fn persist_watermark(
 /// [`Interrupted`] on Ctrl-C, [`decdn_client::GaveUp`] once the stop policy's
 /// no-progress limit passes, or the fault that ended the fetch.
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+    let timings = FetchTimings::start();
     let hash = parse_hash(&args.hash)?;
     let common = &args.common;
     // Before any network or keystore work, reject a flag combination clap
@@ -1519,6 +1539,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
 
     // One discovery-enabled endpoint, reused for probing and the delivery dial.
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
+    timings.mark(Mark::Endpoint);
     // The body runs in `fetch_over`, so the endpoint closes on every exit —
     // success, an early return, an error, or a Ctrl-C — and its open connections
     // end cleanly instead of being aborted on drop. A Ctrl-C drops `fetch_over`
@@ -1528,11 +1549,17 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // The command's peer-record and watermark writes, off the runtime thread.
     let writes = OrderedWrites::default();
     let result = tokio::select! {
-        result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint, &writes) => {
+        result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint, &writes, &timings) => {
             result
         }
         () = interrupt.wait() => Err(Interrupted.into()),
     };
+    let output = if wants_stdout(&args.output) {
+        "stdout"
+    } else {
+        "file"
+    };
+    timings.log(output, result.is_ok());
     // On every exit, a Ctrl-C's included: what the drives queued is durable
     // before the command returns.
     writes.settle().await;
@@ -1562,13 +1589,16 @@ async fn fetch_over(
     store: &Arc<RedbBuyerPoolStore>,
     endpoint: &Endpoint,
     writes: &OrderedWrites,
+    timings: &FetchTimings,
 ) -> anyhow::Result<()> {
     let common = &args.common;
     // The holders to start from: the explicit `--node-id`, or auto-discovery.
     // Only a configuration fault ends the fetch here; with no holder yet, the
     // first open discovers them.
-    let resolved =
-        holders_or_none(resolve_target_node(common, chain, endpoint, relays, hash).await)?;
+    let resolved = holders_or_none(
+        resolve_target_node(common, chain, endpoint, relays, hash, Some(timings)).await,
+    )?;
+    timings.mark(Mark::Resolved);
 
     // Buyer signer (vouchers + the openPool/topUp tx). Loaded after selection so a
     // failed discovery never prompts for a keystore password. Password from env,
@@ -1582,6 +1612,7 @@ async fn fetch_over(
     )?
     .into_secret();
     let signer = Arc::new(load_signer(&chain.keystore, &password)?);
+    timings.mark(Mark::Unlocked);
     let self_address = signer.address();
 
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
@@ -1637,6 +1668,7 @@ async fn fetch_over(
         connections: &connections,
         writes,
         funding: &funding,
+        timings: Some(timings),
     };
 
     let clock = Arc::new(ProgressClock::new());
@@ -1783,6 +1815,8 @@ pub(crate) struct DriveFetchDeps<'a, P> {
     /// The run's funding facts, shared by every lane build and top-up of the
     /// run ([`RunFunding`]).
     pub(crate) funding: &'a RunFunding,
+    /// The `decdn fetch` time-to-first-byte marks; `None` for a `bundle pull`.
+    pub(crate) timings: Option<&'a FetchTimings>,
 }
 
 /// The lane's shared ledger + context: from the run registry when bundle pull
@@ -1953,6 +1987,9 @@ where
         Arc::clone(&ledger),
         provider,
     );
+    if let Some(timings) = deps.timings {
+        timings.mark(Mark::Lane);
+    }
     Ok(MultiLane {
         provider,
         pool_id,
@@ -2198,8 +2235,18 @@ where
     // The bar draws on stderr, so it shows only when stderr is a terminal; stdout
     // carries the verified bytes either way.
     let bar = std::io::IsTerminal::is_terminal(&std::io::stderr()).then(delivery_progress);
-    let on_progress: Option<&dyn Fn(u64, u64)> =
-        bar.as_ref().map(|(_, cb, _)| cb as &dyn Fn(u64, u64));
+    // `copy_verified` reports after each write, so the first report with a
+    // byte is the first byte on stdout.
+    let on_progress = |received: u64, expected: u64| {
+        if received > 0
+            && let Some(timings) = deps.timings
+        {
+            timings.mark(Mark::FirstByte);
+        }
+        if let Some((_, cb, _)) = &bar {
+            cb(received, expected);
+        }
+    };
 
     // The drive runs beside the copy, not inside its reads: a blocked stdout
     // must not stop an open paid leg from paying and draining. The read-ahead
@@ -2210,7 +2257,7 @@ where
             &mut reader,
             &mut stdout,
             total_bytes,
-            on_progress,
+            Some(&on_progress),
         ))
         .await;
 
@@ -2248,7 +2295,15 @@ async fn download_to_file<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let (bar, on_progress, meter) = delivery_progress();
+    let (bar, on_bar, meter) = delivery_progress();
+    let on_progress = |received: u64, expected: u64| {
+        if received > 0
+            && let Some(timings) = deps.timings
+        {
+            timings.mark(Mark::FirstByte);
+        }
+        on_bar(received, expected);
+    };
     let downloader = Downloader::new(
         sources,
         holders,
@@ -4697,6 +4752,7 @@ mod tests {
         let funding = RunFunding::default();
         let entry_deps = || -> anyhow::Result<DriveFetchDeps<'_, _>> {
             Ok(DriveFetchDeps {
+                timings: None,
                 endpoint: &ep,
                 store: &store,
                 contract: &contract,

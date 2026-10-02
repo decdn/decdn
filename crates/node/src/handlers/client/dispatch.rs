@@ -702,7 +702,9 @@ impl ClientHandler {
         // The gate's class. The shed gate admits under it and the first-byte clock
         // records under it. The class is fixed here, because a buffered fill below
         // serves a miss through the cache-hit `deliver`, and that loop cannot tell.
+        // The admit instant ends the clock's admission phase.
         let request_class;
+        let admitted_at;
         if audit.is_serveable() {
             request_class = RequestClass::CacheHit;
             // Serve-path hit rate (see `Metrics::serve_cache_hit`). Metered on the
@@ -710,7 +712,10 @@ impl ClientHandler {
             // ratio stays a property of the store rather than of current pressure.
             self.metrics.serve_cache_hit();
             match self.shed.try_admit(request_class, client_node_id) {
-                Ok(slot) => shed_slot = Some(slot),
+                Ok(slot) => {
+                    shed_slot = Some(slot);
+                    admitted_at = std::time::Instant::now();
+                }
                 Err(reason) => {
                     self.metrics.load_shed_refused(reason);
                     tracing::debug!(
@@ -761,7 +766,10 @@ impl ClientHandler {
                 self.metrics.serve_cache_partial_hit();
                 request_class = RequestClass::CacheHit;
                 match self.shed.try_admit(request_class, client_node_id) {
-                    Ok(slot) => shed_slot = Some(slot),
+                    Ok(slot) => {
+                        shed_slot = Some(slot);
+                        admitted_at = std::time::Instant::now();
+                    }
                     Err(reason) => {
                         self.metrics.load_shed_refused(reason);
                         tracing::debug!(
@@ -800,7 +808,10 @@ impl ClientHandler {
                 self.metrics.serve_cache_miss();
                 request_class = RequestClass::CacheMiss;
                 match self.shed.try_admit(request_class, client_node_id) {
-                    Ok(slot) => shed_slot = Some(slot),
+                    Ok(slot) => {
+                        shed_slot = Some(slot);
+                        admitted_at = std::time::Instant::now();
+                    }
                     Err(reason) => {
                         self.metrics.load_shed_refused(reason);
                         tracing::debug!(
@@ -1020,7 +1031,11 @@ impl ClientHandler {
                                             pool_status.map(|s| s.remaining),
                                             rate_per_mb,
                                             floor_reservation,
-                                            FirstByteClock::new(request_decoded_at, request_class),
+                                            FirstByteClock::new(
+                                                request_decoded_at,
+                                                admitted_at,
+                                                request_class,
+                                            ),
                                         ))
                                         .await;
                                     }
@@ -1131,7 +1146,7 @@ impl ClientHandler {
                             fault_seen,
                             rate_per_mb,
                             floor_reservation,
-                            FirstByteClock::new(request_decoded_at, request_class),
+                            FirstByteClock::new(request_decoded_at, admitted_at, request_class),
                         ))
                         .await;
                     }
@@ -1378,6 +1393,8 @@ impl ClientHandler {
         let (resp, resp_ext) = self.sign_response(body, None)?;
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
+        let mut first_byte = FirstByteClock::new(request_decoded_at, admitted_at, request_class);
+        first_byte.mark_responded();
 
         // Stream the blob, collecting vouchers at each interval boundary.
         self.deliver(
@@ -1393,7 +1410,7 @@ impl ClientHandler {
             client_node_id,
             rate_per_mb,
             floor_reservation,
-            FirstByteClock::new(request_decoded_at, request_class),
+            first_byte,
         )
         .await
     }

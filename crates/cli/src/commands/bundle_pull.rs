@@ -2139,6 +2139,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// builds, for every fetch of an entry ([`Self::acquire_entry`]).
     fn drive_deps(&self, max_blob_bytes: u64) -> anyhow::Result<fetch::DriveFetchDeps<'_, P>> {
         Ok(fetch::DriveFetchDeps {
+            timings: None,
             endpoint: self.endpoint,
             store: self.store,
             contract: self.contract,
@@ -2208,6 +2209,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 self.endpoint,
                 self.relays,
                 hash,
+                None,
             )
             .await;
         }
