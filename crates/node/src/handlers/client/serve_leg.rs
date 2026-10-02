@@ -282,14 +282,16 @@ impl ClientHandler {
         let mut client_left = std::pin::pin!(send.stopped());
 
         // The first frame — awaiting the pull leg if `R` opens on a gap. A pull
-        // that ends `Err` here fails the serve rather than hanging.
+        // that ends `Err` here fails the serve rather than hanging. It is small,
+        // so the first byte waits for a few chunk groups of pull rather than a
+        // whole interval ([`ClientHandler::first_frame_target`]).
         // The first byte is about to go out: from here a stream that ends unpaid
         // forfeits its ramp credit (ADR 003 §Credit window).
         carry.start_delivery();
         let opening_window = self.credit_window(chunk_bytes, carry.ramp_paid(0));
         let mut next_chunk = self
             .frame_unless_client_left(
-                producer.next_frame_chunks(self.frame_target(0, chunk_bytes, opening_window)),
+                producer.next_frame_chunks(self.first_frame_target(chunk_bytes, opening_window)),
                 client_left.as_mut(),
             )
             .await?;

@@ -104,6 +104,11 @@ const POST_END_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// pull-through deadline is configured. In practice the runtime always sets
 /// one alongside the window provider, so this only guards a misconfiguration.
 const WINDOW_PULL_FALLBACK_DEADLINE: Duration = Duration::from_mins(1);
+/// The largest first frame a serve writes ([`ClientHandler::first_frame_target`]):
+/// four bao chunk groups. It sits above the one-group floor the pull side
+/// reserves for a prefetch past a shut window (`decdn_client::PULL_WINDOW_FLOOR`),
+/// so the miss leg's pairing holds.
+const FIRST_FRAME_BYTES: u64 = 4 * decdn_bao_range::CHUNK_GROUP_BYTES;
 
 /// Application-layer idle-close ceiling (ADR 005 §Connection lifetime): a served
 /// connection is closed this long after its last stream closes — or after it is
@@ -2078,6 +2083,18 @@ impl ClientHandler {
             .unwrap_or_else(|_| usize::try_from(decdn_bao_range::CHUNK_GROUP_BYTES).unwrap_or(1))
     }
 
+    /// The target size of a stream's first frame: [`Self::frame_target`] at the
+    /// start of an interval, capped at [`FIRST_FRAME_BYTES`]. A serve writes no
+    /// byte until its first frame is full, so the cap is what the first byte
+    /// waits for: a few chunk groups of store read on a hit, or of upstream pull
+    /// on a miss, rather than a whole interval. Every later frame keeps the
+    /// full target, so the frames still land on the interval boundary.
+    pub(super) fn first_frame_target(&self, interval_bytes: u64, opening_window: u64) -> usize {
+        let cap = usize::try_from(FIRST_FRAME_BYTES).unwrap_or(usize::MAX);
+        self.frame_target(0, interval_bytes, opening_window)
+            .min(cap)
+    }
+
     /// The effective downstream credit window in bytes for a stream whose voucher
     /// interval is `interval_bytes` and whose ramp input is `paid` (ADR 003
     /// §Credit window): the stream's own confirmed payment plus the credit it
@@ -2963,6 +2980,32 @@ mod tests {
         assert_eq!(
             handler.frame_target(interval - group, interval, u64::MAX) as u64,
             group
+        );
+    }
+
+    /// A stream's first frame is small, so its first byte waits for a few chunk
+    /// groups of read or pull rather than a whole interval. A tighter opening
+    /// window still wins, and the frame never drops below one chunk group.
+    #[tokio::test]
+    async fn the_first_frame_is_small() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests(&metrics).await;
+        let interval = decdn_protocol::CHUNK_BYTES;
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+
+        assert_eq!(
+            handler.first_frame_target(interval, u64::MAX) as u64,
+            FIRST_FRAME_BYTES
+        );
+        assert_eq!(
+            handler.first_frame_target(interval, 2 * group) as u64,
+            2 * group
+        );
+        assert_eq!(handler.first_frame_target(interval, 0) as u64, group);
+        assert_eq!(
+            FIRST_FRAME_BYTES % group,
+            0,
+            "the first frame is whole chunk groups"
         );
     }
 
