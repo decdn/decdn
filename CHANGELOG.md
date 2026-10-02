@@ -915,6 +915,26 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **A queue that one lane drains takes an extra stream (#2252).** In
+  `decdn bundle pull`, a lane's own worker takes queued ranges one after
+  another and does not end between them, so no stream end asked for growth.
+  The first growth pass ran as the lane started, before its worker held a
+  range, and found no busy lane to ask. Nothing asked again, so a
+  range-deduped entry's complement went to one holder as one serial request
+  per run. While a range waits and a running lane can be granted streams,
+  the acquire now asks again every second, also when no busy lane could be
+  asked. A busy lane takes an extra stream for every waiting range that its
+  provider has a permit for, not only one, and one growth pass fills every
+  free permit. A lane that waits with nothing to take gives its permit back
+  while it waits, so an idle lane of one entry no longer holds a stream that
+  another entry's queue needs; it takes a free permit again before it takes
+  a range. At `--max-lane-streams` 3 or more, an extra stream never takes a
+  provider's last free permit, so a sibling entry's first stream to that
+  provider still opens; a lane that starts again can take it. The info line
+  `a queued range waits for a stream` logs on the first wait and then at
+  most every 30 s while ranges wait, in place of a line on every change;
+  each change between those lines logs at debug.
+
 - **The client funds a buyer pool from its pool-wide spend, and a short
   wallet no longer drops lanes (#2288, #2289).** The low-water refill
   compares the deposit with the spend of every lane of the pool, not only
