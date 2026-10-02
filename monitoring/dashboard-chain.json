@@ -658,6 +658,24 @@
           "expr": "min(decdn_rpc_healthy{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"})",
           "refId": "B",
           "legendFormat": "min rpc healthy"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(decdn_chain_boot_read_retries_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"})",
+          "refId": "C",
+          "legendFormat": "boot read retries (since start)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max(decdn_fee_shares_watcher_unregistered{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"})",
+          "refId": "D",
+          "legendFormat": "fee-shares watcher unregistered"
         }
       ],
       "fieldConfig": {
@@ -734,7 +752,8 @@
         "x": 16,
         "y": 10
       },
-      "id": 6
+      "id": 6,
+      "description": "Boot read retries counts transient-error retries of boot-time chain reads; the metrics listener binds after them, so it reads as a value since start, not a rate. A rise after a restart points at the RPC provider. Fee-shares watcher unregistered is 1 when the startup feeRouter() read failed: the watcher never started, its downtime gauge reads healthy, and the operator share stays at the floor until restart."
     },
     {
       "datasource": {
@@ -2567,7 +2586,7 @@
       },
       "title": "Vouchers, redemptions and grace closes",
       "type": "timeseries",
-      "description": "vouchers accepted counts signed vouchers on inbound streams. reveals accepted counts PayWord preimage reveals that advanced a lane's chain frontier; reveals are not vouchers. vouchers redeemed counts lane claims that landed on chain — one cumulative voucher per lane. A grace close is a pool its owner is closing while this node still holds unredeemed vouchers on it.",
+      "description": "vouchers accepted counts signed vouchers on inbound streams. reveals accepted counts PayWord preimage reveals that advanced a lane's chain frontier; reveals are not vouchers. vouchers redeemed counts lane claims that landed on chain — one cumulative voucher per lane. A grace close is a pool its owner is closing while this node still holds unredeemed vouchers on it. Watermark reconciles landed counts pre-redeem getWatermarks batches that decoded: the attempt signal behind the already-reconciled skips on the Redemption failures panel. A redeemer submitting claims with this flat at zero is not reconciling.",
       "targets": [
         {
           "datasource": {
@@ -2604,6 +2623,15 @@
           "expr": "sum(rate(decdn_preimage_reveals_received_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "D",
           "legendFormat": "reveals accepted"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_redemption_reconcile_ok_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "E",
+          "legendFormat": "watermark reconciles landed"
         }
       ],
       "fieldConfig": {
@@ -2915,7 +2943,7 @@
       },
       "title": "Buyer ledger integrity",
       "type": "timeseries",
-      "description": "A skipped undecodable record is a buyer-pool row silently omitted from an otherwise successful store hydration, counted once per row per load.",
+      "description": "A skipped undecodable record is a buyer-pool row silently omitted from an otherwise successful store hydration, counted once per row per load. A lane seed failure is a pull refused because the lane's already-paid watermark could not be read; a sustained rate means this node buys nothing from the affected providers. A pool adoption failure means bootstrap could not tell whether this node already owns a pool, so the first miss may escrow a second deposit; it runs once per process, so read it as a value since start.",
       "targets": [
         {
           "datasource": {
@@ -2934,6 +2962,24 @@
           "expr": "sum(rate(decdn_buyer_pool_store_skipped_undecodable_records_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "B",
           "legendFormat": "skipped undecodable records"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(decdn_buyer_lane_seed_failures_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"}[$__rate_interval]))",
+          "refId": "C",
+          "legendFormat": "lane seed failures"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(decdn_buyer_pool_adoption_failures_total{deployment_environment=\"$env\",region=~\"$region\",instance=~\"$instance\"})",
+          "refId": "D",
+          "legendFormat": "pool adoption failures (since start)"
         }
       ],
       "fieldConfig": {
@@ -2986,7 +3032,20 @@
           },
           "unit": "ops"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "D"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {

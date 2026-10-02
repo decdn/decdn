@@ -485,6 +485,24 @@ groups:
             and relies on the event tail alone until a re-read lands. Check
             the RPC provider.
 
+      # The startup PaymentPool.feeRouter() read failed, so the fee-shares
+      # watcher never started. Its own down/last-tick gauges read healthy in
+      # that state, so DecdnFeeSharesWatcherStalled cannot see it. The gauge
+      # holds for the life of the process; only a restart clears it.
+      - alert: DecdnFeeSharesWatcherUnregistered
+        expr: decdn_fee_shares_watcher_unregistered == 1
+        for: 5m
+        labels:
+          component: watcher
+          severity: warning
+        annotations:
+          summary: "Fee-shares watcher not running on {{ $labels.instance }}"
+          description: |
+            The startup feeRouter() read failed, so the fee-shares watcher is
+            not registered and the operator share stays at the floor for the
+            life of this process. Check the RPC provider, then restart the
+            node.
+
       - alert: DecdnRpcUnhealthy
         expr: decdn_rpc_healthy == 0
         for: 2m
@@ -953,6 +971,75 @@ groups:
             decdn_pool_open_failures_insufficient_deposit_total, which starts
             counting once the wallet is actually empty.
 
+      # Adoption runs once per process, before the first scrape, so the value
+      # is read rather than increase(): a failure at boot is already counted
+      # when Prometheus first sees the series. Only a restart clears it.
+      - alert: DecdnBuyerPoolAdoptionFailed
+        expr: decdn_buyer_pool_adoption_failures_total > 0
+        for: 0m
+        labels:
+          component: payments
+          severity: warning
+        annotations:
+          summary: "Buyer pool adoption failed at boot on {{ $labels.instance }}"
+          description: |
+            Bootstrap could not tell whether this node already owns a
+            payment pool on chain, so the first cache miss opens one. That
+            can escrow a second working deposit beside one the node already
+            holds. Check the RPC provider, then restart so adoption runs
+            again. Compare decdn_buyer_wallet_usdc with the pools the
+            operator address owns on chain.
+
+      - alert: DecdnBuyerLaneSeedFailing
+        expr: rate(decdn_buyer_lane_seed_failures_total[15m]) > 0
+        for: 30m
+        labels:
+          component: payments
+          severity: warning
+        annotations:
+          summary: "Buyer lane watermark reads failing on {{ $labels.instance }}"
+          description: |
+            The node keeps refusing node-to-node pulls because it cannot read
+            a lane's already-paid watermark. It refuses rather than resume
+            the lane from zero, which would strand the lane for good. While
+            this holds the node buys nothing from the affected providers and
+            their misses fall through to origin. Check the RPC provider and
+            the buyer store (buyer.redb).
+
+      - alert: DecdnNodePullBackpressureExhausted
+        expr: increase(decdn_node_pull_backpressure_exhausted_total[1h]) > 0
+        for: 0m
+        labels:
+          component: delivery
+          severity: warning
+        annotations:
+          summary: "Sole upstream holder kept refusing on {{ $labels.instance }}"
+          description: |
+            The only holder of a still-missing range refused for
+            backpressure through the whole wait budget, so the assembly ended
+            short and every serve stream attached to it was truncated. Zero
+            is the expected value. The warn! line beside each tick names the
+            holder. A repeat from one holder means its per-signer cap never
+            releases, or a NotFound refusal that is not a cap at all.
+
+      - alert: DecdnNodePullLegNoProgress
+        expr: increase(decdn_node_pull_leg_no_progress_total[1h]) > 0
+        for: 0m
+        labels:
+          component: delivery
+          severity: warning
+        annotations:
+          summary: "A paid pull leg moved no frontier on {{ $labels.instance }}"
+          description: |
+            A pull leg streamed and finished cleanly but moved neither the
+            paid nor the delivered frontier, so the node ended the gap rather
+            than re-pay the range. Zero is the expected value. A tick means
+            the store did not keep the leg's bytes (check eviction around the
+            time: decdn_cache_evictions_total), the ledger did not record the
+            payment, or the upstream ended the stream without the final
+            proof. The warn! line names the range, both frontiers and the
+            paid wire.
+
       - alert: DecdnNodePullNeverSucceeds
         # attempts without a single success over a long window. Not a rate
         # threshold: one success clears it, so this only fires on a leg that is
@@ -973,6 +1060,41 @@ groups:
             decdn_pool_open_failures_{insufficient_deposit,contract_revert,rpc_error}_total
             for the buyer leg, decdn_node_pull_no_providers_total for discovery,
             and decdn_buyer_wallet_usdc for funding.
+
+      # Seeding runs once at cache open, before the first scrape, so the value
+      # is read rather than increase(). Only a restart clears it.
+      - alert: DecdnCacheRecencySeedFailed
+        expr: decdn_cache_recency_seed_failures_total > 0
+        for: 0m
+        labels:
+          component: cache
+          severity: warning
+        annotations:
+          summary: "Cache eviction recency not seeded on {{ $labels.instance }}"
+          description: |
+            The store walk that seeds eviction recency at cache open failed.
+            Until the next restart, blobs from before the restart are not
+            eviction candidates until accessed. Over the size limit the
+            driver releases only blobs touched since open, which can be the
+            in-flight content, or it starves
+            (decdn_cache_evictions_starved_total). Restart once the store is
+            healthy.
+
+      - alert: DecdnCacheOriginRangeTimeouts
+        expr: rate(decdn_cache_origin_range_timeouts_total[15m]) > 0
+        for: 15m
+        labels:
+          component: origin
+          severity: warning
+        annotations:
+          summary: "Origin range reads timing out on {{ $labels.instance }}"
+          description: |
+            Origin reads on the range-pull path keep running past their
+            budget (cache.node_pull_stall_window_sec plus the read size at
+            cache.node_pull_min_throughput_bps). Each timeout is an origin
+            transport fault, so it advances the origin chain or fails the
+            fill. Check the origin backend, or lower the throughput floor for
+            a slow origin.
 
       - alert: DecdnDhtRoutingTableEmpty
         expr: decdn_dht_routing_table_size == 0
