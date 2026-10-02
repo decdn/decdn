@@ -14,7 +14,7 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client::discovery::NodeCandidate;
-use decdn_client::source::SourceFuture;
+use decdn_client::source::{SourceFuture, SourceStream};
 use decdn_client::{
     Holder, LaneLease, LaneLedgers, NoAffordableSource, PeerHealth, PeerSource, PoolContext,
     SourceProvider, SourceSet, StopPolicy, StreamCandidate, first_open,
@@ -24,7 +24,10 @@ use decdn_incentive::{CapabilityGrant, PoolId};
 use iroh::RelayUrl;
 
 use super::bundle_pull::LaneStreamCap;
-use super::fetch::{self, CliFunder, DriveFetchDeps, FaceLaneHandle, ResolvedTargets};
+use super::fetch::{
+    self, CliFunder, DriveFetchDeps, FaceLaneHandle, LateProbes, ProbeOutcome, ProxyWarmingParams,
+    ResolvedTargets,
+};
 
 /// A fetch's first size claim ([`CliSources::first_claim`]): a hint the fetch
 /// grows or shrinks as verified bytes land.
@@ -91,6 +94,10 @@ pub(crate) struct CliSources<'a, P> {
     /// The size hint of the last probe that gave one
     /// ([`ResolvedTargets::size_hint`]): the fetch's first claim.
     size_hint: Mutex<Option<u64>>,
+    /// The pending probes of the streamed round the holders came from
+    /// ([`ResolvedTargets::late`]), until [`SourceProvider::arrivals`] takes
+    /// them.
+    late: Mutex<Option<LateProbes>>,
 }
 
 impl<'a, P> CliSources<'a, P>
@@ -126,11 +133,13 @@ where
             parked: Mutex::new(HashMap::new()),
             pool_id: OnceLock::new(),
             size_hint: Mutex::new(None),
+            late: Mutex::new(None),
         }
     }
 
     /// The holders `targets` names, indexing each one's node for `connect`.
-    /// A probe's size hint is kept for [`Self::first_claim`].
+    /// A probe's size hint is kept for [`Self::first_claim`], and a streamed
+    /// round's pending probes for [`SourceProvider::arrivals`].
     pub(crate) fn holders_from(&self, targets: &ResolvedTargets) -> Vec<Holder> {
         if let Some(hint) = targets.size_hint {
             *self
@@ -138,7 +147,47 @@ where
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some(hint);
         }
+        if let Some(late) = targets.late.take() {
+            *self.late.lock().unwrap_or_else(PoisonError::into_inner) = Some(late);
+        }
         holders_from(targets, &mut self.lock_nodes())
+    }
+
+    /// The [`Holder`] for a late `join`, its node indexed for `connect` as
+    /// [`Self::holders_from`] does. A holder carries its probed coverage; a
+    /// warming proxy carries none and is not a probed holder.
+    fn register_late(&self, join: LateJoin) -> Holder {
+        if let Some(timings) = self.deps.timings {
+            timings.holder_joined();
+        }
+        let (candidate, holder) = match join {
+            LateJoin::Holder(probed) => {
+                let holder = Holder {
+                    provider: probed.candidate.eth_address,
+                    coverage: Some(probed.coverage),
+                    rtt_ms: probed.rtt_ms,
+                    probed_holder: true,
+                };
+                (probed.candidate, holder)
+            }
+            LateJoin::Proxy(proxy) => {
+                let holder = Holder {
+                    provider: proxy.eth_address,
+                    coverage: None,
+                    rtt_ms: proxy.rtt_ms,
+                    probed_holder: false,
+                };
+                let candidate = NodeCandidate {
+                    node_id: proxy.node_id,
+                    eth_address: proxy.eth_address,
+                    region_hint: None,
+                    multiaddrs: proxy.multiaddrs,
+                };
+                (candidate, holder)
+            }
+        };
+        self.lock_nodes().insert(candidate.eth_address, candidate);
+        holder
     }
 
     /// The funder a fetch over these sources tops the pool up through: the
@@ -455,20 +504,64 @@ where
 
     fn discover(&self, hash: [u8; 32]) -> SourceFuture<'_, Vec<Holder>> {
         Box::pin(async move {
-            // A fresh look: skip the peer store's fast path.
+            // A fresh look: skip the peer store's fast path. A rediscovery
+            // settles its round and drops the tail.
             let mut args = self.common.clone();
             args.rediscover = true;
+            let probe = fetch::ProbeOpts {
+                timings: None,
+                round: fetch::ProbeRound::Settle,
+            };
             let targets = fetch::resolve_target_node(
                 &args,
                 self.deps.chain,
                 self.deps.endpoint,
                 self.relays,
                 hash,
-                None,
+                probe,
             )
             .await?;
             Ok(self.holders_from(&targets))
         })
+    }
+
+    /// The late answers of the streamed round the holders came from: each
+    /// holder, and each non-holder the warming rule picks ([`late_join`]), as
+    /// it answers. Every verified answer's probe sample is harvested into the
+    /// peer store once the round ends.
+    fn arrivals(&self) -> Option<SourceStream<'_, Holder>> {
+        use futures_util::StreamExt as _;
+        let LateProbes {
+            tail,
+            best_holder_rtt_ms,
+            warming,
+        } = self
+            .late
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()?;
+        let dir = self.deps.chain.data_dir.clone();
+        Some(Box::pin(futures_util::stream::unfold(
+            (tail, best_holder_rtt_ms, Vec::new()),
+            move |(mut tail, mut best, mut samples)| {
+                let dir = dir.clone();
+                async move {
+                    while let Some(outcome) = tail.next().await {
+                        if let Some(sample) = outcome.sample() {
+                            samples.push(sample);
+                        }
+                        if let Some(join) = late_join(outcome, &mut best, warming) {
+                            let holder = self.register_late(join);
+                            return Some((holder, (tail, best, samples)));
+                        }
+                    }
+                    if !samples.is_empty() {
+                        drop(fetch::spawn_harvest(&dir, Vec::new(), samples));
+                    }
+                    None
+                }
+            },
+        )))
     }
 
     fn connect<'b>(
@@ -529,6 +622,47 @@ impl PeerEvent {
                 }
             }
         }
+    }
+}
+
+/// A late probe answer that joins the running fetch.
+pub(crate) enum LateJoin {
+    /// A verified holder.
+    Holder(decdn_client::discovery::Probed),
+    /// A verified non-holder the warming rule picks as a proxy.
+    Proxy(decdn_client::discovery::WarmingCandidate),
+}
+
+/// Whether a late probe `outcome` joins the running fetch. A verified holder
+/// always joins and lowers `best_holder_rtt_ms`. A verified non-holder joins
+/// as a proxy when the warming rule
+/// ([`decdn_client::discovery::proxy_warming_order`]) picks it against the best
+/// holder known so far. Nothing else joins.
+pub(crate) fn late_join(
+    outcome: ProbeOutcome,
+    best_holder_rtt_ms: &mut f64,
+    warming: ProxyWarmingParams,
+) -> Option<LateJoin> {
+    match outcome {
+        ProbeOutcome::Holder(holder, _) => {
+            *best_holder_rtt_ms = best_holder_rtt_ms.min(holder.rtt_ms);
+            Some(LateJoin::Holder(holder))
+        }
+        ProbeOutcome::NonHolder(candidate, _) => {
+            let picked = warming.enabled
+                && !decdn_client::discovery::proxy_warming_order(
+                    *best_holder_rtt_ms,
+                    warming.rtt_threshold_ms,
+                    warming.margin_ms,
+                    std::slice::from_ref(&candidate),
+                )
+                .is_empty();
+            picked.then_some(LateJoin::Proxy(candidate))
+        }
+        ProbeOutcome::Unreachable
+        | ProbeOutcome::RateLimited
+        | ProbeOutcome::Unverifiable
+        | ProbeOutcome::Unusable => None,
     }
 }
 
@@ -724,6 +858,7 @@ mod tests {
             probed_samples: Vec::new(),
             pinned: false,
             size_hint: None,
+            late: crate::commands::fetch::LateSlot::default(),
         };
         let mut nodes = std::collections::HashMap::new();
         let holders = holders_from(&targets, &mut nodes);
@@ -763,6 +898,81 @@ mod tests {
         assert!(holders.iter().all(|h| h.probed_holder));
     }
 
+    fn warming(enabled: bool) -> crate::commands::fetch::ProxyWarmingParams {
+        crate::commands::fetch::ProxyWarmingParams {
+            enabled,
+            rtt_threshold_ms: 150.0,
+            margin_ms: 30.0,
+        }
+    }
+
+    fn late_non_holder(seed: u8, rtt_ms: f64) -> crate::commands::fetch::ProbeOutcome {
+        let node_id = iroh::SecretKey::from_bytes(&[seed; 32]).public();
+        crate::commands::fetch::ProbeOutcome::NonHolder(
+            decdn_client::discovery::WarmingCandidate {
+                node_id,
+                eth_address: Address::repeat_byte(seed),
+                rtt_ms,
+                multiaddrs: alloy::primitives::Bytes::new(),
+            },
+            (node_id, rtt_ms, 1),
+        )
+    }
+
+    fn late_holder(seed: u8, rtt_ms: f64) -> crate::commands::fetch::ProbeOutcome {
+        let node_id = iroh::SecretKey::from_bytes(&[seed; 32]).public();
+        crate::commands::fetch::ProbeOutcome::Holder(
+            decdn_client::discovery::Probed {
+                candidate: decdn_client::discovery::NodeCandidate {
+                    node_id,
+                    eth_address: Address::repeat_byte(seed),
+                    region_hint: None,
+                    multiaddrs: alloy::primitives::Bytes::new(),
+                },
+                rtt_ms,
+                total_bytes: None,
+                coverage: decdn_protocol::Coverage::full(4),
+            },
+            (node_id, rtt_ms, 1),
+        )
+    }
+
+    /// Late non-holders join only as warming proxies against the best holder
+    /// known so far, and a late holder lowers that best.
+    #[test]
+    fn late_join_applies_the_warming_rule() {
+        use super::{LateJoin, late_join};
+        let mut best = 200.0_f64;
+        assert!(matches!(
+            late_join(late_non_holder(1, 120.0), &mut best, warming(true)),
+            Some(LateJoin::Proxy(_))
+        ));
+        assert!(late_join(late_non_holder(2, 190.0), &mut best, warming(true)).is_none());
+        assert!(late_join(late_non_holder(3, 120.0), &mut best, warming(false)).is_none());
+        assert!(matches!(
+            late_join(late_holder(4, 100.0), &mut best, warming(true)),
+            Some(LateJoin::Holder(_))
+        ));
+        assert!((best - 100.0).abs() < f64::EPSILON);
+        assert!(late_join(late_non_holder(5, 120.0), &mut best, warming(true)).is_none());
+    }
+
+    /// Failed outcomes never join.
+    #[test]
+    fn late_join_ignores_failed_outcomes() {
+        use super::late_join;
+        use crate::commands::fetch::ProbeOutcome;
+        let mut best = 400.0;
+        for outcome in [
+            ProbeOutcome::Unreachable,
+            ProbeOutcome::RateLimited,
+            ProbeOutcome::Unverifiable,
+            ProbeOutcome::Unusable,
+        ] {
+            assert!(late_join(outcome, &mut best, warming(true)).is_none());
+        }
+    }
+
     /// A rediscovery that ranks another node of an operator first replaces
     /// the node the operator's next lane build dials.
     #[test]
@@ -780,6 +990,7 @@ mod tests {
                 probed_samples: Vec::new(),
                 pinned: false,
                 size_hint: None,
+                late: crate::commands::fetch::LateSlot::default(),
             };
         let mut nodes = std::collections::HashMap::new();
         holders_from(&targets(node(1)), &mut nodes);
