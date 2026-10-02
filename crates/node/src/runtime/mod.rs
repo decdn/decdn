@@ -3665,8 +3665,13 @@ const DEPLOYMENT_PREFLIGHT_BUDGET: Duration = Duration::from_mins(1);
 /// `FeeRouter`, `BuybackBurner`, `DecdnGovernor`, the USDC token), and that is
 /// the likeliest wrong-address typo. `getRateBounds()` is the probe because
 /// only `PaymentPool` declares it: `usdc()` is also a view on `FeeRouter` and
-/// `BuybackBurner`, and `feeRouter()` is also a view on `DecdnGovernor`. Runs
-/// BEFORE the lane store opens, because the store's deployment binding
+/// `BuybackBurner`, and `feeRouter()` is also a view on `DecdnGovernor`. The
+/// probe holds only while that stays true: no other contract in the deployment
+/// may declare a function with the `getRateBounds()` selector, and
+/// `contracts/src/PaymentPool.sol` carries the same warning on the view. The
+/// `deployment_preflight_guard` e2e boots against every contract in the deploy
+/// manifest to catch a collision. Runs BEFORE the lane store opens, because
+/// the store's deployment binding
 /// ([`crate::channel_store::Deployment`]) drops the seller lane state when
 /// the stamp differs — a typo in either field must abort bring-up while the
 /// store is untouched, not destroy unredeemed lane state on a WARN. The

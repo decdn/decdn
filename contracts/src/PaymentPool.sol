@@ -695,6 +695,15 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         }
     }
 
+    /// @notice The governed per-MB delivery-rate floor (`deliveryFloor`).
+    /// @dev    The node's boot preflight (`check_deployment_preflight` in
+    ///         `crates/node/src/runtime/mod.rs`) calls this view as the
+    ///         `PaymentPool` identity probe: an address that answers it is taken
+    ///         to be a `PaymentPool`, and the node then binds its seller lane store
+    ///         to that address. No other contract in the deployment may declare a
+    ///         function with this selector, or a node configured with that
+    ///         contract's address passes the probe and drops its seller lane
+    ///         state. Renaming or removing this view breaks the probe.
     function getRateBounds() external view returns (uint256 floor) {
         return deliveryFloor;
     }

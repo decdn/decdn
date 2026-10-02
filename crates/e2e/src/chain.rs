@@ -349,6 +349,7 @@ pub struct ChainFixture {
     chain_id: u64,
     addrs: ContractAddrs,
     usdc: Address,
+    manifest_contracts: Vec<(String, Address)>,
     admin: DynProvider,
     admin_addr: Address,
 }
@@ -382,8 +383,9 @@ impl ChainFixture {
             _anvil: anvil.guard,
             url: anvil.url,
             chain_id: E2E_CHAIN_ID,
-            addrs: shared.addrs,
-            usdc: shared.usdc,
+            addrs: shared.manifest.addrs,
+            usdc: shared.manifest.usdc,
+            manifest_contracts: shared.manifest.contracts,
             admin: anvil.admin,
             admin_addr,
         })
@@ -414,6 +416,16 @@ impl ChainFixture {
     #[must_use]
     pub const fn usdc(&self) -> Address {
         self.usdc
+    }
+
+    /// Every entry of the deploy manifest's `contracts` map, as `(name,
+    /// address)` pairs sorted by name. Unlike [`Self::addrs`], this lists a
+    /// contract the fixture has no typed field for, so a journey that must
+    /// cover the whole deployment picks up a new contract without an edit. An
+    /// entry the deploy left undeployed carries the zero address.
+    #[must_use]
+    pub fn manifest_contracts(&self) -> &[(String, Address)] {
+        &self.manifest_contracts
     }
 
     /// Admin provider (anvil dev #1): raw RPC, minting, TOKEN distribution.
@@ -2149,8 +2161,17 @@ async fn deploy_artifact<P: Provider>(
 /// the deploy manifest. Produced by [`ensure_shared_deployment`].
 struct SharedDeployment {
     state_path: PathBuf,
+    manifest: Manifest,
+}
+
+/// The addresses a deploy manifest records.
+struct Manifest {
+    /// The protocol contracts the fixture has typed handles for.
     addrs: ContractAddrs,
+    /// The settlement USDC (`externalDeps.usdc`).
     usdc: Address,
+    /// Every `contracts` entry as `(name, address)`, sorted by name.
+    contracts: Vec<(String, Address)>,
 }
 
 /// Deploy the protocol once per test run and return handles to the snapshot the
@@ -2219,10 +2240,11 @@ async fn deploy_and_snapshot(
     let token_holder = admin_address()?;
     run_deploy_script(&anvil.admin, contracts, &anvil.rpc_url, usdc, token_holder).await?;
 
-    let (addrs, manifest_usdc) = read_manifest(&forge_manifest)?;
+    let manifest = read_manifest(&forge_manifest)?;
     anyhow::ensure!(
-        manifest_usdc == usdc,
-        "manifest externalDeps.usdc {manifest_usdc} disagrees with deployed mock USDC {usdc}"
+        manifest.usdc == usdc,
+        "manifest externalDeps.usdc {} disagrees with deployed mock USDC {usdc}",
+        manifest.usdc
     );
 
     // Snapshot the fully-deployed chain. `anvil_dumpState` returns a gzip-hex
@@ -2245,8 +2267,7 @@ async fn deploy_and_snapshot(
 
     Ok(SharedDeployment {
         state_path: state_path.to_path_buf(),
-        addrs,
-        usdc,
+        manifest,
     })
 }
 
@@ -2260,11 +2281,9 @@ fn load_cached_deployment(
     if !nonempty_file(state_path) || !nonempty_file(manifest_path) {
         return Ok(None);
     }
-    let (addrs, usdc) = read_manifest(manifest_path)?;
     Ok(Some(SharedDeployment {
         state_path: state_path.to_path_buf(),
-        addrs,
-        usdc,
+        manifest: read_manifest(manifest_path)?,
     }))
 }
 
@@ -2584,7 +2603,7 @@ fn emergency_multisig_role() -> B256 {
 /// Read the protocol contract addresses and the settlement USDC from the deploy
 /// manifest. The mock USDC is recorded under `externalDeps.usdc` — the same
 /// address the fixture deployed and fed to the script as `USDC_ADDRESS`.
-fn read_manifest(path: &Path) -> anyhow::Result<(ContractAddrs, Address)> {
+fn read_manifest(path: &Path) -> anyhow::Result<Manifest> {
     let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
     let contracts = json
         .get("contracts")
@@ -2618,7 +2637,18 @@ fn read_manifest(path: &Path) -> anyhow::Result<(ContractAddrs, Address)> {
         .ok_or_else(|| anyhow::anyhow!("manifest missing externalDeps.usdc"))?
         .parse()
         .context("parse manifest externalDeps.usdc")?;
-    Ok((addrs, usdc))
+    let mut all = contracts
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("manifest `contracts` is not a map"))?
+        .keys()
+        .map(|name| Ok((name.clone(), get(name)?)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    all.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    Ok(Manifest {
+        addrs,
+        usdc,
+        contracts: all,
+    })
 }
 
 #[cfg(test)]
@@ -2720,10 +2750,25 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("manifest.json");
         write_json(&path, &sample_manifest_json());
-        let (addrs, usdc) = read_manifest(&path).expect("parse manifest");
-        assert_eq!(addrs.capacity_bond, Address::with_last_byte(1));
-        assert_eq!(addrs.content_blacklist, Address::with_last_byte(12));
-        assert_eq!(usdc, Address::with_last_byte(0xff));
+        let manifest = read_manifest(&path).expect("parse manifest");
+        assert_eq!(manifest.addrs.capacity_bond, Address::with_last_byte(1));
+        assert_eq!(
+            manifest.addrs.content_blacklist,
+            Address::with_last_byte(12)
+        );
+        assert_eq!(manifest.usdc, Address::with_last_byte(0xff));
+        // Every `contracts` entry, name-sorted, including those with no typed
+        // field.
+        assert_eq!(manifest.contracts.len(), 12);
+        assert_eq!(
+            manifest.contracts.first(),
+            Some(&("CapacityBond".to_string(), Address::with_last_byte(1)))
+        );
+        assert!(
+            manifest.contracts.is_sorted_by(|a, b| a.0 < b.0),
+            "manifest contracts must be sorted by name: {:?}",
+            manifest.contracts
+        );
     }
 
     #[test]
@@ -2762,7 +2807,7 @@ mod tests {
         let hit = load_cached_deployment(&state, &manifest)
             .expect("hit")
             .expect("some");
-        assert_eq!(hit.usdc, Address::with_last_byte(0xff));
+        assert_eq!(hit.manifest.usdc, Address::with_last_byte(0xff));
         assert_eq!(hit.state_path, state);
     }
 

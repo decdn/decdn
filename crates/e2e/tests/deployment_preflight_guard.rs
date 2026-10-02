@@ -11,8 +11,9 @@
 //! after the store open would still exit nonzero, but only after the drop.
 //!
 //! The journey seeds a seller lane, then repoints the node at a codeless
-//! address and at every other contract in the deploy manifest. Each boot exits
-//! nonzero with the matching verdict, and no boot logs a lane drop. The sweep
+//! address, at every other contract the deploy manifest lists, and at the
+//! settlement USDC. Each boot exits nonzero with the matching verdict, and no
+//! boot logs a lane drop. The sweep
 //! also pins that the identity probe tells `PaymentPool` apart from every
 //! sibling, including those that share one of its views: the `FeeRouter`
 //! answers `usdc()` and the `DecdnGovernor` answers `feeRouter()`. With the
@@ -129,23 +130,30 @@ async fn run() -> anyhow::Result<()> {
     node.log_line(&["has no code on chain"])
         .context("the codeless boot never logged the no-code verdict")?;
 
-    // ---- Every sibling contract in the manifest: each has code but does not
-    // answer `PaymentPool.getRateBounds()`, so the preflight aborts on the
-    // identity probe without retrying it.
-    let addrs = chain.addrs();
-    for (name, sibling) in [
-        ("CapacityBond", addrs.capacity_bond),
-        ("FeeRouter", addrs.fee_router),
-        ("TOKEN", addrs.token),
-        ("SlashJudge", addrs.slash_judge),
-        ("SlashAppeal", addrs.slash_appeal),
-        ("DecdnGovernor", addrs.governor),
-        ("TimelockController", addrs.timelock),
-        ("PublisherRegistry", addrs.publisher_registry),
-        ("OriginAssignment", addrs.origin_assignment),
-        ("ManualVettingPolicy", addrs.manual_vetting_policy),
-        ("ContentBlacklist", addrs.content_blacklist),
-    ] {
+    // ---- Every other contract in the deploy manifest, read from the manifest
+    // itself so a new contract joins the sweep without an edit here, plus the
+    // settlement USDC. Each has code but does not answer
+    // `PaymentPool.getRateBounds()`, so the preflight aborts on the identity
+    // probe without retrying it. A zero entry is a contract the deploy left
+    // undeployed (the dormant `BuybackBurner`): there is no code to probe, and
+    // config validation rejects a zero address before the preflight runs.
+    let mut siblings: Vec<(String, Address)> = chain
+        .manifest_contracts()
+        .iter()
+        .filter(|(_, addr)| *addr != payment_pool && !addr.is_zero())
+        .cloned()
+        .collect();
+    siblings.push(("USDC".to_string(), chain.usdc()));
+    // The siblings that share a `PaymentPool` view are the cases a weaker probe
+    // lets through; a renamed manifest key must not drop them silently.
+    for must_cover in ["FeeRouter", "DecdnGovernor"] {
+        anyhow::ensure!(
+            siblings.iter().any(|(name, _)| name == must_cover),
+            "the deploy manifest lists no {must_cover}; the sweep would not cover it: \
+             {siblings:?}"
+        );
+    }
+    for (name, sibling) in siblings {
         node.set_payment_pool_address(sibling)?;
         let status = node
             .respawn_expecting_exit(PREFLIGHT_EXIT)
