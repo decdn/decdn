@@ -273,12 +273,12 @@ as `decdn fetch`):
   fetch of its ranges. A lane of a range-dedup entry can go to a
   proxy-warming non-holder, as for a whole-file entry, and `--max-sources`
   counts such a node as one of its sources. The loop admits one node per
-  operator. Each lane holds one permit of its provider while it
+  operator. Each lane holds one permit of its provider while its own stream
   runs. A lane takes a permit only when a permit is free. When no permit is
   free, the lane build backs off and tries again. A lane gives its permit
-  back when it stops, and a lane that starts again takes a free permit
-  first. An entry holds no lane
-  permit while it waits on a sibling entry. All lanes of an entry write into
+  back when its own stream stops. A lane that starts again takes a free
+  permit first. When no permit is free, the lane tries again each second.
+  An entry holds no lane permit while it waits on a sibling entry. All lanes of an entry write into
   one ranged store. The entry does not mark its donor ranges present in that
   store, so the store promotes the blob only when the loop fetched every
   byte. Concurrent lanes top up the one deposit one at a time.

@@ -1872,13 +1872,14 @@ impl LaneStreamCap {
         self.semaphore(provider).await.try_acquire_owned().ok()
     }
 
-    /// How a lane to `provider` adds a concurrent stream for a faulted lane's
-    /// remainder ([`decdn_client::LaneWiden`]): `grow` takes only permits of
-    /// `provider` that are free now and never waits, and `release` gives one
-    /// back. The lane's own stream holds its permit as its lease, so the
-    /// extra streams fit in the rest of the cap. The acquire gives that lease
-    /// back when the lane's own worker ends, and the lane starts again only on
-    /// a permit `grow` takes.
+    /// How a lane to `provider` takes a stream beyond its lease
+    /// ([`decdn_client::LaneWiden`]): an extra stream for a queued range no
+    /// idle lane takes, or the stream it starts again on. `grow` takes only
+    /// permits of `provider` that are free now and never waits, and `release`
+    /// gives one back. The lane's first stream holds its permit as its lease,
+    /// so the extra streams fit in the rest of the cap. The acquire gives that
+    /// lease back when the lane's own worker ends, and the lane starts again
+    /// only on a permit `grow` takes.
     pub(crate) async fn widen(&self, provider: Address) -> decdn_client::LaneWiden {
         let extras = Arc::new(ExtraPermits::new(self.semaphore(provider).await));
         let released = Arc::clone(&extras);
@@ -1913,22 +1914,41 @@ impl ExtraPermits {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         let mut granted = 0;
         while granted < most {
-            let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
-                break;
-            };
-            held.push(permit);
-            granted += 1;
+            match Arc::clone(&self.semaphore).try_acquire_owned() {
+                Ok(permit) => {
+                    held.push(permit);
+                    granted += 1;
+                }
+                Err(tokio::sync::TryAcquireError::NoPermits) => break,
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    // Nothing closes the semaphore: a closed one grants no
+                    // stream, and says so.
+                    tracing::warn!(
+                        "a lane's stream semaphore is closed; it grants no extra stream"
+                    );
+                    break;
+                }
+            }
         }
         granted
     }
 
-    /// Give back one held permit. With none held it does nothing.
+    /// Give back one held permit. The acquire gives back only what `grant`
+    /// granted, so a call with none held breaks that rule: it does nothing
+    /// and says so.
     fn release_one(&self) {
         let permit = self
             .held
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .pop();
+        debug_assert!(
+            permit.is_some(),
+            "a stream was given back that was never granted"
+        );
+        if permit.is_none() {
+            tracing::warn!("a lane gave back a stream permit it does not hold");
+        }
         drop(permit);
     }
 }
@@ -8627,7 +8647,6 @@ mod tests {
         assert_eq!(extras.grant(1), 0, "the cap is full");
         extras.release_one();
         assert_eq!(extras.grant(1), 1, "a released permit is free again");
-        extras.release_one();
         extras.release_one();
         extras.release_one();
         drop(lease);
