@@ -15,8 +15,9 @@
 //!
 //! Pool lifecycle: the caller's live pool in the persistent
 //! [`RedbBuyerPoolStore`] is reused (the `(signer, provider)` lane watermark is
-//! resumed) — and auto-refilled on-chain via `topUp` when its remaining
-//! deposit has run low, so a sustained series of fetches isn't stranded;
+//! resumed) — and topped up on-chain via `topUp` (best effort) when its
+//! pool-wide remaining deposit has run low, so a sustained series of fetches
+//! isn't stranded;
 //! otherwise one is opened on-chain (USDC `approve` if needed → `openPool`) via
 //! the shared [`decdn_client::buyer_pool::open_pool`] kernel and recorded.
 //! One pool fans out to every provider the caller pays (ADR 003) — there is no
@@ -38,8 +39,9 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client::buyer_pool::{
-    LOW_WATER_DIVISOR, ProgressWrite, ToppedUpPool, ensure_allowance, escrowed_but_untracked,
-    grade_deposit_credit, open_pool, refill_amount, self_owned_lane_ctx, top_up, topped_up_effect,
+    LOW_WATER_DIVISOR, ProgressWrite, TopUpUnconfirmed, ToppedUpPool, WalletShortfall,
+    ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool, refill_amount,
+    self_owned_lane_ctx, top_up, topped_up_effect,
 };
 use decdn_client::driver::DriveConfig;
 use decdn_client::source::{Funder, SourceFuture};
@@ -1616,6 +1618,7 @@ async fn fetch_over(
     // One connection per node for the whole fetch: every lane and leg opens
     // its streams on it.
     let connections = Connections::new(endpoint.clone());
+    let funding = RunFunding::default();
 
     // The shared pull/funding deps every lane borrows for the whole fetch.
     let deps = DriveFetchDeps {
@@ -1633,6 +1636,7 @@ async fn fetch_over(
         deadlines,
         connections: &connections,
         writes,
+        funding: &funding,
     };
 
     let clock = Arc::new(ProgressClock::new());
@@ -1695,6 +1699,9 @@ async fn fetch_over(
     .await;
     on_drop.disarm();
     sources.persist_watermarks().await;
+    if let Some(shortfall) = funding.shortfall() {
+        eprintln!("warning: {shortfall}");
+    }
     result.map_err(|err| sources.annotate(err))
 }
 
@@ -1773,6 +1780,9 @@ pub(crate) struct DriveFetchDeps<'a, P> {
     /// thread in queue order across every fetch the command runs. Every
     /// ordered state write of a fetch goes through it.
     pub(crate) writes: &'a OrderedWrites,
+    /// The run's funding facts, shared by every lane build and top-up of the
+    /// run ([`RunFunding`]).
+    pub(crate) funding: &'a RunFunding,
 }
 
 /// The lane's shared ledger + context: from the run registry when bundle pull
@@ -1892,7 +1902,7 @@ pub(crate) async fn build_multi_lane<'a, P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let ctx = {
+    let (ctx, spend) = {
         // Bundle pull funnels every entry — and every lane of a multi-source
         // entry — through the one shared `PaymentPool` deposit, so the
         // open-or-reuse serializes across the whole bundle. The delegated path
@@ -1914,24 +1924,28 @@ where
             deps.self_address,
             deps.chain,
             deps.endpoint,
+            deps.funding,
         )
         .await?
     };
     let pool_id = ctx.pool_id;
     let prior_amount = ctx.prior_amount;
+    let lane = LaneKey {
+        pool_id,
+        signer: deps.self_address,
+        provider,
+    };
     // The lane's ledger + context, seeded from its persisted `(signer,
     // provider)` cumulative so the first voucher continues the lane (a restart
     // from zero is rejected as a regression) — from the run registry when
     // `ledgers` is `Some`, else a fresh pair.
-    let (ledger, ctx) = lane_ledger(
-        ledgers,
-        LaneKey {
-            pool_id,
-            signer: deps.self_address,
-            provider,
-        },
-        ctx,
-    );
+    let (ledger, ctx) = lane_ledger(ledgers, lane, ctx);
+    // The run's view of the pool's spend counts this lane through its ledger
+    // from now on, whether or not the acquire loop ever starts it. A delegated
+    // lane draws on a pool this caller does not own, and joins nothing.
+    if let Some(spend) = spend {
+        deps.funding.join_lane(lane, spend, &ledger);
+    }
     let source = lane_source(
         deps,
         target,
@@ -2308,10 +2322,183 @@ fn multi_lane_watermarks(
         .collect()
 }
 
+/// What the lane builds of one run learn about funding its pool, shared by
+/// every fetch of the run: one `decdn fetch`, or every entry of a `bundle pull`.
+///
+/// It holds two facts. The first is the pool's spend across every lane: a
+/// baseline for the lanes the run does not drive, plus what each lane the run
+/// built has committed since. The deposit gate reads it
+/// ([`Funder::pool_spent`]), so a pool shared across many providers gates on its
+/// true remaining deposit whichever lanes the acquire loop starts. The second
+/// is a wallet that holds too little USDC to top the pool up: once seen, no
+/// later lane build of the run tries the proactive refill again, a reactive
+/// top-up fails without a transaction, and the command ends with one
+/// `warning:` line naming it.
+#[derive(Debug, Default)]
+pub(crate) struct RunFunding {
+    spend: Mutex<RunSpend>,
+    shortfall: Mutex<Option<String>>,
+}
+
+/// What a lane build learned about the pool's spend, for
+/// [`RunFunding::join_lane`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LaneSpend {
+    /// The pool's spend on every other lane, as the build saw it.
+    pub(crate) outside: U256,
+    /// The amount the lane resumes from.
+    pub(crate) prior: U256,
+    /// Whether the pool row recorded the lane, so that an earlier lane's
+    /// `outside` counts its prior.
+    pub(crate) recorded: bool,
+    /// Whether `outside` came from the pool's on-chain `totalRedeemed` (an
+    /// adopted row), which counts every lane's redeemed watermark, recorded or
+    /// not.
+    pub(crate) from_chain: bool,
+}
+
+/// The pool's spend as a run's lanes join it.
+#[derive(Debug, Default)]
+struct RunSpend {
+    /// The spend on lanes the run does not drive. `None` until the first lane
+    /// joins.
+    baseline: Option<U256>,
+    /// Whether the first lane's `outside` came from the chain.
+    from_chain: bool,
+    /// Every ledger each joined lane has paid through. A lane rebuilt with a
+    /// fresh ledger keeps its earlier ones: vouchers on a lane are cumulative,
+    /// so the lane's spend is the largest of them.
+    lanes: HashMap<LaneKey, Vec<Arc<PoolLedger>>>,
+}
+
+impl RunFunding {
+    /// Record that `lane` joins the run, paying through `ledger`.
+    ///
+    /// The first lane sets the baseline to its `outside`. Each later lane
+    /// moves its prior out of the baseline when the baseline counts it: when
+    /// the row recorded the lane, or when the baseline came from the chain. Its
+    /// ledger counts that amount from now on. A lane that has joined before
+    /// only adds `ledger`, if it is a new one.
+    pub(crate) fn join_lane(&self, lane: LaneKey, spend: LaneSpend, ledger: &Arc<PoolLedger>) {
+        let mut run = self.spend.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(ledgers) = run.lanes.get_mut(&lane) {
+            if !ledgers.iter().any(|known| Arc::ptr_eq(known, ledger)) {
+                ledgers.push(Arc::clone(ledger));
+            }
+            return;
+        }
+        run.lanes.insert(lane, vec![Arc::clone(ledger)]);
+        run.baseline = Some(match run.baseline {
+            None => {
+                run.from_chain = spend.from_chain;
+                spend.outside
+            }
+            Some(baseline) if spend.recorded || run.from_chain => {
+                baseline.saturating_sub(spend.prior)
+            }
+            Some(baseline) => baseline,
+        });
+    }
+
+    /// The pool's spend across every lane: the baseline plus each joined
+    /// lane's committed amount. `None` before any lane joins.
+    pub(crate) fn pool_spent(&self) -> Option<U256> {
+        let run = self.spend.lock().unwrap_or_else(PoisonError::into_inner);
+        let baseline = run.baseline?;
+        Some(run.lanes.values().fold(baseline, |total, ledgers| {
+            let lane = ledgers
+                .iter()
+                .map(|ledger| ledger.committed().amount)
+                .max()
+                .unwrap_or(U256::ZERO);
+            total.saturating_add(lane)
+        }))
+    }
+
+    /// The warning for a wallet seen to hold too little USDC for a top-up in
+    /// this run, if one was.
+    pub(crate) fn shortfall(&self) -> Option<String> {
+        self.shortfall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Diagnose a failed top-up leg (`err`) for `pool_id` by reading the
+    /// wallet's USDC balance. When the wallet holds less than `additional`,
+    /// which no retry fixes, record the shortfall and return its warning; it
+    /// is logged at WARN the first time. Otherwise return `None`, after a WARN
+    /// that names the failure, the balance, or why the balance could not be
+    /// read.
+    pub(crate) async fn check_wallet<P>(
+        &self,
+        rpc: &P,
+        token: Address,
+        owner: Address,
+        pool_id: PoolId,
+        additional: U256,
+        err: &anyhow::Error,
+    ) -> Option<String>
+    where
+        P: alloy::providers::Provider + Clone,
+    {
+        let error = decdn_common::redact::sanitize_err_chain(err);
+        let balance = match decdn_incentive::Erc20::new(token, rpc.clone())
+            .balanceOf(owner)
+            .call()
+            .await
+        {
+            Ok(balance) => balance,
+            Err(read) => {
+                let read = decdn_common::redact::sanitize_err_chain(&anyhow::Error::new(read));
+                tracing::warn!(
+                    %pool_id,
+                    %additional,
+                    %error,
+                    wallet_usdc_error = %read,
+                    "buyer pool top-up failed, and the wallet's USDC balance could not be read"
+                );
+                return None;
+            }
+        };
+        if balance >= additional {
+            tracing::warn!(
+                %pool_id,
+                %additional,
+                wallet_usdc = %balance,
+                %error,
+                "buyer pool top-up failed although the wallet holds enough USDC"
+            );
+            return None;
+        }
+        let warning = format!(
+            "wallet {owner} holds {balance} µUSDC, less than the {additional} µUSDC top-up \
+             buyer pool {pool_id} needs; fund the wallet so the pool can be topped up"
+        );
+        let mut shortfall = self
+            .shortfall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if shortfall.is_none() {
+            tracing::warn!(
+                %pool_id,
+                %additional,
+                wallet_usdc = %balance,
+                %error,
+                "the wallet holds too little USDC to top up the buyer pool"
+            );
+            *shortfall = Some(warning.clone());
+        }
+        Some(warning)
+    }
+}
+
 /// The CLI's [`Funder`]: a mid-fetch reactive top-up runs the same
-/// `ensure_allowance -> top_up -> add_deposit` path `open_or_reuse_pool`'s
-/// proactive low-water refill runs, now behind the driver's injected [`Funder`]
-/// seam so the gap driver stays chain-handle-agnostic. The driver decides
+/// `ensure_allowance -> top_up -> add_deposit` path as the proactive low-water
+/// refill ([`refill_if_low`]), behind the driver's [`Funder`] seam so the gap
+/// driver stays chain-handle-agnostic. Unlike the proactive refill, every
+/// failure here returns to the driver, which rules it unaffordable or, when the
+/// escrow may have moved, fatal. The driver decides
 /// WHETHER to fund (its pacer confirms a genuine, ledger-corroborated
 /// exhaustion and that budget/attempts remain); this only executes the
 /// on-chain move and returns the [`DepositOutcome`] for the driver to credit.
@@ -2332,6 +2519,9 @@ pub(crate) struct CliFunder<'a, P> {
     pub(crate) token: Address,
     pub(crate) payment_pool_addr: Address,
     pub(crate) max_approve: bool,
+    /// The run's funding facts: its outside spend, and a wallet shortfall that
+    /// makes a further top-up pointless.
+    pub(crate) funding: &'a RunFunding,
 }
 
 impl<P> Funder for CliFunder<'_, P>
@@ -2342,28 +2532,57 @@ where
         decdn_client::MAX_TOPUP_ATTEMPTS
     }
 
+    fn pool_spent(&self) -> Option<U256> {
+        self.funding.pool_spent()
+    }
+
     fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
         Box::pin(async move {
             let pool_id =
                 self.pool_id.get().copied().ok_or_else(|| {
                     anyhow::anyhow!("no payment lane is built, so no pool to top up")
                 })?;
+            if let Some(shortfall) = self.funding.shortfall() {
+                return Err(
+                    anyhow::anyhow!("the wallet cannot fund a top-up: {shortfall}")
+                        .context(WalletShortfall),
+                );
+            }
             // `topUp` pulls `additional` USDC via `transferFrom`, so the
             // standing allowance must cover it first: unlimited under
             // `--max-approve`, else exactly `additional`.
-            ensure_allowance(
-                self.rpc,
-                self.token,
-                self.owner,
-                self.payment_pool_addr,
-                if self.max_approve {
-                    None
-                } else {
-                    Some(additional)
-                },
-            )
-            .await?;
-            let ToppedUpPool { credited, tx } = top_up(self.contract, pool_id, additional).await?;
+            let escrowed = async {
+                ensure_allowance(
+                    self.rpc,
+                    self.token,
+                    self.owner,
+                    self.payment_pool_addr,
+                    if self.max_approve {
+                        None
+                    } else {
+                        Some(additional)
+                    },
+                )
+                .await?;
+                top_up(self.contract, pool_id, additional).await
+            }
+            .await;
+            // A failure before any receipt names its cause once: a wallet
+            // short of USDC is recorded for the run's closing warning.
+            let ToppedUpPool { credited, tx } = match escrowed {
+                Ok(topped_up) => topped_up,
+                Err(err) if err.downcast_ref::<TopUpUnconfirmed>().is_some() => return Err(err),
+                Err(err) => {
+                    let short = self
+                        .funding
+                        .check_wallet(self.rpc, self.token, self.owner, pool_id, additional, &err)
+                        .await;
+                    return Err(match short {
+                        Some(_) => err.context(WalletShortfall),
+                        None => err,
+                    });
+                }
+            };
             // Grade here rather than handing the escrowed-but-untracked
             // outcomes back for the driver to bail on. The driver treats them
             // as terminal either way, but `DepositOutcome` has nowhere to carry
@@ -2654,7 +2873,8 @@ async fn build_ctx_for_fetch<P>(
     self_address: Address,
     chain: &ResolvedChain,
     endpoint: &Endpoint,
-) -> anyhow::Result<PoolContext>
+    funding: &RunFunding,
+) -> anyhow::Result<(PoolContext, Option<LaneSpend>)>
 where
     P: alloy::providers::Provider + Clone,
 {
@@ -2671,6 +2891,7 @@ where
             grant,
         )
         .await
+        .map(|ctx| (ctx, None))
     } else {
         build_pool_ctx(
             store,
@@ -2681,8 +2902,10 @@ where
             self_address,
             chain,
             endpoint,
+            funding,
         )
         .await
+        .map(|(ctx, spend)| (ctx, Some(spend)))
     }
 }
 
@@ -2707,14 +2930,16 @@ async fn build_pool_ctx<P>(
     self_address: Address,
     chain: &ResolvedChain,
     endpoint: &Endpoint,
-) -> anyhow::Result<PoolContext>
+    funding: &RunFunding,
+) -> anyhow::Result<(PoolContext, LaneSpend)>
 where
     P: alloy::providers::Provider + Clone,
 {
-    let ctx = open_or_reuse_pool(
+    let (ctx, spend) = open_or_reuse_pool(
         store,
         contract,
         rpc,
+        funding,
         signer,
         provider,
         self_address,
@@ -2726,7 +2951,7 @@ where
         ChainAdoption::for_buy(&chain.data_dir, &chain.keystore)?,
     )
     .await?;
-    attach_client_binding(ctx, chain, endpoint, signer)
+    Ok((attach_client_binding(ctx, chain, endpoint, signer)?, spend))
 }
 
 /// Reject a delegated fetch whose loaded key is not the signer the capability
@@ -2996,10 +3221,178 @@ where
     })
 }
 
+/// What `state`'s pool has spent across all its lanes — vouchered locally, or
+/// redeemed on chain for an adopted row — which the low-water refill compares
+/// against the deposit.
+///
+/// The lanes share one deposit, so the spend is their sum, not the lane being
+/// built. `lane_prior` is the amount `lane` resumes from: when the row has no
+/// record of `lane`, that is the chain watermark, which the row's sum does not
+/// include yet. `spent_elsewhere` is what [`pool_to_reuse`] learned from the
+/// chain for an adopted row, whose lanes account for nothing. It is the pool's
+/// `totalRedeemed`, which already includes every lane's redeemed watermark,
+/// `lane_prior` among them, so the two overlap and the larger is the spend,
+/// not their sum.
+fn pool_spend(
+    state: &BuyerPoolState,
+    lane: LaneKey,
+    lane_prior: U256,
+    spent_elsewhere: U256,
+) -> U256 {
+    let untracked = if state.lane_progress(lane).is_some() {
+        U256::ZERO
+    } else {
+        lane_prior
+    };
+    state
+        .committed_amount()
+        .saturating_add(untracked)
+        .max(spent_elsewhere)
+}
+
+/// The error for a pool with no unspent deposit whose wallet cannot fund a
+/// top-up: [`NoAffordableSource`], which is fatal to the command even inside a
+/// lane build. Nothing a retry or another provider does can pay for the fetch.
+fn cannot_pay(state: &BuyerPoolState, shortfall: &str) -> anyhow::Error {
+    anyhow::Error::new(NoAffordableSource {
+        deposit: state.deposit,
+    })
+    .context(format!(
+        "buyer pool {} has no unspent deposit, and the wallet cannot fund a top-up: \
+         {shortfall}",
+        state.pool_id
+    ))
+}
+
+/// Restore `state`'s remaining deposit (`deposit - spent`) to `working_deposit`
+/// once it falls below the low water — see [`refill_amount`] — and return the
+/// row to build the lane on.
+///
+/// `spent` is the pool-wide spend from [`pool_spend`]. The refill is an
+/// optimisation, so a wallet that holds too little USDC for it does not fail
+/// the lane while the pool can still pay (and ends the command, as
+/// [`NoAffordableSource`], once it cannot): the shortfall is logged at WARN,
+/// recorded on `funding` for the run's closing `warning:` line, and no later
+/// lane build of the run tries the refill again. Any other failure of the
+/// allowance or `topUp` leg fails the lane build, which the acquire loop
+/// retries with backoff. A `topUp` that was broadcast but returned no receipt
+/// ([`TopUpUnconfirmed`]) may have escrowed, and once `topUp` returns a
+/// receipt the escrow has moved, so a failure to credit or re-read the local
+/// row ([`escrowed_but_untracked`]) is fatal: the acquire loop ends the
+/// command instead of retrying, because a retry escrows again.
+#[allow(clippy::too_many_arguments)]
+async fn refill_if_low<P>(
+    store: &RedbBuyerPoolStore,
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    rpc: &P,
+    funding: &RunFunding,
+    state: BuyerPoolState,
+    self_address: Address,
+    spent: U256,
+    working_deposit: U256,
+    max_approve: bool,
+) -> anyhow::Result<BuyerPoolState>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let low_water = working_deposit / U256::from(LOW_WATER_DIVISOR);
+    let additional = refill_amount(state.deposit, spent, working_deposit, low_water);
+    if additional.is_zero() {
+        return Ok(state);
+    }
+    let remaining = state.deposit.saturating_sub(spent);
+    if let Some(shortfall) = funding.shortfall() {
+        // The wallet could not fund a top-up earlier in this run; asking again
+        // costs an allowance read and a reverting `topUp` estimate per lane.
+        if remaining.is_zero() {
+            return Err(cannot_pay(&state, &shortfall));
+        }
+        return Ok(state);
+    }
+    tracing::info!(
+        "buyer pool {} low on deposit ({remaining} µUSDC remaining of {} deposited); \
+         topping up {additional} µUSDC",
+        state.pool_id,
+        state.deposit,
+    );
+    // `topUp` pulls `additional` USDC via `transferFrom`, so the pool's
+    // standing allowance must cover it first. Ensure it in the caller's
+    // mode: unlimited under `--max-approve`, else exactly `additional`.
+    let escrowed = async {
+        ensure_allowance(
+            rpc,
+            state.token,
+            self_address,
+            *contract.address(),
+            if max_approve { None } else { Some(additional) },
+        )
+        .await?;
+        top_up(contract, state.pool_id, additional).await
+    }
+    .await;
+    let err = match escrowed {
+        Ok(ToppedUpPool { credited, tx }) => {
+            // The USDC is escrowed the moment `topUp` mines. A local credit that
+            // does not land leaves the deposit untracked, and continuing would
+            // fetch on a `state.deposit` that understates the chain — so the
+            // low-water check re-fires on every later fetch while nobody
+            // reconciles the escrow. No bytes have been paid for on *this* entry
+            // yet — `bundle pull` reaches this once per entry, through
+            // `open_or_reuse_pool`, so earlier entries may already be paid for and
+            // written — and only the escrow moved, so failing here strands nothing
+            // in flight. The reactive mid-fetch leg takes the same disposition
+            // (`CliFunder::top_up`).
+            let effect = topped_up_effect(state.pool_id, credited);
+            grade_deposit_credit(
+                store.add_deposit(self_address, state.pool_id, credited),
+                &effect,
+                tx,
+            )?;
+            // The credit committed, so the row must be there. A `None` here
+            // means it vanished between the write and this read — the local
+            // record did not survive, which is the same untracked-escrow
+            // condition, not something to paper over with the pre-top-up
+            // snapshot.
+            return store
+                .get_by_pool_id(state.pool_id)?
+                .ok_or_else(|| escrowed_but_untracked(&effect, tx, "the credited row vanished"));
+        }
+        Err(err) => err,
+    };
+    if err.downcast_ref::<TopUpUnconfirmed>().is_some() {
+        return Err(err);
+    }
+    let Some(shortfall) = funding
+        .check_wallet(
+            rpc,
+            state.token,
+            self_address,
+            state.pool_id,
+            additional,
+            &err,
+        )
+        .await
+    else {
+        return Err(err);
+    };
+    if remaining.is_zero() {
+        return Err(cannot_pay(&state, &shortfall));
+    }
+    tracing::warn!(
+        pool_id = %state.pool_id,
+        %remaining,
+        "continuing on the pool's remaining deposit (µUSDC) without a top-up"
+    );
+    Ok(state)
+}
+
 /// Reuse the caller's live pool (resuming `provider`'s lane watermark), or open
-/// and persist a new one. A reused pool whose remaining deposit has run low is
-/// auto-refilled on-chain via `topUp` before it is returned — see
-/// [`refill_amount`] for the policy. There is no pool expiry (ADR 003), so
+/// and persist a new one. A reused pool whose pool-wide remaining deposit has
+/// run low gets an on-chain `topUp` before it is returned; a wallet too short
+/// of USDC for it still returns the pool while it can pay — see
+/// [`refill_if_low`]. The lane then joins `funding`, the run's view of the
+/// pool's spend outside its lanes ([`RunFunding::join_lane`]). There is no
+/// pool expiry (ADR 003), so
 /// there is no replace-on-expiry branch: the same pool is reused for the
 /// caller's whole lifetime, across every provider.
 ///
@@ -3011,6 +3404,7 @@ pub(crate) async fn open_or_reuse_pool<P>(
     store: &RedbBuyerPoolStore,
     contract: &PaymentPool::PaymentPoolInstance<P>,
     rpc: &P,
+    funding: &RunFunding,
     signer: &Arc<PrivateKeySigner>,
     provider: Address,
     self_address: Address,
@@ -3018,7 +3412,7 @@ pub(crate) async fn open_or_reuse_pool<P>(
     working_deposit: U256,
     max_approve: bool,
     adoption: ChainAdoption,
-) -> anyhow::Result<PoolContext>
+) -> anyhow::Result<(PoolContext, LaneSpend)>
 where
     P: alloy::providers::Provider + Clone,
 {
@@ -3043,54 +3437,25 @@ where
 
         // Auto-refill a live pool whose remaining deposit has run low, so a
         // sustained series of fetches isn't stranded by a spent-down deposit.
-        let low_water = working_deposit / U256::from(LOW_WATER_DIVISOR);
-        let spent = prior_amount.max(spent_elsewhere);
-        let additional = refill_amount(state.deposit, spent, working_deposit, low_water);
-        let state = if additional.is_zero() {
-            state
-        } else {
-            tracing::info!(
-                "buyer pool {} low on deposit ({} µUSDC remaining of {} deposited); topping up \
-                 {additional} µUSDC",
-                state.pool_id,
-                state.deposit.saturating_sub(spent),
-                state.deposit,
-            );
-            // `topUp` pulls `additional` USDC via `transferFrom`, so the pool's
-            // standing allowance must cover it first. Ensure it in the caller's
-            // mode: unlimited under `--max-approve`, else exactly `additional`.
-            ensure_allowance(
-                rpc,
-                state.token,
-                self_address,
-                payment_pool_addr,
-                if max_approve { None } else { Some(additional) },
-            )
-            .await?;
-            let ToppedUpPool { credited, tx } = top_up(contract, state.pool_id, additional).await?;
-            // The USDC is escrowed the moment `topUp` mines. A local credit that
-            // does not land leaves the deposit untracked, and continuing would
-            // fetch on a `state.deposit` that understates the chain — so the
-            // low-water check re-fires on every later fetch while nobody
-            // reconciles the escrow. No bytes have been paid for on *this*
-            // entry yet — `bundle pull` calls this once per entry, so earlier
-            // entries may already be paid for and written — and only the escrow
-            // moved, so failing here strands nothing in flight. The reactive
-            // mid-fetch leg takes the same disposition (`CliFunder::top_up`).
-            let effect = topped_up_effect(state.pool_id, credited);
-            grade_deposit_credit(
-                store.add_deposit(self_address, state.pool_id, credited),
-                &effect,
-                tx,
-            )?;
-            // The credit committed, so the row must be there. A `None` here
-            // means it vanished between the write and this read — the local
-            // record did not survive, which is the same untracked-escrow
-            // condition, not something to paper over with the pre-top-up
-            // snapshot.
-            store
-                .get_by_pool_id(state.pool_id)?
-                .ok_or_else(|| escrowed_but_untracked(&effect, tx, "the credited row vanished"))?
+        let recorded = state.lane_progress(lane).is_some();
+        let spent = pool_spend(&state, lane, prior_amount, spent_elsewhere);
+        let state = refill_if_low(
+            store,
+            contract,
+            rpc,
+            funding,
+            state,
+            self_address,
+            spent,
+            working_deposit,
+            max_approve,
+        )
+        .await?;
+        let lane_spend = LaneSpend {
+            outside: spent.saturating_sub(prior_amount),
+            prior: prior_amount,
+            recorded,
+            from_chain: !spent_elsewhere.is_zero(),
         };
         return self_owned_lane_ctx(
             &state,
@@ -3099,7 +3464,8 @@ where
             provider,
             prior_bytes,
             prior_amount,
-        );
+        )
+        .map(|ctx| (ctx, lane_spend));
     }
 
     // Authoritative USDC token for the pool, from the contract itself.
@@ -3131,10 +3497,20 @@ where
     store
         .record(&opened.state)
         .map_err(|e| escrowed_but_untracked("buyer pool opened", opened.tx, e))?;
-    Ok(opened
-        .ctx
-        .with_provider(provider, U256::ZERO, U256::ZERO)
-        .with_capability(opened.capability))
+    // A fresh pool has spent nothing on any lane.
+    let spend = LaneSpend {
+        outside: U256::ZERO,
+        prior: U256::ZERO,
+        recorded: false,
+        from_chain: false,
+    };
+    Ok((
+        opened
+            .ctx
+            .with_provider(provider, U256::ZERO, U256::ZERO)
+            .with_capability(opened.capability),
+        spend,
+    ))
 }
 
 /// A unique `O_CREAT|O_EXCL` temp file in `target`'s directory, ready to be
@@ -4317,6 +4693,7 @@ mod tests {
         let slash_dom = decdn_incentive::slash_judge_domain(1, Address::repeat_byte(0x44));
         let connections = Connections::new(ep.clone());
         let writes = OrderedWrites::default();
+        let funding = RunFunding::default();
         let entry_deps = || -> anyhow::Result<DriveFetchDeps<'_, _>> {
             Ok(DriveFetchDeps {
                 endpoint: &ep,
@@ -4333,6 +4710,7 @@ mod tests {
                 deadlines: PullDeadlines::new(Duration::from_secs(5), Duration::from_secs(5), 0)?,
                 connections: &connections,
                 writes: &writes,
+                funding: &funding,
             })
         };
         let provider = Address::repeat_byte(0xB0);
@@ -4769,6 +5147,23 @@ mod adoption_tests {
         adoption: ChainAdoption,
         calls: Vec<Option<Bytes>>,
     ) -> anyhow::Result<PoolContext> {
+        run_in(store, signer, adoption, calls, &RunFunding::default())
+            .await
+            .0
+            .map(|(ctx, _)| ctx)
+    }
+
+    /// [`run`] as one lane build of the run `funding` describes, with the
+    /// lane's [`LaneSpend`]. The second value is whether every queued answer
+    /// was read: a path that stops short leaves some unread, which is how these
+    /// tests prove a path WAS taken.
+    async fn run_in(
+        store: &RedbBuyerPoolStore,
+        signer: &Arc<PrivateKeySigner>,
+        adoption: ChainAdoption,
+        calls: Vec<Option<Bytes>>,
+        funding: &RunFunding,
+    ) -> (anyhow::Result<(PoolContext, LaneSpend)>, bool) {
         let asserter = Asserter::new();
         for call in calls {
             match call {
@@ -4776,12 +5171,13 @@ mod adoption_tests {
                 None => asserter.push_failure_msg("transient rpc fault"),
             }
         }
-        let rpc = ProviderBuilder::new().connect_mocked_client(asserter);
+        let rpc = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         let contract = PaymentPool::new(PP, rpc.clone());
-        open_or_reuse_pool(
+        let result = open_or_reuse_pool(
             store,
             &contract,
             &rpc,
+            funding,
             signer,
             PROVIDER,
             signer.address(),
@@ -4790,7 +5186,8 @@ mod adoption_tests {
             false,
             adoption,
         )
-        .await
+        .await;
+        (result, asserter.read_q().is_empty())
     }
 
     fn client_store(dir: &tempfile::TempDir) -> RedbBuyerPoolStore {
@@ -4990,48 +5387,522 @@ mod adoption_tests {
         );
     }
 
-    /// An adopted pool that other lanes have drained is topped up, not trusted.
-    ///
-    /// The adopted row has no lanes, so its only view of what the pool has paid
-    /// out is `totalRedeemed`. Ignored, a pool with 0.5 USDC left reads as a full
-    /// 10: no top-up fires, and the provider refuses the fetch on a balance the
-    /// client believes it has. Here the refill fires, so the fetch reaches the
-    /// allowance read — past the end of the queue, which is the proof it went
-    /// there. Ignoring `totalRedeemed` returns `Ok` instead.
+    /// The amounts observed on the pool in #2288: six lanes, 8.655 of 10 USDC
+    /// spent in all, the largest lane 2.374. The first lane is [`PROVIDER`]'s.
+    const LIVE_LANES: [u64; 6] = [2_374_000, 2_360_000, 2_147_000, 1_043_000, 483_000, 248_000];
+
+    /// A tracked row on [`DEPLOYMENT`] holding `deposit`, with one lane per
+    /// `amounts` entry: the first is [`PROVIDER`]'s, each later one another
+    /// provider's. A lane's bytes are its amount times 1000.
+    fn tracked_row(id: B256, owner: Address, deposit: u64, amounts: &[u64]) -> BuyerPoolState {
+        let lanes = amounts
+            .iter()
+            .zip(0u8..)
+            .map(|(&amount, i)| {
+                let provider = if i == 0 {
+                    PROVIDER
+                } else {
+                    Address::repeat_byte(0x40 + i)
+                };
+                (
+                    lane_key(id, owner, provider),
+                    decdn_incentive::BuyerLaneProgress {
+                        last_amount: U256::from(amount),
+                        last_bytes: U256::from(amount) * U256::from(1000u64),
+                    },
+                )
+            })
+            .collect();
+        BuyerPoolState::hydrate(id, DEPLOYMENT, owner, TOKEN, U256::from(deposit), lanes)
+    }
+
+    fn lane_key(id: B256, owner: Address, provider: Address) -> LaneKey {
+        LaneKey {
+            pool_id: id,
+            signer: owner,
+            provider,
+        }
+    }
+
+    /// A refill that fails at the allowance read, then reads a wallet holding
+    /// `usdc` micro-USDC.
+    fn refill_fails_with_wallet(usdc: u64) -> Vec<Option<Bytes>> {
+        vec![None, Some(U256::from(usdc).abi_encode().into())]
+    }
+
+    /// The refill compares the deposit with the pool's spend over every lane.
+    /// Each live lane alone leaves far more than the low water; together they
+    /// leave 1.345 USDC, below the 2 USDC mark, so the pool must refill.
+    #[test]
+    fn pool_spend_sums_every_lane_not_the_one_being_built() {
+        let owner = Address::repeat_byte(0x01);
+        let id = B256::repeat_byte(0xEE);
+        let row = tracked_row(id, owner, WORKING, &LIVE_LANES);
+        let working = U256::from(WORKING);
+        let low_water = working / U256::from(LOW_WATER_DIVISOR);
+        let this_lane = lane_key(id, owner, PROVIDER);
+
+        let spent = pool_spend(&row, this_lane, U256::from(LIVE_LANES[0]), U256::ZERO);
+        assert_eq!(spent, U256::from(8_655_000u64));
+        assert_eq!(
+            refill_amount(row.deposit, spent, working, low_water),
+            U256::from(8_655_000u64),
+            "the refill restores the 1.345 USDC remaining to the 10 USDC working deposit"
+        );
+        for &one_lane in &LIVE_LANES {
+            assert!(
+                refill_amount(row.deposit, U256::from(one_lane), working, low_water).is_zero(),
+                "no single lane reaches the low water, so the spend must be the sum over \
+                 every lane"
+            );
+        }
+    }
+
+    /// A lane the row has no record of resumes from the chain watermark, and
+    /// that watermark is spend the row's sum does not hold yet.
+    #[test]
+    fn pool_spend_adds_an_untracked_lanes_chain_prior() {
+        let owner = Address::repeat_byte(0x01);
+        let id = B256::repeat_byte(0xEE);
+        let row = tracked_row(id, owner, WORKING, &[1_000]);
+        let new_lane = lane_key(id, owner, Address::repeat_byte(0x55));
+        assert_eq!(
+            pool_spend(&row, new_lane, U256::from(250u64), U256::ZERO),
+            U256::from(1_250u64)
+        );
+        // A tracked lane's prior is already in the sum and is not counted twice.
+        assert_eq!(
+            pool_spend(
+                &row,
+                lane_key(id, owner, PROVIDER),
+                U256::from(1_000u64),
+                U256::ZERO
+            ),
+            U256::from(1_000u64)
+        );
+    }
+
+    /// An adopted row has no lanes, so `totalRedeemed` is its only record of
+    /// what other lanes drained. Ignored, a pool with 0.5 USDC left reads as a
+    /// full 10 and no refill fires.
+    #[test]
+    fn pool_spend_honours_an_adopted_pools_total_redeemed() {
+        let owner = Address::repeat_byte(0x01);
+        let id = B256::repeat_byte(0xEE);
+        let adopted = BuyerPoolState::new(id, DEPLOYMENT, owner, TOKEN, U256::from(WORKING));
+        let this_lane = lane_key(id, owner, PROVIDER);
+        assert_eq!(
+            pool_spend(&adopted, this_lane, U256::ZERO, U256::from(9_500_000u64)),
+            U256::from(9_500_000u64)
+        );
+        assert_eq!(
+            pool_spend(&adopted, this_lane, U256::from(600u64), U256::from(500u64)),
+            U256::from(600u64),
+            "the larger of the lane's chain prior and `totalRedeemed` is the spend"
+        );
+    }
+
+    /// #2288 end to end: five lanes of 2 USDC spend the whole 10 USDC deposit,
+    /// so building any lane fires the refill. The wallet holds no USDC, and with
+    /// nothing left in the pool the lane fails. A spend read from the one lane
+    /// alone would see 8 USDC remaining, fire no refill, and return `Ok`.
     #[tokio::test]
-    async fn an_adopted_pool_drained_by_other_lanes_is_topped_up() {
+    async fn a_pool_spent_across_lanes_refills_and_fails_when_nothing_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        let signer = Arc::new(PrivateKeySigner::random());
+        let id = B256::repeat_byte(0xEE);
+        store
+            .record(&tracked_row(id, signer.address(), WORKING, &[2_000_000; 5]))
+            .unwrap();
+
+        let (result, drained) = run_in(
+            &store,
+            &signer,
+            ChainAdoption::Allowed,
+            refill_fails_with_wallet(0),
+            &RunFunding::default(),
+        )
+        .await;
+        let err = result.expect_err("a pool with no unspent deposit cannot pay");
+        assert!(
+            format!("{err:#}").contains("has no unspent deposit, and the wallet cannot fund"),
+            "expected the refill failure, got: {err:#}"
+        );
+        assert!(
+            err.downcast_ref::<NoAffordableSource>().is_some(),
+            "the lane build ends the command rather than retrying: {err:#}"
+        );
+        assert!(
+            drained,
+            "the refill read the allowance and the wallet balance"
+        );
+    }
+
+    /// A lane the row has no record of joins its chain watermark to the
+    /// pool-wide spend. Here the tracked lane has spent 9 USDC and the new
+    /// lane's watermark the last 1, so nothing is left. Without the watermark
+    /// the pool reads 1 USDC remaining and the lane builds.
+    #[tokio::test]
+    async fn an_untracked_lanes_chain_watermark_counts_toward_the_pool_spend() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        let signer = Arc::new(PrivateKeySigner::random());
+        let id = B256::repeat_byte(0xEE);
+        let other = lane_key(id, signer.address(), Address::repeat_byte(0x55));
+        let progress = decdn_incentive::BuyerLaneProgress {
+            last_amount: U256::from(9_000_000u64),
+            last_bytes: U256::from(9_000_000_000u64),
+        };
+        store
+            .record(&BuyerPoolState::hydrate(
+                id,
+                DEPLOYMENT,
+                signer.address(),
+                TOKEN,
+                U256::from(WORKING),
+                vec![(other, progress)],
+            ))
+            .unwrap();
+
+        let mut calls = vec![Some(lane(1_000_000, 1_000_000_000))];
+        calls.extend(refill_fails_with_wallet(0));
+        let (result, drained) = run_in(
+            &store,
+            &signer,
+            ChainAdoption::Allowed,
+            calls,
+            &RunFunding::default(),
+        )
+        .await;
+        let err = result.expect_err("the untracked lane's watermark spends the rest");
+        assert!(
+            format!("{err:#}").contains("has no unspent deposit"),
+            "{err:#}"
+        );
+        assert!(drained);
+    }
+
+    /// #2289: a wallet too short of USDC for the refill keeps the lane while the
+    /// pool can still pay. The live pool has 1.345 USDC unspent, below the low
+    /// water, so the refill fires; the wallet holds none. The lane is built on
+    /// the current deposit, the row is untouched, and the run records the
+    /// shortfall for its closing warning.
+    #[tokio::test]
+    async fn a_wallet_short_of_usdc_keeps_the_lane_while_the_pool_can_still_pay() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        let signer = Arc::new(PrivateKeySigner::random());
+        let id = B256::repeat_byte(0xEE);
+        store
+            .record(&tracked_row(id, signer.address(), WORKING, &LIVE_LANES))
+            .unwrap();
+        let funding = RunFunding::default();
+
+        let (result, drained) = run_in(
+            &store,
+            &signer,
+            ChainAdoption::Allowed,
+            refill_fails_with_wallet(0),
+            &funding,
+        )
+        .await;
+        let (ctx, _) =
+            result.expect("1.345 USDC is left, so a short wallet must not drop the lane");
+
+        assert!(drained, "the refill fired and read the wallet balance");
+        assert_eq!(ctx.pool_id, id);
+        assert_eq!(
+            (ctx.prior_bytes_delivered, ctx.prior_amount),
+            (U256::from(LIVE_LANES[0] * 1000), U256::from(LIVE_LANES[0])),
+            "the lane resumes from its own recorded progress"
+        );
+        let row = store.get_by_owner(signer.address()).unwrap().unwrap();
+        assert_eq!(row.deposit, U256::from(WORKING), "nothing was credited");
+        assert_eq!(row.committed_amount(), U256::from(8_655_000u64));
+        let shortfall = funding.shortfall().expect("the shortfall is recorded");
+        assert!(shortfall.contains("holds 0 µUSDC"), "{shortfall}");
+        assert!(shortfall.contains("8655000 µUSDC top-up"), "{shortfall}");
+    }
+
+    /// Once the run has seen the wallet too short of USDC, a later lane build
+    /// does not ask again: no allowance read, no `topUp`. With no answers
+    /// queued, any chain read would fault the build.
+    #[tokio::test]
+    async fn a_later_lane_build_skips_the_refill_after_a_wallet_shortfall() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        let signer = Arc::new(PrivateKeySigner::random());
+        let id = B256::repeat_byte(0xEE);
+        store
+            .record(&tracked_row(id, signer.address(), WORKING, &LIVE_LANES))
+            .unwrap();
+        let funding = RunFunding::default();
+        let (first, _) = run_in(
+            &store,
+            &signer,
+            ChainAdoption::Allowed,
+            refill_fails_with_wallet(0),
+            &funding,
+        )
+        .await;
+        first.expect("the first build records the shortfall and keeps its lane");
+
+        let (later, _) = run_in(&store, &signer, ChainAdoption::Allowed, vec![], &funding).await;
+        later.expect("the later build reads nothing from the chain");
+    }
+
+    /// A refill that fails while the wallet holds enough USDC is not a
+    /// shortfall: the cause may be transient, so the lane build fails and the
+    /// acquire loop retries it with backoff.
+    #[tokio::test]
+    async fn a_refill_failure_with_a_funded_wallet_fails_the_lane_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        let signer = Arc::new(PrivateKeySigner::random());
+        let id = B256::repeat_byte(0xEE);
+        store
+            .record(&tracked_row(id, signer.address(), WORKING, &LIVE_LANES))
+            .unwrap();
+        let funding = RunFunding::default();
+
+        let (result, drained) = run_in(
+            &store,
+            &signer,
+            ChainAdoption::Allowed,
+            refill_fails_with_wallet(WORKING),
+            &funding,
+        )
+        .await;
+        let err = result.expect_err("a funded wallet's failed refill is retried, not skipped");
+        assert!(
+            format!("{err:#}").contains("read USDC allowance"),
+            "{err:#}"
+        );
+        assert!(drained);
+        assert!(funding.shortfall().is_none());
+    }
+
+    /// An adopted pool that other lanes have drained to 0.5 USDC fires the
+    /// refill through `totalRedeemed`, and still buys on its remainder when
+    /// the wallet is empty. Adoption only takes a pool with deposit left.
+    #[tokio::test]
+    async fn an_adopted_pool_drained_by_other_lanes_refills_and_buys_on_its_remainder() {
         let dir = tempfile::tempdir().unwrap();
         let store = client_store(&dir);
         let signer = Arc::new(PrivateKeySigner::random());
         let owner = signer.address();
         let id = B256::repeat_byte(0xDD);
+        let mut calls = vec![
+            Some(vec![id].abi_encode().into()),
+            Some(pool(owner, 10_000_000, 9_500_000).abi_encode().into()),
+            Some(TOKEN.abi_encode().into()),
+            // This lane itself has spent nothing — the drain is elsewhere.
+            Some(lane(0, 0)),
+        ];
+        calls.extend(refill_fails_with_wallet(0));
+        let funding = RunFunding::default();
 
-        let result = run(
+        let (result, drained) =
+            run_in(&store, &signer, ChainAdoption::Allowed, calls, &funding).await;
+        let (ctx, spend) =
+            result.expect("0.5 USDC is left, so a short wallet must not drop the lane");
+
+        assert!(
+            drained,
+            "0.5 USDC left is below the 2 USDC low water, so the refill must fire"
+        );
+        assert_eq!(ctx.pool_id, id);
+        assert_eq!(
+            spend,
+            LaneSpend {
+                outside: U256::from(9_500_000u64),
+                prior: U256::ZERO,
+                recorded: false,
+                from_chain: true,
+            }
+        );
+    }
+
+    /// A ledger seeded at `amount`.
+    fn ledger_at(amount: u64) -> Arc<PoolLedger> {
+        Arc::new(PoolLedger::new(Cumulative {
+            bytes: U256::from(amount) * U256::from(1000u64),
+            amount: U256::from(amount),
+        }))
+    }
+
+    fn spend(outside: u64, prior: u64, recorded: bool, from_chain: bool) -> LaneSpend {
+        LaneSpend {
+            outside: U256::from(outside),
+            prior: U256::from(prior),
+            recorded,
+            from_chain,
+        }
+    }
+
+    /// The pool's spend is the run's baseline plus every joined lane's
+    /// ledger. The first lane sets the baseline; a later lane the row recorded
+    /// moves its prior out of it, because its ledger counts it now; a lane the
+    /// row did not hold moves nothing, because the baseline never counted its
+    /// chain prior; a lane that joins again changes nothing.
+    #[test]
+    fn run_funding_counts_every_lane_once_on_a_tracked_pool() {
+        let id = B256::repeat_byte(0xEE);
+        let owner = Address::repeat_byte(0x01);
+        let funding = RunFunding::default();
+        assert_eq!(funding.pool_spent(), None);
+
+        // The live pool: PROVIDER's lane is the first to join.
+        let first = lane_key(id, owner, PROVIDER);
+        let first_ledger = ledger_at(2_374_000);
+        funding.join_lane(
+            first,
+            spend(6_281_000, 2_374_000, true, false),
+            &first_ledger,
+        );
+        assert_eq!(funding.pool_spent(), Some(U256::from(8_655_000u64)));
+
+        let second = lane_key(id, owner, Address::repeat_byte(0x41));
+        funding.join_lane(
+            second,
+            spend(0, 2_360_000, true, false),
+            &ledger_at(2_360_000),
+        );
+        assert_eq!(funding.pool_spent(), Some(U256::from(8_655_000u64)));
+
+        // A new provider whose chain watermark the row never held.
+        let fresh = lane_key(id, owner, Address::repeat_byte(0x55));
+        funding.join_lane(fresh, spend(0, 100, false, false), &ledger_at(100));
+        assert_eq!(funding.pool_spent(), Some(U256::from(8_655_100u64)));
+
+        funding.join_lane(first, spend(0, 6_281_000, true, false), &first_ledger);
+        assert_eq!(funding.pool_spent(), Some(U256::from(8_655_100u64)));
+    }
+
+    /// An adopted pool's baseline is `totalRedeemed`, which already counts
+    /// every lane's redeemed watermark. A later lane's chain prior moves out of
+    /// it, recorded or not, so it is counted once, by the lane's ledger.
+    #[test]
+    fn run_funding_counts_every_lane_once_on_an_adopted_pool() {
+        let id = B256::repeat_byte(0xEE);
+        let owner = Address::repeat_byte(0x01);
+        let funding = RunFunding::default();
+        funding.join_lane(
+            lane_key(id, owner, PROVIDER),
+            spend(9_000_000, 500_000, false, true),
+            &ledger_at(500_000),
+        );
+        assert_eq!(funding.pool_spent(), Some(U256::from(9_500_000u64)));
+        funding.join_lane(
+            lane_key(id, owner, Address::repeat_byte(0x41)),
+            spend(0, 1_000_000, false, false),
+            &ledger_at(1_000_000),
+        );
+        assert_eq!(funding.pool_spent(), Some(U256::from(9_500_000u64)));
+    }
+
+    /// A lane's spend is what its ledgers committed, so it grows as the lane
+    /// pays. A lane rebuilt with a fresh ledger from a stale prior keeps the
+    /// larger of its ledgers: vouchers on a lane are cumulative.
+    #[test]
+    fn run_funding_follows_each_lanes_largest_ledger() {
+        let id = B256::repeat_byte(0xEE);
+        let owner = Address::repeat_byte(0x01);
+        let funding = RunFunding::default();
+        let lane = lane_key(id, owner, PROVIDER);
+        let paid = ledger_at(0);
+        funding.join_lane(lane, spend(1_000, 0, false, false), &paid);
+        assert!(paid.reseed(Cumulative {
+            bytes: U256::from(300_000u64),
+            amount: U256::from(300u64),
+        }));
+        assert_eq!(funding.pool_spent(), Some(U256::from(1_300u64)));
+
+        funding.join_lane(lane, spend(1_000, 0, false, false), &ledger_at(0));
+        assert_eq!(funding.pool_spent(), Some(U256::from(1_300u64)));
+    }
+
+    /// A lane build hands back what it learned about the pool's spend: the
+    /// spend on every other lane, and the lane's own recorded prior.
+    #[tokio::test]
+    async fn a_lane_build_reports_the_pools_other_spend() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        let signer = Arc::new(PrivateKeySigner::random());
+        let id = B256::repeat_byte(0xEE);
+        store
+            .record(&tracked_row(id, signer.address(), 2 * WORKING, &LIVE_LANES))
+            .unwrap();
+
+        let (result, drained) = run_in(
             &store,
             &signer,
             ChainAdoption::Allowed,
-            vec![
-                Some(vec![id].abi_encode().into()),
-                Some(pool(owner, 10_000_000, 9_500_000).abi_encode().into()),
-                Some(TOKEN.abi_encode().into()),
-                // This lane itself has spent nothing — the drain is elsewhere.
-                Some(lane(0, 0)),
-            ],
+            vec![],
+            &RunFunding::default(),
         )
         .await;
-
-        assert!(
-            result.is_err(),
-            "0.5 USDC left is below the 2 USDC low water, so a top-up must be attempted"
-        );
+        let (_, spend) = result.expect("11.345 USDC is left, so no refill fires");
+        assert!(drained);
         assert_eq!(
-            store
-                .get_by_owner(owner)
-                .unwrap()
-                .expect("adopted first")
-                .pool_id,
-            id
+            spend,
+            LaneSpend {
+                outside: U256::from(8_655_000u64 - LIVE_LANES[0]),
+                prior: U256::from(LIVE_LANES[0]),
+                recorded: true,
+                from_chain: false,
+            }
         );
+    }
+
+    /// The run's funder reports the pool's spend to the deposit gate. A
+    /// reactive top-up that fails for another reason is not a shortfall; after
+    /// a wallet shortfall, a reactive top-up fails without a chain call and
+    /// says so ([`WalletShortfall`]).
+    #[tokio::test]
+    async fn the_cli_funder_reads_the_run_funding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        let rpc = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let contract = PaymentPool::new(PP, rpc.clone());
+        let funding = RunFunding::default();
+        funding.join_lane(
+            lane_key(
+                B256::repeat_byte(0xEE),
+                Address::repeat_byte(0x01),
+                PROVIDER,
+            ),
+            spend(700, 0, false, false),
+            &ledger_at(0),
+        );
+        let pool_id = std::sync::OnceLock::new();
+        pool_id.set(B256::repeat_byte(0xEE)).unwrap();
+        let funder = CliFunder {
+            contract: &contract,
+            rpc: &rpc,
+            store: &store,
+            owner: Address::repeat_byte(0x01),
+            pool_id: &pool_id,
+            token: TOKEN,
+            payment_pool_addr: PP,
+            max_approve: false,
+            funding: &funding,
+        };
+        assert_eq!(funder.pool_spent(), Some(U256::from(700u64)));
+
+        // No answers are queued, so the wallet read faults: not a shortfall.
+        let err = funder.top_up(U256::from(5u64)).await.unwrap_err();
+        assert!(funding.shortfall().is_none(), "{err:#}");
+        assert!(err.downcast_ref::<WalletShortfall>().is_none(), "{err:#}");
+
+        *funding.shortfall.lock().unwrap() = Some("wallet 0x01 holds 0 µUSDC".to_owned());
+        let err = funder.top_up(U256::from(5u64)).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("the wallet cannot fund a top-up: wallet 0x01 holds 0"),
+            "{err:#}"
+        );
+        assert!(err.downcast_ref::<WalletShortfall>().is_some(), "{err:#}");
     }
 }
 

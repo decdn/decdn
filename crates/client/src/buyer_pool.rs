@@ -130,12 +130,27 @@ pub fn escrowed_but_untracked(
     tx: TxHash,
     cause: impl std::fmt::Display,
 ) -> anyhow::Error {
-    anyhow::anyhow!(
+    anyhow::Error::new(EscrowUntracked(format!(
         "{effect} on-chain (tx {tx}) but the local record did not survive; the deposit is \
          escrowed but untracked — reconcile against the tx before retrying, because a retry \
          escrows again: {cause}"
-    )
+    )))
 }
+
+/// The error [`escrowed_but_untracked`] builds: USDC moved on-chain and the
+/// local record does not account for it. A retry escrows again, so the acquire
+/// loop classifies it as fatal to the command ([`crate::Fault::Fatal`]) instead
+/// of retrying the lane build.
+#[derive(Debug)]
+pub struct EscrowUntracked(String);
+
+impl std::fmt::Display for EscrowUntracked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EscrowUntracked {}
 
 /// The `effect` clause for a landed `topUp`, in the past-tense shape
 /// [`escrowed_but_untracked`] expects.
@@ -584,6 +599,47 @@ impl std::fmt::Display for AllowanceShortfall {
 
 impl std::error::Error for AllowanceShortfall {}
 
+/// Typed marker on a [`top_up`] error raised after the `topUp` was broadcast:
+/// its receipt could not be read. The
+/// transaction may still mine, so the escrow may have moved while no local
+/// record credits it. A caller must not treat it as "nothing escrowed"; the
+/// acquire loop classifies it as fatal to the command
+/// ([`crate::Fault::Fatal`]).
+#[derive(Debug, Clone, Copy)]
+pub struct TopUpUnconfirmed {
+    /// The broadcast `topUp` transaction, which an operator reconciles against.
+    pub tx: TxHash,
+}
+
+impl std::fmt::Display for TopUpUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "topUp tx {} was broadcast but its receipt was not read, so it may have mined; \
+             reconcile against the tx before retrying, because a retry escrows again",
+            self.tx
+        )
+    }
+}
+
+impl std::error::Error for TopUpUnconfirmed {}
+
+/// Typed marker on a failed top-up whose funder found the buyer's wallet
+/// holding too little USDC for it. No retry fixes that, so the acquire loop
+/// classifies it [`crate::Fault::Unaffordable`]: the source waits for the
+/// deposit to rise, and the command stops with the top-up remedy once every
+/// source waits. Any other failed reactive top-up is transient.
+#[derive(Debug, Clone, Copy)]
+pub struct WalletShortfall;
+
+impl std::fmt::Display for WalletShortfall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the wallet holds too little USDC to top up the pool")
+    }
+}
+
+impl std::error::Error for WalletShortfall {}
+
 /// How many times [`top_up`] re-sends a submit rejected as a nonce collision.
 const TOPUP_NONCE_RETRIES: u32 = 3;
 
@@ -615,7 +671,9 @@ const TOPUP_NONCE_BACKOFF: Duration = Duration::from_millis(250);
 ///
 /// # Errors
 ///
-/// Errors if the `topUp` transaction fails (submit, revert, or receipt).
+/// Errors if the `topUp` transaction fails (submit, revert, or receipt). A
+/// receipt that cannot be read carries [`TopUpUnconfirmed`] naming the
+/// broadcast transaction.
 pub async fn top_up<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     pool_id: B256,
@@ -650,7 +708,18 @@ pub async fn top_up<P: Provider + Clone>(
             submit_err
         });
     };
-    let receipt = pending.get_receipt().await.context("await topUp receipt")?;
+    // Capture the hash before `get_receipt` consumes `pending`: past this point
+    // the transaction is broadcast and may mine, so every receipt failure names
+    // it (see [`TopUpUnconfirmed`]).
+    // The wait is unbounded, like `open_pool`'s: giving up does not cancel the
+    // transaction, and the node holds its top-up slot for exactly as long as
+    // this future runs.
+    let tx = *pending.tx_hash();
+    let receipt = pending.get_receipt().await.map_err(|err| {
+        anyhow::Error::new(err)
+            .context("await topUp receipt")
+            .context(TopUpUnconfirmed { tx })
+    })?;
     if !receipt.status() {
         anyhow::bail!("topUp reverted for pool {pool_id}");
     }
@@ -677,7 +746,6 @@ pub async fn top_up<P: Provider + Clone>(
             },
             |ev| ev.additionalDeposit,
         );
-    let tx = receipt.transaction_hash;
     info!(%pool_id, %credited, %tx, "topped up buyer payment pool");
     Ok(ToppedUpPool { credited, tx })
 }
@@ -694,8 +762,9 @@ pub const LOW_WATER_DIVISOR: u64 = 5;
 /// isn't stranded by a spent-down deposit (#1103).
 ///
 /// Pure decision (no I/O) so the policy is unit-testable. `deposit` is the pool's
-/// current on-chain deposit and `prior_amount` the cumulative amount already
-/// vouchered across its lanes, so the remaining spendable is
+/// current on-chain deposit and `prior_amount` the pool-wide cumulative amount
+/// already vouchered — the sum across all its lanes, not the lane being built —
+/// so the remaining spendable is
 /// `deposit - prior_amount`. When that remaining balance has fallen below
 /// `low_water`, return the top-up that restores it to `target_deposit`; otherwise
 /// return `U256::ZERO` (no refill). Hysteresis (`low_water < target_deposit`)

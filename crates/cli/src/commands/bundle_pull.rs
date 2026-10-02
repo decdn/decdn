@@ -1549,6 +1549,7 @@ async fn pull_over(
         namespace_id,
         grant,
         ledgers: LaneLedgers::new(),
+        funding: fetch::RunFunding::default(),
         dedup_stats: DedupStats::default(),
         open_lock: tokio::sync::Mutex::new(()),
         jobs: args.jobs.max(1),
@@ -1618,7 +1619,7 @@ async fn pull_manifest<P: Provider + Clone>(
     let mut interrupt = Interrupt::watch();
     let PullRun {
         outcomes,
-        warnings,
+        mut warnings,
         transfer,
         interrupted,
         stopped,
@@ -1633,6 +1634,7 @@ async fn pull_manifest<P: Provider + Clone>(
         .await;
     ctx.progress.finish();
     warn_leftover_partials(&args.output, &manifest.entries, args.hash.as_deref());
+    warnings.extend(ctx.funding.shortfall());
 
     // Every entry has joined, so the shared dedup counters are now stable.
     let dedup = DedupSummary {
@@ -2042,6 +2044,9 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// issuer, so concurrent same-lane fetches never race the cumulative
     /// watermark.
     ledgers: LaneLedgers,
+    /// The run's funding facts ([`fetch::RunFunding`]): the pool's spend
+    /// outside the run's lanes, and a wallet too short of USDC to top it up.
+    funding: fetch::RunFunding,
     /// Run-scoped range-dedup counters (bytes spliced from disk, hints dropped by
     /// a fault), accumulated by every entry and reported once the pull finishes.
     dedup_stats: DedupStats,
@@ -2117,6 +2122,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             deadlines: PullDeadlines::new(fetch::STALL_WINDOW, fetch::STALL_WINDOW, 0)?,
             connections: &self.connections,
             writes: self.writes,
+            funding: &self.funding,
         })
     }
 

@@ -153,6 +153,7 @@ where
             token: self.deps.token,
             payment_pool_addr: self.deps.chain.payment_pool,
             max_approve: self.deps.chain.max_approve,
+            funding: self.deps.funding,
         }
     }
 

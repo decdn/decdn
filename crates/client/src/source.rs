@@ -213,11 +213,23 @@ pub trait Funder: Send + Sync {
     ///
     /// # Errors
     ///
-    /// If the on-chain `topUp` fails to submit, reverts, or its receipt is not
-    /// obtained — the funds did not move. Also if a mined `topUp` cannot be
-    /// credited locally, in which case the funds **are** escrowed and the error
-    /// names the tx (see `decdn_client::buyer_pool::escrowed_but_untracked`).
+    /// If the on-chain `topUp` fails to submit or reverts — the funds did not
+    /// move. If its receipt is not obtained, the funds may have moved and the
+    /// error carries [`crate::buyer_pool::TopUpUnconfirmed`]. If a mined `topUp`
+    /// cannot be credited locally, the funds **are** escrowed and the error
+    /// names the tx ([`crate::buyer_pool::escrowed_but_untracked`]).
     fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome>;
+
+    /// The funder's own view of what the pool has spent across every lane,
+    /// including lanes the acquire loop does not drive: vouchers to providers
+    /// outside the fetch (or the run). The deposit gate takes the larger of
+    /// this and the committed amounts of the loop's own lanes, so a pool shared
+    /// across many providers gates on its true remaining deposit.
+    ///
+    /// `None` by default: the funder has no view beyond the loop's lanes.
+    fn pool_spent(&self) -> Option<U256> {
+        None
+    }
 }
 
 /// Current unix time in microseconds (the requester-echoed
@@ -1305,6 +1317,7 @@ mod doubles {
         max_topups: u32,
         outcome: DepositOutcome,
         calls: Mutex<Vec<U256>>,
+        pool_spent: Option<U256>,
     }
 
     impl FakeFunder {
@@ -1315,7 +1328,16 @@ mod doubles {
                 max_topups,
                 outcome,
                 calls: Mutex::new(Vec::new()),
+                pool_spent: None,
             }
+        }
+
+        /// This funder, reporting `spent` as the pool's spend across every
+        /// lane ([`Funder::pool_spent`](super::Funder::pool_spent)).
+        #[must_use]
+        pub const fn with_pool_spent(mut self, spent: U256) -> Self {
+            self.pool_spent = Some(spent);
+            self
         }
 
         /// The `additional` amounts passed to [`Funder::top_up`](super::Funder::top_up),
@@ -1338,6 +1360,10 @@ mod doubles {
                 }
                 Ok(self.outcome)
             })
+        }
+
+        fn pool_spent(&self) -> Option<U256> {
+            self.pool_spent
         }
     }
 }
