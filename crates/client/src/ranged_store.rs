@@ -29,6 +29,7 @@
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::Context as _;
@@ -40,6 +41,7 @@ use bytes::Bytes;
 use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, RangedFuture, RangedStore, RangedStoreError};
 
 use crate::sink::{StashedFault, classify_decode_error};
+use crate::source::IngestEnd;
 
 /// A checkpoint-slot wait at least this long is logged at `debug`: ingest does
 /// not read its stream while it waits (#2211).
@@ -549,7 +551,7 @@ impl ClientRangedStore {
     /// fault the call checkpoints every verified leaf before it returns, so a
     /// fault re-pays only the bytes past the last verified chunk group (unless
     /// a checkpoint itself fails). On a crash, or when the caller drops the
-    /// future (a scheduler steal or stall), the unflushed batch is lost and
+    /// future (a scheduler cancel or stall), the unflushed batch is lost and
     /// the queued checkpoints can miss the resume read, so the re-pay is at
     /// most `INGEST_MAX_QUEUED_CHECKPOINTS + 1` intervals. Checkpointed
     /// (durably-recorded) bytes are never re-paid.
@@ -675,6 +677,31 @@ impl ClientRangedStore {
     where
         R: iroh_io::AsyncStreamReader + StashedFault + Send,
     {
+        self.ingest_stream_until(range, reader, on_progress, claimed_total, None)
+            .await
+            .map(|(reader, _)| reader)
+    }
+
+    /// [`Self::ingest_stream`] with an end the caller can lower while the leg
+    /// streams. Once the verified prefix reaches `stop_at`, the call
+    /// checkpoints that prefix and returns [`IngestEnd::Stopped`] without
+    /// reading further; the bytes past it stay missing. A range the decoder
+    /// reads to its end returns [`IngestEnd::Drained`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::ingest_stream`].
+    pub(crate) async fn ingest_stream_until<R>(
+        &self,
+        range: &AlignedRange,
+        reader: R,
+        on_progress: Option<&(dyn Fn(u64) + Send + Sync)>,
+        claimed_total: u64,
+        stop_at: Option<&AtomicU64>,
+    ) -> anyhow::Result<(R, IngestEnd)>
+    where
+        R: iroh_io::AsyncStreamReader + StashedFault + Send,
+    {
         let range = &decdn_bao_range::align_range_clamped(
             range.fetch_start(),
             range.fetch_len(),
@@ -694,7 +721,7 @@ impl ClientRangedStore {
                 return Err(anyhow::Error::new(crate::HashMismatch));
             }
             self.lock_state().prove(0);
-            return Ok(reader);
+            return Ok((reader, IngestEnd::Drained));
         }
         let mut flusher = IngestFlusher::open(self, range, claimed_total).await?;
 
@@ -729,6 +756,16 @@ impl ClientRangedStore {
                             .start(std::mem::take(&mut batch), received_end)
                             .await?;
                         batch_start = received_end;
+                    }
+                    // A steal lowered the end to a split this prefix reached:
+                    // stop here, so the bytes past it go to the stealer alone.
+                    // A prefix that reached the range's end drains as usual.
+                    if received_end < range.fetch_end()
+                        && stop_at.is_some_and(|end| received_end >= end.load(Ordering::Acquire))
+                    {
+                        let r = rest.finish();
+                        flusher.finish(batch, received_end).await?;
+                        return Ok((r, IngestEnd::Stopped));
                     }
                     decoder = rest;
                 }
@@ -765,7 +802,7 @@ impl ClientRangedStore {
                         return Err(fault);
                     }
                     flush_result?;
-                    return Ok(r);
+                    return Ok((r, IngestEnd::Drained));
                 }
             }
         }
@@ -1488,11 +1525,12 @@ impl crate::source::IngestStore for ClientRangedStore {
         reader: R,
         on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
         claimed_total: u64,
-    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<R>> + 'a>>
+        stop_at: Option<&'a AtomicU64>,
+    ) -> crate::source::IngestFuture<'a, R>
     where
         R: crate::source::BaoRangeReader + 'a,
     {
-        Box::pin(self.ingest_stream(range, reader, on_progress, claimed_total))
+        Box::pin(self.ingest_stream_until(range, reader, on_progress, claimed_total, stop_at))
     }
 
     fn flush_present_record(&self) -> crate::source::SourceFuture<'_, ()> {
@@ -2052,6 +2090,52 @@ mod tests {
             sum += (b.0 - a.0) * 1024;
         }
         sum
+    }
+
+    /// An ingest whose end is lowered stops once its verified prefix reaches
+    /// it: the prefix is present, nothing past it is, and the wire it read is
+    /// exactly the encoding of the shorter range, since a group-aligned end
+    /// cuts a pre-order bao encoding between two items. An end at or past the
+    /// range's end drains the range as usual.
+    #[tokio::test]
+    async fn ingest_stream_until_stops_at_a_lowered_end() -> anyhow::Result<()> {
+        let total = 11 * GROUP + 321;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?);
+        let range = decdn_bao_range::align_range(GROUP, 9 * GROUP, total)?;
+        let body = bao_for(root, &plaintext, outboard, &range).slice(8..);
+        for stop in 2..10 {
+            let store = fresh_store(root, total);
+            let end = AtomicU64::new(stop * GROUP);
+            let (rest, ended) = store
+                .ingest_stream_until(&range, body.clone(), None, total, Some(&end))
+                .await?;
+            let kept = decdn_bao_range::align_range(GROUP, (stop - 1) * GROUP, total)?;
+            assert_eq!(ended, IngestEnd::Stopped, "stop at group {stop}");
+            assert_eq!(
+                &store.present_ranges().await?,
+                kept.chunk_ranges(),
+                "stop at group {stop}"
+            );
+            assert_eq!(
+                (body.len() - rest.len()) as u64,
+                kept.wire_len(),
+                "the wire read up to group {stop} is the shorter range's encoding"
+            );
+        }
+
+        let store = fresh_store(root, total);
+        let end = AtomicU64::new(10 * GROUP);
+        let (rest, ended) = store
+            .ingest_stream_until(&range, body.clone(), None, total, Some(&end))
+            .await?;
+        assert_eq!(
+            ended,
+            IngestEnd::Drained,
+            "an end at the range's end drains"
+        );
+        assert!(rest.is_empty());
+        assert_eq!(&store.present_ranges().await?, range.chunk_ranges());
+        Ok(())
     }
 
     #[tokio::test]

@@ -81,7 +81,7 @@ use decdn_protocol::VoucherRejectReason;
 use crate::buyer_pool::EscrowUntracked;
 use crate::fault::HealExhausted;
 use crate::pacer::{DownstreamFrontier, PaceDecision, PaceState};
-use crate::source::{BlobSource, Funder, IngestStore, SourceFuture};
+use crate::source::{BlobSource, Funder, IngestEnd, IngestStore, SourceFuture};
 use crate::{
     MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger, UpstreamPullHeader,
     UpstreamVoucherRejected, genuine_exhaustion, heal_watermark_desync, is_insufficient_deposit,
@@ -701,7 +701,8 @@ where
                 // its own present base directly — there is no cross-lane total to
                 // aggregate. Only the multi-source scheduler passes an aggregator.
                 None,
-                // No unit watchdog on the single-source path.
+                // No unit watchdog and no steal on the single-source path.
+                None,
                 None,
                 pacing_wait,
                 downstream,
@@ -712,6 +713,8 @@ where
                 // lanes here instead (#1506); the client's multi-source
                 // scheduler calls `fill_gap` directly with the same view.
                 pool,
+                // No steal on the single-source path.
+                None,
             )
             .await?;
         }
@@ -860,9 +863,18 @@ pub(crate) async fn fill_gap<St, S, P, F>(
     // watchdog reads. Every verified leaf adds to it as it lands, before the
     // store's checkpoint makes it durable.
     verified: Option<&std::sync::atomic::AtomicU64>,
+    // Multi-source only: the end of the verified prefix this unit's legs have
+    // reached, raised as each leaf lands, before the store's checkpoint makes
+    // it durable. A steal splits past it, so it never hands a stealer bytes
+    // this unit already received.
+    frontier: Option<&std::sync::atomic::AtomicU64>,
     pacing_wait: Option<&dyn PacingWait>,
     downstream: Option<&(dyn Fn() -> DownstreamFrontier + Send + Sync)>,
     pool: Option<&SharedPool<'_>>,
+    // Multi-source only: an end a steal lowers to its split while the gap
+    // runs. The gap ends there, and a leg in flight stops there on its open
+    // stream ([`BlobSource::stop`]) rather than reading on to its range's end.
+    stop_at: Option<&std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<()>
 where
     St: IngestStore,
@@ -929,6 +941,9 @@ where
         // source's (#2213). The bound it is clipped to is the bound the planner
         // works to now: a leg that proves a smaller size shrinks it, and the gap
         // ends there.
+        // A steal may have lowered the gap's end to its split since the last
+        // pass.
+        let asked_end = stop_at.map_or(asked_end, |end| asked_end.min(end.load(Ordering::Acquire)));
         let (still_missing, total_bytes) =
             missing_below_bound(store, gap_start, asked_end.saturating_sub(gap_start)).await?;
         let gap_end = asked_end.min(total_bytes);
@@ -1184,11 +1199,16 @@ where
                 // aggregator folds in DELTAS (`received` is monotonic per leg, and
                 // resets to 0 on each new open — hence a fresh counter per leg).
                 let leg_reported = std::sync::atomic::AtomicU64::new(0);
+                // `received` counts from the leg's own start.
+                let leg_start = aligned.fetch_start();
                 let reporter = move |received: u64| {
                     let delta =
                         received.saturating_sub(leg_reported.swap(received, Ordering::Relaxed));
                     if let Some(verified) = verified {
                         verified.fetch_add(delta, Ordering::Relaxed);
+                    }
+                    if let Some(frontier) = frontier {
+                        frontier.fetch_max(leg_start.saturating_add(received), Ordering::Release);
                     }
                     let Some(cb) = on_progress else { return };
                     let position = match progress_agg {
@@ -1224,15 +1244,29 @@ where
                         // The store is keyed by offset: the leg verifies under
                         // the size its own sender signs, whatever the bound.
                         match store
-                            .ingest_stream(&aligned, reader, Some(&reporter), header.total_bytes)
+                            .ingest_stream(
+                                &aligned,
+                                reader,
+                                Some(&reporter),
+                                header.total_bytes,
+                                stop_at,
+                            )
                             .await
                         {
-                            Ok(reader) => {
+                            Ok((reader, IngestEnd::Drained)) => {
                                 // Drain to stream end and recover the acked voucher
                                 // watermark. It lives in the ledger the caller owns
                                 // (durable persistence is the caller's job); finishing here
                                 // enforces wire-byte completeness.
                                 source.finish(reader).await.map(|_vp| ())
+                            }
+                            // A steal lowered the end to a split this leg reached:
+                            // pay for the received bytes and close the stream. The
+                            // paid and delivered frontiers now reach the split, the
+                            // gap's end, so the next pass ends the gap without a
+                            // new leg.
+                            Ok((reader, IngestEnd::Stopped)) => {
+                                source.stop(reader).await.map(|_vp| ())
                             }
                             Err(err) => Err(err),
                         }
@@ -2392,6 +2426,15 @@ mod tests {
                 }
             })
         }
+
+        fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            Box::pin(async move {
+                match reader {
+                    MaybeFaultReader::Fault(_) => Ok(VoucherProgress::default()),
+                    MaybeFaultReader::Real(r) => self.inner.stop(r).await,
+                }
+            })
+        }
     }
 
     /// A source whose first opens park the queued faults, one per open — the rest
@@ -2441,6 +2484,15 @@ mod tests {
                 match reader {
                     MaybeFaultReader::Fault(_) => Ok(VoucherProgress::default()),
                     MaybeFaultReader::Real(r) => self.inner.finish(r).await,
+                }
+            })
+        }
+
+        fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            Box::pin(async move {
+                match reader {
+                    MaybeFaultReader::Fault(_) => Ok(VoucherProgress::default()),
+                    MaybeFaultReader::Real(r) => self.inner.stop(r).await,
                 }
             })
         }
@@ -2847,6 +2899,10 @@ mod tests {
         fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
             Box::pin(async move { self.inner.finish(reader).await })
         }
+
+        fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            self.inner.stop(reader)
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -2958,6 +3014,10 @@ mod tests {
 
         fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
             self.inner.finish(reader)
+        }
+
+        fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            self.inner.stop(reader)
         }
     }
 
@@ -3535,6 +3595,10 @@ mod tests {
                 ))
             })
         }
+
+        fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            self.inner.stop(reader)
+        }
     }
 
     /// A [`PacingWait`] hook that counts calls and then never resolves, so a
@@ -3806,6 +3870,80 @@ mod tests {
         );
     }
 
+    /// A steal lowers the gap's end while its leg streams: the leg stops at
+    /// the split on its one stream, pays for the wire it read, and the gap
+    /// ends there with no second leg.
+    #[tokio::test]
+    async fn fill_gap_stops_its_leg_at_a_lowered_end() {
+        let total = 8 * GROUP;
+        let (root, plaintext, _) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let (gate, held) = tokio::sync::watch::channel(false);
+        let source = ScriptedSource::new(plaintext)
+            .expect("source")
+            .gated_on(held)
+            .paying(Arc::clone(&ledger));
+        let (pacer, funder) = (BudgetPacer::new(), healthy_funder());
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
+        let mut counters = super::DriveCounters::new();
+        let config = config();
+        let stop_at = std::sync::atomic::AtomicU64::new(u64::MAX);
+        let fill = super::fill_gap(
+            &store,
+            &source,
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            root,
+            0,
+            total,
+            &config,
+            &mut counters,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&stop_at),
+        );
+        // Lower the end once the leg is open, then let it stream.
+        let steal = async {
+            while source.opened_ranges().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            stop_at.store(3 * GROUP, std::sync::atomic::Ordering::Release);
+            gate.send_replace(true);
+        };
+        let (filled, ()) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            futures_util::future::join(fill, steal),
+        )
+        .await
+        .expect("the gap ends at the split");
+        filled.expect("a stopped leg ends the gap cleanly");
+
+        assert_eq!(
+            source.opened_ranges(),
+            vec![(0, total)],
+            "one leg, no reopen"
+        );
+        assert_eq!(source.stopped_pulls(), 1, "the leg stops at the split");
+        let kept = align_range(0, 3 * GROUP, total).expect("align");
+        assert_eq!(
+            &store.present_ranges().await.expect("present"),
+            kept.chunk_ranges()
+        );
+        assert_eq!(
+            ledger.committed().bytes,
+            U256::from(kept.wire_len()),
+            "the stopped leg pays for the wire up to the split"
+        );
+    }
+
     /// A source that claims `total_bytes == 0` for a NON-empty root (#1054) is a
     /// paid-but-wrong delivery: the empty store has no gap to pull and no chunk
     /// group for any decoder to anchor, so without the up-front root check the
@@ -3936,13 +4074,18 @@ mod tests {
             reader: R,
             on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
             claimed_total: u64,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
+            stop_at: Option<&'a std::sync::atomic::AtomicU64>,
+        ) -> crate::source::IngestFuture<'a, R>
         where
             R: crate::source::BaoRangeReader + 'a,
         {
-            Box::pin(
-                self.sink
-                    .ingest_stream(range, reader, on_progress, claimed_total),
+            crate::source::IngestStore::ingest_stream(
+                &self.sink,
+                range,
+                reader,
+                on_progress,
+                claimed_total,
+                stop_at,
             )
         }
 

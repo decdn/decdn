@@ -245,8 +245,8 @@ pub use scheduler::{
 };
 pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{
-    BaoRangeReader, BlobSource, Funder, IngestStore, PRIMED_MAX_IDLE, PeerSource, PrimedSource,
-    SourceFuture,
+    BaoRangeReader, BlobSource, Funder, IngestEnd, IngestFuture, IngestStore, PRIMED_MAX_IDLE,
+    PeerSource, PrimedSource, SourceFuture,
 };
 pub use source_set::{
     Holder, LaneRange, NoAffordableSource, NoSourceHasBlob, SourceProvider, SourceSet,
@@ -3670,6 +3670,74 @@ impl UpstreamPull {
     pub fn abort(mut self) -> VoucherProgress {
         self.close_transport(0, b"client-abandoned");
         self.progress()
+    }
+
+    /// Stop the pull before its promised end, after paying for every wire byte
+    /// it received. A steal that takes the tail of this pull's range stops the
+    /// pull at the split on its open stream, so the stolen tail goes to one
+    /// source and this one opens no new stream for the part it keeps.
+    ///
+    /// A rejection the node already sent waits behind the `ChunkData` it sent
+    /// first, so the stop first passes over what has arrived, without waiting:
+    /// a `VoucherRejected` there rewinds the rejected proof and surfaces as the
+    /// typed rejection, as it does at [`Self::finish`]. A rejection still in
+    /// flight reaches the lane's next leg instead. The closing voucher then
+    /// settles the received residual, the send half is finished, and the
+    /// transport is torn down (this stream, or the whole connection when the
+    /// pull owns it), so the node sees its sending stopped. A node that stops sending before it reads that voucher does not
+    /// redeem it, and the lane's next cumulative voucher covers the same bytes.
+    ///
+    /// A closing voucher that fails to send stays armed in the ledger:
+    /// [`PoolLedger::settlement`] counts it, and the lane's next voucher builds
+    /// on it. The caller's paid frontier, which reads
+    /// [`PoolLedger::committed`], stays behind the received bytes, so its next
+    /// leg re-delivers and pays for them once more.
+    ///
+    /// # Errors
+    ///
+    /// The typed rejection of a `StreamError` that had already arrived, or a
+    /// closing voucher that fails on our side ([`LocalPullFault`]). Any other
+    /// send failure is logged and leaves the residual as above.
+    pub async fn stop(mut self) -> anyhow::Result<VoucherProgress> {
+        if let Some(rejection) = self.arrived_rejection() {
+            self.close_transport(0, b"stopped-at-split");
+            return Err(rejection);
+        }
+        let paid = self.pay_one(self.unproved, true).await;
+        let _ = self.send.finish();
+        self.close_transport(0, b"stopped-at-split");
+        match paid {
+            Ok(remaining) => self.unproved = remaining,
+            Err(err) if err.is::<LocalPullFault>() => return Err(err),
+            Err(err) => tracing::warn!(
+                peer = %self.conn.remote_id(),
+                cumulative = self.cumulative,
+                unproved = self.unproved,
+                error = %format_args!("{err:#}"),
+                "the closing voucher of a pull stopped at a split did not send"
+            ),
+        }
+        Ok(self.progress())
+    }
+
+    /// The typed rejection of a `StreamError` that has already arrived, read
+    /// without waiting past the `ChunkData` in front of it. The frames it
+    /// passes over stay under the request's promised wire length. `None` once
+    /// nothing more has arrived, on any other message, or on a read fault: the
+    /// caller closes the stream either way.
+    fn arrived_rejection(&mut self) -> Option<anyhow::Error> {
+        let mut budget = self.expected_wire_bytes.saturating_sub(self.cumulative);
+        loop {
+            match futures_util::FutureExt::now_or_never(self.read_under_floor_once())? {
+                Ok(ClientMessage::ChunkData(chunk)) => {
+                    budget = budget.checked_sub(chunk.bytes().len() as u64)?;
+                }
+                Ok(ClientMessage::StreamError(e)) => {
+                    return Some(voucher_rejection(&self.ledger, &self.meter, e));
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// Tear down this pull's transport on any exit.

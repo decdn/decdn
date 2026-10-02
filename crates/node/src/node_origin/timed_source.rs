@@ -76,6 +76,10 @@ impl<S: BlobSource> BlobSource for TimedSource<S> {
         self.inner.finish(reader.inner)
     }
 
+    fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+        self.inner.stop(reader.inner)
+    }
+
     fn max_blob_size_bytes(&self) -> u64 {
         self.inner.max_blob_size_bytes()
     }
