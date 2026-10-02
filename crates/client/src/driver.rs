@@ -3677,9 +3677,8 @@ mod tests {
 
         let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let store = FlushCountingStore {
-            inner,
             flushes: Arc::clone(&flushes),
-            flush_delay: std::time::Duration::ZERO,
+            ..FlushCountingStore::new(inner, std::time::Duration::ZERO)
         };
 
         // A work future that stays pending across several 20 ms intervals, so the
@@ -3731,9 +3730,8 @@ mod tests {
         let inner = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
         let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let store = FlushCountingStore {
-            inner,
             flushes: Arc::clone(&flushes),
-            flush_delay: std::time::Duration::from_millis(50),
+            ..FlushCountingStore::new(inner, std::time::Duration::from_millis(50))
         };
 
         let started = tokio::time::Instant::now();

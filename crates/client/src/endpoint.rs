@@ -35,8 +35,8 @@ const CLIENT_STREAM_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
 
 /// Whole-connection QUIC receive window for a client pull. A pull holds one
 /// connection per node ([`crate::Connections`]), and every lane and leg to
-/// that node opens its streams on it, so in a bundle pull several bulk streams
-/// share this window and each gets a part of it. It holds at least
+/// that node opens its streams on it, so several bulk streams (e.g. in a
+/// bundle pull) share this window and each gets a part of it. It holds at least
 /// [`CLIENT_STREAM_RECEIVE_WINDOW`], so a lone stream can fill its own window;
 /// the 2x headroom lets two streams run at full window, without letting
 /// worst-case buffering grow larger than it must.

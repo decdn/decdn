@@ -2757,7 +2757,8 @@ const PROOF_STALL_DEBUG_AFTER: Duration = Duration::from_secs(5);
 /// `unpolled` (the caller did not read the stream, so a proof the node waits
 /// for was not sent), `pay` (waiting for the lane's ledger, signing and
 /// writing the proof), `first_frame` (a fresh leg waited from its open for
-/// its first frame), or `read` (the leg waited for bytes). A `read` stall
+/// its first frame, any time before the caller's first read included), or
+/// `read` (the leg waited for bytes). A `read` stall
 /// with `unproved > 0` can be the node waiting for a proof this leg does not
 /// yet owe; with `unproved == 0` the leg owes nothing and the node is slow to
 /// send. `unpolled` and `pay` are logged when the phase ends; `first_frame`
@@ -3278,8 +3279,9 @@ impl UpstreamPull {
         let floor = &mut self.floor;
         let (peer, hash, byte_offset) = (self.conn.remote_id(), self.hash, self.byte_offset);
         let unproved = self.unproved;
-        // A fresh leg's wait runs from its open, so a first frame that never
-        // comes is named once, as `first_frame` (#2230).
+        // A fresh leg's wait runs from its open, any time before the caller's
+        // first read included, so a first frame that never comes is named
+        // once, as `first_frame` (#2230).
         let (phase, read_started) = if cumulative == 0 {
             ("first_frame", self.opened_at)
         } else {

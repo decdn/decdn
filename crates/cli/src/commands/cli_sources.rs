@@ -226,12 +226,25 @@ where
     /// Persist every built lane's voucher watermark, and return once the
     /// writes land ([`fetch::queue_face_watermarks`]).
     pub(crate) async fn persist_watermarks(&self) {
-        if self.queue_watermarks().await.is_err() {
-            tracing::warn!(
-                "the voucher watermark write did not finish; the next reuse may re-sign a \
-                 stale watermark, which its provider rejects"
-            );
+        if self.queue_watermarks().await.is_ok() {
+            return;
         }
+        let (pools, providers): (Vec<_>, Vec<_>) = self
+            .handles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|h| (h.pool_id.to_string(), h.provider.to_string()))
+            .unzip();
+        tracing::warn!(
+            lanes = providers.len(),
+            pools = %pools.join(","),
+            providers = %providers.join(","),
+            "the voucher watermark write for {} lane(s) did not finish: it panicked or the \
+             runtime cancelled it; the next reuse may re-sign a stale watermark, which its \
+             provider rejects",
+            providers.len()
+        );
     }
 
     /// Persist every built lane's voucher watermark without waiting for the
@@ -243,15 +256,12 @@ where
     /// Read every built lane's watermark from its ledger now, and queue the
     /// writes in that order ([`fetch::queue_face_watermarks`]).
     fn queue_watermarks(&self) -> tokio::sync::oneshot::Receiver<()> {
-        let writes = {
-            let handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
-            fetch::face_watermark_writes(self.deps.self_address, &handles)
-        };
+        let handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
         fetch::queue_face_watermarks(
             self.deps.writes,
             self.deps.store,
             self.deps.self_address,
-            writes,
+            &handles,
         )
     }
 
@@ -606,7 +616,11 @@ mod tests {
             .write(&entry_b);
         });
         release.send(())?;
-        writes.queue_awaitable(|| ()).await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            writes.queue_awaitable(|| ()),
+        )
+        .await??;
         let landed = decdn_client::PeerStore::open(dir.path())
             .get(&node_id)
             .ok_or_else(|| anyhow::anyhow!("the record is missing"))?;
