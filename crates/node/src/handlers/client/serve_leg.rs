@@ -55,13 +55,14 @@ use crate::metrics::FirstByteClock;
 
 use super::MAX_PROOFS_PER_CHUNK;
 use super::outcome::{ServeEnd, ServeStop};
+use super::proof_wait::ChunkDeadline;
 use super::ramp::RampCarry;
 use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked};
 use super::wire::chunk_frame_bufs;
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, CHUNK_GROUP_BYTES, ClientHandler, ClientMessage,
-    FloorReservation, Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256,
-    VecDeque, VoucherRejectReason, VoucherStop,
+    Connection, FloorReservation, Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream,
+    U256, VecDeque, VoucherRejectReason, VoucherStop,
 };
 
 impl ClientHandler {
@@ -103,6 +104,7 @@ impl ClientHandler {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn serve_leg(
         &self,
+        conn: &Connection,
         send: &mut SendStream,
         recv: &mut RecvStream,
         store: NodeRangedStore,
@@ -129,6 +131,7 @@ impl ClientHandler {
         // sighting waits for `StreamEnd`.
         self.cache.touch_recency(hash);
         self.serve_leg_loop(
+            conn,
             send,
             recv,
             store,
@@ -189,6 +192,7 @@ impl ClientHandler {
     )]
     async fn serve_leg_loop(
         &self,
+        conn: &Connection,
         send: &mut SendStream,
         recv: &mut RecvStream,
         store: NodeRangedStore,
@@ -392,10 +396,13 @@ impl ClientHandler {
             let collected_any = !pending.is_empty();
             'chunk: while let Some(mut owed) = pending.pop_front() {
                 let mut attempts = 0u32;
+                // One proof-wait ceiling for every attempt at this chunk.
+                let deadline = ChunkDeadline::start();
                 loop {
                     attempts = attempts.saturating_add(1);
                     let stop = match self
                         .commit_one_proof(
+                            conn,
                             send,
                             recv,
                             &mut reader,
@@ -406,6 +413,7 @@ impl ClientHandler {
                             client_node_id,
                             rate_per_mb,
                             owed,
+                            deadline,
                         )
                         .await
                     {

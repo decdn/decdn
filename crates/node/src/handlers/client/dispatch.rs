@@ -145,6 +145,7 @@ impl ClientHandler {
                         // task's stack frame. Each task holds its own `Arc<Self>`.
                         let span = serve_stream_span(peer, self.node_id);
                         let serve = Box::pin(Arc::clone(&this).serve_stream(
+                            conn.clone(),
                             send,
                             recv,
                             permit,
@@ -281,6 +282,8 @@ impl ClientHandler {
 
     /// Serve one delivery stream end to end. Returns how the stream ended
     /// ([`ServeEnd`]); an `Err` is recorded on the span as `outcome = failed`.
+    /// `conn` is the stream's connection: each proof wait reads its transport
+    /// progress ([`proof_wait`](super::proof_wait)).
     ///
     /// Kept as one linear, ADR-ordered sequence (read → bind → blob gate →
     /// channel → sign → deliver); splitting it would scatter the ADR-005
@@ -289,6 +292,7 @@ impl ClientHandler {
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     pub(super) async fn serve_stream(
         self: Arc<Self>,
+        conn: Connection,
         mut send: SendStream,
         mut recv: RecvStream,
         permit: Option<OwnedSemaphorePermit>,
@@ -1004,6 +1008,7 @@ impl ClientHandler {
                                     // lane, so the extraction always matches.
                                     if let (Some(lk), Some(ln)) = (lane_key, known_lane.as_ref()) {
                                         return Box::pin(self.serve_via_backend_origin(
+                                            &conn,
                                             send,
                                             recv,
                                             &req,
@@ -1113,6 +1118,7 @@ impl ClientHandler {
                     // extraction always matches.
                     if let (Some(lk), Some(ln)) = (lane_key, known_lane.as_ref()) {
                         return Box::pin(self.serve_via_window_pull_through(
+                            &conn,
                             send,
                             recv,
                             &req,
@@ -1375,6 +1381,7 @@ impl ClientHandler {
 
         // Stream the blob, collecting vouchers at each interval boundary.
         self.deliver(
+            &conn,
             &mut send,
             &mut recv,
             hash,

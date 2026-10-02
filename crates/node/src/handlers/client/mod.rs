@@ -71,6 +71,7 @@ mod delivery;
 mod dispatch;
 mod fill;
 mod outcome;
+mod proof_wait;
 mod ramp;
 mod serve_encoder;
 mod serve_leg;
@@ -86,6 +87,9 @@ pub const MAX_CLIENT_STREAMS: usize = 100;
 
 // Per-stage timeouts so a stalled peer cannot pin a stream task indefinitely.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the serve loop waits for a proof while the connection sends no new
+/// STREAM frame. The wait for one proof never passes
+/// [`proof_wait::PROOF_WAIT_CEILING`] (see [`proof_wait`]).
 const VOUCHER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 /// After a clean `StreamEnd`, how long the serve waits for the client's FIN while
@@ -2561,12 +2565,13 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
 /// no headroom for it.
 ///
 /// The bound matters because without it a payer could hold a stream open
-/// indefinitely with a run of zero-credit vouchers, each one refreshing the read
-/// timeout while the delivered-but-unpaid balance never moves — the same shape
-/// of stall the non-empty-`ChunkData` floor closes on the delivery side. The
-/// exact value trades slack against how long that stall may run; every read
-/// inside it still carries its own timeout, so the bound is about liveness, not
-/// about capping any single wait.
+/// indefinitely with a run of zero-credit vouchers, each one refreshing the
+/// no-progress timeout while the delivered-but-unpaid balance never moves — the
+/// same shape of stall the non-empty-`ChunkData` floor closes on the delivery
+/// side. Time is bounded apart from this count: every proof wait for one chunk
+/// counts [`proof_wait::PROOF_WAIT_CEILING`] from the chunk's first wait
+/// ([`proof_wait::ChunkDeadline`]), so the whole run of proofs for a chunk lasts
+/// at most that long. This budget bounds the number of proofs, not the time.
 const MAX_PROOFS_PER_CHUNK: u32 = 8;
 
 /// One payment proof off the wire: a signed voucher, or a released hash-chain
@@ -2586,8 +2591,8 @@ pub(super) enum Proof {
 
 /// Cancellation-safe, buffered reader for `cdn/client/v1` payment-proof frames. Owns
 /// a byte buffer that PERSISTS across [`Self::read`] calls, so a `read` future
-/// cancelled by the outer [`VOUCHER_READ_TIMEOUT`] loses no bytes: any partial
-/// frame stays buffered for the next call.
+/// dropped mid-frame loses no bytes: any partial frame stays buffered for the
+/// next call.
 ///
 /// [`read_frame`] is built on `read_exact` and is NOT cancellation-safe — a
 /// `timeout` firing mid-frame would drop already-consumed bytes and desync the

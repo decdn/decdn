@@ -15,11 +15,12 @@
 //! asymmetry is the point of the hash chain — signatures become O(1) per
 //! transfer plus one per rollover, rather than one per metering interval.
 
+use super::proof_wait::ChunkDeadline;
 use super::{
-    Arc, B256, BufferedProofReader, ClientHandler, DEFAULT_TOLERANCE_BPS, Hash, LaneDeliveryState,
-    LaneKey, LaneState, Mutex, Ordering, Proof, RateError, RecvStream, RetrySignal, SendStream,
-    SignedVoucher, U256, VOUCHER_READ_TIMEOUT, VoucherRejectReason, VoucherStop, WatermarkBundle,
-    verify_rate, voucher_reject_reason, wire_voucher_to_signed,
+    Arc, B256, BufferedProofReader, ClientHandler, Connection, DEFAULT_TOLERANCE_BPS, Hash,
+    LaneDeliveryState, LaneKey, LaneState, Mutex, Ordering, Proof, RateError, RecvStream,
+    RetrySignal, SendStream, SignedVoucher, U256, VoucherRejectReason, VoucherStop,
+    WatermarkBundle, verify_rate, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_incentive::{PoolError, VoucherError};
 
@@ -278,6 +279,7 @@ impl ClientHandler {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) async fn commit_one_proof(
         &self,
+        conn: &Connection,
         send: &mut SendStream,
         recv: &mut RecvStream,
         reader: &mut BufferedProofReader,
@@ -288,6 +290,7 @@ impl ClientHandler {
         client_node_id: B256,
         rate_per_mb: u64,
         owed: OwedChunk,
+        deadline: ChunkDeadline,
     ) -> anyhow::Result<VoucherStop> {
         // Unknown lane: `serve_stream` refuses one pre-serve, so this is a
         // defensive backstop matching the sole callers (which forward `Some`).
@@ -297,16 +300,11 @@ impl ClientHandler {
             return Ok(VoucherStop::Rejected);
         };
 
-        // (1) READ one proof (blocking under VOUCHER_READ_TIMEOUT) WITHOUT
-        // holding the per-lane lock — a network read must not block same-lane
-        // streams. The reader is cancellation-safe.
-        let proof = tokio::time::timeout(VOUCHER_READ_TIMEOUT, reader.read(recv))
-            .await
-            .map_err(|_| {
-                anyhow::Error::new(super::wire::PeerFault).context(format!(
-                    "proof read timed out after {VOUCHER_READ_TIMEOUT:?}"
-                ))
-            })??;
+        // (1) READ one proof (bounded by the proof wait, which counts `conn`'s
+        // transport progress and the owed chunk's `deadline`) WITHOUT holding the
+        // per-lane lock — a network read must not block same-lane streams. The
+        // reader is cancellation-safe.
+        let proof = super::proof_wait::await_proof(reader.read(recv), conn, deadline).await?;
 
         let wire = match proof {
             Proof::Voucher(wire) => wire,
