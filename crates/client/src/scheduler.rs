@@ -117,8 +117,8 @@ use tokio::time::Instant;
 
 use crate::coverage_plan::{SourceCoverage, covered_part, covers_byte_range, spread_segments};
 use crate::driver::{
-    DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PacingWait, SharedPool, WaitReason,
-    contiguous_byte_ranges, fill_gap, ranges_content_len,
+    DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PacingWait, SharedPool,
+    UnitProgress, WaitReason, contiguous_byte_ranges, fill_gap, ranges_content_len,
 };
 use crate::fault::Fault;
 use crate::health::PeerHealth;
@@ -492,36 +492,37 @@ struct Picked {
 /// One unit's live state: its worker writes it as it fetches, and a steal
 /// reads it and lowers its end. [`Work::pick`] gives every unit a fresh one,
 /// so a steal can only touch the unit it trims.
+#[derive(Debug)]
 struct Unit {
-    /// When [`Work::pick`] handed out the unit.
-    started: Instant,
-    /// The unit's verified bytes across its gaps. The lane watchdog judges
-    /// it, and a steal reads the unit's rate off it.
-    verified: AtomicU64,
-    /// The end of the verified prefix the unit's legs have reached, before
-    /// the store's checkpoint makes it durable. A steal splits past it.
-    frontier: AtomicU64,
+    /// The unit's verified bytes, verified frontier and first-byte time,
+    /// which [`fill_gap`] writes.
+    progress: UnitProgress,
     /// The unit's end: `u64::MAX` until a steal lowers it to its split. The
     /// unit's leg then stops there on its open stream ([`fill_gap`]).
     stop_at: AtomicU64,
+    /// Nanoseconds the unit spent parked on the consumer after its first
+    /// verified byte ([`ParkedWait`]).
+    parked: AtomicU64,
 }
 
 impl Unit {
     fn new() -> Self {
         Self {
-            started: Instant::now(),
-            verified: AtomicU64::new(0),
-            frontier: AtomicU64::new(0),
+            progress: UnitProgress::default(),
             stop_at: AtomicU64::new(u64::MAX),
+            parked: AtomicU64::new(0),
         }
     }
 
     /// The unit's rate so far, in bytes per second; `None` before its first
-    /// verified byte. It counts from the pick, so the leg's open is part of
-    /// it.
+    /// verified byte. It counts from that byte and leaves out the time the
+    /// unit spent parked on the consumer, so a leg's open, a cold first
+    /// byte, and the consumer's pace stay out of it.
     fn rate(&self) -> Option<u64> {
-        let verified = self.verified.load(Ordering::Relaxed);
-        let millis = self.started.elapsed().as_millis();
+        let first = self.progress.first_byte.get()?;
+        let verified = self.progress.verified.load(Ordering::Relaxed);
+        let parked = Duration::from_nanos(self.parked.load(Ordering::Relaxed));
+        let millis = first.elapsed().saturating_sub(parked).as_millis();
         if verified == 0 || millis == 0 {
             return None;
         }
@@ -1281,7 +1282,12 @@ impl Work {
             .iter()
             .zip(&remaining)
             .filter_map(|(&owner, &(start, _))| {
-                let frontier = self.live.get(owner)?.frontier.load(Ordering::SeqCst);
+                let frontier = self
+                    .live
+                    .get(owner)?
+                    .progress
+                    .frontier
+                    .load(Ordering::SeqCst);
                 (frontier > start).then(|| (start, frontier - start))
             })
             .collect();
@@ -1360,7 +1366,7 @@ impl Work {
         victim_unit
             .stop_at
             .fetch_min(tail.fetch_start(), Ordering::SeqCst);
-        let frontier = victim_unit.frontier.load(Ordering::SeqCst);
+        let frontier = victim_unit.progress.frontier.load(Ordering::SeqCst);
         let tail = if frontier < tail.fetch_start() {
             tail
         } else if frontier >= tail.fetch_end() {
@@ -1661,6 +1667,8 @@ struct ParkedWait<'a> {
     parked: &'a AtomicBool,
     /// Woken when this worker parks.
     parked_wake: &'a Notify,
+    /// The unit in flight, whose rate leaves out the time parked here.
+    unit: &'a Unit,
 }
 
 /// Clears a worker's parked flag when its wait ends or is dropped.
@@ -1682,7 +1690,15 @@ impl PacingWait for ParkedWait<'_> {
             self.parked.store(true, Ordering::Release);
             let _unpark = Unpark(self.parked);
             self.parked_wake.notify_waiters();
+            let parked_at = Instant::now();
             self.inner.wait(observed, reason).await;
+            // A parked worker holds no open leg, so it verifies nothing while
+            // parked: the whole wait stays out of the unit's rate, once its
+            // rate clock runs.
+            if self.unit.progress.first_byte.get().is_some() {
+                let nanos = u64::try_from(parked_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.unit.parked.fetch_add(nanos, Ordering::Relaxed);
+            }
         })
     }
 }
@@ -1817,11 +1833,6 @@ where
     // `yield_to_front` can move it to an earlier re-queued range.
     let lane_parked = AtomicBool::new(false);
     let lane_parked_wake = Notify::new();
-    let lane_wait = engine.pacing.map(|p| ParkedWait {
-        inner: p.pacing_wait,
-        parked: &lane_parked,
-        parked_wake: &lane_parked_wake,
-    });
     loop {
         // Register for the peer-progress wakeup BEFORE reading the work state, so
         // a peer that changes it between this read and the park below cannot slip
@@ -1952,9 +1963,15 @@ where
         let mut terminal: Option<UnitOutcome> = None;
         // The start of the gap the unit ended on, for an overshoot check.
         let mut piece_at = r_start;
+        let lane_wait = engine.pacing.map(|p| ParkedWait {
+            inner: p.pacing_wait,
+            parked: &lane_parked,
+            parked_wake: &lane_parked_wake,
+            unit: &unit,
+        });
         for (g_start, g_len) in gaps {
             piece_at = g_start;
-            let verified = &unit.verified;
+            let verified = &unit.progress.verified;
             let before = verified.load(Ordering::Relaxed);
             let outcome = {
                 let fill = fill_gap(
@@ -1973,10 +1990,9 @@ where
                     // The shared whole-blob delivered counter: every lane folds its
                     // own leg deltas in, so the bar reads one monotonic position.
                     Some(engine.progress_agg),
-                    // This unit's verified bytes, which the watchdog judges,
-                    // and its verified frontier, which a steal splits past.
-                    Some(verified),
-                    Some(&unit.frontier),
+                    // This unit's progress: the watchdog judges its verified
+                    // bytes, and a steal splits past its frontier.
+                    Some(&unit.progress),
                     // Consumption pacing (#1848): with a `WindowPacer`, gate this
                     // lane against the shared consumer cursor so it never runs more
                     // than one read-ahead window ahead of what the consumer read.
@@ -2037,7 +2053,7 @@ where
         }
 
         // The unit's verified bytes across its gaps, for the fault's log line.
-        let landed = unit.verified.load(Ordering::Relaxed);
+        let landed = unit.progress.verified.load(Ordering::Relaxed);
         if landed > 0 {
             work.lock().await.record_rate(i, unit.rate());
         }
@@ -4445,7 +4461,7 @@ mod tests {
         // durable yet.
         let frontier = total / 4 * 3;
         if let Some(unit) = work.live.first() {
-            unit.frontier.store(frontier, Ordering::Release);
+            unit.progress.frontier.store(frontier, Ordering::Release);
         }
         let picked = work
             .pick(1, total, &coverage, true, &all)?
@@ -4456,6 +4472,42 @@ mod tests {
         assert_eq!(picked.range.fetch_start(), want);
         assert!(picked.range.fetch_start() > frontier);
         Ok(())
+    }
+
+    /// A unit's rate counts from its first verified byte and leaves out the
+    /// time it spent parked on the consumer: a slow open, a cold first byte,
+    /// or the consumer's pace does not read as a slow source.
+    #[tokio::test(start_paused = true)]
+    async fn a_units_rate_runs_from_its_first_byte_and_skips_parked_time() {
+        use std::sync::atomic::Ordering;
+
+        let unit = super::Unit::new();
+        // 5 s to the first byte: no rate before it.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(unit.rate(), None);
+        unit.progress
+            .first_byte
+            .get_or_init(tokio::time::Instant::now);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        unit.progress.verified.store(10 * MIB, Ordering::Relaxed);
+        assert_eq!(
+            unit.rate(),
+            Some(10 * MIB),
+            "the open stays out of the rate"
+        );
+        // 3 s parked on the consumer, then 1 s more streaming 10 MiB.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        unit.parked.store(
+            u64::try_from(Duration::from_secs(3).as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        unit.progress.verified.store(20 * MIB, Ordering::Relaxed);
+        assert_eq!(
+            unit.rate(),
+            Some(10 * MIB),
+            "parked time stays out of the rate"
+        );
     }
 
     /// A fast stealer takes a share of the victim's missing remainder in
@@ -4469,11 +4521,16 @@ mod tests {
         let coverage = cov(1, &[0]);
         let all = [(0, total)];
         let mut work = one_victim_work(total, &coverage);
-        // The victim verified 1 MiB in one second; the stealer ran its last
-        // unit at 3 MiB/s.
+        // The victim verified 1 MiB in the second after its first byte; the
+        // stealer ran its last unit at 3 MiB/s.
+        if let Some(unit) = work.live.first() {
+            unit.progress
+                .first_byte
+                .get_or_init(tokio::time::Instant::now);
+        }
         tokio::time::advance(Duration::from_secs(1)).await;
         if let Some(unit) = work.live.first() {
-            unit.verified.store(1024 * 1024, Ordering::Relaxed);
+            unit.progress.verified.store(1024 * 1024, Ordering::Relaxed);
         }
         work.record_rate(1, Some(3 * 1024 * 1024));
 

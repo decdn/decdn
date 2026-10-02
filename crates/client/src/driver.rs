@@ -454,6 +454,23 @@ async fn await_flush(flush: &mut Option<SourceFuture<'_, ()>>) -> anyhow::Result
     }
 }
 
+/// A multi-source unit's live progress across its gaps, which [`fill_gap`]
+/// writes as each verified leaf lands, before the store's checkpoint makes it
+/// durable.
+#[derive(Debug, Default)]
+pub(crate) struct UnitProgress {
+    /// The unit's verified bytes. The lane watchdog judges it, and a steal
+    /// reads the unit's rate off it.
+    pub(crate) verified: std::sync::atomic::AtomicU64,
+    /// The end of the verified prefix the unit's legs have reached. A steal
+    /// splits past it, so it never hands a stealer bytes this unit already
+    /// received.
+    pub(crate) frontier: std::sync::atomic::AtomicU64,
+    /// When the unit verified its first byte: the start of its rate clock,
+    /// so a leg's open and a cold first byte stay out of its rate.
+    pub(crate) first_byte: std::sync::OnceLock<tokio::time::Instant>,
+}
+
 /// Fetch-wide counters that persist ACROSS the request's gaps (a top-up budget is
 /// per-fetch, not per-gap), plus the last upstream quote used to price the next
 /// voucher.
@@ -703,7 +720,6 @@ where
                 None,
                 // No unit watchdog and no steal on the single-source path.
                 None,
-                None,
                 pacing_wait,
                 downstream,
                 // `None` on the single-source path: this one lane IS the pool,
@@ -859,15 +875,9 @@ pub(crate) async fn fill_gap<St, S, P, F>(
     // its own present base directly (there is only ever one lane, so that value is
     // already the whole-blob position).
     progress_agg: Option<&std::sync::atomic::AtomicU64>,
-    // Multi-source only: this unit's verified-byte counter, which the unit
-    // watchdog reads. Every verified leaf adds to it as it lands, before the
-    // store's checkpoint makes it durable.
-    verified: Option<&std::sync::atomic::AtomicU64>,
-    // Multi-source only: the end of the verified prefix this unit's legs have
-    // reached, raised as each leaf lands, before the store's checkpoint makes
-    // it durable. A steal splits past it, so it never hands a stealer bytes
-    // this unit already received.
-    frontier: Option<&std::sync::atomic::AtomicU64>,
+    // Multi-source only: the unit's live progress, which the unit watchdog
+    // and a steal read ([`UnitProgress`]).
+    unit: Option<&UnitProgress>,
     pacing_wait: Option<&dyn PacingWait>,
     downstream: Option<&(dyn Fn() -> DownstreamFrontier + Send + Sync)>,
     pool: Option<&SharedPool<'_>>,
@@ -1204,13 +1214,15 @@ where
                 let reporter = move |received: u64| {
                     let delta =
                         received.saturating_sub(leg_reported.swap(received, Ordering::Relaxed));
-                    if let Some(verified) = verified {
-                        verified.fetch_add(delta, Ordering::Relaxed);
-                    }
-                    if let Some(frontier) = frontier {
+                    if let Some(unit) = unit {
+                        if delta > 0 {
+                            unit.first_byte.get_or_init(tokio::time::Instant::now);
+                        }
+                        unit.verified.fetch_add(delta, Ordering::Relaxed);
                         // `SeqCst`, against the steal that lowers `stop_at`
                         // and then reads this frontier (`Work::steal`).
-                        frontier.fetch_max(leg_start.saturating_add(received), Ordering::SeqCst);
+                        unit.frontier
+                            .fetch_max(leg_start.saturating_add(received), Ordering::SeqCst);
                     }
                     let Some(cb) = on_progress else { return };
                     let position = match progress_agg {
@@ -3903,7 +3915,6 @@ mod tests {
             total,
             &config,
             &mut counters,
-            None,
             None,
             None,
             None,

@@ -104,7 +104,8 @@ pub enum ClientMessage {
     /// §Hash-chain metering (`PayWord`)). Acceptance is implicit, exactly as for
     /// [`Self::Voucher`].
     ChunkPreimage(ChunkPreimage),
-    /// discriminant 5 — payer → node, signals the payer received the full blob.
+    /// discriminant 5 — node → payer: the node delivered the whole requested
+    /// range, holds payment for every byte of it, and ends the stream.
     StreamEnd,
     /// discriminant 6 — node → payer, mid-stream failure (carries
     /// [`StreamError::VoucherRejected`]); delivery-side errors instead ride in
