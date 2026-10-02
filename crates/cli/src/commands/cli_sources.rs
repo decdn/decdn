@@ -80,7 +80,7 @@ pub(crate) struct CliSources<'a, P> {
     lane_cap: Option<&'a LaneStreamCap>,
     /// Every holder's node, keyed by its on-chain provider address.
     nodes: Mutex<HashMap<Address, NodeCandidate>>,
-    peer_records: PeerRecords,
+    peer_store: decdn_client::PeerStore,
     /// Every built lane's watermark handle, in build order.
     handles: Mutex<Vec<FaceLaneHandle>>,
     /// The lane that answered the first open, handed to the fetch's first
@@ -121,7 +121,7 @@ where
             ledgers,
             lane_cap,
             nodes: Mutex::new(HashMap::new()),
-            peer_records: PeerRecords::new(decdn_client::PeerStore::open(&deps.chain.data_dir)),
+            peer_store: decdn_client::PeerStore::open(&deps.chain.data_dir),
             handles: Mutex::new(Vec::new()),
             parked: Mutex::new(HashMap::new()),
             pool_id: OnceLock::new(),
@@ -224,25 +224,35 @@ where
     }
 
     /// Persist every built lane's voucher watermark, and return once the
-    /// writes land ([`fetch::persist_face_watermarks`]).
+    /// writes land ([`fetch::queue_face_watermarks`]).
     pub(crate) async fn persist_watermarks(&self) {
-        let writes = self.watermark_writes();
-        fetch::persist_face_watermarks(self.deps.store, self.deps.self_address, writes).await;
+        if self.queue_watermarks().await.is_err() {
+            tracing::warn!(
+                "the voucher watermark write did not finish; the next reuse may re-sign a \
+                 stale watermark, which its provider rejects"
+            );
+        }
     }
 
     /// Persist every built lane's voucher watermark without waiting for the
-    /// writes: the settle a dropped fetch runs from its drop guard
-    /// ([`fetch::persist_face_watermarks_detached`]).
+    /// writes: the settle a dropped fetch runs from its drop guard.
     pub(crate) fn persist_watermarks_detached(&self) {
-        let writes = self.watermark_writes();
-        fetch::persist_face_watermarks_detached(self.deps.store, self.deps.self_address, writes);
+        drop(self.queue_watermarks());
     }
 
-    /// The watermark write every built lane calls for, read from the lanes'
-    /// ledgers now.
-    fn watermark_writes(&self) -> Vec<fetch::LaneWrite> {
-        let handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
-        fetch::face_watermark_writes(self.deps.self_address, &handles)
+    /// Read every built lane's watermark from its ledger now, and queue the
+    /// writes in that order ([`fetch::queue_face_watermarks`]).
+    fn queue_watermarks(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let writes = {
+            let handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
+            fetch::face_watermark_writes(self.deps.self_address, &handles)
+        };
+        fetch::queue_face_watermarks(
+            self.deps.writes,
+            self.deps.store,
+            self.deps.self_address,
+            writes,
+        )
     }
 
     /// Reconnect `err` to what the user can do about it: an unbound or
@@ -273,10 +283,18 @@ where
         let Some(node_id) = self.lock_nodes().get(&provider).map(|n| n.node_id) else {
             return;
         };
-        self.peer_records.file(PeerEvent::Open {
+        self.file(PeerEvent::Open {
             node_id,
             rate_per_mb,
         });
+    }
+
+    /// Queue `event` on the command's ordered writes: off the runtime thread,
+    /// and behind every record any entry of the command filed before it
+    /// ([`PeerEvent::write`]).
+    fn file(&self, event: PeerEvent) {
+        let store = self.peer_store.clone();
+        self.deps.writes.queue(move || event.write(&store));
     }
 
     fn lock_nodes(&self) -> std::sync::MutexGuard<'_, HashMap<Address, NodeCandidate>> {
@@ -450,7 +468,7 @@ where
         let Some(node_id) = self.lock_nodes().get(&holder.provider).map(|n| n.node_id) else {
             return;
         };
-        self.peer_records.file(PeerEvent::Failure {
+        self.file(PeerEvent::Failure {
             node_id,
             at_secs: fetch::now_secs_cli(),
         });
@@ -500,51 +518,6 @@ impl PeerEvent {
     }
 }
 
-/// The peer-store records a fetch files, written off the runtime thread in
-/// the order they are filed.
-///
-/// Each record is an fsync, and the hooks that file one run on the fetch's
-/// own future, which every lane of a `bundle pull` shares: a write inline
-/// there stops every lane for as long as the disk takes (#2211). One
-/// blocking-pool task writes the records in turn, so a first open's cleared
-/// failure never lands after a later fault's stamp. The task is a
-/// `spawn_blocking` writer, not a `tokio::spawn` of pull work, so a pull still
-/// runs as one future. It starts with the first record, and ends once these
-/// records drop and every record filed before is written.
-struct PeerRecords {
-    store: decdn_client::PeerStore,
-    writer: OnceLock<std::sync::mpsc::Sender<PeerEvent>>,
-}
-
-impl PeerRecords {
-    /// Records for `store`; no writer runs until the first is filed.
-    const fn new(store: decdn_client::PeerStore) -> Self {
-        Self {
-            store,
-            writer: OnceLock::new(),
-        }
-    }
-
-    /// Queue `event` for the writer. Must run inside a Tokio runtime.
-    fn file(&self, event: PeerEvent) {
-        let writer = self.writer.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::channel::<PeerEvent>();
-            let store = self.store.clone();
-            drop(tokio::task::spawn_blocking(move || {
-                for event in rx {
-                    event.write(&store);
-                }
-            }));
-            tx
-        });
-        // The writer ends only once every sender drops, so a send fails only
-        // if it panicked; the record is then written here.
-        if let Err(std::sync::mpsc::SendError(event)) = writer.send(event) {
-            event.write(&self.store);
-        }
-    }
-}
-
 /// The holders `targets` names, in its order, one per operator: a candidate
 /// whose on-chain provider already has a holder is skipped, so the nearer
 /// node by rank wins (the rule of [`decdn_client::discovery::admit_sources`]).
@@ -589,19 +562,19 @@ pub(crate) fn holders_from(
 
 #[cfg(test)]
 mod tests {
-    use super::{PeerEvent, PeerRecords, holders_from, lane_lease, with_top_up_hint};
+    use super::{PeerEvent, holders_from, lane_lease, with_top_up_hint};
     use crate::commands::bundle_pull::LaneStreamCap;
     use alloy::primitives::{Address, B256, U256};
     use decdn_client::NoAffordableSource;
 
-    /// Records land off the caller's thread, in the order they were filed: a
-    /// fault filed after a first open stays stamped.
+    /// Two entries of one command file records for the same node through the
+    /// command's ordered writes: entry A's first open, then entry B's fault.
+    /// The fault stays stamped, even with both queued behind a slow write.
     #[tokio::test]
-    async fn peer_records_land_in_filing_order() -> anyhow::Result<()> {
+    async fn an_open_and_a_later_fault_from_two_entries_land_in_order() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = decdn_client::PeerStore::open(dir.path());
         let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
-        store.upsert_identity(
+        decdn_client::PeerStore::open(dir.path()).upsert_identity(
             &decdn_client::discovery::NodeCandidate {
                 node_id,
                 eth_address: Address::repeat_byte(3),
@@ -610,27 +583,33 @@ mod tests {
             },
             1_000,
         )?;
-        let records = PeerRecords::new(store.clone());
-        records.file(PeerEvent::Open {
-            node_id,
-            rate_per_mb: 4,
+        let writes = crate::commands::ordered_writes::OrderedWrites::default();
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        writes.queue(move || {
+            let _ = hold.recv();
         });
-        records.file(PeerEvent::Failure {
-            node_id,
-            at_secs: 2_000,
-        });
-        drop(records);
-        let landed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                if let Some(rec) = store.get(&node_id)
-                    && rec.last_failure_at_secs.is_some()
-                {
-                    return rec;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Each entry opens its own store handle, as each entry's sources do.
+        let entry_a = decdn_client::PeerStore::open(dir.path());
+        let entry_b = decdn_client::PeerStore::open(dir.path());
+        writes.queue(move || {
+            PeerEvent::Open {
+                node_id,
+                rate_per_mb: 4,
             }
-        })
-        .await?;
+            .write(&entry_a);
+        });
+        writes.queue(move || {
+            PeerEvent::Failure {
+                node_id,
+                at_secs: 2_000,
+            }
+            .write(&entry_b);
+        });
+        release.send(())?;
+        writes.queue_awaitable(|| ()).await?;
+        let landed = decdn_client::PeerStore::open(dir.path())
+            .get(&node_id)
+            .ok_or_else(|| anyhow::anyhow!("the record is missing"))?;
         assert_eq!(landed.rate_per_mb, Some(4));
         assert_eq!(landed.last_failure_at_secs, Some(2_000));
         Ok(())

@@ -24,6 +24,7 @@ pub mod key_gen;
 pub mod manifest;
 pub mod node;
 pub mod node_top;
+pub(crate) mod ordered_writes;
 pub mod origin;
 pub mod pool;
 pub mod probe;

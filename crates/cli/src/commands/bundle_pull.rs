@@ -94,6 +94,7 @@ use super::chain_ctx;
 use super::fetch;
 use super::interrupt::{Interrupt, Interrupted};
 use super::manifest::build_glob_set;
+use super::ordered_writes::OrderedWrites;
 use super::pull_progress::{self, PullProgress};
 use decdn_bao_range::CHUNK_GROUP_BYTES;
 use decdn_client::discovery::{self, NodeCandidate};
@@ -1550,6 +1551,7 @@ async fn pull_over(
         lane_cap: LaneStreamCap::new(usize::from(args.max_lane_streams)),
         health: Arc::new(PeerHealth::default()),
         connections: Connections::new(endpoint.clone()),
+        writes: OrderedWrites::default(),
         // One clock for the whole command: a stuck entry waits while another
         // lands bytes.
         stop: StopPolicy::new(
@@ -2037,6 +2039,9 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// The command's one connection per node: every entry's lanes, the
     /// range-dedup entries' included, open their streams on it.
     connections: Connections,
+    /// The command's blocking state writes, in queue order across every
+    /// entry ([`OrderedWrites`]).
+    writes: OrderedWrites,
     /// The command's stop policy. Its progress clock is shared by every entry
     /// and the manifest fetch, so the pull gives up only once no entry has
     /// landed a verified byte for the whole limit.
@@ -2075,6 +2080,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             // as the upstream keeps feeding it bytes.
             deadlines: PullDeadlines::new(fetch::STALL_WINDOW, fetch::STALL_WINDOW, 0)?,
             connections: &self.connections,
+            writes: &self.writes,
         })
     }
 
