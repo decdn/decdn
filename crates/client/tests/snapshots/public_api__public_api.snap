@@ -448,6 +448,7 @@ pub fn decdn_client::ranged_store::ClientRangedStore::proven(&self) -> core::opt
 pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)
 pub type decdn_client::source::IngestFuture<'a, R> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<(R, decdn_client::source::IngestEnd)>> + 'a)>>
 pub type decdn_client::source::SourceFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>
+pub type decdn_client::source::SourceStream<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn futures_core::stream::Stream<Item = T> + core::marker::Send + 'a)>>
 pub mod decdn_client::source_set
 pub struct decdn_client::source_set::Holder
 pub decdn_client::source_set::Holder::coverage: core::option::Option<decdn_protocol::coverage::Coverage>
@@ -479,6 +480,7 @@ pub const fn decdn_client::source_set::SourceSet<'p, P>::hash(&self) -> [u8; 32]
 pub const fn decdn_client::source_set::SourceSet<'p, P>::health(&self) -> &alloc::sync::Arc<decdn_client::health::PeerHealth>
 pub fn decdn_client::source_set::SourceSet<'p, P>::holder(&self, alloy_primitives::bits::address::Address) -> core::option::Option<&decdn_client::source_set::Holder>
 pub fn decdn_client::source_set::SourceSet<'p, P>::holders(&self) -> &[decdn_client::source_set::Holder]
+pub fn decdn_client::source_set::SourceSet<'p, P>::holders_arrived(&mut self, alloc::vec::Vec<decdn_client::source_set::Holder>)
 pub fn decdn_client::source_set::SourceSet<'p, P>::lane_built(&mut self, alloy_primitives::bits::address::Address, anyhow::Result<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>, tokio::time::instant::Instant) -> anyhow::Result<alloc::sync::Arc<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>>
 pub fn decdn_client::source_set::SourceSet<'p, P>::new(&'p P, [u8; 32], alloc::sync::Arc<decdn_client::health::PeerHealth>, alloc::vec::Vec<decdn_client::source_set::Holder>) -> Self
 pub fn decdn_client::source_set::SourceSet<'p, P>::next_to_start(&self, tokio::time::instant::Instant, alloy_primitives::aliases::U256, &std::collections::hash::set::HashSet<alloy_primitives::bits::address::Address>) -> core::option::Option<decdn_client::source_set::Holder>
@@ -498,6 +500,7 @@ pub fn decdn_client::source_set::StaticSources<S>::holders(&self) -> alloc::vec:
 pub fn decdn_client::source_set::StaticSources<S>::new(alloc::vec::Vec<decdn_client::streamer::StreamCandidate<S>>) -> anyhow::Result<Self>
 impl<S: decdn_client::source::BlobSource> decdn_client::source_set::SourceProvider for decdn_client::source_set::StaticSources<S>
 pub type decdn_client::source_set::StaticSources<S>::Source = S
+pub fn decdn_client::source_set::StaticSources<S>::arrivals(&self) -> core::option::Option<decdn_client::source::SourceStream<'_, decdn_client::source_set::Holder>>
 pub fn decdn_client::source_set::StaticSources<S>::connect<'a>(&'a self, &'a decdn_client::source_set::Holder) -> decdn_client::source::SourceFuture<'a, decdn_client::streamer::StreamCandidate<S>>
 pub fn decdn_client::source_set::StaticSources<S>::discover(&self, [u8; 32]) -> decdn_client::source::SourceFuture<'_, alloc::vec::Vec<decdn_client::source_set::Holder>>
 pub fn decdn_client::source_set::StaticSources<S>::on_source_fault(&self, &decdn_client::source_set::Holder)
@@ -511,16 +514,19 @@ pub const decdn_client::source_set::DISCOVERY_CAP: core::time::Duration
 pub const decdn_client::source_set::PULL_THROUGH_BAR: core::time::Duration
 pub trait decdn_client::source_set::SourceProvider: core::marker::Send + core::marker::Sync
 pub type decdn_client::source_set::SourceProvider::Source: decdn_client::source::BlobSource
+pub fn decdn_client::source_set::SourceProvider::arrivals(&self) -> core::option::Option<decdn_client::source::SourceStream<'_, decdn_client::source_set::Holder>>
 pub fn decdn_client::source_set::SourceProvider::connect<'a>(&'a self, &'a decdn_client::source_set::Holder) -> decdn_client::source::SourceFuture<'a, decdn_client::streamer::StreamCandidate<Self::Source>>
 pub fn decdn_client::source_set::SourceProvider::discover(&self, [u8; 32]) -> decdn_client::source::SourceFuture<'_, alloc::vec::Vec<decdn_client::source_set::Holder>>
 pub fn decdn_client::source_set::SourceProvider::on_source_fault(&self, &decdn_client::source_set::Holder)
 impl<P: decdn_client::source_set::SourceProvider> decdn_client::source_set::SourceProvider for &P
 pub type &P::Source = <P as decdn_client::source_set::SourceProvider>::Source
+pub fn &P::arrivals(&self) -> core::option::Option<decdn_client::source::SourceStream<'_, decdn_client::source_set::Holder>>
 pub fn &P::connect<'a>(&'a self, &'a decdn_client::source_set::Holder) -> decdn_client::source::SourceFuture<'a, decdn_client::streamer::StreamCandidate<Self::Source>>
 pub fn &P::discover(&self, [u8; 32]) -> decdn_client::source::SourceFuture<'_, alloc::vec::Vec<decdn_client::source_set::Holder>>
 pub fn &P::on_source_fault(&self, &decdn_client::source_set::Holder)
 impl<S: decdn_client::source::BlobSource> decdn_client::source_set::SourceProvider for decdn_client::source_set::StaticSources<S>
 pub type decdn_client::source_set::StaticSources<S>::Source = S
+pub fn decdn_client::source_set::StaticSources<S>::arrivals(&self) -> core::option::Option<decdn_client::source::SourceStream<'_, decdn_client::source_set::Holder>>
 pub fn decdn_client::source_set::StaticSources<S>::connect<'a>(&'a self, &'a decdn_client::source_set::Holder) -> decdn_client::source::SourceFuture<'a, decdn_client::streamer::StreamCandidate<S>>
 pub fn decdn_client::source_set::StaticSources<S>::discover(&self, [u8; 32]) -> decdn_client::source::SourceFuture<'_, alloc::vec::Vec<decdn_client::source_set::Holder>>
 pub fn decdn_client::source_set::StaticSources<S>::on_source_fault(&self, &decdn_client::source_set::Holder)
@@ -1027,6 +1033,7 @@ pub const fn decdn_client::source_set::SourceSet<'p, P>::hash(&self) -> [u8; 32]
 pub const fn decdn_client::source_set::SourceSet<'p, P>::health(&self) -> &alloc::sync::Arc<decdn_client::health::PeerHealth>
 pub fn decdn_client::source_set::SourceSet<'p, P>::holder(&self, alloy_primitives::bits::address::Address) -> core::option::Option<&decdn_client::source_set::Holder>
 pub fn decdn_client::source_set::SourceSet<'p, P>::holders(&self) -> &[decdn_client::source_set::Holder]
+pub fn decdn_client::source_set::SourceSet<'p, P>::holders_arrived(&mut self, alloc::vec::Vec<decdn_client::source_set::Holder>)
 pub fn decdn_client::source_set::SourceSet<'p, P>::lane_built(&mut self, alloy_primitives::bits::address::Address, anyhow::Result<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>, tokio::time::instant::Instant) -> anyhow::Result<alloc::sync::Arc<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>>
 pub fn decdn_client::source_set::SourceSet<'p, P>::new(&'p P, [u8; 32], alloc::sync::Arc<decdn_client::health::PeerHealth>, alloc::vec::Vec<decdn_client::source_set::Holder>) -> Self
 pub fn decdn_client::source_set::SourceSet<'p, P>::next_to_start(&self, tokio::time::instant::Instant, alloy_primitives::aliases::U256, &std::collections::hash::set::HashSet<alloy_primitives::bits::address::Address>) -> core::option::Option<decdn_client::source_set::Holder>
@@ -1046,6 +1053,7 @@ pub fn decdn_client::source_set::StaticSources<S>::holders(&self) -> alloc::vec:
 pub fn decdn_client::source_set::StaticSources<S>::new(alloc::vec::Vec<decdn_client::streamer::StreamCandidate<S>>) -> anyhow::Result<Self>
 impl<S: decdn_client::source::BlobSource> decdn_client::source_set::SourceProvider for decdn_client::source_set::StaticSources<S>
 pub type decdn_client::source_set::StaticSources<S>::Source = S
+pub fn decdn_client::source_set::StaticSources<S>::arrivals(&self) -> core::option::Option<decdn_client::source::SourceStream<'_, decdn_client::source_set::Holder>>
 pub fn decdn_client::source_set::StaticSources<S>::connect<'a>(&'a self, &'a decdn_client::source_set::Holder) -> decdn_client::source::SourceFuture<'a, decdn_client::streamer::StreamCandidate<S>>
 pub fn decdn_client::source_set::StaticSources<S>::discover(&self, [u8; 32]) -> decdn_client::source::SourceFuture<'_, alloc::vec::Vec<decdn_client::source_set::Holder>>
 pub fn decdn_client::source_set::StaticSources<S>::on_source_fault(&self, &decdn_client::source_set::Holder)
@@ -1212,16 +1220,19 @@ pub trait decdn_client::PacingWait: core::marker::Send + core::marker::Sync
 pub fn decdn_client::PacingWait::wait(&self, decdn_client::pacer::DownstreamFrontier, decdn_client::driver::WaitReason) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + '_)>>
 pub trait decdn_client::SourceProvider: core::marker::Send + core::marker::Sync
 pub type decdn_client::SourceProvider::Source: decdn_client::source::BlobSource
+pub fn decdn_client::SourceProvider::arrivals(&self) -> core::option::Option<decdn_client::source::SourceStream<'_, decdn_client::source_set::Holder>>
 pub fn decdn_client::SourceProvider::connect<'a>(&'a self, &'a decdn_client::source_set::Holder) -> decdn_client::source::SourceFuture<'a, decdn_client::streamer::StreamCandidate<Self::Source>>
 pub fn decdn_client::SourceProvider::discover(&self, [u8; 32]) -> decdn_client::source::SourceFuture<'_, alloc::vec::Vec<decdn_client::source_set::Holder>>
 pub fn decdn_client::SourceProvider::on_source_fault(&self, &decdn_client::source_set::Holder)
 impl<P: decdn_client::source_set::SourceProvider> decdn_client::source_set::SourceProvider for &P
 pub type &P::Source = <P as decdn_client::source_set::SourceProvider>::Source
+pub fn &P::arrivals(&self) -> core::option::Option<decdn_client::source::SourceStream<'_, decdn_client::source_set::Holder>>
 pub fn &P::connect<'a>(&'a self, &'a decdn_client::source_set::Holder) -> decdn_client::source::SourceFuture<'a, decdn_client::streamer::StreamCandidate<Self::Source>>
 pub fn &P::discover(&self, [u8; 32]) -> decdn_client::source::SourceFuture<'_, alloc::vec::Vec<decdn_client::source_set::Holder>>
 pub fn &P::on_source_fault(&self, &decdn_client::source_set::Holder)
 impl<S: decdn_client::source::BlobSource> decdn_client::source_set::SourceProvider for decdn_client::source_set::StaticSources<S>
 pub type decdn_client::source_set::StaticSources<S>::Source = S
+pub fn decdn_client::source_set::StaticSources<S>::arrivals(&self) -> core::option::Option<decdn_client::source::SourceStream<'_, decdn_client::source_set::Holder>>
 pub fn decdn_client::source_set::StaticSources<S>::connect<'a>(&'a self, &'a decdn_client::source_set::Holder) -> decdn_client::source::SourceFuture<'a, decdn_client::streamer::StreamCandidate<S>>
 pub fn decdn_client::source_set::StaticSources<S>::discover(&self, [u8; 32]) -> decdn_client::source::SourceFuture<'_, alloc::vec::Vec<decdn_client::source_set::Holder>>
 pub fn decdn_client::source_set::StaticSources<S>::on_source_fault(&self, &decdn_client::source_set::Holder)
@@ -1242,3 +1253,4 @@ pub type decdn_client::IngestFuture<'a, R> = core::pin::Pin<alloc::boxed::Box<(d
 pub type decdn_client::ProgressCallback = (dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync)
 pub type decdn_client::SinkFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>
 pub type decdn_client::SourceFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>
+pub type decdn_client::SourceStream<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn futures_core::stream::Stream<Item = T> + core::marker::Send + 'a)>>

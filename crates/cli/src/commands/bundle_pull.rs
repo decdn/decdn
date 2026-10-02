@@ -2209,10 +2209,15 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 self.endpoint,
                 self.relays,
                 hash,
-                None,
+                fetch::ProbeOpts {
+                    timings: None,
+                    round: fetch::ProbeRound::Stream,
+                },
             )
             .await;
         }
+        // The entry's round streams: its fetch starts at the first verified
+        // holder, and the holders that answer later join it.
         let candidates = self.entry_candidates()?;
         fetch::probe_and_order(
             self.endpoint,
@@ -2221,6 +2226,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             hash,
             fetch::ProxyWarmingParams::from_args(self.common),
             self.slash_dom,
+            fetch::ProbeRound::Stream,
         )
         .await
     }

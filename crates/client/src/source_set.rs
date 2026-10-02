@@ -27,7 +27,7 @@ use tokio::time::{Duration, Instant};
 use crate::UpstreamRefused;
 use crate::fault::{Fault, LaneBuildFault, classify};
 use crate::health::PeerHealth;
-use crate::source::{BlobSource, SourceFuture};
+use crate::source::{BlobSource, SourceFuture, SourceStream};
 use crate::streamer::StreamCandidate;
 
 /// The first wait before a failed lane build is retried.
@@ -101,6 +101,14 @@ pub trait SourceProvider: Send + Sync {
     /// Find and probe the current holders of `hash`.
     fn discover(&self, hash: [u8; 32]) -> SourceFuture<'_, Vec<Holder>>;
 
+    /// Holders found after the set started, pushed as they are found. The
+    /// stream ends when no more will come. The acquire loop takes it once,
+    /// when it starts, and asks for no discovery while it is open. `None`,
+    /// the default, is a provider with nothing to push.
+    fn arrivals(&self) -> Option<SourceStream<'_, Holder>> {
+        None
+    }
+
     /// Build the paid lane to `holder`. An error here is chain-side: the set
     /// retries it later and never blames the holder.
     fn connect<'a>(&'a self, holder: &'a Holder)
@@ -115,6 +123,10 @@ impl<P: SourceProvider> SourceProvider for &P {
 
     fn discover(&self, hash: [u8; 32]) -> SourceFuture<'_, Vec<Holder>> {
         (**self).discover(hash)
+    }
+
+    fn arrivals(&self) -> Option<SourceStream<'_, Holder>> {
+        (**self).arrivals()
     }
 
     fn connect<'a>(
@@ -740,6 +752,14 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         self.looked_at = Some((deposit, self.mark_epoch));
     }
 
+    /// Merge holders the provider pushed ([`SourceProvider::arrivals`]). New
+    /// holders join and known ones update their coverage and RTT, as in
+    /// [`Self::discovery_done`]. A pushed holder is not a discovery attempt,
+    /// so the discovery backoff is unchanged.
+    pub fn holders_arrived(&mut self, holders: Vec<Holder>) {
+        self.merge(holders);
+    }
+
     /// The next discovery backoff after an attempt at `now`.
     fn next_discovery_backoff(&self, now: Instant) -> Backoff {
         let prior = self.discovery.unwrap_or(Backoff {
@@ -1067,6 +1087,35 @@ mod tests {
             lease: LaneLease::new(()),
             widen: None,
         })
+    }
+
+    /// A pushed holder joins the set and leaves the discovery backoff alone.
+    #[test]
+    fn holders_arrived_adds_a_holder_without_touching_discovery() {
+        let provider = provider(Vec::new());
+        let mut set = SourceSet::new(&provider, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
+        set.discovery_done(Ok(Vec::new()), Instant::now(), U256::ZERO);
+        let backoff = set.discovery.map(|b| b.next_at);
+        let looked = set.looked_at;
+        let discovered = set.discovered_at;
+
+        set.holders_arrived(vec![holder(B, 20.0)]);
+
+        assert_eq!(set.holders().len(), 2);
+        assert!(set.holder(B).is_some());
+        assert_eq!(set.discovery.map(|b| b.next_at), backoff);
+        assert_eq!(set.looked_at, looked);
+        assert_eq!(set.discovered_at, discovered);
+    }
+
+    /// A pushed holder the set already knows updates in place.
+    #[test]
+    fn holders_arrived_updates_a_known_holder_in_place() {
+        let provider = provider(Vec::new());
+        let mut set = SourceSet::new(&provider, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
+        set.holders_arrived(vec![holder(A, 4.0)]);
+        assert_eq!(set.holders().len(), 1);
+        assert_eq!(set.holder(A).map(|h| h.rtt_ms), Some(4.0));
     }
 
     /// Two lanes on one provider would run two concurrent voucher streams on

@@ -4,9 +4,11 @@
 //! logs every mark as milliseconds since the fetch started, in one `info`
 //! event named `fetch timings`. `RUST_LOG=info` or `-v` shows it. Each mark is
 //! cumulative, so a mark the fetch never reached shows as absent and the marks
-//! before it still read correctly.
+//! before it still read correctly. The event also counts the holders the fetch
+//! started with and the holders that joined it while it ran.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// One point on the fetch's path to its first byte, in path order.
@@ -34,6 +36,10 @@ pub(crate) enum Mark {
 pub(crate) struct FetchTimings {
     started: Instant,
     marks: [OnceLock<Instant>; 6],
+    /// Holders in the set the fetch starts with.
+    holders_start: AtomicUsize,
+    /// Holders that joined the running fetch.
+    holders_joined: AtomicUsize,
 }
 
 /// Each [`Mark`] as milliseconds since the fetch started, `None` when the
@@ -59,7 +65,27 @@ impl FetchTimings {
         Self {
             started,
             marks: Default::default(),
+            holders_start: AtomicUsize::new(0),
+            holders_joined: AtomicUsize::new(0),
         }
+    }
+
+    /// Record how many holders the fetch starts with.
+    pub(crate) fn set_holders_start(&self, n: usize) {
+        self.holders_start.store(n, Ordering::Relaxed);
+    }
+
+    /// Count one holder that joined the running fetch.
+    pub(crate) fn holder_joined(&self) {
+        self.holders_joined.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(holders at start, holders that joined)`.
+    pub(crate) fn holders(&self) -> (usize, usize) {
+        (
+            self.holders_start.load(Ordering::Relaxed),
+            self.holders_joined.load(Ordering::Relaxed),
+        )
     }
 
     /// Record `mark` now, unless the fetch already reached it.
@@ -94,7 +120,10 @@ impl FetchTimings {
     /// `output` names where the bytes go, and `ok` is the fetch's outcome.
     pub(crate) fn log(&self, output: &'static str, ok: bool) {
         let s = self.snapshot();
+        let (holders_start, holders_joined) = self.holders();
         tracing::info!(
+            holders_start,
+            holders_joined,
             output,
             ok,
             endpoint_ms = s.endpoint,
@@ -117,6 +146,15 @@ fn millis(d: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn holder_counts_accumulate() {
+        let timings = FetchTimings::start();
+        timings.set_holders_start(2);
+        timings.holder_joined();
+        timings.holder_joined();
+        assert_eq!(timings.holders(), (2, 2));
+    }
 
     #[test]
     fn each_mark_keeps_its_first_instant() {
