@@ -925,7 +925,10 @@ since project inception and will roll into the first tagged release.
   the acquire now asks again every second, also when no busy lane could be
   asked. A busy lane takes an extra stream for every waiting range that its
   provider has a permit for, not only one, and one growth pass fills every
-  free permit. At `--max-lane-streams` 3 or more, an extra stream never takes a
+  free permit. A lane that waits with nothing to take gives its permit back
+  while it waits, so an idle lane of one entry no longer holds a stream that
+  another entry's queue needs; it takes a free permit again before it takes
+  a range. At `--max-lane-streams` 3 or more, an extra stream never takes a
   provider's last free permit, so a sibling entry's first stream to that
   provider still opens; a lane that starts again can take it. The info line
   `a queued range waits for a stream` logs on the first wait and then at

@@ -415,7 +415,8 @@ impl<S> Drop for ReleaseLease<S> {
 /// the future is dropped, polled or not.
 #[expect(
     dead_code,
-    reason = "the guards are never read: they act only when the worker's future drops them"
+    reason = "an extra worker's grant is never read: it acts only when the worker's future \
+              drops it"
 )]
 enum Hold<S> {
     /// A lane's own worker: the lane's lease, and the grant the lane started
@@ -428,6 +429,45 @@ enum Hold<S> {
     },
     /// An extra worker ([`Work::add_extra`]) and its grant.
     Extra(ReleaseGrant<S>),
+}
+
+impl<S> Hold<S> {
+    /// Give back the stream of a lane's own worker as it parks with nothing
+    /// to take, when the lane has a [`LaneWiden`]: the lane's lease, or the
+    /// grant it started again on. A parked worker fetches nothing, so a
+    /// sibling fetch can use the stream meanwhile (#2252). Other holds keep
+    /// their stream.
+    fn park(&mut self) {
+        if let Self::Own { lease, grant } = self
+            && lease.0.widen.is_some()
+        {
+            lease.0.lease.release();
+            *grant = None;
+        }
+    }
+
+    /// Whether the worker holds a stream to fetch on: an extra worker's
+    /// grant, a lane's lease or restart grant, or a stream a parked own
+    /// worker takes back now through its lane's `grow`, as a restart.
+    fn stream(&mut self) -> bool {
+        match self {
+            Self::Extra(_) => true,
+            Self::Own { lease, grant } => {
+                let lane = &lease.0;
+                if lane.widen.is_none() || lane.lease.is_held() || grant.is_some() {
+                    return true;
+                }
+                let granted = lane
+                    .widen
+                    .as_ref()
+                    .is_some_and(|widen| widen.grow(GrowFor::Restart));
+                if granted {
+                    *grant = Some(ReleaseGrant(Arc::clone(lane)));
+                }
+                granted
+            }
+        }
+    }
 }
 
 /// A range [`Work::pick`] handed to a worker. `victim` is set when the range is
@@ -1569,7 +1609,7 @@ async fn run_worker<St, S, Pc, F>(
     lane: Arc<StreamCandidate<S>>,
     provider: Address,
     health: &PeerHealth,
-    extra: bool,
+    hold: &mut Hold<S>,
 ) -> anyhow::Result<WorkerEnd>
 where
     St: IngestStore,
@@ -1577,6 +1617,7 @@ where
     Pc: Pacer,
     F: Funder,
 {
+    let extra = matches!(hold, Hold::Extra(_));
     let Engine {
         store,
         hash,
@@ -1645,8 +1686,30 @@ where
                     .is_none_or(|alive| !alive);
             if lane_stopped {
                 None
+            } else if !hold.stream() {
+                // A parked own worker gave its stream back and finds none
+                // free now. It ends when no lane holds work; otherwise it
+                // tries again on a peer's progress or after `GROWTH_RETRY`.
+                if !w.busy() {
+                    w.park(i);
+                    drop(w);
+                    wake();
+                    return Ok(idle());
+                }
+                drop(w);
+                tokio::select! {
+                    () = parked.as_mut() => {}
+                    () = tokio::time::sleep(GROWTH_RETRY) => {}
+                }
+                continue;
             } else {
-                w.pick(i, total_bytes, &my_coverage, !extra, &missing)?
+                let picked = w.pick(i, total_bytes, &my_coverage, !extra, &missing)?;
+                if picked.is_none() {
+                    // Nothing to take: the stream goes back while the worker
+                    // parks or ends.
+                    hold.park();
+                }
+                picked
             }
         };
         let Some(Picked {
@@ -1906,9 +1969,8 @@ where
     Pc: Pacer,
     F: Funder,
 {
-    let extra = matches!(hold, Hold::Extra(_));
-    let _hold = hold;
-    run_worker(engine, i, lane, provider, health, extra).await
+    let mut hold = hold;
+    run_worker(engine, i, lane, provider, health, &mut hold).await
 }
 
 /// Log, where it happens, that an extra worker's stream faulted on `range`
@@ -7571,11 +7633,19 @@ mod tests {
             "one growth pass opened both extra streams: {legs:?}"
         );
         assert_eq!(count.peak(), 2, "the lane held both granted streams");
-        assert!(
-            count
-                .calls()
-                .iter()
-                .all(|(kind, _)| *kind == super::GrowFor::Extra),
+        // The growth pass asks for extra streams. The own worker may later
+        // park while its extras finish and take its stream back as a
+        // restart.
+        let first_grants: Vec<_> = count
+            .calls()
+            .into_iter()
+            .filter(|(_, granted)| *granted)
+            .map(|(kind, _)| kind)
+            .take(2)
+            .collect();
+        assert_eq!(
+            first_grants,
+            [super::GrowFor::Extra, super::GrowFor::Extra],
             "a busy lane asks for extra streams: {:?}",
             count.calls()
         );
@@ -7647,6 +7717,67 @@ mod tests {
             count.peak(),
             1,
             "A's restart holds one grant, and A runs no extra beside it"
+        );
+        assert_eq!(count.released(), count.granted());
+        Ok(())
+    }
+
+    /// A lane with a [`super::LaneWiden`] gives its lease back while its own
+    /// worker parks with nothing to take, so a sibling fetch can use that
+    /// stream while a peer lane drains the rest (#2252). A finishes its half
+    /// fast; B's half is too small to steal from and stalls, so A parks.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_lane_gives_its_stream_back() -> anyhow::Result<()> {
+        let data = blob(24 * MIB as usize);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let lb = Arc::new(PoolLedger::new(Cumulative::default()));
+        let a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&la));
+        let b = busy(&data, &lb)?;
+        let dropped_a = Arc::new(Mutex::new(None));
+        let (widen, count) = counting_widen(1);
+        let mut cand_a = candidate(a.clone(), la, 0xA1, None);
+        cand_a.lease = LaneLease::new(DropStamp(Arc::clone(&dropped_a)));
+        cand_a.widen = Some(widen);
+        let provider = StaticSources::new(vec![cand_a, candidate(b.clone(), lb, 0xB2, None)])?;
+        let (root, _) = (a.root(), a.total_bytes());
+        let (store, dir) = fresh_store(root, a.total_bytes());
+        let released_mid_fetch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let on_progress = {
+            let seen = Arc::clone(&released_mid_fetch);
+            let dropped_a = Arc::clone(&dropped_a);
+            move |_position: u64, _total: u64| {
+                if dropped_a.lock().is_ok_and(|at| at.is_some()) {
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        };
+        run_acquire_with(
+            &store,
+            &provider,
+            root,
+            &BudgetPacer::new(),
+            &no_topups(),
+            Knobs {
+                on_progress: Some(&on_progress),
+                ..Knobs::lanes(2)
+            },
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+        assert_eq!(a.timeline().len(), 1, "A fetched its half on one stream");
+        assert!(
+            released_mid_fetch.load(std::sync::atomic::Ordering::SeqCst),
+            "A's lease was released while B still drained its half"
+        );
+        assert!(
+            count
+                .calls()
+                .iter()
+                .all(|(kind, _)| *kind == super::GrowFor::Restart),
+            "a parked lane takes a stream back only as a restart: {:?}",
+            count.calls()
         );
         assert_eq!(count.released(), count.granted());
         Ok(())
