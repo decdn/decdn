@@ -481,15 +481,21 @@ fn probe_shed(err: &anyhow::Error) -> bool {
 const PROBE_SETTLE_AFTER_HOLDER: Duration = Duration::from_millis(250);
 
 /// Run `probes` concurrently and collect their outcomes until every probe has
-/// answered or `grace` has passed since the first outcome `is_holder` accepts.
-/// Returns the collected outcomes, in answer order, and the probes still
+/// answered or the round's deadline passes. The first outcome `is_holder`
+/// accepts sets the deadline `grace` later. With `cold_grace` set and no
+/// holder yet, the first outcome `is_answer` accepts sets it `cold_grace`
+/// later, and a holder inside that window still ends the round `grace` after
+/// it. Returns the collected outcomes, in answer order, and the probes still
 /// pending. A zero `grace` returns at the first holder with every outcome
 /// already ready: `timeout_at` polls the stream before it checks the deadline.
-/// With no holder, the round waits for every probe and the tail is empty.
+/// With no holder and no `cold_grace`, the round waits for every probe and the
+/// tail is empty.
 async fn settle_probes<T, F>(
     probes: impl IntoIterator<Item = F>,
     grace: Duration,
+    cold_grace: Option<Duration>,
     is_holder: impl Fn(&T) -> bool,
+    is_answer: impl Fn(&T) -> bool,
 ) -> (Vec<T>, futures_util::stream::FuturesUnordered<F>)
 where
     F: std::future::Future<Output = T>,
@@ -498,6 +504,7 @@ where
     let mut pending: futures_util::stream::FuturesUnordered<F> = probes.into_iter().collect();
     let mut settled = Vec::with_capacity(pending.len());
     let mut deadline: Option<tokio::time::Instant> = None;
+    let mut holder_seen = false;
     loop {
         let next = match deadline {
             None => pending.next().await,
@@ -507,15 +514,24 @@ where
             },
         };
         let Some(outcome) = next else { break };
-        if deadline.is_none() && is_holder(&outcome) {
-            deadline = Some(tokio::time::Instant::now() + grace);
+        let now = tokio::time::Instant::now();
+        if !holder_seen && is_holder(&outcome) {
+            holder_seen = true;
+            let at = now + grace;
+            deadline = Some(deadline.map_or(at, |cold| cold.min(at)));
+        } else if deadline.is_none()
+            && let Some(cold) = cold_grace
+            && is_answer(&outcome)
+        {
+            deadline = Some(now + cold);
         }
         settled.push(outcome);
     }
     if !pending.is_empty() {
         tracing::debug!(
             pending = pending.len(),
-            "probe round settled after the first holder; the rest continue as its tail"
+            holder = holder_seen,
+            "probe round settled; the rest continue as its tail"
         );
     }
     (settled, pending)
@@ -570,6 +586,11 @@ impl ProbeOutcome {
         matches!(self, Self::Holder(..))
     }
 
+    /// A verified answer, holder or not.
+    const fn is_answer(&self) -> bool {
+        matches!(self, Self::Holder(..) | Self::NonHolder(..))
+    }
+
     /// The peer-store sample of a verified answer.
     pub(crate) const fn sample(&self) -> Option<(PublicKey, f64, u64)> {
         match self {
@@ -597,6 +618,17 @@ impl ProbeRound {
         match self {
             Self::Stream => Duration::ZERO,
             Self::Settle => PROBE_SETTLE_AFTER_HOLDER,
+        }
+    }
+
+    /// How long the round collects after its first verified answer while no
+    /// holder has answered. A streamed round then starts on the non-holders
+    /// in hand as pull-through targets (#1911), and a holder that answers
+    /// later joins the running fetch. A settled round waits for every probe.
+    const fn cold_grace(self) -> Option<Duration> {
+        match self {
+            Self::Stream => Some(PROBE_SETTLE_AFTER_HOLDER),
+            Self::Settle => None,
         }
     }
 }
@@ -837,7 +869,14 @@ pub(crate) async fn probe_and_order(
             classify_probe(&cand, res, hash, timestamp_us, &slash_domain)
         }
     });
-    let (outcomes, tail) = settle_probes(probes, round.grace(), ProbeOutcome::is_holder).await;
+    let (outcomes, tail) = settle_probes(
+        probes,
+        round.grace(),
+        round.cold_grace(),
+        ProbeOutcome::is_holder,
+        ProbeOutcome::is_answer,
+    )
+    .await;
 
     let ProbeTally {
         holders,
@@ -865,9 +904,9 @@ pub(crate) async fn probe_and_order(
         // No cache holder, but reachable non-holders can serve via pull-through.
         // Log why the fetch is talking to nodes that answered `has_blob:false`.
         tracing::info!(
-            "no probed node holds the blob in cache; falling back to {} reachable bonded \
-             non-holder(s) as pull-through serve targets — a node serves an authorized miss \
-             from its own origin (#1911)",
+            "no node that has answered holds the blob in cache; starting on {} reachable \
+             bonded non-holder(s) as pull-through serve targets — a node serves an authorized \
+             miss from its own origin (#1911), and a holder that answers later joins the fetch",
             non_holders.len()
         );
     }
@@ -3918,7 +3957,7 @@ mod tests {
             answer_after(150, 2, false),
             answer_after(260, 3, true),
         ];
-        let (mut got, tail) = settle_probes(probes, grace, |&(_, h)| h).await;
+        let (mut got, tail) = settle_probes(probes, grace, None, |&(_, h)| h, |_| true).await;
         got.sort_unstable();
         assert_eq!(got, vec![(1, true), (2, false), (3, true)]);
         assert!(tail.is_empty());
@@ -3935,7 +3974,7 @@ mod tests {
             answer_after(170, 2, false),
             answer_after(1850, 3, true),
         ];
-        let (mut got, tail) = settle_probes(probes, grace, |&(_, h)| h).await;
+        let (mut got, tail) = settle_probes(probes, grace, None, |&(_, h)| h, |_| true).await;
         got.sort_unstable();
         assert_eq!(got, vec![(1, true), (2, false)]);
         assert_eq!(tail.len(), 1);
@@ -3948,7 +3987,7 @@ mod tests {
         let grace = Duration::from_millis(250);
         let started = tokio::time::Instant::now();
         let probes = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
-        let (got, tail) = settle_probes(probes, grace, |&(_, h)| h).await;
+        let (got, tail) = settle_probes(probes, grace, None, |&(_, h)| h, |_| true).await;
         assert_eq!(got.len(), 2);
         assert!(tail.is_empty());
         assert_eq!(started.elapsed(), Duration::from_millis(1850));
@@ -3965,7 +4004,8 @@ mod tests {
             answer_after(170, 2, false),
             answer_after(1850, 3, true),
         ];
-        let (got, mut tail) = settle_probes(probes, Duration::ZERO, |&(_, h)| h).await;
+        let (got, mut tail) =
+            settle_probes(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
         assert_eq!(got, vec![(1, true)]);
         assert_eq!(started.elapsed(), Duration::from_millis(25));
         let mut late = Vec::new();
@@ -3984,7 +4024,8 @@ mod tests {
             answer_after(25, 2, false),
             answer_after(900, 3, true),
         ];
-        let (mut got, tail) = settle_probes(probes, Duration::ZERO, |&(_, h)| h).await;
+        let (mut got, tail) =
+            settle_probes(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
         got.sort_unstable();
         assert_eq!(got, vec![(1, true), (2, false)]);
         assert_eq!(tail.len(), 1);
@@ -4048,14 +4089,70 @@ mod tests {
         assert_eq!(*answered.lock().unwrap(), None);
     }
 
-    /// With no holder, a streamed round waits for every probe and leaves no
-    /// tail.
+    /// Without a cold cutoff, a round with no holder waits for every probe and
+    /// leaves no tail.
     #[tokio::test(start_paused = true)]
-    async fn settle_streamed_waits_for_every_probe_without_a_holder() {
+    async fn settle_without_a_cold_cutoff_waits_for_every_probe() {
         let probes = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
-        let (got, tail) = settle_probes(probes, Duration::ZERO, |&(_, h)| h).await;
+        let (got, tail) = settle_probes(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
         assert_eq!(got.len(), 2);
         assert!(tail.is_empty());
+    }
+
+    /// With no holder in hand, a cold cutoff ends the round its grace after
+    /// the first answer; the late holder stays in the tail.
+    #[tokio::test(start_paused = true)]
+    async fn settle_cold_cutoff_returns_the_non_holders_in_hand() {
+        use futures_util::StreamExt as _;
+        let started = tokio::time::Instant::now();
+        let probes = vec![
+            answer_after(25, 1, false),
+            answer_after(100, 2, false),
+            answer_after(1850, 3, true),
+        ];
+        let cold = Some(Duration::from_millis(250));
+        let (got, mut tail) =
+            settle_probes(probes, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
+        assert_eq!(got, vec![(1, false), (2, false)]);
+        assert_eq!(started.elapsed(), Duration::from_millis(275));
+        assert_eq!(tail.next().await, Some((3, true)));
+    }
+
+    /// A holder that answers inside the cold window ends the round at once,
+    /// as it would with no window.
+    #[tokio::test(start_paused = true)]
+    async fn settle_cold_cutoff_yields_to_a_holder() {
+        let started = tokio::time::Instant::now();
+        let probes = vec![
+            answer_after(25, 1, false),
+            answer_after(120, 2, true),
+            answer_after(1850, 3, false),
+        ];
+        let cold = Some(Duration::from_millis(250));
+        let (got, tail) = settle_probes(probes, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
+        assert_eq!(got, vec![(1, false), (2, true)]);
+        assert_eq!(started.elapsed(), Duration::from_millis(120));
+        assert_eq!(tail.len(), 1);
+    }
+
+    /// Only a verified answer opens the cold window: a failed probe does not.
+    #[tokio::test(start_paused = true)]
+    async fn settle_cold_cutoff_ignores_failed_probes() {
+        let started = tokio::time::Instant::now();
+        // `(id, holder)`; id 9 stands for a failed probe.
+        let probes = vec![answer_after(10, 9, false), answer_after(600, 1, false)];
+        let cold = Some(Duration::from_millis(250));
+        let (got, tail) = settle_probes(
+            probes,
+            Duration::ZERO,
+            cold,
+            |&(_, h)| h,
+            |&(id, _)| id != 9,
+        )
+        .await;
+        assert_eq!(got.len(), 2);
+        assert!(tail.is_empty());
+        assert_eq!(started.elapsed(), Duration::from_millis(600));
     }
 
     /// A loopback probe server that closes every connection with `code`, and
