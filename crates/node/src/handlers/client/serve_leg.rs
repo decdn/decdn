@@ -55,6 +55,7 @@ use crate::metrics::FirstByteClock;
 
 use super::MAX_PROOFS_PER_CHUNK;
 use super::outcome::{ServeEnd, ServeStop};
+use super::proof_wait::ChunkDeadline;
 use super::ramp::RampCarry;
 use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked};
 use super::wire::chunk_frame_bufs;
@@ -395,6 +396,8 @@ impl ClientHandler {
             let collected_any = !pending.is_empty();
             'chunk: while let Some(mut owed) = pending.pop_front() {
                 let mut attempts = 0u32;
+                // One proof-wait ceiling for every attempt at this chunk.
+                let deadline = ChunkDeadline::start();
                 loop {
                     attempts = attempts.saturating_add(1);
                     let stop = match self
@@ -410,6 +413,7 @@ impl ClientHandler {
                             client_node_id,
                             rate_per_mb,
                             owed,
+                            deadline,
                         )
                         .await
                     {

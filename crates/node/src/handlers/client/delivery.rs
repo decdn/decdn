@@ -9,6 +9,7 @@ use futures_util::{Stream, StreamExt};
 
 use super::MAX_PROOFS_PER_CHUNK;
 use super::outcome::{ServeEnd, ServeStop};
+use super::proof_wait::ChunkDeadline;
 use super::ramp::RampCarry;
 use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked};
 use super::wire::{FrameAccountingFault, FrameChunks, FrameQueue};
@@ -462,6 +463,8 @@ impl ClientHandler {
             let collected_any = !pending.is_empty();
             while let Some(mut owed) = pending.pop_front() {
                 let mut attempts = 0u32;
+                // One proof-wait ceiling for every attempt at this chunk.
+                let deadline = ChunkDeadline::start();
                 loop {
                     attempts = attempts.saturating_add(1);
                     let stop = self
@@ -477,6 +480,7 @@ impl ClientHandler {
                             client_node_id,
                             rate_per_mb,
                             owed,
+                            deadline,
                         )
                         .await
                         .map_err(|e| {

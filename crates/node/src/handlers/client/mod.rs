@@ -2565,12 +2565,13 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
 /// no headroom for it.
 ///
 /// The bound matters because without it a payer could hold a stream open
-/// indefinitely with a run of zero-credit vouchers, each one refreshing the read
-/// timeout while the delivered-but-unpaid balance never moves — the same shape
-/// of stall the non-empty-`ChunkData` floor closes on the delivery side. The
-/// exact value trades slack against how long that stall may run; every read
-/// inside it still carries its own timeout, so the bound is about liveness, not
-/// about capping any single wait.
+/// indefinitely with a run of zero-credit vouchers, each one refreshing the
+/// no-progress timeout while the delivered-but-unpaid balance never moves — the
+/// same shape of stall the non-empty-`ChunkData` floor closes on the delivery
+/// side. Time is bounded apart from this count: every proof wait for one chunk
+/// counts [`proof_wait::PROOF_WAIT_CEILING`] from the chunk's first wait
+/// ([`proof_wait::ChunkDeadline`]), so the whole run of proofs for a chunk lasts
+/// at most that long. This budget bounds the number of proofs, not the time.
 const MAX_PROOFS_PER_CHUNK: u32 = 8;
 
 /// One payment proof off the wire: a signed voucher, or a released hash-chain
