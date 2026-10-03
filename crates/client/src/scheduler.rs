@@ -26,11 +26,16 @@
 //! preference (#2225): a lane takes what it covers first, and a block no
 //! running lane covers goes to any lane, whose node serves it by pull-through,
 //! while discovery keeps looking for a node that covers it. A lane with nothing
-//! queued *steals* the aligned tail of the missing remainder of the range in
-//! flight it also covers that misses the most ([`steal_split`]), so a fast
-//! source keeps helping a slow one, and a lane that joins late starts by
+//! queued *steals* from a range in flight ([`steal_split`]). It steals only
+//! inside the range's covered suffix: the blocks it covers, from the range's
+//! end back to, but not including, the nearest block it does not cover. Of
+//! the ranges in flight, it picks the one whose covered suffix misses the
+//! most, and takes the aligned tail of that range's missing remainder. So a
+//! fast source keeps helping a slow one, and a lane that joins late starts by
 //! stealing. The split weighs the remainder by the two lanes' observed rates,
-//! so at steady rates one steal leaves both finishing together. The split
+//! so at steady rates one steal leaves both finishing together, unless the
+//! covered suffix starts past that split: then the split moves to the
+//! suffix's start and the victim keeps more than its share. The split
 //! lies past the bytes the victim has already received, and the victim keeps
 //! the front of the rest, so it still has work after the steal. It keeps its
 //! open stream: the steal lowers the victim's end to the split
@@ -115,7 +120,9 @@ use futures_util::stream::FuturesUnordered;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::Instant;
 
-use crate::coverage_plan::{SourceCoverage, covered_part, covers_byte_range, spread_segments};
+use crate::coverage_plan::{
+    SourceCoverage, covered_part, covered_suffix_start, covers_byte_range, spread_segments,
+};
 use crate::driver::{
     DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PacingWait, SharedPool,
     UnitProgress, WaitReason, contiguous_byte_ranges, fill_gap, ranges_content_len,
@@ -1065,17 +1072,27 @@ impl Work {
     /// Whether a lane over `coverage` has anything to take: a pending entry it
     /// covers at least in part, a pending chunk no running lane covers (any
     /// lane may take that one, #2225, when `take_uncovered` allows it), or a
-    /// range in flight it could steal from.
+    /// range in flight it would steal from now ([`Work::plan_steal`], #2303).
+    /// That check counts every byte in flight past its victim's received
+    /// frontier as missing, and gives the lane no rate, so it declines only a
+    /// steal that the size floors or the lane's coverage rule out.
     fn has_work_for(&self, coverage: &Coverage, total_bytes: u64, take_uncovered: bool) -> bool {
-        self.pending
+        if self
+            .pending
             .iter()
             .any(|seg| !covered_part(coverage, seg.chunk_ranges(), total_bytes).is_empty())
             || (take_uncovered && self.uncovered(total_bytes))
-            || self
-                .in_flight
-                .iter()
-                .flatten()
-                .any(|&(s, l)| covers_byte_range(coverage, s, l, total_bytes))
+        {
+            return true;
+        }
+        let mut in_flight: Vec<(u64, u64)> = self.in_flight.iter().flatten().copied().collect();
+        in_flight.sort_unstable();
+        // The ranges in flight are valid ranges of the blob, so the plan
+        // raises no alignment error; an error reads as no work.
+        matches!(
+            self.plan_steal(total_bytes, coverage, &in_flight, None),
+            Ok(Some(_))
+        )
     }
 
     /// The chunks of `seg` no running lane covers.
@@ -1143,9 +1160,10 @@ impl Work {
     /// #1506), else the first covered run of a pending entry, else the first
     /// run of pending chunks no running lane covers (#2225), unless the
     /// worker's lane is barred from those ([`Work::barred`]); when none remain,
-    /// steal the aligned tail of the missing remainder of the COVERABLE range
-    /// in flight that misses the most, split by the two lanes' rates
-    /// ([`steal_split`]). The split lies past the victim's received frontier.
+    /// steal the aligned tail of the missing remainder of the range in flight
+    /// whose covered suffix ([`covered_suffix_start`]) misses the most, split
+    /// by the two lanes' rates ([`steal_split`]). The split lies past the
+    /// victim's received frontier.
     /// The steal trims the victim to end at that split, so no other freed
     /// worker can re-steal the same tail, and lowers the victim's end
     /// (`Unit::stop_at`, [`Work::live`]) to the split, so the victim stops its
@@ -1248,6 +1266,68 @@ impl Work {
         self.steal(i, total_bytes, coverage, missing, unit)
     }
 
+    /// The steal a worker over `coverage` that runs at `stealer_rate` would
+    /// make now: the index in `in_flight` of its victim, and the aligned tail
+    /// it takes ([`steal_split`]). `None` when no range in flight has a
+    /// covered suffix worth a fresh stream. Changes nothing.
+    ///
+    /// Each candidate victim's received prefix reads as delivered, not
+    /// missing: its checkpoints may not be durable yet, but its open stream
+    /// already carried those bytes, and a split behind them would hand them
+    /// to the stealer too. `steal_split` returns WHICH remaining range it
+    /// split, so the caller trims that exact victim: no second argmax to agree
+    /// with. The stealer steals only inside a range's covered suffix (#2303),
+    /// and the split declines a steal that would leave the victim no missing
+    /// byte: that steal takes the victim's whole remaining work, and the
+    /// victim, with nothing left, would steal it straight back.
+    ///
+    /// # Errors
+    ///
+    /// As [`steal_split`].
+    fn plan_steal(
+        &self,
+        total_bytes: u64,
+        coverage: &Coverage,
+        missing: &[(u64, u64)],
+        stealer_rate: Option<u64>,
+    ) -> anyhow::Result<Option<(usize, AlignedRange)>> {
+        let (owners, remaining): (Vec<usize>, Vec<(u64, u64)>) = self
+            .in_flight
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| slot.map(|r| (idx, r)))
+            .unzip();
+        let received: Vec<(u64, u64)> = owners
+            .iter()
+            .zip(&remaining)
+            .filter_map(|(&owner, &(start, _))| {
+                let frontier = self
+                    .live
+                    .get(owner)?
+                    .progress
+                    .frontier
+                    .load(Ordering::SeqCst);
+                (frontier > start).then(|| (start, frontier - start))
+            })
+            .collect();
+        let missing = without_runs(missing, &received);
+        let victim_rate = |k: usize| {
+            owners
+                .get(k)
+                .and_then(|&owner| self.live.get(owner))
+                .and_then(|unit| unit.rate())
+        };
+        let planned = steal_split(
+            &remaining,
+            &missing,
+            total_bytes,
+            |s, l| covered_suffix_start(coverage, s, l, total_bytes),
+            stealer_rate,
+            victim_rate,
+        )?;
+        Ok(planned.and_then(|(v, tail)| Some((*owners.get(v)?, tail))))
+    }
+
     /// The steal arm of [`Work::pick`]: nothing pending worker `i` can serve.
     /// Hands `unit`, the unit's own live state, to the stolen range.
     ///
@@ -1265,59 +1345,14 @@ impl Work {
         // Nothing pending this worker can serve: every remaining byte is
         // either in flight on a busy worker or outside this worker's own
         // coverage. Steal the aligned tail of the missing remainder of the
-        // COVERABLE such range that misses the most. `in_flight[i]` is `None`
-        // here (cleared before this pick), so this worker is excluded from the
-        // remaining set and never steals from itself.
-        let (owners, remaining): (Vec<usize>, Vec<(u64, u64)>) = self
-            .in_flight
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, slot)| slot.map(|r| (idx, r)))
-            .unzip();
-        // Each candidate victim's received prefix reads as delivered, not
-        // missing: its checkpoints may not be durable yet, but its open stream
-        // already carried those bytes, and a split behind them would hand
-        // them to this worker too.
-        let received: Vec<(u64, u64)> = owners
-            .iter()
-            .zip(&remaining)
-            .filter_map(|(&owner, &(start, _))| {
-                let frontier = self
-                    .live
-                    .get(owner)?
-                    .progress
-                    .frontier
-                    .load(Ordering::SeqCst);
-                (frontier > start).then(|| (start, frontier - start))
-            })
-            .collect();
-        let missing = without_runs(missing, &received);
-        // The split weighs the remainder by the two lanes' rates: this
-        // worker's over its last unit, and the victim's on its unit so far.
+        // range in flight whose covered suffix misses the most (#2303).
+        // `in_flight[i]` is `None` here (cleared before this pick), so this
+        // worker is excluded from the remaining set and never steals from
+        // itself. The split weighs the remainder by the two lanes' rates:
+        // this worker's over its last unit, and the victim's on its unit so
+        // far.
         let stealer_rate = self.rates.get(i).copied().flatten();
-        let victim_rate = |k: usize| {
-            owners
-                .get(k)
-                .and_then(|&owner| self.live.get(owner))
-                .and_then(|unit| unit.rate())
-        };
-        // `steal_split` returns WHICH remaining range it split, so the trim below
-        // lands on that exact victim: no second argmax to agree with. The
-        // predicate excludes any range this worker's `coverage` does not fully
-        // include, so a narrow-coverage worker that finds nothing it can serve
-        // gets `None` here and parks rather than stealing a range it cannot
-        // deliver.
-        // The split declines a steal that would leave the victim no missing
-        // byte: that steal takes the victim's whole remaining work, and the
-        // victim, with nothing left, would steal it straight back.
-        let Some((v, tail)) = steal_split(
-            &remaining,
-            &missing,
-            total_bytes,
-            |s, l| covers_byte_range(coverage, s, l, total_bytes),
-            stealer_rate,
-            victim_rate,
-        )?
+        let Some((victim, tail)) = self.plan_steal(total_bytes, coverage, missing, stealer_rate)?
         else {
             *self.slot_mut(i)? = None;
             return Ok(None);
@@ -1334,27 +1369,19 @@ impl Work {
         // of proceeding. Handing out `tail` with the victim untrimmed would leave
         // two workers owning overlapping ranges, and both would pay for the
         // overlap: the exact double-pay the trim exists to prevent.
-        let Some(victim_unit) = owners
-            .get(v)
-            .and_then(|&owner| self.live.get(owner))
-            .map(Arc::clone)
-        else {
+        let Some(victim_unit) = self.live.get(victim).map(Arc::clone) else {
             *self.slot_mut(i)? = None;
             return Ok(None);
         };
-        let trimmed = owners.get(v).copied().and_then(|victim| {
-            if victim == i {
-                return None;
+        let trimmed = match self.in_flight.get_mut(victim) {
+            Some(Some((start, len))) if victim != i && tail.fetch_start() > *start => {
+                let end = start.saturating_add(*len);
+                *len = tail.fetch_start() - *start;
+                Some((*start, end))
             }
-            let (start, len) = self.in_flight.get_mut(victim)?.as_mut()?;
-            if tail.fetch_start() <= *start {
-                return None;
-            }
-            let end = start.saturating_add(*len);
-            *len = tail.fetch_start() - *start;
-            Some((victim, *start, end))
-        });
-        let Some((victim, victim_start, victim_end)) = trimmed else {
+            _ => None,
+        };
+        let Some((victim_start, victim_end)) = trimmed else {
             *self.slot_mut(i)? = None;
             return Ok(None);
         };
@@ -4574,6 +4601,108 @@ mod tests {
         Ok(())
     }
 
+    /// #2303: a lane that covers only the tail blocks of a busy lane's range
+    /// steals inside those blocks. A lane whose coverage misses the range's
+    /// last block finds no work there and takes nothing.
+    #[tokio::test]
+    async fn a_partial_holder_steals_the_covered_tail_of_a_busy_leg() -> anyhow::Result<()> {
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        let mut work = one_victim_work(total, &cov(3, &[0, 1, 2]));
+        let all = [(0, total)];
+
+        let front_only = cov(3, &[0, 1]);
+        assert!(!work.has_work_for(&front_only, total, false));
+        assert!(work.pick(2, total, &front_only, true, &all)?.is_none());
+
+        let tail_only = cov(3, &[1, 2]);
+        assert!(work.has_work_for(&tail_only, total, false));
+        let picked = work
+            .pick(1, total, &tail_only, true, &all)?
+            .ok_or_else(|| anyhow::anyhow!("worker 1 covers the victim's tail and must steal"))?;
+        // No rates: the victim keeps half, which lies inside block 1.
+        assert_eq!(picked.range.fetch_start(), total / 2);
+        assert_eq!(picked.range.fetch_end(), total);
+        assert_eq!(
+            work.in_flight.first().copied().flatten(),
+            Some((0, total / 2))
+        );
+        Ok(())
+    }
+
+    /// #2303: a lane that covers only the last block of a busy lane's range
+    /// steals from that block's start when the split by rate lies before it,
+    /// past the split by rate when that lies inside it, and not at all when
+    /// the victim's remainder is below the floor.
+    #[tokio::test]
+    async fn a_tail_holder_steal_moves_the_split_into_its_covered_suffix() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        const B: u64 = DISCOVERY_BLOCK_BYTES;
+        let total = 3 * B;
+        let all = [(0, total)];
+        let last_only = cov(3, &[2]);
+        let steal_at = |frontier: u64| -> anyhow::Result<(super::Work, Option<super::Picked>)> {
+            let mut work = one_victim_work(total, &cov(3, &[0, 1, 2]));
+            if let Some(unit) = work.live.first() {
+                unit.progress.frontier.store(frontier, Ordering::Release);
+            }
+            let picked = work.pick(1, total, &last_only, true, &all)?;
+            Ok((work, picked))
+        };
+
+        // Frontier at 20 MiB: the even split (106 MiB) lies before block 2,
+        // so the split moves to block 2 and the victim keeps blocks 0 and 1.
+        let (work, picked) = steal_at(20 * MIB)?;
+        let picked = picked.ok_or_else(|| anyhow::anyhow!("block 2 is stealable"))?;
+        assert_eq!(picked.range.fetch_start(), 2 * B);
+        assert_eq!(picked.range.fetch_end(), total);
+        assert_eq!(work.in_flight.first().copied().flatten(), Some((0, 2 * B)));
+        assert_eq!(
+            work.live
+                .first()
+                .map(|unit| unit.stop_at.load(Ordering::Acquire)),
+            Some(2 * B),
+            "the victim stops its open stream at the moved split"
+        );
+
+        // Frontier at 160 MiB: the victim keeps half of the 32 MiB it misses.
+        let (_, picked) = steal_at(160 * MIB)?;
+        let picked = picked.ok_or_else(|| anyhow::anyhow!("32 MiB is stealable"))?;
+        assert_eq!(picked.range.fetch_start(), 176 * MIB);
+
+        // Frontier at 180 MiB: 12 MiB left is below the floor.
+        let (work, picked) = steal_at(180 * MIB)?;
+        assert!(picked.is_none());
+        assert_eq!(work.in_flight.first().copied().flatten(), Some((0, total)));
+        Ok(())
+    }
+
+    /// #2303: a holder that covers a busy range's last block counts as having
+    /// work only while that range's covered suffix has enough left to steal,
+    /// so a lane that could only park never takes a start slot.
+    #[tokio::test]
+    async fn a_tail_holder_has_work_only_while_its_covered_suffix_is_stealable()
+    -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        const B: u64 = DISCOVERY_BLOCK_BYTES;
+        let total = 3 * B;
+        let work = one_victim_work(total, &cov(3, &[0, 1, 2]));
+        let last_only = cov(3, &[2]);
+        assert!(work.has_work_for(&last_only, total, false));
+        assert!(!work.has_work_for(&cov(3, &[0, 1]), total, false));
+        // The victim received all but 12 MiB: below the floor, nothing to steal.
+        if let Some(unit) = work.live.first() {
+            unit.progress.frontier.store(180 * MIB, Ordering::Release);
+        }
+        assert!(!work.has_work_for(&last_only, total, false));
+        assert!(
+            !work.has_work_for(&cov(3, &[0, 1, 2]), total, false),
+            "the floor holds for a full holder too"
+        );
+        Ok(())
+    }
+
     /// THE double-pay test: a fast source and a held-back one over a 64 MiB
     /// blob, arranged so a steal DEFINITELY fires: every leg of the slow source
     /// waits before its first byte until the test sees the fast source open a
@@ -7603,6 +7732,54 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("b"))?, data);
         assert!(a.delivered_bytes() > 0);
         assert!(b.delivered_bytes() > 0, "the late holder delivered");
+        Ok(())
+    }
+
+    /// #2303: a holder of only the last block arrives while the full holder
+    /// streams the whole blob as one range. It steals from inside its block,
+    /// and the stolen part is fetched once.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_tail_holder_steals_the_covered_tail_and_fetches_each_byte_once()
+    -> anyhow::Result<()> {
+        const B: u64 = DISCOVERY_BLOCK_BYTES;
+        let data = blob(2 * B as usize);
+        let (la, lb) = (
+            Arc::new(PoolLedger::new(Cumulative::default())),
+            Arc::new(PoolLedger::new(Cumulative::default())),
+        );
+        let a = busy(&data, &la)?;
+        let b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&lb));
+        let (root, total) = (a.root(), a.total_bytes());
+        let lanes = StaticSources::new(vec![
+            candidate(a.clone(), la, 0xA1, None),
+            candidate(b.clone(), lb, 0xB2, Some(cov(2, &[1]))),
+        ])?;
+        let provider = Arriving::new(
+            &lanes,
+            vec![(Duration::from_secs(1), holder_of(&lanes, 0xB2)?)],
+            Vec::new(),
+        );
+        let (store, dir) = fresh_store(root, total);
+        acquire_over(&store, &provider, vec![holder_of(&lanes, 0xA1)?], root, 2).await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        assert_eq!(
+            a.opened_ranges().first().copied(),
+            Some((0, total)),
+            "the full holder starts on the whole blob, so the tail holder can only steal"
+        );
+        assert!(b.delivered_bytes() > 0, "the tail holder stole its block");
+        assert!(
+            b.opened_ranges().iter().all(|&(s, _)| s >= B),
+            "the tail holder opens only inside its block: {:?}",
+            b.opened_ranges()
+        );
+        assert!(
+            a.delivered_bytes() + b.delivered_bytes() <= total + decdn_bao_range::CHUNK_GROUP_BYTES,
+            "each byte is fetched once: a {} + b {} for {total}",
+            a.delivered_bytes(),
+            b.delivered_bytes()
+        );
         Ok(())
     }
 
