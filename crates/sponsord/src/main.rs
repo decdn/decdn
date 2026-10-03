@@ -25,11 +25,44 @@ async fn main() -> anyhow::Result<()> {
     })
     .await??;
     let sponsor = Arc::new(Sponsor::connect(signer, chain, limits).await?);
+
     let shutdown = CancellationToken::new();
-    tokio::spawn(sponsor.keeper(keeper, shutdown.clone()));
+    let keeper = tokio::spawn(sponsor.keeper(keeper, shutdown.clone()));
     let app = http::router(ApiState::new(sponsor, api_token));
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "sponsord listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown))
+        .await?;
+    // Let a top-up already sent finish before exiting.
+    keeper.await?;
     Ok(())
+}
+
+/// Resolve on Ctrl-C or SIGTERM, cancelling `shutdown`. A handler that fails
+/// to register waits forever instead of resolving, so only an actual signal
+/// shuts the daemon down.
+async fn shutdown_signal(shutdown: CancellationToken) {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = term => {}
+    }
+    tracing::info!("shutting down");
+    shutdown.cancel();
 }

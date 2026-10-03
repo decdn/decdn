@@ -14,8 +14,10 @@ Run these before opening a pull request; CI runs the same:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-# Treasury against a local anvil chain (needs anvil + forge):
+# Against a local anvil chain (needs anvil + forge): the pool client and
+# Sponsor::connect, then the sponsord binary end to end.
 cargo test -p sponsord-core --features anvil-e2e
+cargo test -p sponsord --features anvil-e2e
 ```
 
 The workspace denies `unwrap`, `expect`, `panic!` and slice indexing outside

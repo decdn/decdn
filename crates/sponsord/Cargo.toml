@@ -9,6 +9,11 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The anvil-backed test of the binary (`tests/binary_anvil.rs`); needs
+# `anvil` and `forge` on PATH.
+anvil-e2e = []
+
 [dependencies]
 sponsord-api = { workspace = true, features = ["axum", "secret"] }
 clap.workspace = true
@@ -24,6 +29,11 @@ axum = "0.8"
 subtle = "2"
 
 [dev-dependencies]
+decdn-client.workspace = true
+decdn-e2e = { workspace = true, features = ["anvil-e2e"] }
+reqwest.workspace = true
+tempfile = "3"
 sponsord-core = { workspace = true, features = ["test-support"] }
 serde_json.workspace = true
+tokio-util.workspace = true
 tower = { version = "0.5", features = ["util"] }

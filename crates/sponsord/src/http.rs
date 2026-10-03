@@ -1,12 +1,12 @@
-//! The daemon's HTTP API: `POST /v1/capabilities`, `GET /v1/info`, and an
-//! unauthenticated `GET /healthz`. Every `/v1` route requires
+//! The daemon's HTTP API: `POST /v1/capabilities`, `GET /v1/info`, and the
+//! unauthenticated `GET /healthz` and `GET /metrics`. Every `/v1` route requires
 //! `Authorization: Bearer <token>`, compared in constant time.
 
 use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Request, State};
-use axum::http::header;
+use axum::http::{HeaderValue, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -18,12 +18,15 @@ use sponsord_api::{ErrorBody, ErrorCode};
 use sponsord_core::{Sponsor, SponsorError, TermsError, TermsRequest};
 use subtle::ConstantTimeEq;
 
+use crate::metrics::Metrics;
+
 #[derive(Clone)]
 pub struct ApiState {
     pub sponsor: Arc<Sponsor>,
     /// Compared in constant time; held as a [`Secret`] so it is wiped on drop.
     pub api_token: Arc<Secret>,
     pub clock: Arc<dyn Clock>,
+    pub metrics: Arc<Metrics>,
 }
 
 impl ApiState {
@@ -34,6 +37,7 @@ impl ApiState {
             sponsor,
             api_token: Arc::new(api_token),
             clock: Arc::new(SystemClock),
+            metrics: Arc::default(),
         }
     }
 }
@@ -45,6 +49,7 @@ pub fn router(state: ApiState) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
         .route(routes::HEALTHZ, get(healthz))
+        .route(routes::METRICS, get(metrics))
         .merge(api)
         .with_state(state)
 }
@@ -68,12 +73,27 @@ async fn require_token(State(state): State<ApiState>, req: Request, next: Next) 
         Some(t) if bool::from(t.as_bytes().ct_eq(state.api_token.expose().as_bytes())) => {
             next.run(req).await
         }
-        _ => ErrorCode::Unauthorized.into_response(),
+        _ => {
+            state.metrics.error(ErrorCode::Unauthorized);
+            ErrorCode::Unauthorized.into_response()
+        }
     }
 }
 
 async fn healthz() -> Json<Health> {
     Json(Health { ok: true })
+}
+
+async fn metrics(State(state): State<ApiState>) -> Response {
+    let body = state
+        .metrics
+        .render(&state.sponsor.keeper_status().snapshot());
+    let mut resp = body.into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    resp
 }
 
 async fn info(State(state): State<ApiState>) -> Json<Info> {
@@ -82,6 +102,18 @@ async fn info(State(state): State<ApiState>) -> Json<Info> {
 
 async fn issue(
     State(state): State<ApiState>,
+    body: Result<Json<IssueRequest>, JsonRejection>,
+) -> Result<Json<IssueResponse>, ErrorBody> {
+    let result = issue_inner(&state, body).await;
+    match &result {
+        Ok(Json(issued)) => state.metrics.issued(issued.registered),
+        Err(e) => state.metrics.error(e.error),
+    }
+    result
+}
+
+async fn issue_inner(
+    state: &ApiState,
     body: Result<Json<IssueRequest>, JsonRejection>,
 ) -> Result<Json<IssueResponse>, ErrorBody> {
     let Ok(Json(req)) = body else {

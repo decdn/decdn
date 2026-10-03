@@ -27,9 +27,19 @@ All notable changes to this project are documented here. The format follows
 - `GET /v1/profile`: the chain and contracts the CLI runs `decdn` with, and
   an optional `ONRAMP_MIN_CLI_VERSION`; new optional `ONRAMP_SLASH_JUDGE_ADDR`.
 - `decdn-sponsored --version`.
+- Daemon `GET /metrics` (Prometheus): capabilities issued, request errors
+  by code, and the keeper's view of the pool (remaining, last check and
+  top-up, top-ups, failures). Graceful shutdown on SIGTERM lets a top-up in
+  flight finish.
 - `sponsord-e2e`: tests that run the daemon, onramp and CLI together.
 - `sponsord-core`: `Sponsor::keeper_status()`, what the pool keeper has seen
   and done.
+
+### Fixed
+
+- Behind `ONRAMP_CLIENT_IP_HEADER=X-Forwarded-For`, the onramp keyed rate
+  limits on the client-controlled left-most address; it now uses the
+  right-most (proxy-appended) one and falls back to the TCP peer.
 
 ### Changed
 
