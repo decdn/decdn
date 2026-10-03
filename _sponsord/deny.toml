@@ -1,0 +1,49 @@
+# cargo-deny: license, advisory, and source audit (`cargo deny check`).
+
+[advisories]
+version = 2
+# Transitive "unmaintained" notices with no patched release, each a
+# build-time-only proc-macro or a platform-conditional dependency. Same set
+# and reasoning as decdn's own deny.toml; drop an entry once the upstream
+# chain moves off it (`cargo deny` reports "advisory-not-detected").
+ignore = [
+    # proc-macro-error 0.4: build-time proc-macro, via genawaiter ->
+    # bao-tree / iroh-blobs (decdn-client).
+    "RUSTSEC-2024-0370",
+    # atomic-polyfill 1.x: not compiled on our targets; via heapless 0.7 ->
+    # postcard.
+    "RUSTSEC-2023-0089",
+    # paste 1.0: build-time proc-macro, via alloy-primitives.
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+version = 2
+allow = [
+    "0BSD",
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "OpenSSL",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MPL-2.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# deCDN itself, the only git dependency.
+allow-git = ["https://github.com/decdn/decdn"]

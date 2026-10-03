@@ -7,9 +7,8 @@ name: Release
 # of that SHA256SUMS file (`ONRAMP_WRAPPER_RELEASE` /
 # `ONRAMP_WRAPPER_SUMS_SHA256`); the release notes print both.
 #
-# This workspace path-depends on `../decdn`. A release builds against the
-# commit pinned in `decdn.ref`, not against whatever `decdn` main is, so the
-# same tag always builds the same code.
+# The deCDN crates are git dependencies, and `--locked` builds the commit
+# `Cargo.lock` pins, so the same tag always builds the same code.
 on:
   push:
     tags: ['v[0-9]*']
@@ -30,7 +29,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
-      decdn_ref: ${{ steps.version.outputs.decdn_ref }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,13 +43,7 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME is not vMAJOR.MINOR.PATCH[-pre]"
             exit 1
           fi
-          DECDN_REF="$(tr -d '[:space:]' < decdn.ref)"
-          if ! [[ "$DECDN_REF" =~ ^([0-9a-f]{40}|v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
-            echo "::error::decdn.ref must be a full commit SHA or a vMAJOR.MINOR.PATCH tag"
-            exit 1
-          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "decdn_ref=$DECDN_REF" >> "$GITHUB_OUTPUT"
 
   build:
     name: build ${{ matrix.binary }} ${{ matrix.target }}
@@ -79,21 +71,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          path: sponsord
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: decdn/decdn
-          ref: ${{ needs.version.outputs.decdn_ref }}
-          path: decdn
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.95
       # From inside the checkout, so the target lands on the toolchain that
       # `rust-toolchain.toml` pins rather than on the action's own.
-      - working-directory: sponsord
-        run: rustup target add ${{ matrix.target }}
-      - working-directory: sponsord
-        run: cargo build --release --locked -p ${{ matrix.package }} --target ${{ matrix.target }}
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked -p ${{ matrix.package }} --target ${{ matrix.target }}
 
       # The binary sits at the archive root, the layout decdn's own release
       # archives use and the installers unpack.
@@ -101,7 +84,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          tar -czf "$BINARY-$VERSION-$TARGET.tar.gz" -C "sponsord/target/$TARGET/release" "$BINARY"
+          tar -czf "$BINARY-$VERSION-$TARGET.tar.gz" -C "target/$TARGET/release" "$BINARY"
         env:
           BINARY: ${{ matrix.binary }}
           TARGET: ${{ matrix.target }}
@@ -110,7 +93,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path "sponsord/target/$env:TARGET/release/$env:BINARY.exe" `
+          Compress-Archive -Path "target/$env:TARGET/release/$env:BINARY.exe" `
             -DestinationPath "$env:BINARY-$env:VERSION-$env:TARGET.zip"
         env:
           BINARY: ${{ matrix.binary }}
@@ -130,6 +113,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -154,8 +140,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-          DECDN_REF: ${{ needs.version.outputs.decdn_ref }}
         run: |
+          # The deCDN commit this release was built against, from Cargo.lock.
+          DECDN_REF="$(grep -m1 -o 'git+https://github.com/decdn/decdn?branch=main#[0-9a-f]*' Cargo.lock | cut -d'#' -f2)"
           SUMS_SHA256="$(sha256sum dist/SHA256SUMS | cut -d' ' -f1)"
           {
             echo "Built against decdn/decdn@${DECDN_REF}."

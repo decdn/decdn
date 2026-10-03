@@ -28,7 +28,7 @@ programs that embed it instead of calling the daemon.
 A capability authorizes a key to spend up to its cap against the sponsor's
 pool until its expiry: zero on-chain transactions and zero locked deposit
 per user. The pool itself is opened once, out-of-band, with `decdn pool open`.
-See `../decdn` for the protocol and contracts.
+See [decdn/decdn](https://github.com/decdn/decdn) for the protocol and contracts.
 
 ## The sponsord daemon
 
@@ -213,19 +213,17 @@ fields are ignored.
 
 ## Building against `decdn`
 
-The workspace path-depends on its sibling `decdn` checkout
-(`../decdn/crates/*`), so a local build uses whatever that checkout holds.
-CI checks out `decdn/decdn` beside this repo: `main` by default, or any ref a
-manual run names (`decdn_ref`), so breakage from `decdn` changes shows up
-early. Releases build against the commit pinned in `decdn.ref` instead, so a
-tag always builds the same code. `cargo test -p sponsord-core --features
-anvil-e2e` runs the treasury against a local anvil chain.
+The deCDN crates are git dependencies on
+[decdn/decdn](https://github.com/decdn/decdn), at the commit `Cargo.lock` pins,
+so a fresh clone builds on its own. `cargo update -p decdn-incentive` moves the
+pin; [CONTRIBUTING.md](CONTRIBUTING.md) shows how to build against a local
+checkout instead. `cargo test -p sponsord-core --features anvil-e2e` runs the
+treasury against a local anvil chain.
 
 ## Releasing
 
-1. Point `decdn.ref` at the `decdn` commit (full SHA) or tag to build
-   against, and make sure `Cargo.lock` is consistent with it
-   (`cargo metadata --locked` with that commit checked out beside this repo).
+1. Make sure `Cargo.lock` pins the deCDN commit to build against
+   (`cargo update -p decdn-incentive` to move it); releases build `--locked`.
 2. Push a `vMAJOR.MINOR.PATCH[-pre]` tag. `.github/workflows/release.yml`
    builds `decdn-sponsored` for Linux, macOS and Windows (x86_64 and
    aarch64 each) and `sponsord` and `sponsord-onramp` for Linux, and
@@ -235,3 +233,8 @@ anvil-e2e` runs the treasury against a local anvil chain.
    to make the installers serve it. `decdn` releases are pinned the same way
    (`ONRAMP_DECDN_RELEASE`, and `ONRAMP_DECDN_SUMS_SHA256` = the SHA-256 of
    that release's `SHA256SUMS`).
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.

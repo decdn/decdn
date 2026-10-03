@@ -1402,9 +1402,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.3"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00bdb5da18dac48ca2cc7cd4a98e533e8635a58e2361d13a1a4ee3888e0d72f1"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -1412,9 +1412,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.43.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43103168cc76fe62678a375e722fc9cb3a0146159ac5828bc4f0dfd755c2224c"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
@@ -2714,7 +2714,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.3",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -2738,6 +2738,7 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 [[package]]
 name = "decdn-bao-range"
 version = "0.0.0"
+source = "git+https://github.com/decdn/decdn?branch=main#7f938e6b8437eba614e54375dcbc504de108379d"
 dependencies = [
  "bao-tree",
  "bytes",
@@ -2748,6 +2749,7 @@ dependencies = [
 [[package]]
 name = "decdn-cache"
 version = "0.0.0"
+source = "git+https://github.com/decdn/decdn?branch=main#7f938e6b8437eba614e54375dcbc504de108379d"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2783,6 +2785,7 @@ dependencies = [
 [[package]]
 name = "decdn-client"
 version = "0.0.0"
+source = "git+https://github.com/decdn/decdn?branch=main#7f938e6b8437eba614e54375dcbc504de108379d"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2807,6 +2810,7 @@ dependencies = [
 [[package]]
 name = "decdn-common"
 version = "0.0.0"
+source = "git+https://github.com/decdn/decdn?branch=main#7f938e6b8437eba614e54375dcbc504de108379d"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2828,6 +2832,7 @@ dependencies = [
 [[package]]
 name = "decdn-config-types"
 version = "0.0.0"
+source = "git+https://github.com/decdn/decdn?branch=main#7f938e6b8437eba614e54375dcbc504de108379d"
 dependencies = [
  "anyhow",
  "serde",
@@ -2837,6 +2842,7 @@ dependencies = [
 [[package]]
 name = "decdn-e2e"
 version = "0.0.0"
+source = "git+https://github.com/decdn/decdn?branch=main#7f938e6b8437eba614e54375dcbc504de108379d"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2863,6 +2869,7 @@ dependencies = [
 [[package]]
 name = "decdn-incentive"
 version = "0.0.0"
+source = "git+https://github.com/decdn/decdn?branch=main#7f938e6b8437eba614e54375dcbc504de108379d"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2885,6 +2892,7 @@ dependencies = [
 [[package]]
 name = "decdn-node"
 version = "0.0.0"
+source = "git+https://github.com/decdn/decdn?branch=main#7f938e6b8437eba614e54375dcbc504de108379d"
 dependencies = [
  "alloy",
  "alloy-json-rpc",
@@ -2939,6 +2947,7 @@ dependencies = [
 [[package]]
 name = "decdn-protocol"
 version = "0.0.0"
+source = "git+https://github.com/decdn/decdn?branch=main#7f938e6b8437eba614e54375dcbc504de108379d"
 dependencies = [
  "postcard",
  "serde",
@@ -2949,6 +2958,7 @@ dependencies = [
 [[package]]
 name = "decdn-reputation"
 version = "0.0.0"
+source = "git+https://github.com/decdn/decdn?branch=main#7f938e6b8437eba614e54375dcbc504de108379d"
 dependencies = [
  "anyhow",
  "decdn-protocol",
@@ -3123,7 +3133,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3383,7 +3393,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3916,9 +3926,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.15"
+version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
+checksum = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -5644,7 +5654,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6529,7 +6539,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7039,14 +7049,14 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -7119,7 +7129,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs 1.0.9",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7130,9 +7140,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -7327,7 +7337,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8057,10 +8067,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8913,7 +8923,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
