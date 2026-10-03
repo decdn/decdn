@@ -15,7 +15,7 @@ use decdn_incentive::{CapabilityGrant, voucher_domain};
 use serde_json::{Value, json};
 use sponsord::http::{ApiState, router};
 use sponsord_api::daemon::{Info, IssueResponse};
-use sponsord_api::{ErrorBody, ErrorCode};
+use sponsord_api::{ErrorBody, ErrorCode, MicroUsdc};
 use sponsord_core::pool::{Authorization, PoolChain};
 use sponsord_core::test_support::{FakePool, TEST_CHAIN_ID, TEST_PAYMENT_POOL, fake_sponsor};
 use tower::ServiceExt;
@@ -236,7 +236,7 @@ async fn registered_signer_gets_the_same_token_back() {
     pool.register(
         SIGNER.parse().unwrap(),
         Authorization {
-            spending_cap: first["spending_cap"].as_u64().unwrap(),
+            spending_cap: MicroUsdc(first["spending_cap"].as_u64().unwrap()),
             expiry: first["expiry"].as_u64().unwrap(),
         },
     );
@@ -260,7 +260,7 @@ async fn expired_registration_is_409_signer_expired() {
     pool.register(
         SIGNER.parse().unwrap(),
         Authorization {
-            spending_cap: 5_000_000,
+            spending_cap: MicroUsdc(5_000_000),
             expiry: 1_000,
         },
     );

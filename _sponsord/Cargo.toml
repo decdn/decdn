@@ -23,6 +23,7 @@ indexing_slicing = "deny"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 anyhow = "1"
 alloy = { version = "2", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

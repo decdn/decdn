@@ -13,9 +13,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use sponsord_api::daemon::{Health, Info, IssueRequest, IssueResponse, routes};
 use sponsord_api::time::{Clock, SystemClock};
-use sponsord_api::{ErrorBody, ErrorCode, IssuedCapability, MicroUsdc};
-use sponsord_core::issuer::TermsError;
-use sponsord_core::{Sponsor, SponsorError};
+use sponsord_api::{ErrorBody, ErrorCode};
+use sponsord_core::{Sponsor, SponsorError, TermsError, TermsRequest};
 use subtle::ConstantTimeEq;
 
 #[derive(Clone)]
@@ -75,18 +74,8 @@ async fn healthz() -> Json<Health> {
     Json(Health { ok: true })
 }
 
-fn wire_info(sponsor: &Sponsor) -> Info {
-    let i = sponsor.info();
-    Info {
-        chain_id: i.chain_id,
-        payment_pool: i.payment_pool,
-        max_spending_cap: MicroUsdc(i.max_spending_cap),
-        max_ttl_secs: i.max_ttl_secs,
-    }
-}
-
 async fn info(State(state): State<ApiState>) -> Json<Info> {
-    Json(wire_info(&state.sponsor))
+    Json(state.sponsor.info())
 }
 
 async fn issue(
@@ -97,21 +86,14 @@ async fn issue(
         return Err(ErrorCode::BadRequest.into());
     };
     let now = state.clock.now_unix();
-    match state
-        .sponsor
-        .issue(req.signer, req.spending_cap.map(|c| c.0), req.ttl_secs, now)
-        .await
-    {
-        Ok(i) => Ok(Json(IssueResponse {
-            capability: IssuedCapability {
-                token: i.token,
-                spending_cap: MicroUsdc(i.spending_cap),
-                expiry: i.expiry,
-            },
-            registered: i.registered,
-        })),
+    let terms = TermsRequest {
+        spending_cap: req.spending_cap,
+        ttl_secs: req.ttl_secs,
+    };
+    match state.sponsor.issue(req.signer, &terms, now).await {
+        Ok(issued) => Ok(Json(issued)),
         Err(SponsorError::Terms(TermsError::ExceedsMax { .. })) => {
-            let i = wire_info(&state.sponsor);
+            let i = state.sponsor.info();
             Err(ErrorBody {
                 max_spending_cap: Some(i.max_spending_cap),
                 max_ttl_secs: Some(i.max_ttl_secs),

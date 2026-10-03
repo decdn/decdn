@@ -7840,6 +7840,7 @@ dependencies = [
  "sponsord-core",
  "subtle",
  "tokio",
+ "tokio-util",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -7875,6 +7876,7 @@ dependencies = [
  "sponsord-api",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

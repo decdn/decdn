@@ -22,8 +22,8 @@ use decdn_client::buyer_pool::{ensure_allowance, open_pool};
 use decdn_e2e::chain::ChainFixture;
 use decdn_incentive::Deployment;
 use decdn_incentive::payment_pool::PaymentPool;
-use sponsord_core::MicroUsdc;
-use sponsord_core::pool::{ChainPoolConfig, connect};
+use sponsord_core::pool::{ChainPool, PoolChain};
+use sponsord_core::{ChainConfig, Limits, MicroUsdc, Sponsor, TermsRequest};
 
 /// Opening deposit, in USDC base units (6 decimals), well above the top-up
 /// amount so `remaining` never risks going negative.
@@ -81,13 +81,9 @@ async fn remaining_grows_after_topup() {
 
     // 3. Build the sponsor's pool client against the fixture endpoint + pool addr,
     //    driving it exactly as sponsord does.
-    let cfg = ChainPoolConfig {
-        rpc_url: chain.rpc_url(),
-        payment_pool: chain.addrs().payment_pool,
-        chain_id: chain.chain_id(),
-        signer: signer.clone(),
-    };
-    let pool = connect(&cfg).await.expect("connect");
+    let pool = ChainPool::connect(&chain.rpc_url(), chain.addrs().payment_pool, signer.clone())
+        .await
+        .expect("connect");
 
     assert_eq!(
         pool.pool_owner(pool_id).await.unwrap(),
@@ -108,4 +104,32 @@ async fn remaining_grows_after_topup() {
             .unwrap(),
         None
     );
+
+    // 4. The full sponsor on the same chain: the boot owner check passes and
+    //    an unregistered signer gets a fresh capability.
+    let sponsor = Sponsor::connect(
+        signer,
+        ChainConfig {
+            rpc_url: chain.rpc_url(),
+            chain_id: chain.chain_id(),
+            payment_pool: chain.addrs().payment_pool,
+            pool_id,
+        },
+        Limits {
+            max_spending_cap: MicroUsdc(1_000_000),
+            max_ttl_secs: 3_600,
+        },
+    )
+    .await
+    .expect("sponsor connect");
+    let issued = sponsor
+        .issue(
+            alloy::primitives::Address::repeat_byte(0x77),
+            &TermsRequest::default(),
+            1_769_904_000,
+        )
+        .await
+        .expect("issue");
+    assert!(!issued.registered);
+    assert_eq!(issued.capability.spending_cap, MicroUsdc(1_000_000));
 }

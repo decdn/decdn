@@ -21,6 +21,7 @@ use axum::http::{Request, StatusCode};
 use decdn_incentive::{CapabilityGrant, voucher_domain};
 use serde_json::{Value, json};
 use sponsord::http::ApiState;
+use sponsord_api::MicroUsdc;
 use sponsord_api::client::DaemonClient;
 use sponsord_core::pool::{Authorization, PoolChain};
 use sponsord_core::test_support::{FakePool, TEST_CHAIN_ID, TEST_PAYMENT_POOL, fake_sponsor};
@@ -116,7 +117,7 @@ async fn registered_signer_gets_its_existing_terms_through_the_stack() {
     pool.register(
         Address::from_str(client).unwrap(),
         Authorization {
-            spending_cap: 3_000_000,
+            spending_cap: MicroUsdc(3_000_000),
             expiry,
         },
     );
@@ -134,7 +135,7 @@ async fn expired_registration_is_409_through_the_stack() {
     pool.register(
         Address::from_str(client).unwrap(),
         Authorization {
-            spending_cap: 5_000_000,
+            spending_cap: MicroUsdc(5_000_000),
             expiry: 1_000,
         },
     );

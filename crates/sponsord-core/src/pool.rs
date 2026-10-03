@@ -1,46 +1,43 @@
 //! `PoolChain`: the on-chain `PaymentPool` operations the sponsor needs. It
-//! reads the pool's remaining balance, tops the pool up from the hot wallet,
-//! reads the pool's owner (a boot-time sanity check), and reads a signer's
-//! registration. `ChainPool` backs it in production; tests use
-//! `test_support::FakePool`.
+//! reads the pool's remaining balance, tops the pool up from the treasury
+//! (the hot wallet that owns the pool), reads the pool's owner (a boot-time
+//! sanity check), and reads a signer's registration. `ChainPool` backs it in
+//! production; tests use `test_support::FakePool`.
 
-use alloy::primitives::{Address, B256, U256};
-use alloy::providers::Provider;
-use alloy::signers::local::PrivateKeySigner;
+use alloy::network::{EthereumWallet, TxSigner};
+use alloy::primitives::{Address, B256, Signature, U256};
+use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use async_trait::async_trait;
 use decdn_client::buyer_pool::{ensure_allowance, top_up};
-use decdn_client::provider::build_provider;
 use decdn_incentive::payment_pool::PaymentPool;
-
-use crate::MicroUsdc;
+use sponsord_api::MicroUsdc;
 
 /// A signer's registration under a pool: the terms fixed by the first
 /// capability redeemed for it (`PaymentPool.authorized[poolId][signer]`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Authorization {
-    pub spending_cap: u64,
+    pub spending_cap: MicroUsdc,
     pub expiry: u64,
 }
 
 /// The contract's unregistered state is a zero cap and zero expiry
 /// (`PaymentPool._registerCapability`); anything else is a registration.
-#[must_use]
 fn registration(cap: u64, expiry: u64) -> Option<Authorization> {
     (cap != 0 || expiry != 0).then_some(Authorization {
-        spending_cap: cap,
+        spending_cap: MicroUsdc(cap),
         expiry,
     })
 }
 
 #[async_trait]
 pub trait PoolChain: Send + Sync {
-    /// The hot wallet address, which must be the pool's on-chain owner.
+    /// The treasury wallet address, which must be the pool's on-chain owner.
     fn owner_address(&self) -> Address;
 
     /// The pool's still-payable balance (`deposit - totalRedeemed`).
     async fn remaining(&self, pool_id: B256) -> anyhow::Result<MicroUsdc>;
 
-    /// Add `additional` USDC to the pool from the hot wallet; returns the
+    /// Add `additional` USDC to the pool from the treasury; returns the
     /// credited amount.
     async fn top_up(&self, pool_id: B256, additional: MicroUsdc) -> anyhow::Result<MicroUsdc>;
 
@@ -57,48 +54,61 @@ pub trait PoolChain: Send + Sync {
     ) -> anyhow::Result<Option<Authorization>>;
 }
 
-#[derive(Clone, Debug)]
-pub struct ChainPoolConfig {
-    pub rpc_url: String,
-    pub payment_pool: Address,
-    pub chain_id: u64,
-    pub signer: PrivateKeySigner,
-}
-
-pub struct ChainPool<P: Provider + Clone> {
-    contract: PaymentPool::PaymentPoolInstance<P>,
-    provider: P,
-    self_address: Address,
+/// The `PaymentPool` contract, read through and paid into by the treasury
+/// wallet.
+pub struct ChainPool {
+    contract: PaymentPool::PaymentPoolInstance<DynProvider>,
+    provider: DynProvider,
+    owner: Address,
     token: Address,
     payment_pool: Address,
 }
 
-/// Build a `ChainPool` from `cfg`: a wallet-filled provider signing as
-/// `cfg.signer`, bound to the `PaymentPool` at `cfg.payment_pool`, with the
-/// settlement token read from the contract's immutable `usdc()`.
-pub async fn connect(cfg: &ChainPoolConfig) -> anyhow::Result<Box<dyn PoolChain>> {
-    let signer = cfg.signer.clone();
-    let self_address = signer.address();
-    let provider = build_provider(&cfg.rpc_url, &signer)?;
-    let contract = PaymentPool::new(cfg.payment_pool, provider.clone());
-    let token = contract
-        .usdc()
-        .call()
-        .await
-        .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
-    Ok(Box::new(ChainPool {
-        contract,
-        provider,
-        self_address,
-        token,
-        payment_pool: cfg.payment_pool,
-    }))
+impl ChainPool {
+    /// Connect to the `PaymentPool` at `payment_pool` over `rpc_url`, sending
+    /// transactions as `signer`, and read its settlement token (the
+    /// contract's immutable `usdc()`).
+    ///
+    /// # Errors
+    ///
+    /// A malformed `rpc_url`, or the `usdc()` read fails.
+    pub async fn connect<S>(rpc_url: &str, payment_pool: Address, signer: S) -> anyhow::Result<Self>
+    where
+        S: TxSigner<Signature> + Send + Sync + 'static,
+    {
+        let owner = signer.address();
+        // The URL itself stays out of the error: RPC URLs often carry an API
+        // key in their path or query.
+        let url = rpc_url.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "RPC URL ({} characters) is not a valid URL: {e}",
+                rpc_url.len()
+            )
+        })?;
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::new(signer))
+            .connect_http(url)
+            .erased();
+        let contract = PaymentPool::new(payment_pool, provider.clone());
+        let token = contract
+            .usdc()
+            .call()
+            .await
+            .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
+        Ok(Self {
+            contract,
+            provider,
+            owner,
+            token,
+            payment_pool,
+        })
+    }
 }
 
 #[async_trait]
-impl<P: Provider + Clone + 'static> PoolChain for ChainPool<P> {
+impl PoolChain for ChainPool {
     fn owner_address(&self) -> Address {
-        self.self_address
+        self.owner
     }
 
     async fn remaining(&self, pool_id: B256) -> anyhow::Result<MicroUsdc> {
@@ -116,7 +126,7 @@ impl<P: Provider + Clone + 'static> PoolChain for ChainPool<P> {
         ensure_allowance(
             &self.provider,
             self.token,
-            self.self_address,
+            self.owner,
             self.payment_pool,
             Some(amount),
         )
@@ -153,25 +163,35 @@ impl<P: Provider + Clone + 'static> PoolChain for ChainPool<P> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{Authorization, registration};
+    use alloy::signers::local::PrivateKeySigner;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_malformed_rpc_url_stays_out_of_the_error() {
+        let err = ChainPool::connect(
+            "htt p://rpc.example/v2/SECRET-API-KEY",
+            Address::ZERO,
+            PrivateKeySigner::random(),
+        )
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(!err.contains("SECRET-API-KEY"), "{err}");
+        assert!(err.contains("not a valid URL"), "{err}");
+    }
 
     #[test]
     fn zero_cap_and_expiry_is_unregistered() {
+        let auth = |cap, expiry| Authorization {
+            spending_cap: MicroUsdc(cap),
+            expiry,
+        };
         assert_eq!(registration(0, 0), None);
-        assert_eq!(
-            registration(5, 10),
-            Some(Authorization {
-                spending_cap: 5,
-                expiry: 10
-            })
-        );
-        assert_eq!(
-            registration(0, 10),
-            Some(Authorization {
-                spending_cap: 0,
-                expiry: 10
-            })
-        );
+        assert_eq!(registration(5, 10), Some(auth(5, 10)));
+        assert_eq!(registration(0, 10), Some(auth(0, 10)));
     }
 }

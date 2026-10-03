@@ -17,9 +17,9 @@ use alloy::primitives::{Address, B256};
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use decdn_incentive::voucher_domain;
+use sponsord_api::MicroUsdc;
 
-use crate::MicroUsdc;
-use crate::issuer::Issuer;
+use crate::issuer::{Issuer, Limits};
 use crate::pool::{Authorization, PoolChain};
 use crate::sponsor::Sponsor;
 
@@ -27,13 +27,14 @@ pub const TEST_CHAIN_ID: u64 = 421_614;
 pub const TEST_PAYMENT_POOL: Address = Address::repeat_byte(0x22);
 pub const TEST_POOL_ID: B256 = B256::repeat_byte(0x11);
 
-/// In-memory pool: fixed owner, a mutable remaining balance, and a
-/// settable per-signer registration map.
+/// In-memory pool: fixed owner, a mutable remaining balance, a settable
+/// per-signer registration map, and switches to fail reads or top-ups.
 pub struct FakePool {
     owner: Address,
-    remaining: Mutex<u64>,
+    remaining: Mutex<MicroUsdc>,
     registrations: Mutex<HashMap<Address, Authorization>>,
     fail_authorization: AtomicBool,
+    fail_top_up: AtomicBool,
 }
 
 impl FakePool {
@@ -41,9 +42,10 @@ impl FakePool {
     pub fn new(owner: Address, remaining: u64) -> Self {
         Self {
             owner,
-            remaining: Mutex::new(remaining),
+            remaining: Mutex::new(MicroUsdc(remaining)),
             registrations: Mutex::new(HashMap::new()),
             fail_authorization: AtomicBool::new(false),
+            fail_top_up: AtomicBool::new(false),
         }
     }
 
@@ -56,6 +58,17 @@ impl FakePool {
     pub fn fail_authorization_reads(&self, fail: bool) {
         self.fail_authorization.store(fail, Ordering::SeqCst);
     }
+
+    /// Make every `top_up` fail (an out-of-funds treasury).
+    pub fn fail_top_ups(&self, fail: bool) {
+        self.fail_top_up.store(fail, Ordering::SeqCst);
+    }
+
+    /// The pool's current remaining balance.
+    #[must_use]
+    pub fn remaining_now(&self) -> MicroUsdc {
+        *self.remaining.lock().unwrap()
+    }
 }
 
 #[async_trait]
@@ -64,19 +77,13 @@ impl PoolChain for FakePool {
         self.owner
     }
     async fn remaining(&self, _pool_id: B256) -> anyhow::Result<MicroUsdc> {
-        let r = self
-            .remaining
-            .lock()
-            .map_err(|_| anyhow::anyhow!("poisoned"))?;
-        Ok(MicroUsdc(*r))
+        Ok(self.remaining_now())
     }
     async fn top_up(&self, _pool_id: B256, additional: MicroUsdc) -> anyhow::Result<MicroUsdc> {
-        let mut r = self
-            .remaining
-            .lock()
-            .map_err(|_| anyhow::anyhow!("poisoned"))?;
-        *r = r.saturating_add(additional.0);
-        Ok(MicroUsdc(*r))
+        anyhow::ensure!(!self.fail_top_up.load(Ordering::SeqCst), "top-up failed");
+        let mut r = self.remaining.lock().unwrap();
+        *r = r.saturating_add(additional);
+        Ok(additional)
     }
     async fn pool_owner(&self, _pool_id: B256) -> anyhow::Result<Address> {
         Ok(self.owner)
@@ -94,9 +101,9 @@ impl PoolChain for FakePool {
     }
 }
 
-/// A `Sponsor` with a random owner key over a `FakePool` that owns the
-/// test pool. The returned pool is the same instance the sponsor reads,
-/// so tests can register signers or fail reads on it.
+/// A `Sponsor` with a random owner key over a `FakePool` that owns the test
+/// pool. The returned pool is the same instance the sponsor reads, so tests
+/// can register signers or fail reads on it.
 pub async fn fake_sponsor(max_spending_cap: u64, max_ttl_secs: u64) -> (Sponsor, Arc<FakePool>) {
     let signer = PrivateKeySigner::random();
     let pool = Arc::new(FakePool::new(signer.address(), 100_000_000));
@@ -104,10 +111,12 @@ pub async fn fake_sponsor(max_spending_cap: u64, max_ttl_secs: u64) -> (Sponsor,
         signer,
         voucher_domain(TEST_CHAIN_ID, TEST_PAYMENT_POOL),
         TEST_POOL_ID,
-        max_spending_cap,
-        max_ttl_secs,
+        Limits {
+            max_spending_cap: MicroUsdc(max_spending_cap),
+            max_ttl_secs,
+        },
     );
-    let sponsor = Sponsor::from_parts(
+    let sponsor = Sponsor::new(
         issuer,
         pool.clone() as Arc<dyn PoolChain>,
         TEST_CHAIN_ID,

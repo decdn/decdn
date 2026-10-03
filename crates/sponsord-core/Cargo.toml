@@ -23,6 +23,7 @@ sponsord-api.workspace = true
 tracing.workspace = true
 async-trait = "0.1"
 thiserror = "2"
+tokio-util.workspace = true
 
 [dev-dependencies]
 decdn-e2e = { workspace = true, features = ["anvil-e2e"] }
