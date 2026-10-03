@@ -3659,17 +3659,27 @@ const DEPLOYMENT_PREFLIGHT_BUDGET: Duration = Duration::from_mins(1);
 
 /// Verify the configured `PaymentPool` deployment against the live chain:
 /// the RPC's `eth_chainId` must equal `blockchain.chain_id`, the configured
-/// address must have code, and that code must answer `PaymentPool.usdc()` —
-/// a code-presence check alone would pass a sibling contract pasted from the
-/// same deploy manifest (`CapacityBond`, `FeeRouter`, the USDC token), and that
-/// is the likeliest wrong-address typo. Runs BEFORE the lane store opens,
-/// because the store's deployment binding
+/// address must have code, and that code must answer
+/// `PaymentPool.getRateBounds()` — a code-presence check alone would pass a
+/// sibling contract pasted from the same deploy manifest (`CapacityBond`,
+/// `FeeRouter`, `BuybackBurner`, `DecdnGovernor`, the USDC token), and that is
+/// the likeliest wrong-address typo. `getRateBounds()` is the probe because
+/// only `PaymentPool` declares it: `usdc()` is also a view on `FeeRouter` and
+/// `BuybackBurner`, and `feeRouter()` is also a view on `DecdnGovernor`. The
+/// probe holds only while that stays true: no other contract in the deployment
+/// may declare a function with the `getRateBounds()` selector, and
+/// `contracts/src/PaymentPool.sol` carries the same warning on the view. The
+/// `deployment_preflight_guard` e2e boots against every contract in the deploy
+/// manifest to catch a collision, and the `payment_pool_probe_selector` e2e
+/// fails if any contract in `contracts/src` other than `PaymentPool` exposes
+/// the selector, deployed or not. Runs BEFORE the lane store opens, because
+/// the store's deployment binding
 /// ([`crate::channel_store::Deployment`]) drops the seller lane state when
 /// the stamp differs — a typo in either field must abort bring-up while the
 /// store is untouched, not destroy unredeemed lane state on a WARN. The
 /// reads retry transient RPC errors on `retry`; the mismatch verdicts are
 /// deterministic and fail at once, and a non-`PaymentPool` target surfaces
-/// from `usdc()` as a permanent contract error, not a retry spin.
+/// from `getRateBounds()` as a permanent contract error, not a retry spin.
 async fn check_deployment_preflight<P: Provider + Clone>(
     provider: P,
     deployment: crate::channel_store::Deployment,
@@ -3705,23 +3715,27 @@ async fn check_deployment_preflight<P: Provider + Clone>(
          blockchain.payment_pool_address",
         deployment.payment_pool,
     );
-    // Contract-identity probe: `usdc()` is a cheap immutable view every
-    // `PaymentPool` answers. A contract without it returns no data, which
-    // decodes as a permanent contract error and aborts at once.
+    // Contract-identity probe: `getRateBounds()` is a cheap view every
+    // `PaymentPool` answers and no sibling contract declares. A contract
+    // without it reverts (or, with no code path at all, returns no data), and
+    // either answer is a permanent contract error that aborts at once.
     let contract =
         decdn_incentive::payment_pool::PaymentPool::new(deployment.payment_pool, provider);
     retry
-        .run("deployment preflight (PaymentPool.usdc())", || async {
-            contract.usdc().call().await.with_context(|| {
-                format!(
-                    "blockchain.payment_pool_address {} does not answer PaymentPool.usdc() \
-                     on chain {rpc_chain_id}; the address hosts some other contract, and a \
-                     wrong address would rebind the lane store and drop its seller state — \
-                     fix blockchain.payment_pool_address",
-                    deployment.payment_pool,
-                )
-            })
-        })
+        .run(
+            "deployment preflight (PaymentPool.getRateBounds())",
+            || async {
+                contract.getRateBounds().call().await.with_context(|| {
+                    format!(
+                        "blockchain.payment_pool_address {} does not answer \
+                     PaymentPool.getRateBounds() on chain {rpc_chain_id}; the address hosts \
+                     some other contract, and a wrong address would rebind the lane store and \
+                     drop its seller state — fix blockchain.payment_pool_address",
+                        deployment.payment_pool,
+                    )
+                })
+            },
+        )
         .await?;
     Ok(())
 }
@@ -5212,16 +5226,28 @@ mod tests {
         /// Fault the call as a transient RPC error does, so the preflight
         /// retries it.
         TransientError,
+        /// Fault the call as a node answers an `eth_call` that reverts: JSON-RPC
+        /// error code 3, "execution reverted".
+        Revert,
     }
 
     /// A mocked provider answering the preflight's reads in order:
-    /// `eth_chainId`, `eth_getCode`, then (when reached) the `usdc()` call.
+    /// `eth_chainId`, `eth_getCode`, then (when reached) the `getRateBounds()`
+    /// call.
     fn preflight_provider(answers: Vec<MockAnswer>) -> impl Provider + Clone {
         let asserter = alloy::providers::mock::Asserter::new();
         for answer in answers {
             match answer {
                 MockAnswer::Ok(value) => asserter.push_success(&value),
                 MockAnswer::TransientError => asserter.push_failure_msg("transient rpc fault"),
+                MockAnswer::Revert => asserter.push_failure(
+                    serde_json::from_value(serde_json::json!({
+                        "code": 3,
+                        "message": "execution reverted",
+                        "data": "0x",
+                    }))
+                    .expect("a code-3 error payload must deserialize"),
+                ),
             }
         }
         ProviderBuilder::new().connect_mocked_client(asserter)
@@ -5238,11 +5264,12 @@ mod tests {
         serde_json::json!(alloy::primitives::Bytes::from(vec![0x60]))
     }
 
-    /// `usdc()` answering a token address, as every `PaymentPool` does.
-    fn usdc_answers() -> serde_json::Value {
+    /// `getRateBounds()` answering a per-MB rate floor, as every `PaymentPool`
+    /// does.
+    fn rate_bounds_answers() -> serde_json::Value {
         use alloy::sol_types::SolValue;
-        let token = alloy::primitives::Address::repeat_byte(0x0c);
-        serde_json::json!(alloy::primitives::Bytes::from(token.abi_encode()))
+        let floor = alloy::primitives::U256::from(10u64);
+        serde_json::json!(alloy::primitives::Bytes::from(floor.abi_encode()))
     }
 
     /// An empty-bytes answer: no code at the address for `eth_getCode`, or no
@@ -5258,13 +5285,14 @@ mod tests {
         )
     }
 
-    /// The healthy path: matching chain id, code present, `usdc()` answers.
+    /// The healthy path: matching chain id, code present, `getRateBounds()`
+    /// answers.
     #[tokio::test]
     async fn a_matching_deployment_passes_the_preflight() {
         let provider = preflight_provider(vec![
             MockAnswer::Ok(chain_id_ok()),
             MockAnswer::Ok(code_present()),
-            MockAnswer::Ok(usdc_answers()),
+            MockAnswer::Ok(rate_bounds_answers()),
         ]);
         check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
             .await
@@ -5314,33 +5342,43 @@ mod tests {
         );
     }
 
-    /// A contract that does not answer `usdc()` — a sibling address pasted from
-    /// the same deploy manifest — aborts as a permanent contract error rather
-    /// than passing on code presence alone. Run on the full retry budget
-    /// (`start_paused`, so any sleep is free) to pin that the no-data decode
-    /// classifies PERMANENT: the "not retried" context proves the budget was
-    /// not spun on a deterministic misconfig.
+    /// A contract that does not answer `getRateBounds()` — a sibling address
+    /// pasted from the same deploy manifest — aborts as a permanent contract
+    /// error rather than passing on code presence alone. Both shapes of "no such
+    /// view" are covered: the revert a real node answers (JSON-RPC code 3) and
+    /// the empty return data of a contract with no code path for the selector.
+    /// Run on the full retry budget (`start_paused`, so any sleep is free) to
+    /// pin that each classifies PERMANENT: the "not retried" context proves the
+    /// budget was not spun on a deterministic misconfig.
     #[tokio::test(start_paused = true)]
     async fn a_non_payment_pool_contract_aborts_the_preflight() {
-        let provider = preflight_provider(vec![
-            MockAnswer::Ok(chain_id_ok()),
-            MockAnswer::Ok(code_present()),
-            // `usdc()` returns no data: the target hosts some other contract.
-            MockAnswer::Ok(empty_bytes()),
-        ]);
-        let err =
-            check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
-                .await
-                .expect_err("a non-PaymentPool target must abort");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("does not answer PaymentPool.usdc()"),
-            "the error must say the contract identity check failed: {msg}"
-        );
-        assert!(
-            msg.contains("not retried"),
-            "a wrong contract is deterministic and must not spin the retry budget: {msg}"
-        );
+        for (shape, probe_answer) in [
+            ("revert", MockAnswer::Revert),
+            ("no data", MockAnswer::Ok(empty_bytes())),
+        ] {
+            let provider = preflight_provider(vec![
+                MockAnswer::Ok(chain_id_ok()),
+                MockAnswer::Ok(code_present()),
+                probe_answer,
+            ]);
+            let err = check_deployment_preflight(
+                provider,
+                PREFLIGHT_DEPLOYMENT,
+                &preflight_retry_budget(),
+            )
+            .await
+            .expect_err("a non-PaymentPool target must abort");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("does not answer PaymentPool.getRateBounds()"),
+                "{shape}: the error must say the contract identity check failed: {msg}"
+            );
+            assert!(
+                msg.contains("not retried"),
+                "{shape}: a wrong contract is deterministic and must not spin the retry \
+                 budget: {msg}"
+            );
+        }
     }
 
     /// A transient RPC fault is retried and the preflight then passes — a
@@ -5352,7 +5390,7 @@ mod tests {
             MockAnswer::TransientError,
             MockAnswer::Ok(chain_id_ok()),
             MockAnswer::Ok(code_present()),
-            MockAnswer::Ok(usdc_answers()),
+            MockAnswer::Ok(rate_bounds_answers()),
         ]);
         check_deployment_preflight(provider, PREFLIGHT_DEPLOYMENT, &preflight_retry_budget())
             .await

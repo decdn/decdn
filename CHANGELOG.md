@@ -915,6 +915,16 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **The deployment preflight rejects every sibling contract of the
+  `PaymentPool` (#2279).** Startup identified `blockchain.payment_pool_address`
+  by calling `usdc()`, which `FeeRouter` and `BuybackBurner` also answer. A
+  node pointed at either one passed the preflight, then dropped its seller
+  lane state and forfeited the unredeemed vouchers. The probe is now
+  `PaymentPool.getRateBounds()`, which only `PaymentPool` declares
+  (`feeRouter()` would not do: `DecdnGovernor` answers it too), so the node
+  exits before the lane store opens. The startup error now names
+  `PaymentPool.getRateBounds()`.
+
 - **A partial holder steals the covered tail of a busy leg (#2303).** A
   freed lane stole from a busy lane only when it covered the victim's whole
   range in flight. In a `decdn bundle pull` of mistral-7b, one node held
