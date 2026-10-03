@@ -203,7 +203,7 @@ jobs:
         with:
           shared-key: coverage
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-llvm-cov,cargo-nextest
       # The decdn sources (cargo's git checkout) and registry crates are
@@ -262,7 +262,7 @@ jobs:
         with:
           shared-key: anvil-e2e
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest
       # Hoisted out of the test, as decdn does: a cold contracts compile inside
@@ -328,7 +328,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
         with:
           toolchain: 1.95.0
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-deny@0.20.2
       # Findings warn; a run that checked nothing fails. See cargo_deny_warn.py.
@@ -393,7 +393,7 @@ jobs:
         with:
           shared-key: decdn-main
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest
       - name: Move to decdn main
