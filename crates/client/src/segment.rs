@@ -4,7 +4,7 @@
 //! planner's job ([`crate::coverage_plan::spread_segments`]); this module only
 //! turns one planner-assigned run into fetchable `AlignedRange`s
 //! (`split_evenly`) and picks-and-splits the missing remainder of the range in
-//! flight a freed source covers that misses the most, for it to steal
+//! flight whose covered tail misses the most, for a freed source to steal
 //! (`steal_split`). Every returned range is
 //! chunk-group aligned so it is independently bao-verifiable.
 
@@ -212,13 +212,13 @@ fn missing_within(missing: &[(u64, u64)], start: u64, end: u64) -> Vec<(u64, u64
         .collect()
 }
 
-/// Pick the remaining range this source COVERS with the most missing bytes
-/// and, if it misses at least [`MIN_SPLIT_SIZE`], return its index in
-/// `remaining` together with the aligned tail of its MISSING bytes for a freed
-/// source to steal. Returns `None` when nothing remaining (among the ranges
-/// `covers` accepts) is worth a fresh stream, including when `covers` accepts
-/// nothing at all (the freed source parks rather than stealing a range it
-/// cannot serve, #1506).
+/// Among the remaining ranges that miss at least [`MIN_SPLIT_SIZE`] and whose
+/// covered suffix misses at least [`MIN_STOLEN`], pick the one whose covered
+/// suffix misses the most, and return its index in `remaining` together with
+/// the aligned tail of its MISSING bytes for a freed source to steal. Returns
+/// `None` when no remaining range qualifies, including when the source covers
+/// the last block of no remaining range (the freed source parks rather than
+/// stealing bytes it cannot serve, #1506).
 ///
 /// `remaining` holds the ranges in flight as picked, and `missing` the byte
 /// runs of the blob the store still misses, ascending and disjoint. A range in
@@ -228,21 +228,24 @@ fn missing_within(missing: &[(u64, u64)], start: u64, end: u64) -> Vec<(u64, u64
 ///
 /// The split weighs the remainder by the two sources' observed rates, the
 /// freed source's `stealer_rate` and `victim_rate(index)`: the victim keeps
-/// `r_v / (r_s + r_v)` of the missing bytes, so at steady rates one steal
-/// leaves both sources finishing together. When either side has no non-zero
-/// rate, the victim keeps half. A steal whose share by rate is below
-/// [`MIN_STOLEN`] is declined. The victim keeps at least [`MIN_VICTIM_KEEP`].
+/// `r_v / (r_s + r_v)` of the missing bytes of the whole range, so at steady
+/// rates one steal leaves both sources finishing together. When either side
+/// has no non-zero rate, the victim keeps half. A steal whose share by rate is
+/// below [`MIN_STOLEN`] is declined. The victim keeps at least
+/// [`MIN_VICTIM_KEEP`].
 /// The split point is the offset with the
 /// kept bytes before it, rounded down to a chunk group. The returned tail
 /// runs from there to the range's end. A split that would leave the victim no
 /// missing byte declines the steal: that steal takes the victim's whole
 /// remaining work.
 ///
-/// `covers(start, len)` is the freed source's coverage predicate: a candidate
-/// range is a steal target only when it returns `true` for it. Filtering
-/// happens BEFORE the argmax, so a source with narrow coverage never steals a
-/// huge range it cannot fully deliver just because it happens to be the
-/// biggest one in flight.
+/// `covered_from(start, len)` gives the start of the longest suffix of a
+/// remaining range that the freed source covers, or `None` when it does not
+/// cover the range's last byte (#2303). A victim streams front to back, so a
+/// steal only ever takes a suffix: a split before that start moves to it, and
+/// the victim keeps every byte before it, even past its share by rate. The
+/// argmax counts only the missing bytes in that suffix, so a source with
+/// narrow coverage never picks a huge range for bytes it cannot deliver.
 ///
 /// The INDEX is returned, not just the tail, so the caller trims the range this
 /// function actually split. Re-deriving the argmax at the call site couples two
@@ -264,28 +267,31 @@ pub(crate) fn steal_split(
     remaining: &[(u64, u64)],
     missing: &[(u64, u64)],
     total_bytes: u64,
-    covers: impl Fn(u64, u64) -> bool,
+    covered_from: impl Fn(u64, u64) -> Option<u64>,
     stealer_rate: Option<u64>,
     victim_rate: impl Fn(usize) -> Option<u64>,
 ) -> anyhow::Result<Option<(usize, AlignedRange)>> {
-    let missing_of = |start: u64, len: u64| {
-        missing_within(missing, start, start.saturating_add(len))
+    let missing_of = |start: u64, end: u64| {
+        missing_within(missing, start, end)
             .iter()
             .map(|&(s, e)| e - s)
             .fold(0, u64::saturating_add)
     };
-    let Some((victim, &(start, len), left)) = remaining
+    let Some((victim, &(start, len), from)) = remaining
         .iter()
         .enumerate()
-        .filter(|&(_, &(s, l))| covers(s, l))
-        .map(|(i, r)| (i, r, missing_of(r.0, r.1)))
-        .max_by_key(|&(_, _, left)| left)
+        .filter_map(|(i, r @ &(s, l))| {
+            let from = covered_from(s, l)?;
+            let end = s.saturating_add(l);
+            let stealable = missing_of(from, end);
+            (missing_of(s, end) >= MIN_SPLIT_SIZE && stealable >= MIN_STOLEN)
+                .then_some((i, r, from, stealable))
+        })
+        .max_by_key(|&(_, _, _, stealable)| stealable)
+        .map(|(i, r, from, _)| (i, r, from))
     else {
         return Ok(None);
     };
-    if left < MIN_SPLIT_SIZE {
-        return Ok(None);
-    }
     let Some((canon_start, canon_end)) = canonicalize_ranges(&[(start, len)], total_bytes)?
         .first()
         .copied()
@@ -324,6 +330,12 @@ pub(crate) fn steal_split(
     let Some(split) = split else {
         return Ok(None);
     };
+    // The freed source covers only `[from, end)`: move the split up to
+    // `from`, so the victim keeps every byte before it.
+    let split = split.max(from);
+    if split >= canon_end {
+        return Ok(None);
+    }
     // Align the candidate tail against the CANONICAL end, so the ceiling-up
     // align_range performs internally cannot carry it past the range's own
     // true end into a neighboring segment's territory.
@@ -357,7 +369,7 @@ mod tests {
             &[(0, 64 * MIB)],
             &[(40 * MIB, 24 * MIB)],
             128 * MIB,
-            |_, _| true,
+            |s, _| Some(s),
             None,
             |_| None,
         )?
@@ -375,7 +387,7 @@ mod tests {
             &[(0, 64 * MIB), (64 * MIB, 32 * MIB)],
             &[(60 * MIB, 36 * MIB)],
             96 * MIB,
-            |_, _| true,
+            |s, _| Some(s),
             None,
             |_| None,
         )?
@@ -393,7 +405,7 @@ mod tests {
                 &[(0, 64 * MIB)],
                 &[(60 * MIB, 4 * MIB)],
                 64 * MIB,
-                |_, _| true,
+                |s, _| Some(s),
                 None,
                 |_| None
             )?
@@ -410,7 +422,7 @@ mod tests {
             &[(0, 64 * MIB)],
             &[(0, 8 * MIB), (32 * MIB, 16 * MIB)],
             64 * MIB,
-            |_, _| true,
+            |s, _| Some(s),
             None,
             |_| None,
         )?
@@ -428,7 +440,7 @@ mod tests {
             &[(0, 64 * MIB)],
             &[(24 * MIB, 40 * MIB)],
             64 * MIB,
-            |_, _| true,
+            |s, _| Some(s),
             Some(3 * MIB),
             |_| Some(MIB),
         )?
@@ -445,7 +457,7 @@ mod tests {
                 &[(0, 64 * MIB)],
                 &[(24 * MIB, 40 * MIB)],
                 64 * MIB,
-                |_, _| true,
+                |s, _| Some(s),
                 stealer,
                 |_| victim,
             )?
@@ -463,7 +475,7 @@ mod tests {
                 &[(0, 64 * MIB)],
                 &[(0, 32 * MIB)],
                 64 * MIB,
-                |_, _| true,
+                |s, _| Some(s),
                 Some(stealer),
                 |_| Some(victim),
             )
@@ -475,6 +487,74 @@ mod tests {
         // A victim far faster than the stealer would finish the stealer's
         // share sooner than a fresh stream: no steal.
         assert!(steal(1, 1_000_000)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn steal_split_takes_the_covered_tail_of_a_partly_covered_range() -> anyhow::Result<()> {
+        // #2303: the victim holds [0, 44 MiB) and the stealer covers only
+        // [30, 44 MiB). The even split (22 MiB) lies before the covered
+        // suffix, so the stealer takes the whole suffix and the victim keeps
+        // [0, 30 MiB).
+        let (victim, stolen) = super::steal_split(
+            &[(0, 44 * MIB)],
+            ALL,
+            64 * MIB,
+            |_, _| Some(30 * MIB),
+            None,
+            |_| None,
+        )?
+        .expect("14 MiB of covered tail clears MIN_STOLEN");
+        assert_eq!(victim, 0);
+        assert_eq!(stolen.fetch_start(), 30 * MIB);
+        assert_eq!(stolen.fetch_end(), 44 * MIB);
+        Ok(())
+    }
+
+    #[test]
+    fn steal_split_splits_by_rate_inside_the_covered_tail() -> anyhow::Result<()> {
+        // The covered suffix starts at 18 MiB, before the even split at
+        // 22 MiB: the split by rate stands.
+        let (_, stolen) = super::steal_split(
+            &[(0, 44 * MIB)],
+            ALL,
+            64 * MIB,
+            |_, _| Some(18 * MIB),
+            None,
+            |_| None,
+        )?
+        .expect("44 MiB missing clears the floor");
+        assert_eq!(stolen.fetch_start(), 22 * MIB);
+        assert_eq!(stolen.fetch_end(), 44 * MIB);
+        Ok(())
+    }
+
+    #[test]
+    fn steal_split_declines_when_the_covered_tail_is_below_min_stolen() -> anyhow::Result<()> {
+        // Only [40, 44 MiB) is covered: 4 MiB is too small for a fresh stream.
+        assert!(
+            super::steal_split(
+                &[(0, 44 * MIB)],
+                ALL,
+                64 * MIB,
+                |_, _| Some(40 * MIB),
+                None,
+                |_| None,
+            )?
+            .is_none()
+        );
+        // A larger range whose covered tail is too small does not qualify, so
+        // a smaller range the stealer covers in full is the victim.
+        let (victim, _) = super::steal_split(
+            &[(0, 44 * MIB), (44 * MIB, 20 * MIB)],
+            ALL,
+            64 * MIB,
+            |s, _| Some(if s == 0 { 40 * MIB } else { s }),
+            None,
+            |_| None,
+        )?
+        .expect("the 20 MiB range is covered in full");
+        assert_eq!(victim, 1);
         Ok(())
     }
 
@@ -536,6 +616,25 @@ mod tests {
     }
 
     #[test]
+    fn steal_split_ranks_by_the_covered_tail_not_the_whole_range() -> anyhow::Result<()> {
+        // The 44 MiB range misses more in all (44 MiB), but only 14 MiB of
+        // it lies in the stealer's covered suffix; the 20 MiB range is
+        // covered in full, so it has more to steal.
+        let (victim, stolen) = super::steal_split(
+            &[(0, 44 * MIB), (44 * MIB, 20 * MIB)],
+            ALL,
+            64 * MIB,
+            |s, _| Some(if s == 0 { 30 * MIB } else { s }),
+            None,
+            |_| None,
+        )?
+        .expect("both ranges qualify");
+        assert_eq!(victim, 1);
+        assert_eq!(stolen.fetch_start(), 54 * MIB);
+        Ok(())
+    }
+
+    #[test]
     fn steal_split_takes_second_half_of_largest_above_floor() -> anyhow::Result<()> {
         let total = 100 * 1024 * 1024;
         // Largest remaining is 40 MiB at offset 10 MiB; steal its aligned second half.
@@ -543,7 +642,7 @@ mod tests {
             &[(0, 4 * 1024 * 1024), (10 * 1024 * 1024, 40 * 1024 * 1024)],
             ALL,
             total,
-            |_, _| true,
+            |s, _| Some(s),
             None,
             |_| None,
         )?
@@ -567,7 +666,7 @@ mod tests {
                 &[(0, 8 * 1024 * 1024)],
                 ALL,
                 total,
-                |_, _| true,
+                |s, _| Some(s),
                 None,
                 |_| None
             )?
@@ -592,7 +691,7 @@ mod tests {
             ],
             ALL,
             total,
-            |s, _| s != accepted_start,
+            |s, _| (s != accepted_start).then_some(s),
             None,
             |_| None,
         )?
@@ -616,7 +715,7 @@ mod tests {
                 &[(0, 40 * 1024 * 1024)],
                 ALL,
                 total,
-                |_, _| false,
+                |_, _| None,
                 None,
                 |_| None
             )?
@@ -632,7 +731,7 @@ mod tests {
         // true end of the range (not the blob) is what must bound the steal.
         let range = (0, 20 * 1024 * 1024 + 3 * 1024);
         let total = 64 * 1024 * 1024;
-        let (_, stolen) = super::steal_split(&[range], ALL, total, |_, _| true, None, |_| None)?
+        let (_, stolen) = super::steal_split(&[range], ALL, total, |s, _| Some(s), None, |_| None)?
             .expect("above floor");
         let enclosing_group_end = (range.0 + range.1).div_ceil(16 * 1024) * (16 * 1024);
         assert!(stolen.fetch_end() <= enclosing_group_end.min(total));
@@ -646,7 +745,7 @@ mod tests {
             &[(total, 16 * 1024 * 1024)],
             ALL,
             total,
-            |_, _| true,
+            |s, _| Some(s),
             None,
             |_| None,
         );
@@ -663,7 +762,7 @@ mod tests {
             &[(total - 1024, 16 * 1024 * 1024)],
             ALL,
             total,
-            |_, _| true,
+            |s, _| Some(s),
             None,
             |_| None,
         );

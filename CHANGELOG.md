@@ -915,6 +915,19 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **A partial holder steals the covered tail of a busy leg (#2303).** A
+  freed lane stole from a busy lane only when it covered the victim's whole
+  range in flight. In a `decdn bundle pull` of mistral-7b, one node held
+  blocks 0–43 of a shard as one 2.95 GB leg. A lane that covered blocks
+  18–45 went idle in seconds, and the leg ran alone for 8 min on one
+  stream. A freed lane now steals inside the longest suffix of a range in
+  flight whose blocks it covers: a split before that suffix moves to its
+  start, and the victim keeps every byte before it. A lane whose blocks stop
+  short of a range's last block still cannot steal from that range. A
+  holder counts as having work, and starts, only when it would steal now:
+  a late partial holder starts and steals, and a holder whose only option
+  is a tail below the steal floors no longer takes a lane slot to park.
+
 - **A queue that one lane drains takes an extra stream (#2252).** In
   `decdn bundle pull`, a lane's own worker takes queued ranges one after
   another and does not end between them, so no stream end asked for growth.
