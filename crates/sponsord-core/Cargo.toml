@@ -1,5 +1,6 @@
 [package]
 name = "sponsord-core"
+description = "The sponsord daemon's logic as a library: capability signing and pool top-ups"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

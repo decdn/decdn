@@ -1,5 +1,6 @@
 [package]
 name = "decdn-sponsored"
+description = "Download from deCDN on a sponsor's dime: no wallet, one browser check per download"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

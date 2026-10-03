@@ -1,0 +1,68 @@
+# The daemon and the onramp on one host. From the repository root:
+#
+#   cp deploy/sponsord.env.example deploy/sponsord.env                # edit
+#   cp deploy/sponsord-onramp.env.example deploy/sponsord-onramp.env  # edit
+#   umask 077   # so the secrets below are created private (0600)
+#   mkdir -p deploy/secrets && openssl rand -hex 32 > deploy/secrets/api-token
+#   # deploy/secrets/treasury-password, deploy/secrets/turnstile-secret,
+#   # deploy/secrets/treasury-keystore.json: see docs/operator.md
+#   chmod 700 deploy/secrets && chmod 600 deploy/secrets/*
+#   sudo chown -R 10001 deploy/secrets   # the images run as uid 10001; the
+#   # daemon also refuses a keystore that anyone but its owner can read
+#   docker compose -f deploy/compose.yaml up -d
+#
+# Only the onramp is published. Put a TLS reverse proxy in front of it and
+# set ONRAMP_PUBLIC_URL to the address users reach.
+
+services:
+  sponsord:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        BIN: sponsord
+    env_file: sponsord.env
+    environment:
+      # Inside the compose network only; not published.
+      SPONSORD_BIND: 0.0.0.0:8090
+      SPONSORD_API_TOKEN_FILE: /run/secrets/api-token
+      SPONSORD_TREASURY_PASSWORD_FILE: /run/secrets/treasury-password
+      SPONSORD_TREASURY_KEYSTORE: /run/secrets/treasury-keystore.json
+    secrets:
+      - api-token
+      - treasury-password
+      - treasury-keystore.json
+    restart: unless-stopped
+
+  sponsord-onramp:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        BIN: sponsord-onramp
+    env_file: sponsord-onramp.env
+    environment:
+      ONRAMP_BIND: 0.0.0.0:8080
+      ONRAMP_DAEMON_URL: http://sponsord:8090
+      # The daemon's own token file.
+      ONRAMP_DAEMON_TOKEN_FILE: /run/secrets/api-token
+      ONRAMP_TURNSTILE_SECRET_FILE: /run/secrets/turnstile-secret
+    secrets:
+      - api-token
+      - turnstile-secret
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      - sponsord
+    # The onramp exits at startup while the daemon is unreachable.
+    restart: unless-stopped
+
+secrets:
+  api-token:
+    file: secrets/api-token
+  treasury-password:
+    file: secrets/treasury-password
+  treasury-keystore.json:
+    file: secrets/treasury-keystore.json
+  turnstile-secret:
+    file: secrets/turnstile-secret

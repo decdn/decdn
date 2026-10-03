@@ -32,6 +32,10 @@ All notable changes to this project are documented here. The format follows
   top-up, top-ups, failures). Graceful shutdown on SIGTERM lets a top-up in
   flight finish.
 - `sponsord-e2e`: tests that run the daemon, onramp and CLI together.
+- `deploy/`: a Dockerfile for both servers, a compose file, systemd units
+  with secrets as credentials, and env examples.
+- `docs/`: architecture, operator, integrator, security and CLI guides;
+  `RELEASING.md`.
 - `sponsord-core`: `Sponsor::keeper_status()`, what the pool keeper has seen
   and done.
 

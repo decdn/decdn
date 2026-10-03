@@ -1,0 +1,30 @@
+# sponsord as a systemd service. Secrets come in as credentials, readable
+# only by this service, never as environment variables:
+#
+#   install -m 0600 api-token treasury-password treasury-keystore.json /etc/sponsord/
+#   install -m 0644 sponsord.env /etc/sponsord/sponsord.env   # no secrets in it
+#   systemctl enable --now sponsord
+[Unit]
+Description=sponsord: capability signing and pool top-ups
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/sponsord
+EnvironmentFile=/etc/sponsord/sponsord.env
+LoadCredential=api-token:/etc/sponsord/api-token
+LoadCredential=treasury-password:/etc/sponsord/treasury-password
+LoadCredential=treasury-keystore.json:/etc/sponsord/treasury-keystore.json
+Environment=SPONSORD_API_TOKEN_FILE=%d/api-token
+Environment=SPONSORD_TREASURY_PASSWORD_FILE=%d/treasury-password
+Environment=SPONSORD_TREASURY_KEYSTORE=%d/treasury-keystore.json
+DynamicUser=yes
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

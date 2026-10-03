@@ -1,5 +1,6 @@
 [package]
 name = "sponsord-onramp"
+description = "The public onramp in front of sponsord: a pluggable gate, the installers, and the CLI hand-off"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

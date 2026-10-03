@@ -166,7 +166,7 @@ async fn failure_keeps_state_and_rerun_reuses_capability() {
     assert!(err.to_string().contains("Re-run the same command"));
     let key_before = std::fs::read(state_dir(&data).join("keystore.json")).unwrap();
 
-    // The mock allows exactly one GET /capability, so this run must reuse
+    // The mock allows exactly one GET /v1/capability, so this run must reuse
     // the saved capability and key rather than asking the onramp again.
     let ok = config(&onramp.uri(), &stub_decdn(tmp.path(), 0), &data);
     pull::pull(HASH, &tmp.path().join("out"), None, &ok)

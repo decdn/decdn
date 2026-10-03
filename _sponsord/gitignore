@@ -4,3 +4,5 @@
 .env
 # Local overrides, e.g. building against a deCDN checkout (CONTRIBUTING.md)
 /.cargo/config.toml
+# deploy/compose.yaml secrets
+/deploy/secrets/

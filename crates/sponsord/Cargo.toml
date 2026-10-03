@@ -1,5 +1,6 @@
 [package]
 name = "sponsord"
+description = "The sponsord daemon: signs capped, expiring deCDN capabilities against a sponsor's PaymentPool and keeps it funded"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
