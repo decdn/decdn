@@ -6,3 +6,7 @@
 /.cargo/config.toml
 # deploy/compose.yaml secrets
 /deploy/secrets/
+# Release binaries staged for a local `docker build` (see Dockerfile)
+/dist/
+__pycache__/
+.pytest_cache/

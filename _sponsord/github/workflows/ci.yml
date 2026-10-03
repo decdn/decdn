@@ -1,9 +1,35 @@
 name: CI
 
+# Structure mirrors decdn's ci.yml: path-gated jobs behind a `changes` job, and
+# a single `CI success` gate (re-actors/alls-green) as the one required check.
+#
+# Third-party actions are pinned to full commit SHAs (version in the trailing
+# comment; Dependabot bumps both), as in release.yml and security.yml.
+#
+# The decdn crates are git dependencies on github.com/decdn/decdn, so a plain
+# checkout builds: cargo fetches decdn itself.
+#
+# The gating jobs build against the decdn commit Cargo.lock pins — the same
+# decdn a release builds, and the one the `decdn-*` version requirements are
+# consistent with. Building them against decdn main would turn every sponsord
+# PR red the moment decdn changes a dependency or bumps its version.
+# `decdn-main` keeps the early warning: it moves the lock to decdn main, builds
+# and tests, and may fail without blocking a merge.
+#
+# The decdn commit is never a run input, only the committed lock (or `main` for
+# the canary). An input would let a manual run on main execute an arbitrary
+# ref in jobs that write the cache main builds restore (CodeQL's
+# cache-poisoning finding); to build against another decdn, open a PR that
+# moves the lock (`cargo update -p decdn-incentive`).
+
 on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
+    # No `edited`: a PR-body edit would restart the whole matrix. The cost is
+    # that a title-only edit is not re-linted by `pr-title` until the next push.
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
@@ -15,55 +41,494 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
-# The deCDN crates are git dependencies pinned by `Cargo.lock`, so a plain
-# checkout builds.
 jobs:
-  linux:
-    name: linux (workspace)
+  changes:
+    name: detect changes
     runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      docker: ${{ steps.filter.outputs.docker }}
+      markdown: ${{ steps.filter.outputs.markdown }}
+      scripts: ${{ steps.filter.outputs.scripts }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95
+      - uses: actions/checkout@v7
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+          persist-credentials: false
+      # `token: ''` makes paths-filter diff with git instead of the PR files
+      # API, which goes down during GitHub incidents.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          token: ''
+          filters: |
+            rust:
+              - 'crates/**'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'rustfmt.toml'
+              - 'deny.toml'
+              - '.config/**'
+              - '.github/scripts/cargo_deny_warn.py'
+              - '.github/scripts/cargo-deny-warn.sh'
+              - '.github/workflows/ci.yml'
+            docker:
+              - 'Dockerfile'
+              - '.dockerignore'
+              - '.github/workflows/ci.yml'
+            markdown:
+              - '**/*.md'
+              - '.markdownlint.yaml'
+              - '.github/workflows/ci.yml'
+            scripts:
+              - '.github/scripts/**'
+              - '.github/workflows/ci.yml'
 
-  # `decdn-sponsored` is the end-user CLI, installed by `decdn.sh` on macOS and
-  # Linux and by `decdn.ps1` on Windows x64 and ARM64. The servers (`sponsord`,
-  # `sponsord-onramp`) run only on Linux, so these legs cover the client crate
-  # alone.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        with:
+          toolchain: 1.95.0
+          components: clippy
+      # One cache partition per job, and only main writes: the 10 GiB cache
+      # store saturates if every PR saves its own.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # `anvil-e2e` and `test-support` only gate test code; compiling them
+      # needs no anvil or forge.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  doc:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: doc
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo doc --workspace --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  # Separate from `test`: `cargo llvm-cov nextest` does not run doctests.
+  doctest:
+    name: doctest
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: doctest
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --doc --workspace
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      code-quality: write
+    # Job-level, not step-level, so rust-cache folds them into its cache key;
+    # step-level flags made every run rebuild from scratch in decdn.
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold -C debuginfo=line-tables-only -C split-debuginfo=unpacked"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # decdn-e2e (a dev-dependency) pulls in most of decdn, and an
+      # instrumented build of all of it does not fit the runner's free disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /opt/hostedtoolcache/CodeQL \
+                      /usr/local/lib/android \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/.ghcup
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        with:
+          toolchain: 1.95.0
+          components: llvm-tools-preview
+      - uses: rui314/setup-mold@10ca16bf91dc22e05ebdc935cad9c75ea248f621 # v1
+        with:
+          make-default: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: coverage
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+      # The decdn sources (cargo's git checkout) and registry crates are
+      # compiled into the same binaries; keep them out of sponsord's report.
+      - name: Run tests (with coverage instrumentation)
+        run: >
+          cargo llvm-cov nextest --workspace --no-tests=pass
+          --ignore-filename-regex '\.cargo/(git|registry)/'
+          --cobertura --output-path cobertura.xml
+      - name: Report disk usage
+        if: always()
+        run: df -h /
+      - name: Upload code coverage
+        if: hashFiles('cobertura.xml') != ''
+        continue-on-error: true
+        uses: actions/upload-code-coverage@v1
+        with:
+          file: cobertura.xml
+          language: Rust
+          label: code-coverage/cargo-llvm-cov
+          fail-on-error: false
+
+  anvil-e2e:
+    name: anvil e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold -C debuginfo=line-tables-only -C split-debuginfo=unpacked"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /opt/hostedtoolcache/CodeQL \
+                      /usr/local/lib/android \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/.ghcup
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        with:
+          toolchain: 1.95.0
+      - uses: rui314/setup-mold@10ca16bf91dc22e05ebdc935cad9c75ea248f621 # v1
+        with:
+          make-default: false
+      # The Foundry version decdn's own CI pins (.github/actions/foundry-setup).
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.7.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: anvil-e2e
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-nextest
+      # Hoisted out of the test, as decdn does: a cold contracts compile inside
+      # the fixture eats the deploy timeout. The contracts sit in cargo's git
+      # checkout of decdn (with their submodules), beside decdn-e2e.
+      - name: Build contracts once
+        run: |
+          set -euo pipefail
+          e2e=$(cargo metadata --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "decdn-e2e") | .manifest_path')
+          cd "$(dirname "$e2e")/../../contracts"
+          forge build
+      - name: Run the pool client and the daemon binary against anvil
+        run: >
+          cargo nextest run --features sponsord-core/anvil-e2e,sponsord/anvil-e2e
+          -p sponsord-core -p sponsord --test chain_pool --test binary_anvil
+
+  # decdn-sponsored is the end-user CLI (decdn.sh on macOS/Linux, decdn.ps1 on
+  # Windows x64 and ARM64). The servers run only on Linux, so these legs cover
+  # the client crate alone; the Linux client is covered by `test`.
   client:
     name: client (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-latest
-            target: aarch64-apple-darwin
-            test: true
-          - runner: windows-latest
-            target: x86_64-pc-windows-msvc
-            test: true
+          - { runner: macos-latest, target: aarch64-apple-darwin, test: true }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc, test: true }
           # Cross-compiled on the x64 runner, so it is linted, not run.
-          - runner: windows-latest
-            target: aarch64-pc-windows-msvc
-            test: false
+          - { runner: windows-latest, target: aarch64-pc-windows-msvc, test: false }
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95
+      - uses: actions/checkout@v7
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        with:
+          toolchain: 1.95.0
           components: clippy
-      # From inside the checkout, so the target lands on the toolchain that
-      # `rust-toolchain.toml` pins rather than on the action's own.
-      - run: rustup target add ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: ${{ matrix.target }}
+          shared-key: client-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy -p decdn-sponsored --all-targets --target ${{ matrix.target }} -- -D warnings
       - if: matrix.test
         run: cargo test -p decdn-sponsored --target ${{ matrix.target }}
+      - name: Smoke-run decdn-sponsored
+        if: matrix.test
+        run: cargo run -q -p decdn-sponsored --target ${{ matrix.target }} -- --version
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        with:
+          toolchain: 1.95.0
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-deny@0.20.2
+      # Findings warn; a run that checked nothing fails. See cargo_deny_warn.py.
+      - run: .github/scripts/cargo-deny-warn.sh
+
+  # Static checks that keep the release and publish steps from failing late.
+  # There is no `cargo package` here: packaging resolves the decdn crates from
+  # crates.io, where they are not published yet. publish-crates.sh runs the
+  # full `cargo publish --dry-run` at release time.
+  packaging:
+    name: packaging
+    runs-on: ubuntu-latest
+    needs: changes
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Crate embeds stay inside their package
+        run: .github/scripts/check-package-embeds.sh
+      - name: Image names agree across workflows and the signing script
+        run: .github/scripts/check-image-name.sh
+      - name: Rust version agrees across toolchain, manifest and workflows
+        run: .github/scripts/check-toolchain-pin.sh
+      - name: Every member carries its own version and inherits the lints
+        run: .github/scripts/check-workspace-manifests.sh
+      - name: decdn version requirements match the locked decdn
+        run: .github/scripts/check-decdn-pin.sh
+      - uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        with:
+          toolchain: 1.95.0
+      - name: Cargo.lock is consistent with the manifests
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+  # Early warning, not a gate: the next decdn sponsord will move its lock to.
+  # Cargo checks each `decdn-*` version requirement against the git crate, so
+  # the requirements are first rewritten to decdn main's workspace version,
+  # then the lock moves to decdn main's head. A failure here means the next
+  # bump needs work; ci-success lets it fail.
+  decdn-main:
+    name: decdn main canary
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /opt/hostedtoolcache/CodeQL \
+                      /usr/local/lib/android \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/.ghcup
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        with:
+          toolchain: 1.95.0
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: decdn-main
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-nextest
+      - name: Move to decdn main
+        run: |
+          set -euo pipefail
+          version=$(curl -fsSL https://raw.githubusercontent.com/decdn/decdn/main/Cargo.toml \
+            | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])')
+          sed -i -E "/^decdn-[a-z-]+ = \{ git = /s/version = \"[^\"]+\"/version = \"${version}\"/" Cargo.toml
+          grep -E '^decdn-' Cargo.toml
+          cargo update -p decdn-client -p decdn-incentive -p decdn-e2e
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo nextest run --workspace --no-tests=pass
+
+  docker-build:
+    name: docker build
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docker == 'true' || github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [sponsord, sponsord-onramp]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Lint Dockerfile
+        run: docker buildx build --check --target "$IMAGE" .
+        env:
+          IMAGE: ${{ matrix.image }}
+      # The real images copy release binaries; a placeholder proves the COPY
+      # path, the entrypoint and the runtime user without a release build.
+      - name: Build (single platform, placeholder binary)
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/amd64
+          printf '#!/bin/sh\necho "%s placeholder"\n' "$IMAGE" > "dist/amd64/$IMAGE"
+          chmod +x "dist/amd64/$IMAGE"
+          docker build --platform linux/amd64 --target "$IMAGE" -t "$IMAGE:ci" .
+      - name: Check the entrypoint resolves
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          out=$(docker run --rm "$IMAGE:ci")
+          [ "$out" = "$IMAGE placeholder" ] || {
+            echo "::error::entrypoint did not run the copied binary (got: $out)"; exit 1; }
+      # The onramp keeps nothing on disk; an image that declares a volume
+      # would make operators provision one for nothing.
+      - name: Check the image declares no volume
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          volumes=$(docker image inspect --format '{{json .Config.Volumes}}' "$IMAGE:ci")
+          [ "$volumes" = "null" ] || {
+            echo "::error::$IMAGE declares volumes: $volumes"; exit 1; }
+
+  markdownlint:
+    name: markdownlint
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.markdown == 'true' || github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24.2.0
+        with:
+          globs: |
+            **/*.md
+          config: .markdownlint.yaml
+
+  ci-tooling-tests:
+    name: CI tooling tests
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.scripts == 'true' || github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Test CI tooling
+        run: |
+          python3 -m pip install 'pytest==8.*'
+          python3 -m pytest .github/scripts/tests -q
+
+  pr-title:
+    name: PR title
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      pull-requests: read
+    steps:
+      # Squash merges take the PR title as the commit subject, and git-cliff
+      # builds the release notes from those subjects.
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            chore
+            refactor
+            perf
+            test
+            build
+            ci
+            revert
+          requireScope: false
+          subjectPattern: ^(?![A-Z]).+$
+          subjectPatternError: |
+            The subject "{subject}" found in the pull request title "{title}"
+            didn't match the configured pattern. Please ensure that the subject
+            doesn't start with an uppercase character.
+
+  # The one required status check. `changes` and `packaging` are deliberately
+  # absent from allowed-skips, so a skip of either fails the gate.
+  ci-success:
+    name: CI success
+    if: always()
+    runs-on: ubuntu-latest
+    needs: [changes, fmt, clippy, doc, doctest, test, anvil-e2e, client, deny, packaging,
+            decdn-main, docker-build, markdownlint, ci-tooling-tests, pr-title]
+    steps:
+      - uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
+        with:
+          jobs: ${{ toJSON(needs) }}
+          allowed-failures: decdn-main
+          allowed-skips: fmt, clippy, doc, doctest, test, anvil-e2e, client, deny, decdn-main,
+                         docker-build, markdownlint, ci-tooling-tests, pr-title

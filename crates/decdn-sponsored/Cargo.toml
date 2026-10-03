@@ -1,12 +1,15 @@
 [package]
 name = "decdn-sponsored"
-description = "Download from deCDN on a sponsor's dime: no wallet, one browser check per download"
-version.workspace = true
+description = "Sponsored decdn CLI: gets a capability through a sponsord onramp for each download and hands the pull to decdn"
+readme = "README.md"
+version = "0.1.0"
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
-publish = false
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "decdn-sponsored"

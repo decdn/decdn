@@ -1,10 +1,10 @@
 [package]
 name = "sponsord-e2e"
 description = "Tests that run the sponsord daemon, onramp and CLI together"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 publish = false
 
@@ -12,11 +12,11 @@ publish = false
 workspace = true
 
 [dev-dependencies]
-decdn-sponsored = { path = "../decdn-sponsored" }
+decdn-sponsored.workspace = true
 sponsord.workspace = true
 sponsord-api = { workspace = true, features = ["client"] }
 sponsord-core = { workspace = true, features = ["test-support"] }
-sponsord-onramp = { path = "../sponsord-onramp", features = ["test-support"] }
+sponsord-onramp = { workspace = true, features = ["test-support"] }
 alloy.workspace = true
 axum = "0.8"
 decdn-incentive.workspace = true

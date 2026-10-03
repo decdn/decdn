@@ -16,7 +16,10 @@ pub struct Installers {
 }
 
 impl Installers {
-    /// Render both templates from `cfg`. Every substituted value was checked
+    /// Render both templates from `cfg`. Each release's version is passed
+    /// alongside its tag rather than cut out of it by the scripts, because the
+    /// two repositories tag differently (`v0.1.0`, `decdn-sponsored-v0.1.0`).
+    /// Every substituted value was checked
     /// at startup to hold nothing a quoted shell or PowerShell string could
     /// misread (`config::script_safe_url`, `ReleasePin::new`).
     #[must_use]
@@ -26,8 +29,10 @@ impl Installers {
                 .replace("{{ONRAMP_URL}}", &cfg.public_url)
                 .replace("{{RELEASES_BASE}}", &cfg.releases_base)
                 .replace("{{DECDN_RELEASE}}", &cfg.decdn_release.tag)
+                .replace("{{DECDN_VERSION}}", &cfg.decdn_release.version)
                 .replace("{{DECDN_SUMS_SHA256}}", &cfg.decdn_release.sums_sha256)
                 .replace("{{CLI_RELEASE}}", &cfg.cli_release.tag)
+                .replace("{{CLI_VERSION}}", &cfg.cli_release.version)
                 .replace("{{CLI_SUMS_SHA256}}", &cfg.cli_release.sums_sha256)
         };
         Self {

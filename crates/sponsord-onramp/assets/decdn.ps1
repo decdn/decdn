@@ -28,8 +28,10 @@
     # tag and by the SHA-256 of its SHA256SUMS file.
     $Releases = '{{RELEASES_BASE}}'
     $DecdnRelease = '{{DECDN_RELEASE}}'
+    $DecdnVersion = '{{DECDN_VERSION}}'
     $DecdnSumsSha256 = '{{DECDN_SUMS_SHA256}}'
     $CliRelease = '{{CLI_RELEASE}}'
+    $CliVersion = '{{CLI_VERSION}}'
     $CliSumsSha256 = '{{CLI_SUMS_SHA256}}'
 
     $BinDir = Join-Path $env:LOCALAPPDATA 'decdn\bin'
@@ -55,9 +57,9 @@
     # downloads the archive for this platform and checks it against
     # SHA256SUMS. Nothing lands in BinDir unless both checks pass.
     $FetchBin = {
-      param($Repo, $Bin, $Tag, $SumsSha256)
+      param($Repo, $Bin, $Tag, $Version, $SumsSha256)
       $Base = "$Releases/$Repo/releases/download/$Tag"
-      $Archive = "$Bin-$($Tag.Substring(1))-$Target.zip"
+      $Archive = "$Bin-$Version-$Target.zip"
       $Dir = Join-Path $Work $Bin
       New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 
@@ -89,8 +91,8 @@
     $Work = Join-Path ([IO.Path]::GetTempPath()) ("decdn-" + [Guid]::NewGuid())
     New-Item -ItemType Directory -Force -Path $Work | Out-Null
     try {
-      & $FetchBin 'decdn' 'decdn' $DecdnRelease $DecdnSumsSha256
-      & $FetchBin 'sponsord' 'decdn-sponsored' $CliRelease $CliSumsSha256
+      & $FetchBin 'decdn' 'decdn' $DecdnRelease $DecdnVersion $DecdnSumsSha256
+      & $FetchBin 'sponsord' 'decdn-sponsored' $CliRelease $CliVersion $CliSumsSha256
     } finally {
       Remove-Item -Recurse -Force -Path $Work -ErrorAction SilentlyContinue
     }

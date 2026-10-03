@@ -1,0 +1,100 @@
+# Mirrors decdn's hooks, without the Solidity and ADR ones. The CI jobs are
+# authoritative; these give the same signal before a push. The cargo hooks
+# fetch decdn as a git dependency, like every build.
+#
+#   pre-commit install --hook-type pre-commit --hook-type pre-push
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.48.0
+    hooks:
+      - id: markdownlint
+        args: ["--dot"]
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-doc
+        name: cargo doc
+        entry: env RUSTDOCFLAGS=-D\ warnings cargo doc --workspace --no-deps --document-private-items
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      # Findings print (`verbose`) and never block the commit. A missing
+      # cargo-deny install or a run that checked nothing blocks it. The CI
+      # `deny` job runs the same script. See cargo_deny_warn.py.
+      - id: cargo-deny
+        name: cargo deny (findings warn)
+        entry: .github/scripts/cargo-deny-warn.sh
+        verbose: true
+        language: system
+        pass_filenames: false
+
+      # --- the `packaging` CI job --------------------------------------
+      # An `include_str!` reaching outside its crate builds fine in-tree and
+      # fails for every `cargo install` user: a published .crate holds only
+      # its own directory.
+      - id: package-embeds
+        name: crate embeds stay inside their package
+        entry: .github/scripts/check-package-embeds.sh
+        language: system
+        files: '^crates/.*\.(rs|toml|html|sh|ps1)$'
+        pass_filenames: false
+
+      # The Rust version lives in rust-toolchain.toml, Cargo.toml's
+      # rust-version and every dtolnay/rust-toolchain@… ref under .github/.
+      - id: toolchain-pin
+        name: rust version agrees across toolchain, manifest and workflows
+        entry: .github/scripts/check-toolchain-pin.sh
+        language: system
+        files: '^(rust-toolchain\.toml|Cargo\.toml|\.github/(workflows|actions)/.*\.ya?ml|\.github/scripts/check[-_]toolchain[-_]pin\.(py|sh))$'
+        pass_filenames: false
+
+      # Each crate is versioned on its own: a member that inherits a version, or
+      # an alias that lags its member, ships the wrong number; one without
+      # `[lints] workspace = true` runs under default lint levels.
+      - id: workspace-manifests
+        name: every member carries its own version and inherits the lints
+        entry: .github/scripts/check-workspace-manifests.sh
+        language: system
+        files: '^(Cargo\.toml|crates/[^/]+/Cargo\.toml|\.github/scripts/check[-_]workspace[-_]manifests\.(py|sh))$'
+        pass_filenames: false
+
+      # The decdn-* versions and the decdn commit Cargo.lock pins agree.
+      - id: decdn-pin
+        name: decdn pin agrees with the decdn versions
+        entry: .github/scripts/check-decdn-pin.sh
+        language: system
+        files: '^(Cargo\.(toml|lock)|crates/[^/]+/Cargo\.toml|\.github/scripts/check[-_]decdn[-_]pin\.(py|sh))$'
+        pass_filenames: false
+
+      # The image list in release_plan.py, the Dockerfile, release.yml,
+      # security.yml and sign-release.sh.
+      - id: image-name
+        name: image names agree across workflows and the signing script
+        entry: .github/scripts/check-image-name.sh
+        language: system
+        files: '^(Dockerfile|\.github/workflows/(release|security)\.yml|\.github/scripts/(sign-release\.sh|check-image-name\.sh|release_plan\.py))$'
+        pass_filenames: false

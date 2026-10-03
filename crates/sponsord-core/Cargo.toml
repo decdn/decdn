@@ -1,11 +1,15 @@
 [package]
 name = "sponsord-core"
-description = "The sponsord daemon's logic as a library: capability signing and pool top-ups"
-version.workspace = true
+description = "Library core of sponsord, deCDN's sponsored on-ramp: capability signing and pool top-ups, for embedding"
+readme = "README.md"
+version = "0.1.0"
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lints]
 workspace = true

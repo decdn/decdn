@@ -264,14 +264,21 @@ async fn installer(path: &str) -> String {
 }
 
 /// Both installers name this onramp, download from the pinned GitHub
-/// Releases (`test_config`: decdn v0.1.0, sponsord v0.2.0) by tag and
-/// SHA256SUMS digest, and write only the onramp URL and `decdn` path.
+/// Releases (`test_config`: decdn `v0.1.0`, `decdn-sponsored-v0.2.0`) by tag
+/// and SHA256SUMS digest, name the archives by the version the onramp parsed
+/// out of each tag, and write only the onramp URL and `decdn` path.
 fn assert_installer(body: &str) {
+    let quoted = |s: &str| body.contains(&format!("'{s}'")) || body.contains(&format!("\"{s}\""));
     assert!(!body.contains("{{"), "no placeholder should remain");
     assert!(body.contains("https://up.example.org"));
     assert!(body.contains("https://github.com/decdn"));
-    assert!(body.contains("'v0.1.0'") || body.contains("\"v0.1.0\""));
-    assert!(body.contains("'v0.2.0'") || body.contains("\"v0.2.0\""));
+    assert!(quoted("v0.1.0"), "decdn release tag");
+    assert!(quoted("0.1.0"), "decdn version");
+    assert!(
+        quoted("decdn-sponsored-v0.2.0"),
+        "decdn-sponsored release tag"
+    );
+    assert!(quoted("0.2.0"), "decdn-sponsored version");
     assert!(body.contains(&"ab".repeat(32)), "decdn SHA256SUMS digest");
     assert!(
         body.contains(&"cd".repeat(32)),

@@ -7,15 +7,20 @@
 #   # deploy/secrets/treasury-password, deploy/secrets/turnstile-secret,
 #   # deploy/secrets/treasury-keystore.json: see docs/operator.md
 #   chmod 700 deploy/secrets && chmod 600 deploy/secrets/*
-#   sudo chown -R 10001 deploy/secrets   # the images run as uid 10001; the
+#   sudo chown -R 1000 deploy/secrets   # the images run as uid 1000; the
 #   # daemon also refuses a keystore that anyone but its owner can read
 #   docker compose -f deploy/compose.yaml up -d
 #
 # Only the onramp is published. Put a TLS reverse proxy in front of it and
 # set ONRAMP_PUBLIC_URL to the address users reach.
+#
+# It runs the released images; pin SPONSORD_TAG / ONRAMP_TAG to a release
+# (e.g. `SPONSORD_TAG=0.1.0`). `docker compose build` builds them from source
+# instead, with deploy/Dockerfile.
 
 services:
   sponsord:
+    image: ghcr.io/decdn/sponsord:${SPONSORD_TAG:-latest}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -35,6 +40,7 @@ services:
     restart: unless-stopped
 
   sponsord-onramp:
+    image: ghcr.io/decdn/sponsord-onramp:${ONRAMP_TAG:-latest}
     build:
       context: ..
       dockerfile: deploy/Dockerfile

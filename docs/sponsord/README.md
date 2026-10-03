@@ -49,12 +49,15 @@ it up with, since the daemon refills a drained pool automatically.
    docker compose -f deploy/compose.yaml up -d
    ```
 
-   Or run the release binaries under systemd (`deploy/systemd/`).
+   That runs the released images (`ghcr.io/decdn/sponsord`,
+   `ghcr.io/decdn/sponsord-onramp`). Or run the release binaries under
+   systemd (`deploy/systemd/`).
 3. Put TLS in front of the onramp, then give users one line per download:
 
    ```bash
    curl -fsSL https://downloads.example.org/decdn.sh | sh -s -- pull b3:<hash> --namespace <id>
    ```
+
    ```powershell
    irm https://downloads.example.org/decdn.ps1 | iex; decdn-sponsored pull b3:<hash> --namespace <id>
    ```
@@ -74,14 +77,21 @@ it up with, since the daemon refills a drained pool automatically.
 
 ## Crates
 
-| Crate | What it is |
-|---|---|
-| [`sponsord`](crates/sponsord) | The signing and top-up daemon |
-| [`sponsord-onramp`](crates/sponsord-onramp) | The public onramp: gate, installers, hand-off |
-| [`decdn-sponsored`](crates/decdn-sponsored) | The end-user CLI |
-| [`sponsord-core`](crates/sponsord-core) | The daemon's logic as a library, to embed instead of running the daemon |
-| [`sponsord-api`](crates/sponsord-api) | Wire types, error codes and typed clients for both servers |
-| [`sponsord-e2e`](crates/e2e) | Tests that run all three together |
+Each crate is versioned and released on its own, from a signed
+`<crate>-vX.Y.Z` tag:
+
+| Crate | What it is | Release archives | Image |
+|---|---|---|---|
+| [`sponsord`](crates/sponsord) | The signing and top-up daemon | Linux (x86_64, aarch64) | `ghcr.io/decdn/sponsord` |
+| [`sponsord-onramp`](crates/sponsord-onramp) | The public onramp: gate, installers, hand-off | Linux (x86_64, aarch64) | `ghcr.io/decdn/sponsord-onramp` |
+| [`decdn-sponsored`](crates/decdn-sponsored) | The end-user CLI | Linux, macOS, Windows (x86_64, aarch64 each) | — |
+| [`sponsord-core`](crates/sponsord-core) | The daemon's logic as a library, to embed instead of running the daemon | — | — |
+| [`sponsord-api`](crates/sponsord-api) | Wire types, error codes and typed clients for both servers | — | — |
+| [`sponsord-e2e`](crates/e2e) | Tests that run all three together (not released) | — | — |
+
+All but `sponsord-e2e` also go to crates.io. Images are mirrored to Docker
+Hub. Releases are signed by a maintainer: see [RELEASING.md](RELEASING.md),
+and [SECURITY.md](SECURITY.md) for verifying one.
 
 ## Building
 
@@ -92,9 +102,9 @@ cargo test --workspace
 
 The deCDN crates are git dependencies on
 [decdn/decdn](https://github.com/decdn/decdn), at the commit `Cargo.lock`
-pins. [CONTRIBUTING.md](CONTRIBUTING.md) covers the checks, the anvil tests,
-and building against a local deCDN checkout. [RELEASING.md](RELEASING.md)
-covers releases.
+pins, so a fresh clone builds on its own. [CONTRIBUTING.md](CONTRIBUTING.md)
+covers the toolchain, the checks, the anvil tests, and building against a
+local deCDN checkout.
 
 ## License
 

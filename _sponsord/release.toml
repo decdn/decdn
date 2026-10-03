@@ -1,0 +1,25 @@
+# cargo-release configuration. Each crate is versioned and released on its
+# own: `cargo release -p <crate> <level> --execute` makes one signed commit and
+# one signed `<crate>-v<version>` tag. See RELEASING.md.
+shared-version = false
+tag-name = "{{crate_name}}-v{{version}}"
+# One commit per crate even when several are released in one run, so every
+# commit names the crate it releases.
+consolidate-commits = false
+# No pre-release-hook: cargo-release runs hooks once per package with the cwd
+# set to that package's directory. Changelogs (crates/*/CHANGELOG.md) are
+# maintained per PR; git-cliff generates the GitHub release notes in
+# .github/workflows/release.yml instead.
+pre-release-commit-message = "chore(release): {{crate_name}} v{{version}}"
+push = true
+push-remote = "origin"
+# Not a "we never publish" flag: crates go to crates.io via
+# .github/scripts/publish-crates.sh. It must not happen HERE, before CI has
+# built anything and before a maintainer has signed anything — a crates.io
+# version is immutable, so an upload at this point could never be taken back.
+publish = false
+sign-commit = true
+sign-tag = true
+# Releasing sponsord-core rewrites the version on its [workspace.dependencies]
+# alias, so dependents require the release just cut. They are not re-released.
+dependent-version = "upgrade"

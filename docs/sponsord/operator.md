@@ -54,7 +54,7 @@ on another host needs it.
 | `ONRAMP_TURNSTILE_SECRET` / `_FILE` | required (Turnstile gate) | Cloudflare Turnstile secret |
 | `ONRAMP_TURNSTILE_SITEKEY` | required (Turnstile gate) | Cloudflare Turnstile sitekey |
 | `ONRAMP_DECDN_RELEASE`, `ONRAMP_DECDN_SUMS_SHA256` | required | `decdn` release the installers install, and the SHA-256 of its `SHA256SUMS` |
-| `ONRAMP_CLI_RELEASE`, `ONRAMP_CLI_SUMS_SHA256` | required | `decdn-sponsored` release, likewise (printed in its release notes) |
+| `ONRAMP_CLI_RELEASE`, `ONRAMP_CLI_SUMS_SHA256` | required | `decdn-sponsored` release (`decdn-sponsored-vX.Y.Z`), likewise; both values are printed in its release notes |
 | `ONRAMP_BIND` | `127.0.0.1:8080` | Listen address |
 | `ONRAMP_DAEMON_URL` | `http://127.0.0.1:8090` | The daemon |
 | `ONRAMP_SPENDING_CAP_MICRO_USDC` | daemon maximum | Cap requested per capability |
@@ -107,13 +107,21 @@ For a different kind of check, see [integrator.md](integrator.md).
 
 ## 4. Deploy
 
-- **Docker:** [`deploy/compose.yaml`](../deploy/compose.yaml) builds both
-  images from [`deploy/Dockerfile`](../deploy/Dockerfile) and passes secrets
-  as files. Only the onramp is published, on localhost, for your proxy.
+- **Docker:** [`deploy/compose.yaml`](../deploy/compose.yaml) runs the
+  released images, `ghcr.io/decdn/sponsord` and
+  `ghcr.io/decdn/sponsord-onramp` (also on Docker Hub as `decdn/…`; amd64 and
+  arm64; uid 1000), and passes secrets as files. Only the onramp is published,
+  on localhost, for your proxy. The daemon refuses a keystore anyone but its
+  owner can read, so the secret files must be mode `0600` and owned by uid
+  1000. Pull by the signed digest to pin exact bytes
+  ([SECURITY.md](../SECURITY.md#verify-a-container-image)), or build from
+  source with `docker compose build`
+  ([`deploy/Dockerfile`](../deploy/Dockerfile)).
 - **systemd:** [`deploy/systemd/`](../deploy/systemd) has a unit for each,
   with secrets as `LoadCredential=` credentials.
-- **Release binaries:** each GitHub Release has `sponsord` and
-  `sponsord-onramp` for Linux x86_64 and aarch64.
+- **Release binaries:** each `sponsord-vX.Y.Z` and `sponsord-onramp-vX.Y.Z`
+  GitHub Release has its binary for Linux x86_64 and aarch64, with a signed
+  `SHA256SUMS`.
 
 ## 5. Monitor
 

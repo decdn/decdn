@@ -6,7 +6,7 @@
 //! Implement [`Gate`] for anything else: a login session, a signed token
 //! from your own site, an allowlist.
 
-mod turnstile;
+pub mod turnstile;
 
 use std::net::IpAddr;
 

@@ -1,0 +1,62 @@
+name: Bug report
+description: Something in sponsord, sponsord-onramp, decdn-sponsored or the installers does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security vulnerabilities here. Email security@decdn.org instead (see [SECURITY.md](https://github.com/decdn/sponsord/blob/main/SECURITY.md)).
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - sponsord (signing daemon)
+        - sponsord-onramp (frontend)
+        - decdn-sponsored (CLI)
+        - installers (decdn.sh / decdn.ps1)
+        - sponsord-core (library)
+        - docs / release
+        - other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release tag, Docker image tag, `decdn-sponsored --version`, or the commit SHA you built from (`git rev-parse --short HEAD`).
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: e.g. Ubuntu 24.04 x86_64, macOS 15 arm64, Windows 11 ARM64, Docker image tag
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands and configuration. Remove API tokens, keystore passwords, Turnstile secrets and RPC URLs that carry API keys.
+      placeholder: |
+        1. decdn-sponsored pull b3:...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant log output, with the same secrets removed.
+      render: shell

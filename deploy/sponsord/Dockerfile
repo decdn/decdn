@@ -1,9 +1,11 @@
-# One image per server: build with `--build-arg BIN=sponsord` or
-# `--build-arg BIN=sponsord-onramp`, from the repository root:
+# A server image built from source, for a fork or an unreleased commit. The
+# images each release publishes (ghcr.io/decdn/sponsord, -onramp) come from the
+# root Dockerfile instead, which packages the signed release binaries. Same
+# runtime user (uid 1000) and layout, so either works with deploy/compose.yaml.
+#
+# From the repository root, `--build-arg BIN=sponsord` or `BIN=sponsord-onramp`:
 #
 #   docker build -f deploy/Dockerfile --build-arg BIN=sponsord -t sponsord .
-#
-# deploy/compose.yaml builds both.
 
 FROM rust:1.95-bookworm AS build
 ARG BIN
@@ -17,7 +19,9 @@ FROM debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
- && useradd --system --uid 10001 --no-create-home sponsord
+ && groupadd --gid 1000 sponsord \
+ && useradd --uid 1000 --gid sponsord --create-home sponsord
 COPY --from=build /usr/local/bin/server /usr/local/bin/server
 USER sponsord
+WORKDIR /home/sponsord
 ENTRYPOINT ["/usr/local/bin/server"]

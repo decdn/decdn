@@ -1,0 +1,46 @@
+# Mirrors decdn's dependabot.yml. The decdn crates are public git
+# dependencies, so Dependabot resolves the workspace from this repository
+# alone. It does not move the decdn lock itself (`ignore` below): that is a
+# deliberate bump with its own review (RELEASING.md), and the `decdn-main` CI
+# canary warns when it is due.
+#
+# `chore` with scope gives `chore(deps): …` titles, which pass the `pr-title`
+# check and which cliff.toml leaves out of the release notes.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    ignore:
+      - dependency-name: "decdn-*"
+    groups:
+      # One PR for the patch and minor bumps; majors arrive one by one.
+      cargo-minor:
+        update-types: [minor, patch]
+
+  # Works because the Dockerfile's FROM is pinned by digest.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+
+  # A bump of dtolnay/rust-toolchain stays red in `packaging`
+  # (check-toolchain-pin) until rust-toolchain.toml and rust-version move in
+  # the same PR.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope

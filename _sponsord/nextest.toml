@@ -1,0 +1,16 @@
+# cargo-nextest configuration.
+#
+# A backstop for any wedged test: a test that hangs has no timeout of its own
+# and would otherwise run until the CI job times out. The cap sits far above
+# the slowest legitimate in-process test.
+
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# `chain_pool` and `binary_anvil` boot anvil, deploy decdn's contracts with
+# `forge`, and drive the pool (and the daemon binary) against a live chain, so
+# they are legitimately slower. Their tests build only under `--features
+# anvil-e2e`.
+[[profile.default.overrides]]
+filter = '(package(sponsord-core) & binary(chain_pool)) | (package(sponsord) & binary(binary_anvil))'
+slow-timeout = { period = "120s", terminate-after = 5 }

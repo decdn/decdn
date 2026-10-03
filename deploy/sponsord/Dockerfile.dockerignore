@@ -1,0 +1,7 @@
+# deploy/Dockerfile builds from source, so the crates are in its context. The
+# release Dockerfile at the root uses the root .dockerignore instead.
+target/
+dist/
+.git/
+deploy/secrets/
+*.env

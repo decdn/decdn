@@ -1,0 +1,107 @@
+name: Security
+
+# Mirrors decdn's security.yml: a Trivy scan of the dependency tree on every
+# manifest change and weekly, and of both published images weekly.
+#
+# Third-party actions are pinned to full commit SHAs (version in the trailing
+# comment; Dependabot bumps both), as in release.yml: the image scan hands
+# GITHUB_TOKEN to them, and a scanner is a supply-chain target in its own right.
+
+on:
+  schedule:
+    # Weekly, Mondays at 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**/Cargo.toml"
+      - ".github/workflows/security.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Scans Cargo.lock, which pins the decdn crates' dependencies too, so no
+  # decdn checkout is needed.
+  trivy-fs:
+    name: Trivy filesystem scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+  # `latest` exists once sign-release.sh has published a stable release of the
+  # image's crate, so the scan is skipped only while no such release exists.
+  # Whether the image exists is read from the releases, not by probing the
+  # registry: GHCR answers a missing package and an auth or network failure
+  # alike (`denied`), and treating every failure as "missing" would leave the
+  # scheduled run green with nothing scanned. Once a release exists, any
+  # failure to pull or scan the image fails the job.
+  trivy-image:
+    name: Trivy image scan (${{ matrix.image }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # The images release_plan.py lists; check-image-name.sh holds them in
+        # step.
+        image: [sponsord, sponsord-onramp]
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check the image has been released
+        id: image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          # A gh failure fails the step; only an empty answer means "none yet".
+          tags=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 \
+            --exclude-drafts --exclude-pre-releases --json tagName --jq '.[].tagName')
+          if grep -qE "^${NAME}-v[0-9]" <<<"$tags"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No published ${NAME} release yet, so ${IMAGE}:latest does not exist; skipping scan."
+          fi
+
+      - name: Run Trivy image scan
+        if: steps.image.outputs.exists == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:latest
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"

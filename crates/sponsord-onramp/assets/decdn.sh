@@ -13,11 +13,13 @@ set -eu
 ONRAMP_URL="{{ONRAMP_URL}}"
 
 # The binaries come from pinned GitHub Releases. Each release is pinned by tag
-# and by the SHA-256 of its SHA256SUMS file.
+# and by the SHA-256 of its SHA256SUMS file; the version names its archives.
 RELEASES="{{RELEASES_BASE}}"
 DECDN_RELEASE="{{DECDN_RELEASE}}"
+DECDN_VERSION="{{DECDN_VERSION}}"
 DECDN_SUMS_SHA256="{{DECDN_SUMS_SHA256}}"
 CLI_RELEASE="{{CLI_RELEASE}}"
+CLI_VERSION="{{CLI_VERSION}}"
 CLI_SUMS_SHA256="{{CLI_SUMS_SHA256}}"
 
 BINDIR="${HOME}/.local/bin"
@@ -53,15 +55,15 @@ trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 mkdir -p "$BINDIR" "$DECDN_DIR"
 
-# fetch_bin <repo> <binary> <release tag> <SHA256SUMS digest>
+# fetch_bin <repo> <binary> <release tag> <version> <SHA256SUMS digest>
 #
 # Downloads SHA256SUMS and checks it against the pinned digest, then
 # downloads the archive for this platform and checks it against SHA256SUMS.
 # Nothing lands in BINDIR unless both checks pass.
 fetch_bin() {
-  repo="$1" bin="$2" tag="$3" sums_sha256="$4"
+  repo="$1" bin="$2" tag="$3" version="$4" sums_sha256="$5"
   base="${RELEASES}/${repo}/releases/download/${tag}"
-  archive="${bin}-${tag#v}-${TARGET}.tar.gz"
+  archive="${bin}-${version}-${TARGET}.tar.gz"
   dir="${WORK}/${bin}"
   mkdir -p "$dir"
 
@@ -82,8 +84,8 @@ fetch_bin() {
 }
 
 # 1. Install the decdn and decdn-sponsored binaries.
-fetch_bin decdn decdn "$DECDN_RELEASE" "$DECDN_SUMS_SHA256"
-fetch_bin sponsord decdn-sponsored "$CLI_RELEASE" "$CLI_SUMS_SHA256"
+fetch_bin decdn decdn "$DECDN_RELEASE" "$DECDN_VERSION" "$DECDN_SUMS_SHA256"
+fetch_bin sponsord decdn-sponsored "$CLI_RELEASE" "$CLI_VERSION" "$CLI_SUMS_SHA256"
 
 # 2. Point the CLI at this onramp. Field names MUST match
 # crates/decdn-sponsored/src/config.rs's `File` struct. The chain and

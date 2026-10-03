@@ -11,31 +11,46 @@ use crate::net::ClientIpSource;
 use sponsord_api::MicroUsdc;
 use sponsord_api::daemon::Info;
 
+/// Tag prefix of a `decdn/decdn` release: the workspace shares one version,
+/// so its tags are `vMAJOR.MINOR.PATCH`.
+pub const DECDN_TAG_PREFIX: &str = "v";
+
+/// Tag prefix of a `decdn-sponsored` release: sponsord's crates are versioned
+/// on their own, so its tags name the crate.
+pub const CLI_TAG_PREFIX: &str = "decdn-sponsored-v";
+
 /// A GitHub Release the installers download binaries from, pinned by its tag
 /// and by the SHA-256 of its `SHA256SUMS` file. The installer checks the
 /// downloaded `SHA256SUMS` against `sums_sha256`, then each archive against
 /// `SHA256SUMS`, so a release asset replaced after pinning is rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleasePin {
-    /// `vMAJOR.MINOR.PATCH`, optionally with a `-pre.release` suffix.
+    /// The release tag: a fixed prefix, then `MAJOR.MINOR.PATCH`, optionally
+    /// with a `-pre.release` suffix.
     pub tag: String,
+    /// The version in `tag`, which names the release's archives
+    /// (`<binary>-<version>-<target>`).
+    pub version: String,
     /// 64 lowercase hex characters.
     pub sums_sha256: String,
 }
 
 impl ReleasePin {
-    /// Both values are interpolated into the POSIX and PowerShell installer
-    /// scripts, so they are held to a strict shape rather than escaped.
+    /// All three values are interpolated into the POSIX and PowerShell
+    /// installer scripts, so they are held to a strict shape rather than
+    /// escaped.
     ///
     /// # Errors
     ///
-    /// Returns an error if `tag` is not a semver release tag or
-    /// `sums_sha256` is not 64 lowercase hex characters.
-    pub fn new(tag: &str, sums_sha256: &str) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            is_release_tag(tag),
-            "release tag {tag:?} is not vMAJOR.MINOR.PATCH[-pre]"
-        );
+    /// Returns an error if `tag` is not `prefix` followed by a semver version,
+    /// or `sums_sha256` is not 64 lowercase hex characters.
+    pub fn new(prefix: &str, tag: &str, sums_sha256: &str) -> anyhow::Result<Self> {
+        let version = tag
+            .strip_prefix(prefix)
+            .filter(|v| is_semver(v))
+            .ok_or_else(|| {
+                anyhow::anyhow!("release tag {tag:?} is not {prefix}MAJOR.MINOR.PATCH[-pre]")
+            })?;
         anyhow::ensure!(
             sums_sha256.len() == 64
                 && sums_sha256
@@ -45,15 +60,13 @@ impl ReleasePin {
         );
         Ok(Self {
             tag: tag.to_owned(),
+            version: version.to_owned(),
             sums_sha256: sums_sha256.to_owned(),
         })
     }
 }
 
-fn is_release_tag(tag: &str) -> bool {
-    let Some(version) = tag.strip_prefix('v') else {
-        return false;
-    };
+fn is_semver(version: &str) -> bool {
     let (core, pre) = match version.split_once('-') {
         Some((core, pre)) => (core, Some(pre)),
         None => (version, None),
@@ -176,7 +189,7 @@ pub struct Args {
     #[arg(long, env = "ONRAMP_DECDN_SUMS_SHA256")]
     pub decdn_sums_sha256: String,
     /// `decdn/sponsord` release tag the installers install `decdn-sponsored`
-    /// from.
+    /// from (`decdn-sponsored-vMAJOR.MINOR.PATCH[-pre]`).
     #[arg(long, env = "ONRAMP_CLI_RELEASE")]
     pub cli_release: String,
     /// SHA-256 of that release's `SHA256SUMS` file (printed in its release
@@ -317,10 +330,13 @@ impl OnrampConfig {
             fund_rate_per_min: args.fund_rate_per_min,
             poll_rate_per_min: args.poll_rate_per_min,
             releases_base,
-            decdn_release: ReleasePin::new(&args.decdn_release, &args.decdn_sums_sha256).map_err(
-                |e| anyhow::anyhow!("ONRAMP_DECDN_RELEASE/ONRAMP_DECDN_SUMS_SHA256: {e}"),
-            )?,
-            cli_release: ReleasePin::new(&args.cli_release, &args.cli_sums_sha256)
+            decdn_release: ReleasePin::new(
+                DECDN_TAG_PREFIX,
+                &args.decdn_release,
+                &args.decdn_sums_sha256,
+            )
+            .map_err(|e| anyhow::anyhow!("ONRAMP_DECDN_RELEASE/ONRAMP_DECDN_SUMS_SHA256: {e}"))?,
+            cli_release: ReleasePin::new(CLI_TAG_PREFIX, &args.cli_release, &args.cli_sums_sha256)
                 .map_err(|e| anyhow::anyhow!("ONRAMP_CLI_RELEASE/ONRAMP_CLI_SUMS_SHA256: {e}"))?,
         })
     }
@@ -407,7 +423,7 @@ mod tests {
             ("--turnstile-sitekey", "0x4AAA-key_1"),
             ("--decdn-release", "v0.1.0"),
             ("--decdn-sums-sha256", &ab),
-            ("--cli-release", "v0.2.0-rc.1"),
+            ("--cli-release", "decdn-sponsored-v0.2.0-rc.1"),
             ("--cli-sums-sha256", &cd),
         ];
         for pair in overrides.chunks(2) {
@@ -432,7 +448,9 @@ mod tests {
         assert_eq!(cfg.spending_cap, None);
         assert_eq!(cfg.ttl_secs, None);
         assert_eq!(cfg.decdn_release.tag, "v0.1.0");
-        assert_eq!(cfg.cli_release.tag, "v0.2.0-rc.1");
+        assert_eq!(cfg.decdn_release.version, "0.1.0");
+        assert_eq!(cfg.cli_release.tag, "decdn-sponsored-v0.2.0-rc.1");
+        assert_eq!(cfg.cli_release.version, "0.2.0-rc.1");
         assert!(!format!("{cfg:?}").contains("\"tok\""));
     }
 
@@ -496,9 +514,26 @@ mod tests {
     #[test]
     fn release_pin_accepts_semver_tags_and_hex_digests() {
         let digest = "0123456789abcdef".repeat(4);
-        for tag in ["v0.1.0", "v10.20.30", "v1.0.0-rc.1", "v1.0.0-beta-2"] {
-            assert!(ReleasePin::new(tag, &digest).is_ok(), "{tag}");
+        for (tag, version) in [
+            ("v0.1.0", "0.1.0"),
+            ("v10.20.30", "10.20.30"),
+            ("v1.0.0-rc.1", "1.0.0-rc.1"),
+            ("v1.0.0-beta-2", "1.0.0-beta-2"),
+        ] {
+            let pin = ReleasePin::new(DECDN_TAG_PREFIX, tag, &digest).unwrap();
+            assert_eq!(pin.version, version, "{tag}");
         }
+        let pin = ReleasePin::new(CLI_TAG_PREFIX, "decdn-sponsored-v0.2.0-rc.1", &digest).unwrap();
+        assert_eq!(pin.version, "0.2.0-rc.1");
+    }
+
+    #[test]
+    fn release_pin_requires_its_own_prefix() {
+        let digest = "ab".repeat(32);
+        // A decdn tag is not a CLI release, and the reverse.
+        assert!(ReleasePin::new(CLI_TAG_PREFIX, "v0.2.0", &digest).is_err());
+        assert!(ReleasePin::new(CLI_TAG_PREFIX, "sponsord-v0.2.0", &digest).is_err());
+        assert!(ReleasePin::new(DECDN_TAG_PREFIX, "decdn-sponsored-v0.2.0", &digest).is_err());
     }
 
     #[test]
@@ -515,10 +550,21 @@ mod tests {
             "v0.1.0$(id)",
             "v0.1.0'",
         ] {
-            assert!(ReleasePin::new(tag, &digest).is_err(), "{tag:?}");
+            assert!(
+                ReleasePin::new(DECDN_TAG_PREFIX, tag, &digest).is_err(),
+                "{tag:?}"
+            );
+            let cli = tag.replacen('v', CLI_TAG_PREFIX, 1);
+            assert!(
+                ReleasePin::new(CLI_TAG_PREFIX, &cli, &digest).is_err(),
+                "{cli:?}"
+            );
         }
         for bad in [&"AB".repeat(32), &"ab".repeat(31), &"zz".repeat(32)] {
-            assert!(ReleasePin::new("v0.1.0", bad).is_err(), "{bad}");
+            assert!(
+                ReleasePin::new(DECDN_TAG_PREFIX, "v0.1.0", bad).is_err(),
+                "{bad}"
+            );
         }
     }
 }

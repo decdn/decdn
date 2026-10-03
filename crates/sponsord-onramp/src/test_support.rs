@@ -61,10 +61,12 @@ pub fn test_config() -> OnrampConfig {
         releases_base: "https://github.com/decdn".into(),
         decdn_release: ReleasePin {
             tag: "v0.1.0".into(),
+            version: "0.1.0".into(),
             sums_sha256: "ab".repeat(32),
         },
         cli_release: ReleasePin {
-            tag: "v0.2.0".into(),
+            tag: "decdn-sponsored-v0.2.0".into(),
+            version: "0.2.0".into(),
             sums_sha256: "cd".repeat(32),
         },
     }

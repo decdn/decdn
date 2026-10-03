@@ -1,11 +1,15 @@
 [package]
 name = "sponsord"
-description = "The sponsord daemon: signs capped, expiring deCDN capabilities against a sponsor's PaymentPool and keeps it funded"
-version.workspace = true
+description = "deCDN sponsorship daemon: signs capped, expiring capabilities against a PaymentPool and keeps it topped up"
+readme = "README.md"
+version = "0.1.0"
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lints]
 workspace = true

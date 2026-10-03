@@ -1,4 +1,10 @@
+# The release images copy prebuilt binaries from dist/ (see Dockerfile);
+# nothing else from the tree belongs in their build context. deploy/Dockerfile,
+# which builds from source, has its own deploy/Dockerfile.dockerignore.
 target/
-deploy/secrets/
-*.env
 .git/
+.github/
+crates/
+*.md
+*.env
+deploy/secrets/

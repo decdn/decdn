@@ -1,5 +1,8 @@
 [workspace]
-resolver = "2"
+# Resolver 3, the MSRV-aware resolver: with `rust-version` below, a future
+# `cargo update` prefers dependency versions that still build on the pinned
+# toolchain instead of silently pulling one that raised its MSRV past it.
+resolver = "3"
 members = [
     "crates/decdn-sponsored",
     "crates/e2e",
@@ -10,11 +13,22 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+# No `version` here: each crate is versioned and released on its own
+# (`cargo release -p <crate>`, tag `<crate>-v<version>`; see RELEASING.md), so
+# every member carries its own. check_workspace_manifests.py requires that, and
+# that each internal alias below carries its member's current version.
 edition = "2024"
-rust-version = "1.95"
 license = "MIT OR Apache-2.0"
+# Three parts, not two: this string, `rust-toolchain.toml`'s channel and every
+# `dtolnay/rust-toolchain@…` ref under .github/ are compared byte-for-byte by
+# check_toolchain_pin.py, so they move together.
+rust-version = "1.95.0"
 repository = "https://github.com/decdn/sponsord"
+homepage = "https://decdn.org"
+keywords = ["decdn", "cdn", "p2p", "sponsorship"]
+categories = ["network-programming"]
+# `readme` and `description` are per crate: each is its own crates.io landing
+# page. check_workspace_manifests.py requires both on every publishable member.
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
@@ -23,6 +37,29 @@ panic = "deny"
 indexing_slicing = "deny"
 
 [workspace.dependencies]
+# Internal crates. The `version` is what makes them publishable: a published
+# manifest has no path to follow, so cargo rejects a path dependency without
+# one. Locally the `path` wins. It equals the member's own version;
+# `cargo release -p <member>` rewrites it (`dependent-version = "upgrade"`).
+decdn-sponsored = { path = "crates/decdn-sponsored", version = "0.1.0" }
+sponsord = { path = "crates/sponsord", version = "0.1.0" }
+sponsord-api = { path = "crates/sponsord-api", version = "0.1.0" }
+sponsord-core = { path = "crates/sponsord-core", version = "0.1.0" }
+sponsord-onramp = { path = "crates/sponsord-onramp", version = "0.1.0" }
+
+# deCDN, from its public repository. `Cargo.lock` pins the commit every build
+# uses; `cargo update -p decdn-incentive` moves it (RELEASING.md). The
+# `version` must equal decdn's workspace version at that commit: cargo checks
+# the requirement against the git crate, and it is what a published manifest
+# resolves on crates.io, where `git` is dropped. check_decdn_pin.py enforces
+# both; publish-crates.sh refuses until that version is on crates.io. To build
+# against a local checkout, see CONTRIBUTING.md.
+decdn-client = { git = "https://github.com/decdn/decdn", branch = "main", version = "0.0.0" }
+decdn-incentive = { git = "https://github.com/decdn/decdn", branch = "main", version = "0.0.0" }
+# Dev-only (the anvil fixtures). A dev-dependency without a `version` is
+# stripped from the published manifest, so this one needs none.
+decdn-e2e = { git = "https://github.com/decdn/decdn", branch = "main" }
+
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 anyhow = "1"
@@ -33,13 +70,12 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 reqwest = { version = "0.12", features = ["json"] }
-# deCDN itself, from its public repository. `Cargo.lock` pins the commit;
-# `cargo update -p decdn-incentive` moves it. To build against a local
-# checkout instead, see CONTRIBUTING.md.
-decdn-client = { git = "https://github.com/decdn/decdn", branch = "main" }
-decdn-incentive = { git = "https://github.com/decdn/decdn", branch = "main" }
-decdn-e2e = { git = "https://github.com/decdn/decdn", branch = "main" }
-# This workspace's own crates.
-sponsord = { path = "crates/sponsord" }
-sponsord-api = { path = "crates/sponsord-api" }
-sponsord-core = { path = "crates/sponsord-core" }
+
+[profile.release]
+# Fat LTO + one codegen unit: smaller, faster release binaries at the cost of
+# build time, which lands only on the release workflow (CI never builds
+# --release). Unwinding is kept (no `panic = "abort"`) and the symbol table
+# stays (`strip = "debuginfo"`) so an operator's backtrace names functions.
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"

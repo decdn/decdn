@@ -1,11 +1,15 @@
 [package]
 name = "sponsord-api"
 description = "Wire types, error codes and HTTP clients for the sponsord daemon and onramp"
-version.workspace = true
+readme = "README.md"
+version = "0.1.0"
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lints]
 workspace = true

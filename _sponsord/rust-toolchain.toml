@@ -1,3 +1,5 @@
 [toolchain]
-channel = "1.95"
+# Exact X.Y.Z: check_toolchain_pin.py compares it byte-for-byte with Cargo.toml's
+# rust-version and every dtolnay/rust-toolchain@… ref under .github/.
+channel = "1.95.0"
 components = ["rustfmt", "clippy"]
