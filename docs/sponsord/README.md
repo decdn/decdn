@@ -2,15 +2,15 @@
 
 deCDN's sponsored on-ramp, in three parts:
 
-- **`sponsord`** (`crates/daemon`): the signing and top-up service. It holds
+- **`sponsord`** (`crates/sponsord`): the signing and top-up service. It holds
   the owner key of one `PaymentPool` on Arbitrum Sepolia, signs capped,
   expiring capabilities (`dcap1:` tokens) for trusted callers over a small
   HTTP API, and keeps the pool funded from the treasury. It knows nothing
   about who deserves a capability; that is the caller's decision.
-- **`sponsord-onramp`** (`crates/onramp`): a frontend of the daemon. A
+- **`sponsord-onramp`** (`crates/sponsord-onramp`): the public onramp in front of the daemon. A
   captcha-gated `/fund` page, the `/decdn.sh` and `/decdn.ps1` installers,
   and the `/capability` poll the CLI uses.
-- **`decdn-sponsored`** (`crates/wrapper`): the end-user CLI. Gives each
+- **`decdn-sponsored`** (`crates/decdn-sponsored`): the end-user CLI. Gives each
   download a throwaway key, gets a capability for it through the onramp,
   and hands the pull to `decdn`.
 
@@ -22,7 +22,7 @@ expiry are fixed on-chain at its first redemption, which is why
 renewing it. Spending is bounded by the gate in front of the daemon (the
 captcha on `/fund`), the per-capability cap, and the pool's own balance.
 
-`sponsord-core` (`crates/core`) is the daemon's logic as a library, for Rust
+`sponsord-core` (`crates/sponsord-core`) is the daemon's logic as a library, for Rust
 programs that embed it instead of calling the daemon.
 
 A capability authorizes a key to spend up to its cap against the sponsor's
@@ -112,9 +112,9 @@ A minimal gate of your own is one call after your check passes:
       -H 'content-type: application/json' \
       -d '{"signer":"0x...","spending_cap":1000000,"ttl_secs":86400}'
 
-## The sponsord-onramp frontend
+## The sponsord-onramp service
 
-`sponsord-onramp` is the reference frontend of the daemon: a Cloudflare
+`sponsord-onramp` is the reference onramp for the daemon: a Cloudflare
 Turnstile captcha gate in front of `POST /v1/capabilities`, plus the installers
 and the grant store behind the `decdn-sponsored` CLI. At startup it reads
 `chain_id` and `payment_pool` from the daemon's `/v1/info`, and it refuses to
@@ -148,10 +148,10 @@ example systemd `Restart=on-failure`).
 | `ONRAMP_TURNSTILE_SITEKEY` | **yes** | none | Cloudflare Turnstile sitekey, shown in the `/fund` widget page |
 | `ONRAMP_DECDN_RELEASE` | **yes** | none | `decdn/decdn` release tag (`vMAJOR.MINOR.PATCH`, optionally `-pre`) the installers install `decdn` from |
 | `ONRAMP_DECDN_SUMS_SHA256` | **yes** | none | SHA-256 of that release's `SHA256SUMS` file |
-| `ONRAMP_WRAPPER_RELEASE` | **yes** | none | `decdn/sponsord` release tag (same shape) the installers install `decdn-sponsored` from |
-| `ONRAMP_WRAPPER_SUMS_SHA256` | **yes** | none | SHA-256 of that release's `SHA256SUMS` file (printed in the release notes) |
+| `ONRAMP_CLI_RELEASE` | **yes** | none | `decdn/sponsord` release tag (same shape) the installers install `decdn-sponsored` from |
+| `ONRAMP_CLI_SUMS_SHA256` | **yes** | none | SHA-256 of that release's `SHA256SUMS` file (printed in the release notes) |
 | `ONRAMP_BIND` | no | `127.0.0.1:8080` | Address the HTTP server listens on |
-| `ONRAMP_PUBLIC_URL` | no | `https://up.decdn.org` | This onramp's public base URL; baked into the installers as `{{GATEWAY_BASE}}` |
+| `ONRAMP_PUBLIC_URL` | no | `https://up.decdn.org` | This onramp's public base URL; baked into the installers as `{{ONRAMP_URL}}` |
 | `ONRAMP_DAEMON_URL` | no | `http://127.0.0.1:8090` | Base URL of the sponsord daemon |
 | `ONRAMP_SPENDING_CAP_MICRO_USDC` | no | daemon maximum | Cap requested for each capability |
 | `ONRAMP_TTL_SECS` | no | daemon maximum | TTL requested for each capability |
@@ -173,9 +173,9 @@ On Windows (x64 and ARM64), in PowerShell:
 irm https://up.decdn.org/decdn.ps1 | iex; decdn-sponsored pull b3:<hash> --namespace <id>
 ```
 
-1. The installer served at `GET /decdn.sh` (`crates/onramp/assets/decdn.sh`),
+1. The installer served at `GET /decdn.sh` (`crates/sponsord-onramp/assets/decdn.sh`),
    or its PowerShell twin at `GET /decdn.ps1`
-   (`crates/onramp/assets/decdn.ps1`), installs the `decdn` and
+   (`crates/sponsord-onramp/assets/decdn.ps1`), installs the `decdn` and
    `decdn-sponsored` binaries straight from their pinned GitHub Releases. It
    downloads each release's `SHA256SUMS`, checks it against the pinned digest,
    then checks the platform's archive against `SHA256SUMS`; nothing is
@@ -205,9 +205,9 @@ irm https://up.decdn.org/decdn.ps1 | iex; decdn-sponsored pull b3:<hash> --names
    a new captcha.
 
 The `~/.decdn/sponsor.toml` schema is a hard contract between the installer
-(`crates/onramp/assets/decdn.sh`, `crates/onramp/assets/decdn.ps1`) and the
-wrapper (`crates/wrapper/src/config.rs`): field names must match exactly.
-Fields: `gateway_base`, `decdn_bin`, `data_dir`, `rpc_url`, `payment_pool`,
+(`crates/sponsord-onramp/assets/decdn.sh`, `crates/sponsord-onramp/assets/decdn.ps1`) and the
+CLI (`crates/decdn-sponsored/src/config.rs`): field names must match exactly.
+Fields: `onramp_url`, `decdn_bin`, `data_dir`, `rpc_url`, `payment_pool`,
 `capacity_bond` (optional), `slash_judge` (optional), `chain_id`. Unknown
 fields are ignored.
 
@@ -228,8 +228,8 @@ treasury against a local anvil chain.
    builds `decdn-sponsored` for Linux, macOS and Windows (x86_64 and
    aarch64 each) and `sponsord` and `sponsord-onramp` for Linux, and
    publishes them with a `SHA256SUMS` manifest as a GitHub Release.
-3. The release notes print the `ONRAMP_WRAPPER_RELEASE` and
-   `ONRAMP_WRAPPER_SUMS_SHA256` values that pin it. Set them on the onramp
+3. The release notes print the `ONRAMP_CLI_RELEASE` and
+   `ONRAMP_CLI_SUMS_SHA256` values that pin it. Set them on the onramp
    to make the installers serve it. `decdn` releases are pinned the same way
    (`ONRAMP_DECDN_RELEASE`, and `ONRAMP_DECDN_SUMS_SHA256` = the SHA-256 of
    that release's `SHA256SUMS`).

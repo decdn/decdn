@@ -1,0 +1,28 @@
+[package]
+name = "sponsord"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sponsord-core.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+alloy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum = "0.8"
+subtle = "2"
+
+[dev-dependencies]
+sponsord-core = { workspace = true, features = ["test-support"] }
+decdn-incentive.workspace = true
+serial_test = "3"
+tower = { version = "0.5", features = ["util"] }

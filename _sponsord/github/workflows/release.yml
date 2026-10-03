@@ -1,11 +1,11 @@
 name: Release
 
 # A `vMAJOR.MINOR.PATCH` tag builds `decdn-sponsored` for every platform the
-# installers support and the `sponsord` daemon and `sponsord-onramp` frontend
+# installers support and the `sponsord` daemon and `sponsord-onramp` onramp
 # for Linux, then publishes them with a SHA256SUMS manifest as a GitHub
 # Release. The onramp's installers pin a release by its tag and by the SHA-256
-# of that SHA256SUMS file (`ONRAMP_WRAPPER_RELEASE` /
-# `ONRAMP_WRAPPER_SUMS_SHA256`); the release notes print both.
+# of that SHA256SUMS file (`ONRAMP_CLI_RELEASE` /
+# `ONRAMP_CLI_SUMS_SHA256`); the release notes print both.
 #
 # The deCDN crates are git dependencies, and `--locked` builds the commit
 # `Cargo.lock` pins, so the same tag always builds the same code.
@@ -62,7 +62,7 @@ jobs:
           - { package: decdn-sponsored, binary: decdn-sponsored, target: x86_64-pc-windows-msvc, runner: windows-latest }
           # Cross-compiled on the x64 runner with the MSVC ARM64 toolchain.
           - { package: decdn-sponsored, binary: decdn-sponsored, target: aarch64-pc-windows-msvc, runner: windows-latest }
-          # The onramp frontend, for devops to deploy.
+          # The onramp, for devops to deploy.
           - { package: sponsord-onramp, binary: sponsord-onramp, target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
           - { package: sponsord-onramp, binary: sponsord-onramp, target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
           # The signing and top-up daemon, for devops to deploy.
@@ -150,8 +150,8 @@ jobs:
             echo "Pin this release in the onramp's installers with:"
             echo
             echo '```'
-            echo "ONRAMP_WRAPPER_RELEASE=${TAG}"
-            echo "ONRAMP_WRAPPER_SUMS_SHA256=${SUMS_SHA256}"
+            echo "ONRAMP_CLI_RELEASE=${TAG}"
+            echo "ONRAMP_CLI_SUMS_SHA256=${SUMS_SHA256}"
             echo '```'
           } > notes.md
           gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \

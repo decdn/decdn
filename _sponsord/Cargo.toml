@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/daemon", "crates/onramp", "crates/wrapper"]
+members = [
+    "crates/decdn-sponsored",
+    "crates/sponsord",
+    "crates/sponsord-core",
+    "crates/sponsord-onramp",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -29,3 +34,6 @@ tracing-subscriber = "0.3"
 decdn-client = { git = "https://github.com/decdn/decdn", branch = "main" }
 decdn-incentive = { git = "https://github.com/decdn/decdn", branch = "main" }
 decdn-e2e = { git = "https://github.com/decdn/decdn", branch = "main" }
+# This workspace's own crates.
+sponsord = { path = "crates/sponsord" }
+sponsord-core = { path = "crates/sponsord-core" }
