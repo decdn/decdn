@@ -23,7 +23,7 @@ use sponsord_api::{ErrorCode, IssuedCapability, MicroUsdc};
 
 use crate::config::{GateKind, OnrampConfig, ReleasePin, TurnstileConfig};
 use crate::daemon::CapabilitySource;
-use crate::gate::Gate;
+use crate::gate::{Gate, html_escape};
 use crate::net::ClientIpSource;
 use crate::state::{self, AppState};
 
@@ -159,7 +159,8 @@ impl FakeGate {
 #[async_trait]
 impl Gate for FakeGate {
     fn page(&self, client: Address) -> String {
-        format!("<p>fake gate for {client}</p>")
+        // Escaped like `TurnstileGate::page`, so rust/xss sees a barrier.
+        format!("<p>fake gate for {}</p>", html_escape(&client.to_string()))
     }
 
     async fn verify(

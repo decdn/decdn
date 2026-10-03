@@ -62,11 +62,12 @@ impl TurnstileGate {
 #[async_trait]
 impl Gate for TurnstileGate {
     fn page(&self, client: Address) -> String {
-        // `client` is a parsed address, so its text is hex.
+        // `client` is a parsed address, so its text is hex and escaping it
+        // changes nothing; the call is what CodeQL's rust/xss recognises.
         self.template
             .replace("{{SITEKEY}}", &self.sitekey)
             .replace("{{BRAND_NAME}}", &html_escape(&self.brand_name))
-            .replace("{{CLIENT}}", &client.to_string())
+            .replace("{{CLIENT}}", &html_escape(&client.to_string()))
     }
 
     async fn verify(

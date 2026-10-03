@@ -1,7 +1,0 @@
-name: decdn/sponsord-rust-models
-version: 0.0.0
-library: true
-extensionTargets:
-  codeql/rust-all: "*"
-dataExtensions:
-  - models/**/*.yml
