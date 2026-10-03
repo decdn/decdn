@@ -1,9 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use sponsord_api::client::DaemonClient;
 use sponsord_onramp::captcha::{CaptchaVerifier, Turnstile};
 use sponsord_onramp::config::OnrampConfig;
-use sponsord_onramp::daemon::{CapabilitySource, DaemonClient};
+use sponsord_onramp::daemon::CapabilitySource;
 use sponsord_onramp::{http, state};
 
 /// Bound on every outbound call (daemon and Turnstile), so a hung peer

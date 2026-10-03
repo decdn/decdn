@@ -32,9 +32,10 @@ tokio.workspace = true
 decdn-incentive.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sponsord-api = { workspace = true, features = ["client"] }
 hex = "0.4"
 getrandom = "0.3"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest.workspace = true
 toml = "1"
 clap = { version = "4", features = ["derive"] }
 

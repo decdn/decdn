@@ -14,6 +14,8 @@ use axum::http::{Request, StatusCode};
 use decdn_incentive::{CapabilityGrant, voucher_domain};
 use serde_json::{Value, json};
 use sponsord::http::{ApiState, router};
+use sponsord_api::daemon::{Info, IssueResponse};
+use sponsord_api::{ErrorBody, ErrorCode};
 use sponsord_core::pool::{Authorization, PoolChain};
 use sponsord_core::test_support::{FakePool, TEST_CHAIN_ID, TEST_PAYMENT_POOL, fake_sponsor};
 use tower::ServiceExt;
@@ -23,10 +25,7 @@ const SIGNER: &str = "0x00000000000000000000000000000000000000aa";
 
 async fn app() -> (Router, Arc<FakePool>) {
     let (sponsor, pool) = fake_sponsor(5_000_000, 172_800).await;
-    let app = router(ApiState {
-        sponsor: Arc::new(sponsor),
-        api_token: Arc::from(TOKEN),
-    });
+    let app = router(ApiState::new(Arc::new(sponsor), Arc::from(TOKEN)));
     (app, pool)
 }
 
@@ -106,6 +105,8 @@ async fn info_reports_chain_and_maximums() {
     )
     .await;
     assert_eq!(s, StatusCode::OK);
+    let typed: Info = serde_json::from_value(v.clone()).unwrap();
+    assert_eq!(typed.payment_pool, TEST_PAYMENT_POOL);
     assert_eq!(
         v,
         json!({
@@ -123,6 +124,8 @@ async fn issue_defaults_to_the_maximum_and_signs_for_the_signer() {
     let before = now();
     let (s, v) = send(&app, issue_req(Some(&bearer()), json!({"signer": SIGNER}))).await;
     assert_eq!(s, StatusCode::OK);
+    let typed: IssueResponse = serde_json::from_value(v.clone()).unwrap();
+    assert!(!typed.registered);
     assert_eq!(v["registered"], false);
     assert_eq!(v["spending_cap"], 5_000_000);
     let expiry = v["expiry"].as_u64().unwrap();
@@ -264,6 +267,8 @@ async fn expired_registration_is_409_signer_expired() {
     let (s, v) = send(&app, issue_req(Some(&bearer()), json!({"signer": SIGNER}))).await;
     assert_eq!(s, StatusCode::CONFLICT);
     assert_eq!(v, json!({"error": "signer_expired", "expiry": 1_000}));
+    let typed: ErrorBody = serde_json::from_value(v).unwrap();
+    assert_eq!(typed.error, ErrorCode::SignerExpired);
 }
 
 #[tokio::test]

@@ -10,8 +10,10 @@ mod test_support;
 
 use std::sync::Arc;
 
+use sponsord_api::MicroUsdc;
+use sponsord_api::client::DaemonClient;
 use sponsord_onramp::captcha::CaptchaVerifier;
-use sponsord_onramp::daemon::{CapabilitySource, DaemonClient};
+use sponsord_onramp::daemon::CapabilitySource;
 use sponsord_onramp::state;
 use test_support::{FakeCapabilitySource, FakeCaptcha, SourceBehavior, test_config, test_info};
 
@@ -33,7 +35,7 @@ async fn build_keeps_the_daemon_info() {
 #[tokio::test]
 async fn build_refuses_terms_above_the_daemon_maximum() {
     let mut cfg = test_config(tempfile::tempdir().unwrap().keep());
-    cfg.spending_cap = Some(5_000_001);
+    cfg.spending_cap = Some(MicroUsdc(5_000_001));
     let err = state::build(cfg, fake_source(), captcha())
         .await
         .err()

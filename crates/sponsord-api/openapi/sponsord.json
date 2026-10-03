@@ -1,0 +1,362 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "sponsord",
+    "description": "The sponsord daemon: signs capped, expiring capabilities against the sponsor's PaymentPool for callers holding its bearer token.",
+    "license": {
+      "name": "MIT OR Apache-2.0"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": [],
+        "summary": "Liveness.",
+        "operationId": "daemon_healthz",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": [],
+        "summary": "Prometheus metrics (text exposition format).",
+        "operationId": "metrics",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "text/plain; version=0.0.4": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/capabilities": {
+      "post": {
+        "tags": [],
+        "summary": "Issue a capability for `signer`. A registered, unexpired signer gets its\nexisting capability back whatever terms are asked; an expired one gets\n`409 signer_expired`.",
+        "operationId": "issue",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IssueRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`bad_request`, `exceeds_max` or `zero`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`signer_expired`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`chain_unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/info": {
+      "get": {
+        "tags": [],
+        "summary": "The chain and pool this daemon signs for, and its maximum terms.",
+        "operationId": "info",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Info"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ErrorBody": {
+        "type": "object",
+        "description": "An error response body.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorCode"
+          },
+          "expiry": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "With `signer_expired` (daemon): when the registration expired.",
+            "minimum": 0
+          },
+          "max_spending_cap": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MicroUsdc",
+                "description": "With `exceeds_max`."
+              }
+            ]
+          },
+          "max_ttl_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "With `exceeds_max`.",
+            "minimum": 0
+          }
+        }
+      },
+      "ErrorCode": {
+        "type": "string",
+        "description": "Every error code either server returns, with its HTTP status\n([`ErrorCode::http_status`]).",
+        "enum": [
+          "bad_request",
+          "exceeds_max",
+          "zero",
+          "unauthorized",
+          "gate_failed",
+          "signer_expired",
+          "rate_limited",
+          "internal",
+          "upstream",
+          "chain_unavailable",
+          "unknown"
+        ]
+      },
+      "Health": {
+        "type": "object",
+        "description": "`GET /healthz`.",
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Info": {
+        "type": "object",
+        "description": "`GET /v1/info`: the chain and pool this daemon signs for, and the\nlargest terms it grants.",
+        "required": [
+          "chain_id",
+          "payment_pool",
+          "max_spending_cap",
+          "max_ttl_secs"
+        ],
+        "properties": {
+          "chain_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_spending_cap": {
+            "$ref": "#/components/schemas/MicroUsdc"
+          },
+          "max_ttl_secs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "payment_pool": {
+            "type": "string",
+            "description": "The `PaymentPool` contract."
+          }
+        }
+      },
+      "IssueRequest": {
+        "type": "object",
+        "description": "`POST /v1/capabilities`: a capability for `signer`. An omitted term\ndefaults to the daemon's maximum.",
+        "required": [
+          "signer"
+        ],
+        "properties": {
+          "signer": {
+            "type": "string",
+            "description": "The delegate key the capability authorizes to sign vouchers.",
+            "example": "0x00000000000000000000000000000000000000aa"
+          },
+          "spending_cap": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MicroUsdc"
+              }
+            ]
+          },
+          "ttl_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "IssueResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/IssuedCapability"
+          },
+          {
+            "type": "object",
+            "required": [
+              "registered"
+            ],
+            "properties": {
+              "registered": {
+                "type": "boolean",
+                "description": "Whether the terms come from an existing on-chain registration."
+              }
+            }
+          }
+        ],
+        "description": "`POST /v1/capabilities` success. For a signer already registered on-chain\nthe capability carries its registered terms (`registered: true`),\nwhatever terms were requested."
+      },
+      "IssuedCapability": {
+        "type": "object",
+        "description": "A signed capability: the `dcap1:` token and the terms it carries.",
+        "required": [
+          "token",
+          "spending_cap",
+          "expiry"
+        ],
+        "properties": {
+          "expiry": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix time (seconds) after which the capability is void.",
+            "minimum": 0
+          },
+          "spending_cap": {
+            "$ref": "#/components/schemas/MicroUsdc",
+            "description": "Most the signer may spend against the pool under this capability."
+          },
+          "token": {
+            "type": "string",
+            "description": "The `dcap1:` token handed to `decdn --capability-file`.",
+            "example": "dcap1:..."
+          }
+        }
+      },
+      "MicroUsdc": {
+        "type": "integer",
+        "format": "int64",
+        "description": "An amount of USDC in its base unit (6 decimals): `1_000_000` is $1. On the\nwire it is a bare integer.",
+        "minimum": 0
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  }
+}

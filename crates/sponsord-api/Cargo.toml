@@ -1,0 +1,39 @@
+[package]
+name = "sponsord-api"
+description = "Wire types, error codes and HTTP clients for the sponsord daemon and onramp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Typed HTTP clients: `DaemonClient` (for gates in front of the daemon) and
+# `OnrampClient` (for the CLI).
+client = ["dep:reqwest", "dep:tokio"]
+# `IntoResponse` for `ErrorBody`, for servers built on axum.
+axum = ["dep:axum"]
+# `utoipa` schemas and the OpenAPI documents in `openapi`.
+openapi = ["dep:utoipa", "dep:serde_json"]
+
+[dependencies]
+alloy-primitives = { version = "1", features = ["serde"] }
+semver = { version = "1", features = ["serde"] }
+serde.workspace = true
+thiserror = "2"
+axum = { version = "0.8", optional = true, default-features = false, features = ["json"] }
+reqwest = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokio = { version = "1", optional = true, features = ["time"] }
+utoipa = { version = "5", optional = true }
+
+[dev-dependencies]
+# Builds this crate's own tests with every feature, so `cargo test` covers
+# the clients and checks the committed OpenAPI documents.
+sponsord-api = { path = ".", features = ["client", "axum", "openapi"] }
+serde_json.workspace = true
+tokio.workspace = true
+wiremock = "0.6"

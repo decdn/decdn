@@ -18,8 +18,8 @@ use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use decdn_incentive::voucher_domain;
 
+use crate::MicroUsdc;
 use crate::issuer::Issuer;
-use crate::money::MicroUsdc;
 use crate::pool::{Authorization, PoolChain};
 use crate::sponsor::Sponsor;
 

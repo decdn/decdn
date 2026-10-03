@@ -1,0 +1,424 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "sponsord-onramp",
+    "description": "The sponsord onramp: a gate in front of the daemon, the installers, and the API decdn-sponsored polls.",
+    "license": {
+      "name": "MIT OR Apache-2.0"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/decdn.ps1": {
+      "get": {
+        "tags": [],
+        "summary": "The Windows installer: `irm <onramp>/decdn.ps1 | iex`.",
+        "operationId": "install_ps1",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/decdn.sh": {
+      "get": {
+        "tags": [],
+        "summary": "The macOS/Linux installer: `curl -fsSL <onramp>/decdn.sh | sh`.",
+        "operationId": "install_sh",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "text/x-shellscript": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/fund": {
+      "get": {
+        "tags": [],
+        "summary": "The gate page for `client` (HTML). It calls `POST /v1/fund` once the\ngate's check passes.",
+        "operationId": "fund_page",
+        "parameters": [
+          {
+            "name": "client",
+            "in": "query",
+            "description": "The download key's address.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`bad_request`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": [],
+        "summary": "Liveness.",
+        "operationId": "onramp_healthz",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/capability": {
+      "get": {
+        "tags": [],
+        "summary": "The capability issued to `client`, or `204` while there is none.",
+        "operationId": "capability",
+        "parameters": [
+          {
+            "name": "client",
+            "in": "query",
+            "description": "The download key's address.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilityResponse"
+                }
+              }
+            }
+          },
+          "204": {
+            "description": "No capability issued yet"
+          },
+          "400": {
+            "description": "`bad_request`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "`rate_limited`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/fund": {
+      "post": {
+        "tags": [],
+        "summary": "Get a capability for `client`, given the gate's proof. Idempotent per\nclient while its capability is valid.",
+        "operationId": "fund",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FundRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilityResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`bad_request`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`gate_failed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`signer_expired`: use a new key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "`rate_limited`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "`upstream`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/profile": {
+      "get": {
+        "tags": [],
+        "summary": "What `decdn-sponsored` needs to run `decdn` against this onramp's pool.",
+        "operationId": "profile",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CapabilityResponse": {
+        "type": "object",
+        "description": "The capability issued to a client.",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "The `dcap1:` token."
+          }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "description": "An error response body.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorCode"
+          },
+          "expiry": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "With `signer_expired` (daemon): when the registration expired.",
+            "minimum": 0
+          },
+          "max_spending_cap": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MicroUsdc",
+                "description": "With `exceeds_max`."
+              }
+            ]
+          },
+          "max_ttl_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "With `exceeds_max`.",
+            "minimum": 0
+          }
+        }
+      },
+      "ErrorCode": {
+        "type": "string",
+        "description": "Every error code either server returns, with its HTTP status\n([`ErrorCode::http_status`]).",
+        "enum": [
+          "bad_request",
+          "exceeds_max",
+          "zero",
+          "unauthorized",
+          "gate_failed",
+          "signer_expired",
+          "rate_limited",
+          "internal",
+          "upstream",
+          "chain_unavailable",
+          "unknown"
+        ]
+      },
+      "FundRequest": {
+        "type": "object",
+        "description": "`POST /v1/fund`: ask for a capability for `client`, with the gate's proof\nthat the request may have one (for Turnstile, the widget's token).",
+        "required": [
+          "client",
+          "proof"
+        ],
+        "properties": {
+          "client": {
+            "type": "string"
+          },
+          "proof": {
+            "type": "string"
+          }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "description": "`GET /healthz`.",
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        }
+      },
+      "MicroUsdc": {
+        "type": "integer",
+        "format": "int64",
+        "description": "An amount of USDC in its base unit (6 decimals): `1_000_000` is $1. On the\nwire it is a bare integer.",
+        "minimum": 0
+      },
+      "Profile": {
+        "type": "object",
+        "description": "`GET /v1/profile`: the chain and contracts the CLI hands to `decdn`. The\nCLI reads it on every run, so the onramp can change any of it without\nusers reinstalling.",
+        "required": [
+          "chain_id",
+          "rpc_url",
+          "payment_pool",
+          "capacity_bond"
+        ],
+        "properties": {
+          "capacity_bond": {
+            "type": "string",
+            "description": "The `CapacityBond`, for node discovery."
+          },
+          "chain_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "min_cli_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Oldest `decdn-sponsored` this onramp works with; an older CLI tells\nthe user to re-run the installer.",
+            "example": "0.2.0"
+          },
+          "payment_pool": {
+            "type": "string",
+            "description": "The `PaymentPool` the capabilities are signed against."
+          },
+          "rpc_url": {
+            "type": "string",
+            "description": "JSON-RPC endpoint `decdn` reads the chain through."
+          },
+          "slash_judge": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `SlashJudge`, when the onramp names one."
+          }
+        }
+      }
+    }
+  }
+}

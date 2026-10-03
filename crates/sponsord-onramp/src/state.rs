@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use crate::captcha::CaptchaVerifier;
 use crate::config::OnrampConfig;
-use crate::daemon::{CapabilitySource, DaemonInfo};
+use sponsord_api::daemon::Info;
+use sponsord_api::time::{Clock, SystemClock};
+
+use crate::daemon::CapabilitySource;
 use crate::store::Store;
 
 /// Shared state handed to every HTTP handler.
@@ -14,7 +17,8 @@ pub struct AppState {
     pub cfg: Arc<OnrampConfig>,
     /// The daemon's `/v1/info`, read once at startup; the installers render
     /// its chain id and `PaymentPool` address.
-    pub chain: Arc<DaemonInfo>,
+    pub chain: Arc<Info>,
+    pub clock: Arc<dyn Clock>,
 }
 
 /// Assemble `AppState`: read the daemon's `/v1/info`, refuse configured
@@ -41,5 +45,6 @@ pub async fn build(
         turnstile,
         cfg: Arc::new(cfg),
         chain: Arc::new(info),
+        clock: Arc::new(SystemClock),
     })
 }

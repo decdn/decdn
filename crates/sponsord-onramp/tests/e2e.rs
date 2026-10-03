@@ -21,19 +21,17 @@ use axum::http::{Request, StatusCode};
 use decdn_incentive::{CapabilityGrant, voucher_domain};
 use serde_json::{Value, json};
 use sponsord::http::ApiState;
+use sponsord_api::client::DaemonClient;
 use sponsord_core::pool::{Authorization, PoolChain};
 use sponsord_core::test_support::{FakePool, TEST_CHAIN_ID, TEST_PAYMENT_POOL, fake_sponsor};
-use sponsord_onramp::daemon::{CapabilitySource, DaemonClient};
+use sponsord_onramp::daemon::CapabilitySource;
 use tower::ServiceExt;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
 async fn stack() -> (Router, Arc<FakePool>) {
     let (sponsor, pool) = fake_sponsor(5_000_000, 172_800).await;
-    let daemon = sponsord::http::router(ApiState {
-        sponsor: Arc::new(sponsor),
-        api_token: Arc::from(TOKEN),
-    });
+    let daemon = sponsord::http::router(ApiState::new(Arc::new(sponsor), Arc::from(TOKEN)));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, daemon).await.unwrap() });
@@ -57,10 +55,10 @@ async fn fund(app: &Router, client: &str) -> (StatusCode, Value) {
     let resp = app
         .clone()
         .oneshot(
-            Request::post("/fund")
+            Request::post("/v1/fund")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({"client": client, "turnstile_token": "ok"}).to_string(),
+                    json!({"client": client, "proof": "ok"}).to_string(),
                 ))
                 .unwrap(),
         )
@@ -96,7 +94,7 @@ async fn fund_then_capability_returns_an_owner_signed_token() {
 
     let resp = app
         .oneshot(
-            Request::get(format!("/capability?client={client}"))
+            Request::get(format!("/v1/capability?client={client}"))
                 .body(Body::empty())
                 .unwrap(),
         )

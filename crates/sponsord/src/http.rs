@@ -2,19 +2,18 @@
 //! unauthenticated `GET /healthz`. Every `/v1` route requires
 //! `Authorization: Bearer <token>`, compared in constant time.
 
-use std::str::FromStr;
 use std::sync::Arc;
 
-use alloy::primitives::Address;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::header;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
-use serde_json::json;
+use sponsord_api::daemon::{Health, Info, IssueRequest, IssueResponse, routes};
+use sponsord_api::time::{Clock, SystemClock};
+use sponsord_api::{ErrorBody, ErrorCode, IssuedCapability, MicroUsdc};
 use sponsord_core::issuer::TermsError;
 use sponsord_core::{Sponsor, SponsorError};
 use subtle::ConstantTimeEq;
@@ -23,28 +22,30 @@ use subtle::ConstantTimeEq;
 pub struct ApiState {
     pub sponsor: Arc<Sponsor>,
     pub api_token: Arc<str>,
+    pub clock: Arc<dyn Clock>,
+}
+
+impl ApiState {
+    /// State on the system clock.
+    #[must_use]
+    pub fn new(sponsor: Arc<Sponsor>, api_token: Arc<str>) -> Self {
+        Self {
+            sponsor,
+            api_token,
+            clock: Arc::new(SystemClock),
+        }
+    }
 }
 
 pub fn router(state: ApiState) -> Router {
     let api = Router::new()
-        .route("/v1/capabilities", post(issue))
-        .route("/v1/info", get(info))
+        .route(routes::CAPABILITIES, post(issue))
+        .route(routes::INFO, get(info))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
-        .route("/healthz", get(healthz))
+        .route(routes::HEALTHZ, get(healthz))
         .merge(api)
         .with_state(state)
-}
-
-fn err_json(status: StatusCode, code: &str) -> Response {
-    (status, Json(json!({ "error": code }))).into_response()
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// The token from an `Authorization` value with a case-insensitive `Bearer`
@@ -66,80 +67,69 @@ async fn require_token(State(state): State<ApiState>, req: Request, next: Next) 
         Some(t) if bool::from(t.as_bytes().ct_eq(state.api_token.as_bytes())) => {
             next.run(req).await
         }
-        _ => err_json(StatusCode::UNAUTHORIZED, "unauthorized"),
+        _ => ErrorCode::Unauthorized.into_response(),
     }
 }
 
-async fn healthz() -> Json<serde_json::Value> {
-    Json(json!({ "ok": true }))
+async fn healthz() -> Json<Health> {
+    Json(Health { ok: true })
 }
 
-async fn info(State(state): State<ApiState>) -> Json<serde_json::Value> {
-    let i = state.sponsor.info();
-    Json(json!({
-        "chain_id": i.chain_id,
-        "payment_pool": i.payment_pool.to_string(),
-        "max_spending_cap": i.max_spending_cap,
-        "max_ttl_secs": i.max_ttl_secs,
-    }))
+fn wire_info(sponsor: &Sponsor) -> Info {
+    let i = sponsor.info();
+    Info {
+        chain_id: i.chain_id,
+        payment_pool: i.payment_pool,
+        max_spending_cap: MicroUsdc(i.max_spending_cap),
+        max_ttl_secs: i.max_ttl_secs,
+    }
 }
 
-#[derive(Deserialize)]
-struct IssueRequest {
-    signer: String,
-    spending_cap: Option<u64>,
-    ttl_secs: Option<u64>,
+async fn info(State(state): State<ApiState>) -> Json<Info> {
+    Json(wire_info(&state.sponsor))
 }
 
 async fn issue(
     State(state): State<ApiState>,
     body: Result<Json<IssueRequest>, JsonRejection>,
-) -> Response {
+) -> Result<Json<IssueResponse>, ErrorBody> {
     let Ok(Json(req)) = body else {
-        return err_json(StatusCode::BAD_REQUEST, "bad_request");
+        return Err(ErrorCode::BadRequest.into());
     };
-    let Ok(signer) = Address::from_str(&req.signer) else {
-        return err_json(StatusCode::BAD_REQUEST, "bad_request");
-    };
+    let now = state.clock.now_unix();
     match state
         .sponsor
-        .issue(signer, req.spending_cap, req.ttl_secs, now_unix())
+        .issue(req.signer, req.spending_cap.map(|c| c.0), req.ttl_secs, now)
         .await
     {
-        Ok(i) => Json(json!({
-            "token": i.token,
-            "spending_cap": i.spending_cap,
-            "expiry": i.expiry,
-            "registered": i.registered,
-        }))
-        .into_response(),
+        Ok(i) => Ok(Json(IssueResponse {
+            capability: IssuedCapability {
+                token: i.token,
+                spending_cap: MicroUsdc(i.spending_cap),
+                expiry: i.expiry,
+            },
+            registered: i.registered,
+        })),
         Err(SponsorError::Terms(TermsError::ExceedsMax { .. })) => {
-            let i = state.sponsor.info();
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": "exceeds_max",
-                    "max_spending_cap": i.max_spending_cap,
-                    "max_ttl_secs": i.max_ttl_secs,
-                })),
-            )
-                .into_response()
+            let i = wire_info(&state.sponsor);
+            Err(ErrorBody {
+                max_spending_cap: Some(i.max_spending_cap),
+                max_ttl_secs: Some(i.max_ttl_secs),
+                ..ErrorBody::new(ErrorCode::ExceedsMax)
+            })
         }
-        Err(SponsorError::Terms(TermsError::Zero { .. })) => {
-            err_json(StatusCode::BAD_REQUEST, "zero")
-        }
-        Err(SponsorError::SignerExpired { expiry }) => (
-            StatusCode::CONFLICT,
-            Json(json!({ "error": "signer_expired", "expiry": expiry })),
-        )
-            .into_response(),
+        Err(SponsorError::Terms(TermsError::Zero { .. })) => Err(ErrorCode::Zero.into()),
+        Err(SponsorError::SignerExpired { expiry }) => Err(ErrorBody {
+            expiry: Some(expiry),
+            ..ErrorBody::new(ErrorCode::SignerExpired)
+        }),
         Err(SponsorError::Chain(e)) => {
             tracing::warn!("signer authorization read failed: {e}");
-            err_json(StatusCode::SERVICE_UNAVAILABLE, "chain_unavailable")
+            Err(ErrorCode::ChainUnavailable.into())
         }
         Err(SponsorError::Sign(e)) => {
             tracing::error!("capability signing failed: {e}");
-            err_json(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+            Err(ErrorCode::Internal.into())
         }
     }
 }

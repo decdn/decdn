@@ -12,7 +12,7 @@ use decdn_client::buyer_pool::{ensure_allowance, top_up};
 use decdn_client::provider::build_provider;
 use decdn_incentive::payment_pool::PaymentPool;
 
-use crate::money::MicroUsdc;
+use crate::MicroUsdc;
 
 /// A signer's registration under a pool: the terms fixed by the first
 /// capability redeemed for it (`PaymentPool.authorized[poolId][signer]`).

@@ -10,6 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+sponsord-api = { workspace = true, features = ["axum", "client"] }
 tokio.workspace = true
 anyhow.workspace = true
 alloy.workspace = true
@@ -21,7 +22,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 async-trait = "0.1"
 axum = "0.8"
-thiserror = "2"
 
 [dev-dependencies]
 wiremock = "0.6"

@@ -2,7 +2,8 @@ use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
 use alloy::primitives::Address;
 
-use crate::daemon::DaemonInfo;
+use sponsord_api::MicroUsdc;
+use sponsord_api::daemon::Info;
 
 fn env(k: &str) -> anyhow::Result<String> {
     std::env::var(k).map_err(|_| anyhow::anyhow!("missing env {k}"))
@@ -89,7 +90,7 @@ pub struct OnrampConfig {
     pub rpc_url: String,
     pub capacity_bond: Address,
     /// Cap requested for each capability; `None` takes the daemon maximum.
-    pub spending_cap: Option<u64>,
+    pub spending_cap: Option<MicroUsdc>,
     /// TTL requested for each capability; `None` takes the daemon maximum.
     pub ttl_secs: Option<u64>,
     pub turnstile_secret: String,
@@ -120,7 +121,7 @@ impl OnrampConfig {
             rpc_url: env("ONRAMP_RPC_URL")?,
             capacity_bond: Address::from_str(&env("ONRAMP_CAPACITY_BOND_ADDR")?)
                 .map_err(|e| anyhow::anyhow!("ONRAMP_CAPACITY_BOND_ADDR: {e}"))?,
-            spending_cap: env_opt_u64("ONRAMP_SPENDING_CAP_MICRO_USDC")?,
+            spending_cap: env_opt_u64("ONRAMP_SPENDING_CAP_MICRO_USDC")?.map(MicroUsdc),
             ttl_secs: env_opt_u64("ONRAMP_TTL_SECS")?,
             turnstile_secret: env("ONRAMP_TURNSTILE_SECRET")?,
             turnstile_sitekey: env("ONRAMP_TURNSTILE_SITEKEY")?,
@@ -140,11 +141,11 @@ impl OnrampConfig {
     /// # Errors
     ///
     /// A configured cap or TTL is zero or above the daemon's maximum.
-    pub fn check_against(&self, info: &DaemonInfo) -> anyhow::Result<()> {
+    pub fn check_against(&self, info: &Info) -> anyhow::Result<()> {
         check_term(
             "ONRAMP_SPENDING_CAP_MICRO_USDC",
-            self.spending_cap,
-            info.max_spending_cap,
+            self.spending_cap.map(|c| c.0),
+            info.max_spending_cap.0,
         )?;
         check_term("ONRAMP_TTL_SECS", self.ttl_secs, info.max_ttl_secs)
     }

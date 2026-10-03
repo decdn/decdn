@@ -11,11 +11,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::config::Config;
 use crate::decdn::{self, PullArgs};
 use crate::hash::normalize_hash;
-use crate::onramp::OnrampClient;
+use crate::onramp;
 use crate::session::Session;
 
-/// How long to wait for the browser captcha flow to produce a capability.
+/// How long to wait for the browser gate flow to produce a capability.
 const CAPABILITY_POLL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How often to ask the onramp whether the capability is there yet.
+const CAPABILITY_POLL_EVERY: Duration = Duration::from_secs(2);
 
 /// A default decdn node's capability-expiry margin: it refuses vouchers once
 /// `now + margin` reaches the capability's expiry. The node derives it as one
@@ -38,7 +41,7 @@ pub async fn pull(
     cfg: &Config,
 ) -> anyhow::Result<()> {
     let hash = normalize_hash(hash)?;
-    let api = OnrampClient::new(cfg.onramp_url.clone());
+    let api = onramp::client(&cfg.onramp_url)?;
 
     let mut session = Session::open(&cfg.data_dir, &hash)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -54,16 +57,17 @@ pub async fn pull(
 
     let client = session.ensure_key()?;
     if session.capability()?.is_none() {
-        let info = match api.get_capability(client).await? {
-            Some(info) => info,
+        let token = match api.capability(client).await? {
+            Some(token) => token,
             None => {
                 let url = api.fund_url(client);
                 println!("Solve the captcha to start the download:\n  {url}");
                 open_in_browser(&url);
-                api.poll_capability(client, CAPABILITY_POLL_TIMEOUT).await?
+                api.poll_capability(client, CAPABILITY_POLL_EVERY, CAPABILITY_POLL_TIMEOUT)
+                    .await?
             }
         };
-        session.save_capability(&info.token)?;
+        session.save_capability(&token)?;
     }
 
     let args = PullArgs {

@@ -1,0 +1,116 @@
+//! The sponsord daemon's HTTP API. Every `/v1` route needs
+//! `Authorization: Bearer <SPONSORD_API_TOKEN>`; `/healthz` and `/metrics`
+//! need none.
+
+use alloy_primitives::Address;
+use serde::{Deserialize, Serialize};
+
+use crate::{IssuedCapability, MicroUsdc};
+
+/// Route paths.
+pub mod routes {
+    /// `POST`: [`IssueRequest`](super::IssueRequest) →
+    /// [`IssueResponse`](super::IssueResponse).
+    pub const CAPABILITIES: &str = "/v1/capabilities";
+    /// `GET` → [`Info`](super::Info).
+    pub const INFO: &str = "/v1/info";
+    /// `GET` → [`Health`](crate::daemon::Health), no token.
+    pub const HEALTHZ: &str = "/healthz";
+    /// `GET` → Prometheus text exposition, no token.
+    pub const METRICS: &str = "/metrics";
+}
+
+/// `POST /v1/capabilities`: a capability for `signer`. An omitted term
+/// defaults to the daemon's maximum.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct IssueRequest {
+    /// The delegate key the capability authorizes to sign vouchers.
+    #[cfg_attr(feature = "openapi", schema(value_type = String, example = "0x00000000000000000000000000000000000000aa"))]
+    pub signer: Address,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spending_cap: Option<MicroUsdc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+}
+
+impl IssueRequest {
+    /// A request for `signer` at the daemon's maximum terms.
+    #[must_use]
+    pub fn new(signer: Address) -> Self {
+        Self {
+            signer,
+            spending_cap: None,
+            ttl_secs: None,
+        }
+    }
+}
+
+/// `POST /v1/capabilities` success. For a signer already registered on-chain
+/// the capability carries its registered terms (`registered: true`),
+/// whatever terms were requested.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct IssueResponse {
+    #[serde(flatten)]
+    pub capability: IssuedCapability,
+    /// Whether the terms come from an existing on-chain registration.
+    pub registered: bool,
+}
+
+/// `GET /v1/info`: the chain and pool this daemon signs for, and the
+/// largest terms it grants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct Info {
+    pub chain_id: u64,
+    /// The `PaymentPool` contract.
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    pub payment_pool: Address,
+    pub max_spending_cap: MicroUsdc,
+    pub max_ttl_secs: u64,
+}
+
+/// `GET /healthz`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct Health {
+    pub ok: bool,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn issue_request_omits_unset_terms() {
+        let req = IssueRequest::new(Address::repeat_byte(0xaa));
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            json!({"signer": Address::repeat_byte(0xaa)})
+        );
+        let parsed: IssueRequest =
+            serde_json::from_value(json!({"signer": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}))
+                .unwrap();
+        assert_eq!(parsed, req);
+    }
+
+    #[test]
+    fn issue_response_is_flat() {
+        let resp = IssueResponse {
+            capability: IssuedCapability {
+                token: "dcap1:X".into(),
+                spending_cap: MicroUsdc(5),
+                expiry: 9,
+            },
+            registered: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&resp).unwrap(),
+            json!({"token": "dcap1:X", "spending_cap": 5, "expiry": 9, "registered": true})
+        );
+    }
+}

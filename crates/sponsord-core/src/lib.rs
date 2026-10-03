@@ -5,11 +5,11 @@
 
 pub mod issuer;
 pub mod keeper;
-pub mod money;
 pub mod pool;
 pub mod sponsor;
 
 pub use sponsor::{Info, Issued, Sponsor, SponsorConfig, SponsorError};
+pub use sponsord_api::MicroUsdc;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

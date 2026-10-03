@@ -22,7 +22,7 @@ use decdn_client::buyer_pool::{ensure_allowance, open_pool};
 use decdn_e2e::chain::ChainFixture;
 use decdn_incentive::Deployment;
 use decdn_incentive::payment_pool::PaymentPool;
-use sponsord_core::money::MicroUsdc;
+use sponsord_core::MicroUsdc;
 use sponsord_core::pool::{ChainPoolConfig, connect};
 
 /// Opening deposit, in USDC base units (6 decimals), well above the top-up

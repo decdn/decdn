@@ -14,17 +14,21 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use alloy::primitives::Address;
 use async_trait::async_trait;
 
+use sponsord_api::client::DaemonError;
+use sponsord_api::daemon::{Info, IssueRequest, IssueResponse};
+use sponsord_api::time::SystemClock;
+use sponsord_api::{ErrorCode, IssuedCapability, MicroUsdc};
 use sponsord_onramp::captcha::CaptchaVerifier;
 use sponsord_onramp::config::{OnrampConfig, ReleasePin};
-use sponsord_onramp::daemon::{CapabilitySource, DaemonGrant, DaemonInfo, SourceError};
+use sponsord_onramp::daemon::CapabilitySource;
 use sponsord_onramp::state::AppState;
 use sponsord_onramp::store::Store;
 
-pub fn test_info() -> DaemonInfo {
-    DaemonInfo {
+pub fn test_info() -> Info {
+    Info {
         chain_id: 421_614,
         payment_pool: Address::repeat_byte(0x22),
-        max_spending_cap: 5_000_000,
+        max_spending_cap: MicroUsdc(5_000_000),
         max_ttl_secs: 172_800,
     }
 }
@@ -58,11 +62,8 @@ pub enum SourceBehavior {
     Issue,
     SignerExpired,
     Unavailable,
-    Misconfigured,
+    Rejected,
 }
-
-/// The `(signer, spending_cap, ttl_secs)` of an `issue` call.
-pub type IssueRequest = (Address, Option<u64>, Option<u64>);
 
 /// In-memory daemon: hands out `dcap1:FAKE<n>` tokens with the requested
 /// terms (omitted = `test_info()` maximums), or fails as configured.
@@ -84,7 +85,7 @@ impl FakeCapabilitySource {
         self.issued.load(Ordering::SeqCst)
     }
     pub fn last_request(&self) -> Option<IssueRequest> {
-        *self.last_request.lock().unwrap()
+        self.last_request.lock().unwrap().clone()
     }
 }
 
@@ -97,32 +98,31 @@ fn now_unix() -> u64 {
 
 #[async_trait]
 impl CapabilitySource for FakeCapabilitySource {
-    async fn issue(
-        &self,
-        signer: Address,
-        spending_cap: Option<u64>,
-        ttl_secs: Option<u64>,
-    ) -> Result<DaemonGrant, SourceError> {
-        *self.last_request.lock().unwrap() = Some((signer, spending_cap, ttl_secs));
+    async fn issue(&self, req: &IssueRequest) -> Result<IssueResponse, DaemonError> {
+        *self.last_request.lock().unwrap() = Some(req.clone());
         match self.behavior {
             SourceBehavior::Issue => {
                 let n = self.issued.fetch_add(1, Ordering::SeqCst) + 1;
                 let info = test_info();
-                Ok(DaemonGrant {
-                    token: format!("dcap1:FAKE{n}"),
-                    spending_cap: spending_cap.unwrap_or(info.max_spending_cap),
-                    expiry: now_unix() + ttl_secs.unwrap_or(info.max_ttl_secs),
+                Ok(IssueResponse {
+                    capability: IssuedCapability {
+                        token: format!("dcap1:FAKE{n}"),
+                        spending_cap: req.spending_cap.unwrap_or(info.max_spending_cap),
+                        expiry: now_unix() + req.ttl_secs.unwrap_or(info.max_ttl_secs),
+                    },
+                    registered: false,
                 })
             }
-            SourceBehavior::SignerExpired => Err(SourceError::SignerExpired(1_000)),
-            SourceBehavior::Unavailable => Err(SourceError::Unavailable("down".into())),
-            SourceBehavior::Misconfigured => {
-                Err(SourceError::Misconfigured("401 unauthorized".into()))
-            }
+            SourceBehavior::SignerExpired => Err(DaemonError::SignerExpired { expiry: 1_000 }),
+            SourceBehavior::Unavailable => Err(DaemonError::Unavailable("down".into())),
+            SourceBehavior::Rejected => Err(DaemonError::Rejected {
+                status: 401,
+                code: ErrorCode::Unauthorized,
+            }),
         }
     }
 
-    async fn info(&self) -> Result<DaemonInfo, SourceError> {
+    async fn info(&self) -> Result<Info, DaemonError> {
         Ok(test_info())
     }
 }
@@ -148,7 +148,7 @@ impl CaptchaVerifier for FakeCaptcha {
 pub struct FakeOptions {
     pub captcha_passes: bool,
     pub source: SourceBehavior,
-    pub spending_cap: Option<u64>,
+    pub spending_cap: Option<MicroUsdc>,
     pub ttl_secs: Option<u64>,
 }
 impl Default for FakeOptions {
@@ -179,6 +179,7 @@ pub fn app_state_with_options(opts: FakeOptions) -> (AppState, Arc<FakeCapabilit
         turnstile: Arc::new(FakeCaptcha::new(opts.captcha_passes)),
         cfg: Arc::new(cfg),
         chain: Arc::new(test_info()),
+        clock: Arc::new(SystemClock),
     };
     (state, source)
 }

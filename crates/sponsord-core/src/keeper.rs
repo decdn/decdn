@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use alloy::primitives::B256;
 
-use crate::money::MicroUsdc;
+use crate::MicroUsdc;
 use crate::pool::PoolChain;
 
 /// Whether `remaining` has dropped below `low_water`.

@@ -10,8 +10,8 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use crate::config::OnrampConfig;
-use crate::daemon::DaemonInfo;
 use crate::state::AppState;
+use sponsord_api::daemon::Info;
 
 /// The POSIX installer script, embedded at compile time.
 const DECDN_SH_TEMPLATE: &str = include_str!("../../assets/decdn.sh");
@@ -25,7 +25,7 @@ const DECDN_PS1_TEMPLATE: &str = include_str!("../../assets/decdn.ps1");
 /// `{{DECDN_SUMS_SHA256}}`, `{{CLI_RELEASE}}`, `{{CLI_SUMS_SHA256}}`).
 /// The chain id and `PaymentPool` address come from the daemon, the
 /// authority for the values its capabilities are signed against.
-fn render(template: &str, cfg: &OnrampConfig, chain: &DaemonInfo) -> String {
+fn render(template: &str, cfg: &OnrampConfig, chain: &Info) -> String {
     template
         .replace("{{DECDN_RELEASE}}", &cfg.decdn_release.tag)
         .replace("{{DECDN_SUMS_SHA256}}", &cfg.decdn_release.sums_sha256)

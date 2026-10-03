@@ -25,10 +25,10 @@
   const CLIENT = "{{CLIENT}}";
 
   function onTurnstileToken(token) {
-    fetch("/fund", {
+    fetch("/v1/fund", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ client: CLIENT, turnstile_token: token }),
+      body: JSON.stringify({ client: CLIENT, proof: token }),
     })
       .then((resp) => {
         if (resp.ok) {

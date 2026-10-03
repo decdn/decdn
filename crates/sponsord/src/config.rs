@@ -6,8 +6,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256};
+use sponsord_core::MicroUsdc;
 use sponsord_core::SponsorConfig;
-use sponsord_core::money::MicroUsdc;
 
 /// Shortest accepted `SPONSORD_API_TOKEN`, in bytes (`openssl rand -hex 32`
 /// gives 64).

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/decdn-sponsored",
     "crates/sponsord",
+    "crates/sponsord-api",
     "crates/sponsord-core",
     "crates/sponsord-onramp",
 ]
@@ -28,6 +29,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
 # deCDN itself, from its public repository. `Cargo.lock` pins the commit;
 # `cargo update -p decdn-incentive` moves it. To build against a local
 # checkout instead, see CONTRIBUTING.md.
@@ -36,4 +38,5 @@ decdn-incentive = { git = "https://github.com/decdn/decdn", branch = "main" }
 decdn-e2e = { git = "https://github.com/decdn/decdn", branch = "main" }
 # This workspace's own crates.
 sponsord = { path = "crates/sponsord" }
+sponsord-api = { path = "crates/sponsord-api" }
 sponsord-core = { path = "crates/sponsord-core" }

@@ -16,9 +16,9 @@ use std::time::Duration;
 use alloy::primitives::{Address, B256};
 use decdn_incentive::voucher_domain;
 
+use crate::MicroUsdc;
 use crate::issuer::{Issuer, TermsError};
 use crate::keeper;
-use crate::money::MicroUsdc;
 use crate::pool::{self, ChainPoolConfig, PoolChain};
 
 /// Everything `Sponsor::connect` needs.

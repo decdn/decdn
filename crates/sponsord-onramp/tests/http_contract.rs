@@ -38,7 +38,7 @@ async fn json_body(resp: axum::response::Response) -> Value {
 }
 
 fn fund_body() -> String {
-    serde_json::json!({ "client": CLIENT, "turnstile_token": "ok" }).to_string()
+    serde_json::json!({ "client": CLIENT, "proof": "ok" }).to_string()
 }
 
 #[tokio::test]
@@ -49,7 +49,7 @@ async fn fund_issues_token_then_capability_returns_same_token() {
     let resp = app
         .clone()
         .oneshot(
-            Request::post("/fund")
+            Request::post("/v1/fund")
                 .header("content-type", "application/json")
                 .body(Body::from(fund_body()))
                 .expect("req"),
@@ -65,7 +65,7 @@ async fn fund_issues_token_then_capability_returns_same_token() {
     let resp = app
         .clone()
         .oneshot(
-            Request::get(format!("/capability?client={CLIENT}"))
+            Request::get(format!("/v1/capability?client={CLIENT}"))
                 .body(Body::empty())
                 .expect("req"),
         )
@@ -80,7 +80,7 @@ async fn fund_issues_token_then_capability_returns_same_token() {
     // Second /fund is idempotent: identical token, no re-sign.
     let resp = app
         .oneshot(
-            Request::post("/fund")
+            Request::post("/v1/fund")
                 .header("content-type", "application/json")
                 .body(Body::from(fund_body()))
                 .expect("req"),
@@ -105,7 +105,7 @@ async fn capability_204_before_issue() {
     let app = sponsord_onramp::http::router(state);
     let resp = app
         .oneshot(
-            Request::get(format!("/capability?client={CLIENT}"))
+            Request::get(format!("/v1/capability?client={CLIENT}"))
                 .body(Body::empty())
                 .expect("req"),
         )
@@ -123,7 +123,7 @@ async fn fund_rejects_bad_captcha_403() {
     let app = sponsord_onramp::http::router(state);
     let resp = app
         .oneshot(
-            Request::post("/fund")
+            Request::post("/v1/fund")
                 .header("content-type", "application/json")
                 .body(Body::from(fund_body()))
                 .expect("req"),
@@ -131,10 +131,7 @@ async fn fund_rejects_bad_captcha_403() {
         .await
         .expect("resp");
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        json_body(resp).await["error"].as_str(),
-        Some("captcha_failed")
-    );
+    assert_eq!(json_body(resp).await["error"].as_str(), Some("gate_failed"));
 }
 
 #[tokio::test]
@@ -157,7 +154,8 @@ async fn fund_page_embeds_sitekey_and_client_and_rejects_non_hex() {
         .expect("body");
     let html = String::from_utf8(bytes.to_vec()).expect("utf8");
     assert!(html.contains("TEST_SITEKEY"));
-    assert!(html.contains(CLIENT));
+    let client: alloy::primitives::Address = CLIENT.parse().expect("addr");
+    assert!(html.contains(&client.to_string()));
 
     let resp = app
         .oneshot(
@@ -195,7 +193,7 @@ async fn expired_grant_for_unregistered_signer_is_reissued() {
     let resp = app
         .clone()
         .oneshot(
-            Request::get(format!("/capability?client={CLIENT}"))
+            Request::get(format!("/v1/capability?client={CLIENT}"))
                 .body(Body::empty())
                 .expect("req"),
         )
@@ -206,7 +204,7 @@ async fn expired_grant_for_unregistered_signer_is_reissued() {
     // POST /fund re-issues a fresh token rather than returning the stale one.
     let resp = app
         .oneshot(
-            Request::post("/fund")
+            Request::post("/v1/fund")
                 .header("content-type", "application/json")
                 .body(Body::from(fund_body()))
                 .expect("req"),
@@ -245,7 +243,7 @@ async fn expired_grant_for_expired_registration_is_refused_409() {
     let app = sponsord_onramp::http::router(state);
     let resp = app
         .oneshot(
-            Request::post("/fund")
+            Request::post("/v1/fund")
                 .header("content-type", "application/json")
                 .body(Body::from(fund_body()))
                 .expect("req"),
@@ -342,7 +340,7 @@ async fn decdn_ps1_templated_with_payment_pool() {
 async fn post_fund(app: &axum::Router) -> axum::response::Response {
     app.clone()
         .oneshot(
-            Request::post("/fund")
+            Request::post("/v1/fund")
                 .header("content-type", "application/json")
                 .body(Body::from(fund_body()))
                 .expect("req"),
@@ -366,7 +364,7 @@ async fn fund_maps_daemon_outcomes() {
             "upstream",
         ),
         (
-            SourceBehavior::Misconfigured,
+            SourceBehavior::Rejected,
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
         ),
@@ -388,7 +386,7 @@ async fn fund_requests_configured_terms_and_stores_returned_terms() {
     use std::str::FromStr;
 
     let (state, source) = app_state_with_options(FakeOptions {
-        spending_cap: Some(1_000_000),
+        spending_cap: Some(sponsord_api::MicroUsdc(1_000_000)),
         ttl_secs: Some(3_600),
         ..FakeOptions::default()
     });
@@ -399,7 +397,11 @@ async fn fund_requests_configured_terms_and_stores_returned_terms() {
     let signer = Address::from_str(CLIENT).expect("addr");
     assert_eq!(
         source.last_request(),
-        Some((signer, Some(1_000_000), Some(3_600)))
+        Some(sponsord_api::daemon::IssueRequest {
+            signer,
+            spending_cap: Some(sponsord_api::MicroUsdc(1_000_000)),
+            ttl_secs: Some(3_600),
+        })
     );
     let rec = store.get_grant(signer).expect("read").expect("stored");
     assert_eq!(rec.spending_cap, 1_000_000);

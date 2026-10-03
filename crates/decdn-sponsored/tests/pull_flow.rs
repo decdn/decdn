@@ -98,7 +98,7 @@ fn state_dir(data_dir: &Path) -> PathBuf {
 async fn onramp_with_capability(expiry: u64, expected_calls: u64) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/capability"))
+        .and(path("/v1/capability"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "token": token(expiry)
         })))

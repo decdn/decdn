@@ -9,7 +9,7 @@ deCDN's sponsored on-ramp, in three parts:
   about who deserves a capability; that is the caller's decision.
 - **`sponsord-onramp`** (`crates/sponsord-onramp`): the public onramp in front of the daemon. A
   captcha-gated `/fund` page, the `/decdn.sh` and `/decdn.ps1` installers,
-  and the `/capability` poll the CLI uses.
+  and the `/v1/capability` poll the CLI uses.
 - **`decdn-sponsored`** (`crates/decdn-sponsored`): the end-user CLI. Gives each
   download a throwaway key, gets a capability for it through the onramp,
   and hands the pull to `decdn`.
@@ -17,10 +17,14 @@ deCDN's sponsored on-ramp, in three parts:
 Capabilities are node-agnostic: issuance involves no content hash or node
 discovery, only an allowance against the shared pool. A signer's cap and
 expiry are fixed on-chain at its first redemption, which is why
-`decdn-sponsored` uses one key per download, and why `/fund` answers
+`decdn-sponsored` uses one key per download, and why `/v1/fund` answers
 `409 signer_expired` for a key whose registration has expired instead of
 renewing it. Spending is bounded by the gate in front of the daemon (the
 captcha on `/fund`), the per-capability cap, and the pool's own balance.
+
+`sponsord-api` (`crates/sponsord-api`) defines both servers' wire types and
+error codes once, with typed clients (`DaemonClient`, `OnrampClient`) behind
+its `client` feature.
 
 `sponsord-core` (`crates/sponsord-core`) is the daemon's logic as a library, for Rust
 programs that embed it instead of calling the daemon.
@@ -123,8 +127,10 @@ daemon's maximum. A change to the daemon's pool settings needs an onramp
 restart.
 
 Routes: `/healthz`, `/decdn.sh` and `/decdn.ps1` (templated installers for
-macOS/Linux and Windows), `/fund` (captcha page and capability issuance), and
-`/capability` (poll for an issued capability).
+macOS/Linux and Windows), `/fund` (captcha page), `/v1/fund` (capability
+issuance), and `/v1/capability` (poll for an issued capability). The wire
+types live in `sponsord-api`, and [`docs/openapi/`](docs/openapi) has the
+OpenAPI documents for both servers.
 
 ### Running
 
@@ -188,7 +194,7 @@ irm https://up.decdn.org/decdn.ps1 | iex; decdn-sponsored pull b3:<hash> --names
    `~/.decdn/sponsored/downloads/<hash>/`, and generates a throwaway
    voucher-signing key there with a random password stored beside it. The
    user never sees a key, keystore, or password.
-3. It polls `GET /capability?client=<addr>` and, while that answers `204`,
+3. It polls `GET /v1/capability?client=<addr>` and, while that answers `204`,
    prints (and opens in the browser) `GET /fund?client=<addr>` for the
    captcha. The issued `dcap1:` token is saved in the state directory.
 4. It runs `decdn bundle pull --hash <hash> -o <dir> --capability-file ...
