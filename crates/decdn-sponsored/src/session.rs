@@ -4,21 +4,23 @@
 //! Each download gets its own key, so the user never manages a wallet: the
 //! key holds no funds, is never shown, and its password is random and stored
 //! beside it. The directory survives an interrupted pull, so re-running the
-//! same command resumes with the same key and capability (no new captcha),
+//! same command resumes with the same key and capability (no new trip through the gate),
 //! and is deleted once the pull succeeds. It is also the `--data-dir` handed
 //! to `decdn`, so the buyer-channel store for this key goes with it.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use alloy::primitives::Address;
 use anyhow::Context;
 use decdn_incentive::CapabilityGrant;
 use decdn_incentive::eth_identity;
+use sponsord_api::onramp::Profile;
 
 const PASSWORD_FILE: &str = "password";
+const ADDRESS_FILE: &str = "address";
 const CAPABILITY_FILE: &str = "capability";
+const PROFILE_FILE: &str = "profile.json";
 
 /// One download's state directory.
 #[derive(Debug)]
@@ -61,28 +63,74 @@ impl Session {
     }
 
     /// Return this download's key address, generating the key (and its
-    /// random password) on first use. A key whose password file is missing
-    /// cannot sign, so it is replaced, together with the capability bound to
-    /// it, instead of being handed to `decdn` to fail on.
+    /// random password) on first use. The address is written beside the key
+    /// at generation, so reading it needs no password. A key missing its
+    /// password or address file is replaced, together with the capability
+    /// bound to it, instead of being handed to `decdn` to fail on.
     ///
     /// # Errors
     ///
     /// Returns an error if the key cannot be generated, written, or read.
     pub fn ensure_key(&self) -> anyhow::Result<Address> {
         let keystore = self.keystore_path();
-        if keystore.exists() {
-            if self.password_path().is_file() {
-                return read_address(&keystore);
-            }
-            remove_if_present(&keystore)?;
-            remove_if_present(&self.capability_path())?;
+        if keystore.exists()
+            && self.password_path().is_file()
+            && let Some(address) = self.address()?
+        {
+            return Ok(address);
+        }
+        for stale in [keystore, self.address_path(), self.capability_path()] {
+            remove_if_present(&stale)?;
         }
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret).map_err(|e| anyhow::anyhow!("read OS randomness: {e}"))?;
         let password = hex::encode(secret);
         write_private(&self.password_path(), password.as_bytes())?;
-        eth_identity::generate_and_persist(&self.dir, &password, false)
-            .context("generate throwaway download key")
+        let address = eth_identity::generate_and_persist(&self.dir, &password, false)
+            .context("generate throwaway download key")?;
+        write_private(&self.address_path(), address.to_string().as_bytes())?;
+        Ok(address)
+    }
+
+    fn address_path(&self) -> PathBuf {
+        self.dir.join(ADDRESS_FILE)
+    }
+
+    /// The address written beside the key, if it is there and parses.
+    fn address(&self) -> anyhow::Result<Option<Address>> {
+        let path = self.address_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        Ok(text.trim().parse().ok())
+    }
+
+    /// The onramp profile this download last ran with, if saved: a fallback
+    /// for resuming while the onramp is unreachable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file exists but cannot be read.
+    pub fn profile(&self) -> anyhow::Result<Option<Profile>> {
+        let path = self.dir.join(PROFILE_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        Ok(serde_json::from_str(&text).ok())
+    }
+
+    /// Save the onramp profile this download runs with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be written.
+    pub fn save_profile(&self, profile: &Profile) -> anyhow::Result<()> {
+        let json = serde_json::to_vec(profile)?;
+        write_private(&self.dir.join(PROFILE_FILE), &json)
     }
 
     /// The capability saved for this download, if any. A file whose contents
@@ -143,32 +191,6 @@ fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
             .with_context(|| format!("chmod 0700 {}", dir.display()))?;
     }
     Ok(())
-}
-
-/// Read the plaintext `address` field out of a v3 keystore JSON file.
-///
-/// No password is required: the address is not secret (it's derived from
-/// the public key and stored in the clear in every standard Web3 Secret
-/// Storage v3 keystore).
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be read, is not valid JSON, has no
-/// `address` field, or the field's value doesn't parse as an `Address`.
-fn read_address(keystore_path: &Path) -> anyhow::Result<Address> {
-    let bytes = std::fs::read(keystore_path)?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes)?;
-    let raw = json
-        .get("address")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("keystore missing address field"))?;
-    let with_prefix = if raw.starts_with("0x") {
-        raw.to_owned()
-    } else {
-        format!("0x{raw}")
-    };
-    let address = Address::from_str(&with_prefix)?;
-    Ok(address)
 }
 
 fn remove_if_present(path: &Path) -> anyhow::Result<()> {
@@ -255,16 +277,32 @@ mod tests {
     }
 
     #[test]
-    fn address_reads_from_generated_keystore() {
-        let dir = tempfile::tempdir().unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let addr =
-            decdn_incentive::eth_identity::generate_and_persist(dir.path(), "pw", false).unwrap();
-        let ks = decdn_incentive::eth_identity::keystore_path(dir.path());
-        assert_eq!(read_address(&ks).unwrap(), addr);
+    fn key_without_its_address_file_is_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Session::open(root.path(), HEX).unwrap();
+        let first = session.ensure_key().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(session.dir().join(ADDRESS_FILE)).unwrap(),
+            first.to_string()
+        );
+        std::fs::remove_file(session.dir().join(ADDRESS_FILE)).unwrap();
+        assert_ne!(session.ensure_key().unwrap(), first);
+    }
+
+    #[test]
+    fn profile_round_trips() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Session::open(root.path(), HEX).unwrap();
+        assert!(session.profile().unwrap().is_none());
+        let profile = Profile {
+            chain_id: 1,
+            rpc_url: "https://rpc".into(),
+            payment_pool: Address::repeat_byte(1),
+            capacity_bond: Address::repeat_byte(2),
+            slash_judge: None,
+            min_cli_version: None,
+        };
+        session.save_profile(&profile).unwrap();
+        assert_eq!(session.profile().unwrap(), Some(profile));
     }
 }

@@ -17,10 +17,30 @@ All notable changes to this project are documented here. The format follows
   `ONRAMP_DAEMON_TOKEN_FILE`, `ONRAMP_TURNSTILE_SECRET_FILE`.
 - `ONRAMP_RELEASES_BASE` (default `https://github.com/decdn`): where the
   installers download binaries from.
+- Onramp: a pluggable `Gate` (Turnstile built in; `ONRAMP_GATE`, whose
+  `custom` value lets a program embedding the onramp supply its own gate,
+  with the Turnstile settings then not required), gate-page
+  branding (`ONRAMP_BRAND_NAME`, `ONRAMP_GATE_TEMPLATE`), per-IP rate limits
+  on `/v1/fund` and `/v1/capability` (`ONRAMP_FUND_RATE_PER_MIN`,
+  `ONRAMP_POLL_RATE_PER_MIN`), the client's address passed to the gate
+  (`ONRAMP_CLIENT_IP_HEADER` behind a trusted proxy), and graceful shutdown.
+- `GET /v1/profile`: the chain and contracts the CLI runs `decdn` with, and
+  an optional `ONRAMP_MIN_CLI_VERSION`; new optional `ONRAMP_SLASH_JUDGE_ADDR`.
+- `decdn-sponsored --version`.
+- `sponsord-e2e`: tests that run the daemon, onramp and CLI together.
 - `sponsord-core`: `Sponsor::keeper_status()`, what the pool keeper has seen
   and done.
 
 ### Changed
+
+- `sponsor.toml` holds only `onramp_url`, `decdn_bin` and an optional
+  `data_dir`; the CLI reads the chain and contracts from the onramp's
+  `/v1/profile` on every run (falling back to the last one a resumed
+  download saved), so they can change without users reinstalling.
+- The onramp keeps capabilities in memory for the browser-to-CLI hand-off
+  instead of a redb file; `ONRAMP_DATA_DIR` is gone.
+- The CLI writes each download key's address beside it instead of reading
+  it from the keystore, so it no longer needs alloy's `geth-compat` keystores.
 
 - Crate directories are named after their packages, and the vocabulary is
   one word per component: onramp (not gateway), CLI (not wrapper).

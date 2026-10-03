@@ -1,8 +1,7 @@
 # decdn-sponsored installer for Windows - served by sponsord-onramp at
 # GET /decdn.ps1, with the placeholders below substituted server-side (see
-# crates/sponsord-onramp/src/http/installer.rs) from OnrampConfig and the daemon's
-# /v1/info. The POSIX twin is
-# assets/decdn.sh; the two write the same profile.
+# crates/sponsord-onramp/src/installer.rs). The POSIX twin is assets/decdn.sh;
+# the two write the same profile.
 #
 # Install, then download:
 #   irm <onramp>/decdn.ps1 | iex; decdn-sponsored pull b3:<hash>
@@ -24,10 +23,6 @@
   try {
 
     $OnrampUrl = '{{ONRAMP_URL}}'
-    $RpcUrl = '{{RPC_URL}}'
-    $PaymentPool = '{{PAYMENT_POOL}}'
-    $CapacityBond = '{{CAPACITY_BOND}}'
-    $ChainId = '{{CHAIN_ID}}'
 
     # The binaries come from pinned GitHub Releases. Each release is pinned by
     # tag and by the SHA-256 of its SHA256SUMS file.
@@ -111,21 +106,15 @@
       $env:Path = "$BinDir;$env:Path"
     }
 
-    # 3. Write the CLI's profile. Field names and shape MUST match
-    #    crates/decdn-sponsored/src/config.rs's `Profile` struct exactly. Paths use
+    # 3. Point the CLI at this onramp. Field names MUST match
+    #    crates/decdn-sponsored/src/config.rs's `File` struct. The path uses
     #    forward slashes, which Windows accepts and TOML strings need no
-    #    escaping for. Each download gets its own throwaway key under data_dir.
-    $Fwd = { param($p) $p.Replace('\', '/') }
-    $DecdnBin = & $Fwd (Join-Path $BinDir 'decdn.exe')
-    $DataDir = & $Fwd (Join-Path $DecdnDir 'sponsored')
+    #    escaping for. The chain and contracts come from the onramp's
+    #    /v1/profile on every run, and each download gets its own throwaway key.
+    $DecdnBin = (Join-Path $BinDir 'decdn.exe').Replace('\', '/')
     $ProfileToml = @"
 onramp_url = "$OnrampUrl"
 decdn_bin = "$DecdnBin"
-data_dir = "$DataDir"
-rpc_url = "$RpcUrl"
-payment_pool = "$PaymentPool"
-capacity_bond = "$CapacityBond"
-chain_id = $ChainId
 "@
     # UTF-8 without a byte-order mark: Windows PowerShell 5.1's `-Encoding UTF8`
     # writes one, and a BOM is not valid TOML.

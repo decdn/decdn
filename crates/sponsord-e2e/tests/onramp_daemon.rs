@@ -8,9 +8,6 @@
     clippy::indexing_slicing
 )]
 
-#[path = "../src/test_support.rs"]
-mod test_support;
-
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -25,7 +22,7 @@ use sponsord_api::MicroUsdc;
 use sponsord_api::client::DaemonClient;
 use sponsord_core::pool::{Authorization, PoolChain};
 use sponsord_core::test_support::{FakePool, TEST_CHAIN_ID, TEST_PAYMENT_POOL, fake_sponsor};
-use sponsord_onramp::daemon::CapabilitySource;
+use sponsord_onramp::test_support::{FakeGate, test_config};
 use tower::ServiceExt;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
@@ -37,39 +34,44 @@ async fn stack() -> (Router, Arc<FakePool>) {
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, daemon).await.unwrap() });
 
-    let mut cfg = test_support::test_config(tempfile::tempdir().unwrap().keep());
+    let mut cfg = test_config();
     cfg.daemon_url = url;
-    cfg.daemon_token = TOKEN.into();
-    let source: Arc<dyn CapabilitySource> = Arc::new(DaemonClient::new(
+    let source = Arc::new(DaemonClient::new(
         &cfg.daemon_url,
-        cfg.daemon_token.clone(),
+        TOKEN.into(),
         reqwest::Client::new(),
     ));
-    let st =
-        sponsord_onramp::state::build(cfg, source, Arc::new(test_support::FakeCaptcha::new(true)))
-            .await
-            .unwrap();
+    let st = sponsord_onramp::state::build(&cfg, source, Arc::new(FakeGate::new(true)))
+        .await
+        .unwrap();
     (sponsord_onramp::http::router(st), pool)
 }
 
-async fn fund(app: &Router, client: &str) -> (StatusCode, Value) {
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::post("/v1/fund")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({"client": client, "proof": "ok"}).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Value) {
+    let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap())
+    let v = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, v)
+}
+
+async fn fund(app: &Router, client: &str) -> (StatusCode, Value) {
+    send(
+        app,
+        Request::post("/v1/fund")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"client": client, "proof": "ok"}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
 }
 
 fn decode(token: &str) -> CapabilityGrant {
@@ -93,19 +95,14 @@ async fn fund_then_capability_returns_an_owner_signed_token() {
         pool.owner_address()
     );
 
-    let resp = app
-        .oneshot(
-            Request::get(format!("/v1/capability?client={client}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    let (s, v) = send(
+        &app,
+        Request::get(format!("/v1/capability?client={client}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
     assert_eq!(v["token"].as_str(), Some(token.as_str()));
 }
 
@@ -145,16 +142,14 @@ async fn expired_registration_is_409_through_the_stack() {
 }
 
 #[tokio::test]
-async fn installers_render_the_daemon_chain_values() {
+async fn profile_carries_the_daemon_chain_values() {
     let (app, _) = stack().await;
-    let resp = app
-        .oneshot(Request::get("/decdn.sh").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body = String::from_utf8(bytes.to_vec()).unwrap();
-    assert!(body.contains(&TEST_PAYMENT_POOL.to_string()));
-    assert!(body.contains(&TEST_CHAIN_ID.to_string()));
+    let (s, v) = send(
+        &app,
+        Request::get("/v1/profile").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["payment_pool"], json!(TEST_PAYMENT_POOL));
+    assert_eq!(v["chain_id"], TEST_CHAIN_ID);
 }

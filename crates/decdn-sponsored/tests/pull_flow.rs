@@ -83,12 +83,24 @@ fn config(onramp: &str, decdn_bin: &Path, data_dir: &Path) -> Config {
         onramp_url: onramp.to_string(),
         decdn_bin: decdn_bin.display().to_string(),
         data_dir: data_dir.to_path_buf(),
-        rpc_url: "http://rpc.invalid".into(),
-        payment_pool: Address::repeat_byte(0x01),
-        capacity_bond: Some(Address::repeat_byte(0x02)),
-        slash_judge: None,
-        chain_id: 421_614,
     }
+}
+
+fn profile_json() -> serde_json::Value {
+    serde_json::json!({
+        "chain_id": 421_614,
+        "rpc_url": "http://rpc.invalid",
+        "payment_pool": Address::repeat_byte(0x01),
+        "capacity_bond": Address::repeat_byte(0x02),
+    })
+}
+
+async fn mount_profile(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/profile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(profile_json()))
+        .mount(server)
+        .await;
 }
 
 fn state_dir(data_dir: &Path) -> PathBuf {
@@ -97,6 +109,7 @@ fn state_dir(data_dir: &Path) -> PathBuf {
 
 async fn onramp_with_capability(expiry: u64, expected_calls: u64) -> MockServer {
     let server = MockServer::start().await;
+    mount_profile(&server).await;
     Mock::given(method("GET"))
         .and(path("/v1/capability"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -129,6 +142,14 @@ async fn success_runs_bundle_pull_and_discards_state() {
     assert!(calls.contains("--capability-file"));
     assert!(calls.contains("--keystore-password-file"));
     assert!(calls.contains("--namespace 1"));
+    assert!(
+        calls.contains("--chain-id 421614"),
+        "chain from /v1/profile"
+    );
+    assert!(calls.contains(&format!(
+        "--payment-pool-address {}",
+        Address::repeat_byte(0x01)
+    )));
     assert!(!state_dir(&data).exists());
 }
 
@@ -201,4 +222,43 @@ async fn capability_inside_node_margin_rotates_to_a_fresh_key() {
         .unwrap_err();
     let new_key = std::fs::read(state_dir(&data).join("keystore.json")).unwrap();
     assert_ne!(old_key, new_key);
+}
+
+#[tokio::test]
+async fn a_rerun_resumes_with_the_saved_profile_when_the_onramp_is_down() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("sponsored");
+    let onramp = onramp_with_capability(fresh_expiry(), 1).await;
+    let failing = config(&onramp.uri(), &stub_decdn(tmp.path(), 1), &data);
+    pull::pull(HASH, &tmp.path().join("out"), None, &failing)
+        .await
+        .unwrap_err();
+
+    // The onramp is gone; the saved capability and profile carry the re-run.
+    let down = config("http://127.0.0.1:1", &stub_decdn(tmp.path(), 0), &data);
+    pull::pull(HASH, &tmp.path().join("out"), None, &down)
+        .await
+        .unwrap();
+    let calls = std::fs::read_to_string(tmp.path().join("calls")).unwrap();
+    assert_eq!(calls.lines().count(), 2);
+}
+
+#[tokio::test]
+async fn an_onramp_needing_a_newer_cli_is_refused_before_any_key_is_made() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("sponsored");
+    let server = MockServer::start().await;
+    let mut profile = profile_json();
+    profile["min_cli_version"] = "999.0.0".into();
+    Mock::given(method("GET"))
+        .and(path("/v1/profile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(profile))
+        .mount(&server)
+        .await;
+    let cfg = config(&server.uri(), &stub_decdn(tmp.path(), 0), &data);
+    let err = pull::pull(HASH, &tmp.path().join("out"), None, &cfg)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("re-run its installer"), "{err}");
+    assert!(!state_dir(&data).join("keystore.json").exists());
 }

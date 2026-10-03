@@ -12,24 +12,25 @@ workspace = true
 [dependencies]
 sponsord-api = { workspace = true, features = ["axum", "client", "secret"] }
 clap.workspace = true
+semver = "1"
 tokio.workspace = true
+tokio-util.workspace = true
 anyhow.workspace = true
 alloy.workspace = true
-redb = "4"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 async-trait = "0.1"
 axum = "0.8"
 
+[features]
+# `test_support`: fakes for the daemon and the gate, and a ready `AppState`.
+test-support = []
+
 [dev-dependencies]
+# This crate's own integration tests use `test_support`.
+sponsord-onramp = { path = ".", features = ["test-support"] }
+serde_json.workspace = true
 wiremock = "0.6"
 tower = { version = "0.5", features = ["util"] }
-# Used by `test_support.rs` (pulled into the integration-test binaries via
-# `#[path]`, not part of the shipped lib/bin) and by the store tests.
-tempfile = "3"
-sponsord.workspace = true
-sponsord-core = { workspace = true, features = ["test-support"] }
-decdn-incentive.workspace = true

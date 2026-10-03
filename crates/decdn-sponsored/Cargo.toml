@@ -19,14 +19,7 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
-# `signer-keystore-geth-compat` is additive to the workspace default: it
-# turns on `eth-keystore`'s `geth-compat` feature, which writes the
-# plaintext `address` field into the v3 keystore JSON. Feature
-# unification means this also applies to `decdn-incentive`'s
-# `eth_identity` keystores when built as part of this binary — needed so
-# `read_address` can read the address without the password. See
-# `keystore.rs` for the discovery (decdn's own keystores omit the field).
-alloy = { workspace = true, features = ["signer-keystore-geth-compat"] }
+alloy.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 decdn-incentive.workspace = true
@@ -37,6 +30,7 @@ hex = "0.4"
 getrandom = "0.3"
 reqwest.workspace = true
 toml = "1"
+semver = "1"
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]

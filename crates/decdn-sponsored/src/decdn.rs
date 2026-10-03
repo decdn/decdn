@@ -10,6 +10,8 @@ use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
+use alloy::primitives::Address;
+
 use tokio::process::Command;
 
 /// `decdn` reads this before `--keystore-password-file`; it is removed from
@@ -39,11 +41,11 @@ pub struct PullArgs {
     /// `--rpc-url`: JSON-RPC endpoint for on-chain reads.
     pub rpc_url: String,
     /// `--payment-pool-address`: the sponsor's `PaymentPool` contract.
-    pub payment_pool_address: String,
+    pub payment_pool: Address,
     /// `--capacity-bond-address`: read for node auto-discovery.
-    pub capacity_bond_address: Option<String>,
+    pub capacity_bond: Option<Address>,
     /// `--slash-judge-address`: `SlashJudge` contract address.
-    pub slash_judge_address: Option<String>,
+    pub slash_judge: Option<Address>,
     /// `--chain-id`: EIP-712 `chainId`.
     pub chain_id: u64,
 }
@@ -70,7 +72,7 @@ impl PullArgs {
             "--rpc-url".into(),
             self.rpc_url.clone().into(),
             "--payment-pool-address".into(),
-            self.payment_pool_address.clone().into(),
+            self.payment_pool.to_string().into(),
             "--chain-id".into(),
             self.chain_id.to_string().into(),
         ];
@@ -78,13 +80,13 @@ impl PullArgs {
             args.push("--namespace".into());
             args.push(namespace.to_string().into());
         }
-        if let Some(addr) = &self.capacity_bond_address {
+        if let Some(addr) = self.capacity_bond {
             args.push("--capacity-bond-address".into());
-            args.push(addr.clone().into());
+            args.push(addr.to_string().into());
         }
-        if let Some(addr) = &self.slash_judge_address {
+        if let Some(addr) = self.slash_judge {
             args.push("--slash-judge-address".into());
-            args.push(addr.clone().into());
+            args.push(addr.to_string().into());
         }
         args
     }
@@ -121,9 +123,9 @@ mod tests {
             password_file: PathBuf::from("/s/password"),
             data_dir: PathBuf::from("/s"),
             rpc_url: "http://rpc".into(),
-            payment_pool_address: "0x01".into(),
-            capacity_bond_address: Some("0x02".into()),
-            slash_judge_address: None,
+            payment_pool: Address::repeat_byte(0x01),
+            capacity_bond: Some(Address::repeat_byte(0x02)),
+            slash_judge: None,
             chain_id: 421_614,
         }
     }
@@ -149,7 +151,7 @@ mod tests {
         );
         assert_eq!(
             value_after(&args, "--capacity-bond-address").unwrap(),
-            "0x02"
+            Address::repeat_byte(0x02).to_string()
         );
         assert!(!args.iter().any(|a| a == "--capability"));
         assert_eq!(value_after(&args, "--namespace").unwrap(), "1");

@@ -1,3 +1,5 @@
+//! The onramp's HTTP contract, against a fake daemon and gate.
+
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -5,301 +7,268 @@
     clippy::indexing_slicing
 )]
 
-#[path = "../src/test_support.rs"]
-mod test_support;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
+use alloy::primitives::Address;
+use axum::Router;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
+use serde_json::{Value, json};
+use sponsord_api::onramp::Profile;
+use sponsord_api::time::{Clock, FixedClock, SystemClock};
+use sponsord_api::{ErrorBody, ErrorCode, IssuedCapability, MicroUsdc};
+use sponsord_onramp::net::ClientIpSource;
+use sponsord_onramp::test_support::{
+    FakeOptions, SourceBehavior, app_state_with_fakes, app_state_with_options, test_config,
+};
 use tower::ServiceExt;
-
-use test_support::app_state_with_fakes;
-use test_support::{FakeOptions, app_state_with_options};
-
-use serde_json::Value;
-
-#[tokio::test]
-async fn healthz_ok() {
-    let state = app_state_with_fakes();
-    let app = sponsord_onramp::http::router(state);
-    let resp = app
-        .oneshot(Request::get("/healthz").body(Body::empty()).expect("req"))
-        .await
-        .expect("resp");
-    assert_eq!(resp.status(), StatusCode::OK);
-}
 
 const CLIENT: &str = "0x00000000000000000000000000000000000000aa";
 
-async fn json_body(resp: axum::response::Response) -> Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    serde_json::from_slice(&bytes).expect("json")
+fn client() -> Address {
+    CLIENT.parse().unwrap()
 }
 
-fn fund_body() -> String {
-    serde_json::json!({ "client": CLIENT, "proof": "ok" }).to_string()
+async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+async fn send_json(app: &Router, req: Request<Body>) -> (StatusCode, Value) {
+    let (status, bytes) = send(app, req).await;
+    let v = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, v)
+}
+
+fn get(uri: &str) -> Request<Body> {
+    Request::get(uri).body(Body::empty()).unwrap()
+}
+
+fn fund_req(body: Value) -> Request<Body> {
+    Request::post("/v1/fund")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn fund() -> Request<Body> {
+    fund_req(json!({ "client": CLIENT, "proof": "ok" }))
+}
+
+fn poll() -> Request<Body> {
+    get(&format!("/v1/capability?client={CLIENT}"))
+}
+
+fn error_code(v: &Value) -> ErrorCode {
+    serde_json::from_value::<ErrorBody>(v.clone())
+        .unwrap()
+        .error
 }
 
 #[tokio::test]
-async fn fund_issues_token_then_capability_returns_same_token() {
-    let (state, source) = app_state_with_options(FakeOptions::default());
+async fn healthz_ok() {
+    let app = sponsord_onramp::http::router(app_state_with_fakes().await);
+    let (s, v) = send_json(&app, get("/healthz")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v, json!({"ok": true}));
+}
+
+#[tokio::test]
+async fn fund_issues_a_token_the_poll_then_returns() {
+    let (state, fakes) = app_state_with_options(FakeOptions::default()).await;
     let app = sponsord_onramp::http::router(state);
 
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::post("/v1/fund")
-                .header("content-type", "application/json")
-                .body(Body::from(fund_body()))
-                .expect("req"),
-        )
-        .await
-        .expect("resp");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = json_body(resp).await;
-    let token = v["token"].as_str().expect("token").to_string();
+    let (s, v) = send_json(&app, poll()).await;
+    assert_eq!((s, v), (StatusCode::NO_CONTENT, Value::Null));
+
+    let (s, v) = send_json(&app, fund()).await;
+    assert_eq!(s, StatusCode::OK);
+    let token = v["token"].as_str().unwrap().to_owned();
     assert!(token.starts_with("dcap1:"));
 
-    // GET /capability returns the same token.
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::get(format!("/v1/capability?client={CLIENT}"))
-                .body(Body::empty())
-                .expect("req"),
-        )
-        .await
-        .expect("resp");
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        json_body(resp).await["token"].as_str(),
-        Some(token.as_str())
-    );
+    let (s, v) = send_json(&app, poll()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["token"].as_str(), Some(token.as_str()));
 
-    // Second /fund is idempotent: identical token, no re-sign.
-    let resp = app
-        .oneshot(
-            Request::post("/v1/fund")
-                .header("content-type", "application/json")
-                .body(Body::from(fund_body()))
-                .expect("req"),
-        )
-        .await
-        .expect("resp");
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        json_body(resp).await["token"].as_str(),
-        Some(token.as_str())
-    );
-    assert_eq!(
-        source.issued_count(),
-        1,
-        "second /fund returns the stored grant"
-    );
+    // A second fund is idempotent: the same token, no second daemon call.
+    let (s, v) = send_json(&app, fund()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["token"].as_str(), Some(token.as_str()));
+    assert_eq!(fakes.source.issued_count(), 1);
 }
 
 #[tokio::test]
-async fn capability_204_before_issue() {
-    let state = test_support::app_state_with_fakes();
-    let app = sponsord_onramp::http::router(state);
-    let resp = app
-        .oneshot(
-            Request::get(format!("/v1/capability?client={CLIENT}"))
-                .body(Body::empty())
-                .expect("req"),
-        )
-        .await
-        .expect("resp");
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-}
-
-#[tokio::test]
-async fn fund_rejects_bad_captcha_403() {
-    let (state, _) = app_state_with_options(FakeOptions {
-        captcha_passes: false,
+async fn a_refused_gate_is_403_gate_failed() {
+    let (state, fakes) = app_state_with_options(FakeOptions {
+        gate_passes: false,
         ..FakeOptions::default()
-    });
+    })
+    .await;
     let app = sponsord_onramp::http::router(state);
-    let resp = app
-        .oneshot(
-            Request::post("/v1/fund")
-                .header("content-type", "application/json")
-                .body(Body::from(fund_body()))
-                .expect("req"),
-        )
-        .await
-        .expect("resp");
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert_eq!(json_body(resp).await["error"].as_str(), Some("gate_failed"));
+    let (s, v) = send_json(&app, fund()).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert_eq!(error_code(&v), ErrorCode::GateFailed);
+    assert_eq!(fakes.source.issued_count(), 0);
 }
 
 #[tokio::test]
-async fn fund_page_embeds_sitekey_and_client_and_rejects_non_hex() {
-    let state = test_support::app_state_with_fakes();
-    let app = sponsord_onramp::http::router(state);
-
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::get(format!("/fund?client={CLIENT}"))
-                .body(Body::empty())
-                .expect("req"),
-        )
-        .await
-        .expect("resp");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    let html = String::from_utf8(bytes.to_vec()).expect("utf8");
-    assert!(html.contains("TEST_SITEKEY"));
-    let client: alloy::primitives::Address = CLIENT.parse().expect("addr");
-    assert!(html.contains(&client.to_string()));
-
-    let resp = app
-        .oneshot(
-            Request::get("/fund?client=%3Cscript%3E")
-                .body(Body::empty())
-                .expect("req"),
-        )
-        .await
-        .expect("resp");
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+async fn malformed_requests_are_400_bad_request() {
+    let app = sponsord_onramp::http::router(app_state_with_fakes().await);
+    for req in [
+        fund_req(json!({ "client": "0xnope", "proof": "ok" })),
+        fund_req(json!({ "client": CLIENT })),
+        get("/v1/capability?client=%3Cscript%3E"),
+        get("/v1/capability"),
+        get("/fund?client=%3Cscript%3E"),
+    ] {
+        let uri = req.uri().clone();
+        let (s, v) = send_json(&app, req).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(error_code(&v), ErrorCode::BadRequest, "{uri}");
+    }
 }
 
 #[tokio::test]
-async fn expired_grant_for_unregistered_signer_is_reissued() {
-    use alloy::primitives::Address;
-    use sponsord_onramp::store::GrantRecord;
-    use std::str::FromStr;
-
-    let state = test_support::app_state_with_fakes();
-
-    // Pre-seed the store with an already-expired grant (fixed past unix
-    // timestamp), bypassing the daemon entirely.
-    let signer = Address::from_str(CLIENT).expect("addr");
-    let stale = GrantRecord {
-        spending_cap: 10_000_000,
-        expiry: 1_000_000,
-        issued_unix: 0,
-        token: "dcap1:STALE".to_string(),
-    };
-    state.store.put_grant(signer, &stale).expect("seed grant");
-
-    let app = sponsord_onramp::http::router(state);
-
-    // GET /capability treats the expired grant as absent.
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::get(format!("/v1/capability?client={CLIENT}"))
-                .body(Body::empty())
-                .expect("req"),
-        )
-        .await
-        .expect("resp");
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-
-    // POST /fund re-issues a fresh token rather than returning the stale one.
-    let resp = app
-        .oneshot(
-            Request::post("/v1/fund")
-                .header("content-type", "application/json")
-                .body(Body::from(fund_body()))
-                .expect("req"),
-        )
-        .await
-        .expect("resp");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let token = json_body(resp).await["token"]
-        .as_str()
-        .expect("token")
-        .to_string();
-    assert_ne!(token, "dcap1:STALE");
-    assert!(token.starts_with("dcap1:"));
+async fn fund_page_is_the_gate_page_for_the_client() {
+    let app = sponsord_onramp::http::router(app_state_with_fakes().await);
+    let (s, body) = send(&app, get(&format!("/fund?client={CLIENT}"))).await;
+    assert_eq!(s, StatusCode::OK);
+    let html = String::from_utf8(body).unwrap();
+    assert_eq!(html, format!("<p>fake gate for {}</p>", client()));
 }
 
 #[tokio::test]
-async fn expired_grant_for_expired_registration_is_refused_409() {
-    use alloy::primitives::Address;
-    use sponsord_onramp::store::GrantRecord;
-    use std::str::FromStr;
-
-    let signer = Address::from_str(CLIENT).expect("addr");
-    let (state, _) = app_state_with_options(FakeOptions {
-        source: test_support::SourceBehavior::SignerExpired,
-        ..FakeOptions::default()
-    });
-    let stale = GrantRecord {
-        spending_cap: 10_000_000,
-        expiry: 1_000_000,
-        issued_unix: 0,
-        token: "dcap1:STALE".to_string(),
-    };
-    state.store.put_grant(signer, &stale).expect("seed grant");
-    let store = state.store.clone();
-
-    let app = sponsord_onramp::http::router(state);
-    let resp = app
-        .oneshot(
-            Request::post("/v1/fund")
-                .header("content-type", "application/json")
-                .body(Body::from(fund_body()))
-                .expect("req"),
-        )
-        .await
-        .expect("resp");
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        json_body(resp).await["error"].as_str(),
-        Some("signer_expired")
+async fn an_expired_capability_reads_as_absent_and_is_reissued() {
+    let (mut state, fakes) = app_state_with_options(FakeOptions::default()).await;
+    let now = SystemClock.now_unix();
+    let clock = Arc::new(FixedClock::new(now));
+    state.clock = clock.clone();
+    state.grants.put(
+        client(),
+        IssuedCapability {
+            token: "dcap1:STALE".into(),
+            spending_cap: MicroUsdc(1),
+            expiry: now + 10,
+        },
+        now,
     );
-    // Nothing was signed: the stored grant is untouched.
-    let kept = store.get_grant(signer).expect("get").expect("grant");
-    assert_eq!(kept.token, "dcap1:STALE");
+    let app = sponsord_onramp::http::router(state);
+    let (s, v) = send_json(&app, poll()).await;
+    assert_eq!(
+        (s, v["token"].as_str()),
+        (StatusCode::OK, Some("dcap1:STALE"))
+    );
+
+    clock.advance(10);
+    let (s, _) = send_json(&app, poll()).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, v) = send_json(&app, fund()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_ne!(v["token"].as_str(), Some("dcap1:STALE"));
+    assert_eq!(fakes.source.issued_count(), 1);
 }
 
 #[tokio::test]
-async fn decdn_sh_templated_with_payment_pool() {
-    let state = test_support::app_state_with_fakes();
+async fn fund_maps_daemon_outcomes() {
+    for (behavior, status, code) in [
+        (
+            SourceBehavior::SignerExpired,
+            StatusCode::CONFLICT,
+            ErrorCode::SignerExpired,
+        ),
+        (
+            SourceBehavior::Unavailable,
+            StatusCode::BAD_GATEWAY,
+            ErrorCode::Upstream,
+        ),
+        (
+            SourceBehavior::Rejected,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+        ),
+    ] {
+        let (state, _) = app_state_with_options(FakeOptions {
+            source: behavior,
+            ..FakeOptions::default()
+        })
+        .await;
+        let app = sponsord_onramp::http::router(state);
+        let (s, v) = send_json(&app, fund()).await;
+        assert_eq!(s, status, "{behavior:?}");
+        assert_eq!(error_code(&v), code, "{behavior:?}");
+        let (s, _) = send_json(&app, poll()).await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "nothing held after {behavior:?}");
+    }
+}
+
+#[tokio::test]
+async fn fund_asks_the_daemon_for_the_configured_terms() {
+    let mut config = test_config();
+    config.spending_cap = Some(MicroUsdc(1_000_000));
+    config.ttl_secs = Some(3_600);
+    let (state, fakes) = app_state_with_options(FakeOptions {
+        config,
+        ..FakeOptions::default()
+    })
+    .await;
     let app = sponsord_onramp::http::router(state);
-    let resp = app
-        .oneshot(Request::get("/decdn.sh").body(Body::empty()).expect("req"))
-        .await
-        .expect("resp");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    let body = String::from_utf8(bytes.to_vec()).expect("utf8");
+    assert_eq!(send(&app, fund()).await.0, StatusCode::OK);
+    let req = fakes.source.last_request().unwrap();
+    assert_eq!(req.signer, client());
+    assert_eq!(req.spending_cap, Some(MicroUsdc(1_000_000)));
+    assert_eq!(req.ttl_secs, Some(3_600));
+}
+
+#[tokio::test]
+async fn profile_carries_the_daemon_chain_and_the_configured_contracts() {
+    let mut config = test_config();
+    config.slash_judge = Some(Address::repeat_byte(0x44));
+    config.min_cli_version = Some(semver::Version::new(0, 2, 0));
+    let (state, _) = app_state_with_options(FakeOptions {
+        config,
+        ..FakeOptions::default()
+    })
+    .await;
+    let app = sponsord_onramp::http::router(state);
+    let (s, v) = send_json(&app, get("/v1/profile")).await;
+    assert_eq!(s, StatusCode::OK);
+    let profile: Profile = serde_json::from_value(v).unwrap();
+    assert_eq!(
+        profile,
+        Profile {
+            chain_id: 421_614,
+            rpc_url: "https://rpc.example".into(),
+            payment_pool: Address::repeat_byte(0x22),
+            capacity_bond: Address::repeat_byte(0x33),
+            slash_judge: Some(Address::repeat_byte(0x44)),
+            min_cli_version: Some(semver::Version::new(0, 2, 0)),
+        }
+    );
+}
+
+async fn installer(path: &str) -> String {
+    let app = sponsord_onramp::http::router(app_state_with_fakes().await);
+    let (s, body) = send(&app, get(path)).await;
+    assert_eq!(s, StatusCode::OK);
+    String::from_utf8(body).unwrap()
+}
+
+/// Both installers name this onramp, download from the pinned GitHub
+/// Releases (`test_config`: decdn v0.1.0, sponsord v0.2.0) by tag and
+/// SHA256SUMS digest, and write only the onramp URL and `decdn` path.
+fn assert_installer(body: &str) {
     assert!(!body.contains("{{"), "no placeholder should remain");
-    assert!(
-        body.contains("payment_pool ="),
-        "installer writes payment_pool"
-    );
-    assert_pins_releases(&body);
-    assert_chain_values(&body);
-}
-
-/// Both installers carry the chain id and `PaymentPool` address from the
-/// daemon's `/v1/info` and the RPC URL from the onramp config.
-fn assert_chain_values(body: &str) {
-    assert!(
-        body.contains(&alloy::primitives::Address::repeat_byte(0x22).to_string()),
-        "payment_pool from /v1/info"
-    );
-    assert!(body.contains("421614"), "chain_id from /v1/info");
-    assert!(
-        body.contains("https://rpc.example"),
-        "rpc_url from ONRAMP_RPC_URL"
-    );
-}
-
-/// Both installers download from the GitHub Releases pinned in config
-/// (`test_support`: decdn v0.1.0, sponsord v0.2.0), by tag and by the digest
-/// of each release's SHA256SUMS.
-fn assert_pins_releases(body: &str) {
+    assert!(body.contains("https://up.example.org"));
     assert!(body.contains("https://github.com/decdn"));
     assert!(body.contains("'v0.1.0'") || body.contains("\"v0.1.0\""));
     assert!(body.contains("'v0.2.0'") || body.contains("\"v0.2.0\""));
@@ -308,121 +277,112 @@ fn assert_pins_releases(body: &str) {
         body.contains(&"cd".repeat(32)),
         "sponsord SHA256SUMS digest"
     );
-    assert!(!body.contains("/dl/"), "no onramp-hosted binaries");
-}
-
-#[tokio::test]
-async fn decdn_ps1_templated_with_payment_pool() {
-    let state = test_support::app_state_with_fakes();
-    let app = sponsord_onramp::http::router(state);
-    let resp = app
-        .oneshot(Request::get("/decdn.ps1").body(Body::empty()).expect("req"))
-        .await
-        .expect("resp");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    let body = String::from_utf8(bytes.to_vec()).expect("utf8");
-    assert!(!body.contains("{{"), "no placeholder should remain");
+    assert!(body.contains("onramp_url = "));
+    assert!(body.contains("decdn_bin = "));
     assert!(
-        body.contains("payment_pool ="),
-        "installer writes payment_pool"
+        !body.contains("payment_pool"),
+        "chain values come from /v1/profile"
     );
-    assert!(
-        body.contains("-pc-windows-msvc"),
-        "installer downloads the Windows release archives"
-    );
-    assert_pins_releases(&body);
-    assert_chain_values(&body);
-}
-
-async fn post_fund(app: &axum::Router) -> axum::response::Response {
-    app.clone()
-        .oneshot(
-            Request::post("/v1/fund")
-                .header("content-type", "application/json")
-                .body(Body::from(fund_body()))
-                .expect("req"),
-        )
-        .await
-        .expect("resp")
 }
 
 #[tokio::test]
-async fn fund_maps_daemon_outcomes() {
-    use test_support::SourceBehavior;
-    for (behavior, status, code) in [
-        (
-            SourceBehavior::SignerExpired,
-            StatusCode::CONFLICT,
-            "signer_expired",
-        ),
-        (
-            SourceBehavior::Unavailable,
-            StatusCode::BAD_GATEWAY,
-            "upstream",
-        ),
-        (
-            SourceBehavior::Rejected,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-        ),
-    ] {
-        let (state, _) = app_state_with_options(FakeOptions {
-            source: behavior,
-            ..FakeOptions::default()
-        });
-        let app = sponsord_onramp::http::router(state);
-        let resp = post_fund(&app).await;
-        assert_eq!(resp.status(), status, "{behavior:?}");
-        assert_eq!(json_body(resp).await["error"].as_str(), Some(code));
-    }
+async fn decdn_sh_is_rendered() {
+    let body = installer("/decdn.sh").await;
+    assert_installer(&body);
+    assert!(body.starts_with("#!/bin/sh"));
 }
 
 #[tokio::test]
-async fn fund_requests_configured_terms_and_stores_returned_terms() {
-    use alloy::primitives::Address;
-    use std::str::FromStr;
+async fn decdn_ps1_is_rendered() {
+    let body = installer("/decdn.ps1").await;
+    assert_installer(&body);
+    assert!(body.contains("-pc-windows-msvc"));
+}
 
-    let (state, source) = app_state_with_options(FakeOptions {
-        spending_cap: Some(sponsord_api::MicroUsdc(1_000_000)),
-        ttl_secs: Some(3_600),
+fn from_peer(mut req: Request<Body>, ip: &str) -> Request<Body> {
+    let addr: SocketAddr = format!("{ip}:40000").parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(addr));
+    req
+}
+
+#[tokio::test]
+async fn fund_and_poll_are_rate_limited_per_client_address() {
+    let mut config = test_config();
+    config.fund_rate_per_min = 1;
+    config.poll_rate_per_min = 2;
+    let (state, fakes) = app_state_with_options(FakeOptions {
+        config,
         ..FakeOptions::default()
-    });
-    let store = state.store.clone();
+    })
+    .await;
     let app = sponsord_onramp::http::router(state);
-    assert_eq!(post_fund(&app).await.status(), StatusCode::OK);
 
-    let signer = Address::from_str(CLIENT).expect("addr");
     assert_eq!(
-        source.last_request(),
-        Some(sponsord_api::daemon::IssueRequest {
-            signer,
-            spending_cap: Some(sponsord_api::MicroUsdc(1_000_000)),
-            ttl_secs: Some(3_600),
-        })
+        send(&app, from_peer(fund(), "203.0.113.1")).await.0,
+        StatusCode::OK
     );
-    let rec = store.get_grant(signer).expect("read").expect("stored");
-    assert_eq!(rec.spending_cap, 1_000_000);
-    assert!(rec.expiry > rec.issued_unix + 3_500);
+    let (s, v) = send_json(&app, from_peer(fund(), "203.0.113.1")).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(error_code(&v), ErrorCode::RateLimited);
+    assert_eq!(
+        send(&app, from_peer(fund(), "203.0.113.2")).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        fakes.gate.last_ip(),
+        Some("203.0.113.2".parse().unwrap()),
+        "the gate sees the client's address"
+    );
+
+    for _ in 0..2 {
+        assert_eq!(
+            send(&app, from_peer(poll(), "203.0.113.1")).await.0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        send(&app, from_peer(poll(), "203.0.113.1")).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
 }
 
 #[tokio::test]
-async fn fund_page_has_an_expired_key_message() {
-    let app = sponsord_onramp::http::router(test_support::app_state_with_fakes());
-    let resp = app
-        .oneshot(
-            Request::get(format!("/fund?client={CLIENT}"))
-                .body(Body::empty())
-                .expect("req"),
-        )
-        .await
-        .expect("resp");
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    let html = String::from_utf8(bytes.to_vec()).expect("utf8");
-    assert!(html.contains("id=\"expired\""));
-    assert!(html.contains("409"));
+async fn the_client_address_can_come_from_a_proxy_header() {
+    let mut config = test_config();
+    config.client_ip = ClientIpSource::Header("x-forwarded-for".parse().unwrap());
+    config.fund_rate_per_min = 1;
+    let (state, fakes) = app_state_with_options(FakeOptions {
+        config,
+        ..FakeOptions::default()
+    })
+    .await;
+    let app = sponsord_onramp::http::router(state);
+
+    // The proxy appends the real peer; whatever the client put before it is
+    // ignored, so a spoofed left-hand address neither names the client nor
+    // buys it a fresh rate-limit budget.
+    for spoofed in ["192.0.2.1", "192.0.2.2"] {
+        let mut req = from_peer(fund(), "10.0.0.1");
+        req.headers_mut().insert(
+            "x-forwarded-for",
+            format!("{spoofed}, 198.51.100.9").parse().unwrap(),
+        );
+        let status = send(&app, req).await.0;
+        assert_eq!(fakes.gate.last_ip(), Some("198.51.100.9".parse().unwrap()));
+        if spoofed == "192.0.2.1" {
+            assert_eq!(status, StatusCode::OK);
+        } else {
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+
+    // Without the header, the TCP peer is the client: still limited.
+    assert_eq!(
+        send(&app, from_peer(fund(), "10.0.0.7")).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&app, from_peer(fund(), "10.0.0.7")).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
 }

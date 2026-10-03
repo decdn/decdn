@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/decdn-sponsored",
+    "crates/e2e",
     "crates/sponsord",
     "crates/sponsord-api",
     "crates/sponsord-core",

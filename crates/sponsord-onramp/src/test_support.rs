@@ -1,4 +1,8 @@
-#![allow(dead_code)]
+//! Fakes for testing code built on `sponsord-onramp`: a daemon
+//! ([`FakeCapabilitySource`]), a gate ([`FakeGate`]), and a ready
+//! [`AppState`] over both. Compiled for this crate's tests and, behind the
+//! `test-support` feature, for dependents'.
+
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -6,23 +10,22 @@
     clippy::indexing_slicing
 )]
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
-
 use sponsord_api::client::DaemonError;
 use sponsord_api::daemon::{Info, IssueRequest, IssueResponse};
-use sponsord_api::time::SystemClock;
+use sponsord_api::time::{Clock, SystemClock};
 use sponsord_api::{ErrorCode, IssuedCapability, MicroUsdc};
-use sponsord_onramp::captcha::CaptchaVerifier;
-use sponsord_onramp::config::{OnrampConfig, ReleasePin};
-use sponsord_onramp::daemon::CapabilitySource;
-use sponsord_onramp::state::AppState;
-use sponsord_onramp::store::Store;
+
+use crate::config::{GateKind, OnrampConfig, ReleasePin, TurnstileConfig};
+use crate::daemon::CapabilitySource;
+use crate::gate::Gate;
+use crate::net::ClientIpSource;
+use crate::state::{self, AppState};
 
 pub fn test_info() -> Info {
     Info {
@@ -33,19 +36,28 @@ pub fn test_info() -> Info {
     }
 }
 
-pub fn test_config(data_dir: PathBuf) -> OnrampConfig {
+pub fn test_config() -> OnrampConfig {
     OnrampConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
-        public_url: "https://up.decdn.org".into(),
+        public_url: "https://up.example.org".into(),
         daemon_url: "http://127.0.0.1:8090".into(),
         daemon_token: "t".repeat(32).as_str().into(),
         rpc_url: "https://rpc.example".into(),
-        capacity_bond: Address::ZERO,
+        capacity_bond: Address::repeat_byte(0x33),
+        slash_judge: None,
+        min_cli_version: None,
         spending_cap: None,
         ttl_secs: None,
-        turnstile_secret: "secret".into(),
-        turnstile_sitekey: "TEST_SITEKEY".into(),
-        data_dir,
+        gate: GateKind::Turnstile,
+        brand_name: "deCDN".into(),
+        gate_template: None,
+        turnstile: Some(TurnstileConfig {
+            secret: "secret".into(),
+            sitekey: "TEST_SITEKEY".into(),
+        }),
+        client_ip: ClientIpSource::Peer,
+        fund_rate_per_min: 0,
+        poll_rate_per_min: 0,
         releases_base: "https://github.com/decdn".into(),
         decdn_release: ReleasePin {
             tag: "v0.1.0".into(),
@@ -90,13 +102,6 @@ impl FakeCapabilitySource {
     }
 }
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
 #[async_trait]
 impl CapabilitySource for FakeCapabilitySource {
     async fn issue(&self, req: &IssueRequest) -> Result<IssueResponse, DaemonError> {
@@ -109,7 +114,7 @@ impl CapabilitySource for FakeCapabilitySource {
                     capability: IssuedCapability {
                         token: format!("dcap1:FAKE{n}"),
                         spending_cap: req.spending_cap.unwrap_or(info.max_spending_cap),
-                        expiry: now_unix() + req.ttl_secs.unwrap_or(info.max_ttl_secs),
+                        expiry: SystemClock.now_unix() + req.ttl_secs.unwrap_or(info.max_ttl_secs),
                     },
                     registered: false,
                 })
@@ -128,64 +133,81 @@ impl CapabilitySource for FakeCapabilitySource {
     }
 }
 
-pub struct FakeCaptcha {
+/// A gate that passes or refuses every proof, and records the last client
+/// address it was shown.
+pub struct FakeGate {
     pass: AtomicBool,
+    last_ip: Mutex<Option<IpAddr>>,
 }
-impl FakeCaptcha {
+
+impl FakeGate {
     #[must_use]
     pub fn new(pass: bool) -> Self {
         Self {
             pass: AtomicBool::new(pass),
+            last_ip: Mutex::new(None),
         }
     }
+
+    pub fn last_ip(&self) -> Option<IpAddr> {
+        *self.last_ip.lock().unwrap()
+    }
 }
+
 #[async_trait]
-impl CaptchaVerifier for FakeCaptcha {
-    async fn verify(&self, _token: &str, _remote_ip: Option<&str>) -> anyhow::Result<bool> {
+impl Gate for FakeGate {
+    fn page(&self, client: Address) -> String {
+        format!("<p>fake gate for {client}</p>")
+    }
+
+    async fn verify(
+        &self,
+        _client: Address,
+        _proof: &str,
+        client_ip: Option<IpAddr>,
+    ) -> anyhow::Result<bool> {
+        *self.last_ip.lock().unwrap() = client_ip;
         Ok(self.pass.load(Ordering::SeqCst))
     }
 }
 
 pub struct FakeOptions {
-    pub captcha_passes: bool,
+    pub gate_passes: bool,
     pub source: SourceBehavior,
-    pub spending_cap: Option<MicroUsdc>,
-    pub ttl_secs: Option<u64>,
+    pub config: OnrampConfig,
 }
+
 impl Default for FakeOptions {
     fn default() -> Self {
         Self {
-            captcha_passes: true,
+            gate_passes: true,
             source: SourceBehavior::Issue,
-            spending_cap: None,
-            ttl_secs: None,
+            config: test_config(),
         }
     }
 }
 
-/// Build an `AppState` with a real temp-dir `Store` and fake daemon and
-/// captcha, skipping `state::build`'s daemon round trip. The temp dir is
-/// leaked so it outlives this call; test binaries are short-lived.
-#[must_use]
-pub fn app_state_with_options(opts: FakeOptions) -> (AppState, Arc<FakeCapabilitySource>) {
-    let data_dir = tempfile::tempdir().unwrap().keep();
-    let store = Arc::new(Store::open(&data_dir).unwrap());
-    let source = Arc::new(FakeCapabilitySource::new(opts.source));
-    let mut cfg = test_config(data_dir);
-    cfg.spending_cap = opts.spending_cap;
-    cfg.ttl_secs = opts.ttl_secs;
-    let state = AppState {
-        store,
-        source: source.clone() as Arc<dyn CapabilitySource>,
-        turnstile: Arc::new(FakeCaptcha::new(opts.captcha_passes)),
-        cfg: Arc::new(cfg),
-        chain: Arc::new(test_info()),
-        clock: Arc::new(SystemClock),
-    };
-    (state, source)
+/// The fakes behind an [`AppState`], for tests to inspect.
+pub struct Fakes {
+    pub source: Arc<FakeCapabilitySource>,
+    pub gate: Arc<FakeGate>,
 }
 
-#[must_use]
-pub fn app_state_with_fakes() -> AppState {
-    app_state_with_options(FakeOptions::default()).0
+/// An `AppState` over a fake daemon and gate, built the way production
+/// builds it (`state::build`).
+pub async fn app_state_with_options(opts: FakeOptions) -> (AppState, Fakes) {
+    let source = Arc::new(FakeCapabilitySource::new(opts.source));
+    let gate = Arc::new(FakeGate::new(opts.gate_passes));
+    let state = state::build(
+        &opts.config,
+        source.clone() as Arc<dyn CapabilitySource>,
+        gate.clone() as Arc<dyn Gate>,
+    )
+    .await
+    .unwrap();
+    (state, Fakes { source, gate })
+}
+
+pub async fn app_state_with_fakes() -> AppState {
+    app_state_with_options(FakeOptions::default()).await.0
 }

@@ -9,10 +9,10 @@ use clap::{Parser, Subcommand};
 use decdn_sponsored::config::Config;
 use decdn_sponsored::pull;
 
-/// Download from deCDN, paid for by the sponsor. You solve one captcha per
-/// download; there is no wallet, key, or password to manage.
+/// Download from deCDN, paid for by the sponsor. You pass one check in the
+/// browser per download; there is no wallet, key, or password to manage.
 #[derive(Parser, Debug)]
-#[command(name = "decdn-sponsored")]
+#[command(name = "decdn-sponsored", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

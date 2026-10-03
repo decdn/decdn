@@ -5,20 +5,19 @@
     clippy::indexing_slicing
 )]
 
-#[path = "../src/test_support.rs"]
-mod test_support;
-
 use std::sync::Arc;
 
 use sponsord_api::MicroUsdc;
 use sponsord_api::client::DaemonClient;
-use sponsord_onramp::captcha::CaptchaVerifier;
 use sponsord_onramp::daemon::CapabilitySource;
+use sponsord_onramp::gate::Gate;
 use sponsord_onramp::state;
-use test_support::{FakeCapabilitySource, FakeCaptcha, SourceBehavior, test_config, test_info};
+use sponsord_onramp::test_support::{
+    FakeCapabilitySource, FakeGate, SourceBehavior, test_config, test_info,
+};
 
-fn captcha() -> Arc<dyn CaptchaVerifier> {
-    Arc::new(FakeCaptcha::new(true))
+fn gate() -> Arc<dyn Gate> {
+    Arc::new(FakeGate::new(true))
 }
 
 fn fake_source() -> Arc<dyn CapabilitySource> {
@@ -26,17 +25,19 @@ fn fake_source() -> Arc<dyn CapabilitySource> {
 }
 
 #[tokio::test]
-async fn build_keeps_the_daemon_info() {
-    let cfg = test_config(tempfile::tempdir().unwrap().keep());
-    let st = state::build(cfg, fake_source(), captcha()).await.unwrap();
-    assert_eq!(*st.chain, test_info());
+async fn build_takes_the_chain_from_the_daemon() {
+    let st = state::build(&test_config(), fake_source(), gate())
+        .await
+        .unwrap();
+    assert_eq!(st.profile.chain_id, test_info().chain_id);
+    assert_eq!(st.profile.payment_pool, test_info().payment_pool);
 }
 
 #[tokio::test]
 async fn build_refuses_terms_above_the_daemon_maximum() {
-    let mut cfg = test_config(tempfile::tempdir().unwrap().keep());
+    let mut cfg = test_config();
     cfg.spending_cap = Some(MicroUsdc(5_000_001));
-    let err = state::build(cfg, fake_source(), captcha())
+    let err = state::build(&cfg, fake_source(), gate())
         .await
         .err()
         .unwrap();
@@ -45,9 +46,9 @@ async fn build_refuses_terms_above_the_daemon_maximum() {
         "{err}"
     );
 
-    let mut cfg = test_config(tempfile::tempdir().unwrap().keep());
+    let mut cfg = test_config();
     cfg.ttl_secs = Some(0);
-    let err = state::build(cfg, fake_source(), captcha())
+    let err = state::build(&cfg, fake_source(), gate())
         .await
         .err()
         .unwrap();
@@ -56,13 +57,13 @@ async fn build_refuses_terms_above_the_daemon_maximum() {
 
 #[tokio::test]
 async fn build_refuses_an_unreachable_daemon_and_names_it() {
-    let mut cfg = test_config(tempfile::tempdir().unwrap().keep());
+    let mut cfg = test_config();
     cfg.daemon_url = "http://127.0.0.1:1".into();
     let source: Arc<dyn CapabilitySource> = Arc::new(DaemonClient::new(
         &cfg.daemon_url,
         cfg.daemon_token.clone(),
         reqwest::Client::new(),
     ));
-    let err = state::build(cfg, source, captcha()).await.err().unwrap();
+    let err = state::build(&cfg, source, gate()).await.err().unwrap();
     assert!(err.to_string().contains("http://127.0.0.1:1"), "{err}");
 }

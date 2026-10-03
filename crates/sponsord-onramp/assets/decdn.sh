@@ -1,9 +1,9 @@
 #!/bin/sh
 # decdn-sponsored installer for macOS/Linux - served by sponsord-onramp at
 # GET /decdn.sh, with the placeholders below substituted server-side (see
-# crates/sponsord-onramp/src/http/installer.rs) from OnrampConfig and the daemon's
-# /v1/info, so nothing here needs an environment variable to run. The Windows twin is assets/decdn.ps1;
-# the two write the same profile.
+# crates/sponsord-onramp/src/installer.rs), so nothing here needs an
+# environment variable to run. The Windows twin is assets/decdn.ps1; the two
+# write the same profile.
 #
 # Arguments, when given, are passed to decdn-sponsored after installing, so
 # one line installs and downloads:
@@ -11,10 +11,6 @@
 set -eu
 
 ONRAMP_URL="{{ONRAMP_URL}}"
-RPC_URL="{{RPC_URL}}"
-PAYMENT_POOL="{{PAYMENT_POOL}}"
-CAPACITY_BOND="{{CAPACITY_BOND}}"
-CHAIN_ID="{{CHAIN_ID}}"
 
 # The binaries come from pinned GitHub Releases. Each release is pinned by tag
 # and by the SHA-256 of its SHA256SUMS file.
@@ -89,17 +85,13 @@ fetch_bin() {
 fetch_bin decdn decdn "$DECDN_RELEASE" "$DECDN_SUMS_SHA256"
 fetch_bin sponsord decdn-sponsored "$CLI_RELEASE" "$CLI_SUMS_SHA256"
 
-# 2. Write the CLI's profile. Field names and shape MUST match
-# crates/decdn-sponsored/src/config.rs's `Profile` struct exactly. Each download
-# gets its own throwaway key under data_dir; there is no key to set up here.
+# 2. Point the CLI at this onramp. Field names MUST match
+# crates/decdn-sponsored/src/config.rs's `File` struct. The chain and
+# contracts come from the onramp's /v1/profile on every run, and each
+# download gets its own throwaway key; there is nothing else to set up.
 cat > "${DECDN_DIR}/sponsor.toml" <<EOF
 onramp_url = "${ONRAMP_URL}"
 decdn_bin = "${BINDIR}/decdn"
-data_dir = "${DECDN_DIR}/sponsored"
-rpc_url = "${RPC_URL}"
-payment_pool = "${PAYMENT_POOL}"
-capacity_bond = "${CAPACITY_BOND}"
-chain_id = ${CHAIN_ID}
 EOF
 
 if [ "$#" -gt 0 ]; then
