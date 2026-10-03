@@ -15,13 +15,12 @@
 //! #578 forbids either of those crates depending on the other. `node` is the
 //! one crate that already depends on both.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use decdn_bao_range::{AlignedRange, RangedFuture, RangedStore};
 use decdn_cache::{CacheEngine, FillSession, Hash, NodeRangedStore};
-use decdn_client::{BaoRangeReader, IngestStore};
+use decdn_client::{BaoRangeReader, IngestEnd, IngestStore};
 
 use crate::metrics::Metrics;
 
@@ -142,11 +141,22 @@ impl IngestStore for NodeAdmitStore {
         reader: R,
         _on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
         _claimed_total: u64,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<R>> + 'a>>
+        stop_at: Option<&'a AtomicU64>,
+    ) -> decdn_client::IngestFuture<'a, R>
     where
         R: BaoRangeReader + 'a,
     {
         Box::pin(async move {
+            // Only a steal lowers an end, and the node's pull leg drives one
+            // source with no steal, so the cache admit reads every range to
+            // its end. A caller that asks otherwise is this process's bug,
+            // never the upstream's.
+            if stop_at.is_some() {
+                return Err(
+                    anyhow::anyhow!("the node's admit store reads every range to its end")
+                        .context(decdn_client::LocalPullFault),
+                );
+            }
             // The cache verifies under the size this store was opened with,
             // which is the size the serve leg signs downstream, so the
             // upstream's claim plays no part here.
@@ -180,7 +190,7 @@ impl IngestStore for NodeAdmitStore {
                     if let Some(metrics) = &self.received {
                         metrics.bytes_received(range.fetch_len());
                     }
-                    Ok(reader)
+                    Ok((reader, IngestEnd::Drained))
                 }
                 Err((mut reader, cache_err)) => {
                     // The parked typed peer fault is the real reason the stream
@@ -311,8 +321,8 @@ mod tests {
         let store = NodeAdmitStore::new(engine, hash, total, None);
 
         let reader = MemReader { wire };
-        let mut drained =
-            IngestStore::ingest_stream(&store, &aligned, reader, None, aligned.blob_size())
+        let (mut drained, _) =
+            IngestStore::ingest_stream(&store, &aligned, reader, None, aligned.blob_size(), None)
                 .await
                 .unwrap();
         assert_eq!(
@@ -326,6 +336,35 @@ mod tests {
         assert!(
             !RangedStore::is_complete(&store).await.unwrap(),
             "a single interior group of a 4-group blob must not be complete"
+        );
+    }
+
+    /// The cache admit cannot stop a range early, so an ingest asked to stop
+    /// is refused as this process's own fault before a byte is read.
+    #[tokio::test]
+    async fn node_admit_store_refuses_a_stop_point_as_a_local_fault() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let (root, total, aligned, _ranges, wire) = interior_range_wire();
+        let store = NodeAdmitStore::new(engine, decdn_cache::Hash::from(root), total, None);
+        let end = std::sync::atomic::AtomicU64::new(u64::MAX);
+        let err = IngestStore::ingest_stream(
+            &store,
+            &aligned,
+            MemReader { wire },
+            None,
+            aligned.blob_size(),
+            Some(&end),
+        )
+        .await
+        .err()
+        .expect("a stop point is refused");
+        assert!(err.is::<decdn_client::LocalPullFault>(), "{err:#}");
+        assert!(
+            RangedStore::present_ranges(&store)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -350,7 +389,7 @@ mod tests {
 
         let reader = MemReader { wire };
         let _drained =
-            IngestStore::ingest_stream(&store, &aligned, reader, None, aligned.blob_size())
+            IngestStore::ingest_stream(&store, &aligned, reader, None, aligned.blob_size(), None)
                 .await
                 .unwrap();
 
@@ -396,6 +435,7 @@ mod tests {
             MemReader { wire },
             None,
             aligned.blob_size(),
+            None,
         )
         .await
         .unwrap();

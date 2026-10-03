@@ -26,11 +26,20 @@
 //! preference (#2225): a lane takes what it covers first, and a block no
 //! running lane covers goes to any lane, whose node serves it by pull-through,
 //! while discovery keeps looking for a node that covers it. A lane with nothing
-//! queued *steals* the aligned second half of the missing remainder of the
-//! range in flight it also covers that misses the most ([`steal_split`]), so a
+//! queued *steals* from a range in flight ([`steal_split`]). It steals only
+//! inside the range's covered suffix: the blocks it covers, from the range's
+//! end back to, but not including, the nearest block it does not cover. Of
+//! the ranges in flight, it picks the one whose covered suffix misses the
+//! most, and takes the aligned tail of that range's missing remainder. So a
 //! fast source keeps helping a slow one, and a lane that joins late starts by
-//! stealing. The victim keeps the first half of its remainder, so it still
-//! has work after the steal.
+//! stealing. The split weighs the remainder by the two lanes' observed rates,
+//! so at steady rates one steal leaves both finishing together, unless the
+//! covered suffix starts past that split: then the split moves to the
+//! suffix's start and the victim keeps more than its share. The split
+//! lies past the bytes the victim has already received, and the victim keeps
+//! the front of the rest, so it still has work after the steal. It keeps its
+//! open stream: the steal lowers the victim's end to the split
+//! ([`Work::pick`]), and the victim stops there.
 //!
 //! # Lane correctness: one unit per worker, one worker per lane by default
 //!
@@ -38,14 +47,17 @@
 //! worker loop drives one `fill_gap` to completion before it picks the next
 //! range), and each source has at most one lane. A lane runs one worker, so
 //! parallelism comes from having many sources. The one exception (#2231,
-//! #2230): a queued range no idle worker takes, such as a faulted lane's
-//! remainder, goes to a busy lane on ONE extra worker, granted by the lane's
-//! [`LaneWiden`], so the range does not wait behind the busy lane's whole
-//! range. The busy lane covers part of the range; or, when part of the range
+//! #2230, #2252): a queued range no idle worker takes, such as a faulted
+//! lane's remainder or one of a queue of runs, goes to a busy lane on an
+//! extra worker, granted by the lane's [`LaneWiden`], so the range does not
+//! wait behind the busy lane's whole range. A lane runs as many extra
+//! workers as its `LaneWiden` grants, one per range. The busy lane covers part of the range; or, when part of the range
 //! has no running lane that covers it, it is any busy lane not barred from
 //! pull-through, and its node serves that part by pull-through. The loop asks
 //! as workers end and lanes build, and again after `GROWTH_RETRY` while a
-//! `grow` grants nothing. A lane whose node refuses its extra stream waits,
+//! `grow` grants nothing, or while a range has no lane to ask and a running
+//! lane has a [`LaneWiden`]: a worker that takes its next range wakes no
+//! pass (#2252). A lane whose node refuses its extra stream waits,
 //! from `GROWTH_RETRY` and doubling, before it is asked again. A lane with a
 //! [`LaneWiden`] gives its [`LaneLease`] back when its own worker ends, and
 //! starts again only on a stream `grow` grants. The extra worker shares the
@@ -58,7 +70,7 @@
 //! charged once per outage: a node already charged with no verified byte
 //! since is not charged again.
 //!
-//! # Cancellation: closing the double-pay
+//! # Stopping a lane: closing the double-pay
 //!
 //! A worker's `fill_gap` runs under a [`tokio::select!`] against a per-lane
 //! `CancelHandle` and a progress-relative watchdog, so it can be interrupted
@@ -69,17 +81,23 @@
 //! then reports only the un-checkpointed remainder. A cancel re-fetches at most
 //! the unflushed batch plus the detached checkpoints that land after the requeue
 //! (`INGEST_MAX_QUEUED_CHECKPOINTS + 1` intervals), never a byte an earlier
-//! checkpoint made durable. Two triggers drive one cancellation mechanism:
+//! checkpoint made durable. A cancel re-queues the remainder, and a later
+//! pick opens a new stream for it. Three events end a lane's leg before its
+//! range ends, and only a steal keeps the open stream:
 //!
-//! - **Steal.** When a freed worker steals a busy victim's tail `[mid, end)`,
-//!   where `mid` splits the victim's missing remainder in half,
-//!   `Work::pick` trims the victim's assignment to `[start, mid)`. Once the
-//!   stealer confirms the tail still has missing bytes, `Work::cancel_victim`
-//!   signals the victim's `CancelHandle`. A tail the victim has already
-//!   delivered is not a reason to cancel: the victim finishes its leg
-//!   normally. Otherwise the victim stops fetching past `mid`, re-queues the
-//!   still-missing part of its trimmed `[start, mid)` to `pending`, and picks
-//!   again, so the stolen tail is fetched (and paid for) by exactly ONE source.
+//! - **Steal.** When a freed worker steals a busy victim's tail `[split, end)`,
+//!   `Work::pick` trims the victim's assignment to `[start, split)` and lowers
+//!   the victim's end to `split`, both under the `Work` lock. The split lies at
+//!   least `MIN_VICTIM_KEEP` past the victim's verified frontier, durable or
+//!   not. The victim's leg stops on its open stream once its verified prefix
+//!   reaches `split` ([`fill_gap`]): it pays for every byte it received,
+//!   closes the stream, and ends its unit as complete, with nothing to
+//!   re-queue. So the stolen tail is fetched (and paid for) by ONE source,
+//!   apart from the frames past the split the victim's stream already carried
+//!   when it stopped, and the victim opens no new stream for the part it
+//!   keeps.
+//! - **Proven size.** A proven size that leaves a lane's whole range past
+//!   the end of the blob cancels that lane's unit (`Work::cancel_victim`).
 //! - **Stall / fault.** A lane with no verified progress for the lane watchdog
 //!   ([`LANE_WATCHDOG`]), or whose `fill_gap` returns an `Err`, re-queues the
 //!   UN-fetched remainder of its range to `pending` and ends. The loop
@@ -102,17 +120,19 @@ use futures_util::stream::FuturesUnordered;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::Instant;
 
-use crate::coverage_plan::{SourceCoverage, covered_part, covers_byte_range, spread_segments};
+use crate::coverage_plan::{
+    SourceCoverage, covered_part, covered_suffix_start, covers_byte_range, spread_segments,
+};
 use crate::driver::{
-    DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PacingWait, SharedPool, WaitReason,
-    contiguous_byte_ranges, fill_gap, ranges_content_len,
+    DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PacingWait, SharedPool,
+    UnitProgress, WaitReason, contiguous_byte_ranges, fill_gap, ranges_content_len,
 };
 use crate::fault::Fault;
 use crate::health::PeerHealth;
 use crate::ledgers::LaneLedgers;
 use crate::pacer::DownstreamFrontier;
-use crate::segment::{split_evenly, steal_split};
-use crate::source::{BlobSource, Funder, IngestStore, SourceFuture};
+use crate::segment::{split_evenly, steal_split, without_runs};
+use crate::source::{BlobSource, Funder, IngestStore, SourceFuture, SourceStream};
 use crate::source_set::{Holder, SourceProvider, SourceSet};
 use crate::stop::StopPolicy;
 use crate::streamer::StreamCandidate;
@@ -135,6 +155,9 @@ const FIRST_BYTE_GRACE: Duration = Duration::from_secs(30);
 /// [`LaneWiden`] granted nothing while a queued range had no taker. A stream
 /// that a sibling fetch gives back wakes nothing in the loop, so the loop
 /// looks again on this clock until the range has a taker. It is also the
+/// wait after a pass that found no lane to ask for a queued range while a
+/// running lane has a [`LaneWiden`]: an own worker that takes its next range
+/// wakes nothing, so the loop looks again on this clock. It is also the
 /// first wait before a lane is asked again after a node refused its extra
 /// stream ([`EXTRA_RETRY_CAP`]), and the wait before a lane that found no
 /// free stream tries to start again.
@@ -150,8 +173,8 @@ const EXTRA_RETRY_CAP: Duration = Duration::from_secs(30);
 /// them at info, once per run of refusals.
 const EXTRA_REFUSALS_LOGGED: u32 = 3;
 
-/// How often the loop logs again, at info, that the same queued ranges still
-/// wait for a stream.
+/// How often the loop logs, at info, that queued ranges still wait for a
+/// stream. A change between those lines logs at debug.
 const WAITING_RELOG: Duration = Duration::from_secs(30);
 
 /// The unit the planner grows a size claim by. A claim is a hint: when every
@@ -314,31 +337,43 @@ impl std::fmt::Debug for LaneLease {
     }
 }
 
+/// What a [`LaneWiden`] `grow` asks a stream for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrowFor {
+    /// The stream a lane starts again on after its own worker ended and gave
+    /// its [`LaneLease`] back. It stands in for the lane's first stream.
+    Restart,
+    /// An extra stream beside the lane's own, for a queued range no idle lane
+    /// takes. A caller may refuse it a stream that a sibling fetch's first
+    /// stream still needs, such as a provider's last free permit.
+    Extra,
+}
+
 /// How one lane adds a concurrent stream while an [`acquire`] runs
 /// ([`StreamCandidate::widen`]): a `grow` hook that grants streams and a
 /// `release` hook that gives one back. `grow` grants a lane's extra streams,
 /// and the stream a lane starts again on after its own worker ended and gave
-/// its [`LaneLease`] back.
+/// its [`LaneLease`] back; its [`GrowFor`] says which.
 ///
-/// The acquire relies on three rules. `grow` never waits: it grants only what
-/// it can grant now, such as a stream permit that is free. `grow` never grants
-/// more than it is asked for. And `release` is called exactly once for each
-/// stream `grow` granted, when that stream's worker stops for any reason.
+/// The acquire relies on two rules. `grow` never waits: it grants a stream
+/// only when it can grant one now, such as a stream permit that is free. And
+/// `release` is called exactly once for each stream `grow` granted, when that
+/// stream's worker stops for any reason.
 pub struct LaneWiden {
-    /// Grants up to the given number of streams now, extra streams or a
-    /// restart's stream, without waiting, and returns how many it granted.
-    grow: Box<dyn Fn(usize) -> usize + Send + Sync>,
+    /// Grants one stream of the given [`GrowFor`] now, without waiting, and
+    /// returns whether it did.
+    grow: Box<dyn Fn(GrowFor) -> bool + Send + Sync>,
     /// Gives back one granted stream's hold.
     release: Box<dyn Fn() + Send + Sync>,
 }
 
 impl LaneWiden {
-    /// A pair of `grow`, which grants up to the given number of streams now
-    /// (extra streams, or the stream a lane starts again on) and returns how
-    /// many, and `release`, which gives one back. See the type's rules for
-    /// both.
+    /// A pair of `grow`, which grants one stream of the given [`GrowFor`]
+    /// now (an extra stream, or the stream a lane starts again on) and returns
+    /// whether it did, and `release`, which gives one back. See the type's
+    /// rules for both.
     pub fn new(
-        grow: impl Fn(usize) -> usize + Send + Sync + 'static,
+        grow: impl Fn(GrowFor) -> bool + Send + Sync + 'static,
         release: impl Fn() + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -347,10 +382,10 @@ impl LaneWiden {
         }
     }
 
-    /// Ask for up to `most` streams, extra streams or a restart's stream;
-    /// returns how many were granted, at most `most`.
-    pub(crate) fn grow(&self, most: usize) -> usize {
-        (self.grow)(most).min(most)
+    /// Ask for one stream of kind `kind`: a restart's stream, or an extra
+    /// stream. Returns whether it was granted.
+    pub(crate) fn grow(&self, kind: GrowFor) -> bool {
+        (self.grow)(kind)
     }
 
     /// Give back one granted stream's hold.
@@ -397,7 +432,8 @@ impl<S> Drop for ReleaseLease<S> {
 /// the future is dropped, polled or not.
 #[expect(
     dead_code,
-    reason = "the guards are never read: they act only when the worker's future drops them"
+    reason = "an extra worker's grant is never read: it acts only when the worker's future \
+              drops it"
 )]
 enum Hold<S> {
     /// A lane's own worker: the lane's lease, and the grant the lane started
@@ -412,24 +448,102 @@ enum Hold<S> {
     Extra(ReleaseGrant<S>),
 }
 
-/// A range [`Work::pick`] handed to a worker. `victim` is set when the range is
-/// a stolen tail: the peer it was taken from and that peer's unit number
-/// ([`Work::units`]) at the steal, for [`Work::cancel_victim`]. `uncovered` is
-/// set when the range lies wholly outside the worker's coverage, for its node
-/// to serve by pull-through.
+impl<S> Hold<S> {
+    /// Give back the stream of a lane's own worker as it parks with nothing
+    /// to take, when the lane has a [`LaneWiden`]: the lane's lease, or the
+    /// grant it started again on. A parked worker fetches nothing, so a
+    /// sibling fetch can use the stream meanwhile (#2252). Other holds keep
+    /// their stream.
+    fn park(&mut self) {
+        if let Self::Own { lease, grant } = self
+            && lease.0.widen.is_some()
+        {
+            lease.0.lease.release();
+            *grant = None;
+        }
+    }
+
+    /// Whether the worker holds a stream to fetch on: an extra worker's
+    /// grant, a lane's lease or restart grant, or a stream a parked own
+    /// worker takes back now through its lane's `grow`, as a restart.
+    fn stream(&mut self) -> bool {
+        match self {
+            Self::Extra(_) => true,
+            Self::Own { lease, grant } => {
+                let lane = &lease.0;
+                if lane.widen.is_none() || lane.lease.is_held() || grant.is_some() {
+                    return true;
+                }
+                let granted = lane
+                    .widen
+                    .as_ref()
+                    .is_some_and(|widen| widen.grow(GrowFor::Restart));
+                if granted {
+                    *grant = Some(ReleaseGrant(Arc::clone(lane)));
+                }
+                granted
+            }
+        }
+    }
+}
+
+/// A range [`Work::pick`] handed to a worker. `uncovered` is set when the
+/// range lies wholly outside the worker's coverage, for its node to serve by
+/// pull-through. `unit` is the unit's own live state ([`Work::live`]).
 struct Picked {
     range: AlignedRange,
-    victim: Option<(usize, u64)>,
     uncovered: bool,
+    unit: Arc<Unit>,
+}
+
+/// One unit's live state: its worker writes it as it fetches, and a steal
+/// reads it and lowers its end. [`Work::pick`] gives every unit a fresh one,
+/// so a steal can only touch the unit it trims.
+#[derive(Debug)]
+struct Unit {
+    /// The unit's verified bytes, verified frontier and first-byte time,
+    /// which [`fill_gap`] writes.
+    progress: UnitProgress,
+    /// The unit's end: `u64::MAX` until a steal lowers it to its split. The
+    /// unit's leg then stops there on its open stream ([`fill_gap`]).
+    stop_at: AtomicU64,
+    /// Nanoseconds the unit spent parked on the consumer after its first
+    /// verified byte ([`ParkedWait`]).
+    parked: AtomicU64,
+}
+
+impl Unit {
+    fn new() -> Self {
+        Self {
+            progress: UnitProgress::default(),
+            stop_at: AtomicU64::new(u64::MAX),
+            parked: AtomicU64::new(0),
+        }
+    }
+
+    /// The unit's rate so far, in bytes per second; `None` before its first
+    /// verified byte. It counts from that byte and leaves out the time the
+    /// unit spent parked on the consumer, so a leg's open, a cold first
+    /// byte, and the consumer's pace stay out of it.
+    fn rate(&self) -> Option<u64> {
+        let first = self.progress.first_byte.get()?;
+        let verified = self.progress.verified.load(Ordering::Relaxed);
+        let parked = Duration::from_nanos(self.parked.load(Ordering::Relaxed));
+        let millis = first.elapsed().saturating_sub(parked).as_millis();
+        if verified == 0 || millis == 0 {
+            return None;
+        }
+        u64::try_from(u128::from(verified).saturating_mul(1000) / millis).ok()
+    }
 }
 
 /// Per-lane interrupt: an edge-triggered wakeup ([`Notify`]) plus a `flag`
-/// that says the wakeup means "cancel", not a stale permit. The stealer sets
+/// that says the wakeup means "cancel", not a stale permit. The canceller sets
 /// `flag` and wakes the victim under the `Work` lock; the victim clears it on
 /// its next `Work::pick`, also under the lock, so the two never race.
 struct CancelHandle {
-    /// `true` once a stealer confirms the tail it took from this lane still
-    /// has missing bytes ([`Work::cancel_victim`]); the victim must stop.
+    /// `true` once [`Work::cancel_victim`] cancels this lane's unit; the
+    /// victim must stop.
     flag: AtomicBool,
     /// Wakes the victim's `cancelled` future so it re-reads `flag` promptly.
     notify: Notify,
@@ -511,11 +625,11 @@ where
 /// to `fill_gap`'s own completion, never tripped. A zero deadline disables the
 /// watchdog.
 ///
-/// Before the unit's first verified byte the window is [`FIRST_BYTE_GRACE`]
-/// (or `deadline`, if longer), so a cold miss whose first byte waits on the
-/// node's own upstream is not a stall. After it, a gap between verified bytes
-/// shorter than the deadline never trips; a source that stops trips it within
-/// one to two deadlines.
+/// The first window of each gap is [`FIRST_BYTE_GRACE`] (or `deadline`, if
+/// longer), so a cold miss whose first byte waits on the node's own upstream
+/// is not a stall. After it, a gap between verified bytes shorter than the
+/// deadline never trips; a source that stops trips it within one to two
+/// deadlines.
 ///
 /// It resolves with `None` on a trip. A store error while it checks resolves
 /// with that error ([`store_missing`]), which is this process's fault.
@@ -533,11 +647,7 @@ where
         return std::future::pending().await;
     }
     let mut prev = verified.load(Ordering::Relaxed);
-    let mut window = if prev == 0 {
-        deadline.max(FIRST_BYTE_GRACE)
-    } else {
-        deadline
-    };
+    let mut window = deadline.max(FIRST_BYTE_GRACE);
     loop {
         tokio::time::sleep(window).await;
         window = deadline;
@@ -562,8 +672,9 @@ where
 enum UnitOutcome {
     /// `fill_gap` filled the range: free the lane and pick again.
     Completed,
-    /// A steal claimed this lane's tail: re-queue the trimmed remainder and
-    /// stay live (pick again).
+    /// A proven size left the range past the end of the blob, or a
+    /// consumption-paced lane gave its range back for an earlier one:
+    /// re-queue the remainder and stay live (pick again).
     Cancelled,
     /// The lane stalled or `fill_gap` failed: re-queue the remainder and end
     /// the lane. `Some(e)` carries the `fill_gap` error; `None` is a watchdog
@@ -619,12 +730,20 @@ struct Work {
     /// Per-lane current range, `None` when the lane holds nothing.
     in_flight: Vec<Option<(u64, u64)>>,
     /// Per-lane interrupt handles. [`Work::cancel_victim`] signals
-    /// `cancel[victim]` after a steal; the victim clears it on its next `pick`.
+    /// `cancel[victim]` when a proven size leaves its range past the end; the
+    /// victim clears it on its next `pick`.
     cancel: Vec<Arc<CancelHandle>>,
+    /// Per-slot live state of the unit in flight. A steal reads the victim's
+    /// rate and frontier off it, and lowers its end to the split under the
+    /// same lock as its trim: the victim stops its open stream there
+    /// ([`fill_gap`]), with no new stream for the part it keeps.
+    live: Vec<Arc<Unit>>,
+    /// Per-slot rate over the worker's last unit that verified a byte, in
+    /// bytes per second: the stealer's side of a steal's split.
+    rates: Vec<Option<u64>>,
     /// Per-lane count of units started. Every [`Work::pick`] by worker `i`
-    /// bumps `units[i]`, so a number names one unit. A steal only trims its
-    /// victim's slot and never bumps it, so a victim trimmed by two stealers is
-    /// still on the same unit.
+    /// bumps `units[i]`, so a number names one unit, and
+    /// [`Work::cancel_victim`] cancels only the unit it names.
     units: Vec<u64>,
     /// `alive[i]` is `true` while lane `i`'s worker runs. [`Work::park`]
     /// clears it when the worker ends; [`Work::revive`] sets it when the loop
@@ -642,11 +761,8 @@ struct Work {
     /// ([`Work::add_extra`]).
     lane_of: Vec<usize>,
     /// `extra[i]` is `true` when slot `i` is an extra worker: one more stream
-    /// a lane's [`LaneWiden`] granted for a faulted lane's remainder.
+    /// a lane's [`LaneWiden`] granted for a queued range no idle worker takes.
     extra: Vec<bool>,
-    /// `widened[lane]` is `true` while the lane runs an extra worker. A lane
-    /// runs at most one.
-    widened: Vec<bool>,
     /// `providers[i]` is the payee worker slot `i` fetches from: set by
     /// [`Work::set_provider`] when the loop starts a lane, and copied from
     /// the lane for an extra worker. Steal logs name both sides with it.
@@ -669,13 +785,14 @@ impl Work {
             pending,
             in_flight: Vec::new(),
             cancel: Vec::new(),
+            live: Vec::new(),
+            rates: Vec::new(),
             units: Vec::new(),
             alive: Vec::new(),
             coverage: Vec::new(),
             measured: Vec::new(),
             lane_of: Vec::new(),
             extra: Vec::new(),
-            widened: Vec::new(),
             providers: Vec::new(),
             no_uncovered: Vec::new(),
             front_first,
@@ -714,6 +831,7 @@ impl Work {
         let slot = self.in_flight.len();
         self.in_flight.push(None);
         self.cancel.push(Arc::new(CancelHandle::new()));
+        self.push_unit_state();
         self.units.push(0);
         self.alive.push(true);
         self.measured.push(coverage.is_some());
@@ -721,17 +839,16 @@ impl Work {
             .push(coverage.unwrap_or_else(|| Coverage::full(num_blocks(total_bytes))));
         self.lane_of.push(slot);
         self.extra.push(false);
-        self.widened.push(false);
         self.providers.push(None);
         self.no_uncovered.push(false);
         slot
     }
 
-    /// Give lane `lane` an extra worker's slot, alive and holding nothing, and
-    /// mark the lane widened. Returns the slot. The slot of the lane's last
-    /// extra worker, which has ended, is used again, so a lane takes at most
-    /// one slot for its extra workers however often it grows. Its unit count
-    /// carries on, so a steal made against an earlier unit cannot cancel it.
+    /// Give lane `lane` an extra worker's slot, alive and holding nothing.
+    /// Returns the slot. A slot of an extra worker of the lane that has ended
+    /// is used again, so a lane holds only as many extra slots as it ran extra
+    /// workers at once. Its unit count carries on, so a cancel made against
+    /// an earlier unit cannot cancel it.
     fn add_extra(&mut self, lane: usize) -> usize {
         let ended = (0..self.in_flight.len()).find(|&i| {
             self.extra.get(i) == Some(&true)
@@ -752,6 +869,9 @@ impl Work {
             if let Some(handle) = self.cancel.get_mut(slot) {
                 *handle = Arc::new(CancelHandle::new());
             }
+            if let Some(rate) = self.rates.get_mut(slot) {
+                *rate = None;
+            }
             if let Some(alive) = self.alive.get_mut(slot) {
                 *alive = true;
             }
@@ -764,14 +884,12 @@ impl Work {
             if let Some(p) = self.providers.get_mut(slot) {
                 *p = provider;
             }
-            if let Some(widened) = self.widened.get_mut(lane) {
-                *widened = true;
-            }
             return slot;
         }
         let slot = self.in_flight.len();
         self.in_flight.push(None);
         self.cancel.push(Arc::new(CancelHandle::new()));
+        self.push_unit_state();
         self.units.push(0);
         self.alive.push(true);
         self.measured
@@ -784,30 +902,34 @@ impl Work {
         );
         self.lane_of.push(lane);
         self.extra.push(true);
-        self.widened.push(false);
         self.providers
             .push(self.providers.get(lane).copied().flatten());
         // An extra worker reads its lane's bar through `lane_of`.
         self.no_uncovered.push(false);
-        if let Some(widened) = self.widened.get_mut(lane) {
-            *widened = true;
-        }
         slot
     }
 
-    /// End extra worker slot `i`: it is gone for good, and its lane may be
-    /// widened again.
-    fn end_extra(&mut self, i: usize) {
-        self.park(i);
-        if let Some(&lane) = self.lane_of.get(i)
-            && let Some(widened) = self.widened.get_mut(lane)
-        {
-            *widened = false;
+    /// Give a new slot its unit state: an idle unit and no rate yet.
+    fn push_unit_state(&mut self) {
+        self.live.push(Arc::new(Unit::new()));
+        self.rates.push(None);
+    }
+
+    /// Record `rate`, worker `i`'s rate over the unit it just ended.
+    fn record_rate(&mut self, i: usize, rate: Option<u64>) {
+        if let (Some(slot), Some(rate)) = (self.rates.get_mut(i), rate) {
+            *slot = Some(rate);
         }
     }
 
+    /// End extra worker slot `i`: it is gone for good, and
+    /// [`Work::add_extra`] may use the slot again.
+    fn end_extra(&mut self, i: usize) {
+        self.park(i);
+    }
+
     /// Who can grow for each pending range no idle worker will take: per such
-    /// range, the range and the running lanes that may be asked for one extra
+    /// range, the range and the running lanes that may be asked for an extra
     /// worker for it, in lane order (#2231).
     ///
     /// Ranges are matched to idle workers one to one, in queue order: an idle
@@ -815,7 +937,8 @@ impl Work {
     /// covers, or one that holds a chunk no running lane covers (#2225) unless
     /// its lane is barred from those ([`Work::barred`]), on its next pick. A
     /// lane may be asked for a range only while its own worker runs a range of
-    /// its own, it has no extra worker yet, and `can_grow` allows it. It must
+    /// its own and `can_grow` allows it; its `LaneWiden` bounds how many extra
+    /// workers it runs. It must
     /// also cover part of that range, or, for a range that holds a chunk no
     /// running lane covers, not be barred from pull-through: the same rule as
     /// for an idle worker, so a remainder only the faulted lane covered still
@@ -851,7 +974,6 @@ impl Work {
                     self.extra.get(lane) == Some(&false)
                         && self.alive.get(lane) == Some(&true)
                         && self.in_flight.get(lane).is_some_and(Option::is_some)
-                        && self.widened.get(lane) == Some(&false)
                         && can_grow(lane)
                         && ((orphan && !self.barred(lane)) || covers(lane, seg))
                 })
@@ -950,17 +1072,27 @@ impl Work {
     /// Whether a lane over `coverage` has anything to take: a pending entry it
     /// covers at least in part, a pending chunk no running lane covers (any
     /// lane may take that one, #2225, when `take_uncovered` allows it), or a
-    /// range in flight it could steal from.
+    /// range in flight it would steal from now ([`Work::plan_steal`], #2303).
+    /// That check counts every byte in flight past its victim's received
+    /// frontier as missing, and gives the lane no rate, so it declines only a
+    /// steal that the size floors or the lane's coverage rule out.
     fn has_work_for(&self, coverage: &Coverage, total_bytes: u64, take_uncovered: bool) -> bool {
-        self.pending
+        if self
+            .pending
             .iter()
             .any(|seg| !covered_part(coverage, seg.chunk_ranges(), total_bytes).is_empty())
             || (take_uncovered && self.uncovered(total_bytes))
-            || self
-                .in_flight
-                .iter()
-                .flatten()
-                .any(|&(s, l)| covers_byte_range(coverage, s, l, total_bytes))
+        {
+            return true;
+        }
+        let mut in_flight: Vec<(u64, u64)> = self.in_flight.iter().flatten().copied().collect();
+        in_flight.sort_unstable();
+        // The ranges in flight are valid ranges of the blob, so the plan
+        // raises no alignment error; an error reads as no work.
+        matches!(
+            self.plan_steal(total_bytes, coverage, &in_flight, None),
+            Ok(Some(_))
+        )
     }
 
     /// The chunks of `seg` no running lane covers.
@@ -1028,15 +1160,17 @@ impl Work {
     /// #1506), else the first covered run of a pending entry, else the first
     /// run of pending chunks no running lane covers (#2225), unless the
     /// worker's lane is barred from those ([`Work::barred`]); when none remain,
-    /// steal the aligned second half of the missing remainder of the COVERABLE
-    /// range in flight that misses the most ([`steal_split`]), trimming the
-    /// victim to end at that split so no other freed worker can re-steal the
-    /// same tail. `missing` is the store's missing byte runs, read just before
-    /// the pick; it only overstates what is missing, since bytes that land
-    /// after the read are never taken away. Records the choice in
-    /// `in_flight[i]`. A steal
-    /// does NOT cancel the victim here: the caller does that with
-    /// [`Work::cancel_victim`] once it knows the tail still has missing bytes.
+    /// steal the aligned tail of the missing remainder of the range in flight
+    /// whose covered suffix ([`covered_suffix_start`]) misses the most, split
+    /// by the two lanes' rates ([`steal_split`]). The split lies past the
+    /// victim's received frontier.
+    /// The steal trims the victim to end at that split, so no other freed
+    /// worker can re-steal the same tail, and lowers the victim's end
+    /// (`Unit::stop_at`, [`Work::live`]) to the split, so the victim stops its
+    /// open stream there. `missing` is the store's missing byte runs, read
+    /// just before the pick; it only overstates what is missing, since bytes
+    /// that land after the read are never taken away. Records the choice in
+    /// `in_flight[i]`, and gives the unit fresh live state.
     /// `Ok(None)` means there is nothing this worker can start right now: it
     /// parks while [`Work::busy`] holds, and ends otherwise.
     ///
@@ -1068,6 +1202,13 @@ impl Work {
             Some(unit) => *unit = unit.wrapping_add(1),
             None => anyhow::bail!("worker index {i} out of range for unit counters"),
         }
+        // A fresh live state for the unit, so a steal can only lower the end
+        // of the unit it trims.
+        let unit = Arc::new(Unit::new());
+        match self.live.get_mut(i) {
+            Some(live) => *live = Arc::clone(&unit),
+            None => anyhow::bail!("worker index {i} out of range for unit state"),
+        }
         let covered = |seg: &AlignedRange| {
             covers_byte_range(coverage, seg.fetch_start(), seg.fetch_len(), total_bytes)
         };
@@ -1088,8 +1229,8 @@ impl Work {
                 *self.slot_mut(i)? = Some((seg.fetch_start(), seg.fetch_len()));
                 return Ok(Some(Picked {
                     range: seg,
-                    victim: None,
                     uncovered: false,
+                    unit,
                 }));
             }
         }
@@ -1114,77 +1255,182 @@ impl Work {
             *self.slot_mut(i)? = Some((picked.fetch_start(), picked.fetch_len()));
             return Ok(Some(Picked {
                 range: picked,
-                victim: None,
                 uncovered,
+                unit,
             }));
         }
         if !steal {
             *self.slot_mut(i)? = None;
             return Ok(None);
         }
+        self.steal(i, total_bytes, coverage, missing, unit)
+    }
 
-        // Nothing pending this worker can serve: every remaining byte is
-        // either in flight on a busy worker or outside this worker's own
-        // coverage. Steal the aligned second half of the missing remainder of
-        // the COVERABLE such range that misses the most. `in_flight[i]` is
-        // `None` here (cleared before this pick), so this worker is excluded
-        // from the remaining set and never steals from itself.
+    /// The steal a worker over `coverage` that runs at `stealer_rate` would
+    /// make now: the index in `in_flight` of its victim, and the aligned tail
+    /// it takes ([`steal_split`]). `None` when no range in flight has a
+    /// covered suffix worth a fresh stream. Changes nothing.
+    ///
+    /// Each candidate victim's received prefix reads as delivered, not
+    /// missing: its checkpoints may not be durable yet, but its open stream
+    /// already carried those bytes, and a split behind them would hand them
+    /// to the stealer too. `steal_split` returns WHICH remaining range it
+    /// split, so the caller trims that exact victim: no second argmax to agree
+    /// with. The stealer steals only inside a range's covered suffix (#2303),
+    /// and the split declines a steal that would leave the victim no missing
+    /// byte: that steal takes the victim's whole remaining work, and the
+    /// victim, with nothing left, would steal it straight back.
+    ///
+    /// # Errors
+    ///
+    /// As [`steal_split`].
+    fn plan_steal(
+        &self,
+        total_bytes: u64,
+        coverage: &Coverage,
+        missing: &[(u64, u64)],
+        stealer_rate: Option<u64>,
+    ) -> anyhow::Result<Option<(usize, AlignedRange)>> {
         let (owners, remaining): (Vec<usize>, Vec<(u64, u64)>) = self
             .in_flight
             .iter()
             .enumerate()
             .filter_map(|(idx, slot)| slot.map(|r| (idx, r)))
             .unzip();
-        // `steal_split` returns WHICH remaining range it split, so the trim below
-        // lands on that exact victim: no second argmax to agree with. The
-        // predicate excludes any range this worker's `coverage` does not fully
-        // include, so a narrow-coverage worker that finds nothing it can serve
-        // gets `None` here and parks rather than stealing a range it cannot
-        // deliver.
-        // The split halves the victim's missing bytes, and declines a steal
-        // that would leave the victim none: that steal takes the victim's
-        // whole remaining work, and the victim, with nothing left, would steal
-        // it straight back.
-        let Some((v, half)) = steal_split(&remaining, missing, total_bytes, |s, l| {
-            covers_byte_range(coverage, s, l, total_bytes)
-        })?
+        let received: Vec<(u64, u64)> = owners
+            .iter()
+            .zip(&remaining)
+            .filter_map(|(&owner, &(start, _))| {
+                let frontier = self
+                    .live
+                    .get(owner)?
+                    .progress
+                    .frontier
+                    .load(Ordering::SeqCst);
+                (frontier > start).then(|| (start, frontier - start))
+            })
+            .collect();
+        let missing = without_runs(missing, &received);
+        let victim_rate = |k: usize| {
+            owners
+                .get(k)
+                .and_then(|&owner| self.live.get(owner))
+                .and_then(|unit| unit.rate())
+        };
+        let planned = steal_split(
+            &remaining,
+            &missing,
+            total_bytes,
+            |s, l| covered_suffix_start(coverage, s, l, total_bytes),
+            stealer_rate,
+            victim_rate,
+        )?;
+        Ok(planned.and_then(|(v, tail)| Some((*owners.get(v)?, tail))))
+    }
+
+    /// The steal arm of [`Work::pick`]: nothing pending worker `i` can serve.
+    /// Hands `unit`, the unit's own live state, to the stolen range.
+    ///
+    /// # Errors
+    ///
+    /// As [`Work::pick`].
+    fn steal(
+        &mut self,
+        i: usize,
+        total_bytes: u64,
+        coverage: &Coverage,
+        missing: &[(u64, u64)],
+        unit: Arc<Unit>,
+    ) -> anyhow::Result<Option<Picked>> {
+        // Nothing pending this worker can serve: every remaining byte is
+        // either in flight on a busy worker or outside this worker's own
+        // coverage. Steal the aligned tail of the missing remainder of the
+        // range in flight whose covered suffix misses the most (#2303).
+        // `in_flight[i]` is `None` here (cleared before this pick), so this
+        // worker is excluded from the remaining set and never steals from
+        // itself. The split weighs the remainder by the two lanes' rates:
+        // this worker's over its last unit, and the victim's on its unit so
+        // far.
+        let stealer_rate = self.rates.get(i).copied().flatten();
+        let Some((victim, tail)) = self.plan_steal(total_bytes, coverage, missing, stealer_rate)?
         else {
             *self.slot_mut(i)? = None;
             return Ok(None);
         };
 
         // Trim the victim to end at the split point, so a later freed worker sees
-        // the shortened tail and cannot re-steal the half this worker just took:
+        // the shortened tail and cannot re-steal the part this worker just took:
         // at most one lane owns any range, by construction, in the work-state.
-        // The victim's `requeue_missing` re-queues the missing bytes of this
-        // same trimmed range, so the steal and the requeue split the remainder
-        // at one point.
+        // Under the same lock, lower the victim's end to the split: its leg
+        // stops there on its open stream, and the victim opens no new stream
+        // for the part it keeps.
         //
         // Every branch that cannot complete that trim DECLINES the steal instead
-        // of proceeding. Handing out `half` with the victim untrimmed would leave
+        // of proceeding. Handing out `tail` with the victim untrimmed would leave
         // two workers owning overlapping ranges, and both would pay for the
         // overlap: the exact double-pay the trim exists to prevent.
-        let trimmed = owners.get(v).copied().and_then(|victim| {
-            if victim == i {
-                return None;
-            }
-            let (start, len) = self.in_flight.get_mut(victim)?.as_mut()?;
-            if half.fetch_start() <= *start {
-                return None;
-            }
-            *len = half.fetch_start() - *start;
-            Some(victim)
-        });
-        let Some((victim, unit)) = trimmed.and_then(|v| Some((v, *self.units.get(v)?))) else {
+        let Some(victim_unit) = self.live.get(victim).map(Arc::clone) else {
             *self.slot_mut(i)? = None;
             return Ok(None);
         };
+        let trimmed = match self.in_flight.get_mut(victim) {
+            Some(Some((start, len))) if victim != i && tail.fetch_start() > *start => {
+                let end = start.saturating_add(*len);
+                *len = tail.fetch_start() - *start;
+                Some((*start, end))
+            }
+            _ => None,
+        };
+        let Some((victim_start, victim_end)) = trimmed else {
+            *self.slot_mut(i)? = None;
+            return Ok(None);
+        };
+        // Lower the end, then read the victim's frontier again. Both sides
+        // order their two accesses `SeqCst`: the victim publishes each
+        // verified group's end, then reads its own end (`fill_gap`). So
+        // either the victim sees the lowered end before it verifies past the
+        // split, or this read sees a frontier at or past the split.
+        victim_unit
+            .stop_at
+            .fetch_min(tail.fetch_start(), Ordering::SeqCst);
+        let frontier = victim_unit.progress.frontier.load(Ordering::SeqCst);
+        let tail = if frontier < tail.fetch_start() {
+            tail
+        } else if frontier >= tail.fetch_end() {
+            // The victim received its whole range before it saw the lowered
+            // end, and its leg drains to the end: nothing is left to steal.
+            if let Some(Some((_, len))) = self.in_flight.get_mut(victim) {
+                *len = victim_end - victim_start;
+            }
+            *self.slot_mut(i)? = None;
+            return Ok(None);
+        } else {
+            // The victim verified past the split before it saw the lowered
+            // end. It stops at the frontier read here, or one chunk group
+            // past it: start the tail at that frontier, so the two overlap by
+            // at most one group and leave no byte unowned.
+            if let Some(Some((_, len))) = self.in_flight.get_mut(victim) {
+                *len = frontier - victim_start;
+            }
+            align_range(frontier, tail.fetch_end() - frontier, total_bytes)?
+        };
+        tracing::debug!(
+            stealer = ?self.providers.get(i).copied().flatten(),
+            victim = ?self.providers.get(victim).copied().flatten(),
+            split = tail.fetch_start(),
+            stolen = tail.fetch_len(),
+            victim_range = ?self.in_flight.get(victim).copied().flatten(),
+            victim_frontier = frontier,
+            stealer_rate,
+            victim_rate = victim_unit.rate(),
+            "stole the tail of a lane's missing remainder"
+        );
 
-        *self.slot_mut(i)? = Some((half.fetch_start(), half.fetch_len()));
+        *self.slot_mut(i)? = Some((tail.fetch_start(), tail.fetch_len()));
         Ok(Some(Picked {
-            range: half,
-            victim: Some((victim, unit)),
+            range: tail,
             uncovered: false,
+            unit,
         }))
     }
 
@@ -1229,21 +1475,20 @@ impl Work {
         Ok(Some(take))
     }
 
-    /// Signal a steal's victim to STOP fetching past the split. Its
-    /// already-running `fill_gap` would otherwise fetch (and pay for) the tail
-    /// the stealer took. The signal fires only while the victim still runs
-    /// `unit`, the unit the steal trimmed. A victim that has since finished,
-    /// faulted, or re-queued holds no slot or runs a later unit, and cancelling
-    /// that unit would be wrong. A second steal from the same victim trims its
-    /// slot again but leaves `unit` unchanged, so this cancel still fires. Set
-    /// the flag then wake it, both under the caller's `Work` lock, serialized
-    /// against the victim's own `pick` reset. `notify_one` stores a permit if
-    /// the victim is not parked yet, so the signal is never lost.
+    /// Cancel worker `victim`'s unit `unit`: its `fill_gap` is dropped, and it
+    /// re-queues the missing bytes of its range and picks again. A proven size
+    /// that leaves the unit's whole range past the end of the blob cancels it
+    /// this way ([`Work::clip`]). The signal fires only while the victim still
+    /// runs `unit`. A victim that has since finished, faulted, or re-queued
+    /// holds no slot or runs a later unit, and cancelling that unit would be
+    /// wrong. Set the flag then wake it, both under the caller's `Work` lock,
+    /// serialized against the victim's own `pick` reset. `notify_one` stores a
+    /// permit if the victim is not parked yet, so the signal is never lost.
     fn cancel_victim(&self, victim: usize, unit: u64) {
         let same_unit = self.units.get(victim) == Some(&unit)
             && self.in_flight.get(victim).is_some_and(Option::is_some);
         if !same_unit {
-            tracing::debug!(victim, unit, "steal victim moved on; cancel skipped");
+            tracing::debug!(victim, unit, "the unit to cancel has ended; cancel skipped");
             return;
         }
         if let Some(handle) = self.cancel.get(victim) {
@@ -1449,6 +1694,8 @@ struct ParkedWait<'a> {
     parked: &'a AtomicBool,
     /// Woken when this worker parks.
     parked_wake: &'a Notify,
+    /// The unit in flight, whose rate leaves out the time parked here.
+    unit: &'a Unit,
 }
 
 /// Clears a worker's parked flag when its wait ends or is dropped.
@@ -1470,7 +1717,15 @@ impl PacingWait for ParkedWait<'_> {
             self.parked.store(true, Ordering::Release);
             let _unpark = Unpark(self.parked);
             self.parked_wake.notify_waiters();
+            let parked_at = Instant::now();
             self.inner.wait(observed, reason).await;
+            // A parked worker holds no open leg, so it verifies nothing while
+            // parked: the whole wait stays out of the unit's rate, once its
+            // rate clock runs.
+            if self.unit.progress.first_byte.get().is_some() {
+                let nanos = u64::try_from(parked_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.unit.parked.fetch_add(nanos, Ordering::Relaxed);
+            }
         })
     }
 }
@@ -1568,7 +1823,7 @@ async fn run_worker<St, S, Pc, F>(
     lane: Arc<StreamCandidate<S>>,
     provider: Address,
     health: &PeerHealth,
-    extra: bool,
+    hold: &mut Hold<S>,
 ) -> anyhow::Result<WorkerEnd>
 where
     St: IngestStore,
@@ -1576,6 +1831,7 @@ where
     Pc: Pacer,
     F: Funder,
 {
+    let extra = matches!(hold, Hold::Extra(_));
     let Engine {
         store,
         hash,
@@ -1584,8 +1840,8 @@ where
         ..
     } = *engine;
     // This lane's coverage and cancel handle, cloned once so `cancelled` can
-    // await the handle OUTSIDE the `Work` lock while a peer's
-    // `Work::cancel_victim` signals it under the lock.
+    // await the handle OUTSIDE the `Work` lock while `Work::cancel_victim`
+    // signals it under the lock.
     let (my_coverage, handle) = {
         let w = work.lock().await;
         match (w.coverage.get(i).cloned(), w.cancel.get(i).map(Arc::clone)) {
@@ -1604,11 +1860,6 @@ where
     // `yield_to_front` can move it to an earlier re-queued range.
     let lane_parked = AtomicBool::new(false);
     let lane_parked_wake = Notify::new();
-    let lane_wait = engine.pacing.map(|p| ParkedWait {
-        inner: p.pacing_wait,
-        parked: &lane_parked,
-        parked_wake: &lane_parked_wake,
-    });
     loop {
         // Register for the peer-progress wakeup BEFORE reading the work state, so
         // a peer that changes it between this read and the park below cannot slip
@@ -1644,14 +1895,36 @@ where
                     .is_none_or(|alive| !alive);
             if lane_stopped {
                 None
+            } else if !hold.stream() {
+                // A parked own worker gave its stream back and finds none
+                // free now. It ends when no lane holds work; otherwise it
+                // tries again on a peer's progress or after `GROWTH_RETRY`.
+                if !w.busy() {
+                    w.park(i);
+                    drop(w);
+                    wake();
+                    return Ok(idle());
+                }
+                drop(w);
+                tokio::select! {
+                    () = parked.as_mut() => {}
+                    () = tokio::time::sleep(GROWTH_RETRY) => {}
+                }
+                continue;
             } else {
-                w.pick(i, total_bytes, &my_coverage, !extra, &missing)?
+                let picked = w.pick(i, total_bytes, &my_coverage, !extra, &missing)?;
+                if picked.is_none() {
+                    // Nothing to take: the stream goes back while the worker
+                    // parks or ends.
+                    hold.park();
+                }
+                picked
             }
         };
         let Some(Picked {
             range,
-            victim,
             uncovered,
+            unit,
         }) = picked
         else {
             // Nothing to start right now. An extra worker ends here. A lane's
@@ -1707,36 +1980,26 @@ where
             wake();
             continue;
         }
-        // A stolen tail with missing bytes: stop the victim at the split so the
-        // tail is fetched and paid for once. A fully present tail skips this,
-        // so a victim that has already delivered its range reaches its own
-        // `finish` instead of being dropped just before it.
-        if let Some((v, unit)) = victim {
-            let w = work.lock().await;
-            w.cancel_victim(v, unit);
-            tracing::debug!(
-                stealer = %provider,
-                victim = ?w.providers.get(v).copied().flatten(),
-                split = r_start,
-                victim_range = ?w.in_flight.get(v).copied().flatten(),
-                "stole the second half of a lane's missing remainder"
-            );
-        }
-
-        // Drive each still-missing gap OUTSIDE the lock, racing it against a steal
+        // Drive each still-missing gap OUTSIDE the lock, racing it against a
         // cancel and the stall watchdog. Dropping the `fill_gap` future on either
         // leaves the store's checkpointed prefix intact. `in_flight[i]` stays the
         // whole picked range, trimmed only by a peer's steal, so the steal's
         // split (read from the store's missing runs) and this worker's
-        // `requeue_missing` (the missing bytes of that trimmed range) agree.
+        // `requeue_missing` (the missing bytes of that trimmed range) agree. A
+        // steal also lowers `stop_at`, and the gap in flight ends at the split.
         let mut terminal: Option<UnitOutcome> = None;
-        // The unit's verified bytes across its gaps, for the fault's log line.
-        let mut landed = 0u64;
         // The start of the gap the unit ended on, for an overshoot check.
         let mut piece_at = r_start;
+        let lane_wait = engine.pacing.map(|p| ParkedWait {
+            inner: p.pacing_wait,
+            parked: &lane_parked,
+            parked_wake: &lane_parked_wake,
+            unit: &unit,
+        });
         for (g_start, g_len) in gaps {
             piece_at = g_start;
-            let verified = AtomicU64::new(0);
+            let verified = &unit.progress.verified;
+            let before = verified.load(Ordering::Relaxed);
             let outcome = {
                 let fill = fill_gap(
                     store,
@@ -1754,8 +2017,9 @@ where
                     // The shared whole-blob delivered counter: every lane folds its
                     // own leg deltas in, so the bar reads one monotonic position.
                     Some(engine.progress_agg),
-                    // This unit's verified bytes, which the watchdog judges.
-                    Some(&verified),
+                    // This unit's progress: the watchdog judges its verified
+                    // bytes, and a steal splits past its frontier.
+                    Some(&unit.progress),
                     // Consumption pacing (#1848): with a `WindowPacer`, gate this
                     // lane against the shared consumer cursor so it never runs more
                     // than one read-ahead window ahead of what the consumer read.
@@ -1767,6 +2031,8 @@ where
                     // top-up budget, and the credit path that shows a landed
                     // top-up to EVERY lane.
                     Some(engine.pool),
+                    // The end a peer's steal lowers to its split.
+                    Some(&unit.stop_at),
                 );
                 tokio::select! {
                     biased;
@@ -1777,7 +2043,7 @@ where
                     },
                     () = cancelled(&handle) => UnitOutcome::Cancelled,
                     // Parked on the consumer with an earlier range waiting: give
-                    // this range back (it re-queues like a steal) and take that
+                    // this range back (it re-queues like a cancel) and take that
                     // one. Only under consumption pacing.
                     () = yield_to_front(
                         work,
@@ -1791,13 +2057,12 @@ where
                     // A watchdog trip carries no error by construction: the
                     // source simply stopped making verified progress. A store
                     // error while it checks is ours (#2213).
-                    err = watchdog(store, g_start, g_len, engine.watchdog, &verified) => {
+                    err = watchdog(store, g_start, g_len, engine.watchdog, verified) => {
                         UnitOutcome::Faulted(err)
                     }
                 }
             };
-            let gap_landed = verified.load(Ordering::Relaxed);
-            landed = landed.saturating_add(gap_landed);
+            let gap_landed = verified.load(Ordering::Relaxed).saturating_sub(before);
             if gap_landed > 0 {
                 delivered = true;
                 if uncovered {
@@ -1814,12 +2079,27 @@ where
             }
         }
 
+        // The unit's verified bytes across its gaps, for the fault's log line.
+        let landed = unit.progress.verified.load(Ordering::Relaxed);
+        if landed > 0 {
+            work.lock().await.record_rate(i, unit.rate());
+        }
         match terminal {
-            // Every gap filled: free the lane and pick again.
+            // Every gap filled, up to a peer's split if one stole the tail:
+            // free the lane and pick again.
             None | Some(UnitOutcome::Completed) => {
+                let split = unit.stop_at.load(Ordering::Acquire);
+                if split < r_start.saturating_add(r_len) {
+                    tracing::debug!(
+                        %provider,
+                        start = r_start,
+                        split,
+                        "a lane stopped its stream at a steal split"
+                    );
+                }
                 work.lock().await.clear(i)?;
             }
-            // Stolen: re-queue the trimmed remainder and stay live. The
+            // Cancelled: re-queue the remainder and stay live. The
             // credit-window tail [paid_frontier, checkpointed_frontier) is NOT
             // re-billed here: resume is checkpoint-frontier via `missing_ranges`,
             // a bounded (<= credit window + INGEST_MAX_QUEUED_CHECKPOINTS + 1
@@ -1905,9 +2185,8 @@ where
     Pc: Pacer,
     F: Funder,
 {
-    let extra = matches!(hold, Hold::Extra(_));
-    let _hold = hold;
-    run_worker(engine, i, lane, provider, health, extra).await
+    let mut hold = hold;
+    run_worker(engine, i, lane, provider, health, &mut hold).await
 }
 
 /// Log, where it happens, that an extra worker's stream faulted on `range`
@@ -2196,6 +2475,15 @@ async fn poll_opt<T>(slot: &mut Option<SourceFuture<'_, T>>) -> anyhow::Result<T
     }
 }
 
+/// The next item of `slot`'s stream, or wait forever without one.
+async fn next_opt<T>(slot: &mut Option<SourceStream<'_, T>>) -> Option<T> {
+    use futures_util::StreamExt as _;
+    match slot.as_mut() {
+        Some(stream) => stream.next().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Sleep until `wake`, or forever without one.
 pub(crate) async fn sleep_until_opt(wake: Option<Instant>) {
     match wake {
@@ -2218,19 +2506,24 @@ struct Growth {
     waiting: Vec<(u64, u64)>,
     /// When `waiting` last changed.
     waiting_since: Instant,
-    /// When `waiting` was last logged.
-    logged_at: Instant,
+    /// When `waiting` was last logged at info, or `None` before the first
+    /// such line.
+    logged_at: Option<Instant>,
 }
 
 /// What one growth pass left waiting.
 struct GrowthPass {
     /// Each queued range without a taker, as `(start, len)`.
     waiting: Vec<(u64, u64)>,
-    /// How many of them had candidate lanes that all granted nothing or were
-    /// already asked in this pass.
+    /// How many of them had candidate lanes that all refused a stream in
+    /// this pass.
     refused: usize,
     /// How many of them had no candidate lane at all.
     no_candidate: usize,
+    /// Whether a running lane has a [`LaneWiden`]. A range with no lane to
+    /// ask now can find one once such a lane's own worker holds a range, and
+    /// that pick wakes no pass.
+    growable: bool,
 }
 
 impl Growth {
@@ -2241,7 +2534,7 @@ impl Growth {
             extra_backoff: HashMap::new(),
             waiting: Vec::new(),
             waiting_since: now,
-            logged_at: now,
+            logged_at: None,
         }
     }
 
@@ -2286,16 +2579,18 @@ impl Growth {
 
     /// Record what the pass at `now` left waiting, and when to run the next
     /// pass with no other trigger: after [`GROWTH_RETRY`] when a `grow`
-    /// granted nothing, and when a lane's wait after a refused extra stream
-    /// ends. Log the waiting ranges at info when they change, and every
-    /// [`WAITING_RELOG`] while they stay.
+    /// granted nothing or a range had no lane to ask while a running lane has
+    /// a [`LaneWiden`], and when a lane's wait after a refused extra stream
+    /// ends. Log the waiting ranges at info on the first wait and then at most
+    /// every [`WAITING_RELOG`] while ranges wait, and at debug when they
+    /// change between those lines.
     fn passed(&mut self, now: Instant, hash: [u8; 32], pass: GrowthPass) {
         self.retry_at = None;
         if pass.waiting.is_empty() {
             self.waiting.clear();
             return;
         }
-        if pass.refused > 0 {
+        if pass.refused > 0 || (pass.no_candidate > 0 && pass.growable) {
             self.retry_by(now + GROWTH_RETRY);
         }
         if let Some(ends) = self
@@ -2312,14 +2607,29 @@ impl Growth {
             self.waiting = pass.waiting;
             self.waiting_since = now;
         }
-        if changed || now.saturating_duration_since(self.logged_at) >= WAITING_RELOG {
-            self.logged_at = now;
+        let ranges = byte_runs(self.waiting.iter().copied());
+        let waited_secs = now.saturating_duration_since(self.waiting_since).as_secs();
+        if self
+            .logged_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= WAITING_RELOG)
+        {
+            self.logged_at = Some(now);
             tracing::info!(
                 hash = %blake3::Hash::from_bytes(hash).to_hex(),
-                ranges = %byte_runs(self.waiting.iter().copied()),
+                %ranges,
                 refused = pass.refused,
                 no_candidate = pass.no_candidate,
-                waited_secs = now.saturating_duration_since(self.waiting_since).as_secs(),
+                waited_secs,
+                "a queued range waits for a stream: no idle lane takes it, and no busy lane \
+                 could take one more stream for it"
+            );
+        } else if changed {
+            tracing::debug!(
+                hash = %blake3::Hash::from_bytes(hash).to_hex(),
+                %ranges,
+                refused = pass.refused,
+                no_candidate = pass.no_candidate,
+                waited_secs,
                 "a queued range waits for a stream: no idle lane takes it, and no busy lane \
                  could take one more stream for it"
             );
@@ -2609,6 +2919,10 @@ where
     let mut connecting: FuturesUnordered<Connecting<'p, P::Source>> = FuturesUnordered::new();
     let mut connecting_set: HashSet<Address> = HashSet::new();
     let mut discovering: Option<SourceFuture<'p, Vec<Holder>>> = None;
+    // Holders the provider pushes after the start. While the stream is open
+    // the loop asks for no discovery: the pushed holders are the answer a
+    // discovery would wait for.
+    let mut arrivals: Option<SourceStream<'p, Holder>> = sources.provider().arrivals();
     let mut running: HashSet<Address> = HashSet::new();
     let mut slots: HashMap<Address, usize> = HashMap::new();
     // Each lane slot's provider and lane, for a growth request (#2231).
@@ -2771,7 +3085,7 @@ where
                     let grant = match lane.widen.as_ref() {
                         Some(widen) if restart && !lane.lease.is_held() => {
                             let at = Instant::now();
-                            if widen.grow(1) == 0 {
+                            if !widen.grow(GrowFor::Restart) {
                                 if sources.start_refused(provider, at + GROWTH_RETRY) {
                                     tracing::info!(
                                         %provider,
@@ -2821,36 +3135,51 @@ where
             }
 
             // A queued range no idle worker takes, such as a faulted lane's
-            // remainder, goes to a busy lane on one extra stream, so it does
-            // not wait for that lane's whole range (#2231). The lane covers
+            // remainder, goes to a busy lane on an extra stream, so it does
+            // not wait for that lane's whole range (#2231, #2252). The lane covers
             // part of the range, or, when part of the range has no running
             // lane that covers it, is not barred from pull-through. Asked
             // after this pass started its lanes, so a lane that just started
             // counts as a taker. A lane whose node refused its extra stream
             // waits before it is asked again; a pass that a `grow` refused
-            // runs again after `GROWTH_RETRY` (#2230).
+            // runs again after `GROWTH_RETRY` (#2230). So does a pass that
+            // found no lane to ask while a running lane has a `LaneWiden`: a
+            // worker that takes its next range wakes no pass, and an own
+            // worker drains a whole queue without ending (#2252).
             if growth.due(now) {
                 let mut w = work.lock().await;
                 let wanted = w.growth_wanted(total_bytes, |lane| {
                     growth.may_ask(lane, now)
                         && lane_at.get(&lane).is_some_and(|(_, l)| l.widen.is_some())
                 });
-                let mut asked: HashSet<usize> = HashSet::new();
+                let mut refused_lanes: HashSet<usize> = HashSet::new();
                 let mut pass = GrowthPass {
                     waiting: Vec::new(),
                     refused: 0,
                     no_candidate: 0,
+                    growable: lane_at
+                        .values()
+                        .any(|(provider, l)| running.contains(provider) && l.widen.is_some()),
                 };
                 for (range, candidates) in wanted {
                     let had_candidates = !candidates.is_empty();
-                    // Ask each candidate lane once per pass, in lane order,
-                    // until one grants a stream. `grow` never waits.
+                    // Ask the candidate lanes in lane order until one grants a
+                    // stream. `grow` never waits. A lane that grants may be
+                    // asked again for the next range, so one pass fills every
+                    // stream the lanes grant; a lane that refuses is not asked
+                    // again in this pass.
                     let taker = candidates.into_iter().find_map(|lane| {
-                        if !asked.insert(lane) {
+                        if refused_lanes.contains(&lane) {
                             return None;
                         }
                         let (provider, l) = lane_at.get(&lane)?;
-                        let granted = l.widen.as_ref().is_some_and(|widen| widen.grow(1) > 0);
+                        let granted = l
+                            .widen
+                            .as_ref()
+                            .is_some_and(|widen| widen.grow(GrowFor::Extra));
+                        if !granted {
+                            refused_lanes.insert(lane);
+                        }
                         granted.then(|| (lane, *provider, Arc::clone(l)))
                     });
                     let Some((lane, provider, l)) = taker else {
@@ -2888,6 +3217,7 @@ where
             }
             let uncovered = work.lock().await.uncovered(total_bytes);
             if discovering.is_none()
+                && arrivals.is_none()
                 && sources.wants_discovery(now, deposit, running.len(), uncovered)
             {
                 discovering = Some(sources.provider().discover(sources.hash()));
@@ -3030,6 +3360,21 @@ where
                     let deposit = pool_deposit(&deposit_rx, &started.0);
                     sources.discovery_done(found, Instant::now(), deposit);
                 }
+                arrived = next_opt(&mut arrivals), if arrivals.is_some() => {
+                    match arrived {
+                        Some(holder) => {
+                            tracing::debug!(
+                                provider = %holder.provider,
+                                rtt_ms = holder.rtt_ms,
+                                probed_holder = holder.probed_holder,
+                                "a late holder joined"
+                            );
+                            sources.holders_arrived(vec![holder]);
+                            growth.wanted = true;
+                        }
+                        None => arrivals = None,
+                    }
+                }
                 () = sleep_until_opt(wake) => {}
                 Ok(()) = deposit_rx.changed() => {}
                 // A leg proved a size: the loop top clips the work to it.
@@ -3059,6 +3404,7 @@ where
     // Stop every lane first, so no paid leg sits open while the builds drain.
     drop(workers);
     drop(discovering);
+    drop(arrivals);
     // An error exit can leave a record write in flight: land it before the
     // flush below, so it cannot rename an older snapshot over that one.
     if let Some(pending) = record.take()
@@ -4049,113 +4395,320 @@ mod tests {
         Ok(())
     }
 
-    /// A steal trims the victim but does not cancel it: the stealer cancels
-    /// only after it confirms the stolen tail still has missing bytes, and
-    /// only while the victim still runs the unit the steal trimmed. A second
-    /// steal from the same victim does not hide the first stealer's cancel,
-    /// and a victim that has moved on to a new unit keeps it.
-    #[tokio::test]
-    async fn steal_cancels_the_victim_only_through_cancel_victim() -> anyhow::Result<()> {
+    /// A work-state with three lanes over one discovery block: lane 0 holds
+    /// the whole block on unit 1, lanes 1 and 2 hold nothing.
+    fn one_victim_work(total: u64, coverage: &Coverage) -> super::Work {
         use std::collections::VecDeque;
-        use std::sync::atomic::Ordering;
 
-        use super::{CancelHandle, Work};
+        use super::{CancelHandle, Unit, Work};
 
-        let total = DISCOVERY_BLOCK_BYTES;
-        let coverage = cov(1, &[0]);
-        let fresh_work = || Work {
+        Work {
             pending: VecDeque::new(),
             in_flight: vec![Some((0, total)), None, None],
             cancel: (0..3).map(|_| Arc::new(CancelHandle::new())).collect(),
+            live: (0..3).map(|_| Arc::new(Unit::new())).collect(),
+            rates: vec![None; 3],
             alive: vec![true, true, true],
             units: vec![1, 0, 0],
             coverage: vec![coverage.clone(), coverage.clone(), coverage.clone()],
             measured: vec![true; 3],
             lane_of: (0..3).collect(),
             extra: vec![false; 3],
-            widened: vec![false; 3],
             providers: vec![None; 3],
             no_uncovered: vec![false; 3],
             front_first: false,
-        };
+        }
+    }
+
+    /// A steal trims the victim and lowers the victim's end to the split, under
+    /// one lock, and never cancels it: the victim keeps its open stream and
+    /// stops there. A second steal lowers the end again. Only
+    /// `cancel_victim` cancels, and only the unit it names.
+    #[tokio::test]
+    async fn a_steal_lowers_the_victims_end_and_does_not_cancel_it() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let total = DISCOVERY_BLOCK_BYTES;
+        let coverage = cov(1, &[0]);
         // Nothing is present: every byte in flight is missing.
         let all = [(0, total)];
-        let victim_flag = |w: &Work| {
+        let flag = |w: &super::Work, slot: usize| {
             w.cancel
-                .first()
+                .get(slot)
                 .is_some_and(|h| h.flag.load(Ordering::Acquire))
         };
+        let end = |w: &super::Work, slot: usize| {
+            w.live
+                .get(slot)
+                .map_or(u64::MAX, |unit| unit.stop_at.load(Ordering::Acquire))
+        };
+        // The slot whose range ends where a stolen tail starts.
+        let victim_of = |w: &super::Work, split: u64| {
+            (0..w.in_flight.len()).find(|&slot| {
+                w.in_flight
+                    .get(slot)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|(start, len)| start + len == split)
+            })
+        };
 
-        // A single steal: `pick` trims but does not cancel; `cancel_victim` does.
-        let mut work = fresh_work();
+        let mut work = one_victim_work(total, &coverage);
         let first = work
             .pick(1, total, &coverage, true, &all)?
             .ok_or_else(|| anyhow::anyhow!("worker 1 must steal worker 0's tail"))?;
-        let (victim, unit) = first
-            .victim
-            .ok_or_else(|| anyhow::anyhow!("a steal must name its victim"))?;
-        assert_eq!(victim, 0);
+        let split = first.range.fetch_start();
+        assert_eq!(work.in_flight.first().copied().flatten(), Some((0, split)));
+        assert_eq!(end(&work, 0), split, "the victim must stop at the split");
+        assert!(!flag(&work, 0), "a steal must not cancel the victim");
         assert_eq!(
-            work.in_flight.first().copied().flatten(),
-            Some((0, first.range.fetch_start()))
-        );
-        assert!(!victim_flag(&work), "pick alone must not cancel the victim");
-        work.cancel_victim(victim, unit);
-        assert!(
-            victim_flag(&work),
-            "the victim must be cancelled at the split"
+            first.unit.stop_at.load(Ordering::Acquire),
+            u64::MAX,
+            "the stealer's own end is not lowered"
         );
 
-        // Two steals from one victim before the first stealer cancels: the
-        // second trim leaves the victim on the same unit, so the first
-        // stealer's cancel still fires even if the second stealer skips its own.
-        let mut work = fresh_work();
-        let first = work
-            .pick(1, total, &coverage, true, &all)?
-            .ok_or_else(|| anyhow::anyhow!("worker 1 must steal"))?;
-        let (v1, u1) = first
-            .victim
-            .ok_or_else(|| anyhow::anyhow!("first steal names its victim"))?;
-        // A second stealer trims the victim again, to the first quarter.
-        *work.slot_mut(v1)? = Some((0, first.range.fetch_start() / 2));
-        work.cancel_victim(v1, u1);
+        // A second freed lane steals from one of the two: that victim's end
+        // drops to the new split, still without a cancel.
+        let second = work
+            .pick(2, total, &coverage, true, &all)?
+            .ok_or_else(|| anyhow::anyhow!("worker 2 must steal again"))?;
+        let split = second.range.fetch_start();
+        let victim = victim_of(&work, split)
+            .ok_or_else(|| anyhow::anyhow!("the second steal trims a victim"))?;
+        assert_eq!(end(&work, victim), split);
         assert!(
-            victim_flag(&work),
-            "a second trim must not hide the first stealer's cancel"
+            !flag(&work, victim),
+            "a second steal must not cancel either"
         );
 
-        // The victim finished and started a new unit: a late cancel must not hit it.
-        let mut work = fresh_work();
-        let stolen = work
-            .pick(1, total, &coverage, true, &all)?
-            .ok_or_else(|| anyhow::anyhow!("worker 1 must steal"))?;
-        let (victim, unit) = stolen
-            .victim
-            .ok_or_else(|| anyhow::anyhow!("a steal must name its victim"))?;
-        work.clear(victim)?;
+        // A cancel names a unit: a victim on a new unit keeps it, and an idle
+        // victim has nothing to cancel.
+        let mut work = one_victim_work(total, &coverage);
+        work.clear(0)?;
         work.pending
             .push_back(decdn_bao_range::align_range(0, 1, total)?);
-        work.pick(victim, total, &coverage, true, &all)?
+        work.pick(0, total, &coverage, true, &all)?
             .ok_or_else(|| anyhow::anyhow!("the victim must pick its new unit"))?;
-        work.cancel_victim(victim, unit);
+        work.cancel_victim(0, 1);
         assert!(
-            !victim_flag(&work),
+            !flag(&work, 0),
             "a victim on a new unit must not be cancelled"
         );
+        work.cancel_victim(0, 2);
+        assert!(flag(&work, 0), "a cancel of the unit in flight fires");
+        let mut work = one_victim_work(total, &coverage);
+        work.clear(0)?;
+        work.cancel_victim(0, 1);
+        assert!(!flag(&work, 0), "an idle victim must not be cancelled");
+        Ok(())
+    }
 
-        // The victim finished and holds nothing: nothing to cancel.
-        work.clear(victim)?;
-        work.cancel_victim(victim, unit);
-        assert!(!victim_flag(&work), "an idle victim must not be cancelled");
+    /// A victim's received prefix counts as delivered: the split lies past its
+    /// verified frontier even when the store has not made those bytes durable,
+    /// so the stealer never takes bytes the victim already received.
+    #[tokio::test]
+    async fn a_steal_splits_past_the_victims_received_frontier() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let total = DISCOVERY_BLOCK_BYTES;
+        let coverage = cov(1, &[0]);
+        let all = [(0, total)];
+        let mut work = one_victim_work(total, &coverage);
+        // The victim received three quarters of its range; none of it is
+        // durable yet.
+        let frontier = total / 4 * 3;
+        if let Some(unit) = work.live.first() {
+            unit.progress.frontier.store(frontier, Ordering::Release);
+        }
+        let picked = work
+            .pick(1, total, &coverage, true, &all)?
+            .ok_or_else(|| anyhow::anyhow!("worker 1 must steal"))?;
+        // No rates: the victim keeps half of what it has not received.
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+        let want = (frontier + (total - frontier) / 2) / group * group;
+        assert_eq!(picked.range.fetch_start(), want);
+        assert!(picked.range.fetch_start() > frontier);
+        Ok(())
+    }
+
+    /// A unit's rate counts from its first verified byte and leaves out the
+    /// time it spent parked on the consumer: a slow open, a cold first byte,
+    /// or the consumer's pace does not read as a slow source.
+    #[tokio::test(start_paused = true)]
+    async fn a_units_rate_runs_from_its_first_byte_and_skips_parked_time() {
+        use std::sync::atomic::Ordering;
+
+        let unit = super::Unit::new();
+        // 5 s to the first byte: no rate before it.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(unit.rate(), None);
+        unit.progress
+            .first_byte
+            .get_or_init(tokio::time::Instant::now);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        unit.progress.verified.store(10 * MIB, Ordering::Relaxed);
+        assert_eq!(
+            unit.rate(),
+            Some(10 * MIB),
+            "the open stays out of the rate"
+        );
+        // 3 s parked on the consumer, then 1 s more streaming 10 MiB.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        unit.parked.store(
+            u64::try_from(Duration::from_secs(3).as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        unit.progress.verified.store(20 * MIB, Ordering::Relaxed);
+        assert_eq!(
+            unit.rate(),
+            Some(10 * MIB),
+            "parked time stays out of the rate"
+        );
+    }
+
+    /// A fast stealer takes a share of the victim's missing remainder in
+    /// proportion to the two rates, so a slow victim keeps only what it can
+    /// fetch while the stealer fetches the rest.
+    #[tokio::test(start_paused = true)]
+    async fn a_steal_splits_by_the_two_lanes_rates() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let total = DISCOVERY_BLOCK_BYTES;
+        let coverage = cov(1, &[0]);
+        let all = [(0, total)];
+        let mut work = one_victim_work(total, &coverage);
+        // The victim verified 1 MiB in the second after its first byte; the
+        // stealer ran its last unit at 3 MiB/s.
+        if let Some(unit) = work.live.first() {
+            unit.progress
+                .first_byte
+                .get_or_init(tokio::time::Instant::now);
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        if let Some(unit) = work.live.first() {
+            unit.progress.verified.store(1024 * 1024, Ordering::Relaxed);
+        }
+        work.record_rate(1, Some(3 * 1024 * 1024));
+
+        let picked = work
+            .pick(1, total, &coverage, true, &all)?
+            .ok_or_else(|| anyhow::anyhow!("worker 1 must steal"))?;
+        // The victim keeps a quarter of the block, rounded down to a group.
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+        assert_eq!(picked.range.fetch_start(), (total / 4) / group * group);
+        assert_eq!(picked.range.fetch_end(), total);
+        Ok(())
+    }
+
+    /// #2303: a lane that covers only the tail blocks of a busy lane's range
+    /// steals inside those blocks. A lane whose coverage misses the range's
+    /// last block finds no work there and takes nothing.
+    #[tokio::test]
+    async fn a_partial_holder_steals_the_covered_tail_of_a_busy_leg() -> anyhow::Result<()> {
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        let mut work = one_victim_work(total, &cov(3, &[0, 1, 2]));
+        let all = [(0, total)];
+
+        let front_only = cov(3, &[0, 1]);
+        assert!(!work.has_work_for(&front_only, total, false));
+        assert!(work.pick(2, total, &front_only, true, &all)?.is_none());
+
+        let tail_only = cov(3, &[1, 2]);
+        assert!(work.has_work_for(&tail_only, total, false));
+        let picked = work
+            .pick(1, total, &tail_only, true, &all)?
+            .ok_or_else(|| anyhow::anyhow!("worker 1 covers the victim's tail and must steal"))?;
+        // No rates: the victim keeps half, which lies inside block 1.
+        assert_eq!(picked.range.fetch_start(), total / 2);
+        assert_eq!(picked.range.fetch_end(), total);
+        assert_eq!(
+            work.in_flight.first().copied().flatten(),
+            Some((0, total / 2))
+        );
+        Ok(())
+    }
+
+    /// #2303: a lane that covers only the last block of a busy lane's range
+    /// steals from that block's start when the split by rate lies before it,
+    /// past the split by rate when that lies inside it, and not at all when
+    /// the victim's remainder is below the floor.
+    #[tokio::test]
+    async fn a_tail_holder_steal_moves_the_split_into_its_covered_suffix() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        const B: u64 = DISCOVERY_BLOCK_BYTES;
+        let total = 3 * B;
+        let all = [(0, total)];
+        let last_only = cov(3, &[2]);
+        let steal_at = |frontier: u64| -> anyhow::Result<(super::Work, Option<super::Picked>)> {
+            let mut work = one_victim_work(total, &cov(3, &[0, 1, 2]));
+            if let Some(unit) = work.live.first() {
+                unit.progress.frontier.store(frontier, Ordering::Release);
+            }
+            let picked = work.pick(1, total, &last_only, true, &all)?;
+            Ok((work, picked))
+        };
+
+        // Frontier at 20 MiB: the even split (106 MiB) lies before block 2,
+        // so the split moves to block 2 and the victim keeps blocks 0 and 1.
+        let (work, picked) = steal_at(20 * MIB)?;
+        let picked = picked.ok_or_else(|| anyhow::anyhow!("block 2 is stealable"))?;
+        assert_eq!(picked.range.fetch_start(), 2 * B);
+        assert_eq!(picked.range.fetch_end(), total);
+        assert_eq!(work.in_flight.first().copied().flatten(), Some((0, 2 * B)));
+        assert_eq!(
+            work.live
+                .first()
+                .map(|unit| unit.stop_at.load(Ordering::Acquire)),
+            Some(2 * B),
+            "the victim stops its open stream at the moved split"
+        );
+
+        // Frontier at 160 MiB: the victim keeps half of the 32 MiB it misses.
+        let (_, picked) = steal_at(160 * MIB)?;
+        let picked = picked.ok_or_else(|| anyhow::anyhow!("32 MiB is stealable"))?;
+        assert_eq!(picked.range.fetch_start(), 176 * MIB);
+
+        // Frontier at 180 MiB: 12 MiB left is below the floor.
+        let (work, picked) = steal_at(180 * MIB)?;
+        assert!(picked.is_none());
+        assert_eq!(work.in_flight.first().copied().flatten(), Some((0, total)));
+        Ok(())
+    }
+
+    /// #2303: a holder that covers a busy range's last block counts as having
+    /// work only while that range's covered suffix has enough left to steal,
+    /// so a lane that could only park never takes a start slot.
+    #[tokio::test]
+    async fn a_tail_holder_has_work_only_while_its_covered_suffix_is_stealable()
+    -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        const B: u64 = DISCOVERY_BLOCK_BYTES;
+        let total = 3 * B;
+        let work = one_victim_work(total, &cov(3, &[0, 1, 2]));
+        let last_only = cov(3, &[2]);
+        assert!(work.has_work_for(&last_only, total, false));
+        assert!(!work.has_work_for(&cov(3, &[0, 1]), total, false));
+        // The victim received all but 12 MiB: below the floor, nothing to steal.
+        if let Some(unit) = work.live.first() {
+            unit.progress.frontier.store(180 * MIB, Ordering::Release);
+        }
+        assert!(!work.has_work_for(&last_only, total, false));
+        assert!(
+            !work.has_work_for(&cov(3, &[0, 1, 2]), total, false),
+            "the floor holds for a full holder too"
+        );
         Ok(())
     }
 
     /// THE double-pay test: a fast source and a held-back one over a 64 MiB
     /// blob, arranged so a steal DEFINITELY fires: every leg of the slow source
     /// waits before its first byte until the test sees the fast source open a
-    /// second range, which is the steal of the slow source's tail. With
-    /// steal-cancellation the stolen tail is fetched by exactly ONE source, so
-    /// total delivered ≈ the blob size.
+    /// second range, which is the steal of the slow source's tail. The victim
+    /// stops at the split, so the stolen tail is fetched by exactly ONE
+    /// source, and total delivered ≈ the blob size.
     #[tokio::test]
     async fn forced_steal_does_not_double_fetch_the_stolen_tail() -> anyhow::Result<()> {
         let data = blob(64 * 1024 * 1024);
@@ -4217,6 +4770,64 @@ mod tests {
              (fast={}, slow={}) for a {total}-byte blob",
             src_fast.delivered_bytes(),
             src_slow.delivered_bytes()
+        );
+        Ok(())
+    }
+
+    /// A fast source and a slow one, each with a steady rate, over a 128 MiB
+    /// blob. The fast source finishes its half first and steals from the slow
+    /// one by the two rates, so both finish together: the slow source is
+    /// stolen from once, keeps its one stream, and stops that stream at the
+    /// split. A midpoint split would leave the slow source enough for a second
+    /// steal, and a third.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_victim_is_stolen_from_once() -> anyhow::Result<()> {
+        let data = blob(128 * MIB as usize);
+        let total = data.len() as u64;
+        let ledger_fast = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_slow = Arc::new(PoolLedger::new(Cumulative::default()));
+        let fast = ScriptedSource::new(data.clone())?
+            .throttled(Duration::from_millis(1))
+            .paying(Arc::clone(&ledger_fast));
+        let slow = ScriptedSource::new(data.clone())?
+            .throttled(Duration::from_millis(4))
+            .paying(Arc::clone(&ledger_slow));
+        let root = fast.root();
+        let (store, dir) = fresh_store(root, total);
+        let provider = StaticSources::new(vec![
+            candidate(fast.clone(), ledger_fast, 0xA1, None),
+            candidate(slow.clone(), ledger_slow, 0xB2, None),
+        ])?;
+        let (pacer, funder) = (BudgetPacer::new(), no_topups());
+        tokio::time::timeout(
+            Duration::from_mins(5),
+            run_acquire(&store, &provider, root, total, &pacer, &funder, 2, None),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the fetch stalled"))??;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+        let (fast_opens, slow_opens) = (fast.opened_ranges(), slow.opened_ranges());
+        assert_eq!(
+            fast_opens.len(),
+            2,
+            "the fast source opens its half and one steal: {fast_opens:?} / {slow_opens:?}"
+        );
+        assert_eq!(
+            slow_opens.len(),
+            1,
+            "the slow source keeps its one stream: {fast_opens:?} / {slow_opens:?}"
+        );
+        assert_eq!(
+            slow.stopped_pulls(),
+            1,
+            "the slow source stops at the split"
+        );
+        let delivered = fast.delivered_bytes() + slow.delivered_bytes();
+        assert!(
+            delivered <= total + 2 * MIB,
+            "no byte is fetched twice: delivered {delivered} of {total}"
         );
         Ok(())
     }
@@ -4315,6 +4926,8 @@ mod tests {
         Ok(StealRun {
             thief: thief.opened_ranges(),
             victim: victim.opened_ranges(),
+            victim_stops: victim.stopped_pulls(),
+            delivered: thief.delivered_bytes() + victim.delivered_bytes(),
             victim_range: (start, len),
             frontier,
         })
@@ -4324,51 +4937,54 @@ mod tests {
     struct StealRun {
         thief: Vec<(u64, u64)>,
         victim: Vec<(u64, u64)>,
+        /// The victim's pulls stopped before the end of their range.
+        victim_stops: u32,
+        /// Wire bytes both sources delivered.
+        delivered: u64,
         victim_range: (u64, u64),
         frontier: u64,
     }
 
     /// A steal from a victim that delivered past its picked midpoint splits
-    /// the victim's MISSING remainder: the thief takes its second half, the
-    /// victim keeps the first half, and no byte after the steal is opened by
-    /// both lanes (no steal ping-pong).
+    /// the victim's MISSING remainder: the thief takes its second half (the
+    /// victim has no rate yet), and the victim keeps the first half on its
+    /// open stream. The victim opens no new stream, stops its one pull at the
+    /// split, and no byte past the split is fetched by both lanes.
     #[tokio::test(start_paused = true)]
     async fn a_steal_splits_the_victims_missing_remainder() -> anyhow::Result<()> {
         let run = steal_after_victim_frontier(
             |start, len| start + len / 8 * 5,
-            async |_, victim, gate| open_when(|| victim.opened_ranges().len() >= 2, gate).await,
+            async |thief, _, gate| open_when(|| thief.opened_ranges().len() >= 2, gate).await,
         )
         .await?;
         let (start, len) = run.victim_range;
         let end = start + len;
         let split = run.frontier + (end - run.frontier) / 2;
+        let seen = (&run.thief, &run.victim, run.frontier);
         assert_eq!(
             run.thief.get(1).copied(),
             Some((split, end - split)),
-            "the thief steals the second half of the victim's missing remainder: {run:?}",
-            run = (&run.thief, &run.victim, run.frontier)
+            "the thief steals the second half of the victim's missing remainder: {seen:?}",
         );
         assert_eq!(
-            run.victim.get(1).copied(),
-            Some((run.frontier, split - run.frontier)),
-            "the victim keeps the first half of its missing remainder: {run:?}",
-            run = (&run.thief, &run.victim, run.frontier)
+            run.victim,
+            vec![(start, len)],
+            "the victim keeps its one stream and opens no new one: {seen:?}",
         );
-        let later: Vec<(u64, u64)> = run
-            .thief
-            .iter()
-            .skip(1)
-            .chain(run.victim.iter().skip(1))
-            .copied()
-            .collect();
-        for (k, &(s1, l1)) in later.iter().enumerate() {
-            for &(s2, l2) in later.iter().skip(k + 1) {
-                assert!(
-                    s1 + l1 <= s2 || s2 + l2 <= s1,
-                    "a byte after the steal is opened twice: {later:?}"
-                );
-            }
-        }
+        assert_eq!(
+            run.victim_stops, 1,
+            "the victim stops its pull at the split"
+        );
+        // The victim streams its range from its start, the bytes the test
+        // admitted included, so it re-delivers `[start, frontier)` once. Past
+        // the split only the thief delivers.
+        let wire = |bytes: u64| bytes + bytes / 1024 * 64 / 16;
+        assert!(
+            run.delivered <= wire(128 * MIB + (run.frontier - start)) + 2 * MIB,
+            "a byte past the split was fetched twice: delivered {} of {}",
+            run.delivered,
+            128 * MIB,
+        );
         Ok(())
     }
 
@@ -4724,8 +5340,8 @@ mod tests {
     ///
     /// Each lane covers one discovery block of a two-block blob, so neither can
     /// steal the other's range. The scripted double bills a leg only in
-    /// `finish`, so a leg a steal cancels would read as unpaid here and hide
-    /// which ledger the lane uses.
+    /// `finish` or `stop`, so a leg dropped mid-stream would read as unpaid
+    /// here and hide which ledger the lane uses.
     #[tokio::test]
     async fn distinct_providers_each_pay_their_own_lane() -> anyhow::Result<()> {
         let data = blob(usize::try_from(2 * DISCOVERY_BLOCK_BYTES)?);
@@ -5074,7 +5690,8 @@ mod tests {
             _reader: R,
             _on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
             _claimed_total: u64,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
+            _stop_at: Option<&'a std::sync::atomic::AtomicU64>,
+        ) -> crate::source::IngestFuture<'a, R>
         where
             R: crate::BaoRangeReader + 'a,
         {
@@ -5444,7 +6061,7 @@ mod tests {
         let data = blob(32 * 1024 * 1024);
         let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
         let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
-        // Each lane delivers one ingest checkpoint of its half, then sleeps.
+        // Each lane delivers the first 4 MiB of its half, then sleeps.
         let src_a = ScriptedSource::new(data.clone())?
             .stall_after(4 * 1024 * 1024, Duration::from_hours(1))
             .paying(Arc::clone(&ledger_a));
@@ -5471,9 +6088,10 @@ mod tests {
 
         let reopened = ClientRangedStore::open(dir.path(), "b", root)?;
         let recorded = ranges_content_len(&reopened.present_ranges().await?, total);
+        let landed = 2 * ClientRangedStore::checkpointed_len(4 * 1024 * 1024);
         assert!(
-            recorded >= 8 * 1024 * 1024,
-            "both lanes' landed checkpoints are recorded: {recorded}"
+            recorded >= landed,
+            "both lanes' landed checkpoints are recorded: {recorded}, want at least {landed}"
         );
         assert!(recorded < total);
         Ok(())
@@ -6056,13 +6674,13 @@ mod tests {
         );
         assert!(uncovered, "its node serves the remainder by pull-through");
 
-        // A lane runs at most one extra worker: a second orphan finds no
-        // candidate while the first extra runs.
+        // A lane with an extra worker running is asked again for a second
+        // orphan: its `LaneWiden` bounds its extra workers (#2252).
         work.pending.push_back(align_range(0, MIB, total)?);
         assert_eq!(
             candidates(&work),
-            vec![Vec::<usize>::new()],
-            "a widened lane is not asked for a second extra stream"
+            vec![vec![b]],
+            "a lane running an extra stream is asked for another"
         );
         // Once the extra ends, the lane may grow again, on the same slot.
         work.clear(extra)?;
@@ -6934,10 +7552,10 @@ mod tests {
     struct WidenCount {
         granted: std::sync::atomic::AtomicUsize,
         released: std::sync::atomic::AtomicUsize,
-        /// Calls of `grow`.
-        asks: std::sync::atomic::AtomicUsize,
         /// The most grants held at once.
         peak: std::sync::atomic::AtomicUsize,
+        /// Each `grow` call's kind and whether it granted, in call order.
+        calls: Mutex<Vec<(super::GrowFor, bool)>>,
     }
 
     impl WidenCount {
@@ -6949,21 +7567,25 @@ mod tests {
             self.released.load(std::sync::atomic::Ordering::SeqCst)
         }
 
-        fn asks(&self) -> usize {
-            self.asks.load(std::sync::atomic::Ordering::SeqCst)
-        }
-
         fn peak(&self) -> usize {
             self.peak.load(std::sync::atomic::Ordering::SeqCst)
         }
 
-        /// Count one `grow` call that granted `give`.
-        fn grew(&self, give: usize) {
+        /// Each `grow` call's kind and whether it granted, in call order.
+        fn calls(&self) -> Vec<(super::GrowFor, bool)> {
+            self.calls.lock().map(|c| c.clone()).unwrap_or_default()
+        }
+
+        /// Count one `grow` call of `kind` that granted a stream or not.
+        fn grew(&self, kind: super::GrowFor, granted: bool) {
             use std::sync::atomic::Ordering;
-            self.asks.fetch_add(1, Ordering::SeqCst);
-            self.granted.fetch_add(give, Ordering::SeqCst);
+            self.granted
+                .fetch_add(usize::from(granted), Ordering::SeqCst);
             let held = self.granted().saturating_sub(self.released());
             self.peak.fetch_max(held, Ordering::SeqCst);
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push((kind, granted));
+            }
         }
     }
 
@@ -6974,10 +7596,10 @@ mod tests {
         let count = Arc::new(WidenCount::default());
         let (on_grow, on_release) = (Arc::clone(&count), Arc::clone(&count));
         let widen = super::LaneWiden::new(
-            move |most| {
+            move |kind| {
                 let held = on_grow.granted().saturating_sub(on_grow.released());
-                let give = most.min(room.saturating_sub(held));
-                on_grow.grew(give);
+                let give = held < room;
+                on_grow.grew(kind, give);
                 give
             },
             move || {
@@ -7012,6 +7634,217 @@ mod tests {
                 f.push(holder.provider);
             }
         }
+    }
+
+    /// Static lanes plus holders pushed after the start, each after its own
+    /// delay, and a count of discovery calls. Discovery returns `found`.
+    struct Arriving<'a> {
+        inner: &'a StaticSources<ScriptedSource>,
+        late: Mutex<Option<Vec<(Duration, crate::Holder)>>>,
+        found: Vec<crate::Holder>,
+        discovers: std::sync::atomic::AtomicUsize,
+    }
+
+    impl<'a> Arriving<'a> {
+        fn new(
+            inner: &'a StaticSources<ScriptedSource>,
+            late: Vec<(Duration, crate::Holder)>,
+            found: Vec<crate::Holder>,
+        ) -> Self {
+            Self {
+                inner,
+                late: Mutex::new(Some(late)),
+                found,
+                discovers: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn discovers(&self) -> usize {
+            self.discovers.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::SourceProvider for Arriving<'_> {
+        type Source = ScriptedSource;
+
+        fn discover(&self, _hash: [u8; 32]) -> crate::SourceFuture<'_, Vec<crate::Holder>> {
+            self.discovers
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let found = self.found.clone();
+            Box::pin(async move { Ok(found) })
+        }
+
+        fn connect<'b>(
+            &'b self,
+            holder: &'b crate::Holder,
+        ) -> crate::SourceFuture<'b, StreamCandidate<ScriptedSource>> {
+            self.inner.connect(holder)
+        }
+
+        fn arrivals(&self) -> Option<crate::SourceStream<'_, crate::Holder>> {
+            use futures_util::StreamExt as _;
+            let late = self.late.lock().ok()?.take()?;
+            Some(Box::pin(futures_util::stream::iter(late).then(
+                |(after, holder)| async move {
+                    tokio::time::sleep(after).await;
+                    holder
+                },
+            )))
+        }
+    }
+
+    /// `provider`'s static holder for the lane built with `byte`.
+    fn holder_of(
+        provider: &StaticSources<ScriptedSource>,
+        byte: u8,
+    ) -> anyhow::Result<crate::Holder> {
+        provider
+            .holders()
+            .into_iter()
+            .find(|h| h.provider == Address::repeat_byte(byte))
+            .ok_or_else(|| anyhow::anyhow!("no holder {byte:#x}"))
+    }
+
+    /// A holder pushed one second in takes a free lane beside a busy one, and
+    /// both lanes deliver.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_holder_takes_a_free_lane() -> anyhow::Result<()> {
+        let data = blob(32 * MIB as usize);
+        let (la, lb) = (
+            Arc::new(PoolLedger::new(Cumulative::default())),
+            Arc::new(PoolLedger::new(Cumulative::default())),
+        );
+        let a = busy(&data, &la)?;
+        let b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&lb));
+        let (root, total) = (a.root(), a.total_bytes());
+        let lanes = StaticSources::new(vec![
+            candidate(a.clone(), la, 0xA1, None),
+            candidate(b.clone(), lb, 0xB2, None),
+        ])?;
+        let provider = Arriving::new(
+            &lanes,
+            vec![(Duration::from_secs(1), holder_of(&lanes, 0xB2)?)],
+            Vec::new(),
+        );
+        let (store, dir) = fresh_store(root, total);
+        acquire_over(&store, &provider, vec![holder_of(&lanes, 0xA1)?], root, 2).await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        assert!(a.delivered_bytes() > 0);
+        assert!(b.delivered_bytes() > 0, "the late holder delivered");
+        Ok(())
+    }
+
+    /// #2303: a holder of only the last block arrives while the full holder
+    /// streams the whole blob as one range. It steals from inside its block,
+    /// and the stolen part is fetched once.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_tail_holder_steals_the_covered_tail_and_fetches_each_byte_once()
+    -> anyhow::Result<()> {
+        const B: u64 = DISCOVERY_BLOCK_BYTES;
+        let data = blob(2 * B as usize);
+        let (la, lb) = (
+            Arc::new(PoolLedger::new(Cumulative::default())),
+            Arc::new(PoolLedger::new(Cumulative::default())),
+        );
+        let a = busy(&data, &la)?;
+        let b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&lb));
+        let (root, total) = (a.root(), a.total_bytes());
+        let lanes = StaticSources::new(vec![
+            candidate(a.clone(), la, 0xA1, None),
+            candidate(b.clone(), lb, 0xB2, Some(cov(2, &[1]))),
+        ])?;
+        let provider = Arriving::new(
+            &lanes,
+            vec![(Duration::from_secs(1), holder_of(&lanes, 0xB2)?)],
+            Vec::new(),
+        );
+        let (store, dir) = fresh_store(root, total);
+        acquire_over(&store, &provider, vec![holder_of(&lanes, 0xA1)?], root, 2).await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        assert_eq!(
+            a.opened_ranges().first().copied(),
+            Some((0, total)),
+            "the full holder starts on the whole blob, so the tail holder can only steal"
+        );
+        assert!(b.delivered_bytes() > 0, "the tail holder stole its block");
+        assert!(
+            b.opened_ranges().iter().all(|&(s, _)| s >= B),
+            "the tail holder opens only inside its block: {:?}",
+            b.opened_ranges()
+        );
+        assert!(
+            a.delivered_bytes() + b.delivered_bytes() <= total + decdn_bao_range::CHUNK_GROUP_BYTES,
+            "each byte is fetched once: a {} + b {} for {total}",
+            a.delivered_bytes(),
+            b.delivered_bytes()
+        );
+        Ok(())
+    }
+
+    /// The only starting holder refuses every stream. With a holder still to
+    /// arrive, the loop asks for no discovery and completes from the arrival.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_holder_rescues_a_faulted_start() -> anyhow::Result<()> {
+        let data = blob(8 * MIB as usize);
+        let (la, lb) = (
+            Arc::new(PoolLedger::new(Cumulative::default())),
+            Arc::new(PoolLedger::new(Cumulative::default())),
+        );
+        let a = ScriptedSource::new(data.clone())?
+            .refusing_opens_from(0, || anyhow::anyhow!("scripted refusal"))
+            .paying(Arc::clone(&la));
+        let b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&lb));
+        let (root, total) = (a.root(), a.total_bytes());
+        let lanes = StaticSources::new(vec![
+            candidate(a, la, 0xA1, None),
+            candidate(b, lb, 0xB2, None),
+        ])?;
+        let provider = Arriving::new(
+            &lanes,
+            vec![(Duration::from_secs(2), holder_of(&lanes, 0xB2)?)],
+            Vec::new(),
+        );
+        let (store, dir) = fresh_store(root, total);
+        acquire_over(&store, &provider, vec![holder_of(&lanes, 0xA1)?], root, 1).await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        assert_eq!(
+            provider.discovers(),
+            0,
+            "no discovery while arrivals are open"
+        );
+        Ok(())
+    }
+
+    /// Arrivals that end with nothing hand the loop back to discovery.
+    #[tokio::test(start_paused = true)]
+    async fn discovery_resumes_once_arrivals_end() -> anyhow::Result<()> {
+        let data = blob(8 * MIB as usize);
+        let (la, lb) = (
+            Arc::new(PoolLedger::new(Cumulative::default())),
+            Arc::new(PoolLedger::new(Cumulative::default())),
+        );
+        let a = ScriptedSource::new(data.clone())?
+            .refusing_opens_from(0, || anyhow::anyhow!("scripted refusal"))
+            .paying(Arc::clone(&la));
+        let b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&lb));
+        let (root, total) = (a.root(), a.total_bytes());
+        let lanes = StaticSources::new(vec![
+            candidate(a, la, 0xA1, None),
+            candidate(b, lb, 0xB2, None),
+        ])?;
+        let provider = Arriving::new(&lanes, Vec::new(), vec![holder_of(&lanes, 0xB2)?]);
+        let (store, dir) = fresh_store(root, total);
+        acquire_over(&store, &provider, vec![holder_of(&lanes, 0xA1)?], root, 1).await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        assert!(
+            provider.discovers() >= 1,
+            "discovery ran once arrivals ended"
+        );
+        Ok(())
     }
 
     /// Acquire the whole blob into `store` over `provider`'s lanes, with the
@@ -7326,22 +8159,29 @@ mod tests {
 
     /// A lane's widen hooks over `free`, stream permits it shares with
     /// sibling fetches the test plays: `grow` takes only permits free now,
-    /// and `release` puts one back.
+    /// and `release` puts one back. An extra stream leaves `keep` permits
+    /// free, as the CLI keeps one back for a sibling's first stream; a
+    /// restart may take the last one.
     fn shared_widen(
         free: &Arc<std::sync::atomic::AtomicUsize>,
+        keep: usize,
     ) -> (super::LaneWiden, Arc<WidenCount>) {
         use std::sync::atomic::Ordering;
         let count = Arc::new(WidenCount::default());
         let (on_grow, on_release) = (Arc::clone(&count), Arc::clone(&count));
         let (take, give) = (Arc::clone(free), Arc::clone(free));
         let widen = super::LaneWiden::new(
-            move |most| {
+            move |kind| {
+                let keep = match kind {
+                    super::GrowFor::Restart => 0,
+                    super::GrowFor::Extra => keep,
+                };
                 let taken = take
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                        Some(n.saturating_sub(most))
+                        (n > keep).then(|| n.saturating_sub(1))
                     })
-                    .map_or(0, |n| n.min(most));
-                on_grow.grew(taken);
+                    .is_ok();
+                on_grow.grew(kind, taken);
                 taken
             },
             move || {
@@ -7354,8 +8194,9 @@ mod tests {
 
     /// When a node dies, the busy lane has no free stream, and a sibling
     /// fetch frees one later, the loop asks for growth again on its retry
-    /// clock: the remainder starts on an extra stream before the dead node
-    /// comes back from its cooldown to fault again.
+    /// clock: the remainder starts on an extra stream long before the busy
+    /// lane's own range ends, and before the dead node comes back from its
+    /// cooldown to fault again, if it does.
     #[tokio::test(start_paused = true)]
     async fn growth_is_asked_again_once_a_stream_frees() -> anyhow::Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7366,7 +8207,7 @@ mod tests {
         let a = dead_after_first_mib(&data, &la)?;
         let b = busy(&data, &lb)?;
         let free = Arc::new(AtomicUsize::new(0));
-        let (widen, count) = shared_widen(&free);
+        let (widen, count) = shared_widen(&free, 0);
         let mut cand_b = candidate(b.clone(), Arc::clone(&lb), 0xB2, None);
         cand_b.widen = Some(widen);
         let lanes = StaticSources::new(vec![candidate(a.clone(), la, 0xA1, None), cand_b])?;
@@ -7389,7 +8230,7 @@ mod tests {
         store.finalize().await?;
         assert_eq!(std::fs::read(dir.path().join("b"))?, data);
 
-        let (dead_start, _, _) = a
+        let (dead_start, dead_opened, _) = a
             .timeline()
             .first()
             .copied()
@@ -7403,16 +8244,145 @@ mod tests {
             .map(|(_, opened, _)| opened)
             .min()
             .ok_or_else(|| anyhow::anyhow!("B took A's remainder"))?;
-        let (_, refault, _) = a
-            .timeline()
-            .get(1)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("A came back from its cooldown"))?;
+        // B's own range holds it for 5 s; the retry clock starts the
+        // remainder long before that.
         assert!(
-            extra_opened < refault,
-            "the remainder started on the retry clock, before A came back to fault again"
+            extra_opened <= dead_opened + 2 * super::GROWTH_RETRY,
+            "the remainder started on the retry clock, not when B's range ended"
         );
+        if let Some(&(_, refault, _)) = a.timeline().get(1) {
+            assert!(
+                extra_opened < refault,
+                "the remainder started before A came back to fault again"
+            );
+        }
         assert!(count.granted() >= 1, "B grew an extra stream");
+        assert_eq!(count.released(), count.granted());
+        Ok(())
+    }
+
+    /// A pass arms the growth retry when a `grow` granted nothing, or when a
+    /// range had no lane to ask while a running lane has a [`LaneWiden`]. A
+    /// fetch with no `LaneWiden`, such as `decdn fetch`, arms none for a range
+    /// with no lane to ask, and a pass with nothing waiting clears the wait.
+    #[test]
+    fn a_pass_retries_while_a_lane_can_still_grow() {
+        use super::{GROWTH_RETRY, Growth, GrowthPass};
+        let pass = |refused, no_candidate, growable| GrowthPass {
+            waiting: vec![(0, MIB)],
+            refused,
+            no_candidate,
+            growable,
+        };
+        let now = super::Instant::now();
+        let cases = [
+            (pass(0, 1, false), None),
+            (pass(0, 1, true), Some(now + GROWTH_RETRY)),
+            (pass(1, 0, false), Some(now + GROWTH_RETRY)),
+        ];
+        for (p, want) in cases {
+            let mut growth = Growth::new(now);
+            growth.passed(now, [0; 32], p);
+            assert_eq!(growth.retry_at, want);
+        }
+        let mut growth = Growth::new(now);
+        growth.passed(now, [0; 32], pass(0, 1, true));
+        let empty = GrowthPass {
+            waiting: Vec::new(),
+            refused: 0,
+            no_candidate: 0,
+            growable: true,
+        };
+        growth.passed(now, [0; 32], empty);
+        assert_eq!(growth.retry_at, None);
+        assert!(growth.waiting.is_empty());
+    }
+
+    /// A lane's own worker drains every queued range in turn and never ends
+    /// between them, so no worker end asks for growth. The first pass runs
+    /// as the lane starts, before its worker holds a range, and finds no busy
+    /// lane to ask. The loop asks again on its retry clock, and that one pass
+    /// takes every stream the lane's hook grants for the queue (#2252).
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_one_lane_drains_grows_an_extra_stream() -> anyhow::Result<()> {
+        let data = blob(16 * MIB as usize);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let a = ScriptedSource::new(data)?
+            .slow_finish(Duration::from_secs(2))
+            .paying(Arc::clone(&la));
+        let (widen, count) = counting_widen(2);
+        let mut cand_a = candidate(a.clone(), la, 0xA1, None);
+        cand_a.widen = Some(widen);
+        let provider = StaticSources::new(vec![cand_a])?;
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, _dir) = fresh_store(root, total);
+        let mut set = SourceSet::new(&provider, root, Arc::default(), provider.holders());
+        let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+        let drive = drive_config();
+        let runs: Vec<(u64, u64)> = (0..6).map(|i| (i * 2 * MIB, MIB)).collect();
+        acquire(
+            AcquireTarget {
+                store: &store,
+                hash: root,
+                total_bytes: total,
+                ranges: &runs,
+            },
+            &mut set,
+            &AcquireEnv {
+                pacer: &BudgetPacer::new(),
+                funder: &no_topups(),
+                drive: &drive,
+                max_lanes: 1,
+                stop: &stop,
+                on_progress: None,
+                ledgers: None,
+                pacing: None,
+                max_blob_bytes: 0,
+            },
+        )
+        .await?;
+        let present = ranges_content_len(&store.present_ranges().await?, total);
+        assert_eq!(present, 6 * MIB, "every queued run landed");
+
+        let legs = a.timeline();
+        let most_at_once = legs
+            .iter()
+            .map(|&(_, at, _)| {
+                legs.iter()
+                    .filter(|&&(_, opened, finished)| {
+                        opened <= at && finished.is_none_or(|end| at < end)
+                    })
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            most_at_once, 3,
+            "the own stream and both granted extras ran at once: {legs:?}"
+        );
+        let opened: Vec<_> = legs.iter().map(|&(_, at, _)| at).collect();
+        assert_eq!(
+            opened.get(1),
+            opened.get(2),
+            "one growth pass opened both extra streams: {legs:?}"
+        );
+        assert_eq!(count.peak(), 2, "the lane held both granted streams");
+        // The growth pass asks for extra streams. The own worker may later
+        // park while its extras finish and take its stream back as a
+        // restart.
+        let first_grants: Vec<_> = count
+            .calls()
+            .into_iter()
+            .filter(|(_, granted)| *granted)
+            .map(|(kind, _)| kind)
+            .take(2)
+            .collect();
+        assert_eq!(
+            first_grants,
+            [super::GrowFor::Extra, super::GrowFor::Extra],
+            "a busy lane asks for extra streams: {:?}",
+            count.calls()
+        );
         assert_eq!(count.released(), count.granted());
         Ok(())
     }
@@ -7481,6 +8451,67 @@ mod tests {
             count.peak(),
             1,
             "A's restart holds one grant, and A runs no extra beside it"
+        );
+        assert_eq!(count.released(), count.granted());
+        Ok(())
+    }
+
+    /// A lane with a [`super::LaneWiden`] gives its lease back while its own
+    /// worker parks with nothing to take, so a sibling fetch can use that
+    /// stream while a peer lane drains the rest (#2252). A finishes its half
+    /// fast; B's half is too small to steal from and stalls, so A parks.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_lane_gives_its_stream_back() -> anyhow::Result<()> {
+        let data = blob(24 * MIB as usize);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let lb = Arc::new(PoolLedger::new(Cumulative::default()));
+        let a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&la));
+        let b = busy(&data, &lb)?;
+        let dropped_a = Arc::new(Mutex::new(None));
+        let (widen, count) = counting_widen(1);
+        let mut cand_a = candidate(a.clone(), la, 0xA1, None);
+        cand_a.lease = LaneLease::new(DropStamp(Arc::clone(&dropped_a)));
+        cand_a.widen = Some(widen);
+        let provider = StaticSources::new(vec![cand_a, candidate(b.clone(), lb, 0xB2, None)])?;
+        let (root, _) = (a.root(), a.total_bytes());
+        let (store, dir) = fresh_store(root, a.total_bytes());
+        let released_mid_fetch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let on_progress = {
+            let seen = Arc::clone(&released_mid_fetch);
+            let dropped_a = Arc::clone(&dropped_a);
+            move |_position: u64, _total: u64| {
+                if dropped_a.lock().is_ok_and(|at| at.is_some()) {
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        };
+        run_acquire_with(
+            &store,
+            &provider,
+            root,
+            &BudgetPacer::new(),
+            &no_topups(),
+            Knobs {
+                on_progress: Some(&on_progress),
+                ..Knobs::lanes(2)
+            },
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+        assert_eq!(a.timeline().len(), 1, "A fetched its half on one stream");
+        assert!(
+            released_mid_fetch.load(std::sync::atomic::Ordering::SeqCst),
+            "A's lease was released while B still drained its half"
+        );
+        assert!(
+            count
+                .calls()
+                .iter()
+                .all(|(kind, _)| *kind == super::GrowFor::Restart),
+            "a parked lane takes a stream back only as a restart: {:?}",
+            count.calls()
         );
         assert_eq!(count.released(), count.granted());
         Ok(())
@@ -7582,7 +8613,9 @@ mod tests {
 
     /// A lane that faults and finds no free stream to start again on tries
     /// again each `GROWTH_RETRY`, not on a growing build backoff, and starts
-    /// once a sibling fetch frees a stream. Every grant comes back.
+    /// once a sibling fetch frees a stream. The freed stream is the last free
+    /// one, which an extra stream may not take: the start asks for it as a
+    /// restart. Every grant comes back.
     #[tokio::test(start_paused = true)]
     async fn a_lane_refused_a_stream_starts_again_once_one_frees() -> anyhow::Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7593,7 +8626,7 @@ mod tests {
             .fault_once_after(MIB as usize, || anyhow::anyhow!("scripted reset"))
             .paying(Arc::clone(&la));
         let free = Arc::new(AtomicUsize::new(0));
-        let (widen, count) = shared_widen(&free);
+        let (widen, count) = shared_widen(&free, 1);
         let mut cand_a = candidate(a.clone(), la, 0xA1, None);
         cand_a.widen = Some(widen);
         let lanes = StaticSources::new(vec![cand_a])?;
@@ -7628,21 +8661,31 @@ mod tests {
             late <= super::GROWTH_RETRY,
             "A started again within a retry of the freed stream, {late:?} after"
         );
+        let calls = count.calls();
+        let restarts = calls
+            .iter()
+            .filter(|(kind, _)| *kind == super::GrowFor::Restart)
+            .count();
         assert!(
-            count.asks() <= 25,
-            "A asked for a stream about once a second: {}",
-            count.asks()
+            restarts <= 25,
+            "A asked for a stream to start again on about once a second: {restarts}"
         );
-        assert_eq!(count.granted(), 1);
+        let granted: Vec<_> = calls
+            .iter()
+            .filter(|(_, granted)| *granted)
+            .map(|(kind, _)| *kind)
+            .collect();
+        assert_eq!(granted, [super::GrowFor::Restart], "{calls:?}");
         assert_eq!(count.released(), count.granted());
         Ok(())
     }
 
-    /// A lane runs at most one extra worker however many ranges wait: with
-    /// two dead lanes' remainders queued, the busy lane holds at most one
-    /// grant at a time though its hook would grant three.
-    #[tokio::test(start_paused = true)]
-    async fn a_busy_lane_runs_at_most_one_extra_stream() -> anyhow::Result<()> {
+    /// The most extra streams busy lane B holds at once while two dead lanes'
+    /// remainders wait, with a hook that grants up to `grants` streams at once,
+    /// as `(peak, granted, released)`.
+    async fn peak_extras_for_two_remainders(
+        grants: usize,
+    ) -> anyhow::Result<(usize, usize, usize)> {
         let data = blob(48 * MIB as usize);
         let la = Arc::new(PoolLedger::new(Cumulative::default()));
         let lc = Arc::new(PoolLedger::new(Cumulative::default()));
@@ -7650,7 +8693,7 @@ mod tests {
         let a = dead_after_first_mib(&data, &la)?;
         let c = dead_after_first_mib(&data, &lc)?;
         let b = busy(&data, &lb)?;
-        let (widen, count) = counting_widen(3);
+        let (widen, count) = counting_widen(grants);
         let mut cand_b = candidate(b.clone(), Arc::clone(&lb), 0xB2, None);
         cand_b.widen = Some(widen);
         let lanes = StaticSources::new(vec![
@@ -7663,10 +8706,29 @@ mod tests {
         acquire_over(&store, &lanes, lanes.holders(), root, 3).await?;
         store.finalize().await?;
         assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        Ok((count.peak(), count.granted(), count.released()))
+    }
 
-        assert!(count.granted() >= 1, "B grew an extra stream");
-        assert_eq!(count.peak(), 1, "B held at most one extra stream at a time");
-        assert_eq!(count.released(), count.granted());
+    /// A busy lane runs as many extra workers as its hook grants, one per
+    /// waiting range: with two dead lanes' remainders queued it holds more
+    /// than one extra stream at once, never more than the hook grants, and
+    /// with a hook that grants one it never holds more (#2252).
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_lane_runs_as_many_extra_streams_as_granted() -> anyhow::Result<()> {
+        let (peak, granted, released) = peak_extras_for_two_remainders(3).await?;
+        assert!(
+            (2..=3).contains(&peak),
+            "B held several extra streams at once, within its grant: {peak}"
+        );
+        assert_eq!(released, granted);
+
+        let (peak, granted, released) = peak_extras_for_two_remainders(1).await?;
+        assert!(granted >= 1, "B grew an extra stream");
+        assert_eq!(
+            peak, 1,
+            "B held no more extra streams than its hook granted"
+        );
+        assert_eq!(released, granted);
         Ok(())
     }
 
@@ -7736,7 +8798,8 @@ mod tests {
             reader: R,
             on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
             claimed_total: u64,
-        ) -> core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<R>> + 'a>>
+            stop_at: Option<&'a std::sync::atomic::AtomicU64>,
+        ) -> crate::source::IngestFuture<'a, R>
         where
             R: crate::BaoRangeReader + 'a,
         {
@@ -7746,6 +8809,7 @@ mod tests {
                 reader,
                 on_progress,
                 claimed_total,
+                stop_at,
             )
         }
 

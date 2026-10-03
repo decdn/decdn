@@ -19,6 +19,7 @@ pub mod config;
 pub mod deregister;
 pub mod doctor;
 pub mod fetch;
+pub(crate) mod fetch_timings;
 pub mod interrupt;
 pub mod key_gen;
 pub mod manifest;

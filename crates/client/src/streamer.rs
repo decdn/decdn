@@ -29,7 +29,6 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -50,13 +49,6 @@ use crate::{ClientRangedStore, PoolContext, PoolLedger, PullConfig, RangedStore}
 /// The most verified bytes one store read hands the reader. It bounds the
 /// reader's buffer independently of the read-ahead window.
 const MAX_READ_CHUNK: u64 = 1024 * 1024;
-
-/// How long a reader waiting for new verified bytes sleeps before it re-reads
-/// the store's present frontier on its own. The drive wakes the reader on every
-/// progress report, before a lane parks, and when it ends. A batch flush that
-/// lands between two progress reports has no wakeup of its own, and this bound
-/// caps how long the reader can miss it.
-const FRONTIER_RECHECK: Duration = Duration::from_millis(100);
 
 /// Shared between the drive future and the [`VerifiedReader`]: the fill store,
 /// the consumer cursor, the drive's outcome, and the wake signals that pace one
@@ -196,7 +188,7 @@ pub struct StreamCandidate<S> {
     /// first target's fetch releases it.
     pub lease: LaneLease,
     /// How this lane takes a stream beyond its `lease` ([`crate::LaneWiden`]),
-    /// or `None` to stay at one stream: one extra stream for a queued range
+    /// or `None` to stay at one stream: an extra stream for each queued range
     /// that no idle lane takes, and the stream the lane starts again on once
     /// it gave its `lease` back. Each granted stream is given back as its
     /// worker stops, so it serves every target of a [`crate::Downloader`]
@@ -714,11 +706,14 @@ async fn next_verified(state: Arc<StreamState>, cursor: u64) -> io::Result<Optio
         if state.store.proven().is_some_and(|proven| cursor >= proven) {
             return Ok(None);
         }
-        // Register for the drive's wakeup BEFORE reading the frontier, so a
-        // progress report between the read and the wait is not lost.
+        // Register for both wakeups BEFORE reading the frontier, so a progress
+        // report or a checkpoint between the read and the wait is not lost.
         let progressed = state.progressed.notified();
         tokio::pin!(progressed);
         progressed.as_mut().enable();
+        let grew = state.store.present_grew().notified();
+        tokio::pin!(grew);
+        grew.as_mut().enable();
         // Read the outcome before the frontier: a drive that ended before this
         // frontier read left every verified byte in it.
         let outcome = state.outcome();
@@ -746,8 +741,11 @@ async fn next_verified(state: Arc<StreamState>, cursor: u64) -> io::Result<Optio
             }
             None => {}
         }
-        // Nothing new yet: wait for the drive, or re-check on the bounded tick.
-        let _ = tokio::time::timeout(FRONTIER_RECHECK, progressed).await;
+        // Nothing new yet: wait for the drive or for a checkpoint.
+        tokio::select! {
+            () = progressed => {}
+            () = grew => {}
+        }
     }
 }
 
@@ -1554,6 +1552,10 @@ mod tests {
         }
 
         fn finish(&self, _reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            Box::pin(async { Ok(VoucherProgress::default()) })
+        }
+
+        fn stop(&self, _reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
             Box::pin(async { Ok(VoucherProgress::default()) })
         }
     }

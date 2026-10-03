@@ -1614,6 +1614,37 @@ pub struct DecdnMetrics {
     /// blob first, so on that tier the value grows with blob size.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_first_byte_miss_seconds: Histogram,
+    /// `decdn_serve_admission_seconds`: the admission phase of a paid serve's
+    /// time to first byte, from the decoded request to the load-shed admit. It
+    /// covers the binding check, the deny gates, the `getPool` and
+    /// `getAuthorization` chain reads on a view miss, and the availability
+    /// audit. The class is unknown until the audit ends, so this phase has no
+    /// hit/miss siblings. Records only for a stream that writes its first frame,
+    /// so the three phase histograms and the total share one population.
+    #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
+    pub serve_admission_seconds: Histogram,
+    /// `decdn_serve_response_hit_seconds`: the response phase of a paid hit,
+    /// from the load-shed admit to the signed `StreamResponse` written.
+    #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
+    pub serve_response_hit_seconds: Histogram,
+    /// `decdn_serve_response_miss_seconds`: the response phase of a paid miss,
+    /// from the load-shed admit to the signed `StreamResponse` written. It
+    /// covers the floor reservation, the origin size and range probes, and on a
+    /// node-to-node fill the upstream discovery, pool open and handshake. A
+    /// buffered fill imports the whole blob in this phase.
+    #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
+    pub serve_response_miss_seconds: Histogram,
+    /// `decdn_serve_first_frame_hit_seconds`: the first-frame phase of a paid
+    /// hit, from the `StreamResponse` written to the first `ChunkData` frame
+    /// written. It covers the read and encode of the whole first frame.
+    #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
+    pub serve_first_frame_hit_seconds: Histogram,
+    /// `decdn_serve_first_frame_miss_seconds`: the first-frame phase of a paid
+    /// miss, from the `StreamResponse` written to the first `ChunkData` frame
+    /// written. On a window-paced fill it covers the pull leg filling the whole
+    /// first frame from upstream or origin.
+    #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
+    pub serve_first_frame_miss_seconds: Histogram,
     /// `decdn_origin_directory_get_origins_failures_total`: `getOrigins`
     /// lookups that failed on a cold-namespace cache miss. The directory fails
     /// closed on each (resolves no origins for that request, does not cache
@@ -3883,25 +3914,76 @@ impl Drop for ConnectionGuard<'_> {
 /// hit is a [`RequestClass::CacheHit`]. [`Self::record`] consumes the clock, so a stream
 /// records at most once. A stream that ends before its first frame drops the
 /// clock and records nothing.
+///
+/// The clock also splits the total into three phases: admission (decoded to
+/// load-shed admit), response (admit to the signed `StreamResponse` written)
+/// and first frame (response written to the first frame written). Each phase
+/// records into its own histogram, and a `debug` event carries all three.
 #[derive(Debug)]
 pub(crate) struct FirstByteClock {
     started: Instant,
+    admitted: Instant,
+    responded: Option<Instant>,
     class: RequestClass,
 }
 
 impl FirstByteClock {
-    /// A clock that started at `started`, for a serve of class `class`.
-    pub(crate) const fn new(started: Instant, class: RequestClass) -> Self {
-        Self { started, class }
+    /// A clock that started at `started` and passed the load-shed gate at
+    /// `admitted`, for a serve of class `class`.
+    pub(crate) const fn new(started: Instant, admitted: Instant, class: RequestClass) -> Self {
+        Self {
+            started,
+            admitted,
+            responded: None,
+            class,
+        }
     }
 
-    /// Record the time since the clock started: the first frame is written.
+    /// Mark the signed `StreamResponse` written.
+    pub(crate) fn mark_responded(&mut self) {
+        self.responded = Some(Instant::now());
+    }
+
+    /// Record the time since the clock started and each phase: the first frame
+    /// is written. Without a response mark, only the admission phase and the
+    /// total record.
     pub(crate) fn record(self, metrics: &Metrics) {
-        let secs = self.started.elapsed().as_secs_f64();
-        match self.class {
-            RequestClass::CacheHit => metrics.decdn.serve_first_byte_hit_seconds.observe(secs),
-            RequestClass::CacheMiss => metrics.decdn.serve_first_byte_miss_seconds.observe(secs),
+        let now = Instant::now();
+        let total = now.saturating_duration_since(self.started);
+        let admission = self.admitted.saturating_duration_since(self.started);
+        let m = &metrics.decdn;
+        m.serve_admission_seconds.observe(admission.as_secs_f64());
+        let phases = self.responded.map(|responded| {
+            (
+                responded.saturating_duration_since(self.admitted),
+                now.saturating_duration_since(responded),
+            )
+        });
+        let (first_byte, response, first_frame) = match self.class {
+            RequestClass::CacheHit => (
+                &m.serve_first_byte_hit_seconds,
+                &m.serve_response_hit_seconds,
+                &m.serve_first_frame_hit_seconds,
+            ),
+            RequestClass::CacheMiss => (
+                &m.serve_first_byte_miss_seconds,
+                &m.serve_response_miss_seconds,
+                &m.serve_first_frame_miss_seconds,
+            ),
+        };
+        first_byte.observe(total.as_secs_f64());
+        if let Some((resp, frame)) = phases {
+            response.observe(resp.as_secs_f64());
+            first_frame.observe(frame.as_secs_f64());
         }
+        tracing::debug!(
+            class = ?self.class,
+            total_ms = total.as_millis(),
+            admission_ms = admission.as_millis(),
+            response_ms = phases.map(|(r, _)| r.as_millis()),
+            first_frame_ms = phases.map(|(_, f)| f.as_millis()),
+            "serve first byte"
+        );
     }
 }
 
@@ -3959,12 +4041,17 @@ mod tests {
     /// the base name that a registry row names.
     #[test]
     fn latency_histograms_export_buckets_sum_and_count() {
-        const HISTOGRAMS: [&str; 5] = [
+        const HISTOGRAMS: [&str; 10] = [
             "decdn_probe_collection_latency_seconds",
             "decdn_serve_first_byte_hit_seconds",
             "decdn_serve_first_byte_miss_seconds",
             "decdn_node_pull_first_byte_seconds",
             "decdn_node_pull_through_wait_seconds",
+            "decdn_serve_admission_seconds",
+            "decdn_serve_response_hit_seconds",
+            "decdn_serve_response_miss_seconds",
+            "decdn_serve_first_frame_hit_seconds",
+            "decdn_serve_first_frame_miss_seconds",
         ];
         let metrics = Metrics::new();
         let text = metrics.encode().unwrap();
@@ -3990,7 +4077,8 @@ mod tests {
         let elapsed = Duration::from_millis(40);
         metrics.probe_collection_latency(elapsed);
         metrics.node_pull_first_byte(elapsed);
-        FirstByteClock::new(Instant::now(), RequestClass::CacheHit).record(&metrics);
+        let now = Instant::now();
+        FirstByteClock::new(now, now, RequestClass::CacheHit).record(&metrics);
         let text = metrics.encode().unwrap();
         for name in [HISTOGRAMS[0], HISTOGRAMS[3]] {
             assert!(has_metric_line(
@@ -4023,6 +4111,32 @@ mod tests {
             "decdn_serve_first_byte_miss_seconds_count",
             0
         ));
+    }
+
+    /// The clock records each serve phase once, into the class sibling where the
+    /// phase has one. A clock that never saw its response written records the
+    /// admission phase and the total, and leaves the two later phases empty.
+    #[test]
+    fn first_byte_clock_records_each_phase_once() {
+        let metrics = Metrics::new();
+        let now = Instant::now();
+        let mut miss = FirstByteClock::new(now, now, RequestClass::CacheMiss);
+        miss.mark_responded();
+        miss.record(&metrics);
+        FirstByteClock::new(now, now, RequestClass::CacheHit).record(&metrics);
+
+        let text = metrics.encode().unwrap();
+        for (name, count) in [
+            ("decdn_serve_admission_seconds_count", 2),
+            ("decdn_serve_response_miss_seconds_count", 1),
+            ("decdn_serve_response_hit_seconds_count", 0),
+            ("decdn_serve_first_frame_miss_seconds_count", 1),
+            ("decdn_serve_first_frame_hit_seconds_count", 0),
+            ("decdn_serve_first_byte_miss_seconds_count", 1),
+            ("decdn_serve_first_byte_hit_seconds_count", 1),
+        ] {
+            assert!(has_metric_line(&text, name, count), "{name} != {count}");
+        }
     }
 
     /// A client waits on a cache miss for at most the outer pull deadline, so a

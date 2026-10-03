@@ -26,6 +26,7 @@
 //! deployment-specific and travels on the funder ([`Funder::max_topups`] — CLI 3,
 //! node 1).
 
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -46,6 +47,10 @@ use crate::{
 /// `cache::Origin` use, so a [`Funder`] can be held as `&dyn Funder`.
 pub type SourceFuture<'a, T> =
     core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<T>> + Send + 'a>>;
+
+/// A boxed, `Send` stream returned by the streaming methods in this module,
+/// the stream sibling of [`SourceFuture`].
+pub type SourceStream<'a, T> = core::pin::Pin<Box<dyn futures_util::Stream<Item = T> + Send + 'a>>;
 
 /// A reader over the raw interleaved bao encoding of one range.
 ///
@@ -104,6 +109,20 @@ pub trait BlobSource: Send + Sync {
     /// [`crate::UpstreamPull::finish`] raises.
     fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress>;
 
+    /// Consume a reader whose ingest stopped before the end of its range
+    /// ([`IngestEnd::Stopped`]): pay for every wire byte the pull received,
+    /// then close the pull's transport (its stream, or its one-shot
+    /// connection), and return the voucher watermark for the driver to
+    /// persist. A steal that takes the tail of the range stops the pull this
+    /// way at the split. An unpaid source returns
+    /// [`VoucherProgress::default`].
+    ///
+    /// # Errors
+    ///
+    /// A rejection the source already sent, or a closing payment that fails
+    /// on our side ([`crate::UpstreamPull::stop`]).
+    fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress>;
+
     /// The buyer's received-byte ceiling (#1895): the driver aborts with
     /// [`crate::BlobTooLarge`] once the content BLAKE3-verified into the store
     /// crosses this, enforcing the size cap on the bytes that ACTUALLY arrive rather
@@ -113,6 +132,22 @@ pub trait BlobSource: Send + Sync {
     fn max_blob_size_bytes(&self) -> u64 {
         0
     }
+}
+
+/// The future [`IngestStore::ingest_stream`] returns: the reader back, and how
+/// the ingest ended.
+pub type IngestFuture<'a, R> =
+    core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<(R, IngestEnd)>> + 'a>>;
+
+/// How an [`IngestStore::ingest_stream`] ended without a fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestEnd {
+    /// The decoder reached the end of the range: the source
+    /// [`finish`](BlobSource::finish)es the pull.
+    Drained,
+    /// The verified prefix reached the lowered `stop_at` before the end of the
+    /// range: the source [`stop`](BlobSource::stop)s the pull.
+    Stopped,
 }
 
 /// The store/sink capability the gap-driven [`crate::drive`] needs beyond
@@ -142,13 +177,26 @@ pub trait IngestStore: decdn_bao_range::RangedStore {
     /// The sender serves `range` clamped to that size and encodes it under
     /// that size's tree, so a store keyed by offset verifies the leg under
     /// it.
+    ///
+    /// `stop_at` is an end the caller can lower while the leg streams. Once
+    /// the verified prefix reaches it, the ingest checkpoints that prefix and
+    /// returns [`IngestEnd::Stopped`] without reading further. After each
+    /// verified group it reports the prefix through `on_progress` first, then
+    /// reads `stop_at` with `SeqCst`. A caller that records the prefix with
+    /// `SeqCst`, lowers `stop_at`, and then reads the recorded prefix with
+    /// `SeqCst` knows where the leg stops: at the lowered end when the prefix
+    /// read is short of it, and within one group past that prefix otherwise. A steal lowers
+    /// it to the split, so the leg stops there on its open stream. A
+    /// chunk-group-aligned end cuts the pre-order bao encoding of `range`
+    /// between two items, so the stopped prefix verifies on its own.
     fn ingest_stream<'a, R>(
         &'a self,
         range: &'a AlignedRange,
         reader: R,
         on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
         claimed_total: u64,
-    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<R>> + 'a>>
+        stop_at: Option<&'a AtomicU64>,
+    ) -> IngestFuture<'a, R>
     where
         R: BaoRangeReader + 'a;
 
@@ -511,6 +559,10 @@ impl BlobSource for PeerSource<'_> {
         Box::pin(async move { reader.into_inner().finish().await })
     }
 
+    fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+        Box::pin(async move { reader.into_inner().stop().await })
+    }
+
     fn max_blob_size_bytes(&self) -> u64 {
         self.max_blob_size_bytes
     }
@@ -660,6 +712,10 @@ impl<S: BlobSource> BlobSource for PrimedSource<S> {
         self.inner.finish(reader)
     }
 
+    fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+        self.inner.stop(reader)
+    }
+
     fn max_blob_size_bytes(&self) -> u64 {
         self.inner.max_blob_size_bytes()
     }
@@ -764,10 +820,10 @@ mod doubles {
         /// across every reader). Unlike [`opened`](Self::opened) — which records
         /// the requested `fetch_len` at `open` time, before a byte streams —
         /// this counts bytes that truly left the source, so it is the honest
-        /// proxy for "bytes fetched and paid for". A leg cancelled mid-stream
-        /// stops incrementing this the instant its reader is dropped, which is
-        /// exactly what lets the multi-source no-double-pay assertion see that a
-        /// stolen tail was fetched by ONE source, not two.
+        /// proxy for "bytes fetched and paid for". A leg stopped or dropped
+        /// mid-stream stops incrementing this the instant it stops reading,
+        /// which is exactly what lets the multi-source no-double-pay assertion
+        /// see that a stolen tail was fetched by ONE source, not two.
         delivered: Arc<AtomicU64>,
         /// When set, every reader waits on its first read until the gate reads
         /// `true`: a source held back until the test releases it.
@@ -798,6 +854,12 @@ mod doubles {
         /// zero and it would never complete. `None` keeps the pre-payment "unpaid
         /// double" behaviour for tests that do not drive `fill_gap` to completion.
         ledger: Option<Arc<crate::PoolLedger>>,
+        /// How many pulls were stopped before the end of their range. Shared
+        /// by clones.
+        stops: Arc<AtomicU32>,
+        /// A delay before every `read_bytes` of every reader: a source with a
+        /// steady delivery rate, on the runtime's clock.
+        read_delay: Option<Duration>,
     }
 
     impl std::fmt::Debug for ScriptedSource {
@@ -839,6 +901,8 @@ mod doubles {
                 finish_stall: None,
                 stall_after: None,
                 ledger: None,
+                stops: Arc::new(AtomicU32::new(0)),
+                read_delay: None,
             })
         }
 
@@ -863,6 +927,15 @@ mod doubles {
         #[must_use]
         pub(crate) const fn stall_after(mut self, after_bytes: u64, stall: Duration) -> Self {
             self.stall_after = Some((after_bytes, stall));
+            self
+        }
+
+        #[cfg(test)]
+        /// Sleep `per_read` before every `read_bytes` of every reader, so the
+        /// source delivers at a steady rate a test sets.
+        #[must_use]
+        pub(crate) const fn throttled(mut self, per_read: Duration) -> Self {
+            self.read_delay = Some(per_read);
             self
         }
 
@@ -904,6 +977,49 @@ mod doubles {
         pub fn paying(mut self, ledger: Arc<crate::PoolLedger>) -> Self {
             self.ledger = Some(ledger);
             self
+        }
+
+        /// Stamp `reader`'s leg finished and, on a paying double, commit one
+        /// voucher for `wire` bytes: a successful issue commits optimistically
+        /// (implicit acceptance, ADR 005), advancing `committed.bytes` by the
+        /// paid WIRE bytes so the driver's paid frontier tracks payment.
+        async fn settle(
+            &self,
+            reader: &ScriptedReader,
+            wire: u64,
+        ) -> anyhow::Result<VoucherProgress> {
+            if let Some(leg) = reader.leg
+                && let Ok(mut timeline) = self.timeline.lock()
+                && let Some(entry) = timeline.get_mut(leg)
+            {
+                entry.2 = Some(tokio::time::Instant::now());
+            }
+            let Some(ledger) = &self.ledger else {
+                // Unpaid double: no channel, nothing to drain, no watermark.
+                return Ok(VoucherProgress::default());
+            };
+            if wire > 0 {
+                ledger
+                    .issue(
+                        wire,
+                        SCRIPTED_RATE_PER_MB,
+                        crate::EpochAction::Keep,
+                        |_next, _chain| async { Ok(()) },
+                    )
+                    .await?;
+            }
+            Ok(VoucherProgress::from_cumulative(
+                ledger.committed(),
+                U256::ZERO,
+            ))
+        }
+
+        #[cfg(test)]
+        /// How many pulls this source stopped before the end of their range
+        /// ([`BlobSource::stop`](crate::BlobSource::stop)).
+        #[must_use]
+        pub(crate) fn stopped_pulls(&self) -> u32 {
+            self.stops.load(Ordering::SeqCst)
         }
 
         /// The blob's BLAKE3 root — the `hash` the driver opens against.
@@ -1158,6 +1274,7 @@ mod doubles {
                         first_read_stall: self.first_read_stall,
                         stall_after: self.stall_after,
                         read_so_far: 0,
+                        read_delay: self.read_delay,
                     },
                 ))
             })
@@ -1170,34 +1287,17 @@ mod doubles {
                 if let Some(stall) = self.finish_stall {
                     tokio::time::sleep(stall).await;
                 }
-                if let Some(leg) = reader.leg
-                    && let Ok(mut timeline) = self.timeline.lock()
-                    && let Some(entry) = timeline.get_mut(leg)
-                {
-                    entry.2 = Some(tokio::time::Instant::now());
-                }
-                let Some(ledger) = &self.ledger else {
-                    // Unpaid double: no channel, nothing to drain, no watermark.
-                    return Ok(VoucherProgress::default());
-                };
-                // Model the committed voucher for this leg's wire: a successful
-                // issue commits optimistically (implicit acceptance, ADR 005),
-                // advancing `committed.bytes` by the drained WIRE bytes so the
-                // driver's paid frontier tracks payment.
-                if reader.wire_len > 0 {
-                    ledger
-                        .issue(
-                            reader.wire_len,
-                            SCRIPTED_RATE_PER_MB,
-                            crate::EpochAction::Keep,
-                            |_next, _chain| async { Ok(()) },
-                        )
-                        .await?;
-                }
-                Ok(VoucherProgress::from_cumulative(
-                    ledger.committed(),
-                    U256::ZERO,
-                ))
+                let wire = reader.wire_len;
+                self.settle(&reader, wire).await
+            })
+        }
+
+        fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            Box::pin(async move {
+                self.stops.fetch_add(1, Ordering::SeqCst);
+                // A stopped pull pays for the wire it received, not the range.
+                let wire = reader.wire_len.saturating_sub(reader.wire.len() as u64);
+                self.settle(&reader, wire).await
             })
         }
     }
@@ -1220,7 +1320,7 @@ mod doubles {
         fault_gate: Option<tokio::sync::watch::Receiver<bool>>,
         /// The wire byte count this reader was handed (before consumption), used by
         /// `ScriptedSource`'s [`BlobSource::finish`](crate::BlobSource::finish) to advance a paying ledger by
-        /// this leg's spend.
+        /// this leg's spend. A stopped pull pays for this less the unread wire.
         wire_len: u64,
         /// Shared with the parent [`ScriptedSource`]: bumped by the bytes each
         /// `read_bytes` actually yields, so a mid-stream drop stops counting the
@@ -1235,6 +1335,8 @@ mod doubles {
         /// Wire bytes this reader has yielded so far, against `stall_after`'s
         /// threshold.
         read_so_far: u64,
+        /// See `ScriptedSource::throttled`.
+        read_delay: Option<Duration>,
     }
 
     impl ScriptedReader {
@@ -1251,14 +1353,17 @@ mod doubles {
         async fn read_bytes(&mut self, len: usize) -> std::io::Result<Bytes> {
             // A slow-to-start peer: sleep once before the first byte so a fast
             // peer reliably wins the race, finishes its own segment, and steals
-            // this reader's tail — the deterministic steal trigger. Cancellation
-            // drops this future while it sleeps, delivering nothing on this leg.
+            // this reader's tail — the deterministic steal trigger. The steal
+            // lowers this reader's end, so it then delivers up to the split.
             if let Some(mut gate) = self.gate.take() {
                 // A closed gate channel reads as open.
                 let _ = gate.wait_for(|open| *open).await;
             }
             if let Some(stall) = self.first_read_stall.take() {
                 tokio::time::sleep(stall).await;
+            }
+            if let Some(delay) = self.read_delay {
+                tokio::time::sleep(delay).await;
             }
             // A source that delivered a prefix and then wedged: it holds the
             // connection open, returns no error, and simply stops. Only the
@@ -1447,13 +1552,18 @@ mod flush_double {
             reader: R,
             on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
             claimed_total: u64,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
+            stop_at: Option<&'a std::sync::atomic::AtomicU64>,
+        ) -> super::IngestFuture<'a, R>
         where
             R: BaoRangeReader + 'a,
         {
-            Box::pin(
-                self.inner
-                    .ingest_stream(range, reader, on_progress, claimed_total),
+            IngestStore::ingest_stream(
+                &self.inner,
+                range,
+                reader,
+                on_progress,
+                claimed_total,
+                stop_at,
             )
         }
 

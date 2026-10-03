@@ -135,10 +135,10 @@ fn run_from(
 /// Does `coverage` include every discovery block the byte range
 /// `[start, start + len)` intersects (clamped to `total_bytes`)?
 ///
-/// The scheduler's coverage-filtered steal (#1506) uses this to decide
-/// whether a freed source may take a given remaining range: a source may only
-/// claim a range it can serve in full, never a partial cover that would leave
-/// a hole another lane must still fill.
+/// The scheduler uses this wherever a range must lie wholly inside a source's
+/// coverage: a worker's preference for a pending segment (#1506), and the
+/// count of full holders a planned run splits across. A steal uses
+/// [`covered_suffix_start`] instead.
 #[must_use]
 pub(crate) fn covers_byte_range(
     coverage: &Coverage,
@@ -157,6 +157,39 @@ pub(crate) fn covers_byte_range(
     let first_block = u32::try_from(start / block_bytes).unwrap_or(u32::MAX);
     let last_block = u32::try_from((end - 1) / block_bytes).unwrap_or(u32::MAX);
     (first_block..=last_block).all(|b| coverage.covers(b))
+}
+
+/// The start of the longest suffix of the byte range `[start, start + len)`
+/// (clamped to `total_bytes`) whose every intersected discovery block
+/// `coverage` includes, or `None` when `coverage` does not include the block
+/// that holds the range's last byte. A range `coverage` holds in full gives
+/// `start`; an empty range gives `start` too.
+///
+/// A steal (#2303) takes the tail of a range in flight, so a freed source may
+/// steal from a range it covers only from some block onward: the result is
+/// the lowest offset it may take. The block size is a multiple of the chunk
+/// group, so a result past `start` is group-aligned.
+#[must_use]
+pub(crate) fn covered_suffix_start(
+    coverage: &Coverage,
+    start: u64,
+    len: u64,
+    total_bytes: u64,
+) -> Option<u64> {
+    let end = start.saturating_add(len).min(total_bytes);
+    if end <= start {
+        return Some(start);
+    }
+    let block_bytes = discovery_block_bytes();
+    let first_block = u32::try_from(start / block_bytes).unwrap_or(u32::MAX);
+    let mut block = u32::try_from((end - 1) / block_bytes).unwrap_or(u32::MAX);
+    if !coverage.covers(block) {
+        return None;
+    }
+    while block > first_block && coverage.covers(block - 1) {
+        block -= 1;
+    }
+    Some(u64::from(block).saturating_mul(block_bytes).max(start))
 }
 
 /// The chunks of `chunks` that lie in discovery blocks `coverage` holds.
@@ -440,6 +473,44 @@ mod tests {
             0,
             3 * DISCOVERY_BLOCK_BYTES
         ));
+    }
+
+    #[test]
+    fn covered_suffix_start_is_the_start_of_the_trailing_covered_run() {
+        const B: u64 = DISCOVERY_BLOCK_BYTES;
+        let total = 6 * B;
+        // Blocks 0, 2, 3 and 4 covered; 1 and 5 not.
+        let coverage = cov(6, &[0, 2, 3, 4]);
+        // A range it holds in full gives its own start.
+        assert_eq!(
+            covered_suffix_start(&coverage, 2 * B, 3 * B, total),
+            Some(2 * B)
+        );
+        // Block 1 is a hole: the suffix starts at block 2.
+        assert_eq!(
+            covered_suffix_start(&coverage, 0, 5 * B, total),
+            Some(2 * B)
+        );
+        // The block of the last byte is not covered: nothing to take.
+        assert_eq!(covered_suffix_start(&coverage, 0, 6 * B, total), None);
+        // A start inside a covered block stays the start.
+        assert_eq!(
+            covered_suffix_start(&coverage, 2 * B + 4096, 2 * B, total),
+            Some(2 * B + 4096)
+        );
+        // A zero-length range gives its start.
+        assert_eq!(covered_suffix_start(&coverage, B, 0, total), Some(B));
+        // A covered run that reaches block 0 gives offset 0.
+        assert_eq!(
+            covered_suffix_start(&cov(6, &[0, 1, 2, 3, 4, 5]), 0, total, total),
+            Some(0)
+        );
+        // A partial last block: the suffix is that block.
+        let short = 2 * B + 5 * 1024 * 1024;
+        assert_eq!(
+            covered_suffix_start(&cov(3, &[2]), 0, short, short),
+            Some(2 * B)
+        );
     }
 
     #[test]

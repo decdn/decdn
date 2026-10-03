@@ -1208,6 +1208,48 @@ async fn expect_reject(recv: &mut RecvStream, expected: VoucherRejectReason) -> 
     }
 }
 
+/// A serve's first frame is small, so the first byte leaves after a few chunk
+/// groups rather than a whole interval. The frames after it still fill the
+/// interval exactly, and the node parks for its voucher at the same boundary.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_frame_is_small_and_the_interval_still_ends_on_its_boundary() -> anyhow::Result<()>
+{
+    const CREDIT_MAX: u64 = 64 * 1024 * 1024;
+    const FIRST_FRAME_MAX: u64 = 64 * 1024;
+    let payload = vec![0x45u8; 8 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+    let (target, _server_eth, server_ep, server_task, _metrics) =
+        spawn_pipelined_server_with_metrics(cache, Arc::clone(&store), CREDIT_MAX, 2).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+    let (_send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+
+    let first = tokio::time::timeout(Duration::from_secs(10), read_client_msg(&mut recv))
+        .await
+        .map_err(|_| anyhow::anyhow!("no first frame"))??;
+    let ClientMessage::ChunkData(first) = first else {
+        anyhow::bail!("expected ChunkData, got {first:?}");
+    };
+    let first_len = first.bytes().len() as u64;
+    anyhow::ensure!(
+        first_len <= FIRST_FRAME_MAX,
+        "the first frame carries {first_len} bytes, over {FIRST_FRAME_MAX}"
+    );
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES - first_len).await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// The whole `PayWord` tick, end to end: one signed voucher opens a chain, and
 /// from then on each delivered chunk is paid for by a single 33-byte reveal with
 /// no signature at all. The node credits the reveal exactly as it would a
@@ -7048,6 +7090,88 @@ async fn buyer_accepts_blob_at_exact_ceiling() -> anyhow::Result<()> {
     anyhow::ensure!(
         got.as_ref() == payload.as_slice(),
         "exact-ceiling blob must deliver intact"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// A pull stopped before its promised end (a steal's split) pays for every
+/// wire byte it received, the frames it reads past the split looking for a
+/// rejection included, and closes. The lane stays healthy: the next leg
+/// on the same ledger opens, pays on from there, and completes with no
+/// voucher rejection, whether or not the node read the closing voucher.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pull_stopped_at_a_split_pays_what_arrived_and_the_lane_pulls_on() -> anyhow::Result<()> {
+    let payload = vec![0x3Au8; 8 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth, server_ep, server_task) =
+        spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, signer, deposit);
+    let ledger = Arc::new(ctx.new_ledger());
+    let deadlines = PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?;
+    let slash = slash_domain();
+    let leg = |offset: u64, len: u64| {
+        open_progressive_pull(
+            &client_ep,
+            target.clone(),
+            &ctx,
+            Arc::clone(&ledger),
+            &slash,
+            server_eth.address(),
+            *hash.as_bytes(),
+            decdn_protocol::client::NO_NAMESPACE,
+            offset,
+            0x00c4,
+            0,
+            0,
+            deadlines,
+            len,
+            None,
+        )
+    };
+
+    // `[0, 4 MiB)`, stopped once about a third of its wire has arrived.
+    let (_header, mut pull) = leg(0, 4 * 1024 * 1024).await?;
+    let mut received = 0u64;
+    while received < 3 * 512 * 1024 {
+        let chunk = pull
+            .next_chunk()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("the leg ended before the split"))?;
+        received = received.saturating_add(u64::try_from(chunk.len())?);
+    }
+    // Let the node's credit window queue frames the leg has not read yet:
+    // the stop reads them, without waiting, for a rejection behind them.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let promised = pull.expected_wire_bytes();
+    let stopped = pull.stop().await?;
+    let (stopped_bytes, _) = stopped
+        .advanced()
+        .ok_or_else(|| anyhow::anyhow!("the stopped leg must have paid"))?;
+    anyhow::ensure!(
+        stopped_bytes > U256::from(received) && stopped_bytes <= U256::from(promised),
+        "the stopped leg pays for every frame it read, the queued ones too: \
+         {stopped_bytes} past the {received} read before the stop, at most {promised}"
+    );
+
+    // The next leg on the same ledger pays on from the stopped one's
+    // watermark and completes.
+    let (_header, mut pull) = leg(4 * 1024 * 1024, 4 * 1024 * 1024).await?;
+    let mut next = 0u64;
+    while let Some(chunk) = pull.next_chunk().await? {
+        next = next.saturating_add(u64::try_from(chunk.len())?);
+    }
+    let finished = pull.finish().await?;
+    let (finished_bytes, _) = finished
+        .advanced()
+        .ok_or_else(|| anyhow::anyhow!("the next leg must have paid"))?;
+    anyhow::ensure!(
+        finished_bytes == stopped_bytes + U256::from(next),
+        "the next leg pays on from the stopped one: {finished_bytes} of {stopped_bytes} + {next}"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;

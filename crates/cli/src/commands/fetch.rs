@@ -76,6 +76,7 @@ use decdn_client::probe::probe_once;
 use decdn_client::provider;
 
 use super::buyer_store::{ChainAdoption, DataDirSource, open_client_store_for_buy};
+use super::fetch_timings::{FetchTimings, Mark};
 use super::interrupt::{Interrupt, Interrupted};
 use super::ordered_writes::OrderedWrites;
 use super::tab_progress::TabProgress;
@@ -473,6 +474,335 @@ fn probe_shed(err: &anyhow::Error) -> bool {
     err.downcast_ref::<UpstreamRateLimited>().is_some()
 }
 
+/// How long a probe round keeps collecting answers after the first verified
+/// holder answers. A holder that answers later is either about 125 ms farther
+/// away or still connecting, and would not lead the order. One slow connect
+/// would otherwise hold the whole round for up to the probe timeout.
+const PROBE_SETTLE_AFTER_HOLDER: Duration = Duration::from_millis(250);
+
+/// Run `probes` concurrently and collect their outcomes until every probe has
+/// answered or the round's deadline passes. The first outcome `is_holder`
+/// accepts sets the deadline `grace` later. With `cold_grace` set and no
+/// holder yet, the first outcome `is_answer` accepts sets it `cold_grace`
+/// later, and a holder inside that window still ends the round `grace` after
+/// it. Returns the collected outcomes, in answer order, and the probes still
+/// pending. A zero `grace` returns at the first holder with every outcome
+/// already ready: `timeout_at` polls the stream before it checks the deadline.
+/// With no holder and no `cold_grace`, the round waits for every probe and the
+/// tail is empty.
+async fn settle_probes<T, F>(
+    probes: impl IntoIterator<Item = F>,
+    grace: Duration,
+    cold_grace: Option<Duration>,
+    is_holder: impl Fn(&T) -> bool,
+    is_answer: impl Fn(&T) -> bool,
+) -> (Vec<T>, futures_util::stream::FuturesUnordered<F>)
+where
+    F: std::future::Future<Output = T>,
+{
+    use futures_util::StreamExt as _;
+    let mut pending: futures_util::stream::FuturesUnordered<F> = probes.into_iter().collect();
+    let mut settled = Vec::with_capacity(pending.len());
+    let mut deadline: Option<tokio::time::Instant> = None;
+    let mut holder_seen = false;
+    loop {
+        let next = match deadline {
+            None => pending.next().await,
+            Some(at) => match tokio::time::timeout_at(at, pending.next()).await {
+                Ok(next) => next,
+                Err(_) => break,
+            },
+        };
+        let Some(outcome) = next else { break };
+        let now = tokio::time::Instant::now();
+        if !holder_seen && is_holder(&outcome) {
+            holder_seen = true;
+            let at = now + grace;
+            deadline = Some(deadline.map_or(at, |cold| cold.min(at)));
+        } else if deadline.is_none()
+            && let Some(cold) = cold_grace
+            && is_answer(&outcome)
+        {
+            deadline = Some(now + cold);
+        }
+        settled.push(outcome);
+    }
+    if !pending.is_empty() {
+        tracing::debug!(
+            pending = pending.len(),
+            holder = holder_seen,
+            "probe round settled; the rest continue as its tail"
+        );
+    }
+    (settled, pending)
+}
+
+/// Log one probe's raw result at `debug`, with the time since the round started.
+fn log_probe_result(
+    cand: &NodeCandidate,
+    res: &anyhow::Result<(
+        decdn_protocol::message::ProbeResponse,
+        decdn_protocol::ProbeResponseExt,
+        f64,
+    )>,
+    started: std::time::Instant,
+) {
+    match res {
+        Ok((resp, _, rtt_ms)) => tracing::debug!(
+            node = %cand.node_id,
+            elapsed_ms = started.elapsed().as_millis(),
+            rtt_ms = *rtt_ms,
+            has_blob = resp.body.has_blob,
+            "probe answered"
+        ),
+        Err(error) => tracing::debug!(
+            node = %cand.node_id,
+            elapsed_ms = started.elapsed().as_millis(),
+            error = %format_args!("{error:#}"),
+            "probe failed"
+        ),
+    }
+}
+
+/// One probed candidate, verified and classified ([`classify_probe`]).
+pub(crate) enum ProbeOutcome {
+    /// A verified answer that holds the blob, with its peer-store sample.
+    Holder(discovery::Probed, (PublicKey, f64, u64)),
+    /// A verified answer that does not hold the blob, with its peer-store
+    /// sample.
+    NonHolder(discovery::WarmingCandidate, (PublicKey, f64, u64)),
+    /// No answer.
+    Unreachable,
+    /// The candidate kept shedding the probe.
+    RateLimited,
+    /// The answer's `slash_sig` did not recover to the candidate's operator.
+    Unverifiable,
+    /// The answer's `has_blob` and coverage disagree.
+    Unusable,
+}
+
+impl ProbeOutcome {
+    const fn is_holder(&self) -> bool {
+        matches!(self, Self::Holder(..))
+    }
+
+    /// A verified answer, holder or not.
+    const fn is_answer(&self) -> bool {
+        matches!(self, Self::Holder(..) | Self::NonHolder(..))
+    }
+
+    /// The peer-store sample of a verified answer.
+    pub(crate) const fn sample(&self) -> Option<(PublicKey, f64, u64)> {
+        match self {
+            Self::Holder(_, sample) | Self::NonHolder(_, sample) => Some(*sample),
+            Self::Unreachable | Self::RateLimited | Self::Unverifiable | Self::Unusable => None,
+        }
+    }
+}
+
+/// How a probe round ends once a verified holder answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeRound {
+    /// Return at the first verified holder and keep the pending probes as
+    /// the round's tail ([`LateProbes`]): the first round of a fetch, whose
+    /// late holders join the running fetch.
+    Stream,
+    /// Collect for [`PROBE_SETTLE_AFTER_HOLDER`] after the first verified
+    /// holder and drop the rest: a rediscovery.
+    Settle,
+}
+
+impl ProbeRound {
+    /// How long the round collects after the first verified holder.
+    const fn grace(self) -> Duration {
+        match self {
+            Self::Stream => Duration::ZERO,
+            Self::Settle => PROBE_SETTLE_AFTER_HOLDER,
+        }
+    }
+
+    /// How long the round collects after its first verified answer while no
+    /// holder has answered. A streamed round then starts on the non-holders
+    /// in hand as pull-through targets (#1911), and a holder that answers
+    /// later joins the running fetch. A settled round waits for every probe.
+    const fn cold_grace(self) -> Option<Duration> {
+        match self {
+            Self::Stream => Some(PROBE_SETTLE_AFTER_HOLDER),
+            Self::Settle => None,
+        }
+    }
+}
+
+/// The probes a streamed round left pending, with what deciding a late
+/// answer needs.
+pub(crate) struct LateProbes {
+    /// The pending probes, each yielding its classified outcome.
+    pub(crate) tail: std::pin::Pin<Box<dyn futures_util::Stream<Item = ProbeOutcome> + Send>>,
+    /// The lowest RTT among the holders the round returned.
+    pub(crate) best_holder_rtt_ms: f64,
+    /// The fetch's proxy-warming knobs.
+    pub(crate) warming: ProxyWarmingParams,
+}
+
+/// How a resolve probes: where it records its marks, and how its probe round
+/// ends.
+#[derive(Clone, Copy)]
+pub(crate) struct ProbeOpts<'a> {
+    /// The `decdn fetch` marks; `None` elsewhere.
+    pub(crate) timings: Option<&'a FetchTimings>,
+    /// How the probe round ends.
+    pub(crate) round: ProbeRound,
+}
+
+/// A streamed round's [`LateProbes`], taken once by whoever adopts them.
+#[derive(Default)]
+pub(crate) struct LateSlot(std::sync::Mutex<Option<LateProbes>>);
+
+impl LateSlot {
+    /// A slot holding `late`.
+    pub(crate) const fn new(late: LateProbes) -> Self {
+        Self(std::sync::Mutex::new(Some(late)))
+    }
+
+    /// Take the late probes, leaving the slot empty.
+    pub(crate) fn take(&self) -> Option<LateProbes> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+/// A probe round's outcomes, split by what [`probe_and_order`] does with each.
+struct ProbeTally {
+    /// The verified holders.
+    holders: Vec<discovery::Probed>,
+    /// Probed bonded nodes that answered `has_blob:false` — reachable, with a
+    /// measured RTT, but not holding the blob in their cache store. They serve
+    /// two roles: the proxy-warming candidate pool (ADR 037 § Candidate pool)
+    /// when a holder exists but is distant, and — when NO holder answers — the
+    /// pull-through serve targets a cold blob's first fetch bootstraps from
+    /// (#1911), since `has_blob:false` from the cache store does not mean the
+    /// node cannot serve via its own origin. Always collected, because the
+    /// second role does not depend on warming being on.
+    non_holders: Vec<discovery::WarmingCandidate>,
+    /// `(node_id, rtt_ms, rate_per_mb)` for each verified responder, harvested
+    /// into the peer store off the critical path (`spawn_harvest`, called from
+    /// `discover_provider`).
+    probed_samples: Vec<(PublicKey, f64, u64)>,
+    /// The ways a candidate drops out, counted separately: the terminal error
+    /// has to name the one that actually happened. A wrong
+    /// `slash_judge_address` or `chain_id` makes EVERY honest node fail
+    /// verification, and reporting that as "nobody holds the blob" sends the
+    /// operator hunting for missing content instead of a local
+    /// misconfiguration; a node shedding this client's probe rate is
+    /// reachable, and reporting it as silent points at the network instead.
+    unreachable: usize,
+    rate_limited: usize,
+    unverifiable: usize,
+}
+
+impl ProbeTally {
+    fn of(outcomes: Vec<ProbeOutcome>) -> Self {
+        let mut tally = Self {
+            holders: Vec::new(),
+            non_holders: Vec::new(),
+            probed_samples: Vec::new(),
+            unreachable: 0,
+            rate_limited: 0,
+            unverifiable: 0,
+        };
+        for outcome in outcomes {
+            match outcome {
+                ProbeOutcome::Holder(holder, sample) => {
+                    tally.probed_samples.push(sample);
+                    tally.holders.push(holder);
+                }
+                ProbeOutcome::NonHolder(candidate, sample) => {
+                    tally.probed_samples.push(sample);
+                    tally.non_holders.push(candidate);
+                }
+                ProbeOutcome::Unreachable => tally.unreachable += 1,
+                ProbeOutcome::RateLimited => tally.rate_limited += 1,
+                ProbeOutcome::Unverifiable => tally.unverifiable += 1,
+                ProbeOutcome::Unusable => {}
+            }
+        }
+        tally
+    }
+}
+
+/// Verify `cand`'s probe result and classify it. Every response is verified
+/// before it can influence the order (ADR 014 §1). A failure is requester-local
+/// policy, with no reputation effect, because an unrecovered signature
+/// attributes nothing to anyone.
+fn classify_probe(
+    cand: &NodeCandidate,
+    res: anyhow::Result<(
+        decdn_protocol::message::ProbeResponse,
+        decdn_protocol::ProbeResponseExt,
+        f64,
+    )>,
+    hash: [u8; 32],
+    timestamp_us: u64,
+    slash_domain: &alloy::sol_types::Eip712Domain,
+) -> ProbeOutcome {
+    let (resp, resp_ext, rtt_ms) = match res {
+        Ok(answer) => answer,
+        Err(e) if probe_shed(&e) => return ProbeOutcome::RateLimited,
+        Err(_) => return ProbeOutcome::Unreachable,
+    };
+    if let Err(e) = decdn_client::probe::verify_probe_response(
+        &resp,
+        cand.eth_address,
+        slash_domain,
+        hash,
+        timestamp_us,
+    ) {
+        // A candidate silently vanishing from selection is exactly what the
+        // operator needs told, so log why at `warn`.
+        tracing::warn!(
+            "dropping an unverifiable probe response from {}: {e}",
+            cand.node_id
+        );
+        return ProbeOutcome::Unverifiable;
+    }
+    // #1506: `has_blob` and `coverage.is_empty()` are a biconditional by
+    // construction on an honest responder. Neither field is signed, and an
+    // inconsistency has no attributable author, so drop the candidate rather
+    // than score it.
+    if !resp_ext.consistent_with(resp.body.has_blob) {
+        tracing::warn!(
+            "dropping a probe response from {} with has_blob/coverage mismatch",
+            cand.node_id
+        );
+        return ProbeOutcome::Unusable;
+    }
+    // Every verified responder contributes a probe sample, holder or not.
+    let sample = (cand.node_id, rtt_ms, resp.body.rate_per_mb);
+    if resp.body.has_blob {
+        ProbeOutcome::Holder(
+            discovery::Probed {
+                candidate: cand.clone(),
+                rtt_ms,
+                total_bytes: resp_ext.total_bytes,
+                coverage: resp_ext.coverage,
+            },
+            sample,
+        )
+    } else {
+        ProbeOutcome::NonHolder(
+            discovery::WarmingCandidate {
+                node_id: cand.node_id,
+                eth_address: cand.eth_address,
+                rtt_ms,
+                multiaddrs: cand.multiaddrs.clone(),
+            },
+            sample,
+        )
+    }
+}
+
 /// Probe `candidates` for `hash` over `endpoint` and return the ordered
 /// provider-failover list (#1174, ADR 037 § Fallback): the sequence `fetch`
 /// tries in turn, each entry a fallback for the one before it, until one
@@ -499,6 +829,10 @@ fn probe_shed(err: &anyhow::Error) -> bool {
 /// every provider (ADR 003), so there is no per-provider "already funded"
 /// distinction to prefer.
 ///
+/// The round ends [`PROBE_SETTLE_AFTER_HOLDER`] after the first verified
+/// holder answers, or when every probe has answered. A holder the cutoff drops
+/// stays reachable through the fetch's later discovery.
+///
 /// The order is proxy-warming candidates first (nearest RTT first, ADR 037 §
 /// Client selection policy) when warming is enabled and engages, then the
 /// holders nearest RTT first. A caller that walks it therefore gets ADR 037's
@@ -509,14 +843,6 @@ fn probe_shed(err: &anyhow::Error) -> bool {
 /// When no candidate holds the blob, the order is instead the reachable
 /// non-holders, nearest RTT first, as pull-through serve targets — see
 /// [`failover_order`] for why an empty holder set bootstraps rather than fails.
-// One flat pass over the probe responses: verify, drop the inconsistent, split
-// holders from non-holders, then order. The branch count is that per-candidate
-// classification plus the `tracing` diagnostics on the drop and fallback arms.
-#[expect(
-    clippy::cognitive_complexity,
-    clippy::too_many_lines,
-    reason = "flat per-candidate classification pass, not nested control flow"
-)]
 pub(crate) async fn probe_and_order(
     endpoint: &Endpoint,
     candidates: &[NodeCandidate],
@@ -524,109 +850,42 @@ pub(crate) async fn probe_and_order(
     hash: [u8; 32],
     warming: ProxyWarmingParams,
     slash_domain: &alloy::sol_types::Eip712Domain,
+    round: ProbeRound,
 ) -> anyhow::Result<ResolvedTargets> {
     let timestamp_us = micros_now();
-    // Probe concurrently in one task. `probe_once`'s future is `Send`, so
-    // `tokio::spawn` would work too; `join_all` over a shared `&endpoint` is
-    // kept because it needs no per-probe clone. `probe_once`'s internal
-    // timeout bounds each leg; a candidate that sheds the probe is probed again
-    // after a short wait (`probe_candidate`).
-    let probes = candidates.iter().map(|cand| {
-        let target = probe_target(cand, relay_hint.cloned());
+    // Probe concurrently in one task. `probe_once`'s internal timeout bounds
+    // each leg; a candidate that sheds the probe is probed again after a short
+    // wait (`probe_candidate`). Each probe verifies and classifies its own
+    // answer, so the round ends only on a verified holder. Each probe owns its
+    // inputs, so a streamed round's pending probes outlive this call.
+    let started = std::time::Instant::now();
+    let probes = candidates.iter().cloned().map(|cand| {
+        let target = probe_target(&cand, relay_hint.cloned());
+        let endpoint = endpoint.clone();
+        let slash_domain = slash_domain.clone();
         async move {
-            (
-                cand,
-                probe_candidate(endpoint, target, hash, timestamp_us).await,
-            )
+            let res = probe_candidate(&endpoint, target, hash, timestamp_us).await;
+            log_probe_result(&cand, &res, started);
+            classify_probe(&cand, res, hash, timestamp_us, &slash_domain)
         }
     });
-    let results = futures_util::future::join_all(probes).await;
+    let (outcomes, tail) = settle_probes(
+        probes,
+        round.grace(),
+        round.cold_grace(),
+        ProbeOutcome::is_holder,
+        ProbeOutcome::is_answer,
+    )
+    .await;
 
-    let probe_count = results.len();
-    let mut holders = Vec::new();
-    // Probed bonded nodes that answered `has_blob:false` — reachable, with a
-    // measured RTT, but not holding the blob in their cache store. They serve
-    // two roles: the proxy-warming candidate pool (ADR 037 § Candidate pool)
-    // when a holder exists but is distant, and — when NO holder answers — the
-    // pull-through serve targets a cold blob's first fetch bootstraps from
-    // (#1911), since `has_blob:false` from the cache store does not mean the
-    // node cannot serve via its own origin. Always collected, because the second
-    // role does not depend on warming being on.
-    let mut non_holders: Vec<discovery::WarmingCandidate> = Vec::new();
-    // Four ways a candidate drops out, counted separately: the terminal error below
-    // has to name the one that actually happened. A wrong `slash_judge_address` or
-    // `chain_id` makes EVERY honest node fail verification, and reporting that as
-    // "nobody holds the blob" sends the operator hunting for missing content instead
-    // of a local misconfiguration; a node shedding this client's probe rate is
-    // reachable, and reporting it as silent points at the network instead.
-    let mut unreachable = 0usize;
-    let mut rate_limited = 0usize;
-    let mut unverifiable = 0usize;
-    // (node_id, rtt_ms, rate_per_mb) for each holder that answered a probe
-    // this fetch, harvested into the peer store off the critical path
-    // (spawn_harvest, called from discover_provider).
-    let mut probed_samples: Vec<(PublicKey, f64, u64)> = Vec::new();
-    for (cand, res) in results {
-        let (resp, resp_ext, rtt_ms) = match res {
-            Ok(answer) => answer,
-            Err(e) if probe_shed(&e) => {
-                rate_limited += 1;
-                continue;
-            }
-            Err(_) => {
-                unreachable += 1;
-                continue;
-            }
-        };
-        // Verify BEFORE the response can influence the order (ADR 014 §1). A
-        // failure is requester-local policy — drop it and move on, no reputation
-        // effect, because an unrecovered signature attributes nothing to anyone.
-        if let Err(e) = decdn_client::probe::verify_probe_response(
-            &resp,
-            cand.eth_address,
-            slash_domain,
-            hash,
-            timestamp_us,
-        ) {
-            // A candidate silently vanishing from selection is exactly what the
-            // operator needs told, so log why at `warn`.
-            unverifiable += 1;
-            tracing::warn!(
-                "dropping an unverifiable probe response from {}: {e}",
-                cand.node_id
-            );
-            continue;
-        }
-        // #1506: `has_blob` and `coverage.is_empty()` are a biconditional by
-        // construction on an honest responder — neither field is signed, and
-        // an inconsistency has no attributable author, so drop the candidate
-        // rather than score it (same reasoning as an unrecovered `slash_sig`
-        // above).
-        if !resp_ext.consistent_with(resp.body.has_blob) {
-            tracing::warn!(
-                "dropping a probe response from {} with has_blob/coverage mismatch",
-                cand.node_id
-            );
-            continue;
-        }
-        // Every verified responder contributes a probe sample, holder or not.
-        probed_samples.push((cand.node_id, rtt_ms, resp.body.rate_per_mb));
-        if resp.body.has_blob {
-            holders.push(discovery::Probed {
-                candidate: cand.clone(),
-                rtt_ms,
-                total_bytes: resp_ext.total_bytes,
-                coverage: resp_ext.coverage.clone(),
-            });
-        } else {
-            non_holders.push(discovery::WarmingCandidate {
-                node_id: cand.node_id,
-                eth_address: cand.eth_address,
-                rtt_ms,
-                multiaddrs: cand.multiaddrs.clone(),
-            });
-        }
-    }
+    let ProbeTally {
+        holders,
+        non_holders,
+        probed_samples,
+        unreachable,
+        rate_limited,
+        unverifiable,
+    } = ProbeTally::of(outcomes);
 
     // Terminal only when NOTHING can serve — no holder AND no reachable
     // non-holder to pull through. An empty holder set alone is not terminal: a
@@ -634,7 +893,7 @@ pub(crate) async fn probe_and_order(
     // state (#1911), so as long as one bonded node answered it is a serve target.
     if holders.is_empty() && non_holders.is_empty() {
         return Err(no_serve_target_error(
-            probe_count,
+            candidates.len(),
             unreachable,
             rate_limited,
             unverifiable,
@@ -645,14 +904,15 @@ pub(crate) async fn probe_and_order(
         // No cache holder, but reachable non-holders can serve via pull-through.
         // Log why the fetch is talking to nodes that answered `has_blob:false`.
         tracing::info!(
-            "no probed node holds the blob in cache; falling back to {} reachable bonded \
-             non-holder(s) as pull-through serve targets — a node serves an authorized miss \
-             from its own origin (#1911)",
+            "no node that has answered holds the blob in cache; starting on {} reachable \
+             bonded non-holder(s) as pull-through serve targets — a node serves an authorized \
+             miss from its own origin (#1911), and a holder that answers later joins the fetch",
             non_holders.len()
         );
     }
 
     let size_hint = nearest_size_hint(&holders);
+    let late = late_slot(round, tail, &holders, warming);
     let ordered = failover_order(holders, &non_holders, warming);
     if let Some((node_id, proxy_rtt, best_holder_rtt)) = ordered.warming_lead {
         tracing::info!(
@@ -667,7 +927,59 @@ pub(crate) async fn probe_and_order(
         probed_samples,
         pinned: false,
         size_hint,
+        late,
     })
+}
+
+/// A streamed round's pending probes as its [`LateSlot`], with the best RTT
+/// among the `holders` it returned. Empty for a settled round or an empty
+/// tail.
+///
+/// A task drives the probes from here on, so they keep running and timing
+/// while the fetch unlocks its signer and opens its pool before anything reads
+/// the tail. Their answers wait in a channel. The task stops when the tail
+/// stream is dropped, so no probe outlives the fetch that adopted it.
+fn late_slot<F>(
+    round: ProbeRound,
+    tail: futures_util::stream::FuturesUnordered<F>,
+    holders: &[discovery::Probed],
+    warming: ProxyWarmingParams,
+) -> LateSlot
+where
+    F: std::future::Future<Output = ProbeOutcome> + Send + 'static,
+{
+    use futures_util::StreamExt as _;
+    if round != ProbeRound::Stream || tail.is_empty() {
+        return LateSlot::default();
+    }
+    let best_holder_rtt_ms = holders
+        .iter()
+        .map(|h| h.rtt_ms)
+        .fold(f64::INFINITY, f64::min);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = AbortOnDrop(tokio::spawn(tail.for_each(move |outcome| {
+        // A send fails only once the tail stream is gone, which aborts this
+        // task too.
+        let _ = tx.send(outcome);
+        std::future::ready(())
+    })));
+    let answers = futures_util::stream::unfold((rx, task), |(mut rx, task)| async move {
+        rx.recv().await.map(|outcome| (outcome, (rx, task)))
+    });
+    LateSlot::new(LateProbes {
+        tail: Box::pin(answers),
+        best_holder_rtt_ms,
+        warming,
+    })
+}
+
+/// A task that is aborted when this handle drops.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// The size hint of the nearest holder that gave one: the fetch's first size
@@ -813,7 +1125,13 @@ async fn discover_provider(
     // same `args`, so they travel as `args` rather than as two more positional
     // parameters (clippy caps this function at 7).
     args: &cli::ClientFetchArgs,
+    probe: ProbeOpts<'_>,
 ) -> anyhow::Result<ResolvedTargets> {
+    let mark_probe_start = || {
+        if let Some(timings) = probe.timings {
+            timings.mark(Mark::ProbeStart);
+        }
+    };
     // Probe-less fast path: when the store already holds enough fresh,
     // unsuppressed candidates, skip the network probe round entirely and rank
     // by the store's own EWMA latency. Falls through to today's bootstrap +
@@ -846,8 +1164,17 @@ async fn discover_provider(
         if selected.len() >= store_cfg.min_fresh_candidates {
             let warming = ProxyWarmingParams::from_args(args);
             let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
-            let targets =
-                probe_and_order(endpoint, &selected, relay_hint, hash, warming, &slash_dom).await?;
+            mark_probe_start();
+            let targets = probe_and_order(
+                endpoint,
+                &selected,
+                relay_hint,
+                hash,
+                warming,
+                &slash_dom,
+                probe.round,
+            )
+            .await?;
             // Stats-only harvest, never identity — identity refreshes ONLY on a
             // real registry read (same reasoning as the `Bootstrap::Cached`
             // path): re-`upsert_identity` here would "confirm" identity against
@@ -893,8 +1220,17 @@ async fn discover_provider(
     let selected = select_with_widening(all, chain.region.as_deref(), allow, &store_cfg);
     let warming = ProxyWarmingParams::from_args(args);
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
-    let targets =
-        probe_and_order(endpoint, &selected, relay_hint, hash, warming, &slash_dom).await?;
+    mark_probe_start();
+    let targets = probe_and_order(
+        endpoint,
+        &selected,
+        relay_hint,
+        hash,
+        warming,
+        &slash_dom,
+        probe.round,
+    )
+    .await?;
     // Identity is harvested ONLY against a live registry read, and
     // `resolve_bootstrap` already does that: on a `Bootstrap::Live` read it
     // upserts+prunes identity for every returned node. So the harvest here
@@ -967,6 +1303,7 @@ fn store_fast_path(
         probed_samples: Vec::new(),
         pinned: false,
         size_hint: None,
+        late: LateSlot::default(),
     })
 }
 
@@ -1163,6 +1500,7 @@ pub(crate) fn holders_or_none(
                 probed_samples: Vec::new(),
                 pinned: false,
                 size_hint: None,
+                late: LateSlot::default(),
             })
         }
     }
@@ -1188,6 +1526,9 @@ pub(crate) struct ResolvedTargets {
     /// ([`discovery::Probed::total_bytes`]). `None` when nothing was probed
     /// (a pinned `--node-id`, the peer-store fast path) or no holder knew it.
     pub(crate) size_hint: Option<u64>,
+    /// The probes a streamed round left pending ([`ProbeRound::Stream`]).
+    /// Empty on every other path.
+    pub(crate) late: LateSlot,
 }
 
 /// The one holder of a pinned `--node-id` at `provider`. Nothing was probed,
@@ -1210,6 +1551,7 @@ fn pinned_targets(node_id: PublicKey, provider: Address) -> ResolvedTargets {
         pinned: true,
         // Nothing was probed, so the first claim comes from a header.
         size_hint: None,
+        late: LateSlot::default(),
     }
 }
 
@@ -1218,13 +1560,15 @@ fn pinned_targets(node_id: PublicKey, provider: Address) -> ResolvedTargets {
 /// when `--node-id` is omitted (deriving each provider from its node's registry
 /// entry), nearest first. The acquire loop stripes across them; a set that goes
 /// stale is refreshed by a later discovery with `--rediscover` forced, which
-/// reads the registry rather than the peer store.
+/// reads the registry rather than the peer store. `probe` says where the probe
+/// round's start is recorded and how the round ends.
 pub(crate) async fn resolve_target_node(
     args: &cli::ClientFetchArgs,
     chain: &ResolvedChain,
     endpoint: &Endpoint,
     relays: &[RelayUrl],
     hash: [u8; 32],
+    probe: ProbeOpts<'_>,
 ) -> anyhow::Result<ResolvedTargets> {
     if let Some(raw) = &args.node_id {
         // No reachability pre-check: the endpoint is discovery-enabled, so a
@@ -1262,8 +1606,16 @@ pub(crate) async fn resolve_target_node(
     // here also cancels the ADR 012 § Bootstrap step 4 peer-store fallback,
     // so a client with a usable peer store would be handed a hard failure
     // instead of the degraded-but-working fetch the store exists to provide.
-    let order =
-        discover_provider(endpoint, chain, capacity_bond, relays.first(), hash, args).await?;
+    let order = discover_provider(
+        endpoint,
+        chain,
+        capacity_bond,
+        relays.first(),
+        hash,
+        args,
+        probe,
+    )
+    .await?;
     if !order.candidates.is_empty() {
         // A header event, then one event per candidate — the log-side shape of
         // the previous per-line stderr listing.
@@ -1487,6 +1839,7 @@ fn persist_watermark(
 /// [`Interrupted`] on Ctrl-C, [`decdn_client::GaveUp`] once the stop policy's
 /// no-progress limit passes, or the fault that ended the fetch.
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+    let timings = FetchTimings::start();
     let hash = parse_hash(&args.hash)?;
     let common = &args.common;
     // Before any network or keystore work, reject a flag combination clap
@@ -1519,6 +1872,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
 
     // One discovery-enabled endpoint, reused for probing and the delivery dial.
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
+    timings.mark(Mark::Endpoint);
     // The body runs in `fetch_over`, so the endpoint closes on every exit —
     // success, an early return, an error, or a Ctrl-C — and its open connections
     // end cleanly instead of being aborted on drop. A Ctrl-C drops `fetch_over`
@@ -1528,11 +1882,17 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // The command's peer-record and watermark writes, off the runtime thread.
     let writes = OrderedWrites::default();
     let result = tokio::select! {
-        result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint, &writes) => {
+        result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint, &writes, &timings) => {
             result
         }
         () = interrupt.wait() => Err(Interrupted.into()),
     };
+    let output = if wants_stdout(&args.output) {
+        "stdout"
+    } else {
+        "file"
+    };
+    timings.log(output, result.is_ok());
     // On every exit, a Ctrl-C's included: what the drives queued is durable
     // before the command returns.
     writes.settle().await;
@@ -1562,13 +1922,20 @@ async fn fetch_over(
     store: &Arc<RedbBuyerPoolStore>,
     endpoint: &Endpoint,
     writes: &OrderedWrites,
+    timings: &FetchTimings,
 ) -> anyhow::Result<()> {
     let common = &args.common;
     // The holders to start from: the explicit `--node-id`, or auto-discovery.
     // Only a configuration fault ends the fetch here; with no holder yet, the
-    // first open discovers them.
+    // first open discovers them. The round streams: the fetch starts at the
+    // first verified holder, and the holders that answer later join it.
+    let probe = ProbeOpts {
+        timings: Some(timings),
+        round: ProbeRound::Stream,
+    };
     let resolved =
-        holders_or_none(resolve_target_node(common, chain, endpoint, relays, hash).await)?;
+        holders_or_none(resolve_target_node(common, chain, endpoint, relays, hash, probe).await)?;
+    timings.mark(Mark::Resolved);
 
     // Buyer signer (vouchers + the openPool/topUp tx). Loaded after selection so a
     // failed discovery never prompts for a keystore password. Password from env,
@@ -1582,6 +1949,7 @@ async fn fetch_over(
     )?
     .into_secret();
     let signer = Arc::new(load_signer(&chain.keystore, &password)?);
+    timings.mark(Mark::Unlocked);
     let self_address = signer.address();
 
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
@@ -1637,6 +2005,7 @@ async fn fetch_over(
         connections: &connections,
         writes,
         funding: &funding,
+        timings: Some(timings),
     };
 
     let clock = Arc::new(ProgressClock::new());
@@ -1662,6 +2031,7 @@ async fn fetch_over(
         None,
     );
     let holders = sources.holders_from(&resolved);
+    timings.set_holders_start(holders.len());
     // A fetch dropped by Ctrl-C queues every lane's vouchers for recording too.
     let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
     let result = async {
@@ -1783,6 +2153,8 @@ pub(crate) struct DriveFetchDeps<'a, P> {
     /// The run's funding facts, shared by every lane build and top-up of the
     /// run ([`RunFunding`]).
     pub(crate) funding: &'a RunFunding,
+    /// The `decdn fetch` time-to-first-byte marks; `None` for a `bundle pull`.
+    pub(crate) timings: Option<&'a FetchTimings>,
 }
 
 /// The lane's shared ledger + context: from the run registry when bundle pull
@@ -1953,6 +2325,9 @@ where
         Arc::clone(&ledger),
         provider,
     );
+    if let Some(timings) = deps.timings {
+        timings.mark(Mark::Lane);
+    }
     Ok(MultiLane {
         provider,
         pool_id,
@@ -2198,8 +2573,18 @@ where
     // The bar draws on stderr, so it shows only when stderr is a terminal; stdout
     // carries the verified bytes either way.
     let bar = std::io::IsTerminal::is_terminal(&std::io::stderr()).then(delivery_progress);
-    let on_progress: Option<&dyn Fn(u64, u64)> =
-        bar.as_ref().map(|(_, cb, _)| cb as &dyn Fn(u64, u64));
+    // `copy_verified` reports after each write, so the first report with a
+    // byte is the first byte on stdout.
+    let on_progress = |received: u64, expected: u64| {
+        if received > 0
+            && let Some(timings) = deps.timings
+        {
+            timings.mark(Mark::FirstByte);
+        }
+        if let Some((_, cb, _)) = &bar {
+            cb(received, expected);
+        }
+    };
 
     // The drive runs beside the copy, not inside its reads: a blocked stdout
     // must not stop an open paid leg from paying and draining. The read-ahead
@@ -2210,7 +2595,7 @@ where
             &mut reader,
             &mut stdout,
             total_bytes,
-            on_progress,
+            Some(&on_progress),
         ))
         .await;
 
@@ -2248,7 +2633,15 @@ async fn download_to_file<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let (bar, on_progress, meter) = delivery_progress();
+    let (bar, on_bar, meter) = delivery_progress();
+    let on_progress = |received: u64, expected: u64| {
+        if received > 0
+            && let Some(timings) = deps.timings
+        {
+            timings.mark(Mark::FirstByte);
+        }
+        on_bar(received, expected);
+    };
     let downloader = Downloader::new(
         sources,
         holders,
@@ -2292,10 +2685,11 @@ struct LaneWatermark {
 /// Every lane settles at its ARMED cumulative rather than branching on the
 /// fetch's outcome. The fetch result is ONE outcome shared by
 /// every lane, but "did this lane's last voucher land?" is a PER-LANE question,
-/// and on the multi-source path a successful fetch routinely leaves a lane
-/// armed-above-committed: a tail steal drops the victim's `fill_gap` future
-/// wherever it is parked, including inside the voucher exchange that `issue`
-/// deliberately arms before sending. Settling that lane at `committed` on the
+/// and on the multi-source path a successful fetch can leave a lane
+/// armed-above-committed: a cancelled or stalled leg drops its `fill_gap`
+/// future wherever it is parked, including inside the voucher exchange that
+/// `issue` deliberately arms before sending, and a leg stopped at a steal
+/// split keeps a closing voucher that failed to send armed. Settling that lane at `committed` on the
 /// fetch's `Ok` persists a cumulative BELOW what the node can redeem, and the
 /// next fetch on that lane signs a cumulative the upstream already holds —
 /// rejected as a regression.
@@ -3549,6 +3943,219 @@ mod tests {
         assert!(msg.contains("3 did not answer, 0 answered"), "{msg}");
     }
 
+    /// A probe outcome after `ms` on the paused clock: `(id, holder)`.
+    async fn answer_after(ms: u64, id: u32, holder: bool) -> (u32, bool) {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        (id, holder)
+    }
+
+    /// Every probe that answers within the grace after the first holder is kept.
+    #[tokio::test(start_paused = true)]
+    async fn settle_keeps_every_answer_inside_the_grace() {
+        let grace = Duration::from_millis(250);
+        let probes = vec![
+            answer_after(20, 1, true),
+            answer_after(150, 2, false),
+            answer_after(260, 3, true),
+        ];
+        let (mut got, tail) = settle_probes(probes, grace, None, |&(_, h)| h, |_| true).await;
+        got.sort_unstable();
+        assert_eq!(got, vec![(1, true), (2, false), (3, true)]);
+        assert!(tail.is_empty());
+    }
+
+    /// A probe still pending at the first holder's answer plus the grace is
+    /// left in the tail, and the round ends at that moment.
+    #[tokio::test(start_paused = true)]
+    async fn settle_leaves_a_straggler_past_the_grace_in_the_tail() {
+        let grace = Duration::from_millis(250);
+        let started = tokio::time::Instant::now();
+        let probes = vec![
+            answer_after(25, 1, true),
+            answer_after(170, 2, false),
+            answer_after(1850, 3, true),
+        ];
+        let (mut got, tail) = settle_probes(probes, grace, None, |&(_, h)| h, |_| true).await;
+        got.sort_unstable();
+        assert_eq!(got, vec![(1, true), (2, false)]);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(started.elapsed(), Duration::from_millis(275));
+    }
+
+    /// With no holder, the round waits for every probe.
+    #[tokio::test(start_paused = true)]
+    async fn settle_waits_for_every_probe_without_a_holder() {
+        let grace = Duration::from_millis(250);
+        let started = tokio::time::Instant::now();
+        let probes = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
+        let (got, tail) = settle_probes(probes, grace, None, |&(_, h)| h, |_| true).await;
+        assert_eq!(got.len(), 2);
+        assert!(tail.is_empty());
+        assert_eq!(started.elapsed(), Duration::from_millis(1850));
+    }
+
+    /// A streamed round returns at the first holder; the straggler is in the
+    /// tail and completes when polled.
+    #[tokio::test(start_paused = true)]
+    async fn settle_streams_from_the_first_holder() {
+        use futures_util::StreamExt as _;
+        let started = tokio::time::Instant::now();
+        let probes = vec![
+            answer_after(25, 1, true),
+            answer_after(170, 2, false),
+            answer_after(1850, 3, true),
+        ];
+        let (got, mut tail) =
+            settle_probes(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
+        assert_eq!(got, vec![(1, true)]);
+        assert_eq!(started.elapsed(), Duration::from_millis(25));
+        let mut late = Vec::new();
+        while let Some(outcome) = tail.next().await {
+            late.push(outcome);
+        }
+        assert_eq!(late, vec![(2, false), (3, true)]);
+    }
+
+    /// An answer already in when the first holder answers is collected, not
+    /// left in the tail.
+    #[tokio::test(start_paused = true)]
+    async fn settle_collects_answers_ready_with_the_first_holder() {
+        let probes = vec![
+            answer_after(25, 1, true),
+            answer_after(25, 2, false),
+            answer_after(900, 3, true),
+        ];
+        let (mut got, tail) =
+            settle_probes(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
+        got.sort_unstable();
+        assert_eq!(got, vec![(1, true), (2, false)]);
+        assert_eq!(tail.len(), 1);
+    }
+
+    /// A late probe that records when it answers, then reports `Unreachable`.
+    fn recording_probe(
+        after: Duration,
+        answered: &Arc<std::sync::Mutex<Option<Duration>>>,
+    ) -> impl std::future::Future<Output = ProbeOutcome> + Send + 'static {
+        let answered = Arc::clone(answered);
+        let started = tokio::time::Instant::now();
+        async move {
+            tokio::time::sleep(after).await;
+            if let Ok(mut slot) = answered.lock() {
+                *slot = Some(started.elapsed());
+            }
+            ProbeOutcome::Unreachable
+        }
+    }
+
+    fn no_warming() -> ProxyWarmingParams {
+        ProxyWarmingParams {
+            enabled: false,
+            rtt_threshold_ms: 150.0,
+            margin_ms: 30.0,
+        }
+    }
+
+    /// A streamed round's pending probes keep running while nothing polls the
+    /// tail, so a slow unlock between the round and the fetch neither times
+    /// them out nor inflates their RTT. The answer waits in the tail.
+    #[tokio::test(start_paused = true)]
+    async fn late_probes_run_while_the_tail_is_not_polled() {
+        use futures_util::StreamExt as _;
+        let answered = Arc::new(std::sync::Mutex::new(None));
+        let tail: futures_util::stream::FuturesUnordered<_> =
+            std::iter::once(recording_probe(Duration::from_millis(100), &answered)).collect();
+        let slot = late_slot(ProbeRound::Stream, tail, &[], no_warming());
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(*answered.lock().unwrap(), Some(Duration::from_millis(100)));
+        let mut late = slot.take().expect("a streamed round keeps its tail");
+        assert!(matches!(
+            late.tail.next().await,
+            Some(ProbeOutcome::Unreachable)
+        ));
+        assert!(late.tail.next().await.is_none());
+    }
+
+    /// Dropping the late probes stops the ones still running.
+    #[tokio::test(start_paused = true)]
+    async fn late_probes_stop_when_dropped() {
+        let answered = Arc::new(std::sync::Mutex::new(None));
+        let tail: futures_util::stream::FuturesUnordered<_> =
+            std::iter::once(recording_probe(Duration::from_secs(1), &answered)).collect();
+        let slot = late_slot(ProbeRound::Stream, tail, &[], no_warming());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(slot);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(*answered.lock().unwrap(), None);
+    }
+
+    /// Without a cold cutoff, a round with no holder waits for every probe and
+    /// leaves no tail.
+    #[tokio::test(start_paused = true)]
+    async fn settle_without_a_cold_cutoff_waits_for_every_probe() {
+        let probes = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
+        let (got, tail) = settle_probes(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
+        assert_eq!(got.len(), 2);
+        assert!(tail.is_empty());
+    }
+
+    /// With no holder in hand, a cold cutoff ends the round its grace after
+    /// the first answer; the late holder stays in the tail.
+    #[tokio::test(start_paused = true)]
+    async fn settle_cold_cutoff_returns_the_non_holders_in_hand() {
+        use futures_util::StreamExt as _;
+        let started = tokio::time::Instant::now();
+        let probes = vec![
+            answer_after(25, 1, false),
+            answer_after(100, 2, false),
+            answer_after(1850, 3, true),
+        ];
+        let cold = Some(Duration::from_millis(250));
+        let (got, mut tail) =
+            settle_probes(probes, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
+        assert_eq!(got, vec![(1, false), (2, false)]);
+        assert_eq!(started.elapsed(), Duration::from_millis(275));
+        assert_eq!(tail.next().await, Some((3, true)));
+    }
+
+    /// A holder that answers inside the cold window ends the round at once,
+    /// as it would with no window.
+    #[tokio::test(start_paused = true)]
+    async fn settle_cold_cutoff_yields_to_a_holder() {
+        let started = tokio::time::Instant::now();
+        let probes = vec![
+            answer_after(25, 1, false),
+            answer_after(120, 2, true),
+            answer_after(1850, 3, false),
+        ];
+        let cold = Some(Duration::from_millis(250));
+        let (got, tail) = settle_probes(probes, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
+        assert_eq!(got, vec![(1, false), (2, true)]);
+        assert_eq!(started.elapsed(), Duration::from_millis(120));
+        assert_eq!(tail.len(), 1);
+    }
+
+    /// Only a verified answer opens the cold window: a failed probe does not.
+    #[tokio::test(start_paused = true)]
+    async fn settle_cold_cutoff_ignores_failed_probes() {
+        let started = tokio::time::Instant::now();
+        // `(id, holder)`; id 9 stands for a failed probe.
+        let probes = vec![answer_after(10, 9, false), answer_after(600, 1, false)];
+        let cold = Some(Duration::from_millis(250));
+        let (got, tail) = settle_probes(
+            probes,
+            Duration::ZERO,
+            cold,
+            |&(_, h)| h,
+            |&(id, _)| id != 9,
+        )
+        .await;
+        assert_eq!(got.len(), 2);
+        assert!(tail.is_empty());
+        assert_eq!(started.elapsed(), Duration::from_millis(600));
+    }
+
     /// A loopback probe server that closes every connection with `code`, and
     /// counts the connections it saw.
     async fn closing_probe_server(
@@ -4697,6 +5304,7 @@ mod tests {
         let funding = RunFunding::default();
         let entry_deps = || -> anyhow::Result<DriveFetchDeps<'_, _>> {
             Ok(DriveFetchDeps {
+                timings: None,
                 endpoint: &ep,
                 store: &store,
                 contract: &contract,
@@ -5004,16 +5612,16 @@ mod tests {
     }
 
     /// A multi-source lane settles at its ARMED cumulative, never at `committed`.
-    /// A tail steal drops the victim's `fill_gap` future wherever it is parked —
-    /// including inside the voucher exchange `issue` deliberately arms before
-    /// sending — and that is a routine event on a SUCCESSFUL fetch. Settling that
+    /// A cancelled or stalled leg drops its `fill_gap` future wherever it is
+    /// parked — including inside the voucher exchange `issue` deliberately arms
+    /// before sending — and that can happen on a SUCCESSFUL fetch. Settling that
     /// lane low persists a cumulative below what the node can redeem, and the next
     /// fetch on the lane signs a value the upstream already holds: rejected as a
     /// regression.
     #[test]
     fn multi_lane_watermarks_settle_high_even_when_the_fetch_succeeded() {
         let signer = Address::repeat_byte(0x5E);
-        // The armed cumulative sits ABOVE what was acked — the steal-cancelled
+        // The armed cumulative sits ABOVE what was acked — the dropped-leg
         // shape. Settling at `committed` would persist the lower one.
         let lanes = [lane_wm(1, 0xA1, 0, 300, 400)];
         let out = super::multi_lane_watermarks(signer, &lanes);
@@ -5959,6 +6567,7 @@ pub(crate) mod tests_support {
             probed_samples,
             pinned: false,
             size_hint: Some(128 * 1024 * 1024),
+            late: super::LateSlot::default(),
         };
         (targets, node_a, node_b)
     }
