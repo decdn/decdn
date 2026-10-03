@@ -31,7 +31,7 @@
 
     # The binaries come from pinned GitHub Releases. Each release is pinned by
     # tag and by the SHA-256 of its SHA256SUMS file.
-    $Releases = 'https://github.com/decdn'
+    $Releases = '{{RELEASES_BASE}}'
     $DecdnRelease = '{{DECDN_RELEASE}}'
     $DecdnSumsSha256 = '{{DECDN_SUMS_SHA256}}'
     $CliRelease = '{{CLI_RELEASE}}'

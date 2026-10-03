@@ -15,7 +15,7 @@ const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(10);
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let cfg = OnrampConfig::from_env()?;
+    let cfg = OnrampConfig::load()?;
     let http_client = reqwest::Client::builder()
         .timeout(OUTBOUND_TIMEOUT)
         .build()?;

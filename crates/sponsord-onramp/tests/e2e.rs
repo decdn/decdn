@@ -32,7 +32,7 @@ const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
 async fn stack() -> (Router, Arc<FakePool>) {
     let (sponsor, pool) = fake_sponsor(5_000_000, 172_800).await;
-    let daemon = sponsord::http::router(ApiState::new(Arc::new(sponsor), Arc::from(TOKEN)));
+    let daemon = sponsord::http::router(ApiState::new(Arc::new(sponsor), TOKEN.into()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, daemon).await.unwrap() });

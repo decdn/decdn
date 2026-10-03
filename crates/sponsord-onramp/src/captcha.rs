@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::Deserialize;
+use sponsord_api::secret::Secret;
 
 /// Abstraction over "verify a captcha token" so the HTTP layer can inject a
 /// fake in tests instead of calling out to Cloudflare. `Turnstile` is the
@@ -10,7 +11,7 @@ pub trait CaptchaVerifier: Send + Sync {
 }
 
 pub struct Turnstile {
-    secret: String,
+    secret: Secret,
     http: reqwest::Client,
     endpoint: String,
 }
@@ -21,7 +22,7 @@ struct SiteVerify {
 }
 
 impl Turnstile {
-    pub fn new(secret: String, http: reqwest::Client) -> Self {
+    pub fn new(secret: Secret, http: reqwest::Client) -> Self {
         Self {
             secret,
             http,
@@ -29,7 +30,7 @@ impl Turnstile {
         }
     }
 
-    pub fn with_endpoint(secret: String, http: reqwest::Client, endpoint: String) -> Self {
+    pub fn with_endpoint(secret: Secret, http: reqwest::Client, endpoint: String) -> Self {
         Self {
             secret,
             http,
@@ -38,7 +39,7 @@ impl Turnstile {
     }
 
     pub async fn verify(&self, token: &str, remote_ip: Option<&str>) -> anyhow::Result<bool> {
-        let mut form = vec![("secret", self.secret.as_str()), ("response", token)];
+        let mut form = vec![("secret", self.secret.expose()), ("response", token)];
         if let Some(ip) = remote_ip {
             form.push(("remoteip", ip));
         }

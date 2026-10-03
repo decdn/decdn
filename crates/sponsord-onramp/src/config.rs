@@ -1,20 +1,12 @@
-use std::{net::SocketAddr, path::PathBuf, str::FromStr};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use alloy::primitives::Address;
+use clap::{ArgGroup, Parser};
+use sponsord_api::secret::Secret;
 
 use sponsord_api::MicroUsdc;
 use sponsord_api::daemon::Info;
-
-fn env(k: &str) -> anyhow::Result<String> {
-    std::env::var(k).map_err(|_| anyhow::anyhow!("missing env {k}"))
-}
-
-fn env_opt_u64(k: &str) -> anyhow::Result<Option<u64>> {
-    match std::env::var(k) {
-        Ok(v) => v.parse().map(Some).map_err(|e| anyhow::anyhow!("{k}: {e}")),
-        Err(_) => Ok(None),
-    }
-}
 
 /// A GitHub Release the installers download binaries from, pinned by its tag
 /// and by the SHA-256 of its `SHA256SUMS` file. The installer checks the
@@ -53,11 +45,6 @@ impl ReleasePin {
             sums_sha256: sums_sha256.to_owned(),
         })
     }
-
-    fn from_env(tag_var: &str, sums_var: &str) -> anyhow::Result<Self> {
-        Self::new(&env(tag_var)?, &env(sums_var)?)
-            .map_err(|e| anyhow::anyhow!("{tag_var}/{sums_var}: {e}"))
-    }
 }
 
 fn is_release_tag(tag: &str) -> bool {
@@ -80,22 +67,110 @@ fn is_release_tag(tag: &str) -> bool {
         })
 }
 
+/// sponsord-onramp: the public onramp in front of a sponsord daemon. Serves
+/// the installers, the gate page, and the API decdn-sponsored polls.
+#[derive(Debug, Parser)]
+#[command(name = "sponsord-onramp", version)]
+#[command(group(ArgGroup::new("daemon_token_src").required(true).args(["daemon_token", "daemon_token_file"])))]
+#[command(group(ArgGroup::new("turnstile_secret_src").required(true).args(["turnstile_secret", "turnstile_secret_file"])))]
+pub struct Args {
+    /// Address the HTTP server listens on.
+    #[arg(long, env = "ONRAMP_BIND", default_value = "127.0.0.1:8080")]
+    pub bind: SocketAddr,
+    /// This onramp's public base URL, as users reach it; baked into the
+    /// installers and the gate links.
+    #[arg(long, env = "ONRAMP_PUBLIC_URL")]
+    pub public_url: String,
+
+    /// Base URL of the sponsord daemon.
+    #[arg(
+        long,
+        env = "ONRAMP_DAEMON_URL",
+        default_value = "http://127.0.0.1:8090"
+    )]
+    pub daemon_url: String,
+    /// The daemon's bearer token (its `SPONSORD_API_TOKEN`).
+    #[arg(long, env = "ONRAMP_DAEMON_TOKEN", hide_env_values = true)]
+    pub daemon_token: Option<String>,
+    /// File holding the daemon token, instead of `--daemon-token`.
+    #[arg(long, env = "ONRAMP_DAEMON_TOKEN_FILE")]
+    pub daemon_token_file: Option<PathBuf>,
+
+    /// Public JSON-RPC endpoint end users' `decdn` reads the chain through.
+    #[arg(long, env = "ONRAMP_RPC_URL")]
+    pub rpc_url: String,
+    /// `CapacityBond` contract address, for node discovery.
+    #[arg(long, env = "ONRAMP_CAPACITY_BOND_ADDR")]
+    pub capacity_bond: Address,
+
+    /// Cap requested for each capability, in micro-USDC; unset takes the
+    /// daemon's maximum.
+    #[arg(long, env = "ONRAMP_SPENDING_CAP_MICRO_USDC")]
+    pub spending_cap: Option<MicroUsdc>,
+    /// TTL requested for each capability, in seconds; unset takes the
+    /// daemon's maximum.
+    #[arg(long, env = "ONRAMP_TTL_SECS")]
+    pub ttl_secs: Option<u64>,
+
+    /// Cloudflare Turnstile server-side secret.
+    #[arg(long, env = "ONRAMP_TURNSTILE_SECRET", hide_env_values = true)]
+    pub turnstile_secret: Option<String>,
+    /// File holding the Turnstile secret, instead of `--turnstile-secret`.
+    #[arg(long, env = "ONRAMP_TURNSTILE_SECRET_FILE")]
+    pub turnstile_secret_file: Option<PathBuf>,
+    /// Cloudflare Turnstile sitekey, shown in the gate page.
+    #[arg(long, env = "ONRAMP_TURNSTILE_SITEKEY")]
+    pub turnstile_sitekey: String,
+
+    /// Directory for the grant store.
+    #[arg(long, env = "ONRAMP_DATA_DIR", default_value = "./data")]
+    pub data_dir: PathBuf,
+
+    /// Where the installers download release binaries from:
+    /// `<base>/<repo>/releases/download/<tag>/`.
+    #[arg(
+        long,
+        env = "ONRAMP_RELEASES_BASE",
+        default_value = "https://github.com/decdn"
+    )]
+    pub releases_base: String,
+    /// `decdn/decdn` release tag the installers install `decdn` from
+    /// (`vMAJOR.MINOR.PATCH[-pre]`).
+    #[arg(long, env = "ONRAMP_DECDN_RELEASE")]
+    pub decdn_release: String,
+    /// SHA-256 of that release's `SHA256SUMS` file.
+    #[arg(long, env = "ONRAMP_DECDN_SUMS_SHA256")]
+    pub decdn_sums_sha256: String,
+    /// `decdn/sponsord` release tag the installers install `decdn-sponsored`
+    /// from.
+    #[arg(long, env = "ONRAMP_CLI_RELEASE")]
+    pub cli_release: String,
+    /// SHA-256 of that release's `SHA256SUMS` file (printed in its release
+    /// notes).
+    #[arg(long, env = "ONRAMP_CLI_SUMS_SHA256")]
+    pub cli_sums_sha256: String,
+}
+
+/// Resolved configuration.
+#[derive(Debug)]
 pub struct OnrampConfig {
     pub bind: SocketAddr,
     /// This onramp's own public base URL, baked into the installers.
     pub public_url: String,
     pub daemon_url: String,
-    pub daemon_token: String,
-    /// Public RPC URL baked into the installers for end users.
+    pub daemon_token: Secret,
+    /// Public RPC URL handed to end users.
     pub rpc_url: String,
     pub capacity_bond: Address,
     /// Cap requested for each capability; `None` takes the daemon maximum.
     pub spending_cap: Option<MicroUsdc>,
     /// TTL requested for each capability; `None` takes the daemon maximum.
     pub ttl_secs: Option<u64>,
-    pub turnstile_secret: String,
+    pub turnstile_secret: Secret,
     pub turnstile_sitekey: String,
     pub data_dir: PathBuf,
+    /// Base URL of the release downloads, without a trailing `/`.
+    pub releases_base: String,
     /// The `decdn/decdn` release the installers install `decdn` from.
     pub decdn_release: ReleasePin,
     /// The `decdn/sponsord` release the installers install `decdn-sponsored`
@@ -104,35 +179,60 @@ pub struct OnrampConfig {
 }
 
 impl OnrampConfig {
+    /// Parse the command line and environment.
+    ///
     /// # Errors
     ///
-    /// A required variable is missing or malformed.
-    pub fn from_env() -> anyhow::Result<Self> {
+    /// See [`OnrampConfig::from_args`].
+    pub fn load() -> anyhow::Result<Self> {
+        Self::from_args(Args::parse())
+    }
+
+    /// # Errors
+    ///
+    /// A secret file cannot be read, a URL is malformed or carries
+    /// characters the installer scripts can't hold, the sitekey isn't a
+    /// plain token, or a release pin is malformed.
+    pub fn from_args(args: Args) -> anyhow::Result<Self> {
+        let releases_base = base_url("ONRAMP_RELEASES_BASE", &args.releases_base)?;
+        anyhow::ensure!(
+            releases_base.starts_with("https://"),
+            "ONRAMP_RELEASES_BASE must be an https URL"
+        );
+        anyhow::ensure!(
+            !args.turnstile_sitekey.is_empty()
+                && args
+                    .turnstile_sitekey
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+            "ONRAMP_TURNSTILE_SITEKEY must be letters, digits, '_' and '-'"
+        );
         Ok(Self {
-            bind: SocketAddr::from_str(
-                &std::env::var("ONRAMP_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into()),
-            )
-            .map_err(|e| anyhow::anyhow!("ONRAMP_BIND: {e}"))?,
-            public_url: std::env::var("ONRAMP_PUBLIC_URL")
-                .unwrap_or_else(|_| "https://up.decdn.org".into()),
-            daemon_url: std::env::var("ONRAMP_DAEMON_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
-            daemon_token: env("ONRAMP_DAEMON_TOKEN")?,
-            rpc_url: env("ONRAMP_RPC_URL")?,
-            capacity_bond: Address::from_str(&env("ONRAMP_CAPACITY_BOND_ADDR")?)
-                .map_err(|e| anyhow::anyhow!("ONRAMP_CAPACITY_BOND_ADDR: {e}"))?,
-            spending_cap: env_opt_u64("ONRAMP_SPENDING_CAP_MICRO_USDC")?.map(MicroUsdc),
-            ttl_secs: env_opt_u64("ONRAMP_TTL_SECS")?,
-            turnstile_secret: env("ONRAMP_TURNSTILE_SECRET")?,
-            turnstile_sitekey: env("ONRAMP_TURNSTILE_SITEKEY")?,
-            data_dir: PathBuf::from(
-                std::env::var("ONRAMP_DATA_DIR").unwrap_or_else(|_| "./data".into()),
-            ),
-            decdn_release: ReleasePin::from_env(
-                "ONRAMP_DECDN_RELEASE",
-                "ONRAMP_DECDN_SUMS_SHA256",
+            bind: args.bind,
+            public_url: base_url("ONRAMP_PUBLIC_URL", &args.public_url)?,
+            daemon_url: args.daemon_url,
+            daemon_token: Secret::resolve(
+                "ONRAMP_DAEMON_TOKEN",
+                args.daemon_token,
+                args.daemon_token_file.as_deref(),
             )?,
-            cli_release: ReleasePin::from_env("ONRAMP_CLI_RELEASE", "ONRAMP_CLI_SUMS_SHA256")?,
+            rpc_url: script_safe_url("ONRAMP_RPC_URL", &args.rpc_url)?,
+            capacity_bond: args.capacity_bond,
+            spending_cap: args.spending_cap,
+            ttl_secs: args.ttl_secs,
+            turnstile_secret: Secret::resolve(
+                "ONRAMP_TURNSTILE_SECRET",
+                args.turnstile_secret,
+                args.turnstile_secret_file.as_deref(),
+            )?,
+            turnstile_sitekey: args.turnstile_sitekey,
+            data_dir: args.data_dir,
+            releases_base,
+            decdn_release: ReleasePin::new(&args.decdn_release, &args.decdn_sums_sha256).map_err(
+                |e| anyhow::anyhow!("ONRAMP_DECDN_RELEASE/ONRAMP_DECDN_SUMS_SHA256: {e}"),
+            )?,
+            cli_release: ReleasePin::new(&args.cli_release, &args.cli_sums_sha256)
+                .map_err(|e| anyhow::anyhow!("ONRAMP_CLI_RELEASE/ONRAMP_CLI_SUMS_SHA256: {e}"))?,
         })
     }
 
@@ -149,6 +249,35 @@ impl OnrampConfig {
         )?;
         check_term("ONRAMP_TTL_SECS", self.ttl_secs, info.max_ttl_secs)
     }
+}
+
+/// `raw` as an http(s) URL without a trailing `/`, refusing anything the
+/// POSIX or PowerShell installer could misread inside a quoted string.
+fn script_safe_url(name: &str, raw: &str) -> anyhow::Result<String> {
+    let url = reqwest::Url::parse(raw).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "{name} must be an http or https URL"
+    );
+    let s = url.as_str().trim_end_matches('/').to_owned();
+    anyhow::ensure!(
+        !s.chars()
+            .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '`' | '$' | '\\' | '{' | '}')),
+        "{name} {s:?} holds a character the installers can't quote"
+    );
+    Ok(s)
+}
+
+/// A [`script_safe_url`] that paths are appended to (routes, release
+/// downloads), so it may carry neither a query nor a fragment: either would
+/// swallow everything appended after it.
+fn base_url(name: &str, raw: &str) -> anyhow::Result<String> {
+    let url = reqwest::Url::parse(raw).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    anyhow::ensure!(
+        url.query().is_none() && url.fragment().is_none(),
+        "{name} must be a base URL, without a query or fragment"
+    );
+    script_safe_url(name, raw)
 }
 
 fn check_term(name: &str, value: Option<u64>, max: u64) -> anyhow::Result<()> {
@@ -168,40 +297,88 @@ fn check_term(name: &str, value: Option<u64>, max: u64) -> anyhow::Result<()> {
 )]
 mod tests {
     use super::*;
-    use serial_test::serial;
+
+    /// The required flags, with `overrides` (`[flag, value]` pairs)
+    /// replacing or adding to them.
+    fn args(overrides: &[&str]) -> Result<Args, clap::Error> {
+        let ab = "ab".repeat(32);
+        let cd = "cd".repeat(32);
+        let mut flags: Vec<(&str, &str)> = vec![
+            ("--public-url", "https://up.example.org/"),
+            ("--daemon-token", "tok"),
+            ("--rpc-url", "https://rpc.example"),
+            (
+                "--capacity-bond",
+                "0x0000000000000000000000000000000000000002",
+            ),
+            ("--turnstile-secret", "s"),
+            ("--turnstile-sitekey", "0x4AAA-key_1"),
+            ("--decdn-release", "v0.1.0"),
+            ("--decdn-sums-sha256", &ab),
+            ("--cli-release", "v0.2.0-rc.1"),
+            ("--cli-sums-sha256", &cd),
+        ];
+        for pair in overrides.chunks(2) {
+            let (flag, value) = (pair[0], pair[1]);
+            flags.retain(|(f, _)| *f != flag);
+            flags.push((flag, value));
+        }
+        let argv =
+            std::iter::once("sponsord-onramp").chain(flags.iter().flat_map(|(f, v)| [*f, *v]));
+        Args::try_parse_from(argv)
+    }
 
     #[test]
-    #[serial]
-    fn from_env_reads_required_and_defaults() {
-        unsafe {
-            std::env::set_var("ONRAMP_DAEMON_TOKEN", "t".repeat(32));
-            std::env::set_var("ONRAMP_RPC_URL", "https://rpc.example");
-            std::env::set_var(
-                "ONRAMP_CAPACITY_BOND_ADDR",
-                "0x0000000000000000000000000000000000000002",
-            );
-            std::env::set_var("ONRAMP_TURNSTILE_SECRET", "s");
-            std::env::set_var("ONRAMP_TURNSTILE_SITEKEY", "k");
-            std::env::set_var("ONRAMP_DECDN_RELEASE", "v0.1.0");
-            std::env::set_var("ONRAMP_DECDN_SUMS_SHA256", "ab".repeat(32));
-            std::env::set_var("ONRAMP_CLI_RELEASE", "v0.2.0-rc.1");
-            std::env::set_var("ONRAMP_CLI_SUMS_SHA256", "cd".repeat(32));
-            for k in [
-                "ONRAMP_BIND",
-                "ONRAMP_DAEMON_URL",
-                "ONRAMP_SPENDING_CAP_MICRO_USDC",
-                "ONRAMP_TTL_SECS",
-            ] {
-                std::env::remove_var(k);
-            }
-        }
-        let cfg = OnrampConfig::from_env().unwrap();
+    fn reads_required_and_defaults() {
+        let cfg = OnrampConfig::from_args(args(&[]).unwrap()).unwrap();
         assert_eq!(cfg.bind, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(cfg.public_url, "https://up.example.org");
         assert_eq!(cfg.daemon_url, "http://127.0.0.1:8090");
+        assert_eq!(cfg.releases_base, "https://github.com/decdn");
         assert_eq!(cfg.spending_cap, None);
         assert_eq!(cfg.ttl_secs, None);
         assert_eq!(cfg.decdn_release.tag, "v0.1.0");
         assert_eq!(cfg.cli_release.tag, "v0.2.0-rc.1");
+        assert!(!format!("{cfg:?}").contains("\"tok\""));
+    }
+
+    #[test]
+    fn public_url_is_required() {
+        let argv: Vec<String> = std::iter::once("sponsord-onramp".to_owned()).collect();
+        assert!(Args::try_parse_from(argv).is_err());
+    }
+
+    #[test]
+    fn urls_the_installers_cant_quote_are_refused() {
+        for bad in [
+            "https://up.example.org/$(id)",
+            "https://up.example.org/'x",
+            "ftp://up.example.org",
+            "not a url",
+        ] {
+            let parsed = args(&["--public-url", bad]).unwrap();
+            assert!(OnrampConfig::from_args(parsed).is_err(), "{bad}");
+        }
+        let plain_http = args(&["--releases-base", "http://mirror.example"]).unwrap();
+        assert!(OnrampConfig::from_args(plain_http).is_err());
+        // Paths are appended to these two, so a query or fragment would
+        // swallow them; the RPC URL may keep its query (an API key).
+        for (flag, bad) in [
+            ("--public-url", "https://up.example.org/?x=1"),
+            ("--public-url", "https://up.example.org/#x"),
+            ("--releases-base", "https://mirror.example/?mirror=x"),
+        ] {
+            let parsed = args(&[flag, bad]).unwrap();
+            assert!(OnrampConfig::from_args(parsed).is_err(), "{flag} {bad}");
+        }
+        let keyed_rpc = args(&["--rpc-url", "https://rpc.example/v2?key=abc"]).unwrap();
+        assert!(OnrampConfig::from_args(keyed_rpc).is_ok());
+    }
+
+    #[test]
+    fn sitekey_must_be_a_plain_token() {
+        let parsed = args(&["--turnstile-sitekey", "<script>"]).unwrap();
+        assert!(OnrampConfig::from_args(parsed).is_err());
     }
 
     #[test]

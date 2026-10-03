@@ -19,7 +19,7 @@ const DECDN_SH_TEMPLATE: &str = include_str!("../../assets/decdn.sh");
 /// The PowerShell installer script, embedded at compile time.
 const DECDN_PS1_TEMPLATE: &str = include_str!("../../assets/decdn.ps1");
 
-/// Substitute config and daemon values for the `{{ONRAMP_URL}}`,
+/// Substitute config and daemon values for the `{{ONRAMP_URL}}`, `{{RELEASES_BASE}}`,
 /// `{{RPC_URL}}`, `{{PAYMENT_POOL}}`, `{{CAPACITY_BOND}}`, `{{CHAIN_ID}}`,
 /// and pinned release placeholders (`{{DECDN_RELEASE}}`,
 /// `{{DECDN_SUMS_SHA256}}`, `{{CLI_RELEASE}}`, `{{CLI_SUMS_SHA256}}`).
@@ -31,6 +31,7 @@ fn render(template: &str, cfg: &OnrampConfig, chain: &Info) -> String {
         .replace("{{DECDN_SUMS_SHA256}}", &cfg.decdn_release.sums_sha256)
         .replace("{{CLI_RELEASE}}", &cfg.cli_release.tag)
         .replace("{{CLI_SUMS_SHA256}}", &cfg.cli_release.sums_sha256)
+        .replace("{{RELEASES_BASE}}", &cfg.releases_base)
         .replace("{{ONRAMP_URL}}", &cfg.public_url)
         .replace("{{RPC_URL}}", &cfg.rpc_url)
         .replace("{{PAYMENT_POOL}}", &chain.payment_pool.to_string())

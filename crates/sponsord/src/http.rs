@@ -12,6 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use sponsord_api::daemon::{Health, Info, IssueRequest, IssueResponse, routes};
+use sponsord_api::secret::Secret;
 use sponsord_api::time::{Clock, SystemClock};
 use sponsord_api::{ErrorBody, ErrorCode};
 use sponsord_core::{Sponsor, SponsorError, TermsError, TermsRequest};
@@ -20,17 +21,18 @@ use subtle::ConstantTimeEq;
 #[derive(Clone)]
 pub struct ApiState {
     pub sponsor: Arc<Sponsor>,
-    pub api_token: Arc<str>,
+    /// Compared in constant time; held as a [`Secret`] so it is wiped on drop.
+    pub api_token: Arc<Secret>,
     pub clock: Arc<dyn Clock>,
 }
 
 impl ApiState {
     /// State on the system clock.
     #[must_use]
-    pub fn new(sponsor: Arc<Sponsor>, api_token: Arc<str>) -> Self {
+    pub fn new(sponsor: Arc<Sponsor>, api_token: Secret) -> Self {
         Self {
             sponsor,
-            api_token,
+            api_token: Arc::new(api_token),
             clock: Arc::new(SystemClock),
         }
     }
@@ -63,7 +65,7 @@ async fn require_token(State(state): State<ApiState>, req: Request, next: Next) 
         .and_then(|v| v.to_str().ok())
         .and_then(bearer_token);
     match presented {
-        Some(t) if bool::from(t.as_bytes().ct_eq(state.api_token.as_bytes())) => {
+        Some(t) if bool::from(t.as_bytes().ct_eq(state.api_token.expose().as_bytes())) => {
             next.run(req).await
         }
         _ => ErrorCode::Unauthorized.into_response(),

@@ -25,7 +25,7 @@ const SIGNER: &str = "0x00000000000000000000000000000000000000aa";
 
 async fn app() -> (Router, Arc<FakePool>) {
     let (sponsor, pool) = fake_sponsor(5_000_000, 172_800).await;
-    let app = router(ApiState::new(Arc::new(sponsor), Arc::from(TOKEN)));
+    let app = router(ApiState::new(Arc::new(sponsor), TOKEN.into()));
     (app, pool)
 }
 

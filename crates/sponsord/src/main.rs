@@ -9,21 +9,27 @@ use tokio_util::sync::CancellationToken;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let mut cfg = DaemonConfig::from_env()?;
-    // Moved, not cloned, into the loader: the password is dropped once the key
-    // is decrypted instead of living in `cfg` for the daemon's lifetime.
-    let keystore = std::mem::take(&mut cfg.treasury_keystore);
-    let password = std::mem::take(&mut cfg.treasury_password);
+    let DaemonConfig {
+        bind,
+        api_token,
+        treasury_keystore,
+        treasury_password,
+        chain,
+        limits,
+        keeper,
+    } = DaemonConfig::load()?;
+    // Moved, not cloned, into the loader: the password is dropped (and wiped)
+    // once the key is decrypted instead of living for the daemon's lifetime.
     let signer = tokio::task::spawn_blocking(move || {
-        decdn_incentive::eth_identity::load_signer(&keystore, &password)
+        decdn_incentive::eth_identity::load_signer(&treasury_keystore, treasury_password.expose())
     })
     .await??;
-    let sponsor = Arc::new(Sponsor::connect(signer, cfg.chain, cfg.limits).await?);
+    let sponsor = Arc::new(Sponsor::connect(signer, chain, limits).await?);
     let shutdown = CancellationToken::new();
-    tokio::spawn(sponsor.keeper(cfg.keeper, shutdown.clone()));
-    let app = http::router(ApiState::new(sponsor, Arc::from(cfg.api_token)));
-    let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
-    tracing::info!(bind = %cfg.bind, "sponsord listening");
+    tokio::spawn(sponsor.keeper(keeper, shutdown.clone()));
+    let app = http::router(ApiState::new(sponsor, api_token));
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    tracing::info!(%bind, "sponsord listening");
     axum::serve(listener, app).await?;
     Ok(())
 }

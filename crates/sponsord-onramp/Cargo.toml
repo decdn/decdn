@@ -10,7 +10,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-sponsord-api = { workspace = true, features = ["axum", "client"] }
+sponsord-api = { workspace = true, features = ["axum", "client", "secret"] }
+clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 alloy.workspace = true
@@ -25,7 +26,6 @@ axum = "0.8"
 
 [dev-dependencies]
 wiremock = "0.6"
-serial_test = "3"
 tower = { version = "0.5", features = ["util"] }
 # Used by `test_support.rs` (pulled into the integration-test binaries via
 # `#[path]`, not part of the shipped lib/bin) and by the store tests.

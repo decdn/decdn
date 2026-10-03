@@ -21,6 +21,8 @@ pub mod time;
 pub mod client;
 #[cfg(feature = "openapi")]
 pub mod openapi;
+#[cfg(feature = "secret")]
+pub mod secret;
 
 pub use error::{ErrorBody, ErrorCode};
 pub use money::MicroUsdc;

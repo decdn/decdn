@@ -9,6 +9,7 @@ use alloy_primitives::Address;
 use crate::daemon::{self, Info, IssueRequest, IssueResponse};
 use crate::error::{ErrorBody, ErrorCode};
 use crate::onramp::{self, CapabilityResponse, Profile};
+use crate::secret::Secret;
 
 /// Why a daemon call failed.
 #[derive(Debug, thiserror::Error)]
@@ -26,11 +27,12 @@ pub enum DaemonError {
     Unavailable(String),
 }
 
-/// Client for the daemon's bearer-token API. `Debug` leaves the token out.
+/// Client for the daemon's bearer-token API. The token is held as a
+/// [`Secret`]: `Debug` leaves it out, and it is wiped on drop.
 #[derive(Clone)]
 pub struct DaemonClient {
     base: String,
-    token: String,
+    token: Secret,
     http: reqwest::Client,
 }
 
@@ -47,7 +49,7 @@ impl DaemonClient {
     /// `base` is the daemon's base URL (a trailing `/` is fine); `token` its
     /// `SPONSORD_API_TOKEN`.
     #[must_use]
-    pub fn new(base: &str, token: String, http: reqwest::Client) -> Self {
+    pub fn new(base: &str, token: Secret, http: reqwest::Client) -> Self {
         Self {
             base: base.trim_end_matches('/').to_owned(),
             token,
@@ -70,7 +72,7 @@ impl DaemonClient {
         let resp = self
             .http
             .post(format!("{}{}", self.base, daemon::routes::CAPABILITIES))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.expose())
             .json(req)
             .send()
             .await
@@ -87,7 +89,7 @@ impl DaemonClient {
         let resp = self
             .http
             .get(format!("{}{}", self.base, daemon::routes::INFO))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.expose())
             .send()
             .await
             .map_err(unavailable)?;

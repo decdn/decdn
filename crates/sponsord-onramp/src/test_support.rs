@@ -38,7 +38,7 @@ pub fn test_config(data_dir: PathBuf) -> OnrampConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
         public_url: "https://up.decdn.org".into(),
         daemon_url: "http://127.0.0.1:8090".into(),
-        daemon_token: "t".repeat(32),
+        daemon_token: "t".repeat(32).as_str().into(),
         rpc_url: "https://rpc.example".into(),
         capacity_bond: Address::ZERO,
         spending_cap: None,
@@ -46,6 +46,7 @@ pub fn test_config(data_dir: PathBuf) -> OnrampConfig {
         turnstile_secret: "secret".into(),
         turnstile_sitekey: "TEST_SITEKEY".into(),
         data_dir,
+        releases_base: "https://github.com/decdn".into(),
         decdn_release: ReleasePin {
             tag: "v0.1.0".into(),
             sums_sha256: "ab".repeat(32),

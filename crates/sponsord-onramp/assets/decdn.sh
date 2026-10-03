@@ -18,7 +18,7 @@ CHAIN_ID="{{CHAIN_ID}}"
 
 # The binaries come from pinned GitHub Releases. Each release is pinned by tag
 # and by the SHA-256 of its SHA256SUMS file.
-RELEASES="https://github.com/decdn"
+RELEASES="{{RELEASES_BASE}}"
 DECDN_RELEASE="{{DECDN_RELEASE}}"
 DECDN_SUMS_SHA256="{{DECDN_SUMS_SHA256}}"
 CLI_RELEASE="{{CLI_RELEASE}}"
