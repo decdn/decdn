@@ -48,7 +48,7 @@ const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct HttpOrigin {
     client: reqwest::Client,
     /// The runtime every request send runs on, so the client's pooled
-    /// keep-alive connections live there and not on a caller's per-serve
+    /// keep-alive connections live there and not on a caller's pull-leg
     /// runtime. See [`super::io_runtime`].
     io: IoRuntime,
     base_url: OriginUrl,
@@ -74,7 +74,12 @@ impl HttpOrigin {
     ///
     /// The origin's connections live on the tokio runtime this is called
     /// on, so call it on a runtime that outlives every fetch (the node's
-    /// main runtime). It fails outside a runtime.
+    /// main runtime).
+    ///
+    /// # Errors
+    ///
+    /// Fails outside a tokio runtime, or when the reqwest client cannot be
+    /// built.
     pub fn new(base_url: OriginUrl) -> anyhow::Result<Self> {
         Self::new_with_user_agent(base_url, DEFAULT_USER_AGENT)
     }
@@ -85,6 +90,11 @@ impl HttpOrigin {
     /// `user_agent` must be a valid header value (visible-ASCII; `reqwest`
     /// rejects others at build time and the error is surfaced as a
     /// startup failure).
+    ///
+    /// # Errors
+    ///
+    /// Fails outside a tokio runtime, or when the reqwest client cannot be
+    /// built (an invalid `user_agent`).
     pub fn new_with_user_agent(base_url: OriginUrl, user_agent: &str) -> anyhow::Result<Self> {
         // We want to inspect `Content-Encoding` and run the body through
         // our own decoders, so disable reqwest's built-in transparent
@@ -106,7 +116,7 @@ impl HttpOrigin {
         // reqwest's idle keep-alive pool is safe to share across callers:
         // `send` runs every request on `io`, so each pooled connection lives
         // on the runtime that built this origin, never on a caller's
-        // per-serve runtime (`super::io_runtime`).
+        // pull-leg runtime (`super::io_runtime`).
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(user_agent)
@@ -494,8 +504,9 @@ impl HttpOrigin {
     /// headers timeout covers the whole send — request write through
     /// response-header receipt, plus a connect when no idle connection is
     /// pooled — and bounds a server that accepts the connection but never
-    /// writes back. It runs inside the spawned task, so it also bounds that
-    /// task.
+    /// writes back. The deadline runs on the caller's runtime, so it also
+    /// fires when `io` stops polling the send; dropping the send then aborts
+    /// the spawned task.
     ///
     /// # Errors
     ///
@@ -508,19 +519,18 @@ impl HttpOrigin {
         what: &str,
     ) -> Result<reqwest::Response, OriginPullError> {
         let headers_timeout = self.response_headers_timeout;
-        let sent = self
-            .io
-            .run(tokio::time::timeout(headers_timeout, req.send()))
+        let sent = tokio::time::timeout(headers_timeout, self.io.run(req.send()))
             .await
+            .map_err(|_elapsed| {
+                OriginPullError::Transient(anyhow::anyhow!(
+                    "origin {what} headers timed out after {headers_timeout:?}"
+                ))
+            })?
             .map_err(|e| e.map_inner(|e| e.context(format!("origin {what} failed"))))?;
-        match sent {
-            Err(_elapsed) => Err(OriginPullError::Transient(anyhow::anyhow!(
-                "origin {what} headers timed out after {headers_timeout:?}"
-            ))),
-            Ok(Err(reqwest_err)) => Err(classify_reqwest_error(reqwest_err)
-                .map_inner(|e| e.context(format!("origin {what} failed")))),
-            Ok(Ok(resp)) => Ok(resp),
-        }
+        sent.map_err(|reqwest_err| {
+            classify_reqwest_error(reqwest_err)
+                .map_inner(|e| e.context(format!("origin {what} failed")))
+        })
     }
 
     /// GET `url` and buffer the whole body, capped at `max_bytes`, as an

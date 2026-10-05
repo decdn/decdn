@@ -939,9 +939,12 @@ since project inception and will roll into the first tagged release.
   `S3Origin` kept its pool and was still exposed. Both origins now capture the
   runtime they are built on, which is the node's main runtime, and run every
   request send there. Each pooled connection outlives the pull leg that opened
-  it, and `HttpOrigin` reuses keep-alive connections. `HttpOrigin::new`,
-  `HttpOrigin::parse` and `S3Origin::from_parts` fail outside a tokio
-  runtime, and `S3Origin::from_parts` returns `anyhow::Result<Self>`.
+  it, and `HttpOrigin` reuses keep-alive connections. A request task that
+  panics, or that the shutting-down main runtime cancels, fails as a
+  permanent origin fault. `HttpOrigin::new`,
+  `HttpOrigin::new_with_user_agent`, `HttpOrigin::parse` and
+  `S3Origin::from_parts` fail outside a tokio runtime, and
+  `S3Origin::from_parts` returns `anyhow::Result<Self>`.
 - **The deployment preflight rejects every sibling contract of the
   `PaymentPool` (#2279).** Startup identified `blockchain.payment_pool_address`
   by calling `usdc()`, which `FeeRouter` and `BuybackBurner` also answer. A

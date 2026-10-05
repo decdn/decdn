@@ -192,7 +192,7 @@ pub struct S3Origin {
     client: Client,
     /// The runtime every SDK request send runs on, so the HTTP client's
     /// pooled keep-alive connections live there and not on a caller's
-    /// per-serve runtime. See [`super::io_runtime`].
+    /// pull-leg runtime. See [`super::io_runtime`].
     io: IoRuntime,
     /// Operator-configured bucket. `Arc<str>` so cheap clone preserves
     /// shared ownership for log fields without re-allocating.
@@ -255,7 +255,7 @@ impl S3Origin {
         // shared connection pool keeps idle TLS connections warm across
         // back-to-back cache misses. Every send runs on `io`, so each pooled
         // connection lives on the runtime that built this origin, never on a
-        // caller's per-serve runtime (`super::io_runtime`).
+        // caller's pull-leg runtime (`super::io_runtime`).
         let http_client = HttpBuilder::new()
             .tls_provider(tls::Provider::Rustls(
                 tls::rustls_provider::CryptoMode::AwsLc,
@@ -317,19 +317,24 @@ impl S3Origin {
         Self::from_parts(client, cfg.bucket.as_str(), cfg.prefix.as_str())
     }
 
-    /// Test-only constructor that skips `aws_config::defaults` and takes a
-    /// pre-built `Client`. Used by `tests/s3_origin.rs` to drive the
-    /// backend through `aws_smithy_mocks::mock_client!`-produced clients,
-    /// which can't be obtained via `aws_config::defaults`.
+    /// Assemble an origin from a pre-built `Client`, skipping
+    /// `aws_config::defaults`. [`Self::new`] builds its client and then calls
+    /// this. `tests/s3_origin.rs` calls it to inject
+    /// `aws_smithy_mocks::mock_client!`-produced clients, which can't be
+    /// obtained via `aws_config::defaults`.
     ///
     /// `pub` rather than `pub(crate)` because the integration tests live
     /// outside the crate. `#[doc(hidden)]` excludes the function from
     /// generated rustdoc only — it is technically callable by downstream
-    /// crates and is part of the semver surface by convention. Non-test
+    /// crates and is part of the semver surface by convention. Other
     /// callers use [`Self::new`].
     ///
     /// The origin's connections live on the tokio runtime this is called
-    /// on; it fails outside a runtime.
+    /// on.
+    ///
+    /// # Errors
+    ///
+    /// Fails outside a tokio runtime.
     #[doc(hidden)]
     pub fn from_parts(client: Client, bucket: &str, prefix: &str) -> anyhow::Result<Self> {
         Ok(Self {
@@ -624,7 +629,7 @@ impl Origin for S3Origin {
                         .send(),
                 )
                 .await
-                .map_err(|e| e.map_inner(|e| e.context(log_target.clone())))?
+                .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 GetObject"))))?
             {
                 Ok(r) => r,
                 Err(e) => return classify_get_object_error(e, &log_target),
@@ -780,7 +785,7 @@ impl Origin for S3Origin {
                         .send(),
                 )
                 .await
-                .map_err(|e| e.map_inner(|e| e.context(log_target.clone())))?
+                .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 GetObject"))))?
             {
                 Ok(r) => r,
                 // Reuse the headers-phase classifier. A `NotFound` here is the
@@ -850,7 +855,7 @@ impl Origin for S3Origin {
                         .send(),
                 )
                 .await
-                .map_err(|e| e.map_inner(|e| e.context(log_target.clone())))?
+                .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 GetObject"))))?
             {
                 Ok(r) => r,
                 Err(e) => match classify_get_object_error(e, &log_target)? {
@@ -898,7 +903,7 @@ impl Origin for S3Origin {
                         .send(),
                 )
                 .await
-                .map_err(|e| e.map_inner(|e| e.context(log_target.clone())))?
+                .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 HeadObject"))))?
             {
                 Ok(r) => r,
                 Err(e) => return classify_head_object_error(e, &log_target),
