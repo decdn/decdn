@@ -96,7 +96,7 @@ impl utoipa::Modify for BearerAuth {
     request_body = IssueRequest,
     security(("bearer" = [])),
     responses(
-        (status = 200, body = IssueResponse),
+        (status = 200, description = "The signed capability", body = IssueResponse),
         (status = 400, description = "`bad_request`, `exceeds_max` or `zero`", body = ErrorBody),
         (status = 401, description = "`unauthorized`", body = ErrorBody),
         (status = 409, description = "`signer_expired`", body = ErrorBody),
@@ -112,21 +112,21 @@ fn issue() {}
     path = "/v1/info",
     security(("bearer" = [])),
     responses(
-        (status = 200, body = Info),
+        (status = 200, description = "Chain, pool and maximum terms", body = Info),
         (status = 401, description = "`unauthorized`", body = ErrorBody),
     ),
 )]
 fn info() {}
 
 /// Liveness.
-#[utoipa::path(get, path = "/healthz", responses((status = 200, body = Health)))]
+#[utoipa::path(get, path = "/healthz", responses((status = 200, description = "Up", body = Health)))]
 fn daemon_healthz() {}
 
 /// Prometheus metrics (text exposition format).
 #[utoipa::path(
     get,
     path = "/metrics",
-    responses((status = 200, content_type = "text/plain; version=0.0.4", body = String)),
+    responses((status = 200, description = "Prometheus metrics", content_type = "text/plain; version=0.0.4", body = String)),
 )]
 fn metrics() {}
 
@@ -137,7 +137,7 @@ fn metrics() {}
     path = "/fund",
     params(ClientQuery),
     responses(
-        (status = 200, content_type = "text/html", body = String),
+        (status = 200, description = "The gate page", content_type = "text/html", body = String),
         (status = 400, description = "`bad_request`", body = ErrorBody),
     ),
 )]
@@ -150,7 +150,7 @@ fn fund_page() {}
     path = "/v1/fund",
     request_body = FundRequest,
     responses(
-        (status = 200, body = CapabilityResponse),
+        (status = 200, description = "The capability", body = CapabilityResponse),
         (status = 400, description = "`bad_request`", body = ErrorBody),
         (status = 403, description = "`gate_failed`", body = ErrorBody),
         (status = 409, description = "`signer_expired`: use a new key", body = ErrorBody),
@@ -167,7 +167,7 @@ fn fund() {}
     path = "/v1/capability",
     params(ClientQuery),
     responses(
-        (status = 200, body = CapabilityResponse),
+        (status = 200, description = "The capability", body = CapabilityResponse),
         (status = 204, description = "No capability issued yet"),
         (status = 400, description = "`bad_request`", body = ErrorBody),
         (status = 429, description = "`rate_limited`", body = ErrorBody),
@@ -176,14 +176,14 @@ fn fund() {}
 fn capability() {}
 
 /// What `decdn-sponsored` needs to run `decdn` against this onramp's pool.
-#[utoipa::path(get, path = "/v1/profile", responses((status = 200, body = Profile)))]
+#[utoipa::path(get, path = "/v1/profile", responses((status = 200, description = "The download profile", body = Profile)))]
 fn profile() {}
 
 /// The macOS/Linux installer: `curl -fsSL <onramp>/decdn.sh | sh`.
 #[utoipa::path(
     get,
     path = "/decdn.sh",
-    responses((status = 200, content_type = "text/x-shellscript", body = String)),
+    responses((status = 200, description = "The installer script", content_type = "text/x-shellscript", body = String)),
 )]
 fn install_sh() {}
 
@@ -191,10 +191,10 @@ fn install_sh() {}
 #[utoipa::path(
     get,
     path = "/decdn.ps1",
-    responses((status = 200, content_type = "text/plain", body = String)),
+    responses((status = 200, description = "The installer script", content_type = "text/plain", body = String)),
 )]
 fn install_ps1() {}
 
 /// Liveness.
-#[utoipa::path(get, path = "/healthz", responses((status = 200, body = Health)))]
+#[utoipa::path(get, path = "/healthz", responses((status = 200, description = "Up", body = Health)))]
 fn onramp_healthz() {}

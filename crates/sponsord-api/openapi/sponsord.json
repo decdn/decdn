@@ -16,7 +16,7 @@
         "operationId": "daemon_healthz",
         "responses": {
           "200": {
-            "description": "",
+            "description": "Up",
             "content": {
               "application/json": {
                 "schema": {
@@ -35,7 +35,7 @@
         "operationId": "metrics",
         "responses": {
           "200": {
-            "description": "",
+            "description": "Prometheus metrics",
             "content": {
               "text/plain; version=0.0.4": {
                 "schema": {
@@ -64,7 +64,7 @@
         },
         "responses": {
           "200": {
-            "description": "",
+            "description": "The signed capability",
             "content": {
               "application/json": {
                 "schema": {
@@ -138,7 +138,7 @@
         "operationId": "info",
         "responses": {
           "200": {
-            "description": "",
+            "description": "Chain, pool and maximum terms",
             "content": {
               "application/json": {
                 "schema": {
@@ -190,11 +190,11 @@
           "max_spending_cap": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/MicroUsdc",
                 "description": "With `exceeds_max`."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -282,10 +282,10 @@
           "spending_cap": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/MicroUsdc"
               },
               {
-                "$ref": "#/components/schemas/MicroUsdc"
+                "type": "null"
               }
             ]
           },

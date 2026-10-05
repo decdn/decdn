@@ -16,7 +16,7 @@
         "operationId": "install_ps1",
         "responses": {
           "200": {
-            "description": "",
+            "description": "The installer script",
             "content": {
               "text/plain": {
                 "schema": {
@@ -35,7 +35,7 @@
         "operationId": "install_sh",
         "responses": {
           "200": {
-            "description": "",
+            "description": "The installer script",
             "content": {
               "text/x-shellscript": {
                 "schema": {
@@ -65,7 +65,7 @@
         ],
         "responses": {
           "200": {
-            "description": "",
+            "description": "The gate page",
             "content": {
               "text/html": {
                 "schema": {
@@ -94,7 +94,7 @@
         "operationId": "onramp_healthz",
         "responses": {
           "200": {
-            "description": "",
+            "description": "Up",
             "content": {
               "application/json": {
                 "schema": {
@@ -124,7 +124,7 @@
         ],
         "responses": {
           "200": {
-            "description": "",
+            "description": "The capability",
             "content": {
               "application/json": {
                 "schema": {
@@ -176,7 +176,7 @@
         },
         "responses": {
           "200": {
-            "description": "",
+            "description": "The capability",
             "content": {
               "application/json": {
                 "schema": {
@@ -255,7 +255,7 @@
         "operationId": "profile",
         "responses": {
           "200": {
-            "description": "",
+            "description": "The download profile",
             "content": {
               "application/json": {
                 "schema": {
@@ -305,11 +305,11 @@
           "max_spending_cap": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/MicroUsdc",
                 "description": "With `exceeds_max`."
+              },
+              {
+                "type": "null"
               }
             ]
           },
