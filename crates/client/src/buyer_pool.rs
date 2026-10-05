@@ -277,8 +277,8 @@ pub fn self_owned_lane_ctx(
 /// `amount`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressWrite {
-    /// The lane's ledger rebased DOWN to the upstream's authenticated watermark
-    /// `anchor` (`PoolLedger::rebase`), and no write has recorded it yet. The
+    /// The lane's ledger rebased to the upstream's authenticated watermark
+    /// `anchor`, behind the record on `amount` (`PoolLedger::rebase`), and no write has recorded it yet. The
     /// record is overwritten with `anchor` and then advanced to `totals`. A
     /// monotone advance refuses a lower total, and the next reuse would then sign
     /// from the anchor the upstream already refused.

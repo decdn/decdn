@@ -234,8 +234,9 @@ mod tests {
     }
 
     /// A watermark rejection that no heal took ends the command, as ADR 005
-    /// says: a `BytesRegression` is a single-signer fault, and an `Underpaid`
-    /// or a trailing proof that no bundle heals has nothing to retry from.
+    /// says: a `BytesRegression` with no bundle is a single-signer fault, and
+    /// an `Underpaid` or a trailing proof that no bundle heals has nothing to
+    /// retry from.
     #[test]
     fn a_rejection_no_heal_took_ends_the_command() {
         for reason in [

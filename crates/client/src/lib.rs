@@ -538,8 +538,8 @@ pub struct VoucherProgress {
     amount: U256,
     /// Whether the watermark moved past the lane's seed on this stream.
     advanced: bool,
-    /// The node's watermark the lane's ledger rebased DOWN to
-    /// ([`PoolLedger::rebase`]) and no persist has recorded yet. The caller
+    /// The node's watermark the lane's ledger rebased to, behind it on
+    /// `amount` ([`PoolLedger::rebase`]), and no persist has recorded yet. The caller
     /// overwrites the lane record with it once, then advances to the totals
     /// above.
     rebase_anchor: Option<Cumulative>,
@@ -2355,12 +2355,16 @@ pub(crate) enum Healed {
     /// The bundle was AHEAD of our committed watermark: the node holds a voucher
     /// we lost. [`PoolLedger::reseed`] moved us up to it.
     Reseeded,
-    /// An `Underpaid` bundle was BEHIND our committed watermark: we hold vouchers
-    /// the node never accepted. [`PoolLedger::rebase`] moved us down to it.
+    /// The bundle was BEHIND our committed watermark on `amount`, and the
+    /// ledger moved to it: on `Underpaid`, we hold vouchers the node never
+    /// accepted ([`PoolLedger::rebase`]); on `BytesRegression`, the bundle is
+    /// ahead of us on bytes, because the lane resumed below a voucher the node
+    /// holds ([`PoolLedger::rebase_ahead_on_bytes`]).
     Rebased,
-    /// The ledger already covers this rejection's watermark: an `Underpaid` for
-    /// a voucher signed before the latest rebase, or an `UnderFold` or
-    /// `AmountRegression` whose bundle the ledger has reached. The watermark
+    /// The ledger already covers this rejection's watermark: an `Underpaid` or
+    /// `BytesRegression` for a voucher signed before the latest rebase, or an
+    /// `UnderFold`, `AmountRegression` or `BytesRegression` whose bundle the
+    /// ledger has reached. The watermark
     /// did not move, and the pull retries from the ledger. An `UnderFold` that
     /// no heal has taken yet also retires the live chain the node refused
     /// ([`PoolLedger::retire_unadopted_chain`]), so the retry opens a fresh one.
@@ -2379,9 +2383,12 @@ pub(crate) fn rejection_watermark(err: &anyhow::Error, ctx: &PoolContext) -> Opt
 /// `None` when it proves no desync and the caller must surface the real error.
 ///
 /// A bundle ahead of our committed watermark reseeds, whatever the reason. A
-/// bundle at or behind it rebases only on [`VoucherRejectReason::Underpaid`],
-/// and only for a voucher signed under the ledger's current generation; see
-/// [`PoolLedger::rebase`]. On [`VoucherRejectReason::UnderFold`] or
+/// bundle that does not advance our amount rebases on
+/// [`VoucherRejectReason::Underpaid`], and on a
+/// [`VoucherRejectReason::BytesRegression`] whose bundle is ahead of us on
+/// bytes (see [`heal_bytes_regression`]). A rebase applies only to a voucher
+/// signed under the ledger's current generation; see [`PoolLedger::rebase`].
+/// On [`VoucherRejectReason::UnderFold`] or
 /// [`VoucherRejectReason::AmountRegression`] it retries without moving the
 /// ledger (below). On every other reason it proves no desync: the node attaches
 /// a bundle to every watermark-gated rejection once a voucher is accepted, so an
@@ -2416,11 +2423,83 @@ pub(crate) async fn heal_watermark_desync(
     ) {
         return already_covered(rejected.reason, watermark, ledger).await;
     }
-    if rejected.reason != VoucherRejectReason::Underpaid {
-        return None;
+    match rejected.reason {
+        VoucherRejectReason::Underpaid => {
+            let outcome = ledger.rebase(watermark, rejected.proof_generation).await;
+            rebase_outcome(
+                rejected.reason,
+                outcome,
+                watermark,
+                rejected.proof_generation,
+            )
+        }
+        VoucherRejectReason::BytesRegression => {
+            heal_bytes_regression(watermark, rejected.proof_generation, ledger).await
+        }
+        _ => None,
     }
-    let outcome = ledger.rebase(watermark, rejected.proof_generation).await;
-    rebase_outcome(outcome, watermark, rejected.proof_generation)
+}
+
+/// Resolve a `BytesRegression` whose bundle does not advance our amount.
+///
+/// A bundle ahead of us on bytes is our own voucher that the node holds and
+/// our ledger does not. The lane resumed from a lower anchor, typically the
+/// chain watermark after the payer's store lost the lane, while the node holds
+/// an unredeemed voucher above it. The ledger priced its spans from that lower
+/// anchor, so its amount passed the node's anchor while its bytes still
+/// trailed it. The rebase moves the ledger to the node's anchor
+/// ([`PoolLedger::rebase_ahead_on_bytes`]). The payer never pays more than it
+/// signed for, because the anchor is its own voucher.
+///
+/// A bundle the ledger already covers on both axes retries from the ledger
+/// ([`Healed::Stale`]). The rejected voucher trailed the ledger: a sibling
+/// stream healed first, or a sibling voucher committed past the node's anchor,
+/// or the voucher was signed before the latest rebase. Every voucher the
+/// ledger signs next is at or above the node's anchor on both axes. A
+/// `BytesRegression` with no bundle is the single-signer fault that no heal
+/// takes; it never reaches this function.
+async fn heal_bytes_regression(
+    watermark: Cumulative,
+    proof_generation: Option<u64>,
+    ledger: &PoolLedger,
+) -> Option<Healed> {
+    let outcome = ledger
+        .rebase_ahead_on_bytes(watermark, proof_generation)
+        .await;
+    if outcome != Rebase::Refused {
+        return rebase_outcome(
+            VoucherRejectReason::BytesRegression,
+            outcome,
+            watermark,
+            proof_generation,
+        );
+    }
+    let committed = ledger.committed();
+    if committed.amount >= watermark.amount && committed.bytes >= watermark.bytes {
+        tracing::debug!(
+            bundle_amount = %watermark.amount,
+            bundle_bytes = %watermark.bytes,
+            committed_amount = %committed.amount,
+            committed_bytes = %committed.bytes,
+            ?proof_generation,
+            "bytes-regression rejection carried a watermark our ledger already covers; \
+             retrying from the ledger"
+        );
+    } else {
+        // The bundle is ahead of us on amount, which `reseed` refused a moment
+        // ago: a rewind landed in between. The retry's next rejection carries
+        // the same bundle, and the reseed takes it then.
+        tracing::warn!(
+            bundle_amount = %watermark.amount,
+            bundle_bytes = %watermark.bytes,
+            committed_amount = %committed.amount,
+            committed_bytes = %committed.bytes,
+            ?proof_generation,
+            "bytes-regression rejection carried a watermark ahead of our ledger on amount \
+             that neither a reseed nor a rebase took; retrying"
+        );
+    }
+    Some(Healed::Stale)
 }
 
 /// Resolve a trailing-proof rejection (`UnderFold` or `AmountRegression`) whose
@@ -2496,6 +2575,7 @@ fn log_covered(watermark: Cumulative, committed: Cumulative, retired: Option<B25
 
 /// Log what a [`PoolLedger::rebase`] did and say how the heal resolved.
 fn rebase_outcome(
+    reason: VoucherRejectReason,
     outcome: Rebase,
     watermark: Cumulative,
     proof_generation: Option<u64>,
@@ -2503,20 +2583,22 @@ fn rebase_outcome(
     match outcome {
         Rebase::Rebased { from } => {
             tracing::warn!(
+                ?reason,
                 from_amount = %from.amount,
                 from_bytes = %from.bytes,
                 to_amount = %watermark.amount,
                 to_bytes = %watermark.bytes,
-                "upstream refused our vouchers as underpaid: our lane watermark was ahead of \
-                 the one it accepted; rebased down to it"
+                "upstream refused our vouchers: the watermark it accepted differs from our \
+                 lane's; rebased to it"
             );
             Some(Healed::Rebased)
         }
         Rebase::Stale => {
             tracing::debug!(
+                ?reason,
                 ?proof_generation,
-                "underpaid rejection of a voucher signed before the latest rebase; retrying \
-                 from the healed anchor"
+                "rejection of a voucher signed before the latest rebase; retrying from the \
+                 healed anchor"
             );
             Some(Healed::Stale)
         }
@@ -5103,26 +5185,178 @@ mod tests {
         Ok(())
     }
 
-    /// A bundle not signed by our own key heals nothing, even on `Underpaid`: a
-    /// node cannot talk the payer's ledger down to a watermark it never signed.
+    /// A lane seeded below the node's anchor prices its spans from another base,
+    /// so its amount passes the anchor while its bytes still trail it, and the
+    /// node rejects `BytesRegression`. The bundle is our own voucher, behind on
+    /// amount and ahead on bytes: the ledger rebases to it, and hands the
+    /// anchor to the next persist once.
     #[tokio::test]
-    async fn heal_refuses_an_underpaid_bundle_we_did_not_sign() -> anyhow::Result<()> {
+    async fn heal_rebases_on_a_bytes_regression_bundle_ahead_on_bytes() -> anyhow::Result<()> {
+        let (ctx, signer) = heal_test_ctx();
+        let ledger = PoolLedger::new(Cumulative {
+            bytes: U256::from(5_000u64),
+            amount: U256::from(90u64),
+        });
+        let err = rejected_with_bundle(
+            VoucherRejectReason::BytesRegression,
+            &ctx,
+            &signer,
+            (80, 9_000),
+            Some(0),
+        )?;
+        let anchor = Cumulative {
+            bytes: U256::from(9_000u64),
+            amount: U256::from(80u64),
+        };
+        assert_eq!(heal(&err, &ctx, &ledger).await, Some(Healed::Rebased));
+        assert_eq!(ledger.committed(), anchor);
+        assert_eq!(ledger.generation(), 1);
+        assert_eq!(ledger.take_unsaved_rebase(), Some(anchor));
+        Ok(())
+    }
+
+    /// Concurrent streams on one lane take the same `BytesRegression` with the
+    /// same bundle. The first heal rebases. The rest find the ledger already
+    /// at that bundle and retry, whether or not the rejection names the
+    /// generation its voucher was signed under.
+    #[tokio::test]
+    async fn a_sibling_bytes_regression_after_the_rebase_is_stale() -> anyhow::Result<()> {
+        let (ctx, signer) = heal_test_ctx();
+        let ledger = PoolLedger::new(Cumulative {
+            bytes: U256::from(5_000u64),
+            amount: U256::from(90u64),
+        });
+        let rejected = |generation| {
+            rejected_with_bundle(
+                VoucherRejectReason::BytesRegression,
+                &ctx,
+                &signer,
+                (80, 9_000),
+                generation,
+            )
+        };
+        assert_eq!(
+            heal(&rejected(Some(0))?, &ctx, &ledger).await,
+            Some(Healed::Rebased)
+        );
+        assert_eq!(
+            heal(&rejected(Some(0))?, &ctx, &ledger).await,
+            Some(Healed::Stale)
+        );
+        assert_eq!(
+            heal(&rejected(None)?, &ctx, &ledger).await,
+            Some(Healed::Stale)
+        );
+        assert_eq!(ledger.generation(), 1);
+        Ok(())
+    }
+
+    /// A `BytesRegression` whose bundle the ledger covers on both axes says the
+    /// rejected voucher trailed the ledger, for example a sibling voucher
+    /// committed past the node's anchor first. The pull retries from the
+    /// ledger, which signs at or above the anchor, and nothing moves. A bundle
+    /// equal to the ledger on bytes is not ahead of it and does not rebase.
+    #[tokio::test]
+    async fn a_bytes_regression_the_ledger_covers_retries_without_a_rebase() -> anyhow::Result<()> {
+        let (ctx, signer) = heal_test_ctx();
+        let seed = Cumulative {
+            bytes: U256::from(9_000u64),
+            amount: U256::from(90u64),
+        };
+        for bundle in [(80, 5_000), (80, 9_000)] {
+            let ledger = PoolLedger::new(seed);
+            let err = rejected_with_bundle(
+                VoucherRejectReason::BytesRegression,
+                &ctx,
+                &signer,
+                bundle,
+                Some(0),
+            )?;
+            assert_eq!(
+                heal(&err, &ctx, &ledger).await,
+                Some(Healed::Stale),
+                "{bundle:?}"
+            );
+            assert_eq!(ledger.committed(), seed, "{bundle:?}");
+            assert_eq!(ledger.generation(), 0, "{bundle:?}");
+            assert_eq!(ledger.take_unsaved_rebase(), None, "{bundle:?}");
+        }
+        Ok(())
+    }
+
+    /// A `BytesRegression` for a voucher signed before the latest rebase is
+    /// stale even when its bundle is ahead of the ledger on bytes: it measured
+    /// its span from the anchor the ledger has left. One from the current
+    /// generation rebases again.
+    #[tokio::test]
+    async fn a_bytes_regression_from_an_earlier_generation_is_stale() -> anyhow::Result<()> {
+        let (ctx, signer) = heal_test_ctx();
+        let ledger = PoolLedger::new(Cumulative {
+            bytes: U256::from(5_000u64),
+            amount: U256::from(90u64),
+        });
+        let rejected = |bundle, generation| {
+            rejected_with_bundle(
+                VoucherRejectReason::BytesRegression,
+                &ctx,
+                &signer,
+                bundle,
+                generation,
+            )
+        };
+        assert_eq!(
+            heal(&rejected((80, 9_000), Some(0))?, &ctx, &ledger).await,
+            Some(Healed::Rebased)
+        );
+        // The healed lane pays on.
+        let progressed = Cumulative {
+            bytes: U256::from(9_500u64),
+            amount: U256::from(100u64),
+        };
+        assert!(ledger.reseed(progressed));
+
+        assert_eq!(
+            heal(&rejected((95, 9_800), Some(0))?, &ctx, &ledger).await,
+            Some(Healed::Stale)
+        );
+        assert_eq!(ledger.committed(), progressed);
+        assert_eq!(ledger.generation(), 1);
+
+        assert_eq!(
+            heal(&rejected((95, 9_800), Some(1))?, &ctx, &ledger).await,
+            Some(Healed::Rebased)
+        );
+        assert_eq!(ledger.generation(), 2);
+        assert_eq!(
+            ledger.committed(),
+            Cumulative {
+                bytes: U256::from(9_800u64),
+                amount: U256::from(95u64),
+            }
+        );
+        Ok(())
+    }
+
+    /// A bundle not signed by our own key heals nothing, on `Underpaid` or on a
+    /// `BytesRegression` ahead of us on bytes: a node cannot move the payer's
+    /// ledger to a watermark it never signed.
+    #[tokio::test]
+    async fn heal_refuses_a_rebase_bundle_we_did_not_sign() -> anyhow::Result<()> {
         let (ctx, _signer) = heal_test_ctx();
         let stranger = alloy::signers::local::PrivateKeySigner::random();
         let seed = Cumulative {
             bytes: U256::from(9_000u64),
             amount: U256::from(90u64),
         };
-        let ledger = PoolLedger::new(seed);
-        let err = rejected_with_bundle(
-            VoucherRejectReason::Underpaid,
-            &ctx,
-            &stranger,
-            (60, 5_000),
-            Some(0),
-        )?;
-        assert_eq!(heal(&err, &ctx, &ledger).await, None);
-        assert_eq!(ledger.committed(), seed);
+        for (reason, bundle) in [
+            (VoucherRejectReason::Underpaid, (60, 5_000)),
+            (VoucherRejectReason::BytesRegression, (80, 12_000)),
+        ] {
+            let ledger = PoolLedger::new(seed);
+            let err = rejected_with_bundle(reason, &ctx, &stranger, bundle, Some(0))?;
+            assert_eq!(heal(&err, &ctx, &ledger).await, None, "{reason:?}");
+            assert_eq!(ledger.committed(), seed, "{reason:?}");
+        }
         Ok(())
     }
 
