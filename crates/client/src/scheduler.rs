@@ -3318,9 +3318,10 @@ where
                         // still runs, and it asks for no growth at once: the
                         // lane waits, from `GROWTH_RETRY` and doubling up to
                         // `EXTRA_RETRY_CAP`, before it is asked again. A
-                        // `NotFound` or size-ceiling refusal of a range outside
-                        // the lane's coverage counts toward barring it from
-                        // pull-through, as on its own stream. A lane's last
+                        // `NotFound` or size-ceiling refusal counts as on its
+                        // own stream: outside the lane's coverage toward
+                        // barring it from pull-through, inside toward dropping
+                        // the refused blocks from its coverage. A lane's last
                         // live worker faults for the lane, so once the own
                         // worker has stopped, the extra's fault is recorded
                         // like the lane's own, unless the node is already
@@ -3334,9 +3335,7 @@ where
                                 return Err(err);
                             }
                             log_extra_fault(provider, hash, range, &err);
-                            if range.uncovered {
-                                sources.record_extra_refusal(provider, &err, range, at);
-                            }
+                            sources.record_extra_refusal(provider, &err, range, at);
                             growth.wanted = false;
                             if let Some(lane) = lane_slot {
                                 let refusals = growth.extra_refused(lane, Instant::now());

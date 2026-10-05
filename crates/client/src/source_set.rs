@@ -241,13 +241,20 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// it). Each one serves only the blocks it covers until then.
     no_pull_through: HashMap<Address, Instant>,
     /// Each probed partial holder's `NotFound` answers for ranges inside its
-    /// coverage, keyed by the discovery block the refused range starts in.
-    covered_not_found: HashMap<(Address, u32), u32>,
+    /// coverage, keyed by every discovery block a refused range touches, with
+    /// the time of the last one. A count whose last answer is
+    /// [`PULL_THROUGH_BAR`] old starts again, so sparse transient refusals
+    /// (load shed, a stale chain view) never add up.
+    covered_not_found: HashMap<(Address, u32), (u32, Instant)>,
     /// Blocks each probed partial holder advertised but refused
-    /// [`ABSENT_AFTER_NOT_FOUND`] times. Its coverage claim for them is stale
-    /// (evicted, or a record wider than its store), so they leave its
-    /// coverage for the rest of this blob, rediscovery included.
-    stale_blocks: HashMap<Address, HashSet<u32>>,
+    /// [`ABSENT_AFTER_NOT_FOUND`] times, each with the time its drop ends
+    /// ([`PULL_THROUGH_BAR`] after the refusal that set it). Its coverage
+    /// claim for them is likely stale (evicted, or a record wider than its
+    /// store), so they leave its coverage until then, rediscovery included.
+    stale_blocks: HashMap<Address, HashMap<u32, Instant>>,
+    /// The coverage each holder with a dropped block last advertised: what
+    /// its coverage returns to as each drop ends.
+    advertised: HashMap<Address, Coverage>,
     /// How many times in a row each probed partial holder has been barred
     /// from pull-through. A first bar can come from transient refusals that
     /// also read as `NotFound` (load shed, a stale chain view), so only a
@@ -317,6 +324,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             no_pull_through: HashMap::new(),
             covered_not_found: HashMap::new(),
             stale_blocks: HashMap::new(),
+            advertised: HashMap::new(),
             pull_through_bars: HashMap::new(),
             too_large_pull_through: HashSet::new(),
             too_large: HashSet::new(),
@@ -566,7 +574,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                     Some(range) if range.uncovered => {
                         self.record_pull_through_refusal(provider, refused, now);
                     }
-                    Some(range) => self.record_covered_refusal(provider, refused, range),
+                    Some(range) => self.record_covered_refusal(provider, refused, range, now),
                     None => {}
                 }
             }
@@ -599,50 +607,80 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// Count a `NotFound` from probed partial holder `provider` for `range`,
-    /// which its coverage claims. The node refuses the whole range at its
-    /// first chunk it does not hold, and the refusal does not say which chunk
-    /// that is, so the count goes to every block `range` touches. A block
-    /// that reaches [`ABSENT_AFTER_NOT_FOUND`] answers leaves the holder's
-    /// coverage: its ranges go to the other sources, and the holder keeps the
-    /// blocks it was never refused.
+    /// which its coverage claims, given at `at`. The node refuses the whole
+    /// range at its first chunk it does not hold, and the refusal does not say
+    /// which chunk that is, so the count goes to every block `range` touches.
+    /// A block that reaches [`ABSENT_AFTER_NOT_FOUND`] answers leaves the
+    /// holder's coverage for [`PULL_THROUGH_BAR`]: its ranges go to the other
+    /// sources, and the holder keeps the blocks it was not refused. A
+    /// `NotFound` can also be a transient refusal, so the drop ends, and the
+    /// block's count starts again ([`Self::expire_pull_through_bars`]).
     fn record_covered_refusal(
         &mut self,
         provider: Address,
         refused: &UpstreamRefused,
         range: &LaneRange,
+        at: Instant,
     ) {
         let block_bytes = decdn_protocol::discovery_block_bytes();
         let block_of = |offset: u64| u32::try_from(offset / block_bytes).unwrap_or(u32::MAX);
         let first = block_of(range.offset);
         let last = block_of(range.offset.saturating_add(range.len.max(1)) - 1);
-        let mut stale = HashSet::new();
+        let until = at.checked_add(PULL_THROUGH_BAR).unwrap_or(at);
+        let mut dropped = Vec::new();
         for block in first..=last {
-            let count = self.covered_not_found.entry((provider, block)).or_insert(0);
-            *count = count.saturating_add(1);
-            if *count >= ABSENT_AFTER_NOT_FOUND
-                && self.stale_blocks.entry(provider).or_default().insert(block)
+            let (count, last_at) = self
+                .covered_not_found
+                .entry((provider, block))
+                .or_insert((0, at));
+            if last_at
+                .checked_add(PULL_THROUGH_BAR)
+                .is_some_and(|quiet| quiet <= at)
             {
-                stale.insert(block);
+                *count = 0;
+            }
+            *count = count.saturating_add(1);
+            *last_at = (*last_at).max(at);
+            if *count >= ABSENT_AFTER_NOT_FOUND
+                && self
+                    .stale_blocks
+                    .entry(provider)
+                    .or_default()
+                    .insert(block, until)
+                    .is_none()
+            {
+                dropped.push(block);
             }
         }
-        if stale.is_empty() {
+        if dropped.is_empty() {
             return;
         }
         let hash = blake3::Hash::from_bytes(self.hash).to_hex();
         tracing::info!(
             %provider,
             %hash,
-            blocks = ?stale,
+            blocks = ?dropped,
             "a partial holder keeps refusing blocks its coverage claims; dropping them from \
-             its coverage for this blob"
+             its coverage for a while"
         );
-        if let Some(holder) = self.holders.iter_mut().find(|h| h.provider == provider) {
-            holder.coverage = holder
-                .coverage
-                .take()
-                .map(|coverage| without_blocks(&coverage, &stale));
+        if let Some(coverage) = self.holder(provider).and_then(|h| h.coverage.clone()) {
+            self.advertised.entry(provider).or_insert(coverage);
         }
+        self.narrow(provider);
         self.marked(true, refused);
+    }
+
+    /// Set `provider`'s coverage to what it last advertised, less the blocks
+    /// dropped from it now.
+    fn narrow(&mut self, provider: Address) {
+        let Some(advertised) = self.advertised.get(&provider) else {
+            return;
+        };
+        let stale = self.stale_blocks.get(&provider);
+        let narrowed = without_blocks(advertised, |b| stale.is_some_and(|s| s.contains_key(&b)));
+        if let Some(holder) = self.holders.iter_mut().find(|h| h.provider == provider) {
+            holder.coverage = Some(narrowed);
+        }
     }
 
     /// Count a `NotFound` from probed partial holder `provider` for a range
@@ -682,7 +720,9 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// Lift each `NotFound` bar from pull-through whose time ended by `now`,
     /// and restart its holder's count of refusals. The holder takes one
     /// uncovered range again as a probe; [`ABSENT_AFTER_NOT_FOUND`] more
-    /// refusals bar it again. A size-ceiling bar does not end.
+    /// refusals bar it again. A size-ceiling bar does not end. Each block
+    /// dropped from a holder's coverage whose time ended returns to it the
+    /// same way, with its count restarted.
     pub fn expire_pull_through_bars(&mut self, now: Instant) {
         let ended: Vec<Address> = self
             .no_pull_through
@@ -693,6 +733,31 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         for provider in ended {
             self.no_pull_through.remove(&provider);
             self.pull_through_not_found.remove(&provider);
+        }
+        let mut restored = Vec::new();
+        for (&provider, blocks) in &mut self.stale_blocks {
+            let before = blocks.len();
+            blocks.retain(|&block, until| {
+                let keep = *until > now;
+                if !keep {
+                    self.covered_not_found.remove(&(provider, block));
+                }
+                keep
+            });
+            if blocks.len() != before {
+                restored.push(provider);
+            }
+        }
+        for provider in restored {
+            self.narrow(provider);
+            if self
+                .stale_blocks
+                .get(&provider)
+                .is_some_and(HashMap::is_empty)
+            {
+                self.stale_blocks.remove(&provider);
+                self.advertised.remove(&provider);
+            }
         }
     }
 
@@ -945,14 +1010,16 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     ///
     /// A block a holder's coverage claimed but it refused
     /// ([`Self::record_covered_refusal`]) stays out of the coverage a probe
-    /// reports again: the record that claimed it is the stale one.
+    /// reports again until its drop ends: the record that claimed it is the
+    /// likely stale one.
     fn merge(&mut self, holders: Vec<Holder>) {
         for mut holder in holders {
             if let (Some(coverage), Some(stale)) = (
                 holder.coverage.as_ref(),
                 self.stale_blocks.get(&holder.provider),
             ) {
-                holder.coverage = Some(without_blocks(coverage, stale));
+                self.advertised.insert(holder.provider, coverage.clone());
+                holder.coverage = Some(without_blocks(coverage, |b| stale.contains_key(&b)));
             }
             if holder.probed_holder {
                 self.absent.remove(&holder.provider);
@@ -979,15 +1046,15 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 }
 
-/// `coverage` less the `blocks`.
-fn without_blocks(coverage: &Coverage, blocks: &HashSet<u32>) -> Coverage {
+/// `coverage` less the blocks `dropped` names.
+fn without_blocks(coverage: &Coverage, dropped: impl Fn(u32) -> bool) -> Coverage {
     let num_blocks = coverage
         .covered_blocks()
         .last()
         .map_or(0, |b| b.saturating_add(1));
     Coverage::from_block_indices(
         num_blocks,
-        coverage.covered_blocks().filter(|b| !blocks.contains(b)),
+        coverage.covered_blocks().filter(|&b| !dropped(b)),
     )
 }
 
@@ -1516,8 +1583,8 @@ mod tests {
 
     /// #2281: a partial holder that refuses a block its coverage claims, three
     /// times, loses that block from its coverage and keeps the others. It is
-    /// not barred from pull-through, and a probe that reports the stale claim
-    /// again does not bring the block back.
+    /// not barred from pull-through, a probe that reports the stale claim
+    /// again does not bring the block back, and the drop ends with its time.
     #[tokio::test(start_paused = true)]
     async fn three_covered_refusals_drop_the_block_from_a_partial_holders_coverage() {
         let p = provider(vec![]);
@@ -1556,6 +1623,34 @@ mod tests {
         set.merge(vec![partial(A, 10.0, &[0, 1])]);
         assert!(!covers(&set, 1), "a probe repeating the stale claim");
         assert!(covers(&set, 0));
+
+        // A `NotFound` may be transient, so the drop ends with the bar's time,
+        // and the count starts again.
+        set.expire_pull_through_bars(now + super::PULL_THROUGH_BAR);
+        assert!(covers(&set, 1), "the drop ended");
+        let later = now + super::PULL_THROUGH_BAR;
+        say_not_found_in(&mut set, A, block1(false), 2, later);
+        assert!(covers(&set, 1), "the count restarted with the drop");
+    }
+
+    /// #2281: covered refusals spread out more than [`PULL_THROUGH_BAR`] apart,
+    /// as sparse load shedding gives, never add up to a drop.
+    ///
+    /// [`PULL_THROUGH_BAR`]: super::PULL_THROUGH_BAR
+    #[tokio::test(start_paused = true)]
+    async fn sparse_covered_refusals_never_drop_a_block() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![partial(A, 10.0, &[0, 1])]);
+        let mut at = Instant::now();
+        for _ in 0..5 {
+            say_not_found_in(&mut set, A, block1(false), 1, at);
+            at += super::PULL_THROUGH_BAR;
+        }
+        assert!(
+            set.holder(A)
+                .and_then(|h| h.coverage.as_ref())
+                .is_some_and(|c| c.covers(1))
+        );
     }
 
     /// An uncovered byte verified before the refusal that set the bar is
