@@ -1533,10 +1533,12 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-json"
-version = "0.62.5"
+version = "0.62.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9648b0bb82a2eedd844052c6ad2a1a822d1f8e3adee5fbf668366717e428856a"
+checksum = "701a947f4797e52a911e114a898667c746c39feea467bbd1abd7b3721f702ffa"
 dependencies = [
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
  "aws-smithy-types",
 ]
 
@@ -1643,6 +1645,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "aws-smithy-schema"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7442cb268338f0eb8278140a107c046756aa01093d8ef5e99628d34ae09c94f5"
+dependencies = [
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "http 1.4.0",
 ]
 
 [[package]]

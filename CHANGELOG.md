@@ -3617,6 +3617,12 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- `aws-smithy-json` → 0.62.7 (CVE-2026-18140: uncontrolled recursion on deeply
+  nested JSON, a denial of service). It reaches the node through the S3
+  origin's AWS SDK: `aws-sdk-s3` and the `aws-config` credential chain (SSO,
+  STS, IMDS) parse JSON responses with it. Lockfile-only bump; no dependency
+  requirement changed. The new `aws-smithy-schema` entry is a dependency of
+  0.62.7.
 - **Probe `slash_sig` is now cryptographically verified before a response can
   influence selection.** The requester previously checked only the signature's
   length; `ProbeSlashData::verify_signer` had no production caller, so a node
