@@ -180,6 +180,14 @@ pub trait Pacer: Send + Sync {
     fn decide(&self, state: &PaceState) -> PaceDecision;
 }
 
+/// The smallest reactive top-up worth sending for a confirmed exhaustion the
+/// deposit can still afford: the low water the proactive refill uses
+/// ([`crate::buyer_pool::LOW_WATER_DIVISOR`]).
+#[must_use]
+pub(crate) fn min_reactive_top_up(working_deposit: U256) -> U256 {
+    working_deposit / U256::from(crate::buyer_pool::LOW_WATER_DIVISOR)
+}
+
 /// The client pacing policy: gate on the buyer's own deposit, top up reactively
 /// on a genuine mid-fetch ceiling hit, and stop when the range is satisfied.
 /// Carries no configuration — every input arrives in the [`PaceState`] — so it is
@@ -210,12 +218,24 @@ impl Pacer for BudgetPacer {
         //    gating on our OWN deposit — the remaining balance cannot even cover
         //    the next voucher. Either way, fund it if a top-up is enabled, budget
         //    remains, and there is something to add; otherwise refuse.
+        //
+        //    A confirmed exhaustion our own numbers can still afford also needs
+        //    the top-up to add at least the low water: the deposit already sits
+        //    near the working target, so a top-up of a few micro-USDC moves
+        //    nothing a peer decides on, and costs an approve and a topUp tx.
         let unaffordable = s.remaining_deposit < s.next_voucher_cost;
         let additional = s.working_deposit.saturating_sub(s.remaining_deposit);
         let can_topup =
             s.topups_used < s.max_topups && !s.working_deposit.is_zero() && !additional.is_zero();
-        if s.exhaustion_confirmed || unaffordable {
+        if unaffordable {
             return if can_topup {
+                PaceDecision::TopUp(additional)
+            } else {
+                PaceDecision::Refuse
+            };
+        }
+        if s.exhaustion_confirmed {
+            return if can_topup && additional >= min_reactive_top_up(s.working_deposit) {
                 PaceDecision::TopUp(additional)
             } else {
                 PaceDecision::Refuse
@@ -536,6 +556,37 @@ mod tests {
             PaceDecision::TopUp(_) => {}
             other => panic!("a confirmed exhaustion must top up, got {other:?}"),
         }
+    }
+
+    /// #2296: right after a refill restored the deposit to the working target,
+    /// a stale refusal confirmed an exhaustion whose top-up would add a few
+    /// micro-USDC. That top-up costs two transactions and changes nothing.
+    #[test]
+    fn a_confirmed_exhaustion_below_the_low_water_shortfall_refuses() {
+        let mut s = healthy();
+        s.exhaustion_confirmed = true;
+        // additional = 5000 - 4998 = 2, far below the 1000 low water.
+        s.remaining_deposit = U256::from(4_998u64);
+        assert_eq!(BudgetPacer::new().decide(&s), PaceDecision::Refuse);
+        // At the low water exactly, the top-up is worth sending.
+        s.remaining_deposit = U256::from(4_000u64);
+        assert_eq!(
+            BudgetPacer::new().decide(&s),
+            PaceDecision::TopUp(U256::from(1_000u64))
+        );
+    }
+
+    /// The floor applies only while the deposit still covers the next voucher:
+    /// a deposit that cannot pay for it tops up whatever the shortfall.
+    #[test]
+    fn an_unaffordable_voucher_tops_up_even_a_small_shortfall() {
+        let mut s = healthy();
+        s.next_voucher_cost = U256::from(4_999u64);
+        s.remaining_deposit = U256::from(4_998u64);
+        assert_eq!(
+            BudgetPacer::new().decide(&s),
+            PaceDecision::TopUp(U256::from(2u64))
+        );
     }
 
     #[test]

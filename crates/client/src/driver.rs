@@ -328,6 +328,17 @@ fn locked_deposit(ctx: &Mutex<PoolContext>) -> anyhow::Result<U256> {
         .deposit)
 }
 
+/// Whether `remaining` deposit pays for the next voucher and sits within the
+/// low water of `working_deposit`, so the reactive top-up the pacer could send
+/// is below [`crate::pacer::min_reactive_top_up`]. A peer that still refuses
+/// such a deposit as insufficient reads a balance older than ours.
+fn deposit_near_working(remaining: U256, next_voucher_cost: U256, working_deposit: U256) -> bool {
+    !working_deposit.is_zero()
+        && remaining >= next_voucher_cost
+        && working_deposit.saturating_sub(remaining)
+            < crate::pacer::min_reactive_top_up(working_deposit)
+}
+
 /// Bytes per [`bao_tree::ChunkNum`] — a 1 KiB bao chunk. A gap's byte span is its
 /// chunk-range boundaries scaled by this.
 const CHUNK_BYTES: u64 = 1024;
@@ -1326,7 +1337,25 @@ where
                     //     `PoolExhausted` rather than on an ambiguous miss. The ceiling is
                     //     the sole clamp on how much a lying node can make us escrow, so
                     //     trusting this owner-only signal is money-safe.
+                    //
+                    //     A refusal while the deposit already sits within the low
+                    //     water of `working_deposit` is the node's stale view
+                    //     instead: a refill made elsewhere (another lane's build,
+                    //     a sibling's top-up) has not reached its chain watcher
+                    //     yet, and no top-up the pacer would send moves it. Wait
+                    //     it out on the settle budget, then let the pacer decide.
                     if is_insufficient_deposit(&err) {
+                        if settle_waits < config.max_settle_waits
+                            && deposit_near_working(
+                                locked_deposit(ctx)?.saturating_sub(spent(committed.amount)),
+                                counters.next_voucher_cost,
+                                config.working_deposit,
+                            )
+                        {
+                            settle_waits = settle_waits.saturating_add(1);
+                            tokio::time::sleep(config.settle_backoff).await;
+                            continue;
+                        }
                         exhaustion_confirmed = true;
                         continue;
                     }
@@ -2992,6 +3021,74 @@ mod tests {
         assert!(store.is_complete().await.expect("is_complete"));
         let got = store.read(0, 0).await.expect("read whole blob");
         assert_eq!(got.as_ref(), plaintext.as_slice());
+    }
+
+    /// #2296: a refill made elsewhere already restored the deposit to the
+    /// working target, and the node refuses on the balance it read before. A
+    /// top-up would add nothing worth two transactions, so the driver waits the
+    /// node's watcher out on the settle budget and re-opens.
+    #[tokio::test(start_paused = true)]
+    async fn an_insufficient_deposit_refusal_at_the_working_deposit_settle_waits() {
+        let total = 2 * GROUP;
+        let (root, plaintext, _outboard) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let inner = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+        let root = inner.root();
+        let source = RefuseFirstOpenShortDeposit {
+            inner,
+            opens: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let pacer = BudgetPacer::new();
+        let funder = FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX)));
+
+        let mut ctx = healthy_ctx();
+        ctx.deposit = U256::from(10_000u64);
+        let ctx = Arc::new(Mutex::new(ctx));
+
+        let settle_backoff = std::time::Duration::from_secs(2);
+        let drive_config = DriveConfig {
+            working_deposit: U256::from(10_000u64),
+            seller_reserve: U256::ZERO,
+            max_settle_waits: 2,
+            settle_backoff,
+        };
+
+        let started = tokio::time::Instant::now();
+        drive(
+            &store,
+            &source,
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            root,
+            0,
+            0,
+            &drive_config,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("drive re-opens once the node's watcher catches up");
+
+        assert!(
+            funder.calls().is_empty(),
+            "no top-up for a deposit already at the working target"
+        );
+        assert_eq!(
+            source.opens.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one refused open + one re-open after the settle wait"
+        );
+        assert!(started.elapsed() >= settle_backoff, "the re-open waited");
+        assert!(store.is_complete().await.expect("is_complete"));
     }
 
     /// A [`BlobSource`] that fails its first open with a genuine exhaustion (like

@@ -99,6 +99,26 @@ impl LaneLedgers {
                 .deposit = new_deposit;
         }
     }
+
+    /// Raise every registered lane's pool context to at least `deposit`: a
+    /// refill a lane build made reaches lanes built before it. Never lowers a
+    /// deposit a concurrent top-up raised further. Same lock order as
+    /// [`Self::credit_all`].
+    pub(crate) fn raise_all(&self, deposit: U256) {
+        let ctxs: Vec<Arc<Mutex<PoolContext>>> = {
+            let map = self
+                .map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.values().map(|h| Arc::clone(&h.ctx)).collect()
+        };
+        for ctx in ctxs {
+            let mut ctx = ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ctx.deposit = ctx.deposit.max(deposit);
+        }
+    }
 }
 
 #[cfg(test)]

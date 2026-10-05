@@ -2664,22 +2664,17 @@ fn pool_deposit<S>(
         .fold(*watch.borrow(), U256::max)
 }
 
-/// Seed the deposit watch from `lane`'s pool context while it still holds zero:
-/// the first lane that builds names the pool's deposit.
-fn seed_deposit<S>(deposit: &tokio::sync::watch::Sender<U256>, lane: &StreamCandidate<S>) {
+/// Raise the pool's deposit to `lane`'s, which a lane that just built reads
+/// from its row: the first lane names the deposit, and a later one carries any
+/// refill its build made. `raise` lifts the watch and every started lane's
+/// context, so a lane built before the refill stops gating on the old deposit.
+fn raise_to_lane<S>(raise: &dyn Fn(U256), lane: &StreamCandidate<S>) {
     let Ok(ctx) = lane.ctx.lock() else {
         return;
     };
     let seen = ctx.deposit;
     drop(ctx);
-    deposit.send_if_modified(|current| {
-        if current.is_zero() && !seen.is_zero() {
-            *current = seen;
-            true
-        } else {
-            false
-        }
-    });
+    raise(seen);
 }
 
 /// Fill `target.ranges` of one blob from `sources` (ADR 039 § Dynamic
@@ -2863,6 +2858,30 @@ where
             deposit_tx.send_replace(new_deposit);
             Ok(())
         }),
+    };
+    // Lift the pool's deposit to at least a value a lane build read: never
+    // lowers one a concurrent top-up credited above it.
+    let raise = |seen: U256| {
+        match env.ledgers {
+            Some(reg) => reg.raise_all(seen),
+            None => {
+                for (ctx, _) in pool_lanes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                {
+                    let mut ctx = ctx.lock().unwrap_or_else(PoisonError::into_inner);
+                    ctx.deposit = ctx.deposit.max(seen);
+                }
+            }
+        }
+        deposit_tx.send_if_modified(|current| {
+            let raised = seen > *current;
+            if raised {
+                *current = seen;
+            }
+            raised
+        });
     };
     let topups_used = AtomicU32::new(0);
     // With a run registry every fetch of the run tops up the one deposit, so
@@ -3338,7 +3357,7 @@ where
                         connecting_set.remove(&provider);
                         match sources.lane_built(provider, built, Instant::now()) {
                             Ok(lane) => {
-                                seed_deposit(&deposit_tx, &lane);
+                                raise_to_lane(&raise, &lane);
                                 ready.push((provider, lane));
                                 // A new lane changes who takes a queued range.
                                 growth.wanted = true;
@@ -7050,6 +7069,69 @@ mod tests {
             },
         )
         .await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        Ok(())
+    }
+
+    /// #2296: a lane whose build refilled the pool carries the new deposit,
+    /// and the lanes that started before it take it on as it lands. Without
+    /// it, the earlier lane keeps gating on the deposit it was built with, and
+    /// reads a gap the refill already paid for as unaffordable.
+    #[tokio::test(start_paused = true)]
+    async fn a_refill_a_later_lane_build_made_raises_the_running_lanes() -> anyhow::Result<()> {
+        let data = blob(1024 * 1024);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let lb = Arc::new(PoolLedger::new(Cumulative::default()));
+        // A starts at once and faults, so it is still running when B lands.
+        let a = ScriptedSource::new(data.clone())?
+            .paying(Arc::clone(&la))
+            .fault_once_after(0, || anyhow::anyhow!("scripted reset"));
+        let b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&lb));
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, dir) = fresh_store(root, total);
+        let before = U256::from(u64::MAX);
+        let refilled = U256::from(u128::MAX);
+        let a_ctx = Arc::new(Mutex::new(ctx_with(0xA1, before)));
+        let provider = SlowBuild {
+            lanes: StaticSources::new(vec![
+                candidate_ctx(a, la, Arc::clone(&a_ctx), None),
+                candidate_ctx(b, lb, Arc::new(Mutex::new(ctx_with(0xB2, refilled))), None),
+            ])?,
+            slow: Address::repeat_byte(0xB2),
+            delay: Duration::from_secs(1),
+            built: std::sync::atomic::AtomicBool::new(false),
+        };
+        let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
+        let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+        let drive = drive_config();
+        acquire(
+            AcquireTarget {
+                store: &store,
+                hash: root,
+                total_bytes: total,
+                ranges: &[(0, total)],
+            },
+            &mut set,
+            &AcquireEnv {
+                pacer: &BudgetPacer::new(),
+                funder: &no_topups(),
+                drive: &drive,
+                max_lanes: 2,
+                stop: &stop,
+                on_progress: None,
+                ledgers: None,
+                pacing: None,
+                max_blob_bytes: 0,
+            },
+        )
+        .await?;
+        assert!(provider.built.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            a_ctx.lock().unwrap().deposit,
+            refilled,
+            "the lane built first takes on the deposit the later build read"
+        );
         store.finalize().await?;
         assert_eq!(std::fs::read(dir.path().join("b"))?, data);
         Ok(())
