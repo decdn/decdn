@@ -165,23 +165,31 @@ pub fn sanitize_rpc_display(err: impl std::fmt::Display) -> String {
 /// Use for a typed `std::error::Error`, such as an `alloy` transport or
 /// contract error. Its top-level Display often names only the operation and
 /// the URL, while the failure class (timeout, connection refused, DNS, TLS)
-/// is a deeper `source()`. A layer is skipped when its Display is empty or
-/// already appears in the text built so far: a wrapper whose message embeds
-/// its source (`"{0}"`, `"transport: {0}"`) would otherwise print that source
-/// twice. Each layer is stripped on its own before the join, so
-/// a URL token cannot swallow the `": "` separator after it. For an
-/// `anyhow::Error`, use [`sanitize_err_chain`].
+/// is a deeper `source()`. A layer is skipped when its Display is empty, or
+/// when the previous non-empty layer's raw Display ends with it at a
+/// non-alphanumeric boundary: a wrapper that ends its message with its source
+/// (`"{0}"`, `"transport: {0}"`) would otherwise print that source twice. A
+/// cause that only appears inside an earlier message or URL (`"timeout"` under
+/// `"request timeout exceeded"`) is still printed. Each layer is stripped on
+/// its own before the join, so a URL token cannot swallow the `": "` separator
+/// after it. For an `anyhow::Error`, use [`sanitize_err_chain`].
 pub fn sanitize_error_sources(err: &(dyn std::error::Error + 'static)) -> String {
-    let mut seen = err.to_string();
-    let mut out = strip_urls(&seen).into_owned();
+    let mut prev = err.to_string();
+    let mut out = strip_urls(&prev).into_owned();
     let mut next = err.source();
     while let Some(layer) = next {
         let text = layer.to_string();
-        if !text.is_empty() && !seen.contains(&text) {
-            out.push_str(": ");
-            out.push_str(&strip_urls(&text));
-            seen.push_str(": ");
-            seen.push_str(&text);
+        if !text.is_empty() {
+            let repeats = prev.strip_suffix(text.as_str()).is_some_and(|head| {
+                head.chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric())
+            });
+            if !repeats {
+                out.push_str(": ");
+                out.push_str(&strip_urls(&text));
+            }
+            prev = text;
         }
         next = layer.source();
     }
@@ -422,13 +430,27 @@ mod tests {
 
     #[test]
     fn sanitize_error_sources_skips_repeated_layers() {
-        // A `"transport: {0}"` wrapper embeds its source, and a `"{0}"` wrapper
-        // above it repeats that text verbatim.
+        // A `"transport: {0}"` wrapper ends its message with its source, and a
+        // `"{0}"` wrapper above it repeats that text verbatim.
         let inner = Layer::new("connection refused (os error 61)", None);
         let quoted = Layer::new("transport: connection refused (os error 61)", Some(inner));
         let transparent = Layer::new("transport: connection refused (os error 61)", Some(quoted));
         let out = sanitize_error_sources(&transparent);
         assert_eq!(out, "transport: connection refused (os error 61)");
+    }
+
+    #[test]
+    fn sanitize_error_sources_keeps_a_cause_that_only_appears_inside_the_outer_message() {
+        // "timeout" appears in the outer message but does not end it, so the
+        // source is a distinct cause, not a repeat.
+        let err = Layer::new(
+            "request timeout exceeded",
+            Some(Layer::new("timeout", None)),
+        );
+        assert_eq!(
+            sanitize_error_sources(&err),
+            "request timeout exceeded: timeout"
+        );
     }
 
     #[test]
