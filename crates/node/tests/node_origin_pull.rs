@@ -86,6 +86,14 @@ const RATE: u64 = 10;
 /// A strictly-cheaper quote than [`RATE`] so the stalling provider ranks #1 in
 /// the selection score (#859 fallthrough test).
 const STALL_RATE: u64 = RATE / 2;
+/// A quote that ranks last behind a rate-1 peer under any probe RTTs, for tests
+/// that must rank on a live cold probe and so cannot seed the probe cache.
+///
+/// The score is `rate × max(rtt_ms, 1) / rep²` (`selection::compute_score`), and a
+/// probe slower than `PROBE_TIMEOUT` (500 ms) is dropped. Two accepted probes thus
+/// differ in RTT by less than 500×, and a 1000× rate gap outweighs any RTT a loaded
+/// runner measures (#2268).
+const RANK_LAST_RATE: u64 = 1_000;
 
 const fn slash_verifying() -> Address {
     Address::repeat_byte(0x11)
@@ -5832,18 +5840,19 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, engine, _engine_tmp) = build_origin_with_timeout(
+    // Seeded ranking: a live loopback probe can time N slower than A by more than
+    // their 2× rate gap, and A ranked first never asks N at all (#2268).
+    let (origin, engine, _engine_tmp) = build_origin_seeded_ranking(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
         buyer,
         &local_rep,
         &b_metrics,
-        vec![n_dht, a_dht],
+        &[(n_dht, STALL_RATE), (a_dht, RATE)],
         addr_map,
         Duration::from_secs(20),
         Duration::from_secs(20),
-        0,
     )
     .await;
 
@@ -11792,9 +11801,9 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
 /// that is *unreachable* (no bound endpoint at all, mirroring
 /// `node_origin_probe_unreachable_is_scored`'s "dialing it fails fast") during fetch #1 — so it
 /// is never probed, never becomes a cached candidate, and is never negative-cached — then comes
-/// online between the two fetches. H quotes a far cheaper rate so it always ranks ahead of N
-/// once both are probed fresh, guaranteeing fetch #2's cold path tries H first and delivers
-/// without retrying N.
+/// online between the two fetches. H quotes rate 1 and N [`RANK_LAST_RATE`], so H always
+/// ranks ahead of N once both are probed fresh, guaranteeing fetch #2's cold path tries H
+/// first and delivers without retrying N.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once() -> Result<()> {
@@ -11817,7 +11826,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         Arc::clone(&n_eth),
         slash_domain(),
         total_bytes,
-        RATE,
+        RANK_LAST_RATE,
         StreamError::InternalError,
         Arc::clone(&probes_n),
         Arc::clone(&streams_n),
@@ -12034,7 +12043,8 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Node N: refuses every pull with NotFound (honest, negative-cacheable),
-    //     quoting a cheaper rate so it ranks #1 and is always tried first. -------
+    //     quoting rate 1 against A's `RANK_LAST_RATE` so it ranks #1 on the live
+    //     cold probe and is always tried first. ----------------------------------
     let n_sk = fresh_key();
     let n_id = n_sk.public();
     let n_eth = Arc::new(PrivateKeySigner::random());
@@ -12047,7 +12057,7 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         Arc::clone(&n_eth),
         slash_domain(),
         total_bytes,
-        STALL_RATE,
+        1,
         StreamError::NotFound,
         Arc::clone(&n_probes),
         Arc::clone(&n_streams),
@@ -12087,7 +12097,7 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         limiter,
         cache_a,
         store_a as Arc<dyn PoolStateStore>,
-        RATE,
+        RANK_LAST_RATE,
         &domains,
         16,
     )?;
@@ -12100,7 +12110,7 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         Arc::clone(&a_eth),
         slash_domain(),
         total_bytes,
-        RATE,
+        RANK_LAST_RATE,
         Arc::clone(&a_probes),
     );
 
@@ -12405,14 +12415,14 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         slash_domain(),
         payload1.clone(),
         u64::try_from(payload1.len()).unwrap_or(u64::MAX),
-        RATE,
+        RANK_LAST_RATE,
         VoucherRejectReason::AmountRegression,
         Arc::clone(&probes_a),
         Arc::clone(&streams_a),
     );
 
-    // --- Node H: holds payload2, serves honestly, quotes a far cheaper rate so
-    //     it outranks A whenever both are viable — which is what keeps A un-pulled
+    // --- Node H: holds payload2, serves honestly, quotes rate 1 against A's
+    //     `RANK_LAST_RATE` so it outranks A whenever both are viable — which is what keeps A un-pulled
     //     (and so un-suppressed) for hash2 until the moment under test. -----------
     let (cache_h, hash_h, _tmp_h) = cache_with_blob(&payload2).await?;
     anyhow::ensure!(hash_h == hash2, "fixture hash mismatch");

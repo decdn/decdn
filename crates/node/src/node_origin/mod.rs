@@ -3255,6 +3255,7 @@ fn fold_outcome(local_rep: &LocalReputation, metrics: &Metrics, pk: PublicKey, o
 }
 
 /// Round-trip-time milliseconds as a saturating `u32` for the selection score.
+/// A sub-millisecond RTT truncates to 0; the score applies its 1 ms floor.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // RTT ≥ 0; saturated below u32::MAX.
 fn ms_to_u32(rtt_ms: f64) -> u32 {
     if rtt_ms >= f64::from(u32::MAX) {
