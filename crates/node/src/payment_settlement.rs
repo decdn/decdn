@@ -857,7 +857,7 @@ impl PoolSettlementSink {
 /// every request cannot drive one `getPool` per request, and one failed read does
 /// not refuse a live pool for the full verdict window. Reads are coalesced per
 /// pool: a request that finds a `getPool` in flight for its pool waits for it
-/// and reads its result from the projection or the negative cache.
+/// and takes its answer.
 pub struct ResolvingPoolView<P: Provider + Clone> {
     /// The wallet/RPC-backed `PaymentPool` binding for the admit-path reads
     /// (`getPool`, `getAuthorization`).
@@ -870,8 +870,8 @@ pub struct ResolvingPoolView<P: Provider + Clone> {
     /// The guard is held only to read/insert one entry, never across the
     /// `getPool` await.
     negative: Mutex<HashMap<B256, (NegativeReason, Instant)>>,
-    /// Pool id → a receiver whose channel closes when the in-flight admit
-    /// `getPool` for that pool ends. See [`ReadSlot`]. The guard is held only to
+    /// Pool id → a receiver for the in-flight admit `getPool` of that pool,
+    /// which carries the read's answer. See [`ReadSlot`]. The guard is held only to
     /// read/insert one entry, never across the `getPool` await.
     inflight: InflightReads,
     /// `(pool_id, signer)` → (last-observed authorization, observed-at instant),
@@ -1008,11 +1008,18 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
                 }
             }
             match claim_read(&self.inflight, pool_id) {
-                ReadSlot::Lead(_read) => return self.resolve(pool_id).await,
-                // The channel never carries a value, so `changed` returns only
-                // when the reader's guard drops; then re-check what it wrote.
+                ReadSlot::Lead(read) => {
+                    let status = self.resolve(pool_id).await;
+                    read.finish(status);
+                    return status;
+                }
+                // The reader sends its answer before it ends the read. A read
+                // that ends with no answer was cancelled: re-check, and take
+                // the read over if no other waiter has.
                 ReadSlot::Wait(mut done) => {
-                    let _closed = done.changed().await;
+                    if done.changed().await.is_ok() {
+                        return *done.borrow();
+                    }
                 }
             }
         }
@@ -1135,30 +1142,41 @@ fn remember_negative(
     }
 }
 
-/// Pool id → a receiver whose channel closes when that pool's in-flight admit
-/// `getPool` ends.
-type InflightReads = Mutex<HashMap<B256, watch::Receiver<()>>>;
+/// Pool id → a receiver for that pool's in-flight admit `getPool`. The channel
+/// starts at a seen `None` and carries the read's answer once it ends.
+type InflightReads = Mutex<HashMap<B256, watch::Receiver<Option<PoolStatus>>>>;
 
 /// A request's place in the admit `getPool` for one pool. At most one request
 /// per pool reads at a time; the rest wait for it.
 enum ReadSlot<'a> {
     /// No read is in flight: this request reads, and the guard ends the read.
     Lead(InflightRead<'a>),
-    /// A read is in flight: the receiver's `changed` returns when it ends.
-    Wait(watch::Receiver<()>),
+    /// A read is in flight: the receiver's `changed` returns `Ok` with the
+    /// read's answer, or an error when the read ends unanswered.
+    Wait(watch::Receiver<Option<PoolStatus>>),
 }
 
-/// Ends a pool's in-flight read when dropped: it removes the pool's entry, then
-/// drops the sender, which wakes every waiter. A cancelled reader ends the read
-/// the same way, so a waiter then re-checks and takes over the read.
+/// A pool's in-flight read. [`finish`](Self::finish) hands the answer to every
+/// waiter. Dropping it ends the read: it removes the pool's entry, then drops
+/// the sender, which wakes every waiter. A cancelled reader ends the read with
+/// no answer, so a waiter then re-checks and takes over the read.
 struct InflightRead<'a> {
     /// The map this read is registered in.
     inflight: &'a InflightReads,
     /// The pool being read.
     pool_id: B256,
-    /// Never sent on. Dropped after [`Drop::drop`] removes the entry, which
-    /// closes the channel.
-    _done: watch::Sender<()>,
+    /// Carries the answer to the waiters. Dropped after [`Drop::drop`] removes
+    /// the entry, which closes the channel.
+    done: watch::Sender<Option<PoolStatus>>,
+}
+
+impl InflightRead<'_> {
+    /// Hand `answer` to every waiter, then end the read. The waiters take it
+    /// as their own answer, so the read's outcome reaches them whether or not
+    /// the negative cache had room to record it.
+    fn finish(self, answer: Option<PoolStatus>) {
+        self.done.send_replace(answer);
+    }
 }
 
 impl Drop for InflightRead<'_> {
@@ -1182,12 +1200,12 @@ fn claim_read(inflight: &InflightReads, pool_id: B256) -> ReadSlot<'_> {
     {
         return ReadSlot::Wait(done.clone());
     }
-    let (done, waiters) = watch::channel(());
+    let (done, waiters) = watch::channel(None);
     guard.insert(pool_id, waiters);
     ReadSlot::Lead(InflightRead {
         inflight,
         pool_id,
-        _done: done,
+        done,
     })
 }
 
@@ -3386,6 +3404,57 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .is_empty(),
             "the ended read leaves no in-flight entry"
+        );
+    }
+
+    /// With the negative cache full of in-window entries, the read's fault is
+    /// not cached; its waiters still take the read's answer instead of each
+    /// starting a read of its own in turn.
+    #[tokio::test(start_paused = true)]
+    async fn admit_getpool_waiters_take_the_answer_when_the_cache_is_full() {
+        use crate::chain_events::test_support::bounded;
+        use crate::pool_view::PoolView;
+        use std::sync::atomic::Ordering;
+
+        let (view, calls) = counting_hanging_view();
+        {
+            let mut negative = view
+                .negative
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for i in 0..RESOLVE_NEGATIVE_CACHE_MAX {
+                let id = B256::from(U256::from(i).to_be_bytes::<32>());
+                remember_negative(&mut negative, id, NegativeReason::Verdict);
+            }
+        }
+        let pool_id = B256::repeat_byte(0xfe);
+        let started = tokio::time::Instant::now();
+        let answers = bounded(
+            "admit getPool",
+            futures_util::future::join_all((0..8).map(|_| view.status(pool_id))),
+        )
+        .await;
+        assert!(
+            answers.iter().all(Option::is_none),
+            "every request is refused"
+        );
+        assert_eq!(
+            started.elapsed(),
+            crate::chain_events::DEFAULT_RPC_CALL_TIMEOUT,
+            "the waiters end with the one read"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "one getPool for eight requests"
+        );
+        assert!(
+            !view
+                .negative
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&pool_id),
+            "the full cache did not record the fault"
         );
     }
 
