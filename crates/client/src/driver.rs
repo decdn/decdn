@@ -598,12 +598,12 @@ fn log_healed_retry(
 }
 
 /// True when `err` is a lane-watermark voucher rejection that a heal past the
-/// resume budget scopes to its source: `UnderFold`, `AmountRegression` or
-/// `Underpaid`. A heal reseeds on any reason whose bundle is ahead of the
-/// ledger, so the reason decides the scope, not the heal. A
-/// `BytesRegression` is a single-signer fault and ends the command (ADR 005).
-/// A `SpendingCapExhausted` is the pool's, one deposit behind every lane, so
-/// the exhaustion check judges it instead.
+/// resume budget scopes to its source: `UnderFold`, `AmountRegression`,
+/// `Underpaid` or `BytesRegression`. A heal reseeds on any reason whose bundle
+/// is ahead of the ledger, so the reason decides the scope, not the heal. A
+/// `BytesRegression` with no bundle never heals, so it stays bare and ends the
+/// command (ADR 005). A `SpendingCapExhausted` is the pool's, one deposit
+/// behind every lane, so the exhaustion check judges it instead.
 fn scopes_to_source(err: &anyhow::Error) -> bool {
     err.downcast_ref::<UpstreamVoucherRejected>()
         .is_some_and(|r| {
@@ -612,6 +612,7 @@ fn scopes_to_source(err: &anyhow::Error) -> bool {
                 VoucherRejectReason::UnderFold
                     | VoucherRejectReason::AmountRegression
                     | VoucherRejectReason::Underpaid
+                    | VoucherRejectReason::BytesRegression
             )
         })
 }
@@ -1453,17 +1454,19 @@ where
 
                     // 2. Desync heal (driver-owned, NOT a PaceDecision): an
                     //    authenticated bundle that ADVANCES our committed
-                    //    watermark means the node holds a voucher we lost, and
-                    //    an `Underpaid` bundle BEHIND it means we hold vouchers
-                    //    the node never took — heal the ledger and retry. A heal
-                    //    past the resume budget still leaves the ledger where the
-                    //    node holds it, but this source kept rejecting after each
-                    //    heal: mark the rejection `HealExhausted`, so the source
-                    //    cools rather than the command ending. A rejection that
-                    //    no heal takes stays bare and falls through to step 4.
-                    //    Only a lane-watermark reason is marked
-                    //    (`scopes_to_source`): a `BytesRegression` stays fatal,
-                    //    and a spending-cap rejection reaches step 3's check.
+                    //    watermark means the node holds a voucher we lost, an
+                    //    `Underpaid` bundle BEHIND it means we hold vouchers the
+                    //    node never took, and a `BytesRegression` bundle behind
+                    //    on amount but ahead on bytes means the lane resumed
+                    //    below a voucher the node holds — heal the ledger and
+                    //    retry. A heal past the resume budget still leaves the
+                    //    ledger where the node holds it, but this source kept
+                    //    rejecting after each heal: mark the rejection
+                    //    `HealExhausted`, so the source cools rather than the
+                    //    command ending. A rejection that no heal takes stays
+                    //    bare and falls through to step 4. Only a lane-watermark
+                    //    reason is marked (`scopes_to_source`): a spending-cap
+                    //    rejection reaches step 3's check instead.
                     let healed = match watermark {
                         Some(watermark) => heal_watermark_desync(&err, watermark, ledger).await,
                         None => None,
@@ -2721,6 +2724,33 @@ mod tests {
         );
     }
 
+    /// A lane seeded below the node's anchor draws a `BytesRegression` whose
+    /// bundle, signed by our own key, is behind on amount and ahead on bytes.
+    /// The driver rebases the ledger to it and completes the fetch, instead of
+    /// ending the command.
+    #[tokio::test]
+    async fn a_bytes_regression_ahead_on_bytes_rebases_and_the_fetch_completes() {
+        let ledger = ledger_ahead_of_the_node();
+        let (result, store, opens) = drive_through_faults(healthy_ctx(), &ledger, |ctx| {
+            let mut err = underpaid(ctx, (80, 12_000), Some(0));
+            if let Some(rejected) = err.downcast_mut::<UpstreamVoucherRejected>() {
+                rejected.reason = VoucherRejectReason::BytesRegression;
+            }
+            vec![err]
+        })
+        .await;
+        result.expect("the rebased lane completes the fetch");
+
+        assert!(store.is_complete().await.expect("is_complete"));
+        assert_eq!(opens, 2, "the faulted open plus the healthy one");
+        assert_eq!(ledger.generation(), 1, "the ledger rebased once");
+        let committed = ledger.committed();
+        assert!(
+            committed.bytes > U256::from(12_000u64) && committed.amount > U256::from(80u64),
+            "the healed ledger builds on the node's anchor: {committed:?}"
+        );
+    }
+
     /// A second `Underpaid` for a voucher signed before the rebase — a sibling's
     /// stale rejection — retries the leg without moving the ledger again, and the
     /// fetch completes.
@@ -2780,58 +2810,92 @@ mod tests {
         );
     }
 
-    /// A spending-cap or bytes-regression rejection whose bundle keeps
-    /// reseeding the ledger is healed within the resume budget, and past it
-    /// ends the command bare: neither is a lane-watermark fault, so neither
-    /// carries the marker that scopes a fault to one source.
+    /// Repeated `BytesRegression` rejections are bounded by
+    /// `MAX_RESUME_ATTEMPTS`. The first bundle rebases the ledger and the rest
+    /// are stale, so every one healed it: the last one carries
+    /// [`crate::HealExhausted`] and cools only this source.
+    #[tokio::test]
+    async fn repeated_bytes_regression_rejections_are_bounded_and_scoped() {
+        let ledger = ledger_ahead_of_the_node();
+        let (result, _store, opens) = drive_through_faults(healthy_ctx(), &ledger, |ctx| {
+            (0..8)
+                .map(|_| {
+                    let mut err = underpaid(ctx, (80, 12_000), Some(0));
+                    if let Some(rejected) = err.downcast_mut::<UpstreamVoucherRejected>() {
+                        rejected.reason = VoucherRejectReason::BytesRegression;
+                    }
+                    err
+                })
+                .collect()
+        })
+        .await;
+        let err = result.expect_err("an endless stream of rejections must end the fetch");
+        assert!(
+            err.downcast_ref::<UpstreamVoucherRejected>()
+                .is_some_and(|r| r.reason == VoucherRejectReason::BytesRegression),
+            "the terminal error is the rejection itself: {err:#}"
+        );
+        assert!(
+            err.downcast_ref::<crate::HealExhausted>().is_some(),
+            "a healed rejection past the budget carries the marker: {err:#}"
+        );
+        assert_eq!(crate::classify(&err), crate::Fault::Source);
+        assert_eq!(ledger.generation(), 1, "only the first bundle rebased");
+        let budget = usize::try_from(crate::MAX_RESUME_ATTEMPTS).unwrap_or(usize::MAX);
+        assert_eq!(
+            opens,
+            budget + 1,
+            "one open per resume attempt, plus the first"
+        );
+    }
+
+    /// A spending-cap rejection whose bundle keeps reseeding the ledger is
+    /// healed within the resume budget, and past it ends the command bare: it
+    /// is not a lane-watermark fault, so it never carries the marker that
+    /// scopes a fault to one source.
     #[tokio::test]
     async fn a_non_lane_rejection_past_the_budget_is_never_scoped_to_the_source() {
-        for reason in [
-            VoucherRejectReason::SpendingCapExhausted,
-            VoucherRejectReason::BytesRegression,
-        ] {
-            let ledger = ledger_ahead_of_the_node();
-            let (result, _store, opens) = drive_through_faults(healthy_ctx(), &ledger, |ctx| {
-                (0..8u64)
-                    .map(|i| {
-                        let mut err =
-                            underpaid(ctx, (100_000 + i * 1_000, 50_000 + i * 1_000), None);
-                        if let Some(rejected) = err.downcast_mut::<UpstreamVoucherRejected>() {
-                            rejected.reason = reason;
-                        }
-                        err
-                    })
-                    .collect()
-            })
-            .await;
-            let err = result.expect_err("an endless stream of rejections must end the fetch");
-            assert!(
-                err.downcast_ref::<UpstreamVoucherRejected>()
-                    .is_some_and(|r| r.reason == reason),
-                "{reason:?}: the terminal error is the rejection itself: {err:#}"
-            );
-            assert!(
-                err.downcast_ref::<crate::HealExhausted>().is_none(),
-                "{reason:?}: never carries the marker: {err:#}"
-            );
-            assert_eq!(
-                crate::classify(&err),
-                crate::Fault::Fatal(crate::FatalScope::Command),
-                "{reason:?}"
-            );
-            let budget = usize::try_from(crate::MAX_RESUME_ATTEMPTS).unwrap_or(usize::MAX);
-            assert_eq!(
-                opens,
-                budget + 1,
-                "{reason:?}: one open per resume attempt, plus the first"
-            );
-        }
+        let reason = VoucherRejectReason::SpendingCapExhausted;
+        let ledger = ledger_ahead_of_the_node();
+        let (result, _store, opens) = drive_through_faults(healthy_ctx(), &ledger, |ctx| {
+            (0..8u64)
+                .map(|i| {
+                    let mut err = underpaid(ctx, (100_000 + i * 1_000, 50_000 + i * 1_000), None);
+                    if let Some(rejected) = err.downcast_mut::<UpstreamVoucherRejected>() {
+                        rejected.reason = reason;
+                    }
+                    err
+                })
+                .collect()
+        })
+        .await;
+        let err = result.expect_err("an endless stream of rejections must end the fetch");
+        assert!(
+            err.downcast_ref::<UpstreamVoucherRejected>()
+                .is_some_and(|r| r.reason == reason),
+            "{reason:?}: the terminal error is the rejection itself: {err:#}"
+        );
+        assert!(
+            err.downcast_ref::<crate::HealExhausted>().is_none(),
+            "{reason:?}: never carries the marker: {err:#}"
+        );
+        assert_eq!(
+            crate::classify(&err),
+            crate::Fault::Fatal(crate::FatalScope::Command),
+            "{reason:?}"
+        );
+        let budget = usize::try_from(crate::MAX_RESUME_ATTEMPTS).unwrap_or(usize::MAX);
+        assert_eq!(
+            opens,
+            budget + 1,
+            "{reason:?}: one open per resume attempt, plus the first"
+        );
     }
 
     /// A voucher rejection that no heal takes ends the drive on the first open
     /// and stays fatal for the command (ADR 005): an `Underpaid` with no bundle
-    /// has no watermark to rebase to, a `BytesRegression` is a single-signer
-    /// fault, and a trailing proof whose bundle the ledger covers on amount but
+    /// has no watermark to rebase to, a `BytesRegression` with no bundle is a
+    /// single-signer fault, and a trailing proof whose bundle the ledger covers on amount but
     /// not on bytes cannot heal.
     #[tokio::test]
     async fn a_rejection_no_heal_takes_ends_the_command() {

@@ -937,6 +937,19 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **A lane seeded from the chain watermark below the provider's unredeemed
+  voucher now heals instead of suppressing the provider (#2254).** After a
+  buyer-table schema bump, a node adopts its pool with no lanes, and each
+  lane seeds from `getWatermark` on its first use. The seed sits below any
+  voucher the provider has not redeemed yet. The ledger prices its spans from
+  that lower seed, so its amount passes the provider's anchor while its bytes
+  still trail it, and the provider rejects `BytesRegression` with the anchor
+  attached. The payer now rebases to that anchor, its own voucher, and
+  resumes (ADR 005). Before, the pull ended and node-origin suppressed a
+  healthy provider. A healed `BytesRegression` that keeps rejecting past the
+  resume budget now cools only that source. Two streams that find one lane
+  missing seed it once. Each lane has its own seed lock, and the watermark
+  read times out after 10 s.
 - **A sub-millisecond probe RTT no longer erases the price signal in
   candidate ranking (#2268).** The selection score multiplies the rate by the
   probe RTT in whole milliseconds, and a probe faster than 1 ms truncated to
