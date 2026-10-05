@@ -227,12 +227,13 @@ struct Pipeline {
     /// [`PoolLedger::issue`], a matching [`PoolLedger::confirm_armed_stamped`] or
     /// [`PoolLedger::resolve_reject`], or a [`PoolLedger::reseed`].
     armed: Option<Armed>,
-    /// How many times [`PoolLedger::rebase`] has moved this ledger DOWN to a
-    /// node's watermark. Every voucher is stamped with the generation it was
-    /// signed under (`StreamProof::Voucher`), so an `Underpaid` rejection of a
-    /// voucher signed before the latest rebase is recognisably stale.
+    /// How many times a rebase has moved this ledger to a node's watermark
+    /// behind it on `amount`. Every voucher is stamped with the generation it
+    /// was signed under (`StreamProof::Voucher`), so an `Underpaid` or
+    /// `BytesRegression` rejection of a voucher signed before the latest
+    /// rebase is recognisably stale.
     generation: u64,
-    /// The watermark the latest [`PoolLedger::rebase`] moved down to, until the
+    /// The watermark the latest rebase moved to, until the
     /// caller records it ([`PoolLedger::take_unsaved_rebase`]). A monotone
     /// advance refuses a lower watermark, so the next persist overwrites the
     /// lane record with this anchor once, then advances from it.
@@ -341,7 +342,7 @@ pub(crate) enum StreamProof {
 /// What [`PoolLedger::rebase`] did with a node's watermark.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rebase {
-    /// The committed watermark moved down to the node's, from `from`.
+    /// The committed watermark moved to the node's, from `from`.
     Rebased {
         /// The committed-plus-accrued watermark the ledger held before.
         from: Cumulative,
@@ -349,7 +350,8 @@ pub enum Rebase {
     /// The rejected voucher was signed before the latest rebase, so its
     /// rejection says nothing about the healed anchor. Nothing moved.
     Stale,
-    /// The watermark is not below the ledger's. Nothing moved.
+    /// The watermark is not one this rebase moves to (see
+    /// [`PoolLedger::rebase`] and the `BytesRegression` heal). Nothing moved.
     Refused,
 }
 
@@ -997,8 +999,8 @@ impl PoolLedger {
     /// — it measured its span from the anchor this ledger has already left — so
     /// that rejection is [`Rebase::Stale`] and moves nothing. Rebasing on it
     /// would re-sign amounts the node has since accepted from the healed anchor,
-    /// with different bytes, which the node refuses as a terminal
-    /// `BytesRegression`. A rejection of a voucher from the current generation
+    /// with different bytes, which the node refuses as a `BytesRegression`. A
+    /// rejection of a voucher from the current generation
     /// is a fresh divergence, and rebases again. `None` means the generation is
     /// unknown, and counts as current.
     ///
@@ -1011,6 +1013,52 @@ impl PoolLedger {
     /// [`Self::reseed`]'s case) or equal to the committed watermark (an echo).
     /// A `cum` equal on `amount` but behind on `bytes` rebases.
     pub async fn rebase(&self, cum: Cumulative, proof_generation: Option<u64>) -> Rebase {
+        // A watermark ahead on `amount` is `reseed`'s case, and one equal to
+        // ours is an echo that proves nothing. Anything else is the node's
+        // accepted state behind ours — including one equal on `amount` but
+        // behind on `bytes`, which still makes every span we sign underpay.
+        self.rebase_if(cum, proof_generation, |from| {
+            cum.amount <= from.amount && cum != from
+        })
+        .await
+    }
+
+    /// Move the committed watermark to `cum` — the node's last-accepted
+    /// watermark from a [`WatermarkBundle`] on a `BytesRegression` — when
+    /// `cum` is at or behind the ledger on `amount` and ahead of it on
+    /// `bytes`.
+    ///
+    /// That shape says the lane resumed from a lower anchor than the node
+    /// holds, and priced its spans from there: its `amount` passed the node's
+    /// anchor while its bytes still trailed it. The rebase is safe for the
+    /// payer for the reason [`Self::rebase`] gives: `cum` is a voucher the
+    /// payer signed.
+    ///
+    /// The bytes test runs under the issuance lock, beside the generation
+    /// test, so a sibling voucher that commits past `cum` while this call
+    /// waits makes it [`Rebase::Refused`] instead of moving the ledger below
+    /// a voucher the node accepted.
+    pub(crate) async fn rebase_ahead_on_bytes(
+        &self,
+        cum: Cumulative,
+        proof_generation: Option<u64>,
+    ) -> Rebase {
+        self.rebase_if(cum, proof_generation, |from| {
+            cum.amount <= from.amount && cum.bytes > from.bytes
+        })
+        .await
+    }
+
+    /// The shared body of [`Self::rebase`] and [`Self::rebase_ahead_on_bytes`]:
+    /// under the issuance lock, refuse a stale generation, then move to `cum`
+    /// when `admits` accepts the committed-plus-accrued watermark it would
+    /// leave.
+    async fn rebase_if(
+        &self,
+        cum: Cumulative,
+        proof_generation: Option<u64>,
+        admits: impl FnOnce(Cumulative) -> bool,
+    ) -> Rebase {
         let _issuing = self.issuance.lock().await;
         let from = {
             let mut pipeline = self.pipeline();
@@ -1018,11 +1066,7 @@ impl PoolLedger {
                 return Rebase::Stale;
             }
             let from = pipeline.committed.plus(pipeline.accrued);
-            // A watermark ahead on `amount` is `reseed`'s case, and one equal to
-            // ours is an echo that proves nothing. Anything else is the node's
-            // accepted state behind ours — including one equal on `amount` but
-            // behind on `bytes`, which still makes every span we sign underpay.
-            if cum.amount > from.amount || cum == from {
+            if !admits(from) {
                 return Rebase::Refused;
             }
             pipeline.overwrite(cum);
@@ -1036,13 +1080,13 @@ impl PoolLedger {
     }
 
     /// The generation vouchers are currently signed under: how many times
-    /// [`Self::rebase`] has moved this ledger down.
+    /// a rebase has moved this ledger to a node's watermark.
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.pipeline().generation
     }
 
-    /// Take the watermark the latest [`Self::rebase`] moved down to, if no
+    /// Take the watermark the latest rebase moved to, if no
     /// persist has recorded it yet. The caller overwrites the lane record with it
     /// once and advances from there; every later persist is a monotone advance
     /// again. Taking it clears it, so a second persist sees `None`.

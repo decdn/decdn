@@ -1466,6 +1466,36 @@ mod tests {
         );
     }
 
+    /// A voucher past the signed anchor on amount but short of it on bytes —
+    /// a payer that resumed below the node's anchor and priced its spans from
+    /// there — rejects `BytesRegression` WITH the watermark bundle. The bundle
+    /// is the anchor the payer rebases to (ADR 005); without it the payer's
+    /// lane would have no way back.
+    #[test]
+    fn a_voucher_past_the_amount_but_short_on_bytes_carries_the_anchor() {
+        let lane = LiveChainLane::proved_to(0);
+        let verified = lane.verify(
+            B256::ZERO,
+            U256::ZERO,
+            lane.anchor_amount + lane.price,
+            lane.anchor_bytes - decdn_incentive::chain::CHUNK_BYTES,
+        );
+        let Err(super::VerifyStop::Reject(reason, bundle)) = verified else {
+            panic!("expected a BytesRegression Reject");
+        };
+        assert_eq!(
+            reason,
+            decdn_protocol::client::VoucherRejectReason::BytesRegression
+        );
+        let bundle = bundle.expect("a lane-level BytesRegression carries the watermark bundle");
+        assert_eq!(
+            U256::from(bundle.amount),
+            lane.anchor_amount,
+            "the bundle states the signed anchor"
+        );
+        assert_eq!(bundle.bytes_delivered, lane.anchor_bytes);
+    }
+
     /// A lane holding a live chain: a signed anchor at 5 chunks plus 9 chunks
     /// proved on top of it, and the key that signs its vouchers (#2167).
     struct LiveChainLane {

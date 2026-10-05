@@ -1368,6 +1368,43 @@ mod tests {
         Ok(())
     }
 
+    /// A `BytesRegression` rebase anchor is behind the record on amount and
+    /// ahead of it on bytes. The rebase overwrites the record with it all the
+    /// same and advances to the totals.
+    #[test]
+    fn rebase_progress_takes_an_anchor_ahead_on_bytes() -> anyhow::Result<()> {
+        let (_d, db) = db()?;
+        let s = state(8);
+        tbl(&db).record(&s)?;
+        let lane = s
+            .lanes()
+            .next()
+            .map(|(k, _)| k)
+            .ok_or_else(|| anyhow::anyhow!("fixture has no lane"))?;
+        let progress = s
+            .lane_progress(lane)
+            .ok_or_else(|| anyhow::anyhow!("missing progress"))?;
+        let anchor = BuyerLaneProgress {
+            last_amount: progress.last_amount - U256::from(10u64),
+            last_bytes: progress.last_bytes + U256::from(4_000u64),
+        };
+        let totals = BuyerLaneProgress {
+            last_amount: progress.last_amount + U256::from(3u64),
+            last_bytes: anchor.last_bytes + U256::from(300u64),
+        };
+        let outcome = tbl(&db).rebase_progress(s.owner, s.pool_id, lane, anchor, totals)?;
+        anyhow::ensure!(
+            matches!(outcome, AdvanceOutcome::Advanced),
+            "a rebase must write, got {outcome:?}"
+        );
+        let stored = tbl(&db)
+            .get_by_owner(s.owner)?
+            .and_then(|row| row.lane_progress(lane))
+            .ok_or_else(|| anyhow::anyhow!("row vanished"))?;
+        anyhow::ensure!(stored == totals, "got {stored:?}");
+        Ok(())
+    }
+
     /// A rebase overwrites the committed watermark DOWN (the ledger moved to the
     /// node's watermark), and keeps the same pool-id guard as an advance: it
     /// never clobbers a row replaced by a newer open.
