@@ -41,6 +41,7 @@ use iroh_blobs::Hash;
 use tokio_util::io::ReaderStream;
 
 use super::fs::OBAO4_SUFFIX;
+use super::io_runtime::IoRuntime;
 use super::{
     BlobTooLargeMarker, DecompressMode, Origin, OriginByteStream, OriginFetch, OriginKind,
     OriginRangeFetch, OriginRangeRequest, OriginUrl, OutboardFetch, decompress,
@@ -189,6 +190,10 @@ fn key_for(prefix: &str, hash: Hash) -> String {
 #[derive(Debug, Clone)]
 pub struct S3Origin {
     client: Client,
+    /// The runtime every SDK request send runs on, so the HTTP client's
+    /// pooled keep-alive connections live there and not on a caller's
+    /// per-serve runtime. See [`super::io_runtime`].
+    io: IoRuntime,
     /// Operator-configured bucket. `Arc<str>` so cheap clone preserves
     /// shared ownership for log fields without re-allocating.
     bucket: Arc<str>,
@@ -248,7 +253,9 @@ impl S3Origin {
         // Constructed once per S3Origin and shared across every fetch via
         // `Client::clone` (the SDK Client is cheaply cloneable). A single
         // shared connection pool keeps idle TLS connections warm across
-        // back-to-back cache misses.
+        // back-to-back cache misses. Every send runs on `io`, so each pooled
+        // connection lives on the runtime that built this origin, never on a
+        // caller's per-serve runtime (`super::io_runtime`).
         let http_client = HttpBuilder::new()
             .tls_provider(tls::Provider::Rustls(
                 tls::rustls_provider::CryptoMode::AwsLc,
@@ -307,11 +314,7 @@ impl S3Origin {
             .build();
         let client = Client::from_conf(s3_config);
 
-        Ok(Self::from_parts(
-            client,
-            cfg.bucket.as_str(),
-            cfg.prefix.as_str(),
-        ))
+        Self::from_parts(client, cfg.bucket.as_str(), cfg.prefix.as_str())
     }
 
     /// Test-only constructor that skips `aws_config::defaults` and takes a
@@ -324,14 +327,18 @@ impl S3Origin {
     /// generated rustdoc only — it is technically callable by downstream
     /// crates and is part of the semver surface by convention. Non-test
     /// callers use [`Self::new`].
+    ///
+    /// The origin's connections live on the tokio runtime this is called
+    /// on; it fails outside a runtime.
     #[doc(hidden)]
-    pub fn from_parts(client: Client, bucket: &str, prefix: &str) -> Self {
-        Self {
+    pub fn from_parts(client: Client, bucket: &str, prefix: &str) -> anyhow::Result<Self> {
+        Ok(Self {
             client,
+            io: IoRuntime::current()?,
             bucket: Arc::from(bucket),
             prefix: Arc::from(prefix),
             decompress: DecompressMode::Auto,
-        }
+        })
     }
 
     /// Set the [`DecompressMode`]. See that type for the semantics of
@@ -608,12 +615,16 @@ impl Origin for S3Origin {
             let log_target = format!("s3://{}/{}", self.bucket, key);
 
             let resp = match self
-                .client
-                .get_object()
-                .bucket(self.bucket.as_ref())
-                .key(&key)
-                .send()
+                .io
+                .run(
+                    self.client
+                        .get_object()
+                        .bucket(self.bucket.as_ref())
+                        .key(&key)
+                        .send(),
+                )
                 .await
+                .map_err(|e| e.map_inner(|e| e.context(log_target.clone())))?
             {
                 Ok(r) => r,
                 Err(e) => return classify_get_object_error(e, &log_target),
@@ -759,13 +770,17 @@ impl Origin for S3Origin {
             let want = req.len();
             let log_target = format!("s3://{}/{} (range {range_val})", self.bucket, data_key);
             let resp = match self
-                .client
-                .get_object()
-                .bucket(self.bucket.as_ref())
-                .key(&data_key)
-                .range(range_val)
-                .send()
+                .io
+                .run(
+                    self.client
+                        .get_object()
+                        .bucket(self.bucket.as_ref())
+                        .key(&data_key)
+                        .range(range_val)
+                        .send(),
+                )
                 .await
+                .map_err(|e| e.map_inner(|e| e.context(log_target.clone())))?
             {
                 Ok(r) => r,
                 // Reuse the headers-phase classifier. A `NotFound` here is the
@@ -826,12 +841,16 @@ impl Origin for S3Origin {
             let obao4_key = format!("{data_key}{OBAO4_SUFFIX}");
             let log_target = format!("s3://{}/{}", self.bucket, obao4_key);
             let resp = match self
-                .client
-                .get_object()
-                .bucket(self.bucket.as_ref())
-                .key(&obao4_key)
-                .send()
+                .io
+                .run(
+                    self.client
+                        .get_object()
+                        .bucket(self.bucket.as_ref())
+                        .key(&obao4_key)
+                        .send(),
+                )
                 .await
+                .map_err(|e| e.map_inner(|e| e.context(log_target.clone())))?
             {
                 Ok(r) => r,
                 Err(e) => match classify_get_object_error(e, &log_target)? {
@@ -870,12 +889,16 @@ impl Origin for S3Origin {
             // `Content-Length`) without transferring the body — the cheapest
             // way to learn the canonical blob size before a range pull.
             let resp = match self
-                .client
-                .head_object()
-                .bucket(self.bucket.as_ref())
-                .key(&key)
-                .send()
+                .io
+                .run(
+                    self.client
+                        .head_object()
+                        .bucket(self.bucket.as_ref())
+                        .key(&key)
+                        .send(),
+                )
                 .await
+                .map_err(|e| e.map_inner(|e| e.context(log_target.clone())))?
             {
                 Ok(r) => r,
                 Err(e) => return classify_head_object_error(e, &log_target),

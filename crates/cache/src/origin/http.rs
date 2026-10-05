@@ -16,6 +16,7 @@ use reqwest::StatusCode;
 use reqwest::header::{CONTENT_ENCODING, CONTENT_LENGTH, RANGE};
 
 use super::fs::OBAO4_SUFFIX;
+use super::io_runtime::IoRuntime;
 use super::{
     DEFAULT_USER_AGENT, DecompressMode, Origin, OriginFetch, OriginKind, OriginRangeFetch,
     OriginRangeRequest, OriginUrl, OutboardFetch, decompress, parse_origin_url, redact_for_log,
@@ -46,6 +47,10 @@ const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone)]
 pub struct HttpOrigin {
     client: reqwest::Client,
+    /// The runtime every request send runs on, so the client's pooled
+    /// keep-alive connections live there and not on a caller's per-serve
+    /// runtime. See [`super::io_runtime`].
+    io: IoRuntime,
     base_url: OriginUrl,
     response_headers_timeout: Duration,
     chunk_idle_timeout: Duration,
@@ -66,6 +71,10 @@ impl HttpOrigin {
     /// Sets [`DEFAULT_USER_AGENT`] on the inner reqwest client so origin
     /// access logs can attribute CDN pull-through traffic (#435). Override
     /// via [`Self::new_with_user_agent`].
+    ///
+    /// The origin's connections live on the tokio runtime this is called
+    /// on, so call it on a runtime that outlives every fetch (the node's
+    /// main runtime). It fails outside a runtime.
     pub fn new(base_url: OriginUrl) -> anyhow::Result<Self> {
         Self::new_with_user_agent(base_url, DEFAULT_USER_AGENT)
     }
@@ -93,30 +102,15 @@ impl HttpOrigin {
         // serve `{base}/{hex}` directly anyway (query/fragment are
         // already rejected by `parse_origin_url`), so a redirect was
         // never a legitimate response shape.
-        // `pool_max_idle_per_host(0)` disables reqwest's idle keep-alive pool: every
-        // request opens a fresh connection and closes it when done, so no connection is
-        // ever reused across two callers. This is REQUIRED for correctness, not tuning
-        // (#1673). The own-origin serve-miss pull leg runs on an EPHEMERAL per-serve
-        // current-thread runtime that the orchestration drops the instant that serve
-        // finishes (`serve_via_backend_origin` in the node crate). Because this
-        // `HttpOrigin`'s `Client` is shared (one per engine, cloned across serves), a
-        // pooled keep-alive connection first driven on serve A's runtime could be
-        // reused by a concurrent serve B — and when serve A finishes and its runtime is
-        // dropped, that connection's hyper dispatch task dies under B, failing B's
-        // in-flight GET with "dispatch task is gone: runtime dropped the dispatch task"
-        // (a mid-stream close the paying client sees as `early eof`). Under CI
-        // coverage-starvation the drop-while-in-flight window is wide, so two disjoint
-        // concurrent own-origin pulls flake; on fast cores it almost never lands. With
-        // no idle pool each serve opens its own connection on its own runtime, so a
-        // finishing serve's runtime teardown can never strand another's request. The
-        // own-origin path fetches few, large ranges, so the per-request handshake cost
-        // amortizes over big transfers. The stable-pull-runtime fix that would let us
-        // restore origin keep-alive is tracked in #1675.
+        //
+        // reqwest's idle keep-alive pool is safe to share across callers:
+        // `send` runs every request on `io`, so each pooled connection lives
+        // on the runtime that built this origin, never on a caller's
+        // per-serve runtime (`super::io_runtime`).
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(user_agent)
             .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(0)
             .no_gzip()
             .no_deflate()
             .no_brotli()
@@ -125,6 +119,7 @@ impl HttpOrigin {
             .context("failed to build reqwest client")?;
         Ok(Self {
             client,
+            io: IoRuntime::current()?,
             base_url,
             response_headers_timeout: RESPONSE_HEADERS_TIMEOUT,
             chunk_idle_timeout: CHUNK_IDLE_TIMEOUT,
@@ -233,26 +228,9 @@ impl Origin for HttpOrigin {
             // from `base_url`, and errors go to logs.
             let url_log = redact_for_log(&url);
 
-            // `connect_timeout` on the client covers the TCP/TLS handshake.
-            // This wrapper covers `.send()` — which is request write through
-            // response-header receipt (and a pool-miss connect if no idle
-            // connection is available), bounding a server that accepts the
-            // TCP/TLS but never writes back.
-            let headers_timeout = self.response_headers_timeout;
-            let send_fut = self.client.get(url.clone()).send();
-            let resp = match tokio::time::timeout(headers_timeout, send_fut).await {
-                Err(_elapsed) => {
-                    // Headers-phase timeout: transient.
-                    return Err(OriginPullError::Transient(anyhow::anyhow!(
-                        "origin GET {url_log} headers timed out after {headers_timeout:?}"
-                    )));
-                }
-                Ok(Err(reqwest_err)) => {
-                    return Err(classify_reqwest_error(reqwest_err)
-                        .map_inner(|e| e.context(format!("origin GET {url_log} failed"))));
-                }
-                Ok(Ok(resp)) => resp,
-            };
+            let resp = self
+                .send(self.client.get(url.clone()), &format!("GET {url_log}"))
+                .await?;
 
             let status = resp.status();
             // SSRF defence (#579): with `redirect::Policy::none()` (set
@@ -448,19 +426,9 @@ impl Origin for HttpOrigin {
             let url_log = redact_for_log(&url);
             // A `HEAD` is the cheapest way to learn the canonical length — no
             // body crosses the wire.
-            let send_fut = self.client.head(url.clone()).send();
-            let resp = match tokio::time::timeout(self.response_headers_timeout, send_fut).await {
-                Err(_elapsed) => {
-                    return Err(OriginPullError::Transient(anyhow::anyhow!(
-                        "origin HEAD {url_log} headers timed out"
-                    )));
-                }
-                Ok(Err(reqwest_err)) => {
-                    return Err(classify_reqwest_error(reqwest_err)
-                        .map_inner(|e| e.context(format!("origin HEAD {url_log} failed"))));
-                }
-                Ok(Ok(resp)) => resp,
-            };
+            let resp = self
+                .send(self.client.head(url.clone()), &format!("HEAD {url_log}"))
+                .await?;
             let status = resp.status();
             // Status classification mirrors `fetch` and the S3 adapter's
             // `classify_head_object_error`: only a 404 asserts absence and
@@ -519,6 +487,42 @@ impl Origin for HttpOrigin {
 }
 
 impl HttpOrigin {
+    /// Send `req` on [`Self::io`] and wait for the response headers.
+    /// `what` names the request in errors (`GET {url}`, already redacted).
+    ///
+    /// The client's `connect_timeout` covers the TCP/TLS handshake. The
+    /// headers timeout covers the whole send — request write through
+    /// response-header receipt, plus a connect when no idle connection is
+    /// pooled — and bounds a server that accepts the connection but never
+    /// writes back. It runs inside the spawned task, so it also bounds that
+    /// task.
+    ///
+    /// # Errors
+    ///
+    /// A headers timeout is [`OriginPullError::Transient`]. A transport fault
+    /// is classified by `classify_reqwest_error`. A fault of the spawned task
+    /// itself comes from [`IoRuntime::run`].
+    async fn send(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<reqwest::Response, OriginPullError> {
+        let headers_timeout = self.response_headers_timeout;
+        let sent = self
+            .io
+            .run(tokio::time::timeout(headers_timeout, req.send()))
+            .await
+            .map_err(|e| e.map_inner(|e| e.context(format!("origin {what} failed"))))?;
+        match sent {
+            Err(_elapsed) => Err(OriginPullError::Transient(anyhow::anyhow!(
+                "origin {what} headers timed out after {headers_timeout:?}"
+            ))),
+            Ok(Err(reqwest_err)) => Err(classify_reqwest_error(reqwest_err)
+                .map_inner(|e| e.context(format!("origin {what} failed")))),
+            Ok(Ok(resp)) => Ok(resp),
+        }
+    }
+
     /// GET `url` and buffer the whole body, capped at `max_bytes`, as an
     /// [`OutboardFetch`]. A genuine 404 is [`OutboardFetch::NotFound`]; every
     /// other non-success status — redirect (disabled per #579), permission
@@ -530,19 +534,9 @@ impl HttpOrigin {
         max_bytes: u64,
     ) -> Result<OutboardFetch, OriginPullError> {
         let url_log = redact_for_log(url);
-        let send_fut = self.client.get(url.clone()).send();
-        let resp = match tokio::time::timeout(self.response_headers_timeout, send_fut).await {
-            Err(_elapsed) => {
-                return Err(OriginPullError::Transient(anyhow::anyhow!(
-                    "origin GET {url_log} headers timed out"
-                )));
-            }
-            Ok(Err(reqwest_err)) => {
-                return Err(classify_reqwest_error(reqwest_err)
-                    .map_inner(|e| e.context(format!("origin GET {url_log} failed"))));
-            }
-            Ok(Ok(resp)) => resp,
-        };
+        let resp = self
+            .send(self.client.get(url.clone()), &format!("GET {url_log}"))
+            .await?;
         if resp.status() == StatusCode::NOT_FOUND {
             return Ok(OutboardFetch::NotFound);
         }
@@ -578,19 +572,12 @@ impl HttpOrigin {
         want: u64,
     ) -> Result<Option<Bytes>, OriginPullError> {
         let url_log = redact_for_log(url);
-        let send_fut = self.client.get(url.clone()).header(RANGE, range_val).send();
-        let resp = match tokio::time::timeout(self.response_headers_timeout, send_fut).await {
-            Err(_elapsed) => {
-                return Err(OriginPullError::Transient(anyhow::anyhow!(
-                    "origin GET {url_log} (range) headers timed out"
-                )));
-            }
-            Ok(Err(reqwest_err)) => {
-                return Err(classify_reqwest_error(reqwest_err)
-                    .map_inner(|e| e.context(format!("origin GET {url_log} (range) failed"))));
-            }
-            Ok(Ok(resp)) => resp,
-        };
+        let resp = self
+            .send(
+                self.client.get(url.clone()).header(RANGE, range_val),
+                &format!("GET {url_log} (range)"),
+            )
+            .await?;
         // Only `206 Partial Content` is an honored range. A `200` means the
         // origin ignored `Range` and is sending the whole blob — degrade
         // before reading the (potentially huge) body.
@@ -938,10 +925,19 @@ mod tests {
 
     /// `HttpOrigin::new_with_user_agent` accepts a non-default UA without
     /// erroring on a typical operator-supplied value.
-    #[test]
-    fn new_with_user_agent_accepts_custom_value() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn new_with_user_agent_accepts_custom_value() -> anyhow::Result<()> {
         let url = parse_origin_url("https://origin.example/")?;
         let _origin = HttpOrigin::new_with_user_agent(url, "MyCdn/1.0 (+ops@example.com)")?;
+        Ok(())
+    }
+
+    /// Building an origin outside a tokio runtime is an error, never a panic:
+    /// the origin has no runtime to own its connections.
+    #[test]
+    fn new_outside_a_runtime_is_an_error() -> anyhow::Result<()> {
+        let url = parse_origin_url("https://origin.example/")?;
+        anyhow::ensure!(HttpOrigin::new(url).is_err(), "built outside a runtime");
         Ok(())
     }
 }

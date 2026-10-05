@@ -57,7 +57,7 @@ fn mock_s3_client_match_any(rules: &[&Rule]) -> Client {
 
 /// Build an `S3Origin` over a mock-backed client. The bucket is fixed to
 /// [`BUCKET`]; the prefix can vary so we can exercise prefix application.
-fn s3_origin(client: Client, prefix: &str) -> S3Origin {
+fn s3_origin(client: Client, prefix: &str) -> anyhow::Result<S3Origin> {
     S3Origin::from_parts(client, BUCKET, prefix)
 }
 
@@ -91,7 +91,7 @@ async fn fetch_returns_origin_bytes_on_success() -> anyhow::Result<()> {
                 .build()
         });
     let client = mock_s3_client(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     let bytes = origin
         .fetch(hash, 16 * 1024 * 1024)
@@ -115,7 +115,7 @@ async fn fetch_no_such_key_maps_to_not_found() -> anyhow::Result<()> {
     let rule = mock!(Client::get_object)
         .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
     let client = mock_s3_client(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     match origin.fetch(hash, 16 * 1024 * 1024).await? {
         OriginFetch::NotFound => Ok(()),
@@ -142,7 +142,7 @@ async fn fetch_bare_http_404_maps_to_not_found() -> anyhow::Result<()> {
         .http_status(404, None)
         .build();
     let client = mock_s3_client(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     match origin.fetch(hash, 16 * 1024 * 1024).await? {
         OriginFetch::NotFound => Ok(()),
@@ -175,7 +175,7 @@ async fn fetch_404_with_no_such_bucket_is_permanent_not_not_found() -> anyhow::R
         .http_status(404, Some(body))
         .build();
     let client = mock_s3_client(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     // Match on the result directly — `?` would propagate the Err that
     // we're trying to inspect.
@@ -220,7 +220,7 @@ async fn fetch_404_with_access_denied_is_permanent_not_not_found() -> anyhow::Re
         .http_status(404, Some(body))
         .build();
     let client = mock_s3_client(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     let err = origin
         .fetch(hash, 16 * 1024 * 1024)
@@ -262,7 +262,7 @@ async fn fetch_5xx_classifies_as_transient_with_no_internal_retry() -> anyhow::R
         .http_status(503, None)
         .build();
     let client = mock_s3_client(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     let err = origin
         .fetch(hash, 16 * 1024 * 1024)
@@ -304,7 +304,7 @@ async fn cache_engine_retries_transient_via_origin_retry_policy() -> anyhow::Res
         })
         .build();
     let client = mock_s3_client(&[&rule]);
-    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
+    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, "")?);
 
     let tmp = tempfile::tempdir()?;
     // Use a fast policy so the test doesn't spend wall-time in jittered
@@ -361,7 +361,7 @@ async fn fetch_4xx_classifies_as_permanent_and_does_not_retry() -> anyhow::Resul
         .http_status(403, None)
         .build();
     let client = mock_s3_client(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     let err = origin
         .fetch(hash, 16 * 1024 * 1024)
@@ -410,7 +410,7 @@ async fn fetch_with_content_encoding_gzip_is_decompressed() -> anyhow::Result<()
             .build()
     });
     let client = mock_s3_client(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     let bytes = origin
         .fetch(hash, 16 * 1024 * 1024)
@@ -439,7 +439,7 @@ async fn fetch_with_content_encoding_zstd_is_decompressed() -> anyhow::Result<()
             .build()
     });
     let client = mock_s3_client(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     let bytes = origin
         .fetch(hash, 16 * 1024 * 1024)
@@ -467,7 +467,7 @@ async fn fetch_with_strict_mode_rejects_gzip_encoding() -> anyhow::Result<()> {
             .build()
     });
     let client = mock_s3_client(&[&rule]);
-    let origin = s3_origin(client, "").with_decompress_mode(DecompressMode::Strict);
+    let origin = s3_origin(client, "")?.with_decompress_mode(DecompressMode::Strict);
 
     let err = origin
         .fetch(hash, 16 * 1024 * 1024)
@@ -502,7 +502,7 @@ async fn fetch_with_unknown_encoding_is_permanent() -> anyhow::Result<()> {
             .build()
     });
     let client = mock_s3_client(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     let err = origin
         .fetch(hash, 16 * 1024 * 1024)
@@ -538,7 +538,7 @@ async fn fetch_with_content_encoding_identity_is_accepted() -> anyhow::Result<()
             .build()
     });
     let client = mock_s3_client(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     let bytes = origin
         .fetch(hash, 16 * 1024 * 1024)
@@ -576,7 +576,7 @@ async fn fetch_oversize_body_streams_through_for_engine_cap() -> anyhow::Result<
             .build()
     });
     let client = mock_s3_client(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     // Adapter fetch returns the stream (no cap at the adapter).
     let bytes = origin
@@ -621,7 +621,7 @@ async fn fetch_applies_prefix_with_sharded_key_layout() -> anyhow::Result<()> {
     // ("no rule matched the bucket/key" beats "sequence position out of
     // range") if a future regression breaks the key layout.
     let client = mock_s3_client_match_any(&[&rule]);
-    let origin = s3_origin(client, prefix);
+    let origin = s3_origin(client, prefix)?;
 
     let bytes = origin
         .fetch(hash, 16 * 1024 * 1024)
@@ -653,7 +653,7 @@ async fn cache_engine_miss_pulls_from_s3_and_caches() -> anyhow::Result<()> {
             .build()
     });
     let client = mock_s3_client(&[&rule]);
-    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
+    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, "")?);
 
     let tmp = tempfile::tempdir()?;
     // Disable our outer retry policy so the test surfaces a deterministic
@@ -713,7 +713,7 @@ async fn cache_engine_rejects_s3_body_larger_than_max_blob_bytes() -> anyhow::Re
             .build()
     });
     let client = mock_s3_client(&[&rule]);
-    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
+    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, "")?);
 
     let tmp = tempfile::tempdir()?;
     let engine = CacheEngine::open_full(
@@ -765,7 +765,7 @@ async fn cache_engine_s3_truncated_gzip_is_permanent_decompression_failed() -> a
             .build()
     });
     let client = mock_s3_client(&[&rule]);
-    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
+    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, "")?);
 
     let tmp = tempfile::tempdir()?;
     // Fast policy with retries available: the assertion is that the
@@ -847,7 +847,7 @@ async fn cache_engine_s3_rejects_decompression_bomb() -> anyhow::Result<()> {
             .build()
     });
     let client = mock_s3_client(&[&rule]);
-    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
+    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, "")?);
 
     let tmp = tempfile::tempdir()?;
     let engine = CacheEngine::open(
@@ -890,7 +890,7 @@ async fn cache_engine_s3_blake3_verify_runs_over_decompressed_bytes() -> anyhow:
             .build()
     });
     let client = mock_s3_client(&[&rule]);
-    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
+    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, "")?);
 
     let tmp = tempfile::tempdir()?;
     let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
@@ -940,7 +940,7 @@ async fn cache_engine_s3_compressed_above_buffer_threshold_succeeds() -> anyhow:
             .build()
     });
     let client = mock_s3_client(&[&rule]);
-    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
+    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, "")?);
 
     let tmp = tempfile::tempdir()?;
     // Default policy → buffered_max_bytes = 4 MiB; max_blob_size = 16 MiB.
@@ -966,7 +966,7 @@ async fn cache_engine_surfaces_not_found_for_no_such_key() -> anyhow::Result<()>
     let rule = mock!(Client::get_object)
         .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
     let client = mock_s3_client(&[&rule]);
-    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
+    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, "")?);
 
     let tmp = tempfile::tempdir()?;
     let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
@@ -1027,7 +1027,7 @@ async fn fetch_range_data_returns_span() -> anyhow::Result<()> {
                 .build()
         });
     let client = mock_s3_client_match_any(&[&data_rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     let req = OriginRangeRequest {
         fetch_start: start as u64,
@@ -1058,7 +1058,7 @@ async fn fetch_range_data_missing_object_is_unsupported() -> anyhow::Result<()> 
         .match_requests(move |req| req.key() == Some(&data_match))
         .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
     let client = mock_s3_client_match_any(&[&data_rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     let req = OriginRangeRequest {
         fetch_start: 0,
@@ -1092,7 +1092,7 @@ async fn fetch_range_data_wrong_length_span_degrades() -> anyhow::Result<()> {
                 .build()
         });
     let client = mock_s3_client_match_any(&[&data_rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     let req = OriginRangeRequest {
         fetch_start: 16 * 1024,
@@ -1125,7 +1125,7 @@ async fn size_returns_head_object_content_length() -> anyhow::Result<()> {
         .match_requests(move |req| req.key() == Some(&key))
         .then_output(|| HeadObjectOutput::builder().content_length(4096).build());
     let client = mock_s3_client_match_any(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     anyhow::ensure!(
         origin.size(hash).await? == Some(4096),
@@ -1147,7 +1147,7 @@ async fn size_compressed_object_is_unknown() -> anyhow::Result<()> {
             .build()
     });
     let client = mock_s3_client_match_any(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     anyhow::ensure!(
         origin.size(hash).await?.is_none(),
@@ -1162,7 +1162,7 @@ async fn size_missing_object_is_none() -> anyhow::Result<()> {
     let rule = mock!(Client::head_object)
         .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
     let client = mock_s3_client_match_any(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     anyhow::ensure!(
         origin.size(hash).await?.is_none(),
@@ -1195,7 +1195,7 @@ async fn fetch_outboard_returns_sibling_obao4() -> anyhow::Result<()> {
                 .build()
         });
     let client = mock_s3_client_match_any(&[&obao4_rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     match origin.fetch_outboard(hash, 1 << 20).await? {
         OutboardFetch::Found(bytes) => {
@@ -1220,7 +1220,7 @@ async fn fetch_outboard_missing_sibling_is_not_found() -> anyhow::Result<()> {
         .match_requests(move |req| req.key() == Some(&obao4_match))
         .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
     let client = mock_s3_client_match_any(&[&obao4_rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     anyhow::ensure!(
         matches!(
@@ -1250,7 +1250,7 @@ async fn fetch_outboard_oversize_degrades_without_buffering() -> anyhow::Result<
                 .build()
         });
     let client = mock_s3_client_match_any(&[&obao4_rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "")?;
 
     anyhow::ensure!(
         matches!(

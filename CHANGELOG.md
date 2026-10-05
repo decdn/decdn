@@ -929,6 +929,19 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Origin requests keep their connections across serve-miss pulls, and HTTP
+  origins reuse keep-alive connections again (#1675).** A serve-miss pull leg
+  runs on its own current-thread runtime, which drops when the leg returns.
+  A pooled origin connection opened there lived on that runtime, so a
+  concurrent serve that reused it lost its in-flight request with "dispatch
+  task is gone" (#1673). `HttpOrigin` avoided this by turning its keep-alive
+  pool off, and paid a fresh TCP and TLS handshake on every request.
+  `S3Origin` kept its pool and was still exposed. Both origins now capture the
+  runtime they are built on, which is the node's main runtime, and run every
+  request send there. Each pooled connection outlives the pull leg that opened
+  it, and `HttpOrigin` reuses keep-alive connections. `HttpOrigin::new`,
+  `HttpOrigin::parse` and `S3Origin::from_parts` fail outside a tokio
+  runtime, and `S3Origin::from_parts` returns `anyhow::Result<Self>`.
 - **The deployment preflight rejects every sibling contract of the
   `PaymentPool` (#2279).** Startup identified `blockchain.payment_pool_address`
   by calling `usdc()`, which `FeeRouter` and `BuybackBurner` also answer. A
