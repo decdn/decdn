@@ -895,35 +895,60 @@ impl FillOutcome {
 }
 
 /// The serve-miss exit that refused a request. It names the cause in the
-/// refusal's log line only: the wire answer is the same for every path
-/// ([`ServeRejectReason::wire_error`]).
+/// refusal's log line only: the wire answer depends on the refusal's reason,
+/// never on its path ([`ServeRejectReason::wire_error`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MissPath {
     /// The pull leg opened, but its ranked candidates do not cover part of the
     /// range this node does not hold (#2195).
-    CoverageGate,
-    /// The pull leg open found no provider it could open.
-    PullLegMiss,
-    /// The pull leg open ran past the pull-through deadline.
+    CoverageGate(CoverageShortfall),
+    /// The pull leg open ended without a target, for the reason the
+    /// [`PullMiss`](crate::node_origin::PullMiss) names: no reachable provider
+    /// or every candidate declined (`clean_miss`), every candidate quoted above
+    /// the buy ceiling (`below_margin`), or a fault in this node (`local_fault`).
+    PullLegMiss(crate::node_origin::PullMiss),
+    /// The pull leg open ran past its deadline: the configured pull-through
+    /// timeout, or [`WINDOW_PULL_FALLBACK_DEADLINE`] when none is set.
     PullLegTimeout,
-    /// The buffered pull-through ran and did not fill the blob.
+    /// The buffered pull-through ran and did not fill the blob. A deadline
+    /// expiry lands here too: this tier has no separate timeout path.
     BufferedMiss,
-    /// No pull-through ran: none is configured, or the request is not
-    /// authorized to make this node spend.
+    /// The request may make this node spend, but no node-to-node pull-through
+    /// is configured. The local-origin tiers may have run and missed first.
     NoPullThrough,
+    /// The request may not make this node spend: it carries no verified
+    /// binding, or this node holds no lane for its signer. No fill tier ran.
+    /// A remote peer reaches this path at will, so its line is throttled.
+    NoLane,
 }
 
 impl MissPath {
     /// The `path` value the refusal's log line records.
     const fn as_str(self) -> &'static str {
         match self {
-            Self::CoverageGate => "coverage_gate",
-            Self::PullLegMiss => "pull_leg_miss",
+            Self::CoverageGate(_) => "coverage_gate",
+            Self::PullLegMiss(_) => "pull_leg_miss",
             Self::PullLegTimeout => "pull_leg_timeout",
             Self::BufferedMiss => "buffered_miss",
             Self::NoPullThrough => "no_pull_through",
+            Self::NoLane => "no_lane",
         }
     }
+}
+
+/// Why the coverage gate refused: the part of the pull range no ranked
+/// candidate covers (#2195).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CoverageShortfall {
+    /// Start of the range the pull would fetch. It differs from the request's
+    /// start when this serve attaches to a live fill for the front of it.
+    pull_offset: u64,
+    /// Length of the range the pull would fetch.
+    pull_len: u64,
+    /// How many ranked candidates the pull leg holds.
+    candidates: usize,
+    /// The first 1 KiB chunk no candidate covers.
+    first_uncovered_chunk: Option<u64>,
 }
 
 /// A terminal serve-miss refusal: the reject reason
@@ -1450,6 +1475,9 @@ pub struct ClientHandler {
     /// Throttle for the `warn!` on a stream request that names no known lane. A
     /// remote peer triggers it at will.
     unknown_lane_warn: WarnThrottle,
+    /// Throttle for the serve-miss refusal line on a request with no lane here
+    /// ([`MissPath::NoLane`]). A remote peer triggers it at will.
+    no_lane_miss_log: WarnThrottle,
     /// Application-layer idle-close ceiling (ADR 005 §Connection lifetime).
     /// `None` (the default and production path) reads as [`APP_IDLE_TIMEOUT`]
     /// (30s); a shorter value is set at construction via [`ClientHandlerDeps`]
@@ -1565,6 +1593,7 @@ impl ClientHandler {
             binding_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             unbound_request_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             unknown_lane_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
+            no_lane_miss_log: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             idle_timeout: deps.idle_timeout,
             pool_recheck_interval: deps.pool_recheck_interval,
             warming_credit: deps.warming_credit,

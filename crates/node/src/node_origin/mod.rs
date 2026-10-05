@@ -1568,8 +1568,9 @@ pub enum PullMiss {
 }
 
 impl PullMiss {
-    /// The `outcome` value an `upstream_stream` span records for this miss.
-    const fn as_str(self) -> &'static str {
+    /// The `outcome` value an `upstream_stream` span records for this miss, and
+    /// the `cause` a serve-miss refusal's log line records.
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Clean => "clean_miss",
             Self::LocalFault => "local_fault",

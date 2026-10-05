@@ -10,9 +10,9 @@ use crate::metrics::FirstByteClock;
 use crate::node_origin::{PrimeLeg, PullLegTarget};
 
 use super::{
-    Arc, B256, CHUNK_BYTES, ClientHandler, Connection, FloorReservation, Hash, LaneDeliveryState,
-    LaneKey, MissPath, MissRefusal, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason,
-    StreamRequest, StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
+    Arc, B256, CHUNK_BYTES, ClientHandler, Connection, CoverageShortfall, FloorReservation, Hash,
+    LaneDeliveryState, LaneKey, MissPath, MissRefusal, Mutex, NodeOrigin, RecvStream, SendStream,
+    ServeRejectReason, StreamRequest, StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
 };
 
 /// Release a miss leg's floor reservation on a refusal taken BEFORE the serve
@@ -434,7 +434,7 @@ impl ClientHandler {
         // (6c) Coverage gate (#2195): refuse with a signed miss the client can fail over
         // on, instead of `ok: true` and a truncated stream, when the ranked candidates
         // cannot cover the part of the pull range this node does not hold.
-        if self
+        if let Some(shortfall) = self
             .pull_range_uncovered(hash, total_bytes, pull_range, target.as_ref())
             .await
         {
@@ -443,7 +443,7 @@ impl ClientHandler {
                 .respond_miss(
                     &mut send,
                     req,
-                    MissRefusal::new(fault_seen, MissPath::CoverageGate),
+                    MissRefusal::new(fault_seen, MissPath::CoverageGate(shortfall)),
                     rate_per_mb,
                 )
                 .await;
@@ -985,12 +985,12 @@ impl ClientHandler {
     /// length). `Err(refusal)` is:
     /// - a clean miss on THIS tier, or a latched earlier-tier / local fault honored
     ///   per #1129 / #1560 (a walk that failed on our own broken buyer key is not
-    ///   evidence the blob is absent) — [`MissPath::PullLegMiss`], with the
+    ///   evidence the blob is absent) — [`MissPath::PullLegMiss`] carrying the miss, with the
     ///   [`miss_reason`](super::FillOutcome::miss_reason) of
     ///   `fault_seen || miss.is_local_fault()`;
-    /// - the pull-through deadline elapsing (a slow/absent upstream must not pin the
-    ///   stream) — the timeout metric fires, [`MissPath::PullLegTimeout`], with the
-    ///   reason `miss_reason(fault_seen)`.
+    /// - the open deadline elapsing (a slow/absent upstream must not pin the
+    ///   stream) — the timeout metric fires and the refusal is
+    ///   [`MissPath::PullLegTimeout`] with reason `miss_reason(fault_seen)`.
     ///
     /// `prime` is the pull this miss expects to own, when it can say: the handshake
     /// then opens that pull's first leg for the pull leg to adopt (#2063).
@@ -1011,7 +1011,7 @@ impl ClientHandler {
             Ok(Ok(target)) => Ok(target),
             Ok(Err(miss)) => Err(MissRefusal::new(
                 fault_seen || miss.is_local_fault(),
-                MissPath::PullLegMiss,
+                MissPath::PullLegMiss(miss),
             )),
             Err(_elapsed) => {
                 self.metrics.node_pull_through_timeout();
@@ -1020,13 +1020,13 @@ impl ClientHandler {
         }
     }
 
-    /// Whether `target`'s candidates leave part of `pull_range` uncovered, counting
-    /// only the chunks this node does not already hold (#2195). `false` when this
-    /// serve drives no pull.
+    /// The part of `pull_range` that `target`'s candidates leave uncovered,
+    /// counting only the chunks this node does not already hold (#2195). `None`
+    /// when this serve drives no pull or the candidates cover the whole gap.
     ///
     /// It is the test the ranged assembly's first round applies, judged against the
-    /// signed `total_bytes`, so `true` means the pull cannot fill the range and the
-    /// serve must refuse before `ok: true`. A store read fault fails open (`false`):
+    /// signed `total_bytes`, so `Some` means the pull cannot fill the range and the
+    /// serve must refuse before `ok: true`. A store read fault fails open (`None`):
     /// the assembly's own read raises and classifies it.
     async fn pull_range_uncovered(
         &self,
@@ -1034,10 +1034,10 @@ impl ClientHandler {
         total_bytes: u64,
         pull_range: Option<(u64, u64)>,
         target: Option<&PullLegTarget>,
-    ) -> bool {
+    ) -> Option<CoverageShortfall> {
         use decdn_bao_range::RangedStore as _;
         let (Some((pull_offset, pull_len)), Some(target)) = (pull_range, target) else {
-            return false;
+            return None;
         };
         let store = decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
         let gap = match store.missing_ranges(pull_offset, pull_len).await {
@@ -1049,22 +1049,19 @@ impl ClientHandler {
                     "serve-miss: cannot read the missing range for the coverage gate; \
                      committing without it"
                 );
-                return false;
+                return None;
             }
         };
         let uncovered = target.uncovered(&gap);
         if uncovered.is_empty() {
-            return false;
+            return None;
         }
-        tracing::debug!(
-            %hash,
+        Some(CoverageShortfall {
             pull_offset,
             pull_len,
-            candidates = target.candidate_count(),
-            first_uncovered_chunk = uncovered.boundaries().first().map(|c| c.0),
-            "serve-miss: no candidate covers part of the missing range; refusing before commit"
-        );
-        true
+            candidates: target.candidate_count(),
+            first_uncovered_chunk: uncovered.boundaries().first().map(|c| c.0),
+        })
     }
 
     /// Seed the shared fill session's outboard with proof nodes for ranges this

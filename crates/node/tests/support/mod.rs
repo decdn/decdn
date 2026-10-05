@@ -912,11 +912,37 @@ pub(crate) struct CapturedSpan {
     pub(crate) parent: Option<&'static str>,
 }
 
-/// Collects closed spans into a shared list.
+/// Collects closed spans, and the events `decdn_node` emits, into shared lists.
 #[derive(Clone, Default)]
-pub(crate) struct SpanCapture(Arc<std::sync::Mutex<Vec<CapturedSpan>>>);
+pub(crate) struct SpanCapture(
+    Arc<std::sync::Mutex<Vec<CapturedSpan>>>,
+    Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+);
 
 impl SpanCapture {
+    /// The fields of every captured event whose `message` reads `message` and
+    /// whose `field` reads `value`.
+    pub(crate) fn events(
+        &self,
+        message: &str,
+        field: &str,
+        value: &str,
+    ) -> Vec<std::collections::HashMap<String, String>> {
+        self.1.lock().map_or_else(
+            |_| Vec::new(),
+            |events| {
+                events
+                    .iter()
+                    .filter(|e| {
+                        e.get("message").is_some_and(|m| m == message)
+                            && e.get(field).is_some_and(|v| v == value)
+                    })
+                    .cloned()
+                    .collect()
+            },
+        )
+    }
+
     /// Every closed span named `name` whose `field` reads `value`.
     pub(crate) fn matching(&self, name: &str, field: &str, value: &str) -> Vec<CapturedSpan> {
         self.0.lock().map_or_else(
@@ -977,6 +1003,24 @@ where
         }
     }
 
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        // The registry has no level filter, so keep only this crate's events at
+        // INFO or above: the per-chunk debug and trace events would pile up.
+        let meta = event.metadata();
+        if *meta.level() > tracing::Level::INFO || !meta.target().starts_with("decdn_node") {
+            return;
+        }
+        let mut fields = std::collections::HashMap::new();
+        event.record(&mut FieldVisitor(&mut fields));
+        if let Ok(mut events) = self.1.lock() {
+            events.push(fields);
+        }
+    }
+
     fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
         let Some(span) = ctx.span(&id) else {
             return;
@@ -997,7 +1041,7 @@ where
     }
 }
 
-/// Install a process-wide span capture once and return it. Global, not
+/// Install a process-wide span and event capture once and return it. Global, not
 /// thread-local, because the serve and pull tasks run on runtime worker and
 /// pull threads. Shared across the tests of one binary, so each test filters
 /// by a field unique to it (such as its `hash`).

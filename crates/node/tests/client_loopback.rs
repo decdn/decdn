@@ -10624,6 +10624,8 @@ async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
     // trip the internal-error counter. Over-promoting clean misses would report a
     // healthy-but-empty node as broken and steer clients away from it.
     assert_reject_reason(&metrics, 0, 1)?;
+    // Authorized, but node-to-node is off: the local tier ran and missed.
+    assert_one_miss_line(&spans, hash, "no_pull_through", "cache_miss")?;
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
 
@@ -10659,6 +10661,76 @@ async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
                 && s.parent == Some("pull_through")),
         "origin_pull: {walks:?}"
     );
+    Ok(())
+}
+
+/// #2282: a request that may not make this node spend (here: no client
+/// binding) runs no fill tier and refuses on the `no_lane` path. A remote peer
+/// reaches that path at will, so its refusal line is throttled: two misses
+/// from one unbound peer write one line.
+#[tokio::test(flavor = "multi_thread")]
+async fn unbound_miss_refuses_on_a_throttled_no_lane_line() -> anyhow::Result<()> {
+    let spans = support::capture_spans();
+    let payload = vec![0x5Au8; 64 * 1024];
+    let hash = decdn_cache::Hash::new(&payload);
+    let origin_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+    let cache_metrics = Arc::new(CacheMetrics::default());
+    let cache = CacheEngine::open_full(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        CircuitBreakerPolicy::default(),
+        Some(Arc::clone(&cache_metrics)),
+        Duration::ZERO,
+    )
+    .await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task, metrics) =
+        spawn_fault_server(cache, Arc::clone(&store), FaultTiers::LocalOnly).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    // No client binding: the request names no signer this node can hold a
+    // lane for.
+    let ctx = unbound_context(Arc::clone(&signer), deposit);
+    for _ in 0..2 {
+        match stream_fetch(
+            &client_ep,
+            target.clone(),
+            &ctx,
+            &slash_domain(),
+            server_eth_addr,
+            *hash.as_bytes(),
+            0,
+            0x00c0_ffee,
+            Duration::from_secs(20),
+        )
+        .await
+        {
+            Ok(_) => anyhow::bail!("an unbound miss must be refused"),
+            Err(e) => anyhow::ensure!(
+                e.to_string().contains("NotFound"),
+                "expected a signed NotFound, got: {e}"
+            ),
+        }
+    }
+    // No fill tier ran: the local origin was never consulted.
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 0,
+        "an unbound request must not reach the local origin, got {}",
+        cache_metrics.origin_fetches.get()
+    );
+    assert_reject_reason(&metrics, 0, 2)?;
+    let line = assert_one_miss_line(&spans, hash, "no_lane", "cache_miss")?;
+    anyhow::ensure!(
+        line.get("suppressed").map(String::as_str) == Some("0"),
+        "the first line of a window suppresses nothing: {line:?}"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -10759,6 +10831,32 @@ fn assert_reject_reason(
         );
     }
     Ok(())
+}
+
+/// Assert the serve handler logged exactly one serve-miss refusal line for
+/// `hash`, on `path` with `reason` (#2282), and return its fields. The wire
+/// error and the counters do not name the path, so the line is the only place
+/// a mis-routed exit shows.
+fn assert_one_miss_line(
+    spans: &support::SpanCapture,
+    hash: decdn_cache::Hash,
+    path: &str,
+    reason: &str,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let lines = spans.events(
+        "serve-miss: refusing the request",
+        "hash",
+        &hash.to_string(),
+    );
+    let [line] = lines.as_slice() else {
+        anyhow::bail!("expected one serve-miss refusal line for the hash, got {lines:?}");
+    };
+    anyhow::ensure!(
+        line.get("path").map(String::as_str) == Some(path)
+            && line.get("reason").map(String::as_str) == Some(reason),
+        "expected path={path} reason={reason}: {line:?}"
+    );
+    Ok(line.clone())
 }
 
 /// An origin that always fails with a TRANSIENT backend error — the shape of an
@@ -10907,6 +11005,7 @@ async fn local_origin_hard_fault_is_internal_error_not_signed_not_found() -> any
 /// `NotFound`. This is what `fault_seen` threading exists to prevent.
 #[tokio::test(flavor = "multi_thread")]
 async fn local_hard_fault_survives_fallthrough_to_the_window_tier() -> anyhow::Result<()> {
+    let spans = support::capture_spans();
     let payload = vec![0x3Du8; 64 * 1024];
     let (cache, hash, origin_hits, _cache_tmp) = empty_cache_with_failing_origin(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
@@ -10952,6 +11051,13 @@ async fn local_hard_fault_survives_fallthrough_to_the_window_tier() -> anyhow::R
         "the failing local origin should have been consulted before the window tier"
     );
     assert_reject_reason(&metrics, 1, 0)?;
+    // The unprovisioned window origin has no provider to open: a clean pull-leg
+    // miss, refused as `internal_error` because the local fault is latched.
+    let line = assert_one_miss_line(&spans, hash, "pull_leg_miss", "internal_error")?;
+    anyhow::ensure!(
+        line.get("cause").map(String::as_str) == Some("clean_miss"),
+        "pull-leg miss cause: {line:?}"
+    );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
@@ -10967,6 +11073,7 @@ async fn local_hard_fault_survives_fallthrough_to_the_window_tier() -> anyhow::R
 /// side of that `||` is exercised nowhere else.
 #[tokio::test(flavor = "multi_thread")]
 async fn buffered_pull_through_hard_fault_is_internal_error() -> anyhow::Result<()> {
+    let spans = support::capture_spans();
     let payload = vec![0x9Cu8; 64 * 1024];
     let (cache, hash, origin_hits, _cache_tmp) = empty_cache_with_failing_origin(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
@@ -11010,6 +11117,7 @@ async fn buffered_pull_through_hard_fault_is_internal_error() -> anyhow::Result<
         "the failing origin should have been consulted by the buffered tier"
     );
     assert_reject_reason(&metrics, 1, 0)?;
+    assert_one_miss_line(&spans, hash, "buffered_miss", "internal_error")?;
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())

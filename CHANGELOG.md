@@ -2674,16 +2674,23 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
-- **Node: every serve-miss refusal logs one info line that names its path
-  (#2282).** A node that answers a paid request `NotFound` (or
-  `InternalError`) from a miss path now logs `serve-miss: refusing the
-  request` with `hash`, `byte_offset`, `byte_len`, `reason` and `path`. `path`
-  is `coverage_gate`, `pull_leg_miss`, `pull_leg_timeout`, `buffered_miss` or
-  `no_pull_through`. Before, only the coverage gate logged at info, so most
-  refusals showed only as a tick on
-  `decdn_serve_stream_rejected_cache_miss_total`. The coverage gate's own
-  detail line (candidate count, first uncovered chunk) moves to debug. The
-  wire answer and the reject counters do not change.
+- **Node: every cache-miss refusal logs one info line that names its path
+  (#2282).** A node that refuses a paid request from a serve-miss exit
+  (reason `cache_miss`, or `internal_error` when a fill tier faulted) now logs
+  `serve-miss: refusing the request` with `hash`, `byte_offset`, `byte_len`,
+  `reason` and `path`. `path` is `coverage_gate`, `pull_leg_miss`,
+  `pull_leg_timeout`, `buffered_miss`, `no_pull_through` or `no_lane`. A
+  `pull_leg_miss` line adds `cause` (`clean_miss`, `below_margin` or
+  `local_fault`). A `coverage_gate` line adds `pull_offset`, `pull_len`,
+  `candidates` and `first_uncovered_chunk`; the separate coverage-gate detail
+  line is gone. `no_lane` (the request carries no binding, or this node holds
+  no lane for its signer, so no fill tier ran) is a path any peer can reach, so
+  its line is throttled to one per minute with a `suppressed` count. Before,
+  only the coverage gate logged at info, so most refusals showed only as a
+  tick on `decdn_serve_stream_rejected_cache_miss_total`. Other `NotFound`
+  refusals (`pull_loop_guard`, `load_shed_miss`, the channel-class reasons)
+  keep their own logging. The wire answer and the reject counters do not
+  change.
 - **CLI: a range-dedup entry stripes its ranges across its holders (#2123).**
   A `bundle pull` entry that pays for many scattered complement ranges used
   one provider's link for all of them, even when several holders were probed.
