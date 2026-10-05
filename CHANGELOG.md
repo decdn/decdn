@@ -937,6 +937,13 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **A sub-millisecond probe RTT no longer erases the price signal in
+  candidate ranking (#2268).** The selection score multiplies the rate by the
+  probe RTT in whole milliseconds, and a probe faster than 1 ms truncated to
+  0. Every such peer scored 0, so two of them tied whatever they quoted, and a
+  dear one outranked every cheaper peer at 1 ms or more. The score now uses an
+  RTT floor of 1 ms (ADR 001), so peers on a LAN or in one datacenter rank on
+  rate and reputation.
 - **Origin requests keep their connections across serve-miss pulls, and HTTP
   origins reuse keep-alive connections again (#1675).** A serve-miss pull leg
   runs on its own current-thread runtime, which drops when the leg returns.
