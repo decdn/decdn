@@ -1768,8 +1768,11 @@ async fn throwaway_open_then_real_open_shares_one_multi_draw_fill() -> anyhow::R
         *counts.entry(range.as_str()).or_default() += 1;
     }
     let repeated: Vec<(&str, usize)> = counts.into_iter().filter(|&(_, n)| n > 1).collect();
+    // The serviceability probe also starts at byte 0, but it is not a draw: a
+    // repeated probe is not the exception this allows.
+    let probe = probe_range_val(blob.len());
     let first_draw_repeated_once = |&(range, n): &(&str, usize)| {
-        n == 2 && parse_byte_range(range).is_some_and(|(start, _)| start == 0)
+        n == 2 && range != probe && parse_byte_range(range).is_some_and(|(start, _)| start == 0)
     };
     anyhow::ensure!(
         repeated.len() <= 1 && repeated.iter().all(first_draw_repeated_once),
