@@ -55,3 +55,9 @@ release.
 - **Release metadata.** Versioned and released on its own
   (`sponsord-onramp-vX.Y.Z`), with crates.io metadata, dual-licensed MIT OR
   Apache-2.0.
+
+### Changed
+
+- **HTTPS through rustls.** reqwest 0.13 replaces OpenSSL (native-tls)
+  with rustls and checks certificates with the platform verifier, so the
+  binary no longer links `libssl` on Linux.
