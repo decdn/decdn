@@ -25,11 +25,13 @@ clap.workspace = true
 sponsord-core.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+decdn-common.workspace = true
 decdn-incentive.workspace = true
 anyhow.workspace = true
 alloy.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
+# `env-filter`: `RUST_LOG`, with the RPC URL's span held back (main.rs).
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 axum = "0.8"
 subtle = "2"
 

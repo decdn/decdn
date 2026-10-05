@@ -403,7 +403,7 @@ jobs:
             | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])')
           sed -i -E "/^decdn-[a-z-]+ = \{ git = /s/version = \"[^\"]+\"/version = \"${version}\"/" Cargo.toml
           grep -E '^decdn-' Cargo.toml
-          cargo update -p decdn-client -p decdn-incentive -p decdn-e2e
+          cargo update -p decdn-client -p decdn-common -p decdn-incentive -p decdn-e2e
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo nextest run --workspace --no-tests=pass
 

@@ -111,7 +111,7 @@ commit still releases binaries and images; it just cannot go to crates.io.
 To move the lock to decdn's current `main`:
 
 ```bash
-cargo update -p decdn-client -p decdn-incentive -p decdn-e2e
+cargo update -p decdn-client -p decdn-common -p decdn-incentive -p decdn-e2e
 # if decdn's workspace version moved, set version = "<it>" on each decdn-*
 # entry in Cargo.toml, then:
 cargo metadata --locked --format-version 1 > /dev/null

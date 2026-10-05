@@ -26,13 +26,20 @@ use crate::sponsor::Sponsor;
 pub const TEST_CHAIN_ID: u64 = 421_614;
 pub const TEST_PAYMENT_POOL: Address = Address::repeat_byte(0x22);
 pub const TEST_POOL_ID: B256 = B256::repeat_byte(0x11);
+/// The RPC URL `FakePool` failures name, with an API key in its path, so
+/// tests can assert it never reaches a log line.
+pub const FAKE_RPC_URL: &str = "http://rpc.example/v3/FAKE-RPC-KEY";
 
 /// In-memory pool: fixed owner, a mutable remaining balance, a settable
-/// per-signer registration map, and switches to fail reads or top-ups.
+/// per-signer registration map, and switches to fail reads or top-ups. A
+/// failure reads like a raw reqwest transport error naming [`FAKE_RPC_URL`]:
+/// unlike `ChainPool`, it does not redact, so tests exercise the log sites'
+/// own redaction.
 pub struct FakePool {
     owner: Address,
     remaining: Mutex<MicroUsdc>,
     registrations: Mutex<HashMap<Address, Authorization>>,
+    fail_remaining: AtomicBool,
     fail_authorization: AtomicBool,
     fail_top_up: AtomicBool,
 }
@@ -44,6 +51,7 @@ impl FakePool {
             owner,
             remaining: Mutex::new(MicroUsdc(remaining)),
             registrations: Mutex::new(HashMap::new()),
+            fail_remaining: AtomicBool::new(false),
             fail_authorization: AtomicBool::new(false),
             fail_top_up: AtomicBool::new(false),
         }
@@ -52,6 +60,11 @@ impl FakePool {
     /// Record `signer` as registered on-chain with `auth`.
     pub fn register(&self, signer: Address, auth: Authorization) {
         self.registrations.lock().unwrap().insert(signer, auth);
+    }
+
+    /// Make every `remaining` read fail (an RPC outage).
+    pub fn fail_remaining_reads(&self, fail: bool) {
+        self.fail_remaining.store(fail, Ordering::SeqCst);
     }
 
     /// Make every `authorization` read fail (an RPC outage).
@@ -77,10 +90,17 @@ impl PoolChain for FakePool {
         self.owner
     }
     async fn remaining(&self, _pool_id: B256) -> anyhow::Result<MicroUsdc> {
+        anyhow::ensure!(
+            !self.fail_remaining.load(Ordering::SeqCst),
+            "remaining read failed: error sending request for url ({FAKE_RPC_URL})"
+        );
         Ok(self.remaining_now())
     }
     async fn top_up(&self, _pool_id: B256, additional: MicroUsdc) -> anyhow::Result<MicroUsdc> {
-        anyhow::ensure!(!self.fail_top_up.load(Ordering::SeqCst), "top-up failed");
+        anyhow::ensure!(
+            !self.fail_top_up.load(Ordering::SeqCst),
+            "top-up failed: error sending request for url ({FAKE_RPC_URL})"
+        );
         let mut r = self.remaining.lock().unwrap();
         *r = r.saturating_add(additional);
         Ok(additional)
@@ -95,7 +115,7 @@ impl PoolChain for FakePool {
     ) -> anyhow::Result<Option<Authorization>> {
         anyhow::ensure!(
             !self.fail_authorization.load(Ordering::SeqCst),
-            "authorization read failed"
+            "authorization read failed: error sending request for url ({FAKE_RPC_URL})"
         );
         Ok(self.registrations.lock().unwrap().get(&signer).copied())
     }
@@ -125,4 +145,42 @@ pub async fn fake_sponsor(max_spending_cap: u64, max_ttl_secs: u64) -> (Sponsor,
     .await
     .unwrap();
     (sponsor, pool)
+}
+
+/// `tracing` output captured from the current thread, for asserting what a
+/// test logged and what it must not (an RPC URL).
+#[derive(Clone, Default)]
+pub struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLog {
+    /// Send this thread's events here until the guard drops.
+    /// `#[tokio::test]`'s current-thread runtime keeps the test's futures on
+    /// this thread.
+    #[must_use]
+    pub fn install(&self) -> tracing::subscriber::DefaultGuard {
+        let sink = self.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    /// Everything logged so far.
+    #[must_use]
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }

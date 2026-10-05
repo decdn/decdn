@@ -21,8 +21,9 @@ use crate::issuer::{Issuer, Limits, TermsError, TermsRequest};
 use crate::keeper::{self, KeeperConfig, KeeperStatus};
 use crate::pool::{ChainPool, PoolChain};
 
-/// The chain, contract and pool a sponsor signs for.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The chain, contract and pool a sponsor signs for. `Debug` shows the RPC
+/// URL's length, not the URL: it often carries an API key (#38).
+#[derive(Clone, PartialEq, Eq)]
 pub struct ChainConfig {
     pub rpc_url: String,
     pub chain_id: u64,
@@ -42,6 +43,20 @@ pub enum SponsorError {
     Chain(anyhow::Error),
     #[error("{0:#}")]
     Sign(anyhow::Error),
+}
+
+impl std::fmt::Debug for ChainConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainConfig")
+            .field(
+                "rpc_url",
+                &format_args!("<{} characters>", self.rpc_url.len()),
+            )
+            .field("chain_id", &self.chain_id)
+            .field("payment_pool", &self.payment_pool)
+            .field("pool_id", &self.pool_id)
+            .finish()
+    }
 }
 
 pub struct Sponsor {

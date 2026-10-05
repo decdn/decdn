@@ -36,12 +36,18 @@ release.
   (`7f938e6b8437eba614e54375dcbc504de108379d`); `decdn.ref` and the sibling
   checkout are gone.
 
-### Security
-
-- **No RPC URL in errors.** A malformed RPC URL is reported by length, not
-  echoed, since it often carries an API key.
-
 ### Added
 
 - **Published as its own crate.** Versioned and released independently of the
   binaries, with crates.io metadata, dual-licensed MIT OR Apache-2.0.
+
+### Security
+
+- **No RPC URL in errors.** A malformed RPC URL is reported by length, not
+  echoed, since it often carries an API key. A failed chain call no longer
+  names it either: the URL reqwest puts in its errors is stripped from every
+  error `ChainPool` returns and from the keeper's warnings, which now carry
+  the cause (connection refused, timeout, DNS, TLS) as well. `top_up` errors
+  still downcast to decdn's `TopUpUnconfirmed` and `AllowanceShortfall`.
+  `ChainConfig`'s `Debug` shows the URL's length
+  ([#38](https://github.com/decdn/sponsord/issues/38)).

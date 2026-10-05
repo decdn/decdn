@@ -5,10 +5,35 @@ use sponsord::http::{self, ApiState};
 use sponsord_core::Sponsor;
 use tokio_util::sync::CancellationToken;
 
+/// Print a fatal error through [`decdn_common::redact::sanitize_err_chain`]
+/// instead of returning it, which would let std's `Termination` impl
+/// Debug-print it unredacted. `ChainPool` already strips the RPC URL, whose
+/// path or query often holds an API key, from its errors; this is the
+/// backstop for any other error that names it (#38).
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {}", decdn_common::redact::sanitize_err_chain(&e));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
 
+/// `RUST_LOG` filtering, as `tracing_subscriber::fmt::init` does, with
+/// `alloy_transport_http` held at `info` whatever `RUST_LOG` says: it logs
+/// only at debug and trace, inside a `debug_span!` that records the RPC URL,
+/// and every event inside that span (reqwest's, hyper's) would print it (#38).
+fn init_tracing() -> anyhow::Result<()> {
+    let filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("alloy_transport_http=info".parse()?);
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+    Ok(())
+}
+
+async fn run() -> anyhow::Result<()> {
+    init_tracing()?;
     let DaemonConfig {
         bind,
         api_token,
@@ -26,10 +51,12 @@ async fn main() -> anyhow::Result<()> {
     .await??;
     let sponsor = Arc::new(Sponsor::connect(signer, chain, limits).await?);
 
+    // Bound before the keeper starts: a bind failure that returned while a
+    // top-up was in flight would drop it between the approve and the top-up.
+    let listener = tokio::net::TcpListener::bind(bind).await?;
     let shutdown = CancellationToken::new();
     let keeper = tokio::spawn(sponsor.keeper(keeper, shutdown.clone()));
     let app = http::router(ApiState::new(sponsor, api_token));
-    let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "sponsord listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(shutdown))

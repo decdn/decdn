@@ -1,9 +1,10 @@
 # cargo-deny configuration, mirroring decdn's deny.toml. Every advisory ignored
 # below reaches this workspace through the decdn crates (decdn-client,
-# decdn-incentive, and decdn-e2e as a dev-dependency), so the justifications are
-# decdn's: keep this list in step with decdn's own deny.toml rather than editing
-# the reasoning here. CI runs it through .github/scripts/cargo-deny-warn.sh,
-# which reports findings without failing the build.
+# decdn-common, decdn-incentive, and decdn-e2e as a dev-dependency), so the
+# justifications are decdn's: keep this list in step with decdn's own deny.toml
+# rather than editing the reasoning here. CI runs it through
+# .github/scripts/cargo-deny-warn.sh, which reports findings without failing
+# the build.
 
 [advisories]
 version = 2

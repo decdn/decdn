@@ -16,19 +16,23 @@ workspace = true
 
 [features]
 anvil-e2e = []
-test-support = []
+test-support = ["dep:tracing-subscriber"]
 
 [dependencies]
 tokio.workspace = true
 anyhow.workspace = true
 alloy.workspace = true
 decdn-client.workspace = true
+decdn-common.workspace = true
 decdn-incentive.workspace = true
 sponsord-api.workspace = true
 tracing.workspace = true
 async-trait = "0.1"
 thiserror = "2"
 tokio-util.workspace = true
+# The log capture in `test_support`.
+tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
 decdn-e2e = { workspace = true, features = ["anvil-e2e"] }
+tracing-subscriber.workspace = true

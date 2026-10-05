@@ -17,7 +17,9 @@ use sponsord::http::{ApiState, router};
 use sponsord_api::daemon::{Info, IssueResponse};
 use sponsord_api::{ErrorBody, ErrorCode, MicroUsdc};
 use sponsord_core::pool::{Authorization, PoolChain};
-use sponsord_core::test_support::{FakePool, TEST_CHAIN_ID, TEST_PAYMENT_POOL, fake_sponsor};
+use sponsord_core::test_support::{
+    CapturedLog, FakePool, TEST_CHAIN_ID, TEST_PAYMENT_POOL, fake_sponsor,
+};
 use tower::ServiceExt;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
@@ -275,9 +277,20 @@ async fn expired_registration_is_409_signer_expired() {
 async fn failed_chain_read_is_503() {
     let (app, pool) = app().await;
     pool.fail_authorization_reads(true);
-    let (s, v) = send(&app, issue_req(Some(&bearer()), json!({"signer": SIGNER}))).await;
+    let log = CapturedLog::default();
+    let (s, v) = {
+        let _guard = log.install();
+        send(&app, issue_req(Some(&bearer()), json!({"signer": SIGNER}))).await
+    };
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(v["error"], "chain_unavailable");
+
+    // The warning keeps the error text but not the RPC URL (#38).
+    let text = log.text();
+    assert!(text.contains("signer authorization read failed"), "{text}");
+    assert!(text.contains("error sending request"), "{text}");
+    assert!(!text.contains("FAKE-RPC-KEY"), "{text}");
+    assert!(!text.contains("rpc.example"), "{text}");
 }
 
 #[tokio::test]

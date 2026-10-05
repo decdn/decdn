@@ -48,6 +48,7 @@ covers moving it). To build against a local checkout instead (say
 ```toml
 [patch."https://github.com/decdn/decdn"]
 decdn-client = { path = "../decdn/crates/client" }
+decdn-common = { path = "../decdn/crates/common" }
 decdn-incentive = { path = "../decdn/crates/incentive" }
 decdn-e2e = { path = "../decdn/crates/e2e" }
 ```

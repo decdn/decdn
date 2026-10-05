@@ -35,7 +35,8 @@ pub struct Args {
     pub api_token_file: Option<PathBuf>,
 
     /// JSON-RPC endpoint of the chain the pool is on.
-    #[arg(long, env = "SPONSORD_RPC_URL")]
+    // Hidden from `--help`, like the secrets: it often carries an API key.
+    #[arg(long, env = "SPONSORD_RPC_URL", hide_env_values = true)]
     pub rpc_url: String,
     /// Chain id (421614 is Arbitrum Sepolia).
     #[arg(long, env = "SPONSORD_CHAIN_ID", default_value_t = 421_614)]
@@ -237,7 +238,19 @@ mod tests {
         let shown = format!("{cfg:?}");
         assert!(!shown.contains(&"a".repeat(32)));
         assert!(!shown.contains("\"pw\""));
+        assert!(!shown.contains("localhost:8545"), "the RPC URL: {shown}");
         assert!(shown.contains("<redacted>"));
+    }
+
+    /// `--help` prints `[env: NAME=value]` for a set variable unless its value
+    /// is hidden; the RPC URL often carries an API key (#38).
+    #[test]
+    fn help_hides_secret_env_values() {
+        let cmd = <Args as clap::CommandFactory>::command();
+        for id in ["api_token", "treasury_password", "rpc_url"] {
+            let arg = cmd.get_arguments().find(|a| a.get_id() == id).unwrap();
+            assert!(arg.is_hide_env_values_set(), "{id}");
+        }
     }
 
     #[test]

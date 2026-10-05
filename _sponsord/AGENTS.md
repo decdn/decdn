@@ -100,8 +100,8 @@ rather than writing new ones.
 - **The decdn pin**: `Cargo.lock` decides which decdn commit gets built. The
   `version` on each `decdn-*` git dependency must equal decdn's workspace
   version at that commit (`check-decdn-pin.sh`). To move it, run
-  `cargo update -p decdn-client -p decdn-incentive -p decdn-e2e` in a PR of
-  its own. To build against a local `../decdn`, use an untracked
+  `cargo update -p decdn-client -p decdn-common -p decdn-incentive -p decdn-e2e`
+  in a PR of its own. To build against a local `../decdn`, use an untracked
   `.cargo/config.toml` `[patch]` (see `CONTRIBUTING.md`), and do not commit
   the lockfile changes it causes.
 - **The toolchain version is written in three places**:

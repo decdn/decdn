@@ -7489,6 +7489,7 @@ dependencies = [
  "axum",
  "clap",
  "decdn-client",
+ "decdn-common",
  "decdn-e2e",
  "decdn-incentive",
  "reqwest",
@@ -7531,6 +7532,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "decdn-client",
+ "decdn-common",
  "decdn-e2e",
  "decdn-incentive",
  "sponsord-api",
@@ -7538,6 +7540,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

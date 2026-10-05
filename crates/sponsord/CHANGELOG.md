@@ -54,3 +54,13 @@ release.
   ([#36](https://github.com/decdn/sponsord/issues/36)). If you installed a copy
   of the unit, take its new `RuntimeDirectory=`, `RuntimeDirectoryMode=`,
   `ExecStartPre=` and `SPONSORD_TREASURY_KEYSTORE` lines.
+
+### Security
+
+- **No RPC URL in logs, the exit error or `--help`.** `SPONSORD_RPC_URL`
+  often carries a provider API key. A failed chain call no longer prints it
+  in the exit error or the daemon's warnings (issue and keeper), which show
+  the failure class (connection refused, timeout, DNS, TLS) instead.
+  `RUST_LOG=debug` no longer prints it either: `alloy_transport_http`, whose
+  request span records it, is held at `info`. `--help` hides its value
+  ([#38](https://github.com/decdn/sponsord/issues/38)).

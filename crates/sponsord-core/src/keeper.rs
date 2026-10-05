@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy::primitives::B256;
+use decdn_common::redact::sanitize_err_chain;
 use sponsord_api::MicroUsdc;
 use sponsord_api::time::{Clock, SystemClock};
 use tokio_util::sync::CancellationToken;
@@ -105,7 +106,11 @@ async fn sweep(
         Ok(r) => r,
         Err(e) => {
             status.failures.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(pool = %pool_id, "pool remaining read failed: {e}");
+            tracing::warn!(
+                pool = %pool_id,
+                "pool remaining read failed: {}",
+                sanitize_err_chain(&e)
+            );
             return;
         }
     };
@@ -132,7 +137,11 @@ async fn sweep(
         }
         Err(e) => {
             status.failures.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(pool = %pool_id, "pool top-up failed: {e}");
+            tracing::warn!(
+                pool = %pool_id,
+                "pool top-up failed: {}",
+                sanitize_err_chain(&e)
+            );
         }
     }
 }
@@ -144,7 +153,7 @@ mod tests {
     use sponsord_api::time::FixedClock;
 
     use super::*;
-    use crate::test_support::{FakePool, TEST_POOL_ID};
+    use crate::test_support::{CapturedLog, FakePool, TEST_POOL_ID};
 
     const CFG: KeeperConfig = KeeperConfig {
         low_water: MicroUsdc(20_000_000),
@@ -188,9 +197,42 @@ mod tests {
         let pool = FakePool::new(Address::repeat_byte(1), 0);
         pool.fail_top_ups(true);
         let status = KeeperStatus::default();
-        sweep(&pool, TEST_POOL_ID, &CFG, &status, &FixedClock::new(1)).await;
+        let log = CapturedLog::default();
+        {
+            let _guard = log.install();
+            sweep(&pool, TEST_POOL_ID, &CFG, &status, &FixedClock::new(1)).await;
+        }
         let s = status.snapshot();
         assert_eq!((s.topups, s.failures), (0, 1));
+
+        // The warning keeps the error text but not the RPC URL (#38).
+        let text = log.text();
+        assert!(text.contains("pool top-up failed"), "{text}");
+        assert!(text.contains("error sending request"), "{text}");
+        assert!(!text.contains("FAKE-RPC-KEY"), "{text}");
+        assert!(!text.contains("rpc.example"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_remaining_read_is_counted_and_logged_without_the_url() {
+        let pool = FakePool::new(Address::repeat_byte(1), 0);
+        pool.fail_remaining_reads(true);
+        let status = KeeperStatus::default();
+        let log = CapturedLog::default();
+        {
+            let _guard = log.install();
+            sweep(&pool, TEST_POOL_ID, &CFG, &status, &FixedClock::new(1)).await;
+        }
+        let s = status.snapshot();
+        assert_eq!((s.topups, s.failures, s.last_check_unix), (0, 1, 0));
+        assert_eq!(pool.remaining_now(), MicroUsdc(0), "no top-up was sent");
+
+        // The warning keeps the error text but not the RPC URL (#38).
+        let text = log.text();
+        assert!(text.contains("pool remaining read failed"), "{text}");
+        assert!(text.contains("error sending request"), "{text}");
+        assert!(!text.contains("FAKE-RPC-KEY"), "{text}");
+        assert!(!text.contains("rpc.example"), "{text}");
     }
 
     #[tokio::test(start_paused = true)]
