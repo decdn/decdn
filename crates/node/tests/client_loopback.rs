@@ -1374,6 +1374,64 @@ async fn a_preimage_at_index_zero_is_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A reveal inside the capability's expiry margin is refused with
+/// `CapabilityExpired`, exactly as a voucher is, even on a stream the node
+/// anchored before the margin started. Otherwise the claim could keep growing
+/// after the redeemer's cutoff sweep has read the lane (#2233).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_preimage_inside_the_expiry_margin_is_refused() -> anyhow::Result<()> {
+    const CREDIT_MAX: u64 = 64 * 1024 * 1024;
+    let payload = vec![0x49u8; 4 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+    // The margin starts two seconds from now.
+    let cutoff = unix_now()?.saturating_add(2);
+    let mut lane = store
+        .get(lane_key(signer.address()))?
+        .ok_or_else(|| anyhow::anyhow!("lane row missing"))?;
+    lane.expiry = cutoff.saturating_add(DEFAULT_EXPIRY_MARGIN);
+    store.record(&lane)?;
+
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_pipelined_server(cache, Arc::clone(&store), CREDIT_MAX, 2).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+
+    // The anchor voucher lands before the margin.
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+    open_chain(&mut send, &signer, chain_root(), RATE_PER_MB, U256::ZERO, 0).await?;
+    anyhow::ensure!(
+        unix_now()? < cutoff,
+        "the anchor must land before the margin"
+    );
+
+    // The reveal lands inside it.
+    while unix_now()? < cutoff {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    release(&mut send, 1).await?;
+    expect_reject(&mut recv, VoucherRejectReason::CapabilityExpired).await?;
+
+    let lane = store
+        .get(lane_key(signer.address()))?
+        .ok_or_else(|| anyhow::anyhow!("lane row missing"))?;
+    anyhow::ensure!(
+        lane.chain().verified_index == 0,
+        "the refused reveal must not extend the claim"
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// A value from another chain never reaches the node's tip, and it cannot: only
 /// the payer can produce a value at a given depth. The rejection is terminal —
 /// a wrong seed or a wrong chain is a payer bug, not transient state.
