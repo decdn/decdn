@@ -346,7 +346,8 @@ async fn throwaway_open(
     let (conn, total) =
         idle_open(client_ep, target, client_node_id, client_eth, pool_id, hash).await?;
     // Exactly what `UpstreamPull::abort` / `Drop` do on the CLI: close the
-    // connection; the node's serve leg learns of it on its next write.
+    // connection. The node's serve leg learns of it at once through
+    // `send.stopped()`, and the last-out lease release cancels its fill.
     conn.close(0u32.into(), b"client-abandoned");
     Ok(total)
 }
@@ -1624,8 +1625,11 @@ async fn bounded_unaligned_offset_own_origin_miss_streams_the_exact_bytes() -> a
 /// per-hash slot until the throwaway's current draw is admitted, then probes the
 /// origin and claims — attaching to the live fill or owning a fresh one, depending
 /// on whether the throwaway's serve leg has torn down yet. Every ordering must give
-/// a byte-exact delivery, both opens entering the two-leg tier, no whole-blob GET,
-/// and no span fetched twice in full.
+/// a byte-exact delivery, both opens entering the two-leg tier, and no whole-blob
+/// GET. When the real open attaches, no span is fetched twice. When it owns a fresh
+/// fill, the teardown has aborted the throwaway's in-flight first draw, and the new
+/// owner GETs that draw again: the one duplicate draw a thrown-away open costs
+/// (`decdn_client::PrimedSource`). No later draw is fetched twice in either ordering.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn throwaway_open_then_real_open_shares_one_multi_draw_fill() -> anyhow::Result<()> {
@@ -1743,7 +1747,8 @@ async fn throwaway_open_then_real_open_shares_one_multi_draw_fill() -> anyhow::R
     })
     .await?;
     anyhow::ensure!(wholeblob_gets == 0, "saw {wholeblob_gets} un-ranged GET(s)");
-    // No span fetched twice in full: every ranged GET carries a distinct Range.
+    // No span fetched twice in full, except one repeat of the first draw when the
+    // real open owns a fresh fill after the throwaway's teardown aborted it.
     let reqs = server
         .received_requests()
         .await
@@ -1758,12 +1763,17 @@ async fn throwaway_open_then_real_open_shares_one_multi_draw_fill() -> anyhow::R
         ranges.len() >= 2,
         "test premise: a 3 MiB blob takes several draws, saw {ranges:?}"
     );
-    let mut distinct = ranges.clone();
-    distinct.sort();
-    distinct.dedup();
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    for range in &ranges {
+        *counts.entry(range.as_str()).or_default() += 1;
+    }
+    let repeated: Vec<(&str, usize)> = counts.into_iter().filter(|&(_, n)| n > 1).collect();
+    let first_draw_repeated_once = |&(range, n): &(&str, usize)| {
+        n == 2 && parse_byte_range(range).is_some_and(|(start, _)| start == 0)
+    };
     anyhow::ensure!(
-        distinct.len() == ranges.len(),
-        "a span was fetched twice in full: {ranges:?}"
+        repeated.len() <= 1 && repeated.iter().all(first_draw_repeated_once),
+        "a span other than the aborted first draw was fetched twice in full: {ranges:?}"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
