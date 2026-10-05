@@ -52,8 +52,10 @@ pub fn redact_userinfo(raw: &str) -> Cow<'_, str> {
 }
 
 /// Strip URL-bearing fragments from an error's rendered text so an `rpc_url`
-/// secret never reaches a log or operator-facing error — the transport-failure
-/// *class* (timeout / connection refused / DNS / TLS) still shows.
+/// secret never reaches a log or operator-facing error. Any failure class in
+/// the input text (timeout / connection refused / DNS / TLS) is kept; to
+/// include the `source()` chain, call [`sanitize_error_sources`] or
+/// [`sanitize_err_chain`].
 ///
 /// Unlike [`redact_userinfo`], which only scrubs `user:pass@` userinfo, this
 /// removes the whole URL: an `rpc_url` secret commonly lives in the path or
@@ -163,9 +165,10 @@ pub fn sanitize_rpc_display(err: impl std::fmt::Display) -> String {
 /// Use for a typed `std::error::Error`, such as an `alloy` transport or
 /// contract error. Its top-level Display often names only the operation and
 /// the URL, while the failure class (timeout, connection refused, DNS, TLS)
-/// is a deeper `source()`. A layer whose Display already appears in the text
-/// built so far is skipped, because a transparent or `"{0}"` wrapper repeats
-/// its source verbatim. Each layer is stripped on its own before the join, so
+/// is a deeper `source()`. A layer is skipped when its Display is empty or
+/// already appears in the text built so far: a wrapper whose message embeds
+/// its source (`"{0}"`, `"transport: {0}"`) would otherwise print that source
+/// twice. Each layer is stripped on its own before the join, so
 /// a URL token cannot swallow the `": "` separator after it. For an
 /// `anyhow::Error`, use [`sanitize_err_chain`].
 pub fn sanitize_error_sources(err: &(dyn std::error::Error + 'static)) -> String {
@@ -185,8 +188,10 @@ pub fn sanitize_error_sources(err: &(dyn std::error::Error + 'static)) -> String
     out
 }
 
-/// Render an `anyhow` error's full `context: cause: cause` chain (alternate
-/// Display) with URL fragments stripped.
+/// Render an `anyhow` error's full `context: cause: cause` chain with URL
+/// fragments stripped, through [`sanitize_error_sources`]: the context layers
+/// and the wrapped error's `source()` chain share one walk, so a repeated
+/// layer is printed once and each layer is stripped on its own.
 ///
 /// Use for any propagated chain-RPC error — at the `main()` print boundary so
 /// no raw `rpc_url` is echoed, and at watcher `tracing` sites so the reason
@@ -197,7 +202,7 @@ pub fn sanitize_error_sources(err: &(dyn std::error::Error + 'static)) -> String
 /// that context and drops the timeout entirely — the operator sees a bare
 /// restatement of what was attempted, never why it failed.
 pub fn sanitize_err_chain(err: &anyhow::Error) -> String {
-    strip_urls(&format!("{err:#}")).into_owned()
+    sanitize_error_sources(err.as_ref())
 }
 
 #[cfg(test)]
@@ -369,14 +374,14 @@ mod tests {
     #[derive(Debug)]
     struct Layer {
         msg: String,
-        source: Option<Box<dyn std::error::Error + 'static>>,
+        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     }
 
     impl Layer {
         fn new(msg: &str, source: Option<Layer>) -> Self {
             Self {
                 msg: msg.to_owned(),
-                source: source.map(|s| Box::new(s) as Box<dyn std::error::Error>),
+                source: source.map(|s| Box::new(s) as Box<dyn std::error::Error + Send + Sync>),
             }
         }
     }
@@ -389,7 +394,9 @@ mod tests {
 
     impl std::error::Error for Layer {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            self.source.as_deref()
+            self.source
+                .as_deref()
+                .map(|s| s as &(dyn std::error::Error + 'static))
         }
     }
 
@@ -415,7 +422,8 @@ mod tests {
 
     #[test]
     fn sanitize_error_sources_skips_repeated_layers() {
-        // A transparent wrapper and a `"{0}"` wrapper both repeat their source.
+        // A `"transport: {0}"` wrapper embeds its source, and a `"{0}"` wrapper
+        // above it repeats that text verbatim.
         let inner = Layer::new("connection refused (os error 61)", None);
         let quoted = Layer::new("transport: connection refused (os error 61)", Some(inner));
         let transparent = Layer::new("transport: connection refused (os error 61)", Some(quoted));
@@ -434,6 +442,26 @@ mod tests {
         );
         let out = sanitize_error_sources(&err);
         assert_eq!(out, "getPool call failed: reach <redacted-url> failed");
+    }
+
+    #[test]
+    fn sanitize_err_chain_dedupes_and_strips_each_layer() {
+        // alloy's shape under `chain_events::timed`: a `"{0}"` transport layer
+        // repeats the reqwest text, and the URL token would swallow a joined
+        // `": "` separator if the chain were stripped as one string.
+        let reqwest = Layer::new(
+            "error sending request for url (https://eth.example/v3/SECRETKEY)",
+            Some(Layer::new("client error (Connect)", None)),
+        );
+        let transport = Layer::new(
+            "error sending request for url (https://eth.example/v3/SECRETKEY)",
+            Some(reqwest),
+        );
+        let err = anyhow::Error::new(transport).context("admit getPool");
+        assert_eq!(
+            sanitize_err_chain(&err),
+            "admit getPool: error sending request: client error (Connect)"
+        );
     }
 
     #[test]

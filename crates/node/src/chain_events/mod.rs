@@ -118,10 +118,12 @@ pub(crate) const DEFAULT_RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// graceful-shutdown path.
 ///
 /// This helper guarantees only that a call is *bounded*. What a timeout **means**
-/// is the call site's decision, and each documents its own — the two live shapes
+/// is the call site's decision, and each documents its own — the two watcher shapes
 /// being fail-the-tick-and-back-off (`getChannel`, origin's `getOrigins`) and
 /// degrade-and-continue (`slash`'s `get_block`, the registry's `nodeIdOf`,
-/// origin's `nodeIdOf`).
+/// origin's `nodeIdOf`). The serve-admission reads in `ResolvingPoolView`
+/// (`getPool`, `getAuthorization`) refuse the request or fall back to a cached
+/// read.
 ///
 /// `nodeIdOf` is the same read at two sites under one policy: the registry and
 /// origin both count-and-skip because their projections self-heal on the

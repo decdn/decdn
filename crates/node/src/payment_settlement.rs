@@ -812,7 +812,8 @@ impl PoolSettlementSink {
 /// re-requesting the same dead pool every request cannot drive one `getPool` per
 /// request.
 pub struct ResolvingPoolView<P: Provider + Clone> {
-    /// The wallet/RPC-backed `PaymentPool` binding the admit-path `getPool` reads.
+    /// The wallet/RPC-backed `PaymentPool` binding for the admit-path reads
+    /// (`getPool`, `getAuthorization`).
     contract: PaymentPool::PaymentPoolInstance<P>,
     /// The event-fed projection this view reads first and folds a resolved pool
     /// into. Shared with the settlement watcher's sink (the authoritative writer).
@@ -839,8 +840,8 @@ impl<P: Provider + Clone> std::fmt::Debug for ResolvingPoolView<P> {
 }
 
 impl<P: Provider + Clone> ResolvingPoolView<P> {
-    /// Wrap the event-fed `projection` with an admit-path `getPool` fallback
-    /// against `contract`.
+    /// Wrap the event-fed `projection` with admit-path `getPool` and
+    /// `getAuthorization` fallbacks against `contract`.
     #[must_use]
     pub fn new(contract: PaymentPool::PaymentPoolInstance<P>, projection: PoolProjection) -> Self {
         Self {
@@ -905,7 +906,8 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
                 warn!(
                     error = %sanitize_err_chain(&err),
                     %pool_id,
-                    "admit getPool failed; refusing this pool"
+                    suppressed_for = ?RESOLVE_NEGATIVE_TTL,
+                    "admit getPool failed; refusing this pool until the negative cache lapses"
                 );
                 let mut guard = self
                     .negative
@@ -2799,10 +2801,16 @@ mod tests {
 
         let view = hanging_view();
         let pool_id = B256::repeat_byte(0x51);
+        let started = tokio::time::Instant::now();
         assert!(
             bounded("admit getPool", view.status(pool_id))
                 .await
                 .is_none()
+        );
+        assert_eq!(
+            started.elapsed(),
+            crate::chain_events::DEFAULT_RPC_CALL_TIMEOUT,
+            "the admit read uses the default bound"
         );
         let guard = view
             .negative
@@ -2815,7 +2823,7 @@ mod tests {
     }
 
     /// A hung admit `getAuthorization` past `SIGNER_AUTH_TTL` times out and falls
-    /// back to the cached registration, as an RPC error does (#2270).
+    /// back to the cached registration, as an RPC error does.
     #[tokio::test(start_paused = true)]
     async fn admit_getauthorization_hang_falls_back_to_the_cached_registration() -> Result<()> {
         use crate::chain_events::test_support::bounded;
@@ -2840,6 +2848,15 @@ mod tests {
             Some(registered(1_000_000, 200_000)),
             "the timeout falls back to the last cached registration"
         );
+        // The fallback does not refresh the entry: a fresh stamp would let the
+        // fast path serve it for a full TTL without the spent-raise.
+        let stamped = view
+            .auth_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(pool_id, signer))
+            .map(|(_, at)| *at);
+        assert_eq!(stamped, Some(aged), "the fallback leaves the entry's age");
         Ok(())
     }
 
@@ -2860,6 +2877,15 @@ mod tests {
             )
             .await,
             None
+        );
+        // A fault caches nothing: a cached `Unregistered` here would answer the
+        // fast path for a full TTL.
+        assert!(
+            view.auth_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "a timed-out read leaves the signer cache empty"
         );
     }
 
