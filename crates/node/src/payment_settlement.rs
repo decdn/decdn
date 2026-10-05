@@ -1095,16 +1095,26 @@ async fn redeemer_loop<P: Provider + Clone>(
     let mut ticker = tokio::time::interval(redeem_interval);
     // Skip the immediate first tick: new vouchers hint anyway, and the first
     // sweep waits one interval. A lane persisted before a restart whose claim
-    // cannot wait that long gets its cutoff sweep instead ([`startup_cutoff`]).
+    // cannot wait that long gets its cutoff sweep instead: no scan has run yet,
+    // so a cutoff that passed while the node was down is due at once.
     ticker.tick().await;
-    let mut next_cutoff = load_lanes(store.as_ref())
-        .and_then(|states| startup_cutoff(&states, &paid, self_address, margin_secs, unix_now()));
+    let mut swept_at = 0;
+    let mut next_cutoff = load_lanes(store.as_ref()).and_then(|states| {
+        next_serve_cutoff(
+            &states,
+            &paid,
+            self_address,
+            margin_secs,
+            swept_at,
+            unix_now(),
+        )
+    });
     loop {
         tokio::select! {
             hint = redeem_rx.recv() => match hint {
                 Some(key) => {
                     let wake = redeem_one(
-                        &contract, &store, &paid, self_address, margin_secs,
+                        &contract, &store, &paid, self_address, margin_secs, swept_at,
                         redeem_threshold, max_vouchers, key, &metrics, &pool_view,
                     )
                     .await;
@@ -1125,7 +1135,15 @@ async fn redeemer_loop<P: Provider + Clone>(
             next_cutoff = next_cutoff.filter(|wake| *wake > unix_now());
             continue;
         };
-        next_cutoff = next_serve_cutoff(&states, &paid, self_address, margin_secs, unix_now());
+        swept_at = unix_now();
+        next_cutoff = next_serve_cutoff(
+            &states,
+            &paid,
+            self_address,
+            margin_secs,
+            swept_at,
+            swept_at,
+        );
         redeem_sweep(
             &contract,
             &store,
@@ -1352,17 +1370,25 @@ fn lane_cutoff_wake(
     Some(st.expiry.saturating_sub(margin_secs).saturating_add(1))
 }
 
-/// A lane's [`lane_cutoff_wake`] when it is still ahead of `now`. A wake at or
-/// before `now` is `None`: the sweep that runs at a cutoff must not schedule
-/// that cutoff again.
+/// When the redeemer must sweep for one lane's cutoff, given that its last
+/// sweep scanned the lane store at `swept_at` (`0` before the first scan).
+///
+/// A scan at or after the lane's [`lane_cutoff_wake`] already read the final
+/// claim, so the lane needs no further cutoff sweep. Otherwise the sweep is due
+/// at the wake, or at `now` when the wake has passed unscanned: the node was
+/// down at the cutoff, or the lane's first hint waited behind redemption work
+/// until after it. A lane that [`capability_expired`] skips at `now` cannot be
+/// redeemed and needs no sweep.
 fn serve_cutoff_wake(
     st: &LaneState,
     paid: &PaidWatermarks,
     self_address: Address,
     margin_secs: u64,
+    swept_at: u64,
     now: u64,
 ) -> Option<u64> {
-    lane_cutoff_wake(st, paid, self_address, margin_secs).filter(|wake| *wake > now)
+    let wake = lane_cutoff_wake(st, paid, self_address, margin_secs)?;
+    (wake > swept_at && !capability_expired(st.expiry, now)).then_some(wake.max(now))
 }
 
 /// The earliest [`serve_cutoff_wake`] across `states`.
@@ -1371,35 +1397,13 @@ fn next_serve_cutoff(
     paid: &PaidWatermarks,
     self_address: Address,
     margin_secs: u64,
+    swept_at: u64,
     now: u64,
 ) -> Option<u64> {
     states
         .iter()
-        .filter_map(|st| serve_cutoff_wake(st, paid, self_address, margin_secs, now))
+        .filter_map(|st| serve_cutoff_wake(st, paid, self_address, margin_secs, swept_at, now))
         .min()
-}
-
-/// The redeemer's first cutoff wake at start. A lane whose cutoff passed while
-/// the node was down, and whose capability [`capability_expired`] does not yet
-/// skip, is due at once: no sweep has read its final claim, no hint comes for
-/// it, and the first self-tick can fall past the landing slack. Otherwise this
-/// is [`next_serve_cutoff`].
-fn startup_cutoff(
-    states: &[LaneState],
-    paid: &PaidWatermarks,
-    self_address: Address,
-    margin_secs: u64,
-    now: u64,
-) -> Option<u64> {
-    let overdue = states.iter().any(|st| {
-        lane_cutoff_wake(st, paid, self_address, margin_secs)
-            .is_some_and(|wake| wake <= now && !capability_expired(st.expiry, now))
-    });
-    if overdue {
-        Some(now)
-    } else {
-        next_serve_cutoff(states, paid, self_address, margin_secs, now)
-    }
 }
 
 /// Sleep until the Unix second `wake`, or forever when there is none.
@@ -1656,8 +1660,9 @@ fn plan_lanes(
 /// Hint-path redemption: plan one lane and, if it clears the per-chunk `floor`,
 /// submit it as a one-lane `redeemMany`. A sub-floor hint defers to the next
 /// sweep, which packs it with other lanes, and reads nothing from the chain.
-/// Returns the lane's [`serve_cutoff_wake`], so a lane first seen between sweeps
-/// gets its cutoff sweep.
+/// Returns the lane's [`serve_cutoff_wake`] against the last sweep scan at
+/// `swept_at`, so a lane first seen between sweeps gets its cutoff sweep, even
+/// when the hint waited behind redemption work until after the cutoff.
 #[allow(clippy::too_many_arguments)]
 async fn redeem_one<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
@@ -1665,6 +1670,7 @@ async fn redeem_one<P: Provider + Clone>(
     paid: &PaidWatermarks,
     self_address: Address,
     margin_secs: u64,
+    swept_at: u64,
     floor: U256,
     max_vouchers: usize,
     key: LaneKey,
@@ -1681,7 +1687,7 @@ async fn redeem_one<P: Provider + Clone>(
         }
     };
     let now = unix_now();
-    let wake = serve_cutoff_wake(&st, paid, self_address, margin_secs, now);
+    let wake = serve_cutoff_wake(&st, paid, self_address, margin_secs, swept_at, now);
     let plans = plan_lanes(paid, self_address, vec![st], metrics, pool_view, now);
     // Hint path: require the durability floor and skip the submit on a failed
     // flush (`strict_flush`); the lane defers to the next sweep.
@@ -3993,21 +3999,50 @@ mod tests {
         let me = Address::from([20u8; 20]);
         let paid = PaidWatermarks::default();
         let st = expiring_lane(1, 10_000);
-        assert_eq!(serve_cutoff_wake(&st, &paid, me, 420, 0), Some(9_581));
+        assert_eq!(serve_cutoff_wake(&st, &paid, me, 420, 0, 0), Some(9_581));
         assert_eq!(
-            serve_cutoff_wake(&st, &paid, me, 420, 9_580),
+            serve_cutoff_wake(&st, &paid, me, 420, 9_580, 9_580),
             Some(9_581),
-            "a wake still ahead of now is kept"
+            "a wake still ahead of the last scan is kept"
         );
         assert_eq!(
-            serve_cutoff_wake(&st, &paid, me, 420, 9_581),
+            serve_cutoff_wake(&st, &paid, me, 420, 9_581, 9_581),
             None,
             "the sweep at a cutoff does not schedule that cutoff again"
         );
         assert_eq!(
-            serve_cutoff_wake(&expiring_lane(1, 100), &paid, me, 420, 0),
-            Some(1),
+            serve_cutoff_wake(&expiring_lane(1, 200), &paid, me, 100, 0, 0),
+            Some(101),
             "an expiry inside the margin saturates instead of underflowing"
+        );
+    }
+
+    /// A cutoff that passed with no scan after it is due at once: at start
+    /// (`swept_at == 0`), or for a hint handled after its lane's cutoff.
+    #[test]
+    fn a_cutoff_passed_unscanned_is_due_now() {
+        let me = Address::from([20u8; 20]);
+        let paid = PaidWatermarks::default();
+        let st = expiring_lane(1, 10_000);
+        assert_eq!(
+            serve_cutoff_wake(&st, &paid, me, 420, 0, 9_700),
+            Some(9_700),
+            "the node was down at the cutoff"
+        );
+        assert_eq!(
+            serve_cutoff_wake(&st, &paid, me, 420, 9_500, 9_700),
+            Some(9_700),
+            "the last scan ran before the cutoff"
+        );
+        assert_eq!(
+            serve_cutoff_wake(&st, &paid, me, 420, 9_600, 9_700),
+            None,
+            "a scan after the cutoff already read the final claim"
+        );
+        assert_eq!(
+            serve_cutoff_wake(&st, &paid, me, 420, 0, 10_000 - REDEEM_LANDING_SLACK_SECS),
+            None,
+            "a lane inside the landing slack cannot be redeemed, so it is not due"
         );
     }
 
@@ -4016,25 +4051,20 @@ mod tests {
         let me = Address::from([20u8; 20]);
         let paid = PaidWatermarks::default();
         assert_eq!(
-            serve_cutoff_wake(&expiring_lane(1, 0), &paid, me, 420, 0),
+            serve_cutoff_wake(&expiring_lane(1, 0), &paid, me, 420, 0, 0),
             None,
             "a lane with no tracked expiry never expires"
         );
+        let other = Address::from([9u8; 20]);
         assert_eq!(
-            serve_cutoff_wake(
-                &expiring_lane(1, 10_000),
-                &paid,
-                Address::from([9u8; 20]),
-                420,
-                0
-            ),
+            serve_cutoff_wake(&expiring_lane(1, 10_000), &paid, other, 420, 0, 0),
             None,
             "another provider's lane"
         );
         let settled = expiring_lane(1, 10_000);
         paid.set(settled.key(), settled.owed());
         assert_eq!(
-            serve_cutoff_wake(&settled, &paid, me, 420, 0),
+            serve_cutoff_wake(&settled, &paid, me, 420, 0, 0),
             None,
             "a fully paid lane"
         );
@@ -4050,13 +4080,21 @@ mod tests {
             expiring_lane(3, 10_000),
             expiring_lane(4, 20_000),
         ];
-        assert_eq!(next_serve_cutoff(&states, &paid, me, 420, 0), Some(9_581));
         assert_eq!(
-            next_serve_cutoff(&states, &paid, me, 420, 9_581),
-            Some(19_581),
-            "a passed cutoff yields to the next one"
+            next_serve_cutoff(&states, &paid, me, 420, 0, 0),
+            Some(9_581)
         );
-        assert_eq!(next_serve_cutoff(&[], &paid, me, 420, 0), None);
+        assert_eq!(
+            next_serve_cutoff(&states, &paid, me, 420, 9_581, 9_581),
+            Some(19_581),
+            "a scanned cutoff yields to the next one"
+        );
+        assert_eq!(
+            next_serve_cutoff(&states, &paid, me, 420, 0, 9_700),
+            Some(9_700),
+            "an unscanned passed cutoff comes first"
+        );
+        assert_eq!(next_serve_cutoff(&[], &paid, me, 420, 0, 0), None);
     }
 
     /// The voucher path's margin predicate refuses from the cutoff on, and the
@@ -4068,41 +4106,12 @@ mod tests {
         let me = Address::from([20u8; 20]);
         let paid = PaidWatermarks::default();
         let (expiry, margin) = (10_000, 420);
-        let wake = serve_cutoff_wake(&expiring_lane(1, expiry), &paid, me, margin, 0);
+        let wake = serve_cutoff_wake(&expiring_lane(1, expiry), &paid, me, margin, 0, 0);
         assert_eq!(wake, Some(9_581));
         assert!(!inside_capability_expiry_margin(expiry, margin, 9_579));
         assert!(
             inside_capability_expiry_margin(expiry, margin, 9_580),
             "the gate is closed one second before the wake"
-        );
-    }
-
-    #[test]
-    fn startup_cutoff_sweeps_at_once_for_a_cutoff_passed_while_down() {
-        let me = Address::from([20u8; 20]);
-        let paid = PaidWatermarks::default();
-        let (expiry, margin) = (10_000, 420);
-        let states = [expiring_lane(1, expiry), expiring_lane(2, 20_000)];
-        assert_eq!(
-            startup_cutoff(&states, &paid, me, margin, 9_700),
-            Some(9_700),
-            "a passed cutoff with time left to land is due now"
-        );
-        assert_eq!(
-            startup_cutoff(&states, &paid, me, margin, 9_000),
-            Some(9_581),
-            "with nothing overdue, the next cutoff"
-        );
-        assert_eq!(
-            startup_cutoff(
-                &states,
-                &paid,
-                me,
-                margin,
-                expiry - REDEEM_LANDING_SLACK_SECS
-            ),
-            Some(19_581),
-            "a lane inside the landing slack cannot be redeemed, so it is not due"
         );
     }
 
@@ -4339,6 +4348,37 @@ mod tests {
             Duration::from_hours(1),
             Arc::clone(&metrics),
         );
+
+        await_metric_line(&metrics, "decdn_onchain_tx_send_failed_total 1").await?;
+        ensure_metric_lines(&metrics, &["decdn_redemption_reconcile_ok_total 1"])?;
+
+        drop(tx);
+        handle.await?;
+        Ok(())
+    }
+
+    /// A hint handled after its lane's cutoff, with no sweep since, makes the
+    /// cutoff sweep due at once rather than leaving the lane to the next tick.
+    #[tokio::test]
+    async fn a_hint_after_an_unscanned_cutoff_sweeps_at_once() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store = CountingLoadStore::new(usize::MAX);
+        let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0), lane(0)]]);
+        asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
+        let lane_value = expiring_lane(1, 0).owed();
+        let (tx, handle, margin) = spawn_redeemer(
+            contract,
+            Arc::clone(&store) as Arc<dyn PoolStateStore>,
+            lane_value * U256::from(2u64),
+            Duration::from_hours(1),
+            Arc::clone(&metrics),
+        );
+        await_until("the startup scan", || Ok(store.loads() == 1)).await?;
+
+        // The cutoff passed 10 s ago; the landing slack is an hour away.
+        let expiry = unix_now() + margin - 10;
+        let (hinted, _) = record_lanes(store.as_ref(), 1..=2, expiry)?;
+        tx.send(hinted).await?;
 
         await_metric_line(&metrics, "decdn_onchain_tx_send_failed_total 1").await?;
         ensure_metric_lines(&metrics, &["decdn_redemption_reconcile_ok_total 1"])?;
