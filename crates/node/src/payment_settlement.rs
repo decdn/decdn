@@ -2929,6 +2929,58 @@ mod tests {
         Ok(())
     }
 
+    /// In-memory sink for the tracing output a test captures.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLog {
+        /// Capture this thread's tracing output until the guard drops. A
+        /// paused-clock test runs on one thread, so the thread default sees
+        /// every event the view logs.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+
+        /// Every captured line that contains `needle`, or an error that shows
+        /// the whole log when none does.
+        fn lines(&self, needle: &str) -> Result<Vec<String>> {
+            let bytes = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let text = String::from_utf8(bytes)?;
+            let found: Vec<String> = text
+                .lines()
+                .filter(|l| l.contains(needle))
+                .map(str::to_owned)
+                .collect();
+            if found.is_empty() {
+                anyhow::bail!("no captured line contains {needle:?}:\n{text}");
+            }
+            Ok(found)
+        }
+    }
+
     /// A view whose every chain read hangs forever. Pair with
     /// `#[tokio::test(start_paused = true)]` so the `timed` bound fires on
     /// virtual time.
@@ -2944,11 +2996,15 @@ mod tests {
 
     /// A hung admit `getPool` times out and takes the fault path: the pool is
     /// refused and negative-cached, so the next request does not wait again.
+    /// The WARN carries the timeout and the suppression window.
     #[tokio::test(start_paused = true)]
-    async fn admit_getpool_hang_refuses_within_the_bound() {
+    async fn admit_getpool_hang_refuses_within_the_bound() -> Result<()> {
+        use crate::chain_events::DEFAULT_RPC_CALL_TIMEOUT;
         use crate::chain_events::test_support::bounded;
         use crate::pool_view::PoolView;
 
+        let log = CapturedLog::default();
+        let _subscriber = log.install();
         let view = hanging_view();
         let pool_id = B256::repeat_byte(0x51);
         let started = tokio::time::Instant::now();
@@ -2959,17 +3015,40 @@ mod tests {
         );
         assert_eq!(
             started.elapsed(),
-            crate::chain_events::DEFAULT_RPC_CALL_TIMEOUT,
+            DEFAULT_RPC_CALL_TIMEOUT,
             "the admit read uses the default bound"
         );
-        let guard = view
-            .negative
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
-            guard.contains_key(&pool_id),
+            view.negative
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&pool_id),
             "the timed-out pool is negative-cached"
         );
+        assert!(
+            bounded("admit getPool", view.status(pool_id))
+                .await
+                .is_none(),
+            "the negative cache refuses the next request"
+        );
+        assert_eq!(
+            started.elapsed(),
+            DEFAULT_RPC_CALL_TIMEOUT,
+            "the next request does not wait on the chain again"
+        );
+        let warns = log.lines("admit getPool failed")?;
+        assert_eq!(warns.len(), 1, "only the first request reads: {warns:?}");
+        let line = warns.first().map_or("", String::as_str);
+        assert!(line.contains("WARN"), "{line}");
+        assert!(
+            line.contains("admit getPool timed out after 10s"),
+            "the WARN keeps the failure class: {line}"
+        );
+        assert!(
+            line.contains("suppressed_for=60s"),
+            "the WARN names the negative-cache window: {line}"
+        );
+        Ok(())
     }
 
     /// A hung admit `getAuthorization` past `SIGNER_AUTH_TTL` times out and falls
@@ -2979,6 +3058,8 @@ mod tests {
         use crate::chain_events::test_support::bounded;
         use crate::pool_view::PoolView;
 
+        let log = CapturedLog::default();
+        let _subscriber = log.install();
         let view = hanging_view();
         let pool_id = B256::repeat_byte(0x52);
         let signer = Address::from([7u8; 20]);
@@ -3007,16 +3088,25 @@ mod tests {
             .get(&(pool_id, signer))
             .map(|(_, at)| *at);
         assert_eq!(stamped, Some(aged), "the fallback leaves the entry's age");
+        let warns = log.lines("using the last cached registration")?;
+        let line = warns.first().map_or("", String::as_str);
+        assert!(line.contains("WARN"), "{line}");
+        assert!(
+            line.contains("admit getAuthorization timed out after 10s"),
+            "the WARN keeps the failure class: {line}"
+        );
         Ok(())
     }
 
     /// A hung admit `getAuthorization` with no cached read times out and refuses
     /// the signer.
     #[tokio::test(start_paused = true)]
-    async fn admit_getauthorization_hang_with_no_cached_read_refuses() {
+    async fn admit_getauthorization_hang_with_no_cached_read_refuses() -> Result<()> {
         use crate::chain_events::test_support::bounded;
         use crate::pool_view::PoolView;
 
+        let log = CapturedLog::default();
+        let _subscriber = log.install();
         let view = hanging_view();
         let pool_id = B256::repeat_byte(0x53);
         let signer = Address::from([8u8; 20]);
@@ -3037,6 +3127,14 @@ mod tests {
                 .is_empty(),
             "a timed-out read leaves the signer cache empty"
         );
+        let warns = log.lines("refusing this signer")?;
+        let line = warns.first().map_or("", String::as_str);
+        assert!(line.contains("WARN"), "{line}");
+        assert!(
+            line.contains("admit getAuthorization timed out after 10s"),
+            "the WARN keeps the failure class: {line}"
+        );
+        Ok(())
     }
 
     /// The stale fallback raises the cached `spent` to the projection's fold, so a
