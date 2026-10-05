@@ -217,13 +217,13 @@ pub(crate) mod test_support {
     ///
     /// Failure legibility, not correctness: if a `timed` wrap is ever dropped
     /// from the site under test, the read hangs forever and the test hangs with
-    /// it — and nothing cuts that short, since the repo carries no nextest
-    /// config at all and the built-in `slow-timeout` only warns (it sets no
-    /// `terminate-after`), so CI would stall for its whole run rather than
-    /// fail. Wrapping
-    /// here turns that regression into a millisecond failure that names the
-    /// site. Both deadlines are virtual under `start_paused`, so this costs no
-    /// wall-clock in the passing case.
+    /// it. The only other bound is the nextest backstop in
+    /// `.config/nextest.toml`, which terminates a `decdn-node` test after 180s
+    /// of wall-clock (`terminate-after = 3` at a 60s period) and retries it
+    /// twice, so the regression costs minutes of CI and reports only a
+    /// timeout. Wrapping here turns it into a millisecond failure that names
+    /// the site. Both deadlines are virtual under `start_paused`, so this costs
+    /// no wall-clock in the passing case.
     pub(crate) async fn bounded<T>(what: &str, fut: impl Future<Output = T>) -> T {
         // `unwrap_or_else` rather than a `match` with an `Err(_)` arm: the only
         // error here is `Elapsed`, and matching it as a wildcard trips
