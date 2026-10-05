@@ -10,9 +10,14 @@
 //!   and path so the offending entry is still identifiable.
 //! - **Whole URL** — a chain `rpc_url` secret commonly lives in the path or
 //!   query (Infura/Alchemy keys), which userinfo redaction would NOT scrub. So
-//!   when an `rpc_url` reaches a *transport/chain error*, [`strip_urls`] (via
-//!   [`sanitize_rpc_display`] / [`sanitize_err_chain`]) removes the URL
-//!   entirely, keeping only the failure class.
+//!   when an `rpc_url` reaches a *transport/chain error*, [`strip_urls`]
+//!   removes the URL entirely. The failure class (timeout, connection refused,
+//!   DNS, TLS) usually lives in the error's `source()` chain, not in its
+//!   top-level Display. [`sanitize_err_chain`] (for an `anyhow::Error`) and
+//!   [`sanitize_error_sources`] (for a typed `std::error::Error`) render that
+//!   chain, so the class survives the strip. [`sanitize_rpc_display`] renders
+//!   only the top-level Display, so it suits a plain `Display` value such as a
+//!   `String` reason.
 //!
 //! Routing every gate through this single module keeps each invariant from
 //! drifting between copies.
@@ -47,8 +52,10 @@ pub fn redact_userinfo(raw: &str) -> Cow<'_, str> {
 }
 
 /// Strip URL-bearing fragments from an error's rendered text so an `rpc_url`
-/// secret never reaches a log or operator-facing error — the transport-failure
-/// *class* (timeout / connection refused / DNS / TLS) still shows.
+/// secret never reaches a log or operator-facing error. Any failure class in
+/// the input text (timeout / connection refused / DNS / TLS) is kept; to
+/// include the `source()` chain, call [`sanitize_error_sources`] or
+/// [`sanitize_err_chain`].
 ///
 /// Unlike [`redact_userinfo`], which only scrubs `user:pass@` userinfo, this
 /// removes the whole URL: an `rpc_url` secret commonly lives in the path or
@@ -137,19 +144,62 @@ fn redact_bare_urls(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Render any error's Display, with URL fragments stripped, for a single
-/// log/error line. Use at `tracing` sites where the value is the raw `alloy`
-/// transport error (its transparent Display carries the `reqwest` URL tail).
+/// Render a plain `Display` value, with URL fragments stripped, for a single
+/// log/error line. Use for a value with no `source()` chain, such as a
+/// `String` reason.
 ///
-/// Prefer [`sanitize_err_chain`] for an `anyhow::Error`: Display renders only
-/// the *outermost* context, so any `.with_context(…)` on the way up silently
-/// replaces the underlying reason rather than adding to it.
+/// For an error, prefer a helper that walks the chain: Display renders only
+/// the *outermost* layer, so the failure class beneath it is lost.
+/// [`sanitize_err_chain`] takes an `anyhow::Error`, whose `.with_context(…)`
+/// layers would otherwise replace the underlying reason.
+/// [`sanitize_error_sources`] takes a typed `std::error::Error` (an `alloy`
+/// `ContractError`, `RpcError`, or `PendingTransactionError`), whose
+/// transport class (timeout, connection refused, DNS, TLS) sits in `source()`.
 pub fn sanitize_rpc_display(err: impl std::fmt::Display) -> String {
     strip_urls(&err.to_string()).into_owned()
 }
 
-/// Render an `anyhow` error's full `context: cause: cause` chain (alternate
-/// Display) with URL fragments stripped.
+/// Render a typed error and each layer of its `source()` chain as
+/// `outer: cause: cause`, with URL fragments stripped.
+///
+/// Use for a typed `std::error::Error`, such as an `alloy` transport or
+/// contract error. Its top-level Display often names only the operation and
+/// the URL, while the failure class (timeout, connection refused, DNS, TLS)
+/// is a deeper `source()`. A layer is skipped when its Display is empty, or
+/// when the previous non-empty layer's raw Display ends with it at a
+/// non-alphanumeric boundary: a wrapper that ends its message with its source
+/// (`"{0}"`, `"transport: {0}"`) would otherwise print that source twice. A
+/// cause that only appears inside an earlier message or URL (`"timeout"` under
+/// `"request timeout exceeded"`) is still printed. Each layer is stripped on
+/// its own before the join, so a URL token cannot swallow the `": "` separator
+/// after it. For an `anyhow::Error`, use [`sanitize_err_chain`].
+pub fn sanitize_error_sources(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut prev = err.to_string();
+    let mut out = strip_urls(&prev).into_owned();
+    let mut next = err.source();
+    while let Some(layer) = next {
+        let text = layer.to_string();
+        if !text.is_empty() {
+            let repeats = prev.strip_suffix(text.as_str()).is_some_and(|head| {
+                head.chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric())
+            });
+            if !repeats {
+                out.push_str(": ");
+                out.push_str(&strip_urls(&text));
+            }
+            prev = text;
+        }
+        next = layer.source();
+    }
+    out
+}
+
+/// Render an `anyhow` error's full `context: cause: cause` chain with URL
+/// fragments stripped, through [`sanitize_error_sources`]: the context layers
+/// and the wrapped error's `source()` chain share one walk, so a repeated
+/// layer is printed once and each layer is stripped on its own.
 ///
 /// Use for any propagated chain-RPC error — at the `main()` print boundary so
 /// no raw `rpc_url` is echoed, and at watcher `tracing` sites so the reason
@@ -160,7 +210,7 @@ pub fn sanitize_rpc_display(err: impl std::fmt::Display) -> String {
 /// that context and drops the timeout entirely — the operator sees a bare
 /// restatement of what was attempted, never why it failed.
 pub fn sanitize_err_chain(err: &anyhow::Error) -> String {
-    strip_urls(&format!("{err:#}")).into_owned()
+    sanitize_error_sources(err.as_ref())
 }
 
 #[cfg(test)]
@@ -326,6 +376,114 @@ mod tests {
         assert!(out.contains("failed to read minCapacityMbps"));
         assert!(!out.contains("SECRETKEY"));
         assert!(!out.contains("eth.example"));
+    }
+
+    /// A test error layer with a fixed Display and an optional source.
+    #[derive(Debug)]
+    struct Layer {
+        msg: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    }
+
+    impl Layer {
+        fn new(msg: &str, source: Option<Layer>) -> Self {
+            Self {
+                msg: msg.to_owned(),
+                source: source.map(|s| Box::new(s) as Box<dyn std::error::Error + Send + Sync>),
+            }
+        }
+    }
+
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.msg)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_deref()
+                .map(|s| s as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn sanitize_error_sources_keeps_the_class_beneath_a_url_layer() {
+        // The reqwest shape: the top layer names the URL, the class is a source.
+        let err = Layer::new(
+            "error sending request for url (https://eth.example/v3/SECRETKEY)",
+            Some(Layer::new(
+                "client error (Connect)",
+                Some(Layer::new("operation timed out", None)),
+            )),
+        );
+        let out = sanitize_error_sources(&err);
+        assert_eq!(
+            out,
+            "error sending request: client error (Connect): operation timed out"
+        );
+        assert!(!out.contains("SECRETKEY") && !out.contains("eth.example"));
+        // The top-level Display alone loses the class.
+        assert!(!sanitize_rpc_display(&err).contains("timed out"));
+    }
+
+    #[test]
+    fn sanitize_error_sources_skips_repeated_layers() {
+        // A `"transport: {0}"` wrapper ends its message with its source, and a
+        // `"{0}"` wrapper above it repeats that text verbatim.
+        let inner = Layer::new("connection refused (os error 61)", None);
+        let quoted = Layer::new("transport: connection refused (os error 61)", Some(inner));
+        let transparent = Layer::new("transport: connection refused (os error 61)", Some(quoted));
+        let out = sanitize_error_sources(&transparent);
+        assert_eq!(out, "transport: connection refused (os error 61)");
+    }
+
+    #[test]
+    fn sanitize_error_sources_keeps_a_cause_that_only_appears_inside_the_outer_message() {
+        // "timeout" appears in the outer message but does not end it, so the
+        // source is a distinct cause, not a repeat.
+        let err = Layer::new(
+            "request timeout exceeded",
+            Some(Layer::new("timeout", None)),
+        );
+        assert_eq!(
+            sanitize_error_sources(&err),
+            "request timeout exceeded: timeout"
+        );
+    }
+
+    #[test]
+    fn sanitize_error_sources_redacts_a_url_in_a_deeper_layer() {
+        let err = Layer::new(
+            "getPool call failed",
+            Some(Layer::new(
+                "reach https://eth.example/rpc?apikey=SECRETKEY failed",
+                None,
+            )),
+        );
+        let out = sanitize_error_sources(&err);
+        assert_eq!(out, "getPool call failed: reach <redacted-url> failed");
+    }
+
+    #[test]
+    fn sanitize_err_chain_dedupes_and_strips_each_layer() {
+        // alloy's shape under `chain_events::timed`: a `"{0}"` transport layer
+        // repeats the reqwest text, and the URL token would swallow a joined
+        // `": "` separator if the chain were stripped as one string.
+        let reqwest = Layer::new(
+            "error sending request for url (https://eth.example/v3/SECRETKEY)",
+            Some(Layer::new("client error (Connect)", None)),
+        );
+        let transport = Layer::new(
+            "error sending request for url (https://eth.example/v3/SECRETKEY)",
+            Some(reqwest),
+        );
+        let err = anyhow::Error::new(transport).context("admit getPool");
+        assert_eq!(
+            sanitize_err_chain(&err),
+            "admit getPool: error sending request: client error (Connect)"
+        );
     }
 
     #[test]

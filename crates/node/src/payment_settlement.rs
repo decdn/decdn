@@ -78,7 +78,7 @@ use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use decdn_common::config::{REDEEM_LANDING_SLACK_SECS, capability_expiry_margin_secs};
-use decdn_common::redact::sanitize_rpc_display;
+use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::sig_canon::is_high_s;
 use decdn_incentive::{
@@ -810,7 +810,10 @@ impl PoolSettlementSink {
 /// Rather than fail open on that gap, [`status`](crate::pool_view::PoolView::status) does ONE `getPool` at
 /// admission — a read the admission path tolerates (it may block) — folds a
 /// servable pool into the projection, and refuses an absent, closed, or errored
-/// pool. The client re-sends its capability on its next request (the documented
+/// pool. Every admit-path chain read (`getPool` and the signer's
+/// `getAuthorization`) runs under `chain_events::timed`'s default bound, so a
+/// hung read times out and takes the fault path instead of stalling admission.
+/// The client re-sends its capability on its next request (the documented
 /// lane recovery path), and by then the folded owner registers the lane.
 ///
 /// The mid-stream re-check calls [`cached_status`](crate::pool_view::PoolView::cached_status), which reads the
@@ -822,7 +825,8 @@ impl PoolSettlementSink {
 /// re-requesting the same dead pool every request cannot drive one `getPool` per
 /// request.
 pub struct ResolvingPoolView<P: Provider + Clone> {
-    /// The wallet/RPC-backed `PaymentPool` binding the admit-path `getPool` reads.
+    /// The wallet/RPC-backed `PaymentPool` binding for the admit-path reads
+    /// (`getPool`, `getAuthorization`).
     contract: PaymentPool::PaymentPoolInstance<P>,
     /// The event-fed projection this view reads first and folds a resolved pool
     /// into. Shared with the settlement watcher's sink (the authoritative writer).
@@ -849,8 +853,8 @@ impl<P: Provider + Clone> std::fmt::Debug for ResolvingPoolView<P> {
 }
 
 impl<P: Provider + Clone> ResolvingPoolView<P> {
-    /// Wrap the event-fed `projection` with an admit-path `getPool` fallback
-    /// against `contract`.
+    /// Wrap the event-fed `projection` with admit-path `getPool` and
+    /// `getAuthorization` fallbacks against `contract`.
     #[must_use]
     pub fn new(contract: PaymentPool::PaymentPoolInstance<P>, projection: PoolProjection) -> Self {
         Self {
@@ -907,13 +911,16 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
                 return None;
             }
         }
-        let pool = match self.contract.getPool(pool_id).call().await {
+        // Bounded: the alloy HTTP provider sets no timeout of its own, so a hung
+        // read times out here and takes the fault path below.
+        let pool = match timed(None, "admit getPool", self.contract.getPool(pool_id).call()).await {
             Ok(pool) => pool,
             Err(err) => {
                 warn!(
-                    error = %sanitize_rpc_display(&err),
+                    error = %sanitize_err_chain(&err),
                     %pool_id,
-                    "admit getPool failed; refusing this pool"
+                    suppressed_for = ?RESOLVE_NEGATIVE_TTL,
+                    "admit getPool failed; refusing this pool until the negative cache lapses"
                 );
                 let mut guard = self
                     .negative
@@ -975,25 +982,34 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
                 return Some(*auth);
             }
         }
-        let auth = match self.contract.getAuthorization(pool_id, signer).call().await {
+        // Bounded: a hung read times out here and takes the fault path below, so
+        // the cached-registration fallback still runs against a stalled RPC.
+        let auth = match timed(
+            None,
+            "admit getAuthorization",
+            self.contract.getAuthorization(pool_id, signer).call(),
+        )
+        .await
+        {
             Ok(auth) => auth,
             Err(err) => {
-                // A read fault is not a verdict on the signer. Fall back to the last
-                // observed registration, whatever its age: `cap` and `expiry` are
-                // write-once, and `spent` is raised to what the projection has
-                // folded since, as the mid-stream re-check reads it. Refuse a signer
-                // this node holds no cached registered read of.
+                // A read fault (an error or a timeout) is not a verdict on the
+                // signer. Fall back to the last observed registration, whatever
+                // its age: `cap` and `expiry` are write-once, and `spent` is
+                // raised to what the projection has folded since, as the
+                // mid-stream re-check reads it. Refuse a signer this node holds
+                // no cached registered read of.
                 let stale = self.stale_authorization(pool_id, signer);
                 if stale.is_some() {
                     warn!(
-                        error = %sanitize_rpc_display(&err),
+                        error = %sanitize_err_chain(&err),
                         %pool_id,
                         %signer,
                         "admit getAuthorization failed; using the last cached registration"
                     );
                 } else {
                     warn!(
-                        error = %sanitize_rpc_display(&err),
+                        error = %sanitize_err_chain(&err),
                         %pool_id,
                         %signer,
                         "admit getAuthorization failed; refusing this signer"
@@ -1650,7 +1666,7 @@ fn plan_lanes(
             Ok(None) => {}
             Err(err) => {
                 metrics.redemption_failure();
-                warn!(error = %sanitize_rpc_display(&err), pool_id = %st.pool_id, "redemption planning failed");
+                warn!(error = %sanitize_err_chain(&err), pool_id = %st.pool_id, "redemption planning failed");
             }
         }
     }
@@ -1827,7 +1843,7 @@ async fn submit_chunk<P: Provider + Clone>(
         }
         TxOutcome::SendErr(err) => {
             record_tx_failure(&span, "send_failed", None);
-            warn!(error = %sanitize_rpc_display(&err), voucher_count, "redeemMany send failed; leaving claims for retry");
+            warn!(error = %sanitize_error_sources(&err), voucher_count, "redeemMany send failed; leaving claims for retry");
         }
         TxOutcome::ReceiptErr {
             error,
@@ -1835,7 +1851,7 @@ async fn submit_chunk<P: Provider + Clone>(
             last_lookup,
         } => {
             record_tx_failure(&span, "receipt_failed", Some(tx_hash));
-            warn!(error = %sanitize_rpc_display(&error), %last_lookup, voucher_count, tx = %tx_hash, "redeemMany receipt wait failed and the by-hash lookup missed; unconfirmed, leaving claims for retry");
+            warn!(error = %sanitize_error_sources(&error), %last_lookup, voucher_count, tx = %tx_hash, "redeemMany receipt wait failed and the by-hash lookup missed; unconfirmed, leaving claims for retry");
         }
         TxOutcome::Timeout {
             tx_hash,
@@ -1896,7 +1912,7 @@ async fn record_landed_chunk<P: Provider + Clone>(
             Ok(auths) => persist_registered_expiries(store, chunk, &auths),
             Err(err) => {
                 warn!(
-                    error = %sanitize_rpc_display(err),
+                    error = %sanitize_err_chain(&err),
                     lanes = chunk.len(),
                     "post-redeem registration read failed; the next sweep re-registers and re-reads"
                 );
@@ -2028,7 +2044,7 @@ async fn reconcile_onchain_watermarks<P: Provider + Clone>(
             Err(err) => {
                 warn!(
                     stage = "reconcile",
-                    error = %sanitize_rpc_display(err),
+                    error = %sanitize_err_chain(&err),
                     lanes = chunk.len(),
                     "pre-redeem watermark reconciliation failed; submitting on the contract's own no-op guard"
                 );
@@ -2909,6 +2925,214 @@ mod tests {
             asserter.read_q().len(),
             0,
             "the second call did read the chain"
+        );
+        Ok(())
+    }
+
+    /// In-memory sink for the tracing output a test captures.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLog {
+        /// Capture this thread's tracing output until the guard drops. A
+        /// paused-clock test runs on one thread, so the thread default sees
+        /// every event the view logs.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+
+        /// Every captured line that contains `needle`, or an error that shows
+        /// the whole log when none does.
+        fn lines(&self, needle: &str) -> Result<Vec<String>> {
+            let bytes = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let text = String::from_utf8(bytes)?;
+            let found: Vec<String> = text
+                .lines()
+                .filter(|l| l.contains(needle))
+                .map(str::to_owned)
+                .collect();
+            if found.is_empty() {
+                anyhow::bail!("no captured line contains {needle:?}:\n{text}");
+            }
+            Ok(found)
+        }
+    }
+
+    /// A view whose every chain read hangs forever. Pair with
+    /// `#[tokio::test(start_paused = true)]` so the `timed` bound fires on
+    /// virtual time.
+    fn hanging_view() -> ResolvingPoolView<impl Provider + Clone + 'static> {
+        ResolvingPoolView::new(
+            PaymentPool::new(
+                Address::ZERO,
+                crate::chain_events::test_support::hanging_provider(),
+            ),
+            PoolProjection::new(),
+        )
+    }
+
+    /// A hung admit `getPool` times out and takes the fault path: the pool is
+    /// refused and negative-cached, so the next request does not wait again.
+    /// The WARN carries the timeout and the suppression window.
+    #[tokio::test(start_paused = true)]
+    async fn admit_getpool_hang_refuses_within_the_bound() -> Result<()> {
+        use crate::chain_events::DEFAULT_RPC_CALL_TIMEOUT;
+        use crate::chain_events::test_support::bounded;
+        use crate::pool_view::PoolView;
+
+        let log = CapturedLog::default();
+        let _subscriber = log.install();
+        let view = hanging_view();
+        let pool_id = B256::repeat_byte(0x51);
+        let started = tokio::time::Instant::now();
+        assert!(
+            bounded("admit getPool", view.status(pool_id))
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            started.elapsed(),
+            DEFAULT_RPC_CALL_TIMEOUT,
+            "the admit read uses the default bound"
+        );
+        assert!(
+            view.negative
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&pool_id),
+            "the timed-out pool is negative-cached"
+        );
+        assert!(
+            bounded("admit getPool", view.status(pool_id))
+                .await
+                .is_none(),
+            "the negative cache refuses the next request"
+        );
+        assert_eq!(
+            started.elapsed(),
+            DEFAULT_RPC_CALL_TIMEOUT,
+            "the next request does not wait on the chain again"
+        );
+        let warns = log.lines("admit getPool failed")?;
+        assert_eq!(warns.len(), 1, "only the first request reads: {warns:?}");
+        let line = warns.first().map_or("", String::as_str);
+        assert!(line.contains("WARN"), "{line}");
+        assert!(
+            line.contains("admit getPool timed out after 10s"),
+            "the WARN keeps the failure class: {line}"
+        );
+        assert!(
+            line.contains("suppressed_for=60s"),
+            "the WARN names the negative-cache window: {line}"
+        );
+        Ok(())
+    }
+
+    /// A hung admit `getAuthorization` past `SIGNER_AUTH_TTL` times out and falls
+    /// back to the cached registration, as an RPC error does.
+    #[tokio::test(start_paused = true)]
+    async fn admit_getauthorization_hang_falls_back_to_the_cached_registration() -> Result<()> {
+        use crate::chain_events::test_support::bounded;
+        use crate::pool_view::PoolView;
+
+        let log = CapturedLog::default();
+        let _subscriber = log.install();
+        let view = hanging_view();
+        let pool_id = B256::repeat_byte(0x52);
+        let signer = Address::from([7u8; 20]);
+        let aged = Instant::now()
+            .checked_sub(SIGNER_AUTH_TTL * 2)
+            .ok_or_else(|| anyhow::anyhow!("clock too close to its epoch"))?;
+        view.auth_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((pool_id, signer), (registered(1_000_000, 200_000), aged));
+        assert_eq!(
+            bounded(
+                "admit getAuthorization",
+                view.signer_authorization(pool_id, signer)
+            )
+            .await,
+            Some(registered(1_000_000, 200_000)),
+            "the timeout falls back to the last cached registration"
+        );
+        // The fallback does not refresh the entry: a fresh stamp would let the
+        // fast path serve it for a full TTL without the spent-raise.
+        let stamped = view
+            .auth_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(pool_id, signer))
+            .map(|(_, at)| *at);
+        assert_eq!(stamped, Some(aged), "the fallback leaves the entry's age");
+        let warns = log.lines("using the last cached registration")?;
+        let line = warns.first().map_or("", String::as_str);
+        assert!(line.contains("WARN"), "{line}");
+        assert!(
+            line.contains("admit getAuthorization timed out after 10s"),
+            "the WARN keeps the failure class: {line}"
+        );
+        Ok(())
+    }
+
+    /// A hung admit `getAuthorization` with no cached read times out and refuses
+    /// the signer.
+    #[tokio::test(start_paused = true)]
+    async fn admit_getauthorization_hang_with_no_cached_read_refuses() -> Result<()> {
+        use crate::chain_events::test_support::bounded;
+        use crate::pool_view::PoolView;
+
+        let log = CapturedLog::default();
+        let _subscriber = log.install();
+        let view = hanging_view();
+        let pool_id = B256::repeat_byte(0x53);
+        let signer = Address::from([8u8; 20]);
+        assert_eq!(
+            bounded(
+                "admit getAuthorization",
+                view.signer_authorization(pool_id, signer)
+            )
+            .await,
+            None
+        );
+        // A fault caches nothing: a cached `Unregistered` here would answer the
+        // fast path for a full TTL.
+        assert!(
+            view.auth_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "a timed-out read leaves the signer cache empty"
+        );
+        let warns = log.lines("refusing this signer")?;
+        let line = warns.first().map_or("", String::as_str);
+        assert!(line.contains("WARN"), "{line}");
+        assert!(
+            line.contains("admit getAuthorization timed out after 10s"),
+            "the WARN keeps the failure class: {line}"
         );
         Ok(())
     }

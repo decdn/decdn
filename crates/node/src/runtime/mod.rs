@@ -50,7 +50,9 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_common::address::parse_nonzero_address;
 use decdn_common::config::ResolvedConfig;
-use decdn_common::redact::{redact_userinfo, sanitize_rpc_display};
+use decdn_common::redact::{
+    redact_userinfo, sanitize_err_chain, sanitize_error_sources, sanitize_rpc_display,
+};
 use decdn_incentive::PoolStateStore;
 use decdn_incentive::eth_identity;
 
@@ -2151,7 +2153,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                 Ok(service) => Arc::new(service),
                 Err(err) => {
                     tracing::warn!(
-                        error = %sanitize_rpc_display(&err),
+                        error = %sanitize_err_chain(&err),
                         payment_pool_addr = %payment_pool_addr_for_buyer,
                         "buyer-side PaymentPool bootstrap failed; node→node paid cache-miss \
                          pulls are DISABLED for this process (seller settlement is unaffected). \
@@ -3035,7 +3037,7 @@ fn warn_no_home_relay(relays: &[iroh::endpoint::RelayStatus], grace: Duration) {
             tracing::warn!(
                 relay = %url,
                 ?grace,
-                error = relay.last_error().map(sanitize_rpc_display),
+                error = relay.last_error().map(|e| sanitize_error_sources(e)),
                 "home relay not connected after bring-up; iroh keeps retrying in the \
                  background. Check the relay URL and that the relay is up"
             );
@@ -3819,7 +3821,7 @@ async fn probe_rpc_classified(client: &reqwest::Client, rpc_url: &str) -> RpcPro
         Err(err) => {
             return RpcProbe::Transient(format!(
                 "is not reachable (timeout or connection error): {}",
-                sanitize_rpc_display(&err)
+                sanitize_error_sources(&err)
             ));
         }
     };
@@ -3894,11 +3896,11 @@ fn spawn_rpc_watchdog(
                 }
                 Err(err) => {
                     if prev_healthy {
-                        // Sanitize: `probe_rpc` wraps the reqwest error, whose
-                        // Display embeds the full `rpc_url` (an API key may live
-                        // in its path/query, not just userinfo). The transport
-                        // failure class survives; the URL does not (issue #954).
-                        tracing::warn!(error = %sanitize_rpc_display(&err), "RPC endpoint unhealthy");
+                        // `probe_rpc_classified` already strips the URL from the
+                        // transport error before `probe_rpc` wraps it. Strip again
+                        // here as a backstop: an `rpc_url` can hold an API key in
+                        // its path or query, not only in userinfo.
+                        tracing::warn!(error = %sanitize_err_chain(&err), "RPC endpoint unhealthy");
                     }
                     false
                 }
@@ -4680,6 +4682,25 @@ mod tests {
             };
             assert_eq!(got, want, "status {status} misclassified");
         }
+    }
+
+    /// A refused connection reaches the probe verdict with its failure class and
+    /// without the `rpc_url` secret. Port 1 on loopback refuses at once, so this
+    /// needs no network and pins the real reqwest error chain, whose class sits
+    /// in `source()` beneath a top layer that names the URL.
+    #[tokio::test]
+    async fn preflight_transient_keeps_the_class_and_drops_the_url() {
+        let client = preflight_client();
+        let probe =
+            probe_rpc_classified(&client, "http://127.0.0.1:1/v3/SECRETKEY?apikey=SECRETKEY").await;
+        let RpcProbe::Transient(msg) = probe else {
+            panic!("a refused connection is transient");
+        };
+        assert!(!msg.contains("SECRETKEY"), "leaked the rpc_url: {msg}");
+        assert!(
+            msg.to_lowercase().contains("connect"),
+            "lost the failure class: {msg}"
+        );
     }
 
     /// Returns 429 for the first `fail_first` calls, then 200 — models a
