@@ -370,22 +370,15 @@ impl ClientHandler {
         // or under it is stale: the lane already holds its payment.
         let prior_last_amount = guard.state.last_amount();
 
-        // Capability-expiry gate (ADR 003 §Revocation). `expiry == 0` means "not
-        // tracked" and never expires. The node stops accepting vouchers a margin
-        // BEFORE the expiry: one redeem interval plus the redeemer's landing
-        // slack. A voucher accepted at the edge then still meets one self-tick
-        // sweep and lands before the contract stops paying the capability. A
-        // grant inside the margin surfaces as `CapabilityExpired` — distinct from
-        // a cap-exhausted `SpendingCapExhausted`, since the fix is a fresh
-        // capability, not a cap raise.
-        let expiry = guard.state.expiry;
-        if expiry != 0
-            && self
-                .coarse_clock
-                .unix_seconds()
-                .saturating_add(self.capability_expiry_margin_secs)
-                >= expiry
-        {
+        // Capability-expiry gate (ADR 003 §Revocation). The node stops accepting
+        // vouchers a margin BEFORE the expiry: one redeem interval plus the
+        // redeemer's landing slack. The preimage path applies the same gate, so
+        // the lane's claim is final when the margin starts, and the redeemer's
+        // cutoff sweep redeems it before the contract stops paying the
+        // capability. A grant inside the margin surfaces as `CapabilityExpired` —
+        // distinct from a cap-exhausted `SpendingCapExhausted`, since the fix is
+        // a fresh capability, not a cap raise.
+        if self.inside_expiry_margin(guard.state.expiry) {
             drop(guard);
             self.write_reject(send, VoucherRejectReason::CapabilityExpired, None)
                 .await?;
@@ -512,6 +505,17 @@ impl ClientHandler {
         Ok(VoucherStop::Continue { credited_bytes })
     }
 
+    /// Whether a capability that expires at `expiry` is inside this node's
+    /// expiry margin now, read off the coarse clock. Both proof paths refuse a
+    /// proof inside the margin with `CapabilityExpired`.
+    fn inside_expiry_margin(&self, expiry: u64) -> bool {
+        decdn_common::config::inside_capability_expiry_margin(
+            expiry,
+            self.capability_expiry_margin_secs,
+            self.coarse_clock.unix_seconds(),
+        )
+    }
+
     /// Accept ONE released hash-chain preimage: place it against this stream's
     /// anchor, fold it into the lane under the per-lane lock, and record the
     /// advance (ADR 003 §Hash-chain metering).
@@ -522,7 +526,7 @@ impl ClientHandler {
     /// walked, and a duplicate or out-of-order reveal costs not even that.
     /// Acceptance is implicit, exactly as for a voucher: the node simply keeps
     /// delivering.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn commit_one_preimage(
         &self,
         send: &mut SendStream,
@@ -583,6 +587,15 @@ impl ClientHandler {
         };
 
         let mut guard = lane.lock().await;
+        // The voucher path's capability-expiry gate. Without it a stream
+        // anchored before the margin could keep extending the claim after the
+        // redeemer's cutoff sweep has read it.
+        if self.inside_expiry_margin(guard.state.expiry) {
+            drop(guard);
+            self.write_reject(send, VoucherRejectReason::CapabilityExpired, None)
+                .await?;
+            return Ok(VoucherStop::Rejected);
+        }
         let (next_state, applied) = match guard
             .state
             .advance_preimage_verified(root, index, reveal, walked, walked_ok)
