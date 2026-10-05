@@ -76,9 +76,18 @@ pub enum CacheError {
         source: anyhow::Error,
     },
 
-    /// The underlying iroh-blobs store failed.
+    /// This node's own iroh-blobs store failed, or a store operation asked for
+    /// bytes the store does not hold. Always a local fault: the bytes a sender
+    /// feeds into an admit failing to arrive is [`Self::Feed`], and bytes that
+    /// fail to verify are [`Self::VerifyFailed`].
     #[error("store error")]
     Store(#[source] anyhow::Error),
+
+    /// The bao stream fed into an admit ended early or failed to read, or its
+    /// claimed size cannot belong to the hash. A fault of the sender's delivery,
+    /// not of this node's store.
+    #[error("admit feed failed")]
+    Feed(#[source] anyhow::Error),
 
     /// A code bug in the cache: a broken internal invariant or a caught panic.
     /// Never an origin fault and never a store fault, so an operator reads it
@@ -238,11 +247,11 @@ pub type CacheResult<T> = std::result::Result<T, CacheError>;
 /// [`crate::RetryPolicy::max_retries`], `Permanent` failures surface to the
 /// caller immediately.
 ///
-/// Both variants carry an [`anyhow::Error`] so adapters can keep their
-/// existing `with_context` chains intact; classification is the only new
-/// signal. After the retry loop exhausts (or the failure is permanent), the
-/// engine collapses both variants back into [`CacheError::OriginError`] so
-/// external observers see no change in the error surface.
+/// Both variants carry an [`anyhow::Error`] so adapters keep their
+/// `with_context` chains intact. The retry loop, the circuit breaker and the
+/// presence probe read the classification. A caller that surfaces the failure
+/// drops it with [`Self::into_inner`] and returns the cause as
+/// [`CacheError::OriginError`].
 #[derive(Debug, Error)]
 pub enum OriginPullError {
     /// A retry-eligible failure: HTTP 5xx/408/429, connect/headers/chunk
@@ -302,10 +311,11 @@ mod tests {
         anyhow::anyhow!(ROOT).context(OUTER)
     }
 
-    fn faults() -> [(CacheError, String); 3] {
+    fn faults() -> [(CacheError, String); 4] {
         let hash = Hash::from_bytes([0; 32]);
         [
             (CacheError::Store(chained()), "store error".to_owned()),
+            (CacheError::Feed(chained()), "admit feed failed".to_owned()),
             (CacheError::Internal(chained()), "internal fault".to_owned()),
             (
                 CacheError::OriginError {

@@ -74,7 +74,9 @@ use std::time::Duration;
 
 use alloy::primitives::U256;
 use bao_tree::ChunkRanges;
-use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, RangedStore, align_range};
+use decdn_bao_range::{
+    AlignedRange, CHUNK_GROUP_BYTES, RangedStore, RangedStoreError, align_range,
+};
 use decdn_incentive::DepositOutcome;
 use decdn_protocol::VoucherRejectReason;
 
@@ -761,11 +763,17 @@ where
     // denominator. A no-op on the node's serve legs, which pass `on_progress =
     // None`.
     if let Some(cb) = on_progress {
-        let base_present = ranges_content_len(&store.present_ranges().await?, total_bytes);
+        let base_present = ranges_content_len(
+            &store.present_ranges().await.map_err(store_query_fault)?,
+            total_bytes,
+        );
         cb(base_present, total_bytes);
     }
 
-    let missing = store.missing_ranges(offset, len).await?;
+    let missing = store
+        .missing_ranges(offset, len)
+        .await
+        .map_err(store_query_fault)?;
     let gaps = contiguous_byte_ranges(&missing, total_bytes);
 
     // Fill every gap while a single periodic tick flushes the `.ranges` present
@@ -829,7 +837,7 @@ where
     // renames the whole `.partial`, which it cannot do while bytes outside `R`
     // are still missing. A whole-blob `R` reaches this complete; a partial `R`
     // leaves the `.partial` in place for a later fetch to finish.
-    if store.is_complete().await? {
+    if store.is_complete().await.map_err(store_query_fault)? {
         store.finalize().await?;
     }
     Ok(())
@@ -867,6 +875,20 @@ pub(crate) fn leg_range(
     Ok(align_range(resume_start, draw_len, total_bytes)?)
 }
 
+/// A store query's error, marked [`crate::LocalPullFault`] when the store itself
+/// failed ([`RangedStoreError::Backend`]): no source caused it, and every source
+/// would meet it. An alignment error is about the requested range, not the store,
+/// so it stays unmarked.
+fn store_query_fault(err: RangedStoreError) -> anyhow::Error {
+    let store_failed = matches!(err, RangedStoreError::Backend(_));
+    let err = anyhow::Error::new(err);
+    if store_failed {
+        err.context(crate::LocalPullFault)
+    } else {
+        err
+    }
+}
+
 /// The missing gaps of every range in `ranges`, merged and in ascending order.
 /// Each range is `(offset, len)`, and `len == 0` means "to the end of the blob".
 /// Overlapping or adjacent ranges merge, so the gaps are disjoint.
@@ -876,7 +898,10 @@ async fn range_set_gaps<St: RangedStore + ?Sized>(
 ) -> anyhow::Result<Vec<(u64, u64)>> {
     let mut missing = ChunkRanges::empty();
     for &(offset, len) in ranges {
-        missing |= store.missing_ranges(offset, len).await?;
+        missing |= store
+            .missing_ranges(offset, len)
+            .await
+            .map_err(store_query_fault)?;
     }
     Ok(contiguous_byte_ranges(&missing, store.total_bytes()))
 }
@@ -1592,6 +1617,30 @@ mod tests {
     use decdn_protocol::client::{
         StreamError, StreamResponse, StreamResponseBody, StreamResponseExt, VoucherRejectReason,
     };
+
+    /// A store that fails a query ends the command as this machine's fault: no
+    /// source caused it. A range the store refuses as out of bounds is about the
+    /// request, so it is not marked.
+    #[test]
+    fn a_failed_store_query_is_a_local_fault_and_a_bad_range_is_not() {
+        let failed = super::store_query_fault(decdn_bao_range::RangedStoreError::Backend(
+            "store read failed".into(),
+        ));
+        assert!(failed.is::<crate::LocalPullFault>(), "{failed:#}");
+        assert_eq!(
+            crate::classify(&failed),
+            crate::Fault::Fatal(crate::FatalScope::Command)
+        );
+
+        let bad_range = super::store_query_fault(decdn_bao_range::RangedStoreError::Alignment(
+            decdn_bao_range::RangeVerifyError::RangeOutOfBounds {
+                offset: 10,
+                len: 1,
+                blob_size: 4,
+            },
+        ));
+        assert!(!bad_range.is::<crate::LocalPullFault>(), "{bad_range:#}");
+    }
 
     const GROUP: u64 = CHUNK_GROUP_BYTES;
 

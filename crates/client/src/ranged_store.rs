@@ -1006,7 +1006,7 @@ impl IngestFlusher {
         let path = store
             .data_path
             .lock()
-            .map_err(|_| anyhow::anyhow!("{}", lock_poisoned("data_path")))?
+            .map_err(|_| anyhow::Error::new(lock_poisoned("data_path")))?
             .clone();
         let data = tokio::task::spawn_blocking(move || {
             std::fs::OpenOptions::new()
@@ -1161,7 +1161,7 @@ impl IngestPipeline {
     fn lock_state(&self) -> anyhow::Result<std::sync::MutexGuard<'_, PipelineState>> {
         self.state
             .lock()
-            .map_err(|_| anyhow::anyhow!("{}", lock_poisoned("ingest pipeline")))
+            .map_err(|_| anyhow::Error::new(lock_poisoned("ingest pipeline")))
     }
 
     /// The worker body: checkpoint every queued batch until the queue is
@@ -1205,7 +1205,7 @@ impl IngestPipeline {
         let mut data = self
             .data
             .lock()
-            .map_err(|_| anyhow::anyhow!("{}", lock_poisoned("ingest data file")))?;
+            .map_err(|_| anyhow::Error::new(lock_poisoned("ingest data file")))?;
         let mut slots = Vec::with_capacity(cap);
         while let Some(first) = self.pop(true)? {
             let mut received_end = write_checkpoint(&mut data, first, &mut slots)?;

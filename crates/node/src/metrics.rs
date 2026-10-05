@@ -1367,13 +1367,15 @@ pub struct DecdnMetrics {
     pub node_pull_stalled: Counter,
     /// `decdn_node_pull_local_fault_total` (#1145 review): a pull failed for a reason
     /// that is OURS — a broken signer, an encode fault, a bad range computation, an
-    /// unusable deadline config, or a buyer channel open this node's own state defeated
+    /// unusable deadline config, a buyer channel open this node's own state defeated
     /// (an unreadable or unwritable channel store, a poisoned open lock, a panicked open
-    /// task, a wallet that cannot fund a deposit; #1560) — and the upstream was exonerated.
+    /// task, a wallet that cannot fund a deposit; #1560), or a cache store that cannot
+    /// take the pulled bytes (a full or read-only disk, a cache code bug; #2286) — and
+    /// the upstream was exonerated.
     ///
     /// The only counter here that says nothing about the network. Any sustained rate is
-    /// an emergency: a node that cannot sign a voucher cannot pay for anything, so every
-    /// pull it attempts will fail. Before this existed those failures were scored against
+    /// an emergency: a node that cannot sign a voucher or store a byte cannot complete a
+    /// pull, so every pull it attempts will fail. Before this existed those failures were scored against
     /// whichever honest providers the node happened to try, so the symptom was a node
     /// steadily blaming a healthy network in its own reputation scores.
     ///
@@ -3356,9 +3358,9 @@ recorders! {
     /// provider scored `Unreachable`.
     node_pull_stalled => node_pull_stalled.inc();
 
-    /// A pull failed for a LOCAL reason (#1145 review) — signer, encode, range — so
-    /// the upstream was exonerated. Says nothing about the network; any sustained
-    /// rate means this node cannot pay for anything.
+    /// A pull failed for a LOCAL reason (#1145 review) — signer, encode, range, or
+    /// this node's own cache store — so the upstream was exonerated. Says nothing
+    /// about the network; any sustained rate means this node cannot complete a pull.
     node_pull_local_fault => node_pull_local_fault.inc();
 
     /// A buyer channel open outlived the per-candidate budget (#1143). The open

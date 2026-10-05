@@ -348,6 +348,18 @@ pub(super) fn encoded_ranges(offset: u64, end: u64, total: u64) -> anyhow::Resul
         .map_err(|e| anyhow::anyhow!("serve range [{offset}, {end}) does not align: {e}"))
 }
 
+/// The encoder's failure as a typed chain. An I/O failure comes from the data
+/// reader, the outboard reader or the frame channel under the encode, and keeps its
+/// own chain: for a store read, down to a [`decdn_cache::CacheError`].
+/// `EncodeError`'s `Display` is its `Debug`, which would dump that chain as one
+/// nested `Debug` value instead of one cause per link.
+fn encode_error(err: bao_tree::io::EncodeError) -> anyhow::Error {
+    match err {
+        bao_tree::io::EncodeError::Io(io) => anyhow::Error::new(io),
+        other => anyhow::Error::new(other),
+    }
+}
+
 /// One step of [`CoherentFrameProducer::pump`]: the encode finished (or faulted), or
 /// the channel yielded an encoded chunk (`None` if it closed).
 enum PumpStep {
@@ -405,7 +417,7 @@ impl CoherentFrameProducer {
             }
             encode_ranges_validated(&mut data, &mut outboard, ranges.as_ref(), &mut writer)
                 .await
-                .map_err(|e| anyhow::anyhow!("coherent range encode failed: {e}"))
+                .map_err(|e| encode_error(e).context("coherent range encode failed"))
         });
 
         Ok(Self {
@@ -591,7 +603,7 @@ impl CoherentFrameProducer {
         self.queue.clear();
         tracing::error!(
             hash = %self.hash,
-            error = %e,
+            error = %format_args!("{e:#}"),
             "coherent range encode faulted; abandoning the delivery"
         );
     }

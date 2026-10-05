@@ -10,17 +10,22 @@ pub type RangedFuture<'a, T> =
     core::pin::Pin<Box<dyn core::future::Future<Output = Result<T, RangedStoreError>> + Send + 'a>>;
 
 /// What a [`RangedStore`] operation can fail with.
+///
+/// A variant that wraps a cause names only itself in `Display` and returns the
+/// cause from `source()`, so a chain renderer (`{:#}` or `{:?}` on an
+/// `anyhow::Error`, or a `source()` walk) prints each cause once. Render it
+/// through one, not plain `Display`.
 #[derive(Debug, thiserror::Error)]
 pub enum RangedStoreError {
     /// The requested range is not chunk-group aligned, or does not verify
     /// against the outboard.
-    #[error("range alignment: {0}")]
+    #[error("range alignment")]
     Alignment(#[from] crate::RangeVerifyError),
     /// Finalization was asked for while ranges are still missing.
     #[error("blob is incomplete: cannot finalize")]
     Incomplete,
     /// The underlying store (file, blob store) failed.
-    #[error("backend: {0}")]
+    #[error("backend")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
@@ -77,5 +82,38 @@ mod tests {
             blob_size: 0,
         });
         assert!(matches!(err, RangedStoreError::Alignment(_)));
+    }
+
+    /// A wrapping variant names only itself and hands its cause to `source()`,
+    /// so a chain walk prints each cause once.
+    #[test]
+    fn a_wrapping_variant_renders_its_cause_once_in_a_chain() {
+        const ROOT: &str = "store-root-7f3a";
+        let wrapping = [
+            (RangedStoreError::Backend(ROOT.into()), "backend"),
+            (
+                RangedStoreError::Alignment(crate::RangeVerifyError::RangeOutOfBounds {
+                    offset: 9,
+                    len: 1,
+                    blob_size: 4,
+                }),
+                "range alignment",
+            ),
+        ];
+        for (err, shown) in wrapping {
+            assert_eq!(err.to_string(), shown);
+            let mut chain = vec![err.to_string()];
+            let mut cause = std::error::Error::source(&err);
+            while let Some(next) = cause {
+                chain.push(next.to_string());
+                cause = next.source();
+            }
+            let rendered = chain.join(": ");
+            assert_eq!(chain.len(), 2, "{rendered}");
+            let Some(inner) = chain.get(1) else {
+                continue;
+            };
+            assert_eq!(rendered.matches(inner.as_str()).count(), 1, "{rendered}");
+        }
     }
 }

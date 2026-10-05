@@ -4111,9 +4111,11 @@ impl CacheEngine {
     /// - [`CacheError::VerifyFailed`] — the decoder rejected a chunk group or
     ///   parent hash against the root `hash`: the forwarded bytes are corrupt
     ///   (a lying upstream). Nothing is admitted.
-    /// - [`CacheError::Store`] — a local store fault, an import-channel fault, or a
-    ///   truncated/short feed off `reader` (distinct from corruption — see
-    ///   `classify_admit_decode_error`).
+    /// - [`CacheError::Feed`] — a truncated or failed feed off `reader`, or a zero
+    ///   `total_bytes` for a non-empty `hash`: the sender's fault (distinct from
+    ///   corruption — see `classify_admit_decode_error`).
+    /// - [`CacheError::Store`] — a fault of this node's store or its import
+    ///   channel.
     ///
     /// The `reader` is carried on BOTH result arms: `Ok(reader)` on success and
     /// `Err((reader, err))` on failure. The error arm hands it back so the
@@ -4140,14 +4142,13 @@ impl CacheEngine {
             // `import_bao_reader`: the canonical empty hash is a no-op success
             // (nothing to import, store, or protect), while a zero size under any
             // other hash is an upstream inconsistency (the signed `total_bytes`
-            // disagrees with a non-empty content hash) — a Store-class fault, as
-            // before.
+            // disagrees with a non-empty content hash) — the sender's fault.
             if hash == Hash::EMPTY {
                 return Ok(reader);
             }
             return Err((
                 reader,
-                CacheError::Store(anyhow::anyhow!(
+                CacheError::Feed(anyhow::anyhow!(
                     "admit_bao_stream: zero total_bytes for non-empty hash {hash}"
                 )),
             ));
@@ -5781,14 +5782,14 @@ const ADMIT_BAO_LOCAL_UPDATE_CAP: usize = 8;
 /// genuine bao verify rejection (chunk-group or parent hash mismatch) is an
 /// `io::Error` of kind `InvalidData` (see `bao_tree::io::error::DecodeError`'s
 /// `From<DecodeError> for io::Error`); a truncated/short feed instead surfaces
-/// `UnexpectedEof`, and any other failure is a genuinely local read/transport
+/// `UnexpectedEof`, and any other failure is the feed's own read or transport
 /// fault. Only the mismatch is a corrupt-upstream `VerifyFailed`; everything else
-/// is transport-class `Store`.
+/// is a `Feed` fault. Neither is this node's store.
 fn classify_admit_decode_error(hash: Hash, e: std::io::Error) -> CacheError {
     if e.kind() == std::io::ErrorKind::InvalidData {
         CacheError::VerifyFailed { expected: hash }
     } else {
-        CacheError::Store(anyhow::Error::from(e).context("admit_bao_stream: decode/feed failed"))
+        CacheError::Feed(anyhow::Error::from(e).context("admit_bao_stream: decode/feed failed"))
     }
 }
 /// True when the body-phase `io::Error` wraps a typed
@@ -11168,7 +11169,7 @@ mod tests {
             .expect("admitting the empty blob is a no-op success");
 
         // A zero size under any OTHER hash is an upstream inconsistency (the signed
-        // total_bytes disagrees with a non-empty content hash) — a Store fault.
+        // total_bytes disagrees with a non-empty content hash) — a Feed fault.
         let (_reader, err) = engine
             .admit_bao_stream(
                 Hash::from([9u8; 32]),
@@ -11180,8 +11181,8 @@ mod tests {
             .await
             .expect_err("zero size under a non-empty hash is rejected");
         assert!(
-            matches!(err, CacheError::Store(_)),
-            "expected Store, got {err:?}"
+            matches!(err, CacheError::Feed(_)),
+            "expected Feed, got {err:?}"
         );
     }
 
@@ -11568,7 +11569,11 @@ mod tests {
         let failed = engine
             .admit_bao_stream(hash, ranges, total, truncated, None)
             .await;
-        assert!(failed.is_err(), "a truncated feed must fail the admit");
+        let Err((_reader, err)) = failed else {
+            panic!("a truncated feed must fail the admit");
+        };
+        // The sender's short delivery, not this node's store.
+        assert!(matches!(err, CacheError::Feed(_)), "{err:?}");
         assert!(
             engine.coverage(hash).await.unwrap().covers(0),
             "fixture precondition: block 0 landed before the feed ended"
