@@ -814,6 +814,20 @@ impl Work {
         }
     }
 
+    /// Set lane `lane`'s probed coverage, and its extra workers', to
+    /// `coverage`. A lane that holds the whole blob keeps its coverage.
+    fn set_coverage(&mut self, lane: usize, coverage: &Coverage) {
+        for i in 0..self.coverage.len() {
+            if self.lane_of.get(i) == Some(&lane)
+                && self.measured.get(i) == Some(&true)
+                && let Some(c) = self.coverage.get_mut(i)
+                && c != coverage
+            {
+                c.clone_from(coverage);
+            }
+        }
+    }
+
     /// Whether worker slot `i`'s lane is barred from ranges outside its
     /// coverage.
     fn barred(&self, i: usize) -> bool {
@@ -3053,11 +3067,17 @@ where
             let starts = {
                 let mut w = work.lock().await;
                 // A fault, a delivery, a discovery or the end of a bar's time
-                // may have set or lifted a source's bar from pull-through since
+                // may have set or lifted a source's bar from pull-through, or
+                // dropped a block a source refused from its coverage, since
                 // the last pass.
                 sources.expire_pull_through_bars(now);
                 for (&provider, &slot) in &slots {
                     w.set_no_uncovered(slot, sources.no_pull_through(provider));
+                    if let Some(coverage) =
+                        sources.holder(provider).and_then(|h| h.coverage.as_ref())
+                    {
+                        w.set_coverage(slot, coverage);
+                    }
                 }
                 lanes_to_start(sources, &w, total_bytes, now, deposit, busy, room)
             };
@@ -6789,6 +6809,92 @@ mod tests {
                 .opened_ranges()
                 .iter()
                 .any(|&(start, _)| start >= DISCOVERY_BLOCK_BYTES),
+            "B serves block 1"
+        );
+        Ok(())
+    }
+
+    /// #2281: a partial holder whose coverage claims block 1 but which refuses
+    /// it, as a node with a stale coverage record does, loses the block after
+    /// [`ABSENT_AFTER_NOT_FOUND`] refusals, rather than being asked again each
+    /// time its cooldown ends. Once the block is outside its coverage, the
+    /// pull-through bar bounds the rest, and the whole holder serves block 1
+    /// once its lane builds.
+    ///
+    /// [`ABSENT_AFTER_NOT_FOUND`]: crate::source_set::ABSENT_AFTER_NOT_FOUND
+    #[tokio::test(start_paused = true)]
+    async fn a_partial_holder_refusing_a_covered_block_loses_it_from_its_coverage()
+    -> anyhow::Result<()> {
+        let total = 2 * DISCOVERY_BLOCK_BYTES;
+        let data = blob(total as usize);
+        let n = num_blocks(total);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(data.clone())?
+            .paying(Arc::clone(&ledger_a))
+            .refusing_blocks(&[1], || {
+                anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::NotFound))
+            });
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let (store, dir) = fresh_store(root, total);
+        let provider = SlowBuild {
+            lanes: StaticSources::new(vec![
+                candidate(src_a.clone(), ledger_a, 0xA1, Some(cov(n, &[0, 1]))),
+                candidate(src_b.clone(), ledger_b, 0xB2, None),
+            ])?,
+            slow: Address::repeat_byte(0xB2),
+            delay: crate::source_set::PULL_THROUGH_BAR.saturating_sub(Duration::from_secs(5)),
+            built: std::sync::atomic::AtomicBool::new(false),
+        };
+        let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
+        let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+        let drive = drive_config();
+        acquire(
+            AcquireTarget {
+                store: &store,
+                hash: root,
+                total_bytes: total,
+                ranges: &[(0, total)],
+            },
+            &mut set,
+            &AcquireEnv {
+                pacer: &BudgetPacer::new(),
+                funder: &no_topups(),
+                drive: &drive,
+                max_lanes: 2,
+                stop: &stop,
+                on_progress: None,
+                ledgers: None,
+                pacing: None,
+                max_blob_bytes: 0,
+            },
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+        assert!(
+            set.holder(Address::repeat_byte(0xA1))
+                .and_then(|h| h.coverage.as_ref())
+                .is_some_and(|c| !c.covers(1)),
+            "block 1 left A's coverage"
+        );
+        let asked = src_a
+            .opened_ranges()
+            .into_iter()
+            .filter(|&(start, len)| start + len > DISCOVERY_BLOCK_BYTES)
+            .count();
+        let bound = 2 * crate::source_set::ABSENT_AFTER_NOT_FOUND as usize;
+        assert!(
+            (1..=bound).contains(&asked),
+            "A was asked for block 1 {asked} times"
+        );
+        assert!(
+            src_b
+                .opened_ranges()
+                .iter()
+                .any(|&(start, len)| start + len > DISCOVERY_BLOCK_BYTES),
             "B serves block 1"
         );
         Ok(())

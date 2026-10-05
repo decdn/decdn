@@ -240,6 +240,14 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// the time its bar ends ([`PULL_THROUGH_BAR`] after the refusal that set
     /// it). Each one serves only the blocks it covers until then.
     no_pull_through: HashMap<Address, Instant>,
+    /// Each probed partial holder's `NotFound` answers for ranges inside its
+    /// coverage, keyed by the discovery block the refused range starts in.
+    covered_not_found: HashMap<(Address, u32), u32>,
+    /// Blocks each probed partial holder advertised but refused
+    /// [`ABSENT_AFTER_NOT_FOUND`] times. Its coverage claim for them is stale
+    /// (evicted, or a record wider than its store), so they leave its
+    /// coverage for the rest of this blob, rediscovery included.
+    stale_blocks: HashMap<Address, HashSet<u32>>,
     /// How many times in a row each probed partial holder has been barred
     /// from pull-through. A first bar can come from transient refusals that
     /// also read as `NotFound` (load shed, a stale chain view), so only a
@@ -307,6 +315,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             pull_through_refused_at: HashMap::new(),
             pull_through_served_at: HashMap::new(),
             no_pull_through: HashMap::new(),
+            covered_not_found: HashMap::new(),
+            stale_blocks: HashMap::new(),
             pull_through_bars: HashMap::new(),
             too_large_pull_through: HashSet::new(),
             too_large: HashSet::new(),
@@ -441,9 +451,10 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// Record a refusal on an extra stream of `provider`'s lane
     /// ([`crate::LaneWiden`]) for `range`, given at `at`, while the lane's own
     /// worker runs or the node is already charged for this outage. The node
-    /// does not cool for it. A `NotFound` for a range outside the coverage of
-    /// a probed partial holder counts toward barring it from pull-through,
-    /// and a size-ceiling refusal bars it at once, as on its own stream.
+    /// does not cool for it. A `NotFound` from a probed partial holder counts
+    /// as on its own stream: outside its coverage toward barring it from
+    /// pull-through, inside toward dropping the refused block from its
+    /// coverage. A size-ceiling refusal bars it at once.
     pub(crate) fn record_extra_refusal(
         &mut self,
         provider: Address,
@@ -455,7 +466,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             return;
         };
         if crate::fault::says_absent(err) && !range.past_end {
-            self.record_not_found(provider, refused, range.uncovered, at);
+            self.record_not_found(provider, refused, Some(&range), at);
         }
         if matches!(refused.error(), StreamError::BlobTooLarge) {
             self.record_too_large(provider, refused);
@@ -513,8 +524,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                     && !range.is_some_and(|r| r.past_end)
                     && let Some(refused) = err.downcast_ref::<UpstreamRefused>()
                 {
-                    let uncovered = range.is_some_and(|r| r.uncovered);
-                    self.record_not_found(provider, refused, uncovered, now);
+                    self.record_not_found(provider, refused, range.as_ref(), now);
                 }
                 if let Some(refused) = err.downcast_ref::<UpstreamRefused>()
                     && matches!(refused.error(), StreamError::BlobTooLarge)
@@ -535,22 +545,30 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// knows ([`LaneRange::past_end`]). A provider that is not a probed
     /// holder is marked absent once its count reaches
     /// [`ABSENT_AFTER_NOT_FOUND`]. A probed holder is never marked absent.
-    /// Inside its coverage the answer is a delivery fault only. For a range
-    /// outside the coverage of a partial holder (`uncovered`), the answer
-    /// counts toward barring it from pull-through.
+    /// For a partial holder, an answer for a range outside its coverage
+    /// ([`LaneRange::uncovered`]) counts toward barring it from pull-through,
+    /// and one for a range inside it counts toward dropping the block the
+    /// range starts in from its coverage. To a whole holder the answer is a
+    /// delivery fault only.
     fn record_not_found(
         &mut self,
         provider: Address,
         refused: &UpstreamRefused,
-        uncovered: bool,
+        range: Option<&LaneRange>,
         now: Instant,
     ) {
         let Some(holder) = self.holder(provider) else {
             return;
         };
         if holder.probed_holder {
-            if uncovered && holder.coverage.is_some() {
-                self.record_pull_through_refusal(provider, refused, now);
+            if holder.coverage.is_some() {
+                match range {
+                    Some(range) if range.uncovered => {
+                        self.record_pull_through_refusal(provider, refused, now);
+                    }
+                    Some(range) => self.record_covered_refusal(provider, refused, range),
+                    None => {}
+                }
             }
             return;
         }
@@ -578,6 +596,53 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             self.too_large.insert(provider)
         };
         self.marked(newly, refused);
+    }
+
+    /// Count a `NotFound` from probed partial holder `provider` for `range`,
+    /// which its coverage claims. The node refuses the whole range at its
+    /// first chunk it does not hold, and the refusal does not say which chunk
+    /// that is, so the count goes to every block `range` touches. A block
+    /// that reaches [`ABSENT_AFTER_NOT_FOUND`] answers leaves the holder's
+    /// coverage: its ranges go to the other sources, and the holder keeps the
+    /// blocks it was never refused.
+    fn record_covered_refusal(
+        &mut self,
+        provider: Address,
+        refused: &UpstreamRefused,
+        range: &LaneRange,
+    ) {
+        let block_bytes = decdn_protocol::discovery_block_bytes();
+        let block_of = |offset: u64| u32::try_from(offset / block_bytes).unwrap_or(u32::MAX);
+        let first = block_of(range.offset);
+        let last = block_of(range.offset.saturating_add(range.len.max(1)) - 1);
+        let mut stale = HashSet::new();
+        for block in first..=last {
+            let count = self.covered_not_found.entry((provider, block)).or_insert(0);
+            *count = count.saturating_add(1);
+            if *count >= ABSENT_AFTER_NOT_FOUND
+                && self.stale_blocks.entry(provider).or_default().insert(block)
+            {
+                stale.insert(block);
+            }
+        }
+        if stale.is_empty() {
+            return;
+        }
+        let hash = blake3::Hash::from_bytes(self.hash).to_hex();
+        tracing::info!(
+            %provider,
+            %hash,
+            blocks = ?stale,
+            "a partial holder keeps refusing blocks its coverage claims; dropping them from \
+             its coverage for this blob"
+        );
+        if let Some(holder) = self.holders.iter_mut().find(|h| h.provider == provider) {
+            holder.coverage = holder
+                .coverage
+                .take()
+                .map(|coverage| without_blocks(&coverage, &stale));
+        }
+        self.marked(true, refused);
     }
 
     /// Count a `NotFound` from probed partial holder `provider` for a range
@@ -877,8 +942,18 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// that reports a block the holder did not cover before also clears its
     /// pull-through count and bar: the block it refused may be one it now
     /// holds.
+    ///
+    /// A block a holder's coverage claimed but it refused
+    /// ([`Self::record_covered_refusal`]) stays out of the coverage a probe
+    /// reports again: the record that claimed it is the stale one.
     fn merge(&mut self, holders: Vec<Holder>) {
-        for holder in holders {
+        for mut holder in holders {
+            if let (Some(coverage), Some(stale)) = (
+                holder.coverage.as_ref(),
+                self.stale_blocks.get(&holder.provider),
+            ) {
+                holder.coverage = Some(without_blocks(coverage, stale));
+            }
             if holder.probed_holder {
                 self.absent.remove(&holder.provider);
                 self.not_found.remove(&holder.provider);
@@ -902,6 +977,18 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             }
         }
     }
+}
+
+/// `coverage` less the `blocks`.
+fn without_blocks(coverage: &Coverage, blocks: &HashSet<u32>) -> Coverage {
+    let num_blocks = coverage
+        .covered_blocks()
+        .last()
+        .map_or(0, |b| b.saturating_add(1));
+    Coverage::from_block_indices(
+        num_blocks,
+        coverage.covered_blocks().filter(|b| !blocks.contains(b)),
+    )
 }
 
 /// Whether coverage `new` holds a block `old` does not. `None` is the whole
@@ -1389,6 +1476,17 @@ mod tests {
         }
     }
 
+    /// A range in discovery block 0, inside the lane's coverage.
+    const fn block0() -> super::LaneRange {
+        super::LaneRange {
+            offset: 0,
+            len: 64 << 20,
+            landed: 0,
+            past_end: false,
+            uncovered: false,
+        }
+    }
+
     /// A partial holder that says `NotFound` three times to ranges outside
     /// its coverage is barred from pull-through. Refusals inside its coverage
     /// never bar it, a verified byte inside its coverage keeps the bar, and a
@@ -1398,7 +1496,7 @@ mod tests {
         let p = provider(vec![]);
         let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![partial(A, 10.0, &[0])]);
         let now = Instant::now();
-        say_not_found_in(&mut set, A, block1(false), 10, now);
+        say_not_found_in(&mut set, A, block0(), 10, now);
         assert!(!set.no_pull_through(A), "refusals inside its coverage");
         say_not_found_in(
             &mut set,
@@ -1414,6 +1512,50 @@ mod tests {
         assert!(set.no_pull_through(A), "a covered byte keeps the bar");
         set.record_pull_through(A, now + Duration::from_millis(1));
         assert!(!set.no_pull_through(A), "an uncovered byte lifts the bar");
+    }
+
+    /// #2281: a partial holder that refuses a block its coverage claims, three
+    /// times, loses that block from its coverage and keeps the others. It is
+    /// not barred from pull-through, and a probe that reports the stale claim
+    /// again does not bring the block back.
+    #[tokio::test(start_paused = true)]
+    async fn three_covered_refusals_drop_the_block_from_a_partial_holders_coverage() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(
+            &p,
+            [0; 32],
+            Arc::default(),
+            vec![partial(A, 10.0, &[0, 1]), holder(B, 20.0)],
+        );
+        let now = Instant::now();
+        let covers = |set: &SourceSet<'_, _>, block| {
+            set.holder(A)
+                .and_then(|h| h.coverage.as_ref())
+                .is_some_and(|c| c.covers(block))
+        };
+        say_not_found_in(
+            &mut set,
+            A,
+            block1(false),
+            super::ABSENT_AFTER_NOT_FOUND - 1,
+            now,
+        );
+        assert!(covers(&set, 1), "two answers are not enough");
+        say_not_found_in(&mut set, A, block1(false), 1, now);
+        assert!(!covers(&set, 1), "the refused block leaves the coverage");
+        assert!(covers(&set, 0), "the block it serves stays");
+        assert!(
+            !set.no_pull_through(A),
+            "a covered refusal is not a pull-through bar"
+        );
+        assert!(
+            set.holder(B).is_some_and(|h| h.coverage.is_none()),
+            "the whole holder is untouched"
+        );
+
+        set.merge(vec![partial(A, 10.0, &[0, 1])]);
+        assert!(!covers(&set, 1), "a probe repeating the stale claim");
+        assert!(covers(&set, 0));
     }
 
     /// An uncovered byte verified before the refusal that set the bar is
