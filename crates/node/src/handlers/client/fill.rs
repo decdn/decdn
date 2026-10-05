@@ -1,60 +1,48 @@
 //! Cache-fill tiers for the serve-miss path.
 
 use super::{
-    Address, B256, CacheError, ClientHandler, Duration, FillOutcome, Hash, LaneKey, StreamRequest,
+    Arc, CacheError, ClientHandler, Duration, FillOutcome, Hash, LaneDeliveryState, LaneKey, Mutex,
 };
 use tracing::Instrument as _;
 
 impl ClientHandler {
-    /// Whether `req` is authorized to trigger a paid pull-through (#831): it must
-    /// carry a verified client binding (`verified_client`) whose recovered
-    /// address is the named channel's pinned `voucher_signer`. Channel
-    /// *existence* is public (on-chain `ChannelOpened`), so it cannot authorize
-    /// spend — only proof of *voucher authority* can, since only the pinned
-    /// signer can produce a voucher this channel will accept. An unbound
+    /// The lane that authorizes this request to make the node spend on a cache
+    /// miss, or `None` when it may not. Every fill tier (own-origin, local
+    /// populate, window and buffered pull-through, #831) and the pre-spend floor
+    /// reservation are gated on it. Authority needs a verified client
+    /// binding whose recovered address is the lane's pinned `voucher_signer`.
+    /// Channel *existence* is public (on-chain `ChannelOpened`), so it cannot
+    /// authorize spend — only proof of *voucher authority* can, since only the
+    /// pinned signer can produce a voucher this channel will accept. An unbound
     /// request, or a binding that does not match that signer, must not make this
-    /// node front upstream USDC. Mirrors the binding gate in `dispatch.rs`,
-    /// applied *before* any spend.
+    /// node front upstream USDC or its own origin's egress.
     ///
-    /// Also a spend-side origin-blacklist gate (ADR 011), keyed on the channel's
-    /// FUNDER — the same subject `dispatch.rs`'s serve gate uses, so the two
-    /// paths agree. ADR 011 sanctions the *money*: a takedown names the address
-    /// that funded the delivery, not whichever throwaway key happened to sign
-    /// the vouchers. The two questions are deliberately not conflated — spend
-    /// authority is a *signer* question, compliance is a *funder* question — so
-    /// a blacklisted delegate signer over a clean funder is NOT refused here,
-    /// and a clean delegate signer never launders a blacklisted funder.
+    /// Spend authority is a *signer* question. In the shared-payment-pool model
+    /// the lane is keyed by that signer directly, so authority reduces to "does
+    /// a lane exist for `(pool_id, bound_signer, this operator)`?" — the seller
+    /// resolves the lane from exactly that triple (brief §E1). `lane_key` is
+    /// that triple (`None` for an unbound request) and `known_lane` is the lane
+    /// `serve_stream` resolved for it, once, after the request's own capability
+    /// intake. Authority is derived from that single resolution and never from a
+    /// second registry read: a lane a sibling stream registers while this request
+    /// is in flight cannot flip the answer between fill tiers (#2315). The
+    /// returned pair is what the serve legs take, so a tier that is authorized
+    /// always holds the lane it serves on.
     ///
-    /// Refusing the *spend* is the part that actually costs the operator:
-    /// without this check a blacklisted funder's request could still make this
-    /// node front upstream USDC egress and warm its cache on that funder's
-    /// behalf, only for the delivery to be refused afterwards.
+    /// The spend-side origin-blacklist gate (ADR 011) is a separate *funder*
+    /// question. ADR 011 sanctions the *money*: a takedown names the address that
+    /// funded the delivery (`getPool.owner`), not whichever throwaway key happened
+    /// to sign the vouchers. So a blacklisted delegate signer over a clean funder
+    /// is not refused, and a clean delegate signer never launders a blacklisted
+    /// funder. That gate runs at the serve gate's open-time funder check in
+    /// `dispatch.rs`, which precedes every fill tier — a blacklisted funder is
+    /// refused there before this authority is consulted, so no fill fronts USDC
+    /// or origin egress on a blacklisted funder's behalf.
     pub(super) fn pull_authorized(
-        &self,
-        req: &StreamRequest,
-        verified_client: Option<Address>,
-    ) -> bool {
-        let Some(client) = verified_client else {
-            return false;
-        };
-        // Spend authority is a *signer* question: only the capability's pinned
-        // signer can pay for this upstream pull, so only it can authorize the
-        // spend. In the shared-payment-pool model the lane is keyed by that
-        // signer directly, so authority reduces to "does a lane exist for
-        // `(pool_id, bound_signer, this operator)`?" — the seller resolves the
-        // lane from exactly that triple (brief §E1).
-        let lane_key = LaneKey {
-            pool_id: B256::from(req.pool_id),
-            signer: client,
-            provider: self.eth_signer.address(),
-        };
-        // This is a lane-membership (spend-authority) check only. The spend-side
-        // origin-blacklist gate (ADR 011) keys on the pool FUNDER
-        // (`getPool.owner`), and it runs at the serve gate's open-time funder
-        // check in `dispatch.rs`, which precedes every fill tier — a blacklisted
-        // funder is refused there before this authority check is ever reached, so
-        // no fill fronts USDC on a blacklisted funder's behalf.
-        self.lanes.contains_key(&lane_key)
+        lane_key: Option<LaneKey>,
+        known_lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
+    ) -> Option<(LaneKey, &Arc<Mutex<LaneDeliveryState>>)> {
+        lane_key.zip(known_lane)
     }
 
     /// Attempt to fill a cache miss by pulling from an upstream node (#831). The
