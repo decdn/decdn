@@ -118,7 +118,10 @@ For a different kind of check, see [integrator.md](integrator.md).
   source with `docker compose build`
   ([`deploy/Dockerfile`](../deploy/Dockerfile)).
 - **systemd:** [`deploy/systemd/`](../deploy/systemd) has a unit for each,
-  with secrets as `LoadCredential=` credentials.
+  with secrets as `LoadCredential=` credentials (systemd 252 or later). Some
+  systemd versions load credentials at mode `0440`, which the daemon refuses
+  for a keystore. So the daemon's unit copies the keystore to a `0600` file
+  under `/run/sponsord` before start.
 - **Release binaries:** each `sponsord-vX.Y.Z` and `sponsord-onramp-vX.Y.Z`
   GitHub Release has its binary for Linux x86_64 and aarch64, with a signed
   `SHA256SUMS`.

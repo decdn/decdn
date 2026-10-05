@@ -17,7 +17,15 @@ LoadCredential=treasury-password:/etc/sponsord/treasury-password
 LoadCredential=treasury-keystore.json:/etc/sponsord/treasury-keystore.json
 Environment=SPONSORD_API_TOKEN_FILE=%d/api-token
 Environment=SPONSORD_TREASURY_PASSWORD_FILE=%d/treasury-password
-Environment=SPONSORD_TREASURY_KEYSTORE=%d/treasury-keystore.json
+# Some systemd versions (254+ on Linux 6.4+, seen on 255) load credentials at
+# mode 0440, and the daemon refuses a keystore with any group or other bit
+# set. So copy it to a private 0600 file first. The copy is still the
+# encrypted keystore, the password stays in %d, and systemd removes
+# /run/sponsord when the service stops.
+RuntimeDirectory=sponsord
+RuntimeDirectoryMode=0700
+ExecStartPre=/usr/bin/install -m 0600 %d/treasury-keystore.json %t/sponsord/treasury-keystore.json
+Environment=SPONSORD_TREASURY_KEYSTORE=%t/sponsord/treasury-keystore.json
 DynamicUser=yes
 Restart=on-failure
 RestartSec=5s
