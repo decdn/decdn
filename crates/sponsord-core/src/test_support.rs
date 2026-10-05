@@ -10,17 +10,18 @@
 )]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, TxHash};
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
+use decdn_client::buyer_pool::TopUpUnconfirmed;
 use decdn_incentive::voucher_domain;
 use sponsord_api::MicroUsdc;
 
 use crate::issuer::{Issuer, Limits};
-use crate::pool::{Authorization, PoolChain};
+use crate::pool::{Authorization, PoolChain, TxState};
 use crate::sponsor::Sponsor;
 
 pub const TEST_CHAIN_ID: u64 = 421_614;
@@ -29,12 +30,14 @@ pub const TEST_POOL_ID: B256 = B256::repeat_byte(0x11);
 /// The RPC URL `FakePool` failures name, with an API key in its path, so
 /// tests can assert it never reaches a log line.
 pub const FAKE_RPC_URL: &str = "http://rpc.example/v3/FAKE-RPC-KEY";
+/// The `topUp` transaction an unconfirmed `FakePool` top-up names.
+pub const FAKE_TOPUP_TX: TxHash = TxHash::repeat_byte(0xAB);
 
 /// In-memory pool: fixed owner, a mutable remaining balance, a settable
-/// per-signer registration map, and switches to fail reads or top-ups. A
-/// failure reads like a raw reqwest transport error naming [`FAKE_RPC_URL`]:
-/// unlike `ChainPool`, it does not redact, so tests exercise the log sites'
-/// own redaction.
+/// per-signer registration map, a settable transaction state and confirmed
+/// nonce, and switches to fail reads or top-ups. A failure reads like a raw
+/// reqwest transport error naming [`FAKE_RPC_URL`]: unlike `ChainPool`, it
+/// does not redact, so tests exercise the log sites' own redaction.
 pub struct FakePool {
     owner: Address,
     remaining: Mutex<MicroUsdc>,
@@ -42,6 +45,12 @@ pub struct FakePool {
     fail_remaining: AtomicBool,
     fail_authorization: AtomicBool,
     fail_top_up: AtomicBool,
+    unconfirm_top_up: AtomicBool,
+    fail_tx_reads: AtomicBool,
+    tx_state: Mutex<TxState>,
+    pub(crate) confirmed_nonce: AtomicU64,
+    pending_nonce: AtomicU64,
+    top_up_calls: AtomicU64,
 }
 
 impl FakePool {
@@ -54,6 +63,12 @@ impl FakePool {
             fail_remaining: AtomicBool::new(false),
             fail_authorization: AtomicBool::new(false),
             fail_top_up: AtomicBool::new(false),
+            unconfirm_top_up: AtomicBool::new(false),
+            fail_tx_reads: AtomicBool::new(false),
+            tx_state: Mutex::new(TxState::Unknown),
+            confirmed_nonce: AtomicU64::new(0),
+            pending_nonce: AtomicU64::new(0),
+            top_up_calls: AtomicU64::new(0),
         }
     }
 
@@ -77,6 +92,42 @@ impl FakePool {
         self.fail_top_up.store(fail, Ordering::SeqCst);
     }
 
+    /// Make every `top_up` broadcast [`FAKE_TOPUP_TX`] but fail to read its
+    /// receipt: the error carries decdn's `TopUpUnconfirmed`, and nothing is
+    /// credited.
+    pub fn unconfirm_top_ups(&self, unconfirm: bool) {
+        self.unconfirm_top_up.store(unconfirm, Ordering::SeqCst);
+    }
+
+    /// Make every `transaction`, `confirmed_nonce` and `pending_nonce` read
+    /// fail (an RPC outage).
+    pub fn fail_tx_reads(&self, fail: bool) {
+        self.fail_tx_reads.store(fail, Ordering::SeqCst);
+    }
+
+    /// What `transaction` reports, for any hash. Starts [`TxState::Unknown`].
+    pub fn set_tx_state(&self, state: TxState) {
+        *self.tx_state.lock().unwrap() = state;
+    }
+
+    /// What `confirmed_nonce` reports. Starts at 0. Named for the RPC's
+    /// transaction count: CodeQL takes a literal passed to a `*nonce*`
+    /// function for a hard-coded cryptographic nonce.
+    pub fn set_confirmed_tx_count(&self, count: u64) {
+        self.confirmed_nonce.store(count, Ordering::SeqCst);
+    }
+
+    /// What `pending_nonce` reports. Starts at 0.
+    pub fn set_pending_tx_count(&self, count: u64) {
+        self.pending_nonce.store(count, Ordering::SeqCst);
+    }
+
+    /// How many times `top_up` has been called, failed or not.
+    #[must_use]
+    pub fn top_up_calls(&self) -> u64 {
+        self.top_up_calls.load(Ordering::SeqCst)
+    }
+
     /// The pool's current remaining balance.
     #[must_use]
     pub fn remaining_now(&self) -> MicroUsdc {
@@ -97,6 +148,15 @@ impl PoolChain for FakePool {
         Ok(self.remaining_now())
     }
     async fn top_up(&self, _pool_id: B256, additional: MicroUsdc) -> anyhow::Result<MicroUsdc> {
+        self.top_up_calls.fetch_add(1, Ordering::SeqCst);
+        if self.unconfirm_top_up.load(Ordering::SeqCst) {
+            // Shaped like decdn's `top_up` error after the broadcast.
+            return Err(
+                anyhow::anyhow!("error sending request for url ({FAKE_RPC_URL})")
+                    .context("await topUp receipt")
+                    .context(TopUpUnconfirmed { tx: FAKE_TOPUP_TX }),
+            );
+        }
         anyhow::ensure!(
             !self.fail_top_up.load(Ordering::SeqCst),
             "top-up failed: error sending request for url ({FAKE_RPC_URL})"
@@ -118,6 +178,27 @@ impl PoolChain for FakePool {
             "authorization read failed: error sending request for url ({FAKE_RPC_URL})"
         );
         Ok(self.registrations.lock().unwrap().get(&signer).copied())
+    }
+    async fn transaction(&self, _tx: TxHash) -> anyhow::Result<TxState> {
+        anyhow::ensure!(
+            !self.fail_tx_reads.load(Ordering::SeqCst),
+            "transaction read failed: error sending request for url ({FAKE_RPC_URL})"
+        );
+        Ok(*self.tx_state.lock().unwrap())
+    }
+    async fn confirmed_nonce(&self) -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            !self.fail_tx_reads.load(Ordering::SeqCst),
+            "nonce read failed: error sending request for url ({FAKE_RPC_URL})"
+        );
+        Ok(self.confirmed_nonce.load(Ordering::SeqCst))
+    }
+    async fn pending_nonce(&self) -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            !self.fail_tx_reads.load(Ordering::SeqCst),
+            "pending nonce read failed: error sending request for url ({FAKE_RPC_URL})"
+        );
+        Ok(self.pending_nonce.load(Ordering::SeqCst))
     }
 }
 

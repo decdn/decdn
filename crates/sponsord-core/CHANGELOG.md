@@ -28,6 +28,10 @@ release.
   (`ChainPool::connect`), `pool_watch` → `keeper`, `FakeTreasury` → `FakePool`.
 - **Keeper.** `Sponsor::keeper(KeeperConfig, CancellationToken)` runs until
   cancelled; `Sponsor::keeper_status()` reports what it has seen and done.
+- **`PoolChain` reads transactions and nonces.** Implementors add
+  `transaction(TxHash) -> pool::TxState`, `confirmed_nonce()` and
+  `pending_nonce()`, which the keeper uses to settle an unconfirmed top-up.
+  `KeeperSnapshot` gains `topup_unconfirmed_since_unix`.
 
 ### Changed
 
@@ -40,6 +44,26 @@ release.
 
 - **Published as its own crate.** Versioned and released independently of the
   binaries, with crates.io metadata, dual-licensed MIT OR Apache-2.0.
+
+### Fixed
+
+- **No second top-up while one may still mine.** When a `topUp` was broadcast
+  but its receipt could not be read (decdn's `TopUpUnconfirmed`), the keeper
+  used to send another one at the next tick, so both could mine and the
+  treasury paid two refills. It now holds further top-ups until that
+  transaction has a receipt, or the RPC node no longer knows it and the
+  treasury's confirmed nonce has passed every nonce it could have (bounded
+  by the pending nonce read before each top-up). It logs the hash at
+  `error`. A dropped top-up is cleared by sending 0-value self-transfers
+  from the treasury. A submission that fails after the node accepted it is
+  still not held
+  ([decdn/decdn#2319](https://github.com/decdn/decdn/issues/2319))
+  ([#40](https://github.com/decdn/sponsord/issues/40)).
+- **Nonces from the node.** `ChainPool` asks the node for each
+  transaction's nonce instead of using alloy's cached nonce, which never
+  re-syncs: a dropped transaction left every later top-up queued behind its
+  nonce until a restart, and a transaction sent from the treasury elsewhere
+  made the next one reuse a spent nonce.
 
 ### Security
 

@@ -139,11 +139,31 @@ For a different kind of check, see [integrator.md](integrator.md).
 | `sponsord_pool_last_check_unix` | gauge | Last successful balance read |
 | `sponsord_pool_last_topup_unix` | gauge | Last successful top-up |
 | `sponsord_pool_topups_total` | counter | Successful top-ups |
-| `sponsord_pool_keeper_failures_total` | counter | Failed balance reads and top-ups |
+| `sponsord_pool_keeper_failures_total` | counter | Failed chain reads and top-ups |
+| `sponsord_pool_topup_unconfirmed_since_unix` | gauge | When a top-up came back unconfirmed, while further top-ups are held (0: none) |
 
 Alert on `sponsord_pool_keeper_failures_total` rising (the treasury wallet
 may be out of USDC or gas), on `sponsord_pool_last_check_unix` going stale,
 and on the treasury wallet's own balance.
+
+Also alert on `sponsord_pool_topup_unconfirmed_since_unix` staying non-zero.
+It means the keeper broadcast a `topUp` but could not read its receipt. A
+second top-up could refill the pool twice, so the keeper sends none until
+that transaction has a receipt, or until the RPC node no longer knows it and
+the treasury's confirmed nonce has passed every nonce it could have. The
+`error` log line names the transaction and that highest nonce.
+
+The hold clears by itself once the transaction mines. If it was dropped
+instead, nothing else uses its nonce, so send 0-value transactions from the
+treasury to itself until the hold clears. The log says how many it takes at
+most. Each one takes the next nonce, so a transaction still pending
+elsewhere either mines first or can never mine. Do not restart `sponsord`
+to clear the hold: a restart forgets it, and if the transaction is still
+pending somewhere the pool can be refilled twice.
+
+A top-up whose submission fails after the RPC node accepted it (the
+response is lost) carries no transaction hash, so it is not held. Tracked in
+[decdn/decdn#2319](https://github.com/decdn/decdn/issues/2319).
 
 ## 6. Upgrades
 

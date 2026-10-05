@@ -341,6 +341,7 @@ async fn metrics_need_no_token_and_count_issues_errors_and_the_pool() {
         "sponsord_request_errors_total{code=\"unauthorized\"} 1",
         "sponsord_pool_remaining_micro_usdc 100000000",
         "sponsord_pool_topups_total 0",
+        "sponsord_pool_topup_unconfirmed_since_unix 0",
     ] {
         assert!(
             text.lines().any(|l| l == line),

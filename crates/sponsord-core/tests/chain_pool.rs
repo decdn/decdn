@@ -16,13 +16,14 @@
 
 use std::sync::Arc;
 
-use alloy::primitives::U256;
+use alloy::primitives::{TxHash, U256};
+use alloy::providers::Provider as _;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client::buyer_pool::{ensure_allowance, open_pool};
 use decdn_e2e::chain::ChainFixture;
-use decdn_incentive::Deployment;
 use decdn_incentive::payment_pool::PaymentPool;
-use sponsord_core::pool::{ChainPool, PoolChain};
+use decdn_incentive::{Deployment, Erc20};
+use sponsord_core::pool::{ChainPool, PoolChain, TxState};
 use sponsord_core::{ChainConfig, Limits, MicroUsdc, Sponsor, TermsRequest};
 
 /// Opening deposit, in USDC base units (6 decimals), well above the top-up
@@ -96,6 +97,44 @@ async fn remaining_grows_after_topup() {
         .unwrap();
     let after = pool.remaining(pool_id).await.unwrap();
     assert_eq!(after.0, before.0 + credited.0);
+
+    // What the keeper reads to settle an unconfirmed top-up. The treasury
+    // has sent three transactions: the approve, openPool and topUp (the
+    // top-up's own approve was skipped, as step 1's allowance covered it).
+    assert_eq!(pool.confirmed_nonce().await.unwrap(), 3);
+    assert_eq!(pool.pending_nonce().await.unwrap(), 3);
+    assert_eq!(
+        pool.transaction(TxHash::repeat_byte(0x99)).await.unwrap(),
+        TxState::Unknown
+    );
+
+    // With automining off, a sent transaction waits in the pool at nonce 3:
+    // pending, counted by the pending nonce but not the confirmed one.
+    let raw = chain.provider_for(&signer);
+    raw.raw_request::<_, ()>("evm_setAutomine".into(), (false,))
+        .await
+        .unwrap();
+    let sent = Erc20::new(chain.usdc(), raw.clone())
+        .approve(chain.addrs().payment_pool, U256::ZERO)
+        .send()
+        .await
+        .unwrap();
+    let tx = *sent.tx_hash();
+    assert_eq!(
+        pool.transaction(tx).await.unwrap(),
+        TxState::Pending { nonce: 3 }
+    );
+    assert_eq!(pool.confirmed_nonce().await.unwrap(), 3);
+    assert_eq!(pool.pending_nonce().await.unwrap(), 4);
+
+    raw.raw_request::<_, String>("evm_mine".into(), ())
+        .await
+        .unwrap();
+    raw.raw_request::<_, ()>("evm_setAutomine".into(), (true,))
+        .await
+        .unwrap();
+    assert_eq!(pool.transaction(tx).await.unwrap(), TxState::Mined);
+    assert_eq!(pool.confirmed_nonce().await.unwrap(), 4);
 
     // A signer that never redeemed is unregistered.
     assert_eq!(
