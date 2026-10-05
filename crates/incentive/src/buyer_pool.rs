@@ -117,6 +117,11 @@ pub struct BuyerPoolState {
     /// Per-`(signer, provider)` lane progress. Private — mutate only through
     /// [`Self::advance_lane`] or [`Self::hydrate`].
     lanes: HashMap<LaneKey, BuyerLaneProgress>,
+    /// The pool's on-chain `totalRedeemed` when this row adopted the pool from
+    /// chain: spend that lanes outside this row redeemed before the row
+    /// existed, so no tracked lane accounts for it. Zero for a pool this row
+    /// opened. Set only through [`Self::with_redeemed_elsewhere`].
+    redeemed_elsewhere: U256,
 }
 
 impl BuyerPoolState {
@@ -137,7 +142,24 @@ impl BuyerPoolState {
             token,
             deposit,
             lanes: HashMap::new(),
+            redeemed_elsewhere: U256::ZERO,
         }
+    }
+
+    /// Record `redeemed` as the pool spend no tracked lane accounts for: the
+    /// on-chain `totalRedeemed` a row adopted from chain starts with.
+    #[must_use]
+    pub const fn with_redeemed_elsewhere(mut self, redeemed: U256) -> Self {
+        self.redeemed_elsewhere = redeemed;
+        self
+    }
+
+    /// The pool spend no tracked lane accounts for: the on-chain
+    /// `totalRedeemed` this row adopted the pool with, or zero for a pool
+    /// this row opened.
+    #[must_use]
+    pub const fn redeemed_elsewhere(&self) -> U256 {
+        self.redeemed_elsewhere
     }
 
     /// Whether this row describes a pool on `deployment`: the same chain and
@@ -171,6 +193,7 @@ impl BuyerPoolState {
             token,
             deposit,
             lanes: lanes.into_iter().collect(),
+            redeemed_elsewhere: U256::ZERO,
         }
     }
 
