@@ -68,6 +68,7 @@ use decdn_incentive::{
 };
 use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
+use tokio_util::task::AbortOnDropHandle;
 
 use decdn_client::UpstreamRateLimited;
 use decdn_client::discovery::{self, NodeCandidate};
@@ -957,7 +958,7 @@ where
         .map(|h| h.rtt_ms)
         .fold(f64::INFINITY, f64::min);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let task = AbortOnDrop(tokio::spawn(tail.for_each(move |outcome| {
+    let task = AbortOnDropHandle::new(tokio::spawn(tail.for_each(move |outcome| {
         // A send fails only once the tail stream is gone, which aborts this
         // task too.
         let _ = tx.send(outcome);
@@ -971,15 +972,6 @@ where
         best_holder_rtt_ms,
         warming,
     })
-}
-
-/// A task that is aborted when this handle drops.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }
 
 /// The size hint of the nearest holder that gave one: the fetch's first size

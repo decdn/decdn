@@ -10248,7 +10248,8 @@ mod tests {
         use std::time::Duration;
 
         let (_, hash, mut origin, aligned) = multi_window_stub();
-        // Every wire stalls in its second window, holding its permit.
+        // Every wire reads one chunk, so its encode parks on the full wire
+        // channel, holding its permit.
         origin.gate_from = crate::RANGE_PULL_WINDOW_BYTES;
         let tmp = tempfile::tempdir()?;
         let cm = Arc::new(CacheMetrics::default());
@@ -10297,6 +10298,41 @@ mod tests {
             reopened.is_some(),
             "dropped wires must release their permits"
         );
+        Ok(())
+    }
+
+    /// Dropping a wire whose encode is parked inside an origin window fetch
+    /// aborts the encode and frees its permit. The fetch never returns, so only
+    /// the abort ends the task: a dropped receiver alone does not.
+    #[tokio::test]
+    async fn dropping_a_wire_parked_in_an_origin_fetch_frees_its_permit() -> anyhow::Result<()> {
+        use std::time::Duration;
+
+        let (_, hash, mut origin, aligned) = multi_window_stub();
+        origin.gate_from = crate::RANGE_PULL_WINDOW_BYTES;
+        let (engine, _tmp) = stub_engine(vec![origin]).await?;
+        let pool = Arc::clone(&engine.inner.own_origin_range_pulls);
+        let mut wire = engine
+            .origin_range_wire(hash, &aligned)
+            .await?
+            .expect("opens");
+        // Drain the first window until the encode parks on the gated second fetch.
+        while tokio::time::timeout(Duration::from_millis(200), wire.next_chunk())
+            .await
+            .is_ok()
+        {}
+        anyhow::ensure!(
+            pool.available_permits() == crate::MAX_CONCURRENT_RANGE_PULLS - 1,
+            "the parked encode must hold its permit"
+        );
+        drop(wire);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while pool.available_permits() < crate::MAX_CONCURRENT_RANGE_PULLS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("a dropped wire must abort its parked encode"))?;
         Ok(())
     }
 

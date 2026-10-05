@@ -28,6 +28,7 @@ use futures_util::FutureExt;
 use iroh_blobs::Hash;
 use iroh_io::{AsyncSliceReader, AsyncStreamWriter};
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::error::{CacheError, CacheResult};
 use crate::metrics::CacheMetrics;
@@ -569,7 +570,7 @@ pub struct OriginRangeWire {
     rx: mpsc::Receiver<Bytes>,
     fault: FaultSlot,
     ended: bool,
-    task: tokio::task::JoinHandle<()>,
+    _task: AbortOnDropHandle<()>,
 }
 
 impl std::fmt::Debug for OriginRangeWire {
@@ -698,7 +699,7 @@ impl OriginRangeWire {
             rx,
             fault,
             ended: false,
-            task,
+            _task: AbortOnDropHandle::new(task),
         })
     }
 
@@ -718,12 +719,6 @@ impl OriginRangeWire {
             .unwrap_or_else(PoisonError::into_inner)
             .take()
             .map(Err)
-    }
-}
-
-impl Drop for OriginRangeWire {
-    fn drop(&mut self) {
-        self.task.abort();
     }
 }
 

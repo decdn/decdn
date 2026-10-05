@@ -133,14 +133,15 @@ use decdn_client::provider::is_permanent_rpc_error;
 use decdn_common::config::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN;
 use decdn_common::redact::sanitize_err_chain;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::rpc_metrics::is_rate_limit;
 
 use super::resumable_watcher::{CursorStart, LogSink, WatcherHandle, WatcherHook, fire};
 use super::shared_head::HeadSource;
-use super::{AbortOnDrop, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF};
 use super::{Shrunk, WindowSpan, timed, window_end};
+use super::{WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF};
 
 /// Object-safe adapter over [`LogSink`], so routes with different concrete sink
 /// types live in one `Vec<Box<dyn ErasedSink>>`. `LogSink::apply` /
@@ -1089,8 +1090,8 @@ async fn run_tick<P: Provider + Clone>(
 
 /// Fires every route's `on_task_panic` and logs at `error!` iff the enclosing
 /// [`run`] is unwinding on a panic (mirrors
-/// `resumable_watcher::PanicGuard`, #1316). The poller task is spawned
-/// detached ([`AbortOnDrop`]) and never awaited, so a panic is otherwise
+/// `resumable_watcher::PanicGuard`, #1316). The poller task is held
+/// only by an [`AbortOnDropHandle`] that nothing awaits, so a panic is otherwise
 /// discarded with no log, counter, or restart; this guard is the only thing
 /// that still runs on the unwind.
 ///
@@ -1202,7 +1203,7 @@ where
             ..rs
         })
         .collect();
-    let task = AbortOnDrop(tokio::spawn(run(provider, poller, shutdown.clone())));
+    let task = AbortOnDropHandle::new(tokio::spawn(run(provider, poller, shutdown.clone())));
     WatcherHandle::new(shutdown, task)
 }
 
