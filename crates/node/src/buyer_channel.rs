@@ -23,7 +23,7 @@
 //!   the local record.
 //!
 //! Structurally this mirrors [`crate::payment_settlement::PoolSettlementService`]:
-//! a generic-over-`Provider` struct owning an `AbortOnDropHandle` background task.
+//! a generic-over-`Provider` struct that owns a background task and aborts it on drop.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

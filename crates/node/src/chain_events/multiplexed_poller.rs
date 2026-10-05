@@ -1090,8 +1090,8 @@ async fn run_tick<P: Provider + Clone>(
 
 /// Fires every route's `on_task_panic` and logs at `error!` iff the enclosing
 /// [`run`] is unwinding on a panic (mirrors
-/// `resumable_watcher::PanicGuard`, #1316). The poller task is spawned
-/// detached ([`AbortOnDropHandle`]) and never awaited, so a panic is otherwise
+/// `resumable_watcher::PanicGuard`, #1316). The poller task is held
+/// only by an [`AbortOnDropHandle`] that nothing awaits, so a panic is otherwise
 /// discarded with no log, counter, or restart; this guard is the only thing
 /// that still runs on the unwind.
 ///

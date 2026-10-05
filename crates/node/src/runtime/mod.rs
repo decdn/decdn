@@ -2229,8 +2229,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             }
         }
 
-        // Hold the service (and thus its `AbortOnDropHandle` reclaim/reconcile
-        // sweeps) alive until shutdown — reclaim must keep running even when
+        // Hold the service (and thus its `AbortOnDropHandle` reclaim sweep)
+        // alive until shutdown — reclaim must keep running even when
         // pull-through is off (`node_origin_opt` is `None`).
         let _service = service;
         let _ = buyer_bootstrap_stop_rx.await;
