@@ -1634,7 +1634,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // the process lifetime so its reclaim sweep keeps running even when
     // pull-through is off. The backgrounded bootstrap task (#1109, below) owns
     // that binding via its `let _service` hold — and thus keeps the service's
-    // `AbortOnDrop` reclaim task alive to shutdown.
+    // `AbortOnDropHandle` reclaim task alive to shutdown.
     //
     // Unlike the seller service, a buyer-bootstrap failure is NON-fatal: buying
     // is opportunistic cost-recovery, so a failed startup `approve` tx (e.g.
@@ -2229,7 +2229,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             }
         }
 
-        // Hold the service (and thus its `AbortOnDrop` reclaim/reconcile
+        // Hold the service (and thus its `AbortOnDropHandle` reclaim/reconcile
         // sweeps) alive until shutdown — reclaim must keep running even when
         // pull-through is off (`node_origin_opt` is `None`).
         let _service = service;
@@ -2689,7 +2689,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // The ONE multiplexed poller driving all registered watcher routes stops here,
     // once. It exits cooperatively — cancelling its loop at the next await
     // boundary and flushing every persisting route's checkpoint (settlement's
-    // `PoolOpened`) before returning — with its `WatcherHandle`'s `AbortOnDrop`
+    // `PoolOpened`) before returning — with its `WatcherHandle`'s `AbortOnDropHandle`
     // as the backstop.
     //
     // *After* `router.shutdown` deliberately, and the capacity-bond route is why:

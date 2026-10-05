@@ -48,6 +48,7 @@ decdn-client = { workspace = true }
 decdn-bao-range = { workspace = true }
 iroh = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

@@ -23,7 +23,7 @@
 //!   the local record.
 //!
 //! Structurally this mirrors [`crate::payment_settlement::PoolSettlementService`]:
-//! a generic-over-`Provider` struct owning an `AbortOnDrop` background task.
+//! a generic-over-`Provider` struct owning an `AbortOnDropHandle` background task.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -42,9 +42,9 @@ use decdn_incentive::{
     PoolOpenFailureReason,
 };
 use futures_util::FutureExt;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::chain_events::AbortOnDrop;
 use crate::metrics::Metrics;
 use decdn_client::buyer_pool::{
     LOW_WATER_DIVISOR, ProgressWrite, ToppedUpPool, ensure_allowance, grade_deposit_credit,
@@ -625,7 +625,7 @@ pub struct BuyerPoolService<P: Provider + Clone + 'static> {
     /// seeded now.
     seed_slots: Mutex<HashMap<LaneKey, SeedSlot>>,
     metrics: Arc<Metrics>,
-    _reclaimer: AbortOnDrop,
+    _reclaimer: AbortOnDropHandle<()>,
 }
 
 impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
@@ -709,7 +709,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             topup_in_flight: Arc::new(Mutex::new(None)),
             seed_slots: Mutex::new(HashMap::new()),
             metrics,
-            _reclaimer: AbortOnDrop(reclaimer),
+            _reclaimer: AbortOnDropHandle::new(reclaimer),
         })
     }
 
@@ -3136,7 +3136,7 @@ mod tests {
             topup_in_flight: Arc::new(Mutex::new(None)),
             seed_slots: Mutex::new(HashMap::new()),
             metrics: Arc::new(Metrics::new()),
-            _reclaimer: AbortOnDrop(tokio::spawn(std::future::pending())),
+            _reclaimer: AbortOnDropHandle::new(tokio::spawn(std::future::pending())),
         }
     }
 

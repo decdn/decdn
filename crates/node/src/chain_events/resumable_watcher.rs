@@ -35,9 +35,8 @@ use decdn_common::redact::sanitize_rpc_display as n;
 use decdn_incentive::{CheckpointKey, KeyedCheckpointStore};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::warn;
-
-use super::AbortOnDrop;
 
 /// A durable per-key scan checkpoint: the store plus the key it reads and writes
 /// under. Carried by [`CursorStart::FromCheckpoint`], which persists its cursor
@@ -344,7 +343,7 @@ pub(crate) const fn resolve_head_window_start(head: u64, window: u64, floor: u64
 /// through [`shutdown`], so no call site can conjure or drop an inert token — the
 /// mistake #1230 fixed by convention, made unrepresentable (#1236). [`shutdown`]
 /// is the graceful path (the loop flushes every route's cursor and returns); the
-/// wrapped `AbortOnDrop` guard is the hard safety net when the handle drops
+/// wrapped [`AbortOnDropHandle`] guard is the hard safety net when the handle drops
 /// without a prior `shutdown`.
 ///
 /// [`shutdown`]: WatcherHandle::shutdown
@@ -354,7 +353,7 @@ pub(crate) const fn resolve_head_window_start(head: u64, window: u64, floor: u64
 #[derive(Debug)]
 pub struct WatcherHandle {
     shutdown: CancellationToken,
-    _task: AbortOnDrop,
+    _task: AbortOnDropHandle<()>,
 }
 
 impl WatcherHandle {
@@ -362,7 +361,7 @@ impl WatcherHandle {
     /// [`multiplexed_poller`](super::multiplexed_poller) spawn mints the token
     /// and constructs this handle, so the token is always paired with a live
     /// task and can never be inert.
-    pub(crate) const fn new(shutdown: CancellationToken, task: AbortOnDrop) -> Self {
+    pub(crate) const fn new(shutdown: CancellationToken, task: AbortOnDropHandle<()>) -> Self {
         Self {
             shutdown,
             _task: task,

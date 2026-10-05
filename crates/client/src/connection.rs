@@ -22,6 +22,7 @@ use std::time::Duration;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use tokio::runtime::Handle;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument as _;
 
 use decdn_protocol::ALPN_CLIENT;
@@ -65,8 +66,7 @@ pub(crate) async fn dial(
     let endpoint = endpoint.clone();
     let connect = async move { endpoint.connect(target, ALPN_CLIENT).await }
         .instrument(tracing::Span::current());
-    let mut task = AbortOnDrop(runtime.spawn(connect));
-    (&mut task.0)
+    AbortOnDropHandle::new(runtime.spawn(connect))
         .await
         .map_err(|e| {
             let outcome = if e.is_panic() {
@@ -77,16 +77,6 @@ pub(crate) async fn dial(
             anyhow::anyhow!("{stage}: the dial task {outcome}").context(LocalPullFault)
         })?
         .map_err(|e| rate_limited::transport_error(stage, e))
-}
-
-/// Aborts the spawned task when dropped, so a dial the caller stops waiting for
-/// stops too.
-struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
-
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }
 
 /// A dialed `cdn/client/v1` connection reused across many hash fetches.
@@ -472,25 +462,6 @@ mod tests {
             "the failure must say the task was cancelled: {err:#}"
         );
         drop(peer);
-    }
-
-    /// Dropping the guard aborts the task it holds, so a dial the caller stops
-    /// waiting for (an `open` timeout) does not run on to completion.
-    #[tokio::test]
-    async fn dropping_the_guard_aborts_its_task() {
-        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
-        let guard = super::AbortOnDrop(tokio::spawn(async move {
-            let _held = held_tx;
-            std::future::pending::<()>().await;
-        }));
-        drop(guard);
-        assert!(
-            tokio::time::timeout(Duration::from_secs(10), held_rx)
-                .await
-                .expect("the aborted task must drop its state promptly")
-                .is_err(),
-            "the task must end by abort, never by sending"
-        );
     }
 
     /// A peer that accepts every connection and holds each one open, counting
