@@ -85,7 +85,12 @@ pub struct BuyerLaneProgress {
 /// instead of opening a new one — not the identity key: two pools can
 /// (transiently) exist for the same owner, e.g. across a rotate. Per-lane
 /// progress MUST only advance — through [`BuyerPoolState::advance_lane`] (the
-/// validated mutator) or hydration from a [`BuyerPoolStore`]. `lanes` is
+/// validated mutator), [`BuyerPoolState::seed_lane`] (a lane's on-chain
+/// watermark), or hydration from a [`BuyerPoolStore`];
+/// [`BuyerPoolState::rebase_lane`] is the one sanctioned overwrite. On an
+/// adopted row, a lane with a nonzero on-chain watermark enters through
+/// `seed_lane`, so its share of the adopted `totalRedeemed` moves out of
+/// [`BuyerPoolState::redeemed_elsewhere`] and counts once. `lanes` is
 /// private so nothing outside this module can insert a lane's progress
 /// without going through the monotonicity guard; the cross-crate hydration
 /// path (`decdn-node` decoding the redb record) uses
@@ -115,7 +120,8 @@ pub struct BuyerPoolState {
     /// top-ups).
     pub deposit: U256,
     /// Per-`(signer, provider)` lane progress. Private — mutate only through
-    /// [`Self::advance_lane`] or [`Self::hydrate`].
+    /// [`Self::advance_lane`], [`Self::seed_lane`], [`Self::rebase_lane`] or
+    /// [`Self::hydrate`].
     lanes: HashMap<LaneKey, BuyerLaneProgress>,
     /// Redeemed spend no tracked lane accounts for: the pool's on-chain
     /// `totalRedeemed` when this row adopted the pool from chain, less the
@@ -146,12 +152,23 @@ impl BuyerPoolState {
         }
     }
 
-    /// Record `redeemed` as the pool spend no tracked lane accounts for: the
-    /// on-chain `totalRedeemed` a row adopted from chain starts with.
+    /// Construct the row for a live pool adopted from chain, with no lanes
+    /// tracked yet. `total_redeemed` is the pool's on-chain `totalRedeemed`:
+    /// what lanes outside the row already paid out, which the row counts as
+    /// [`Self::redeemed_elsewhere`] until seeded lanes take their shares.
     #[must_use]
-    pub const fn with_redeemed_elsewhere(mut self, redeemed: U256) -> Self {
-        self.redeemed_elsewhere = redeemed;
-        self
+    pub fn adopt(
+        pool_id: PoolId,
+        deployment: Deployment,
+        owner: Address,
+        token: Address,
+        deposit: U256,
+        total_redeemed: U256,
+    ) -> Self {
+        Self {
+            redeemed_elsewhere: total_redeemed,
+            ..Self::new(pool_id, deployment, owner, token, deposit)
+        }
     }
 
     /// The redeemed spend no tracked lane accounts for (see the field).
@@ -173,8 +190,9 @@ impl BuyerPoolState {
     /// Record `lane`'s on-chain watermark `(bytes, amount)` as its progress.
     ///
     /// A lane new to the row moves `amount` out of
-    /// [`Self::redeemed_elsewhere`]: the adopted `totalRedeemed` already holds
-    /// it, and the lane now accounts for it. So the pool spend counts it once,
+    /// [`Self::redeemed_elsewhere`]: the adopted `totalRedeemed` holds at most
+    /// it (less, if the lane redeemed more after adoption), and the lane
+    /// accounts for it from then on. So the pool spend counts it once,
     /// and keeps counting the other lanes' redeemed spend as this lane
     /// advances. A lane the row already tracks advances monotonically, as
     /// through [`Self::advance_lane`].
@@ -211,7 +229,8 @@ impl BuyerPoolState {
 
     /// Reconstruct pool state from a trusted persistent store — the one
     /// cross-crate path allowed to seed per-lane progress directly (mirrors
-    /// [`crate::lane::LaneState::hydrate`]).
+    /// [`crate::lane::LaneState::hydrate`]). `redeemed_elsewhere` is the stored
+    /// [`Self::redeemed_elsewhere`].
     #[must_use]
     pub fn hydrate(
         pool_id: PoolId,
@@ -220,6 +239,7 @@ impl BuyerPoolState {
         token: Address,
         deposit: U256,
         lanes: Vec<(LaneKey, BuyerLaneProgress)>,
+        redeemed_elsewhere: U256,
     ) -> Self {
         Self {
             pool_id,
@@ -228,7 +248,7 @@ impl BuyerPoolState {
             token,
             deposit,
             lanes: lanes.into_iter().collect(),
-            redeemed_elsewhere: U256::ZERO,
+            redeemed_elsewhere,
         }
     }
 
@@ -247,10 +267,9 @@ impl BuyerPoolState {
     }
 
     /// The cumulative amount vouchered across every `(signer, provider)` lane
-    /// this row tracks: the row's view of what the single shared deposit has
-    /// spent. A lane the row has no record of, such as every lane of a pool
-    /// adopted from chain, is not counted, so `deposit - committed_amount()` is
-    /// an upper bound on the remaining spendable deposit.
+    /// this row tracks. It leaves out [`Self::redeemed_elsewhere`];
+    /// [`Self::pool_spend`] is the row's view of what the shared deposit has
+    /// spent.
     #[must_use]
     pub fn committed_amount(&self) -> U256 {
         self.lanes

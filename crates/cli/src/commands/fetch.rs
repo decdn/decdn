@@ -2742,12 +2742,13 @@ pub(crate) struct LaneSpend {
     pub(crate) outside: U256,
     /// The amount the lane resumes from.
     pub(crate) prior: U256,
-    /// Whether the pool row recorded the lane, so that an earlier lane's
-    /// `outside` counts its prior.
+    /// Whether the pool row recorded the lane before this build seeded it from
+    /// chain, so that an earlier lane's `outside` counts its prior.
     pub(crate) recorded: bool,
-    /// Whether `outside` came from the pool's on-chain `totalRedeemed` (an
-    /// adopted row), which counts every lane's redeemed watermark, recorded or
-    /// not.
+    /// Whether `outside` includes redeemed spend no tracked lane accounts for
+    /// ([`BuyerPoolState::redeemed_elsewhere`], from an adopted row's
+    /// `totalRedeemed`), which counts the watermark of every lane the row has
+    /// not seeded.
     pub(crate) from_chain: bool,
 }
 
@@ -3474,8 +3475,8 @@ pub(crate) fn attach_client_binding(
 
 /// Adopt the live pool `owner` already holds on `deployment`, recording it in
 /// the client store, or return `None` if the chain lists no `Open` pool with
-/// deposit left to spend. The adopted row comes back with the pool's
-/// `totalRedeemed`, which the row itself does not carry.
+/// deposit left to spend. The adopted row carries the pool's `totalRedeemed`
+/// as [`BuyerPoolState::redeemed_elsewhere`].
 ///
 /// The node adopts by the same rule at bootstrap (the newest `Open`, solvent
 /// pool); the client does it on demand, because a client is a one-shot process
@@ -3507,9 +3508,15 @@ where
             format!("read PaymentPool.usdc() while adopting live pool {pool_id}")
         })?;
     // The row has no lanes to account for what the pool already paid out, so it
-    // keeps `totalRedeemed` for every later run that reuses it.
-    let state = BuyerPoolState::new(pool_id, deployment, owner, token, U256::from(pool.deposit))
-        .with_redeemed_elsewhere(U256::from(pool.totalRedeemed));
+    // keeps `totalRedeemed`, less what each lane it seeds takes over.
+    let state = BuyerPoolState::adopt(
+        pool_id,
+        deployment,
+        owner,
+        token,
+        U256::from(pool.deposit),
+        U256::from(pool.totalRedeemed),
+    );
     store.record(&state).with_context(|| {
         format!(
             "found live pool {pool_id} on chain but could not record it in the local buyer \
@@ -3576,7 +3583,8 @@ where
 /// remaining USDC cannot cover it.
 ///
 /// An adopted row carries the pool's `totalRedeemed` as
-/// [`BuyerPoolState::redeemed_elsewhere`], and keeps it on every later run.
+/// [`BuyerPoolState::redeemed_elsewhere`], and keeps the part no seeded lane
+/// has taken over on every later run.
 /// The row has no lanes to account for what the pool paid out before
 /// adoption, and without it the refill decision reads a pool other lanes
 /// drained as a full deposit: no top-up fires, and the provider refuses the
@@ -3618,47 +3626,66 @@ where
 
 /// Record `lane`'s on-chain watermark `(bytes, amount)` in the row before the
 /// lane resumes from it ([`BuyerPoolState::seed_lane`]), and return the row
-/// with it.
+/// with it and the progress the lane resumes from.
 ///
 /// The pool spend the refill and the run's funding read
 /// ([`BuyerPoolState::pool_spend`]) then counts the watermark once. On an
 /// adopted row it moves out of the redeemed spend no lane accounts for, so the
 /// spend keeps counting the other lanes' redemptions as this lane advances. A
-/// zero watermark has nothing to record.
+/// zero watermark has nothing to record. A row another run already moved past
+/// the watermark wins: the lane resumes from the row's progress.
 ///
 /// # Errors
 ///
-/// The buyer store could not commit the seed: the lane would resume with
-/// spend the row does not count, so the build fails and retries.
+/// The buyer store could not commit the seed, or the row is gone or names
+/// another pool now (another run forgot or replaced it). Either way the build
+/// fails and retries from a fresh read: going on would price the lane, or
+/// escrow a refill, against a row the store no longer holds.
 fn seed_lane(
     store: &RedbBuyerPoolStore,
     mut state: BuyerPoolState,
     lane: LaneKey,
     bytes: U256,
     amount: U256,
-) -> anyhow::Result<BuyerPoolState> {
+) -> anyhow::Result<(BuyerPoolState, U256, U256)> {
     if bytes.is_zero() && amount.is_zero() {
-        return Ok(state);
+        return Ok((state, bytes, amount));
     }
+    let pool_id = state.pool_id;
     let outcome = store
-        .seed_progress(state.owner, state.pool_id, lane, bytes, amount)
+        .seed_progress(state.owner, pool_id, lane, bytes, amount)
         .with_context(|| {
             format!(
-                "record the on-chain watermark of lane {} in pool {}",
-                lane.provider, state.pool_id
+                "record the on-chain watermark of lane {} in pool {pool_id}",
+                lane.provider
             )
         })?;
-    // Any other outcome leaves a committed row the seed did not move: one
-    // already at or past the watermark, or a row another run replaced.
-    if !matches!(outcome, AdvanceOutcome::Advanced) {
-        tracing::debug!(?outcome, pool_id = %state.pool_id, "lane seed did not advance the row");
+    match outcome {
+        AdvanceOutcome::Advanced => {
+            // The in-memory row has no record of the lane, so the seed takes.
+            if let Err(err) = state.seed_lane(lane, bytes, amount) {
+                tracing::debug!(error = %err, "lane seed did not advance the in-memory row");
+            }
+            Ok((state, bytes, amount))
+        }
+        AdvanceOutcome::Regressed(_) => {
+            let row = store.get_by_pool_id(pool_id)?.ok_or_else(|| {
+                anyhow::anyhow!("buyer row for pool {pool_id} vanished during a lane seed")
+            })?;
+            let progress = row.lane_progress(lane).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "buyer row for pool {pool_id} lost lane {} during a seed",
+                    lane.provider
+                )
+            })?;
+            Ok((row, progress.last_bytes, progress.last_amount))
+        }
+        AdvanceOutcome::UnknownPool | AdvanceOutcome::PoolMismatch => Err(anyhow::anyhow!(
+            "the buyer row for pool {pool_id} was forgotten or replaced while lane {} was built; \
+             the build retries from the store",
+            lane.provider
+        )),
     }
-    // The row can only be at or past a watermark the chain holds; a row already
-    // ahead keeps its own progress.
-    if let Err(err) = state.seed_lane(lane, bytes, amount) {
-        tracing::debug!(error = %err, "lane seed did not advance the in-memory row");
-    }
-    Ok(state)
 }
 
 /// The error for a pool with no unspent deposit whose wallet cannot fund a
@@ -3841,14 +3868,13 @@ where
         let (state, prior_bytes, prior_amount) = if let Some(p) = state.lane_progress(lane) {
             (state, p.last_bytes, p.last_amount)
         } else {
-            // No local record of this lane — always so for an adopted pool, and
+            // No local record of this lane — always so for a pool just adopted, and
             // for a tracked pool's first contact with a provider. The chain may
             // still hold a watermark for it, and a voucher at or below that
             // watermark redeems nothing — so resuming from zero would stream bytes
             // the provider can never cash. Resume from the chain.
             let (bytes, amount) = lane_watermark(contract, lane).await?;
-            let state = seed_lane(store, state, lane, bytes, amount)?;
-            (state, bytes, amount)
+            seed_lane(store, state, lane, bytes, amount)?
         };
 
         // Auto-refill a live pool whose remaining deposit has run low, so a
@@ -6042,7 +6068,15 @@ mod adoption_tests {
                 )
             })
             .collect();
-        BuyerPoolState::hydrate(id, DEPLOYMENT, owner, TOKEN, U256::from(deposit), lanes)
+        BuyerPoolState::hydrate(
+            id,
+            DEPLOYMENT,
+            owner,
+            TOKEN,
+            U256::from(deposit),
+            lanes,
+            U256::ZERO,
+        )
     }
 
     fn lane_key(id: B256, owner: Address, provider: Address) -> LaneKey {
@@ -6063,7 +6097,7 @@ mod adoption_tests {
     /// Each live lane alone leaves far more than the low water; together they
     /// leave 1.345 USDC, below the 2 USDC mark, so the pool must refill.
     #[test]
-    fn pool_spend_sums_every_lane_not_the_one_being_built() {
+    fn pool_spend_sums_every_tracked_lane() {
         let owner = Address::repeat_byte(0x01);
         let id = B256::repeat_byte(0xEE);
         let row = tracked_row(id, owner, WORKING, &LIVE_LANES);
@@ -6118,8 +6152,14 @@ mod adoption_tests {
         let owner = Address::repeat_byte(0x01);
         let id = B256::repeat_byte(0xEE);
         let adopted = |redeemed: u64| {
-            BuyerPoolState::new(id, DEPLOYMENT, owner, TOKEN, U256::from(WORKING))
-                .with_redeemed_elsewhere(U256::from(redeemed))
+            BuyerPoolState::adopt(
+                id,
+                DEPLOYMENT,
+                owner,
+                TOKEN,
+                U256::from(WORKING),
+                U256::from(redeemed),
+            )
         };
         assert_eq!(adopted(9_500_000).pool_spend(), U256::from(9_500_000u64));
 
@@ -6194,6 +6234,7 @@ mod adoption_tests {
                 TOKEN,
                 U256::from(WORKING),
                 vec![(other, progress)],
+                U256::ZERO,
             ))
             .unwrap();
 
@@ -6494,8 +6535,8 @@ mod adoption_tests {
         assert_eq!(funding.pool_spent(), Some(U256::from(8_655_100u64)));
     }
 
-    /// An adopted pool's baseline is `totalRedeemed`, which already counts
-    /// every lane's redeemed watermark. A later lane's chain prior moves out of
+    /// An adopted pool's baseline holds its redeemed spend no seeded lane
+    /// accounts for, which counts every unseeded lane's redeemed watermark. A later lane's chain prior moves out of
     /// it, recorded or not, so it is counted once, by the lane's ledger.
     #[test]
     fn run_funding_counts_every_lane_once_on_an_adopted_pool() {

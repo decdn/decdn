@@ -508,14 +508,13 @@ async fn fund_pool<P: Provider + Clone + 'static>(
 /// `U256::ZERO` when the remaining deposit still has headroom, else the amount
 /// that restores it to the `working_deposit` target — the deposit a proven-good
 /// pool refills toward — with the trigger at `working_deposit / LOW_WATER_DIVISOR`
-/// (20% remaining). `committed` is the pool's spend as its row knows it
+/// (20% remaining). `spent` is the pool's spend as its row knows it
 /// ([`BuyerPoolState::pool_spend`]), so the remaining spendable is
-/// `deposit - committed`. Pure so the
-/// policy is unit-testable; the shared [`refill_amount`] kernel is the same one
-/// the CLI fetch auto-refill uses.
-fn refill_decision(deposit: U256, committed: U256, working_deposit: U256) -> U256 {
+/// `deposit - spent`. Pure so the policy is unit-testable; the shared
+/// [`refill_amount`] kernel is the same one the CLI fetch auto-refill uses.
+fn refill_decision(deposit: U256, spent: U256, working_deposit: U256) -> U256 {
     let low_water = working_deposit / U256::from(LOW_WATER_DIVISOR);
-    refill_amount(deposit, committed, working_deposit, low_water)
+    refill_amount(deposit, spent, working_deposit, low_water)
 }
 
 /// Build the [`PoolContext`] paying `provider_addr` from this pool's state,
@@ -784,8 +783,10 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     ///
     /// Reached whenever the local record is missing and the chain's is not: a
     /// pool adopted at bootstrap after a store reset, or a row lost under a
-    /// partially-restored store. `advance_progress` is monotone, so a lane the
-    /// node is already ahead of keeps its local watermark.
+    /// partially-restored store. `seed_progress` is monotone, so a lane the
+    /// node is already ahead of keeps its local watermark, and a lane new to an
+    /// adopted row takes its watermark out of the row's redeemed spend
+    /// ([`BuyerPoolState::seed_lane`]).
     ///
     /// **A failed read refuses the pull.** Resuming the lane from zero is not a
     /// recoverable degradation: the first pull persists its own progress on every
@@ -1420,8 +1421,14 @@ async fn reconcile_owned_pool<P: Provider + Clone>(
     };
     // The row has no lanes to account for what the pool already paid out, so it
     // keeps `totalRedeemed` until the lanes it seeds from chain take it over.
-    let state = BuyerPoolState::new(pool_id, deployment, owner, token, U256::from(pool.deposit))
-        .with_redeemed_elsewhere(U256::from(pool.totalRedeemed));
+    let state = BuyerPoolState::adopt(
+        pool_id,
+        deployment,
+        owner,
+        token,
+        U256::from(pool.deposit),
+        U256::from(pool.totalRedeemed),
+    );
     if let Err(err) = store.record(&state) {
         metrics.buyer_pool_adoption_failure();
         warn!(
@@ -2273,6 +2280,57 @@ mod tests {
         assert_eq!(adopted.pool_id, newer);
         assert_eq!(adopted.deposit, U256::from(10_000_000u64));
         assert_eq!(adopted.token, token);
+    }
+
+    /// #2292: an adopted pool other lanes drained keeps its `totalRedeemed` in
+    /// the row, and the node's low-water refill reads it. A row that counted
+    /// only its own (no) lanes would read the pool as full and never refill,
+    /// and providers would refuse the node's pulls on its spent deposit.
+    #[tokio::test]
+    async fn an_adopted_drained_pool_keeps_its_redeemed_spend_and_refills() {
+        use alloy::sol_types::SolValue;
+
+        let owner = Address::repeat_byte(1);
+        let token = Address::repeat_byte(2);
+        let id = PoolId::from([0xCC; 32]);
+        let mut drained = onchain_pool(owner, PaymentPool::Status::Open, 10_000_000);
+        drained.totalRedeemed = 9_500_000;
+        let contract = mocked_pool_contract(vec![
+            vec![id].abi_encode().into(),
+            drained.abi_encode().into(),
+        ]);
+        let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+        assert!(
+            reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await
+        );
+        let row = store.get_by_owner(owner).unwrap().expect("row recorded");
+        assert_eq!(row.redeemed_elsewhere(), U256::from(9_500_000u64));
+        assert_eq!(row.pool_spend(), U256::from(9_500_000u64));
+
+        let service = mocked_service(vec![], Arc::clone(&store), signer(), owner);
+        service.spawn_refill_if_low(&row);
+        let requested = service
+            .topup_in_flight
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|t| t.requested);
+        assert!(
+            requested.is_some_and(|r| !r.is_zero()),
+            "0.5 USDC left of 10 is below the low water: the refill fires"
+        );
+
+        let full = BuyerPoolState::adopt(
+            id,
+            DEPLOYMENT,
+            owner,
+            token,
+            U256::from(10_000_000u64),
+            U256::ZERO,
+        );
+        let control = mocked_service(vec![], Arc::clone(&store), signer(), owner);
+        control.spawn_refill_if_low(&full);
+        assert!(control.topup_in_flight.lock().unwrap().is_none());
     }
 
     /// A row written against a DIFFERENT `PaymentPool` deployment is dropped,
@@ -3175,6 +3233,51 @@ mod tests {
                 .lane_progress(lane)
                 .is_some()
         );
+    }
+
+    /// #2292: a lane seeded from chain on an adopted row takes its watermark
+    /// out of the row's redeemed spend, so the pool spend counts it once.
+    #[tokio::test]
+    async fn a_lane_seeded_on_an_adopted_row_counts_its_watermark_once() {
+        use alloy::sol_types::SolValue;
+
+        let owner = Address::repeat_byte(1);
+        let provider_addr = Address::repeat_byte(3);
+        let pool_id = PoolId::from([7u8; 32]);
+        let signer = signer();
+        let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+        let adopted = BuyerPoolState::adopt(
+            pool_id,
+            DEPLOYMENT,
+            owner,
+            Address::repeat_byte(2),
+            U256::from(10_000_000u64),
+            U256::from(9_500_000u64),
+        );
+        store.record(&adopted).unwrap();
+        let service = mocked_service(
+            vec![
+                PaymentPool::Lane {
+                    amount: 1_000_000,
+                    bytesDelivered: 4_096,
+                }
+                .abi_encode()
+                .into(),
+            ],
+            Arc::clone(&store),
+            Arc::clone(&signer),
+            owner,
+        );
+
+        let seeded = service
+            .reseed_lane_from_chain(adopted, provider_addr)
+            .await
+            .expect("seed succeeds");
+        assert_eq!(seeded.redeemed_elsewhere(), U256::from(8_500_000u64));
+        assert_eq!(seeded.pool_spend(), U256::from(9_500_000u64));
+        let row = store.get_by_owner(owner).unwrap().unwrap();
+        assert_eq!(row.redeemed_elsewhere(), U256::from(8_500_000u64));
+        assert_eq!(row.pool_spend(), U256::from(9_500_000u64));
     }
 
     /// A lane the node already tracks locally is never re-read from the chain.

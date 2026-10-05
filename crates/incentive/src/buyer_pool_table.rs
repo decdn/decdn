@@ -51,11 +51,11 @@ use crate::store::StoreError;
 ///
 /// **`_v6`**: the primary key is `pool_id` (32 bytes); the value carries the
 /// [`Deployment`] the pool lives on (chain id and `PaymentPool` address), a
-/// variable-length per-lane progress table, and the redeemed spend an adopted
-/// row starts with. A layout change that is not a trailing addition bumps this
-/// suffix. So does a trailing addition whose older rows this binary cannot
-/// read: the exact-match `schema_version` refuses them, and a point lookup
-/// that errors fails the fetch, where a missing table reads as no row.
+/// variable-length per-lane progress table, and the redeemed spend no tracked
+/// lane accounts for ([`BuyerPoolState::redeemed_elsewhere`]). Every layout
+/// change bumps this suffix, a trailing addition too: the exact-match
+/// `schema_version` refuses an older row, and a point lookup that errors fails
+/// the fetch, where a missing table reads as no row.
 ///
 /// A file written under an older suffix holds no table of this name, so
 /// `open_table` reports `TableDoesNotExist` and every read path treats the
@@ -110,12 +110,12 @@ struct StoredLane {
 /// byte arrays so the encoded width per field is stable across postcard
 /// versions; `lanes` is the one variable-length part, encoded as a postcard
 /// `Vec` (length-prefixed).
-/// `schema_version` lives in the value, not the key. A field appended at the
-/// END ships under a bumped `schema_version` alone — decode uses
-/// [`postcard::take_from_bytes`], which tolerates trailing bytes. A field
-/// inserted anywhere else shifts every field after it, so it needs the
-/// table-name suffix bumped too, or an older record would decode into the wrong
-/// fields.
+/// `schema_version` lives in the value, not the key, and decode uses
+/// [`postcard::take_from_bytes`], which tolerates trailing bytes. Any field
+/// change, appended or not, bumps `schema_version` and the table-name suffix:
+/// the exact-match version check refuses an older row, a refused row fails the
+/// point lookup, and a missing table reads as empty. A field inserted anywhere
+/// but the end also shifts every field after it.
 ///
 /// **The field order is the wire order.** Postcard encodes struct fields
 /// positionally and unnamed, so reordering or retyping a field silently
@@ -203,8 +203,8 @@ impl StoredBuyerPoolState {
             Address::from(self.token),
             U256::from_be_bytes(self.deposit),
             lanes,
-        )
-        .with_redeemed_elsewhere(U256::from_be_bytes(self.redeemed_elsewhere)))
+            U256::from_be_bytes(self.redeemed_elsewhere),
+        ))
     }
 }
 
@@ -902,7 +902,7 @@ mod tests {
             signer: Address::repeat_byte(0x88),
             provider: Address::repeat_byte(0x99),
         };
-        let mut s = BuyerPoolState::new(
+        let mut s = BuyerPoolState::adopt(
             pool_id,
             Deployment {
                 chain_id: 0x5555_5555_5555_5555,
@@ -911,8 +911,8 @@ mod tests {
             owner,
             Address::repeat_byte(0x33),
             U256::from(0xAAAA_AAAA_AAAA_AAAAu64),
-        )
-        .with_redeemed_elsewhere(U256::from(0xF0F0_F0F0_F0F0_F0F0u64));
+            U256::from(0xF0F0_F0F0_F0F0_F0F0u64),
+        );
         s.advance_lane(
             lane_a,
             U256::from(0xDDDD_DDDD_DDDD_DDDDu64),
@@ -1027,7 +1027,16 @@ mod tests {
     #[test]
     fn seed_progress_moves_a_new_lanes_watermark_out_of_the_redeemed_spend() -> anyhow::Result<()> {
         let (_d, db) = db()?;
-        let s = state(1).with_redeemed_elsewhere(U256::from(100u64));
+        let base = state(1);
+        let s = BuyerPoolState::hydrate(
+            base.pool_id,
+            base.deployment,
+            base.owner,
+            base.token,
+            base.deposit,
+            base.lanes().collect(),
+            U256::from(100u64),
+        );
         tbl(&db).record(&s)?;
         let lane = LaneKey {
             pool_id: s.pool_id,

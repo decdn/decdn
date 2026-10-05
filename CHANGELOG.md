@@ -936,9 +936,11 @@ since project inception and will roll into the first tagged release.
   micro-USDC it was short of the working deposit: an `approve` and a `topUp`
   each, and one of the run's three reactive top-ups. Such a refusal while the
   deposit sits within the low water (working deposit / 5) of the working
-  deposit now waits out the node's watcher on the settle budget, and a
+  deposit now waits out the node's watcher on its own settle budget, and a
   confirmed exhaustion the deposit can still afford tops up only when it adds
-  at least that low water. A lane build that refilled the pool now raises
+  at least that low water. A node that keeps refusing past the budget faults
+  as a source (it cools and is asked again, with one WARN), not as priced out
+  by a deposit no top-up raises. A lane build that refilled the pool now raises
   every running lane to the new deposit, so a lane built before the refill no
   longer reads a gap the refill paid for as unaffordable.
 
@@ -946,20 +948,23 @@ since project inception and will roll into the first tagged release.
   asked for them (#2281).** A `NotFound` for a range inside a probed partial
   holder's advertised coverage counted as a delivery fault only, so the
   holder was asked for the same range again every few seconds for the rest
-  of the entry. Such a refusal, on the lane's own stream or an extra one,
-  now counts against every discovery block the range touches. After three,
+  of the entry. Such a refusal on the lane's own stream now counts against
+  every discovery block the refused part of the range touches. After three,
   the block leaves the holder's coverage for a minute, rediscovery included,
   and its ranges go to the other holders. A `NotFound` can also be a
-  transient refusal, so the block then returns, and refusals a minute or
-  more apart never add up.
+  transient refusal, so the block then returns, refusals within one cooldown
+  count once, refusals a minute or more apart never add up, and a verified
+  byte in the block clears its count. An extra stream's covered `NotFound`
+  does not count: it is most often the node's per-signer live cap.
 
 - **A range-dedup entry that waits for a sibling's chunks no longer holds a
   `--jobs` slot (#2283).** `decdn bundle pull` kept the slot of an entry
   whose complement had landed while it waited for the sibling that fetches
   its donor chunks. On an SDXL pull with `--jobs 5`, such waiters held the
   run to 2–3 downloading entries for minutes at a time. A waiter now gives
-  its slot to a queued entry and takes one again before it fetches. A
-  pull's file bar appears once the entry holds a slot.
+  its slot to a queued entry while it waits, and takes one again as the wait
+  ends, ahead of entries still to start. A pull's file bar appears once the
+  entry holds a slot.
 
 - **A partial holder steals the covered tail of a busy leg (#2303).** A
   freed lane stole from a busy lane only when it covered the victim's whole
