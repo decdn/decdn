@@ -66,8 +66,9 @@ use iroh::endpoint::Connection;
 
 mod support;
 use support::{
-    HandlerDomains, build_handler_full, build_handler_full_configured, cache_with_blob,
-    empty_cache, fresh_key, local_endpoint, permissive_limiter, shutdown, spawn_server,
+    BufferedClientReader, HandlerDomains, build_handler_full, build_handler_full_configured,
+    cache_with_blob, empty_cache, fresh_key, local_endpoint, permissive_limiter, shutdown,
+    spawn_server,
 };
 
 /// Frame size these hostile-server fixtures cut their wire bytes at.
@@ -10252,8 +10253,12 @@ async fn window_pull_through_sliver_voucher_leaves_the_rest_owed() -> Result<()>
     )
     .await?;
 
+    // Every read from here on can time out and then read the same stream again,
+    // so it goes through one cancel-safe reader (#2306).
+    let mut reader = BufferedClientReader::default();
+
     // The rest of the interval is still owed, so B delivers nothing more.
-    match tokio::time::timeout(Duration::from_secs(2), read_client(&mut leaf.recv)).await {
+    match tokio::time::timeout(Duration::from_secs(2), reader.read(&mut leaf.recv)).await {
         Err(_elapsed) => {}
         Ok(Ok(ClientMessage::ChunkData(chunk))) => anyhow::bail!(
             "B sent {} more wire bytes on a sliver payment instead of waiting for the rest",
@@ -10275,7 +10280,7 @@ async fn window_pull_through_sliver_voucher_leaves_the_rest_owed() -> Result<()>
             "B never finished the stream ({} bytes read, {paid} paid)",
             leaf.delivered
         );
-        match tokio::time::timeout(Duration::from_millis(500), read_client(&mut leaf.recv)).await {
+        match tokio::time::timeout(Duration::from_millis(500), reader.read(&mut leaf.recv)).await {
             Ok(Ok(ClientMessage::ChunkData(chunk))) => {
                 leaf.delivered = leaf.delivered.saturating_add(chunk.bytes().len() as u64);
             }

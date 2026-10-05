@@ -80,11 +80,11 @@ use iroh::{Endpoint, EndpointAddr};
 mod support;
 use decdn_node::receipt_log::{DownloadReceipt, spawn_receipt_writer};
 use support::{
-    BlockingReceiptLog, FailingReceiptLog, FailingRecordStore, HandlerDomains, VecReceiptLog,
-    build_handler_full, build_handler_full_configured, build_handler_full_with_receipts,
-    build_handler_full_with_sink, cache_with_blob, empty_cache, fresh_key, local_endpoint,
-    permissive_limiter, read_client_msg, read_stream_response, shutdown, spawn_server,
-    spawn_server_counting, write_client_msg,
+    BlockingReceiptLog, BufferedClientReader, FailingReceiptLog, FailingRecordStore,
+    HandlerDomains, VecReceiptLog, build_handler_full, build_handler_full_configured,
+    build_handler_full_with_receipts, build_handler_full_with_sink, cache_with_blob, empty_cache,
+    fresh_key, local_endpoint, permissive_limiter, read_client_msg, read_stream_response, shutdown,
+    spawn_server, spawn_server_counting, write_client_msg,
 };
 
 const CHAIN_ID: u64 = 421_614;
@@ -1886,9 +1886,11 @@ async fn pay_range_to_end(
     mut paid: u64,
 ) -> anyhow::Result<u64> {
     let (mut send, mut recv) = open_paid_range_stream(conn, hash, Some(ext), 0, range).await?;
+    // The loop reads the stream again after a timeout, so the read must be cancel-safe.
+    let mut reader = BufferedClientReader::default();
     let mut received = paid;
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), read_client_msg(&mut recv)).await {
+        match tokio::time::timeout(Duration::from_secs(5), reader.read(&mut recv)).await {
             Ok(msg) => match msg? {
                 ClientMessage::ChunkData(chunk) => {
                     received = received.saturating_add(chunk.bytes().len() as u64);
@@ -6516,8 +6518,10 @@ async fn pay_and_read_to_end(
     let mut received = HARNESS_INTERVAL_BYTES;
     pay_cumulative(send, signer, received).await?;
     let mut paid = received;
+    // The loop reads the stream again after a timeout, so the read must be cancel-safe.
+    let mut reader = BufferedClientReader::default();
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), read_client_msg(recv)).await {
+        match tokio::time::timeout(Duration::from_secs(5), reader.read(recv)).await {
             Ok(msg) => match msg? {
                 ClientMessage::ChunkData(chunk) => {
                     received = received.saturating_add(chunk.bytes().len() as u64);
