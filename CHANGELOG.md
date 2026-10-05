@@ -1158,6 +1158,14 @@ since project inception and will roll into the first tagged release.
   and a spending-cap rejection, still end the command. The heal branch and
   each healed retry log at `info`.
 
+- **A delegated lane is redeemed when its expiry margin starts (#2233).**
+  The redeemer also sweeps one second after a lane's capability enters the
+  node's expiry margin, when the lane's value is final. Before, only the
+  periodic sweep could redeem it, and a sweep delayed by a receipt wait
+  passed the expiry and forfeited the lane. Lanes that are each below
+  `redeem_threshold_micro_usdc` but clear it together are redeemed in one
+  `redeemMany`.
+
 - **Expiry and close deadlines hold a safety margin (#2242).** A node
   refuses a voucher with `CapabilityExpired` once the capability expires
   within one redeem interval plus 120 s, so every voucher it accepts meets at
