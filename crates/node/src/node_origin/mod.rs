@@ -964,7 +964,8 @@ impl Origin for NodeOrigin {
 ///
 /// A [`PullMiss::LocalFault`] is not. The blob may exist on every candidate we
 /// asked; what failed is US — a buyer key that cannot sign, a deadline config that
-/// cannot run, a signature the upstream cannot verify. Reported as a miss it
+/// cannot run, a signature the upstream cannot verify, a cache store that cannot
+/// take the bytes. Reported as a miss it
 /// becomes a signed wire `NotFound`, which is exactly the false claim about content
 /// that `StreamError::InternalError` ("unexpected failure; do not retry this node")
 /// exists to keep a broken node from making. So it surfaces as an origin error
@@ -973,7 +974,7 @@ impl Origin for NodeOrigin {
 /// rest.
 ///
 /// [`OriginPullError::Permanent`] rather than `Transient`, on three counts: the
-/// retry loop must not re-run a pull whose signer is broken; `Permanent` records
+/// retry loop must not re-run a pull whose signer or store is broken; `Permanent` records
 /// `OriginOutcome::Available` on the per-origin circuit breaker, so our own defect
 /// does not trip a breaker that describes the PEER origin's health; and the engine's
 /// chain walk lets any error outrank a `NotFound` from another origin, which is the
@@ -987,9 +988,9 @@ fn miss_answer(miss: PullMiss) -> Result<OriginFetch, OriginPullError> {
     match miss {
         PullMiss::Clean | PullMiss::BelowMargin => Ok(OriginFetch::NotFound),
         PullMiss::LocalFault => Err(OriginPullError::Permanent(anyhow::anyhow!(
-            "node-origin: a LOCAL buyer-side fault hit at least one attempted candidate \
-             and none delivered; this node cannot pay, so it refuses rather than signing \
-             a NotFound for content that may well exist (#1560)"
+            "node-origin: a LOCAL fault hit at least one attempted candidate and none \
+             delivered; this node cannot complete the pull, so it refuses rather than \
+             signing a NotFound for content that may well exist (#1560)"
         ))),
     }
 }
@@ -1557,9 +1558,9 @@ pub enum PullMiss {
     /// the one a wire `NotFound` is true of.
     Clean,
     /// The attempt failed on a fault in THIS node: a broken signer, a bad
-    /// encode/range, an unusable deadline config, or an upstream that could not
-    /// VERIFY a signature we produced. Says nothing about whether the content
-    /// exists.
+    /// encode/range, an unusable deadline config, an upstream that could not
+    /// VERIFY a signature we produced, or a cache store that could not take the
+    /// bytes. Says nothing about whether the content exists.
     LocalFault,
     /// Candidates existed but every one quoted above the serve-economics buy
     /// ceiling; the node declined an unprofitable relay. Wire-identical to
@@ -2608,9 +2609,10 @@ enum PullVerdict {
     OurVoucherRetryable(VoucherRejectReason),
     /// The peer refused delivery, carrying the wire code's own verdict (#1144).
     Refused(RefusalVerdict),
-    /// A fault in THIS node — a broken signer, a bad encode, a bad range. It says nothing
-    /// about the peer, and a node in this state would otherwise tar every honest provider
-    /// it meets.
+    /// A fault in THIS node — a broken signer, a bad encode, a bad range, or its own
+    /// cache store failing under the pull (a full or read-only disk, a cache code bug).
+    /// It says nothing about the peer, and a node in this state would otherwise tar
+    /// every honest provider it meets.
     OurLocalFault,
     /// Reachable, paid, and served the wrong bytes.
     Corruption,
@@ -2850,7 +2852,30 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
     if err.downcast_ref::<HashMismatch>().is_some() {
         return PullVerdict::Corruption;
     }
+    // Ahead of the catch-all: this node's own store failed under the pull (#2286).
+    // A stream the peer ended early is `CacheError::Feed`, not a store fault, so it
+    // still falls through and scores `Unreachable`.
+    if is_local_store_fault(err) {
+        return PullVerdict::OurLocalFault;
+    }
     PullVerdict::Unreachable
+}
+
+/// Whether `err`'s chain holds a fault of this node's own cache store: a
+/// [`decdn_cache::CacheError::Store`] (a full, read-only or broken disk, a store
+/// actor fault) or a [`decdn_cache::CacheError::Internal`] (a cache code bug).
+///
+/// It walks the chain because a store query fails with the `CacheError` boxed
+/// under a `RangedStoreError::Backend`. It does not rest on the `io::ErrorKind`
+/// under the `CacheError`: iroh-blobs reports a failed data-file write as a
+/// kind-less `Other`, so a full disk does not say so.
+fn is_local_store_fault(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<decdn_cache::CacheError>(),
+            Some(decdn_cache::CacheError::Store(_) | decdn_cache::CacheError::Internal(_))
+        )
+    })
 }
 
 /// Meter a backpressure refusal on a node-origin leg — a first-leg or header
@@ -3149,18 +3174,18 @@ fn classify_pull_failure(
                 }
             }
         }
-        // A broken signer, a bad encode, a bad range — none of it says anything about the
-        // peer, and a node in this state walks the whole candidate list tarring every honest
-        // provider it meets with an `Unreachable` (a local EWMA hit; ADR 008 scoring is
-        // local-only, with no cross-node propagation) on the strength of its own defect. `warn!`, not
-        // `debug!`: a node that cannot sign cannot pay, so this is operator-actionable —
-        // and it is about US.
+        // A broken signer, a bad encode, a bad range, a failed cache store — none of it
+        // says anything about the peer, and a node in this state walks the whole candidate
+        // list tarring every honest provider it meets with an `Unreachable` (a local EWMA
+        // hit; ADR 008 scoring is local-only, with no cross-node propagation) on the
+        // strength of its own defect. `warn!`, not `debug!`: a node that cannot sign or
+        // store cannot complete a pull, so this is operator-actionable — and it is about US.
         PullVerdict::OurLocalFault => {
             deps.metrics.node_pull_local_fault();
             warn!(
                 %provider_addr, error = %format_args!("{err:#}"),
-                "node-origin: LOCAL buyer-side fault during a pull (signer/encode/range) — this node \
-                 cannot pay; exonerating the upstream"
+                "node-origin: LOCAL fault during a pull (signer/encode/range/store) — not the \
+                 upstream's; exonerating it"
             );
         }
         PullVerdict::LegNoProgress => {
@@ -4058,6 +4083,70 @@ mod tests {
     fn an_unrecognised_failure_still_scores_the_peer() {
         let err = anyhow::anyhow!("connection refused").context("dial provider");
         assert_eq!(pull_verdict(&err), PullVerdict::Unreachable);
+    }
+
+    /// A store import failure as iroh-blobs reports a failed data-file write — a
+    /// full or read-only disk among them: a kind-less `io::Error` under a context,
+    /// inside [`decdn_cache::CacheError::Store`].
+    fn store_fault() -> decdn_cache::CacheError {
+        let io = iroh_blobs::api::Error::from(std::io::Error::other("write batch failed"));
+        decdn_cache::CacheError::Store(
+            anyhow::Error::new(io).context("admit_bao_stream: store import"),
+        )
+    }
+
+    /// This node's own store failing under a pull is not the peer's fault (#2286): a
+    /// store fault on the write path (the `CacheError` is the anyhow root), the same
+    /// fault on a store query (boxed under `RangedStoreError::Backend`), and an
+    /// internal fault all rule `OurLocalFault`, never the `Unreachable` catch-all.
+    #[test]
+    fn a_local_store_fault_is_not_scored_against_the_peer() {
+        let written = anyhow::Error::from(store_fault()).context("pull from candidate");
+        assert_eq!(
+            pull_verdict(&written),
+            PullVerdict::OurLocalFault,
+            "{written:#}"
+        );
+
+        let queried = anyhow::Error::new(decdn_bao_range::RangedStoreError::Backend(Box::new(
+            store_fault(),
+        )))
+        .context("pull from candidate");
+        assert_eq!(
+            pull_verdict(&queried),
+            PullVerdict::OurLocalFault,
+            "{queried:#}"
+        );
+
+        let internal = anyhow::Error::from(decdn_cache::CacheError::Internal(anyhow::anyhow!(
+            "reader invariant broken"
+        )))
+        .context("pull from candidate");
+        assert_eq!(
+            pull_verdict(&internal),
+            PullVerdict::OurLocalFault,
+            "{internal:#}"
+        );
+    }
+
+    /// A stream the peer ended early fails the admit with a
+    /// [`decdn_cache::CacheError::Feed`]. That short delivery is the peer's, so the
+    /// store-fault arm must not excuse it.
+    #[test]
+    fn a_truncated_delivery_still_scores_the_peer() {
+        let truncated = anyhow::Error::from(decdn_cache::CacheError::Feed(
+            anyhow::Error::from(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "stream ended early",
+            ))
+            .context("admit_bao_stream: decode/feed failed"),
+        ))
+        .context("pull from candidate");
+        assert_eq!(
+            pull_verdict(&truncated),
+            PullVerdict::Unreachable,
+            "{truncated:#}"
+        );
     }
 
     /// The ladder's ORDER is load-bearing and invisible to the compiler. A stall is the one

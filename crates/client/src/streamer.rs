@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use anyhow::Context as _;
 use bytes::Bytes;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::Notify;
@@ -688,7 +689,7 @@ async fn present_frontier(store: &ClientRangedStore) -> anyhow::Result<u64> {
     let present = store
         .present_ranges()
         .await
-        .map_err(|e| anyhow::anyhow!("read present ranges: {e}"))?;
+        .context("read present ranges")?;
     Ok(
         match crate::driver::contiguous_byte_ranges(&present, store.bound()).first() {
             Some(&(0, len)) => len,
@@ -722,12 +723,9 @@ async fn next_verified(state: Arc<StreamState>, cursor: u64) -> io::Result<Optio
             .map_err(|e| io::Error::other(format!("present frontier: {e:#}")))?;
         if frontier > cursor {
             let len = (frontier - cursor).min(MAX_READ_CHUNK);
-            return state
-                .store
-                .read(cursor, len)
-                .await
-                .map(Some)
-                .map_err(|e| io::Error::other(format!("read verified prefix: {e:#}")));
+            return state.store.read(cursor, len).await.map(Some).map_err(|e| {
+                io::Error::other(format!("read verified prefix: {:#}", anyhow::Error::new(e)))
+            });
         }
         match outcome {
             Some(Err(e)) => {

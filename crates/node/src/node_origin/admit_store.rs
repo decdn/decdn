@@ -461,4 +461,87 @@ mod tests {
             "a multi-group blob has interior nodes to capture"
         );
     }
+
+    /// Set every directory under `root` to `mode`, so a store opened there can
+    /// (or cannot) create files.
+    #[cfg(unix)]
+    fn chmod_dirs(root: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    dirs.push(entry.path());
+                }
+            }
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+
+    /// The store failing under an ingest is this node's own fault (#2286). The
+    /// failure comes from the real store, not a hand-built error: iroh-blobs
+    /// reports a failed data-file write without its `io::ErrorKind`, so the
+    /// verdict cannot rest on the kind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_store_that_cannot_write_is_a_local_fault_not_the_peers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let (root, total, aligned, _ranges, wire) = interior_range_wire();
+        let store = NodeAdmitStore::new(engine, decdn_cache::Hash::from(root), total, None);
+
+        chmod_dirs(tmp.path(), 0o555);
+        if std::fs::File::create(tmp.path().join("probe")).is_ok() {
+            // Running as root: directory modes do not stop it, so there is no
+            // store fault to observe.
+            chmod_dirs(tmp.path(), 0o755);
+            return;
+        }
+        let err = IngestStore::ingest_stream(
+            &store,
+            &aligned,
+            MemReader { wire },
+            None,
+            aligned.blob_size(),
+            None,
+        )
+        .await
+        .err();
+        chmod_dirs(tmp.path(), 0o755);
+        let err = err.expect("a store that cannot create its data file fails the ingest");
+        assert_eq!(
+            super::super::pull_verdict(&err),
+            super::super::PullVerdict::OurLocalFault,
+            "{err:#}"
+        );
+    }
+
+    /// A wire the peer cut short fails the same ingest, and that is the peer's
+    /// short delivery: it still scores `Unreachable`.
+    #[tokio::test]
+    async fn a_truncated_wire_is_the_peers_fault() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let (root, total, aligned, _ranges, wire) = interior_range_wire();
+        let store = NodeAdmitStore::new(engine, decdn_cache::Hash::from(root), total, None);
+
+        let cut = wire.slice(..wire.len() / 2);
+        let err = IngestStore::ingest_stream(
+            &store,
+            &aligned,
+            MemReader { wire: cut },
+            None,
+            aligned.blob_size(),
+            None,
+        )
+        .await
+        .err()
+        .expect("a truncated wire fails the ingest");
+        assert_eq!(
+            super::super::pull_verdict(&err),
+            super::super::PullVerdict::Unreachable,
+            "{err:#}"
+        );
+    }
 }

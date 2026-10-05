@@ -1537,7 +1537,8 @@ impl PeerRunSink<'_> {
 ///
 /// A fatal fault ([`classify`]: a voucher rejection that no heal took, an
 /// origin blacklist, an over-cap blob, a local fault) cannot be fixed by
-/// another lane. Nor can the
+/// another lane, and neither can a fault of this node's own store
+/// ([`super::is_local_store_fault`]): every holder's bytes land in it. Nor can the
 /// pacer's [`PoolExhausted`]: the node's one shared pool funds every holder, so
 /// once it is dry no holder can be paid. An open-time `InsufficientDeposit` is
 /// this holder's reservation floor outrunning the pool, and a different holder
@@ -1546,6 +1547,9 @@ impl PeerRunSink<'_> {
 /// ([`decdn_client::HealExhausted`]). Anything else is a property of this
 /// source's delivery.
 fn ends_the_assembly(err: &anyhow::Error) -> bool {
+    if super::is_local_store_fault(err) {
+        return true;
+    }
     match classify(err) {
         Fault::Fatal(_) => true,
         Fault::Unaffordable => err.downcast_ref::<PoolExhausted>().is_some(),
@@ -2146,38 +2150,37 @@ mod local_pull_leg_tests {
         assert!(!super::is_internal_fault(&anyhow::anyhow!("bare")));
     }
 
-    /// The store's import failure in the shape `admit_bao_stream` builds it:
-    /// the iroh-blobs I/O error under a context, inside [`CacheError::Store`].
+    /// The store's import failure as iroh-blobs reports a failed data-file write
+    /// (a full disk among them): a kind-less I/O error under a context, inside
+    /// [`CacheError::Store`].
     fn full_disk_store_fault() -> decdn_cache::CacheError {
-        let io = iroh_blobs::api::Error::io(std::io::ErrorKind::StorageFull, "no space left");
+        let io = iroh_blobs::api::Error::from(std::io::Error::other("write batch failed"));
         decdn_cache::CacheError::Store(
             anyhow::Error::new(io).context("admit_bao_stream: store import"),
         )
     }
 
-    /// A full local disk under a [`CacheError::Store`] is this node's own fault.
-    /// `classify` reaches the I/O error through the `CacheError`'s `source()` and
-    /// gives it the local-fault verdict `LocalPullFault` gets, so the assembly
-    /// ends instead of moving the range to the next holder.
+    /// A fault of this node's own store ends the assembly instead of moving the
+    /// range to the next holder: every holder's bytes land in the same store. It
+    /// holds whether the `CacheError` is the root (an admit) or boxed under a
+    /// `RangedStoreError::Backend` (a store query).
     #[test]
     fn a_full_disk_under_a_store_fault_ends_the_assembly() {
         let admitted = anyhow::Error::from(full_disk_store_fault());
-        assert_eq!(
-            decdn_client::classify(&admitted),
-            decdn_client::Fault::Fatal(decdn_client::FatalScope::Command),
-            "{admitted:#}"
-        );
         assert!(super::ends_the_assembly(&admitted), "{admitted:#}");
 
         let ranged = anyhow::Error::new(decdn_bao_range::RangedStoreError::Backend(Box::new(
             full_disk_store_fault(),
         )));
-        assert_eq!(
-            decdn_client::classify(&ranged),
-            decdn_client::Fault::Fatal(decdn_client::FatalScope::Command),
-            "{ranged:#}"
-        );
         assert!(super::ends_the_assembly(&ranged), "{ranged:#}");
+
+        let fed = anyhow::Error::from(decdn_cache::CacheError::Feed(anyhow::anyhow!(
+            "stream ended early"
+        )));
+        assert!(
+            !super::ends_the_assembly(&fed),
+            "a short delivery is the holder's, so the range moves on: {fed:#}"
+        );
     }
 }
 
