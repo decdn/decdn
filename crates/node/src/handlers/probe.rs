@@ -227,7 +227,7 @@ impl ProbeHandler {
             Ok(preview) => preview.size_bytes,
             Err(e) => {
                 tracing::warn!(
-                    error = %e,
+                    error = %e.display_chain(),
                     %hash,
                     "inspect failed for a blob just proven present; advertising without a size"
                 );
@@ -448,7 +448,7 @@ impl ProbeHandler {
                     // when a degrading backend is most worth surfacing.
                     Err(e) => {
                         tracing::warn!(
-                            error = %e,
+                            error = %e.display_chain(),
                             %hash,
                             "cache error during stake-lane shed presence check; \
                              answering has_blob:false"
@@ -502,7 +502,7 @@ impl ProbeHandler {
                     // actionable signal.
                     Err(e) => {
                         tracing::warn!(
-                            error = %e,
+                            error = %e.display_chain(),
                             "cache error during probe hold check; answering has_blob:false"
                         );
                         (false, None)
@@ -611,7 +611,7 @@ impl ProbeHandler {
                 Ok((c, size)) => (c, total_bytes.or(size)),
                 Err(e) => {
                     tracing::warn!(
-                        error = %e,
+                        error = %e.display_chain(),
                         %hash,
                         "cache error deriving probe coverage; advertising none"
                     );

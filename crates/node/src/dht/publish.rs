@@ -488,7 +488,7 @@ impl HolderSnapshot {
             metrics.dht_republish_seed_store_walk_failure();
             tracing::warn!(
                 context,
-                error = %err,
+                error = %err.display_chain(),
                 "dht republish: seed could not walk the store and covered the \
                  origin-held half only. Blobs held only in the store stay \
                  un-republished until a later seed walks it successfully"
@@ -1148,7 +1148,7 @@ async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash)
         Err(err) => {
             tracing::debug!(
                 hash = ?hash,
-                error = %err,
+                error = %err.display_chain(),
                 "dht republish: store query faulted at the due-time gate"
             );
             None
@@ -1252,7 +1252,7 @@ async fn fetch_coverage(cache: &decdn_cache::CacheEngine, hash: ContentHash) -> 
         Err(err) => {
             tracing::debug!(
                 hash = ?hash,
-                error = %err,
+                error = %err.display_chain(),
                 "dht republish: coverage query faulted; publishing empty coverage this cycle"
             );
             Coverage::empty()

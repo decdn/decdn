@@ -74,7 +74,7 @@ pub(crate) fn resolve_encoding(
     Ok(Some(supported))
 }
 
-/// Wrap a decoder `io::Error` into an `io::Error` whose source is a
+/// Wrap a decoder `io::Error` into an `io::Error` whose inner error is a
 /// typed [`OriginError::DecompressionFailed`]. The engine's
 /// `count_and_cap_stream` side-channel preserves the `io::Error`
 /// verbatim; `crate::retry::classify_io_error` then downcasts the

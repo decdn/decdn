@@ -84,7 +84,7 @@ impl ClientHandler {
             // A clean miss — no origin/provider had it — is the normal
             // unfillable case (`NotFound`/`NoOrigin`); log at debug and move on.
             Ok(Err(e @ (CacheError::NotFound { .. } | CacheError::NoOrigin { .. }))) => {
-                tracing::debug!(%hash, error = %e, "node-to-node pull-through found no source");
+                tracing::debug!(%hash, error = %e.display_chain(), "node-to-node pull-through found no source");
                 FillOutcome::CleanMiss
             }
             // A backend fault — the node is degraded, not empty. Report it as a fault so
@@ -102,7 +102,7 @@ impl ClientHandler {
                 | CacheError::Internal(_)),
             )) => {
                 self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e, "node-to-node pull-through hit a backend fault");
+                tracing::warn!(%hash, error = %e.display_chain(), "node-to-node pull-through hit a backend fault");
                 FillOutcome::HardFault
             }
             // Everything else (`BlobTooLarge`, `HashMismatch`, `VerifyFailed`,
@@ -114,7 +114,7 @@ impl ClientHandler {
             // through as a plain miss.
             Ok(Err(e)) => {
                 self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e, "node-to-node pull-through hit a permanent cache-engine error");
+                tracing::warn!(%hash, error = %e.display_chain(), "node-to-node pull-through hit a permanent cache-engine error");
                 FillOutcome::CleanMiss
             }
             Err(_) => self.on_pull_through_timeout(hash, timeout).await,
@@ -148,7 +148,7 @@ impl ClientHandler {
         match tokio::time::timeout(timeout, self.cache.populate_local(hash)).await {
             Ok(Ok(())) => FillOutcome::Filled,
             Ok(Err(e @ (CacheError::NotFound { .. } | CacheError::NoOrigin { .. }))) => {
-                tracing::debug!(%hash, error = %e, "reactive local-origin pull-through found no source");
+                tracing::debug!(%hash, error = %e.display_chain(), "reactive local-origin pull-through found no source");
                 FillOutcome::CleanMiss
             }
             // Transient — the operator's own origin is down. See
@@ -160,14 +160,14 @@ impl ClientHandler {
                 | CacheError::Internal(_)),
             )) => {
                 self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e, "reactive local-origin pull-through hit a transient backend fault");
+                tracing::warn!(%hash, error = %e.display_chain(), "reactive local-origin pull-through hit a transient backend fault");
                 FillOutcome::HardFault
             }
             // Deterministic (`BlobTooLarge` / `HashMismatch` / `VerifyFailed`):
             // recurs every request, so it is not evidence this node is degraded.
             Ok(Err(e)) => {
                 self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e, "reactive local-origin pull-through hit a permanent cache-engine error");
+                tracing::warn!(%hash, error = %e.display_chain(), "reactive local-origin pull-through hit a permanent cache-engine error");
                 FillOutcome::CleanMiss
             }
             Err(_) => self.on_local_populate_timeout(hash, timeout).await,
@@ -196,7 +196,7 @@ impl ClientHandler {
                 // timeout or emit a misleading "timed out" line for it. It is a
                 // genuine local store fault, so the node is degraded, not empty.
                 self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e, "reactive local-origin pull-through store lookup failed after deadline");
+                tracing::warn!(%hash, error = %e.display_chain(), "reactive local-origin pull-through store lookup failed after deadline");
                 return FillOutcome::HardFault;
             }
         }
@@ -286,7 +286,7 @@ impl ClientHandler {
                 // an operator chasing the network while the disk is dying. Same rule
                 // `on_local_populate_timeout` states.
                 self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e, "node-to-node pull-through store lookup failed after deadline");
+                tracing::warn!(%hash, error = %e.display_chain(), "node-to-node pull-through store lookup failed after deadline");
                 faulted = true;
             }
         }
