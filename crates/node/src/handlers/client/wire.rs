@@ -130,10 +130,15 @@ impl ClientHandler {
         Ok(super::outcome::ServeEnd::Refused(reason))
     }
 
-    /// Log a terminal serve-miss refusal once at info, then send it through
-    /// [`Self::respond_error`]. The log line names the exit that refused
-    /// (`path`), which the wire answer and the per-reason metric do not carry,
-    /// so an operator can see why this node answered a request `NotFound`.
+    /// Send a terminal serve-miss refusal through [`Self::respond_error`], then
+    /// log it once at info. The log line names the exit that refused (`path`),
+    /// which the wire answer and the per-reason metric do not carry, so an
+    /// operator can see why this node answered a request `NotFound`.
+    ///
+    /// The line follows the send, so it appears only when the stream ends as
+    /// this refusal. A signing or encoding fault, or a write this node failed,
+    /// returns the error without the line: the dispatch sink counts that end as
+    /// a node fault, not a refusal.
     pub(super) async fn respond_miss(
         &self,
         send: &mut SendStream,
@@ -141,9 +146,11 @@ impl ClientHandler {
         refusal: MissRefusal,
         rate_per_mb: u64,
     ) -> anyhow::Result<super::outcome::ServeEnd> {
+        let end = self
+            .respond_error(send, req, refusal.reason, rate_per_mb)
+            .await?;
         log_miss_refusal(req, refusal);
-        self.respond_error(send, req, refusal.reason, rate_per_mb)
-            .await
+        Ok(end)
     }
 
     /// Write a mid-stream `StreamError { VoucherRejected }` and finish the
