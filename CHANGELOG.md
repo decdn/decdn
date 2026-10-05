@@ -28,6 +28,16 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Buyer pool rows keep an adopted pool's redeemed spend, and both buyer
+  tables move to `_v6` (#2292).** A row adopted from chain has no lanes, so
+  the pool's `totalRedeemed` is its only record of what other lanes paid
+  out. The row now stores it (record schema 4), so every later `decdn fetch`
+  and `decdn bundle pull` that reuses the row counts it, not only the run
+  that adopted the pool. **Existing buyer rows are not read:**
+  `buyer_pool_state_v5` / `buyer_pool_owner_index_v5` become `_v6`, so on
+  first run the store reads as empty, and a node or client re-adopts its live
+  pool from chain.
+
 - **`bundle pull --json` renames `deduped` to `reused` and adds `excluded`
   (#2190).** `deduped` counted whole-file reuse only, so beside a
   `range-dedup: spliced 12.7 GB` line a `0 deduped` count read as a
@@ -914,6 +924,36 @@ since project inception and will roll into the first tagged release.
   explicit operator pinning ([ADR 022](adr/022-content-discovery.md)).
 
 ### Fixed
+
+- **A reactive top-up of a few micro-USDC no longer goes on chain, and a
+  refill reaches lanes already running (#2296).** Right after a refill, a
+  node whose chain watcher had not seen it yet refused the next open as
+  `InsufficientDeposit`, and the client topped the pool up by the few
+  micro-USDC it was short of the working deposit: an `approve` and a `topUp`
+  each, and one of the run's three reactive top-ups. Such a refusal while the
+  deposit sits within the low water (working deposit / 5) of the working
+  deposit now waits out the node's watcher on the settle budget, and a
+  confirmed exhaustion the deposit can still afford tops up only when it adds
+  at least that low water. A lane build that refilled the pool now raises
+  every running lane to the new deposit, so a lane built before the refill no
+  longer reads a gap the refill paid for as unaffordable.
+
+- **A partial holder that refuses blocks its coverage claims stops being
+  asked for them (#2281).** A `NotFound` for a range inside a probed partial
+  holder's advertised coverage counted as a delivery fault only, so the
+  holder was asked for the same range again every few seconds for the rest
+  of the entry. Such a refusal now counts against every discovery block the
+  range touches. After three, the block leaves the holder's coverage for the
+  rest of the blob, rediscovery included, and its ranges go to the other
+  holders.
+
+- **A range-dedup entry that waits for a sibling's chunks no longer holds a
+  `--jobs` slot (#2283).** `decdn bundle pull` kept the slot of an entry
+  whose complement had landed while it waited for the sibling that fetches
+  its donor chunks. On an SDXL pull with `--jobs 5`, such waiters held the
+  run to 2–3 downloading entries for minutes at a time. A waiter now gives
+  its slot to a queued entry and takes one again before it fetches. A
+  pull's file bar appears once the entry holds a slot.
 
 - **A partial holder steals the covered tail of a busy leg (#2303).** A
   freed lane stole from a busy lane only when it covered the victim's whole

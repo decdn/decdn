@@ -49,10 +49,13 @@ use crate::store::StoreError;
 /// Callers supply the `Database` (the one thing they legitimately differ
 /// on) and nothing else.
 ///
-/// **`_v5`**: the primary key is `pool_id` (32 bytes); the value carries the
-/// [`Deployment`] the pool lives on (chain id and `PaymentPool` address) plus a
-/// variable-length per-lane progress table. A layout change that is not a trailing addition bumps this
-/// suffix.
+/// **`_v6`**: the primary key is `pool_id` (32 bytes); the value carries the
+/// [`Deployment`] the pool lives on (chain id and `PaymentPool` address), a
+/// variable-length per-lane progress table, and the redeemed spend an adopted
+/// row starts with. A layout change that is not a trailing addition bumps this
+/// suffix. So does a trailing addition whose older rows this binary cannot
+/// read: the exact-match `schema_version` refuses them, and a point lookup
+/// that errors fails the fetch, where a missing table reads as no row.
 ///
 /// A file written under an older suffix holds no table of this name, so
 /// `open_table` reports `TableDoesNotExist` and every read path treats the
@@ -63,7 +66,7 @@ use crate::store::StoreError;
 /// per table is a separate guard, and it fires on a type change, not on this
 /// rename: the key/value types here are unchanged.)
 const BUYER_POOL_TABLE: TableDefinition<'static, &'static [u8; 32], &'static [u8]> =
-    TableDefinition::new("buyer_pool_state_v5");
+    TableDefinition::new("buyer_pool_state_v6");
 
 /// Secondary index: `owner (20 bytes) → pool_id (32 bytes)`. Maintained
 /// alongside [`BUYER_POOL_TABLE`] on every `record`/`forget`/
@@ -76,7 +79,7 @@ const BUYER_POOL_TABLE: TableDefinition<'static, &'static [u8; 32], &'static [u8
 /// only visible via [`BuyerPoolTable::load_all`] (the reclaim sweep's path)
 /// — never via [`BuyerPoolTable::get_by_owner`].
 const BUYER_OWNER_INDEX_TABLE: TableDefinition<'static, &'static [u8; 20], &'static [u8; 32]> =
-    TableDefinition::new("buyer_pool_owner_index_v5");
+    TableDefinition::new("buyer_pool_owner_index_v6");
 
 /// The buyer-record `schema_version` this binary reads and writes.
 ///
