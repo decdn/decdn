@@ -63,6 +63,40 @@ const RECLAIM_SWEEP_INTERVAL: Duration = Duration::from_hours(1);
 /// so a hung RPC must not hold the lane's first pull open indefinitely.
 const WATERMARK_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A lane's seed queue: the lock the streams seeding one lane take in turn, and
+/// the watermark read the first of them made, for the lane it read. The rest
+/// reuse that read, so the chain is asked once per queue.
+type SeedSlot = Arc<tokio::sync::Mutex<Option<(LaneKey, PaymentPool::Lane)>>>;
+
+/// One stream's hold on a lane's [`SeedSlot`]. Dropping it removes the slot
+/// from the map when no other stream holds the slot, so a lane that has
+/// finished seeding, or whose pull was cancelled while it waited, leaves
+/// nothing behind.
+struct SeedTurn<'a> {
+    slots: &'a Mutex<HashMap<LaneKey, SeedSlot>>,
+    lane: LaneKey,
+    slot: SeedSlot,
+}
+
+impl Drop for SeedTurn<'_> {
+    fn drop(&mut self) {
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Every holder clones the slot under this map lock, so the count read
+        // here is exact: the map's handle plus this one means nobody waits.
+        let last = Arc::strong_count(&self.slot) <= 2;
+        if last
+            && slots
+                .get(&self.lane)
+                .is_some_and(|held| Arc::ptr_eq(held, &self.slot))
+        {
+            slots.remove(&self.lane);
+        }
+    }
+}
+
 /// Expiry stamped on the self-owned capability the buyer signs for its own key.
 /// Typed sentinel: the caller's `open_or_reuse_pool` budget elapsed while the
 /// pool open is still in flight. The open **keeps going** in a detached task; the
@@ -582,13 +616,14 @@ pub struct BuyerPoolService<P: Provider + Clone + 'static> {
     /// slot also tracks how much of the running `topUp` no pull has claimed, so two
     /// reactive top-ups cannot both count one escrow as their own.
     topup_in_flight: Arc<Mutex<Option<InFlightTopUp>>>,
-    /// One lock per lane, held across that lane's seed from chain
-    /// ([`Self::reseed_lane_from_chain`]), so two streams that both find the
-    /// lane missing read its watermark once. A lane's lock never blocks another
-    /// lane's seed, which matters after a buyer-table schema bump, when every
-    /// lane seeds at once. One entry per lane the node has paid on, the same
-    /// bound as the row's lanes.
-    seed_locks: Mutex<HashMap<LaneKey, Arc<tokio::sync::Mutex<()>>>>,
+    /// One [`SeedSlot`] per lane that a stream is seeding from chain
+    /// ([`Self::reseed_lane_from_chain`]), so the streams that find one lane
+    /// missing at the same time read its watermark once. A lane's slot never
+    /// blocks another lane's seed, which matters after a buyer-table schema
+    /// bump, when every lane seeds at once. A slot leaves the map with the last
+    /// stream queued on it ([`SeedTurn`]), so the map holds only lanes being
+    /// seeded now.
+    seed_slots: Mutex<HashMap<LaneKey, SeedSlot>>,
     metrics: Arc<Metrics>,
     _reclaimer: AbortOnDrop,
 }
@@ -672,7 +707,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             working_deposit,
             open_in_flight: Arc::new(Mutex::new(None)),
             topup_in_flight: Arc::new(Mutex::new(None)),
-            seed_locks: Mutex::new(HashMap::new()),
+            seed_slots: Mutex::new(HashMap::new()),
             metrics,
             _reclaimer: AbortOnDrop(reclaimer),
         })
@@ -803,7 +838,8 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// its local watermark, and a lane new to an adopted row takes its watermark
     /// out of the row's redeemed spend ([`BuyerPoolState::seed_lane`]).
     /// Concurrent streams that find one lane missing seed it once
-    /// ([`Self::seed_locks`]).
+    /// ([`Self::seed_slots`]). They share one watermark read, a zero read
+    /// included, so a burst of first pulls costs one `getWatermark`.
     ///
     /// The chain's watermark counts *redeemed* vouchers only. A provider still
     /// holding an unredeemed voucher is ahead of it by at most its own
@@ -845,10 +881,10 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         if state.lane_progress(lane).is_some() {
             return Ok(state);
         }
-        let seed_lock = self.lane_seed_lock(lane);
-        let _seeding = seed_lock.lock().await;
+        let turn = self.seed_turn(lane);
+        let mut shared_read = turn.slot.lock().await;
         // A sibling stream may have seeded the lane while this one waited for
-        // the lock, so re-read the row before going to the chain.
+        // the slot, so re-read the row before going to the chain.
         let state = self.reread_before_seed(lane.pool_id)?;
         let lane = LaneKey {
             pool_id: state.pool_id,
@@ -857,19 +893,17 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         if state.lane_progress(lane).is_some() {
             return Ok(state);
         }
-        let call = self
-            .contract
-            .getWatermark(state.pool_id, lane.signer, provider_addr);
-        let onchain = match tokio::time::timeout(WATERMARK_READ_TIMEOUT, call.call()).await {
-            Ok(Ok(onchain)) => onchain,
-            Ok(Err(err)) => {
-                let shown = sanitize_rpc_display(&err);
-                return Err(self.unread_watermark(lane, &shown, anyhow::Error::new(err)));
-            }
-            Err(elapsed) => {
-                let shown = format!("no answer within {WATERMARK_READ_TIMEOUT:?}");
-                return Err(self.unread_watermark(lane, &shown, anyhow::Error::new(elapsed)));
-            }
+        // A zero read persists nothing, so the row cannot tell the next stream
+        // in the queue that the chain was already asked; the slot does.
+        let onchain = if let Some((_, onchain)) = shared_read
+            .as_ref()
+            .filter(|(read_for, _)| *read_for == lane)
+        {
+            onchain.clone()
+        } else {
+            let onchain = self.read_watermark(lane).await?;
+            *shared_read = Some((lane, onchain.clone()));
+            onchain
         };
         if onchain.amount == 0 && onchain.bytesDelivered == 0 {
             // The chain has never paid this lane, so zero is the right resume
@@ -886,13 +920,40 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         Ok(self.pin_seeded_state(state, lane, &onchain))
     }
 
-    /// The seed lock for `lane`, created on first use.
-    fn lane_seed_lock(&self, lane: LaneKey) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self
-            .seed_locks
+    /// This stream's place in `lane`'s seed queue: the lane's [`SeedSlot`],
+    /// created on first use.
+    fn seed_turn(&self, lane: LaneKey) -> SeedTurn<'_> {
+        let mut slots = self
+            .seed_slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Arc::clone(locks.entry(lane).or_default())
+        SeedTurn {
+            slots: &self.seed_slots,
+            lane,
+            slot: Arc::clone(slots.entry(lane).or_default()),
+        }
+    }
+
+    /// Read `lane`'s on-chain watermark, bounded by [`WATERMARK_READ_TIMEOUT`].
+    ///
+    /// # Errors
+    ///
+    /// The read failed or timed out; see [`Self::unread_watermark`].
+    async fn read_watermark(&self, lane: LaneKey) -> Result<PaymentPool::Lane> {
+        let call = self
+            .contract
+            .getWatermark(lane.pool_id, lane.signer, lane.provider);
+        match tokio::time::timeout(WATERMARK_READ_TIMEOUT, call.call()).await {
+            Ok(Ok(onchain)) => Ok(onchain),
+            Ok(Err(err)) => {
+                let shown = sanitize_rpc_display(&err);
+                Err(self.unread_watermark(lane, &shown, anyhow::Error::new(err)))
+            }
+            Err(elapsed) => {
+                let shown = format!("no answer within {WATERMARK_READ_TIMEOUT:?}");
+                Err(self.unread_watermark(lane, &shown, anyhow::Error::new(elapsed)))
+            }
+        }
     }
 
     /// The node's buyer row, read again under a lane's seed lock. A row that a
@@ -3073,7 +3134,7 @@ mod tests {
             working_deposit: U256::from(10_000_000u64),
             open_in_flight: Arc::new(Mutex::new(None)),
             topup_in_flight: Arc::new(Mutex::new(None)),
-            seed_locks: Mutex::new(HashMap::new()),
+            seed_slots: Mutex::new(HashMap::new()),
             metrics: Arc::new(Metrics::new()),
             _reclaimer: AbortOnDrop(tokio::spawn(std::future::pending())),
         }
@@ -3358,11 +3419,25 @@ mod tests {
     }
 
     /// Two streams that both find the lane missing seed it once. Both pass the
-    /// lock-free check and wait on the lane's seed lock; the second then takes
+    /// lock-free check and wait on the lane's seed slot; the second then takes
     /// the first one's seed from the store and reads no watermark, so a mock
-    /// with one queued `getWatermark` answers both.
+    /// with one queued `getWatermark` answers both. The slot leaves the map
+    /// with the last of them.
     #[tokio::test]
     async fn concurrent_reseeds_of_one_lane_read_the_chain_once() {
+        concurrent_reseeds_read_the_chain_once(191_205, 4_096).await;
+    }
+
+    /// A zero watermark persists nothing, so the row cannot stop the next
+    /// stream in the queue from asking the chain again. The slot's shared read
+    /// does: a mock with one queued zero `getWatermark` answers both streams,
+    /// and both resume the lane from zero.
+    #[tokio::test]
+    async fn concurrent_reseeds_of_a_zero_watermark_read_the_chain_once() {
+        concurrent_reseeds_read_the_chain_once(0, 0).await;
+    }
+
+    async fn concurrent_reseeds_read_the_chain_once(amount: u64, bytes: u64) {
         use alloy::sol_types::SolValue;
 
         let owner = Address::repeat_byte(1);
@@ -3382,8 +3457,8 @@ mod tests {
         let service = mocked_service(
             vec![
                 PaymentPool::Lane {
-                    amount: 191_205,
-                    bytesDelivered: 4_096,
+                    amount,
+                    bytesDelivered: bytes,
                 }
                 .abi_encode()
                 .into(),
@@ -3398,10 +3473,10 @@ mod tests {
             provider: provider_addr,
         };
 
-        // Hold the lane's lock until both seeds are parked on it, so the second
+        // Hold the lane's slot until both seeds are parked on it, so the second
         // passes the lock-free check against the same empty snapshot.
-        let seed_lock = service.lane_seed_lock(lane);
-        let held = seed_lock.lock().await;
+        let turn = service.seed_turn(lane);
+        let held = turn.slot.lock().await;
         let (first, second, ()) = tokio::join!(
             service.reseed_lane_from_chain(adopted.clone(), provider_addr),
             service.reseed_lane_from_chain(adopted, provider_addr),
@@ -3411,13 +3486,28 @@ mod tests {
             },
         );
         for seeded in [first, second] {
-            let progress = seeded
-                .expect("both seeds succeed on one chain read")
-                .lane_progress(lane)
-                .expect("lane seeded");
-            assert_eq!(progress.last_amount, U256::from(191_205u64));
-            assert_eq!(progress.last_bytes, U256::from(4_096u64));
+            let seeded = seeded.expect("both seeds succeed on one chain read");
+            if amount == 0 && bytes == 0 {
+                assert_eq!(
+                    seeded.lane_progress(lane),
+                    None,
+                    "a zero lane resumes from zero"
+                );
+            } else {
+                let progress = seeded.lane_progress(lane).expect("lane seeded");
+                assert_eq!(progress.last_amount, U256::from(amount));
+                assert_eq!(progress.last_bytes, U256::from(bytes));
+            }
         }
+        drop(turn);
+        assert!(
+            service
+                .seed_slots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "the slot leaves the map with the last stream that held it"
+        );
     }
 
     /// #2292: a lane seeded from chain on an adopted row takes its watermark
