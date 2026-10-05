@@ -95,7 +95,11 @@ pub fn classify(err: &anyhow::Error) -> Fault {
     {
         return Fault::Fatal(FatalScope::Item);
     }
-    if err.downcast_ref::<HealExhausted>().is_some() {
+    if err.downcast_ref::<HealExhausted>().is_some()
+        || err
+            .downcast_ref::<crate::driver::StaleDepositView>()
+            .is_some()
+    {
         return Fault::Source;
     }
     if err.downcast_ref::<UpstreamVoucherRejected>().is_some() {

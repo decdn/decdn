@@ -258,7 +258,9 @@ as `decdn fetch`):
   evaluated **per destination**, so an already-present duplicate path
   triggers no fetch of its own (the group still fetches once if any
   sibling path needs bytes).
-- **Concurrency** is bounded by `--jobs` (over distinct blobs). Fetches share a
+- **Concurrency** is bounded by `--jobs` (over distinct blobs). An entry
+  that waits for a sibling to fetch the chunks it splices holds no slot
+  while it waits. It takes a slot again before it fetches. Fetches share a
   `LaneLedger` per `(pool, signer, provider)` lane. `--max-lane-streams`
   (default 4) caps how many streams run at once on one lane. The shared
   ledger keeps voucher issuance monotonic across concurrent streams on a

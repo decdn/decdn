@@ -49,10 +49,13 @@ use crate::store::StoreError;
 /// Callers supply the `Database` (the one thing they legitimately differ
 /// on) and nothing else.
 ///
-/// **`_v5`**: the primary key is `pool_id` (32 bytes); the value carries the
-/// [`Deployment`] the pool lives on (chain id and `PaymentPool` address) plus a
-/// variable-length per-lane progress table. A layout change that is not a trailing addition bumps this
-/// suffix.
+/// **`_v6`**: the primary key is `pool_id` (32 bytes); the value carries the
+/// [`Deployment`] the pool lives on (chain id and `PaymentPool` address), a
+/// variable-length per-lane progress table, and the redeemed spend no tracked
+/// lane accounts for ([`BuyerPoolState::redeemed_elsewhere`]). Every layout
+/// change bumps this suffix, a trailing addition too: the exact-match
+/// `schema_version` refuses an older row, and a point lookup that errors fails
+/// the fetch, where a missing table reads as no row.
 ///
 /// A file written under an older suffix holds no table of this name, so
 /// `open_table` reports `TableDoesNotExist` and every read path treats the
@@ -63,7 +66,7 @@ use crate::store::StoreError;
 /// per table is a separate guard, and it fires on a type change, not on this
 /// rename: the key/value types here are unchanged.)
 const BUYER_POOL_TABLE: TableDefinition<'static, &'static [u8; 32], &'static [u8]> =
-    TableDefinition::new("buyer_pool_state_v5");
+    TableDefinition::new("buyer_pool_state_v6");
 
 /// Secondary index: `owner (20 bytes) → pool_id (32 bytes)`. Maintained
 /// alongside [`BUYER_POOL_TABLE`] on every `record`/`forget`/
@@ -76,7 +79,7 @@ const BUYER_POOL_TABLE: TableDefinition<'static, &'static [u8; 32], &'static [u8
 /// only visible via [`BuyerPoolTable::load_all`] (the reclaim sweep's path)
 /// — never via [`BuyerPoolTable::get_by_owner`].
 const BUYER_OWNER_INDEX_TABLE: TableDefinition<'static, &'static [u8; 20], &'static [u8; 32]> =
-    TableDefinition::new("buyer_pool_owner_index_v5");
+    TableDefinition::new("buyer_pool_owner_index_v6");
 
 /// The buyer-record `schema_version` this binary reads and writes.
 ///
@@ -84,7 +87,7 @@ const BUYER_OWNER_INDEX_TABLE: TableDefinition<'static, &'static [u8; 20], &'sta
 /// written under a different version does not decode into these fields — it
 /// decodes into the wrong ones, silently. Refusing anything that is not this
 /// exact layout is the only answer that cannot mis-map.
-const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 3;
+const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 4;
 
 /// Sanity ceiling on trailing bytes per record. Trailing bytes are tolerated
 /// (forward-compat with additive schema changes), but a `remainder.len()`
@@ -107,12 +110,12 @@ struct StoredLane {
 /// byte arrays so the encoded width per field is stable across postcard
 /// versions; `lanes` is the one variable-length part, encoded as a postcard
 /// `Vec` (length-prefixed).
-/// `schema_version` lives in the value, not the key. A field appended at the
-/// END ships under a bumped `schema_version` alone — decode uses
-/// [`postcard::take_from_bytes`], which tolerates trailing bytes. A field
-/// inserted anywhere else shifts every field after it, so it needs the
-/// table-name suffix bumped too, or an older record would decode into the wrong
-/// fields.
+/// `schema_version` lives in the value, not the key, and decode uses
+/// [`postcard::take_from_bytes`], which tolerates trailing bytes. Any field
+/// change, appended or not, bumps `schema_version` and the table-name suffix:
+/// the exact-match version check refuses an older row, a refused row fails the
+/// point lookup, and a missing table reads as empty. A field inserted anywhere
+/// but the end also shifts every field after it.
 ///
 /// **The field order is the wire order.** Postcard encodes struct fields
 /// positionally and unnamed, so reordering or retyping a field silently
@@ -134,6 +137,8 @@ struct StoredBuyerPoolState {
     token: [u8; 20],
     deposit: [u8; 32],
     lanes: Vec<StoredLane>,
+    /// [`BuyerPoolState::redeemed_elsewhere`], big-endian.
+    redeemed_elsewhere: [u8; 32],
 }
 
 impl From<&BuyerPoolState> for StoredBuyerPoolState {
@@ -159,6 +164,7 @@ impl From<&BuyerPoolState> for StoredBuyerPoolState {
             token: state.token.into(),
             deposit: state.deposit.to_be_bytes(),
             lanes,
+            redeemed_elsewhere: state.redeemed_elsewhere().to_be_bytes(),
         }
     }
 }
@@ -197,6 +203,7 @@ impl StoredBuyerPoolState {
             Address::from(self.token),
             U256::from_be_bytes(self.deposit),
             lanes,
+            U256::from_be_bytes(self.redeemed_elsewhere),
         ))
     }
 }
@@ -627,8 +634,27 @@ impl<'a> BuyerPoolTable<'a> {
         })
     }
 
-    /// The shared body of [`Self::advance_progress`] and
-    /// [`Self::rebase_progress`]: owner-index CAS, then `apply` to the
+    /// Atomically record `lane`'s on-chain watermark in `owner`'s pool
+    /// ([`BuyerPoolState::seed_lane`]), inside the same single write
+    /// transaction and owner-index CAS as [`Self::advance_progress`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] / [`StoreError::Codec`] on I/O or codec
+    /// failure.
+    pub fn seed_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: LaneKey,
+        bytes: U256,
+        amount: U256,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        self.write_lane(owner, pool_id, |state| state.seed_lane(lane, bytes, amount))
+    }
+
+    /// The shared body of [`Self::advance_progress`],
+    /// [`Self::seed_progress`] and [`Self::rebase_progress`]: owner-index CAS, then `apply` to the
     /// committed row and write it back, all in one durable write transaction.
     fn write_lane(
         &self,
@@ -876,7 +902,7 @@ mod tests {
             signer: Address::repeat_byte(0x88),
             provider: Address::repeat_byte(0x99),
         };
-        let mut s = BuyerPoolState::new(
+        let mut s = BuyerPoolState::adopt(
             pool_id,
             Deployment {
                 chain_id: 0x5555_5555_5555_5555,
@@ -885,6 +911,7 @@ mod tests {
             owner,
             Address::repeat_byte(0x33),
             U256::from(0xAAAA_AAAA_AAAA_AAAAu64),
+            U256::from(0xF0F0_F0F0_F0F0_F0F0u64),
         );
         s.advance_lane(
             lane_a,
@@ -901,7 +928,7 @@ mod tests {
 
     use alloy::primitives::B256;
 
-    /// Postcard encoding of [`golden_state`] (schema v3). Two lanes, sorted
+    /// Postcard encoding of [`golden_state`] (schema v4). Two lanes, sorted
     /// by `(signer, provider)` for a deterministic encoding regardless of
     /// `HashMap` iteration order.
     ///
@@ -910,7 +937,7 @@ mod tests {
     /// `last_amount` already says which chain the lane resumes on — there is no
     /// counter here to keep, and none to get wrong.
     const GOLDEN_RECORD_HEX: &str = concat!(
-        "03",                                                               // schema_version (varint)
+        "04",                                                               // schema_version (varint)
         "1111111111111111111111111111111111111111111111111111111111111111", // pool_id
         "5555555555555555",                                                 // chain_id (big-endian)
         "9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c",                         // payment_pool
@@ -926,6 +953,7 @@ mod tests {
         "9999999999999999999999999999999999999999", // lane b: provider
         "000000000000000000000000000000000000000000000000cccccccccccccccc", // lane b: last_amount
         "000000000000000000000000000000000000000000000000eeeeeeeeeeeeeeee", // lane b: last_bytes
+        "000000000000000000000000000000000000000000000000f0f0f0f0f0f0f0f0", // redeemed_elsewhere
     );
 
     /// Lowercase hex of `bytes`. `fold` + `write!` rather than the obvious
@@ -990,6 +1018,53 @@ mod tests {
         anyhow::ensure!(tbl(&db).load_all()?.pools.is_empty());
         anyhow::ensure!(tbl(&db).get_by_owner(state(1).owner)?.is_none());
         anyhow::ensure!(tbl(&db).get_by_pool_id(state(1).pool_id)?.is_none());
+        Ok(())
+    }
+
+    /// A lane seeded from chain on an adopted row takes its watermark out of
+    /// the redeemed spend no lane accounts for, once: a second seed of the same
+    /// lane only advances it.
+    #[test]
+    fn seed_progress_moves_a_new_lanes_watermark_out_of_the_redeemed_spend() -> anyhow::Result<()> {
+        let (_d, db) = db()?;
+        let base = state(1);
+        let s = BuyerPoolState::hydrate(
+            base.pool_id,
+            base.deployment,
+            base.owner,
+            base.token,
+            base.deposit,
+            base.lanes().collect(),
+            U256::from(100u64),
+        );
+        tbl(&db).record(&s)?;
+        let lane = LaneKey {
+            pool_id: s.pool_id,
+            signer: Address::repeat_byte(0x61),
+            provider: Address::repeat_byte(0x71),
+        };
+        let seed = |amount: u64| {
+            tbl(&db).seed_progress(
+                s.owner,
+                s.pool_id,
+                lane,
+                U256::from(amount * 1000),
+                U256::from(amount),
+            )
+        };
+        anyhow::ensure!(matches!(seed(60)?, AdvanceOutcome::Advanced));
+        let row = tbl(&db)
+            .get_by_pool_id(s.pool_id)?
+            .ok_or_else(|| anyhow::anyhow!("row"))?;
+        anyhow::ensure!(row.redeemed_elsewhere() == U256::from(40u64));
+        let base = s.committed_amount();
+        anyhow::ensure!(row.pool_spend() == base + U256::from(100u64));
+        anyhow::ensure!(matches!(seed(70)?, AdvanceOutcome::Advanced));
+        let row = tbl(&db)
+            .get_by_pool_id(s.pool_id)?
+            .ok_or_else(|| anyhow::anyhow!("row"))?;
+        anyhow::ensure!(row.redeemed_elsewhere() == U256::from(40u64));
+        anyhow::ensure!(row.pool_spend() == base + U256::from(110u64));
         Ok(())
     }
 

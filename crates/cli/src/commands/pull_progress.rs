@@ -1,8 +1,9 @@
 //! Multi-bar progress for `decdn bundle pull`.
 //!
 //! A `bundle pull` run fetches many blobs concurrently, so it renders a stack of
-//! per-file bars — one per in-flight pull, bounded by `--jobs` — above one bottom
-//! **total** bar, all sharing an [`indicatif::MultiProgress`], under a one-line
+//! per-file bars — one per pull that holds a `--jobs` slot, plus any that wait
+//! for a sibling's donor chunks — above one bottom **total** bar, all sharing
+//! an [`indicatif::MultiProgress`], under a one-line
 //! header naming the run and its download vs on-disk sizes. A finished file's bar
 //! clears, so only active pulls stay on screen.
 //!

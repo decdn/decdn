@@ -73,8 +73,10 @@ pub struct BundlePullArgs {
     /// Maximum concurrent entry fetches across the whole run. Each distinct blob
     /// is one unit of work holding one slot: a plain whole-file entry, or a
     /// range-dedup entry across its complement drive, donor splice, and any
-    /// re-fetch. A byte range a sibling entry already holds is spliced from disk,
-    /// not fetched, so it never takes a slot of its own.
+    /// re-fetch. A range-dedup entry that only waits for a sibling to finish the
+    /// chunks it splices gives its slot to a queued entry until then. A byte
+    /// range a sibling entry already holds is spliced from disk, not fetched, so
+    /// it never takes a slot of its own.
     #[arg(long, value_name = "N", default_value_t = 4)]
     pub jobs: usize,
 
