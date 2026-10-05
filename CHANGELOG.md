@@ -28,6 +28,14 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`decdn-cache` network origins bind to the runtime they are built on
+  (#1675).** `HttpOrigin::new`, `HttpOrigin::new_with_user_agent`,
+  `HttpOrigin::parse`, `S3Origin::new` and `S3Origin::from_parts` capture the
+  current tokio runtime, and every request send runs there, so build them on
+  a runtime that outlives every fetch. Each fails outside a tokio runtime, so
+  a caller that built an `HttpOrigin` from synchronous code builds it inside
+  the runtime instead. `S3Origin::from_parts` returns `anyhow::Result<Self>`;
+  a caller adds `?`.
 - **Buyer pool rows keep an adopted pool's redeemed spend, and both buyer
   tables move to `_v6` (#2292).** A row adopted from chain has no lanes, so
   the pool's `totalRedeemed` is its only record of what other lanes paid
@@ -941,10 +949,8 @@ since project inception and will roll into the first tagged release.
   request send there. Each pooled connection outlives the pull leg that opened
   it, and `HttpOrigin` reuses keep-alive connections. A request task that
   panics, or that the shutting-down main runtime cancels, fails as a
-  permanent origin fault. `HttpOrigin::new`,
-  `HttpOrigin::new_with_user_agent`, `HttpOrigin::parse` and
-  `S3Origin::from_parts` fail outside a tokio runtime, and
-  `S3Origin::from_parts` returns `anyhow::Result<Self>`.
+  permanent origin fault. The constructor changes are under Changed
+  (BREAKING).
 - **The deployment preflight rejects every sibling contract of the
   `PaymentPool` (#2279).** Startup identified `blockchain.payment_pool_address`
   by calling `usdc()`, which `FeeRouter` and `BuybackBurner` also answer. A

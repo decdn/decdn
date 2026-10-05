@@ -230,6 +230,17 @@ impl S3Origin {
     /// the implicit path — older SDK versions panicked when no
     /// `BehaviorVersion` was set; current versions surface a runtime error.
     /// Either way, the explicit call site cannot regress.
+    ///
+    /// **Runtime:** the origin's pooled connections live on the tokio
+    /// runtime this future runs on, and every later request send runs there
+    /// (see `origin::io_runtime`). Build it on a runtime that outlives every
+    /// fetch — the node's main runtime — never on a short-lived one such as a
+    /// pull leg's.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a `Static` credential carries an empty key or secret, or
+    /// when this future does not run inside a tokio runtime.
     pub async fn new(cfg: &S3OriginConfig) -> anyhow::Result<Self> {
         // Defense in depth against a config-resolver gap or a downstream
         // caller that bypasses `decdn_common::config::resolve_origin` and
