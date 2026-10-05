@@ -84,7 +84,7 @@ use decdn_incentive::sig_canon::is_high_s;
 use decdn_incentive::{
     CheckpointKey, KeyedCheckpointStore, LaneKey, LaneState, PoolId, PoolStateStore, StoreError,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{Instrument as _, debug, error, info, warn};
 
@@ -103,20 +103,51 @@ use crate::pool_view::{Lifecycle, PoolProjection, PoolStatus, SignerAuthorizatio
 /// lanes without backpressuring the voucher-accept path.
 pub const REDEEM_HINT_CAPACITY: usize = 256;
 
-/// How long the admit-path `getPool` suppresses a repeat call for a pool it
-/// just found not-servable (nonexistent / `Closed`) or that errored. A
-/// not-servable pool never folds into the projection, so its `snapshot` stays
-/// `None`; without this a client re-sending its capability on every request would
-/// drive one `getPool` per request against the same dead pool. On expiry the pool
-/// is re-checked once — the window is short enough that a pool opened after a
-/// negative result still becomes servable within it, long enough to collapse a
-/// request flood to ~one call per pool per window.
-const RESOLVE_NEGATIVE_TTL: Duration = Duration::from_mins(1);
+/// How long the admit path suppresses a repeat `getPool` for a pool it just
+/// found not-servable (nonexistent / `Closed`). A not-servable pool never folds
+/// into the projection, so its `snapshot` stays `None`; without this a client
+/// re-sending its capability on every request would drive one `getPool` per
+/// request against the same dead pool. On expiry the pool is re-checked once
+/// — the window is short enough that a pool opened after a negative result still
+/// becomes servable within it, long enough to collapse a request flood to ~one
+/// call per pool per window.
+const RESOLVE_VERDICT_TTL: Duration = Duration::from_mins(1);
+
+/// How long the admit path suppresses a repeat `getPool` for a pool whose read
+/// faulted (an RPC error or a `timed` timeout). A fault says nothing about the
+/// pool, so the window is far shorter than [`RESOLVE_VERDICT_TTL`]: a live pool
+/// is admitted again a few seconds after the RPC recovers. It is not zero: in an
+/// outage a request inside the window refuses at once instead of waiting out a
+/// read of its own. The window starts when the read ends; while a read is in
+/// flight, other requests for that pool wait on it (see [`ReadSlot`]), so an
+/// outage costs one read per pool at a time.
+const RESOLVE_FAULT_TTL: Duration = Duration::from_secs(5);
+
+/// Why a pool sits in the admit-path negative cache. The reason picks the
+/// suppression window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NegativeReason {
+    /// `getPool` answered: the pool is absent or `Closed`.
+    Verdict,
+    /// `getPool` failed or timed out; nothing is known about the pool.
+    Fault,
+}
+
+impl NegativeReason {
+    /// How long an entry with this reason suppresses a repeat `getPool`.
+    const fn ttl(self) -> Duration {
+        match self {
+            Self::Verdict => RESOLVE_VERDICT_TTL,
+            Self::Fault => RESOLVE_FAULT_TTL,
+        }
+    }
+}
 
 /// Cap on the admit-path negative cache, bounding its memory against a flood of
-/// distinct nonexistent pool ids. At the cap an insert first prunes expired
-/// entries; a flood of live distinct negatives past that simply pays one
-/// `getPool` per admit rather than growing the cache without limit.
+/// distinct nonexistent pool ids. At the cap an insert first prunes lapsed
+/// entries; if the cache is still full it skips the insert, so a flood of
+/// distinct in-window negatives past the cap pays one `getPool` per admit rather
+/// than growing the cache without limit.
 const RESOLVE_NEGATIVE_CACHE_MAX: usize = 4096;
 
 /// How long an admit-path `getAuthorization` read stays fresh in the signer-auth
@@ -809,7 +840,7 @@ impl PoolSettlementSink {
 /// scan, so its owner is absent from the projection even though the pool is live.
 /// Rather than fail open on that gap, [`status`](crate::pool_view::PoolView::status) does ONE `getPool` at
 /// admission — a read the admission path tolerates (it may block) — folds a
-/// servable pool into the projection, and refuses an absent, closed, or errored
+/// servable pool into the projection, and refuses an absent, closed, or faulted
 /// pool. Every admit-path chain read (`getPool` and the signer's
 /// `getAuthorization`) runs under `chain_events::timed`'s default bound, so a
 /// hung read times out and takes the fault path instead of stalling admission.
@@ -820,10 +851,13 @@ impl PoolSettlementSink {
 /// projection ONLY and never blocks on a `getPool` — a chain read at a voucher
 /// boundary would stall delivery.
 ///
-/// A short-TTL negative cache suppresses a repeat
-/// `getPool` for a pool just found not-servable or that errored, so a client
-/// re-requesting the same dead pool every request cannot drive one `getPool` per
-/// request.
+/// A short-TTL negative cache suppresses a repeat `getPool` for a pool just
+/// found not-servable (`RESOLVE_VERDICT_TTL`) or whose read faulted (the far
+/// shorter `RESOLVE_FAULT_TTL`), so a client re-requesting the same dead pool
+/// every request cannot drive one `getPool` per request, and one failed read does
+/// not refuse a live pool for the full verdict window. Reads are coalesced per
+/// pool: a request that finds a `getPool` in flight for its pool waits for it
+/// and reads its result from the projection or the negative cache.
 pub struct ResolvingPoolView<P: Provider + Clone> {
     /// The wallet/RPC-backed `PaymentPool` binding for the admit-path reads
     /// (`getPool`, `getAuthorization`).
@@ -831,10 +865,15 @@ pub struct ResolvingPoolView<P: Provider + Clone> {
     /// The event-fed projection this view reads first and folds a resolved pool
     /// into. Shared with the settlement watcher's sink (the authoritative writer).
     projection: PoolProjection,
-    /// Pool id → last-negative instant for pools recently found not-servable or
-    /// that errored. The guard is held only to read/insert one entry, never across
-    /// the `getPool` await.
-    negative: Mutex<HashMap<B256, Instant>>,
+    /// Pool id → (why, when) for pools recently found not-servable or whose read
+    /// faulted. The reason picks the entry's window ([`NegativeReason::ttl`]).
+    /// The guard is held only to read/insert one entry, never across the
+    /// `getPool` await.
+    negative: Mutex<HashMap<B256, (NegativeReason, Instant)>>,
+    /// Pool id → a receiver whose channel closes when the in-flight admit
+    /// `getPool` for that pool ends. See [`ReadSlot`]. The guard is held only to
+    /// read/insert one entry, never across the `getPool` await.
+    inflight: InflightReads,
     /// `(pool_id, signer)` → (last-observed authorization, observed-at instant),
     /// for the admit-path signer confirm. An entry younger than
     /// [`SIGNER_AUTH_TTL`] is served without a `getAuthorization`. The guard is
@@ -861,6 +900,7 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
             contract,
             projection,
             negative: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
             auth_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -893,24 +933,12 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
     }
 }
 
-#[async_trait::async_trait]
-impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPoolView<P> {
-    async fn status(&self, pool_id: B256) -> Option<PoolStatus> {
-        // Fast path: the event fold already knows this pool — no chain call.
-        if let Some(status) = self.projection.snapshot(pool_id) {
-            return Some(status);
-        }
-        // A pool recently found not-servable (or that errored) is suppressed for
-        // the negative-cache window, so a re-request flood cannot storm `getPool`.
-        {
-            let guard = self
-                .negative
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if negative_cache_hit(&guard, pool_id) {
-                return None;
-            }
-        }
+impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
+    /// Read `pool_id` on-chain once and record the result: fold a servable pool
+    /// into the projection, or negative-cache an absent / `Closed` pool as a
+    /// [`NegativeReason::Verdict`] and a failed read as a
+    /// [`NegativeReason::Fault`]. The caller holds the pool's [`ReadSlot::Lead`].
+    async fn resolve(&self, pool_id: B256) -> Option<PoolStatus> {
         // Bounded: the alloy HTTP provider sets no timeout of its own, so a hung
         // read times out here and takes the fault path below.
         let pool = match timed(None, "admit getPool", self.contract.getPool(pool_id).call()).await {
@@ -919,14 +947,14 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
                 warn!(
                     error = %sanitize_err_chain(&err),
                     %pool_id,
-                    suppressed_for = ?RESOLVE_NEGATIVE_TTL,
+                    suppressed_for = ?RESOLVE_FAULT_TTL,
                     "admit getPool failed; refusing this pool until the negative cache lapses"
                 );
                 let mut guard = self
                     .negative
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                remember_negative(&mut guard, pool_id);
+                remember_negative(&mut guard, pool_id, NegativeReason::Fault);
                 return None;
             }
         };
@@ -936,13 +964,13 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
                 .negative
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            remember_negative(&mut guard, pool_id);
+            remember_negative(&mut guard, pool_id, NegativeReason::Verdict);
             return None;
         };
         self.projection
             .record_resolved(pool_id, pool.owner, U256::from(pool.deposit), lifecycle);
-        // A later reopen at the same id (or a transient error that has since
-        // cleared) must not stay suppressed once the pool actually resolves.
+        // The pool resolved: drop its lapsed negative entry. The projection
+        // answers for it from here on.
         {
             let mut guard = self
                 .negative
@@ -951,6 +979,43 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
             guard.remove(&pool_id);
         }
         self.projection.snapshot(pool_id)
+    }
+}
+
+#[async_trait::async_trait]
+impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPoolView<P> {
+    async fn status(&self, pool_id: B256) -> Option<PoolStatus> {
+        loop {
+            // Fast path: the event fold already knows this pool — no chain call.
+            if let Some(status) = self.projection.snapshot(pool_id) {
+                return Some(status);
+            }
+            // A pool recently found not-servable, or whose read faulted, is
+            // suppressed for its reason's window, so a re-request flood cannot
+            // storm `getPool`.
+            {
+                let guard = self
+                    .negative
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(reason) = negative_cache_hit(&guard, pool_id) {
+                    debug!(
+                        %pool_id,
+                        ?reason,
+                        "admit getPool suppressed by the negative cache; refusing"
+                    );
+                    return None;
+                }
+            }
+            match claim_read(&self.inflight, pool_id) {
+                ReadSlot::Lead(_read) => return self.resolve(pool_id).await,
+                // The channel never carries a value, so `changed` returns only
+                // when the reader's guard drops; then re-check what it wrote.
+                ReadSlot::Wait(mut done) => {
+                    let _closed = done.changed().await;
+                }
+            }
+        }
     }
 
     async fn cached_status(&self, pool_id: B256) -> Option<PoolStatus> {
@@ -1039,23 +1104,91 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
     }
 }
 
-/// Whether `pool_id` is in the negative cache and still fresh — the admit path
-/// then skips the `getPool`. Pure, so the TTL gate is unit-testable without a
-/// provider.
-fn negative_cache_hit(cache: &HashMap<B256, Instant>, pool_id: B256) -> bool {
+/// Why `pool_id` is suppressed, when its negative-cache entry is still inside its
+/// reason's window — the admit path then skips the `getPool`. `None` for an
+/// absent or lapsed entry. Provider-free, so the TTL gate is unit-testable.
+fn negative_cache_hit(
+    cache: &HashMap<B256, (NegativeReason, Instant)>,
+    pool_id: B256,
+) -> Option<NegativeReason> {
     cache
         .get(&pool_id)
-        .is_some_and(|at| at.elapsed() < RESOLVE_NEGATIVE_TTL)
+        .filter(|(reason, at)| at.elapsed() < reason.ttl())
+        .map(|(reason, _)| *reason)
 }
 
-/// Remember `pool_id` as recently not-servable / errored. At the cache cap, prune
-/// expired entries first so a flood of distinct nonexistent ids cannot grow the
-/// map without bound. Pure, so the cap-prune is unit-testable.
-fn remember_negative(cache: &mut HashMap<B256, Instant>, pool_id: B256) {
+/// Remember `pool_id` as recently not-servable or faulted, per `reason`. At the
+/// cache cap, prune lapsed entries first; if the cache is still full, skip the
+/// insert, so a flood of distinct ids cannot grow the map past
+/// [`RESOLVE_NEGATIVE_CACHE_MAX`]. Provider-free, so the cap-prune is
+/// unit-testable.
+fn remember_negative(
+    cache: &mut HashMap<B256, (NegativeReason, Instant)>,
+    pool_id: B256,
+    reason: NegativeReason,
+) {
     if cache.len() >= RESOLVE_NEGATIVE_CACHE_MAX {
-        cache.retain(|_, at| at.elapsed() < RESOLVE_NEGATIVE_TTL);
+        cache.retain(|_, (reason, at)| at.elapsed() < reason.ttl());
     }
-    cache.insert(pool_id, Instant::now());
+    if cache.len() < RESOLVE_NEGATIVE_CACHE_MAX || cache.contains_key(&pool_id) {
+        cache.insert(pool_id, (reason, Instant::now()));
+    }
+}
+
+/// Pool id → a receiver whose channel closes when that pool's in-flight admit
+/// `getPool` ends.
+type InflightReads = Mutex<HashMap<B256, watch::Receiver<()>>>;
+
+/// A request's place in the admit `getPool` for one pool. At most one request
+/// per pool reads at a time; the rest wait for it.
+enum ReadSlot<'a> {
+    /// No read is in flight: this request reads, and the guard ends the read.
+    Lead(InflightRead<'a>),
+    /// A read is in flight: the receiver's `changed` returns when it ends.
+    Wait(watch::Receiver<()>),
+}
+
+/// Ends a pool's in-flight read when dropped: it removes the pool's entry, then
+/// drops the sender, which wakes every waiter. A cancelled reader ends the read
+/// the same way, so a waiter then re-checks and takes over the read.
+struct InflightRead<'a> {
+    /// The map this read is registered in.
+    inflight: &'a InflightReads,
+    /// The pool being read.
+    pool_id: B256,
+    /// Never sent on. Dropped after [`Drop::drop`] removes the entry, which
+    /// closes the channel.
+    _done: watch::Sender<()>,
+}
+
+impl Drop for InflightRead<'_> {
+    fn drop(&mut self) {
+        self.inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.pool_id);
+    }
+}
+
+/// Join the in-flight read for `pool_id`, or start one.
+fn claim_read(inflight: &InflightReads, pool_id: B256) -> ReadSlot<'_> {
+    let mut guard = inflight
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A closed channel means its read already ended: start a new one rather
+    // than wait on it, which would return at once and spin the caller's loop.
+    if let Some(done) = guard.get(&pool_id)
+        && done.has_changed().is_ok()
+    {
+        return ReadSlot::Wait(done.clone());
+    }
+    let (done, waiters) = watch::channel(());
+    guard.insert(pool_id, waiters);
+    ReadSlot::Lead(InflightRead {
+        inflight,
+        pool_id,
+        _done: done,
+    })
 }
 
 /// The serve-path serve status a resolved `getPool` snapshot maps to, or `None`
@@ -2510,45 +2643,143 @@ mod tests {
         );
     }
 
+    /// An instant `age` in the past, for the freshness gate.
+    fn aged(age: Duration) -> Instant {
+        Instant::now().checked_sub(age).unwrap_or_else(Instant::now)
+    }
+
+    /// An instant past the fault window but inside the verdict window.
+    fn between_windows() -> Instant {
+        aged(RESOLVE_FAULT_TTL + Duration::from_secs(1))
+    }
+
+    /// An instant past both windows.
     fn stale_instant() -> Instant {
-        // An instant older than the negative-cache TTL, for the freshness gate.
-        Instant::now()
-            .checked_sub(RESOLVE_NEGATIVE_TTL + Duration::from_secs(1))
-            .unwrap_or_else(Instant::now)
+        aged(RESOLVE_VERDICT_TTL + Duration::from_secs(1))
     }
 
     #[test]
     fn negative_cache_hit_only_for_a_fresh_entry() {
-        let mut cache: HashMap<B256, Instant> = HashMap::new();
+        let mut cache = HashMap::new();
         let id = B256::repeat_byte(0x33);
-        assert!(!negative_cache_hit(&cache, id), "an absent id is not a hit");
-        remember_negative(&mut cache, id);
-        assert!(
+        assert_eq!(
             negative_cache_hit(&cache, id),
-            "a just-recorded id is a hit"
+            None,
+            "an absent id is not a hit"
         );
-        cache.insert(id, stale_instant());
-        assert!(
-            !negative_cache_hit(&cache, id),
-            "an entry past the TTL is re-checked, not suppressed"
+        for reason in [NegativeReason::Verdict, NegativeReason::Fault] {
+            remember_negative(&mut cache, id, reason);
+            assert_eq!(
+                negative_cache_hit(&cache, id),
+                Some(reason),
+                "a just-recorded id is a hit that names its reason"
+            );
+            cache.insert(id, (reason, stale_instant()));
+            assert_eq!(
+                negative_cache_hit(&cache, id),
+                None,
+                "an entry past its window is re-checked, not suppressed"
+            );
+        }
+    }
+
+    /// A fault lapses long before a verdict: an entry of the same age suppresses
+    /// a repeat `getPool` as a verdict but not as a fault.
+    #[test]
+    fn negative_cache_fault_lapses_before_a_verdict() {
+        let mut cache = HashMap::new();
+        let id = B256::repeat_byte(0x34);
+        cache.insert(id, (NegativeReason::Fault, between_windows()));
+        assert_eq!(
+            negative_cache_hit(&cache, id),
+            None,
+            "a fault past its short window is re-checked"
+        );
+        cache.insert(id, (NegativeReason::Verdict, between_windows()));
+        assert_eq!(
+            negative_cache_hit(&cache, id),
+            Some(NegativeReason::Verdict),
+            "a verdict of the same age still suppresses"
         );
     }
 
     #[test]
     fn remember_negative_prunes_expired_entries_at_the_cap() {
-        let mut cache: HashMap<B256, Instant> = HashMap::new();
+        let mut cache = HashMap::new();
         // Fill to the cap with stale entries, then record one more: the insert
         // prunes the expired ones instead of growing past the cap.
         for i in 0..RESOLVE_NEGATIVE_CACHE_MAX {
             let id = B256::from(U256::from(i).to_be_bytes::<32>());
-            cache.insert(id, stale_instant());
+            cache.insert(id, (NegativeReason::Verdict, stale_instant()));
         }
         assert_eq!(cache.len(), RESOLVE_NEGATIVE_CACHE_MAX);
-        remember_negative(&mut cache, B256::repeat_byte(0xff));
+        remember_negative(&mut cache, B256::repeat_byte(0xff), NegativeReason::Verdict);
         assert_eq!(
             cache.len(),
             1,
             "the cap-prune drops every expired entry, leaving only the fresh insert"
+        );
+    }
+
+    /// The cap-prune applies each entry's own window: a fault past its short
+    /// window goes, a verdict of the same age stays.
+    #[test]
+    fn remember_negative_prunes_each_entry_by_its_reason() {
+        let mut cache = HashMap::new();
+        let mut verdicts = 0;
+        for i in 0..RESOLVE_NEGATIVE_CACHE_MAX {
+            let id = B256::from(U256::from(i).to_be_bytes::<32>());
+            let reason = if i % 2 == 0 {
+                verdicts += 1;
+                NegativeReason::Verdict
+            } else {
+                NegativeReason::Fault
+            };
+            cache.insert(id, (reason, between_windows()));
+        }
+        remember_negative(&mut cache, B256::repeat_byte(0xff), NegativeReason::Fault);
+        assert_eq!(
+            cache.len(),
+            verdicts + 1,
+            "the prune keeps every in-window verdict and drops every lapsed fault"
+        );
+        assert!(
+            cache
+                .values()
+                .filter(|(_, at)| at.elapsed() >= RESOLVE_FAULT_TTL)
+                .all(|(reason, _)| *reason == NegativeReason::Verdict),
+            "no lapsed fault survives the prune"
+        );
+    }
+
+    /// A cache full of in-window entries skips a new insert rather than grow
+    /// past the cap; an existing entry is still refreshed.
+    #[test]
+    fn remember_negative_skips_the_insert_when_full_of_fresh_entries() {
+        let mut cache = HashMap::new();
+        for i in 0..RESOLVE_NEGATIVE_CACHE_MAX {
+            let id = B256::from(U256::from(i).to_be_bytes::<32>());
+            remember_negative(&mut cache, id, NegativeReason::Verdict);
+        }
+        let newcomer = B256::repeat_byte(0xff);
+        remember_negative(&mut cache, newcomer, NegativeReason::Fault);
+        assert_eq!(
+            cache.len(),
+            RESOLVE_NEGATIVE_CACHE_MAX,
+            "the map stays at the cap"
+        );
+        assert_eq!(
+            negative_cache_hit(&cache, newcomer),
+            None,
+            "the newcomer is not cached"
+        );
+
+        let resident = B256::from(U256::from(0u8).to_be_bytes::<32>());
+        remember_negative(&mut cache, resident, NegativeReason::Fault);
+        assert_eq!(
+            negative_cache_hit(&cache, resident),
+            Some(NegativeReason::Fault),
+            "a resident entry is still overwritten"
         );
     }
 
@@ -2627,42 +2858,57 @@ mod tests {
         Ok(())
     }
 
-    /// Admit path (ii): an absent (`owner == 0`) or `Closed` pool the `getPool`
-    /// returns is refused (`None`) and never folded, and the negative cache then
-    /// suppresses a repeat `getPool`.
+    /// Admit path (ii, verdict): an absent (`owner == 0`) or `Closed` pool the
+    /// `getPool` returns is refused (`None`), never folded, and negative-cached as
+    /// a `Verdict`. The entry still suppresses a repeat `getPool` past the fault
+    /// window: a queued live answer is left unread and the pool stays refused.
     #[tokio::test]
     async fn resolving_status_refuses_absent_pool_and_caches_negative() -> Result<()> {
         use crate::pool_view::PoolView;
+        use alloy::sol_types::SolValue;
 
-        let (view, projection, asserter) =
-            mocked_getpool_view(Some(pool(Address::ZERO, PaymentPool::Status::Open, 0)));
-        let pool_id = B256::repeat_byte(0x55);
+        let owner = Address::from([7u8; 20]);
+        for (case, dead) in [
+            ("absent", pool(Address::ZERO, PaymentPool::Status::Open, 0)),
+            ("closed", pool(owner, PaymentPool::Status::Closed, 0)),
+        ] {
+            let (view, projection, asserter) = mocked_getpool_view(Some(dead));
+            let pool_id = B256::repeat_byte(0x55);
 
-        assert!(
-            view.status(pool_id).await.is_none(),
-            "an absent (zero-owner) pool is refused"
-        );
-        assert!(
-            projection.snapshot(pool_id).is_none(),
-            "an absent pool is never folded into the projection"
-        );
-        assert!(
+            assert!(view.status(pool_id).await.is_none(), "{case}: refused");
+            assert!(
+                projection.snapshot(pool_id).is_none(),
+                "{case}: never folded into the projection"
+            );
+            let reason = view
+                .negative
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&pool_id)
+                .map(|(reason, _)| *reason);
+            assert_eq!(reason, Some(NegativeReason::Verdict), "{case}: a verdict");
+
+            // Age the entry past the fault window and queue a live answer: a
+            // verdict still suppresses, so the answer is never read.
             view.negative
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(&pool_id),
-            "the refusal is remembered in the negative cache"
-        );
-        // The negative cache short-circuits before any getPool — the queue stays
-        // empty (only the first response was consumed), so no second call is made.
-        assert!(view.status(pool_id).await.is_none());
-        assert_eq!(asserter.read_q().len(), 0, "no second getPool was issued");
+                .insert(pool_id, (NegativeReason::Verdict, between_windows()));
+            asserter.push_success(&Bytes::from(
+                pool(owner, PaymentPool::Status::Open, 0).abi_encode(),
+            ));
+            assert!(
+                view.status(pool_id).await.is_none(),
+                "{case}: still refused"
+            );
+            assert_eq!(asserter.read_q().len(), 1, "{case}: no second getPool");
+        }
         Ok(())
     }
 
-    /// Admit path (ii, errored): a `getPool` RPC fault refuses the pool (`None`)
-    /// and remembers it in the negative cache, so a re-request flood cannot storm
-    /// `getPool`.
+    /// Admit path (ii, fault): a `getPool` RPC error refuses the pool (`None`) and
+    /// negative-caches it as a `Fault`, so a re-request flood inside
+    /// `RESOLVE_FAULT_TTL` cannot storm `getPool`.
     #[tokio::test]
     async fn resolving_status_refuses_on_getpool_error_and_caches_negative() -> Result<()> {
         use crate::pool_view::PoolView;
@@ -2676,12 +2922,52 @@ mod tests {
             "a getPool fault refuses the pool"
         );
         assert!(projection.snapshot(pool_id).is_none());
+        let reason = view
+            .negative
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&pool_id)
+            .map(|(reason, _)| *reason);
+        assert_eq!(
+            reason,
+            Some(NegativeReason::Fault),
+            "an RPC error is negative-cached as a fault"
+        );
+        Ok(())
+    }
+
+    /// A live pool refused on a fault is admitted once the fault window lapses
+    /// and the RPC answers: the re-read folds it and drops the negative entry.
+    #[tokio::test]
+    async fn resolving_status_admits_a_faulted_pool_after_the_rpc_recovers() -> Result<()> {
+        use crate::pool_view::PoolView;
+        use alloy::sol_types::SolValue;
+
+        let (view, projection, asserter) = mocked_getpool_view(None);
+        let pool_id = B256::repeat_byte(0x67);
+        let owner = Address::from([9u8; 20]);
+        assert!(view.status(pool_id).await.is_none(), "the fault refuses");
+
+        view.negative
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(pool_id, (NegativeReason::Fault, between_windows()));
+        asserter.push_success(&Bytes::from(
+            pool(owner, PaymentPool::Status::Open, 0).abi_encode(),
+        ));
+        assert!(view.status(pool_id).await.is_some(), "the re-read admits");
+        assert_eq!(
+            projection.snapshot(pool_id).map(|s| s.owner),
+            Some(owner),
+            "the pool is folded"
+        );
         assert!(
-            view.negative
+            !view
+                .negative
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains_key(&pool_id),
-            "an errored getPool is remembered in the negative cache"
+            "the resolve drops the negative entry"
         );
         Ok(())
     }
@@ -2985,18 +3271,26 @@ mod tests {
     /// `#[tokio::test(start_paused = true)]` so the `timed` bound fires on
     /// virtual time.
     fn hanging_view() -> ResolvingPoolView<impl Provider + Clone + 'static> {
-        ResolvingPoolView::new(
-            PaymentPool::new(
-                Address::ZERO,
-                crate::chain_events::test_support::hanging_provider(),
-            ),
+        counting_hanging_view().0
+    }
+
+    /// A [`hanging_view`] plus a count of the chain reads dispatched to it.
+    fn counting_hanging_view() -> (
+        ResolvingPoolView<impl Provider + Clone + 'static>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (provider, calls) = crate::chain_events::test_support::counting_hanging_provider();
+        let view = ResolvingPoolView::new(
+            PaymentPool::new(Address::ZERO, provider),
             PoolProjection::new(),
-        )
+        );
+        (view, calls)
     }
 
     /// A hung admit `getPool` times out and takes the fault path: the pool is
-    /// refused and negative-cached, so the next request does not wait again.
-    /// The WARN carries the timeout and the suppression window.
+    /// refused and negative-cached as a fault, so a request inside
+    /// `RESOLVE_FAULT_TTL` refuses at once instead of waiting again. The WARN
+    /// carries the timeout and the fault window.
     #[tokio::test(start_paused = true)]
     async fn admit_getpool_hang_refuses_within_the_bound() -> Result<()> {
         use crate::chain_events::DEFAULT_RPC_CALL_TIMEOUT;
@@ -3018,12 +3312,16 @@ mod tests {
             DEFAULT_RPC_CALL_TIMEOUT,
             "the admit read uses the default bound"
         );
-        assert!(
-            view.negative
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(&pool_id),
-            "the timed-out pool is negative-cached"
+        let reason = view
+            .negative
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&pool_id)
+            .map(|(reason, _)| *reason);
+        assert_eq!(
+            reason,
+            Some(NegativeReason::Fault),
+            "the timed-out pool is negative-cached as a fault"
         );
         assert!(
             bounded("admit getPool", view.status(pool_id))
@@ -3045,10 +3343,125 @@ mod tests {
             "the WARN keeps the failure class: {line}"
         );
         assert!(
-            line.contains("suppressed_for=60s"),
-            "the WARN names the negative-cache window: {line}"
+            line.contains("suppressed_for=5s"),
+            "the WARN names the fault window: {line}"
         );
         Ok(())
+    }
+
+    /// Concurrent requests for one pool share one in-flight `getPool`: they all
+    /// end when the single hung read times out, and only that read reaches the
+    /// RPC.
+    #[tokio::test(start_paused = true)]
+    async fn admit_getpool_coalesces_concurrent_reads() {
+        use crate::chain_events::test_support::bounded;
+        use crate::pool_view::PoolView;
+        use std::sync::atomic::Ordering;
+
+        let (view, calls) = counting_hanging_view();
+        let pool_id = B256::repeat_byte(0x55);
+        let started = tokio::time::Instant::now();
+        let answers = bounded(
+            "admit getPool",
+            futures_util::future::join_all((0..8).map(|_| view.status(pool_id))),
+        )
+        .await;
+        assert!(
+            answers.iter().all(Option::is_none),
+            "every request is refused"
+        );
+        assert_eq!(
+            started.elapsed(),
+            crate::chain_events::DEFAULT_RPC_CALL_TIMEOUT,
+            "the waiters end with the one read, not after reads of their own"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "one getPool for eight requests"
+        );
+        assert!(
+            view.inflight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "the ended read leaves no in-flight entry"
+        );
+    }
+
+    /// A reader that is cancelled mid-read ends the read for its waiters: one of
+    /// them takes over and issues its own `getPool`.
+    #[tokio::test(start_paused = true)]
+    async fn admit_getpool_waiter_takes_over_a_cancelled_read() {
+        use crate::chain_events::test_support::bounded;
+        use crate::pool_view::PoolView;
+        use std::sync::atomic::Ordering;
+
+        let (view, calls) = counting_hanging_view();
+        let pool_id = B256::repeat_byte(0x56);
+        let cancel_after = Duration::from_secs(1);
+        let started = tokio::time::Instant::now();
+        let (reader, waiter) = bounded("admit getPool", async {
+            tokio::join!(
+                tokio::time::timeout(cancel_after, view.status(pool_id)),
+                view.status(pool_id)
+            )
+        })
+        .await;
+        assert!(reader.is_err(), "the first reader is cancelled");
+        assert!(waiter.is_none(), "the waiter's own read times out");
+        assert_eq!(
+            started.elapsed(),
+            cancel_after + crate::chain_events::DEFAULT_RPC_CALL_TIMEOUT,
+            "the waiter reads from the cancellation on"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "the waiter issued a read");
+    }
+
+    /// A pool negative-cached for a fault is read again once the short fault
+    /// window lapses, while a verdict of the same age still suppresses the read.
+    /// The cache stamps each entry with a `std::time::Instant`, which the paused
+    /// tokio clock does not advance, so each entry is backdated rather than
+    /// waited out.
+    #[tokio::test(start_paused = true)]
+    async fn admit_getpool_rereads_a_faulted_pool_after_the_fault_window() {
+        use crate::chain_events::test_support::bounded;
+        use crate::pool_view::PoolView;
+
+        let view = hanging_view();
+        let pool_id = B256::repeat_byte(0x54);
+        let backdate = |reason| {
+            view.negative
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(pool_id, (reason, between_windows()));
+        };
+
+        backdate(NegativeReason::Fault);
+        let started = tokio::time::Instant::now();
+        assert!(
+            bounded("admit getPool", view.status(pool_id))
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            started.elapsed(),
+            crate::chain_events::DEFAULT_RPC_CALL_TIMEOUT,
+            "a lapsed fault re-reads the pool (and waits out the hung read)"
+        );
+
+        backdate(NegativeReason::Verdict);
+        let started = tokio::time::Instant::now();
+        assert!(
+            bounded("admit getPool", view.status(pool_id))
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "a verdict of the same age suppresses the read"
+        );
     }
 
     /// A hung admit `getAuthorization` past `SIGNER_AUTH_TTL` times out and falls

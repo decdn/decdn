@@ -165,12 +165,18 @@ pub(crate) mod test_support {
     use alloy::transports::{TransportError, TransportFut};
     use alloy_json_rpc::{RequestPacket, ResponsePacket};
     use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use std::time::Duration;
 
-    /// Dispatches every request into a future that never completes.
-    #[derive(Clone, Debug)]
-    struct HangingTransport;
+    /// Dispatches every request into a future that never completes, counting
+    /// each dispatch.
+    #[derive(Clone, Debug, Default)]
+    struct HangingTransport {
+        /// Requests dispatched so far.
+        calls: Arc<AtomicUsize>,
+    }
 
     impl tower::Service<RequestPacket> for HangingTransport {
         type Response = ResponsePacket;
@@ -182,6 +188,7 @@ pub(crate) mod test_support {
         }
 
         fn call(&mut self, _req: RequestPacket) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             Box::pin(std::future::pending())
         }
     }
@@ -189,9 +196,17 @@ pub(crate) mod test_support {
     /// A `Provider` on which every RPC hangs forever. Pair with
     /// `#[tokio::test(start_paused = true)]` so the deadline fires instantly.
     pub(crate) fn hanging_provider() -> impl Provider + Clone {
+        counting_hanging_provider().0
+    }
+
+    /// A [`hanging_provider`] plus a count of the requests dispatched to it.
+    pub(crate) fn counting_hanging_provider() -> (impl Provider + Clone, Arc<AtomicUsize>) {
+        let transport = HangingTransport::default();
+        let calls = Arc::clone(&transport.calls);
         // `is_local = false`: the local flag only relaxes alloy's own polling
         // cadences, and nothing here should imply this endpoint is fast.
-        ProviderBuilder::new().connect_client(RpcClient::new(HangingTransport, false))
+        let provider = ProviderBuilder::new().connect_client(RpcClient::new(transport, false));
+        (provider, calls)
     }
 
     /// Backstop deadline for [`bounded`]: strictly longer than any production
