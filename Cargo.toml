@@ -116,7 +116,7 @@ postcard = { version = "1", features = ["alloc"] }
 base64 = "0.23"
 
 # Cryptography
-ed25519-dalek = { version = "2", features = ["serde"] }
+ed25519-dalek = { version = "3", features = ["serde"] }
 chacha20poly1305 = "0.11"
 
 # Blockchain / EVM
