@@ -9259,8 +9259,8 @@ async fn spent_out_channel_never_reaches_the_paid_pull() -> anyhow::Result<()> {
 
 /// ADR 011 keys compliance on the FUNDER, so a blacklisted funder must not make
 /// this node front upstream USDC even when a perfectly clean delegate key is
-/// doing the signing. The delegate's binding satisfies the *spend-authority*
-/// half of `pull_authorized`; the funder check is the only thing standing
+/// doing the signing. The delegate's binding satisfies `pull_authorized` (spend
+/// authority); the serve gate's funder check is the only thing standing
 /// between a sanctioned address and this operator's egress bill.
 #[tokio::test(flavor = "multi_thread")]
 async fn pull_through_refuses_a_blacklisted_funder_behind_a_clean_delegate() -> anyhow::Result<()> {
@@ -10734,44 +10734,60 @@ async fn unbound_miss_refuses_on_a_throttled_no_lane_line() -> anyhow::Result<()
     Ok(())
 }
 
+/// What the local fs origin holds for a #2315 mid-request-lane test.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OriginHolds {
+    /// Nothing: every local tier misses.
+    Nothing,
+    /// The blob only: the own-origin spine declines (no outboard), the local
+    /// populate and the buffered pull-through can fill.
+    Blob,
+    /// The blob and its `{H}.obao4` outboard: the own-origin spine serves.
+    BlobAndOutboard,
+}
+
 /// #2315: a sibling stream registers this request's lane after the request
 /// resolved it as unknown. The miss tiers keep the request's one answer: no
-/// fill tier runs, and the refusal is the `no_lane` `NotFound`. The local leg
-/// (blob in the local origin) must spend no origin egress on the request, and
-/// the window leg (blob nowhere) must not fall through to a false
-/// `InternalError` at the size gate.
+/// fill tier runs, and the refusal is the `no_lane` `NotFound`. The window leg
+/// must not fall through to a false `InternalError` at the size gate, and no
+/// leg may spend origin egress on the request. The lane is live for the NEXT
+/// request: when the origin holds the blob, a second fetch on the same binding
+/// is served.
 async fn lane_registered_mid_request_refuses_on_no_lane(
     tiers: FaultTiers,
-    origin_holds_blob: bool,
+    holds: OriginHolds,
 ) -> anyhow::Result<()> {
     let spans = support::capture_spans();
     let payload = vec![0x6Du8; 64 * 1024];
-    let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) = if origin_holds_blob {
-        empty_cache_with_fs_origin(&payload).await?
-    } else {
-        let origin_dir = tempfile::tempdir()?;
-        let cache_dir = tempfile::tempdir()?;
-        let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
-        let cache_metrics = Arc::new(CacheMetrics::default());
-        let cache = CacheEngine::open_full(
-            cache_dir.path(),
-            vec![origin as Arc<dyn decdn_cache::Origin>],
-            16,
-            PinnedHashes::empty(),
-            RetryPolicy::default(),
-            CircuitBreakerPolicy::default(),
-            Some(Arc::clone(&cache_metrics)),
-            Duration::ZERO,
-        )
-        .await?;
-        (
-            cache,
-            decdn_cache::Hash::new(&payload),
-            cache_metrics,
-            origin_dir,
-            cache_dir,
-        )
-    };
+    let hash = decdn_cache::Hash::new(&payload);
+    let origin_dir = tempfile::tempdir()?;
+    if holds != OriginHolds::Nothing {
+        let encoded = decdn_bao_range::encode_outboard(payload.as_slice(), payload.len() as u64)?;
+        anyhow::ensure!(
+            encoded.hash_hex == hash.to_hex().as_str(),
+            "encoder hash mismatch"
+        );
+        let shard = origin_dir.path().join(encoded.shard());
+        std::fs::create_dir_all(&shard)?;
+        std::fs::write(shard.join(&encoded.hash_hex), &payload)?;
+        if holds == OriginHolds::BlobAndOutboard {
+            std::fs::write(shard.join(encoded.obao4_name()), &encoded.outboard)?;
+        }
+    }
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+    let cache_metrics = Arc::new(CacheMetrics::default());
+    let cache = CacheEngine::open_full(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        CircuitBreakerPolicy::default(),
+        Some(Arc::clone(&cache_metrics)),
+        Duration::ZERO,
+    )
+    .await?;
     // No lane in the store: the bound request resolves its lane as unknown.
     let store: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
     let signer = Arc::new(PrivateKeySigner::random());
@@ -10785,20 +10801,22 @@ async fn lane_registered_mid_request_refuses_on_no_lane(
     let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
     let ctx =
         channel_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let slash = slash_domain();
+    let fetch = || {
+        stream_fetch(
+            &client_ep,
+            target.clone(),
+            &ctx,
+            &slash,
+            server_eth_addr,
+            *hash.as_bytes(),
+            0,
+            0x00c0_ffee,
+            Duration::from_secs(20),
+        )
+    };
 
-    match stream_fetch(
-        &client_ep,
-        target,
-        &ctx,
-        &slash_domain(),
-        server_eth_addr,
-        *hash.as_bytes(),
-        0,
-        0x00c0_ffee,
-        Duration::from_secs(20),
-    )
-    .await
-    {
+    match fetch().await {
         Ok(_) => anyhow::bail!("a request whose lane was unknown at resolution must be refused"),
         Err(e) => anyhow::ensure!(
             e.to_string().contains("delivery refused") && e.to_string().contains("NotFound"),
@@ -10817,20 +10835,49 @@ async fn lane_registered_mid_request_refuses_on_no_lane(
     assert_reject_reason(&metrics, 0, 1)?;
     assert_one_miss_line(&spans, hash, "no_lane", "cache_miss")?;
 
+    // The registered lane is this binding's own: the next request resolves it
+    // and is served.
+    if holds != OriginHolds::Nothing {
+        let served = fetch().await?;
+        anyhow::ensure!(
+            served == payload,
+            "the next request must be served the blob"
+        );
+    }
+
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
-/// #2315, local leg: see [`lane_registered_mid_request_refuses_on_no_lane`].
+/// #2315, local populate leg: see [`lane_registered_mid_request_refuses_on_no_lane`].
 #[tokio::test(flavor = "multi_thread")]
 async fn lane_registered_mid_request_spends_no_origin_egress() -> anyhow::Result<()> {
-    lane_registered_mid_request_refuses_on_no_lane(FaultTiers::LocalOnly, true).await
+    lane_registered_mid_request_refuses_on_no_lane(FaultTiers::LocalOnly, OriginHolds::Blob).await
+}
+
+/// #2315, own-origin spine leg (the origin publishes the outboard): see
+/// [`lane_registered_mid_request_refuses_on_no_lane`].
+#[tokio::test(flavor = "multi_thread")]
+async fn lane_registered_mid_request_skips_the_own_origin_spine() -> anyhow::Result<()> {
+    lane_registered_mid_request_refuses_on_no_lane(
+        FaultTiers::LocalOnly,
+        OriginHolds::BlobAndOutboard,
+    )
+    .await
+}
+
+/// #2315, buffered pull-through leg: see
+/// [`lane_registered_mid_request_refuses_on_no_lane`].
+#[tokio::test(flavor = "multi_thread")]
+async fn lane_registered_mid_request_skips_the_buffered_pull() -> anyhow::Result<()> {
+    lane_registered_mid_request_refuses_on_no_lane(FaultTiers::Buffered, OriginHolds::Blob).await
 }
 
 /// #2315, window leg: see [`lane_registered_mid_request_refuses_on_no_lane`].
 #[tokio::test(flavor = "multi_thread")]
 async fn lane_registered_mid_request_is_not_an_internal_error() -> anyhow::Result<()> {
-    lane_registered_mid_request_refuses_on_no_lane(FaultTiers::LocalAndWindow, false).await
+    lane_registered_mid_request_refuses_on_no_lane(FaultTiers::LocalAndWindow, OriginHolds::Nothing)
+        .await
 }
 
 /// Which reactive fill tiers a fault-test server arms (#1129).

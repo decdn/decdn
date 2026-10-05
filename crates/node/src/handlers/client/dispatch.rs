@@ -611,9 +611,10 @@ impl ClientHandler {
 
         // Resolve the live lane AFTER intake, so a lane just registered from this
         // request's own capability is visible to the spend + serve gates below.
-        // The resolved `Arc` is KEPT rather than dropped: the cache-miss arm below
-        // reuses the same lane, and re-resolving it would take the lane's shard
-        // lock again for no reason.
+        // This is the request's ONE lane read. The cache-miss arm below derives
+        // its spend authority from it (`pull_authorized`) and serves on the same
+        // `Arc`. A second registry read there could see a lane a sibling stream
+        // registered since, and flip the answer between fill tiers (#2315).
         let known_lane = match lane_key {
             Some(key) => self.lanes.get(&key).map(|e| Arc::clone(e.value())),
             None => None,
@@ -914,13 +915,20 @@ impl ClientHandler {
                 //
                 // `remaining` comes from the cached `getPool` view resolved above;
                 // a `None` view fails open (the on-chain `redeem` is the backstop).
-                // Skipped for an unknown lane — `pull_authorized` refuses those
-                // before every tier, so no spend happens there anyway.
                 //
                 // `authority` is this request's one answer to `pull_authorized`,
                 // taken from the lane it resolved above. Every tier below reads it
                 // rather than the live registry, so the request sees one answer
-                // throughout: served on its lane, or refused on the no-lane path.
+                // throughout: every tier runs on its lane, or none runs and the
+                // request refuses on the `no_lane` path. That holds in both
+                // directions. A lane a sibling stream registers after the
+                // resolution does not authorize this request. A lane `forget_lane`
+                // drops after it (a reclaimed pool) still does: the spend stays
+                // bounded by this floor reservation and the credit window, and a
+                // cache hit serves on a resolved lane the same way.
+                //
+                // With no authority (an unbound request, or no lane at resolution)
+                // this reservation is skipped too: no tier spends.
                 let authority = Self::pull_authorized(lane_key, known_lane.as_ref());
                 if let Some((key, _)) = authority
                     && let Some(status) = pool_status
@@ -1150,8 +1158,9 @@ impl ClientHandler {
                     ))
                     .await;
                 } else {
-                    // Buffered pull-through (#831): used when no window provider is
-                    // set.
+                    // Buffered pull-through (#831): reached when no window provider
+                    // is set, or when the request has no spend authority. This arm
+                    // is where every unauthorized miss refuses on the `no_lane` path.
                     // A request not authorized to make this node spend, or a node
                     // with no pull-through configured, attempts nothing here, so this
                     // tier contributes no new information. The two keep separate

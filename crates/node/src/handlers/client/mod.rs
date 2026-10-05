@@ -1444,14 +1444,14 @@ pub struct ClientHandler {
     /// [`ClientHandlerDeps`]. Read through [`Self::frame_target`], which clamps it
     /// to the credit window's remaining room.
     frame_target_bytes: u64,
-    /// Live content deny-set (ADR 011). Consulted at three points, all of which
-    /// must gate or the check is bypassable: the hash gate above the
-    /// availability check in `serve_stream`, the origin gate right after channel
-    /// resolution, and the same origin gate inside `pull_authorized` — that last
-    /// one runs EARLIEST and decides whether to front upstream USDC egress, so
-    /// omitting it would have this node pay on a blacklisted origin's behalf
-    /// before ever reaching the serve refusal. The window-paced serve path
-    /// (`window.rs`) is a fourth, independent ladder.
+    /// Live content deny-set (ADR 011), keyed on the pool FUNDER. Consulted at
+    /// two points, both of which must gate or the check is bypassable: the
+    /// open-time funder gate in `serve_stream`, right after the pool status
+    /// resolves, and [`Self::takedown_landed`], the per-interval in-flight
+    /// re-check every serve leg runs. The open-time gate precedes every fill
+    /// tier, so omitting it would have this node front upstream USDC or origin
+    /// egress on a blacklisted funder's behalf. The hash half of ADR 011 is the
+    /// cache's own deny state (`CacheEngine::is_denied` / `refuses`).
     pub(crate) content_deny: Arc<crate::content_deny::ContentDenylist>,
     /// Served per-MB price, fixed at startup (see
     /// [`ClientHandlerDeps::rate_per_mb`]).

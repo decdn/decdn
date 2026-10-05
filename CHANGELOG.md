@@ -944,11 +944,12 @@ since project inception and will roll into the first tagged release.
   request may make the node spend. When a sibling stream registered the lane
   between the two reads, the window tier fell through to the size gate, logged
   a false "just-filled blob" warning and refused `InternalError`, so the
-  requester routed around a healthy node. The own-origin tier instead filled
-  the blob from the operator's origin and then refused `UnknownChannel`. Every
-  fill tier now takes its answer from the request's one lane resolution. Such a
-  request refuses on the `no_lane` path (`NotFound`, counted as `cache_miss`)
-  and runs no fill tier.
+  requester routed around a healthy node. The local-origin populate tier
+  (#1116) instead filled the blob from the operator's origin and then refused
+  `UnknownChannel`. Every fill tier now takes its answer from the request's one
+  lane resolution. A request whose lane was unknown when it resolved refuses on
+  the `no_lane` path (`NotFound`, counted as `cache_miss`) and runs no fill
+  tier.
 - **A lane seeded from the chain watermark below the provider's unredeemed
   voucher now heals instead of suppressing the provider (#2254).** After a
   buyer-table schema bump, a node adopts its pool with no lanes, and each

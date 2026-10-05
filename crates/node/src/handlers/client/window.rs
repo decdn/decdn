@@ -143,8 +143,8 @@ impl ClientHandler {
     ) -> anyhow::Result<super::outcome::ServeEnd> {
         // The ADR 011 OPEN-TIME deny gates are already discharged on the only
         // path that reaches here: `serve_stream` refuses a denylisted hash
-        // before the availability check, and this branch is entered only behind
-        // `pull_authorized`, which refuses a blacklisted funding origin. Keep it
+        // before the availability check, and refuses a blacklisted funder at
+        // its open-time funder gate, which precedes every fill tier. Keep it
         // that way — if this function ever gains a second caller, that caller
         // owes both checks, because this is a spend-and-serve path.
         //
@@ -653,8 +653,8 @@ impl ClientHandler {
     /// once, not twice (a real dollar saving).
     ///
     /// The ADR 011 open-time deny gates are already discharged (a denylisted hash
-    /// is refused before the availability check; this branch is entered only
-    /// behind `pull_authorized`, which refuses a blacklisted funding origin). A
+    /// is refused before the availability check; a blacklisted funder is refused
+    /// at `serve_stream`'s open-time funder gate, which precedes every fill tier). A
     /// takedown that lands mid-stream is caught per interval inside
     /// [`Self::serve_leg`].
     ///

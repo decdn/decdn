@@ -6,14 +6,16 @@ use super::{
 use tracing::Instrument as _;
 
 impl ClientHandler {
-    /// The lane that authorizes a paid pull-through (#831), or `None` when the
-    /// request may not make this node spend. Authority needs a verified client
+    /// The lane that authorizes this request to make the node spend on a cache
+    /// miss, or `None` when it may not. Every fill tier (own-origin, local
+    /// populate, window and buffered pull-through, #831) and the pre-spend floor
+    /// reservation are gated on it. Authority needs a verified client
     /// binding whose recovered address is the lane's pinned `voucher_signer`.
     /// Channel *existence* is public (on-chain `ChannelOpened`), so it cannot
     /// authorize spend — only proof of *voucher authority* can, since only the
     /// pinned signer can produce a voucher this channel will accept. An unbound
     /// request, or a binding that does not match that signer, must not make this
-    /// node front upstream USDC.
+    /// node front upstream USDC or its own origin's egress.
     ///
     /// Spend authority is a *signer* question. In the shared-payment-pool model
     /// the lane is keyed by that signer directly, so authority reduces to "does
