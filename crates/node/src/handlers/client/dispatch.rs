@@ -618,6 +618,8 @@ impl ClientHandler {
             Some(key) => self.lanes.get(&key).map(|e| Arc::clone(e.value())),
             None => None,
         };
+        #[cfg(any(test, feature = "test-support"))]
+        self.fire_lane_after_resolution();
 
         // Hold the signer's registered terms on the lane (ADR 003 §Capability
         // delegation): the voucher path refuses past the lane's `cap` and `expiry`,
@@ -914,8 +916,13 @@ impl ClientHandler {
                 // a `None` view fails open (the on-chain `redeem` is the backstop).
                 // Skipped for an unknown lane — `pull_authorized` refuses those
                 // before every tier, so no spend happens there anyway.
-                if known_lane.is_some()
-                    && let Some(key) = lane_key
+                //
+                // `authority` is this request's one answer to `pull_authorized`,
+                // taken from the lane it resolved above. Every tier below reads it
+                // rather than the live registry, so the request sees one answer
+                // throughout: served on its lane, or refused on the no-lane path.
+                let authority = Self::pull_authorized(lane_key, known_lane.as_ref());
+                if let Some((key, _)) = authority
                     && let Some(status) = pool_status
                 {
                     // Reserve the un-self-funded credit this stream fronts before it
@@ -1003,7 +1010,7 @@ impl ClientHandler {
                 // streams the same filling cache to its own client (no double origin
                 // egress). The registry is range-aware, so this coalescing is not
                 // limited to the whole-blob case.
-                if self.pull_authorized(&req, verified_client) {
+                if let Some((lk, ln)) = authority {
                     match self.cache.origin_size(hash).await {
                         Ok(Some(total)) => {
                             match self.cache.origin_range_serviceable(hash, total).await {
@@ -1014,31 +1021,27 @@ impl ClientHandler {
                                 // coalescing decision happens here.
                                 Ok(true) => {
                                     // Boxed: the serve future is large
-                                    // (clippy::large_futures). `pull_authorized`
-                                    // (checked in the `if` above) guarantees a
-                                    // lane, so the extraction always matches.
-                                    if let (Some(lk), Some(ln)) = (lane_key, known_lane.as_ref()) {
-                                        return Box::pin(self.serve_via_backend_origin(
-                                            &conn,
-                                            send,
-                                            recv,
-                                            &req,
-                                            hash,
-                                            client_node_id,
-                                            lk,
-                                            ln,
-                                            total,
-                                            pool_status.map(|s| s.remaining),
-                                            rate_per_mb,
-                                            floor_reservation,
-                                            FirstByteClock::new(
-                                                request_decoded_at,
-                                                admitted_at,
-                                                request_class,
-                                            ),
-                                        ))
-                                        .await;
-                                    }
+                                    // (clippy::large_futures).
+                                    return Box::pin(self.serve_via_backend_origin(
+                                        &conn,
+                                        send,
+                                        recv,
+                                        &req,
+                                        hash,
+                                        client_node_id,
+                                        lk,
+                                        ln,
+                                        total,
+                                        pool_status.map(|s| s.remaining),
+                                        rate_per_mb,
+                                        floor_reservation,
+                                        FirstByteClock::new(
+                                            request_decoded_at,
+                                            admitted_at,
+                                            request_class,
+                                        ),
+                                    ))
+                                    .await;
                                 }
                                 // Size known but no origin publishes the outboard
                                 // and serves ranges — not serviceable via the range
@@ -1097,7 +1100,7 @@ impl ClientHandler {
                 // health.)
                 if !locally_filled
                     && let Some(timeout) = self.local_populate
-                    && self.pull_authorized(&req, verified_client)
+                    && authority.is_some()
                 {
                     let local = self.try_local_populate(hash, timeout).await;
                     fault_seen |= local.is_fault();
@@ -1122,34 +1125,30 @@ impl ClientHandler {
                     // the node→node fill and fall through to the size gate +
                     // delivery.
                 } else if let Some(origin) = self.pull_through_origin.as_ref()
-                    && self.pull_authorized(&req, verified_client)
+                    && let Some((lk, ln)) = authority
                 {
                     // Boxed: the serve future is large; keep it off the
                     // `serve_stream` stack frame (clippy::large_futures). The
                     // orchestration claims the fill (owner-or-attach) internally after
                     // signing the response, so two concurrent same-hash misses share one
                     // upstream pull (no double spend, #305) without a decision here.
-                    // `pull_authorized` (the `if` above) guarantees a lane, so the
-                    // extraction always matches.
-                    if let (Some(lk), Some(ln)) = (lane_key, known_lane.as_ref()) {
-                        return Box::pin(self.serve_via_window_pull_through(
-                            &conn,
-                            send,
-                            recv,
-                            &req,
-                            hash,
-                            client_node_id,
-                            lk,
-                            ln,
-                            Arc::clone(origin),
-                            pool_status.map(|s| s.remaining),
-                            fault_seen,
-                            rate_per_mb,
-                            floor_reservation,
-                            FirstByteClock::new(request_decoded_at, admitted_at, request_class),
-                        ))
-                        .await;
-                    }
+                    return Box::pin(self.serve_via_window_pull_through(
+                        &conn,
+                        send,
+                        recv,
+                        &req,
+                        hash,
+                        client_node_id,
+                        lk,
+                        ln,
+                        Arc::clone(origin),
+                        pool_status.map(|s| s.remaining),
+                        fault_seen,
+                        rate_per_mb,
+                        floor_reservation,
+                        FirstByteClock::new(request_decoded_at, admitted_at, request_class),
+                    ))
+                    .await;
                 } else {
                     // Buffered pull-through (#831): used when no window provider is
                     // set.
@@ -1158,9 +1157,7 @@ impl ClientHandler {
                     // tier contributes no new information. The two keep separate
                     // paths: only the first is a remote peer's to trigger.
                     let (buffered, path) = match self.pull_through {
-                        _ if !self.pull_authorized(&req, verified_client) => {
-                            (FillOutcome::CleanMiss, MissPath::NoLane)
-                        }
+                        _ if authority.is_none() => (FillOutcome::CleanMiss, MissPath::NoLane),
                         Some(timeout) => (
                             self.try_pull_through(hash, timeout).await,
                             MissPath::BufferedMiss,

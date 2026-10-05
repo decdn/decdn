@@ -1365,6 +1365,10 @@ pub struct ClientHandler {
     /// the gauge off an ordered walk of the (possibly large) lane map on the
     /// registration path.
     lane_count: AtomicUsize,
+    /// Test-only: a lane [`ClientHandler::register_lane_after_next_resolution`]
+    /// armed, registered right after the next request resolves its lane.
+    #[cfg(any(test, feature = "test-support"))]
+    lane_after_resolution: std::sync::Mutex<Option<LaneState>>,
     /// Serializes the read-and-publish half of [`Self::tune_lane_gauge`], so
     /// two concurrent lane-lifecycle calls cannot publish `decdn_lanes_open`
     /// out of order. The atomic alone fixes the count, not the publication:
@@ -1574,6 +1578,8 @@ impl ClientHandler {
             chain_freshness: deps.chain_freshness,
             lanes: Arc::new(map),
             lane_count,
+            #[cfg(any(test, feature = "test-support"))]
+            lane_after_resolution: std::sync::Mutex::new(None),
             lane_gauge_publish: std::sync::Mutex::new(()),
             capability_verify_cache: std::sync::Mutex::new(CapabilityVerifyCache::default()),
             pool_floor: Arc::new(std::sync::Mutex::new(pool_floor)),
@@ -1931,6 +1937,33 @@ impl ClientHandler {
             self.tune_lane_gauge(1);
         }
         Ok(())
+    }
+
+    /// Test-only: register `state` right after the next `serve_stream` resolves
+    /// its lane. It stands in for a sibling stream whose capability intake lands
+    /// while this request is past its lane resolution, the window in which the
+    /// request must keep the answer it resolved.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn register_lane_after_next_resolution(&self, state: LaneState) {
+        if let Ok(mut armed) = self.lane_after_resolution.lock() {
+            *armed = Some(state);
+        }
+    }
+
+    /// Test-only: register the lane [`Self::register_lane_after_next_resolution`]
+    /// armed, if any. `serve_stream` calls it once its lane is resolved.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn fire_lane_after_resolution(&self) {
+        let armed = self
+            .lane_after_resolution
+            .lock()
+            .ok()
+            .and_then(|mut armed| armed.take());
+        if let Some(state) = armed
+            && let Err(e) = self.register_lane(state)
+        {
+            tracing::warn!(error = %e, "test seam: armed lane registration failed");
+        }
     }
 
     /// Clamp a live lane to its signer's on-chain registration (ADR 003

@@ -10734,6 +10734,105 @@ async fn unbound_miss_refuses_on_a_throttled_no_lane_line() -> anyhow::Result<()
     Ok(())
 }
 
+/// #2315: a sibling stream registers this request's lane after the request
+/// resolved it as unknown. The miss tiers keep the request's one answer: no
+/// fill tier runs, and the refusal is the `no_lane` `NotFound`. The local leg
+/// (blob in the local origin) must spend no origin egress on the request, and
+/// the window leg (blob nowhere) must not fall through to a false
+/// `InternalError` at the size gate.
+async fn lane_registered_mid_request_refuses_on_no_lane(
+    tiers: FaultTiers,
+    origin_holds_blob: bool,
+) -> anyhow::Result<()> {
+    let spans = support::capture_spans();
+    let payload = vec![0x6Du8; 64 * 1024];
+    let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) = if origin_holds_blob {
+        empty_cache_with_fs_origin(&payload).await?
+    } else {
+        let origin_dir = tempfile::tempdir()?;
+        let cache_dir = tempfile::tempdir()?;
+        let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+        let cache_metrics = Arc::new(CacheMetrics::default());
+        let cache = CacheEngine::open_full(
+            cache_dir.path(),
+            vec![origin as Arc<dyn decdn_cache::Origin>],
+            16,
+            PinnedHashes::empty(),
+            RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
+            Some(Arc::clone(&cache_metrics)),
+            Duration::ZERO,
+        )
+        .await?;
+        (
+            cache,
+            decdn_cache::Hash::new(&payload),
+            cache_metrics,
+            origin_dir,
+            cache_dir,
+        )
+    };
+    // No lane in the store: the bound request resolves its lane as unknown.
+    let store: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
+    let signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(10_000_000u64);
+    let (target, server_eth_addr, server_ep, server_task, metrics, handler) =
+        spawn_fault_server_with_handler(cache, store, tiers).await?;
+    handler.register_lane_after_next_resolution(fresh_lane(signer.address(), deposit));
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let own_node_id = B256::from(*client_ep.id().as_bytes());
+    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
+    let ctx =
+        channel_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+
+    match stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await
+    {
+        Ok(_) => anyhow::bail!("a request whose lane was unknown at resolution must be refused"),
+        Err(e) => anyhow::ensure!(
+            e.to_string().contains("delivery refused") && e.to_string().contains("NotFound"),
+            "expected a signed NotFound, got: {e}"
+        ),
+    }
+    anyhow::ensure!(
+        metric_line_present(&metrics.encode()?, "decdn_lanes_open 1"),
+        "precondition: the armed lane must be registered mid-request"
+    );
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 0,
+        "no fill tier may run for the request, got {} origin fetches",
+        cache_metrics.origin_fetches.get()
+    );
+    assert_reject_reason(&metrics, 0, 1)?;
+    assert_one_miss_line(&spans, hash, "no_lane", "cache_miss")?;
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// #2315, local leg: see [`lane_registered_mid_request_refuses_on_no_lane`].
+#[tokio::test(flavor = "multi_thread")]
+async fn lane_registered_mid_request_spends_no_origin_egress() -> anyhow::Result<()> {
+    lane_registered_mid_request_refuses_on_no_lane(FaultTiers::LocalOnly, true).await
+}
+
+/// #2315, window leg: see [`lane_registered_mid_request_refuses_on_no_lane`].
+#[tokio::test(flavor = "multi_thread")]
+async fn lane_registered_mid_request_is_not_an_internal_error() -> anyhow::Result<()> {
+    lane_registered_mid_request_refuses_on_no_lane(FaultTiers::LocalAndWindow, false).await
+}
+
 /// Which reactive fill tiers a fault-test server arms (#1129).
 #[derive(Clone, Copy)]
 enum FaultTiers {
@@ -10766,6 +10865,25 @@ async fn spawn_fault_server(
     tokio::task::JoinHandle<()>,
     Arc<Metrics>,
 )> {
+    let (target, server_eth_addr, server_ep, server_task, metrics, _handler) =
+        spawn_fault_server_with_handler(cache, store, tiers).await?;
+    Ok((target, server_eth_addr, server_ep, server_task, metrics))
+}
+
+/// [`spawn_fault_server`], also returning the serving `ClientHandler` so a test
+/// can arm its test-support seams.
+async fn spawn_fault_server_with_handler(
+    cache: CacheEngine,
+    store: Arc<dyn PoolStateStore>,
+    tiers: FaultTiers,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Address,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<Metrics>,
+    Arc<ClientHandler>,
+)> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = operator_signer();
@@ -10791,7 +10909,7 @@ async fn spawn_fault_server(
         },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
+    let server_task = spawn_server(server_ep.clone(), Arc::clone(&handler));
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
     Ok((
         target,
@@ -10799,6 +10917,7 @@ async fn spawn_fault_server(
         server_ep,
         server_task,
         metrics,
+        handler,
     ))
 }
 
