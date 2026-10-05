@@ -9,8 +9,8 @@ use bytes::Bytes;
 use iroh::endpoint::WriteError;
 
 use super::{
-    B256, ClientHandler, ClientMessage, FrameError, Hash, RawReceipt, SendStream,
-    ServeRejectReason, StreamError, StreamRequest, StreamResponse, StreamResponseBody,
+    B256, ClientHandler, ClientMessage, FrameError, Hash, MissPath, MissRefusal, RawReceipt,
+    SendStream, ServeRejectReason, StreamError, StreamRequest, StreamResponse, StreamResponseBody,
     StreamResponseExt, StreamSlashData, U256, VoucherRejectReason, WatermarkBundle, encode_message,
     write_frame,
 };
@@ -128,6 +128,42 @@ impl ClientHandler {
         )?;
         let _ = send.finish();
         Ok(super::outcome::ServeEnd::Refused(reason))
+    }
+
+    /// Send a terminal serve-miss refusal through [`Self::respond_error`], then
+    /// log it once at info. The log line names the exit that refused (`path`),
+    /// which the wire answer and the per-reason metric do not carry, so an
+    /// operator can see why this node answered a request `NotFound` or
+    /// `InternalError`. A [`MissPath::NoLane`] line passes the
+    /// `no_lane_miss_log` throttle first, because a remote peer reaches that
+    /// path at will.
+    ///
+    /// The line follows the send, so it appears only when the stream ends as
+    /// this refusal. A signing or encoding fault, or a write that fails on this
+    /// node's own stream state, returns the error without the line, with the
+    /// path in its context: the dispatch sink counts that end as a node fault.
+    /// A peer that left before reading the refusal still gets the line, because
+    /// the refusal stands as the stream's outcome.
+    pub(super) async fn respond_miss(
+        &self,
+        send: &mut SendStream,
+        req: &StreamRequest,
+        refusal: MissRefusal,
+        rate_per_mb: u64,
+    ) -> anyhow::Result<super::outcome::ServeEnd> {
+        let end = self
+            .respond_error(send, req, refusal.reason, rate_per_mb)
+            .await
+            .with_context(|| format!("send the {} serve-miss refusal", refusal.path.as_str()))?;
+        match refusal.path {
+            MissPath::NoLane => {
+                if let Some(suppressed) = self.no_lane_miss_log.admit() {
+                    log_miss_refusal(req, refusal, Some(suppressed));
+                }
+            }
+            _ => log_miss_refusal(req, refusal, None),
+        }
+        Ok(end)
     }
 
     /// Write a mid-stream `StreamError { VoucherRejected }` and finish the
@@ -295,6 +331,37 @@ pub(super) fn is_peer_attributable(e: &anyhow::Error) -> bool {
 /// `RUST_LOG=info` filters out of the `debug!` line.
 pub(super) fn record_stream_error(detail: impl std::fmt::Display) {
     tracing::Span::current().record("error", tracing::field::display(detail));
+}
+
+/// The info line [`ClientHandler::respond_miss`] writes for one serve-miss
+/// refusal. `reason` is the same snake-case value the `serve_stream` span
+/// records. A pull-leg miss adds its `cause`; a coverage-gate refusal adds the
+/// pull range, the candidate count and the first uncovered chunk; a throttled
+/// line adds the count of lines it `suppressed`. An absent field is not
+/// recorded.
+fn log_miss_refusal(req: &StreamRequest, refusal: MissRefusal, suppressed: Option<u64>) {
+    let cause = match refusal.path {
+        MissPath::PullLegMiss(miss) => Some(miss.as_str()),
+        _ => None,
+    };
+    let shortfall = match refusal.path {
+        MissPath::CoverageGate(shortfall) => Some(shortfall),
+        _ => None,
+    };
+    tracing::info!(
+        hash = %Hash::from_bytes(req.hash),
+        byte_offset = req.byte_offset,
+        byte_len = req.byte_len,
+        reason = super::outcome::refusal_reason(refusal.reason),
+        path = refusal.path.as_str(),
+        cause,
+        pull_offset = shortfall.map(|s| s.pull_offset),
+        pull_len = shortfall.map(|s| s.pull_len),
+        candidates = shortfall.map(|s| s.candidates),
+        first_uncovered_chunk = shortfall.and_then(|s| s.first_uncovered_chunk),
+        suppressed,
+        "serve-miss: refusing the request"
+    );
 }
 
 /// Absorb a write that fails because the peer already left.
@@ -605,10 +672,145 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        ClientPaymentFault, FrameError, FrameQueue, PaidProgress, PeerFault, WriteError,
-        chunk_frame_bufs, is_peer_attributable, tag_paid_progress, tolerate_departed_peer,
-        write_chunk_error, write_frame_error,
+        ClientPaymentFault, FrameError, FrameQueue, MissRefusal, PaidProgress, PeerFault,
+        ServeRejectReason, StreamRequest, WriteError, chunk_frame_bufs, is_peer_attributable,
+        log_miss_refusal, tag_paid_progress, tolerate_departed_peer, write_chunk_error,
+        write_frame_error,
     };
+    use crate::handlers::client::{CoverageShortfall, MissPath};
+    use crate::node_origin::PullMiss;
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A coverage shortfall with every detail field set.
+    const SHORTFALL: CoverageShortfall = CoverageShortfall {
+        pull_offset: 32_768,
+        pull_len: 65_536,
+        candidates: 2,
+        first_uncovered_chunk: Some(48),
+    };
+
+    /// A miss refusal is `InternalError` exactly when a tier faulted, whatever
+    /// the path, and every path logs under its own stable name (#2282).
+    #[test]
+    fn a_miss_refusal_carries_the_fault_reason_and_a_stable_path_name() {
+        let paths = [
+            (MissPath::CoverageGate(SHORTFALL), "coverage_gate"),
+            (MissPath::PullLegMiss(PullMiss::Clean), "pull_leg_miss"),
+            (MissPath::PullLegTimeout, "pull_leg_timeout"),
+            (MissPath::BufferedMiss, "buffered_miss"),
+            (MissPath::NoPullThrough, "no_pull_through"),
+            (MissPath::NoLane, "no_lane"),
+        ];
+        for (path, name) in paths {
+            assert_eq!(path.as_str(), name);
+            assert_eq!(
+                MissRefusal::new(false, path).reason,
+                ServeRejectReason::CacheMiss
+            );
+            assert_eq!(
+                MissRefusal::new(true, path).reason,
+                ServeRejectReason::InternalError
+            );
+        }
+    }
+
+    /// The one line `log_miss_refusal` writes for `refusal`, captured at INFO.
+    fn refusal_line(refusal: MissRefusal, suppressed: Option<u64>) -> String {
+        let log = CapturedLog::default();
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        let req = StreamRequest {
+            hash: [0xAB; 32],
+            namespace_id: [0; 32],
+            pool_id: [0xCD; 32],
+            byte_offset: 16_384,
+            byte_len: 82_251,
+            timestamp_us: 0,
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            log_miss_refusal(&req, refusal, suppressed);
+        });
+        let text = String::from_utf8(
+            log.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "one line per refusal: {text}");
+        lines[0].to_owned()
+    }
+
+    /// The refusal line is what an operator greps Loki for: it must name the
+    /// hash, the requested range, the span's `reason` value and the path, at
+    /// info. A pull-leg miss names its cause, so a buy-ceiling decline reads
+    /// apart from an absent blob (#2282).
+    #[test]
+    fn a_miss_refusal_logs_one_info_line_with_hash_range_reason_path_and_cause() {
+        let line = refusal_line(
+            MissRefusal::new(false, MissPath::PullLegMiss(PullMiss::BelowMargin)),
+            None,
+        );
+        assert!(line.contains(" INFO "), "{line}");
+        assert!(line.contains("serve-miss: refusing the request"), "{line}");
+        assert!(
+            line.contains(&format!("hash={}", "ab".repeat(32))),
+            "{line}"
+        );
+        assert!(line.contains("byte_offset=16384"), "{line}");
+        assert!(line.contains("byte_len=82251"), "{line}");
+        assert!(line.contains("reason=\"cache_miss\""), "{line}");
+        assert!(line.contains("path=\"pull_leg_miss\""), "{line}");
+        assert!(line.contains("cause=\"below_margin\""), "{line}");
+        for absent in ["pull_offset=", "candidates=", "suppressed="] {
+            assert!(!line.contains(absent), "unexpected `{absent}`: {line}");
+        }
+    }
+
+    /// The coverage-gate line carries the shortfall that tells one partial
+    /// holder apart from a gap every holder shares (#2195, #2282).
+    #[test]
+    fn a_coverage_gate_refusal_logs_its_shortfall() {
+        let line = refusal_line(
+            MissRefusal::new(false, MissPath::CoverageGate(SHORTFALL)),
+            None,
+        );
+        assert!(line.contains("path=\"coverage_gate\""), "{line}");
+        assert!(line.contains("pull_offset=32768"), "{line}");
+        assert!(line.contains("pull_len=65536"), "{line}");
+        assert!(line.contains("candidates=2"), "{line}");
+        assert!(line.contains("first_uncovered_chunk=48"), "{line}");
+        assert!(!line.contains("cause="), "{line}");
+    }
+
+    /// A throttled no-lane line counts the lines it stands for.
+    #[test]
+    fn a_throttled_no_lane_refusal_logs_its_suppressed_count() {
+        let line = refusal_line(MissRefusal::new(false, MissPath::NoLane), Some(7));
+        assert!(line.contains("path=\"no_lane\""), "{line}");
+        assert!(line.contains("suppressed=7"), "{line}");
+    }
 
     /// The whole classification rests on a marker staying recoverable under the
     /// context layers callers stack on the way up to the dispatch sink. This file

@@ -10,9 +10,9 @@ use crate::metrics::FirstByteClock;
 use crate::node_origin::{PrimeLeg, PullLegTarget};
 
 use super::{
-    Arc, B256, CHUNK_BYTES, ClientHandler, Connection, FillOutcome, FloorReservation, Hash,
-    LaneDeliveryState, LaneKey, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason,
-    StreamRequest, StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
+    Arc, B256, CHUNK_BYTES, ClientHandler, Connection, CoverageShortfall, FloorReservation, Hash,
+    LaneDeliveryState, LaneKey, MissPath, MissRefusal, Mutex, NodeOrigin, RecvStream, SendStream,
+    ServeRejectReason, StreamRequest, StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
 };
 
 /// Release a miss leg's floor reservation on a refusal taken BEFORE the serve
@@ -93,9 +93,10 @@ impl ClientHandler {
     /// `fault_seen` carries whether an EARLIER tier (the reactive local-origin
     /// populate) hit a backend fault for this request (#1129). This path
     /// is the last tier, so its MISS exits — no openable provider, the open
-    /// deadline, and the coverage gate — refuse via [`FillOutcome::miss_reason`],
-    /// reporting `InternalError` when this node is degraded rather than merely
-    /// empty. The pull-loop guard is not a miss and ignores `fault_seen`.
+    /// deadline, and the coverage gate — refuse via [`Self::respond_miss`] with
+    /// the [`miss_reason`](super::FillOutcome::miss_reason), reporting
+    /// `InternalError` when this node is degraded rather than merely empty. The
+    /// pull-loop guard is not a miss and ignores `fault_seen`.
     ///
     /// The no-openable-provider exit adds a SECOND source of that fault: the pull's
     /// own [`PullMiss`](crate::node_origin::PullMiss), which says whether the
@@ -310,10 +311,10 @@ impl ClientHandler {
                         target = Some(opened);
                         total
                     }
-                    Err(reason) => {
+                    Err(refusal) => {
                         release_reservation_unspent(floor_reservation.as_ref());
                         return self
-                            .respond_error(&mut send, req, reason, rate_per_mb)
+                            .respond_miss(&mut send, req, refusal, rate_per_mb)
                             .await;
                     }
                 }
@@ -421,10 +422,10 @@ impl ClientHandler {
                 .await
             {
                 Ok(opened) => target = Some(opened),
-                Err(reason) => {
+                Err(refusal) => {
                     release_reservation_unspent(floor_reservation.as_ref());
                     return self
-                        .respond_error(&mut send, req, reason, rate_per_mb)
+                        .respond_miss(&mut send, req, refusal, rate_per_mb)
                         .await;
                 }
             }
@@ -433,16 +434,16 @@ impl ClientHandler {
         // (6c) Coverage gate (#2195): refuse with a signed miss the client can fail over
         // on, instead of `ok: true` and a truncated stream, when the ranked candidates
         // cannot cover the part of the pull range this node does not hold.
-        if self
+        if let Some(shortfall) = self
             .pull_range_uncovered(hash, total_bytes, pull_range, target.as_ref())
             .await
         {
             release_reservation_unspent(floor_reservation.as_ref());
             return self
-                .respond_error(
+                .respond_miss(
                     &mut send,
                     req,
-                    FillOutcome::miss_reason(fault_seen),
+                    MissRefusal::new(fault_seen, MissPath::CoverageGate(shortfall)),
                     rate_per_mb,
                 )
                 .await;
@@ -974,20 +975,22 @@ impl ClientHandler {
     }
 
     /// Discover + open a bounded upstream pull leg for `hash`, classifying every
-    /// failure into the wire reject reason the caller must respond with. Factored out
+    /// failure into the miss refusal the caller must respond with. Factored out
     /// so [`Self::serve_via_window_pull_through`] can open the leg from TWO points —
     /// up front on a cold miss (step 3), or late when a peeked fill retired between
     /// the advisory peek and the atomic `claim_fill` (step 6b) — without duplicating
     /// the timeout + [`crate::node_origin::PullMiss`] classification.
     ///
     /// `Ok(target)` is the bound leg (its `total_bytes` is the header-handshaked blob
-    /// length). `Err(reason)` is:
+    /// length). `Err(refusal)` is:
     /// - a clean miss on THIS tier, or a latched earlier-tier / local fault honored
     ///   per #1129 / #1560 (a walk that failed on our own broken buyer key is not
-    ///   evidence the blob is absent) — [`FillOutcome::miss_reason`] of
+    ///   evidence the blob is absent) — [`MissPath::PullLegMiss`] carrying the miss, with the
+    ///   [`miss_reason`](super::FillOutcome::miss_reason) of
     ///   `fault_seen || miss.is_local_fault()`;
-    /// - the pull-through deadline elapsing (a slow/absent upstream must not pin the
-    ///   stream) — the timeout metric fires and the reason is `miss_reason(fault_seen)`.
+    /// - the open deadline elapsing (a slow/absent upstream must not pin the
+    ///   stream) — the timeout metric fires and the refusal is
+    ///   [`MissPath::PullLegTimeout`] with reason `miss_reason(fault_seen)`.
     ///
     /// `prime` is the pull this miss expects to own, when it can say: the handshake
     /// then opens that pull's first leg for the pull leg to adopt (#2063).
@@ -1002,27 +1005,28 @@ impl ClientHandler {
         fault_seen: bool,
         prime: Option<PrimeLeg>,
         requester: B256,
-    ) -> Result<PullLegTarget, ServeRejectReason> {
+    ) -> Result<PullLegTarget, MissRefusal> {
         let open = origin.open_pull_leg(hash, namespace_id, prime, requester.0);
         match tokio::time::timeout(deadline, open).await {
             Ok(Ok(target)) => Ok(target),
-            Ok(Err(miss)) => Err(FillOutcome::miss_reason(
+            Ok(Err(miss)) => Err(MissRefusal::new(
                 fault_seen || miss.is_local_fault(),
+                MissPath::PullLegMiss(miss),
             )),
             Err(_elapsed) => {
                 self.metrics.node_pull_through_timeout();
-                Err(FillOutcome::miss_reason(fault_seen))
+                Err(MissRefusal::new(fault_seen, MissPath::PullLegTimeout))
             }
         }
     }
 
-    /// Whether `target`'s candidates leave part of `pull_range` uncovered, counting
-    /// only the chunks this node does not already hold (#2195). `false` when this
-    /// serve drives no pull.
+    /// The part of `pull_range` that `target`'s candidates leave uncovered,
+    /// counting only the chunks this node does not already hold (#2195). `None`
+    /// when this serve drives no pull or the candidates cover the whole gap.
     ///
     /// It is the test the ranged assembly's first round applies, judged against the
-    /// signed `total_bytes`, so `true` means the pull cannot fill the range and the
-    /// serve must refuse before `ok: true`. A store read fault fails open (`false`):
+    /// signed `total_bytes`, so `Some` means the pull cannot fill the range and the
+    /// serve must refuse before `ok: true`. A store read fault fails open (`None`):
     /// the assembly's own read raises and classifies it.
     async fn pull_range_uncovered(
         &self,
@@ -1030,10 +1034,10 @@ impl ClientHandler {
         total_bytes: u64,
         pull_range: Option<(u64, u64)>,
         target: Option<&PullLegTarget>,
-    ) -> bool {
+    ) -> Option<CoverageShortfall> {
         use decdn_bao_range::RangedStore as _;
         let (Some((pull_offset, pull_len)), Some(target)) = (pull_range, target) else {
-            return false;
+            return None;
         };
         let store = decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
         let gap = match store.missing_ranges(pull_offset, pull_len).await {
@@ -1045,22 +1049,19 @@ impl ClientHandler {
                     "serve-miss: cannot read the missing range for the coverage gate; \
                      committing without it"
                 );
-                return false;
+                return None;
             }
         };
         let uncovered = target.uncovered(&gap);
         if uncovered.is_empty() {
-            return false;
+            return None;
         }
-        tracing::info!(
-            %hash,
+        Some(CoverageShortfall {
             pull_offset,
             pull_len,
-            candidates = target.candidate_count(),
-            first_uncovered_chunk = uncovered.boundaries().first().map(|c| c.0),
-            "serve-miss: no candidate covers part of the missing range; refusing before commit"
-        );
-        true
+            candidates: target.candidate_count(),
+            first_uncovered_chunk: uncovered.boundaries().first().map(|c| c.0),
+        })
     }
 
     /// Seed the shared fill session's outboard with proof nodes for ranges this

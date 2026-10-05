@@ -15678,6 +15678,7 @@ impl DiscoveryCase {
 /// would report the (genuinely uncovered) range as covered.
 #[allow(clippy::too_many_lines)]
 async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result<()> {
+    let spans = support::capture_spans();
     let (_block_guard, payload, hash) = two_block_blob()?;
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let partial = Coverage::from_block_indices(2, [0].into_iter());
@@ -15816,6 +15817,30 @@ async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result
             format!("{err:#}").contains("delivery refused"),
             "S must refuse before committing, not truncate after `ok: true`: {err:#}"
         );
+        // S logs the refusal on the coverage-gate path with its shortfall (#2282).
+        // Filtered by path too: the cases share this blob, so a single-process
+        // test run sees each case's line.
+        let lines: Vec<_> = spans
+            .events(
+                "serve-miss: refusing the request",
+                "hash",
+                &hash.to_string(),
+            )
+            .into_iter()
+            .filter(|l| l.get("path").map(String::as_str) == Some("coverage_gate"))
+            .collect();
+        anyhow::ensure!(
+            !lines.is_empty(),
+            "no coverage_gate refusal line for the hash"
+        );
+        for line in &lines {
+            anyhow::ensure!(
+                line.get("reason").map(String::as_str) == Some("cache_miss")
+                    && line.contains_key("candidates")
+                    && line.contains_key("first_uncovered_chunk"),
+                "coverage_gate line: {line:?}"
+            );
+        }
     } else {
         let outcome = pulled?;
         anyhow::ensure!(outcome.completed, "leaf delivery did not complete");

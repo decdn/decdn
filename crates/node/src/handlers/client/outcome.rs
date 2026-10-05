@@ -65,8 +65,9 @@ impl ResetCause {
 }
 
 /// The `reason` value a span records for a refusal: snake case, like every
-/// other `reason` and `outcome` value, so one attribute reads one way.
-const fn refusal_reason(reason: ServeRejectReason) -> &'static str {
+/// other `reason` and `outcome` value, so one attribute reads one way. A
+/// serve-miss refusal's log line records the same value.
+pub(super) const fn refusal_reason(reason: ServeRejectReason) -> &'static str {
     match reason {
         ServeRejectReason::EvictedSinceProbe => "evicted_since_probe",
         ServeRejectReason::CacheMiss => "cache_miss",
