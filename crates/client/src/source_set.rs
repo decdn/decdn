@@ -45,14 +45,18 @@ pub struct Holder {
     /// The provider's on-chain address: the payment lane's payee and the key
     /// of its health.
     pub provider: Address,
-    /// The blocks it holds, or `None` for the whole blob.
+    /// The blocks it serves: its advertised coverage less any block dropped
+    /// after repeated refusals inside it, or
+    /// `None` for the whole blob.
     pub coverage: Option<Coverage>,
     /// The probed round-trip time. Lower starts first.
     pub rtt_ms: f64,
-    /// Whether a probe reported that this provider holds the blob. A
-    /// `NotFound` from a probed holder is a delivery fault only: on the wire
-    /// it also means load shed, a per-signer cap, or a pool the node cannot
-    /// confirm yet. A provider the probe did not report as a holder (a
+    /// Whether a probe reported that this provider holds the blob. A probed
+    /// holder is never marked absent: on the wire a `NotFound` also means load
+    /// shed, a per-signer cap, or a pool the node cannot confirm yet. To a
+    /// whole holder it is a delivery fault only. A partial holder's counts
+    /// toward dropping the refused blocks from its coverage (inside it) or
+    /// barring it from pull-through (outside it), each for a while. A provider the probe did not report as a holder (a
     /// pull-through or proxy-warming target) counts as absent after
     /// [`ABSENT_AFTER_NOT_FOUND`] such answers with no verified byte between
     /// them.
@@ -84,13 +88,16 @@ pub struct LaneRange {
 /// How many `NotFound` answers in a row, with no verified byte between them,
 /// mark a provider that is not a probed holder as absent. The same count of
 /// `NotFound` answers for ranges outside a probed partial holder's coverage
-/// bars it from pull-through ([`SourceSet::no_pull_through`]).
+/// bars it from pull-through ([`SourceSet::no_pull_through`]), and for one
+/// block inside it drops that block from its coverage for a while.
 pub const ABSENT_AFTER_NOT_FOUND: u32 = 3;
 
 /// How long a bar from pull-through set by `NotFound` answers lasts. A node
 /// also answers `NotFound` when it sheds miss load or its chain view is stale,
 /// so the bar ends after the longest cooldown and the holder takes one
-/// uncovered range again as a probe.
+/// uncovered range again as a probe. It is also how long a block dropped from
+/// a partial holder's coverage stays out, and the quiet time after which a
+/// block's count of covered refusals starts again.
 pub const PULL_THROUGH_BAR: Duration = crate::health::COOL_CAP;
 
 /// Where a [`SourceSet`] finds holders and builds their lanes.
@@ -241,11 +248,13 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// it). Each one serves only the blocks it covers until then.
     no_pull_through: HashMap<Address, Instant>,
     /// Each probed partial holder's `NotFound` answers for ranges inside its
-    /// coverage, keyed by every discovery block a refused range touches, with
-    /// the time of the last one. A count whose last answer is
-    /// [`PULL_THROUGH_BAR`] old starts again, so sparse transient refusals
-    /// (load shed, a stale chain view) never add up.
-    covered_not_found: HashMap<(Address, u32), (u32, Instant)>,
+    /// coverage, keyed by every discovery block the refused part of a range
+    /// touches, with the time of the last one counted. Answers within
+    /// [`crate::health::COOL_BASE`] of the last one count once, a count whose
+    /// last answer is [`PULL_THROUGH_BAR`] old starts again, and a verified
+    /// byte in the block clears it ([`SourceSet::record_covered_served`]). So
+    /// transient refusals (load shed, a stale chain view) do not add up.
+    covered_not_found: HashMap<(Address, u32), (u32, Option<Instant>)>,
     /// Blocks each probed partial holder advertised but refused
     /// [`ABSENT_AFTER_NOT_FOUND`] times, each with the time its drop ends
     /// ([`PULL_THROUGH_BAR`] after the refusal that set it). Its coverage
@@ -459,10 +468,11 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// Record a refusal on an extra stream of `provider`'s lane
     /// ([`crate::LaneWiden`]) for `range`, given at `at`, while the lane's own
     /// worker runs or the node is already charged for this outage. The node
-    /// does not cool for it. A `NotFound` from a probed partial holder counts
-    /// as on its own stream: outside its coverage toward barring it from
-    /// pull-through, inside toward dropping the refused block from its
-    /// coverage. A size-ceiling refusal bars it at once.
+    /// does not cool for it. A `NotFound` for a range outside the coverage of
+    /// a probed partial holder counts toward barring it from pull-through,
+    /// and a size-ceiling refusal bars it at once, as on its own stream. The
+    /// scheduler passes only uncovered ranges here: an extra stream's covered
+    /// `NotFound` is most often the node's per-signer live cap.
     pub(crate) fn record_extra_refusal(
         &mut self,
         provider: Address,
@@ -555,8 +565,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// [`ABSENT_AFTER_NOT_FOUND`]. A probed holder is never marked absent.
     /// For a partial holder, an answer for a range outside its coverage
     /// ([`LaneRange::uncovered`]) counts toward barring it from pull-through,
-    /// and one for a range inside it counts toward dropping the block the
-    /// range starts in from its coverage. To a whole holder the answer is a
+    /// and one for a range inside it counts toward dropping each block the
+    /// refused part of the range touches from its coverage. To a whole holder the answer is a
     /// delivery fault only.
     fn record_not_found(
         &mut self,
@@ -622,25 +632,25 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         range: &LaneRange,
         at: Instant,
     ) {
-        let block_bytes = decdn_protocol::discovery_block_bytes();
-        let block_of = |offset: u64| u32::try_from(offset / block_bytes).unwrap_or(u32::MAX);
-        let first = block_of(range.offset);
-        let last = block_of(range.offset.saturating_add(range.len.max(1)) - 1);
+        // The bytes before `landed` verified: only the part after them is refused.
+        let refused_from = range.offset.saturating_add(range.landed);
+        let refused_end = range.offset.saturating_add(range.len);
         let until = at.checked_add(PULL_THROUGH_BAR).unwrap_or(at);
         let mut dropped = Vec::new();
-        for block in first..=last {
+        for block in blocks_of(refused_from, refused_end) {
             let (count, last_at) = self
                 .covered_not_found
                 .entry((provider, block))
-                .or_insert((0, at));
-            if last_at
-                .checked_add(PULL_THROUGH_BAR)
-                .is_some_and(|quiet| quiet <= at)
-            {
-                *count = 0;
+                .or_insert((0, None));
+            match *last_at {
+                // One burst (the own stream and its extras refused together, or
+                // one load-shed moment) counts once.
+                Some(last) if at < last + crate::health::COOL_BASE => continue,
+                Some(last) if last + PULL_THROUGH_BAR <= at => *count = 0,
+                _ => {}
             }
             *count = count.saturating_add(1);
-            *last_at = (*last_at).max(at);
+            *last_at = Some(at);
             if *count >= ABSENT_AFTER_NOT_FOUND
                 && self
                     .stale_blocks
@@ -670,12 +680,26 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         self.marked(true, refused);
     }
 
+    /// Record bytes `provider` verified in `ranges` (`(offset, len)`) of its
+    /// own coverage: it holds those blocks after all, so their counts of
+    /// covered refusals clear.
+    pub(crate) fn record_covered_served(&mut self, provider: Address, ranges: &[(u64, u64)]) {
+        for &(offset, len) in ranges {
+            for block in blocks_of(offset, offset.saturating_add(len)) {
+                self.covered_not_found.remove(&(provider, block));
+            }
+        }
+    }
+
     /// Set `provider`'s coverage to what it last advertised, less the blocks
-    /// dropped from it now.
+    /// dropped from it now. A holder whose coverage is the whole blob keeps it.
     fn narrow(&mut self, provider: Address) {
         let Some(advertised) = self.advertised.get(&provider) else {
             return;
         };
+        if self.holder(provider).is_some_and(|h| h.coverage.is_none()) {
+            return;
+        }
         let stale = self.stale_blocks.get(&provider);
         let narrowed = without_blocks(advertised, |b| stale.is_some_and(|s| s.contains_key(&b)));
         if let Some(holder) = self.holders.iter_mut().find(|h| h.provider == provider) {
@@ -1012,8 +1036,17 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// ([`Self::record_covered_refusal`]) stays out of the coverage a probe
     /// reports again until its drop ends: the record that claimed it is the
     /// likely stale one.
+    ///
+    /// A probe that reports a holder as whole replaces its partial record, so
+    /// it also ends every block drop and count of covered refusals it had.
     fn merge(&mut self, holders: Vec<Holder>) {
         for mut holder in holders {
+            if holder.coverage.is_none() {
+                let provider = holder.provider;
+                self.stale_blocks.remove(&provider);
+                self.advertised.remove(&provider);
+                self.covered_not_found.retain(|(p, _), _| *p != provider);
+            }
             if let (Some(coverage), Some(stale)) = (
                 holder.coverage.as_ref(),
                 self.stale_blocks.get(&holder.provider),
@@ -1044,6 +1077,17 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             }
         }
     }
+}
+
+/// The discovery blocks the byte range `[start, end)` touches; none for an
+/// empty range.
+fn blocks_of(start: u64, end: u64) -> std::ops::Range<u32> {
+    if start >= end {
+        return 0..0;
+    }
+    let block_bytes = decdn_protocol::discovery_block_bytes();
+    let block_of = |offset: u64| u32::try_from(offset / block_bytes).unwrap_or(u32::MAX);
+    block_of(start)..block_of(end - 1).saturating_add(1)
 }
 
 /// `coverage` less the blocks `dropped` names.
@@ -1595,22 +1639,18 @@ mod tests {
             vec![partial(A, 10.0, &[0, 1]), holder(B, 20.0)],
         );
         let now = Instant::now();
-        let covers = |set: &SourceSet<'_, _>, block| {
-            set.holder(A)
-                .and_then(|h| h.coverage.as_ref())
-                .is_some_and(|c| c.covers(block))
-        };
-        say_not_found_in(
+        let at = say_covered_not_found(
             &mut set,
             A,
             block1(false),
             super::ABSENT_AFTER_NOT_FOUND - 1,
             now,
         );
-        assert!(covers(&set, 1), "two answers are not enough");
-        say_not_found_in(&mut set, A, block1(false), 1, now);
-        assert!(!covers(&set, 1), "the refused block leaves the coverage");
-        assert!(covers(&set, 0), "the block it serves stays");
+        assert!(covers(&set, A, 1), "two answers are not enough");
+        let at =
+            say_covered_not_found(&mut set, A, block1(false), 1, at + crate::health::COOL_BASE);
+        assert!(!covers(&set, A, 1), "the refused block leaves the coverage");
+        assert!(covers(&set, A, 0), "the block it serves stays");
         assert!(
             !set.no_pull_through(A),
             "a covered refusal is not a pull-through bar"
@@ -1621,16 +1661,43 @@ mod tests {
         );
 
         set.merge(vec![partial(A, 10.0, &[0, 1])]);
-        assert!(!covers(&set, 1), "a probe repeating the stale claim");
-        assert!(covers(&set, 0));
+        assert!(!covers(&set, A, 1), "a probe repeating the stale claim");
+        assert!(covers(&set, A, 0));
 
         // A `NotFound` may be transient, so the drop ends with the bar's time,
         // and the count starts again.
-        set.expire_pull_through_bars(now + super::PULL_THROUGH_BAR);
-        assert!(covers(&set, 1), "the drop ended");
-        let later = now + super::PULL_THROUGH_BAR;
-        say_not_found_in(&mut set, A, block1(false), 2, later);
-        assert!(covers(&set, 1), "the count restarted with the drop");
+        let later = at + super::PULL_THROUGH_BAR;
+        set.expire_pull_through_bars(later);
+        assert!(covers(&set, A, 1), "the drop ended");
+        say_covered_not_found(&mut set, A, block1(false), 2, later);
+        assert!(covers(&set, A, 1), "the count restarted with the drop");
+    }
+
+    /// Whether `provider`'s coverage in `set` holds `block`.
+    fn covers<P: SourceProvider>(set: &SourceSet<'_, P>, provider: Address, block: u32) -> bool {
+        set.holder(provider)
+            .and_then(|h| h.coverage.as_ref())
+            .is_some_and(|c| c.covers(block))
+    }
+
+    /// Record `times` covered `NotFound` answers from `provider` for `range`,
+    /// a cooldown apart from `start`, as a lane that retries after each gives
+    /// them. Returns the time of the last one.
+    fn say_covered_not_found<P: SourceProvider>(
+        set: &mut SourceSet<'_, P>,
+        provider: Address,
+        range: super::LaneRange,
+        times: u32,
+        start: Instant,
+    ) -> Instant {
+        let mut at = start;
+        for n in 0..times {
+            if n > 0 {
+                at += crate::health::COOL_BASE;
+            }
+            say_not_found_in(set, provider, range, 1, at);
+        }
+        at
     }
 
     /// #2281: covered refusals spread out more than [`PULL_THROUGH_BAR`] apart,
@@ -1646,10 +1713,77 @@ mod tests {
             say_not_found_in(&mut set, A, block1(false), 1, at);
             at += super::PULL_THROUGH_BAR;
         }
+        assert!(covers(&set, A, 1));
+    }
+
+    /// #2281: one burst of covered refusals (the own stream and its extras
+    /// refused at one load-shed moment) counts once, and a verified byte in the
+    /// block clears its count.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_counts_once_and_a_served_byte_clears_the_count() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![partial(A, 10.0, &[0, 1])]);
+        let now = Instant::now();
+        say_not_found_in(&mut set, A, block1(false), 10, now);
+        let at = say_covered_not_found(
+            &mut set,
+            A,
+            block1(false),
+            1,
+            now + crate::health::COOL_BASE,
+        );
+        assert!(covers(&set, A, 1), "a burst and one more answer are two");
+
+        set.record_covered_served(A, &[(64 << 20, 1024)]);
+        say_covered_not_found(&mut set, A, block1(false), 2, at + crate::health::COOL_BASE);
+        assert!(covers(&set, A, 1), "the served byte restarted the count");
+    }
+
+    /// #2281: a refusal mid-range counts only toward the blocks after the bytes
+    /// that landed: the node served the ones before.
+    #[tokio::test(start_paused = true)]
+    async fn a_mid_range_refusal_counts_only_the_blocks_after_what_landed() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![partial(A, 10.0, &[0, 1])]);
+        let spanning = super::LaneRange {
+            offset: 0,
+            len: 128 << 20,
+            landed: 64 << 20,
+            past_end: false,
+            uncovered: false,
+        };
+        say_covered_not_found(
+            &mut set,
+            A,
+            spanning,
+            super::ABSENT_AFTER_NOT_FOUND,
+            Instant::now(),
+        );
+        assert!(covers(&set, A, 0), "block 0 landed");
+        assert!(!covers(&set, A, 1));
+    }
+
+    /// #2281: a probe that reports a holder with a dropped block as whole ends
+    /// the drop, so its end does not turn the holder partial again.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_reported_whole_keeps_the_whole_blob_when_a_drop_ends() {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![partial(A, 10.0, &[0, 1])]);
+        let now = Instant::now();
+        let at = say_covered_not_found(
+            &mut set,
+            A,
+            block1(false),
+            super::ABSENT_AFTER_NOT_FOUND,
+            now,
+        );
+        assert!(!covers(&set, A, 1));
+
+        set.merge(vec![holder(A, 10.0)]);
+        set.expire_pull_through_bars(at + super::PULL_THROUGH_BAR);
         assert!(
-            set.holder(A)
-                .and_then(|h| h.coverage.as_ref())
-                .is_some_and(|c| c.covers(1))
+            set.holder(A).is_some_and(|h| h.coverage.is_none()),
+            "the whole holder stays whole"
         );
     }
 

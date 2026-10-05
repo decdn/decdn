@@ -221,6 +221,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn raise_all_lifts_every_lane_and_never_lowers_one() {
+        let reg = LaneLedgers::new();
+        let low = reg.get_or_insert(lane(1), || LaneHandle::for_test(Cumulative::default()));
+        let high = reg.get_or_insert(lane(2), || LaneHandle::for_test(Cumulative::default()));
+        let deposit = |h: &LaneHandle| {
+            h.ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .deposit
+        };
+        let set = |h: &LaneHandle, d: u64| {
+            h.ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .deposit = U256::from(d);
+        };
+        set(&low, 100);
+        set(&high, 500);
+        reg.raise_all(U256::from(300u64));
+        assert_eq!(deposit(&low), U256::from(300u64), "raised");
+        assert_eq!(deposit(&high), U256::from(500u64), "never lowered");
+    }
+
     // The lock-order invariant `credit_all` relies on: `total_committed` locks the
     // map but never a `ctx`, so it completes even while a caller holds a lane `ctx`
     // guard — the opposite order `credit_all` avoids by releasing the map lock

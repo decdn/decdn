@@ -710,6 +710,10 @@ struct WorkerEnd {
     /// When the worker last verified a byte of a range outside its coverage:
     /// its node serves such ranges by pull-through.
     pulled_through: Option<Instant>,
+    /// The `(offset, len)` pieces inside its coverage in which the worker
+    /// verified bytes: its node holds those blocks
+    /// ([`SourceSet::record_covered_served`]).
+    covered_served: Vec<(u64, u64)>,
     /// Whether it was an extra worker ([`Work::add_extra`]): its end touches
     /// neither the lane's running state nor its source's health.
     extra: bool,
@@ -1865,6 +1869,14 @@ where
     };
     let mut delivered = false;
     let mut pulled_through = None;
+    let covered_served: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+    let take_served = || {
+        std::mem::take(
+            &mut *covered_served
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    };
     // Per-worker resume/quote state. The reactive-top-up budget is NOT in here:
     // it is a property of the one shared pool and lives in `pool`.
     let mut counters = DriveCounters::new();
@@ -1890,6 +1902,7 @@ where
             end: LaneEnd::Idle,
             delivered,
             pulled_through,
+            covered_served: take_served(),
             extra,
         };
         // The store's missing runs, which a steal splits by. Read off the
@@ -2081,6 +2094,11 @@ where
                 delivered = true;
                 if uncovered {
                     pulled_through = Some(Instant::now());
+                } else {
+                    covered_served
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((g_start, gap_landed));
                 }
                 health.record_progress(provider);
             }
@@ -2162,6 +2180,7 @@ where
                     },
                     delivered,
                     pulled_through,
+                    covered_served: take_served(),
                     extra,
                 });
             }
@@ -2175,6 +2194,7 @@ where
                 end: LaneEnd::Idle,
                 delivered,
                 pulled_through,
+                covered_served: take_served(),
                 extra,
             });
         }
@@ -2680,14 +2700,15 @@ fn pool_deposit<S>(
 
 /// Raise the pool's deposit to `lane`'s, which a lane that just built reads
 /// from its row: the first lane names the deposit, and a later one carries any
-/// refill its build made. `raise` lifts the watch and every started lane's
-/// context, so a lane built before the refill stops gating on the old deposit.
+/// refill its build made. `raise` lifts the watch and every lane context the
+/// acquire shares (the run registry's, or its own started lanes'), so a lane
+/// built before the refill stops gating on the old deposit.
 fn raise_to_lane<S>(raise: &dyn Fn(U256), lane: &StreamCandidate<S>) {
-    let Ok(ctx) = lane.ctx.lock() else {
-        return;
-    };
-    let seen = ctx.deposit;
-    drop(ctx);
+    let seen = lane
+        .ctx
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .deposit;
     raise(seen);
 }
 
@@ -2830,8 +2851,10 @@ where
     let work = AsyncMutex::new(Work::new(pending, env.pacing.is_some()));
     let progress_wake = Notify::new();
 
-    // The pool deposit every lane draws on, as the loop last saw it. The first
-    // built lane seeds it; a landed top-up publishes the new value.
+    // The pool deposit every lane draws on, as the loop last saw it. Each built
+    // lane raises it to the deposit its row read (the first names it, a later
+    // one carries any refill its build made); a landed top-up publishes the new
+    // value.
     let (deposit_tx, mut deposit_rx) = tokio::sync::watch::channel(U256::ZERO);
     // Every started lane's `(ctx, ledger)`: the pool-wide view when there is no
     // run registry.
@@ -3270,7 +3293,7 @@ where
                 biased;
                 Some(end) = workers.next(), if !workers.is_empty() => {
                     // `Err` here is this process's fault (store I/O, a slot bug).
-                    let WorkerEnd { provider, end, delivered, pulled_through, extra } = match end {
+                    let WorkerEnd { provider, end, delivered, pulled_through, covered_served, extra } = match end {
                         Ok(end) => end,
                         Err(err) => return Err(err),
                     };
@@ -3293,6 +3316,7 @@ where
                     growth.wanted = true;
                     if delivered {
                         sources.record_progress(provider);
+                        sources.record_covered_served(provider, &covered_served);
                         charged.remove(&provider);
                     }
                     if let Some(at) = pulled_through {
@@ -3318,10 +3342,9 @@ where
                         // still runs, and it asks for no growth at once: the
                         // lane waits, from `GROWTH_RETRY` and doubling up to
                         // `EXTRA_RETRY_CAP`, before it is asked again. A
-                        // `NotFound` or size-ceiling refusal counts as on its
-                        // own stream: outside the lane's coverage toward
-                        // barring it from pull-through, inside toward dropping
-                        // the refused blocks from its coverage. A lane's last
+                        // `NotFound` or size-ceiling refusal of a range outside
+                        // the lane's coverage counts toward barring it from
+                        // pull-through, as on its own stream. A lane's last
                         // live worker faults for the lane, so once the own
                         // worker has stopped, the extra's fault is recorded
                         // like the lane's own, unless the node is already
@@ -3335,7 +3358,13 @@ where
                                 return Err(err);
                             }
                             log_extra_fault(provider, hash, range, &err);
-                            sources.record_extra_refusal(provider, &err, range, at);
+                            // Only an uncovered range: a node's per-signer live
+                            // cap, which extra streams hit, refuses as a plain
+                            // `NotFound` too, and inside the coverage that says
+                            // nothing about the blocks it holds.
+                            if range.uncovered {
+                                sources.record_extra_refusal(provider, &err, range, at);
+                            }
                             growth.wanted = false;
                             if let Some(lane) = lane_slot {
                                 let refusals = growth.extra_refused(lane, Instant::now());
@@ -6637,6 +6666,45 @@ mod tests {
         Ok(())
     }
 
+    /// #2281: narrowing a probed lane's coverage reaches its extra workers and
+    /// leaves a whole-blob lane alone, and widening it again when a block's
+    /// drop ends hands the lane the block's range once more.
+    #[test]
+    fn set_coverage_narrows_and_restores_a_probed_lane_and_its_extras() -> anyhow::Result<()> {
+        use std::collections::VecDeque;
+
+        use decdn_bao_range::align_range;
+
+        use super::Work;
+
+        let total = 2 * DISCOVERY_BLOCK_BYTES;
+        let in_block1 = align_range(DISCOVERY_BLOCK_BYTES, DISCOVERY_BLOCK_BYTES, total)?;
+        let mut work = Work::new(VecDeque::from(vec![in_block1]), false);
+        let a = work.add_lane(Some(cov(2, &[0, 1])), total);
+        let x = work.add_extra(a);
+        let b = work.add_lane(None, total);
+        let covers1 =
+            |work: &Work, slot: usize| work.coverage.get(slot).is_some_and(|c| c.covers(1));
+
+        work.set_coverage(a, &cov(2, &[0]));
+        assert!(
+            !covers1(&work, a) && !covers1(&work, x),
+            "lane and extra narrow"
+        );
+        work.set_coverage(b, &cov(2, &[0]));
+        assert!(covers1(&work, b), "a whole-blob lane keeps its coverage");
+
+        work.set_coverage(a, &cov(2, &[0, 1]));
+        assert!(covers1(&work, a) && covers1(&work, x), "the drop ended");
+        let a_cov = cov(2, &[0, 1]);
+        let picked = work.pick(a, total, &a_cov, true, &[(0, total)])?;
+        assert!(
+            picked.is_some_and(|p| p.range.fetch_start() == DISCOVERY_BLOCK_BYTES && !p.uncovered),
+            "the restored block's range is covered work for the lane again"
+        );
+        Ok(())
+    }
+
     /// A faulted lane's remainder that only that lane covered (#2230): once
     /// the lane has stopped, no running lane covers it, so a busy lane not
     /// barred from pull-through may grow for it, and its extra worker takes
@@ -7236,6 +7304,68 @@ mod tests {
             a_ctx.lock().unwrap().deposit,
             refilled,
             "the lane built first takes on the deposit the later build read"
+        );
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        Ok(())
+    }
+
+    /// #2296: the raise only ever lifts a deposit. A lane whose build read an
+    /// older, lower row does not lower a lane a top-up already credited.
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_built_on_a_lower_deposit_never_lowers_the_running_lanes() -> anyhow::Result<()>
+    {
+        let data = blob(1024 * 1024);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let lb = Arc::new(PoolLedger::new(Cumulative::default()));
+        // A starts at once and faults, so it is still running when B lands.
+        let a = ScriptedSource::new(data.clone())?
+            .paying(Arc::clone(&la))
+            .fault_once_after(0, || anyhow::anyhow!("scripted reset"));
+        let b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&lb));
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, dir) = fresh_store(root, total);
+        let before = U256::from(u128::MAX);
+        let refilled = U256::from(u64::MAX);
+        let a_ctx = Arc::new(Mutex::new(ctx_with(0xA1, before)));
+        let provider = SlowBuild {
+            lanes: StaticSources::new(vec![
+                candidate_ctx(a, la, Arc::clone(&a_ctx), None),
+                candidate_ctx(b, lb, Arc::new(Mutex::new(ctx_with(0xB2, refilled))), None),
+            ])?,
+            slow: Address::repeat_byte(0xB2),
+            delay: Duration::from_secs(1),
+            built: std::sync::atomic::AtomicBool::new(false),
+        };
+        let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
+        let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+        let drive = drive_config();
+        acquire(
+            AcquireTarget {
+                store: &store,
+                hash: root,
+                total_bytes: total,
+                ranges: &[(0, total)],
+            },
+            &mut set,
+            &AcquireEnv {
+                pacer: &BudgetPacer::new(),
+                funder: &no_topups(),
+                drive: &drive,
+                max_lanes: 2,
+                stop: &stop,
+                on_progress: None,
+                ledgers: None,
+                pacing: None,
+                max_blob_bytes: 0,
+            },
+        )
+        .await?;
+        assert!(provider.built.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            a_ctx.lock().unwrap().deposit,
+            before,
+            "a later build that read a lower deposit does not lower a running lane"
         );
         store.finalize().await?;
         assert_eq!(std::fs::read(dir.path().join("b"))?, data);

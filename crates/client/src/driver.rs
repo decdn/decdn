@@ -118,6 +118,38 @@ impl std::fmt::Display for PoolExhausted {
 
 impl std::error::Error for PoolExhausted {}
 
+/// A source kept refusing a new stream as `InsufficientDeposit` while the pool's
+/// remaining deposit already sat within the low water of the working deposit,
+/// past the settle budget ([`DriveConfig::max_settle_waits`]).
+///
+/// No top-up the pacer would send moves such a deposit, so the source is not
+/// priced out by it: either its chain view has not seen a refill yet, or its
+/// refundable floor `M` exceeds what this working deposit can cover. The fault
+/// classifier ([`crate::classify`]) rules it [`crate::Fault::Source`], so the
+/// source cools and is asked again, instead of waiting for a deposit rise that
+/// never comes.
+#[derive(Debug)]
+pub(crate) struct StaleDepositView {
+    /// The remaining deposit by our own ledger.
+    pub(crate) remaining: U256,
+    /// The working deposit the pacer tops up toward.
+    pub(crate) working: U256,
+}
+
+impl std::fmt::Display for StaleDepositView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the source refuses the pool as short of deposit while {} of the {} µUSDC working \
+             deposit remains: its chain view is stale, or its refundable floor exceeds the \
+             working deposit",
+            self.remaining, self.working
+        )
+    }
+}
+
+impl std::error::Error for StaleDepositView {}
+
 /// Marker on a reactive top-up that failed: [`Funder::top_up`] returned an
 /// error, so the deposit did not rise. The failure is the buyer's funding,
 /// never the serving source's delivery, so the fault classifier
@@ -337,6 +369,39 @@ fn deposit_near_working(remaining: U256, next_voucher_cost: U256, working_deposi
         && remaining >= next_voucher_cost
         && working_deposit.saturating_sub(remaining)
             < crate::pacer::min_reactive_top_up(working_deposit)
+}
+
+/// Decide the next step for a source that refuses a deposit near the working
+/// target ([`deposit_near_working`]) after `waits` settle waits: `None` to
+/// wait once more, or the [`StaleDepositView`] fault once the budget is spent.
+/// Logs the first wait at info, each later one at debug, and the fault at warn.
+fn stale_view_wait(remaining: U256, config: &DriveConfig, waits: u32) -> Option<StaleDepositView> {
+    let working = config.working_deposit;
+    if waits >= config.max_settle_waits {
+        tracing::warn!(
+            %remaining,
+            %working,
+            waits,
+            "a source keeps refusing a deposit near the working target; its chain view is \
+             stale or its refundable floor exceeds the working deposit"
+        );
+        return Some(StaleDepositView { remaining, working });
+    }
+    if waits == 0 {
+        tracing::info!(
+            %remaining,
+            %working,
+            "a source refuses a deposit near the working target; waiting for its chain view \
+             to catch up"
+        );
+    } else {
+        tracing::debug!(
+            %remaining,
+            waits,
+            "still waiting for a source's chain view of the deposit"
+        );
+    }
+    None
 }
 
 /// Bytes per [`bao_tree::ChunkNum`] — a 1 KiB bao chunk. A gap's byte span is its
@@ -923,6 +988,10 @@ where
     // per-open and resets the moment a leg lands.
     let mut awaiting_settle = false;
     let mut settle_waits = 0u32;
+    // Waits on a source's stale view of a deposit already near the working
+    // target (step 1b). Apart from `settle_waits`, which a top-up re-arms: this
+    // path never tops up, so a landed leg re-arms it instead.
+    let mut stale_view_waits = 0u32;
     let mut exhaustion_confirmed = false;
 
     // Paid-frontier anchor (PER-LEG, not per-gap). A "leg" is one contiguous
@@ -1299,6 +1368,9 @@ where
                     Err(err) => Err(err),
                 };
 
+                if leg.is_ok() {
+                    stale_view_waits = 0;
+                }
                 if let Err(err) = leg {
                     // --- fault classification (mirrors the CLI loop, REUSING the
                     // shipped predicates) ---
@@ -1342,17 +1414,27 @@ where
                     //     water of `working_deposit` is the node's stale view
                     //     instead: a refill made elsewhere (another lane's build,
                     //     a sibling's top-up) has not reached its chain watcher
-                    //     yet, and no top-up the pacer would send moves it. Wait
-                    //     it out on the settle budget, then let the pacer decide.
+                    //     yet, and no top-up the pacer would send moves it (the
+                    //     pacer refuses a top-up below
+                    //     [`crate::pacer::min_reactive_top_up`]). Wait it out on
+                    //     its own budget. Past it, the source faults as
+                    //     [`StaleDepositView`]: it cools and is asked again,
+                    //     rather than read as priced out by a deposit that never
+                    //     rises.
                     if is_insufficient_deposit(&err) {
-                        if settle_waits < config.max_settle_waits
-                            && deposit_near_working(
-                                locked_deposit(ctx)?.saturating_sub(spent(committed.amount)),
-                                counters.next_voucher_cost,
-                                config.working_deposit,
-                            )
-                        {
-                            settle_waits = settle_waits.saturating_add(1);
+                        let remaining =
+                            locked_deposit(ctx)?.saturating_sub(spent(committed.amount));
+                        if deposit_near_working(
+                            remaining,
+                            counters.next_voucher_cost,
+                            config.working_deposit,
+                        ) {
+                            if let Some(stale) =
+                                stale_view_wait(remaining, config, stale_view_waits)
+                            {
+                                return Err(err.context(stale));
+                            }
+                            stale_view_waits = stale_view_waits.saturating_add(1);
                             tokio::time::sleep(config.settle_backoff).await;
                             continue;
                         }
@@ -2895,6 +2977,8 @@ mod tests {
     struct RefuseFirstOpenShortDeposit {
         inner: ScriptedSource,
         opens: std::sync::atomic::AtomicUsize,
+        /// How many opens, from the first, it refuses.
+        refusals: usize,
     }
 
     impl BlobSource for RefuseFirstOpenShortDeposit {
@@ -2907,7 +2991,7 @@ mod tests {
         ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
             let n = self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move {
-                if n == 0 {
+                if n < self.refusals {
                     // A real open-stage refusal: the node signs `StreamResponse
                     // { ok: false }` with the delivery-side `InsufficientDeposit` in
                     // the trailing ext, exactly the shape `open_progressive_pull`
@@ -2969,6 +3053,7 @@ mod tests {
         let source = RefuseFirstOpenShortDeposit {
             inner,
             opens: std::sync::atomic::AtomicUsize::new(0),
+            refusals: 1,
         };
 
         let pacer = BudgetPacer::new();
@@ -3041,6 +3126,7 @@ mod tests {
         let source = RefuseFirstOpenShortDeposit {
             inner,
             opens: std::sync::atomic::AtomicUsize::new(0),
+            refusals: 1,
         };
 
         let pacer = BudgetPacer::new();
@@ -3089,6 +3175,75 @@ mod tests {
         );
         assert!(started.elapsed() >= settle_backoff, "the re-open waited");
         assert!(store.is_complete().await.expect("is_complete"));
+    }
+
+    /// A source that keeps refusing a deposit at the working target exhausts
+    /// the stale-view budget and faults as [`StaleDepositView`]: a source
+    /// fault, so it cools and is asked again. Never a sub-floor top-up, and
+    /// never `PoolExhausted`, which would price the source out until a deposit
+    /// rise that no top-up brings.
+    #[tokio::test(start_paused = true)]
+    async fn a_source_that_keeps_refusing_a_full_deposit_faults_as_a_stale_view() {
+        let total = 2 * GROUP;
+        let (root, plaintext, _outboard) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let inner = ScriptedSource::new(plaintext)
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+        let root = inner.root();
+        let source = RefuseFirstOpenShortDeposit {
+            inner,
+            opens: std::sync::atomic::AtomicUsize::new(0),
+            refusals: usize::MAX,
+        };
+
+        let pacer = BudgetPacer::new();
+        let funder = FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX)));
+        let mut ctx = healthy_ctx();
+        ctx.deposit = U256::from(10_000u64);
+        let ctx = Arc::new(Mutex::new(ctx));
+        let settle_backoff = std::time::Duration::from_secs(2);
+        let drive_config = DriveConfig {
+            working_deposit: U256::from(10_000u64),
+            seller_reserve: U256::ZERO,
+            max_settle_waits: 2,
+            settle_backoff,
+        };
+
+        let started = tokio::time::Instant::now();
+        let err = drive(
+            &store,
+            &source,
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            root,
+            0,
+            0,
+            &drive_config,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a source that never catches up faults");
+
+        assert!(
+            err.downcast_ref::<super::StaleDepositView>().is_some(),
+            "{err:#}"
+        );
+        assert_eq!(crate::classify(&err), crate::Fault::Source);
+        assert!(funder.calls().is_empty(), "no sub-floor top-up");
+        assert_eq!(
+            source.opens.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the first refusal and one re-open per settle wait"
+        );
+        assert!(started.elapsed() >= 2 * settle_backoff);
     }
 
     /// A [`BlobSource`] that fails its first open with a genuine exhaustion (like
