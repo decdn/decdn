@@ -508,8 +508,9 @@ async fn fund_pool<P: Provider + Clone + 'static>(
 /// `U256::ZERO` when the remaining deposit still has headroom, else the amount
 /// that restores it to the `working_deposit` target — the deposit a proven-good
 /// pool refills toward — with the trigger at `working_deposit / LOW_WATER_DIVISOR`
-/// (20% remaining). `committed` is the pool's cumulative vouchered amount across
-/// all its lanes, so the remaining spendable is `deposit - committed`. Pure so the
+/// (20% remaining). `committed` is the pool's spend as its row knows it
+/// ([`BuyerPoolState::pool_spend`]), so the remaining spendable is
+/// `deposit - committed`. Pure so the
 /// policy is unit-testable; the shared [`refill_amount`] kernel is the same one
 /// the CLI fetch auto-refill uses.
 fn refill_decision(deposit: U256, committed: U256, working_deposit: U256) -> U256 {
@@ -894,14 +895,14 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
 
     /// Apply a committed lane seed to an in-memory snapshot, so a pinned context
     /// carries it even when the store cannot be re-read. Monotone via
-    /// [`BuyerPoolState::advance_lane`]; a snapshot already ahead keeps its own
+    /// [`BuyerPoolState::seed_lane`]; a snapshot already ahead keeps its own
     /// watermark.
     fn apply_seed_in_memory(
         mut state: BuyerPoolState,
         lane: LaneKey,
         onchain: &PaymentPool::Lane,
     ) -> BuyerPoolState {
-        if let Err(err) = state.advance_lane(
+        if let Err(err) = state.seed_lane(
             lane,
             U256::from(onchain.bytesDelivered),
             U256::from(onchain.amount),
@@ -915,7 +916,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// [`Self::reseed_lane_from_chain`] so the read, the decision and the write
     /// each stay legible on their own.
     ///
-    /// An outcome other than `Advanced` is not an error: `advance_progress` is
+    /// An outcome other than `Advanced` is not an error: `seed_progress` is
     /// monotone, so a committed row already at or beyond the seed is the answer
     /// the caller wanted. Only a store fault fails, because that leaves the lane
     /// unpriced.
@@ -924,7 +925,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     ///
     /// The buyer store could not commit the seed.
     fn persist_lane_seed(&self, lane: LaneKey, onchain: &PaymentPool::Lane) -> Result<()> {
-        match self.store.advance_progress(
+        match self.store.seed_progress(
             self.owner,
             lane.pool_id,
             lane,
@@ -976,11 +977,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// dropped, `fund_pool`'s `error!` and `buyer_topup_failure()` are all the
     /// operator gets.
     fn spawn_refill_if_low(&self, state: &BuyerPoolState) {
-        let additional = refill_decision(
-            state.deposit,
-            state.committed_amount(),
-            self.working_deposit,
-        );
+        let additional = refill_decision(state.deposit, state.pool_spend(), self.working_deposit);
         if additional.is_zero() {
             return; // still above the low-water mark
         }
@@ -1421,7 +1418,10 @@ async fn reconcile_owned_pool<P: Provider + Clone>(
     let Some((pool_id, pool)) = candidate else {
         return false;
     };
-    let state = BuyerPoolState::new(pool_id, deployment, owner, token, U256::from(pool.deposit));
+    // The row has no lanes to account for what the pool already paid out, so it
+    // keeps `totalRedeemed` until the lanes it seeds from chain take it over.
+    let state = BuyerPoolState::new(pool_id, deployment, owner, token, U256::from(pool.deposit))
+        .with_redeemed_elsewhere(U256::from(pool.totalRedeemed));
     if let Err(err) = store.record(&state) {
         metrics.buyer_pool_adoption_failure();
         warn!(
@@ -3359,6 +3359,16 @@ mod tests {
         ) -> std::result::Result<AdvanceOutcome, StoreError> {
             Err(StoreError::Backend("rebase_progress faulted".into()))
         }
+        fn seed_progress(
+            &self,
+            _owner: Address,
+            _pool_id: PoolId,
+            _lane: LaneKey,
+            _bytes: U256,
+            _amount: U256,
+        ) -> std::result::Result<AdvanceOutcome, StoreError> {
+            Err(StoreError::Backend("seed_progress faulted".into()))
+        }
         fn add_deposit(
             &self,
             _owner: Address,
@@ -3493,6 +3503,16 @@ mod tests {
         ) -> std::result::Result<AdvanceOutcome, StoreError> {
             self.0.rebase_progress(owner, pool_id, lane, anchor, totals)
         }
+        fn seed_progress(
+            &self,
+            owner: Address,
+            pool_id: PoolId,
+            lane: LaneKey,
+            bytes: U256,
+            amount: U256,
+        ) -> std::result::Result<AdvanceOutcome, StoreError> {
+            self.0.seed_progress(owner, pool_id, lane, bytes, amount)
+        }
         fn add_deposit(
             &self,
             owner: Address,
@@ -3555,6 +3575,16 @@ mod tests {
             totals: BuyerLaneProgress,
         ) -> std::result::Result<AdvanceOutcome, StoreError> {
             self.0.rebase_progress(owner, pool_id, lane, anchor, totals)
+        }
+        fn seed_progress(
+            &self,
+            owner: Address,
+            pool_id: PoolId,
+            lane: LaneKey,
+            bytes: U256,
+            amount: U256,
+        ) -> std::result::Result<AdvanceOutcome, StoreError> {
+            self.0.seed_progress(owner, pool_id, lane, bytes, amount)
         }
         fn add_deposit(
             &self,

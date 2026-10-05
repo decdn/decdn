@@ -117,10 +117,10 @@ pub struct BuyerPoolState {
     /// Per-`(signer, provider)` lane progress. Private — mutate only through
     /// [`Self::advance_lane`] or [`Self::hydrate`].
     lanes: HashMap<LaneKey, BuyerLaneProgress>,
-    /// The pool's on-chain `totalRedeemed` when this row adopted the pool from
-    /// chain: spend that lanes outside this row redeemed before the row
-    /// existed, so no tracked lane accounts for it. Zero for a pool this row
-    /// opened. Set only through [`Self::with_redeemed_elsewhere`].
+    /// Redeemed spend no tracked lane accounts for: the pool's on-chain
+    /// `totalRedeemed` when this row adopted the pool from chain, less the
+    /// watermark of each lane seeded since ([`Self::seed_lane`]). Zero for a
+    /// pool this row opened.
     redeemed_elsewhere: U256,
 }
 
@@ -154,12 +154,47 @@ impl BuyerPoolState {
         self
     }
 
-    /// The pool spend no tracked lane accounts for: the on-chain
-    /// `totalRedeemed` this row adopted the pool with, or zero for a pool
-    /// this row opened.
+    /// The redeemed spend no tracked lane accounts for (see the field).
     #[must_use]
     pub const fn redeemed_elsewhere(&self) -> U256 {
         self.redeemed_elsewhere
+    }
+
+    /// What the pool has spent as far as this row knows: every tracked lane's
+    /// cumulative amount plus the redeemed spend no tracked lane accounts for.
+    /// A lower bound: a voucher another row signed and no provider redeemed
+    /// yet is in neither.
+    #[must_use]
+    pub fn pool_spend(&self) -> U256 {
+        self.committed_amount()
+            .saturating_add(self.redeemed_elsewhere)
+    }
+
+    /// Record `lane`'s on-chain watermark `(bytes, amount)` as its progress.
+    ///
+    /// A lane new to the row moves `amount` out of
+    /// [`Self::redeemed_elsewhere`]: the adopted `totalRedeemed` already holds
+    /// it, and the lane now accounts for it. So the pool spend counts it once,
+    /// and keeps counting the other lanes' redeemed spend as this lane
+    /// advances. A lane the row already tracks advances monotonically, as
+    /// through [`Self::advance_lane`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuyerProgressError`] if a tracked lane's `bytes` or `amount`
+    /// is below its recorded value.
+    pub fn seed_lane(
+        &mut self,
+        lane: LaneKey,
+        bytes: U256,
+        amount: U256,
+    ) -> Result<(), BuyerProgressError> {
+        let new = !self.lanes.contains_key(&lane);
+        self.advance_lane(lane, bytes, amount)?;
+        if new {
+            self.redeemed_elsewhere = self.redeemed_elsewhere.saturating_sub(amount);
+        }
+        Ok(())
     }
 
     /// Whether this row describes a pool on `deployment`: the same chain and
@@ -502,6 +537,24 @@ pub trait BuyerPoolStore: Send + Sync {
         totals: BuyerLaneProgress,
     ) -> Result<AdvanceOutcome, StoreError>;
 
+    /// Atomically record `lane`'s on-chain watermark in `owner`'s pool
+    /// ([`BuyerPoolState::seed_lane`]): the same owner-index and `pool_id`
+    /// checks and the same single durable write transaction as
+    /// [`Self::advance_progress`]. A lane new to the row moves its amount out
+    /// of [`BuyerPoolState::redeemed_elsewhere`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] only on a backend/codec fault.
+    fn seed_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: LaneKey,
+        bytes: U256,
+        amount: U256,
+    ) -> Result<AdvanceOutcome, StoreError>;
+
     /// Atomically add `additional` to the committed deposit for `owner`'s
     /// pool.
     ///
@@ -678,6 +731,33 @@ impl BuyerPoolStore for MemoryBuyerPoolStore {
         };
         state.rebase_lane(lane, anchor, totals);
         Ok(AdvanceOutcome::Advanced)
+    }
+
+    fn seed_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: LaneKey,
+        bytes: U256,
+        amount: U256,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        let Some(mapped) = guard.owner_index.get(&owner).copied() else {
+            return Ok(AdvanceOutcome::UnknownPool);
+        };
+        if mapped != pool_id {
+            return Ok(AdvanceOutcome::PoolMismatch);
+        }
+        let Some(state) = guard.pools.get_mut(&pool_id) else {
+            return Ok(AdvanceOutcome::UnknownPool);
+        };
+        match state.seed_lane(lane, bytes, amount) {
+            Ok(()) => Ok(AdvanceOutcome::Advanced),
+            Err(err) => Ok(AdvanceOutcome::Regressed(err)),
+        }
     }
 
     fn add_deposit(

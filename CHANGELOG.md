@@ -33,7 +33,11 @@ since project inception and will roll into the first tagged release.
   the pool's `totalRedeemed` is its only record of what other lanes paid
   out. The row now stores it (record schema 4), so every later `decdn fetch`
   and `decdn bundle pull` that reuses the row counts it, not only the run
-  that adopted the pool. **Existing buyer rows are not read:**
+  that adopted the pool. A lane seeded from its on-chain watermark takes its
+  own share out of that amount, so the pool spend is the tracked lanes plus
+  what no tracked lane accounts for, and stays right as a seeded lane
+  advances. A node adopts its pool the same way, and its low-water refill
+  reads the same pool spend. **Existing buyer rows are not read:**
   `buyer_pool_state_v5` / `buyer_pool_owner_index_v5` become `_v6`, so on
   first run the store reads as empty, and a node or client re-adopts its live
   pool from chain.
@@ -942,10 +946,12 @@ since project inception and will roll into the first tagged release.
   asked for them (#2281).** A `NotFound` for a range inside a probed partial
   holder's advertised coverage counted as a delivery fault only, so the
   holder was asked for the same range again every few seconds for the rest
-  of the entry. Such a refusal now counts against every discovery block the
-  range touches. After three, the block leaves the holder's coverage for the
-  rest of the blob, rediscovery included, and its ranges go to the other
-  holders.
+  of the entry. Such a refusal, on the lane's own stream or an extra one,
+  now counts against every discovery block the range touches. After three,
+  the block leaves the holder's coverage for a minute, rediscovery included,
+  and its ranges go to the other holders. A `NotFound` can also be a
+  transient refusal, so the block then returns, and refusals a minute or
+  more apart never add up.
 
 - **A range-dedup entry that waits for a sibling's chunks no longer holds a
   `--jobs` slot (#2283).** `decdn bundle pull` kept the slot of an entry

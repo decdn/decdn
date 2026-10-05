@@ -3616,27 +3616,49 @@ where
     })
 }
 
-/// What `state`'s pool has spent across all its lanes — vouchered locally, or
-/// redeemed on chain for an adopted row — which the low-water refill compares
-/// against the deposit.
+/// Record `lane`'s on-chain watermark `(bytes, amount)` in the row before the
+/// lane resumes from it ([`BuyerPoolState::seed_lane`]), and return the row
+/// with it.
 ///
-/// The lanes share one deposit, so the spend is their sum, not the lane being
-/// built. `lane_prior` is the amount `lane` resumes from: when the row has no
-/// record of `lane`, that is the chain watermark, which the row's sum does not
-/// include yet. [`BuyerPoolState::redeemed_elsewhere`] is the pool's
-/// `totalRedeemed` when the row adopted it from chain. It already includes
-/// every lane's redeemed watermark, `lane_prior` among them, so the two
-/// overlap and the larger is the spend, not their sum.
-fn pool_spend(state: &BuyerPoolState, lane: LaneKey, lane_prior: U256) -> U256 {
-    let untracked = if state.lane_progress(lane).is_some() {
-        U256::ZERO
-    } else {
-        lane_prior
-    };
-    state
-        .committed_amount()
-        .saturating_add(untracked)
-        .max(state.redeemed_elsewhere())
+/// The pool spend the refill and the run's funding read
+/// ([`BuyerPoolState::pool_spend`]) then counts the watermark once. On an
+/// adopted row it moves out of the redeemed spend no lane accounts for, so the
+/// spend keeps counting the other lanes' redemptions as this lane advances. A
+/// zero watermark has nothing to record.
+///
+/// # Errors
+///
+/// The buyer store could not commit the seed: the lane would resume with
+/// spend the row does not count, so the build fails and retries.
+fn seed_lane(
+    store: &RedbBuyerPoolStore,
+    mut state: BuyerPoolState,
+    lane: LaneKey,
+    bytes: U256,
+    amount: U256,
+) -> anyhow::Result<BuyerPoolState> {
+    if bytes.is_zero() && amount.is_zero() {
+        return Ok(state);
+    }
+    let outcome = store
+        .seed_progress(state.owner, state.pool_id, lane, bytes, amount)
+        .with_context(|| {
+            format!(
+                "record the on-chain watermark of lane {} in pool {}",
+                lane.provider, state.pool_id
+            )
+        })?;
+    // Any other outcome leaves a committed row the seed did not move: one
+    // already at or past the watermark, or a row another run replaced.
+    if !matches!(outcome, AdvanceOutcome::Advanced) {
+        tracing::debug!(?outcome, pool_id = %state.pool_id, "lane seed did not advance the row");
+    }
+    // The row can only be at or past a watermark the chain holds; a row already
+    // ahead keeps its own progress.
+    if let Err(err) = state.seed_lane(lane, bytes, amount) {
+        tracing::debug!(error = %err, "lane seed did not advance the in-memory row");
+    }
+    Ok(state)
 }
 
 /// The error for a pool with no unspent deposit whose wallet cannot fund a
@@ -3657,7 +3679,7 @@ fn cannot_pay(state: &BuyerPoolState, shortfall: &str) -> anyhow::Error {
 /// once it falls below the low water — see [`refill_amount`] — and return the
 /// row to build the lane on.
 ///
-/// `spent` is the pool-wide spend from [`pool_spend`]. The refill is an
+/// `spent` is the pool-wide spend from [`BuyerPoolState::pool_spend`]. The refill is an
 /// optimisation, so a wallet that holds too little USDC for it does not fail
 /// the lane while the pool can still pay (and ends the command, as
 /// [`NoAffordableSource`], once it cannot): the shortfall is logged at WARN,
@@ -3814,21 +3836,24 @@ where
             signer: self_address,
             provider,
         };
-        let (prior_bytes, prior_amount) = match state.lane_progress(lane) {
-            Some(p) => (p.last_bytes, p.last_amount),
+        let recorded = state.lane_progress(lane).is_some();
+        let from_chain = !state.redeemed_elsewhere().is_zero();
+        let (state, prior_bytes, prior_amount) = if let Some(p) = state.lane_progress(lane) {
+            (state, p.last_bytes, p.last_amount)
+        } else {
             // No local record of this lane — always so for an adopted pool, and
             // for a tracked pool's first contact with a provider. The chain may
             // still hold a watermark for it, and a voucher at or below that
             // watermark redeems nothing — so resuming from zero would stream bytes
             // the provider can never cash. Resume from the chain.
-            None => lane_watermark(contract, lane).await?,
+            let (bytes, amount) = lane_watermark(contract, lane).await?;
+            let state = seed_lane(store, state, lane, bytes, amount)?;
+            (state, bytes, amount)
         };
 
         // Auto-refill a live pool whose remaining deposit has run low, so a
         // sustained series of fetches isn't stranded by a spent-down deposit.
-        let recorded = state.lane_progress(lane).is_some();
-        let spent = pool_spend(&state, lane, prior_amount);
-        let from_chain = !state.redeemed_elsewhere().is_zero();
+        let spent = state.pool_spend();
         let state = refill_if_low(
             store,
             contract,
@@ -6044,9 +6069,8 @@ mod adoption_tests {
         let row = tracked_row(id, owner, WORKING, &LIVE_LANES);
         let working = U256::from(WORKING);
         let low_water = working / U256::from(LOW_WATER_DIVISOR);
-        let this_lane = lane_key(id, owner, PROVIDER);
 
-        let spent = pool_spend(&row, this_lane, U256::from(LIVE_LANES[0]));
+        let spent = row.pool_spend();
         assert_eq!(spent, U256::from(8_655_000u64));
         assert_eq!(
             refill_amount(row.deposit, spent, working, low_water),
@@ -6063,45 +6087,51 @@ mod adoption_tests {
     }
 
     /// A lane the row has no record of resumes from the chain watermark, and
-    /// that watermark is spend the row's sum does not hold yet.
+    /// that watermark is spend the row's sum does not hold yet: the seed
+    /// records it. A tracked lane's seed is not counted twice.
     #[test]
-    fn pool_spend_adds_an_untracked_lanes_chain_prior() {
+    fn a_seeded_lanes_chain_prior_counts_toward_the_pool_spend() {
         let owner = Address::repeat_byte(0x01);
         let id = B256::repeat_byte(0xEE);
-        let row = tracked_row(id, owner, WORKING, &[1_000]);
+        let mut row = tracked_row(id, owner, WORKING, &[1_000]);
         let new_lane = lane_key(id, owner, Address::repeat_byte(0x55));
-        assert_eq!(
-            pool_spend(&row, new_lane, U256::from(250u64)),
-            U256::from(1_250u64)
-        );
-        // A tracked lane's prior is already in the sum and is not counted twice.
-        assert_eq!(
-            pool_spend(&row, lane_key(id, owner, PROVIDER), U256::from(1_000u64)),
-            U256::from(1_000u64)
-        );
+        row.seed_lane(new_lane, U256::from(250_000u64), U256::from(250u64))
+            .unwrap();
+        assert_eq!(row.pool_spend(), U256::from(1_250u64));
+        row.seed_lane(
+            lane_key(id, owner, PROVIDER),
+            U256::from(1_000_000u64),
+            U256::from(1_000u64),
+        )
+        .unwrap();
+        assert_eq!(row.pool_spend(), U256::from(1_250u64));
     }
 
     /// An adopted row has no lanes, so `totalRedeemed` is its only record of
     /// what other lanes drained. Ignored, a pool with 0.5 USDC left reads as a
-    /// full 10 and no refill fires.
+    /// full 10 and no refill fires. A lane seeded from chain takes its share
+    /// over, so the other lanes' share still counts as that lane advances
+    /// (#2292 review): 100 redeemed, 60 of it on A, A advancing to 80 spends
+    /// 120.
     #[test]
-    fn pool_spend_honours_an_adopted_pools_total_redeemed() {
+    fn pool_spend_keeps_an_adopted_pools_redeemed_spend_as_its_lanes_advance() {
         let owner = Address::repeat_byte(0x01);
         let id = B256::repeat_byte(0xEE);
         let adopted = |redeemed: u64| {
             BuyerPoolState::new(id, DEPLOYMENT, owner, TOKEN, U256::from(WORKING))
                 .with_redeemed_elsewhere(U256::from(redeemed))
         };
-        let this_lane = lane_key(id, owner, PROVIDER);
-        assert_eq!(
-            pool_spend(&adopted(9_500_000), this_lane, U256::ZERO),
-            U256::from(9_500_000u64)
-        );
-        assert_eq!(
-            pool_spend(&adopted(500), this_lane, U256::from(600u64)),
-            U256::from(600u64),
-            "the larger of the lane's chain prior and `totalRedeemed` is the spend"
-        );
+        assert_eq!(adopted(9_500_000).pool_spend(), U256::from(9_500_000u64));
+
+        let a = lane_key(id, owner, PROVIDER);
+        let mut row = adopted(100);
+        row.seed_lane(a, U256::from(60_000u64), U256::from(60u64))
+            .unwrap();
+        assert_eq!(row.redeemed_elsewhere(), U256::from(40u64));
+        assert_eq!(row.pool_spend(), U256::from(100u64));
+        row.advance_lane(a, U256::from(80_000u64), U256::from(80u64))
+            .unwrap();
+        assert_eq!(row.pool_spend(), U256::from(120u64));
     }
 
     /// #2288 end to end: five lanes of 2 USDC spend the whole 10 USDC deposit,
@@ -6326,10 +6356,12 @@ mod adoption_tests {
         );
     }
 
-    /// #2292: the run after adoption reuses the row, and asks the chain only
-    /// for the lane watermark. The pool's `totalRedeemed` stays in its spend:
-    /// read only by the adopting run, every later run would count just the
-    /// lanes this machine recorded since, and read the pool as fuller than it is.
+    /// #2292: the run after adoption reuses the row without asking the chain.
+    /// The pool's `totalRedeemed` stays in its spend: read only by the
+    /// adopting run, every later run would count just the lanes this machine
+    /// recorded since, and read the pool as fuller than it is. The lane the
+    /// adopting run seeds from chain takes over its own share of it, so the
+    /// other lanes' share still counts once that lane advances.
     #[tokio::test]
     async fn a_reused_adopted_row_keeps_the_pools_redeemed_spend() {
         let dir = tempfile::tempdir().unwrap();
@@ -6337,13 +6369,14 @@ mod adoption_tests {
         let signer = Arc::new(PrivateKeySigner::random());
         let owner = signer.address();
         let id = B256::repeat_byte(0xDE);
-        let adopted_spend = LaneSpend {
-            outside: U256::from(3_000_000u64),
-            prior: U256::ZERO,
-            recorded: false,
+        let lane_spend = |outside: u64, recorded: bool| LaneSpend {
+            outside: U256::from(outside),
+            prior: U256::from(1_000_000u64),
+            recorded,
             from_chain: true,
         };
 
+        // 3 USDC redeemed, 1 USDC of it on this lane.
         let (adopting, drained) = run_in(
             &store,
             &signer,
@@ -6352,28 +6385,29 @@ mod adoption_tests {
                 Some(vec![id].abi_encode().into()),
                 Some(pool(owner, 10_000_000, 3_000_000).abi_encode().into()),
                 Some(TOKEN.abi_encode().into()),
-                Some(lane(0, 0)),
+                Some(lane(1_000_000, 1_000_000_000)),
             ],
             &RunFunding::default(),
         )
         .await;
         assert!(drained);
-        assert_eq!(adopting.expect("the live pool is adopted").1, adopted_spend);
         assert_eq!(
-            store
-                .get_by_owner(owner)
-                .unwrap()
-                .expect("adopted row is recorded")
-                .redeemed_elsewhere(),
-            U256::from(3_000_000u64)
+            adopting.expect("the live pool is adopted").1,
+            lane_spend(2_000_000, false)
         );
+        let row = store
+            .get_by_owner(owner)
+            .unwrap()
+            .expect("adopted row is recorded");
+        assert_eq!(row.redeemed_elsewhere(), U256::from(2_000_000u64));
+        assert_eq!(row.pool_spend(), U256::from(3_000_000u64));
 
-        // No `getPools`/`getPool` answers queued: the row is tracked now.
+        // No chain answers queued: the row and its lane are tracked now.
         let (reusing, drained) = run_in(
             &store,
             &signer,
             ChainAdoption::Allowed,
-            vec![Some(lane(0, 0))],
+            vec![],
             &RunFunding::default(),
         )
         .await;
@@ -6381,8 +6415,26 @@ mod adoption_tests {
         let (ctx, spend) = reusing.expect("the tracked row is reused");
         assert_eq!(ctx.pool_id, id);
         assert_eq!(
-            spend, adopted_spend,
+            spend,
+            lane_spend(2_000_000, true),
             "a later run sees the redeemed spend the adopting run saw"
+        );
+
+        // The lane pays on to 1.5 USDC: the pool has spent 3.5 USDC.
+        let a = lane_key(id, owner, PROVIDER);
+        let outcome = store
+            .advance_progress(
+                owner,
+                id,
+                a,
+                U256::from(1_500_000_000u64),
+                U256::from(1_500_000u64),
+            )
+            .unwrap();
+        assert!(matches!(outcome, AdvanceOutcome::Advanced));
+        assert_eq!(
+            store.get_by_owner(owner).unwrap().unwrap().pool_spend(),
+            U256::from(3_500_000u64)
         );
     }
 

@@ -251,6 +251,18 @@ impl BuyerPoolStore for RedbBuyerPoolStore {
             .rebase_progress(owner, pool_id, lane, anchor, totals)
     }
 
+    fn seed_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: LaneKey,
+        bytes: U256,
+        amount: U256,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        self.table()
+            .seed_progress(owner, pool_id, lane, bytes, amount)
+    }
+
     fn add_deposit(
         &self,
         owner: Address,

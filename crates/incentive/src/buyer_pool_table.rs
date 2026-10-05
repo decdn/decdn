@@ -634,8 +634,27 @@ impl<'a> BuyerPoolTable<'a> {
         })
     }
 
-    /// The shared body of [`Self::advance_progress`] and
-    /// [`Self::rebase_progress`]: owner-index CAS, then `apply` to the
+    /// Atomically record `lane`'s on-chain watermark in `owner`'s pool
+    /// ([`BuyerPoolState::seed_lane`]), inside the same single write
+    /// transaction and owner-index CAS as [`Self::advance_progress`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] / [`StoreError::Codec`] on I/O or codec
+    /// failure.
+    pub fn seed_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: LaneKey,
+        bytes: U256,
+        amount: U256,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        self.write_lane(owner, pool_id, |state| state.seed_lane(lane, bytes, amount))
+    }
+
+    /// The shared body of [`Self::advance_progress`],
+    /// [`Self::seed_progress`] and [`Self::rebase_progress`]: owner-index CAS, then `apply` to the
     /// committed row and write it back, all in one durable write transaction.
     fn write_lane(
         &self,
@@ -999,6 +1018,44 @@ mod tests {
         anyhow::ensure!(tbl(&db).load_all()?.pools.is_empty());
         anyhow::ensure!(tbl(&db).get_by_owner(state(1).owner)?.is_none());
         anyhow::ensure!(tbl(&db).get_by_pool_id(state(1).pool_id)?.is_none());
+        Ok(())
+    }
+
+    /// A lane seeded from chain on an adopted row takes its watermark out of
+    /// the redeemed spend no lane accounts for, once: a second seed of the same
+    /// lane only advances it.
+    #[test]
+    fn seed_progress_moves_a_new_lanes_watermark_out_of_the_redeemed_spend() -> anyhow::Result<()> {
+        let (_d, db) = db()?;
+        let s = state(1).with_redeemed_elsewhere(U256::from(100u64));
+        tbl(&db).record(&s)?;
+        let lane = LaneKey {
+            pool_id: s.pool_id,
+            signer: Address::repeat_byte(0x61),
+            provider: Address::repeat_byte(0x71),
+        };
+        let seed = |amount: u64| {
+            tbl(&db).seed_progress(
+                s.owner,
+                s.pool_id,
+                lane,
+                U256::from(amount * 1000),
+                U256::from(amount),
+            )
+        };
+        anyhow::ensure!(matches!(seed(60)?, AdvanceOutcome::Advanced));
+        let row = tbl(&db)
+            .get_by_pool_id(s.pool_id)?
+            .ok_or_else(|| anyhow::anyhow!("row"))?;
+        anyhow::ensure!(row.redeemed_elsewhere() == U256::from(40u64));
+        let base = s.committed_amount();
+        anyhow::ensure!(row.pool_spend() == base + U256::from(100u64));
+        anyhow::ensure!(matches!(seed(70)?, AdvanceOutcome::Advanced));
+        let row = tbl(&db)
+            .get_by_pool_id(s.pool_id)?
+            .ok_or_else(|| anyhow::anyhow!("row"))?;
+        anyhow::ensure!(row.redeemed_elsewhere() == U256::from(40u64));
+        anyhow::ensure!(row.pool_spend() == base + U256::from(110u64));
         Ok(())
     }
 
