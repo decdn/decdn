@@ -41,6 +41,7 @@ use iroh_blobs::Hash;
 use tokio_util::io::ReaderStream;
 
 use super::fs::OBAO4_SUFFIX;
+use super::io_runtime::IoRuntime;
 use super::{
     BlobTooLargeMarker, DecompressMode, Origin, OriginByteStream, OriginFetch, OriginKind,
     OriginRangeFetch, OriginRangeRequest, OriginUrl, OutboardFetch, decompress,
@@ -189,6 +190,10 @@ fn key_for(prefix: &str, hash: Hash) -> String {
 #[derive(Debug, Clone)]
 pub struct S3Origin {
     client: Client,
+    /// The runtime every SDK request send runs on, so the HTTP client's
+    /// pooled keep-alive connections live there and not on a caller's
+    /// pull-leg runtime. See [`super::io_runtime`].
+    io: IoRuntime,
     /// Operator-configured bucket. `Arc<str>` so cheap clone preserves
     /// shared ownership for log fields without re-allocating.
     bucket: Arc<str>,
@@ -225,6 +230,17 @@ impl S3Origin {
     /// the implicit path — older SDK versions panicked when no
     /// `BehaviorVersion` was set; current versions surface a runtime error.
     /// Either way, the explicit call site cannot regress.
+    ///
+    /// **Runtime:** the origin's pooled connections live on the tokio
+    /// runtime this future runs on, and every later request send runs there
+    /// (see `origin::io_runtime`). Build it on a runtime that outlives every
+    /// fetch — the node's main runtime — never on a short-lived one such as a
+    /// pull leg's.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a `Static` credential carries an empty key or secret, or
+    /// when this future does not run inside a tokio runtime.
     pub async fn new(cfg: &S3OriginConfig) -> anyhow::Result<Self> {
         // Defense in depth against a config-resolver gap or a downstream
         // caller that bypasses `decdn_common::config::resolve_origin` and
@@ -248,7 +264,9 @@ impl S3Origin {
         // Constructed once per S3Origin and shared across every fetch via
         // `Client::clone` (the SDK Client is cheaply cloneable). A single
         // shared connection pool keeps idle TLS connections warm across
-        // back-to-back cache misses.
+        // back-to-back cache misses. Every send runs on `io`, so each pooled
+        // connection lives on the runtime that built this origin, never on a
+        // caller's pull-leg runtime (`super::io_runtime`).
         let http_client = HttpBuilder::new()
             .tls_provider(tls::Provider::Rustls(
                 tls::rustls_provider::CryptoMode::AwsLc,
@@ -307,31 +325,36 @@ impl S3Origin {
             .build();
         let client = Client::from_conf(s3_config);
 
-        Ok(Self::from_parts(
-            client,
-            cfg.bucket.as_str(),
-            cfg.prefix.as_str(),
-        ))
+        Self::from_parts(client, cfg.bucket.as_str(), cfg.prefix.as_str())
     }
 
-    /// Test-only constructor that skips `aws_config::defaults` and takes a
-    /// pre-built `Client`. Used by `tests/s3_origin.rs` to drive the
-    /// backend through `aws_smithy_mocks::mock_client!`-produced clients,
-    /// which can't be obtained via `aws_config::defaults`.
+    /// Assemble an origin from a pre-built `Client`, skipping
+    /// `aws_config::defaults`. [`Self::new`] builds its client and then calls
+    /// this. `tests/s3_origin.rs` calls it to inject
+    /// `aws_smithy_mocks::mock_client!`-produced clients, which can't be
+    /// obtained via `aws_config::defaults`.
     ///
     /// `pub` rather than `pub(crate)` because the integration tests live
     /// outside the crate. `#[doc(hidden)]` excludes the function from
     /// generated rustdoc only — it is technically callable by downstream
-    /// crates and is part of the semver surface by convention. Non-test
+    /// crates and is part of the semver surface by convention. Other
     /// callers use [`Self::new`].
+    ///
+    /// The origin's connections live on the tokio runtime this is called
+    /// on.
+    ///
+    /// # Errors
+    ///
+    /// Fails outside a tokio runtime.
     #[doc(hidden)]
-    pub fn from_parts(client: Client, bucket: &str, prefix: &str) -> Self {
-        Self {
+    pub fn from_parts(client: Client, bucket: &str, prefix: &str) -> anyhow::Result<Self> {
+        Ok(Self {
             client,
+            io: IoRuntime::current()?,
             bucket: Arc::from(bucket),
             prefix: Arc::from(prefix),
             decompress: DecompressMode::Auto,
-        }
+        })
     }
 
     /// Set the [`DecompressMode`]. See that type for the semantics of
@@ -608,12 +631,16 @@ impl Origin for S3Origin {
             let log_target = format!("s3://{}/{}", self.bucket, key);
 
             let resp = match self
-                .client
-                .get_object()
-                .bucket(self.bucket.as_ref())
-                .key(&key)
-                .send()
+                .io
+                .run(
+                    self.client
+                        .get_object()
+                        .bucket(self.bucket.as_ref())
+                        .key(&key)
+                        .send(),
+                )
                 .await
+                .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 GetObject"))))?
             {
                 Ok(r) => r,
                 Err(e) => return classify_get_object_error(e, &log_target),
@@ -759,13 +786,17 @@ impl Origin for S3Origin {
             let want = req.len();
             let log_target = format!("s3://{}/{} (range {range_val})", self.bucket, data_key);
             let resp = match self
-                .client
-                .get_object()
-                .bucket(self.bucket.as_ref())
-                .key(&data_key)
-                .range(range_val)
-                .send()
+                .io
+                .run(
+                    self.client
+                        .get_object()
+                        .bucket(self.bucket.as_ref())
+                        .key(&data_key)
+                        .range(range_val)
+                        .send(),
+                )
                 .await
+                .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 GetObject"))))?
             {
                 Ok(r) => r,
                 // Reuse the headers-phase classifier. A `NotFound` here is the
@@ -826,12 +857,16 @@ impl Origin for S3Origin {
             let obao4_key = format!("{data_key}{OBAO4_SUFFIX}");
             let log_target = format!("s3://{}/{}", self.bucket, obao4_key);
             let resp = match self
-                .client
-                .get_object()
-                .bucket(self.bucket.as_ref())
-                .key(&obao4_key)
-                .send()
+                .io
+                .run(
+                    self.client
+                        .get_object()
+                        .bucket(self.bucket.as_ref())
+                        .key(&obao4_key)
+                        .send(),
+                )
                 .await
+                .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 GetObject"))))?
             {
                 Ok(r) => r,
                 Err(e) => match classify_get_object_error(e, &log_target)? {
@@ -870,12 +905,16 @@ impl Origin for S3Origin {
             // `Content-Length`) without transferring the body — the cheapest
             // way to learn the canonical blob size before a range pull.
             let resp = match self
-                .client
-                .head_object()
-                .bucket(self.bucket.as_ref())
-                .key(&key)
-                .send()
+                .io
+                .run(
+                    self.client
+                        .head_object()
+                        .bucket(self.bucket.as_ref())
+                        .key(&key)
+                        .send(),
+                )
                 .await
+                .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 HeadObject"))))?
             {
                 Ok(r) => r,
                 Err(e) => return classify_head_object_error(e, &log_target),

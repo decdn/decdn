@@ -3309,6 +3309,9 @@ async fn build_cache(
     node_metrics: Arc<metrics::Metrics>,
     node_origin: Option<Arc<dyn Origin>>,
 ) -> anyhow::Result<CacheEngine> {
+    // HTTP and S3 origins capture the runtime they are built on and run every
+    // request send there, so their pooled connections outlive the pull-leg
+    // runtimes that call them. This runs on the node's main runtime.
     let mut origins: Vec<Arc<dyn Origin>> = Vec::with_capacity(cfg.cache.origins.len());
     for (idx, resolved) in cfg.cache.origins.iter().enumerate() {
         let backend: Arc<dyn Origin> = match resolved {
