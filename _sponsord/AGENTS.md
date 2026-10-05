@@ -104,9 +104,10 @@ rather than writing new ones.
   in a PR of its own. To build against a local `../decdn`, use an untracked
   `.cargo/config.toml` `[patch]` (see `CONTRIBUTING.md`), and do not commit
   the lockfile changes it causes.
-- **The toolchain version is written in three places**:
-  `rust-toolchain.toml`, `rust-version` in the root `Cargo.toml`, and every
-  `dtolnay/rust-toolchain@…` ref under `.github/`. Change all three together.
+- **The toolchain version is written in four places**:
+  `rust-toolchain.toml`, `rust-version` in the root `Cargo.toml`, every
+  `dtolnay/rust-toolchain@…` ref under `.github/`, and the MSRV badge in
+  `README.md`. Change all four together. CI checks only the first three.
 
 ## Pull requests
 
