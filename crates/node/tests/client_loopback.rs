@@ -35,9 +35,9 @@
 //! rejected in band while the accepted watermark survives; the per-connection
 //! stream-cap sheds an over-cap stream with a bare QUIC reset and no signed
 //! `StreamResponse`; the buyer rejects a server that over-sends past the promised
-//! length or delivers hash-mismatched bytes; and the request-read and
-//! voucher-read timeouts each tear down a peer that opens a stream (or parks a
-//! paid delivery) and then goes silent.
+//! length or delivers hash-mismatched bytes; and the request-read timeout and
+//! the proof wait each tear down a peer that opens a stream (or parks a paid
+//! delivery) and then goes silent.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -80,11 +80,11 @@ use iroh::{Endpoint, EndpointAddr};
 mod support;
 use decdn_node::receipt_log::{DownloadReceipt, spawn_receipt_writer};
 use support::{
-    BlockingReceiptLog, FailingReceiptLog, FailingRecordStore, HandlerDomains, VecReceiptLog,
-    build_handler_full, build_handler_full_configured, build_handler_full_with_receipts,
-    build_handler_full_with_sink, cache_with_blob, empty_cache, fresh_key, local_endpoint,
-    permissive_limiter, read_client_msg, read_stream_response, shutdown, spawn_server,
-    spawn_server_counting, write_client_msg,
+    BlockingReceiptLog, BufferedClientReader, FailingReceiptLog, FailingRecordStore,
+    HandlerDomains, VecReceiptLog, build_handler_full, build_handler_full_configured,
+    build_handler_full_with_receipts, build_handler_full_with_sink, cache_with_blob, empty_cache,
+    fresh_key, local_endpoint, permissive_limiter, read_client_msg, read_stream_response, shutdown,
+    spawn_server, spawn_server_counting, write_client_msg,
 };
 
 const CHAIN_ID: u64 = 421_614;
@@ -830,8 +830,9 @@ async fn a_restarted_payer_heals_a_transfer_that_repeats_the_anchor() -> anyhow:
 
 /// Run `earlier` healthy 256 KiB transfers, each resuming from the watermark
 /// the last one left, then the same transfer from a payer whose watermark is
-/// gone. The 8s budget sits below the 10s `VOUCHER_READ_TIMEOUT` backstop, so
-/// the heal must fire on the rejection itself.
+/// gone. The 8s budget sits below the node's proof-wait backstop (10s with no
+/// transport progress, `VOUCHER_READ_TIMEOUT`), so the heal must fire on the
+/// rejection itself.
 async fn restarted_sub_chunk_transfer(earlier: u64) -> anyhow::Result<()> {
     let payload = vec![0x3Cu8; 256 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
@@ -1207,6 +1208,48 @@ async fn expect_reject(recv: &mut RecvStream, expected: VoucherRejectReason) -> 
     }
 }
 
+/// A serve's first frame is small, so the first byte leaves after a few chunk
+/// groups rather than a whole interval. The frames after it still fill the
+/// interval exactly, and the node parks for its voucher at the same boundary.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_frame_is_small_and_the_interval_still_ends_on_its_boundary() -> anyhow::Result<()>
+{
+    const CREDIT_MAX: u64 = 64 * 1024 * 1024;
+    const FIRST_FRAME_MAX: u64 = 64 * 1024;
+    let payload = vec![0x45u8; 8 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+    let (target, _server_eth, server_ep, server_task, _metrics) =
+        spawn_pipelined_server_with_metrics(cache, Arc::clone(&store), CREDIT_MAX, 2).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+    let (_send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+
+    let first = tokio::time::timeout(Duration::from_secs(10), read_client_msg(&mut recv))
+        .await
+        .map_err(|_| anyhow::anyhow!("no first frame"))??;
+    let ClientMessage::ChunkData(first) = first else {
+        anyhow::bail!("expected ChunkData, got {first:?}");
+    };
+    let first_len = first.bytes().len() as u64;
+    anyhow::ensure!(
+        first_len <= FIRST_FRAME_MAX,
+        "the first frame carries {first_len} bytes, over {FIRST_FRAME_MAX}"
+    );
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES - first_len).await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// The whole `PayWord` tick, end to end: one signed voucher opens a chain, and
 /// from then on each delivered chunk is paid for by a single 33-byte reveal with
 /// no signature at all. The node credits the reveal exactly as it would a
@@ -1325,6 +1368,64 @@ async fn a_preimage_at_index_zero_is_refused() -> anyhow::Result<()> {
     open_chain(&mut send, &signer, chain_root(), RATE_PER_MB, U256::ZERO, 0).await?;
     release(&mut send, 0).await?;
     expect_reject(&mut recv, VoucherRejectReason::ChainIndexZero).await?;
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// A reveal inside the capability's expiry margin is refused with
+/// `CapabilityExpired`, exactly as a voucher is, even on a stream the node
+/// anchored before the margin started. Otherwise the claim could keep growing
+/// after the redeemer's cutoff sweep has read the lane (#2233).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_preimage_inside_the_expiry_margin_is_refused() -> anyhow::Result<()> {
+    const CREDIT_MAX: u64 = 64 * 1024 * 1024;
+    let payload = vec![0x49u8; 4 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+    // The margin starts two seconds from now.
+    let cutoff = unix_now()?.saturating_add(2);
+    let mut lane = store
+        .get(lane_key(signer.address()))?
+        .ok_or_else(|| anyhow::anyhow!("lane row missing"))?;
+    lane.expiry = cutoff.saturating_add(DEFAULT_EXPIRY_MARGIN);
+    store.record(&lane)?;
+
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_pipelined_server(cache, Arc::clone(&store), CREDIT_MAX, 2).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+
+    // The anchor voucher lands before the margin.
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+    open_chain(&mut send, &signer, chain_root(), RATE_PER_MB, U256::ZERO, 0).await?;
+    anyhow::ensure!(
+        unix_now()? < cutoff,
+        "the anchor must land before the margin"
+    );
+
+    // The reveal lands inside it.
+    while unix_now()? < cutoff {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    release(&mut send, 1).await?;
+    expect_reject(&mut recv, VoucherRejectReason::CapabilityExpired).await?;
+
+    let lane = store
+        .get(lane_key(signer.address()))?
+        .ok_or_else(|| anyhow::anyhow!("lane row missing"))?;
+    anyhow::ensure!(
+        lane.chain().verified_index == 0,
+        "the refused reveal must not extend the claim"
+    );
 
     conn.close(0u32.into(), b"done");
     shutdown([server_task], [&client_ep, &server_ep]).await?;
@@ -1631,7 +1732,7 @@ async fn a_below_frontier_reveal_is_credited_from_lane_headroom() -> anyhow::Res
 /// retired root: it folds nothing, and the node can only pay its stream from
 /// lane headroom. If the rollover voucher took that headroom for its own
 /// stream's outstanding chunk, the sibling would wait for a proof the payer
-/// never sends, and its stream would die on the proof-read timeout.
+/// never sends, and its stream would die when its proof wait faults.
 ///
 /// Stream X anchors the first chain and pays one chunk with index 1. Stream Y
 /// anchors the same chain. X then rolls to a second chain with a voucher that
@@ -1717,7 +1818,7 @@ async fn a_sibling_roll_does_not_take_a_retired_reveals_credit() -> anyhow::Resu
 
     // Y sends index 2 on the retired root. It folds nothing, but the rollover
     // already put its money on the lane, so the node must credit Y from that
-    // headroom at once — well inside the node's proof-read timeout.
+    // headroom at once — well inside the node's proof wait.
     release(&mut send_y, 2).await?;
     tokio::time::timeout(
         Duration::from_secs(3),
@@ -1843,9 +1944,11 @@ async fn pay_range_to_end(
     mut paid: u64,
 ) -> anyhow::Result<u64> {
     let (mut send, mut recv) = open_paid_range_stream(conn, hash, Some(ext), 0, range).await?;
+    // The loop reads the stream again after a timeout, so the read must be cancel-safe.
+    let mut reader = BufferedClientReader::default();
     let mut received = paid;
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), read_client_msg(&mut recv)).await {
+        match tokio::time::timeout(Duration::from_secs(5), reader.read(&mut recv)).await {
             Ok(msg) => match msg? {
                 ClientMessage::ChunkData(chunk) => {
                     received = received.saturating_add(chunk.bytes().len() as u64);
@@ -2337,8 +2440,11 @@ struct VoucherTotals {
 /// there. `expected_wire` bytes is the whole delivery, so with a payload well
 /// under one chunk the server has exactly one (closing) voucher left
 /// to collect and is now parked reading it — the stall is a protocol-level
-/// rendezvous, not a race, and it holds until the test pays (well inside the
-/// handler's 10s `VOUCHER_READ_TIMEOUT`).
+/// rendezvous, not a race, and it holds until the test pays or the handler's
+/// proof wait ends it. The client holds every byte, so the stream adds no
+/// transport progress: the wait ends after 10s (`VOUCHER_READ_TIMEOUT`) when the
+/// connection carries nothing else, and up to 30s while sibling streams on it
+/// keep sending.
 async fn stall_delivery_at_closing_voucher(
     conn: &Connection,
     hash: [u8; 32],
@@ -2622,7 +2728,8 @@ async fn active_delivery_stream_defers_idle_close() -> anyhow::Result<()> {
 
     // The reaper is disabled while the stream is in flight: no close, however many
     // idle windows pass. `idle * 5` is well past the window yet far short of the
-    // 10s voucher-read timeout, so a pass is the gate holding, not the park expiring.
+    // 10s no-progress proof wait, so a pass is the gate holding, not the park
+    // expiring.
     let premature = tokio::time::timeout(idle * 5, conn.closed()).await;
     anyhow::ensure!(
         premature.is_err(),
@@ -4350,9 +4457,10 @@ async fn client_restart_with_stale_watermark_heals_and_resumes() -> anyhow::Resu
     // believes it is at zero. It must still complete: the node hands back its
     // watermark and the client reseeds forward.
     //
-    // The 8s budget is deliberately BELOW the node's 10s `VOUCHER_READ_TIMEOUT`
-    // backstop: recovery must fire on the first stale proof the lane headroom
-    // cannot pay, not wait for the read to time out. An unhealed stream wedges at the ~1 MiB floor
+    // The 8s budget is deliberately BELOW the node's proof-wait backstop (10s
+    // with no transport progress, `VOUCHER_READ_TIMEOUT`): recovery must fire on
+    // the first stale proof the lane headroom cannot pay, not wait for the proof
+    // wait to fault. An unhealed stream wedges at the ~1 MiB floor
     // and blows this budget.
     let ctx2 = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
     let got2 = stream_fetch(
@@ -4387,8 +4495,9 @@ async fn client_restart_with_stale_watermark_heals_and_resumes() -> anyhow::Resu
 /// it, and completes — against a real handler, whose bundle carries the lane's
 /// real chain state.
 ///
-/// The 8s budget is below the node's 10s `VOUCHER_READ_TIMEOUT`, so the heal must
-/// fire on the rejection itself, not on a read timeout.
+/// The 8s budget is below the node's proof-wait backstop (10s with no transport
+/// progress, `VOUCHER_READ_TIMEOUT`), so the heal must fire on the rejection
+/// itself, not on a proof-wait fault.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_ahead_of_the_node_rebases_and_resumes() -> anyhow::Result<()> {
     let payload: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
@@ -4519,9 +4628,9 @@ async fn client_resuming_at_the_anchor_under_a_live_chain_heals() -> anyhow::Res
 /// it with the bundle however many streams the lane holds.
 ///
 /// The sibling is a sub-chunk delivery held at its closing voucher, so the lane
-/// has two live streams for the whole pull. The 8s budget sits
-/// below the 10s `VOUCHER_READ_TIMEOUT` backstop, so a stream left waiting on a
-/// proof the payer never sends blows it.
+/// has two live streams for the whole pull. The 8s budget sits below the node's
+/// proof-wait backstop (10s with no transport progress, `VOUCHER_READ_TIMEOUT`),
+/// so a stream left waiting on a proof the payer never sends blows it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_payer_beside_a_live_sibling_heals_below_the_anchor() -> anyhow::Result<()> {
     // Larger than the seeded lane's five proved chunks, so a stream cannot
@@ -4684,8 +4793,9 @@ fn lane_with_proved_frontier(
 /// The node must reject the first voucher `UnderFold` with the bundle stating
 /// the fold owed; the client folds, reseeds, and completes. Crediting it zero
 /// instead leaves the node waiting on a proof the client never sends, and the
-/// stream only dies at the 10s `VOUCHER_READ_TIMEOUT`. The 8s budget sits below
-/// that backstop, so the heal must fire on the rejection itself.
+/// stream only dies at the proof-wait backstop (10s with no transport progress,
+/// `VOUCHER_READ_TIMEOUT`). The 8s budget sits below that backstop, so the heal
+/// must fire on the rejection itself.
 async fn resume_under_a_live_chain(above_anchor: u64) -> anyhow::Result<()> {
     let payload: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
@@ -6284,7 +6394,7 @@ async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()>
     // A: admit (reserves one floor), deliver its first interval, then leave it
     // PARKED reading a voucher we never send — it holds its live floor reservation
     // for the pool's whole `committed` while the test runs, well inside the 10s
-    // voucher-read timeout. `_send_a` is kept so the stream stays open.
+    // no-progress proof wait. `_send_a` is kept so the stream stays open.
     let (_send_a, mut recv_a) = open_paid_stream(&conn, *hash_a.as_bytes(), Some(&ext_a)).await?;
     read_exact_chunks(&mut recv_a, HARNESS_INTERVAL_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv_a).await?;
@@ -6466,8 +6576,10 @@ async fn pay_and_read_to_end(
     let mut received = HARNESS_INTERVAL_BYTES;
     pay_cumulative(send, signer, received).await?;
     let mut paid = received;
+    // The loop reads the stream again after a timeout, so the read must be cancel-safe.
+    let mut reader = BufferedClientReader::default();
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), read_client_msg(recv)).await {
+        match tokio::time::timeout(Duration::from_secs(5), reader.read(recv)).await {
             Ok(msg) => match msg? {
                 ClientMessage::ChunkData(chunk) => {
                     received = received.saturating_add(chunk.bytes().len() as u64);
@@ -7040,6 +7152,88 @@ async fn buyer_accepts_blob_at_exact_ceiling() -> anyhow::Result<()> {
     anyhow::ensure!(
         got.as_ref() == payload.as_slice(),
         "exact-ceiling blob must deliver intact"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// A pull stopped before its promised end (a steal's split) pays for every
+/// wire byte it received, the frames it reads past the split looking for a
+/// rejection included, and closes. The lane stays healthy: the next leg
+/// on the same ledger opens, pays on from there, and completes with no
+/// voucher rejection, whether or not the node read the closing voucher.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pull_stopped_at_a_split_pays_what_arrived_and_the_lane_pulls_on() -> anyhow::Result<()> {
+    let payload = vec![0x3Au8; 8 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth, server_ep, server_task) =
+        spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, signer, deposit);
+    let ledger = Arc::new(ctx.new_ledger());
+    let deadlines = PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?;
+    let slash = slash_domain();
+    let leg = |offset: u64, len: u64| {
+        open_progressive_pull(
+            &client_ep,
+            target.clone(),
+            &ctx,
+            Arc::clone(&ledger),
+            &slash,
+            server_eth.address(),
+            *hash.as_bytes(),
+            decdn_protocol::client::NO_NAMESPACE,
+            offset,
+            0x00c4,
+            0,
+            0,
+            deadlines,
+            len,
+            None,
+        )
+    };
+
+    // `[0, 4 MiB)`, stopped once about a third of its wire has arrived.
+    let (_header, mut pull) = leg(0, 4 * 1024 * 1024).await?;
+    let mut received = 0u64;
+    while received < 3 * 512 * 1024 {
+        let chunk = pull
+            .next_chunk()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("the leg ended before the split"))?;
+        received = received.saturating_add(u64::try_from(chunk.len())?);
+    }
+    // Let the node's credit window queue frames the leg has not read yet:
+    // the stop reads them, without waiting, for a rejection behind them.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let promised = pull.expected_wire_bytes();
+    let stopped = pull.stop().await?;
+    let (stopped_bytes, _) = stopped
+        .advanced()
+        .ok_or_else(|| anyhow::anyhow!("the stopped leg must have paid"))?;
+    anyhow::ensure!(
+        stopped_bytes > U256::from(received) && stopped_bytes <= U256::from(promised),
+        "the stopped leg pays for every frame it read, the queued ones too: \
+         {stopped_bytes} past the {received} read before the stop, at most {promised}"
+    );
+
+    // The next leg on the same ledger pays on from the stopped one's
+    // watermark and completes.
+    let (_header, mut pull) = leg(4 * 1024 * 1024, 4 * 1024 * 1024).await?;
+    let mut next = 0u64;
+    while let Some(chunk) = pull.next_chunk().await? {
+        next = next.saturating_add(u64::try_from(chunk.len())?);
+    }
+    let finished = pull.finish().await?;
+    let (finished_bytes, _) = finished
+        .advanced()
+        .ok_or_else(|| anyhow::anyhow!("the next leg must have paid"))?;
+    anyhow::ensure!(
+        finished_bytes == stopped_bytes + U256::from(next),
+        "the next leg pays on from the stopped one: {finished_bytes} of {stopped_bytes} + {next}"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
@@ -8323,8 +8517,9 @@ async fn honest_concurrent_rollovers_draw_no_voucher_rejection() -> anyhow::Resu
 /// voucher pay a closing partial. So after a stream's last reveal, or on a stream
 /// that makes none, the payer must send only the closing voucher: no open,
 /// re-anchor, or roll voucher. An anchor or re-anchor sent before a sub-chunk
-/// stream's closing voucher would be read while only the partial is owed. It would take lane headroom that belongs to a sibling's unread proof,
-/// and that sibling would then fail at the proof-read timeout. The payer anchors a
+/// stream's closing voucher would be read while only the partial is owed. It
+/// would take lane headroom that belongs to a sibling's unread proof, and that
+/// sibling would then fail when its proof wait faults. The payer anchors a
 /// stream only before its first reveal, and a sub-chunk stream makes none.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sub_chunk_stream_on_a_live_chain_sends_only_its_closing_voucher() -> anyhow::Result<()> {
@@ -12484,17 +12679,18 @@ async fn request_read_timeout_resets_a_silent_opener() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The voucher-read timeout tears down a parked paid delivery: a payer that reads
-/// the whole blob and then withholds its closing voucher is cut off once
-/// `VOUCHER_READ_TIMEOUT` elapses (the stream resets with no `StreamEnd`), and no
-/// watermark advances — a silent payer cannot pin the serve loop indefinitely.
+/// The proof wait tears down a parked paid delivery: a payer that reads the whole
+/// blob and then withholds its closing voucher leaves the connection with no
+/// transport progress, so it is cut off once `VOUCHER_READ_TIMEOUT` elapses (the
+/// stream resets with no `StreamEnd`), and no watermark advances — a silent payer
+/// cannot pin the serve loop indefinitely.
 #[tokio::test(flavor = "multi_thread")]
 async fn voucher_read_timeout_ends_a_parked_delivery() -> anyhow::Result<()> {
     // Under one credit-window floor, so the delivery parks at a single closing
     // voucher — the exact point `commit_one_proof` blocks under the timeout.
     let payload = vec![0x62u8; 64 * 1024];
-    // Idle window well past the 10s voucher-read timeout the test is waiting on,
-    // so the app-layer idle reaper never fires first.
+    // Idle window well past the 10s no-progress proof wait the test is waiting
+    // on, so the app-layer idle reaper never fires first.
     let fx = idle_fixture(&payload, Duration::from_secs(45)).await?;
     let blob = fx.blob(0)?;
 
@@ -12513,8 +12709,8 @@ async fn voucher_read_timeout_ends_a_parked_delivery() -> anyhow::Result<()> {
     )
     .await?;
 
-    // Withhold the voucher. The server is parked in `commit_one_proof`'s bounded
-    // read and must give up at the voucher-read timeout (10s), ending the stream
+    // Withhold the voucher. The server is parked in `commit_one_proof`'s proof
+    // wait and must give up at the no-progress timeout (10s), ending the stream
     // with no `StreamEnd` — whether by a reset or a clean close, the payment never
     // completes, so the next read yields an error rather than a `StreamEnd`.
     let ended =
@@ -12526,7 +12722,7 @@ async fn voucher_read_timeout_ends_a_parked_delivery() -> anyhow::Result<()> {
         }
         Ok(Ok(other)) => anyhow::bail!("expected the stream to end unpaid, got {other:?}"),
         Err(_elapsed) => {
-            anyhow::bail!("server never ended the parked delivery within the voucher-read timeout")
+            anyhow::bail!("server never ended the parked delivery within its proof wait")
         }
     }
 
@@ -12540,6 +12736,95 @@ async fn voucher_read_timeout_ends_a_parked_delivery() -> anyhow::Result<()> {
         );
     }
 
+    shutdown([fx.server_task], [&client_ep, &fx.server_ep]).await?;
+    Ok(())
+}
+
+/// The proof wait counts transport progress, and only progress extends it
+/// (#2230). A payer that stops reading and paying right after the response
+/// leaves the node's first credit window in its receive buffer: the connection
+/// sends no new STREAM frame, so the node gives up on proof 1 at the 10s
+/// no-progress timeout, well before the 30s proof-wait ceiling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payer_that_stops_reading_faults_at_the_no_progress_timeout() -> anyhow::Result<()> {
+    // Several chunks, so the node writes one credit window, then waits for the
+    // proof of its first chunk. One window fits the client's stream receive
+    // window, so the node's writes complete although the client reads nothing.
+    let payload: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    // Idle window well past the 30s ceiling, so the app-layer idle reaper never
+    // fires first.
+    let fx = idle_fixture(&payload, Duration::from_secs(45)).await?;
+    let blob = fx.blob(0)?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(fx.target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&fx.client_signer, client_node_id)?;
+
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    let req = StreamRequest {
+        hash: *blob.hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x0012_61a1,
+    };
+    let request = encode_stream_request(&req, Some(&ext))
+        .map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
+    write_frame(&mut send, &request)
+        .await
+        .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
+    let (resp, resp_ext) = read_stream_response(&mut recv).await?;
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
+
+    // Read nothing more and pay nothing. The node ends the stream by dropping
+    // its receive half, which stops this send half.
+    let waiting_since = Instant::now();
+    let stopped = tokio::time::timeout(Duration::from_secs(25), send.stopped()).await;
+    let waited = waiting_since.elapsed();
+    match stopped {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => anyhow::bail!("the stream ended without a stop: {e}"),
+        Err(_elapsed) => anyhow::bail!("the node held a silent payer past 25s"),
+    }
+    anyhow::ensure!(
+        waited >= Duration::from_secs(9),
+        "the node faulted the payer after {waited:?}, before the 10s no-progress timeout"
+    );
+    anyhow::ensure!(
+        waited < Duration::from_secs(15),
+        "the node held a payer with no transport progress for {waited:?}; it must fault \
+         at the 10s no-progress timeout, not at the 30s ceiling"
+    );
+
+    // The stall is the payer's fault: it ends on exactly one inbound reason
+    // counter, and that counter is not the node-fault one.
+    support::assert_inbound_failures_attributed(&fx.metrics, 1).await?;
+    anyhow::ensure!(
+        counter(&fx.metrics, "decdn_serve_stream_node_fault_total")? == 0,
+        "a stalled payer must not count as a node fault"
+    );
+
+    // No proof was ever accepted, so the lane watermark stayed at zero.
+    let persisted = fx.store.load_all()?;
+    if let Some(lane) = persisted.first() {
+        anyhow::ensure!(
+            lane.last_bytes_delivered() == U256::ZERO,
+            "an unpaid delivery must advance no watermark, got {}",
+            lane.last_bytes_delivered()
+        );
+    }
+
+    drop(recv);
+    drop(send);
+    conn.close(0u32.into(), b"done");
     shutdown([fx.server_task], [&client_ep, &fx.server_ep]).await?;
     Ok(())
 }

@@ -50,8 +50,10 @@ const TIMESTAMP_US: u64 = 0x00c0_ffe1;
 /// node's closing-voucher pause is the terminator on a successful delivery.
 ///
 /// Load-bearing coupling: this must stay below the node's `VOUCHER_READ_TIMEOUT`
-/// (10s, `crates/node/src/handlers/client/mod.rs`), or the node gives up on the
-/// voucher and resets the stream before the tap decides it has gone idle.
+/// (10s with no transport progress, `crates/node/src/handlers/client/mod.rs`).
+/// The tap has read every frame, so the connection shows no progress, and past
+/// that timeout the node gives up on the voucher and resets the stream before
+/// the tap decides it has gone idle.
 const WIRE_TAP_IDLE: Duration = Duration::from_secs(5);
 /// How long the tap waits for the *first* frame. Far larger than
 /// [`WIRE_TAP_IDLE`] because the first frame is gated on the node's entire

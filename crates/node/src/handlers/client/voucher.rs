@@ -15,11 +15,12 @@
 //! asymmetry is the point of the hash chain — signatures become O(1) per
 //! transfer plus one per rollover, rather than one per metering interval.
 
+use super::proof_wait::ChunkProofs;
 use super::{
-    Arc, B256, BufferedProofReader, ClientHandler, DEFAULT_TOLERANCE_BPS, Hash, LaneDeliveryState,
-    LaneKey, LaneState, Mutex, Ordering, Proof, RateError, RecvStream, RetrySignal, SendStream,
-    SignedVoucher, U256, VOUCHER_READ_TIMEOUT, VoucherRejectReason, VoucherStop, WatermarkBundle,
-    verify_rate, voucher_reject_reason, wire_voucher_to_signed,
+    Arc, B256, BufferedProofReader, ClientHandler, Connection, DEFAULT_TOLERANCE_BPS, Hash,
+    LaneDeliveryState, LaneKey, LaneState, Mutex, Ordering, Proof, RateError, RecvStream,
+    RetrySignal, SendStream, SignedVoucher, U256, VoucherRejectReason, VoucherStop,
+    WatermarkBundle, verify_rate, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_incentive::{PoolError, VoucherError};
 
@@ -278,6 +279,7 @@ impl ClientHandler {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) async fn commit_one_proof(
         &self,
+        conn: &Connection,
         send: &mut SendStream,
         recv: &mut RecvStream,
         reader: &mut BufferedProofReader,
@@ -288,6 +290,7 @@ impl ClientHandler {
         client_node_id: B256,
         rate_per_mb: u64,
         owed: OwedChunk,
+        proofs: &ChunkProofs,
     ) -> anyhow::Result<VoucherStop> {
         // Unknown lane: `serve_stream` refuses one pre-serve, so this is a
         // defensive backstop matching the sole callers (which forward `Some`).
@@ -297,16 +300,11 @@ impl ClientHandler {
             return Ok(VoucherStop::Rejected);
         };
 
-        // (1) READ one proof (blocking under VOUCHER_READ_TIMEOUT) WITHOUT
+        // (1) READ one proof (bounded by the proof wait, which counts `conn`'s
+        // transport progress and the owed chunk's ceiling in `proofs`) WITHOUT
         // holding the per-lane lock — a network read must not block same-lane
         // streams. The reader is cancellation-safe.
-        let proof = tokio::time::timeout(VOUCHER_READ_TIMEOUT, reader.read(recv))
-            .await
-            .map_err(|_| {
-                anyhow::Error::new(super::wire::PeerFault).context(format!(
-                    "proof read timed out after {VOUCHER_READ_TIMEOUT:?}"
-                ))
-            })??;
+        let proof = super::proof_wait::await_proof(reader.read(recv), conn, proofs).await?;
 
         let wire = match proof {
             Proof::Voucher(wire) => wire,
@@ -372,22 +370,15 @@ impl ClientHandler {
         // or under it is stale: the lane already holds its payment.
         let prior_last_amount = guard.state.last_amount();
 
-        // Capability-expiry gate (ADR 003 §Revocation). `expiry == 0` means "not
-        // tracked" and never expires. The node stops accepting vouchers a margin
-        // BEFORE the expiry: one redeem interval plus the redeemer's landing
-        // slack. A voucher accepted at the edge then still meets one self-tick
-        // sweep and lands before the contract stops paying the capability. A
-        // grant inside the margin surfaces as `CapabilityExpired` — distinct from
-        // a cap-exhausted `SpendingCapExhausted`, since the fix is a fresh
-        // capability, not a cap raise.
-        let expiry = guard.state.expiry;
-        if expiry != 0
-            && self
-                .coarse_clock
-                .unix_seconds()
-                .saturating_add(self.capability_expiry_margin_secs)
-                >= expiry
-        {
+        // Capability-expiry gate (ADR 003 §Revocation). The node stops accepting
+        // vouchers a margin BEFORE the expiry: one redeem interval plus the
+        // redeemer's landing slack. The preimage path applies the same gate, so
+        // the lane's claim is final when the margin starts, and the redeemer's
+        // cutoff sweep redeems it before the contract stops paying the
+        // capability. A grant inside the margin surfaces as `CapabilityExpired` —
+        // distinct from a cap-exhausted `SpendingCapExhausted`, since the fix is
+        // a fresh capability, not a cap raise.
+        if self.inside_expiry_margin(guard.state.expiry) {
             drop(guard);
             self.write_reject(send, VoucherRejectReason::CapabilityExpired, None)
                 .await?;
@@ -514,6 +505,17 @@ impl ClientHandler {
         Ok(VoucherStop::Continue { credited_bytes })
     }
 
+    /// Whether a capability that expires at `expiry` is inside this node's
+    /// expiry margin now, read off the coarse clock. Both proof paths refuse a
+    /// proof inside the margin with `CapabilityExpired`.
+    fn inside_expiry_margin(&self, expiry: u64) -> bool {
+        decdn_common::config::inside_capability_expiry_margin(
+            expiry,
+            self.capability_expiry_margin_secs,
+            self.coarse_clock.unix_seconds(),
+        )
+    }
+
     /// Accept ONE released hash-chain preimage: place it against this stream's
     /// anchor, fold it into the lane under the per-lane lock, and record the
     /// advance (ADR 003 §Hash-chain metering).
@@ -524,7 +526,7 @@ impl ClientHandler {
     /// walked, and a duplicate or out-of-order reveal costs not even that.
     /// Acceptance is implicit, exactly as for a voucher: the node simply keeps
     /// delivering.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn commit_one_preimage(
         &self,
         send: &mut SendStream,
@@ -585,6 +587,15 @@ impl ClientHandler {
         };
 
         let mut guard = lane.lock().await;
+        // The voucher path's capability-expiry gate. Without it a stream
+        // anchored before the margin could keep extending the claim after the
+        // redeemer's cutoff sweep has read it.
+        if self.inside_expiry_margin(guard.state.expiry) {
+            drop(guard);
+            self.write_reject(send, VoucherRejectReason::CapabilityExpired, None)
+                .await?;
+            return Ok(VoucherStop::Rejected);
+        }
         let (next_state, applied) = match guard
             .state
             .advance_preimage_verified(root, index, reveal, walked, walked_ok)

@@ -1037,7 +1037,7 @@ async fn response_headers_timeout_fires_on_silent_server() -> anyhow::Result<()>
     .await?;
 
     let err = err_of(engine.get(Hash::new(b"anything")).await)?;
-    let msg = format!("{err:#}");
+    let msg = err.display_chain().to_string();
     anyhow::ensure!(
         matches!(err, CacheError::OriginError { .. }),
         "expected OriginError from headers timeout, got: {err:?}"
@@ -1073,7 +1073,7 @@ async fn chunk_idle_timeout_fires_when_origin_stalls_mid_body() -> anyhow::Resul
     .await?;
 
     let err = err_of(engine.get(Hash::new(b"anything")).await)?;
-    let msg = format!("{err:#}");
+    let msg = err.display_chain().to_string();
     anyhow::ensure!(
         matches!(err, CacheError::OriginError { .. }),
         "expected OriginError from idle timeout, got: {err:?}"
@@ -1698,7 +1698,7 @@ async fn http_origin_rejects_oversized_compressed_content_length() -> anyhow::Re
     let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
 
     let err = err_of(engine.get(canonical).await)?;
-    let msg = format!("{err:#}");
+    let msg = err.display_chain().to_string();
     anyhow::ensure!(
         matches!(err, CacheError::OriginError { .. }),
         "expected OriginError from compressed C-L cap, got: {err:?}"
@@ -1848,7 +1848,7 @@ async fn http_origin_4xx_other_than_404_surfaces_origin_error() -> anyhow::Resul
 
     for (status, hash) in statuses.iter().zip(hashes.iter()) {
         let err = err_of(engine.get(*hash).await)?;
-        let msg = format!("{err:#}");
+        let msg = err.display_chain().to_string();
         anyhow::ensure!(
             matches!(err, CacheError::OriginError { .. }),
             "expected OriginError for status {status}, got: {err:?}"
@@ -1882,7 +1882,7 @@ async fn http_origin_5xx_surfaces_origin_error() -> anyhow::Result<()> {
 
     for (status, hash) in statuses.iter().zip(hashes.iter()) {
         let err = err_of(engine.get(*hash).await)?;
-        let msg = format!("{err:#}");
+        let msg = err.display_chain().to_string();
         anyhow::ensure!(
             matches!(err, CacheError::OriginError { .. }),
             "expected OriginError for status {status}, got: {err:?}"
@@ -1999,7 +1999,7 @@ async fn http_origin_rejects_advertised_oversize_before_reading_body() -> anyhow
         CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 1).await?;
 
     let err = err_of(engine.get(Hash::new(b"anything")).await)?;
-    let msg = format!("{err:#}");
+    let msg = err.display_chain().to_string();
     anyhow::ensure!(
         matches!(err, CacheError::OriginError { .. }),
         "expected OriginError from Content-Length fast-path, got: {err:?}"
@@ -2067,7 +2067,7 @@ async fn http_origin_rejects_content_length_one_over_cap() -> anyhow::Result<()>
     let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], CAP_MB).await?;
 
     let err = err_of(engine.get(hash).await)?;
-    let msg = format!("{err:#}");
+    let msg = err.display_chain().to_string();
     anyhow::ensure!(
         matches!(err, CacheError::OriginError { .. }),
         "expected OriginError at cap+1, got: {err:?}"
@@ -3954,7 +3954,7 @@ async fn all_origins_error_surfaces_origin_error_with_last_failure() -> anyhow::
         matches!(err, CacheError::OriginError { .. }),
         "all-error chain must surface OriginError (=> 5xx at edge), got: {err:?}",
     );
-    let chain = format!("{err:#}");
+    let chain = err.display_chain().to_string();
     anyhow::ensure!(
         chain.contains("mirror-marker"),
         "OriginError must carry the LAST origin's failure marker; got chain: {chain}",

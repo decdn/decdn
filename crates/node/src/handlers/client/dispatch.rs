@@ -145,6 +145,7 @@ impl ClientHandler {
                         // task's stack frame. Each task holds its own `Arc<Self>`.
                         let span = serve_stream_span(peer, self.node_id);
                         let serve = Box::pin(Arc::clone(&this).serve_stream(
+                            conn.clone(),
                             send,
                             recv,
                             permit,
@@ -281,6 +282,8 @@ impl ClientHandler {
 
     /// Serve one delivery stream end to end. Returns how the stream ended
     /// ([`ServeEnd`]); an `Err` is recorded on the span as `outcome = failed`.
+    /// `conn` is the stream's connection: each proof wait reads its transport
+    /// progress ([`proof_wait`](super::proof_wait)).
     ///
     /// Kept as one linear, ADR-ordered sequence (read → bind → blob gate →
     /// channel → sign → deliver); splitting it would scatter the ADR-005
@@ -289,6 +292,7 @@ impl ClientHandler {
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     pub(super) async fn serve_stream(
         self: Arc<Self>,
+        conn: Connection,
         mut send: SendStream,
         mut recv: RecvStream,
         permit: Option<OwnedSemaphorePermit>,
@@ -675,7 +679,7 @@ impl ClientHandler {
             Err(e) => {
                 tracing::warn!(
                     %hash,
-                    error = %e,
+                    error = %e.display_chain(),
                     "cache `serve_audit` lookup failed on delivery path"
                 );
                 return self
@@ -698,7 +702,9 @@ impl ClientHandler {
         // The gate's class. The shed gate admits under it and the first-byte clock
         // records under it. The class is fixed here, because a buffered fill below
         // serves a miss through the cache-hit `deliver`, and that loop cannot tell.
+        // The admit instant ends the clock's admission phase.
         let request_class;
+        let admitted_at;
         if audit.is_serveable() {
             request_class = RequestClass::CacheHit;
             // Serve-path hit rate (see `Metrics::serve_cache_hit`). Metered on the
@@ -706,7 +712,10 @@ impl ClientHandler {
             // ratio stays a property of the store rather than of current pressure.
             self.metrics.serve_cache_hit();
             match self.shed.try_admit(request_class, client_node_id) {
-                Ok(slot) => shed_slot = Some(slot),
+                Ok(slot) => {
+                    shed_slot = Some(slot);
+                    admitted_at = std::time::Instant::now();
+                }
                 Err(reason) => {
                     self.metrics.load_shed_refused(reason);
                     tracing::debug!(
@@ -757,7 +766,10 @@ impl ClientHandler {
                 self.metrics.serve_cache_partial_hit();
                 request_class = RequestClass::CacheHit;
                 match self.shed.try_admit(request_class, client_node_id) {
-                    Ok(slot) => shed_slot = Some(slot),
+                    Ok(slot) => {
+                        shed_slot = Some(slot);
+                        admitted_at = std::time::Instant::now();
+                    }
                     Err(reason) => {
                         self.metrics.load_shed_refused(reason);
                         tracing::debug!(
@@ -796,7 +808,10 @@ impl ClientHandler {
                 self.metrics.serve_cache_miss();
                 request_class = RequestClass::CacheMiss;
                 match self.shed.try_admit(request_class, client_node_id) {
-                    Ok(slot) => shed_slot = Some(slot),
+                    Ok(slot) => {
+                        shed_slot = Some(slot);
+                        admitted_at = std::time::Instant::now();
+                    }
                     Err(reason) => {
                         self.metrics.load_shed_refused(reason);
                         tracing::debug!(
@@ -1004,6 +1019,7 @@ impl ClientHandler {
                                     // lane, so the extraction always matches.
                                     if let (Some(lk), Some(ln)) = (lane_key, known_lane.as_ref()) {
                                         return Box::pin(self.serve_via_backend_origin(
+                                            &conn,
                                             send,
                                             recv,
                                             &req,
@@ -1015,7 +1031,11 @@ impl ClientHandler {
                                             pool_status.map(|s| s.remaining),
                                             rate_per_mb,
                                             floor_reservation,
-                                            FirstByteClock::new(request_decoded_at, request_class),
+                                            FirstByteClock::new(
+                                                request_decoded_at,
+                                                admitted_at,
+                                                request_class,
+                                            ),
                                         ))
                                         .await;
                                     }
@@ -1031,7 +1051,7 @@ impl ClientHandler {
                                 // then fall through — another source may still serve.
                                 Err(e) => {
                                     self.metrics.node_pull_through_error();
-                                    tracing::warn!(%hash, error = %format_args!("{e:#}"), "own-origin range probe faulted; falling through");
+                                    tracing::warn!(%hash, error = %e.display_chain(), "own-origin range probe faulted; falling through");
                                     fault_seen = true;
                                 }
                             }
@@ -1045,7 +1065,7 @@ impl ClientHandler {
                         // later-tier miss reports InternalError not NotFound.
                         Err(e) => {
                             self.metrics.node_pull_through_error();
-                            tracing::warn!(%hash, error = %e, "own-origin size probe faulted; falling through");
+                            tracing::warn!(%hash, error = %e.display_chain(), "own-origin size probe faulted; falling through");
                             fault_seen = true;
                         }
                     }
@@ -1113,6 +1133,7 @@ impl ClientHandler {
                     // extraction always matches.
                     if let (Some(lk), Some(ln)) = (lane_key, known_lane.as_ref()) {
                         return Box::pin(self.serve_via_window_pull_through(
+                            &conn,
                             send,
                             recv,
                             &req,
@@ -1125,7 +1146,7 @@ impl ClientHandler {
                             fault_seen,
                             rate_per_mb,
                             floor_reservation,
-                            FirstByteClock::new(request_decoded_at, request_class),
+                            FirstByteClock::new(request_decoded_at, admitted_at, request_class),
                         ))
                         .await;
                     }
@@ -1175,7 +1196,7 @@ impl ClientHandler {
             let size = match self.cache.inspect(hash).await {
                 Ok(preview) => preview.size_bytes,
                 Err(e) => {
-                    tracing::warn!(%hash, error = %e, "cache `inspect` failed on delivery path");
+                    tracing::warn!(%hash, error = %e.display_chain(), "cache `inspect` failed on delivery path");
                     return self
                         .respond_error(
                             &mut send,
@@ -1372,9 +1393,12 @@ impl ClientHandler {
         let (resp, resp_ext) = self.sign_response(body, None)?;
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
+        let mut first_byte = FirstByteClock::new(request_decoded_at, admitted_at, request_class);
+        first_byte.mark_responded();
 
         // Stream the blob, collecting vouchers at each interval boundary.
         self.deliver(
+            &conn,
             &mut send,
             &mut recv,
             hash,
@@ -1386,7 +1410,7 @@ impl ClientHandler {
             client_node_id,
             rate_per_mb,
             floor_reservation,
-            FirstByteClock::new(request_decoded_at, request_class),
+            first_byte,
         )
         .await
     }

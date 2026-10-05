@@ -560,6 +560,47 @@ mod tests {
         }
     }
 
+    /// A group-aligned end cuts the pre-order encoding of a range between two
+    /// items: the encoding of `[offset, split)` is a byte prefix of the
+    /// encoding of `[offset, end)`. A client that stops a leg at a steal's
+    /// split relies on it, so the bytes it read verify on their own and are
+    /// exactly what it pays for.
+    #[test]
+    fn a_shorter_range_encodes_as_a_prefix_of_a_longer_one() {
+        let g = CHUNK_GROUP_BYTES;
+        for total in [5 * g, 9 * g + 321, 16 * g, 17 * g - 1] {
+            let data: Vec<u8> = (0..total)
+                .map(|i| u8::try_from(i * 31 % 251).expect("below 251"))
+                .collect();
+            let ob = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
+            let root = *ob.root.as_bytes();
+            let outboard = Bytes::from(ob.data);
+            let encode = |offset: u64, end: u64| {
+                let aligned = align_range(offset, end - offset, total).expect("aligned");
+                let window = usize::try_from(aligned.fetch_start()).expect("fits")
+                    ..usize::try_from(aligned.fetch_end()).expect("fits");
+                let slice = data.get(window).expect("in the blob");
+                let combined = encode_verified_range(root, &aligned, slice, outboard.clone())
+                    .expect("encodes");
+                combined.slice(8..)
+            };
+            let groups = total.div_ceil(g);
+            for first in 0..groups {
+                let longer = encode(first * g, total);
+                for split in first + 1..groups {
+                    let shorter = encode(first * g, split * g);
+                    assert_eq!(
+                        longer.get(..shorter.len()),
+                        Some(&shorter[..]),
+                        "total={total} offset={} split={}",
+                        first * g,
+                        split * g
+                    );
+                }
+            }
+        }
+    }
+
     /// Large trees, small windows: the walk is `O(window)` so it stays testable,
     /// and the closed form must agree on offsets deep inside multi-level trees —
     /// including the ragged final group of a blob in the gigabytes.

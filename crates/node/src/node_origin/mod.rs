@@ -3157,7 +3157,7 @@ fn classify_pull_failure(
         PullVerdict::OurLocalFault => {
             deps.metrics.node_pull_local_fault();
             warn!(
-                %provider_addr, error = %err,
+                %provider_addr, error = %format_args!("{err:#}"),
                 "node-origin: LOCAL buyer-side fault during a pull (signer/encode/range) — this node \
                  cannot pay; exonerating the upstream"
             );
@@ -3173,7 +3173,7 @@ fn classify_pull_failure(
             record_outcome(deps, pk, &Outcome::Corruption);
         }
         PullVerdict::Unreachable => {
-            debug!(peer = %pk, %provider_addr, error = %err, "node-origin: upstream pull failed; scoring unreachable");
+            debug!(peer = %pk, %provider_addr, error = %format_args!("{err:#}"), "node-origin: upstream pull failed; scoring unreachable");
             record_outcome(deps, pk, &Outcome::Unreachable);
         }
     }
@@ -3255,6 +3255,7 @@ fn fold_outcome(local_rep: &LocalReputation, metrics: &Metrics, pk: PublicKey, o
 }
 
 /// Round-trip-time milliseconds as a saturating `u32` for the selection score.
+/// A sub-millisecond RTT truncates to 0; the score applies its 1 ms floor.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // RTT ≥ 0; saturated below u32::MAX.
 fn ms_to_u32(rtt_ms: f64) -> u32 {
     if rtt_ms >= f64::from(u32::MAX) {

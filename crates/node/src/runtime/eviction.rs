@@ -252,7 +252,7 @@ async fn sweep(
                 warming.forget(hash);
             }
             Err(err) => {
-                tracing::warn!(%hash, error = %err, "eviction driver: release_for_eviction failed; skipping hash");
+                tracing::warn!(%hash, error = %err.display_chain(), "eviction driver: release_for_eviction failed; skipping hash");
             }
         }
     }
@@ -348,7 +348,7 @@ async fn tick(
         Err(err) => {
             metrics.size_measure_failures.inc();
             tracing::warn!(
-                error = %err,
+                error = %err.display_chain(),
                 "eviction driver: cache size measurement failed; skipping tick \
                  (decdn_cache_bytes is now stale — alert on decdn_cache_size_measure_failures_total)"
             );

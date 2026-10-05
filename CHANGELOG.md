@@ -28,6 +28,28 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`decdn-cache` network origins bind to the runtime they are built on
+  (#1675).** `HttpOrigin::new`, `HttpOrigin::new_with_user_agent`,
+  `HttpOrigin::parse`, `S3Origin::new` and `S3Origin::from_parts` capture the
+  current tokio runtime, and every request send runs there, so build them on
+  a runtime that outlives every fetch. Each fails outside a tokio runtime, so
+  a caller that built an `HttpOrigin` from synchronous code builds it inside
+  the runtime instead. `S3Origin::from_parts` returns `anyhow::Result<Self>`;
+  a caller adds `?`.
+- **Buyer pool rows keep an adopted pool's redeemed spend, and both buyer
+  tables move to `_v6` (#2292).** A row adopted from chain has no lanes, so
+  the pool's `totalRedeemed` is its only record of what other lanes paid
+  out. The row now stores it (record schema 4), so every later `decdn fetch`
+  and `decdn bundle pull` that reuses the row counts it, not only the run
+  that adopted the pool. A lane seeded from its on-chain watermark takes its
+  own share out of that amount, so the pool spend is the tracked lanes plus
+  what no tracked lane accounts for, and stays right as a seeded lane
+  advances. A node adopts its pool the same way, and its low-water refill
+  reads the same pool spend. **Existing buyer rows are not read:**
+  `buyer_pool_state_v5` / `buyer_pool_owner_index_v5` become `_v6`, so on
+  first run the store reads as empty, and a node or client re-adopts its live
+  pool from chain.
+
 - **`bundle pull --json` renames `deduped` to `reused` and adds `excluded`
   (#2190).** `deduped` counted whole-file reuse only, so beside a
   `range-dedup: spliced 12.7 GB` line a `0 deduped` count read as a
@@ -915,6 +937,154 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **A sub-millisecond probe RTT no longer erases the price signal in
+  candidate ranking (#2268).** The selection score multiplies the rate by the
+  probe RTT in whole milliseconds, and a probe faster than 1 ms truncated to
+  0. Every such peer scored 0, so two of them tied whatever they quoted, and a
+  dear one outranked every cheaper peer at 1 ms or more. The score now uses an
+  RTT floor of 1 ms (ADR 001), so peers on a LAN or in one datacenter rank on
+  rate and reputation.
+- **Origin requests keep their connections across serve-miss pulls, and HTTP
+  origins reuse keep-alive connections again (#1675).** A serve-miss pull leg
+  runs on its own current-thread runtime, which drops when the leg returns.
+  A pooled origin connection opened there lived on that runtime, so a
+  concurrent serve that reused it lost its in-flight request with "dispatch
+  task is gone" (#1673). `HttpOrigin` avoided this by turning its keep-alive
+  pool off, and paid a fresh TCP and TLS handshake on every request.
+  `S3Origin` kept its pool and was still exposed. Both origins now capture the
+  runtime they are built on, which is the node's main runtime, and run every
+  request send there. Each pooled connection outlives the pull leg that opened
+  it, and `HttpOrigin` reuses keep-alive connections. A request task that
+  panics, or that the shutting-down main runtime cancels, fails as a
+  permanent origin fault. The constructor changes are under Changed
+  (BREAKING).
+- **The deployment preflight rejects every sibling contract of the
+  `PaymentPool` (#2279).** Startup identified `blockchain.payment_pool_address`
+  by calling `usdc()`, which `FeeRouter` and `BuybackBurner` also answer. A
+  node pointed at either one passed the preflight, then dropped its seller
+  lane state and forfeited the unredeemed vouchers. The probe is now
+  `PaymentPool.getRateBounds()`, which only `PaymentPool` declares
+  (`feeRouter()` would not do: `DecdnGovernor` answers it too), so the node
+  exits before the lane store opens. The startup error now names
+  `PaymentPool.getRateBounds()`.
+
+- **A reactive top-up of a few micro-USDC no longer goes on chain, and a
+  refill reaches lanes already running (#2296).** Right after a refill, a
+  node whose chain watcher had not seen it yet refused the next open as
+  `InsufficientDeposit`, and the client topped the pool up by the few
+  micro-USDC it was short of the working deposit: an `approve` and a `topUp`
+  each, and one of the run's three reactive top-ups. Such a refusal while the
+  deposit sits within the low water (working deposit / 5) of the working
+  deposit now waits out the node's watcher on its own settle budget, and a
+  confirmed exhaustion the deposit can still afford tops up only when it adds
+  at least that low water. A node that keeps refusing past the budget faults
+  as a source (it cools and is asked again, with one WARN), not as priced out
+  by a deposit no top-up raises. A lane build that refilled the pool now raises
+  every running lane to the new deposit, so a lane built before the refill no
+  longer reads a gap the refill paid for as unaffordable.
+
+- **A partial holder that refuses blocks its coverage claims stops being
+  asked for them (#2281).** A `NotFound` for a range inside a probed partial
+  holder's advertised coverage counted as a delivery fault only, so the
+  holder was asked for the same range again every few seconds for the rest
+  of the entry. Such a refusal on the lane's own stream now counts against
+  every discovery block the refused part of the range touches. After three,
+  the block leaves the holder's coverage for a minute, rediscovery included,
+  and its ranges go to the other holders. A `NotFound` can also be a
+  transient refusal, so the block then returns, refusals within one cooldown
+  count once, refusals a minute or more apart never add up, and a verified
+  byte in the block clears its count. An extra stream's covered `NotFound`
+  does not count: it is most often the node's per-signer live cap.
+
+- **A range-dedup entry that waits for a sibling's chunks no longer holds a
+  `--jobs` slot (#2283).** `decdn bundle pull` kept the slot of an entry
+  whose complement had landed while it waited for the sibling that fetches
+  its donor chunks. On an SDXL pull with `--jobs 5`, such waiters held the
+  run to 2–3 downloading entries for minutes at a time. A waiter now gives
+  its slot to a queued entry while it waits, and takes one again as the wait
+  ends, ahead of entries still to start. A pull's file bar appears once the
+  entry holds a slot.
+
+- **A partial holder steals the covered tail of a busy leg (#2303).** A
+  freed lane stole from a busy lane only when it covered the victim's whole
+  range in flight. In a `decdn bundle pull` of mistral-7b, one node held
+  blocks 0–43 of a shard as one 2.95 GB leg. A lane that covered blocks
+  18–45 went idle in seconds, and the leg ran alone for 8 min on one
+  stream. A freed lane now steals inside the longest suffix of a range in
+  flight whose blocks it covers: a split before that suffix moves to its
+  start, and the victim keeps every byte before it. A lane whose blocks stop
+  short of a range's last block still cannot steal from that range. A
+  holder counts as having work, and starts, only when it would steal now:
+  a late partial holder starts and steals, and a holder whose only option
+  is a tail below the steal floors no longer takes a lane slot to park.
+
+- **A queue that one lane drains takes an extra stream (#2252).** In
+  `decdn bundle pull`, a lane's own worker takes queued ranges one after
+  another and does not end between them, so no stream end asked for growth.
+  The first growth pass ran as the lane started, before its worker held a
+  range, and found no busy lane to ask. Nothing asked again, so a
+  range-deduped entry's complement went to one holder as one serial request
+  per run. While a range waits and a running lane can be granted streams,
+  the acquire now asks again every second, also when no busy lane could be
+  asked. A busy lane takes an extra stream for every waiting range that its
+  provider has a permit for, not only one, and one growth pass fills every
+  free permit. A lane that waits with nothing to take gives its permit back
+  while it waits, so an idle lane of one entry no longer holds a stream that
+  another entry's queue needs; it takes a free permit again before it takes
+  a range. At `--max-lane-streams` 3 or more, an extra stream never takes a
+  provider's last free permit, so a sibling entry's first stream to that
+  provider still opens; a lane that starts again can take it. The info line
+  `a queued range waits for a stream` logs on the first wait and then at
+  most every 30 s while ranges wait, in place of a line on every change;
+  each change between those lines logs at debug.
+
+- **The client funds a buyer pool from its pool-wide spend, and a short
+  wallet no longer drops lanes (#2288, #2289).** The low-water refill
+  compares the deposit with the spend of every lane of the pool, not only
+  the lane being built, so a pool spent across many providers refills. The
+  reactive top-up and the check of a node's `SpendingCapExhausted` refusal
+  use the same pool-wide view. When the wallet holds too little USDC for a
+  refill, the fetch continues on the pool's remaining deposit, logs one WARN,
+  makes no further refill attempts that run, and ends with one
+  `warning: wallet … holds … µUSDC, less than the … µUSDC top-up …` line on
+  stderr, visible without `-v`. A pool with nothing left and a short wallet
+  ends the command with the top-up remedy. A `topUp` whose receipt cannot be
+  read, or that mined but could not be recorded locally, now ends the command
+  and names the tx instead of retrying, because a retry escrows again. A
+  failed reactive top-up retries without cooling the serving node.
+
+- **The node no longer faults a paying client whose bytes are still in
+  flight (#2230).** A write returns once the transport buffers it, so the
+  node's wait for a proof can start while several chunks are still on the
+  way to the client. The wait now faults only after 10 s with no proof and no
+  new STREAM frame sent on the connection. All the proofs for one owed chunk
+  share a 30 s ceiling from the chunk's first wait, so proofs that credit
+  nothing cannot stretch it. A client that stops reading faults at 10 s when
+  its connection carries nothing else; traffic on sibling streams of the same
+  connection counts as progress and can hold the wait up to the 30 s ceiling.
+  A ceiling fault does not count on
+  `decdn_node_pull_through_client_abandoned_total`. The fault text gives the
+  measured times and the STREAM frames the wait saw, then the connection's
+  selected path (relay or direct, IPv4 or IPv6) with its RTT and congestion
+  window and the path's lifetime totals of lost packets, congestion events and
+  black holes detected: `no proof and no transport progress for 10.0s; …` or
+  `the chunk's proofs ran past their wait ceiling after 30.0s; …`. It replaces
+  `proof read timed out after 10s` in the `serve_stream` failure span.
+
+- **A faulted lane's remainder starts within a second of a stream freeing
+  (#2230).** In `decdn bundle pull`, a lane gives its stream permit back when
+  its own worker ends, so a sibling entry can use it. It starts again only on
+  a permit that is free then, and tries again each second while none is. A
+  queued range that no idle lane takes goes to a busy lane on one extra
+  stream; when part of the range has no running lane that covers it, any busy
+  lane not barred from pull-through can take it by pull-through. When a
+  provider has no free permit for that stream, the acquire asks again every
+  second. A node that refuses a lane's extra streams is asked again after
+  1 s, doubling to 30 s, and its `NotFound` refusals of uncovered ranges on
+  extra streams bar it from pull-through as on its own stream. The info line
+  `a queued range waits for a stream` names the waiting ranges and logs when
+  they change, and every 30 s while they stay.
+
 - **Chain-read logs no longer carry the RPC URL (#2264).** The node's
   binding check, buyer lane seed, owned-pool walk, top-up, pool open and
   reclaim sweep log their RPC errors through the URL-stripping redactor, so a
@@ -987,6 +1157,17 @@ since project inception and will roll into the first tagged release.
   source instead of ending the command. A rejection that no bundle heals,
   and a spending-cap rejection, still end the command. The heal branch and
   each healed retry log at `info`.
+
+- **A delegated lane is swept when its expiry margin starts (#2233).** The
+  node refuses preimage reveals inside a capability's expiry margin, as it
+  already refused vouchers, so a lane's claim is final when the margin
+  starts. The redeemer sweeps one second later. Before, a lane's final value
+  waited for the next periodic sweep, and a sweep that a receipt wait
+  delayed into the expiry's landing slack skipped the lane and forfeited it.
+  The cutoff sweep batches the lane with the node's other owed lanes, so
+  lanes that are each below `redeem_threshold_micro_usdc` but clear it
+  together are redeemed before the expiry. A node that restarts after a
+  lane's margin starts sweeps that lane at once.
 
 - **Expiry and close deadlines hold a safety margin (#2242).** A node
   refuses a voucher with `CapabilityExpired` once the capability expires
@@ -3454,6 +3635,12 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- `aws-smithy-json` → 0.62.7 (CVE-2026-18140: uncontrolled recursion on deeply
+  nested JSON, a denial of service). It reaches the node through the S3
+  origin's AWS SDK: `aws-sdk-s3` and the `aws-config` credential chain (SSO,
+  STS, IMDS) parse JSON responses with it. Lockfile-only bump; no dependency
+  requirement changed. The new `aws-smithy-schema` entry is a dependency of
+  0.62.7.
 - **Probe `slash_sig` is now cryptographically verified before a response can
   influence selection.** The requester previously checked only the signature's
   length; `ProbeSlashData::verify_signer` had no production caller, so a node

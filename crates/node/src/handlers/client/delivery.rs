@@ -9,13 +9,14 @@ use futures_util::{Stream, StreamExt};
 
 use super::MAX_PROOFS_PER_CHUNK;
 use super::outcome::{ServeEnd, ServeStop};
+use super::proof_wait::ChunkProofs;
 use super::ramp::RampCarry;
 use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked};
 use super::wire::{FrameAccountingFault, FrameChunks, FrameQueue};
 use super::{
-    Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, FloorReservation,
-    Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256, VoucherRejectReason,
-    VoucherStop,
+    Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, Connection,
+    FloorReservation, Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256,
+    VoucherRejectReason, VoucherStop,
 };
 use crate::metrics::FirstByteClock;
 
@@ -137,11 +138,11 @@ impl ChunkFramer {
                     self.queue.clear();
                     tracing::error!(
                         hash = %self.hash,
-                        error = %e,
+                        error = %e.display_chain(),
                         "bao export faulted mid-delivery; aborting the serve without StreamEnd \
                          (the client sees a short delivery and does not pay the closing voucher)"
                     );
-                    return Err(anyhow::anyhow!("cache bao export failed: {e}"));
+                    return Err(anyhow::Error::from(e).context("cache bao export failed"));
                 }
                 None => self.drained = true,
             }
@@ -200,6 +201,7 @@ impl ClientHandler {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn deliver(
         &self,
+        conn: &Connection,
         send: &mut SendStream,
         recv: &mut RecvStream,
         hash: Hash,
@@ -226,6 +228,7 @@ impl ClientHandler {
         // paid.
         let carry = self.take_ramp_carry(lane).await;
         self.deliver_loop(
+            conn,
             send,
             recv,
             hash,
@@ -256,6 +259,7 @@ impl ClientHandler {
     )]
     async fn deliver_loop(
         &self,
+        conn: &Connection,
         send: &mut SendStream,
         recv: &mut RecvStream,
         hash: Hash,
@@ -309,7 +313,7 @@ impl ClientHandler {
             .cache
             .export_bao_range_stream(hash, byte_offset, byte_len, total_bytes)
             .await
-            .map_err(|e| anyhow::anyhow!("cache export_bao_range_stream failed: {e}"))?;
+            .map_err(|e| anyhow::Error::from(e).context("cache export_bao_range_stream failed"))?;
 
         let chunk_bytes = CHUNK_BYTES;
 
@@ -349,14 +353,15 @@ impl ClientHandler {
         // live — that is where a mid-export store fault or the truncation refusal
         // surfaces, because the export streams (#1132).
         let mut chunks = ChunkFramer::new(data, hash);
-        // Nothing is delivered, paid, or vouchered yet, so the opening frame may run
-        // a whole interval against the whole opening window.
+        // The opening frame is small, so the first byte leaves after a few chunk
+        // groups of store read rather than a whole interval
+        // ([`ClientHandler::first_frame_target`]).
         // The first byte is about to go out: from here a stream that ends unpaid
         // forfeits its ramp credit (ADR 003 §Credit window).
         carry.start_delivery();
         let opening_window = self.credit_window(chunk_bytes, carry.ramp_paid(0));
         let mut next_chunk = chunks
-            .next_frame_chunks(self.frame_target(0, chunk_bytes, opening_window))
+            .next_frame_chunks(self.first_frame_target(chunk_bytes, opening_window))
             .await
             .map_err(|e| self.meter_frame_fault(e))?;
 
@@ -458,11 +463,14 @@ impl ClientHandler {
             // many proofs a payer may send without settling it.
             let collected_any = !pending.is_empty();
             while let Some(mut owed) = pending.pop_front() {
-                let mut attempts = 0u32;
+                // One proof budget and one proof-wait ceiling for every proof
+                // this chunk takes.
+                let mut proofs = ChunkProofs::start();
                 loop {
-                    attempts = attempts.saturating_add(1);
+                    let attempt = proofs.next_attempt();
                     let stop = self
                         .commit_one_proof(
+                            conn,
                             send,
                             recv,
                             &mut reader,
@@ -473,11 +481,12 @@ impl ClientHandler {
                             client_node_id,
                             rate_per_mb,
                             owed,
+                            &proofs,
                         )
                         .await
                         .map_err(|e| {
                             e.context(format!(
-                                "proof {attempts} of at most {MAX_PROOFS_PER_CHUNK} for a {}-byte \
+                                "proof {attempt} of at most {MAX_PROOFS_PER_CHUNK} for a {}-byte \
                                  chunk ({} bytes owed, {} more queued)",
                                 owed.len(),
                                 owed.remaining(),
@@ -494,7 +503,8 @@ impl ClientHandler {
                             if owed.settle(credited_bytes)? {
                                 break;
                             }
-                            if attempts >= MAX_PROOFS_PER_CHUNK {
+                            if proofs.exhausted() {
+                                let attempts = proofs.attempts();
                                 // A payer that spends its per-chunk proof budget
                                 // without settling the chunk is at fault, not this
                                 // node, so the stream ends as a stop, not an error.
@@ -889,8 +899,8 @@ mod tests {
             }
         };
         anyhow::ensure!(
-            err.to_string().contains("refusing truncated export"),
-            "fault lost its cause: {err}"
+            format!("{err:#}").contains("refusing truncated export"),
+            "fault lost its cause: {err:#}"
         );
 
         // The framer must now be POISONED. Without it, the 476 unverified bytes

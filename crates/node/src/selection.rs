@@ -230,7 +230,13 @@ pub struct RankedCandidate {
 
 /// Compute the unified selection score (ADR 001). Lower is better.
 ///
-/// `score = rate_per_mb × rtt_ms × (1 / clamp(reputation, 0.1, 1.0)²)`
+/// `score = rate_per_mb × max(rtt_ms, 1) × (1 / clamp(reputation, 0.1, 1.0)²)`
+///
+/// The RTT has a floor of 1 ms. A probe faster than 1 ms truncates to
+/// `rtt_ms = 0`, and a zero factor would make the score 0 for any rate: two
+/// such peers would tie whatever they quote, and a dear one would outrank every
+/// cheaper peer at 1 ms or more. With the floor, sub-millisecond peers rank on
+/// rate and reputation, and only `rate_per_mb = 0` gives a score of 0.
 ///
 /// ADR 001 § Node Selection Algorithm states the denominator as
 /// `max(reputation, 0.1)`; the upper bound here is a defensive extension
@@ -249,7 +255,7 @@ pub struct RankedCandidate {
 // affect ordering decisions here.
 fn compute_score(rate_per_mb: u64, rtt_ms: u32, reputation: f32) -> f64 {
     let rate = rate_per_mb as f64;
-    let rtt = f64::from(rtt_ms);
+    let rtt = f64::from(rtt_ms.max(1));
     // Clamp in f32 (input's domain), then promote once for the f64 score
     // arithmetic. Promoting first would let `f32(0.1)` slip just above the
     // floor (it rounds to ~0.10000000149f64), an unintuitive boundary.
@@ -910,6 +916,27 @@ mod tests {
         let positive = make_candidate(2, 1, 1, 1.0); // score 1
         let out = rank_candidates(vec![positive, zero]);
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
+    }
+
+    #[test]
+    fn sub_millisecond_rtt_keeps_the_price_signal() {
+        // Both probes truncate to 0 ms. The cheaper peer must win every time,
+        // not by the tier-3 coin flip.
+        for _ in 0..64 {
+            let dear = make_candidate(1, 10, 0, 0.5);
+            let cheap = make_candidate(2, 5, 0, 0.5);
+            let out = rank_candidates(vec![dear, cheap]);
+            assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
+        }
+    }
+
+    #[test]
+    fn sub_millisecond_rtt_does_not_outrank_a_cheaper_peer() {
+        // 0 ms (a sub-ms probe) scores as 1 ms: 10 × 1 = 10 vs 5 × 1 = 5.
+        let dear_fast = make_candidate(1, 10, 0, 0.5);
+        let cheap = make_candidate(2, 5, 1, 0.5);
+        let out = rank_candidates(vec![dear_fast, cheap]);
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
     }
 
     #[test]

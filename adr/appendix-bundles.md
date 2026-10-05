@@ -258,7 +258,9 @@ as `decdn fetch`):
   evaluated **per destination**, so an already-present duplicate path
   triggers no fetch of its own (the group still fetches once if any
   sibling path needs bytes).
-- **Concurrency** is bounded by `--jobs` (over distinct blobs). Fetches share a
+- **Concurrency** is bounded by `--jobs` (over distinct blobs). An entry
+  that waits for a sibling to fetch the chunks it splices holds no slot
+  while it waits. It takes a slot again before it fetches. Fetches share a
   `LaneLedger` per `(pool, signer, provider)` lane. `--max-lane-streams`
   (default 4) caps how many streams run at once on one lane. The shared
   ledger keeps voucher issuance monotonic across concurrent streams on a
@@ -273,10 +275,12 @@ as `decdn fetch`):
   fetch of its ranges. A lane of a range-dedup entry can go to a
   proxy-warming non-holder, as for a whole-file entry, and `--max-sources`
   counts such a node as one of its sources. The loop admits one node per
-  operator. Each lane holds one permit of its provider while it
+  operator. Each lane holds one permit of its provider while its own stream
   runs. A lane takes a permit only when a permit is free. When no permit is
-  free, the lane build backs off and tries again. An entry holds no lane
-  permit while it waits on a sibling entry. All lanes of an entry write into
+  free, the lane build backs off and tries again. A lane gives its permit
+  back when its own stream stops. A lane that starts again takes a free
+  permit first. When no permit is free, the lane tries again each second.
+  An entry holds no lane permit while it waits on a sibling entry. All lanes of an entry write into
   one ranged store. The entry does not mark its donor ranges present in that
   store, so the store promotes the blob only when the loop fetched every
   byte. Concurrent lanes top up the one deposit one at a time.

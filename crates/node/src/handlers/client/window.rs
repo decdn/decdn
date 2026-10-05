@@ -10,9 +10,9 @@ use crate::metrics::FirstByteClock;
 use crate::node_origin::{PrimeLeg, PullLegTarget};
 
 use super::{
-    Arc, B256, CHUNK_BYTES, ClientHandler, FillOutcome, FloorReservation, Hash, LaneDeliveryState,
-    LaneKey, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason, StreamRequest,
-    StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
+    Arc, B256, CHUNK_BYTES, ClientHandler, Connection, FillOutcome, FloorReservation, Hash,
+    LaneDeliveryState, LaneKey, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason,
+    StreamRequest, StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
 };
 
 /// Release a miss leg's floor reservation on a refusal taken BEFORE the serve
@@ -125,6 +125,7 @@ impl ClientHandler {
     )]
     pub(super) async fn serve_via_window_pull_through(
         &self,
+        conn: &Connection,
         mut send: SendStream,
         mut recv: RecvStream,
         req: &StreamRequest,
@@ -137,7 +138,7 @@ impl ClientHandler {
         fault_seen: bool,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
-        first_byte: FirstByteClock,
+        mut first_byte: FirstByteClock,
     ) -> anyhow::Result<super::outcome::ServeEnd> {
         // The ADR 011 OPEN-TIME deny gates are already discharged on the only
         // path that reaches here: `serve_stream` refuses a denylisted hash
@@ -461,6 +462,7 @@ impl ClientHandler {
         let (resp, resp_ext) = self.sign_response(body, None)?;
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
+        first_byte.mark_responded();
 
         // Seed the shared per-hash outboard with proof for the held ranges inside
         // this serve's range, which no pull admits (`seed_held_outboard`;
@@ -579,6 +581,7 @@ impl ClientHandler {
         // scope end.
         let serve_result = self
             .serve_leg(
+                conn,
                 &mut send,
                 &mut recv,
                 serve_store,
@@ -660,6 +663,7 @@ impl ClientHandler {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) async fn serve_via_backend_origin(
         &self,
+        conn: &Connection,
         mut send: SendStream,
         mut recv: RecvStream,
         req: &StreamRequest,
@@ -671,7 +675,7 @@ impl ClientHandler {
         pool_remaining: Option<U256>,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
-        first_byte: FirstByteClock,
+        mut first_byte: FirstByteClock,
     ) -> anyhow::Result<super::outcome::ServeEnd> {
         // Mark that the own-origin serve-miss tier fired for this request, before
         // any admission guard below — the tier-selection signal (#1130), not a
@@ -778,6 +782,7 @@ impl ClientHandler {
         let (resp, resp_ext) = self.sign_response(body, None)?;
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
+        first_byte.mark_responded();
 
         // (5) The two decoupled legs (ADR 037). Identical coordination
         // shape to the peer twin: the SERVE leg runs HERE on the accept task (it must
@@ -928,6 +933,7 @@ impl ClientHandler {
         // scope end.
         let serve_result = self
             .serve_leg(
+                conn,
                 &mut send,
                 &mut recv,
                 serve_store,
@@ -1035,7 +1041,7 @@ impl ClientHandler {
             Err(err) => {
                 tracing::warn!(
                     %hash,
-                    error = %err,
+                    error = %decdn_cache::ErrorChain::new(&err),
                     "serve-miss: cannot read the missing range for the coverage gate; \
                      committing without it"
                 );
@@ -1086,7 +1092,7 @@ impl ClientHandler {
             Err(err) => {
                 tracing::warn!(
                     %hash,
-                    error = %err,
+                    error = %err.display_chain(),
                     "serve-miss: cannot read the held ranges; the serve may park on \
                      held-span proof"
                 );
@@ -1107,7 +1113,7 @@ impl ClientHandler {
             Ok(pairs) => session.capture_many(pairs),
             Err(err) => tracing::warn!(
                 %hash,
-                error = %err,
+                error = %err.display_chain(),
                 "serve-miss: held-range outboard seed failed; the serve may park on \
                  held-span proof"
             ),

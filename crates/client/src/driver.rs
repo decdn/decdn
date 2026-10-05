@@ -78,9 +78,10 @@ use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, RangedStore, align_range}
 use decdn_incentive::DepositOutcome;
 use decdn_protocol::VoucherRejectReason;
 
+use crate::buyer_pool::EscrowUntracked;
 use crate::fault::HealExhausted;
 use crate::pacer::{DownstreamFrontier, PaceDecision, PaceState};
-use crate::source::{BlobSource, Funder, IngestStore, SourceFuture};
+use crate::source::{BlobSource, Funder, IngestEnd, IngestStore, SourceFuture};
 use crate::{
     MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger, UpstreamPullHeader,
     UpstreamVoucherRejected, genuine_exhaustion, heal_watermark_desync, is_insufficient_deposit,
@@ -116,6 +117,60 @@ impl std::fmt::Display for PoolExhausted {
 }
 
 impl std::error::Error for PoolExhausted {}
+
+/// A source kept refusing a new stream as `InsufficientDeposit` while the pool's
+/// remaining deposit already sat within the low water of the working deposit,
+/// past the settle budget ([`DriveConfig::max_settle_waits`]).
+///
+/// No top-up the pacer would send moves such a deposit, so the source is not
+/// priced out by it: either its chain view has not seen a refill yet, or its
+/// refundable floor `M` exceeds what this working deposit can cover. The fault
+/// classifier ([`crate::classify`]) rules it [`crate::Fault::Source`], so the
+/// source cools and is asked again, instead of waiting for a deposit rise that
+/// never comes.
+#[derive(Debug)]
+pub(crate) struct StaleDepositView {
+    /// The remaining deposit by our own ledger.
+    pub(crate) remaining: U256,
+    /// The working deposit the pacer tops up toward.
+    pub(crate) working: U256,
+}
+
+impl std::fmt::Display for StaleDepositView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the source refuses the pool as short of deposit while {} of the {} µUSDC working \
+             deposit remains: its chain view is stale, or its refundable floor exceeds the \
+             working deposit",
+            self.remaining, self.working
+        )
+    }
+}
+
+impl std::error::Error for StaleDepositView {}
+
+/// Marker on a reactive top-up that failed: [`Funder::top_up`] returned an
+/// error, so the deposit did not rise. The failure is the buyer's funding,
+/// never the serving source's delivery, so the fault classifier
+/// ([`crate::classify`]) rules it [`crate::Fault::Transient`]: the source keeps
+/// its health and the loop retries. A funder that found the wallet short of
+/// USDC ([`crate::buyer_pool::WalletShortfall`]) makes it
+/// [`crate::Fault::Unaffordable`], like [`PoolExhausted`], and an error that may
+/// have escrowed USDC
+/// ([`crate::buyer_pool::TopUpUnconfirmed`],
+/// [`crate::buyer_pool::EscrowUntracked`]) stays fatal, whatever marker it
+/// carries.
+#[derive(Debug)]
+pub struct TopUpFailed;
+
+impl std::fmt::Display for TopUpFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the reactive pool top-up failed")
+    }
+}
+
+impl std::error::Error for TopUpFailed {}
 
 /// A leg of a gap opened, streamed and finished cleanly, yet left both the gap's
 /// paid frontier and the store's delivered frontier where they were.
@@ -305,6 +360,50 @@ fn locked_deposit(ctx: &Mutex<PoolContext>) -> anyhow::Result<U256> {
         .deposit)
 }
 
+/// Whether `remaining` deposit pays for the next voucher and sits within the
+/// low water of `working_deposit`, so the reactive top-up the pacer could send
+/// is below [`crate::pacer::min_reactive_top_up`]. A peer that still refuses
+/// such a deposit as insufficient reads a balance older than ours.
+fn deposit_near_working(remaining: U256, next_voucher_cost: U256, working_deposit: U256) -> bool {
+    !working_deposit.is_zero()
+        && remaining >= next_voucher_cost
+        && working_deposit.saturating_sub(remaining)
+            < crate::pacer::min_reactive_top_up(working_deposit)
+}
+
+/// Decide the next step for a source that refuses a deposit near the working
+/// target ([`deposit_near_working`]) after `waits` settle waits: `None` to
+/// wait once more, or the [`StaleDepositView`] fault once the budget is spent.
+/// Logs the first wait at info, each later one at debug, and the fault at warn.
+fn stale_view_wait(remaining: U256, config: &DriveConfig, waits: u32) -> Option<StaleDepositView> {
+    let working = config.working_deposit;
+    if waits >= config.max_settle_waits {
+        tracing::warn!(
+            %remaining,
+            %working,
+            waits,
+            "a source keeps refusing a deposit near the working target; its chain view is \
+             stale or its refundable floor exceeds the working deposit"
+        );
+        return Some(StaleDepositView { remaining, working });
+    }
+    if waits == 0 {
+        tracing::info!(
+            %remaining,
+            %working,
+            "a source refuses a deposit near the working target; waiting for its chain view \
+             to catch up"
+        );
+    } else {
+        tracing::debug!(
+            %remaining,
+            waits,
+            "still waiting for a source's chain view of the deposit"
+        );
+    }
+    None
+}
+
 /// Bytes per [`bao_tree::ChunkNum`] — a 1 KiB bao chunk. A gap's byte span is its
 /// chunk-range boundaries scaled by this.
 const CHUNK_BYTES: u64 = 1024;
@@ -429,6 +528,23 @@ async fn await_flush(flush: &mut Option<SourceFuture<'_, ()>>) -> anyhow::Result
         Some(pending) => pending.await,
         None => std::future::pending().await,
     }
+}
+
+/// A multi-source unit's live progress across its gaps, which [`fill_gap`]
+/// writes as each verified leaf lands, before the store's checkpoint makes it
+/// durable.
+#[derive(Debug, Default)]
+pub(crate) struct UnitProgress {
+    /// The unit's verified bytes. The lane watchdog judges it, and a steal
+    /// reads the unit's rate off it.
+    pub(crate) verified: std::sync::atomic::AtomicU64,
+    /// The end of the verified prefix the unit's legs have reached. A steal
+    /// splits past it, so it never hands a stealer bytes this unit already
+    /// received.
+    pub(crate) frontier: std::sync::atomic::AtomicU64,
+    /// When the unit verified its first byte: the start of its rate clock,
+    /// so a leg's open and a cold first byte stay out of its rate.
+    pub(crate) first_byte: std::sync::OnceLock<tokio::time::Instant>,
 }
 
 /// Fetch-wide counters that persist ACROSS the request's gaps (a top-up budget is
@@ -678,7 +794,7 @@ where
                 // its own present base directly — there is no cross-lane total to
                 // aggregate. Only the multi-source scheduler passes an aggregator.
                 None,
-                // No unit watchdog on the single-source path.
+                // No unit watchdog and no steal on the single-source path.
                 None,
                 pacing_wait,
                 downstream,
@@ -689,6 +805,8 @@ where
                 // lanes here instead (#1506); the client's multi-source
                 // scheduler calls `fill_gap` directly with the same view.
                 pool,
+                // No steal on the single-source path.
+                None,
             )
             .await?;
         }
@@ -833,13 +951,16 @@ pub(crate) async fn fill_gap<St, S, P, F>(
     // its own present base directly (there is only ever one lane, so that value is
     // already the whole-blob position).
     progress_agg: Option<&std::sync::atomic::AtomicU64>,
-    // Multi-source only: this unit's verified-byte counter, which the unit
-    // watchdog reads. Every verified leaf adds to it as it lands, before the
-    // store's checkpoint makes it durable.
-    verified: Option<&std::sync::atomic::AtomicU64>,
+    // Multi-source only: the unit's live progress, which the unit watchdog
+    // and a steal read ([`UnitProgress`]).
+    unit: Option<&UnitProgress>,
     pacing_wait: Option<&dyn PacingWait>,
     downstream: Option<&(dyn Fn() -> DownstreamFrontier + Send + Sync)>,
     pool: Option<&SharedPool<'_>>,
+    // Multi-source only: an end a steal lowers to its split while the gap
+    // runs. The gap ends there, and a leg in flight stops there on its open
+    // stream ([`BlobSource::stop`]) rather than reading on to its range's end.
+    stop_at: Option<&std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<()>
 where
     St: IngestStore,
@@ -867,6 +988,10 @@ where
     // per-open and resets the moment a leg lands.
     let mut awaiting_settle = false;
     let mut settle_waits = 0u32;
+    // Waits on a source's stale view of a deposit already near the working
+    // target (step 1b). Apart from `settle_waits`, which a top-up re-arms: this
+    // path never tops up, so a landed leg re-arms it instead.
+    let mut stale_view_waits = 0u32;
     let mut exhaustion_confirmed = false;
 
     // Paid-frontier anchor (PER-LEG, not per-gap). A "leg" is one contiguous
@@ -906,6 +1031,9 @@ where
         // source's (#2213). The bound it is clipped to is the bound the planner
         // works to now: a leg that proves a smaller size shrinks it, and the gap
         // ends there.
+        // A steal may have lowered the gap's end to its split since the last
+        // pass.
+        let asked_end = stop_at.map_or(asked_end, |end| asked_end.min(end.load(Ordering::Acquire)));
         let (still_missing, total_bytes) =
             missing_below_bound(store, gap_start, asked_end.saturating_sub(gap_start)).await?;
         let gap_end = asked_end.min(total_bytes);
@@ -1067,7 +1195,11 @@ where
                 if pool.is_some() && locked_deposit(ctx)? > deposit {
                     continue;
                 }
-                match funder.top_up(additional).await? {
+                match funder
+                    .top_up(additional)
+                    .await
+                    .map_err(|err| err.context(TopUpFailed))?
+                {
                     DepositOutcome::Added(new_deposit) => {
                         // Credit the new deposit through the shared handle so the
                         // source's next open (which clones the context) sees it.
@@ -1084,20 +1216,22 @@ where
                             }
                         }
                     }
+                    // Typed as an untracked escrow, so the acquire loop ends the
+                    // command rather than retrying into a second escrow.
                     DepositOutcome::UnknownPool => {
-                        anyhow::bail!(
+                        return Err(anyhow::Error::new(EscrowUntracked(format!(
                             "mid-fetch top-up of {additional} landed on-chain but no local \
                              record remains to credit it: the deposit is escrowed and \
                              untracked. Reconcile against the chain before retrying"
-                        );
+                        ))));
                     }
                     DepositOutcome::PoolMismatch => {
-                        anyhow::bail!(
+                        return Err(anyhow::Error::new(EscrowUntracked(format!(
                             "mid-fetch top-up of {additional} landed on-chain but the local \
                              record now tracks a different pool: the deposit is escrowed \
                              against the topped-up pool. Reconcile against the chain \
                              before retrying"
-                        );
+                        ))));
                     }
                 }
                 // Spend one unit of the top-up budget — the shared one when lanes
@@ -1155,11 +1289,20 @@ where
                 // aggregator folds in DELTAS (`received` is monotonic per leg, and
                 // resets to 0 on each new open — hence a fresh counter per leg).
                 let leg_reported = std::sync::atomic::AtomicU64::new(0);
+                // `received` counts from the leg's own start.
+                let leg_start = aligned.fetch_start();
                 let reporter = move |received: u64| {
                     let delta =
                         received.saturating_sub(leg_reported.swap(received, Ordering::Relaxed));
-                    if let Some(verified) = verified {
-                        verified.fetch_add(delta, Ordering::Relaxed);
+                    if let Some(unit) = unit {
+                        if delta > 0 {
+                            unit.first_byte.get_or_init(tokio::time::Instant::now);
+                        }
+                        unit.verified.fetch_add(delta, Ordering::Relaxed);
+                        // `SeqCst`, against the steal that lowers `stop_at`
+                        // and then reads this frontier (`Work::steal`).
+                        unit.frontier
+                            .fetch_max(leg_start.saturating_add(received), Ordering::SeqCst);
                     }
                     let Some(cb) = on_progress else { return };
                     let position = match progress_agg {
@@ -1195,15 +1338,29 @@ where
                         // The store is keyed by offset: the leg verifies under
                         // the size its own sender signs, whatever the bound.
                         match store
-                            .ingest_stream(&aligned, reader, Some(&reporter), header.total_bytes)
+                            .ingest_stream(
+                                &aligned,
+                                reader,
+                                Some(&reporter),
+                                header.total_bytes,
+                                stop_at,
+                            )
                             .await
                         {
-                            Ok(reader) => {
+                            Ok((reader, IngestEnd::Drained)) => {
                                 // Drain to stream end and recover the acked voucher
                                 // watermark. It lives in the ledger the caller owns
                                 // (durable persistence is the caller's job); finishing here
                                 // enforces wire-byte completeness.
                                 source.finish(reader).await.map(|_vp| ())
+                            }
+                            // A steal lowered the end to a split this leg reached:
+                            // pay for the received bytes and close the stream. The
+                            // paid and delivered frontiers now reach the split, the
+                            // gap's end, so the next pass ends the gap without a
+                            // new leg.
+                            Ok((reader, IngestEnd::Stopped)) => {
+                                source.stop(reader).await.map(|_vp| ())
                             }
                             Err(err) => Err(err),
                         }
@@ -1211,6 +1368,9 @@ where
                     Err(err) => Err(err),
                 };
 
+                if leg.is_ok() {
+                    stale_view_waits = 0;
+                }
                 if let Err(err) = leg {
                     // --- fault classification (mirrors the CLI loop, REUSING the
                     // shipped predicates) ---
@@ -1249,7 +1409,35 @@ where
                     //     `PoolExhausted` rather than on an ambiguous miss. The ceiling is
                     //     the sole clamp on how much a lying node can make us escrow, so
                     //     trusting this owner-only signal is money-safe.
+                    //
+                    //     A refusal while the deposit already sits within the low
+                    //     water of `working_deposit` is the node's stale view
+                    //     instead: a refill made elsewhere (another lane's build,
+                    //     a sibling's top-up) has not reached its chain watcher
+                    //     yet, and no top-up the pacer would send moves it (the
+                    //     pacer refuses a top-up below
+                    //     [`crate::pacer::min_reactive_top_up`]). Wait it out on
+                    //     its own budget. Past it, the source faults as
+                    //     [`StaleDepositView`]: it cools and is asked again,
+                    //     rather than read as priced out by a deposit that never
+                    //     rises.
                     if is_insufficient_deposit(&err) {
+                        let remaining =
+                            locked_deposit(ctx)?.saturating_sub(spent(committed.amount));
+                        if deposit_near_working(
+                            remaining,
+                            counters.next_voucher_cost,
+                            config.working_deposit,
+                        ) {
+                            if let Some(stale) =
+                                stale_view_wait(remaining, config, stale_view_waits)
+                            {
+                                return Err(err.context(stale));
+                            }
+                            stale_view_waits = stale_view_waits.saturating_add(1);
+                            tokio::time::sleep(config.settle_backoff).await;
+                            continue;
+                        }
                         exhaustion_confirmed = true;
                         continue;
                     }
@@ -1393,7 +1581,7 @@ mod tests {
     use crate::pacer::{BudgetPacer, PaceDecision, PaceState};
     use crate::source::Funder;
     use crate::source::PrimedSource;
-    use crate::source::{BlobSource, FakeFunder, ScriptedSource, SourceFuture};
+    use crate::source::{BlobSource, FakeFunder, FlushCountingStore, ScriptedSource, SourceFuture};
     use crate::{
         ClientRangedStore, Cumulative, PoolContext, PoolLedger, UpstreamPullHeader,
         UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
@@ -2363,6 +2551,15 @@ mod tests {
                 }
             })
         }
+
+        fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            Box::pin(async move {
+                match reader {
+                    MaybeFaultReader::Fault(_) => Ok(VoucherProgress::default()),
+                    MaybeFaultReader::Real(r) => self.inner.stop(r).await,
+                }
+            })
+        }
     }
 
     /// A source whose first opens park the queued faults, one per open — the rest
@@ -2412,6 +2609,15 @@ mod tests {
                 match reader {
                     MaybeFaultReader::Fault(_) => Ok(VoucherProgress::default()),
                     MaybeFaultReader::Real(r) => self.inner.finish(r).await,
+                }
+            })
+        }
+
+        fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            Box::pin(async move {
+                match reader {
+                    MaybeFaultReader::Fault(_) => Ok(VoucherProgress::default()),
+                    MaybeFaultReader::Real(r) => self.inner.stop(r).await,
                 }
             })
         }
@@ -2771,6 +2977,8 @@ mod tests {
     struct RefuseFirstOpenShortDeposit {
         inner: ScriptedSource,
         opens: std::sync::atomic::AtomicUsize,
+        /// How many opens, from the first, it refuses.
+        refusals: usize,
     }
 
     impl BlobSource for RefuseFirstOpenShortDeposit {
@@ -2783,7 +2991,7 @@ mod tests {
         ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
             let n = self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move {
-                if n == 0 {
+                if n < self.refusals {
                     // A real open-stage refusal: the node signs `StreamResponse
                     // { ok: false }` with the delivery-side `InsufficientDeposit` in
                     // the trailing ext, exactly the shape `open_progressive_pull`
@@ -2818,6 +3026,10 @@ mod tests {
         fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
             Box::pin(async move { self.inner.finish(reader).await })
         }
+
+        fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            self.inner.stop(reader)
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -2841,6 +3053,7 @@ mod tests {
         let source = RefuseFirstOpenShortDeposit {
             inner,
             opens: std::sync::atomic::AtomicUsize::new(0),
+            refusals: 1,
         };
 
         let pacer = BudgetPacer::new();
@@ -2895,6 +3108,144 @@ mod tests {
         assert_eq!(got.as_ref(), plaintext.as_slice());
     }
 
+    /// #2296: a refill made elsewhere already restored the deposit to the
+    /// working target, and the node refuses on the balance it read before. A
+    /// top-up would add nothing worth two transactions, so the driver waits the
+    /// node's watcher out on the settle budget and re-opens.
+    #[tokio::test(start_paused = true)]
+    async fn an_insufficient_deposit_refusal_at_the_working_deposit_settle_waits() {
+        let total = 2 * GROUP;
+        let (root, plaintext, _outboard) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let inner = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+        let root = inner.root();
+        let source = RefuseFirstOpenShortDeposit {
+            inner,
+            opens: std::sync::atomic::AtomicUsize::new(0),
+            refusals: 1,
+        };
+
+        let pacer = BudgetPacer::new();
+        let funder = FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX)));
+
+        let mut ctx = healthy_ctx();
+        ctx.deposit = U256::from(10_000u64);
+        let ctx = Arc::new(Mutex::new(ctx));
+
+        let settle_backoff = std::time::Duration::from_secs(2);
+        let drive_config = DriveConfig {
+            working_deposit: U256::from(10_000u64),
+            seller_reserve: U256::ZERO,
+            max_settle_waits: 2,
+            settle_backoff,
+        };
+
+        let started = tokio::time::Instant::now();
+        drive(
+            &store,
+            &source,
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            root,
+            0,
+            0,
+            &drive_config,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("drive re-opens once the node's watcher catches up");
+
+        assert!(
+            funder.calls().is_empty(),
+            "no top-up for a deposit already at the working target"
+        );
+        assert_eq!(
+            source.opens.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one refused open + one re-open after the settle wait"
+        );
+        assert!(started.elapsed() >= settle_backoff, "the re-open waited");
+        assert!(store.is_complete().await.expect("is_complete"));
+    }
+
+    /// A source that keeps refusing a deposit at the working target exhausts
+    /// the stale-view budget and faults as [`StaleDepositView`]: a source
+    /// fault, so it cools and is asked again. Never a sub-floor top-up, and
+    /// never `PoolExhausted`, which would price the source out until a deposit
+    /// rise that no top-up brings.
+    #[tokio::test(start_paused = true)]
+    async fn a_source_that_keeps_refusing_a_full_deposit_faults_as_a_stale_view() {
+        let total = 2 * GROUP;
+        let (root, plaintext, _outboard) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let inner = ScriptedSource::new(plaintext)
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+        let root = inner.root();
+        let source = RefuseFirstOpenShortDeposit {
+            inner,
+            opens: std::sync::atomic::AtomicUsize::new(0),
+            refusals: usize::MAX,
+        };
+
+        let pacer = BudgetPacer::new();
+        let funder = FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX)));
+        let mut ctx = healthy_ctx();
+        ctx.deposit = U256::from(10_000u64);
+        let ctx = Arc::new(Mutex::new(ctx));
+        let settle_backoff = std::time::Duration::from_secs(2);
+        let drive_config = DriveConfig {
+            working_deposit: U256::from(10_000u64),
+            seller_reserve: U256::ZERO,
+            max_settle_waits: 2,
+            settle_backoff,
+        };
+
+        let started = tokio::time::Instant::now();
+        let err = drive(
+            &store,
+            &source,
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            root,
+            0,
+            0,
+            &drive_config,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a source that never catches up faults");
+
+        assert!(
+            err.downcast_ref::<super::StaleDepositView>().is_some(),
+            "{err:#}"
+        );
+        assert_eq!(crate::classify(&err), crate::Fault::Source);
+        assert!(funder.calls().is_empty(), "no sub-floor top-up");
+        assert_eq!(
+            source.opens.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the first refusal and one re-open per settle wait"
+        );
+        assert!(started.elapsed() >= 2 * settle_backoff);
+    }
+
     /// A [`BlobSource`] that fails its first open with a genuine exhaustion (like
     /// [`FailFirstOpen`]), serves the next open, refuses the THIRD open as a stale
     /// resume ([`ResumeOffsetPastEnd`]), and serves every open after that. It
@@ -2929,6 +3280,10 @@ mod tests {
 
         fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
             self.inner.finish(reader)
+        }
+
+        fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            self.inner.stop(reader)
         }
     }
 
@@ -3061,6 +3416,11 @@ mod tests {
             assert!(
                 msg.contains("escrowed"),
                 "the operator must learn the money moved: {msg}"
+            );
+            assert_eq!(
+                crate::classify(&err),
+                crate::Fault::Fatal(crate::FatalScope::Command),
+                "{outcome:?}: a retry escrows again, so the acquire loop must end: {msg}"
             );
             assert!(
                 !store.is_complete().await.expect("is_complete"),
@@ -3501,6 +3861,10 @@ mod tests {
                 ))
             })
         }
+
+        fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            self.inner.stop(reader)
+        }
     }
 
     /// A [`PacingWait`] hook that counts calls and then never resolves, so a
@@ -3645,82 +4009,6 @@ mod tests {
         assert!(funder.calls().is_empty(), "no top-up was needed");
     }
 
-    /// An [`IngestStore`] wrapper that counts `flush_present_record` calls and
-    /// delegates every real operation to an inner [`ClientRangedStore`]. It lets
-    /// a test observe the interval flush firing during a still-running fetch.
-    /// `flush_delay` makes each flush take that long before it writes, to model
-    /// a record fsync under writeback pressure.
-    struct FlushCountingStore {
-        inner: ClientRangedStore,
-        flushes: Arc<std::sync::atomic::AtomicUsize>,
-        flush_delay: std::time::Duration,
-    }
-
-    impl RangedStore for FlushCountingStore {
-        fn total_bytes(&self) -> u64 {
-            self.inner.total_bytes()
-        }
-        fn present_ranges(&self) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
-            self.inner.present_ranges()
-        }
-        fn missing_ranges(
-            &self,
-            byte_offset: u64,
-            byte_len: u64,
-        ) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
-            self.inner.missing_ranges(byte_offset, byte_len)
-        }
-        fn admit(
-            &self,
-            range: AlignedRange,
-            bao_bytes: Bytes,
-        ) -> decdn_bao_range::RangedFuture<'_, ()> {
-            self.inner.admit(range, bao_bytes)
-        }
-        fn read(
-            &self,
-            byte_offset: u64,
-            byte_len: u64,
-        ) -> decdn_bao_range::RangedFuture<'_, Bytes> {
-            self.inner.read(byte_offset, byte_len)
-        }
-        fn is_complete(&self) -> decdn_bao_range::RangedFuture<'_, bool> {
-            self.inner.is_complete()
-        }
-        fn finalize(&self) -> decdn_bao_range::RangedFuture<'_, ()> {
-            self.inner.finalize()
-        }
-    }
-
-    impl crate::source::IngestStore for FlushCountingStore {
-        fn ingest_stream<'a, R>(
-            &'a self,
-            range: &'a AlignedRange,
-            reader: R,
-            on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
-            claimed_total: u64,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
-        where
-            R: crate::source::BaoRangeReader + 'a,
-        {
-            Box::pin(
-                self.inner
-                    .ingest_stream(range, reader, on_progress, claimed_total),
-            )
-        }
-
-        fn flush_present_record(&self) -> crate::source::SourceFuture<'_, ()> {
-            self.flushes
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let write = crate::source::IngestStore::flush_present_record(&self.inner);
-            let delay = self.flush_delay;
-            Box::pin(async move {
-                tokio::time::sleep(delay).await;
-                write.await
-            })
-        }
-    }
-
     /// The interval flush persists resume progress MID-fetch, not only at
     /// completion: `drive_with_interval_flush` is raced against a
     /// work future that stays pending for several short intervals, and the
@@ -3753,9 +4041,8 @@ mod tests {
 
         let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let store = FlushCountingStore {
-            inner,
             flushes: Arc::clone(&flushes),
-            flush_delay: std::time::Duration::ZERO,
+            ..FlushCountingStore::new(inner, std::time::Duration::ZERO)
         };
 
         // A work future that stays pending across several 20 ms intervals, so the
@@ -3807,9 +4094,8 @@ mod tests {
         let inner = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
         let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let store = FlushCountingStore {
-            inner,
             flushes: Arc::clone(&flushes),
-            flush_delay: std::time::Duration::from_millis(50),
+            ..FlushCountingStore::new(inner, std::time::Duration::from_millis(50))
         };
 
         let started = tokio::time::Instant::now();
@@ -3847,6 +4133,79 @@ mod tests {
         assert!(
             flushes.load(std::sync::atomic::Ordering::SeqCst) >= 1,
             "the interval owner must still flush during the fetch"
+        );
+    }
+
+    /// A steal lowers the gap's end while its leg streams: the leg stops at
+    /// the split on its one stream, pays for the wire it read, and the gap
+    /// ends there with no second leg.
+    #[tokio::test]
+    async fn fill_gap_stops_its_leg_at_a_lowered_end() {
+        let total = 8 * GROUP;
+        let (root, plaintext, _) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let (gate, held) = tokio::sync::watch::channel(false);
+        let source = ScriptedSource::new(plaintext)
+            .expect("source")
+            .gated_on(held)
+            .paying(Arc::clone(&ledger));
+        let (pacer, funder) = (BudgetPacer::new(), healthy_funder());
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
+        let mut counters = super::DriveCounters::new();
+        let config = config();
+        let stop_at = std::sync::atomic::AtomicU64::new(u64::MAX);
+        let fill = super::fill_gap(
+            &store,
+            &source,
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            root,
+            0,
+            total,
+            &config,
+            &mut counters,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&stop_at),
+        );
+        // Lower the end once the leg is open, then let it stream.
+        let steal = async {
+            while source.opened_ranges().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            stop_at.store(3 * GROUP, std::sync::atomic::Ordering::Release);
+            gate.send_replace(true);
+        };
+        let (filled, ()) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            futures_util::future::join(fill, steal),
+        )
+        .await
+        .expect("the gap ends at the split");
+        filled.expect("a stopped leg ends the gap cleanly");
+
+        assert_eq!(
+            source.opened_ranges(),
+            vec![(0, total)],
+            "one leg, no reopen"
+        );
+        assert_eq!(source.stopped_pulls(), 1, "the leg stops at the split");
+        let kept = align_range(0, 3 * GROUP, total).expect("align");
+        assert_eq!(
+            &store.present_ranges().await.expect("present"),
+            kept.chunk_ranges()
+        );
+        assert_eq!(
+            ledger.committed().bytes,
+            U256::from(kept.wire_len()),
+            "the stopped leg pays for the wire up to the split"
         );
     }
 
@@ -3980,13 +4339,18 @@ mod tests {
             reader: R,
             on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
             claimed_total: u64,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
+            stop_at: Option<&'a std::sync::atomic::AtomicU64>,
+        ) -> crate::source::IngestFuture<'a, R>
         where
             R: crate::source::BaoRangeReader + 'a,
         {
-            Box::pin(
-                self.sink
-                    .ingest_stream(range, reader, on_progress, claimed_total),
+            crate::source::IngestStore::ingest_stream(
+                &self.sink,
+                range,
+                reader,
+                on_progress,
+                claimed_total,
+                stop_at,
             )
         }
 

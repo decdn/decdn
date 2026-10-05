@@ -37,6 +37,14 @@
 //!   chunks, and submits a chunk — one `redeemMany` — only once the aggregate
 //!   unredeemed value across that chunk's lanes clears a configurable floor,
 //!   so a dropped hint never strands a lane whose chunk has cleared the floor.
+//!   The same sweep also runs at each serve cutoff: one second after the voucher
+//!   and preimage paths start to refuse a lane whose capability expiry is near.
+//!   The lane's claim is final there, and the sweep has about one redeem interval
+//!   to start the redemption and the landing slack to land it before the
+//!   contract stops paying the capability. On a restart, a lane whose cutoff
+//!   passed while the node was down is swept at once. A value that stays below
+//!   the floor is not redeemed by the cutoff sweep; a later sweep before the
+//!   landing slack can still pack it with other lanes.
 //!   The node flushes the lane store durable after planning a chunk and before
 //!   submitting it, so post-crash on-disk `owed ≥ submitted`.
 //! - **Redeem before reclaim.** A pool is owner-owned and owner-closed; the node
@@ -69,7 +77,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
-use decdn_common::config::REDEEM_LANDING_SLACK_SECS;
+use decdn_common::config::{REDEEM_LANDING_SLACK_SECS, capability_expiry_margin_secs};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::sig_canon::is_high_s;
@@ -375,6 +383,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             redeem_threshold,
             redeem_max_vouchers_per_tx,
             redeem_interval,
+            capability_expiry_margin_secs(redeem_interval.as_secs()),
             redeem_rx,
             Arc::clone(&metrics),
             pool_view.clone(),
@@ -440,9 +449,13 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         // forfeiting the claim across the stop is worse than a bounded re-serve
         // risk. It still applies the configured per-chunk floor, so sub-floor
         // dust stays unredeemed across the stop.
+        let Some(states) = load_lanes(self.store.as_ref()) else {
+            return;
+        };
         redeem_sweep(
             &self.contract,
             &self.store,
+            states,
             &self.paid,
             self.self_address,
             self.redeem_threshold,
@@ -1065,11 +1078,22 @@ fn resolved_lifecycle(pool: &PaymentPool::Pool) -> Option<Lifecycle> {
 }
 
 /// Redemption task: chunk lanes' accrued claims and `redeemMany` a chunk once
-/// its aggregate unredeemed value clears the floor, driven by two sources —
-/// advisory hints ([`LaneKey`]) from the voucher-accept path and a
-/// low-frequency self-tick that sweeps every lane into chunked `redeemMany`
-/// transactions so a dropped hint can never strand a lane whose chunk has
-/// cleared the floor. Ends cleanly when every hint sender is dropped.
+/// its aggregate unredeemed value clears the floor, driven by three sources —
+/// advisory hints ([`LaneKey`]) from the voucher-accept path, a low-frequency
+/// self-tick that sweeps every lane into chunked `redeemMany` transactions so a
+/// dropped hint can never strand a lane whose chunk has cleared the floor, and a
+/// sweep at the earliest serve cutoff of a lane with a finite capability expiry
+/// and value owed ([`serve_cutoff_wake`]). Ends cleanly when every hint sender
+/// is dropped.
+///
+/// The cutoff sweep is what makes a delegated lane's final claim redeemable. The
+/// claim stops growing at the serve cutoff, and the sweep then has about one
+/// redeem interval of room before [`capability_expired`] skips the lane. A
+/// self-tick alone leaves no room for delay: the last tick before the expiry can
+/// fall just before the landing slack, and the loop is serial, so a receipt wait
+/// that delays that tick forfeits the lane. The cutoff sweep waits behind an
+/// in-flight redemption too, but the interval absorbs that wait.
+/// `margin_secs` is the voucher path's capability-expiry margin.
 #[allow(clippy::too_many_arguments)]
 async fn redeemer_loop<P: Provider + Clone>(
     contract: PaymentPool::PaymentPoolInstance<P>,
@@ -1079,35 +1103,76 @@ async fn redeemer_loop<P: Provider + Clone>(
     redeem_threshold: U256,
     max_vouchers: usize,
     redeem_interval: Duration,
+    margin_secs: u64,
     mut redeem_rx: mpsc::Receiver<LaneKey>,
     metrics: Arc<Metrics>,
     pool_view: PoolProjection,
 ) {
     let mut ticker = tokio::time::interval(redeem_interval);
-    // Skip the immediate first tick: nothing has accrued right after bootstrap,
-    // and the first vouchers hint anyway.
+    // Skip the immediate first tick: new vouchers hint anyway, and the first
+    // sweep waits one interval. A lane persisted before a restart whose claim
+    // cannot wait that long gets its cutoff sweep instead: no scan has run yet,
+    // so a cutoff that passed while the node was down is due at once.
     ticker.tick().await;
+    let mut swept_at = 0;
+    let mut next_cutoff = load_lanes(store.as_ref()).and_then(|states| {
+        next_serve_cutoff(
+            &states,
+            &paid,
+            self_address,
+            margin_secs,
+            swept_at,
+            unix_now(),
+        )
+    });
     loop {
         tokio::select! {
             hint = redeem_rx.recv() => match hint {
                 Some(key) => {
-                    redeem_one(
-                        &contract, &store, &paid, self_address,
+                    let wake = redeem_one(
+                        &contract, &store, &paid, self_address, margin_secs, swept_at,
                         redeem_threshold, max_vouchers, key, &metrics, &pool_view,
                     )
                     .await;
+                    next_cutoff = next_cutoff.into_iter().chain(wake).min();
+                    continue;
                 }
                 // All hint senders dropped — the service is going away.
                 None => break,
             },
-            _ = ticker.tick() => {
-                redeem_sweep(
-                    &contract, &store, &paid, self_address,
-                    redeem_threshold, max_vouchers, true, &metrics, &pool_view,
-                )
-                .await;
-            }
+            _ = ticker.tick() => {}
+            () = sleep_until_unix(next_cutoff) => {}
         }
+        // A tick or a cutoff: sweep every lane, and schedule the next cutoff
+        // from the same scan. A failed load keeps every cutoff still ahead and
+        // drops one that has passed, so the loop does not re-fire it at once;
+        // the next tick retries the scan.
+        let Some(states) = load_lanes(store.as_ref()) else {
+            next_cutoff = next_cutoff.filter(|wake| *wake > unix_now());
+            continue;
+        };
+        swept_at = unix_now();
+        next_cutoff = next_serve_cutoff(
+            &states,
+            &paid,
+            self_address,
+            margin_secs,
+            swept_at,
+            swept_at,
+        );
+        redeem_sweep(
+            &contract,
+            &store,
+            states,
+            &paid,
+            self_address,
+            redeem_threshold,
+            max_vouchers,
+            true,
+            &metrics,
+            &pool_view,
+        )
+        .await;
     }
     debug!("PaymentPool redeemer loop ended (all hint senders dropped)");
 }
@@ -1292,6 +1357,80 @@ fn partition_redeemable(
 /// expires.
 const fn capability_expired(expiry: u64, now: u64) -> bool {
     expiry != 0 && now.saturating_add(REDEEM_LANDING_SLACK_SECS) >= expiry
+}
+
+/// When the redeemer wakes for one lane's serve cutoff, in Unix seconds, or
+/// `None` when the lane needs no cutoff sweep.
+///
+/// The serve cutoff is `expiry − margin_secs`. From that second on, the voucher
+/// and preimage paths refuse the lane's proofs with `CapabilityExpired`
+/// ([`inside_capability_expiry_margin`](decdn_common::config::inside_capability_expiry_margin)),
+/// so the lane's claim is final. The wake
+/// is one second after the cutoff, because those paths read a coarse clock that
+/// can lag the wall clock by up to one refresh. A sweep at the wake has one
+/// redeem interval, less that second, to start the redemption before
+/// [`capability_expired`] skips the lane, and [`REDEEM_LANDING_SLACK_SECS`] to
+/// land it.
+///
+/// Only a lane this node provides, with a finite expiry and value owed beyond its
+/// cached paid watermark, needs a wake.
+fn lane_cutoff_wake(
+    st: &LaneState,
+    paid: &PaidWatermarks,
+    self_address: Address,
+    margin_secs: u64,
+) -> Option<u64> {
+    if st.provider != self_address || st.expiry == 0 || st.owed() <= paid.get(&st.key()) {
+        return None;
+    }
+    Some(st.expiry.saturating_sub(margin_secs).saturating_add(1))
+}
+
+/// When the redeemer must sweep for one lane's cutoff, given that its last
+/// sweep scanned the lane store at `swept_at` (`0` before the first scan).
+///
+/// A scan at or after the lane's [`lane_cutoff_wake`] already read the final
+/// claim, so the lane needs no further cutoff sweep. Otherwise the sweep is due
+/// at the wake, or at `now` when the wake has passed unscanned: the node was
+/// down at the cutoff, or the lane's first hint waited behind redemption work
+/// until after it. A lane that [`capability_expired`] skips at `now` cannot be
+/// redeemed and needs no sweep.
+fn serve_cutoff_wake(
+    st: &LaneState,
+    paid: &PaidWatermarks,
+    self_address: Address,
+    margin_secs: u64,
+    swept_at: u64,
+    now: u64,
+) -> Option<u64> {
+    let wake = lane_cutoff_wake(st, paid, self_address, margin_secs)?;
+    (wake > swept_at && !capability_expired(st.expiry, now)).then_some(wake.max(now))
+}
+
+/// The earliest [`serve_cutoff_wake`] across `states`.
+fn next_serve_cutoff(
+    states: &[LaneState],
+    paid: &PaidWatermarks,
+    self_address: Address,
+    margin_secs: u64,
+    swept_at: u64,
+    now: u64,
+) -> Option<u64> {
+    states
+        .iter()
+        .filter_map(|st| serve_cutoff_wake(st, paid, self_address, margin_secs, swept_at, now))
+        .min()
+}
+
+/// Sleep until the Unix second `wake`, or forever when there is none.
+async fn sleep_until_unix(wake: Option<u64>) {
+    match wake {
+        Some(wake) => {
+            let wait = Duration::from_secs(wake.saturating_sub(unix_now()));
+            tokio::time::sleep(wait).await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// Whether a lane's observed registration is still live at `now`. `0`
@@ -1537,42 +1676,60 @@ fn plan_lanes(
 /// Hint-path redemption: plan one lane and, if it clears the per-chunk `floor`,
 /// submit it as a one-lane `redeemMany`. A sub-floor hint defers to the next
 /// sweep, which packs it with other lanes, and reads nothing from the chain.
+/// Returns the lane's [`serve_cutoff_wake`] against the last sweep scan at
+/// `swept_at`, so a lane first seen between sweeps gets its cutoff sweep, even
+/// when the hint waited behind redemption work until after the cutoff.
 #[allow(clippy::too_many_arguments)]
 async fn redeem_one<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
     paid: &PaidWatermarks,
     self_address: Address,
+    margin_secs: u64,
+    swept_at: u64,
     floor: U256,
     max_vouchers: usize,
     key: LaneKey,
     metrics: &Arc<Metrics>,
     pool_view: &PoolProjection,
-) {
+) -> Option<u64> {
     let st = match store.get(key) {
         Ok(Some(st)) => st,
-        Ok(None) => return,
+        Ok(None) => return None,
         Err(err) => {
             metrics.redemption_failure();
             warn!(error = %err, pool_id = %key.pool_id, "redemption planning failed to load lane");
-            return;
+            return None;
         }
     };
-    let plans = plan_lanes(paid, self_address, vec![st], metrics, pool_view, unix_now());
+    let now = unix_now();
+    let wake = serve_cutoff_wake(&st, paid, self_address, margin_secs, swept_at, now);
+    let plans = plan_lanes(paid, self_address, vec![st], metrics, pool_view, now);
     // Hint path: require the durability floor and skip the submit on a failed
     // flush (`strict_flush`); the lane defers to the next sweep.
     redeem_planned_lanes(contract, store, plans, floor, max_vouchers, true, metrics).await;
+    wake
 }
 
-/// Self-tick sweep: scan every persisted lane, plan each (per-lane error
-/// isolation through the planning phase), then chunk the survivors under the
-/// per-chunk floor + voucher-count cap and submit each chunk as its own
-/// `redeemMany`. Value is spread across chunks so dust settles alongside real
-/// value; a chunk that cannot clear the floor defers to a later tick.
+/// Load every persisted lane for a sweep or for cutoff scheduling. A load
+/// failure is logged and returns `None`.
+fn load_lanes(store: &dyn PoolStateStore) -> Option<Vec<LaneState>> {
+    store
+        .load_all()
+        .inspect_err(|err| warn!(error = %err, "redeemer sweep: failed to load lane state"))
+        .ok()
+}
+
+/// Sweep: plan every lane in `states` (per-lane error isolation through the
+/// planning phase), then chunk the survivors under the per-chunk floor +
+/// voucher-count cap and submit each chunk as its own `redeemMany`. Value is
+/// spread across chunks so dust settles alongside real value; a chunk that
+/// cannot clear the floor defers to a later sweep.
 #[allow(clippy::too_many_arguments)]
 async fn redeem_sweep<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
+    states: Vec<LaneState>,
     paid: &PaidWatermarks,
     self_address: Address,
     floor: U256,
@@ -1581,13 +1738,6 @@ async fn redeem_sweep<P: Provider + Clone>(
     metrics: &Arc<Metrics>,
     pool_view: &PoolProjection,
 ) {
-    let states = match store.load_all() {
-        Ok(s) => s,
-        Err(err) => {
-            warn!(error = %err, "redeemer self-tick: failed to load lane state");
-            return;
-        }
-    };
     let plans = plan_lanes(paid, self_address, states, metrics, pool_view, unix_now());
     // Publish the pending-redemption total once per sweep. This is the whole
     // planned set, before the per-chunk floor defers any dust — a lane below the
@@ -3960,6 +4110,459 @@ mod tests {
         ] {
             anyhow::ensure!(text.lines().any(|l| l == expected), "{expected}\n{text}");
         }
+        Ok(())
+    }
+
+    /// A lane this node provides, owed value, with capability `expiry`.
+    fn expiring_lane(signer: u8, expiry: u64) -> LaneState {
+        let mut st = signed_lane_state(1, signer, 20, None);
+        st.expiry = expiry;
+        st
+    }
+
+    #[test]
+    fn serve_cutoff_wake_is_one_second_past_the_cutoff() {
+        let me = Address::from([20u8; 20]);
+        let paid = PaidWatermarks::default();
+        let st = expiring_lane(1, 10_000);
+        assert_eq!(serve_cutoff_wake(&st, &paid, me, 420, 0, 0), Some(9_581));
+        assert_eq!(
+            serve_cutoff_wake(&st, &paid, me, 420, 9_580, 9_580),
+            Some(9_581),
+            "a wake still ahead of the last scan is kept"
+        );
+        assert_eq!(
+            serve_cutoff_wake(&st, &paid, me, 420, 9_581, 9_581),
+            None,
+            "the sweep at a cutoff does not schedule that cutoff again"
+        );
+        assert_eq!(
+            serve_cutoff_wake(&expiring_lane(1, 200), &paid, me, 100, 0, 0),
+            Some(101),
+            "an expiry inside the margin saturates instead of underflowing"
+        );
+    }
+
+    /// A cutoff that passed with no scan after it is due at once: at start
+    /// (`swept_at == 0`), or for a hint handled after its lane's cutoff.
+    #[test]
+    fn a_cutoff_passed_unscanned_is_due_now() {
+        let me = Address::from([20u8; 20]);
+        let paid = PaidWatermarks::default();
+        let st = expiring_lane(1, 10_000);
+        assert_eq!(
+            serve_cutoff_wake(&st, &paid, me, 420, 0, 9_700),
+            Some(9_700),
+            "the node was down at the cutoff"
+        );
+        assert_eq!(
+            serve_cutoff_wake(&st, &paid, me, 420, 9_500, 9_700),
+            Some(9_700),
+            "the last scan ran before the cutoff"
+        );
+        assert_eq!(
+            serve_cutoff_wake(&st, &paid, me, 420, 9_600, 9_700),
+            None,
+            "a scan after the cutoff already read the final claim"
+        );
+        assert_eq!(
+            serve_cutoff_wake(&st, &paid, me, 420, 0, 10_000 - REDEEM_LANDING_SLACK_SECS),
+            None,
+            "a lane inside the landing slack cannot be redeemed, so it is not due"
+        );
+    }
+
+    #[test]
+    fn serve_cutoff_wake_skips_lanes_that_need_no_redeem() {
+        let me = Address::from([20u8; 20]);
+        let paid = PaidWatermarks::default();
+        assert_eq!(
+            serve_cutoff_wake(&expiring_lane(1, 0), &paid, me, 420, 0, 0),
+            None,
+            "a lane with no tracked expiry never expires"
+        );
+        let other = Address::from([9u8; 20]);
+        assert_eq!(
+            serve_cutoff_wake(&expiring_lane(1, 10_000), &paid, other, 420, 0, 0),
+            None,
+            "another provider's lane"
+        );
+        let settled = expiring_lane(1, 10_000);
+        paid.set(settled.key(), settled.owed());
+        assert_eq!(
+            serve_cutoff_wake(&settled, &paid, me, 420, 0, 0),
+            None,
+            "a fully paid lane"
+        );
+    }
+
+    #[test]
+    fn next_serve_cutoff_picks_the_earliest_wake() {
+        let me = Address::from([20u8; 20]);
+        let paid = PaidWatermarks::default();
+        let states = [
+            expiring_lane(1, 30_000),
+            expiring_lane(2, 0),
+            expiring_lane(3, 10_000),
+            expiring_lane(4, 20_000),
+        ];
+        assert_eq!(
+            next_serve_cutoff(&states, &paid, me, 420, 0, 0),
+            Some(9_581)
+        );
+        assert_eq!(
+            next_serve_cutoff(&states, &paid, me, 420, 9_581, 9_581),
+            Some(19_581),
+            "a scanned cutoff yields to the next one"
+        );
+        assert_eq!(
+            next_serve_cutoff(&states, &paid, me, 420, 0, 9_700),
+            Some(9_700),
+            "an unscanned passed cutoff comes first"
+        );
+        assert_eq!(next_serve_cutoff(&[], &paid, me, 420, 0, 0), None);
+    }
+
+    /// The voucher path's margin predicate refuses from the cutoff on, and the
+    /// wake falls one second after it: no proof can land after the cutoff sweep
+    /// reads the lane.
+    #[test]
+    fn the_cutoff_wake_follows_the_voucher_margin_gate() {
+        use decdn_common::config::inside_capability_expiry_margin;
+        let me = Address::from([20u8; 20]);
+        let paid = PaidWatermarks::default();
+        let (expiry, margin) = (10_000, 420);
+        let wake = serve_cutoff_wake(&expiring_lane(1, expiry), &paid, me, margin, 0, 0);
+        assert_eq!(wake, Some(9_581));
+        assert!(!inside_capability_expiry_margin(expiry, margin, 9_579));
+        assert!(
+            inside_capability_expiry_margin(expiry, margin, 9_580),
+            "the gate is closed one second before the wake"
+        );
+    }
+
+    /// An in-memory lane store that counts `load_all` calls and fails every
+    /// call after the first `ok_loads`.
+    struct CountingLoadStore {
+        inner: decdn_incentive::MemoryPoolStateStore,
+        loads: std::sync::atomic::AtomicUsize,
+        ok_loads: usize,
+    }
+
+    impl CountingLoadStore {
+        fn new(ok_loads: usize) -> Arc<Self> {
+            Arc::new(Self {
+                inner: decdn_incentive::MemoryPoolStateStore::new(),
+                loads: std::sync::atomic::AtomicUsize::new(0),
+                ok_loads,
+            })
+        }
+
+        fn loads(&self) -> usize {
+            self.loads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl PoolStateStore for CountingLoadStore {
+        fn load_all(&self) -> Result<Vec<LaneState>, StoreError> {
+            let n = self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.ok_loads {
+                self.inner.load_all()
+            } else {
+                Err(StoreError::Backend("load refused".into()))
+            }
+        }
+
+        fn record(&self, state: &LaneState) -> Result<(), StoreError> {
+            self.inner.record(state)
+        }
+
+        fn forget(&self, key: LaneKey) -> Result<(), StoreError> {
+            self.inner.forget(key)
+        }
+
+        fn get(&self, key: LaneKey) -> Result<Option<LaneState>, StoreError> {
+            self.inner.get(key)
+        }
+
+        fn flush(&self) -> Result<(), StoreError> {
+            self.inner.flush()
+        }
+    }
+
+    /// Spawn `redeemer_loop` with self-tick `interval`. With a one-hour tick,
+    /// only a hint or a serve cutoff makes it act within a test. Returns the
+    /// hint sender (drop it to end the loop), the loop's handle, and its margin.
+    fn spawn_redeemer<P: Provider + Clone + 'static>(
+        contract: PaymentPool::PaymentPoolInstance<P>,
+        store: Arc<dyn PoolStateStore>,
+        floor: U256,
+        interval: Duration,
+        metrics: Arc<Metrics>,
+    ) -> (mpsc::Sender<LaneKey>, JoinHandle<()>, u64) {
+        let margin = capability_expiry_margin_secs(interval.as_secs());
+        let (tx, rx) = mpsc::channel(8);
+        let handle = tokio::spawn(redeemer_loop(
+            contract,
+            store,
+            PaidWatermarks::default(),
+            Address::from([20u8; 20]),
+            floor,
+            300,
+            interval,
+            margin,
+            rx,
+            metrics,
+            PoolProjection::new(),
+        ));
+        (tx, handle, margin)
+    }
+
+    /// The margin of a redeemer with a one-hour self-tick.
+    fn hour_tick_margin() -> u64 {
+        capability_expiry_margin_secs(Duration::from_hours(1).as_secs())
+    }
+
+    /// Record a registered lane for each signer in `signers`, all expiring at
+    /// `expiry`. Returns the first lane's key and the lanes' total owed value.
+    fn record_lanes(
+        store: &dyn PoolStateStore,
+        signers: std::ops::RangeInclusive<u8>,
+        expiry: u64,
+    ) -> Result<(LaneKey, U256)> {
+        let mut first = None;
+        let mut total = U256::ZERO;
+        for signer in signers {
+            let mut st = expiring_lane(signer, expiry);
+            st.registered_until = u64::MAX;
+            total += st.owed();
+            store.record(&st)?;
+            first.get_or_insert(st.key());
+        }
+        Ok((first.context("at least one lane")?, total))
+    }
+
+    /// Wait up to 15 s for `done` to hold.
+    async fn await_until(what: &str, mut done: impl FnMut() -> Result<bool>) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !done()? {
+            anyhow::ensure!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok(())
+    }
+
+    /// Wait up to 15 s for `line` to appear in the encoded metrics.
+    async fn await_metric_line(metrics: &Metrics, line: &str) -> Result<()> {
+        await_until(line, || Ok(metrics.encode()?.lines().any(|l| l == line))).await
+    }
+
+    /// Assert every line in `lines` is in the encoded metrics.
+    fn ensure_metric_lines(metrics: &Metrics, lines: &[&str]) -> Result<()> {
+        let text = metrics.encode()?;
+        for line in lines {
+            anyhow::ensure!(text.lines().any(|l| l == *line), "{line}\n{text}");
+        }
+        Ok(())
+    }
+
+    /// #2233: several sub-floor lanes hold capabilities with the same expiry.
+    /// Their serve cutoff is about 3 s away, long before the next hourly
+    /// self-tick, and together they clear the floor. The lanes appear after the
+    /// loop starts, so a hint registers the cutoff. The cutoff sweep sends one
+    /// `redeemMany` for all of them, no earlier than the wake, and runs once.
+    #[tokio::test]
+    async fn sub_floor_lanes_are_redeemed_together_at_their_serve_cutoff() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store = CountingLoadStore::new(usize::MAX);
+        let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0), lane(0), lane(0)]]);
+        // The redeemMany send fails at its first RPC call, so the send is metered.
+        asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
+
+        let lane_value = expiring_lane(1, 0).owed();
+        let floor = lane_value * U256::from(3u64);
+        let (tx, handle, margin) = spawn_redeemer(
+            contract,
+            Arc::clone(&store) as Arc<dyn PoolStateStore>,
+            floor,
+            Duration::from_hours(1),
+            Arc::clone(&metrics),
+        );
+        // Let the loop run its startup scan on the empty store.
+        await_until("the startup scan", || Ok(store.loads() == 1)).await?;
+
+        let expiry = unix_now() + margin + 2;
+        let wake = expiry - margin + 1;
+        let (hinted, _) = record_lanes(store.as_ref(), 1..=3, expiry)?;
+        assert!(lane_value < floor, "each lane alone is below the floor");
+        tx.send(hinted).await?;
+
+        await_metric_line(&metrics, "decdn_onchain_tx_send_failed_total 1").await?;
+        assert!(
+            unix_now() >= wake,
+            "the cutoff sweep runs no earlier than the wake"
+        );
+        assert_eq!(asserter.read_q().len(), 0, "the chunk was read and sent");
+
+        // The sweep does not re-fire its passed cutoff: any second sweep would
+        // reach the empty mock queue and count a reconcile failure.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        ensure_metric_lines(
+            &metrics,
+            &[
+                "decdn_redemption_reconcile_ok_total 1",
+                "decdn_redemption_reconcile_failures_total 0",
+                "decdn_onchain_tx_send_failed_total 1",
+            ],
+        )?;
+        assert_eq!(store.loads(), 2, "the startup scan and one cutoff sweep");
+
+        drop(tx);
+        handle.await?;
+        Ok(())
+    }
+
+    /// Lanes persisted before the loop starts keep their cutoff sweep. A set
+    /// that stays below the floor at the cutoff is swept once and left
+    /// unredeemed: the sweep reads nothing from the chain.
+    #[tokio::test]
+    async fn a_sub_floor_set_at_its_serve_cutoff_reads_nothing() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store = CountingLoadStore::new(usize::MAX);
+        let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0), lane(0)]]);
+        let expiry = unix_now() + hour_tick_margin() + 2;
+        let (_, total) = record_lanes(store.as_ref(), 1..=2, expiry)?;
+        let (tx, handle, _) = spawn_redeemer(
+            contract,
+            Arc::clone(&store) as Arc<dyn PoolStateStore>,
+            total + U256::from(1u64),
+            Duration::from_hours(1),
+            Arc::clone(&metrics),
+        );
+
+        // Every sweep publishes the planned total, so this line marks the
+        // cutoff sweep.
+        await_metric_line(&metrics, &format!("decdn_unredeemed_usdc {total}")).await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(store.loads(), 2, "the startup scan and one cutoff sweep");
+        drop(tx);
+        handle.await?;
+        assert_eq!(
+            asserter.read_q().len(),
+            1,
+            "the queued getWatermarks response is untouched by a sub-floor set"
+        );
+        Ok(())
+    }
+
+    /// A lane whose cutoff passed while the node was down, with time left
+    /// before the landing slack, is swept at once on start rather than after
+    /// the first self-tick.
+    #[tokio::test]
+    async fn a_cutoff_passed_before_start_is_swept_at_once() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+        let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0)]]);
+        asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
+        // The cutoff passed 10 s ago; the landing slack is an hour away.
+        let expiry = unix_now() + hour_tick_margin() - 10;
+        let (_, total) = record_lanes(store.as_ref(), 1..=1, expiry)?;
+        let (tx, handle, _) = spawn_redeemer(
+            contract,
+            store,
+            total,
+            Duration::from_hours(1),
+            Arc::clone(&metrics),
+        );
+
+        await_metric_line(&metrics, "decdn_onchain_tx_send_failed_total 1").await?;
+        ensure_metric_lines(&metrics, &["decdn_redemption_reconcile_ok_total 1"])?;
+
+        drop(tx);
+        handle.await?;
+        Ok(())
+    }
+
+    /// A hint handled after its lane's cutoff, with no sweep since, makes the
+    /// cutoff sweep due at once rather than leaving the lane to the next tick.
+    #[tokio::test]
+    async fn a_hint_after_an_unscanned_cutoff_sweeps_at_once() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store = CountingLoadStore::new(usize::MAX);
+        let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0), lane(0)]]);
+        asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
+        let lane_value = expiring_lane(1, 0).owed();
+        let (tx, handle, margin) = spawn_redeemer(
+            contract,
+            Arc::clone(&store) as Arc<dyn PoolStateStore>,
+            lane_value * U256::from(2u64),
+            Duration::from_hours(1),
+            Arc::clone(&metrics),
+        );
+        await_until("the startup scan", || Ok(store.loads() == 1)).await?;
+
+        // The cutoff passed 10 s ago; the landing slack is an hour away.
+        let expiry = unix_now() + margin - 10;
+        let (hinted, _) = record_lanes(store.as_ref(), 1..=2, expiry)?;
+        tx.send(hinted).await?;
+
+        await_metric_line(&metrics, "decdn_onchain_tx_send_failed_total 1").await?;
+        ensure_metric_lines(&metrics, &["decdn_redemption_reconcile_ok_total 1"])?;
+
+        drop(tx);
+        handle.await?;
+        Ok(())
+    }
+
+    /// A failed load at the cutoff sweep drops the passed cutoff instead of
+    /// re-firing it: the loop parks until the next tick or hint.
+    #[tokio::test]
+    async fn a_failed_load_at_the_cutoff_does_not_spin() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        // The startup scan succeeds; every later load fails.
+        let store = CountingLoadStore::new(1);
+        let (contract, _asserter) = mocked_getwatermarks_pool(&[]);
+        let expiry = unix_now() + hour_tick_margin() + 2;
+        let (_, total) = record_lanes(store.as_ref(), 1..=1, expiry)?;
+        let (tx, handle, _) = spawn_redeemer(
+            contract,
+            Arc::clone(&store) as Arc<dyn PoolStateStore>,
+            total,
+            Duration::from_hours(1),
+            Arc::clone(&metrics),
+        );
+
+        await_until("the failed cutoff load", || Ok(store.loads() >= 2)).await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(store.loads(), 2, "the passed cutoff is not re-fired");
+
+        drop(tx);
+        handle.await?;
+        Ok(())
+    }
+
+    /// The self-tick sweeps an owed lane that no hint and no cutoff names.
+    #[tokio::test]
+    async fn the_self_tick_sweeps_a_lane_without_a_hint() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+        let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0)]]);
+        asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
+        // No tracked expiry, so no cutoff wake.
+        let (_, total) = record_lanes(store.as_ref(), 1..=1, 0)?;
+        let (tx, handle, _) = spawn_redeemer(
+            contract,
+            store,
+            total,
+            Duration::from_secs(1),
+            Arc::clone(&metrics),
+        );
+
+        await_metric_line(&metrics, "decdn_onchain_tx_send_failed_total 1").await?;
+        ensure_metric_lines(&metrics, &["decdn_redemption_reconcile_ok_total 1"])?;
+
+        drop(tx);
+        handle.await?;
         Ok(())
     }
 

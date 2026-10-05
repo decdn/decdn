@@ -104,7 +104,8 @@ pub enum ClientMessage {
     /// §Hash-chain metering (`PayWord`)). Acceptance is implicit, exactly as for
     /// [`Self::Voucher`].
     ChunkPreimage(ChunkPreimage),
-    /// discriminant 5 — payer → node, signals the payer received the full blob.
+    /// discriminant 5 — node → payer: the node delivered the whole requested
+    /// range, holds payment for every byte of it, and ends the stream.
     StreamEnd,
     /// discriminant 6 — node → payer, mid-stream failure (carries
     /// [`StreamError::VoucherRejected`]); delivery-side errors instead ride in
@@ -1221,10 +1222,11 @@ pub enum VoucherRejectReason {
     SpendingCapExhausted,
     /// The signer's capability has passed its `expiry`, or lies within the node's
     /// expiry margin of it. The node's serve-side check compares its LOCAL wall
-    /// clock (`unix_now`, operator-settable) plus that margin against `expiry` and
-    /// stops serving the lane. The margin is one redeem interval plus a landing
-    /// slack, so each voucher the node accepts meets at least one redeem sweep
-    /// before the expiry (ADR 003 §Revocation). A lane below the redemption
+    /// clock (operator-settable) plus that margin against `expiry`, refuses the
+    /// voucher or preimage, and stops serving the lane. The margin is one redeem
+    /// interval plus a landing slack, so the lane's claim is final when the
+    /// margin starts, and the node's redeem sweep one second later has time to
+    /// land before the expiry (ADR 003 §Revocation). A lane below the redemption
     /// floor can still wait past it. On-chain settlement separately gates redemption on
     /// `block.timestamp`. Already-earned vouchers stay redeemable until expiry at
     /// settlement. Recovery: the owner mints a **fresh capability** with a new expiry —

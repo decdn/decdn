@@ -240,12 +240,13 @@ pub use peer_store::{PeerRecord, PeerStore, StoreConfig};
 pub use ranged_store::ClientRangedStore;
 pub use rate_limited::UpstreamRateLimited;
 pub use scheduler::{
-    AcquireEnv, AcquireTarget, ConsumptionPacing, LANE_WATCHDOG, LaneLease, LaneWiden, acquire,
+    AcquireEnv, AcquireTarget, ConsumptionPacing, GrowFor, LANE_WATCHDOG, LaneLease, LaneWiden,
+    acquire,
 };
 pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{
-    BaoRangeReader, BlobSource, Funder, IngestStore, PRIMED_MAX_IDLE, PeerSource, PrimedSource,
-    SourceFuture,
+    BaoRangeReader, BlobSource, Funder, IngestEnd, IngestFuture, IngestStore, PRIMED_MAX_IDLE,
+    PeerSource, PrimedSource, SourceFuture, SourceStream,
 };
 pub use source_set::{
     Holder, LaneRange, NoAffordableSource, NoSourceHasBlob, SourceProvider, SourceSet,
@@ -2756,11 +2757,13 @@ const PROOF_STALL_DEBUG_AFTER: Duration = Duration::from_secs(5);
 /// [`PROOF_STALL_DEBUG_AFTER`]. Each phase names one place a leg can stall:
 /// `unpolled` (the caller did not read the stream, so a proof the node waits
 /// for was not sent), `pay` (waiting for the lane's ledger, signing and
-/// writing the proof), or `read` (the leg waited for bytes). A `read` stall
+/// writing the proof), `first_frame` (a fresh leg waited from its open for
+/// its first frame, any time before the caller's first read included), or
+/// `read` (the leg waited for bytes). A `read` stall
 /// with `unproved > 0` can be the node waiting for a proof this leg does not
 /// yet owe; with `unproved == 0` the leg owes nothing and the node is slow to
-/// send. `unpolled` and `pay` are logged when the phase ends; `read` is logged
-/// while the leg still waits.
+/// send. `unpolled` and `pay` are logged when the phase ends; `first_frame`
+/// and `read` are logged while the leg still waits.
 fn log_proof_stall(
     pull: (&dyn std::fmt::Display, [u8; 32], u64),
     cumulative: u64,
@@ -2895,6 +2898,9 @@ pub struct UpstreamPull {
     /// When `next_chunk` last returned a chunk, so the next call can tell how
     /// long the caller left the stream unread ([`log_proof_stall`]).
     returned_at: Option<tokio::time::Instant>,
+    /// When the open returned, so a fresh leg's wait for its first frame is
+    /// timed from there ([`log_proof_stall`]).
+    opened_at: tokio::time::Instant,
 }
 
 impl std::fmt::Debug for UpstreamPull {
@@ -3197,6 +3203,7 @@ async fn open_progressive_pull_impl(
             unproved: 0,
             ended: false,
             returned_at: None,
+            opened_at: tokio::time::Instant::now(),
         };
         Ok((header, pull))
     }
@@ -3273,12 +3280,19 @@ impl UpstreamPull {
         let floor = &mut self.floor;
         let (peer, hash, byte_offset) = (self.conn.remote_id(), self.hash, self.byte_offset);
         let unproved = self.unproved;
-        let read_started = tokio::time::Instant::now();
-        // The `read` stall line runs on its own timer, not on the sampler,
-        // whose period follows the configurable window and can be later than
-        // the node's proof timeout.
+        // A fresh leg's wait runs from its open, any time before the caller's
+        // first read included, so a first frame that never comes is named
+        // once, as `first_frame` (#2230).
+        let (phase, read_started) = if cumulative == 0 {
+            ("first_frame", self.opened_at)
+        } else {
+            ("read", tokio::time::Instant::now())
+        };
+        // The stall line runs on its own timer, not on the sampler, whose
+        // period follows the configurable window and can be later than the
+        // node's proof timeout.
         let read_stall_at = read_started + PROOF_STALL_DEBUG_AFTER;
-        let mut read_stall_logged = cumulative == 0;
+        let mut read_stall_logged = false;
         let mut reader = progress::ProgressReader::new(recv, Arc::clone(&self.progress_counter));
         // Pin ONE read future and poll it across ticks. `read_client_message` is not
         // cancellation-safe — `read_frame` fills a frame with `read_exact`, so dropping the
@@ -3320,13 +3334,13 @@ impl UpstreamPull {
                         });
                     }
                 }
-                // Once bytes have flowed, a long wait here is the leg waiting
-                // on the node while the node may wait on a proof.
+                // A long wait here is the leg waiting on the node, while the
+                // node may wait on a proof or still be sending its first frame.
                 () = tokio::time::sleep_until(read_stall_at), if !read_stall_logged => {
                     read_stall_logged = true;
                     let waited = read_started.elapsed();
                     let pull = (&peer as &dyn std::fmt::Display, hash, byte_offset);
-                    log_proof_stall(pull, cumulative, unproved, "read", waited);
+                    log_proof_stall(pull, cumulative, unproved, phase, waited);
                 }
             }
         }
@@ -3656,6 +3670,85 @@ impl UpstreamPull {
     pub fn abort(mut self) -> VoucherProgress {
         self.close_transport(0, b"client-abandoned");
         self.progress()
+    }
+
+    /// Stop the pull before its promised end, after paying for every wire byte
+    /// it received. A steal that takes the tail of this pull's range stops the
+    /// pull at the split on its open stream, so the stolen tail goes to one
+    /// source and this one opens no new stream for the part it keeps.
+    ///
+    /// A rejection the node already sent waits behind the `ChunkData` it sent
+    /// first, so the stop first reads what has arrived, without waiting, and
+    /// counts those frames as received: a `VoucherRejected` there rewinds the
+    /// rejected proof and surfaces as the typed rejection, as it does at
+    /// [`Self::finish`]. A rejection still in
+    /// flight reaches the lane's next leg instead. The closing voucher then
+    /// settles the received residual, the send half is finished, and the
+    /// transport is torn down (this stream, or the whole connection when the
+    /// pull owns it), so the node sees its sending stopped. A node that stops sending before it reads that voucher does not
+    /// redeem it, and the lane's next cumulative voucher covers the same bytes.
+    ///
+    /// A closing voucher that fails to send stays armed in the ledger:
+    /// [`PoolLedger::settlement`] counts it, and the lane's next voucher builds
+    /// on it. The caller's paid frontier, which reads
+    /// [`PoolLedger::committed`], stays behind the received bytes, so its next
+    /// leg re-delivers and pays for them once more.
+    ///
+    /// # Errors
+    ///
+    /// The typed rejection of a `StreamError` that had already arrived, or a
+    /// closing voucher that fails on our side ([`LocalPullFault`]). Any other
+    /// send failure is logged and leaves the residual as above.
+    pub async fn stop(mut self) -> anyhow::Result<VoucherProgress> {
+        if let Some(rejection) = self.arrived_rejection() {
+            self.close_transport(0, b"stopped-at-split");
+            return Err(rejection);
+        }
+        let paid = self.pay_one(self.unproved, true).await;
+        let _ = self.send.finish();
+        self.close_transport(0, b"stopped-at-split");
+        match paid {
+            Ok(remaining) => self.unproved = remaining,
+            Err(err) if err.is::<LocalPullFault>() => return Err(err),
+            Err(err) => tracing::warn!(
+                peer = %self.conn.remote_id(),
+                cumulative = self.cumulative,
+                unproved = self.unproved,
+                error = %format_args!("{err:#}"),
+                "the closing voucher of a pull stopped at a split did not send"
+            ),
+        }
+        Ok(self.progress())
+    }
+
+    /// The typed rejection of a `StreamError` that has already arrived, read
+    /// without waiting past the `ChunkData` in front of it. Every frame it
+    /// takes in counts as received, as in [`Self::next_chunk`], so the closing
+    /// voucher pays for it. A frame past the request's promised wire length
+    /// or past our received-byte ceiling ends the read unpaid: an honest node
+    /// sends neither. `None` once nothing more has arrived, on any other
+    /// message, or on a read fault: the caller closes the stream either way.
+    fn arrived_rejection(&mut self) -> Option<anyhow::Error> {
+        loop {
+            match futures_util::FutureExt::now_or_never(self.read_under_floor_once())? {
+                Ok(ClientMessage::ChunkData(chunk)) => {
+                    let seen = self.cumulative.saturating_add(chunk.bytes().len() as u64);
+                    if seen > self.expected_wire_bytes
+                        || (self.max_received_wire > 0 && seen > self.max_received_wire)
+                    {
+                        return None;
+                    }
+                    self.unproved = self
+                        .unproved
+                        .saturating_add(seen.saturating_sub(self.cumulative));
+                    self.cumulative = seen;
+                }
+                Ok(ClientMessage::StreamError(e)) => {
+                    return Some(voucher_rejection(&self.ledger, &self.meter, e));
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// Tear down this pull's transport on any exit.

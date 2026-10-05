@@ -29,6 +29,7 @@
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::Context as _;
@@ -40,6 +41,7 @@ use bytes::Bytes;
 use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, RangedFuture, RangedStore, RangedStoreError};
 
 use crate::sink::{StashedFault, classify_decode_error};
+use crate::source::IngestEnd;
 
 /// A checkpoint-slot wait at least this long is logged at `debug`: ingest does
 /// not read its stream while it waits (#2211).
@@ -121,6 +123,9 @@ pub struct ClientRangedStore {
     /// `admit`/`ingest_stream`/`set_bound`, persisted by
     /// `admit`/`finalize`/`flush_present_record`).
     state: Arc<Mutex<StoreState>>,
+    /// Woken each time an ingest checkpoint extends `present`
+    /// ([`Self::present_grew`]).
+    present_grew: Arc<tokio::sync::Notify>,
     /// Test-only stall injected before each ingest checkpoint fsync, to model
     /// a slow disk.
     #[cfg(test)]
@@ -129,6 +134,9 @@ pub struct ClientRangedStore {
     /// `ingest_stream` call on this store.
     #[cfg(test)]
     fsyncs: Arc<std::sync::atomic::AtomicU32>,
+    /// Test-only prefix end of each ingest checkpoint, in queue order.
+    #[cfg(test)]
+    checkpoint_ends: Arc<Mutex<Vec<u64>>>,
 }
 
 impl std::fmt::Debug for ClientRangedStore {
@@ -313,10 +321,13 @@ impl ClientRangedStore {
             data_path: Arc::new(Mutex::new(data_path)),
             ranges_path,
             state: Arc::new(Mutex::new(state)),
+            present_grew: Arc::default(),
             #[cfg(test)]
             fsync_delay: std::time::Duration::ZERO,
             #[cfg(test)]
             fsyncs: Arc::default(),
+            #[cfg(test)]
+            checkpoint_ends: Arc::default(),
         }
     }
 
@@ -510,6 +521,15 @@ impl ClientRangedStore {
         crate::driver::contiguous_byte_ranges(&state.present, state.bound)
     }
 
+    /// Woken each time an ingest checkpoint makes more verified bytes durable
+    /// and present. A reader waiting for bytes registers on it before reading
+    /// the present frontier, so a checkpoint that lands between the read and
+    /// the wait still wakes it.
+    #[must_use]
+    pub(crate) fn present_grew(&self) -> &tokio::sync::Notify {
+        &self.present_grew
+    }
+
     /// Move the planner's bound to `bound`. The record picks it up at its next
     /// flush. A proven size is final: once a leg has proved one, the bound
     /// stays at it and this does nothing.
@@ -549,7 +569,7 @@ impl ClientRangedStore {
     /// fault the call checkpoints every verified leaf before it returns, so a
     /// fault re-pays only the bytes past the last verified chunk group (unless
     /// a checkpoint itself fails). On a crash, or when the caller drops the
-    /// future (a scheduler steal or stall), the unflushed batch is lost and
+    /// future (a scheduler cancel or stall), the unflushed batch is lost and
     /// the queued checkpoints can miss the resume read, so the re-pay is at
     /// most `INGEST_MAX_QUEUED_CHECKPOINTS + 1` intervals. Checkpointed
     /// (durably-recorded) bytes are never re-paid.
@@ -561,7 +581,47 @@ impl ClientRangedStore {
     /// times the fsync rate, which is a storage tradeoff rather than a
     /// payment-correctness one — the payer re-pays only what it genuinely
     /// re-pulls either way.
+    ///
+    /// Each call ramps up to this size from
+    /// [`Self::INGEST_FIRST_CHECKPOINT_BYTES`], so the bound holds for every
+    /// checkpoint.
     pub(crate) const INGEST_CHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
+
+    /// The batch size of each [`Self::ingest_stream`] call's first checkpoint.
+    /// Each later checkpoint doubles it ([`Self::next_checkpoint_bytes`]) up
+    /// to [`Self::INGEST_CHECKPOINT_BYTES`].
+    ///
+    /// A reader of the verified stream sees a byte only once its checkpoint is
+    /// durable and present, so the first checkpoint sets how soon the first
+    /// bytes are readable. 64 KiB (four chunk groups) makes them readable
+    /// after one small fsync. The ramp reaches the full interval within six
+    /// checkpoints, so a long range costs only a few extra fsyncs.
+    pub(crate) const INGEST_FIRST_CHECKPOINT_BYTES: u64 = 64 * 1024;
+
+    /// The batch size of the checkpoint after one of `current` bytes: double
+    /// it, capped at [`Self::INGEST_CHECKPOINT_BYTES`].
+    pub(crate) const fn next_checkpoint_bytes(current: u64) -> u64 {
+        let doubled = current.saturating_mul(2);
+        if doubled < Self::INGEST_CHECKPOINT_BYTES {
+            doubled
+        } else {
+            Self::INGEST_CHECKPOINT_BYTES
+        }
+    }
+
+    /// The prefix one [`Self::ingest_stream`] call has checkpointed once
+    /// `received` bytes of its range have arrived and the stream then stalls:
+    /// the end of the last whole checkpoint of the ramp.
+    #[cfg(test)]
+    pub(crate) const fn checkpointed_len(received: u64) -> u64 {
+        let mut size = Self::INGEST_FIRST_CHECKPOINT_BYTES;
+        let mut end = 0;
+        while end + size <= received {
+            end += size;
+            size = Self::next_checkpoint_bytes(size);
+        }
+        end
+    }
 
     /// The most checkpoints one [`Self::ingest_stream`] call holds between the
     /// decode loop and durability: queued for the fsync worker, or written by
@@ -593,11 +653,13 @@ impl ClientRangedStore {
     ///
     /// The call verifies each chunk group against the root as
     /// [`bao_tree::io::fsm::ResponseDecoder`] decodes it, collects the verified
-    /// leaves into a batch, and hands each batch of roughly
-    /// `INGEST_CHECKPOINT_BYTES` (plus the remainder at completion) to a
-    /// checkpoint worker as one durable checkpoint: positioned-write the leaves
-    /// into the `.partial` data file, fsync it, then union the received prefix
-    /// into `present`.
+    /// leaves into a batch, and hands each batch (plus the remainder at
+    /// completion) to a checkpoint worker as one durable checkpoint:
+    /// positioned-write the leaves into the `.partial` data file, fsync it,
+    /// union the received prefix into `present`, then wake the readers that
+    /// wait for present bytes. The first batch is
+    /// `INGEST_FIRST_CHECKPOINT_BYTES`, and each later one doubles up to
+    /// `INGEST_CHECKPOINT_BYTES`.
     ///
     /// Every file operation runs on a `tokio::task::spawn_blocking` worker,
     /// never on a runtime worker. The paid pull pays from inside this decode
@@ -675,6 +737,31 @@ impl ClientRangedStore {
     where
         R: iroh_io::AsyncStreamReader + StashedFault + Send,
     {
+        self.ingest_stream_until(range, reader, on_progress, claimed_total, None)
+            .await
+            .map(|(reader, _)| reader)
+    }
+
+    /// [`Self::ingest_stream`] with an end the caller can lower while the leg
+    /// streams. Once the verified prefix reaches `stop_at`, the call
+    /// checkpoints that prefix and returns [`IngestEnd::Stopped`] without
+    /// reading further; the bytes past it stay missing. A range the decoder
+    /// reads to its end returns [`IngestEnd::Drained`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::ingest_stream`].
+    pub(crate) async fn ingest_stream_until<R>(
+        &self,
+        range: &AlignedRange,
+        reader: R,
+        on_progress: Option<&(dyn Fn(u64) + Send + Sync)>,
+        claimed_total: u64,
+        stop_at: Option<&AtomicU64>,
+    ) -> anyhow::Result<(R, IngestEnd)>
+    where
+        R: iroh_io::AsyncStreamReader + StashedFault + Send,
+    {
         let range = &decdn_bao_range::align_range_clamped(
             range.fetch_start(),
             range.fetch_len(),
@@ -694,7 +781,7 @@ impl ClientRangedStore {
                 return Err(anyhow::Error::new(crate::HashMismatch));
             }
             self.lock_state().prove(0);
-            return Ok(reader);
+            return Ok((reader, IngestEnd::Drained));
         }
         let mut flusher = IngestFlusher::open(self, range, claimed_total).await?;
 
@@ -711,6 +798,8 @@ impl ClientRangedStore {
         // `[batch_start, received_end)` sits in `batch`.
         let mut batch_start = range.fetch_start();
         let mut batch = FlushBatch::default();
+        // The size at which the batch in progress checkpoints.
+        let mut batch_target = Self::INGEST_FIRST_CHECKPOINT_BYTES;
 
         loop {
             match decoder.next().await {
@@ -724,11 +813,24 @@ impl ClientRangedStore {
                     if let Some(cb) = on_progress {
                         cb(received_end.saturating_sub(range.fetch_start()));
                     }
-                    if received_end.saturating_sub(batch_start) >= Self::INGEST_CHECKPOINT_BYTES {
+                    if received_end.saturating_sub(batch_start) >= batch_target {
                         flusher
                             .start(std::mem::take(&mut batch), received_end)
                             .await?;
                         batch_start = received_end;
+                        batch_target = Self::next_checkpoint_bytes(batch_target);
+                    }
+                    // A steal lowered the end to a split this prefix reached:
+                    // stop here, so the bytes past it go to the stealer alone.
+                    // A prefix that reached the range's end drains as usual.
+                    // `on_progress` above published this prefix before the
+                    // end is read, the order a steal relies on.
+                    if received_end < range.fetch_end()
+                        && stop_at.is_some_and(|end| received_end >= end.load(Ordering::SeqCst))
+                    {
+                        let r = rest.finish();
+                        flusher.finish(batch, received_end).await?;
+                        return Ok((r, IngestEnd::Stopped));
                     }
                     decoder = rest;
                 }
@@ -765,7 +867,7 @@ impl ClientRangedStore {
                         return Err(fault);
                     }
                     flush_result?;
-                    return Ok(r);
+                    return Ok((r, IngestEnd::Drained));
                 }
             }
         }
@@ -887,6 +989,9 @@ struct IngestFlusher {
     /// workers, and a worker exits only once the queue is empty or it has
     /// failed, so this is the one worker that can still run or that failed.
     worker: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    /// Test-only record of each queued checkpoint's prefix end.
+    #[cfg(test)]
+    checkpoint_ends: Arc<Mutex<Vec<u64>>>,
 }
 
 impl IngestFlusher {
@@ -914,6 +1019,7 @@ impl IngestFlusher {
             state: Mutex::new(PipelineState::default()),
             data: Mutex::new(data),
             store: Arc::clone(&store.state),
+            present_grew: Arc::clone(&store.present_grew),
             claim,
             range: range.clone(),
             #[cfg(test)]
@@ -927,6 +1033,8 @@ impl IngestFlusher {
                 ClientRangedStore::INGEST_MAX_QUEUED_CHECKPOINTS,
             )),
             worker: None,
+            #[cfg(test)]
+            checkpoint_ends: Arc::clone(&store.checkpoint_ends),
         })
     }
 
@@ -939,6 +1047,10 @@ impl IngestFlusher {
     ///
     /// The worker's own error (or panic) when a checkpoint failed.
     async fn start(&mut self, batch: FlushBatch, received_end: u64) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Ok(mut ends) = self.checkpoint_ends.lock() {
+            ends.push(received_end);
+        }
         let waiting_since = tokio::time::Instant::now();
         let slot = Arc::clone(&self.slots)
             .acquire_owned()
@@ -1020,6 +1132,9 @@ struct IngestPipeline {
     data: Mutex<File>,
     /// The store's state, which each durable checkpoint extends.
     store: Arc<Mutex<StoreState>>,
+    /// The store's [`ClientRangedStore::present_grew`], woken after each
+    /// durable checkpoint.
+    present_grew: Arc<tokio::sync::Notify>,
     /// The size the leg's sender claims, which the leg verifies under.
     claim: u64,
     /// The leg's range, aligned under `claim`.
@@ -1107,6 +1222,7 @@ impl IngestPipeline {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             sync_and_union(&data, &self.store, self.claim, &self.range, received_end)?;
+            self.present_grew.notify_waiters();
             slots.clear();
         }
         Ok(())
@@ -1488,11 +1604,12 @@ impl crate::source::IngestStore for ClientRangedStore {
         reader: R,
         on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
         claimed_total: u64,
-    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<R>> + 'a>>
+        stop_at: Option<&'a AtomicU64>,
+    ) -> crate::source::IngestFuture<'a, R>
     where
         R: crate::source::BaoRangeReader + 'a,
     {
-        Box::pin(self.ingest_stream(range, reader, on_progress, claimed_total))
+        Box::pin(self.ingest_stream_until(range, reader, on_progress, claimed_total, stop_at))
     }
 
     fn flush_present_record(&self) -> crate::source::SourceFuture<'_, ()> {
@@ -2054,6 +2171,52 @@ mod tests {
         sum
     }
 
+    /// An ingest whose end is lowered stops once its verified prefix reaches
+    /// it: the prefix is present, nothing past it is, and the wire it read is
+    /// exactly the encoding of the shorter range, since a group-aligned end
+    /// cuts a pre-order bao encoding between two items. An end at or past the
+    /// range's end drains the range as usual.
+    #[tokio::test]
+    async fn ingest_stream_until_stops_at_a_lowered_end() -> anyhow::Result<()> {
+        let total = 11 * GROUP + 321;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?);
+        let range = decdn_bao_range::align_range(GROUP, 9 * GROUP, total)?;
+        let body = bao_for(root, &plaintext, outboard, &range).slice(8..);
+        for stop in 2..10 {
+            let store = fresh_store(root, total);
+            let end = AtomicU64::new(stop * GROUP);
+            let (rest, ended) = store
+                .ingest_stream_until(&range, body.clone(), None, total, Some(&end))
+                .await?;
+            let kept = decdn_bao_range::align_range(GROUP, (stop - 1) * GROUP, total)?;
+            assert_eq!(ended, IngestEnd::Stopped, "stop at group {stop}");
+            assert_eq!(
+                &store.present_ranges().await?,
+                kept.chunk_ranges(),
+                "stop at group {stop}"
+            );
+            assert_eq!(
+                (body.len() - rest.len()) as u64,
+                kept.wire_len(),
+                "the wire read up to group {stop} is the shorter range's encoding"
+            );
+        }
+
+        let store = fresh_store(root, total);
+        let end = AtomicU64::new(10 * GROUP);
+        let (rest, ended) = store
+            .ingest_stream_until(&range, body.clone(), None, total, Some(&end))
+            .await?;
+        assert_eq!(
+            ended,
+            IngestEnd::Drained,
+            "an end at the range's end drains"
+        );
+        assert!(rest.is_empty());
+        assert_eq!(&store.present_ranges().await?, range.chunk_ranges());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn ingest_stream_writes_positioned_and_reflects_presence() -> anyhow::Result<()> {
         let total = 3 * GROUP + 123;
@@ -2431,15 +2594,17 @@ mod tests {
     }
 
     /// The decode loop, and so the payment it drives, runs past a checkpoint
-    /// whose fsync stalls: four checkpoints fit the pipeline slots, so the
-    /// whole blob is received before the first fsync lands. `present` extends
-    /// only after the fsync.
+    /// whose fsync stalls: the first four checkpoints of the ramp fit the
+    /// pipeline slots plus the batch in progress, so the whole blob is
+    /// received before the first fsync lands. `present` extends only after
+    /// the fsync.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ingest_stream_decodes_past_a_slow_fsync() -> anyhow::Result<()> {
         const FSYNC_DELAY: Duration = Duration::from_secs(3);
 
         let dir = tempfile::tempdir()?;
-        let data = blob(checkpoints(4)?);
+        let slots = ClientRangedStore::INGEST_MAX_QUEUED_CHECKPOINTS;
+        let data = blob(usize::try_from(ramp_sum(slots + 1))?);
         let total = u64::try_from(data.len())?;
         let (store, aligned, wire) = slow_fsync_store(dir.path(), &data, FSYNC_DELAY)?;
 
@@ -2515,17 +2680,17 @@ mod tests {
         Ok(())
     }
 
-    /// Checkpoints that queue behind a slow fsync share the next fsync. Three
-    /// checkpoints fit the pipeline slots, so the loop queues all three
-    /// without waiting. The first fsync holds at least the first one; the
-    /// rest queue during its stall and the worker folds them into one second
-    /// fsync. One fsync per checkpoint would be three.
+    /// Checkpoints that queue behind a slow fsync share the next fsync. The
+    /// first three checkpoints of the ramp fit the pipeline slots, so the
+    /// loop queues all three without waiting. The first fsync holds at least
+    /// the first one; the rest queue during its stall and the worker folds
+    /// them into one second fsync. One fsync per checkpoint would be three.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ingest_stream_coalesces_queued_checkpoints() -> anyhow::Result<()> {
-        let slots = u64::try_from(ClientRangedStore::INGEST_MAX_QUEUED_CHECKPOINTS)?;
+        let slots = ClientRangedStore::INGEST_MAX_QUEUED_CHECKPOINTS;
 
         let dir = tempfile::tempdir()?;
-        let data = blob(checkpoints(slots)?);
+        let data = blob(usize::try_from(ramp_sum(slots))?);
         let (store, aligned, wire) = slow_fsync_store(dir.path(), &data, Duration::from_secs(1))?;
 
         store
@@ -2538,6 +2703,78 @@ mod tests {
             "{slots} queued checkpoints took {fsyncs} fsyncs, want at most 2"
         );
         assert_eq!(&store.present_ranges().await?, aligned.chunk_ranges());
+        Ok(())
+    }
+
+    /// The batch size of each checkpoint of one call, in order, up to `n` of
+    /// them: the ramp from `INGEST_FIRST_CHECKPOINT_BYTES` to
+    /// `INGEST_CHECKPOINT_BYTES`.
+    fn ramp(n: usize) -> Vec<u64> {
+        std::iter::successors(
+            Some(ClientRangedStore::INGEST_FIRST_CHECKPOINT_BYTES),
+            |&b| Some(ClientRangedStore::next_checkpoint_bytes(b)),
+        )
+        .take(n)
+        .collect()
+    }
+
+    /// The sum of the first `n` ramp steps.
+    fn ramp_sum(n: usize) -> u64 {
+        ramp(n).iter().sum()
+    }
+
+    /// Each call's checkpoints start small and double up to
+    /// `INGEST_CHECKPOINT_BYTES`, so the first verified bytes are durable,
+    /// and readable, after one small batch rather than a full interval.
+    #[tokio::test]
+    async fn ingest_stream_ramps_its_checkpoints() -> anyhow::Result<()> {
+        let sizes = ramp(8);
+        assert_eq!(sizes.first(), Some(&(64 * KIB)));
+        assert_eq!(
+            sizes.last(),
+            Some(&ClientRangedStore::INGEST_CHECKPOINT_BYTES)
+        );
+
+        // Five ramp steps, then a tail shorter than the sixth.
+        let total = ramp_sum(5) + 1024 * KIB;
+        let data = blob(usize::try_from(total)?);
+        let (root, _) = bao_root_and_outboard(&data);
+        let dir = tempfile::tempdir()?;
+        let store = ClientRangedStore::create(dir.path(), "b", root, total)?;
+        let aligned = decdn_bao_range::align_range(0, 0, total)?;
+        let wire = scripted_reader_for(&data, &aligned)?;
+        store.ingest_stream(&aligned, wire, None, total).await?;
+
+        let mut want: Vec<u64> = (1..=5).map(ramp_sum).collect();
+        want.push(total);
+        let ends = store
+            .checkpoint_ends
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock poisoned"))?
+            .clone();
+        assert_eq!(ends, want);
+        Ok(())
+    }
+
+    /// A waiter on `present_grew` wakes when a checkpoint extends `present`,
+    /// with no other signal.
+    #[tokio::test]
+    async fn a_checkpoint_wakes_present_waiters() -> anyhow::Result<()> {
+        let total = 256 * KIB;
+        let data = blob(usize::try_from(total)?);
+        let (root, _) = bao_root_and_outboard(&data);
+        let dir = tempfile::tempdir()?;
+        let store = ClientRangedStore::create(dir.path(), "b", root, total)?;
+        let aligned = decdn_bao_range::align_range(0, 0, total)?;
+        let wire = scripted_reader_for(&data, &aligned)?;
+
+        let grew = store.present_grew().notified();
+        tokio::pin!(grew);
+        grew.as_mut().enable();
+        store.ingest_stream(&aligned, wire, None, total).await?;
+        tokio::time::timeout(Duration::from_secs(1), grew)
+            .await
+            .map_err(|_| anyhow::anyhow!("no wakeup when present grew"))?;
         Ok(())
     }
 

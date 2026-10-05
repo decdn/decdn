@@ -126,10 +126,11 @@ const TIMESTAMP_US: u64 = 0x00c0_ffe1;
 const FIRST_FRAME_BUDGET: Duration = Duration::from_secs(30);
 /// How long a held-open read waits for the NEXT frame of the credit window before
 /// deciding the node has parked awaiting the voucher we never send. Kept below the
-/// node's `VOUCHER_READ_TIMEOUT` (10s) so a park is observed as an idle gap, not a
-/// connection close. In the happy path the loop breaks on delivered ≥ floor before
-/// ever hitting this idle — the window's frames stream back-to-back — so it only
-/// bounds the failure case where a stream parks SHORT of its floor.
+/// node's `VOUCHER_READ_TIMEOUT` (10s with no transport progress) so a park is
+/// observed as an idle gap, not a connection close. In the happy path the loop
+/// breaks on delivered ≥ floor before ever hitting this idle — the window's
+/// frames stream back-to-back — so it only bounds the failure case where a stream
+/// parks SHORT of its floor.
 const IDLE_BUDGET: Duration = Duration::from_secs(5);
 /// How long the first request against the freshly-opened pool rides out the
 /// node's pool-registration readiness window (its `getPool` view resolving the
@@ -139,8 +140,9 @@ const READY_RETRY_BUDGET: Duration = Duration::from_secs(45);
 /// below makes `remaining − M` cover exactly this many one-window reservations, so
 /// this many DISTINCT-signer streams fit and the next is refused. Kept small so
 /// every held stream is opened well inside the node's 10s `VOUCHER_READ_TIMEOUT`
-/// (a parked stream's reservation is released once that elapses), leaving the
-/// whole set live at the instant the overflow stream is refused.
+/// (a parked stream's reservation is released once 10s pass with no proof and no
+/// transport progress), leaving the whole set live at the instant the overflow
+/// stream is refused.
 const HELD_STREAMS: u64 = 2;
 /// Per-signer LIVE concurrency cap, in windows, frozen far above anything this
 /// journey draws. Each held stream is on its OWN signer and holds exactly one
@@ -426,7 +428,8 @@ fn delegate_context(
 /// `ok: true` (which reserves one credit-window floor against the pool at the
 /// admission gate), streamed the window, and is now parked awaiting a voucher that
 /// never comes — so its reservation stays LIVE on the pool's floor accumulator for
-/// as long as this value is kept alive (up to the node's `VOUCHER_READ_TIMEOUT`).
+/// as long as this value is kept alive (up to the node's `VOUCHER_READ_TIMEOUT`,
+/// 10s with no transport progress).
 /// Dropping it closes the connection, which returns the node's serve task and
 /// releases the reservation.
 struct HeldStream {
@@ -488,7 +491,7 @@ async fn hold_open_until_ready(
 /// The read loop stops as soon as `floor_bytes` have arrived rather than waiting
 /// for the node to fall idle: the window's frames stream back-to-back, so this
 /// confirms the real floor was served AND returns fast, leaving the reservation
-/// live well inside the node's 10s `VOUCHER_READ_TIMEOUT`. The per-frame
+/// live well inside the node's 10s no-progress `VOUCHER_READ_TIMEOUT`. The per-frame
 /// [`IDLE_BUDGET`] only bounds the failure case where a stream parks SHORT of its
 /// floor. Mirrors `abandonment_bucket_throttle.rs`'s `open_and_withhold`, but
 /// retains the connection instead of closing it.

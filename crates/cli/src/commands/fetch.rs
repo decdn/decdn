@@ -15,8 +15,9 @@
 //!
 //! Pool lifecycle: the caller's live pool in the persistent
 //! [`RedbBuyerPoolStore`] is reused (the `(signer, provider)` lane watermark is
-//! resumed) — and auto-refilled on-chain via `topUp` when its remaining
-//! deposit has run low, so a sustained series of fetches isn't stranded;
+//! resumed) — and topped up on-chain via `topUp` (best effort) when its
+//! pool-wide remaining deposit has run low, so a sustained series of fetches
+//! isn't stranded;
 //! otherwise one is opened on-chain (USDC `approve` if needed → `openPool`) via
 //! the shared [`decdn_client::buyer_pool::open_pool`] kernel and recorded.
 //! One pool fans out to every provider the caller pays (ADR 003) — there is no
@@ -38,8 +39,9 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client::buyer_pool::{
-    LOW_WATER_DIVISOR, ProgressWrite, ToppedUpPool, ensure_allowance, escrowed_but_untracked,
-    grade_deposit_credit, open_pool, refill_amount, self_owned_lane_ctx, top_up, topped_up_effect,
+    LOW_WATER_DIVISOR, ProgressWrite, TopUpUnconfirmed, ToppedUpPool, WalletShortfall,
+    ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool, refill_amount,
+    self_owned_lane_ctx, top_up, topped_up_effect,
 };
 use decdn_client::driver::DriveConfig;
 use decdn_client::source::{Funder, SourceFuture};
@@ -74,7 +76,9 @@ use decdn_client::probe::probe_once;
 use decdn_client::provider;
 
 use super::buyer_store::{ChainAdoption, DataDirSource, open_client_store_for_buy};
+use super::fetch_timings::{FetchTimings, Mark};
 use super::interrupt::{Interrupt, Interrupted};
+use super::ordered_writes::OrderedWrites;
 use super::tab_progress::TabProgress;
 
 /// Per-candidate probe timeout during auto-discovery (#936). The K probes run
@@ -470,6 +474,335 @@ fn probe_shed(err: &anyhow::Error) -> bool {
     err.downcast_ref::<UpstreamRateLimited>().is_some()
 }
 
+/// How long a probe round keeps collecting answers after the first verified
+/// holder answers. A holder that answers later is either about 125 ms farther
+/// away or still connecting, and would not lead the order. One slow connect
+/// would otherwise hold the whole round for up to the probe timeout.
+const PROBE_SETTLE_AFTER_HOLDER: Duration = Duration::from_millis(250);
+
+/// Run `probes` concurrently and collect their outcomes until every probe has
+/// answered or the round's deadline passes. The first outcome `is_holder`
+/// accepts sets the deadline `grace` later. With `cold_grace` set and no
+/// holder yet, the first outcome `is_answer` accepts sets it `cold_grace`
+/// later, and a holder inside that window still ends the round `grace` after
+/// it. Returns the collected outcomes, in answer order, and the probes still
+/// pending. A zero `grace` returns at the first holder with every outcome
+/// already ready: `timeout_at` polls the stream before it checks the deadline.
+/// With no holder and no `cold_grace`, the round waits for every probe and the
+/// tail is empty.
+async fn settle_probes<T, F>(
+    probes: impl IntoIterator<Item = F>,
+    grace: Duration,
+    cold_grace: Option<Duration>,
+    is_holder: impl Fn(&T) -> bool,
+    is_answer: impl Fn(&T) -> bool,
+) -> (Vec<T>, futures_util::stream::FuturesUnordered<F>)
+where
+    F: std::future::Future<Output = T>,
+{
+    use futures_util::StreamExt as _;
+    let mut pending: futures_util::stream::FuturesUnordered<F> = probes.into_iter().collect();
+    let mut settled = Vec::with_capacity(pending.len());
+    let mut deadline: Option<tokio::time::Instant> = None;
+    let mut holder_seen = false;
+    loop {
+        let next = match deadline {
+            None => pending.next().await,
+            Some(at) => match tokio::time::timeout_at(at, pending.next()).await {
+                Ok(next) => next,
+                Err(_) => break,
+            },
+        };
+        let Some(outcome) = next else { break };
+        let now = tokio::time::Instant::now();
+        if !holder_seen && is_holder(&outcome) {
+            holder_seen = true;
+            let at = now + grace;
+            deadline = Some(deadline.map_or(at, |cold| cold.min(at)));
+        } else if deadline.is_none()
+            && let Some(cold) = cold_grace
+            && is_answer(&outcome)
+        {
+            deadline = Some(now + cold);
+        }
+        settled.push(outcome);
+    }
+    if !pending.is_empty() {
+        tracing::debug!(
+            pending = pending.len(),
+            holder = holder_seen,
+            "probe round settled; the rest continue as its tail"
+        );
+    }
+    (settled, pending)
+}
+
+/// Log one probe's raw result at `debug`, with the time since the round started.
+fn log_probe_result(
+    cand: &NodeCandidate,
+    res: &anyhow::Result<(
+        decdn_protocol::message::ProbeResponse,
+        decdn_protocol::ProbeResponseExt,
+        f64,
+    )>,
+    started: std::time::Instant,
+) {
+    match res {
+        Ok((resp, _, rtt_ms)) => tracing::debug!(
+            node = %cand.node_id,
+            elapsed_ms = started.elapsed().as_millis(),
+            rtt_ms = *rtt_ms,
+            has_blob = resp.body.has_blob,
+            "probe answered"
+        ),
+        Err(error) => tracing::debug!(
+            node = %cand.node_id,
+            elapsed_ms = started.elapsed().as_millis(),
+            error = %format_args!("{error:#}"),
+            "probe failed"
+        ),
+    }
+}
+
+/// One probed candidate, verified and classified ([`classify_probe`]).
+pub(crate) enum ProbeOutcome {
+    /// A verified answer that holds the blob, with its peer-store sample.
+    Holder(discovery::Probed, (PublicKey, f64, u64)),
+    /// A verified answer that does not hold the blob, with its peer-store
+    /// sample.
+    NonHolder(discovery::WarmingCandidate, (PublicKey, f64, u64)),
+    /// No answer.
+    Unreachable,
+    /// The candidate kept shedding the probe.
+    RateLimited,
+    /// The answer's `slash_sig` did not recover to the candidate's operator.
+    Unverifiable,
+    /// The answer's `has_blob` and coverage disagree.
+    Unusable,
+}
+
+impl ProbeOutcome {
+    const fn is_holder(&self) -> bool {
+        matches!(self, Self::Holder(..))
+    }
+
+    /// A verified answer, holder or not.
+    const fn is_answer(&self) -> bool {
+        matches!(self, Self::Holder(..) | Self::NonHolder(..))
+    }
+
+    /// The peer-store sample of a verified answer.
+    pub(crate) const fn sample(&self) -> Option<(PublicKey, f64, u64)> {
+        match self {
+            Self::Holder(_, sample) | Self::NonHolder(_, sample) => Some(*sample),
+            Self::Unreachable | Self::RateLimited | Self::Unverifiable | Self::Unusable => None,
+        }
+    }
+}
+
+/// How a probe round ends once a verified holder answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeRound {
+    /// Return at the first verified holder and keep the pending probes as
+    /// the round's tail ([`LateProbes`]): the first round of a fetch, whose
+    /// late holders join the running fetch.
+    Stream,
+    /// Collect for [`PROBE_SETTLE_AFTER_HOLDER`] after the first verified
+    /// holder and drop the rest: a rediscovery.
+    Settle,
+}
+
+impl ProbeRound {
+    /// How long the round collects after the first verified holder.
+    const fn grace(self) -> Duration {
+        match self {
+            Self::Stream => Duration::ZERO,
+            Self::Settle => PROBE_SETTLE_AFTER_HOLDER,
+        }
+    }
+
+    /// How long the round collects after its first verified answer while no
+    /// holder has answered. A streamed round then starts on the non-holders
+    /// in hand as pull-through targets (#1911), and a holder that answers
+    /// later joins the running fetch. A settled round waits for every probe.
+    const fn cold_grace(self) -> Option<Duration> {
+        match self {
+            Self::Stream => Some(PROBE_SETTLE_AFTER_HOLDER),
+            Self::Settle => None,
+        }
+    }
+}
+
+/// The probes a streamed round left pending, with what deciding a late
+/// answer needs.
+pub(crate) struct LateProbes {
+    /// The pending probes, each yielding its classified outcome.
+    pub(crate) tail: std::pin::Pin<Box<dyn futures_util::Stream<Item = ProbeOutcome> + Send>>,
+    /// The lowest RTT among the holders the round returned.
+    pub(crate) best_holder_rtt_ms: f64,
+    /// The fetch's proxy-warming knobs.
+    pub(crate) warming: ProxyWarmingParams,
+}
+
+/// How a resolve probes: where it records its marks, and how its probe round
+/// ends.
+#[derive(Clone, Copy)]
+pub(crate) struct ProbeOpts<'a> {
+    /// The `decdn fetch` marks; `None` elsewhere.
+    pub(crate) timings: Option<&'a FetchTimings>,
+    /// How the probe round ends.
+    pub(crate) round: ProbeRound,
+}
+
+/// A streamed round's [`LateProbes`], taken once by whoever adopts them.
+#[derive(Default)]
+pub(crate) struct LateSlot(std::sync::Mutex<Option<LateProbes>>);
+
+impl LateSlot {
+    /// A slot holding `late`.
+    pub(crate) const fn new(late: LateProbes) -> Self {
+        Self(std::sync::Mutex::new(Some(late)))
+    }
+
+    /// Take the late probes, leaving the slot empty.
+    pub(crate) fn take(&self) -> Option<LateProbes> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+/// A probe round's outcomes, split by what [`probe_and_order`] does with each.
+struct ProbeTally {
+    /// The verified holders.
+    holders: Vec<discovery::Probed>,
+    /// Probed bonded nodes that answered `has_blob:false` — reachable, with a
+    /// measured RTT, but not holding the blob in their cache store. They serve
+    /// two roles: the proxy-warming candidate pool (ADR 037 § Candidate pool)
+    /// when a holder exists but is distant, and — when NO holder answers — the
+    /// pull-through serve targets a cold blob's first fetch bootstraps from
+    /// (#1911), since `has_blob:false` from the cache store does not mean the
+    /// node cannot serve via its own origin. Always collected, because the
+    /// second role does not depend on warming being on.
+    non_holders: Vec<discovery::WarmingCandidate>,
+    /// `(node_id, rtt_ms, rate_per_mb)` for each verified responder, harvested
+    /// into the peer store off the critical path (`spawn_harvest`, called from
+    /// `discover_provider`).
+    probed_samples: Vec<(PublicKey, f64, u64)>,
+    /// The ways a candidate drops out, counted separately: the terminal error
+    /// has to name the one that actually happened. A wrong
+    /// `slash_judge_address` or `chain_id` makes EVERY honest node fail
+    /// verification, and reporting that as "nobody holds the blob" sends the
+    /// operator hunting for missing content instead of a local
+    /// misconfiguration; a node shedding this client's probe rate is
+    /// reachable, and reporting it as silent points at the network instead.
+    unreachable: usize,
+    rate_limited: usize,
+    unverifiable: usize,
+}
+
+impl ProbeTally {
+    fn of(outcomes: Vec<ProbeOutcome>) -> Self {
+        let mut tally = Self {
+            holders: Vec::new(),
+            non_holders: Vec::new(),
+            probed_samples: Vec::new(),
+            unreachable: 0,
+            rate_limited: 0,
+            unverifiable: 0,
+        };
+        for outcome in outcomes {
+            match outcome {
+                ProbeOutcome::Holder(holder, sample) => {
+                    tally.probed_samples.push(sample);
+                    tally.holders.push(holder);
+                }
+                ProbeOutcome::NonHolder(candidate, sample) => {
+                    tally.probed_samples.push(sample);
+                    tally.non_holders.push(candidate);
+                }
+                ProbeOutcome::Unreachable => tally.unreachable += 1,
+                ProbeOutcome::RateLimited => tally.rate_limited += 1,
+                ProbeOutcome::Unverifiable => tally.unverifiable += 1,
+                ProbeOutcome::Unusable => {}
+            }
+        }
+        tally
+    }
+}
+
+/// Verify `cand`'s probe result and classify it. Every response is verified
+/// before it can influence the order (ADR 014 §1). A failure is requester-local
+/// policy, with no reputation effect, because an unrecovered signature
+/// attributes nothing to anyone.
+fn classify_probe(
+    cand: &NodeCandidate,
+    res: anyhow::Result<(
+        decdn_protocol::message::ProbeResponse,
+        decdn_protocol::ProbeResponseExt,
+        f64,
+    )>,
+    hash: [u8; 32],
+    timestamp_us: u64,
+    slash_domain: &alloy::sol_types::Eip712Domain,
+) -> ProbeOutcome {
+    let (resp, resp_ext, rtt_ms) = match res {
+        Ok(answer) => answer,
+        Err(e) if probe_shed(&e) => return ProbeOutcome::RateLimited,
+        Err(_) => return ProbeOutcome::Unreachable,
+    };
+    if let Err(e) = decdn_client::probe::verify_probe_response(
+        &resp,
+        cand.eth_address,
+        slash_domain,
+        hash,
+        timestamp_us,
+    ) {
+        // A candidate silently vanishing from selection is exactly what the
+        // operator needs told, so log why at `warn`.
+        tracing::warn!(
+            "dropping an unverifiable probe response from {}: {e}",
+            cand.node_id
+        );
+        return ProbeOutcome::Unverifiable;
+    }
+    // #1506: `has_blob` and `coverage.is_empty()` are a biconditional by
+    // construction on an honest responder. Neither field is signed, and an
+    // inconsistency has no attributable author, so drop the candidate rather
+    // than score it.
+    if !resp_ext.consistent_with(resp.body.has_blob) {
+        tracing::warn!(
+            "dropping a probe response from {} with has_blob/coverage mismatch",
+            cand.node_id
+        );
+        return ProbeOutcome::Unusable;
+    }
+    // Every verified responder contributes a probe sample, holder or not.
+    let sample = (cand.node_id, rtt_ms, resp.body.rate_per_mb);
+    if resp.body.has_blob {
+        ProbeOutcome::Holder(
+            discovery::Probed {
+                candidate: cand.clone(),
+                rtt_ms,
+                total_bytes: resp_ext.total_bytes,
+                coverage: resp_ext.coverage,
+            },
+            sample,
+        )
+    } else {
+        ProbeOutcome::NonHolder(
+            discovery::WarmingCandidate {
+                node_id: cand.node_id,
+                eth_address: cand.eth_address,
+                rtt_ms,
+                multiaddrs: cand.multiaddrs.clone(),
+            },
+            sample,
+        )
+    }
+}
+
 /// Probe `candidates` for `hash` over `endpoint` and return the ordered
 /// provider-failover list (#1174, ADR 037 § Fallback): the sequence `fetch`
 /// tries in turn, each entry a fallback for the one before it, until one
@@ -496,6 +829,10 @@ fn probe_shed(err: &anyhow::Error) -> bool {
 /// every provider (ADR 003), so there is no per-provider "already funded"
 /// distinction to prefer.
 ///
+/// The round ends [`PROBE_SETTLE_AFTER_HOLDER`] after the first verified
+/// holder answers, or when every probe has answered. A holder the cutoff drops
+/// stays reachable through the fetch's later discovery.
+///
 /// The order is proxy-warming candidates first (nearest RTT first, ADR 037 §
 /// Client selection policy) when warming is enabled and engages, then the
 /// holders nearest RTT first. A caller that walks it therefore gets ADR 037's
@@ -506,14 +843,6 @@ fn probe_shed(err: &anyhow::Error) -> bool {
 /// When no candidate holds the blob, the order is instead the reachable
 /// non-holders, nearest RTT first, as pull-through serve targets — see
 /// [`failover_order`] for why an empty holder set bootstraps rather than fails.
-// One flat pass over the probe responses: verify, drop the inconsistent, split
-// holders from non-holders, then order. The branch count is that per-candidate
-// classification plus the `tracing` diagnostics on the drop and fallback arms.
-#[expect(
-    clippy::cognitive_complexity,
-    clippy::too_many_lines,
-    reason = "flat per-candidate classification pass, not nested control flow"
-)]
 pub(crate) async fn probe_and_order(
     endpoint: &Endpoint,
     candidates: &[NodeCandidate],
@@ -521,109 +850,42 @@ pub(crate) async fn probe_and_order(
     hash: [u8; 32],
     warming: ProxyWarmingParams,
     slash_domain: &alloy::sol_types::Eip712Domain,
+    round: ProbeRound,
 ) -> anyhow::Result<ResolvedTargets> {
     let timestamp_us = micros_now();
-    // Probe concurrently in one task. `probe_once`'s future is `Send`, so
-    // `tokio::spawn` would work too; `join_all` over a shared `&endpoint` is
-    // kept because it needs no per-probe clone. `probe_once`'s internal
-    // timeout bounds each leg; a candidate that sheds the probe is probed again
-    // after a short wait (`probe_candidate`).
-    let probes = candidates.iter().map(|cand| {
-        let target = probe_target(cand, relay_hint.cloned());
+    // Probe concurrently in one task. `probe_once`'s internal timeout bounds
+    // each leg; a candidate that sheds the probe is probed again after a short
+    // wait (`probe_candidate`). Each probe verifies and classifies its own
+    // answer, so the round ends only on a verified holder. Each probe owns its
+    // inputs, so a streamed round's pending probes outlive this call.
+    let started = std::time::Instant::now();
+    let probes = candidates.iter().cloned().map(|cand| {
+        let target = probe_target(&cand, relay_hint.cloned());
+        let endpoint = endpoint.clone();
+        let slash_domain = slash_domain.clone();
         async move {
-            (
-                cand,
-                probe_candidate(endpoint, target, hash, timestamp_us).await,
-            )
+            let res = probe_candidate(&endpoint, target, hash, timestamp_us).await;
+            log_probe_result(&cand, &res, started);
+            classify_probe(&cand, res, hash, timestamp_us, &slash_domain)
         }
     });
-    let results = futures_util::future::join_all(probes).await;
+    let (outcomes, tail) = settle_probes(
+        probes,
+        round.grace(),
+        round.cold_grace(),
+        ProbeOutcome::is_holder,
+        ProbeOutcome::is_answer,
+    )
+    .await;
 
-    let probe_count = results.len();
-    let mut holders = Vec::new();
-    // Probed bonded nodes that answered `has_blob:false` — reachable, with a
-    // measured RTT, but not holding the blob in their cache store. They serve
-    // two roles: the proxy-warming candidate pool (ADR 037 § Candidate pool)
-    // when a holder exists but is distant, and — when NO holder answers — the
-    // pull-through serve targets a cold blob's first fetch bootstraps from
-    // (#1911), since `has_blob:false` from the cache store does not mean the
-    // node cannot serve via its own origin. Always collected, because the second
-    // role does not depend on warming being on.
-    let mut non_holders: Vec<discovery::WarmingCandidate> = Vec::new();
-    // Four ways a candidate drops out, counted separately: the terminal error below
-    // has to name the one that actually happened. A wrong `slash_judge_address` or
-    // `chain_id` makes EVERY honest node fail verification, and reporting that as
-    // "nobody holds the blob" sends the operator hunting for missing content instead
-    // of a local misconfiguration; a node shedding this client's probe rate is
-    // reachable, and reporting it as silent points at the network instead.
-    let mut unreachable = 0usize;
-    let mut rate_limited = 0usize;
-    let mut unverifiable = 0usize;
-    // (node_id, rtt_ms, rate_per_mb) for each holder that answered a probe
-    // this fetch, harvested into the peer store off the critical path
-    // (spawn_harvest, called from discover_provider).
-    let mut probed_samples: Vec<(PublicKey, f64, u64)> = Vec::new();
-    for (cand, res) in results {
-        let (resp, resp_ext, rtt_ms) = match res {
-            Ok(answer) => answer,
-            Err(e) if probe_shed(&e) => {
-                rate_limited += 1;
-                continue;
-            }
-            Err(_) => {
-                unreachable += 1;
-                continue;
-            }
-        };
-        // Verify BEFORE the response can influence the order (ADR 014 §1). A
-        // failure is requester-local policy — drop it and move on, no reputation
-        // effect, because an unrecovered signature attributes nothing to anyone.
-        if let Err(e) = decdn_client::probe::verify_probe_response(
-            &resp,
-            cand.eth_address,
-            slash_domain,
-            hash,
-            timestamp_us,
-        ) {
-            // A candidate silently vanishing from selection is exactly what the
-            // operator needs told, so log why at `warn`.
-            unverifiable += 1;
-            tracing::warn!(
-                "dropping an unverifiable probe response from {}: {e}",
-                cand.node_id
-            );
-            continue;
-        }
-        // #1506: `has_blob` and `coverage.is_empty()` are a biconditional by
-        // construction on an honest responder — neither field is signed, and
-        // an inconsistency has no attributable author, so drop the candidate
-        // rather than score it (same reasoning as an unrecovered `slash_sig`
-        // above).
-        if !resp_ext.consistent_with(resp.body.has_blob) {
-            tracing::warn!(
-                "dropping a probe response from {} with has_blob/coverage mismatch",
-                cand.node_id
-            );
-            continue;
-        }
-        // Every verified responder contributes a probe sample, holder or not.
-        probed_samples.push((cand.node_id, rtt_ms, resp.body.rate_per_mb));
-        if resp.body.has_blob {
-            holders.push(discovery::Probed {
-                candidate: cand.clone(),
-                rtt_ms,
-                total_bytes: resp_ext.total_bytes,
-                coverage: resp_ext.coverage.clone(),
-            });
-        } else {
-            non_holders.push(discovery::WarmingCandidate {
-                node_id: cand.node_id,
-                eth_address: cand.eth_address,
-                rtt_ms,
-                multiaddrs: cand.multiaddrs.clone(),
-            });
-        }
-    }
+    let ProbeTally {
+        holders,
+        non_holders,
+        probed_samples,
+        unreachable,
+        rate_limited,
+        unverifiable,
+    } = ProbeTally::of(outcomes);
 
     // Terminal only when NOTHING can serve — no holder AND no reachable
     // non-holder to pull through. An empty holder set alone is not terminal: a
@@ -631,7 +893,7 @@ pub(crate) async fn probe_and_order(
     // state (#1911), so as long as one bonded node answered it is a serve target.
     if holders.is_empty() && non_holders.is_empty() {
         return Err(no_serve_target_error(
-            probe_count,
+            candidates.len(),
             unreachable,
             rate_limited,
             unverifiable,
@@ -642,14 +904,15 @@ pub(crate) async fn probe_and_order(
         // No cache holder, but reachable non-holders can serve via pull-through.
         // Log why the fetch is talking to nodes that answered `has_blob:false`.
         tracing::info!(
-            "no probed node holds the blob in cache; falling back to {} reachable bonded \
-             non-holder(s) as pull-through serve targets — a node serves an authorized miss \
-             from its own origin (#1911)",
+            "no node that has answered holds the blob in cache; starting on {} reachable \
+             bonded non-holder(s) as pull-through serve targets — a node serves an authorized \
+             miss from its own origin (#1911), and a holder that answers later joins the fetch",
             non_holders.len()
         );
     }
 
     let size_hint = nearest_size_hint(&holders);
+    let late = late_slot(round, tail, &holders, warming);
     let ordered = failover_order(holders, &non_holders, warming);
     if let Some((node_id, proxy_rtt, best_holder_rtt)) = ordered.warming_lead {
         tracing::info!(
@@ -664,7 +927,59 @@ pub(crate) async fn probe_and_order(
         probed_samples,
         pinned: false,
         size_hint,
+        late,
     })
+}
+
+/// A streamed round's pending probes as its [`LateSlot`], with the best RTT
+/// among the `holders` it returned. Empty for a settled round or an empty
+/// tail.
+///
+/// A task drives the probes from here on, so they keep running and timing
+/// while the fetch unlocks its signer and opens its pool before anything reads
+/// the tail. Their answers wait in a channel. The task stops when the tail
+/// stream is dropped, so no probe outlives the fetch that adopted it.
+fn late_slot<F>(
+    round: ProbeRound,
+    tail: futures_util::stream::FuturesUnordered<F>,
+    holders: &[discovery::Probed],
+    warming: ProxyWarmingParams,
+) -> LateSlot
+where
+    F: std::future::Future<Output = ProbeOutcome> + Send + 'static,
+{
+    use futures_util::StreamExt as _;
+    if round != ProbeRound::Stream || tail.is_empty() {
+        return LateSlot::default();
+    }
+    let best_holder_rtt_ms = holders
+        .iter()
+        .map(|h| h.rtt_ms)
+        .fold(f64::INFINITY, f64::min);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = AbortOnDrop(tokio::spawn(tail.for_each(move |outcome| {
+        // A send fails only once the tail stream is gone, which aborts this
+        // task too.
+        let _ = tx.send(outcome);
+        std::future::ready(())
+    })));
+    let answers = futures_util::stream::unfold((rx, task), |(mut rx, task)| async move {
+        rx.recv().await.map(|outcome| (outcome, (rx, task)))
+    });
+    LateSlot::new(LateProbes {
+        tail: Box::pin(answers),
+        best_holder_rtt_ms,
+        warming,
+    })
+}
+
+/// A task that is aborted when this handle drops.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// The size hint of the nearest holder that gave one: the fetch's first size
@@ -810,7 +1125,13 @@ async fn discover_provider(
     // same `args`, so they travel as `args` rather than as two more positional
     // parameters (clippy caps this function at 7).
     args: &cli::ClientFetchArgs,
+    probe: ProbeOpts<'_>,
 ) -> anyhow::Result<ResolvedTargets> {
+    let mark_probe_start = || {
+        if let Some(timings) = probe.timings {
+            timings.mark(Mark::ProbeStart);
+        }
+    };
     // Probe-less fast path: when the store already holds enough fresh,
     // unsuppressed candidates, skip the network probe round entirely and rank
     // by the store's own EWMA latency. Falls through to today's bootstrap +
@@ -843,8 +1164,17 @@ async fn discover_provider(
         if selected.len() >= store_cfg.min_fresh_candidates {
             let warming = ProxyWarmingParams::from_args(args);
             let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
-            let targets =
-                probe_and_order(endpoint, &selected, relay_hint, hash, warming, &slash_dom).await?;
+            mark_probe_start();
+            let targets = probe_and_order(
+                endpoint,
+                &selected,
+                relay_hint,
+                hash,
+                warming,
+                &slash_dom,
+                probe.round,
+            )
+            .await?;
             // Stats-only harvest, never identity — identity refreshes ONLY on a
             // real registry read (same reasoning as the `Bootstrap::Cached`
             // path): re-`upsert_identity` here would "confirm" identity against
@@ -890,8 +1220,17 @@ async fn discover_provider(
     let selected = select_with_widening(all, chain.region.as_deref(), allow, &store_cfg);
     let warming = ProxyWarmingParams::from_args(args);
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
-    let targets =
-        probe_and_order(endpoint, &selected, relay_hint, hash, warming, &slash_dom).await?;
+    mark_probe_start();
+    let targets = probe_and_order(
+        endpoint,
+        &selected,
+        relay_hint,
+        hash,
+        warming,
+        &slash_dom,
+        probe.round,
+    )
+    .await?;
     // Identity is harvested ONLY against a live registry read, and
     // `resolve_bootstrap` already does that: on a `Bootstrap::Live` read it
     // upserts+prunes identity for every returned node. So the harvest here
@@ -964,6 +1303,7 @@ fn store_fast_path(
         probed_samples: Vec::new(),
         pinned: false,
         size_hint: None,
+        late: LateSlot::default(),
     })
 }
 
@@ -1160,6 +1500,7 @@ pub(crate) fn holders_or_none(
                 probed_samples: Vec::new(),
                 pinned: false,
                 size_hint: None,
+                late: LateSlot::default(),
             })
         }
     }
@@ -1185,6 +1526,9 @@ pub(crate) struct ResolvedTargets {
     /// ([`discovery::Probed::total_bytes`]). `None` when nothing was probed
     /// (a pinned `--node-id`, the peer-store fast path) or no holder knew it.
     pub(crate) size_hint: Option<u64>,
+    /// The probes a streamed round left pending ([`ProbeRound::Stream`]).
+    /// Empty on every other path.
+    pub(crate) late: LateSlot,
 }
 
 /// The one holder of a pinned `--node-id` at `provider`. Nothing was probed,
@@ -1207,6 +1551,7 @@ fn pinned_targets(node_id: PublicKey, provider: Address) -> ResolvedTargets {
         pinned: true,
         // Nothing was probed, so the first claim comes from a header.
         size_hint: None,
+        late: LateSlot::default(),
     }
 }
 
@@ -1215,13 +1560,15 @@ fn pinned_targets(node_id: PublicKey, provider: Address) -> ResolvedTargets {
 /// when `--node-id` is omitted (deriving each provider from its node's registry
 /// entry), nearest first. The acquire loop stripes across them; a set that goes
 /// stale is refreshed by a later discovery with `--rediscover` forced, which
-/// reads the registry rather than the peer store.
+/// reads the registry rather than the peer store. `probe` says where the probe
+/// round's start is recorded and how the round ends.
 pub(crate) async fn resolve_target_node(
     args: &cli::ClientFetchArgs,
     chain: &ResolvedChain,
     endpoint: &Endpoint,
     relays: &[RelayUrl],
     hash: [u8; 32],
+    probe: ProbeOpts<'_>,
 ) -> anyhow::Result<ResolvedTargets> {
     if let Some(raw) = &args.node_id {
         // No reachability pre-check: the endpoint is discovery-enabled, so a
@@ -1259,8 +1606,16 @@ pub(crate) async fn resolve_target_node(
     // here also cancels the ADR 012 § Bootstrap step 4 peer-store fallback,
     // so a client with a usable peer store would be handed a hard failure
     // instead of the degraded-but-working fetch the store exists to provide.
-    let order =
-        discover_provider(endpoint, chain, capacity_bond, relays.first(), hash, args).await?;
+    let order = discover_provider(
+        endpoint,
+        chain,
+        capacity_bond,
+        relays.first(),
+        hash,
+        args,
+        probe,
+    )
+    .await?;
     if !order.candidates.is_empty() {
         // A header event, then one event per candidate — the log-side shape of
         // the previous per-line stderr listing.
@@ -1390,9 +1745,10 @@ pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext)
 ///
 /// A drive persists its lanes' voucher watermarks after it returns. A dropped
 /// drive never gets there, so this guard runs `settle` from its `Drop` instead:
-/// the lanes' paid bytes are recorded, at the armed (HIGH) settlement, and the
-/// next run's vouchers continue from them. A drive that returns calls
-/// [`Self::disarm`] and settles on its normal path.
+/// the lanes' paid bytes are queued for recording, at the armed (HIGH)
+/// settlement ([`queue_face_watermarks`]), and the next run's vouchers continue
+/// from them. A drive that returns calls [`Self::disarm`] and settles on its
+/// normal path.
 pub(crate) struct SettleOnDrop<F: FnOnce()> {
     /// The settle to run on drop; `None` once disarmed.
     settle: Option<F>,
@@ -1483,6 +1839,7 @@ fn persist_watermark(
 /// [`Interrupted`] on Ctrl-C, [`decdn_client::GaveUp`] once the stop policy's
 /// no-progress limit passes, or the fault that ended the fetch.
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+    let timings = FetchTimings::start();
     let hash = parse_hash(&args.hash)?;
     let common = &args.common;
     // Before any network or keystore work, reject a flag combination clap
@@ -1506,20 +1863,39 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // The buyer-pool store, opened once and recorded into by open-or-reuse.
     // The guard runs here, before the keystore password prompt: the answer
     // depends only on the data dir, and a refusal must not cost a prompt first.
-    let store = open_client_store_for_buy(&chain.data_dir, chain.data_dir_source, "fetch")?;
+    // Shared, so a lane's watermark write runs off the runtime thread.
+    let store = Arc::new(open_client_store_for_buy(
+        &chain.data_dir,
+        chain.data_dir_source,
+        "fetch",
+    )?);
 
     // One discovery-enabled endpoint, reused for probing and the delivery dial.
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
+    timings.mark(Mark::Endpoint);
     // The body runs in `fetch_over`, so the endpoint closes on every exit —
     // success, an early return, an error, or a Ctrl-C — and its open connections
     // end cleanly instead of being aborted on drop. A Ctrl-C drops `fetch_over`
-    // mid-transfer: each drive's drop guard records what it paid, and the
-    // `.partial` is the next run's resume prefix.
+    // mid-transfer: each drive's drop guard queues what it paid for recording,
+    // and the `.partial` is the next run's resume prefix.
     let mut interrupt = Interrupt::watch();
+    // The command's peer-record and watermark writes, off the runtime thread.
+    let writes = OrderedWrites::default();
     let result = tokio::select! {
-        result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint) => result,
+        result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint, &writes, &timings) => {
+            result
+        }
         () = interrupt.wait() => Err(Interrupted.into()),
     };
+    let output = if wants_stdout(&args.output) {
+        "stdout"
+    } else {
+        "file"
+    };
+    timings.log(output, result.is_ok());
+    // On every exit, a Ctrl-C's included: what the drives queued is durable
+    // before the command returns.
+    writes.settle().await;
     endpoint.close().await;
     result
 }
@@ -1536,22 +1912,30 @@ pub(crate) const STALL_WINDOW: Duration = Duration::from_secs(30);
 /// ends on done, a fault only the user can fix, or the stop policy: a
 /// terminal waits for Ctrl-C, a script gives up after 10 minutes
 /// without progress, and `--give-up-after-secs` overrides both.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn fetch_over(
     args: &cli::FetchArgs,
     hash: [u8; 32],
     relays: &[RelayUrl],
     chain: &ResolvedChain,
     grant: Option<CapabilityGrant>,
-    store: &RedbBuyerPoolStore,
+    store: &Arc<RedbBuyerPoolStore>,
     endpoint: &Endpoint,
+    writes: &OrderedWrites,
+    timings: &FetchTimings,
 ) -> anyhow::Result<()> {
     let common = &args.common;
     // The holders to start from: the explicit `--node-id`, or auto-discovery.
     // Only a configuration fault ends the fetch here; with no holder yet, the
-    // first open discovers them.
+    // first open discovers them. The round streams: the fetch starts at the
+    // first verified holder, and the holders that answer later join it.
+    let probe = ProbeOpts {
+        timings: Some(timings),
+        round: ProbeRound::Stream,
+    };
     let resolved =
-        holders_or_none(resolve_target_node(common, chain, endpoint, relays, hash).await)?;
+        holders_or_none(resolve_target_node(common, chain, endpoint, relays, hash, probe).await)?;
+    timings.mark(Mark::Resolved);
 
     // Buyer signer (vouchers + the openPool/topUp tx). Loaded after selection so a
     // failed discovery never prompts for a keystore password. Password from env,
@@ -1565,6 +1949,7 @@ async fn fetch_over(
     )?
     .into_secret();
     let signer = Arc::new(load_signer(&chain.keystore, &password)?);
+    timings.mark(Mark::Unlocked);
     let self_address = signer.address();
 
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
@@ -1601,6 +1986,7 @@ async fn fetch_over(
     // One connection per node for the whole fetch: every lane and leg opens
     // its streams on it.
     let connections = Connections::new(endpoint.clone());
+    let funding = RunFunding::default();
 
     // The shared pull/funding deps every lane borrows for the whole fetch.
     let deps = DriveFetchDeps {
@@ -1617,6 +2003,9 @@ async fn fetch_over(
         max_blob_bytes,
         deadlines,
         connections: &connections,
+        writes,
+        funding: &funding,
+        timings: Some(timings),
     };
 
     let clock = Arc::new(ProgressClock::new());
@@ -1642,8 +2031,9 @@ async fn fetch_over(
         None,
     );
     let holders = sources.holders_from(&resolved);
-    // A fetch dropped by Ctrl-C records every lane's vouchers too.
-    let on_drop = SettleOnDrop::new(|| sources.persist_watermarks());
+    timings.set_holders_start(holders.len());
+    // A fetch dropped by Ctrl-C queues every lane's vouchers for recording too.
+    let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
     let result = async {
         // The first size claim: the probe's hint, or a header-only open.
         let claim = sources.first_claim(hash, holders, &health, &stop).await?;
@@ -1678,7 +2068,10 @@ async fn fetch_over(
     }
     .await;
     on_drop.disarm();
-    sources.persist_watermarks();
+    sources.persist_watermarks().await;
+    if let Some(shortfall) = funding.shortfall() {
+        eprintln!("warning: {shortfall}");
+    }
     result.map_err(|err| sources.annotate(err))
 }
 
@@ -1735,7 +2128,9 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
 /// lanes. Every field is a borrow or a `Copy` scalar.
 pub(crate) struct DriveFetchDeps<'a, P> {
     pub(crate) endpoint: &'a Endpoint,
-    pub(crate) store: &'a RedbBuyerPoolStore,
+    /// Shared, so a lane's watermark write runs on the blocking pool
+    /// ([`queue_face_watermarks`]).
+    pub(crate) store: &'a Arc<RedbBuyerPoolStore>,
     pub(crate) contract: &'a PaymentPool::PaymentPoolInstance<P>,
     pub(crate) rpc: &'a P,
     pub(crate) slash_dom: &'a Eip712Domain,
@@ -1751,6 +2146,15 @@ pub(crate) struct DriveFetchDeps<'a, P> {
     /// The command's one connection per node, shared by every lane of every
     /// fetch the command runs.
     pub(crate) connections: &'a Connections,
+    /// The command's peer-record and watermark writes, run off the runtime
+    /// thread in queue order across every fetch the command runs. Every
+    /// ordered state write of a fetch goes through it.
+    pub(crate) writes: &'a OrderedWrites,
+    /// The run's funding facts, shared by every lane build and top-up of the
+    /// run ([`RunFunding`]).
+    pub(crate) funding: &'a RunFunding,
+    /// The `decdn fetch` time-to-first-byte marks; `None` for a `bundle pull`.
+    pub(crate) timings: Option<&'a FetchTimings>,
 }
 
 /// The lane's shared ledger + context: from the run registry when bundle pull
@@ -1870,7 +2274,7 @@ pub(crate) async fn build_multi_lane<'a, P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let ctx = {
+    let (ctx, spend) = {
         // Bundle pull funnels every entry — and every lane of a multi-source
         // entry — through the one shared `PaymentPool` deposit, so the
         // open-or-reuse serializes across the whole bundle. The delegated path
@@ -1892,24 +2296,28 @@ where
             deps.self_address,
             deps.chain,
             deps.endpoint,
+            deps.funding,
         )
         .await?
     };
     let pool_id = ctx.pool_id;
     let prior_amount = ctx.prior_amount;
+    let lane = LaneKey {
+        pool_id,
+        signer: deps.self_address,
+        provider,
+    };
     // The lane's ledger + context, seeded from its persisted `(signer,
     // provider)` cumulative so the first voucher continues the lane (a restart
     // from zero is rejected as a regression) — from the run registry when
     // `ledgers` is `Some`, else a fresh pair.
-    let (ledger, ctx) = lane_ledger(
-        ledgers,
-        LaneKey {
-            pool_id,
-            signer: deps.self_address,
-            provider,
-        },
-        ctx,
-    );
+    let (ledger, ctx) = lane_ledger(ledgers, lane, ctx);
+    // The run's view of the pool's spend counts this lane through its ledger
+    // from now on, whether or not the acquire loop ever starts it. A delegated
+    // lane draws on a pool this caller does not own, and joins nothing.
+    if let Some(spend) = spend {
+        deps.funding.join_lane(lane, spend, &ledger);
+    }
     let source = lane_source(
         deps,
         target,
@@ -1917,6 +2325,9 @@ where
         Arc::clone(&ledger),
         provider,
     );
+    if let Some(timings) = deps.timings {
+        timings.mark(Mark::Lane);
+    }
     Ok(MultiLane {
         provider,
         pool_id,
@@ -1970,13 +2381,30 @@ pub(crate) struct FaceLaneHandle {
 /// The per-lane [`LaneWatermark`]s to persist after a face fetch, read from the
 /// retained [`FaceLaneHandle`]s — the same settle-at-armed-cumulative rule
 /// [`multi_lane_watermarks`] then keys for persistence.
+///
+/// One watermark per ledger: a lane rebuilt on the run's shared ledger leaves a
+/// second handle on it, and the first read takes the ledger's unsaved rebase,
+/// so a second write for it would only repeat the first. Each rebuild read its
+/// own baseline from the store, and a sibling entry's rebase can have moved
+/// that baseline down since the first build, so the watermark takes the lowest
+/// one: the advance past it still persists.
 fn stream_lane_watermarks(lanes: &[FaceLaneHandle]) -> Vec<LaneWatermark> {
-    lanes
-        .iter()
-        .map(|l| LaneWatermark {
+    let mut per_ledger: Vec<(&FaceLaneHandle, U256)> = Vec::new();
+    for l in lanes {
+        match per_ledger
+            .iter_mut()
+            .find(|(first, _)| Arc::ptr_eq(&first.ledger, &l.ledger))
+        {
+            Some((_, prior)) => *prior = (*prior).min(l.prior_amount),
+            None => per_ledger.push((l, l.prior_amount)),
+        }
+    }
+    per_ledger
+        .into_iter()
+        .map(|(l, prior_amount)| LaneWatermark {
             pool_id: l.pool_id,
             provider: l.provider,
-            prior_amount: l.prior_amount,
+            prior_amount,
             // Taken before the settlement read, so the settlement is at or above it.
             rebase_anchor: l.ledger.take_unsaved_rebase(),
             settlement: l.ledger.settlement(),
@@ -2027,18 +2455,69 @@ where
     Ok(drained)
 }
 
-/// Persist every face lane's voucher watermark from the retained handles — the
-/// same settle-at-armed-cumulative rule the file path applies. The faces do not
-/// persist, so the thin CLI layer does it after the fetch, before surfacing any
-/// error: the bytes each lane delivered are paid for whatever the outcome.
-pub(crate) fn persist_face_watermarks(
-    store: &RedbBuyerPoolStore,
-    self_address: Address,
-    handles: &[FaceLaneHandle],
-) {
-    for (lane, vprogress) in multi_lane_watermarks(self_address, &stream_lane_watermarks(handles)) {
+/// One lane's buyer-store watermark write: the lane and the progress to record.
+type LaneWrite = (LaneKey, VoucherProgress);
+
+/// The watermark write every face lane calls for, read from the retained
+/// handles now — the same settle-at-armed-cumulative rule the file path
+/// applies, one write per lane ledger.
+fn face_watermark_writes(self_address: Address, handles: &[FaceLaneHandle]) -> Vec<LaneWrite> {
+    multi_lane_watermarks(self_address, &stream_lane_watermarks(handles))
+}
+
+/// Apply every write in `writes`. Blocking: each write that moves the row is a
+/// redb commit.
+fn write_watermarks(store: &RedbBuyerPoolStore, self_address: Address, writes: Vec<LaneWrite>) {
+    for (lane, vprogress) in writes {
         persist_watermark(store, self_address, lane.pool_id, lane, &vprogress);
     }
+}
+
+/// Read every face lane's voucher watermark from its ledger now
+/// ([`face_watermark_writes`]), queue the writes on the command's ordered
+/// `writes`, and return a receiver that resolves once they land. The faces do
+/// not persist, so the thin CLI layer does it after the fetch, before surfacing
+/// any error: the bytes each lane delivered are paid for whatever the outcome.
+///
+/// Each write that moves the row is a durable redb commit, and a `bundle
+/// pull`'s lanes share the caller's task, so a commit inline would stop every
+/// lane of the run while it syncs (#2211). The queue keeps the writes in the
+/// order the ledgers were read, across every entry: a rebase replaces the lane
+/// row outright, so a rebase landing after a newer advance, or a stale advance
+/// landing after a rebase, would leave the next run signing from the wrong
+/// progress. The read and the queueing are one synchronous call for that
+/// reason, and the order holds only while every caller polls on one task, as
+/// a fetch and a `bundle pull` do.
+///
+/// A drop guard, which cannot wait, drops the receiver. The command then waits
+/// for the queue before it returns ([`OrderedWrites::settle`]), on a Ctrl-C
+/// too. A second Ctrl-C exits the process at once, and a write still queued or
+/// running then is lost; the next run may re-sign a stale watermark, which its
+/// provider rejects. A runtime that shuts down cancels blocking tasks that have
+/// not started, and the queue then drains on the shutting-down thread.
+pub(crate) fn queue_face_watermarks(
+    writes: &OrderedWrites,
+    store: &Arc<RedbBuyerPoolStore>,
+    self_address: Address,
+    handles: &[FaceLaneHandle],
+) -> tokio::sync::oneshot::Receiver<()> {
+    queue_watermark_writes(
+        writes,
+        store,
+        self_address,
+        face_watermark_writes(self_address, handles),
+    )
+}
+
+/// Queue `lane_writes` on `writes` ([`queue_face_watermarks`]).
+fn queue_watermark_writes(
+    writes: &OrderedWrites,
+    store: &Arc<RedbBuyerPoolStore>,
+    self_address: Address,
+    lane_writes: Vec<LaneWrite>,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let store = Arc::clone(store);
+    writes.queue_awaitable(move || write_watermarks(&store, self_address, lane_writes))
 }
 
 /// Stream `hash`'s verified bytes to STDOUT via the [`Streamer`] consumption face
@@ -2094,8 +2573,18 @@ where
     // The bar draws on stderr, so it shows only when stderr is a terminal; stdout
     // carries the verified bytes either way.
     let bar = std::io::IsTerminal::is_terminal(&std::io::stderr()).then(delivery_progress);
-    let on_progress: Option<&dyn Fn(u64, u64)> =
-        bar.as_ref().map(|(_, cb, _)| cb as &dyn Fn(u64, u64));
+    // `copy_verified` reports after each write, so the first report with a
+    // byte is the first byte on stdout.
+    let on_progress = |received: u64, expected: u64| {
+        if received > 0
+            && let Some(timings) = deps.timings
+        {
+            timings.mark(Mark::FirstByte);
+        }
+        if let Some((_, cb, _)) = &bar {
+            cb(received, expected);
+        }
+    };
 
     // The drive runs beside the copy, not inside its reads: a blocked stdout
     // must not stop an open paid leg from paying and draining. The read-ahead
@@ -2106,7 +2595,7 @@ where
             &mut reader,
             &mut stdout,
             total_bytes,
-            on_progress,
+            Some(&on_progress),
         ))
         .await;
 
@@ -2144,7 +2633,15 @@ async fn download_to_file<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let (bar, on_progress, meter) = delivery_progress();
+    let (bar, on_bar, meter) = delivery_progress();
+    let on_progress = |received: u64, expected: u64| {
+        if received > 0
+            && let Some(timings) = deps.timings
+        {
+            timings.mark(Mark::FirstByte);
+        }
+        on_bar(received, expected);
+    };
     let downloader = Downloader::new(
         sources,
         holders,
@@ -2188,10 +2685,11 @@ struct LaneWatermark {
 /// Every lane settles at its ARMED cumulative rather than branching on the
 /// fetch's outcome. The fetch result is ONE outcome shared by
 /// every lane, but "did this lane's last voucher land?" is a PER-LANE question,
-/// and on the multi-source path a successful fetch routinely leaves a lane
-/// armed-above-committed: a tail steal drops the victim's `fill_gap` future
-/// wherever it is parked, including inside the voucher exchange that `issue`
-/// deliberately arms before sending. Settling that lane at `committed` on the
+/// and on the multi-source path a successful fetch can leave a lane
+/// armed-above-committed: a cancelled or stalled leg drops its `fill_gap`
+/// future wherever it is parked, including inside the voucher exchange that
+/// `issue` deliberately arms before sending, and a leg stopped at a steal
+/// split keeps a closing voucher that failed to send armed. Settling that lane at `committed` on the
 /// fetch's `Ok` persists a cumulative BELOW what the node can redeem, and the
 /// next fetch on that lane signs a cumulative the upstream already holds —
 /// rejected as a regression.
@@ -2218,10 +2716,184 @@ fn multi_lane_watermarks(
         .collect()
 }
 
+/// What the lane builds of one run learn about funding its pool, shared by
+/// every fetch of the run: one `decdn fetch`, or every entry of a `bundle pull`.
+///
+/// It holds two facts. The first is the pool's spend across every lane: a
+/// baseline for the lanes the run does not drive, plus what each lane the run
+/// built has committed since. The deposit gate reads it
+/// ([`Funder::pool_spent`]), so a pool shared across many providers gates on its
+/// true remaining deposit whichever lanes the acquire loop starts. The second
+/// is a wallet that holds too little USDC to top the pool up: once seen, no
+/// later lane build of the run tries the proactive refill again, a reactive
+/// top-up fails without a transaction, and the command ends with one
+/// `warning:` line naming it.
+#[derive(Debug, Default)]
+pub(crate) struct RunFunding {
+    spend: Mutex<RunSpend>,
+    shortfall: Mutex<Option<String>>,
+}
+
+/// What a lane build learned about the pool's spend, for
+/// [`RunFunding::join_lane`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LaneSpend {
+    /// The pool's spend on every other lane, as the build saw it.
+    pub(crate) outside: U256,
+    /// The amount the lane resumes from.
+    pub(crate) prior: U256,
+    /// Whether the pool row recorded the lane before this build seeded it from
+    /// chain, so that an earlier lane's `outside` counts its prior.
+    pub(crate) recorded: bool,
+    /// Whether `outside` includes redeemed spend no tracked lane accounts for
+    /// ([`BuyerPoolState::redeemed_elsewhere`], from an adopted row's
+    /// `totalRedeemed`), which counts the watermark of every lane the row has
+    /// not seeded.
+    pub(crate) from_chain: bool,
+}
+
+/// The pool's spend as a run's lanes join it.
+#[derive(Debug, Default)]
+struct RunSpend {
+    /// The spend on lanes the run does not drive. `None` until the first lane
+    /// joins.
+    baseline: Option<U256>,
+    /// Whether the first lane's `outside` came from the chain.
+    from_chain: bool,
+    /// Every ledger each joined lane has paid through. A lane rebuilt with a
+    /// fresh ledger keeps its earlier ones: vouchers on a lane are cumulative,
+    /// so the lane's spend is the largest of them.
+    lanes: HashMap<LaneKey, Vec<Arc<PoolLedger>>>,
+}
+
+impl RunFunding {
+    /// Record that `lane` joins the run, paying through `ledger`.
+    ///
+    /// The first lane sets the baseline to its `outside`. Each later lane
+    /// moves its prior out of the baseline when the baseline counts it: when
+    /// the row recorded the lane, or when the baseline came from the chain. Its
+    /// ledger counts that amount from now on. A lane that has joined before
+    /// only adds `ledger`, if it is a new one.
+    pub(crate) fn join_lane(&self, lane: LaneKey, spend: LaneSpend, ledger: &Arc<PoolLedger>) {
+        let mut run = self.spend.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(ledgers) = run.lanes.get_mut(&lane) {
+            if !ledgers.iter().any(|known| Arc::ptr_eq(known, ledger)) {
+                ledgers.push(Arc::clone(ledger));
+            }
+            return;
+        }
+        run.lanes.insert(lane, vec![Arc::clone(ledger)]);
+        run.baseline = Some(match run.baseline {
+            None => {
+                run.from_chain = spend.from_chain;
+                spend.outside
+            }
+            Some(baseline) if spend.recorded || run.from_chain => {
+                baseline.saturating_sub(spend.prior)
+            }
+            Some(baseline) => baseline,
+        });
+    }
+
+    /// The pool's spend across every lane: the baseline plus each joined
+    /// lane's committed amount. `None` before any lane joins.
+    pub(crate) fn pool_spent(&self) -> Option<U256> {
+        let run = self.spend.lock().unwrap_or_else(PoisonError::into_inner);
+        let baseline = run.baseline?;
+        Some(run.lanes.values().fold(baseline, |total, ledgers| {
+            let lane = ledgers
+                .iter()
+                .map(|ledger| ledger.committed().amount)
+                .max()
+                .unwrap_or(U256::ZERO);
+            total.saturating_add(lane)
+        }))
+    }
+
+    /// The warning for a wallet seen to hold too little USDC for a top-up in
+    /// this run, if one was.
+    pub(crate) fn shortfall(&self) -> Option<String> {
+        self.shortfall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Diagnose a failed top-up leg (`err`) for `pool_id` by reading the
+    /// wallet's USDC balance. When the wallet holds less than `additional`,
+    /// which no retry fixes, record the shortfall and return its warning; it
+    /// is logged at WARN the first time. Otherwise return `None`, after a WARN
+    /// that names the failure, the balance, or why the balance could not be
+    /// read.
+    pub(crate) async fn check_wallet<P>(
+        &self,
+        rpc: &P,
+        token: Address,
+        owner: Address,
+        pool_id: PoolId,
+        additional: U256,
+        err: &anyhow::Error,
+    ) -> Option<String>
+    where
+        P: alloy::providers::Provider + Clone,
+    {
+        let error = decdn_common::redact::sanitize_err_chain(err);
+        let balance = match decdn_incentive::Erc20::new(token, rpc.clone())
+            .balanceOf(owner)
+            .call()
+            .await
+        {
+            Ok(balance) => balance,
+            Err(read) => {
+                let read = decdn_common::redact::sanitize_err_chain(&anyhow::Error::new(read));
+                tracing::warn!(
+                    %pool_id,
+                    %additional,
+                    %error,
+                    wallet_usdc_error = %read,
+                    "buyer pool top-up failed, and the wallet's USDC balance could not be read"
+                );
+                return None;
+            }
+        };
+        if balance >= additional {
+            tracing::warn!(
+                %pool_id,
+                %additional,
+                wallet_usdc = %balance,
+                %error,
+                "buyer pool top-up failed although the wallet holds enough USDC"
+            );
+            return None;
+        }
+        let warning = format!(
+            "wallet {owner} holds {balance} µUSDC, less than the {additional} µUSDC top-up \
+             buyer pool {pool_id} needs; fund the wallet so the pool can be topped up"
+        );
+        let mut shortfall = self
+            .shortfall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if shortfall.is_none() {
+            tracing::warn!(
+                %pool_id,
+                %additional,
+                wallet_usdc = %balance,
+                %error,
+                "the wallet holds too little USDC to top up the buyer pool"
+            );
+            *shortfall = Some(warning.clone());
+        }
+        Some(warning)
+    }
+}
+
 /// The CLI's [`Funder`]: a mid-fetch reactive top-up runs the same
-/// `ensure_allowance -> top_up -> add_deposit` path `open_or_reuse_pool`'s
-/// proactive low-water refill runs, now behind the driver's injected [`Funder`]
-/// seam so the gap driver stays chain-handle-agnostic. The driver decides
+/// `ensure_allowance -> top_up -> add_deposit` path as the proactive low-water
+/// refill ([`refill_if_low`]), behind the driver's [`Funder`] seam so the gap
+/// driver stays chain-handle-agnostic. Unlike the proactive refill, every
+/// failure here returns to the driver, which rules it unaffordable or, when the
+/// escrow may have moved, fatal. The driver decides
 /// WHETHER to fund (its pacer confirms a genuine, ledger-corroborated
 /// exhaustion and that budget/attempts remain); this only executes the
 /// on-chain move and returns the [`DepositOutcome`] for the driver to credit.
@@ -2242,6 +2914,9 @@ pub(crate) struct CliFunder<'a, P> {
     pub(crate) token: Address,
     pub(crate) payment_pool_addr: Address,
     pub(crate) max_approve: bool,
+    /// The run's funding facts: its outside spend, and a wallet shortfall that
+    /// makes a further top-up pointless.
+    pub(crate) funding: &'a RunFunding,
 }
 
 impl<P> Funder for CliFunder<'_, P>
@@ -2252,28 +2927,57 @@ where
         decdn_client::MAX_TOPUP_ATTEMPTS
     }
 
+    fn pool_spent(&self) -> Option<U256> {
+        self.funding.pool_spent()
+    }
+
     fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
         Box::pin(async move {
             let pool_id =
                 self.pool_id.get().copied().ok_or_else(|| {
                     anyhow::anyhow!("no payment lane is built, so no pool to top up")
                 })?;
+            if let Some(shortfall) = self.funding.shortfall() {
+                return Err(
+                    anyhow::anyhow!("the wallet cannot fund a top-up: {shortfall}")
+                        .context(WalletShortfall),
+                );
+            }
             // `topUp` pulls `additional` USDC via `transferFrom`, so the
             // standing allowance must cover it first: unlimited under
             // `--max-approve`, else exactly `additional`.
-            ensure_allowance(
-                self.rpc,
-                self.token,
-                self.owner,
-                self.payment_pool_addr,
-                if self.max_approve {
-                    None
-                } else {
-                    Some(additional)
-                },
-            )
-            .await?;
-            let ToppedUpPool { credited, tx } = top_up(self.contract, pool_id, additional).await?;
+            let escrowed = async {
+                ensure_allowance(
+                    self.rpc,
+                    self.token,
+                    self.owner,
+                    self.payment_pool_addr,
+                    if self.max_approve {
+                        None
+                    } else {
+                        Some(additional)
+                    },
+                )
+                .await?;
+                top_up(self.contract, pool_id, additional).await
+            }
+            .await;
+            // A failure before any receipt names its cause once: a wallet
+            // short of USDC is recorded for the run's closing warning.
+            let ToppedUpPool { credited, tx } = match escrowed {
+                Ok(topped_up) => topped_up,
+                Err(err) if err.downcast_ref::<TopUpUnconfirmed>().is_some() => return Err(err),
+                Err(err) => {
+                    let short = self
+                        .funding
+                        .check_wallet(self.rpc, self.token, self.owner, pool_id, additional, &err)
+                        .await;
+                    return Err(match short {
+                        Some(_) => err.context(WalletShortfall),
+                        None => err,
+                    });
+                }
+            };
             // Grade here rather than handing the escrowed-but-untracked
             // outcomes back for the driver to bail on. The driver treats them
             // as terminal either way, but `DepositOutcome` has nowhere to carry
@@ -2564,7 +3268,8 @@ async fn build_ctx_for_fetch<P>(
     self_address: Address,
     chain: &ResolvedChain,
     endpoint: &Endpoint,
-) -> anyhow::Result<PoolContext>
+    funding: &RunFunding,
+) -> anyhow::Result<(PoolContext, Option<LaneSpend>)>
 where
     P: alloy::providers::Provider + Clone,
 {
@@ -2581,6 +3286,7 @@ where
             grant,
         )
         .await
+        .map(|ctx| (ctx, None))
     } else {
         build_pool_ctx(
             store,
@@ -2591,8 +3297,10 @@ where
             self_address,
             chain,
             endpoint,
+            funding,
         )
         .await
+        .map(|(ctx, spend)| (ctx, Some(spend)))
     }
 }
 
@@ -2617,14 +3325,16 @@ async fn build_pool_ctx<P>(
     self_address: Address,
     chain: &ResolvedChain,
     endpoint: &Endpoint,
-) -> anyhow::Result<PoolContext>
+    funding: &RunFunding,
+) -> anyhow::Result<(PoolContext, LaneSpend)>
 where
     P: alloy::providers::Provider + Clone,
 {
-    let ctx = open_or_reuse_pool(
+    let (ctx, spend) = open_or_reuse_pool(
         store,
         contract,
         rpc,
+        funding,
         signer,
         provider,
         self_address,
@@ -2636,7 +3346,7 @@ where
         ChainAdoption::for_buy(&chain.data_dir, &chain.keystore)?,
     )
     .await?;
-    attach_client_binding(ctx, chain, endpoint, signer)
+    Ok((attach_client_binding(ctx, chain, endpoint, signer)?, spend))
 }
 
 /// Reject a delegated fetch whose loaded key is not the signer the capability
@@ -2765,8 +3475,8 @@ pub(crate) fn attach_client_binding(
 
 /// Adopt the live pool `owner` already holds on `deployment`, recording it in
 /// the client store, or return `None` if the chain lists no `Open` pool with
-/// deposit left to spend. The adopted row comes back with the pool's
-/// `totalRedeemed`, which the row itself does not carry.
+/// deposit left to spend. The adopted row carries the pool's `totalRedeemed`
+/// as [`BuyerPoolState::redeemed_elsewhere`].
 ///
 /// The node adopts by the same rule at bootstrap (the newest `Open`, solvent
 /// pool); the client does it on demand, because a client is a one-shot process
@@ -2782,7 +3492,7 @@ async fn adopt_owned_pool<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     owner: Address,
     deployment: Deployment,
-) -> anyhow::Result<Option<(BuyerPoolState, U256)>>
+) -> anyhow::Result<Option<BuyerPoolState>>
 where
     P: alloy::providers::Provider + Clone,
 {
@@ -2797,7 +3507,16 @@ where
         contract.usdc().call().await.with_context(|| {
             format!("read PaymentPool.usdc() while adopting live pool {pool_id}")
         })?;
-    let state = BuyerPoolState::new(pool_id, deployment, owner, token, U256::from(pool.deposit));
+    // The row has no lanes to account for what the pool already paid out, so it
+    // keeps `totalRedeemed`, less what each lane it seeds takes over.
+    let state = BuyerPoolState::adopt(
+        pool_id,
+        deployment,
+        owner,
+        token,
+        U256::from(pool.deposit),
+        U256::from(pool.totalRedeemed),
+    );
     store.record(&state).with_context(|| {
         format!(
             "found live pool {pool_id} on chain but could not record it in the local buyer \
@@ -2811,7 +3530,7 @@ where
         "adopted a live buyer pool this wallet already owns on chain, instead of opening a \
          second one"
     );
-    Ok(Some((state, U256::from(pool.totalRedeemed))))
+    Ok(Some(state))
 }
 
 /// The on-chain `(bytes, amount)` watermark for `lane` — what a lane with no
@@ -2863,9 +3582,11 @@ where
 /// escrowing a second deposit beside it, which reverts when the wallet's
 /// remaining USDC cannot cover it.
 ///
-/// The second value is the adopted pool's `totalRedeemed`, and zero for a
-/// tracked row. An adopted row has no lanes to account for what the pool has
-/// paid out, and without this the refill decision reads a pool other lanes
+/// An adopted row carries the pool's `totalRedeemed` as
+/// [`BuyerPoolState::redeemed_elsewhere`], and keeps the part no seeded lane
+/// has taken over on every later run.
+/// The row has no lanes to account for what the pool paid out before
+/// adoption, and without it the refill decision reads a pool other lanes
 /// drained as a full deposit: no top-up fires, and the provider refuses the
 /// fetch on a balance the client believes it has.
 async fn pool_to_reuse<P>(
@@ -2874,7 +3595,7 @@ async fn pool_to_reuse<P>(
     self_address: Address,
     deployment: Deployment,
     adoption: ChainAdoption,
-) -> anyhow::Result<(Option<BuyerPoolState>, U256)>
+) -> anyhow::Result<Option<BuyerPoolState>>
 where
     P: alloy::providers::Provider + Clone,
 {
@@ -2895,98 +3616,170 @@ where
         None => None,
     };
     Ok(match (tracked, adoption) {
-        (Some(state), _) => (Some(state), U256::ZERO),
-        (None, ChainAdoption::Refused) => (None, U256::ZERO),
+        (Some(state), _) => Some(state),
+        (None, ChainAdoption::Refused) => None,
         (None, ChainAdoption::Allowed) => {
-            match adopt_owned_pool(store, contract, self_address, deployment).await? {
-                Some((state, redeemed)) => (Some(state), redeemed),
-                None => (None, U256::ZERO),
-            }
+            adopt_owned_pool(store, contract, self_address, deployment).await?
         }
     })
 }
 
-/// Reuse the caller's live pool (resuming `provider`'s lane watermark), or open
-/// and persist a new one. A reused pool whose remaining deposit has run low is
-/// auto-refilled on-chain via `topUp` before it is returned — see
-/// [`refill_amount`] for the policy. There is no pool expiry (ADR 003), so
-/// there is no replace-on-expiry branch: the same pool is reused for the
-/// caller's whole lifetime, across every provider.
+/// Record `lane`'s on-chain watermark `(bytes, amount)` in the row before the
+/// lane resumes from it ([`BuyerPoolState::seed_lane`]), and return the row
+/// with it and the progress the lane resumes from.
 ///
-/// `deployment` is the chain and `PaymentPool` that `contract` talks to: a
-/// tracked row is reused only on it, a new or adopted row carries it, and the
-/// voucher EIP-712 domain derives from it.
+/// The pool spend the refill and the run's funding read
+/// ([`BuyerPoolState::pool_spend`]) then counts the watermark once. On an
+/// adopted row it moves out of the redeemed spend no lane accounts for, so the
+/// spend keeps counting the other lanes' redemptions as this lane advances. A
+/// zero watermark has nothing to record. A row another run already moved past
+/// the watermark wins: the lane resumes from the row's progress.
+///
+/// # Errors
+///
+/// The buyer store could not commit the seed, or the row is gone or names
+/// another pool now (another run forgot or replaced it). Either way the build
+/// fails and retries from a fresh read: going on would price the lane, or
+/// escrow a refill, against a row the store no longer holds.
+fn seed_lane(
+    store: &RedbBuyerPoolStore,
+    mut state: BuyerPoolState,
+    lane: LaneKey,
+    bytes: U256,
+    amount: U256,
+) -> anyhow::Result<(BuyerPoolState, U256, U256)> {
+    if bytes.is_zero() && amount.is_zero() {
+        return Ok((state, bytes, amount));
+    }
+    let pool_id = state.pool_id;
+    let outcome = store
+        .seed_progress(state.owner, pool_id, lane, bytes, amount)
+        .with_context(|| {
+            format!(
+                "record the on-chain watermark of lane {} in pool {pool_id}",
+                lane.provider
+            )
+        })?;
+    match outcome {
+        AdvanceOutcome::Advanced => {
+            // The in-memory row has no record of the lane, so the seed takes.
+            if let Err(err) = state.seed_lane(lane, bytes, amount) {
+                tracing::debug!(error = %err, "lane seed did not advance the in-memory row");
+            }
+            Ok((state, bytes, amount))
+        }
+        AdvanceOutcome::Regressed(_) => {
+            let row = store.get_by_pool_id(pool_id)?.ok_or_else(|| {
+                anyhow::anyhow!("buyer row for pool {pool_id} vanished during a lane seed")
+            })?;
+            let progress = row.lane_progress(lane).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "buyer row for pool {pool_id} lost lane {} during a seed",
+                    lane.provider
+                )
+            })?;
+            Ok((row, progress.last_bytes, progress.last_amount))
+        }
+        AdvanceOutcome::UnknownPool | AdvanceOutcome::PoolMismatch => Err(anyhow::anyhow!(
+            "the buyer row for pool {pool_id} was forgotten or replaced while lane {} was built; \
+             the build retries from the store",
+            lane.provider
+        )),
+    }
+}
+
+/// The error for a pool with no unspent deposit whose wallet cannot fund a
+/// top-up: [`NoAffordableSource`], which is fatal to the command even inside a
+/// lane build. Nothing a retry or another provider does can pay for the fetch.
+fn cannot_pay(state: &BuyerPoolState, shortfall: &str) -> anyhow::Error {
+    anyhow::Error::new(NoAffordableSource {
+        deposit: state.deposit,
+    })
+    .context(format!(
+        "buyer pool {} has no unspent deposit, and the wallet cannot fund a top-up: \
+         {shortfall}",
+        state.pool_id
+    ))
+}
+
+/// Restore `state`'s remaining deposit (`deposit - spent`) to `working_deposit`
+/// once it falls below the low water — see [`refill_amount`] — and return the
+/// row to build the lane on.
+///
+/// `spent` is the pool-wide spend from [`BuyerPoolState::pool_spend`]. The refill is an
+/// optimisation, so a wallet that holds too little USDC for it does not fail
+/// the lane while the pool can still pay (and ends the command, as
+/// [`NoAffordableSource`], once it cannot): the shortfall is logged at WARN,
+/// recorded on `funding` for the run's closing `warning:` line, and no later
+/// lane build of the run tries the refill again. Any other failure of the
+/// allowance or `topUp` leg fails the lane build, which the acquire loop
+/// retries with backoff. A `topUp` that was broadcast but returned no receipt
+/// ([`TopUpUnconfirmed`]) may have escrowed, and once `topUp` returns a
+/// receipt the escrow has moved, so a failure to credit or re-read the local
+/// row ([`escrowed_but_untracked`]) is fatal: the acquire loop ends the
+/// command instead of retrying, because a retry escrows again.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn open_or_reuse_pool<P>(
+async fn refill_if_low<P>(
     store: &RedbBuyerPoolStore,
     contract: &PaymentPool::PaymentPoolInstance<P>,
     rpc: &P,
-    signer: &Arc<PrivateKeySigner>,
-    provider: Address,
+    funding: &RunFunding,
+    state: BuyerPoolState,
     self_address: Address,
-    deployment: Deployment,
+    spent: U256,
     working_deposit: U256,
     max_approve: bool,
-    adoption: ChainAdoption,
-) -> anyhow::Result<PoolContext>
+) -> anyhow::Result<BuyerPoolState>
 where
     P: alloy::providers::Provider + Clone,
 {
-    let payment_pool_addr = deployment.payment_pool;
-    let (tracked, spent_elsewhere) =
-        pool_to_reuse(store, contract, self_address, deployment, adoption).await?;
-    if let Some(state) = tracked {
-        let lane = LaneKey {
-            pool_id: state.pool_id,
-            signer: self_address,
-            provider,
-        };
-        let (prior_bytes, prior_amount) = match state.lane_progress(lane) {
-            Some(p) => (p.last_bytes, p.last_amount),
-            // No local record of this lane — always so for an adopted pool, and
-            // for a tracked pool's first contact with a provider. The chain may
-            // still hold a watermark for it, and a voucher at or below that
-            // watermark redeems nothing — so resuming from zero would stream bytes
-            // the provider can never cash. Resume from the chain.
-            None => lane_watermark(contract, lane).await?,
-        };
-
-        // Auto-refill a live pool whose remaining deposit has run low, so a
-        // sustained series of fetches isn't stranded by a spent-down deposit.
-        let low_water = working_deposit / U256::from(LOW_WATER_DIVISOR);
-        let spent = prior_amount.max(spent_elsewhere);
-        let additional = refill_amount(state.deposit, spent, working_deposit, low_water);
-        let state = if additional.is_zero() {
-            state
-        } else {
-            tracing::info!(
-                "buyer pool {} low on deposit ({} µUSDC remaining of {} deposited); topping up \
-                 {additional} µUSDC",
-                state.pool_id,
-                state.deposit.saturating_sub(spent),
-                state.deposit,
-            );
-            // `topUp` pulls `additional` USDC via `transferFrom`, so the pool's
-            // standing allowance must cover it first. Ensure it in the caller's
-            // mode: unlimited under `--max-approve`, else exactly `additional`.
-            ensure_allowance(
-                rpc,
-                state.token,
-                self_address,
-                payment_pool_addr,
-                if max_approve { None } else { Some(additional) },
-            )
-            .await?;
-            let ToppedUpPool { credited, tx } = top_up(contract, state.pool_id, additional).await?;
+    let low_water = working_deposit / U256::from(LOW_WATER_DIVISOR);
+    let additional = refill_amount(state.deposit, spent, working_deposit, low_water);
+    if additional.is_zero() {
+        return Ok(state);
+    }
+    let remaining = state.deposit.saturating_sub(spent);
+    if let Some(shortfall) = funding.shortfall() {
+        // The wallet could not fund a top-up earlier in this run; asking again
+        // costs an allowance read and a reverting `topUp` estimate per lane.
+        if remaining.is_zero() {
+            return Err(cannot_pay(&state, &shortfall));
+        }
+        return Ok(state);
+    }
+    tracing::info!(
+        "buyer pool {} low on deposit ({remaining} µUSDC remaining of {} deposited); \
+         topping up {additional} µUSDC",
+        state.pool_id,
+        state.deposit,
+    );
+    // `topUp` pulls `additional` USDC via `transferFrom`, so the pool's
+    // standing allowance must cover it first. Ensure it in the caller's
+    // mode: unlimited under `--max-approve`, else exactly `additional`.
+    let escrowed = async {
+        ensure_allowance(
+            rpc,
+            state.token,
+            self_address,
+            *contract.address(),
+            if max_approve { None } else { Some(additional) },
+        )
+        .await?;
+        top_up(contract, state.pool_id, additional).await
+    }
+    .await;
+    let err = match escrowed {
+        Ok(ToppedUpPool { credited, tx }) => {
             // The USDC is escrowed the moment `topUp` mines. A local credit that
             // does not land leaves the deposit untracked, and continuing would
             // fetch on a `state.deposit` that understates the chain — so the
             // low-water check re-fires on every later fetch while nobody
-            // reconciles the escrow. No bytes have been paid for on *this*
-            // entry yet — `bundle pull` calls this once per entry, so earlier
-            // entries may already be paid for and written — and only the escrow
-            // moved, so failing here strands nothing in flight. The reactive
-            // mid-fetch leg takes the same disposition (`CliFunder::top_up`).
+            // reconciles the escrow. No bytes have been paid for on *this* entry
+            // yet — `bundle pull` reaches this once per entry, through
+            // `open_or_reuse_pool`, so earlier entries may already be paid for and
+            // written — and only the escrow moved, so failing here strands nothing
+            // in flight. The reactive mid-fetch leg takes the same disposition
+            // (`CliFunder::top_up`).
             let effect = topped_up_effect(state.pool_id, credited);
             grade_deposit_credit(
                 store.add_deposit(self_address, state.pool_id, credited),
@@ -2998,9 +3791,112 @@ where
             // record did not survive, which is the same untracked-escrow
             // condition, not something to paper over with the pre-top-up
             // snapshot.
-            store
+            return store
                 .get_by_pool_id(state.pool_id)?
-                .ok_or_else(|| escrowed_but_untracked(&effect, tx, "the credited row vanished"))?
+                .ok_or_else(|| escrowed_but_untracked(&effect, tx, "the credited row vanished"));
+        }
+        Err(err) => err,
+    };
+    if err.downcast_ref::<TopUpUnconfirmed>().is_some() {
+        return Err(err);
+    }
+    let Some(shortfall) = funding
+        .check_wallet(
+            rpc,
+            state.token,
+            self_address,
+            state.pool_id,
+            additional,
+            &err,
+        )
+        .await
+    else {
+        return Err(err);
+    };
+    if remaining.is_zero() {
+        return Err(cannot_pay(&state, &shortfall));
+    }
+    // `check_wallet` already logged the shortfall at WARN.
+    tracing::info!(
+        pool_id = %state.pool_id,
+        %remaining,
+        "continuing on the pool's remaining deposit (µUSDC) without a top-up"
+    );
+    Ok(state)
+}
+
+/// Reuse the caller's live pool (resuming `provider`'s lane watermark), or open
+/// and persist a new one. A reused pool whose pool-wide remaining deposit has
+/// run low gets an on-chain `topUp` before it is returned; a wallet too short
+/// of USDC for it still returns the pool while it can pay — see
+/// [`refill_if_low`]. The lane then joins `funding`, the run's view of the
+/// pool's spend outside its lanes ([`RunFunding::join_lane`]). There is no
+/// pool expiry (ADR 003), so
+/// there is no replace-on-expiry branch: the same pool is reused for the
+/// caller's whole lifetime, across every provider.
+///
+/// `deployment` is the chain and `PaymentPool` that `contract` talks to: a
+/// tracked row is reused only on it, a new or adopted row carries it, and the
+/// voucher EIP-712 domain derives from it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_or_reuse_pool<P>(
+    store: &RedbBuyerPoolStore,
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    rpc: &P,
+    funding: &RunFunding,
+    signer: &Arc<PrivateKeySigner>,
+    provider: Address,
+    self_address: Address,
+    deployment: Deployment,
+    working_deposit: U256,
+    max_approve: bool,
+    adoption: ChainAdoption,
+) -> anyhow::Result<(PoolContext, LaneSpend)>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let payment_pool_addr = deployment.payment_pool;
+    let tracked = pool_to_reuse(store, contract, self_address, deployment, adoption).await?;
+    if let Some(state) = tracked {
+        let lane = LaneKey {
+            pool_id: state.pool_id,
+            signer: self_address,
+            provider,
+        };
+        let recorded = state.lane_progress(lane).is_some();
+        let from_chain = !state.redeemed_elsewhere().is_zero();
+        let (state, prior_bytes, prior_amount) = if let Some(p) = state.lane_progress(lane) {
+            (state, p.last_bytes, p.last_amount)
+        } else {
+            // No local record of this lane — always so for a pool just adopted, and
+            // for a tracked pool's first contact with a provider. The chain may
+            // still hold a watermark for it, and a voucher at or below that
+            // watermark redeems nothing — so resuming from zero would stream bytes
+            // the provider can never cash. Resume from the chain.
+            let (bytes, amount) = lane_watermark(contract, lane).await?;
+            seed_lane(store, state, lane, bytes, amount)?
+        };
+
+        // Auto-refill a live pool whose remaining deposit has run low, so a
+        // sustained series of fetches isn't stranded by a spent-down deposit.
+        let spent = state.pool_spend();
+        let state = refill_if_low(
+            store,
+            contract,
+            rpc,
+            funding,
+            state,
+            self_address,
+            spent,
+            working_deposit,
+            max_approve,
+        )
+        .await?;
+        let lane_spend = LaneSpend {
+            outside: spent.saturating_sub(prior_amount),
+            prior: prior_amount,
+            recorded,
+            from_chain,
         };
         return self_owned_lane_ctx(
             &state,
@@ -3009,7 +3905,8 @@ where
             provider,
             prior_bytes,
             prior_amount,
-        );
+        )
+        .map(|ctx| (ctx, lane_spend));
     }
 
     // Authoritative USDC token for the pool, from the contract itself.
@@ -3041,10 +3938,20 @@ where
     store
         .record(&opened.state)
         .map_err(|e| escrowed_but_untracked("buyer pool opened", opened.tx, e))?;
-    Ok(opened
-        .ctx
-        .with_provider(provider, U256::ZERO, U256::ZERO)
-        .with_capability(opened.capability))
+    // A fresh pool has spent nothing on any lane.
+    let spend = LaneSpend {
+        outside: U256::ZERO,
+        prior: U256::ZERO,
+        recorded: false,
+        from_chain: false,
+    };
+    Ok((
+        opened
+            .ctx
+            .with_provider(provider, U256::ZERO, U256::ZERO)
+            .with_capability(opened.capability),
+        spend,
+    ))
 }
 
 /// A unique `O_CREAT|O_EXCL` temp file in `target`'s directory, ready to be
@@ -3080,6 +3987,219 @@ mod tests {
         let msg = no_serve_target_error(3, 3, 0, 0).to_string();
         assert!(!msg.contains("rate-limited"), "{msg}");
         assert!(msg.contains("3 did not answer, 0 answered"), "{msg}");
+    }
+
+    /// A probe outcome after `ms` on the paused clock: `(id, holder)`.
+    async fn answer_after(ms: u64, id: u32, holder: bool) -> (u32, bool) {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        (id, holder)
+    }
+
+    /// Every probe that answers within the grace after the first holder is kept.
+    #[tokio::test(start_paused = true)]
+    async fn settle_keeps_every_answer_inside_the_grace() {
+        let grace = Duration::from_millis(250);
+        let probes = vec![
+            answer_after(20, 1, true),
+            answer_after(150, 2, false),
+            answer_after(260, 3, true),
+        ];
+        let (mut got, tail) = settle_probes(probes, grace, None, |&(_, h)| h, |_| true).await;
+        got.sort_unstable();
+        assert_eq!(got, vec![(1, true), (2, false), (3, true)]);
+        assert!(tail.is_empty());
+    }
+
+    /// A probe still pending at the first holder's answer plus the grace is
+    /// left in the tail, and the round ends at that moment.
+    #[tokio::test(start_paused = true)]
+    async fn settle_leaves_a_straggler_past_the_grace_in_the_tail() {
+        let grace = Duration::from_millis(250);
+        let started = tokio::time::Instant::now();
+        let probes = vec![
+            answer_after(25, 1, true),
+            answer_after(170, 2, false),
+            answer_after(1850, 3, true),
+        ];
+        let (mut got, tail) = settle_probes(probes, grace, None, |&(_, h)| h, |_| true).await;
+        got.sort_unstable();
+        assert_eq!(got, vec![(1, true), (2, false)]);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(started.elapsed(), Duration::from_millis(275));
+    }
+
+    /// With no holder, the round waits for every probe.
+    #[tokio::test(start_paused = true)]
+    async fn settle_waits_for_every_probe_without_a_holder() {
+        let grace = Duration::from_millis(250);
+        let started = tokio::time::Instant::now();
+        let probes = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
+        let (got, tail) = settle_probes(probes, grace, None, |&(_, h)| h, |_| true).await;
+        assert_eq!(got.len(), 2);
+        assert!(tail.is_empty());
+        assert_eq!(started.elapsed(), Duration::from_millis(1850));
+    }
+
+    /// A streamed round returns at the first holder; the straggler is in the
+    /// tail and completes when polled.
+    #[tokio::test(start_paused = true)]
+    async fn settle_streams_from_the_first_holder() {
+        use futures_util::StreamExt as _;
+        let started = tokio::time::Instant::now();
+        let probes = vec![
+            answer_after(25, 1, true),
+            answer_after(170, 2, false),
+            answer_after(1850, 3, true),
+        ];
+        let (got, mut tail) =
+            settle_probes(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
+        assert_eq!(got, vec![(1, true)]);
+        assert_eq!(started.elapsed(), Duration::from_millis(25));
+        let mut late = Vec::new();
+        while let Some(outcome) = tail.next().await {
+            late.push(outcome);
+        }
+        assert_eq!(late, vec![(2, false), (3, true)]);
+    }
+
+    /// An answer already in when the first holder answers is collected, not
+    /// left in the tail.
+    #[tokio::test(start_paused = true)]
+    async fn settle_collects_answers_ready_with_the_first_holder() {
+        let probes = vec![
+            answer_after(25, 1, true),
+            answer_after(25, 2, false),
+            answer_after(900, 3, true),
+        ];
+        let (mut got, tail) =
+            settle_probes(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
+        got.sort_unstable();
+        assert_eq!(got, vec![(1, true), (2, false)]);
+        assert_eq!(tail.len(), 1);
+    }
+
+    /// A late probe that records when it answers, then reports `Unreachable`.
+    fn recording_probe(
+        after: Duration,
+        answered: &Arc<std::sync::Mutex<Option<Duration>>>,
+    ) -> impl std::future::Future<Output = ProbeOutcome> + Send + 'static {
+        let answered = Arc::clone(answered);
+        let started = tokio::time::Instant::now();
+        async move {
+            tokio::time::sleep(after).await;
+            if let Ok(mut slot) = answered.lock() {
+                *slot = Some(started.elapsed());
+            }
+            ProbeOutcome::Unreachable
+        }
+    }
+
+    fn no_warming() -> ProxyWarmingParams {
+        ProxyWarmingParams {
+            enabled: false,
+            rtt_threshold_ms: 150.0,
+            margin_ms: 30.0,
+        }
+    }
+
+    /// A streamed round's pending probes keep running while nothing polls the
+    /// tail, so a slow unlock between the round and the fetch neither times
+    /// them out nor inflates their RTT. The answer waits in the tail.
+    #[tokio::test(start_paused = true)]
+    async fn late_probes_run_while_the_tail_is_not_polled() {
+        use futures_util::StreamExt as _;
+        let answered = Arc::new(std::sync::Mutex::new(None));
+        let tail: futures_util::stream::FuturesUnordered<_> =
+            std::iter::once(recording_probe(Duration::from_millis(100), &answered)).collect();
+        let slot = late_slot(ProbeRound::Stream, tail, &[], no_warming());
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(*answered.lock().unwrap(), Some(Duration::from_millis(100)));
+        let mut late = slot.take().expect("a streamed round keeps its tail");
+        assert!(matches!(
+            late.tail.next().await,
+            Some(ProbeOutcome::Unreachable)
+        ));
+        assert!(late.tail.next().await.is_none());
+    }
+
+    /// Dropping the late probes stops the ones still running.
+    #[tokio::test(start_paused = true)]
+    async fn late_probes_stop_when_dropped() {
+        let answered = Arc::new(std::sync::Mutex::new(None));
+        let tail: futures_util::stream::FuturesUnordered<_> =
+            std::iter::once(recording_probe(Duration::from_secs(1), &answered)).collect();
+        let slot = late_slot(ProbeRound::Stream, tail, &[], no_warming());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(slot);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(*answered.lock().unwrap(), None);
+    }
+
+    /// Without a cold cutoff, a round with no holder waits for every probe and
+    /// leaves no tail.
+    #[tokio::test(start_paused = true)]
+    async fn settle_without_a_cold_cutoff_waits_for_every_probe() {
+        let probes = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
+        let (got, tail) = settle_probes(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
+        assert_eq!(got.len(), 2);
+        assert!(tail.is_empty());
+    }
+
+    /// With no holder in hand, a cold cutoff ends the round its grace after
+    /// the first answer; the late holder stays in the tail.
+    #[tokio::test(start_paused = true)]
+    async fn settle_cold_cutoff_returns_the_non_holders_in_hand() {
+        use futures_util::StreamExt as _;
+        let started = tokio::time::Instant::now();
+        let probes = vec![
+            answer_after(25, 1, false),
+            answer_after(100, 2, false),
+            answer_after(1850, 3, true),
+        ];
+        let cold = Some(Duration::from_millis(250));
+        let (got, mut tail) =
+            settle_probes(probes, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
+        assert_eq!(got, vec![(1, false), (2, false)]);
+        assert_eq!(started.elapsed(), Duration::from_millis(275));
+        assert_eq!(tail.next().await, Some((3, true)));
+    }
+
+    /// A holder that answers inside the cold window ends the round at once,
+    /// as it would with no window.
+    #[tokio::test(start_paused = true)]
+    async fn settle_cold_cutoff_yields_to_a_holder() {
+        let started = tokio::time::Instant::now();
+        let probes = vec![
+            answer_after(25, 1, false),
+            answer_after(120, 2, true),
+            answer_after(1850, 3, false),
+        ];
+        let cold = Some(Duration::from_millis(250));
+        let (got, tail) = settle_probes(probes, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
+        assert_eq!(got, vec![(1, false), (2, true)]);
+        assert_eq!(started.elapsed(), Duration::from_millis(120));
+        assert_eq!(tail.len(), 1);
+    }
+
+    /// Only a verified answer opens the cold window: a failed probe does not.
+    #[tokio::test(start_paused = true)]
+    async fn settle_cold_cutoff_ignores_failed_probes() {
+        let started = tokio::time::Instant::now();
+        // `(id, holder)`; id 9 stands for a failed probe.
+        let probes = vec![answer_after(10, 9, false), answer_after(600, 1, false)];
+        let cold = Some(Duration::from_millis(250));
+        let (got, tail) = settle_probes(
+            probes,
+            Duration::ZERO,
+            cold,
+            |&(_, h)| h,
+            |&(id, _)| id != 9,
+        )
+        .await;
+        assert_eq!(got.len(), 2);
+        assert!(tail.is_empty());
+        assert_eq!(started.elapsed(), Duration::from_millis(600));
     }
 
     /// A loopback probe server that closes every connection with `code`, and
@@ -4212,7 +5332,7 @@ mod tests {
 
         let (ep, _) = loopback(Vec::new()).await?;
         let dir = tempfile::tempdir()?;
-        let store = RedbBuyerPoolStore::open(&dir.path().join("data"))?;
+        let store = Arc::new(RedbBuyerPoolStore::open(&dir.path().join("data"))?);
         let rpc = alloy::providers::ProviderBuilder::new()
             .connect_mocked_client(alloy::providers::mock::Asserter::new());
         let contract = PaymentPool::new(Address::repeat_byte(0x33), rpc.clone());
@@ -4226,8 +5346,11 @@ mod tests {
         )?;
         let slash_dom = decdn_incentive::slash_judge_domain(1, Address::repeat_byte(0x44));
         let connections = Connections::new(ep.clone());
+        let writes = OrderedWrites::default();
+        let funding = RunFunding::default();
         let entry_deps = || -> anyhow::Result<DriveFetchDeps<'_, _>> {
             Ok(DriveFetchDeps {
+                timings: None,
                 endpoint: &ep,
                 store: &store,
                 contract: &contract,
@@ -4241,6 +5364,8 @@ mod tests {
                 max_blob_bytes: 0,
                 deadlines: PullDeadlines::new(Duration::from_secs(5), Duration::from_secs(5), 0)?,
                 connections: &connections,
+                writes: &writes,
+                funding: &funding,
             })
         };
         let provider = Address::repeat_byte(0xB0);
@@ -4326,6 +5451,156 @@ mod tests {
         Ok(())
     }
 
+    /// A lane built twice on one shared ledger commits once per entry; a lane
+    /// on its own ledger keeps its own write. The one write takes the lowest
+    /// baseline of the ledger's handles: a sibling's rebase moved the store
+    /// from 90 to 70 between the two builds, and the ledger settled at 80, so
+    /// the advance from 70 to 80 still persists.
+    #[test]
+    fn duplicate_lane_handles_commit_once_from_the_lowest_baseline() {
+        let handle = |ledger: &Arc<PoolLedger>, provider: u8, prior: u64| FaceLaneHandle {
+            pool_id: PoolId::repeat_byte(1),
+            provider: Address::repeat_byte(provider),
+            prior_amount: U256::from(prior),
+            ledger: Arc::clone(ledger),
+            ctx: Arc::new(Mutex::new(ctx_with(None))),
+        };
+        let shared = Arc::new(PoolLedger::new(Cumulative {
+            bytes: U256::from(100u64),
+            amount: U256::from(80u64),
+        }));
+        let other = Arc::new(PoolLedger::new(Cumulative {
+            bytes: U256::from(10u64),
+            amount: U256::from(7u64),
+        }));
+        let handles = [
+            handle(&shared, 0xA1, 90),
+            handle(&other, 0xB2, 0),
+            handle(&shared, 0xA1, 70),
+        ];
+        let writes = face_watermark_writes(Address::repeat_byte(0x5E), &handles);
+        let providers: Vec<Address> = writes.iter().map(|(lane, _)| lane.provider).collect();
+        assert_eq!(
+            providers,
+            [Address::repeat_byte(0xA1), Address::repeat_byte(0xB2)]
+        );
+        assert_eq!(
+            writes[0].1.advanced(),
+            Some((U256::from(100u64), U256::from(80u64))),
+            "the shared lane advances past its lowest baseline"
+        );
+    }
+
+    /// Hold `writes` until the returned sender fires, so every write queued
+    /// meanwhile waits behind the hold.
+    fn hold(writes: &OrderedWrites) -> std::sync::mpsc::Sender<()> {
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        writes.queue(move || {
+            let _ = hold.recv();
+        });
+        release
+    }
+
+    /// One lane's write of `totals` over baseline `prior`, rebased to `anchor`.
+    fn lane_write(
+        lane: LaneKey,
+        totals: (u64, u64),
+        prior: u64,
+        anchor: Option<(u64, u64)>,
+    ) -> LaneWrite {
+        let cum = |(bytes, amount): (u64, u64)| Cumulative {
+            bytes: U256::from(bytes),
+            amount: U256::from(amount),
+        };
+        (
+            lane,
+            VoucherProgress::from_cumulative(cum(totals), U256::from(prior))
+                .with_rebase_anchor(anchor.map(cum)),
+        )
+    }
+
+    /// Two entries settle one lane: the first read takes the ledger's rebase
+    /// (down to 60, totals 70), the second a newer advance to 80. They land
+    /// in that order, so the rebase never replaces the newer row.
+    #[tokio::test]
+    async fn a_rebase_read_first_never_lands_over_a_newer_advance() -> anyhow::Result<()> {
+        let (_dir, store, owner, pool_id, lane) = rebase_store_fixture()?;
+        let store = Arc::new(store);
+        let writes = OrderedWrites::default();
+        let release = hold(&writes);
+        let rebase = lane_write(lane, (200, 70), 90, Some((100, 60)));
+        drop(queue_watermark_writes(&writes, &store, owner, vec![rebase]));
+        let advance = lane_write(lane, (300, 80), 70, None);
+        let landed = queue_watermark_writes(&writes, &store, owner, vec![advance]);
+        release.send(())?;
+        tokio::time::timeout(Duration::from_secs(10), landed).await??;
+        let got = lane_record(&store, pool_id, lane)?;
+        assert_eq!(
+            (got.last_bytes, got.last_amount),
+            (U256::from(300u64), U256::from(80u64))
+        );
+        Ok(())
+    }
+
+    /// Two entries settle one lane: the first read is an advance to 95 from
+    /// before the node refused it, the second the rebase down to 60 (totals
+    /// 70). They land in that order, so the refused watermark never returns.
+    #[tokio::test]
+    async fn a_stale_advance_read_first_never_lands_over_a_rebase() -> anyhow::Result<()> {
+        let (_dir, store, owner, pool_id, lane) = rebase_store_fixture()?;
+        let store = Arc::new(store);
+        let writes = OrderedWrites::default();
+        let release = hold(&writes);
+        let advance = lane_write(lane, (600, 95), 90, None);
+        drop(queue_watermark_writes(
+            &writes,
+            &store,
+            owner,
+            vec![advance],
+        ));
+        let rebase = lane_write(lane, (200, 70), 90, Some((100, 60)));
+        let landed = queue_watermark_writes(&writes, &store, owner, vec![rebase]);
+        release.send(())?;
+        tokio::time::timeout(Duration::from_secs(10), landed).await??;
+        let got = lane_record(&store, pool_id, lane)?;
+        assert_eq!(
+            (got.last_bytes, got.last_amount),
+            (U256::from(200u64), U256::from(70u64))
+        );
+        Ok(())
+    }
+
+    /// A drop guard's settle drops its receiver and returns. The write it
+    /// queued, behind a slow one, still lands before the runtime finishes
+    /// dropping: the runtime waits for the blocking pool as it shuts down.
+    #[test]
+    fn a_detached_settle_lands_by_runtime_shutdown() -> anyhow::Result<()> {
+        let (_dir, store, owner, pool_id, lane) = rebase_store_fixture()?;
+        let store = Arc::new(store);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()?;
+        runtime.block_on(async {
+            let writes = OrderedWrites::default();
+            writes.queue(|| std::thread::sleep(Duration::from_millis(100)));
+            let advance = lane_write(lane, (600, 95), 90, None);
+            drop(queue_watermark_writes(
+                &writes,
+                &store,
+                owner,
+                vec![advance],
+            ));
+        });
+        drop(runtime);
+        let got = lane_record(&store, pool_id, lane)?;
+        assert_eq!(
+            (got.last_bytes, got.last_amount),
+            (U256::from(600u64), U256::from(95u64))
+        );
+        Ok(())
+    }
+
     /// The multi-source path carries each lane's own rebase anchor.
     #[test]
     fn multi_lane_watermarks_carry_the_rebase_anchor() {
@@ -4383,16 +5658,16 @@ mod tests {
     }
 
     /// A multi-source lane settles at its ARMED cumulative, never at `committed`.
-    /// A tail steal drops the victim's `fill_gap` future wherever it is parked —
-    /// including inside the voucher exchange `issue` deliberately arms before
-    /// sending — and that is a routine event on a SUCCESSFUL fetch. Settling that
+    /// A cancelled or stalled leg drops its `fill_gap` future wherever it is
+    /// parked — including inside the voucher exchange `issue` deliberately arms
+    /// before sending — and that can happen on a SUCCESSFUL fetch. Settling that
     /// lane low persists a cumulative below what the node can redeem, and the next
     /// fetch on the lane signs a value the upstream already holds: rejected as a
     /// regression.
     #[test]
     fn multi_lane_watermarks_settle_high_even_when_the_fetch_succeeded() {
         let signer = Address::repeat_byte(0x5E);
-        // The armed cumulative sits ABOVE what was acked — the steal-cancelled
+        // The armed cumulative sits ABOVE what was acked — the dropped-leg
         // shape. Settling at `committed` would persist the lower one.
         let lanes = [lane_wm(1, 0xA1, 0, 300, 400)];
         let out = super::multi_lane_watermarks(signer, &lanes);
@@ -4527,6 +5802,23 @@ mod adoption_tests {
         adoption: ChainAdoption,
         calls: Vec<Option<Bytes>>,
     ) -> anyhow::Result<PoolContext> {
+        run_in(store, signer, adoption, calls, &RunFunding::default())
+            .await
+            .0
+            .map(|(ctx, _)| ctx)
+    }
+
+    /// [`run`] as one lane build of the run `funding` describes, with the
+    /// lane's [`LaneSpend`]. The second value is whether every queued answer
+    /// was read: a path that stops short leaves some unread, which is how these
+    /// tests prove a path WAS taken.
+    async fn run_in(
+        store: &RedbBuyerPoolStore,
+        signer: &Arc<PrivateKeySigner>,
+        adoption: ChainAdoption,
+        calls: Vec<Option<Bytes>>,
+        funding: &RunFunding,
+    ) -> (anyhow::Result<(PoolContext, LaneSpend)>, bool) {
         let asserter = Asserter::new();
         for call in calls {
             match call {
@@ -4534,12 +5826,13 @@ mod adoption_tests {
                 None => asserter.push_failure_msg("transient rpc fault"),
             }
         }
-        let rpc = ProviderBuilder::new().connect_mocked_client(asserter);
+        let rpc = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         let contract = PaymentPool::new(PP, rpc.clone());
-        open_or_reuse_pool(
+        let result = open_or_reuse_pool(
             store,
             &contract,
             &rpc,
+            funding,
             signer,
             PROVIDER,
             signer.address(),
@@ -4548,7 +5841,8 @@ mod adoption_tests {
             false,
             adoption,
         )
-        .await
+        .await;
+        (result, asserter.read_q().is_empty())
     }
 
     fn client_store(dir: &tempfile::TempDir) -> RedbBuyerPoolStore {
@@ -4698,7 +5992,7 @@ mod adoption_tests {
                 ))
                 .unwrap();
 
-            let (tracked, spent_elsewhere) = pool_to_reuse(
+            let tracked = pool_to_reuse(
                 &store,
                 &contract,
                 signer.address(),
@@ -4709,11 +6003,11 @@ mod adoption_tests {
             .expect("a refused adoption reads nothing from the chain");
 
             assert_eq!(
-                tracked.map(|state| state.pool_id),
+                tracked.as_ref().map(|state| state.pool_id),
                 reused.then_some(id),
                 "row on {foreign:?}, buying on {DEPLOYMENT:?}"
             );
-            assert_eq!(spent_elsewhere, U256::ZERO);
+            assert!(tracked.is_none_or(|state| state.redeemed_elsewhere().is_zero()));
         }
     }
 
@@ -4748,48 +6042,622 @@ mod adoption_tests {
         );
     }
 
-    /// An adopted pool that other lanes have drained is topped up, not trusted.
-    ///
-    /// The adopted row has no lanes, so its only view of what the pool has paid
-    /// out is `totalRedeemed`. Ignored, a pool with 0.5 USDC left reads as a full
-    /// 10: no top-up fires, and the provider refuses the fetch on a balance the
-    /// client believes it has. Here the refill fires, so the fetch reaches the
-    /// allowance read — past the end of the queue, which is the proof it went
-    /// there. Ignoring `totalRedeemed` returns `Ok` instead.
+    /// The amounts observed on the pool in #2288: six lanes, 8.655 of 10 USDC
+    /// spent in all, the largest lane 2.374. The first lane is [`PROVIDER`]'s.
+    const LIVE_LANES: [u64; 6] = [2_374_000, 2_360_000, 2_147_000, 1_043_000, 483_000, 248_000];
+
+    /// A tracked row on [`DEPLOYMENT`] holding `deposit`, with one lane per
+    /// `amounts` entry: the first is [`PROVIDER`]'s, each later one another
+    /// provider's. A lane's bytes are its amount times 1000.
+    fn tracked_row(id: B256, owner: Address, deposit: u64, amounts: &[u64]) -> BuyerPoolState {
+        let lanes = amounts
+            .iter()
+            .zip(0u8..)
+            .map(|(&amount, i)| {
+                let provider = if i == 0 {
+                    PROVIDER
+                } else {
+                    Address::repeat_byte(0x40 + i)
+                };
+                (
+                    lane_key(id, owner, provider),
+                    decdn_incentive::BuyerLaneProgress {
+                        last_amount: U256::from(amount),
+                        last_bytes: U256::from(amount) * U256::from(1000u64),
+                    },
+                )
+            })
+            .collect();
+        BuyerPoolState::hydrate(
+            id,
+            DEPLOYMENT,
+            owner,
+            TOKEN,
+            U256::from(deposit),
+            lanes,
+            U256::ZERO,
+        )
+    }
+
+    fn lane_key(id: B256, owner: Address, provider: Address) -> LaneKey {
+        LaneKey {
+            pool_id: id,
+            signer: owner,
+            provider,
+        }
+    }
+
+    /// A refill that fails at the allowance read, then reads a wallet holding
+    /// `usdc` micro-USDC.
+    fn refill_fails_with_wallet(usdc: u64) -> Vec<Option<Bytes>> {
+        vec![None, Some(U256::from(usdc).abi_encode().into())]
+    }
+
+    /// The refill compares the deposit with the pool's spend over every lane.
+    /// Each live lane alone leaves far more than the low water; together they
+    /// leave 1.345 USDC, below the 2 USDC mark, so the pool must refill.
+    #[test]
+    fn pool_spend_sums_every_tracked_lane() {
+        let owner = Address::repeat_byte(0x01);
+        let id = B256::repeat_byte(0xEE);
+        let row = tracked_row(id, owner, WORKING, &LIVE_LANES);
+        let working = U256::from(WORKING);
+        let low_water = working / U256::from(LOW_WATER_DIVISOR);
+
+        let spent = row.pool_spend();
+        assert_eq!(spent, U256::from(8_655_000u64));
+        assert_eq!(
+            refill_amount(row.deposit, spent, working, low_water),
+            U256::from(8_655_000u64),
+            "the refill restores the 1.345 USDC remaining to the 10 USDC working deposit"
+        );
+        for &one_lane in &LIVE_LANES {
+            assert!(
+                refill_amount(row.deposit, U256::from(one_lane), working, low_water).is_zero(),
+                "no single lane reaches the low water, so the spend must be the sum over \
+                 every lane"
+            );
+        }
+    }
+
+    /// A lane the row has no record of resumes from the chain watermark, and
+    /// that watermark is spend the row's sum does not hold yet: the seed
+    /// records it. A tracked lane's seed is not counted twice.
+    #[test]
+    fn a_seeded_lanes_chain_prior_counts_toward_the_pool_spend() {
+        let owner = Address::repeat_byte(0x01);
+        let id = B256::repeat_byte(0xEE);
+        let mut row = tracked_row(id, owner, WORKING, &[1_000]);
+        let new_lane = lane_key(id, owner, Address::repeat_byte(0x55));
+        row.seed_lane(new_lane, U256::from(250_000u64), U256::from(250u64))
+            .unwrap();
+        assert_eq!(row.pool_spend(), U256::from(1_250u64));
+        row.seed_lane(
+            lane_key(id, owner, PROVIDER),
+            U256::from(1_000_000u64),
+            U256::from(1_000u64),
+        )
+        .unwrap();
+        assert_eq!(row.pool_spend(), U256::from(1_250u64));
+    }
+
+    /// An adopted row has no lanes, so `totalRedeemed` is its only record of
+    /// what other lanes drained. Ignored, a pool with 0.5 USDC left reads as a
+    /// full 10 and no refill fires. A lane seeded from chain takes its share
+    /// over, so the other lanes' share still counts as that lane advances
+    /// (#2292 review): 100 redeemed, 60 of it on A, A advancing to 80 spends
+    /// 120.
+    #[test]
+    fn pool_spend_keeps_an_adopted_pools_redeemed_spend_as_its_lanes_advance() {
+        let owner = Address::repeat_byte(0x01);
+        let id = B256::repeat_byte(0xEE);
+        let adopted = |redeemed: u64| {
+            BuyerPoolState::adopt(
+                id,
+                DEPLOYMENT,
+                owner,
+                TOKEN,
+                U256::from(WORKING),
+                U256::from(redeemed),
+            )
+        };
+        assert_eq!(adopted(9_500_000).pool_spend(), U256::from(9_500_000u64));
+
+        let a = lane_key(id, owner, PROVIDER);
+        let mut row = adopted(100);
+        row.seed_lane(a, U256::from(60_000u64), U256::from(60u64))
+            .unwrap();
+        assert_eq!(row.redeemed_elsewhere(), U256::from(40u64));
+        assert_eq!(row.pool_spend(), U256::from(100u64));
+        row.advance_lane(a, U256::from(80_000u64), U256::from(80u64))
+            .unwrap();
+        assert_eq!(row.pool_spend(), U256::from(120u64));
+    }
+
+    /// #2288 end to end: five lanes of 2 USDC spend the whole 10 USDC deposit,
+    /// so building any lane fires the refill. The wallet holds no USDC, and with
+    /// nothing left in the pool the lane fails. A spend read from the one lane
+    /// alone would see 8 USDC remaining, fire no refill, and return `Ok`.
     #[tokio::test]
-    async fn an_adopted_pool_drained_by_other_lanes_is_topped_up() {
+    async fn a_pool_spent_across_lanes_refills_and_fails_when_nothing_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        let signer = Arc::new(PrivateKeySigner::random());
+        let id = B256::repeat_byte(0xEE);
+        store
+            .record(&tracked_row(id, signer.address(), WORKING, &[2_000_000; 5]))
+            .unwrap();
+
+        let (result, drained) = run_in(
+            &store,
+            &signer,
+            ChainAdoption::Allowed,
+            refill_fails_with_wallet(0),
+            &RunFunding::default(),
+        )
+        .await;
+        let err = result.expect_err("a pool with no unspent deposit cannot pay");
+        assert!(
+            format!("{err:#}").contains("has no unspent deposit, and the wallet cannot fund"),
+            "expected the refill failure, got: {err:#}"
+        );
+        assert!(
+            err.downcast_ref::<NoAffordableSource>().is_some(),
+            "the lane build ends the command rather than retrying: {err:#}"
+        );
+        assert!(
+            drained,
+            "the refill read the allowance and the wallet balance"
+        );
+    }
+
+    /// A lane the row has no record of joins its chain watermark to the
+    /// pool-wide spend. Here the tracked lane has spent 9 USDC and the new
+    /// lane's watermark the last 1, so nothing is left. Without the watermark
+    /// the pool reads 1 USDC remaining and the lane builds.
+    #[tokio::test]
+    async fn an_untracked_lanes_chain_watermark_counts_toward_the_pool_spend() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        let signer = Arc::new(PrivateKeySigner::random());
+        let id = B256::repeat_byte(0xEE);
+        let other = lane_key(id, signer.address(), Address::repeat_byte(0x55));
+        let progress = decdn_incentive::BuyerLaneProgress {
+            last_amount: U256::from(9_000_000u64),
+            last_bytes: U256::from(9_000_000_000u64),
+        };
+        store
+            .record(&BuyerPoolState::hydrate(
+                id,
+                DEPLOYMENT,
+                signer.address(),
+                TOKEN,
+                U256::from(WORKING),
+                vec![(other, progress)],
+                U256::ZERO,
+            ))
+            .unwrap();
+
+        let mut calls = vec![Some(lane(1_000_000, 1_000_000_000))];
+        calls.extend(refill_fails_with_wallet(0));
+        let (result, drained) = run_in(
+            &store,
+            &signer,
+            ChainAdoption::Allowed,
+            calls,
+            &RunFunding::default(),
+        )
+        .await;
+        let err = result.expect_err("the untracked lane's watermark spends the rest");
+        assert!(
+            format!("{err:#}").contains("has no unspent deposit"),
+            "{err:#}"
+        );
+        assert!(drained);
+    }
+
+    /// #2289: a wallet too short of USDC for the refill keeps the lane while the
+    /// pool can still pay. The live pool has 1.345 USDC unspent, below the low
+    /// water, so the refill fires; the wallet holds none. The lane is built on
+    /// the current deposit, the row is untouched, and the run records the
+    /// shortfall for its closing warning.
+    #[tokio::test]
+    async fn a_wallet_short_of_usdc_keeps_the_lane_while_the_pool_can_still_pay() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        let signer = Arc::new(PrivateKeySigner::random());
+        let id = B256::repeat_byte(0xEE);
+        store
+            .record(&tracked_row(id, signer.address(), WORKING, &LIVE_LANES))
+            .unwrap();
+        let funding = RunFunding::default();
+
+        let (result, drained) = run_in(
+            &store,
+            &signer,
+            ChainAdoption::Allowed,
+            refill_fails_with_wallet(0),
+            &funding,
+        )
+        .await;
+        let (ctx, _) =
+            result.expect("1.345 USDC is left, so a short wallet must not drop the lane");
+
+        assert!(drained, "the refill fired and read the wallet balance");
+        assert_eq!(ctx.pool_id, id);
+        assert_eq!(
+            (ctx.prior_bytes_delivered, ctx.prior_amount),
+            (U256::from(LIVE_LANES[0] * 1000), U256::from(LIVE_LANES[0])),
+            "the lane resumes from its own recorded progress"
+        );
+        let row = store.get_by_owner(signer.address()).unwrap().unwrap();
+        assert_eq!(row.deposit, U256::from(WORKING), "nothing was credited");
+        assert_eq!(row.committed_amount(), U256::from(8_655_000u64));
+        let shortfall = funding.shortfall().expect("the shortfall is recorded");
+        assert!(shortfall.contains("holds 0 µUSDC"), "{shortfall}");
+        assert!(shortfall.contains("8655000 µUSDC top-up"), "{shortfall}");
+    }
+
+    /// Once the run has seen the wallet too short of USDC, a later lane build
+    /// does not ask again: no allowance read, no `topUp`. With no answers
+    /// queued, any chain read would fault the build.
+    #[tokio::test]
+    async fn a_later_lane_build_skips_the_refill_after_a_wallet_shortfall() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        let signer = Arc::new(PrivateKeySigner::random());
+        let id = B256::repeat_byte(0xEE);
+        store
+            .record(&tracked_row(id, signer.address(), WORKING, &LIVE_LANES))
+            .unwrap();
+        let funding = RunFunding::default();
+        let (first, _) = run_in(
+            &store,
+            &signer,
+            ChainAdoption::Allowed,
+            refill_fails_with_wallet(0),
+            &funding,
+        )
+        .await;
+        first.expect("the first build records the shortfall and keeps its lane");
+
+        let (later, _) = run_in(&store, &signer, ChainAdoption::Allowed, vec![], &funding).await;
+        later.expect("the later build reads nothing from the chain");
+    }
+
+    /// A refill that fails while the wallet holds enough USDC is not a
+    /// shortfall: the cause may be transient, so the lane build fails and the
+    /// acquire loop retries it with backoff.
+    #[tokio::test]
+    async fn a_refill_failure_with_a_funded_wallet_fails_the_lane_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        let signer = Arc::new(PrivateKeySigner::random());
+        let id = B256::repeat_byte(0xEE);
+        store
+            .record(&tracked_row(id, signer.address(), WORKING, &LIVE_LANES))
+            .unwrap();
+        let funding = RunFunding::default();
+
+        let (result, drained) = run_in(
+            &store,
+            &signer,
+            ChainAdoption::Allowed,
+            refill_fails_with_wallet(WORKING),
+            &funding,
+        )
+        .await;
+        let err = result.expect_err("a funded wallet's failed refill is retried, not skipped");
+        assert!(
+            format!("{err:#}").contains("read USDC allowance"),
+            "{err:#}"
+        );
+        assert!(drained);
+        assert!(funding.shortfall().is_none());
+    }
+
+    /// An adopted pool that other lanes have drained to 0.5 USDC fires the
+    /// refill through `totalRedeemed`, and still buys on its remainder when
+    /// the wallet is empty. Adoption only takes a pool with deposit left.
+    #[tokio::test]
+    async fn an_adopted_pool_drained_by_other_lanes_refills_and_buys_on_its_remainder() {
         let dir = tempfile::tempdir().unwrap();
         let store = client_store(&dir);
         let signer = Arc::new(PrivateKeySigner::random());
         let owner = signer.address();
         let id = B256::repeat_byte(0xDD);
+        let mut calls = vec![
+            Some(vec![id].abi_encode().into()),
+            Some(pool(owner, 10_000_000, 9_500_000).abi_encode().into()),
+            Some(TOKEN.abi_encode().into()),
+            // This lane itself has spent nothing — the drain is elsewhere.
+            Some(lane(0, 0)),
+        ];
+        calls.extend(refill_fails_with_wallet(0));
+        let funding = RunFunding::default();
 
-        let result = run(
+        let (result, drained) =
+            run_in(&store, &signer, ChainAdoption::Allowed, calls, &funding).await;
+        let (ctx, spend) =
+            result.expect("0.5 USDC is left, so a short wallet must not drop the lane");
+
+        assert!(
+            drained,
+            "0.5 USDC left is below the 2 USDC low water, so the refill must fire"
+        );
+        assert_eq!(ctx.pool_id, id);
+        assert_eq!(
+            spend,
+            LaneSpend {
+                outside: U256::from(9_500_000u64),
+                prior: U256::ZERO,
+                recorded: false,
+                from_chain: true,
+            }
+        );
+    }
+
+    /// #2292: the run after adoption reuses the row without asking the chain.
+    /// The pool's `totalRedeemed` stays in its spend: read only by the
+    /// adopting run, every later run would count just the lanes this machine
+    /// recorded since, and read the pool as fuller than it is. The lane the
+    /// adopting run seeds from chain takes over its own share of it, so the
+    /// other lanes' share still counts once that lane advances.
+    #[tokio::test]
+    async fn a_reused_adopted_row_keeps_the_pools_redeemed_spend() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        let signer = Arc::new(PrivateKeySigner::random());
+        let owner = signer.address();
+        let id = B256::repeat_byte(0xDE);
+        let lane_spend = |outside: u64, recorded: bool| LaneSpend {
+            outside: U256::from(outside),
+            prior: U256::from(1_000_000u64),
+            recorded,
+            from_chain: true,
+        };
+
+        // 3 USDC redeemed, 1 USDC of it on this lane.
+        let (adopting, drained) = run_in(
             &store,
             &signer,
             ChainAdoption::Allowed,
             vec![
                 Some(vec![id].abi_encode().into()),
-                Some(pool(owner, 10_000_000, 9_500_000).abi_encode().into()),
+                Some(pool(owner, 10_000_000, 3_000_000).abi_encode().into()),
                 Some(TOKEN.abi_encode().into()),
-                // This lane itself has spent nothing — the drain is elsewhere.
-                Some(lane(0, 0)),
+                Some(lane(1_000_000, 1_000_000_000)),
             ],
+            &RunFunding::default(),
         )
         .await;
-
-        assert!(
-            result.is_err(),
-            "0.5 USDC left is below the 2 USDC low water, so a top-up must be attempted"
-        );
+        assert!(drained);
         assert_eq!(
-            store
-                .get_by_owner(owner)
-                .unwrap()
-                .expect("adopted first")
-                .pool_id,
-            id
+            adopting.expect("the live pool is adopted").1,
+            lane_spend(2_000_000, false)
         );
+        let row = store
+            .get_by_owner(owner)
+            .unwrap()
+            .expect("adopted row is recorded");
+        assert_eq!(row.redeemed_elsewhere(), U256::from(2_000_000u64));
+        assert_eq!(row.pool_spend(), U256::from(3_000_000u64));
+
+        // No chain answers queued: the row and its lane are tracked now.
+        let (reusing, drained) = run_in(
+            &store,
+            &signer,
+            ChainAdoption::Allowed,
+            vec![],
+            &RunFunding::default(),
+        )
+        .await;
+        assert!(drained);
+        let (ctx, spend) = reusing.expect("the tracked row is reused");
+        assert_eq!(ctx.pool_id, id);
+        assert_eq!(
+            spend,
+            lane_spend(2_000_000, true),
+            "a later run sees the redeemed spend the adopting run saw"
+        );
+
+        // The lane pays on to 1.5 USDC: the pool has spent 3.5 USDC.
+        let a = lane_key(id, owner, PROVIDER);
+        let outcome = store
+            .advance_progress(
+                owner,
+                id,
+                a,
+                U256::from(1_500_000_000u64),
+                U256::from(1_500_000u64),
+            )
+            .unwrap();
+        assert!(matches!(outcome, AdvanceOutcome::Advanced));
+        assert_eq!(
+            store.get_by_owner(owner).unwrap().unwrap().pool_spend(),
+            U256::from(3_500_000u64)
+        );
+    }
+
+    /// A ledger seeded at `amount`.
+    fn ledger_at(amount: u64) -> Arc<PoolLedger> {
+        Arc::new(PoolLedger::new(Cumulative {
+            bytes: U256::from(amount) * U256::from(1000u64),
+            amount: U256::from(amount),
+        }))
+    }
+
+    fn spend(outside: u64, prior: u64, recorded: bool, from_chain: bool) -> LaneSpend {
+        LaneSpend {
+            outside: U256::from(outside),
+            prior: U256::from(prior),
+            recorded,
+            from_chain,
+        }
+    }
+
+    /// The pool's spend is the run's baseline plus every joined lane's
+    /// ledger. The first lane sets the baseline; a later lane the row recorded
+    /// moves its prior out of it, because its ledger counts it now; a lane the
+    /// row did not hold moves nothing, because the baseline never counted its
+    /// chain prior; a lane that joins again changes nothing.
+    #[test]
+    fn run_funding_counts_every_lane_once_on_a_tracked_pool() {
+        let id = B256::repeat_byte(0xEE);
+        let owner = Address::repeat_byte(0x01);
+        let funding = RunFunding::default();
+        assert_eq!(funding.pool_spent(), None);
+
+        // The live pool: PROVIDER's lane is the first to join.
+        let first = lane_key(id, owner, PROVIDER);
+        let first_ledger = ledger_at(2_374_000);
+        funding.join_lane(
+            first,
+            spend(6_281_000, 2_374_000, true, false),
+            &first_ledger,
+        );
+        assert_eq!(funding.pool_spent(), Some(U256::from(8_655_000u64)));
+
+        let second = lane_key(id, owner, Address::repeat_byte(0x41));
+        funding.join_lane(
+            second,
+            spend(0, 2_360_000, true, false),
+            &ledger_at(2_360_000),
+        );
+        assert_eq!(funding.pool_spent(), Some(U256::from(8_655_000u64)));
+
+        // A new provider whose chain watermark the row never held.
+        let fresh = lane_key(id, owner, Address::repeat_byte(0x55));
+        funding.join_lane(fresh, spend(0, 100, false, false), &ledger_at(100));
+        assert_eq!(funding.pool_spent(), Some(U256::from(8_655_100u64)));
+
+        funding.join_lane(first, spend(0, 6_281_000, true, false), &first_ledger);
+        assert_eq!(funding.pool_spent(), Some(U256::from(8_655_100u64)));
+    }
+
+    /// An adopted pool's baseline holds its redeemed spend no seeded lane
+    /// accounts for, which counts every unseeded lane's redeemed watermark. A later lane's chain prior moves out of
+    /// it, recorded or not, so it is counted once, by the lane's ledger.
+    #[test]
+    fn run_funding_counts_every_lane_once_on_an_adopted_pool() {
+        let id = B256::repeat_byte(0xEE);
+        let owner = Address::repeat_byte(0x01);
+        let funding = RunFunding::default();
+        funding.join_lane(
+            lane_key(id, owner, PROVIDER),
+            spend(9_000_000, 500_000, false, true),
+            &ledger_at(500_000),
+        );
+        assert_eq!(funding.pool_spent(), Some(U256::from(9_500_000u64)));
+        funding.join_lane(
+            lane_key(id, owner, Address::repeat_byte(0x41)),
+            spend(0, 1_000_000, false, false),
+            &ledger_at(1_000_000),
+        );
+        assert_eq!(funding.pool_spent(), Some(U256::from(9_500_000u64)));
+    }
+
+    /// A lane's spend is what its ledgers committed, so it grows as the lane
+    /// pays. A lane rebuilt with a fresh ledger from a stale prior keeps the
+    /// larger of its ledgers: vouchers on a lane are cumulative.
+    #[test]
+    fn run_funding_follows_each_lanes_largest_ledger() {
+        let id = B256::repeat_byte(0xEE);
+        let owner = Address::repeat_byte(0x01);
+        let funding = RunFunding::default();
+        let lane = lane_key(id, owner, PROVIDER);
+        let paid = ledger_at(0);
+        funding.join_lane(lane, spend(1_000, 0, false, false), &paid);
+        assert!(paid.reseed(Cumulative {
+            bytes: U256::from(300_000u64),
+            amount: U256::from(300u64),
+        }));
+        assert_eq!(funding.pool_spent(), Some(U256::from(1_300u64)));
+
+        funding.join_lane(lane, spend(1_000, 0, false, false), &ledger_at(0));
+        assert_eq!(funding.pool_spent(), Some(U256::from(1_300u64)));
+    }
+
+    /// A lane build hands back what it learned about the pool's spend: the
+    /// spend on every other lane, and the lane's own recorded prior.
+    #[tokio::test]
+    async fn a_lane_build_reports_the_pools_other_spend() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        let signer = Arc::new(PrivateKeySigner::random());
+        let id = B256::repeat_byte(0xEE);
+        store
+            .record(&tracked_row(id, signer.address(), 2 * WORKING, &LIVE_LANES))
+            .unwrap();
+
+        let (result, drained) = run_in(
+            &store,
+            &signer,
+            ChainAdoption::Allowed,
+            vec![],
+            &RunFunding::default(),
+        )
+        .await;
+        let (_, spend) = result.expect("11.345 USDC is left, so no refill fires");
+        assert!(drained);
+        assert_eq!(
+            spend,
+            LaneSpend {
+                outside: U256::from(8_655_000u64 - LIVE_LANES[0]),
+                prior: U256::from(LIVE_LANES[0]),
+                recorded: true,
+                from_chain: false,
+            }
+        );
+    }
+
+    /// The run's funder reports the pool's spend to the deposit gate. A
+    /// reactive top-up that fails for another reason is not a shortfall; after
+    /// a wallet shortfall, a reactive top-up fails without a chain call and
+    /// says so ([`WalletShortfall`]).
+    #[tokio::test]
+    async fn the_cli_funder_reads_the_run_funding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        let rpc = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let contract = PaymentPool::new(PP, rpc.clone());
+        let funding = RunFunding::default();
+        funding.join_lane(
+            lane_key(
+                B256::repeat_byte(0xEE),
+                Address::repeat_byte(0x01),
+                PROVIDER,
+            ),
+            spend(700, 0, false, false),
+            &ledger_at(0),
+        );
+        let pool_id = std::sync::OnceLock::new();
+        pool_id.set(B256::repeat_byte(0xEE)).unwrap();
+        let funder = CliFunder {
+            contract: &contract,
+            rpc: &rpc,
+            store: &store,
+            owner: Address::repeat_byte(0x01),
+            pool_id: &pool_id,
+            token: TOKEN,
+            payment_pool_addr: PP,
+            max_approve: false,
+            funding: &funding,
+        };
+        assert_eq!(funder.pool_spent(), Some(U256::from(700u64)));
+
+        // No answers are queued, so the wallet read faults: not a shortfall.
+        let err = funder.top_up(U256::from(5u64)).await.unwrap_err();
+        assert!(funding.shortfall().is_none(), "{err:#}");
+        assert!(err.downcast_ref::<WalletShortfall>().is_none(), "{err:#}");
+
+        *funding.shortfall.lock().unwrap() = Some("wallet 0x01 holds 0 µUSDC".to_owned());
+        let err = funder.top_up(U256::from(5u64)).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("the wallet cannot fund a top-up: wallet 0x01 holds 0"),
+            "{err:#}"
+        );
+        assert!(err.downcast_ref::<WalletShortfall>().is_some(), "{err:#}");
     }
 }
 
@@ -4845,6 +6713,7 @@ pub(crate) mod tests_support {
             probed_samples,
             pinned: false,
             size_hint: Some(128 * 1024 * 1024),
+            late: super::LateSlot::default(),
         };
         (targets, node_a, node_b)
     }

@@ -45,7 +45,9 @@ pub use engine::{
     CacheEngine, EvictionCandidates, EvictionPreview, OriginHeldReport, OriginPresence,
     PresentRanges, ServeAudit,
 };
-pub use error::{CacheError, CacheResult, OriginError, OriginPullError, SupportedEncoding};
+pub use error::{
+    CacheError, CacheResult, ErrorChain, OriginError, OriginPullError, SupportedEncoding,
+};
 pub use fill_session::{
     Demand, DemandSlot, DownstreamWatch, FillClaim, FillError, FillRegistry, FillSession, Frontier,
     HashOutboard, ObserverLease, SessionOutboardReader,

@@ -74,7 +74,7 @@ use decdn_e2e::bindings::Erc20;
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::cli::ensure_decdn_cli_built;
 use decdn_e2e::client::ClientFixture;
-use decdn_e2e::node::NodeFixture;
+use decdn_e2e::node::{FOREIGN_LANE_DROPPED, FOREIGN_LANES_DROPPED, NodeFixture};
 use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools};
 
 /// Overall ceiling so an unbounded await fails fast. Each journey stands up
@@ -125,11 +125,6 @@ const FOREIGN_ROW_DROPPED: &str =
 /// any pull runs.
 const FOREIGN_ROW_IGNORED: &str =
     "ignoring a tracked buyer pool from another PaymentPool deployment";
-
-/// The WARN a seeder logs when its boot drops seller state another deployment
-/// wrote.
-const FOREIGN_LANES_DROPPED: &str = "dropping seller lane state, pending settles and watcher \
-                                     checkpoints written against another PaymentPool deployment";
 
 /// Deterministic pseudo-random blob spanning many chunk groups.
 fn make_blob(len: usize) -> Vec<u8> {
@@ -395,7 +390,7 @@ async fn run_repointed_seeder() -> anyhow::Result<()> {
     // races. The value math is pinned by the `forfeited_value` unit test.
     anyhow::ensure!(
         r.seeder1
-            .log_line(&["last record of its unredeemed claim", &foreign])
+            .log_line(&[FOREIGN_LANE_DROPPED, &foreign])
             .is_some(),
         "the repointed SEEDER #1 must log the per-lane last-record line"
     );

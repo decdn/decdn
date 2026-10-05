@@ -33,6 +33,18 @@ use crate::chain::{ChainFixture, ContractAddrs};
 /// via `DECDN_KEYSTORE_PASSWORD` (#1032).
 pub const KEYSTORE_PASSWORD: &str = "decdn-e2e-test-password";
 
+/// The summary WARN a daemon logs when its lane store opens against another
+/// `PaymentPool` deployment and drops the seller lane state, the pending
+/// settles and the watcher checkpoints. Shared so a journey that asserts the
+/// drop and one that asserts its absence match the same text.
+pub const FOREIGN_LANES_DROPPED: &str = "dropping seller lane state, pending settles and watcher \
+                                         checkpoints written against another PaymentPool \
+                                         deployment";
+
+/// The per-lane WARN a daemon logs for each decodable seller lane that a
+/// deployment rebind drops, before the [`FOREIGN_LANES_DROPPED`] summary.
+pub const FOREIGN_LANE_DROPPED: &str = "dropping this seller lane with the deployment rebind";
+
 /// Kills the spawned `decdn-node` on drop so a panicking assertion never leaks
 /// the daemon process. The `Child` is behind a `Mutex` so [`NodeFixture::wait_healthy`]
 /// can `try_wait` it through a shared `&self` reference.
@@ -619,19 +631,7 @@ impl NodeFixture {
     /// `Mutex`, so the swap needs no exclusive borrow. A daemon halted by
     /// [`Self::stop`] is respawned.
     pub async fn restart(&self) -> anyhow::Result<()> {
-        // Kill the old process and swap in the new one, holding the guard lock
-        // only briefly (never across an await). `wait()` reaps the old process
-        // so it has released its ports before the replacement binds them.
-        {
-            let mut child = self
-                .child
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _ = child.kill();
-            let _ = child.wait();
-            *child = spawn_daemon(&self.config_path, self.data_dir.path(), &self.log)?;
-        }
+        self.respawn_child()?;
         self.wait_healthy(Duration::from_secs(30))
             .await
             .context("node never became healthy after restart")
@@ -673,39 +673,12 @@ impl NodeFixture {
             let child = self.child.0.lock().unwrap_or_else(PoisonError::into_inner);
             i32::try_from(child.id()).context("decdn-node pid does not fit a pid_t")?
         };
-        let started = tokio::time::Instant::now();
         nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid),
             nix::sys::signal::Signal::SIGTERM,
         )
         .context("send SIGTERM to decdn-node")?;
-        loop {
-            // The guard lock is held only for the non-blocking `try_wait`, never
-            // across the sleep.
-            let exited = {
-                let mut child = self.child.0.lock().unwrap_or_else(PoisonError::into_inner);
-                child.try_wait().context("poll decdn-node for exit")?
-            };
-            if let Some(status) = exited {
-                let took = started.elapsed();
-                anyhow::ensure!(
-                    self.log.drained(LOG_DRAIN_TIMEOUT).await,
-                    "decdn-node exited ({status}) but its log capture did not reach EOF \
-                     within {LOG_DRAIN_TIMEOUT:?}, so its last lines may be missing"
-                );
-                return Ok((status, took));
-            }
-            if started.elapsed() >= timeout {
-                self.stop()
-                    .context("kill decdn-node after its SIGTERM timed out")?;
-                anyhow::bail!(
-                    "decdn-node did not exit within {timeout:?} of SIGTERM; its last \
-                     {LOG_TAIL_LINES} lines:\n{}",
-                    self.log.tail(LOG_TAIL_LINES)
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        self.wait_for_exit(timeout, "SIGTERM").await
     }
 
     /// Point the daemon at the `PaymentPool` at `payment_pool` and at
@@ -728,6 +701,100 @@ impl NodeFixture {
         self.restart()
             .await
             .context("restart after PaymentPool repoint")
+    }
+
+    /// Point the config at the `PaymentPool` at `payment_pool`, leaving every
+    /// other key — the discovery peers included — as it is. Only the config file
+    /// changes: the running daemon keeps its old deployment until a
+    /// [`Self::restart`] or [`Self::respawn_expecting_exit`] reads the new one.
+    pub fn set_payment_pool_address(&self, payment_pool: Address) -> anyhow::Result<()> {
+        let config = std::fs::read_to_string(&self.config_path).context("read node config")?;
+        let rewritten = rewrite_payment_pool_address(&config, payment_pool)?;
+        std::fs::write(&self.config_path, rewritten).context("write node config")
+    }
+
+    /// Kill the daemon, respawn it against the same config and data dir, and
+    /// wait up to `timeout` for the new process to exit, returning its exit
+    /// status.
+    ///
+    /// The daemon is expected to fail bring-up; a later [`Self::restart`]
+    /// respawns it. Unlike [`Self::restart`], this never waits for health. A
+    /// daemon still running at `timeout` is killed and reaped, and the call
+    /// fails with the daemon's last log lines.
+    ///
+    /// It returns `Ok` only once the log capture has read both pipes to EOF, so
+    /// a [`Self::log_line`] after it sees every line the failed bring-up wrote.
+    pub async fn respawn_expecting_exit(
+        &self,
+        timeout: Duration,
+    ) -> anyhow::Result<std::process::ExitStatus> {
+        self.respawn_child()?;
+        let (status, _) = self.wait_for_exit(timeout, "its respawn").await?;
+        Ok(status)
+    }
+
+    /// Kill and reap the current daemon, then spawn a new one against the same
+    /// config and data dir. The guard lock is held only for this swap, never
+    /// across an await. Reaping first means the old process has released its
+    /// ports before the replacement binds them; a stopped daemon is already
+    /// reaped, and `kill` and `wait` both answer `Ok` for it.
+    fn respawn_child(&self) -> anyhow::Result<()> {
+        let mut child = self.child.0.lock().unwrap_or_else(PoisonError::into_inner);
+        child.kill().context("kill decdn-node before its respawn")?;
+        child.wait().context("reap decdn-node before its respawn")?;
+        *child = spawn_daemon(&self.config_path, self.data_dir.path(), &self.log)?;
+        Ok(())
+    }
+
+    /// Poll the daemon until it exits, up to `timeout` after `event` (named in
+    /// the timeout error), and return its exit status and how long it took.
+    ///
+    /// On exit it requires the log capture to read both pipes to EOF. A daemon
+    /// still running at `timeout` is killed and reaped, its log drained, and
+    /// the call fails with its last log lines; a failed kill is added to that
+    /// error, not reported instead of it.
+    async fn wait_for_exit(
+        &self,
+        timeout: Duration,
+        event: &str,
+    ) -> anyhow::Result<(std::process::ExitStatus, Duration)> {
+        let started = tokio::time::Instant::now();
+        loop {
+            // The guard lock is held only for the non-blocking `try_wait`, never
+            // across the sleep.
+            let exited = {
+                let mut child = self.child.0.lock().unwrap_or_else(PoisonError::into_inner);
+                child.try_wait().context("poll decdn-node for exit")?
+            };
+            if let Some(status) = exited {
+                let took = started.elapsed();
+                anyhow::ensure!(
+                    self.log.drained(LOG_DRAIN_TIMEOUT).await,
+                    "decdn-node exited ({status}) but its log capture did not reach EOF \
+                     within {LOG_DRAIN_TIMEOUT:?}, so its last lines may be missing"
+                );
+                return Ok((status, took));
+            }
+            if started.elapsed() >= timeout {
+                let stopped = self.stop();
+                let drained = self.log.drained(LOG_DRAIN_TIMEOUT).await;
+                let mut message = format!(
+                    "decdn-node did not exit within {timeout:?} of {event}; its last \
+                     {LOG_TAIL_LINES} lines{}:\n{}",
+                    if drained {
+                        ""
+                    } else {
+                        " (log capture not drained)"
+                    },
+                    self.log.tail(LOG_TAIL_LINES)
+                );
+                if let Err(err) = stopped {
+                    let _ = write!(message, "\nkilling it afterwards also failed: {err:#}");
+                }
+                anyhow::bail!(message);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// The first line this daemon logged — across every spawn — that contains
@@ -1084,17 +1151,11 @@ fn rewrite_pool_min_remaining_deposit(config: &str, micro_usdc: u64) -> anyhow::
     toml::to_string(&doc).context("render node config")
 }
 
-/// Rewrite `blockchain.payment_pool_address` and replace
-/// `[network.discovery.peers]` with `discovery_peers` in a node TOML config,
-/// preserving every other key. Separate from [`NodeFixture::repoint_payment_pool`]
-/// so its parse → mutate → `toml::to_string` round-trip is testable without a
-/// live daemon, mirroring [`rewrite_rate_per_mb`]. Peers take the
-/// `addrs = ["127.0.0.1:{port}"]` shape [`render_config`] writes.
-fn rewrite_payment_pool(
-    config: &str,
-    payment_pool: Address,
-    discovery_peers: &[(iroh::PublicKey, u16)],
-) -> anyhow::Result<String> {
+/// Rewrite `blockchain.payment_pool_address` in a node TOML config, preserving
+/// every other key. Separate from [`NodeFixture::set_payment_pool_address`] so
+/// its parse → mutate → `toml::to_string` round-trip is testable without a live
+/// daemon, mirroring [`rewrite_rate_per_mb`].
+fn rewrite_payment_pool_address(config: &str, payment_pool: Address) -> anyhow::Result<String> {
     let mut doc: toml::Table = config.parse().context("parse node config")?;
     let blockchain = doc
         .get_mut("blockchain")
@@ -1104,6 +1165,23 @@ fn rewrite_payment_pool(
         "payment_pool_address".to_string(),
         toml::Value::String(payment_pool.to_string()),
     );
+    toml::to_string(&doc).context("render node config")
+}
+
+/// Rewrite `blockchain.payment_pool_address` (through
+/// [`rewrite_payment_pool_address`]) and replace `[network.discovery.peers]`
+/// with `discovery_peers` in a node TOML config, preserving every other key.
+/// Separate from [`NodeFixture::repoint_payment_pool`] so its parse → mutate →
+/// `toml::to_string` round-trip is testable without a live daemon, mirroring
+/// [`rewrite_rate_per_mb`]. Peers take the `addrs = ["127.0.0.1:{port}"]` shape
+/// [`render_config`] writes.
+fn rewrite_payment_pool(
+    config: &str,
+    payment_pool: Address,
+    discovery_peers: &[(iroh::PublicKey, u16)],
+) -> anyhow::Result<String> {
+    let repointed = rewrite_payment_pool_address(config, payment_pool)?;
+    let mut doc: toml::Table = repointed.parse().context("parse node config")?;
     let network = doc
         .get_mut("network")
         .and_then(toml::Value::as_table_mut)
@@ -1132,9 +1210,10 @@ fn rewrite_payment_pool(
 /// reports.
 const LOG_TAIL_LINES: usize = 20;
 
-/// How long [`NodeFixture::terminate`] waits, after the daemon exits, for its log
-/// capture to read both pipes to EOF. A pipe closes the moment the process that
-/// holds it exits, so this only bounds the reader threads' last few reads.
+/// How long [`NodeFixture::terminate`] and [`NodeFixture::respawn_expecting_exit`]
+/// wait, after the daemon exits, for its log capture to read both pipes to EOF.
+/// A pipe closes the moment the process that holds it exits, so this only bounds
+/// the reader threads' last few reads.
 const LOG_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Everything every spawn of one daemon has written to stdout and stderr, line
@@ -1690,6 +1769,44 @@ mod tests {
         );
         // Everything around the mutation is intact.
         assert_eq!(doc["network"]["bind_port"].as_integer(), Some(4433));
+        assert_eq!(doc["blockchain"]["chain_id"].as_integer(), Some(31_337));
+        assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
+        assert_eq!(
+            doc["cache"]["node_to_node_pull_through_enabled"].as_bool(),
+            Some(true)
+        );
+    }
+
+    /// `set_payment_pool_address`'s parse → mutate → serialize step
+    /// (`rewrite_payment_pool_address`) sets only the address: the discovery
+    /// peers and the `[cache]` table survive the round-trip.
+    #[test]
+    fn rewrite_payment_pool_address_keeps_peers_and_cache() {
+        let peer = iroh::SecretKey::from_bytes(&[0xCC; 32]).public();
+        let with_peer = rewrite_payment_pool(
+            &sample_rendered_config(),
+            Address::from([0x22; 20]),
+            &[(peer, 4434)],
+        )
+        .expect("rewrite_payment_pool must succeed");
+        let codeless = Address::repeat_byte(0xC0);
+        let rewritten = rewrite_payment_pool_address(&with_peer, codeless)
+            .expect("rewrite_payment_pool_address must succeed");
+        let doc: toml::Value =
+            toml::from_str(&rewritten).expect("rewritten config must be valid TOML");
+
+        assert_eq!(
+            doc["blockchain"]["payment_pool_address"].as_str(),
+            Some(codeless.to_string().as_str())
+        );
+        let peers = doc["network"]["discovery"]["peers"]
+            .as_table()
+            .expect("discovery peers must be a table");
+        assert_eq!(peers.len(), 1, "peers are kept as they were: {peers:?}");
+        assert_eq!(
+            peers[&peer.to_string()]["addrs"][0].as_str(),
+            Some("127.0.0.1:4434")
+        );
         assert_eq!(doc["blockchain"]["chain_id"].as_integer(), Some(31_337));
         assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
         assert_eq!(

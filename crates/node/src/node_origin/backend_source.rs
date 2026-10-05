@@ -136,6 +136,16 @@ impl BlobSource for BackendSource {
         })
     }
 
+    fn stop(&self, _reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+        // Only a steal stops a leg early, and the node's pull leg drives one
+        // source with no steal. A caller that asks otherwise is this
+        // process's bug, never the origin's.
+        Box::pin(async {
+            Err(anyhow::anyhow!("a backend leg runs every range to its end")
+                .context(decdn_client::LocalPullFault))
+        })
+    }
+
     fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
         Box::pin(async move {
             // Advance the LOCAL completion counter by this leg's wire length at
@@ -216,7 +226,7 @@ impl<W: WireChunks> BackendReader<W> {
             match self.wire.next_chunk().await {
                 Some(Ok(chunk)) => self.pending = chunk,
                 Some(Err(fault)) => {
-                    let msg = fault.to_string();
+                    let msg = fault.display_chain().to_string();
                     self.fault = Some(fault);
                     return Err(std::io::Error::other(msg));
                 }
@@ -436,8 +446,9 @@ mod tests {
         let tmp2 = tempfile::tempdir()?;
         let engine2 = CacheEngine::open(tmp2.path(), vec![], 64).await?;
         let store = NodeAdmitStore::new(engine2.clone(), hash, total, None);
-        let mut drained =
-            IngestStore::ingest_stream(&store, &aligned, reader, None, aligned.blob_size()).await?;
+        let (mut drained, _) =
+            IngestStore::ingest_stream(&store, &aligned, reader, None, aligned.blob_size(), None)
+                .await?;
         assert_eq!(
             drained.read_bytes(1).await?.len(),
             0,
@@ -491,10 +502,11 @@ mod tests {
         let tmp2 = tempfile::tempdir()?;
         let engine2 = CacheEngine::open(tmp2.path(), vec![], 64).await?;
         let store = NodeAdmitStore::new(engine2, hash, total, None);
-        let err = IngestStore::ingest_stream(&store, &aligned, reader, None, aligned.blob_size())
-            .await
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("expected VerifyFailed, got Ok"))?;
+        let err =
+            IngestStore::ingest_stream(&store, &aligned, reader, None, aligned.blob_size(), None)
+                .await
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("expected VerifyFailed, got Ok"))?;
         let cache_err = err
             .downcast_ref::<decdn_cache::CacheError>()
             .ok_or_else(|| anyhow::anyhow!("expected a CacheError, got {err:?}"))?;
@@ -598,6 +610,7 @@ mod tests {
             reader_over(items),
             None,
             aligned.blob_size(),
+            None,
         )
         .await?;
         assert!(RangedStore::is_complete(&store).await?);

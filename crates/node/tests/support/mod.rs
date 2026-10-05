@@ -779,6 +779,58 @@ pub(crate) async fn read_client_msg(recv: &mut RecvStream) -> anyhow::Result<Cli
     Ok(msg)
 }
 
+/// Cancel-safe reader for the [`ClientMessage`] frames a node sends on one
+/// `cdn/client/v1` stream.
+///
+/// [`read_client_msg`] is built on `read_exact` and is not cancel-safe: a
+/// `timeout` that fires partway through a frame drops the bytes already read,
+/// and the next read decodes from the middle of that frame. This reader keeps
+/// every byte it reads in a buffer that outlives each [`Self::read`] call, so a
+/// test can wrap `read` in a `timeout`, act on the quiet spell, and read the
+/// same stream again. It mirrors the node's own `BufferedProofReader`.
+///
+/// Once a stream is read through an instance, every later read on that stream
+/// must go through the same instance: the buffer can hold the start of the
+/// next frame.
+#[derive(Default)]
+pub(crate) struct BufferedClientReader {
+    /// Bytes read from the stream that do not yet make a whole frame.
+    buf: Vec<u8>,
+}
+
+impl BufferedClientReader {
+    /// Read the next [`ClientMessage`] from `recv`. **Cancel-safe:** if the
+    /// future is dropped, the bytes it read stay buffered for the next call.
+    pub(crate) async fn read(&mut self, recv: &mut RecvStream) -> anyhow::Result<ClientMessage> {
+        loop {
+            if let Some((header_len, payload_len)) = decdn_protocol::framing::parse_frame(&self.buf)
+                .map_err(|e| anyhow::anyhow!("parse frame: {e}"))?
+            {
+                let total = header_len.saturating_add(payload_len);
+                let frame: Vec<u8> = self.buf.drain(..total).skip(header_len).collect();
+                let (msg, _rest) = decode_message::<ClientMessage>(&frame)
+                    .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+                return Ok(msg);
+            }
+            // tokio's `AsyncReadExt::read` is cancel-safe: a dropped future
+            // consumes nothing, and the bytes of a completed read are appended
+            // before the next await. Named explicitly because iroh's inherent
+            // `RecvStream::read` shadows it.
+            let mut scratch = [0u8; 4096];
+            let n = tokio::io::AsyncReadExt::read(recv, &mut scratch)
+                .await
+                .map_err(|e| anyhow::anyhow!("read: {e}"))?;
+            anyhow::ensure!(
+                n > 0,
+                "stream ended with {} bytes of a partial frame buffered",
+                self.buf.len()
+            );
+            self.buf
+                .extend_from_slice(scratch.get(..n).unwrap_or_default());
+        }
+    }
+}
+
 /// Read one length-framed `StreamResponse` together with its trailing
 /// [`StreamResponseExt`] (ADR 013 §Tier 1, two-phase).
 ///

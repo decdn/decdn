@@ -116,14 +116,7 @@ async fn serve_error(
         .await?;
     while let Some(item) = stream.next().await {
         if let Err(err) = item {
-            let mut text = err.to_string();
-            let mut source = std::error::Error::source(&err);
-            while let Some(cause) = source {
-                text.push_str(": ");
-                text.push_str(&cause.to_string());
-                source = cause.source();
-            }
-            return Ok(Some(text));
+            return Ok(Some(err.display_chain().to_string()));
         }
     }
     Ok(None)

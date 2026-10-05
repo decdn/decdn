@@ -140,13 +140,21 @@ pub const DEFAULT_REDEEM_INTERVAL_SECS: u64 = 300;
 /// batch.
 pub const REDEEM_LANDING_SLACK_SECS: u64 = 120;
 /// The node's capability-expiry margin in seconds for a redeem interval: one
-/// interval plus [`REDEEM_LANDING_SLACK_SECS`] (ADR 003 §Revocation). The node
-/// rejects a voucher once `now + margin` reaches its capability's expiry, so a
-/// voucher accepted at the edge still meets one self-tick sweep with landing time
-/// to spare.
+/// interval plus [`REDEEM_LANDING_SLACK_SECS`] (ADR 003 §Revocation). Inside the
+/// margin the node accepts no voucher and no preimage for the capability
+/// ([`inside_capability_expiry_margin`]), so the lane's claim is final. The
+/// redeemer sweeps the lane one second after the margin starts, and that sweep
+/// has one interval to start the redemption and the landing slack to land it.
 #[must_use]
 pub const fn capability_expiry_margin_secs(redeem_interval_secs: u64) -> u64 {
     redeem_interval_secs.saturating_add(REDEEM_LANDING_SLACK_SECS)
+}
+/// Whether the Unix second `now` falls inside the expiry margin of a capability
+/// that expires at `expiry`: `now + margin_secs >= expiry`. An `expiry` of `0`
+/// means "not tracked" and is never inside the margin.
+#[must_use]
+pub const fn inside_capability_expiry_margin(expiry: u64, margin_secs: u64, now: u64) -> bool {
+    expiry != 0 && now.saturating_add(margin_secs) >= expiry
 }
 /// Upper bound on the redeemer self-tick interval: 6h (`21_600s`). The sweep is the
 /// node's only defense against an owner's grace-window close — it must run several

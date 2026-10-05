@@ -71,6 +71,7 @@ mod delivery;
 mod dispatch;
 mod fill;
 mod outcome;
+mod proof_wait;
 mod ramp;
 mod serve_encoder;
 mod serve_leg;
@@ -86,6 +87,11 @@ pub const MAX_CLIENT_STREAMS: usize = 100;
 
 // Per-stage timeouts so a stalled peer cannot pin a stream task indefinitely.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the serve loop waits for a proof while the connection sends no new
+/// STREAM frame. The proofs of one owed chunk never wait past
+/// [`proof_wait::PROOF_WAIT_CEILING`] in total, from the chunk's first proof
+/// wait (see [`proof_wait`]). Traffic on sibling streams of the same
+/// connection counts as progress, so it can hold a wait up to that ceiling.
 const VOUCHER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 /// After a clean `StreamEnd`, how long the serve waits for the client's FIN while
@@ -98,6 +104,11 @@ const POST_END_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// pull-through deadline is configured. In practice the runtime always sets
 /// one alongside the window provider, so this only guards a misconfiguration.
 const WINDOW_PULL_FALLBACK_DEADLINE: Duration = Duration::from_mins(1);
+/// The largest first frame a serve writes ([`ClientHandler::first_frame_target`]):
+/// four bao chunk groups. It sits above the one-group floor the pull side
+/// reserves for a prefetch past a shut window (`decdn_client::PULL_WINDOW_FLOOR`),
+/// so the miss leg's pairing holds.
+const FIRST_FRAME_BYTES: u64 = 4 * decdn_bao_range::CHUNK_GROUP_BYTES;
 
 /// Application-layer idle-close ceiling (ADR 005 §Connection lifetime): a served
 /// connection is closed this long after its last stream closes — or after it is
@@ -2072,6 +2083,18 @@ impl ClientHandler {
             .unwrap_or_else(|_| usize::try_from(decdn_bao_range::CHUNK_GROUP_BYTES).unwrap_or(1))
     }
 
+    /// The target size of a stream's first frame: [`Self::frame_target`] at the
+    /// start of an interval, capped at [`FIRST_FRAME_BYTES`]. A serve writes no
+    /// byte until its first frame is full, so the cap is what the first byte
+    /// waits for: a few chunk groups of store read on a hit, or of upstream pull
+    /// on a miss, rather than a whole interval. Every later frame keeps the
+    /// full target, so the frames still land on the interval boundary.
+    pub(super) fn first_frame_target(&self, interval_bytes: u64, opening_window: u64) -> usize {
+        let cap = usize::try_from(FIRST_FRAME_BYTES).unwrap_or(usize::MAX);
+        self.frame_target(0, interval_bytes, opening_window)
+            .min(cap)
+    }
+
     /// The effective downstream credit window in bytes for a stream whose voucher
     /// interval is `interval_bytes` and whose ramp input is `paid` (ADR 003
     /// §Credit window): the stream's own confirmed payment plus the credit it
@@ -2561,12 +2584,15 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
 /// no headroom for it.
 ///
 /// The bound matters because without it a payer could hold a stream open
-/// indefinitely with a run of zero-credit vouchers, each one refreshing the read
-/// timeout while the delivered-but-unpaid balance never moves — the same shape
-/// of stall the non-empty-`ChunkData` floor closes on the delivery side. The
-/// exact value trades slack against how long that stall may run; every read
-/// inside it still carries its own timeout, so the bound is about liveness, not
-/// about capping any single wait.
+/// indefinitely with a run of zero-credit vouchers, each one refreshing the
+/// no-progress timeout while the delivered-but-unpaid balance never moves — the
+/// same shape of stall the non-empty-`ChunkData` floor closes on the delivery
+/// side. This budget bounds the number of proofs for one owed chunk, not the
+/// time. [`proof_wait::ChunkProofs`] counts them, and it also holds the chunk's
+/// time bound: every proof wait for the chunk ends at
+/// [`proof_wait::PROOF_WAIT_CEILING`] after the chunk's first wait. So one owed
+/// chunk holds the stream for at most that long, however many proofs it takes.
+/// A stream that owes several chunks waits up to that long for each of them.
 const MAX_PROOFS_PER_CHUNK: u32 = 8;
 
 /// One payment proof off the wire: a signed voucher, or a released hash-chain
@@ -2586,8 +2612,8 @@ pub(super) enum Proof {
 
 /// Cancellation-safe, buffered reader for `cdn/client/v1` payment-proof frames. Owns
 /// a byte buffer that PERSISTS across [`Self::read`] calls, so a `read` future
-/// cancelled by the outer [`VOUCHER_READ_TIMEOUT`] loses no bytes: any partial
-/// frame stays buffered for the next call.
+/// dropped mid-frame loses no bytes: any partial frame stays buffered for the
+/// next call.
 ///
 /// [`read_frame`] is built on `read_exact` and is NOT cancellation-safe — a
 /// `timeout` firing mid-frame would drop already-consumed bytes and desync the
@@ -2610,9 +2636,9 @@ pub(super) struct BufferedProofReader {
 impl BufferedProofReader {
     /// Read one framed payment proof — a [`ClientMessage::Voucher`] or a
     /// [`ClientMessage::ChunkPreimage`] — filling the buffer incrementally.
-    /// **Cancellation-safe:** if the returned future is dropped (a gather
-    /// `timeout` elapsed), bytes already read stay in `self.buf` for the next
-    /// call — no frame is torn.
+    /// **Cancellation-safe:** if the returned future is dropped (the proof wait
+    /// faulted, or the stream is torn down), bytes already read stay in
+    /// `self.buf` for the next call — no frame is torn.
     ///
     /// These two variants are the entire payer→node vocabulary after the
     /// opening `StreamRequest`, so this is the one place every proof passes
@@ -2633,7 +2659,7 @@ impl BufferedProofReader {
             // iroh's inherent Quinn `read` shadows it) — it is documented
             // cancel-safe: a dropped future consumes nothing, and on `Ready(n)` we
             // append to `self.buf` before the next await, so no bytes are ever lost
-            // to a gather timeout. `0` is EOF.
+            // when the caller drops the read. `0` is EOF.
             let mut scratch = [0u8; 4096];
             let n = AsyncReadExt::read(recv, &mut scratch).await.map_err(|e| {
                 anyhow::Error::new(wire::PeerFault)
@@ -2954,6 +2980,32 @@ mod tests {
         assert_eq!(
             handler.frame_target(interval - group, interval, u64::MAX) as u64,
             group
+        );
+    }
+
+    /// A stream's first frame is small, so its first byte waits for a few chunk
+    /// groups of read or pull rather than a whole interval. A tighter opening
+    /// window still wins, and the frame never drops below one chunk group.
+    #[tokio::test]
+    async fn the_first_frame_is_small() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests(&metrics).await;
+        let interval = decdn_protocol::CHUNK_BYTES;
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+
+        assert_eq!(
+            handler.first_frame_target(interval, u64::MAX) as u64,
+            FIRST_FRAME_BYTES
+        );
+        assert_eq!(
+            handler.first_frame_target(interval, 2 * group) as u64,
+            2 * group
+        );
+        assert_eq!(handler.first_frame_target(interval, 0) as u64, group);
+        assert_eq!(
+            FIRST_FRAME_BYTES % group,
+            0,
+            "the first frame is whole chunk groups"
         );
     }
 
