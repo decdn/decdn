@@ -9,7 +9,8 @@
 //! one node, otherwise each distinct blob discovers its own holder among the
 //! region-nearest active nodes. Every group's fetch — a plain whole-file blob,
 //! or a hint-carrying entry's pay-now-range fetch — fans out concurrently,
-//! bounded by one global `--jobs` cap (`PullCtx.gate`). A manifest `chunks`
+//! bounded by one global `--jobs` cap (`PullCtx.gate`). An entry that only
+//! waits for a sibling's donor chunks holds no slot of it. A manifest `chunks`
 //! entry is never fetched or stored as its own blob: its hints only let a
 //! byte range shared with another entry be recognized and spliced from disk
 //! instead of paid for again.
@@ -69,7 +70,7 @@ use std::io::IsTerminal as _;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::Address;
@@ -1552,7 +1553,6 @@ async fn pull_over(
         funding: fetch::RunFunding::default(),
         dedup_stats: DedupStats::default(),
         open_lock: tokio::sync::Mutex::new(()),
-        jobs: args.jobs.max(1),
         gate: tokio::sync::Semaphore::new(args.jobs.max(1)),
         lane_cap: LaneStreamCap::new(usize::from(args.max_lane_streams)),
         health: Arc::new(PeerHealth::default()),
@@ -2043,6 +2043,69 @@ impl ExtraPermits {
     }
 }
 
+/// One `--jobs` permit of [`PullCtx::gate`], held by one hash group's fetch.
+///
+/// A range-dedup entry gives it back while it only waits for a sibling to
+/// register its donor chunks ([`RangeDriver::release_slot`]): a waiter moves
+/// no bytes, and holding the permit would keep a queued entry from fetching.
+/// It takes a permit again before any further drive ([`Self::ensure`]).
+struct FetchSlot<'g> {
+    gate: &'g tokio::sync::Semaphore,
+    permit: Mutex<Option<tokio::sync::SemaphorePermit<'g>>>,
+}
+
+impl<'g> FetchSlot<'g> {
+    /// Wait for a permit of `gate`.
+    async fn acquire(gate: &'g tokio::sync::Semaphore) -> anyhow::Result<Self> {
+        let permit = gate
+            .acquire()
+            .await
+            .map_err(|_| anyhow!("bundle pull concurrency gate closed"))?;
+        Ok(Self {
+            gate,
+            permit: Mutex::new(Some(permit)),
+        })
+    }
+
+    /// Give the permit back, if this slot holds it.
+    fn release(&self) {
+        drop(
+            self.permit
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+    }
+
+    /// Hold a permit: wait for one if [`Self::release`] gave it back.
+    async fn ensure(&self) -> anyhow::Result<()> {
+        if self
+            .permit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+        {
+            return Ok(());
+        }
+        let permit = self
+            .gate
+            .acquire()
+            .await
+            .map_err(|_| anyhow!("bundle pull concurrency gate closed"))?;
+        *self.permit.lock().unwrap_or_else(PoisonError::into_inner) = Some(permit);
+        Ok(())
+    }
+
+    /// Whether this slot holds a permit now.
+    #[cfg(test)]
+    fn held(&self) -> bool {
+        self.permit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+}
+
 /// Shared, by-reference state for the entry fetch loop. Borrowed by every
 /// in-flight entry future, and every entry must be polled on one task, as
 /// `buffer_unordered` does: each entry reads its lanes' ledgers and queues
@@ -2097,16 +2160,13 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// also perform a low-water top-up) and released before streaming, so
     /// delivery itself still runs concurrently once each entry has its context.
     open_lock: tokio::sync::Mutex<()>,
-    /// Live per-file/group bar fan-out bound; the actual in-flight-fetch cap is
-    /// `gate`. Set from `--jobs` (min 1) so a bundle with many entries never
-    /// instantiates more live progress bars than the run can actually service
-    /// at once.
-    jobs: usize,
-    /// Global cap on concurrent blob fetches, one permit per group: a plain
-    /// whole-file fetch, or a hint-carrying entry's complement-range fetch (plus
-    /// its donor splice and any re-fetch), held as one logical fetch unit. A
-    /// byte range a sibling entry already holds is spliced from disk instead of
-    /// fetched, so it never takes a permit of its own.
+    /// Global `--jobs` cap (min 1) on hash groups at work, one permit per group
+    /// ([`FetchSlot`]), taken before the group's file bar: a plain whole-file
+    /// fetch, or a hint-carrying entry's complement drive, donor splice and any
+    /// re-fetch. A range-dedup entry gives its permit back while it only waits
+    /// for a sibling's donor chunks, and takes one again to drive. A byte range
+    /// a sibling entry already holds is spliced from disk instead of fetched,
+    /// so it never takes a permit of its own.
     gate: tokio::sync::Semaphore,
     /// Per-provider cap on concurrent same-lane streams (`--max-lane-streams`,
     /// default 4). Every lane an entry's fetch builds holds one of its
@@ -2169,18 +2229,17 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// Fetch one whole blob into `staging` through the acquire loop (ADR 039),
     /// across the entry's holders ([`Self::entry_targets`]). See
     /// [`Self::acquire_entry`] for the fetch itself and what it returns.
+    ///
+    /// `slot` is the caller's `--jobs` permit; the fetch runs under it.
     async fn fetch_to_staging(
         &self,
         hash: [u8; 32],
         staging: &Path,
         total: Option<u64>,
         progress: Option<&ProgressCallback>,
+        slot: &FetchSlot<'_>,
     ) -> anyhow::Result<bool> {
-        let _permit = self
-            .gate
-            .acquire()
-            .await
-            .map_err(|_| anyhow!("bundle pull concurrency gate closed"))?;
+        slot.ensure().await?;
         let targets = self.entry_targets(hash).await?;
         self.acquire_entry(&targets, hash, staging, total, None, progress)
             .await
@@ -2349,7 +2408,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let staging = staging_path(out_root, hash)?;
         // The manifest blob fetch is silent (no bar): `progress` is disabled here
         // anyway, and the per-file bars belong to the entries, not the manifest.
-        self.fetch_to_staging(hash, &staging, None, None).await?;
+        let slot = FetchSlot::acquire(&self.gate).await?;
+        self.fetch_to_staging(hash, &staging, None, None, &slot)
+            .await?;
         let bytes =
             std::fs::read(&staging).with_context(|| format!("read {}", staging.display()))?;
         remove_staging_off_runtime(&staging).await;
@@ -2360,11 +2421,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// hash: entries sharing a hash (one file at two bundle paths) are fetched and
     /// reconstructed once, then materialized at each path (#1306) — never fetched,
     /// nor *paid for*, twice. Each unit of work runs via `buffer_unordered` (no
-    /// `tokio::spawn`, by choice — nothing here is `!Send`), offered `--jobs` at
-    /// a time so live per-file/group bars stay bounded; `PullCtx.gate` is the
-    /// real cap on in-flight fetches, so parallelism comes from concurrent
-    /// in-flight network I/O, while the run's shared `LaneLedgers` keep
-    /// same-lane voucher issuance monotonic across every entry.
+    /// `tokio::spawn`, by choice — nothing here is `!Send`), every one in flight
+    /// at once and waiting in start order for its slot of `PullCtx.gate`, the
+    /// one `--jobs` cap; a group's file bar appears only once it holds a slot.
+    /// Parallelism comes from concurrent in-flight network I/O, while the run's
+    /// shared `LaneLedgers` keep same-lane voucher issuance monotonic across
+    /// every entry.
     ///
     /// A run-wide [`ChunkIndex`] threads through every group: an entry that
     /// carries chunk hints and completes registers its chunks, and a later entry
@@ -2434,8 +2496,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// Fetch every distinct blob once (grouped by hash) and materialize it at each
     /// destination path (#1306), routing each group through [`Self::pull_entry`] so a
     /// blob whose chunk hints overlap an already-materialized sibling pays only for
-    /// the complement. Live per-group bars are bounded at `--jobs`; `PullCtx.gate`
-    /// is the real cap on in-flight fetches.
+    /// the complement. `PullCtx.gate` caps the groups at work at `--jobs`; a
+    /// range-dedup entry waiting for donors holds no slot, so a queued group
+    /// starts in its place.
     // The run-wide context (index, fetch plan, disk pre-pass, flush cache) all
     // threads through here; bundling it into a struct would only rename the fields.
     #[allow(clippy::too_many_arguments)]
@@ -2501,9 +2564,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             };
             stopped = run_groups(
                 groups_by_hash,
-                // Live-bar fan-out bounded by --jobs; the global gate is the real
-                // in-flight-fetch cap.
-                self.jobs.min(group_count),
+                // Every group in flight at once: each waits for its slot of the
+                // global gate, the one `--jobs` cap, in start order.
+                group_count,
                 run,
                 |i, (run, updates, warnings)| {
                     settle_group_run(&mut groups, &flush_tx, i, run, updates, warnings)
@@ -2555,9 +2618,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         index: &ChunkIndex,
         fetch_plan: &FetchPlan,
         file: Option<&pull_progress::FileBar>,
+        slot: &FetchSlot<'_>,
     ) -> anyhow::Result<EntryBytes> {
         let started = std::time::Instant::now();
-        self.pull_entry_untimed(hash, hints, total, staging, index, fetch_plan, file)
+        self.pull_entry_untimed(hash, hints, total, staging, index, fetch_plan, file, slot)
             .await
             .inspect(|&bytes| log_entry_done(hash, staging, bytes, started.elapsed()))
     }
@@ -2598,6 +2662,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         index: &ChunkIndex,
         fetch_plan: &FetchPlan,
         file: Option<&pull_progress::FileBar>,
+        slot: &FetchSlot<'_>,
     ) -> anyhow::Result<EntryBytes> {
         // The byte-delivery callback drives the file bar's download and the total
         // bar's download meter; the `file` handle also carries the phase transitions
@@ -2666,7 +2731,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             // manifest's `size`, when it gives one, is the entry's first size claim,
             // a hint; the paid count is the verified blob's length.
             let refetched = self
-                .fetch_to_staging(hash, staging, total, progress)
+                .fetch_to_staging(hash, staging, total, progress, slot)
                 .await?;
             index.register(hints, staging);
             let len = tokio::fs::metadata(staging).await.map_or(0, |m| m.len());
@@ -2674,14 +2739,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             return Ok(EntryBytes::whole_blob(len, resumed));
         };
 
-        // Dedup path. Hold one fetch permit across the complement drive, the donor
-        // splice, and any re-fetch — one logical fetch unit, exactly as
-        // `fetch_to_staging` scopes its permit.
-        let _permit = self
-            .gate
-            .acquire()
-            .await
-            .map_err(|_| anyhow!("bundle pull concurrency gate closed"))?;
+        // Dedup path. The group's `slot` covers every drive below; the entry
+        // gives it back only while it waits for a sibling's donor chunks
+        // ([`RangeDriver::release_slot`]), and each drive takes it again.
+        slot.ensure().await?;
 
         // Resolve the entry's holders ONCE and reuse them across every drive
         // below (complement, donor re-fetch, whole-blob re-drive), so the entry
@@ -2695,6 +2756,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             total,
             progress,
             refetched: AtomicBool::new(false),
+            slot,
         };
 
         // On any dedup-path success, true up the file + total progress bars to
@@ -2747,9 +2809,14 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         disk: &DiskState,
     ) -> GroupRun {
         // The group's shared hash is carried explicitly; parse it once, and a bad
-        // hash fails every path in the group.
-        let hash = match fetch::parse_hash(group.hash) {
-            Ok(h) => h,
+        // hash fails every path in the group. Then wait for the group's `--jobs`
+        // slot: every group of the run is in flight at once, and this is the cap.
+        let slot = match fetch::parse_hash(group.hash) {
+            Ok(h) => FetchSlot::acquire(&self.gate).await.map(|slot| (h, slot)),
+            Err(e) => Err(e),
+        };
+        let (hash, slot) = match slot {
+            Ok(ok) => ok,
             Err(e) => {
                 return GroupRun::done(
                     group
@@ -2855,6 +2922,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 index,
                 fetch_plan,
                 Some(&file_bar),
+                &slot,
             )
             .await;
         file_bar.finish();
@@ -3086,6 +3154,10 @@ trait RangeDriver {
         &'a self,
         ranges: &'a [(u64, u64)],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>>;
+
+    /// Give back the entry's `--jobs` slot while it only waits for a sibling's
+    /// donor chunks. The next [`Self::drive`] takes a slot again.
+    fn release_slot(&self) {}
 }
 
 /// The production [`RangeDriver`]: each drive fills its ranges through the
@@ -3103,7 +3175,7 @@ trait RangeDriver {
 /// store, so a drive promotes the entry only once fetched bytes fill the
 /// whole store: a resumed store that already held the rest, or the self-heal
 /// re-drive of the whole blob.
-struct AcquireRangeDriver<'a, P: Provider + Clone> {
+struct AcquireRangeDriver<'a, 'g, P: Provider + Clone> {
     ctx: &'a PullCtx<'a, P>,
     targets: &'a fetch::ResolvedTargets,
     hash: [u8; 32],
@@ -3114,9 +3186,12 @@ struct AcquireRangeDriver<'a, P: Provider + Clone> {
     /// Set once a drive's finalize failed its hash and the drive fetched the
     /// whole blob again ([`PullCtx::acquire_entry`]).
     refetched: AtomicBool,
+    /// The entry's `--jobs` slot: held for each drive, given back while the
+    /// entry waits for donors.
+    slot: &'a FetchSlot<'g>,
 }
 
-impl<P: Provider + Clone> RangeDriver for AcquireRangeDriver<'_, P> {
+impl<P: Provider + Clone> RangeDriver for AcquireRangeDriver<'_, '_, P> {
     fn hash(&self) -> [u8; 32] {
         self.hash
     }
@@ -3130,6 +3205,7 @@ impl<P: Provider + Clone> RangeDriver for AcquireRangeDriver<'_, P> {
         ranges: &'a [(u64, u64)],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
         Box::pin(async move {
+            self.slot.ensure().await?;
             let refetched = self
                 .ctx
                 .acquire_entry(
@@ -3146,6 +3222,10 @@ impl<P: Provider + Clone> RangeDriver for AcquireRangeDriver<'_, P> {
             }
             Ok(())
         })
+    }
+
+    fn release_slot(&self) {
+        self.slot.release();
     }
 }
 
@@ -3463,7 +3543,10 @@ async fn reconcile_deferred(
         if let Some(f) = file {
             f.set_pending();
         }
-        // Block until the next registration or group-finish, then rescan.
+        // Block until the next registration or group-finish, then rescan. A
+        // waiter moves no bytes, so its `--jobs` slot goes to a queued entry
+        // meanwhile; a fallback drive takes one again.
+        driver.release_slot();
         notified.as_mut().await;
         notified.set(index.progress.notified());
     }
@@ -7007,6 +7090,120 @@ mod tests {
                 .any(|&(off, len)| off == 0 && len == deferred_len),
             "the deferred range must be driven as a fallback: {driven_ranges:?}"
         );
+    }
+
+    /// A [`RecordingDriver`] that drives under a `--jobs` [`FetchSlot`], as the
+    /// production driver does, and records whether the slot was held for each
+    /// drive.
+    struct SlotDriver<'s, 'g> {
+        inner: RecordingDriver,
+        slot: &'s FetchSlot<'g>,
+        held_on_drive: std::sync::Mutex<Vec<bool>>,
+    }
+    impl RangeDriver for SlotDriver<'_, '_> {
+        fn hash(&self) -> [u8; 32] {
+            self.inner.hash()
+        }
+        fn staging(&self) -> &Path {
+            self.inner.staging()
+        }
+        fn drive<'a>(
+            &'a self,
+            ranges: &'a [(u64, u64)],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
+            Box::pin(async move {
+                self.slot.ensure().await?;
+                self.held_on_drive
+                    .lock()
+                    .expect("held lock")
+                    .push(self.slot.held());
+                self.inner.drive(ranges).await
+            })
+        }
+        fn release_slot(&self) {
+            self.slot.release();
+        }
+    }
+
+    /// #2283: an entry whose complement has landed and that only waits for a
+    /// sibling's donor chunks gives its `--jobs` slot to a queued entry, and
+    /// takes one again for the fallback drive when the sibling finishes
+    /// without them. With one slot, a waiter that kept it would starve the
+    /// queued entry until the wait ended.
+    #[tokio::test]
+    async fn a_donor_waiter_gives_its_slot_to_a_queued_entry_and_retakes_it_to_drive() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let total = 4 * GROUP;
+        let content: Vec<u8> = (0..total)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+            .collect();
+        let whole = *blake3::hash(&content).as_bytes();
+        let deferred_len = 2 * GROUP;
+        let dl = usize::try_from(deferred_len).expect("fits usize");
+        let chunk_hash = *blake3::hash(&content[..dl]).as_bytes();
+
+        let gate = tokio::sync::Semaphore::new(1);
+        let slot = FetchSlot::acquire(&gate).await.expect("first slot");
+        let staging = tmp.path().join("blob");
+        let driver = SlotDriver {
+            inner: RecordingDriver {
+                hash: whole,
+                staging: staging.clone(),
+                content: content.clone(),
+                driven: std::sync::Mutex::new(Vec::new()),
+            },
+            slot: &slot,
+            held_on_drive: std::sync::Mutex::new(Vec::new()),
+        };
+        let plan = ReassemblePlan {
+            donor: Vec::new(),
+            deferred: vec![whole_deferred(Hint {
+                hash: chunk_hash,
+                offset: 0,
+                len: deferred_len,
+            })],
+            drive: vec![(deferred_len, 2 * GROUP)],
+        };
+        let index = ChunkIndex::default();
+        let mut fetch_plan = FetchPlan::default();
+        fetch_plan.assigned.insert(chunk_hash, [0xaa; 32]);
+
+        // The queued entry: it waits for the one slot, holds it briefly, then
+        // its sibling (the assigned fetcher) finishes without the chunk.
+        let queued = async {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(10), gate.acquire())
+                .await
+                .is_ok_and(|permit| permit.is_ok());
+            index.mark_finished([0xaa; 32]);
+            got
+        };
+        let (res, queued_ran) = tokio::join!(
+            reassemble_dedup(
+                &driver,
+                &plan,
+                total,
+                &[],
+                None,
+                &index,
+                &fetch_plan,
+                None,
+                &|| {},
+            ),
+            queued
+        );
+        assert!(res.is_ok(), "reassembly must succeed via fallback: {res:?}");
+        assert!(
+            queued_ran,
+            "the waiter must give its slot to the queued entry"
+        );
+        assert_eq!(std::fs::read(&staging).expect("read staging"), content);
+        let held = driver.held_on_drive.lock().expect("held lock").clone();
+        assert_eq!(
+            held,
+            vec![true, true],
+            "the complement drive and the fallback drive each run under a slot"
+        );
+        assert!(slot.held(), "the entry ends holding its slot again");
     }
 
     /// Review #3 (money-band): the run-end sweep removes a normal donor staging
