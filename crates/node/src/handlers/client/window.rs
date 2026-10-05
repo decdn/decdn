@@ -10,8 +10,8 @@ use crate::metrics::FirstByteClock;
 use crate::node_origin::{PrimeLeg, PullLegTarget};
 
 use super::{
-    Arc, B256, CHUNK_BYTES, ClientHandler, Connection, FillOutcome, FloorReservation, Hash,
-    LaneDeliveryState, LaneKey, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason,
+    Arc, B256, CHUNK_BYTES, ClientHandler, Connection, FloorReservation, Hash, LaneDeliveryState,
+    LaneKey, MissPath, MissRefusal, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason,
     StreamRequest, StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
 };
 
@@ -93,9 +93,10 @@ impl ClientHandler {
     /// `fault_seen` carries whether an EARLIER tier (the reactive local-origin
     /// populate) hit a backend fault for this request (#1129). This path
     /// is the last tier, so its MISS exits — no openable provider, the open
-    /// deadline, and the coverage gate — refuse via [`FillOutcome::miss_reason`],
-    /// reporting `InternalError` when this node is degraded rather than merely
-    /// empty. The pull-loop guard is not a miss and ignores `fault_seen`.
+    /// deadline, and the coverage gate — refuse via [`Self::respond_miss`] with
+    /// the [`miss_reason`](super::FillOutcome::miss_reason), reporting
+    /// `InternalError` when this node is degraded rather than merely empty. The
+    /// pull-loop guard is not a miss and ignores `fault_seen`.
     ///
     /// The no-openable-provider exit adds a SECOND source of that fault: the pull's
     /// own [`PullMiss`](crate::node_origin::PullMiss), which says whether the
@@ -310,10 +311,10 @@ impl ClientHandler {
                         target = Some(opened);
                         total
                     }
-                    Err(reason) => {
+                    Err(refusal) => {
                         release_reservation_unspent(floor_reservation.as_ref());
                         return self
-                            .respond_error(&mut send, req, reason, rate_per_mb)
+                            .respond_miss(&mut send, req, refusal, rate_per_mb)
                             .await;
                     }
                 }
@@ -421,10 +422,10 @@ impl ClientHandler {
                 .await
             {
                 Ok(opened) => target = Some(opened),
-                Err(reason) => {
+                Err(refusal) => {
                     release_reservation_unspent(floor_reservation.as_ref());
                     return self
-                        .respond_error(&mut send, req, reason, rate_per_mb)
+                        .respond_miss(&mut send, req, refusal, rate_per_mb)
                         .await;
                 }
             }
@@ -439,10 +440,10 @@ impl ClientHandler {
         {
             release_reservation_unspent(floor_reservation.as_ref());
             return self
-                .respond_error(
+                .respond_miss(
                     &mut send,
                     req,
-                    FillOutcome::miss_reason(fault_seen),
+                    MissRefusal::new(fault_seen, MissPath::CoverageGate),
                     rate_per_mb,
                 )
                 .await;
@@ -974,20 +975,22 @@ impl ClientHandler {
     }
 
     /// Discover + open a bounded upstream pull leg for `hash`, classifying every
-    /// failure into the wire reject reason the caller must respond with. Factored out
+    /// failure into the miss refusal the caller must respond with. Factored out
     /// so [`Self::serve_via_window_pull_through`] can open the leg from TWO points —
     /// up front on a cold miss (step 3), or late when a peeked fill retired between
     /// the advisory peek and the atomic `claim_fill` (step 6b) — without duplicating
     /// the timeout + [`crate::node_origin::PullMiss`] classification.
     ///
     /// `Ok(target)` is the bound leg (its `total_bytes` is the header-handshaked blob
-    /// length). `Err(reason)` is:
+    /// length). `Err(refusal)` is:
     /// - a clean miss on THIS tier, or a latched earlier-tier / local fault honored
     ///   per #1129 / #1560 (a walk that failed on our own broken buyer key is not
-    ///   evidence the blob is absent) — [`FillOutcome::miss_reason`] of
+    ///   evidence the blob is absent) — [`MissPath::PullLegMiss`], with the
+    ///   [`miss_reason`](super::FillOutcome::miss_reason) of
     ///   `fault_seen || miss.is_local_fault()`;
     /// - the pull-through deadline elapsing (a slow/absent upstream must not pin the
-    ///   stream) — the timeout metric fires and the reason is `miss_reason(fault_seen)`.
+    ///   stream) — the timeout metric fires, [`MissPath::PullLegTimeout`], with the
+    ///   reason `miss_reason(fault_seen)`.
     ///
     /// `prime` is the pull this miss expects to own, when it can say: the handshake
     /// then opens that pull's first leg for the pull leg to adopt (#2063).
@@ -1002,16 +1005,17 @@ impl ClientHandler {
         fault_seen: bool,
         prime: Option<PrimeLeg>,
         requester: B256,
-    ) -> Result<PullLegTarget, ServeRejectReason> {
+    ) -> Result<PullLegTarget, MissRefusal> {
         let open = origin.open_pull_leg(hash, namespace_id, prime, requester.0);
         match tokio::time::timeout(deadline, open).await {
             Ok(Ok(target)) => Ok(target),
-            Ok(Err(miss)) => Err(FillOutcome::miss_reason(
+            Ok(Err(miss)) => Err(MissRefusal::new(
                 fault_seen || miss.is_local_fault(),
+                MissPath::PullLegMiss,
             )),
             Err(_elapsed) => {
                 self.metrics.node_pull_through_timeout();
-                Err(FillOutcome::miss_reason(fault_seen))
+                Err(MissRefusal::new(fault_seen, MissPath::PullLegTimeout))
             }
         }
     }
@@ -1052,7 +1056,7 @@ impl ClientHandler {
         if uncovered.is_empty() {
             return false;
         }
-        tracing::info!(
+        tracing::debug!(
             %hash,
             pull_offset,
             pull_len,

@@ -2674,6 +2674,16 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **Node: every serve-miss refusal logs one info line that names its path
+  (#2282).** A node that answers a paid request `NotFound` (or
+  `InternalError`) from a miss path now logs `serve-miss: refusing the
+  request` with `hash`, `byte_offset`, `byte_len`, `reason` and `path`. `path`
+  is `coverage_gate`, `pull_leg_miss`, `pull_leg_timeout`, `buffered_miss` or
+  `no_pull_through`. Before, only the coverage gate logged at info, so most
+  refusals showed only as a tick on
+  `decdn_serve_stream_rejected_cache_miss_total`. The coverage gate's own
+  detail line (candidate count, first uncovered chunk) moves to debug. The
+  wire answer and the reject counters do not change.
 - **CLI: a range-dedup entry stripes its ranges across its holders (#2123).**
   A `bundle pull` entry that pays for many scattered complement ranges used
   one provider's link for all of them, even when several holders were probed.

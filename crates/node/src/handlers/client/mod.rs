@@ -894,6 +894,60 @@ impl FillOutcome {
     }
 }
 
+/// The serve-miss exit that refused a request. It names the cause in the
+/// refusal's log line only: the wire answer is the same for every path
+/// ([`ServeRejectReason::wire_error`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissPath {
+    /// The pull leg opened, but its ranked candidates do not cover part of the
+    /// range this node does not hold (#2195).
+    CoverageGate,
+    /// The pull leg open found no provider it could open.
+    PullLegMiss,
+    /// The pull leg open ran past the pull-through deadline.
+    PullLegTimeout,
+    /// The buffered pull-through ran and did not fill the blob.
+    BufferedMiss,
+    /// No pull-through ran: none is configured, or the request is not
+    /// authorized to make this node spend.
+    NoPullThrough,
+}
+
+impl MissPath {
+    /// The `path` value the refusal's log line records.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CoverageGate => "coverage_gate",
+            Self::PullLegMiss => "pull_leg_miss",
+            Self::PullLegTimeout => "pull_leg_timeout",
+            Self::BufferedMiss => "buffered_miss",
+            Self::NoPullThrough => "no_pull_through",
+        }
+    }
+}
+
+/// A terminal serve-miss refusal: the reject reason
+/// ([`FillOutcome::miss_reason`]) and the exit that refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MissRefusal {
+    /// The reason the refusal carries: `CacheMiss`, or `InternalError` when a
+    /// tier this request attempted hit a hard fault.
+    reason: ServeRejectReason,
+    /// The exit that refused.
+    path: MissPath,
+}
+
+impl MissRefusal {
+    /// The refusal `path` sends, given whether any tier attempted for this
+    /// request hit a hard fault.
+    const fn new(fault_seen: bool, path: MissPath) -> Self {
+        Self {
+            reason: FillOutcome::miss_reason(fault_seen),
+            path,
+        }
+    }
+}
+
 /// Construction bundle for [`ClientHandler`] — the 16 required runtime deps plus
 /// every optional wiring hook, so a handler's full configuration is one literal
 /// at its call site instead of a `new()` call followed by a setter chain.

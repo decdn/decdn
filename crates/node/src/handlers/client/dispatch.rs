@@ -4,10 +4,10 @@
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
-    FirstMessage, FloorRefusal, FloorRefusalSite, FloorReservation, Hash, LaneKey,
-    OwnedSemaphorePermit, PublicKey, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore,
-    SendStream, ServeRejectReason, StreamReadError, StreamRequest, StreamResponseBody, U256,
-    VarInt, read_first_message, reset_stream, verify_binding,
+    FirstMessage, FloorRefusal, FloorRefusalSite, FloorReservation, Hash, LaneKey, MissPath,
+    MissRefusal, OwnedSemaphorePermit, PublicKey, REJECTION_CLOSE_TIMEOUT, RecvStream,
+    RejectReason, Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamRequest,
+    StreamResponseBody, U256, VarInt, read_first_message, reset_stream, verify_binding,
 };
 use arc_swap::ArcSwapOption;
 use std::panic::AssertUnwindSafe;
@@ -1090,8 +1090,8 @@ impl ClientHandler {
                 // tier fills, the terminal refusal must report a degraded node
                 // (`InternalError`) rather than an empty one (`NotFound`). Every
                 // terminal MISS below therefore goes through
-                // `FillOutcome::miss_reason` — including the window path's leech
-                // shed. (The channel-class refusals — `UnknownChannel`,
+                // `FillOutcome::miss_reason`, inside a `MissRefusal` sent via
+                // `respond_miss`. (The channel-class refusals — `UnknownChannel`,
                 // `InsufficientDeposit` — keep their own reasons: they are
                 // client-attributable and would refuse regardless of origin
                 // health.)
@@ -1153,19 +1153,20 @@ impl ClientHandler {
                 } else {
                     // Buffered pull-through (#831): used when no window provider is
                     // set.
-                    let buffered = match self.pull_through {
-                        Some(timeout) if self.pull_authorized(&req, verified_client) => {
-                            self.try_pull_through(hash, timeout).await
-                        }
+                    let (buffered, path) = match self.pull_through {
+                        Some(timeout) if self.pull_authorized(&req, verified_client) => (
+                            self.try_pull_through(hash, timeout).await,
+                            MissPath::BufferedMiss,
+                        ),
                         // No pull-through configured, or the request is not
                         // authorized to make this node spend: nothing was attempted,
                         // so this tier contributes no new information.
-                        _ => FillOutcome::CleanMiss,
+                        _ => (FillOutcome::CleanMiss, MissPath::NoPullThrough),
                     };
                     if !buffered.is_filled() {
-                        let reason = FillOutcome::miss_reason(fault_seen || buffered.is_fault());
+                        let refusal = MissRefusal::new(fault_seen || buffered.is_fault(), path);
                         return self
-                            .respond_error(&mut send, &req, reason, rate_per_mb)
+                            .respond_miss(&mut send, &req, refusal, rate_per_mb)
                             .await;
                     }
                 }

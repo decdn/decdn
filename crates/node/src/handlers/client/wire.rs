@@ -9,7 +9,7 @@ use bytes::Bytes;
 use iroh::endpoint::WriteError;
 
 use super::{
-    B256, ClientHandler, ClientMessage, FrameError, Hash, RawReceipt, SendStream,
+    B256, ClientHandler, ClientMessage, FrameError, Hash, MissRefusal, RawReceipt, SendStream,
     ServeRejectReason, StreamError, StreamRequest, StreamResponse, StreamResponseBody,
     StreamResponseExt, StreamSlashData, U256, VoucherRejectReason, WatermarkBundle, encode_message,
     write_frame,
@@ -128,6 +128,22 @@ impl ClientHandler {
         )?;
         let _ = send.finish();
         Ok(super::outcome::ServeEnd::Refused(reason))
+    }
+
+    /// Log a terminal serve-miss refusal once at info, then send it through
+    /// [`Self::respond_error`]. The log line names the exit that refused
+    /// (`path`), which the wire answer and the per-reason metric do not carry,
+    /// so an operator can see why this node answered a request `NotFound`.
+    pub(super) async fn respond_miss(
+        &self,
+        send: &mut SendStream,
+        req: &StreamRequest,
+        refusal: MissRefusal,
+        rate_per_mb: u64,
+    ) -> anyhow::Result<super::outcome::ServeEnd> {
+        log_miss_refusal(req, refusal);
+        self.respond_error(send, req, refusal.reason, rate_per_mb)
+            .await
     }
 
     /// Write a mid-stream `StreamError { VoucherRejected }` and finish the
@@ -295,6 +311,20 @@ pub(super) fn is_peer_attributable(e: &anyhow::Error) -> bool {
 /// `RUST_LOG=info` filters out of the `debug!` line.
 pub(super) fn record_stream_error(detail: impl std::fmt::Display) {
     tracing::Span::current().record("error", tracing::field::display(detail));
+}
+
+/// The info line [`ClientHandler::respond_miss`] writes for one serve-miss
+/// refusal. `reason` is the same snake-case value the `serve_stream` span
+/// records.
+fn log_miss_refusal(req: &StreamRequest, refusal: MissRefusal) {
+    tracing::info!(
+        hash = %Hash::from_bytes(req.hash),
+        byte_offset = req.byte_offset,
+        byte_len = req.byte_len,
+        reason = super::outcome::refusal_reason(refusal.reason),
+        path = refusal.path.as_str(),
+        "serve-miss: refusing the request"
+    );
 }
 
 /// Absorb a write that fails because the peer already left.
@@ -605,10 +635,98 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        ClientPaymentFault, FrameError, FrameQueue, PaidProgress, PeerFault, WriteError,
-        chunk_frame_bufs, is_peer_attributable, tag_paid_progress, tolerate_departed_peer,
-        write_chunk_error, write_frame_error,
+        ClientPaymentFault, FrameError, FrameQueue, MissRefusal, PaidProgress, PeerFault,
+        ServeRejectReason, StreamRequest, WriteError, chunk_frame_bufs, is_peer_attributable,
+        log_miss_refusal, tag_paid_progress, tolerate_departed_peer, write_chunk_error,
+        write_frame_error,
     };
+    use crate::handlers::client::MissPath;
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A miss refusal is `InternalError` exactly when a tier faulted, whatever
+    /// the path, and every path logs under its own stable name (#2282).
+    #[test]
+    fn a_miss_refusal_carries_the_fault_reason_and_a_stable_path_name() {
+        let paths = [
+            (MissPath::CoverageGate, "coverage_gate"),
+            (MissPath::PullLegMiss, "pull_leg_miss"),
+            (MissPath::PullLegTimeout, "pull_leg_timeout"),
+            (MissPath::BufferedMiss, "buffered_miss"),
+            (MissPath::NoPullThrough, "no_pull_through"),
+        ];
+        for (path, name) in paths {
+            assert_eq!(path.as_str(), name);
+            assert_eq!(
+                MissRefusal::new(false, path).reason,
+                ServeRejectReason::CacheMiss
+            );
+            assert_eq!(
+                MissRefusal::new(true, path).reason,
+                ServeRejectReason::InternalError
+            );
+        }
+    }
+
+    /// The refusal line is what an operator greps Loki for: it must name the
+    /// hash, the requested range, the span's `reason` value and the path, at
+    /// info (#2282).
+    #[test]
+    fn a_miss_refusal_logs_one_info_line_with_hash_range_reason_and_path() {
+        let log = CapturedLog::default();
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        let req = StreamRequest {
+            hash: [0xAB; 32],
+            namespace_id: [0; 32],
+            pool_id: [0xCD; 32],
+            byte_offset: 16_384,
+            byte_len: 82_251,
+            timestamp_us: 0,
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            log_miss_refusal(&req, MissRefusal::new(false, MissPath::PullLegMiss));
+        });
+        let text = String::from_utf8(
+            log.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "one line per refusal: {text}");
+        let line = lines[0];
+        assert!(line.contains(" INFO "), "{line}");
+        assert!(line.contains("serve-miss: refusing the request"), "{line}");
+        assert!(
+            line.contains(&format!("hash={}", "ab".repeat(32))),
+            "{line}"
+        );
+        assert!(line.contains("byte_offset=16384"), "{line}");
+        assert!(line.contains("byte_len=82251"), "{line}");
+        assert!(line.contains("reason=\"cache_miss\""), "{line}");
+        assert!(line.contains("path=\"pull_leg_miss\""), "{line}");
+    }
 
     /// The whole classification rests on a marker staying recoverable under the
     /// context layers callers stack on the way up to the dispatch sink. This file
