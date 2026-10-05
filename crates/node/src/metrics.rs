@@ -1375,8 +1375,8 @@ pub struct DecdnMetrics {
     ///
     /// The only counter here that says nothing about the network. Any sustained rate is
     /// an emergency: a node that cannot sign a voucher or store a byte cannot complete a
-    /// pull, so every pull it attempts will fail. Before this existed those failures were scored against
-    /// whichever honest providers the node happened to try, so the symptom was a node
+    /// pull, so every pull it attempts will fail. These failures land here, not on the
+    /// honest providers the node tries: scored against them, they would show as a node
     /// steadily blaming a healthy network in its own reputation scores.
     ///
     /// Counted PER CANDIDATE, not per request: one node-wide fault moves this by up to
