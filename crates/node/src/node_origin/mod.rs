@@ -3157,7 +3157,7 @@ fn classify_pull_failure(
         PullVerdict::OurLocalFault => {
             deps.metrics.node_pull_local_fault();
             warn!(
-                %provider_addr, error = %err,
+                %provider_addr, error = %format_args!("{err:#}"),
                 "node-origin: LOCAL buyer-side fault during a pull (signer/encode/range) — this node \
                  cannot pay; exonerating the upstream"
             );
@@ -3173,7 +3173,7 @@ fn classify_pull_failure(
             record_outcome(deps, pk, &Outcome::Corruption);
         }
         PullVerdict::Unreachable => {
-            debug!(peer = %pk, %provider_addr, error = %err, "node-origin: upstream pull failed; scoring unreachable");
+            debug!(peer = %pk, %provider_addr, error = %format_args!("{err:#}"), "node-origin: upstream pull failed; scoring unreachable");
             record_outcome(deps, pk, &Outcome::Unreachable);
         }
     }

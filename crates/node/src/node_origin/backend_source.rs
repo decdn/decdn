@@ -226,7 +226,7 @@ impl<W: WireChunks> BackendReader<W> {
             match self.wire.next_chunk().await {
                 Some(Ok(chunk)) => self.pending = chunk,
                 Some(Err(fault)) => {
-                    let msg = fault.to_string();
+                    let msg = fault.display_chain().to_string();
                     self.fault = Some(fault);
                     return Err(std::io::Error::other(msg));
                 }

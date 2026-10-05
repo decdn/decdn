@@ -138,11 +138,11 @@ impl ChunkFramer {
                     self.queue.clear();
                     tracing::error!(
                         hash = %self.hash,
-                        error = %e,
+                        error = %e.display_chain(),
                         "bao export faulted mid-delivery; aborting the serve without StreamEnd \
                          (the client sees a short delivery and does not pay the closing voucher)"
                     );
-                    return Err(anyhow::anyhow!("cache bao export failed: {e}"));
+                    return Err(anyhow::Error::from(e).context("cache bao export failed"));
                 }
                 None => self.drained = true,
             }
@@ -313,7 +313,7 @@ impl ClientHandler {
             .cache
             .export_bao_range_stream(hash, byte_offset, byte_len, total_bytes)
             .await
-            .map_err(|e| anyhow::anyhow!("cache export_bao_range_stream failed: {e}"))?;
+            .map_err(|e| anyhow::Error::from(e).context("cache export_bao_range_stream failed"))?;
 
         let chunk_bytes = CHUNK_BYTES;
 
@@ -899,8 +899,8 @@ mod tests {
             }
         };
         anyhow::ensure!(
-            err.to_string().contains("refusing truncated export"),
-            "fault lost its cause: {err}"
+            format!("{err:#}").contains("refusing truncated export"),
+            "fault lost its cause: {err:#}"
         );
 
         // The framer must now be POISONED. Without it, the 476 unverified bytes

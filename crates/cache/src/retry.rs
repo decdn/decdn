@@ -164,7 +164,7 @@ where
                         %hash,
                         attempts = attempt.saturating_add(1),
                         max_retries = policy.max_retries,
-                        error = %e,
+                        error = %format_args!("{e:#}"),
                         "origin fetch exhausted retry budget; surfacing as permanent",
                     );
                     return (
@@ -179,7 +179,7 @@ where
                     attempt = attempt + 1,
                     of = policy.max_retries,
                     sleep_ms,
-                    error = %e,
+                    error = %format_args!("{e:#}"),
                     "origin fetch transient failure; retrying after backoff",
                 );
                 tokio::time::sleep(sleep).await;

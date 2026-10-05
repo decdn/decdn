@@ -28,6 +28,20 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Buyer pool rows keep an adopted pool's redeemed spend, and both buyer
+  tables move to `_v6` (#2292).** A row adopted from chain has no lanes, so
+  the pool's `totalRedeemed` is its only record of what other lanes paid
+  out. The row now stores it (record schema 4), so every later `decdn fetch`
+  and `decdn bundle pull` that reuses the row counts it, not only the run
+  that adopted the pool. A lane seeded from its on-chain watermark takes its
+  own share out of that amount, so the pool spend is the tracked lanes plus
+  what no tracked lane accounts for, and stays right as a seeded lane
+  advances. A node adopts its pool the same way, and its low-water refill
+  reads the same pool spend. **Existing buyer rows are not read:**
+  `buyer_pool_state_v5` / `buyer_pool_owner_index_v5` become `_v6`, so on
+  first run the store reads as empty, and a node or client re-adopts its live
+  pool from chain.
+
 - **`bundle pull --json` renames `deduped` to `reused` and adds `excluded`
   (#2190).** `deduped` counted whole-file reuse only, so beside a
   `range-dedup: spliced 12.7 GB` line a `0 deduped` count read as a
@@ -924,6 +938,43 @@ since project inception and will roll into the first tagged release.
   (`feeRouter()` would not do: `DecdnGovernor` answers it too), so the node
   exits before the lane store opens. The startup error now names
   `PaymentPool.getRateBounds()`.
+
+- **A reactive top-up of a few micro-USDC no longer goes on chain, and a
+  refill reaches lanes already running (#2296).** Right after a refill, a
+  node whose chain watcher had not seen it yet refused the next open as
+  `InsufficientDeposit`, and the client topped the pool up by the few
+  micro-USDC it was short of the working deposit: an `approve` and a `topUp`
+  each, and one of the run's three reactive top-ups. Such a refusal while the
+  deposit sits within the low water (working deposit / 5) of the working
+  deposit now waits out the node's watcher on its own settle budget, and a
+  confirmed exhaustion the deposit can still afford tops up only when it adds
+  at least that low water. A node that keeps refusing past the budget faults
+  as a source (it cools and is asked again, with one WARN), not as priced out
+  by a deposit no top-up raises. A lane build that refilled the pool now raises
+  every running lane to the new deposit, so a lane built before the refill no
+  longer reads a gap the refill paid for as unaffordable.
+
+- **A partial holder that refuses blocks its coverage claims stops being
+  asked for them (#2281).** A `NotFound` for a range inside a probed partial
+  holder's advertised coverage counted as a delivery fault only, so the
+  holder was asked for the same range again every few seconds for the rest
+  of the entry. Such a refusal on the lane's own stream now counts against
+  every discovery block the refused part of the range touches. After three,
+  the block leaves the holder's coverage for a minute, rediscovery included,
+  and its ranges go to the other holders. A `NotFound` can also be a
+  transient refusal, so the block then returns, refusals within one cooldown
+  count once, refusals a minute or more apart never add up, and a verified
+  byte in the block clears its count. An extra stream's covered `NotFound`
+  does not count: it is most often the node's per-signer live cap.
+
+- **A range-dedup entry that waits for a sibling's chunks no longer holds a
+  `--jobs` slot (#2283).** `decdn bundle pull` kept the slot of an entry
+  whose complement had landed while it waited for the sibling that fetches
+  its donor chunks. On an SDXL pull with `--jobs 5`, such waiters held the
+  run to 2–3 downloading entries for minutes at a time. A waiter now gives
+  its slot to a queued entry while it waits, and takes one again as the wait
+  ends, ahead of entries still to start. A pull's file bar appears once the
+  entry holds a slot.
 
 - **A partial holder steals the covered tail of a busy leg (#2303).** A
   freed lane stole from a busy lane only when it covered the victim's whole

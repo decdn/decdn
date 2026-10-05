@@ -2786,7 +2786,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // exit to know the store may be inconsistent.
     let cache_shutdown_err = cache.shutdown().await.err();
     if let Some(err) = cache_shutdown_err.as_ref() {
-        tracing::error!(error = %err, "cache shutdown failed; store state may be inconsistent");
+        tracing::error!(error = %err.display_chain(), "cache shutdown failed; store state may be inconsistent");
     }
 
     // Last-resort abort handle for the RPC watchdog, which lives *outside* the

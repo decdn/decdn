@@ -1041,7 +1041,7 @@ impl ClientHandler {
             Err(err) => {
                 tracing::warn!(
                     %hash,
-                    error = %err,
+                    error = %decdn_cache::ErrorChain::new(&err),
                     "serve-miss: cannot read the missing range for the coverage gate; \
                      committing without it"
                 );
@@ -1092,7 +1092,7 @@ impl ClientHandler {
             Err(err) => {
                 tracing::warn!(
                     %hash,
-                    error = %err,
+                    error = %err.display_chain(),
                     "serve-miss: cannot read the held ranges; the serve may park on \
                      held-span proof"
                 );
@@ -1113,7 +1113,7 @@ impl ClientHandler {
             Ok(pairs) => session.capture_many(pairs),
             Err(err) => tracing::warn!(
                 %hash,
-                error = %err,
+                error = %err.display_chain(),
                 "serve-miss: held-range outboard seed failed; the serve may park on \
                  held-span proof"
             ),
