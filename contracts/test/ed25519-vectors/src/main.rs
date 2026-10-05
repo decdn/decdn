@@ -38,8 +38,8 @@ use sha3::{Digest, Keccak256};
 /// Reference dalek versions, echoed into the generated marker frame. Keep in
 /// sync with `Cargo.toml`'s `=` pins; CI's pin-parity guard asserts these match
 /// the version `decdn-incentive` resolves off-chain.
-const ED25519_DALEK_VERSION: &str = "2.2.0";
-const CURVE25519_DALEK_VERSION: &str = "4.1.3";
+const ED25519_DALEK_VERSION: &str = "3.0.0";
+const CURVE25519_DALEK_VERSION: &str = "5.0.0";
 
 fn main() {
     let write_mode = match std::env::args().nth(1).as_deref() {

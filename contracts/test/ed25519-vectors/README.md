@@ -46,8 +46,8 @@ populated by a normal workspace build — no network fetch required.
 
 | Crate | Pin | Role |
 |---|---|---|
-| `ed25519-dalek` | `=2.2.0` | `verify_strict` — the parity bar |
-| `curve25519-dalek` | `=4.1.3` | `EIGHT_TORSION`, point decompression |
+| `ed25519-dalek` | `=3.0.0` | `verify_strict` — the parity bar |
+| `curve25519-dalek` | `=5.0.0` | `EIGHT_TORSION`, point decompression |
 | `hex` | `=0.4.3` | encoding only |
 | `sha3` | `=0.10.8` | keccak256 for the `registerNode` digest (section 4) |
 
