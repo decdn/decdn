@@ -114,10 +114,10 @@ impl AwaitingDataReader {
     }
 
     /// Authoritative store-backed presence probe for `[offset, offset + len)`, used
-    /// only once no live fill covers the read: to settle the race where a fill
-    /// retires between the liveness and outcome reads, and to serve bytes a failed
-    /// pull landed before it faulted. Never on the per-leaf hot path, which answers
-    /// from [`Self::covers_locally`].
+    /// only once no live fill covers the read and no outcome is recorded: it
+    /// settles the race where a fill retires between the liveness and outcome
+    /// reads. Never on the per-leaf hot path, which answers from
+    /// [`Self::covers_locally`].
     ///
     /// Takes `&mut self` (though it mutates nothing) so the future holds a
     /// `&mut AwaitingDataReader` rather than `&AwaitingDataReader` across the store
@@ -184,24 +184,30 @@ impl AsyncSliceReader for AwaitingDataReader {
                     Some(Ok(())) => break,
                     // A failed pull fills no more of the range, but it can fail
                     // after it landed the bytes this read needs (a fault later in
-                    // the range, or on a leg past this read). Serve them when the
-                    // store durably holds them; fail only a read whose bytes the
-                    // store does not hold.
+                    // the range, or on a leg past this read). A takedown gate
+                    // refuses the hash first: the ranged read below does not apply
+                    // the deny/blacklist/evict/quarantine guard that
+                    // `present_ranges` applies, so this arm checks it itself.
+                    // Otherwise the arm attempts the authoritative ranged read
+                    // directly rather than gating it on the observed present
+                    // bitfield, which can lag a durable admit (see the clean arm
+                    // above). The read checks the store's own current bitfield and
+                    // fails with "missing range" for any absent byte, so it returns
+                    // only bytes the store durably holds and never fills a gap.
                     Some(Err(msg)) => {
-                        match self.present_covers(offset, need).await {
-                            Ok(true) => break,
-                            Ok(false) => {}
-                            Err(err) => {
-                                return Err(io::Error::other(format!(
-                                    "upstream pull failed before content [{offset}, +{len}) \
-                                     landed: {msg}; the store presence check failed: {}",
-                                    decdn_cache::ErrorChain::new(&err)
-                                )));
-                            }
+                        if self.store.refuses() {
+                            return Err(io::Error::other(format!(
+                                "upstream pull failed before content [{offset}, +{len}) \
+                                 landed: {msg}; the hash is refused"
+                            )));
                         }
-                        return Err(io::Error::other(format!(
-                            "upstream pull failed before content [{offset}, +{len}) landed: {msg}"
-                        )));
+                        return self.store.read(offset, need).await.map_err(|err| {
+                            io::Error::other(format!(
+                                "upstream pull failed before content [{offset}, +{len}) \
+                                 landed: {msg}; the store read failed: {}",
+                                decdn_cache::ErrorChain::new(&err)
+                            ))
+                        });
                     }
                     // No recorded outcome, yet nothing live covers the range:
                     // `range_still_live` and `outcome` are read separately, so a fill
@@ -649,7 +655,7 @@ mod tests {
     use bytes::Bytes;
     use decdn_bao_range::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
     use decdn_cache::{CacheEngine, FillClaim, FillError, FillSession, Hash, NodeRangedStore};
-    use iroh_io::AsyncStreamReader;
+    use iroh_io::{AsyncSliceReader, AsyncStreamReader};
 
     use super::{CoherentFrameProducer, encoded_ranges, serve_end};
 
@@ -1237,6 +1243,51 @@ mod tests {
         assert!(
             !reader.covers_locally(&range),
             "an evicted hash is refused locally, mirroring present_ranges"
+        );
+    }
+
+    /// After a failed pull, the data reader serves a held range only while no
+    /// takedown gate refuses the hash: the direct store read does not apply that
+    /// gate, so the reader applies it first. The same held bytes read back before
+    /// the eviction and fail after it.
+    #[tokio::test]
+    async fn a_failed_pull_does_not_read_a_refused_hash() {
+        let total = 4 * G;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let hash = Hash::from(root);
+        let a_root = bao_tree::blake3::Hash::from(root);
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 64).await.unwrap();
+        let (ranges, wire) = range_wire(root, &plaintext, &outboard, total, 0, total);
+        engine
+            .admit_bao_stream(hash, ranges, total, MemReader { wire }, None)
+            .await
+            .map_err(|(_reader, e)| e)
+            .expect("admit the whole blob");
+
+        let FillClaim::Owner { session, lease: _l } =
+            engine.claim_fill(hash, 0, total, total, || FillSession::new(a_root, total))
+        else {
+            panic!("sole claimant owns its whole request");
+        };
+        session.mark_ended(Err(FillError::new("upstream pull died")));
+
+        let store = NodeRangedStore::new(engine.clone(), hash, total);
+        let mut reader = super::AwaitingDataReader::new(store, total, session, Arc::default());
+        let held = reader
+            .read_at(0, G as usize)
+            .await
+            .expect("held bytes read");
+        assert_eq!(held.as_ref(), &plaintext[..G as usize]);
+
+        engine.evict(hash).await.unwrap();
+        let err = reader
+            .read_at(0, G as usize)
+            .await
+            .expect_err("a refused hash must not be served");
+        assert!(
+            err.to_string().contains("the hash is refused"),
+            "the read fails on the takedown gate: {err}"
         );
     }
 

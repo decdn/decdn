@@ -774,12 +774,12 @@ pub struct DecdnMetrics {
     /// Redeem hints the redeemer dropped because their lane is parked (#2340).
     /// A lane parks when its hint-path redemption hits a chain fault — a
     /// failed pre-redeem watermark read or a `redeemMany` that did not land,
-    /// an RPC fault or a revert alike — and stays parked until the next sweep
-    /// (self-tick or serve cutoff), which retries it with every other lane.
-    /// The first hint after the sweep tries the lane once more. Parking bounds
-    /// an RPC outage to at most one hint-path attempt per lane per sweep, plus
-    /// the sweep's own batched retry, instead of one attempt per voucher. A non-zero rate tracks
-    /// chain faults on the settlement path; read it beside
+    /// an RPC fault or a revert alike. Each sweep (self-tick or serve cutoff)
+    /// retries the parked lanes with every other lane, and only a sweep that
+    /// finishes without a chain fault releases them. So an RPC outage costs one
+    /// failed attempt per lane per interval: the sweep's batched retry. Hints
+    /// for a parked lane stay dropped until a sweep finishes without a chain
+    /// fault. A non-zero rate tracks chain faults on the settlement path; read it beside
     /// `decdn_onchain_tx_send_failed_total` and
     /// `decdn_redemption_reconcile_failures_total`. Operator-visible name:
     /// `decdn_redeem_hints_parked_total`.

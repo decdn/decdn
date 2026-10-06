@@ -560,7 +560,9 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         let Some(states) = load_lanes(self.store.as_ref()) else {
             return;
         };
-        redeem_sweep(
+        // No later sweep follows and no lane is parked, so the chain-fault flag
+        // has no use here.
+        let _chain_fault = redeem_sweep(
             &self.contract,
             &self.store,
             states,
@@ -1339,13 +1341,15 @@ fn resolved_lifecycle(pool: &PaymentPool::Pool) -> Option<Lifecycle> {
 /// `margin_secs` is the voucher path's capability-expiry margin.
 ///
 /// A lane whose hint-path redemption hits a chain fault (an RPC fault or a
-/// revert) is parked until the next sweep: each later hint for it is dropped
-/// and counted into `redeem_hints_parked`. Each tick or cutoff clears the
-/// parked set, and the sweep that follows retries the parked lanes with every
-/// other lane. The first hint after that sweep tries the lane once more and
-/// parks it again on a fault. So during an RPC outage each lane costs at most
-/// one hint-path attempt per sweep plus the sweep's own batched retry, not one
-/// attempt per voucher.
+/// revert) is parked: each later hint for it is dropped and counted into
+/// `redeem_hints_parked`. Each tick or cutoff sweep retries the parked lanes
+/// with every other lane. Only a sweep that runs and reports no chain fault
+/// clears the parked set. A failed lane load runs no sweep and keeps the set,
+/// and a sweep with any chain fault keeps the whole set. So during an RPC
+/// outage each lane costs one failed attempt per interval: the sweep's batched
+/// retry. Hints for a parked lane stay dropped until a sweep finishes without a
+/// chain fault. Parking delays only the hint path: the sweep retries every lane
+/// each interval, and a serve cutoff still wakes a sweep, so no claim strands.
 #[allow(clippy::too_many_arguments)]
 async fn redeemer_loop<P: Provider + Clone>(
     contract: PaymentPool::PaymentPoolInstance<P>,
@@ -1406,10 +1410,9 @@ async fn redeemer_loop<P: Provider + Clone>(
         // A tick or a cutoff: sweep every lane, and schedule the next cutoff
         // from the same scan. A failed load keeps every cutoff still ahead and
         // drops one that has passed, so the loop does not re-fire it at once;
-        // the next tick retries the scan. Each tick or cutoff clears the parked
-        // set, and the sweep that follows retries the parked lanes with every
-        // other lane.
-        parked.clear();
+        // the next tick retries the scan. The sweep retries the parked lanes
+        // with every other lane. A failed load runs no sweep, so the parked set
+        // stays.
         let Some(states) = load_lanes(store.as_ref()) else {
             next_cutoff = next_cutoff.filter(|wake| *wake > unix_now());
             continue;
@@ -1423,7 +1426,7 @@ async fn redeemer_loop<P: Provider + Clone>(
             swept_at,
             swept_at,
         );
-        redeem_sweep(
+        let chain_fault = redeem_sweep(
             &contract,
             &store,
             states,
@@ -1436,6 +1439,12 @@ async fn redeemer_loop<P: Provider + Clone>(
             &pool_view,
         )
         .await;
+        // Release the parked lanes only after a sweep without a chain fault. A
+        // sweep with a fault keeps the whole set: one failed attempt per lane
+        // per interval, the sweep's own batched retry.
+        if !chain_fault {
+            parked.clear();
+        }
     }
     debug!("PaymentPool redeemer loop ended (all hint senders dropped)");
 }
@@ -1936,14 +1945,14 @@ fn plan_lanes(
     plans
 }
 
-/// Park `key` until the next sweep after a chain fault on its hint path
-/// ([`redeemer_loop`]).
+/// Park `key` after a chain fault on its hint path, until a sweep finishes
+/// without a chain fault ([`redeemer_loop`]).
 fn park_lane(parked: &mut HashSet<LaneKey>, key: LaneKey) {
     debug!(
         pool_id = %key.pool_id,
         signer = %key.signer,
         provider = %key.provider,
-        "lane parked until the next sweep after a chain fault"
+        "lane parked after a chain fault until a sweep finishes without one"
     );
     parked.insert(key);
 }
@@ -2014,6 +2023,10 @@ fn load_lanes(store: &dyn PoolStateStore) -> Option<Vec<LaneState>> {
 /// voucher-count cap and submit each chunk as its own `redeemMany`. Value is
 /// spread across chunks so dust settles alongside real value; a chunk that
 /// cannot clear the floor defers to a later sweep.
+///
+/// Returns whether the sweep hit a chain fault, as [`redeem_planned_lanes`]
+/// reports it. The periodic sweep in [`redeemer_loop`] releases the parked
+/// lanes only when it returns `false`.
 #[allow(clippy::too_many_arguments)]
 async fn redeem_sweep<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
@@ -2026,7 +2039,7 @@ async fn redeem_sweep<P: Provider + Clone>(
     strict_flush: bool,
     metrics: &Arc<Metrics>,
     pool_view: &PoolProjection,
-) {
+) -> bool {
     let plans = plan_lanes(paid, self_address, states, metrics, pool_view, unix_now());
     // Publish the pending-redemption total once per sweep. This is the whole
     // planned set, before the per-chunk floor defers any dust — a lane below the
@@ -2041,8 +2054,8 @@ async fn redeem_sweep<P: Provider + Clone>(
     if !plans.is_empty() {
         metrics.set_pool_deposit_usdc(sum_recoverable_deposit(&plans, pool_view));
     }
-    // A sweep is the retry for every lane, so it parks nothing and drops the
-    // chain-fault flag.
+    // A sweep is the retry for every lane, so it parks nothing itself. The
+    // caller decides from the chain-fault flag whether parked lanes go free.
     redeem_planned_lanes(
         contract,
         store,
@@ -2052,7 +2065,7 @@ async fn redeem_sweep<P: Provider + Clone>(
         strict_flush,
         metrics,
     )
-    .await;
+    .await
 }
 
 /// Submit one chunk of planned lanes as a single `redeemMany`. On an oversize
@@ -5561,32 +5574,103 @@ mod tests {
         Ok(())
     }
 
-    /// #2340: a sweep releases a parked lane. A hint parks the lane, a second
-    /// hint is dropped, the self-tick sweep retries the lane, and a hint after
-    /// that sweep redeems again. The paused clock fires the tick only once the
-    /// loop is idle, so both hints land before the sweep.
-    #[tokio::test(start_paused = true)]
-    async fn a_sweep_releases_a_parked_lane() -> Result<()> {
+    /// A mocked `PaymentPool` that answers each entry of `responses` in order:
+    /// `Some(lanes)` is a `getWatermarks` read, `None` is a failed RPC call (a
+    /// `redeemMany` send).
+    fn mocked_redeem_pool(
+        responses: &[Option<Vec<PaymentPool::Lane>>],
+    ) -> (
+        PaymentPool::PaymentPoolInstance<impl Provider + Clone + 'static>,
+        alloy::providers::mock::Asserter,
+    ) {
         use alloy::providers::ProviderBuilder;
         use alloy::providers::mock::Asserter;
         use alloy::sol_types::SolCall;
 
+        let asserter = Asserter::new();
+        for response in responses {
+            match response {
+                Some(lanes) => asserter.push_success(&Bytes::from(
+                    PaymentPool::getWatermarksCall::abi_encode_returns(lanes),
+                )),
+                None => asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error()),
+            }
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        (PaymentPool::new(Address::ZERO, provider), asserter)
+    }
+
+    /// #2340: a sweep with a chain fault keeps the parked lane parked. A hint
+    /// parks the lane, the self-tick sweep retries it and its send fails, and a
+    /// hint after that sweep is dropped and reads nothing: a further read would
+    /// reach the empty mock queue and count a reconcile failure. So an RPC
+    /// outage costs the lane one failed attempt per interval. The paused clock
+    /// fires the tick only once the loop is idle.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_sweep_keeps_the_lane_parked() -> Result<()> {
         let metrics = Arc::new(Metrics::new());
         let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
-        // One read and one failed send each for the first hint, the sweep and
-        // the hint after the sweep, in the order the mock answers them.
-        let asserter = Asserter::new();
-        for _ in 0..3 {
-            asserter.push_success(&Bytes::from(
-                PaymentPool::getWatermarksCall::abi_encode_returns(&vec![lane(0)]),
-            ));
-            asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
-        }
-        let contract = PaymentPool::new(
-            Address::ZERO,
-            ProviderBuilder::new().connect_mocked_client(asserter.clone()),
-        );
+        // One read and one failed send each for the first hint and the sweep.
+        let (contract, asserter) =
+            mocked_redeem_pool(&[Some(vec![lane(0)]), None, Some(vec![lane(0)]), None]);
         let (hinted, total) = record_lanes(store.as_ref(), 1..=1, 0)?;
+        let (tx, handle, _) = spawn_redeemer(
+            contract,
+            store,
+            total,
+            Duration::from_secs(3),
+            Arc::clone(&metrics),
+        );
+
+        tx.send(hinted).await?;
+        await_metric_line(&metrics, "decdn_onchain_tx_send_failed_total 1").await?;
+
+        // The self-tick sweep retries the parked lane and faults.
+        await_metric_line(&metrics, "decdn_onchain_tx_send_failed_total 2").await?;
+        ensure_metric_lines(&metrics, &["decdn_redemption_reconcile_ok_total 2"])?;
+
+        // The faulted sweep kept the parked set, so this hint is dropped.
+        tx.send(hinted).await?;
+        await_metric_line(&metrics, "decdn_redeem_hints_parked_total 1").await?;
+        ensure_metric_lines(
+            &metrics,
+            &[
+                "decdn_redemption_reconcile_ok_total 2",
+                "decdn_redemption_reconcile_failures_total 0",
+                "decdn_onchain_tx_send_failed_total 2",
+            ],
+        )?;
+        assert_eq!(
+            asserter.read_q().len(),
+            0,
+            "the hint and the sweep each read and sent once"
+        );
+
+        drop(tx);
+        handle.await?;
+        Ok(())
+    }
+
+    /// #2340: a sweep without a chain fault releases a parked lane. A hint
+    /// parks the lane and a second hint is dropped. The self-tick sweep reads
+    /// the lane as settled on-chain, so it submits nothing and faults nothing,
+    /// and a hint after that sweep reads the watermark again. The paused clock
+    /// fires the tick only once the loop is idle, so both hints land before the
+    /// sweep.
+    #[tokio::test(start_paused = true)]
+    async fn a_clean_sweep_releases_a_parked_lane() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+        let (hinted, total) = record_lanes(store.as_ref(), 1..=1, 0)?;
+        let settled = u64::try_from(total)?;
+        // A read and a failed send for the first hint, then a read that shows
+        // the lane settled for the sweep and for the hint after it.
+        let (contract, asserter) = mocked_redeem_pool(&[
+            Some(vec![lane(0)]),
+            None,
+            Some(vec![lane(settled)]),
+            Some(vec![lane(settled)]),
+        ]);
         let (tx, handle, _) = spawn_redeemer(
             contract,
             store,
@@ -5600,21 +5684,23 @@ mod tests {
         await_metric_line(&metrics, "decdn_redeem_hints_parked_total 1").await?;
         ensure_metric_lines(&metrics, &["decdn_onchain_tx_send_failed_total 1"])?;
 
-        // The self-tick sweep retries the parked lane.
-        await_metric_line(&metrics, "decdn_onchain_tx_send_failed_total 2").await?;
-        ensure_metric_lines(&metrics, &["decdn_redemption_reconcile_ok_total 2"])?;
+        // The self-tick sweep finds the lane settled and faults nothing.
+        await_metric_line(&metrics, "decdn_redemption_reconcile_ok_total 2").await?;
+        ensure_metric_lines(&metrics, &["decdn_redemption_reconciled_skip_total 1"])?;
 
-        // The sweep cleared the parked set, so this hint redeems again.
+        // The clean sweep cleared the parked set, so this hint reads again.
         tx.send(hinted).await?;
-        await_metric_line(&metrics, "decdn_onchain_tx_send_failed_total 3").await?;
+        await_metric_line(&metrics, "decdn_redemption_reconcile_ok_total 3").await?;
         ensure_metric_lines(
             &metrics,
             &[
-                "decdn_redemption_reconcile_ok_total 3",
+                "decdn_redemption_reconciled_skip_total 2",
                 "decdn_redemption_reconcile_failures_total 0",
+                "decdn_onchain_tx_send_failed_total 1",
                 "decdn_redeem_hints_parked_total 1",
             ],
         )?;
+        assert_eq!(asserter.read_q().len(), 0, "every queued answer was read");
 
         drop(tx);
         handle.await?;
