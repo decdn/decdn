@@ -1015,7 +1015,8 @@ fn build_lane_snapshots(
                 // the on-chain `withdrawnAmount`, so it compares the full
                 // accrued claim against the threshold (documented on the
                 // DTO field). `>=` matches the redeemer's `< threshold`
-                // short-circuit (`redeem_one` in payment_settlement.rs).
+                // short-circuit (`redeem_planned_lanes` in
+                // payment_settlement.rs).
                 settlement_eligible: outstanding >= threshold,
             }
         })
