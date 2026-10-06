@@ -475,13 +475,14 @@ pub struct NodeOriginConfig {
 /// ADR 030 default heuristic (RTT > 150ms to a same-claimed-region node). The
 /// value compared against it is `probe_once`'s RTT: the request/response
 /// exchange on the open connection, or the direct path's RTT when hole punching
-/// selects one in time and it is lower. It never spans the connect. Only an RTT
-/// that a direct path backs is compared ([`ProbeRtt::direct`]): an exchange
-/// that rode the relay measures the relay detour, not how far the peer is, and
-/// an honest in-region peer behind a distant relay can read well past 150ms.
-/// The threshold is a documented constant, deliberately not yet a governance
-/// knob per ADR 030 (which defers threshold/sample/decay tuning to a later
-/// ADR 008 revision).
+/// selects one in time and it is lower. It never spans the connect. An RTT with
+/// no direct path behind it ([`ProbeRtt::direct`] is `false`) is compared too:
+/// the peer controls whether hole punching succeeds, so exempting a relay RTT
+/// would let a region spoofer escape the penalty by refusing direct paths. The
+/// cost is that an honest in-region peer stuck on a distant relay can read past
+/// 150ms. The threshold is a documented constant, deliberately not yet a
+/// governance knob per ADR 030 (which defers threshold/sample/decay tuning to a
+/// later ADR 008 revision).
 ///
 /// [`ProbeRtt::direct`]: decdn_client::probe::ProbeRtt::direct
 const REGION_LATENCY_MAX_MS: u32 = 150;
@@ -491,16 +492,9 @@ const REGION_LATENCY_MAX_MS: u32 = 150;
 /// It fires only when the peer self-attests the observer's *own* region
 /// (`own_region`) yet the observed probe latency exceeds [`REGION_LATENCY_MAX_MS`]
 /// — the canonical region-spoofing signal. An unset own region (`None`) or an
-/// unknown peer region (empty) disables it: there is nothing to contradict. An
-/// RTT that no direct path backs (`direct == false`) disables it too: it is
-/// not evidence of where the peer is.
-fn region_latency_penalty_applies(
-    own_region: Option<&str>,
-    claimed: &str,
-    rtt_ms: u32,
-    direct: bool,
-) -> bool {
-    direct && !claimed.is_empty() && own_region == Some(claimed) && rtt_ms > REGION_LATENCY_MAX_MS
+/// unknown peer region (empty) disables it: there is nothing to contradict.
+fn region_latency_penalty_applies(own_region: Option<&str>, claimed: &str, rtt_ms: u32) -> bool {
+    !claimed.is_empty() && own_region == Some(claimed) && rtt_ms > REGION_LATENCY_MAX_MS
 }
 
 impl NodeOriginConfig {
@@ -1255,8 +1249,9 @@ async fn probe_round(
 /// its region. A local-only signal — folded straight into the local EWMA — so
 /// it self-corrects as fast as we probe and needs no new protocol surface. An
 /// RTT with no direct path behind it (`direct == false`) can be the relay
-/// detour: it still ranks the candidate, and sits in the probe cache for its
-/// TTL, but it is never evidence against the claim.
+/// detour. It still counts as evidence, because the peer controls whether a
+/// direct path forms; the logs carry `direct` so an operator can tell a relay
+/// reading from a direct one.
 fn score_probe_latency(deps: &NodeOriginDeps, pk: PublicKey, region: &str, rtt: u32, direct: bool) {
     if !direct {
         debug!(
@@ -1265,7 +1260,7 @@ fn score_probe_latency(deps: &NodeOriginDeps, pk: PublicKey, region: &str, rtt: 
             "node-origin: probe RTT has no direct path behind it; ranking on the exchange RTT"
         );
     }
-    if region_latency_penalty_applies(deps.config.own_region.as_deref(), region, rtt, direct) {
+    if region_latency_penalty_applies(deps.config.own_region.as_deref(), region, rtt) {
         // Log with the disambiguating context (the metric alone cannot tell a
         // spoofer from a mis-set local `identity.region`): peer, both regions,
         // and the observed latency vs ceiling.
@@ -1274,6 +1269,7 @@ fn score_probe_latency(deps: &NodeOriginDeps, pk: PublicKey, region: &str, rtt: 
             own_region = deps.config.own_region.as_deref().unwrap_or(""),
             claimed_region = %region,
             rtt_ms = rtt,
+            direct,
             ceiling_ms = REGION_LATENCY_MAX_MS,
             "node-origin: same-region claim contradicted by probe latency; \
              applying ADR 030 latency penalty"
@@ -3460,35 +3456,20 @@ mod tests {
         assert!(region_latency_penalty_applies(
             Some("DE"),
             "DE",
-            REGION_LATENCY_MAX_MS + 1,
-            true
-        ));
-        // Same region and slow, but no direct path backs the RTT → not penalized
-        // (a relay detour says nothing about where the peer is).
-        assert!(!region_latency_penalty_applies(
-            Some("DE"),
-            "DE",
-            5000,
-            false
+            REGION_LATENCY_MAX_MS + 1
         ));
         // Same region but at/under the ceiling → not penalized (boundary is >).
         assert!(!region_latency_penalty_applies(
             Some("DE"),
             "DE",
-            REGION_LATENCY_MAX_MS,
-            true
+            REGION_LATENCY_MAX_MS
         ));
         // Different region, however slow → not penalized (the claim is plausible).
-        assert!(!region_latency_penalty_applies(
-            Some("DE"),
-            "US",
-            5000,
-            true
-        ));
+        assert!(!region_latency_penalty_applies(Some("DE"), "US", 5000));
         // Own region unset → penalty disabled (nothing to compare against).
-        assert!(!region_latency_penalty_applies(None, "DE", 5000, true));
+        assert!(!region_latency_penalty_applies(None, "DE", 5000));
         // Peer region unknown (not in the peer table) → no claim to contradict.
-        assert!(!region_latency_penalty_applies(Some("DE"), "", 5000, true));
+        assert!(!region_latency_penalty_applies(Some("DE"), "", 5000));
     }
 
     /// The failure-class `reason` (#966) the `open_channel` kernel attaches to
