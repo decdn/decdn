@@ -1668,7 +1668,7 @@ mod tests {
 
         // A listener that is never accepted: the kernel completes the
         // handshake into the backlog and buffers the request, so the RPC call
-        // connects but never gets a reply. With no error there is no retry
+        // can never get a reply or an error. With no error there is no retry
         // backoff, and with no reply there is no result, so the 5 s cap is the
         // only way out. Paused time makes that cap instant.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

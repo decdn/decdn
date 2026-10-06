@@ -12,12 +12,14 @@
 //!
 //! Determinism: the breaker cooldown is driven by an injected
 //! [`decdn_cache::ManualClock`] (via `open_full_with_clock`), so no test
-//! sleeps for a real cooldown. The retry-backoff schedule is set large
-//! on purpose so that *if* a short-circuit ever leaked into the retry
-//! loop the cost would be unmistakable — proven two ways: a real-clock
-//! `tokio::time::timeout` guard on the OPEN miss, and an
-//! `origin_retry_exhausted` counter that moves only after a backoff sleep
-//! fires.
+//! sleeps for a real cooldown. `open_breaker_skips_the_60s_backoff_loop`
+//! sets the retry-backoff schedule large on purpose, so a short-circuit
+//! that leaked into a backoff would be unmistakable: a real-clock
+//! `tokio::time::timeout` guard on the OPEN miss catches a backoff from
+//! any source, and an `origin_retry_exhausted` counter that moves only
+//! after a backoff sleep fires shows the retry loop never ran. The other
+//! OPEN-path tests prove the short-circuit through the unchanged origin
+//! fetch count and the short-circuit counter.
 
 #![allow(
     clippy::unwrap_used,
@@ -138,15 +140,18 @@ impl Origin for NotFoundOrigin {
 }
 
 /// Retry policy with a *deliberately huge* backoff so that any
-/// short-circuit leaking into the retry loop is unmistakable — a
-/// real-clock `tokio::time::timeout` guard fails fast instead of silently
-/// passing, and the exhaustion counter moves on a slept retry.
+/// short-circuit leaking into a backoff is unmistakable: it becomes a
+/// real-time stall that the OPEN-miss timeout guard catches. The
+/// exhaustion counter moves once per pull that exhausts its budget after
+/// a slept retry.
 /// `max_retries = 2` means 3 attempts per pull when the loop *does* run
 /// (CLOSED / HALF-OPEN trials).
 fn slow_retry() -> RetryPolicy {
     RetryPolicy {
         max_retries: 2,
-        initial_backoff_ms: 60_000, // 60s — never actually slept in a passing test
+        // 60s — never waited out in wall time; the trip phase skips it on a
+        // paused clock.
+        initial_backoff_ms: 60_000,
         max_backoff_ms: 60_000,
         jitter_ratio: 0.0,
         buffered_max_bytes: 0,
@@ -199,10 +204,9 @@ async fn build(
 async fn opens_on_repeated_transient_then_fast_fails_with_no_backoff() -> anyhow::Result<()> {
     let origin = Arc::new(ControllableOrigin::new(b"cb-payload-1"));
     let hash = origin.hash();
-    // `slow_retry` has `max_retries = 0`-equivalent backoff that would
-    // block 60s if it ever ran during a short-circuit. We DON'T want the
-    // closed-state failures to take 60s either, so use `disabled` retry
-    // for the trip phase: each failing `get` is a single attempt.
+    // `disabled` retry: each failing miss is a single attempt with no
+    // backoff, so the trip phase costs no time. The backoff proof lives in
+    // `open_breaker_skips_the_60s_backoff_loop`.
     let (engine, metrics, _clk, _tmp) = build(
         Arc::clone(&origin),
         RetryPolicy::disabled(),
@@ -230,7 +234,7 @@ async fn opens_on_repeated_transient_then_fast_fails_with_no_backoff() -> anyhow
     );
 
     // Now OPEN. A miss must short-circuit: no new origin call, fast error,
-    // short-circuit counter bumped. The timeout proves no backoff sleep.
+    // short-circuit counter bumped. The timeout guards against a hang.
     let res = tokio::time::timeout(Duration::from_secs(1), engine.get(hash))
         .await
         .expect("OPEN breaker miss must return immediately, not block on backoff");
@@ -252,18 +256,20 @@ async fn opens_on_repeated_transient_then_fast_fails_with_no_backoff() -> anyhow
     Ok(())
 }
 
-/// Fast-fail-incurs-no-backoff, proved a second way: a 60s backoff retry
-/// policy, run until the breaker trips, then one OPEN miss. The proof is
-/// the `origin_retry_exhausted` counter. The retry loop bumps it only on
-/// exhaustion after at least one retry, so only after a backoff sleep has
-/// fired. Each trip-phase miss runs the full loop and bumps it, which shows
-/// the signal is live. The OPEN miss must leave it where it was: a
-/// short-circuit, not a slept retry.
+/// Fast-fail-incurs-no-backoff: a 60s backoff retry policy, run until the
+/// breaker trips, then one OPEN miss.
 ///
-/// The paused Tokio clock only skips the trip phase's real 60s backoff
-/// sleeps: the idle runtime auto-advances to each pending sleep. No
-/// assertion reads the clock, so an auto-advance during `get`'s
-/// cross-runtime store I/O cannot change the result.
+/// The trip phase runs on a paused Tokio clock, so its 60s backoff sleeps
+/// (two per miss) take no wall time: the idle runtime auto-advances to each
+/// pending sleep. The clock then resumes, so the OPEN miss runs in real
+/// time and nothing auto-advances during `get`'s cross-runtime store I/O.
+///
+/// Two signals prove the OPEN miss incurs no backoff. A 30s real-clock
+/// timeout catches a 60s backoff from any source on the miss path. The
+/// `origin_retry_exhausted` counter shows the retry loop never ran: the
+/// loop bumps it only on exhaustion after at least one retry, so only
+/// after a backoff sleep has fired. Each trip-phase miss bumps it, which
+/// shows the signal is live; the OPEN miss must leave it where it was.
 #[tokio::test(start_paused = true)]
 async fn open_breaker_skips_the_60s_backoff_loop() -> anyhow::Result<()> {
     let origin = Arc::new(ControllableOrigin::new(b"cb-payload-2"));
@@ -286,8 +292,12 @@ async fn open_breaker_skips_the_60s_backoff_loop() -> anyhow::Result<()> {
     );
 
     // OPEN now. The miss must resolve as a short-circuit that never enters
-    // the retry loop, so no backoff sleep fires and nothing exhausts.
-    let res = engine.get(hash).await;
+    // the retry loop, so no backoff sleep fires and nothing exhausts. On the
+    // resumed clock a leaked 60s backoff takes real time and trips the guard.
+    tokio::time::resume();
+    let res = tokio::time::timeout(Duration::from_secs(30), engine.get(hash))
+        .await
+        .expect("OPEN breaker miss must return without a backoff sleep");
     assert!(res.is_err());
     assert_eq!(
         metrics.circuit_breaker_short_circuits.get(),
@@ -449,7 +459,7 @@ async fn permanent_not_found_never_trips_breaker() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A disabled breaker policy reproduces pre-#963 behaviour: every miss
+/// A disabled breaker policy leaves the miss path unguarded: every miss
 /// runs the retry loop and hits the origin, even under a sustained
 /// outage — the breaker never short-circuits.
 #[tokio::test]
