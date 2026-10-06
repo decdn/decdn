@@ -15,9 +15,9 @@
 //! sleeps for a real cooldown. The retry-backoff schedule is set large
 //! on purpose so that *if* a short-circuit ever leaked into the retry
 //! loop the cost would be unmistakable — proven two ways: a real-clock
-//! `tokio::time::timeout` guard on the OPEN miss, and a paused-clock
-//! delta measurement that stays ~zero only when no backoff sleep is
-//! registered.
+//! `tokio::time::timeout` guard on the OPEN miss, and an
+//! `origin_retry_exhausted` counter that moves only after a backoff sleep
+//! fires.
 
 #![allow(
     clippy::unwrap_used,
@@ -140,7 +140,7 @@ impl Origin for NotFoundOrigin {
 /// Retry policy with a *deliberately huge* backoff so that any
 /// short-circuit leaking into the retry loop is unmistakable — a
 /// real-clock `tokio::time::timeout` guard fails fast instead of silently
-/// passing, and a paused-clock delta jumps by a full backoff interval.
+/// passing, and the exhaustion counter moves on a slept retry.
 /// `max_retries = 2` means 3 attempts per pull when the loop *does* run
 /// (CLOSED / HALF-OPEN trials).
 fn slow_retry() -> RetryPolicy {
@@ -253,28 +253,22 @@ async fn opens_on_repeated_transient_then_fast_fails_with_no_backoff() -> anyhow
 }
 
 /// Fast-fail-incurs-no-backoff, proved a second way: a 60s backoff retry
-/// policy under a *paused* Tokio clock. Paused time auto-advances to the
-/// next pending timer only when the runtime is otherwise idle, so the
-/// trip-phase backoff sleeps resolve without real wall-time. Once OPEN,
-/// the miss must resolve WITHOUT registering a backoff timer at all — a
-/// short-circuit, not a slept retry. We prove that by measuring the
-/// paused-clock delta across the OPEN miss: a short-circuit registers no
-/// sleep, so paused time does not advance; a leaked retry would register
-/// 60s backoff sleeps that the otherwise-idle runtime auto-advances
-/// through, moving the clock by at least one backoff interval.
+/// policy, run until the breaker trips, then one OPEN miss. The proof is
+/// the `origin_retry_exhausted` counter. The retry loop bumps it only on
+/// exhaustion after at least one retry, so only after a backoff sleep has
+/// fired. Each trip-phase miss runs the full loop and bumps it, which shows
+/// the signal is live. The OPEN miss must leave it where it was: a
+/// short-circuit, not a slept retry.
 ///
-/// We deliberately do NOT wrap the call in `tokio::time::timeout`: that
-/// would itself register a pending timer, and `get`'s cross-thread store
-/// I/O momentarily idles the current-thread runtime, letting it
-/// auto-advance straight to the timeout deadline and fire spuriously even
-/// on a correct short-circuit (the source of this test's prior flakiness).
-/// With no pending timer, an idle runtime has nothing to advance to, so
-/// the clock only moves if the retry loop's own backoff sleep leaks.
+/// The paused Tokio clock only skips the trip phase's real 60s backoff
+/// sleeps: the idle runtime auto-advances to each pending sleep. No
+/// assertion reads the clock, so an auto-advance during `get`'s
+/// cross-runtime store I/O cannot change the result.
 #[tokio::test(start_paused = true)]
 async fn open_breaker_skips_the_60s_backoff_loop() -> anyhow::Result<()> {
     let origin = Arc::new(ControllableOrigin::new(b"cb-payload-2"));
     let hash = origin.hash();
-    let (engine, _metrics, _clk, _tmp) =
+    let (engine, metrics, _clk, _tmp) =
         build(Arc::clone(&origin), slow_retry(), breaker_policy()).await?;
 
     // Trip the breaker. Each failing miss runs the full retry budget; the
@@ -285,20 +279,25 @@ async fn open_breaker_skips_the_60s_backoff_loop() -> anyhow::Result<()> {
         assert!(r.is_err());
     }
     let fetches_at_trip = origin.fetches();
+    assert_eq!(
+        metrics.origin_retry_exhausted.get(),
+        2,
+        "each trip-phase miss slept through its backoff and exhausted the budget"
+    );
 
-    // OPEN now. The miss must resolve as a fast short-circuit. A leaked
-    // backoff would register a 60s timer; with no concurrent task to keep
-    // the runtime busy the paused clock would auto-advance through it,
-    // pushing the measured delta past a backoff interval. A correct
-    // short-circuit registers no timer, so the delta stays ~zero.
-    let before = tokio::time::Instant::now();
+    // OPEN now. The miss must resolve as a short-circuit that never enters
+    // the retry loop, so no backoff sleep fires and nothing exhausts.
     let res = engine.get(hash).await;
-    let elapsed = before.elapsed();
     assert!(res.is_err());
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "OPEN breaker miss advanced the paused clock by {elapsed:?}; a short-circuit \
-         registers no backoff timer, so any advance means a retry sleep leaked"
+    assert_eq!(
+        metrics.circuit_breaker_short_circuits.get(),
+        1,
+        "the OPEN miss is a short-circuit"
+    );
+    assert_eq!(
+        metrics.origin_retry_exhausted.get(),
+        2,
+        "no retry loop ran while OPEN, so no backoff sleep fired"
     );
     assert_eq!(
         origin.fetches(),
