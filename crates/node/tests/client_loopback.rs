@@ -1471,12 +1471,39 @@ async fn a_foreign_preimage_is_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Assert that the node wrote exactly one `rejecting a payment proof` line for
+/// `signer`, with `reason` and `with_watermark`. The capture is shared across
+/// the binary, so the per-test random signer keeps the filter unique (#2342).
+fn assert_one_reject_line(
+    spans: &support::SpanCapture,
+    signer: &PrivateKeySigner,
+    reason: &str,
+    with_watermark: bool,
+) -> anyhow::Result<()> {
+    let lines = spans.events(
+        "rejecting a payment proof",
+        "signer",
+        &signer.address().to_string(),
+    );
+    let [line] = lines.as_slice() else {
+        anyhow::bail!("expected one proof-reject line for the signer, got {lines:?}");
+    };
+    let with_watermark = with_watermark.to_string();
+    anyhow::ensure!(
+        line.get("reason").map(String::as_str) == Some(reason)
+            && line.get("with_watermark") == Some(&with_watermark),
+        "expected reason={reason} with_watermark={with_watermark}: {line:?}"
+    );
+    Ok(())
+}
+
 /// The node MUST check the price it is being paid. A reveal carries no price of
 /// its own, so a chain opened at the wrong `chunk_price` would meter every later
 /// chunk below the node's quote with no per-tick moment revealing it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_chain_opened_below_the_quoted_rate_is_refused() -> anyhow::Result<()> {
     const CREDIT_MAX: u64 = 64 * 1024 * 1024;
+    let spans = support::capture_spans();
     let payload = vec![0x48u8; 4 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, _deposit) = seeded_store()?;
@@ -1498,6 +1525,8 @@ async fn a_chain_opened_below_the_quoted_rate_is_refused() -> anyhow::Result<()>
     // ten times it.
     open_chain(&mut send, &signer, chain_root(), 1, U256::ZERO, 0).await?;
     expect_reject(&mut recv, VoucherRejectReason::ChunkPriceMismatch).await?;
+    // The node logs before it writes the frame, so the line is already there.
+    assert_one_reject_line(&spans, &signer, "ChunkPriceMismatch", false)?;
 
     conn.close(0u32.into(), b"done");
     shutdown([server_task], [&client_ep, &server_ep]).await?;
@@ -11787,6 +11816,7 @@ async fn bad_signature_after_an_accepted_voucher_is_rejected() -> anyhow::Result
 /// as a rejected voucher even though a voucher already paid (#2073).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_zero_byte_voucher_after_paying_counts_as_rejected() -> anyhow::Result<()> {
+    let spans = support::capture_spans();
     let mut fx = drive_to_second_interval_awaiting_voucher().await?;
 
     // Interval 1 is paid. Re-sign its byte count at a higher amount.
@@ -11809,6 +11839,8 @@ async fn a_zero_byte_voucher_after_paying_counts_as_rejected() -> anyhow::Result
         counter(&fx.metrics, "decdn_serve_stream_client_abandoned_total")? == 0,
         "a rate-check bail after payment is not an abandon"
     );
+    // No frame names the cause, so the INFO line is the only record of it.
+    assert_one_reject_line(&spans, &fx.signer, "RateCheck", false)?;
 
     fx.conn.close(0u32.into(), b"done");
     shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
