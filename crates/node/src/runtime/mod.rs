@@ -118,7 +118,7 @@ const REPUTATION_EVICT_INTERVAL: Duration = Duration::from_hours(1);
 /// application-layer and lives in the cdn/client/v1 handler's serve loop
 /// (`handlers::client::APP_IDLE_TIMEOUT`), which reaps keep-alive'd-but-
 /// streamless connections the transport timer cannot.
-const QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Interval between QUIC PING keep-alive frames. Per ADR 005 §Connection
 /// lifetime, endpoints SHOULD send PINGs at 10s intervals — strictly
