@@ -15964,6 +15964,9 @@ struct HolderPull {
     /// The leaf pulls from the first-ranked holder's own endpoint, so it is the
     /// requester S discovers.
     leaf_is_first: bool,
+    /// How many `cdn/client/v1` connections the full holder O answers with a
+    /// signed `NotFound` before it serves.
+    full_holder_refusals: usize,
 }
 
 /// What [`holder_pull_case`] observed at the first-ranked holder.
@@ -16012,7 +16015,7 @@ async fn holder_pull_case(case: HolderPull) -> Result<FirstHolderSeen> {
         ab_pool_id,
         s_buyer.address(),
         Coverage::full(2),
-        0,
+        case.full_holder_refusals,
     )
     .await?;
     let f_dht = DhtNodeId::from_bytes(*f_id.as_bytes());
@@ -16122,8 +16125,37 @@ async fn a_serve_miss_asks_a_partial_holder_only_for_blocks_it_holds() -> Result
     let seen = holder_pull_case(HolderPull {
         first_blocks: &[1],
         leaf_is_first: false,
+        full_holder_refusals: 0,
     })
     .await?;
+    anyhow::ensure!(
+        seen.refused_misses == 0,
+        "the partial holder was asked for bytes it does not hold ({} refused misses)",
+        seen.refused_misses
+    );
+    Ok(())
+}
+
+/// When the first run's holder refuses the header handshake, the walk moves on
+/// to the first-ranked partial holder, which lacks block 0, where the pull
+/// starts. Learning the blob's size from it asks only for a block it holds, so
+/// it refuses nothing as a miss.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_first_run_handshake_asks_the_partial_holder_only_for_blocks_it_holds()
+-> Result<()> {
+    // The full holder refuses two connections: a signed `NotFound` on the
+    // primed open reads as a range past the blob's end, so the handshake asks
+    // the full holder again for the whole blob, and that refusal fails it.
+    let seen = holder_pull_case(HolderPull {
+        first_blocks: &[1],
+        leaf_is_first: false,
+        full_holder_refusals: 2,
+    })
+    .await?;
+    anyhow::ensure!(
+        seen.inbound_streams > 0,
+        "the handshake never reached the partial holder after the full holder refused"
+    );
     anyhow::ensure!(
         seen.refused_misses == 0,
         "the partial holder was asked for bytes it does not hold ({} refused misses)",
@@ -16142,6 +16174,7 @@ async fn a_serve_miss_handshakes_with_the_first_runs_holder() -> Result<()> {
     let seen = holder_pull_case(HolderPull {
         first_blocks: &[1],
         leaf_is_first: false,
+        full_holder_refusals: 0,
     })
     .await?;
     anyhow::ensure!(
@@ -16168,6 +16201,7 @@ async fn a_serve_miss_never_pulls_from_its_requester() -> Result<()> {
     let seen = holder_pull_case(HolderPull {
         first_blocks: &[0, 1],
         leaf_is_first: true,
+        full_holder_refusals: 0,
     })
     .await?;
     anyhow::ensure!(
