@@ -11,7 +11,8 @@
 //!   cleanly the range is durably stored, so it reads straight from the store rather
 //!   than waiting on the observed bitfield, which can lag the admit;
 //! - the proof `(left, right)` hash pairs come from the serve leg's shared
-//!   [`decdn_cache::SessionOutboardReader`], fed by the pull leg's capture;
+//!   [`decdn_cache::SessionOutboardReader`], fed by the pull leg's capture, and
+//!   from the store's outboard once no live fill covers a node;
 //! - the encoded bytes are pushed through a bounded channel ([`ChannelWriter`]) and
 //!   cut into `cdn/client/v1` frames of a caller-chosen target size by
 //!   [`CoherentFrameProducer`].
@@ -60,8 +61,9 @@ struct AwaitingDataReader {
     /// Live present-range watch, opened lazily once the blob materializes.
     watch: Option<PresentRangeWatch>,
     /// The shared fill session: [`FillSession::range_still_live`] races the
-    /// present-range watch so a range no live pull will fill fails the read rather
-    /// than hanging. Under partial-overlap coalescing a leaf may be filled by a
+    /// present-range watch so a read of a range no live pull will fill settles
+    /// rather than hanging: served from the store when it holds the bytes, failed
+    /// otherwise. Under partial-overlap coalescing a leaf may be filled by a
     /// sibling pull (of the same hash), so termination consults ALL live fills, not
     /// just this session's own terminal signal.
     session: Arc<FillSession>,
@@ -183,11 +185,19 @@ impl AsyncSliceReader for AwaitingDataReader {
                     // A failed pull fills no more of the range, but it can fail
                     // after it landed the bytes this read needs (a fault later in
                     // the range, or on a leg past this read). Serve them when the
-                    // store durably holds them; fail only a read the store cannot
-                    // answer.
+                    // store durably holds them; fail only a read whose bytes the
+                    // store does not hold.
                     Some(Err(msg)) => {
-                        if self.present_covers(offset, need).await? {
-                            break;
+                        match self.present_covers(offset, need).await {
+                            Ok(true) => break,
+                            Ok(false) => {}
+                            Err(err) => {
+                                return Err(io::Error::other(format!(
+                                    "upstream pull failed before content [{offset}, +{len}) \
+                                     landed: {msg}; the store presence check failed: {}",
+                                    decdn_cache::ErrorChain::new(&err)
+                                )));
+                            }
                         }
                         return Err(io::Error::other(format!(
                             "upstream pull failed before content [{offset}, +{len}) landed: {msg}"
@@ -405,8 +415,9 @@ impl CoherentFrameProducer {
         let ranges = encoded_ranges(offset, end, total)?;
 
         // A proof node no live fill will capture is read from the local store,
-        // so a pull that faults mid-range still lets the encode stream every
-        // byte the store holds before the hole.
+        // so a pull that faults mid-range still lets the encode stream the held
+        // bytes before the hole, less the encoded chunks still buffered (up to
+        // `ENCODE_CHANNEL_CAP`) when the encode faults.
         let outboard = session
             .outboard_reader()
             .with_store_fallback(store.engine().clone());
@@ -777,7 +788,8 @@ mod tests {
     /// #2328: a pull that faults leaves a hole in a range the store otherwise
     /// holds, and no fill captured the held content's proof. The encode still
     /// streams the held bytes before the hole, reading their proof nodes from the
-    /// store, and faults only at the hole.
+    /// store, less the encoded chunks still buffered (up to `ENCODE_CHANNEL_CAP`)
+    /// when it faults at the hole.
     #[tokio::test]
     async fn a_faulted_pull_still_streams_the_held_prefix() {
         let total = 32 * G;

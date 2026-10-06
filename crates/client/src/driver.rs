@@ -960,6 +960,36 @@ pub async fn first_leg<St: RangedStore + ?Sized>(
     .map(Some)
 }
 
+/// Warn when the store holds bytes after a hole in the gap
+/// `[gap_start, gap_end)`, once per distinct hole start. `hole` is the gap's
+/// contiguous delivered frontier and `missing_bytes` the gap's missing bytes, so
+/// the span past the hole less those is what the store holds after it. The next
+/// leg opens at the hole and pays for those bytes again. `warned_hole` holds the
+/// start of the last hole warned about.
+fn warn_on_new_hole(
+    warned_hole: &mut Option<u64>,
+    hash: [u8; 32],
+    gap_start: u64,
+    hole: u64,
+    gap_end: u64,
+    missing_bytes: u64,
+) {
+    let present_after_hole = gap_end.saturating_sub(missing_bytes).saturating_sub(hole);
+    if present_after_hole == 0 || *warned_hole == Some(hole) {
+        return;
+    }
+    *warned_hole = Some(hole);
+    tracing::warn!(
+        hash = %blake3::Hash::from_bytes(hash).to_hex(),
+        gap_start,
+        hole,
+        gap_end,
+        present_after_hole,
+        "the store holds bytes after a hole in the gap; the next leg opens at the hole and \
+         pays for them again"
+    );
+}
+
 /// The per-gap resume/pay loop. Fills the contiguous content span
 /// `[gap_start, gap_start + gap_len)` — a single gap of `missing_ranges` — driving
 /// the [`Pacer`] until it is fully present. `counters` persist across gaps.
@@ -1066,13 +1096,17 @@ where
 
     let asked_end = gap_start.saturating_add(gap_len);
 
+    // The start of the last hole this gap warned about, so each distinct hole
+    // logs once however many passes it takes to fill.
+    let mut warned_hole: Option<u64> = None;
+
     loop {
         // The store's DELIVERED frontier for this gap: the end of the present
         // bytes contiguous from `gap_start`, which is the start of the gap's
         // first missing range, or the gap's end when nothing is missing. Present
         // bytes past a hole do not count: the gap resumes at the hole. It caps
-        // the paid frontier, so completion and every resume start sit at bytes
-        // the store holds. A store that cannot answer is this process's fault,
+        // the paid frontier, so the store holds every byte below the completion
+        // point and below each resume start. A store that cannot answer is this process's fault,
         // not the source's (#2213). The bound it is clipped to is the bound the
         // planner works to now: a leg that proves a smaller size shrinks it, and
         // the gap ends there.
@@ -1088,16 +1122,25 @@ where
         let gap_len = gap_end - gap_start;
         let delivered_frontier =
             contiguous_frontier(&still_missing, total_bytes, gap_start, gap_end);
+        warn_on_new_hole(
+            &mut warned_hole,
+            hash,
+            gap_start,
+            delivered_frontier,
+            gap_end,
+            ranges_content_len(&still_missing, total_bytes),
+        );
 
         // Received-byte ceiling (#1895): enforce the source's `max_blob_size_bytes`
         // on the content that has ACTUALLY been received and BLAKE3-verified into the
         // store, never on the peer's unverified signed `total_bytes`.
-        // `delivered_frontier` is an absolute content offset the store holds every
-        // byte of from `gap_start`, so once it crosses the ceiling the blob is
-        // genuinely oversized — abort. The Draw arm clamps each leg so this fires
-        // within one chunk group of the ceiling rather than after a whole-gap
-        // `BudgetPacer` draw. `0` = unlimited (and own-origin, whose engine store
-        // applies its own cap).
+        // The store holds every byte of `[gap_start, delivered_frontier)`, so once
+        // `delivered_frontier` crosses the ceiling the blob is genuinely oversized —
+        // abort. A hole below the ceiling holds the frontier at the hole, so the
+        // check waits until a later leg fills it. The Draw arm clamps each leg so
+        // this fires within one chunk group of the ceiling rather than after a
+        // whole-gap `BudgetPacer` draw. `0` = unlimited (and own-origin, whose
+        // engine store applies its own cap).
         let max_blob_size_bytes = source.max_blob_size_bytes();
         if max_blob_size_bytes > 0 && delivered_frontier > max_blob_size_bytes {
             return Err(anyhow::Error::new(crate::BlobTooLarge {
@@ -1132,12 +1175,15 @@ where
         // arm) before the bytes are in the store, so `drive` returns `Ok` with the
         // blob incomplete and never finalizes it: success for a blob that is not
         // there. Clamping to `delivered_frontier` is the same guard against that
-        // overshoot every resumable pull needs. On a solo pull and the whole client path
-        // delivery runs AHEAD of payment (ADR 003's credit window), so
-        // `delivered_frontier >= paid_frontier` and the clamp is a NO-OP — resume
+        // overshoot every resumable pull needs. When the store keeps every byte a leg
+        // delivers, delivery runs AHEAD of payment (ADR 003's credit window), so
+        // `delivered_frontier >= paid_frontier` and the clamp is a no-op: resume
         // still starts at the true paid frontier and the delivered-but-unpaid tail is
-        // still re-billed (no under-pay). It bites ONLY when a shared-ledger
-        // concurrent pull overshoots this leg's delivery.
+        // still re-billed (no under-pay). The clamp bites in two cases. A
+        // shared-ledger concurrent pull overshoots this leg's delivery. Or the store
+        // leaves a hole before present bytes: the contiguous delivered frontier stops
+        // at the hole, so the paid frontier stops there too and the next leg opens
+        // at the hole.
         let paid_frontier =
             crate::sink::content_paid_frontier(leg_start, total_bytes, paid_wire_this_leg)
                 .min(gap_end)
@@ -1306,9 +1352,10 @@ where
                 // after an exhaustion — `ingest_stream` re-writes the already-present
                 // bytes idempotently and the pull re-bills them, so the credit-window
                 // tail the store checkpointed ahead of payment is finally paid. A
-                // hole the store left behind present bytes caps the paid frontier
+                // hole the store left before present bytes caps the paid frontier
                 // at the hole, so the leg opens there and re-delivers the present
-                // bytes after it the same idempotent way.
+                // bytes after it the same idempotent way. The pull pays for those
+                // present bytes again: a bounded over-pay, never an under-pay.
                 if paid_frontier >= gap_end {
                     // Paid AND delivered to the gap end (`paid_frontier` is clamped to
                     // the delivered frontier above) — the pacer should have returned
@@ -4617,13 +4664,15 @@ mod tests {
 
     /// A store that keeps every leg it ingests except one range of the first
     /// leg: that leg pays for the whole gap and leaves a hole with present bytes
-    /// after it. Queries answer from `view`, which holds only what was kept.
+    /// after it. Queries answer from `view`, which holds only what was kept. A
+    /// `sticky` hole drops that range from every leg, so the store never keeps it.
     struct HoleOnceStore {
         view: ClientRangedStore,
         sink: ClientRangedStore,
         plaintext: Vec<u8>,
         outboard: Bytes,
         hole: Mutex<Option<(u64, u64)>>,
+        sticky: bool,
     }
 
     impl RangedStore for HoleOnceStore {
@@ -4685,7 +4734,11 @@ mod tests {
                 )
                 .await?;
                 let (start, end) = (range.fetch_start(), range.fetch_end());
-                let kept = match self.hole.lock().unwrap().take() {
+                let hole = {
+                    let mut hole = self.hole.lock().unwrap();
+                    if self.sticky { *hole } else { hole.take() }
+                };
+                let kept = match hole {
                     Some((hole, len)) => vec![(start, hole), (hole + len, end)],
                     None => vec![(start, end)],
                 };
@@ -4704,8 +4757,8 @@ mod tests {
     }
 
     /// #2328: a paid leg the store keeps only in part leaves a hole mid-gap with
-    /// present bytes after it. The next leg opens at the hole, not past the
-    /// present tail, so the gap fills and the drive completes.
+    /// present bytes after it. The next leg opens at the hole, so the gap fills
+    /// and the drive completes.
     #[tokio::test]
     async fn a_hole_behind_present_bytes_is_refilled_from_the_hole() {
         let total = 4 * GROUP;
@@ -4716,6 +4769,7 @@ mod tests {
             plaintext: plaintext.clone(),
             outboard,
             hole: Mutex::new(Some((GROUP, GROUP))),
+            sticky: false,
         };
         let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
         let source = ScriptedSource::new(plaintext.clone())
@@ -4735,6 +4789,44 @@ mod tests {
         assert_eq!(
             store.view.read(0, total).await.expect("read").as_ref(),
             plaintext.as_slice()
+        );
+    }
+
+    /// #2328: a hole the store never keeps holds both frontiers at the hole. The
+    /// leg that opens there moves neither, so the gap ends with
+    /// [`LegNoProgress`] after two opens rather than re-paying the hole forever.
+    #[tokio::test]
+    async fn a_hole_the_store_never_keeps_ends_the_gap_after_two_opens() {
+        let total = 4 * GROUP;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let store = HoleOnceStore {
+            view: fresh_store(root, total),
+            sink: fresh_store(root, total),
+            plaintext: plaintext.clone(),
+            outboard,
+            hole: Mutex::new(Some((GROUP, GROUP))),
+            sticky: true,
+        };
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(plaintext)
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+
+        let err = drive_bounded(&store, &source, &ledger)
+            .await
+            .expect_err("a hole the store never keeps cannot complete the gap");
+
+        let stuck = err
+            .downcast_ref::<LegNoProgress>()
+            .unwrap_or_else(|| panic!("expected LegNoProgress, got {err:#}"));
+        assert_eq!(
+            stuck.delivered_frontier, GROUP,
+            "the frontier stops at the hole"
+        );
+        assert_eq!(
+            source.opened_ranges(),
+            vec![(0, total), (GROUP, total - GROUP)],
+            "one open at the gap start, one at the hole, no repeat"
         );
     }
 

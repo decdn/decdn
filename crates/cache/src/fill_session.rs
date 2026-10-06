@@ -37,9 +37,11 @@
 //! The one thing that must generalize past a single pull is termination: "await this
 //! node, or fail" has to consult ALL live fills whose `covered` ranges intersect the
 //! node's byte span, not one pull's terminal signal. [`FillSession::range_still_live`]
-//! (backed by [`FillRegistry::range_still_live`]) answers exactly that — it fails a
-//! parked reader iff no live session's `covered` still intersects the range, which is
-//! the N-fill generalization of the single-pull failure race.
+//! (backed by [`FillRegistry::range_still_live`]) answers exactly that — it settles
+//! a parked reader once no live session's `covered` still intersects the range,
+//! which is the N-fill generalization of the single-pull failure race. A settled
+//! read is served from the local store when the store holds what it needs, and
+//! fails otherwise; it never hangs.
 //!
 //! # Ownership seam (cache owns the structure, the node drives it)
 //!
@@ -697,7 +699,9 @@ impl FillSession {
 
     /// Mint a serve-side [`SessionOutboardReader`] over this hash's shared outboard.
     /// The reader snapshots the (already-adopted) outboard and holds this session so
-    /// its termination race can reach the registry.
+    /// its termination race can reach the registry. A serve path attaches the store
+    /// ([`SessionOutboardReader::with_store_fallback`]); without it, a load of a node
+    /// no live fill captures fails.
     #[must_use]
     pub fn outboard_reader(self: &Arc<Self>) -> SessionOutboardReader {
         SessionOutboardReader {
@@ -790,8 +794,9 @@ impl FillSession {
 
     /// The per-hash liveness signal, notified whenever any session for this hash
     /// ends or is cancelled. A serve-side data reader awaits it (alongside the
-    /// present-range watch) so a range no live pull will fill fails the read rather
-    /// than hanging. Handed out as an owned `Arc<Notify>` so the node's data reader
+    /// present-range watch) so a read of a range no live pull will fill settles
+    /// rather than hanging: served from the store when it holds the bytes, failed
+    /// otherwise. Handed out as an owned `Arc<Notify>` so the node's data reader
     /// need not name the cache-private [`HashOutboard`].
     #[must_use]
     pub fn liveness_signal(&self) -> Arc<Notify> {
@@ -862,9 +867,9 @@ impl FillSession {
 /// Serve-side [`Outboard`] over a hash's shared [`HashOutboard`]. Its
 /// [`Outboard::load`] awaits a not-yet-captured node, racing the registry-wide fill
 /// liveness for the no-hang guarantee: once no live fill still covers the node's
-/// byte range, it reads the node from the local store when it has one
-/// ([`Self::with_store_fallback`]) and fails when that cannot supply it. Minted via
-/// [`FillSession::outboard_reader`].
+/// byte range, it reads the node from the local store when the reader carries a
+/// store fallback ([`Self::with_store_fallback`]), and fails when that cannot
+/// supply it. Minted via [`FillSession::outboard_reader`].
 #[derive(Debug)]
 pub struct SessionOutboardReader {
     session: Arc<FillSession>,
@@ -894,16 +899,18 @@ struct StoreFallback {
 }
 
 impl StoreFallback {
-    /// Capture into `outboard` the pairs of the proof path to ONE chunk group the
-    /// store holds under a node of chunk range `node_range`. The path holds every
-    /// parent above the group, the node among them, so the cost is one chunk group
-    /// however much content the node spans. Captures nothing when the store holds
-    /// nothing under the node.
+    /// Capture into `outboard` the pairs `export_bao` emits for ONE chunk group the
+    /// store holds under a node of chunk range `node_range`: every parent on the
+    /// group's proof path, the node among them, plus the right-siblings over
+    /// absent content. The store reads and verifies at most that one group's
+    /// leaves, however much content the node spans. Captures nothing when the
+    /// store holds nothing under the node. Returns whether the export yielded any
+    /// pairs.
     async fn capture(
         &mut self,
         outboard: &HashOutboard,
         node_range: &ChunkRanges,
-    ) -> CacheResult<()> {
+    ) -> CacheResult<bool> {
         let hash = Hash::from_bytes(*outboard.root.as_bytes());
         if (node_range & &self.present).is_empty() {
             self.present = self
@@ -915,7 +922,7 @@ impl StoreFallback {
         }
         let held = node_range & &self.present;
         let Some(first) = held.boundaries().first().copied() else {
-            return Ok(());
+            return Ok(false);
         };
         let group_chunks = 1u64 << IROH_BLOCK_SIZE.chunk_log();
         let group_start = first.0 / group_chunks * group_chunks;
@@ -923,8 +930,9 @@ impl StoreFallback {
             ChunkNum(group_start)..ChunkNum(group_start.saturating_add(group_chunks)),
         );
         let pairs = self.engine.outboard_pairs(hash, &(&held & &group)).await?;
+        let exported = !pairs.is_empty();
         outboard.capture_many(pairs);
-        Ok(())
+        Ok(exported)
     }
 }
 
@@ -949,6 +957,27 @@ impl SessionOutboardReader {
     #[must_use]
     pub fn parked_on(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.parked_on)
+    }
+
+    /// Log a node the store fallback supplied. After a failed pull, or once
+    /// every covering pull ended, the store is the expected source: debug. After
+    /// this session's own pull completed cleanly, the pull should have captured
+    /// the node itself, so the fallback covers a capture defect: warn.
+    fn log_store_hit(&self, node: TreeNode) {
+        let hash = self.outboard.root;
+        if matches!(self.session.outcome(), Some(Ok(()))) {
+            tracing::warn!(
+                %hash,
+                ?node,
+                "a clean pull never captured an outboard node; read it from the store"
+            );
+        } else {
+            tracing::debug!(
+                %hash,
+                ?node,
+                "read an outboard node no live fill will capture from the store"
+            );
+        }
     }
 
     /// The terminal error for a node no live fill will supply: a precise message
@@ -1008,14 +1037,23 @@ impl Outboard for SessionOutboardReader {
                 if let Some(pair) = self.outboard.try_load(idx) {
                     return Ok(Some(pair));
                 }
-                let stored = match self.store.as_mut() {
+                let exported = match self.store.as_mut() {
                     Some(fallback) => fallback.capture(&self.outboard, &node_range).await,
-                    None => Ok(()),
+                    None => Ok(false),
                 };
-                match stored {
-                    Ok(()) => {
+                match exported {
+                    Ok(exported) => {
                         if let Some(pair) = self.outboard.try_load(idx) {
+                            if exported {
+                                self.log_store_hit(node);
+                            }
                             return Ok(Some(pair));
+                        }
+                        if exported {
+                            return Err(io::Error::other(format!(
+                                "the store holds content under outboard node {node:?} but \
+                                 its export did not yield the node"
+                            )));
                         }
                     }
                     Err(err) => {

@@ -1338,12 +1338,14 @@ fn resolved_lifecycle(pool: &PaymentPool::Pool) -> Option<Lifecycle> {
 /// in-flight redemption too, but the interval absorbs that wait.
 /// `margin_secs` is the voucher path's capability-expiry margin.
 ///
-/// A lane whose hint-path redemption hits a chain fault is parked until the
-/// next sweep: each later hint for it is dropped and counted into
-/// `redeem_hints_parked`, so an RPC outage costs one failed attempt per lane
-/// per interval, not one per voucher. Every sweep clears the parked set before
-/// it runs, and the sweep itself retries the parked lanes. The set holds at
-/// most one entry per lane.
+/// A lane whose hint-path redemption hits a chain fault (an RPC fault or a
+/// revert) is parked until the next sweep: each later hint for it is dropped
+/// and counted into `redeem_hints_parked`. Each tick or cutoff clears the
+/// parked set, and the sweep that follows retries the parked lanes with every
+/// other lane. The first hint after that sweep tries the lane once more and
+/// parks it again on a fault. So during an RPC outage each lane costs at most
+/// one hint-path attempt per sweep plus the sweep's own batched retry, not one
+/// attempt per voucher.
 #[allow(clippy::too_many_arguments)]
 async fn redeemer_loop<P: Provider + Clone>(
     contract: PaymentPool::PaymentPoolInstance<P>,
@@ -1390,7 +1392,7 @@ async fn redeemer_loop<P: Provider + Clone>(
                     )
                     .await;
                     if outcome.chain_fault {
-                        parked.insert(key);
+                        park_lane(&mut parked, key);
                     }
                     next_cutoff = next_cutoff.into_iter().chain(outcome.wake).min();
                     continue;
@@ -1404,8 +1406,9 @@ async fn redeemer_loop<P: Provider + Clone>(
         // A tick or a cutoff: sweep every lane, and schedule the next cutoff
         // from the same scan. A failed load keeps every cutoff still ahead and
         // drops one that has passed, so the loop does not re-fire it at once;
-        // the next tick retries the scan. Every sweep releases the parked
-        // lanes, so their hints redeem again after it.
+        // the next tick retries the scan. Each tick or cutoff clears the parked
+        // set, and the sweep that follows retries the parked lanes with every
+        // other lane.
         parked.clear();
         let Some(states) = load_lanes(store.as_ref()) else {
             next_cutoff = next_cutoff.filter(|wake| *wake > unix_now());
@@ -1933,6 +1936,18 @@ fn plan_lanes(
     plans
 }
 
+/// Park `key` until the next sweep after a chain fault on its hint path
+/// ([`redeemer_loop`]).
+fn park_lane(parked: &mut HashSet<LaneKey>, key: LaneKey) {
+    debug!(
+        pool_id = %key.pool_id,
+        signer = %key.signer,
+        provider = %key.provider,
+        "lane parked until the next sweep after a chain fault"
+    );
+    parked.insert(key);
+}
+
 /// What one hint-path redemption tells [`redeemer_loop`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct HintOutcome {
@@ -2087,6 +2102,7 @@ async fn submit_chunk<P: Provider + Clone>(
     let sent = contract.redeemMany(batches).send().await;
     let outcome = send_and_await_receipt(sent, Some(REDEEM_RECEIPT_TIMEOUT), metrics).await;
     let failed = is_redemption_failure(&outcome);
+    let chain_fault = is_chain_fault(&outcome);
     match outcome {
         TxOutcome::Landed(receipt) => {
             span.record("tx", tracing::field::display(receipt.transaction_hash));
@@ -2147,7 +2163,22 @@ async fn submit_chunk<P: Provider + Clone>(
     if failed {
         metrics.redemption_failure();
     }
-    true
+    chain_fault
+}
+
+/// Whether a `redeemMany` outcome is a chain fault that parks a hinted lane
+/// ([`redeemer_loop`]). Every outcome but `Landed` is one, the unconfirmed ones
+/// included: the lane's claim stays unsettled either way, so a hint that retries
+/// it at once meets the same fault. An oversize send that `submit_chunk` halves
+/// takes the outcome of its halves instead.
+const fn is_chain_fault(outcome: &TxOutcome) -> bool {
+    match outcome {
+        TxOutcome::Landed(_) => false,
+        TxOutcome::Reverted(_)
+        | TxOutcome::SendErr(_)
+        | TxOutcome::ReceiptErr { .. }
+        | TxOutcome::Timeout { .. } => true,
+    }
 }
 
 /// Whether a `redeemMany` outcome counts into `decdn_redemption_failures_total`.
@@ -2457,9 +2488,8 @@ fn holds_unredeemed(states: &[LaneState], pool_id: PoolId, provider: Address) ->
 /// a bounded re-serve risk.
 ///
 /// Returns whether the cycle hit a chain fault: a failed watermark read or a
-/// chunk that did not land. A set the floor defers, a set with nothing left to
-/// submit, and a failed strict flush are not chain faults. A failed flush is
-/// local to this node, so it does not count.
+/// chunk that did not land. A floor deferral, an empty chunk set and a failed
+/// strict flush add no fault of their own; the flush is local to this node.
 async fn redeem_planned_lanes<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
@@ -4373,7 +4403,31 @@ mod tests {
         use alloy::providers::PendingTransactionError;
         use alloy::transports::TransportErrorKind;
 
-        let receipt = || alloy::rpc::types::TransactionReceipt {
+        let tx_hash = B256::repeat_byte(0x17);
+        let last_lookup = || "no receipt yet".to_owned();
+
+        assert!(is_redemption_failure(&TxOutcome::Reverted(blank_receipt())));
+        assert!(is_redemption_failure(&TxOutcome::SendErr(
+            TransportErrorKind::custom_str("rejected").into()
+        )));
+        assert!(!is_redemption_failure(&TxOutcome::Landed(blank_receipt())));
+        assert!(!is_redemption_failure(&TxOutcome::ReceiptErr {
+            error: PendingTransactionError::TransportError(TransportErrorKind::custom_str(
+                "error code 26: Unknown block"
+            )),
+            tx_hash,
+            last_lookup: last_lookup(),
+        }));
+        assert!(!is_redemption_failure(&TxOutcome::Timeout {
+            tx_hash,
+            last_lookup: last_lookup(),
+        }));
+    }
+
+    /// A minimal receipt for outcome classification tests, which read only the
+    /// `TxOutcome` variant.
+    fn blank_receipt() -> alloy::rpc::types::TransactionReceipt {
+        alloy::rpc::types::TransactionReceipt {
             inner: alloy::consensus::ReceiptEnvelope::Eip1559(alloy::consensus::ReceiptWithBloom {
                 receipt: alloy::consensus::Receipt {
                     status: alloy::consensus::Eip658Value::Eip658(true),
@@ -4393,23 +4447,32 @@ mod tests {
             from: Address::ZERO,
             to: None,
             contract_address: None,
-        };
+        }
+    }
+
+    /// #2340: every `redeemMany` outcome but a landed one parks a hinted lane,
+    /// the unconfirmed ones included.
+    #[test]
+    fn every_outcome_but_landed_is_a_chain_fault() {
+        use alloy::providers::PendingTransactionError;
+        use alloy::transports::TransportErrorKind;
+
         let tx_hash = B256::repeat_byte(0x17);
         let last_lookup = || "no receipt yet".to_owned();
 
-        assert!(is_redemption_failure(&TxOutcome::Reverted(receipt())));
-        assert!(is_redemption_failure(&TxOutcome::SendErr(
+        assert!(!is_chain_fault(&TxOutcome::Landed(blank_receipt())));
+        assert!(is_chain_fault(&TxOutcome::Reverted(blank_receipt())));
+        assert!(is_chain_fault(&TxOutcome::SendErr(
             TransportErrorKind::custom_str("rejected").into()
         )));
-        assert!(!is_redemption_failure(&TxOutcome::Landed(receipt())));
-        assert!(!is_redemption_failure(&TxOutcome::ReceiptErr {
+        assert!(is_chain_fault(&TxOutcome::ReceiptErr {
             error: PendingTransactionError::TransportError(TransportErrorKind::custom_str(
                 "error code 26: Unknown block"
             )),
             tx_hash,
             last_lookup: last_lookup(),
         }));
-        assert!(!is_redemption_failure(&TxOutcome::Timeout {
+        assert!(is_chain_fault(&TxOutcome::Timeout {
             tx_hash,
             last_lookup: last_lookup(),
         }));
@@ -5500,8 +5563,9 @@ mod tests {
 
     /// #2340: a sweep releases a parked lane. A hint parks the lane, a second
     /// hint is dropped, the self-tick sweep retries the lane, and a hint after
-    /// that sweep redeems again.
-    #[tokio::test]
+    /// that sweep redeems again. The paused clock fires the tick only once the
+    /// loop is idle, so both hints land before the sweep.
+    #[tokio::test(start_paused = true)]
     async fn a_sweep_releases_a_parked_lane() -> Result<()> {
         use alloy::providers::ProviderBuilder;
         use alloy::providers::mock::Asserter;
@@ -5555,6 +5619,127 @@ mod tests {
         drop(tx);
         handle.await?;
         Ok(())
+    }
+
+    /// #2340: a chain fault parks only its own lane. Lane A's hint faults and
+    /// parks A, so A's second hint is dropped. Lane B's hint still reads and
+    /// sends.
+    #[tokio::test]
+    async fn a_chain_fault_parks_only_its_own_lane() -> Result<()> {
+        use alloy::providers::ProviderBuilder;
+        use alloy::providers::mock::Asserter;
+        use alloy::sol_types::SolCall;
+
+        let metrics = Arc::new(Metrics::new());
+        let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+        // One read and one failed send for lane A's first hint, then the same
+        // for lane B's hint.
+        let asserter = Asserter::new();
+        for _ in 0..2 {
+            asserter.push_success(&Bytes::from(
+                PaymentPool::getWatermarksCall::abi_encode_returns(&vec![lane(0)]),
+            ));
+            asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
+        }
+        let contract = PaymentPool::new(
+            Address::ZERO,
+            ProviderBuilder::new().connect_mocked_client(asserter.clone()),
+        );
+        // No tracked expiry, so no cutoff wake, and a one-hour tick: only the
+        // hints act within the test. The floor is one lane's value, so each
+        // one-lane hint clears it.
+        let (lane_a, _) = record_lanes(store.as_ref(), 1..=2, 0)?;
+        let lane_b = expiring_lane(2, 0).key();
+        let (tx, handle, _) = spawn_redeemer(
+            contract,
+            store,
+            expiring_lane(1, 0).owed(),
+            Duration::from_hours(1),
+            Arc::clone(&metrics),
+        );
+
+        tx.send(lane_a).await?;
+        tx.send(lane_a).await?;
+        tx.send(lane_b).await?;
+
+        await_metric_line(&metrics, "decdn_onchain_tx_send_failed_total 2").await?;
+        ensure_metric_lines(
+            &metrics,
+            &[
+                "decdn_redeem_hints_parked_total 1",
+                "decdn_redemption_reconcile_ok_total 2",
+                "decdn_redemption_reconcile_failures_total 0",
+            ],
+        )?;
+        assert_eq!(asserter.read_q().len(), 0, "both lanes read and sent once");
+
+        drop(tx);
+        handle.await?;
+        Ok(())
+    }
+
+    /// A failed strict flush skips the submit and adds no chain fault of its
+    /// own: the flush is local to this node.
+    #[tokio::test]
+    async fn a_failed_strict_flush_skips_the_submit_without_a_chain_fault() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store: Arc<dyn PoolStateStore> = Arc::new(FailingFlushStore(
+            decdn_incentive::MemoryPoolStateStore::new(),
+        ));
+        let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0)]]);
+
+        let faulted = redeem_planned_lanes(
+            &contract,
+            &store,
+            vec![planned(1, 0, 1_000, false)],
+            U256::from(1u64),
+            300,
+            true,
+            &metrics,
+        )
+        .await;
+
+        assert!(!faulted, "a failed flush is not a chain fault");
+        assert_eq!(asserter.read_q().len(), 0, "the watermark was read");
+        ensure_metric_lines(
+            &metrics,
+            &[
+                "decdn_redemption_reconcile_ok_total 1",
+                "decdn_onchain_tx_send_failed_total 0",
+            ],
+        )
+    }
+
+    /// A failed watermark read stays a chain fault when a failed strict flush
+    /// then skips the submit.
+    #[tokio::test]
+    async fn a_failed_read_stays_a_chain_fault_past_a_failed_strict_flush() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store: Arc<dyn PoolStateStore> = Arc::new(FailingFlushStore(
+            decdn_incentive::MemoryPoolStateStore::new(),
+        ));
+        // An empty queue fails the watermark read.
+        let (contract, _asserter) = mocked_getwatermarks_pool(&[]);
+
+        let faulted = redeem_planned_lanes(
+            &contract,
+            &store,
+            vec![planned(1, 0, 1_000, false)],
+            U256::from(1u64),
+            300,
+            true,
+            &metrics,
+        )
+        .await;
+
+        assert!(faulted, "the failed read is a chain fault");
+        ensure_metric_lines(
+            &metrics,
+            &[
+                "decdn_redemption_reconcile_failures_total 1",
+                "decdn_onchain_tx_send_failed_total 0",
+            ],
+        )
     }
 
     #[test]

@@ -315,15 +315,15 @@ struct DownstreamWait {
 /// leg's to end, not the pull's.
 ///
 /// The threshold exceeds the time a serve leg needs to notice a vanished payer.
-/// A payer that goes without a `CONNECTION_CLOSE` ends its serve leg at the QUIC
-/// idle timeout ([`QUIC_MAX_IDLE_TIMEOUT`]) or at the proof-wait ceiling
+/// The serve leg of a payer that vanishes without a `CONNECTION_CLOSE` ends at the
+/// QUIC idle timeout ([`QUIC_MAX_IDLE_TIMEOUT`]) or at the proof-wait ceiling
 /// ([`PROOF_WAIT_CEILING`]). The end of the last serve leg then cancels the pull.
 /// So a pause that reaches the warning means a live serve leg holds the pull.
 const PULL_WAIT_WARN_AFTER: Duration = Duration::from_secs(45);
 
-/// The least time [`PULL_WAIT_WARN_AFTER`] keeps above each serve-leg ceiling. A
-/// serve leg ends a few seconds after its ceiling passes, and its end must then
-/// reach the pull.
+/// The least time [`PULL_WAIT_WARN_AFTER`] keeps above each of its two ceilings: the
+/// QUIC idle timeout and the proof-wait ceiling. A serve leg ends a few seconds after
+/// its ceiling passes, and its end must then reach the pull.
 const PULL_WAIT_WARN_MARGIN: Duration = Duration::from_secs(10);
 
 const _: () = assert!(

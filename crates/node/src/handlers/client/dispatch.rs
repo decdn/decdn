@@ -273,7 +273,7 @@ impl ClientHandler {
         end.meter(&self.metrics);
         let paid_wire_bytes = e
             .downcast_ref::<super::wire::PaidProgress>()
-            .map(|paid| paid.wire_bytes);
+            .map(|paid| paid.wire_bytes.get());
         if end == ErrEnd::NodeFault {
             span.record("otel.status_code", "ERROR");
             tracing::error!(

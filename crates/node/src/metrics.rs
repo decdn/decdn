@@ -773,10 +773,12 @@ pub struct DecdnMetrics {
     pub redeem_hints_dropped: Counter,
     /// Redeem hints the redeemer dropped because their lane is parked (#2340).
     /// A lane parks when its hint-path redemption hits a chain fault — a
-    /// failed pre-redeem watermark read or a `redeemMany` that did not land —
-    /// and stays parked until the next sweep (self-tick or serve cutoff), which
-    /// retries it. Parking bounds an RPC outage to one failed attempt per lane
-    /// per sweep interval instead of one per voucher. A non-zero rate tracks
+    /// failed pre-redeem watermark read or a `redeemMany` that did not land,
+    /// an RPC fault or a revert alike — and stays parked until the next sweep
+    /// (self-tick or serve cutoff), which retries it with every other lane.
+    /// The first hint after the sweep tries the lane once more. Parking bounds
+    /// an RPC outage to at most one hint-path attempt per lane per sweep, plus
+    /// the sweep's own batched retry, instead of one attempt per voucher. A non-zero rate tracks
     /// chain faults on the settlement path; read it beside
     /// `decdn_onchain_tx_send_failed_total` and
     /// `decdn_redemption_reconcile_failures_total`. Operator-visible name:
@@ -1512,7 +1514,8 @@ pub struct DecdnMetrics {
     /// observation per pause.
     /// Most pauses end within a voucher round trip; a tail near the top bucket
     /// means a payer that stalls or a pacing regression that parks the pull
-    /// with no serve leg left to wake it. A pause past 30 s also logs a warning.
+    /// with no serve leg left to wake it. A pause past `PULL_WAIT_WARN_AFTER` (45 s)
+    /// also logs a warning.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub node_pull_through_wait_seconds: Histogram,
     /// `decdn_node_pull_through_client_abandoned_total` (#856): window-paced

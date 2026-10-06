@@ -510,8 +510,8 @@ impl std::error::Error for ClientPaymentFault {}
 /// `anyhow::Error::downcast_ref` to read how much the vouchers credited.
 #[derive(Debug)]
 pub(super) struct PaidProgress {
-    /// The wire bytes accepted vouchers credited on the stream. Never zero.
-    pub(super) wire_bytes: u64,
+    /// The wire bytes accepted vouchers credited on the stream.
+    pub(super) wire_bytes: std::num::NonZeroU64,
 }
 
 impl std::fmt::Display for PaidProgress {
@@ -525,10 +525,9 @@ impl std::error::Error for PaidProgress {}
 /// Tag a serve loop's error with [`PaidProgress`] when `paid` — the wire bytes
 /// that accepted vouchers credited on the stream — is nonzero.
 pub(super) fn tag_paid_progress(e: anyhow::Error, paid: u64) -> anyhow::Error {
-    if paid > 0 {
-        e.context(PaidProgress { wire_bytes: paid })
-    } else {
-        e
+    match std::num::NonZeroU64::new(paid) {
+        Some(wire_bytes) => e.context(PaidProgress { wire_bytes }),
+        None => e,
     }
 }
 
@@ -940,7 +939,8 @@ mod tests {
         let paid = tag_paid_progress(anyhow::Error::new(PeerFault).context("gone"), 50_176);
         assert!(paid.is::<PaidProgress>(), "a paid stream is tagged");
         assert_eq!(
-            paid.downcast_ref::<PaidProgress>().map(|p| p.wire_bytes),
+            paid.downcast_ref::<PaidProgress>()
+                .map(|p| p.wire_bytes.get()),
             Some(50_176),
             "the tag carries the credited wire bytes"
         );

@@ -729,7 +729,7 @@ async fn probe_unknown_discriminant_returns_unsupported_code() -> anyhow::Result
 /// wrong backoff/penalty discipline. Pairs the existing
 /// `probe_garbage_postcard_returns_malformed_code` (genuine
 /// `Decode`-class fault, 0x03) and
-/// `probe_read_timeout_resets_stream_with_zero_code` (timeout, 0x00).
+/// `probe_read_timeout_closes_with_zero_code` (timeout, 0x00).
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_io_truncated_frame_returns_zero_code() -> anyhow::Result<()> {
     let h = spin_up_probe_harness().await?;
@@ -814,7 +814,7 @@ async fn probe_response_on_server_stream_returns_unsupported_code() -> anyhow::R
 /// auto-advances to the next timer whenever the runtime idles on socket I/O,
 /// which can fire `ACCEPT_BI_TIMEOUT` before the stream reaches the server.
 #[tokio::test]
-async fn probe_read_timeout_resets_stream_with_zero_code() -> anyhow::Result<()> {
+async fn probe_read_timeout_closes_with_zero_code() -> anyhow::Result<()> {
     let h = spin_up_probe_harness().await?;
     let (mut send, _recv) = h
         .client_conn
