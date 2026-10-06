@@ -229,12 +229,12 @@ impl HashOutboard {
         }
     }
 
-    /// Capture a whole admit's worth of node pairs under one lock acquisition, then
-    /// fire `captured` exactly once. A serve leg parked on any of these nodes reads
-    /// them all back the same as a per-node [`Self::capture`] loop would, but every
-    /// parked reader wakes once per admit instead of once per node — the admit-time
-    /// notify no longer scales with the number of proof nodes it carries. Leaves are
-    /// ignored; the notify fires only if at least one internal node was written.
+    /// Capture a batch of node pairs under one lock acquisition, then fire
+    /// `captured` exactly once. A serve leg parked on any of these nodes reads them
+    /// all back the same as a per-node [`Self::capture`] loop would, but every parked
+    /// reader wakes once per batch instead of once per node. The admit path hands
+    /// each leaf's run of proof nodes here just before the leaf. Leaves are ignored;
+    /// the notify fires only if at least one internal node was written.
     fn capture_many(
         &self,
         pairs: impl IntoIterator<Item = (TreeNode, (blake3::Hash, blake3::Hash))>,
@@ -822,10 +822,11 @@ impl FillSession {
         self.outboard().capture(node, pair);
     }
 
-    /// Capture a whole admit's node pairs into the per-hash outboard in one shot,
-    /// waking parked serve legs once for the batch rather than once per node. The
-    /// admit path collects an admitted range's proof nodes and hands them here, so a
-    /// large range's fill no longer fires a wake per node it carries.
+    /// Capture a batch of node pairs into the per-hash outboard in one shot, waking
+    /// parked serve legs once for the batch rather than once per node. The admit path
+    /// hands each leaf's run of proof nodes here just before the leaf, so a serve leg
+    /// reads a leaf's proof as soon as that leaf arrives, with at most one wake per
+    /// leaf.
     pub fn capture_many(
         &self,
         pairs: impl IntoIterator<Item = (TreeNode, (blake3::Hash, blake3::Hash))>,
