@@ -1544,7 +1544,7 @@ impl Work {
 
 /// `coverage`'s covered discovery blocks as inclusive runs, `0-22,42-66`, for
 /// a log line; `none` when it covers no block.
-fn block_runs(coverage: &Coverage) -> String {
+pub(crate) fn block_runs(coverage: &Coverage) -> String {
     let mut runs: Vec<(u32, u32)> = Vec::new();
     for block in coverage.covered_blocks() {
         match runs.last_mut() {
