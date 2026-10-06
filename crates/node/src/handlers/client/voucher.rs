@@ -267,6 +267,55 @@ fn voucher_credit_delta(wire: &decdn_protocol::client::Voucher, owed: OwedChunk)
     }
 }
 
+/// Log one rejected payment proof at `info!`: the proof kind (`voucher` or
+/// `reveal`), the wire reason, the lane, and whether the reject frame carries
+/// a watermark bundle.
+///
+/// Each rejection ends a paid stream and counts once on
+/// `decdn_serve_stream_voucher_rejected_total`, which has no reason split. This
+/// line, with [`log_rate_check_reject`], gives the cause of every count at the
+/// level nodes run at.
+///
+/// `with_watermark` is true only for a watermark-gated reason
+/// ([`VoucherRejectReason::is_watermark_gated`]) on a lane that holds a prior
+/// signature. The payer then rebases from the bundle: a bundle-carrying
+/// `AmountRegression`, for example, is a payer whose ledger trails the node's.
+/// `BadSignature` and `WrongSigner` are payer faults and never carry a bundle.
+fn log_proof_reject(
+    proof: &'static str,
+    lane_key: &LaneKey,
+    reason: VoucherRejectReason,
+    with_watermark: bool,
+) {
+    tracing::info!(
+        proof,
+        ?reason,
+        pool_id = %lane_key.pool_id,
+        signer = %lane_key.signer,
+        with_watermark,
+        "rejecting a payment proof"
+    );
+}
+
+/// Log a voucher that fails the rate check with zero bytes or an overflow, at
+/// `info!` and under the same message as [`log_proof_reject`].
+///
+/// This stop writes no reject frame: the stream ends as a
+/// [`ClientPaymentFault`](super::wire::ClientPaymentFault) bail. The dispatch
+/// sink still counts it on `decdn_serve_stream_voucher_rejected_total`, so it
+/// logs here with `reason=RateCheck` to keep a cause beside every count.
+fn log_rate_check_reject(lane_key: &LaneKey, error: &anyhow::Error) {
+    tracing::info!(
+        proof = "voucher",
+        reason = tracing::field::display("RateCheck"),
+        pool_id = %lane_key.pool_id,
+        signer = %lane_key.signer,
+        with_watermark = false,
+        %error,
+        "rejecting a payment proof"
+    );
+}
+
 impl ClientHandler {
     /// Read ONE cumulative voucher, verify it under the per-lane lock, and — on
     /// success — advance the in-memory lane watermark and record it to the pool
@@ -295,9 +344,15 @@ impl ClientHandler {
         // Unknown lane: `serve_stream` refuses one pre-serve, so this is a
         // defensive backstop matching the sole callers (which forward `Some`).
         let Some(lane) = lane else {
-            self.write_reject(send, VoucherRejectReason::WrongPool, None)
-                .await?;
-            return Ok(VoucherStop::Rejected);
+            return self
+                .reject_proof(
+                    send,
+                    "voucher",
+                    &lane_key,
+                    VoucherRejectReason::WrongPool,
+                    None,
+                )
+                .await;
         };
 
         // (1) READ one proof (bounded by the proof wait, which counts `conn`'s
@@ -327,9 +382,15 @@ impl ClientHandler {
         // (1b) The node MUST check the price it is being paid before it meters
         // anything against this voucher (ADR 003 §Chunk Cadence).
         if !chunk_price_matches_quote(&wire, rate_per_mb) {
-            self.write_reject(send, VoucherRejectReason::ChunkPriceMismatch, None)
-                .await?;
-            return Ok(VoucherStop::Rejected);
+            return self
+                .reject_proof(
+                    send,
+                    "voucher",
+                    &lane_key,
+                    VoucherRejectReason::ChunkPriceMismatch,
+                    None,
+                )
+                .await;
         }
 
         // (2) RECOVER + verify the signature WITHOUT holding the per-lane lock.
@@ -346,17 +407,24 @@ impl ClientHandler {
         let Ok(signed) =
             wire_voucher_to_signed(&wire, lane_key.pool_id, lane_key.signer, lane_key.provider)
         else {
-            self.write_reject(send, VoucherRejectReason::BadSignature, None)
-                .await?;
-            return Ok(VoucherStop::Rejected);
+            return self
+                .reject_proof(
+                    send,
+                    "voucher",
+                    &lane_key,
+                    VoucherRejectReason::BadSignature,
+                    None,
+                )
+                .await;
         };
         if let Err(e) = signed.verify_signer(lane_key.signer, &self.voucher_domain) {
             let reason = match e {
                 VoucherError::InvalidSignature => VoucherRejectReason::BadSignature,
                 VoucherError::WrongSigner { .. } => VoucherRejectReason::WrongSigner,
             };
-            self.write_reject(send, reason, None).await?;
-            return Ok(VoucherStop::Rejected);
+            return self
+                .reject_proof(send, "voucher", &lane_key, reason, None)
+                .await;
         }
 
         // (3) RE-CHECK the watermark-dependent guards + ADVANCE under the per-lane
@@ -380,9 +448,15 @@ impl ClientHandler {
         // a fresh capability, not a cap raise.
         if self.inside_expiry_margin(guard.state.expiry) {
             drop(guard);
-            self.write_reject(send, VoucherRejectReason::CapabilityExpired, None)
-                .await?;
-            return Ok(VoucherStop::Rejected);
+            return self
+                .reject_proof(
+                    send,
+                    "voucher",
+                    &lane_key,
+                    VoucherRejectReason::CapabilityExpired,
+                    None,
+                )
+                .await;
         }
 
         let verified = match Self::verify_voucher(
@@ -395,16 +469,15 @@ impl ClientHandler {
             Ok(v) => v,
             Err(VerifyStop::Reject(reason, bundle)) => {
                 drop(guard);
-                tracing::debug!(
-                    ?reason,
-                    with_watermark = bundle.is_some(),
-                    "rejecting voucher"
-                );
-                self.write_reject(send, reason, bundle).await?;
-                return Ok(VoucherStop::Rejected);
+                return self
+                    .reject_proof(send, "voucher", &lane_key, reason, bundle)
+                    .await;
             }
             Err(VerifyStop::Bail(e)) => {
                 drop(guard);
+                if e.is::<super::wire::ClientPaymentFault>() {
+                    log_rate_check_reject(&lane_key, &e);
+                }
                 return Err(e);
             }
         };
@@ -450,8 +523,9 @@ impl ClientHandler {
                 paid_credited,
                 verified.new_bytes,
             );
-            self.write_reject(send, reason, bundle).await?;
-            return Ok(VoucherStop::Rejected);
+            return self
+                .reject_proof(send, "voucher", &lane_key, reason, bundle)
+                .await;
         };
 
         // Advance in-memory, then record to the buffered store (a cheap map write;
@@ -505,6 +579,22 @@ impl ClientHandler {
         Ok(VoucherStop::Continue { credited_bytes })
     }
 
+    /// Log a rejected payment proof, write the `VoucherRejected` frame, and
+    /// stop the stream. Every proof rejection on both proof paths goes through
+    /// here, so each one leaves exactly one [`log_proof_reject`] line.
+    async fn reject_proof(
+        &self,
+        send: &mut SendStream,
+        proof: &'static str,
+        lane_key: &LaneKey,
+        reason: VoucherRejectReason,
+        bundle: Option<WatermarkBundle>,
+    ) -> anyhow::Result<VoucherStop> {
+        log_proof_reject(proof, lane_key, reason, bundle.is_some());
+        self.write_reject(send, reason, bundle).await?;
+        Ok(VoucherStop::Rejected)
+    }
+
     /// Whether a capability that expires at `expiry` is inside this node's
     /// expiry margin now, read off the coarse clock. Both proof paths refuse a
     /// proof inside the margin with `CapabilityExpired`.
@@ -545,9 +635,15 @@ impl ClientHandler {
         // of the chain cannot be encoded — a stronger guarantee than a runtime
         // comparison.
         if preimage.index == 0 {
-            self.write_reject(send, VoucherRejectReason::ChainIndexZero, None)
-                .await?;
-            return Ok(VoucherStop::Rejected);
+            return self
+                .reject_proof(
+                    send,
+                    "reveal",
+                    &lane_key,
+                    VoucherRejectReason::ChainIndexZero,
+                    None,
+                )
+                .await;
         }
         // Rule 1: a reveal on a stream that carries no anchor cannot be placed,
         // because a bare preimage does not name its chain. Not fatal — the payer
@@ -555,9 +651,15 @@ impl ClientHandler {
         // resend is free because a metering voucher at or below the watermark
         // is already-satisfied and pays no whole chunk.
         let Some(root) = anchor.root else {
-            self.write_reject(send, VoucherRejectReason::UnanchoredPreimage, None)
-                .await?;
-            return Ok(VoucherStop::Rejected);
+            return self
+                .reject_proof(
+                    send,
+                    "reveal",
+                    &lane_key,
+                    VoucherRejectReason::UnanchoredPreimage,
+                    None,
+                )
+                .await;
         };
 
         // Optimistic PayWord walk (issue #1792 item 5). Rule 2 still holds — the
@@ -592,9 +694,15 @@ impl ClientHandler {
         // redeemer's cutoff sweep has read it.
         if self.inside_expiry_margin(guard.state.expiry) {
             drop(guard);
-            self.write_reject(send, VoucherRejectReason::CapabilityExpired, None)
-                .await?;
-            return Ok(VoucherStop::Rejected);
+            return self
+                .reject_proof(
+                    send,
+                    "reveal",
+                    &lane_key,
+                    VoucherRejectReason::CapabilityExpired,
+                    None,
+                )
+                .await;
         }
         let (next_state, applied) = match guard
             .state
@@ -619,8 +727,9 @@ impl ClientHandler {
                 // `None` for every chain-specific reason on its own.
                 let bundle = Self::watermark_bundle_for_reject(reason, &guard.state);
                 drop(guard);
-                self.write_reject(send, reason, bundle).await?;
-                return Ok(VoucherStop::Rejected);
+                return self
+                    .reject_proof(send, "reveal", &lane_key, reason, bundle)
+                    .await;
             }
         };
 
@@ -676,8 +785,9 @@ impl ClientHandler {
                     paid_credited,
                     owed_bytes,
                 );
-                self.write_reject(send, reason, bundle).await?;
-                return Ok(VoucherStop::Rejected);
+                return self
+                    .reject_proof(send, "reveal", &lane_key, reason, bundle)
+                    .await;
             };
             guard.paid_credited = new_credited;
             guard
@@ -910,7 +1020,9 @@ impl ClientHandler {
     }
 
     /// Log a stale proof that lane headroom could not pay, before the caller
-    /// rejects it `AmountRegression`.
+    /// rejects it `AmountRegression`. Its line (`debug!`, or `warn!` when there
+    /// is no bundle) adds the headroom numbers to the `info!` line that
+    /// [`log_proof_reject`] writes for the reject.
     ///
     /// The reject exists to hand the payer the watermark bundle it reseeds from.
     /// A lane that holds no signature, or a watermark past `u64`, yields no
@@ -1845,5 +1957,105 @@ mod tests {
         snapshot
             .advance_presigned(&voucher_lo)
             .expect("against the stale zero snapshot the straggler advances");
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The one line `log` writes for a fixed lane, captured at INFO.
+    fn reject_line(log_fn: impl FnOnce(&LaneKey)) -> String {
+        let log = CapturedLog::default();
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        let lane_key = LaneKey {
+            pool_id: B256::repeat_byte(0x21),
+            signer: Address::repeat_byte(0x33),
+            provider: Address::repeat_byte(0x55),
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            log_fn(&lane_key);
+        });
+        let text = String::from_utf8(
+            log.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .expect("the fmt layer writes UTF-8");
+        let mut lines = text.lines();
+        let line = lines.next().expect("a rejection logs a line").to_owned();
+        assert!(lines.next().is_none(), "one line per rejection: {text}");
+        line
+    }
+
+    /// A proof rejection counts on `decdn_serve_stream_voucher_rejected_total`,
+    /// and the counter has no reason split. The line must reach an INFO node
+    /// with the cause: the proof kind, the reason, the lane, and whether the
+    /// payer got a watermark to rebase from (#2342).
+    #[test]
+    fn a_proof_rejection_logs_one_info_line_with_reason_lane_and_bundle_flag() {
+        use decdn_protocol::client::VoucherRejectReason;
+
+        let line = reject_line(|lane| {
+            super::log_proof_reject("voucher", lane, VoucherRejectReason::AmountRegression, true);
+        });
+        assert!(line.contains(" INFO "), "{line}");
+        assert!(line.contains("rejecting a payment proof"), "{line}");
+        assert!(line.contains("proof=\"voucher\""), "{line}");
+        assert!(line.contains("reason=AmountRegression"), "{line}");
+        assert!(
+            line.contains(&format!("pool_id={}", B256::repeat_byte(0x21))),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!("signer={}", Address::repeat_byte(0x33))),
+            "{line}"
+        );
+        assert!(line.contains("with_watermark=true"), "{line}");
+
+        let line = reject_line(|lane| {
+            super::log_proof_reject("reveal", lane, VoucherRejectReason::BadSignature, false);
+        });
+        assert!(line.contains(" INFO "), "{line}");
+        assert!(line.contains("proof=\"reveal\""), "{line}");
+        assert!(line.contains("reason=BadSignature"), "{line}");
+        assert!(line.contains("with_watermark=false"), "{line}");
+    }
+
+    /// A rate-check bail writes no reject frame but still counts on
+    /// `decdn_serve_stream_voucher_rejected_total`, so it logs under the same
+    /// message with `reason=RateCheck` and the error (#2342).
+    #[test]
+    fn a_rate_check_bail_logs_one_info_line_under_the_reject_message() {
+        let error = anyhow::Error::new(crate::handlers::client::wire::ClientPaymentFault)
+            .context("voucher fails rate check: zero bytes");
+        let line = reject_line(|lane| super::log_rate_check_reject(lane, &error));
+        assert!(line.contains(" INFO "), "{line}");
+        assert!(line.contains("rejecting a payment proof"), "{line}");
+        assert!(line.contains("proof=\"voucher\""), "{line}");
+        assert!(line.contains("reason=RateCheck"), "{line}");
+        assert!(line.contains("with_watermark=false"), "{line}");
+        assert!(
+            line.contains("error=voucher fails rate check: zero bytes"),
+            "{line}"
+        );
     }
 }
