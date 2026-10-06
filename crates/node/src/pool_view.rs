@@ -176,16 +176,16 @@ pub trait PoolView: Send + Sync + std::fmt::Debug {
     ///   presented capability) or no chain wired.
     /// - `Some(SignerAuthorization::Registered { .. })` — the registered terms and
     ///   the signer's current `spent`.
-    /// - `None` — the on-chain read faulted and no earlier registered read of
-    ///   this signer is held. The caller refuses it as unconfirmed rather than fail open. A
-    ///   fault for a signer with an earlier `Registered` read answers with that
-    ///   read; an earlier `Unregistered` read is not trusted, because a
-    ///   registration can land at any time.
+    /// - `None` — the on-chain read faulted and no registered read of this
+    ///   signer is held. The caller refuses it as unconfirmed rather than fail
+    ///   open. An earlier `Unregistered` read is not trusted after a fault,
+    ///   because a registration can land at any time.
     ///
     /// The default reports every signer unregistered: the bare [`PoolProjection`]
     /// and test doubles hold no chain. The production wrapper
     /// ([`crate::payment_settlement::ResolvingPoolView`]) overrides it with one
-    /// briefly-cached `getAuthorization`.
+    /// `getAuthorization` per `(pool, signer)`, held for good once it reads
+    /// `Registered` and with `spent` brought up to the projection's fold.
     async fn signer_authorization(
         &self,
         pool_id: B256,

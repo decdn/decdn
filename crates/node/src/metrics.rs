@@ -1625,6 +1625,20 @@ pub struct DecdnMetrics {
     /// so the three phase histograms and the total share one population.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_admission_seconds: Histogram,
+    /// `decdn_serve_signer_auth_cached_total`: admit-path signer confirms the
+    /// signer-auth cache answered, with no `getAuthorization`. A `Registered`
+    /// read answers for good; an `Unregistered` one for a short window.
+    pub serve_signer_auth_cached: Counter,
+    /// `decdn_serve_signer_auth_first_read_total`: admit-path signer confirms for
+    /// a `(pool, signer)` the node holds no read of: a new signer, or one
+    /// evicted from the bounded cache. Each waits on a `getAuthorization`, its
+    /// own or one already in flight for the pair.
+    pub serve_signer_auth_first_read: Counter,
+    /// `decdn_serve_signer_auth_reread_total`: admit-path signer confirms that
+    /// re-read an `Unregistered` signer, because the read aged out or the
+    /// projection has since folded a redemption by it. Each waits on a
+    /// `getAuthorization`, its own or one already in flight for the pair.
+    pub serve_signer_auth_reread: Counter,
     /// `decdn_serve_response_hit_seconds`: the response phase of a paid hit,
     /// from the load-shed admit to the signed `StreamResponse` written.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
@@ -3163,6 +3177,15 @@ recorders! {
     /// faulted), or a `getAuthorization` fault left the signer with no cached
     /// registered read — kept distinct from a real deposit-exhaustion refusal.
     serve_stream_rejected_pool_unconfirmed => serve_stream_rejected_pool_unconfirmed.inc();
+
+    /// Record an admit signer confirm the signer-auth cache answered.
+    serve_signer_auth_cached => serve_signer_auth_cached.inc();
+
+    /// Record an admit signer confirm for a `(pool, signer)` with no held read.
+    serve_signer_auth_first_read => serve_signer_auth_first_read.inc();
+
+    /// Record an admit signer confirm that re-reads an `Unregistered` signer.
+    serve_signer_auth_reread => serve_signer_auth_reread.inc();
 
     /// Record a `serve_stream` admission refused because the request's voucher
     /// signer has drained its shared on-chain `cap` (`cap − spent` below the serve

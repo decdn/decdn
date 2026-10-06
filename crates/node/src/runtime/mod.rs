@@ -1351,6 +1351,7 @@ async fn build_chain_and_handlers(
     let resolving_pool_view = crate::payment_settlement::ResolvingPoolView::new(
         decdn_incentive::payment_pool::PaymentPool::new(payment_pool_addr, wallet_provider.clone()),
         pool_view.clone(),
+        Arc::clone(&infra.node_metrics),
     );
     // ADR 041 serve-credit inputs: a non-blocking sink in front of the SAME warming
     // allowance the buy loop debits and the eviction path forgets, plus the live
