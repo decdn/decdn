@@ -83,10 +83,10 @@ pub struct LaneRange {
     /// for such a range from a probed partial holder counts toward barring
     /// that holder from pull-through ([`SourceSet::no_pull_through`]).
     ///
-    /// Only a partial holder's lane can hold an uncovered range. A lane with
-    /// no measured coverage (a whole holder, or a non-holder that serves by
-    /// pull-through) covers the whole blob, so this is always `false` there
-    /// and does not say that the node holds the range.
+    /// Only a lane built with measured coverage can hold an uncovered range.
+    /// A lane built without it (a pinned holder, or a provider the probe did
+    /// not report as a holder) covers the whole blob, so this is always
+    /// `false` there, and `false` never says that the node holds the range.
     pub uncovered: bool,
 }
 
@@ -500,9 +500,12 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     ///
     /// Each fault is logged at info where it is recorded: the provider, the
     /// blob, the lane's `range` and the bytes of it that landed when the lane
-    /// held one, the provider's `lane_kind` (`partial_holder`,
-    /// `whole_holder`, `non_holder` or `unknown`), and the error. A fetch
-    /// that recovers reports no lane fault, so this line is the record of it.
+    /// held one, the error, and the provider's record in the set when the
+    /// fault is logged: `probed_holder` and its `coverage` as block runs
+    /// (`whole blob` with none measured, `unknown` for a provider the set has
+    /// no record of). A rediscovery can change the record after the lane
+    /// started. A fetch that recovers reports no lane fault, so this line is
+    /// the record of it.
     pub fn record_fault(
         &mut self,
         provider: Address,
@@ -513,7 +516,18 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     ) -> Fault {
         let fault = classify(err);
         let hash = blake3::Hash::from_bytes(self.hash).to_hex();
-        let lane_kind = lane_kind(self.holder(provider));
+        let (probed_holder, coverage) = self.holder(provider).map_or_else(
+            || (false, "unknown".to_owned()),
+            |holder| {
+                (
+                    holder.probed_holder,
+                    holder
+                        .coverage
+                        .as_ref()
+                        .map_or_else(|| "whole blob".to_owned(), crate::scheduler::block_runs),
+                )
+            },
+        );
         if let Some(LaneRange {
             offset,
             len,
@@ -530,7 +544,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 landed,
                 past_end,
                 uncovered,
-                lane_kind,
+                probed_holder,
+                %coverage,
                 ?fault,
                 error = %format_args!("{err:#}"),
                 "a lane faulted; its remainder goes to the other lanes"
@@ -539,7 +554,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             tracing::info!(
                 %provider,
                 %hash,
-                lane_kind,
+                probed_holder,
+                %coverage,
                 ?fault,
                 error = %format_args!("{err:#}"),
                 "a source faulted"
@@ -1097,32 +1113,6 @@ fn blocks_of(start: u64, end: u64) -> std::ops::Range<u32> {
     let block_bytes = decdn_protocol::discovery_block_bytes();
     let block_of = |offset: u64| u32::try_from(offset / block_bytes).unwrap_or(u32::MAX);
     block_of(start)..block_of(end - 1).saturating_add(1)
-}
-
-/// What `holder` is to the fetch, as a fault line names it: `partial_holder`
-/// (a probed holder with measured coverage), `whole_holder` (a probed holder
-/// with none, so the whole blob), `non_holder` (a pull-through or
-/// proxy-warming target, or a peer-store candidate) or `unknown` (no longer
-/// in the set). Only a partial holder's lane can hold a range outside its
-/// coverage ([`LaneRange::uncovered`]).
-const fn lane_kind(holder: Option<&Holder>) -> &'static str {
-    match holder {
-        Some(Holder {
-            probed_holder: true,
-            coverage: Some(_),
-            ..
-        }) => "partial_holder",
-        Some(Holder {
-            probed_holder: true,
-            coverage: None,
-            ..
-        }) => "whole_holder",
-        Some(Holder {
-            probed_holder: false,
-            ..
-        }) => "non_holder",
-        None => "unknown",
-    }
 }
 
 /// `coverage` less the blocks `dropped` names.
@@ -2130,12 +2120,11 @@ mod tests {
         );
     }
 
-    /// The lane-fault line names what the provider is to the fetch, because
+    /// The lane-fault line names the provider's record, because
     /// `uncovered=false` alone does not say that the node holds the range: a
-    /// non-holder's lane covers the whole blob and serves it by pull-through
-    /// (#2339).
+    /// non-holder's lane covers the whole blob (#2339).
     #[tokio::test(start_paused = true)]
-    async fn the_lane_fault_line_names_the_lane_kind() {
+    async fn the_lane_fault_line_names_the_holder_record() {
         #[derive(Clone, Default)]
         struct CapturedLog(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for CapturedLog {
@@ -2155,7 +2144,7 @@ mod tests {
             &p,
             [0; 32],
             Arc::default(),
-            vec![non_holder(A, 10.0), partial(B, 20.0, &[0])],
+            vec![non_holder(A, 10.0), partial(B, 20.0, &[0, 2, 3])],
         );
         let now = Instant::now();
         let log = CapturedLog::default();
@@ -2168,6 +2157,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             set.record_fault(A, &not_found(), Some(block0()), now, U256::ZERO);
             set.record_fault(B, &not_found(), Some(block0()), now, U256::ZERO);
+            set.record_fault(B, &anyhow::anyhow!("reset"), None, now, U256::ZERO);
         });
         let text = String::from_utf8_lossy(
             &log.0
@@ -2175,15 +2165,22 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
         .into_owned();
-        let mut faults = text.lines().filter(|line| line.contains("a lane faulted"));
-        let a_line = faults.next().unwrap_or_default();
-        let b_line = faults.next().unwrap_or_default();
-        assert!(faults.next().is_none(), "two fault lines: {text}");
+        let mut lines = text.lines();
+        let a_line = lines.next().unwrap_or_default();
+        let b_line = lines.next().unwrap_or_default();
+        let b_source_line = lines.next().unwrap_or_default();
+        assert!(lines.next().is_none(), "three fault lines: {text}");
+        assert!(a_line.contains("a lane faulted"), "{text}");
         assert!(a_line.contains(&format!("provider={A}")), "{text}");
         assert!(a_line.contains("uncovered=false"), "{text}");
-        assert!(a_line.contains("lane_kind=\"non_holder\""), "{text}");
+        assert!(a_line.contains("probed_holder=false"), "{text}");
+        assert!(a_line.contains("coverage=whole blob"), "{text}");
+        assert!(b_line.contains("a lane faulted"), "{text}");
         assert!(b_line.contains(&format!("provider={B}")), "{text}");
-        assert!(b_line.contains("lane_kind=\"partial_holder\""), "{text}");
+        assert!(b_line.contains("probed_holder=true"), "{text}");
+        assert!(b_line.contains("coverage=0,2-3"), "{text}");
+        assert!(b_source_line.contains("a source faulted"), "{text}");
+        assert!(b_source_line.contains("coverage=0,2-3"), "{text}");
     }
 
     /// A bound that overshoots the blob sends pieces past its true end, and an
