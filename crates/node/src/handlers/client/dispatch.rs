@@ -264,19 +264,29 @@ impl ClientHandler {
     /// `debug!`. [`ErrEnd::of`] holds the classification.
     ///
     /// `{e:#}` rather than `{e}`: the marker sits in the chain, so the alternate
-    /// form is what prints the cause beside it. A node-side fault also marks the
-    /// stream's `span` as an error for the trace backend.
+    /// form is what prints the cause beside it. A stream that ended after payment
+    /// also logs `paid_wire_bytes`, the wire bytes its vouchers credited. A
+    /// node-side fault also marks the stream's `span` as an error for the trace
+    /// backend.
     fn log_stream_end(&self, e: &anyhow::Error, span: &tracing::Span) {
         let end = ErrEnd::of(e);
         end.meter(&self.metrics);
+        let paid_wire_bytes = e
+            .downcast_ref::<super::wire::PaidProgress>()
+            .map(|paid| paid.wire_bytes);
         if end == ErrEnd::NodeFault {
             span.record("otel.status_code", "ERROR");
             tracing::error!(
                 error = %format_args!("{e:#}"),
+                paid_wire_bytes,
                 "client stream ended with a node-side fault"
             );
         } else {
-            tracing::debug!(error = %format_args!("{e:#}"), "client stream ended with error");
+            tracing::debug!(
+                error = %format_args!("{e:#}"),
+                paid_wire_bytes,
+                "client stream ended with error"
+            );
         }
     }
 

@@ -54,12 +54,14 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError, Weak};
 
 use bao_tree::io::fsm::Outboard;
-use bao_tree::{BaoTree, BlockSize, ChunkRanges, TreeNode, blake3};
+use bao_tree::{BaoTree, BlockSize, ChunkNum, ChunkRanges, TreeNode, blake3};
 use decdn_bao_range::align_range_clamped;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::Hash;
+use crate::engine::CacheEngine;
+use crate::error::{CacheResult, ErrorChain};
 
 /// iroh-blobs' block size — 16 KiB chunk groups (`2^4` 1 KiB chunks). Identical by
 /// construction to `decdn_bao_range::IROH_BLOCK_SIZE` and
@@ -702,6 +704,7 @@ impl FillSession {
             session: Arc::clone(self),
             outboard: self.outboard(),
             parked_on: Arc::new(AtomicU64::new(0)),
+            store: None,
         }
     }
 
@@ -858,8 +861,10 @@ impl FillSession {
 
 /// Serve-side [`Outboard`] over a hash's shared [`HashOutboard`]. Its
 /// [`Outboard::load`] awaits a not-yet-captured node, racing the registry-wide fill
-/// liveness for the no-hang guarantee: it fails iff no live fill still covers the
-/// node's byte range. Minted via [`FillSession::outboard_reader`].
+/// liveness for the no-hang guarantee: once no live fill still covers the node's
+/// byte range, it reads the node from the local store when it has one
+/// ([`Self::with_store_fallback`]) and fails when that cannot supply it. Minted via
+/// [`FillSession::outboard_reader`].
 #[derive(Debug)]
 pub struct SessionOutboardReader {
     session: Arc<FillSession>,
@@ -873,9 +878,71 @@ pub struct SessionOutboardReader {
     /// stands this value via its [`DemandSlot`] only once it is
     /// starved of encoded bytes ([`Self::parked_on`]).
     parked_on: Arc<AtomicU64>,
+    /// The local store, read for a node no live fill will capture
+    /// ([`Self::with_store_fallback`]). `None` fails such a load.
+    store: Option<StoreFallback>,
+}
+
+/// The local store a [`SessionOutboardReader`] reads a node's pair from when no
+/// live fill will capture it.
+#[derive(Debug)]
+struct StoreFallback {
+    engine: CacheEngine,
+    /// The store's present chunks of the hash as last read. A node they already
+    /// meet needs no fresh read.
+    present: ChunkRanges,
+}
+
+impl StoreFallback {
+    /// Capture into `outboard` the pairs of the proof path to ONE chunk group the
+    /// store holds under a node of chunk range `node_range`. The path holds every
+    /// parent above the group, the node among them, so the cost is one chunk group
+    /// however much content the node spans. Captures nothing when the store holds
+    /// nothing under the node.
+    async fn capture(
+        &mut self,
+        outboard: &HashOutboard,
+        node_range: &ChunkRanges,
+    ) -> CacheResult<()> {
+        let hash = Hash::from_bytes(*outboard.root.as_bytes());
+        if (node_range & &self.present).is_empty() {
+            self.present = self
+                .engine
+                .present_ranges(hash)
+                .await?
+                .chunk_ranges()
+                .clone();
+        }
+        let held = node_range & &self.present;
+        let Some(first) = held.boundaries().first().copied() else {
+            return Ok(());
+        };
+        let group_chunks = 1u64 << IROH_BLOCK_SIZE.chunk_log();
+        let group_start = first.0 / group_chunks * group_chunks;
+        let group = ChunkRanges::from(
+            ChunkNum(group_start)..ChunkNum(group_start.saturating_add(group_chunks)),
+        );
+        let pairs = self.engine.outboard_pairs(hash, &(&held & &group)).await?;
+        outboard.capture_many(pairs);
+        Ok(())
+    }
 }
 
 impl SessionOutboardReader {
+    /// Read a node no live fill will capture from `engine`, the local store, before
+    /// failing the load. The store can hold content under such a node: a pull that
+    /// faulted landed part of its range first, or an earlier fill stored it. The
+    /// store's outboard then holds the node's pair. Without the fallback such a
+    /// load fails.
+    #[must_use]
+    pub fn with_store_fallback(mut self, engine: CacheEngine) -> Self {
+        self.store = Some(StoreFallback {
+            engine,
+            present: ChunkRanges::empty(),
+        });
+        self
+    }
+
     /// The cell this reader writes the content end it waits on into. A frame
     /// consumer shares it with its data reader and stands it as serve demand
     /// while it has no encoded bytes left to take.
@@ -932,12 +999,32 @@ impl Outboard for SessionOutboardReader {
                 return Ok(Some(pair));
             }
 
-            // Not captured yet. If no live fill still covers this node's range, the
-            // proof node will never arrive — decide now. A clean end may lag one
-            // capture behind the outcome, so re-check once before failing.
+            // Not captured yet. If no live fill still covers this node's range, no
+            // pull will capture the node — decide now. A clean end may lag one
+            // capture behind the outcome, so re-check once. Then read the node
+            // from the store, which may hold content under it that a fill landed
+            // before it ended, and fail only when the store cannot supply it.
             if !self.session.range_still_live(&node_range) {
                 if let Some(pair) = self.outboard.try_load(idx) {
                     return Ok(Some(pair));
+                }
+                let stored = match self.store.as_mut() {
+                    Some(fallback) => fallback.capture(&self.outboard, &node_range).await,
+                    None => Ok(()),
+                };
+                match stored {
+                    Ok(()) => {
+                        if let Some(pair) = self.outboard.try_load(idx) {
+                            return Ok(Some(pair));
+                        }
+                    }
+                    Err(err) => {
+                        return Err(io::Error::other(format!(
+                            "{}; the store read for it failed: {}",
+                            self.dead_range_error(node),
+                            ErrorChain::new(&err)
+                        )));
+                    }
                 }
                 return Err(self.dead_range_error(node));
             }

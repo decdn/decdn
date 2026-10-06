@@ -112,9 +112,10 @@ impl AwaitingDataReader {
     }
 
     /// Authoritative store-backed presence probe for `[offset, offset + len)`, used
-    /// only to settle the rare race where a fill retires between the liveness and
-    /// outcome reads — not on the per-leaf hot path, which answers from
-    /// [`Self::covers_locally`].
+    /// only once no live fill covers the read: to settle the race where a fill
+    /// retires between the liveness and outcome reads, and to serve bytes a failed
+    /// pull landed before it faulted. Never on the per-leaf hot path, which answers
+    /// from [`Self::covers_locally`].
     ///
     /// Takes `&mut self` (though it mutates nothing) so the future holds a
     /// `&mut AwaitingDataReader` rather than `&AwaitingDataReader` across the store
@@ -179,8 +180,15 @@ impl AsyncSliceReader for AwaitingDataReader {
                     // Timing-INDEPENDENT — the decision rests on the outcome, never a
                     // wall clock.
                     Some(Ok(())) => break,
-                    // A failed pull can never make the byte present — fail fast.
+                    // A failed pull fills no more of the range, but it can fail
+                    // after it landed the bytes this read needs (a fault later in
+                    // the range, or on a leg past this read). Serve them when the
+                    // store durably holds them; fail only a read the store cannot
+                    // answer.
                     Some(Err(msg)) => {
+                        if self.present_covers(offset, need).await? {
+                            break;
+                        }
                         return Err(io::Error::other(format!(
                             "upstream pull failed before content [{offset}, +{len}) landed: {msg}"
                         )));
@@ -396,7 +404,12 @@ impl CoherentFrameProducer {
         // the encode future below skips the encoder and ends at once.
         let ranges = encoded_ranges(offset, end, total)?;
 
-        let outboard = session.outboard_reader();
+        // A proof node no live fill will capture is read from the local store,
+        // so a pull that faults mid-range still lets the encode stream every
+        // byte the store holds before the hole.
+        let outboard = session
+            .outboard_reader()
+            .with_store_fallback(store.engine().clone());
         let parked_on = outboard.parked_on();
         let demand = session.demand_slot();
         let hash = store.hash();
@@ -759,6 +772,65 @@ mod tests {
             out.extend_from_slice(&frame);
         }
         Ok(out)
+    }
+
+    /// #2328: a pull that faults leaves a hole in a range the store otherwise
+    /// holds, and no fill captured the held content's proof. The encode still
+    /// streams the held bytes before the hole, reading their proof nodes from the
+    /// store, and faults only at the hole.
+    #[tokio::test]
+    async fn a_faulted_pull_still_streams_the_held_prefix() {
+        let total = 32 * G;
+        let hole = 24 * G;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let hash = Hash::from(root);
+        let a_root = bao_tree::blake3::Hash::from(root);
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 64).await.unwrap();
+        // Content an earlier fill stored: everything but one chunk group.
+        for (off, len) in [(0, hole), (hole + G, total - hole - G)] {
+            let (ranges, wire) = range_wire(root, &plaintext, &outboard, total, off, len);
+            engine
+                .admit_bao_stream(hash, ranges, total, MemReader { wire }, None)
+                .await
+                .map_err(|(_reader, e)| e)
+                .expect("admit held range");
+        }
+
+        let FillClaim::Owner { session, lease: _l } =
+            engine.claim_fill(hash, 0, total, total, || FillSession::new(a_root, total))
+        else {
+            panic!("sole claimant owns its whole request");
+        };
+        session.mark_ended(Err(FillError::new("upstream pull died")));
+
+        let store = NodeRangedStore::new(engine.clone(), hash, total);
+        let mut producer = CoherentFrameProducer::new(store, Arc::clone(&session), 0, total, total)
+            .expect("align");
+        let mut streamed = Vec::new();
+        let err = loop {
+            match producer.next_frame(1024).await {
+                Ok(Some(frame)) => streamed.extend_from_slice(&frame),
+                Ok(None) => panic!("a range with a hole cannot complete"),
+                Err(err) => break err,
+            }
+        };
+
+        let (_, whole) = range_wire(root, &plaintext, &outboard, total, 0, total);
+        assert!(
+            streamed.len() as u64 > hole - 4 * G,
+            "most of the held prefix streams, got {} bytes",
+            streamed.len()
+        );
+        assert_eq!(
+            streamed.as_slice(),
+            &whole[..streamed.len()],
+            "the streamed bytes are the range's own encoding"
+        );
+        assert!(
+            format!("{err:#}").contains("upstream pull failed before content"),
+            "the encode faults at the hole: {err:#}"
+        );
     }
 
     /// An encode fault is terminal, and a second call must say so rather than report

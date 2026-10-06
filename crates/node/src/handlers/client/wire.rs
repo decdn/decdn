@@ -506,9 +506,13 @@ impl std::error::Error for ClientPaymentFault {}
 /// and the dispatch sink reads it to split a peer-attributable end between
 /// `decdn_serve_stream_client_declined_total` and
 /// `decdn_serve_stream_client_abandoned_total`. Attach it with
-/// [`anyhow::Error::context`] and recover it with `anyhow::Error::is`.
+/// [`anyhow::Error::context`] and recover it with `anyhow::Error::is`, or with
+/// `anyhow::Error::downcast_ref` to read how much the vouchers credited.
 #[derive(Debug)]
-pub(super) struct PaidProgress;
+pub(super) struct PaidProgress {
+    /// The wire bytes accepted vouchers credited on the stream. Never zero.
+    pub(super) wire_bytes: u64,
+}
 
 impl std::fmt::Display for PaidProgress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -518,10 +522,14 @@ impl std::fmt::Display for PaidProgress {
 
 impl std::error::Error for PaidProgress {}
 
-/// Tag a serve loop's error with [`PaidProgress`] when `paid` — the bytes that
-/// accepted vouchers credited on the stream — is nonzero.
+/// Tag a serve loop's error with [`PaidProgress`] when `paid` — the wire bytes
+/// that accepted vouchers credited on the stream — is nonzero.
 pub(super) fn tag_paid_progress(e: anyhow::Error, paid: u64) -> anyhow::Error {
-    if paid > 0 { e.context(PaidProgress) } else { e }
+    if paid > 0 {
+        e.context(PaidProgress { wire_bytes: paid })
+    } else {
+        e
+    }
 }
 
 /// A queue of not-yet-framed export bytes plus its running byte count, holding the
@@ -929,8 +937,17 @@ mod tests {
             "an unpaid stream is not tagged"
         );
 
-        let paid = tag_paid_progress(anyhow::Error::new(PeerFault).context("gone"), 1);
+        let paid = tag_paid_progress(anyhow::Error::new(PeerFault).context("gone"), 50_176);
         assert!(paid.is::<PaidProgress>(), "a paid stream is tagged");
+        assert_eq!(
+            paid.downcast_ref::<PaidProgress>().map(|p| p.wire_bytes),
+            Some(50_176),
+            "the tag carries the credited wire bytes"
+        );
+        assert!(
+            format!("{paid:#}").starts_with("after payment: "),
+            "{paid:#}"
+        );
         assert!(paid.is::<PeerFault>(), "the peer marker survives the tag");
 
         let node = tag_paid_progress(anyhow::anyhow!("store fault"), 1);

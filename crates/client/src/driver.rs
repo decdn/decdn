@@ -653,6 +653,23 @@ pub(crate) fn ranges_content_len(ranges: &ChunkRanges, total_bytes: u64) -> u64 
         .fold(0u64, u64::saturating_add)
 }
 
+/// The end of the present bytes contiguous from `gap_start` in a gap that ends
+/// at `gap_end`, given the gap's `missing` chunks: the start of the first
+/// missing range that overlaps the gap, clamped to `[gap_start, gap_end]`, or
+/// `gap_end` when nothing in the gap is missing. Present bytes past a hole do
+/// not move it.
+pub(crate) fn contiguous_frontier(
+    missing: &ChunkRanges,
+    total_bytes: u64,
+    gap_start: u64,
+    gap_end: u64,
+) -> u64 {
+    contiguous_byte_ranges(missing, total_bytes)
+        .into_iter()
+        .find(|&(start, len)| start.saturating_add(len) > gap_start && start < gap_end)
+        .map_or(gap_end, |(start, _)| start.max(gap_start).min(gap_end))
+}
+
 /// The chunks of `[start, start + len)` the store misses, clipped to its
 /// bound, and that bound. A range at or past the bound misses nothing. A leg
 /// can prove a smaller size between the bound read and the query, so a query
@@ -1050,13 +1067,15 @@ where
     let asked_end = gap_start.saturating_add(gap_len);
 
     loop {
-        // The store's DELIVERED frontier for this gap (contiguous from `gap_start`):
-        // where its present ranges end. Used only to re-anchor after a reseed and
-        // for the progress bar base — NOT for completion, which is payment-based.
-        // A store that cannot answer is this process's fault, not the
-        // source's (#2213). The bound it is clipped to is the bound the planner
-        // works to now: a leg that proves a smaller size shrinks it, and the gap
-        // ends there.
+        // The store's DELIVERED frontier for this gap: the end of the present
+        // bytes contiguous from `gap_start`, which is the start of the gap's
+        // first missing range, or the gap's end when nothing is missing. Present
+        // bytes past a hole do not count: the gap resumes at the hole. It caps
+        // the paid frontier, so completion and every resume start sit at bytes
+        // the store holds. A store that cannot answer is this process's fault,
+        // not the source's (#2213). The bound it is clipped to is the bound the
+        // planner works to now: a leg that proves a smaller size shrinks it, and
+        // the gap ends there.
         // A steal may have lowered the gap's end to its split since the last
         // pass.
         let asked_end = stop_at.map_or(asked_end, |end| asked_end.min(end.load(Ordering::Acquire)));
@@ -1067,17 +1086,18 @@ where
             return Ok(());
         }
         let gap_len = gap_end - gap_start;
-        let missing_bytes = ranges_content_len(&still_missing, total_bytes);
-        let delivered_frontier = gap_end.saturating_sub(missing_bytes);
+        let delivered_frontier =
+            contiguous_frontier(&still_missing, total_bytes, gap_start, gap_end);
 
         // Received-byte ceiling (#1895): enforce the source's `max_blob_size_bytes`
         // on the content that has ACTUALLY been received and BLAKE3-verified into the
         // store, never on the peer's unverified signed `total_bytes`.
-        // `delivered_frontier` is the absolute content offset present from the blob
-        // start, so once it crosses the ceiling the blob is genuinely oversized —
-        // abort. The Draw arm clamps each leg so this fires within one chunk group of
-        // the ceiling rather than after a whole-gap `BudgetPacer` draw. `0` =
-        // unlimited (and own-origin, whose engine store applies its own cap).
+        // `delivered_frontier` is an absolute content offset the store holds every
+        // byte of from `gap_start`, so once it crosses the ceiling the blob is
+        // genuinely oversized — abort. The Draw arm clamps each leg so this fires
+        // within one chunk group of the ceiling rather than after a whole-gap
+        // `BudgetPacer` draw. `0` = unlimited (and own-origin, whose engine store
+        // applies its own cap).
         let max_blob_size_bytes = source.max_blob_size_bytes();
         if max_blob_size_bytes > 0 && delivered_frontier > max_blob_size_bytes {
             return Err(anyhow::Error::new(crate::BlobTooLarge {
@@ -1285,7 +1305,10 @@ where
                 // the delivered-but-unpaid span `[paid_frontier, delivered_frontier)`
                 // after an exhaustion — `ingest_stream` re-writes the already-present
                 // bytes idempotently and the pull re-bills them, so the credit-window
-                // tail the store checkpointed ahead of payment is finally paid.
+                // tail the store checkpointed ahead of payment is finally paid. A
+                // hole the store left behind present bytes caps the paid frontier
+                // at the hole, so the leg opens there and re-delivers the present
+                // bytes after it the same idempotent way.
                 if paid_frontier >= gap_end {
                     // Paid AND delivered to the gap end (`paid_frontier` is clamped to
                     // the delivered frontier above) — the pacer should have returned
@@ -4590,6 +4613,157 @@ mod tests {
             crate::Fault::Source,
             "another source may still fill the gap"
         );
+    }
+
+    /// A store that keeps every leg it ingests except one range of the first
+    /// leg: that leg pays for the whole gap and leaves a hole with present bytes
+    /// after it. Queries answer from `view`, which holds only what was kept.
+    struct HoleOnceStore {
+        view: ClientRangedStore,
+        sink: ClientRangedStore,
+        plaintext: Vec<u8>,
+        outboard: Bytes,
+        hole: Mutex<Option<(u64, u64)>>,
+    }
+
+    impl RangedStore for HoleOnceStore {
+        fn total_bytes(&self) -> u64 {
+            self.view.total_bytes()
+        }
+        fn present_ranges(&self) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
+            self.view.present_ranges()
+        }
+        fn missing_ranges(
+            &self,
+            byte_offset: u64,
+            byte_len: u64,
+        ) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
+            self.view.missing_ranges(byte_offset, byte_len)
+        }
+        fn admit(
+            &self,
+            range: AlignedRange,
+            bao_bytes: Bytes,
+        ) -> decdn_bao_range::RangedFuture<'_, ()> {
+            self.view.admit(range, bao_bytes)
+        }
+        fn read(
+            &self,
+            byte_offset: u64,
+            byte_len: u64,
+        ) -> decdn_bao_range::RangedFuture<'_, Bytes> {
+            self.view.read(byte_offset, byte_len)
+        }
+        fn is_complete(&self) -> decdn_bao_range::RangedFuture<'_, bool> {
+            self.view.is_complete()
+        }
+        fn finalize(&self) -> decdn_bao_range::RangedFuture<'_, ()> {
+            self.view.finalize()
+        }
+    }
+
+    impl crate::source::IngestStore for HoleOnceStore {
+        fn ingest_stream<'a, R>(
+            &'a self,
+            range: &'a AlignedRange,
+            reader: R,
+            on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+            claimed_total: u64,
+            stop_at: Option<&'a std::sync::atomic::AtomicU64>,
+        ) -> crate::source::IngestFuture<'a, R>
+        where
+            R: crate::source::BaoRangeReader + 'a,
+        {
+            Box::pin(async move {
+                let out = crate::source::IngestStore::ingest_stream(
+                    &self.sink,
+                    range,
+                    reader,
+                    on_progress,
+                    claimed_total,
+                    stop_at,
+                )
+                .await?;
+                let (start, end) = (range.fetch_start(), range.fetch_end());
+                let kept = match self.hole.lock().unwrap().take() {
+                    Some((hole, len)) => vec![(start, hole), (hole + len, end)],
+                    None => vec![(start, end)],
+                };
+                let total = self.view.total_bytes();
+                for (from, to) in kept.into_iter().filter(|(from, to)| to > from) {
+                    let aligned = align_range(from, to - from, total).expect("align kept");
+                    preadmit(&self.view, &self.plaintext, &self.outboard, &aligned).await;
+                }
+                Ok(out)
+            })
+        }
+
+        fn flush_present_record(&self) -> crate::source::SourceFuture<'_, ()> {
+            crate::source::IngestStore::flush_present_record(&self.view)
+        }
+    }
+
+    /// #2328: a paid leg the store keeps only in part leaves a hole mid-gap with
+    /// present bytes after it. The next leg opens at the hole, not past the
+    /// present tail, so the gap fills and the drive completes.
+    #[tokio::test]
+    async fn a_hole_behind_present_bytes_is_refilled_from_the_hole() {
+        let total = 4 * GROUP;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let store = HoleOnceStore {
+            view: fresh_store(root, total),
+            sink: fresh_store(root, total),
+            plaintext: plaintext.clone(),
+            outboard,
+            hole: Mutex::new(Some((GROUP, GROUP))),
+        };
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+
+        drive_bounded(&store, &source, &ledger)
+            .await
+            .expect("the leg after the hole fills the gap");
+
+        assert_eq!(
+            source.opened_ranges(),
+            vec![(0, total), (GROUP, total - GROUP)],
+            "the second leg opens at the hole"
+        );
+        assert!(store.view.is_complete().await.expect("complete"));
+        assert_eq!(
+            store.view.read(0, total).await.expect("read").as_ref(),
+            plaintext.as_slice()
+        );
+    }
+
+    /// The contiguous frontier stops at the first missing range in the gap,
+    /// whatever lies past it, and reaches the gap's end when nothing is missing.
+    #[test]
+    fn the_delivered_frontier_stops_at_the_first_hole() {
+        let total = 8 * GROUP;
+        let chunks = |from: u64, to: u64| {
+            bao_tree::ChunkRanges::from(
+                bao_tree::ChunkNum(from / super::CHUNK_BYTES)
+                    ..bao_tree::ChunkNum(to / super::CHUNK_BYTES),
+            )
+        };
+        let frontier = |missing: &bao_tree::ChunkRanges| {
+            super::contiguous_frontier(missing, total, GROUP, 7 * GROUP)
+        };
+        assert_eq!(frontier(&chunks(3 * GROUP, 4 * GROUP)), 3 * GROUP);
+        assert_eq!(
+            frontier(&(chunks(3 * GROUP, 4 * GROUP) | chunks(6 * GROUP, 7 * GROUP))),
+            3 * GROUP,
+            "a later hole does not move it"
+        );
+        assert_eq!(
+            frontier(&chunks(0, 2 * GROUP)),
+            GROUP,
+            "clamped to the gap start"
+        );
+        assert_eq!(frontier(&bao_tree::ChunkRanges::empty()), 7 * GROUP);
     }
 
     /// #2194: a leg the store keeps but the ledger never pays for advances the
