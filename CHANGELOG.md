@@ -937,6 +937,16 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Every voucher rejection logs its cause at `info` (#2342).** A rejected
+  voucher or chunk preimage ends a paid stream and counts on
+  `decdn_serve_stream_voucher_rejected_total`, which has no reason split. The
+  node logs `rejecting a payment proof` once per rejection, with `proof`
+  (`voucher` or `reveal`), `reason`, `pool_id`, `signer` and `with_watermark`.
+  A voucher that fails the rate check writes no reject frame but counts on the
+  same counter, so it logs the same line with `reason=RateCheck` and the error.
+  Before, the reason logged at `debug` or not at all, so a node at the default
+  level showed the count with no cause.
+
 - **A serve miss keeps the lane answer it resolved, so a lane registered
   mid-request no longer makes it spend origin egress or answer a false
   `InternalError` (#2315).** `serve_stream` resolves the request's lane once.
