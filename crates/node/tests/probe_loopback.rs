@@ -553,9 +553,10 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
 }
 
 /// Spin up a probe server and return the client's connected [`Connection`]
-/// plus the background accept task and endpoints. The accept task is expected
-/// to return `Err` once the server handler rejects the client's input — that
-/// is the signal the correct app error code was emitted.
+/// plus the background accept task and endpoints. The accept task resolves to
+/// the handler's result once it finishes with the connection; the error-path
+/// tests observe the app error code on the client side, not through this
+/// result.
 struct Harness {
     client_conn: Connection,
     accept_task: JoinHandle<anyhow::Result<()>>,
@@ -633,9 +634,9 @@ async fn assert_reset_with_code(
 async fn tear_down(h: Harness) -> anyhow::Result<()> {
     h.client_conn.close(0u32.into(), b"bye");
     shutdown([], [&h.client_ep]).await?;
-    // Handler is expected to return Err on these error-path tests; we only need
-    // to confirm the task joined, not that it succeeded — bounded, so a handler
-    // that parks fails here rather than parking the test.
+    // The handler's result is not checked here; we only need to confirm the
+    // task joined — bounded, so a handler that parks fails here rather than
+    // parking the test.
     let _ = support::reap("accept", h.accept_task).await;
     shutdown([], [&h.server_ep]).await?;
     Ok(())
@@ -790,15 +791,23 @@ async fn probe_response_on_server_stream_returns_unsupported_code() -> anyhow::R
 }
 
 // ProbeHandler has two phase-level timeouts: ACCEPT_BI_TIMEOUT (client
-// connected but never opened a bi-stream) and PROBE_READ_TIMEOUT (client
-// opened a stream but never completed a frame). Both are 5s at runtime;
-// gating tests on the real deadline would slow every CI run, so each test
-// pauses the tokio clock and lets virtual time reach the handler's
-// `tokio::time::timeout`. The iroh bind and QUIC handshake run on the real
-// clock first: a paused clock auto-advances to iroh/noq timers (PTO,
+// connected but never opened, or never wrote to, a bi-stream) and
+// PROBE_READ_TIMEOUT (client wrote to a stream but never completed a frame).
+// Both are 5s at runtime; gating tests on the real deadline would slow every
+// CI run, so each test pauses the tokio clock and lets virtual time reach the
+// handler's `tokio::time::timeout`. The iroh bind and QUIC handshake run on
+// the real clock first: a paused clock auto-advances to iroh/noq timers (PTO,
 // keep-alive, path idle) whenever a loopback datagram is not yet readable,
-// which can turn a handshake into a `TimedOut`. `pause()` requires the
-// current_thread runtime; iroh doesn't insist on multi-thread.
+// which can turn a handshake into a `TimedOut`. On a paused clock an outer
+// `tokio::time::timeout` always trips once the runtime idles, so it bounds a
+// handler that never returns. `pause()` requires the current_thread runtime,
+// which is why these two tests use the bare `#[tokio::test]`; iroh doesn't
+// insist on multi-thread.
+
+/// Virtual-time bound on each paused-clock timeout test. It sits above the
+/// handler's 5s deadlines and below anything that would hide a much longer
+/// `PROBE_READ_TIMEOUT`.
+const PAUSED_TEST_BOUND: Duration = Duration::from_secs(10);
 
 #[tokio::test]
 async fn probe_read_timeout_resets_stream_with_zero_code() -> anyhow::Result<()> {
@@ -813,21 +822,25 @@ async fn probe_read_timeout_resets_stream_with_zero_code() -> anyhow::Result<()>
     // unwritten stream leaves the server in `accept_bi` and exercises
     // ACCEPT_BI_TIMEOUT instead. One varint byte with the continuation bit
     // set lets the server accept the stream and park `read_frame` on the
-    // rest of the length prefix. `send` stays open (never finished, never
-    // dropped) for the whole test: an EOF takes the `FrameError::Io` arm,
-    // which also closes with code 0 and `probe-error`.
+    // rest of the length prefix. `send` stays open (not finished, not
+    // dropped) until the handler returns: an EOF takes the `FrameError::Io`
+    // arm, which also closes with code 0 and `probe-error`. The `elapsed`
+    // check below is what tells the timeout apart from that arm.
+    //
+    // `start` precedes the write, so the server's read deadline cannot start
+    // before it, whenever the stream frame lands.
+    let start = tokio::time::Instant::now();
     send.write_all(&[0x80])
         .await
         .map_err(|e| anyhow::anyhow!("write: {e}"))?;
 
-    // No explicit `advance`: auto-advance fires timers in deadline order with
-    // an I/O poll between jumps, so the stream frame lands before the 5s read
-    // deadline. The outer timeout runs on the same virtual clock and always
-    // trips once the runtime idles, so a handler that never times out fails
-    // here instead of hanging the test.
+    // No explicit `advance`. The stream frame races the ACCEPT_BI_TIMEOUT
+    // deadline armed on the real clock during the handshake. noq's PTO and
+    // ack-delay timers sit well below 5s, and auto-advance polls I/O between
+    // timer jumps, so the frame lands first. A lost race fails loudly here:
+    // the accept path closes with an empty reason and returns `Err`.
     tokio::time::pause();
-    let paused_at = tokio::time::Instant::now();
-    let joined = tokio::time::timeout(Duration::from_secs(30), async {
+    let observed = tokio::time::timeout(PAUSED_TEST_BOUND, async {
         // Handler resets the stream AND closes the connection with app code 0
         // (ADR 013 defines no timeout-specific code; the handler uses 0 for
         // "no app error"). `assert_reset_with_code` tolerates either
@@ -841,23 +854,26 @@ async fn probe_read_timeout_resets_stream_with_zero_code() -> anyhow::Result<()>
                 if error_code == VarInt::from_u32(0) && reason.as_ref() == b"probe-error" => {}
             other => anyhow::bail!("expected a code-0 `probe-error` close, got {other:?}"),
         }
-        anyhow::Ok(())
+        let elapsed = start.elapsed();
+        anyhow::ensure!(
+            elapsed >= Duration::from_secs(5),
+            "probe connection closed after {elapsed:?}, before PROBE_READ_TIMEOUT"
+        );
+
+        // The read-fault path handles the fault and returns `Ok`; the
+        // ACCEPT_BI_TIMEOUT path returns `Err`.
+        h.accept_task
+            .await
+            .map_err(|e| anyhow::anyhow!("join: {e}"))?
+            .map_err(|e| anyhow::anyhow!("handler should return Ok on PROBE_READ_TIMEOUT: {e}"))
     })
     .await
-    .map_err(|_| anyhow::anyhow!("PROBE_READ_TIMEOUT never closed the probe connection"))?;
-    joined?;
-    let elapsed = paused_at.elapsed();
-    anyhow::ensure!(
-        elapsed >= Duration::from_secs(5),
-        "probe connection closed after {elapsed:?}, before PROBE_READ_TIMEOUT"
-    );
-
-    // The read-fault path handles the fault and returns `Ok`; the
-    // ACCEPT_BI_TIMEOUT path returns `Err`.
-    h.accept_task
-        .await
-        .map_err(|e| anyhow::anyhow!("join: {e}"))?
-        .map_err(|e| anyhow::anyhow!("handler should return Ok on PROBE_READ_TIMEOUT: {e}"))?;
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "PROBE_READ_TIMEOUT never closed the probe connection within {PAUSED_TEST_BOUND:?}"
+        )
+    })?;
+    observed?;
     drop(send);
 
     // Manual teardown — `h.accept_task` was consumed above, so the shared
@@ -880,13 +896,9 @@ async fn probe_accept_bi_timeout_errors_handler() -> anyhow::Result<()> {
     tokio::time::advance(Duration::from_secs(6)).await;
 
     // Confirm the server task returned Err with the expected message.
-    // Just `.await` — no wrapper timeout, because under `start_paused`
-    // `tokio::time::timeout` itself runs on the virtual clock and would
-    // not trip on a non-timer deadlock. Cargo's test-harness global
-    // timeout covers that pathological case.
-    let joined = h
-        .accept_task
+    let joined = tokio::time::timeout(PAUSED_TEST_BOUND, h.accept_task)
         .await
+        .map_err(|_| anyhow::anyhow!("handler never returned within {PAUSED_TEST_BOUND:?}"))?
         .map_err(|e| anyhow::anyhow!("join: {e}"))?;
     let Err(err) = joined else {
         anyhow::bail!("handler should have returned Err on ACCEPT_BI_TIMEOUT, got Ok");
@@ -898,7 +910,9 @@ async fn probe_accept_bi_timeout_errors_handler() -> anyhow::Result<()> {
     );
 
     // Manual teardown — `h.accept_task` was consumed above, so the shared
-    // `tear_down` helper can't run as-is. Real clock, as above.
+    // `tear_down` helper can't run as-is. Teardown's deadline must run on the
+    // real clock: a paused one auto-advances past it whenever the runtime
+    // idles on socket I/O, a spurious breach.
     tokio::time::resume();
     h.client_conn.close(0u32.into(), b"bye");
     shutdown([], [&h.client_ep, &h.server_ep]).await?;
