@@ -78,6 +78,8 @@ use super::{
 };
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::NodeId as DhtNodeId;
+use crate::handlers::client::PROOF_WAIT_CEILING;
+use crate::runtime::QUIC_MAX_IDLE_TIMEOUT;
 use crate::selection::{CHANNEL_OPEN_CALLER_BUDGET, Candidate, MAX_PROVIDER_ATTEMPTS};
 use decdn_client::{
     PoolContext, PullDeadlines, open_progressive_pull as open_progressive_upstream,
@@ -311,7 +313,27 @@ struct DownstreamWait {
 /// How long one window-paced pause runs before [`DownstreamWait`] logs a warning.
 /// The pause keeps waiting after the warning: a payer that stalls is the serve
 /// leg's to end, not the pull's.
-const PULL_WAIT_WARN_AFTER: Duration = Duration::from_secs(30);
+///
+/// The threshold exceeds the time a serve leg needs to notice a vanished payer.
+/// The serve leg of a payer that vanishes without a `CONNECTION_CLOSE` ends at the
+/// QUIC idle timeout ([`QUIC_MAX_IDLE_TIMEOUT`]) or at the proof-wait ceiling
+/// ([`PROOF_WAIT_CEILING`]). The end of the last serve leg then cancels the pull.
+/// So a pause that reaches the warning means a live serve leg holds the pull.
+const PULL_WAIT_WARN_AFTER: Duration = Duration::from_secs(45);
+
+/// The least time [`PULL_WAIT_WARN_AFTER`] keeps above each of its two ceilings: the
+/// QUIC idle timeout and the proof-wait ceiling. A serve leg ends a few seconds after
+/// its ceiling passes, and its end must then reach the pull.
+const PULL_WAIT_WARN_MARGIN: Duration = Duration::from_secs(10);
+
+const _: () = assert!(
+    PULL_WAIT_WARN_AFTER.as_secs()
+        >= QUIC_MAX_IDLE_TIMEOUT.as_secs() + PULL_WAIT_WARN_MARGIN.as_secs()
+        && PULL_WAIT_WARN_AFTER.as_secs()
+            >= PROOF_WAIT_CEILING.as_secs() + PULL_WAIT_WARN_MARGIN.as_secs(),
+    "PULL_WAIT_WARN_AFTER must exceed the QUIC idle timeout and the proof-wait ceiling \
+     by PULL_WAIT_WARN_MARGIN, or a vanished payer trips the warning"
+);
 
 impl DownstreamWait {
     /// A wait over `session`'s downstream frontiers, for a pull of `hash`.

@@ -11156,6 +11156,63 @@ mod tests {
         }
     }
 
+    /// #2328: once the pull has faulted, a serve reader with the store fallback
+    /// reads every node the store holds content under from the store's outboard.
+    /// A node over absent content still fails, and so does a reader without the
+    /// fallback.
+    #[tokio::test]
+    async fn a_dead_reader_reads_a_node_over_held_content_from_the_store() {
+        use bao_tree::io::fsm::Outboard;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 8 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let (hash, held, bao) = bao_for(root, &plaintext, outboard, group, group, total);
+        engine
+            .admit_bao_stream(hash, held.clone(), total, bao.slice(8..), None)
+            .await
+            .map_err(|(_reader, e)| e)
+            .unwrap();
+
+        let session = crate::FillSession::new(bao_tree::blake3::Hash::from(root), total);
+        session.mark_ended(Err(crate::FillError::new("upstream died")));
+
+        let truth = bao_tree::io::outboard::PreOrderMemOutboard::create(
+            &plaintext,
+            crate::range_pull::IROH_BLOCK_SIZE,
+        );
+        let tree = truth.tree;
+        let internal: Vec<_> = tree
+            .pre_order_nodes_iter()
+            .filter(|n| tree.pre_order_offset(*n).is_some())
+            .collect();
+        let over_held = |n: &bao_tree::TreeNode| {
+            !(&bao_tree::ChunkRanges::from(n.chunk_range()) & &held).is_empty()
+        };
+        assert!(internal.iter().any(over_held) && !internal.iter().all(over_held));
+
+        let mut bare = session.outboard_reader();
+        assert!(
+            bare.load(tree.root()).await.is_err(),
+            "without the fallback a dead node fails"
+        );
+
+        let mut reader = session
+            .outboard_reader()
+            .with_store_fallback(engine.clone());
+        for node in internal {
+            let loaded = reader.load(node).await;
+            if over_held(&node) {
+                let want = bao_tree::io::sync::Outboard::load(&truth, node).unwrap();
+                assert_eq!(loaded.unwrap(), want, "node {node:?} reads from the store");
+            } else {
+                let err = loaded.expect_err("the store holds nothing under this node");
+                assert!(err.to_string().contains("upstream pull failed"), "{err}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn admit_bao_stream_handles_zero_total_bytes() {
         let tmp = tempfile::tempdir().unwrap();

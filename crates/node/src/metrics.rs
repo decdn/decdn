@@ -771,6 +771,19 @@ pub struct DecdnMetrics {
     /// the slow self-tick. Operator-visible name:
     /// `decdn_redeem_hints_dropped_total`.
     pub redeem_hints_dropped: Counter,
+    /// Redeem hints the redeemer dropped because their lane is parked (#2340).
+    /// A lane parks when its hint-path redemption hits a chain fault — a
+    /// failed pre-redeem watermark read or a `redeemMany` that did not land,
+    /// an RPC fault or a revert alike. Each sweep (self-tick or serve cutoff)
+    /// retries the parked lanes with every other lane, and only a sweep that
+    /// finishes without a chain fault releases them. So an RPC outage costs one
+    /// failed attempt per lane per interval: the sweep's batched retry. Hints
+    /// for a parked lane stay dropped until a sweep finishes without a chain
+    /// fault. A non-zero rate tracks chain faults on the settlement path; read it beside
+    /// `decdn_onchain_tx_send_failed_total` and
+    /// `decdn_redemption_reconcile_failures_total`. Operator-visible name:
+    /// `decdn_redeem_hints_parked_total`.
+    pub redeem_hints_parked: Counter,
     /// Download-receipt audit writes dropped because the bounded writer queue
     /// was full (`try_send` → `Full`, #803), counted once per dropped receipt.
     /// The receipt log is audit-only and the payment already advanced the lane
@@ -1501,7 +1514,8 @@ pub struct DecdnMetrics {
     /// observation per pause.
     /// Most pauses end within a voucher round trip; a tail near the top bucket
     /// means a payer that stalls or a pacing regression that parks the pull
-    /// with no serve leg left to wake it. A pause past 30 s also logs a warning.
+    /// with no serve leg left to wake it. A pause past `PULL_WAIT_WARN_AFTER` (45 s)
+    /// also logs a warning.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub node_pull_through_wait_seconds: Histogram,
     /// `decdn_node_pull_through_client_abandoned_total` (#856): window-paced
@@ -2965,6 +2979,10 @@ recorders! {
     /// (`try_send` → `Full`, #751). Advisory, so a few drops are benign; a
     /// sustained rate means the redeemer is not keeping up with fan-out.
     redeem_hint_dropped => redeem_hints_dropped.inc();
+
+    /// A redeem hint was dropped because its lane is parked after a chain
+    /// fault on the hint path (#2340). The next sweep retries the lane.
+    redeem_hint_parked => redeem_hints_parked.inc();
 
     /// A download-receipt audit write was dropped because the bounded writer
     /// queue was full (`try_send` → `Full`, #803). Audit-only, so a drop never
@@ -5186,6 +5204,7 @@ mod tests {
             "decdn_receipt_write_failures_total",
             "decdn_serve_stream_midstream_pool_exhausted_total",
             "decdn_serve_stream_proof_budget_exhausted_total",
+            "decdn_redeem_hints_parked_total",
         ] {
             assert!(
                 has_metric_line(&text, name, 0),

@@ -1634,7 +1634,7 @@ since project inception and will roll into the first tagged release.
   `decdn_cache_range_pull_permit_waits_total` (draws that waited on the full
   range-pull pool, warning past 10 s) and
   `decdn_node_pull_through_wait_seconds` (length of each pull pause, warning
-  past 30 s). `decdn_cache_fill_not_coalesced_total` now counts once per claim,
+  past 45 s). `decdn_cache_fill_not_coalesced_total` now counts once per claim,
   and only when the skipped fill overlaps the request.
 
 - **The cache footprint counts a partial blob's present bytes (#2157).**

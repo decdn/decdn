@@ -79,6 +79,8 @@ mod voucher;
 mod window;
 mod wire;
 
+pub(crate) use proof_wait::PROOF_WAIT_CEILING;
+
 /// Default per-connection concurrent-stream cap for `cdn/client/v1` (ADR 005
 /// §Concurrent stream limits). The QUIC transport config also caps bidi
 /// streams at this value; the application semaphore makes the per-ALPN bound

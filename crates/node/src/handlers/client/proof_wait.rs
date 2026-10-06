@@ -46,7 +46,7 @@ use super::{MAX_PROOFS_PER_CHUNK, VOUCHER_READ_TIMEOUT};
 /// The longest the serve loop waits for the proofs of one owed chunk,
 /// transport progress or not. The clock starts with the chunk's first proof
 /// wait and runs across all of its proofs ([`ChunkProofs`]).
-pub(super) const PROOF_WAIT_CEILING: Duration = Duration::from_secs(30);
+pub(crate) const PROOF_WAIT_CEILING: Duration = Duration::from_secs(30);
 
 /// How often a proof wait samples the connection's STREAM frame count. It
 /// sets the resolution of the no-progress fault: the wait faults at most one

@@ -42,7 +42,9 @@
 //!   `FillSession::mark_ended`, which fires the per-hash liveness signal. A serve
 //!   read parked on a gap races the present-range watch against that signal and
 //!   re-checks `range_still_live`: once no live fill covers the gap the read
-//!   fails instead of hanging. This is the no-hang guarantee.
+//!   settles instead of hanging. It is served from the store when the store
+//!   holds the bytes and proof pairs, and fails otherwise. This is the no-hang
+//!   guarantee.
 //!
 //! The serve leg owns termination: it is what fulfils `R` for the client, so its
 //! completion (or error) ends the serve and drops the pull leg.

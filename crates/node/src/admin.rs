@@ -1014,8 +1014,9 @@ fn build_lane_snapshots(
                 // Upper-bound eligibility: the admin surface doesn't read
                 // the on-chain `withdrawnAmount`, so it compares the full
                 // accrued claim against the threshold (documented on the
-                // DTO field). `>=` matches the redeemer's `< threshold`
-                // short-circuit (`redeem_one` in payment_settlement.rs).
+                // DTO field). `>=` matches the redeemer's `< floor`
+                // short-circuit (`redeem_planned_lanes` in
+                // payment_settlement.rs), whose floor is this threshold.
                 settlement_eligible: outstanding >= threshold,
             }
         })
