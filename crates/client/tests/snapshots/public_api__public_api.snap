@@ -318,7 +318,10 @@ pub const decdn_client::peer_store::LATENCY_TTL_SECS: u64
 pub const decdn_client::peer_store::LRU_CAP: usize
 pub const decdn_client::peer_store::MIN_FRESH_CANDIDATES: usize
 pub mod decdn_client::probe
-pub async fn decdn_client::probe::probe_once(&iroh::endpoint::Endpoint, iroh_base::endpoint_addr::EndpointAddr, [u8; 32], u64, core::time::Duration) -> anyhow::Result<(decdn_protocol::message::ProbeResponse, decdn_protocol::message::ProbeResponseExt, f64)>
+pub struct decdn_client::probe::ProbeRtt
+pub decdn_client::probe::ProbeRtt::direct: bool
+pub decdn_client::probe::ProbeRtt::ms: f64
+pub async fn decdn_client::probe::probe_once(&iroh::endpoint::Endpoint, iroh_base::endpoint_addr::EndpointAddr, [u8; 32], u64, core::time::Duration) -> anyhow::Result<(decdn_protocol::message::ProbeResponse, decdn_protocol::message::ProbeResponseExt, decdn_client::probe::ProbeRtt)>
 pub fn decdn_client::probe::verify_probe_response(&decdn_protocol::message::ProbeResponse, alloy_primitives::bits::address::Address, &alloy_sol_types::eip712::Eip712Domain, [u8; 32], u64) -> anyhow::Result<()>
 pub mod decdn_client::provider
 pub fn decdn_client::provider::build_provider(&str, &alloy_signer_local::PrivateKeySigner) -> anyhow::Result<impl alloy_provider::provider::trait::Provider + core::clone::Clone + use<>>

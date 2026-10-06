@@ -473,12 +473,18 @@ pub struct NodeOriginConfig {
 }
 
 /// ADR 030 default heuristic (RTT > 150ms to a same-claimed-region node). The
-/// value compared against it is `probe_once`'s observed probe latency, which on
-/// the cold path also spans QUIC connection setup — not a bare network round
-/// trip — so 150ms is a deliberately generous ceiling that a truly in-region
-/// peer clears even with a full handshake. The threshold is a documented
-/// constant, deliberately not yet a governance knob per ADR 030 (which defers
-/// threshold/sample/decay tuning to a later ADR 008 revision).
+/// value compared against it is `probe_once`'s RTT: the request/response
+/// exchange on the open connection, or the direct path's RTT when hole punching
+/// selects one in time and it is lower. It never spans the connect. An RTT with
+/// no direct path behind it ([`ProbeRtt::direct`] is `false`) is compared too:
+/// the peer controls whether hole punching succeeds, so exempting a relay RTT
+/// would let a region spoofer escape the penalty by refusing direct paths. The
+/// cost is that an honest in-region peer stuck on a distant relay can read past
+/// 150ms. The threshold is a documented constant, deliberately not yet a
+/// governance knob per ADR 030 (which defers threshold/sample/decay tuning to a
+/// later ADR 008 revision).
+///
+/// [`ProbeRtt::direct`]: decdn_client::probe::ProbeRtt::direct
 const REGION_LATENCY_MAX_MS: u32 = 150;
 
 /// Whether the ADR 030 latency-vs-claim penalty applies to a probed peer.
@@ -1236,6 +1242,43 @@ async fn probe_round(
     selected
 }
 
+/// Read one probe's RTT as evidence about the peer's region claim.
+///
+/// ADR 030 canonical latency-vs-claim penalty: a peer that self-attests THIS
+/// node's own region yet answers slower than the latency ceiling is spoofing
+/// its region. A local-only signal — folded straight into the local EWMA — so
+/// it self-corrects as fast as we probe and needs no new protocol surface. An
+/// RTT with no direct path behind it (`direct == false`) can be the relay
+/// detour. It still counts as evidence, because the peer controls whether a
+/// direct path forms; the logs carry `direct` so an operator can tell a relay
+/// reading from a direct one.
+fn score_probe_latency(deps: &NodeOriginDeps, pk: PublicKey, region: &str, rtt: u32, direct: bool) {
+    if !direct {
+        debug!(
+            peer = %pk,
+            rtt_ms = rtt,
+            "node-origin: probe RTT has no direct path behind it; ranking on the exchange RTT"
+        );
+    }
+    if region_latency_penalty_applies(deps.config.own_region.as_deref(), region, rtt) {
+        // Log with the disambiguating context (the metric alone cannot tell a
+        // spoofer from a mis-set local `identity.region`): peer, both regions,
+        // and the observed latency vs ceiling.
+        debug!(
+            peer = %pk,
+            own_region = deps.config.own_region.as_deref().unwrap_or(""),
+            claimed_region = %region,
+            rtt_ms = rtt,
+            direct,
+            ceiling_ms = REGION_LATENCY_MAX_MS,
+            "node-origin: same-region claim contradicted by probe latency; \
+             applying ADR 030 latency penalty"
+        );
+        deps.metrics.node_region_latency_penalty();
+        record_outcome(deps, pk, &Outcome::RegionLatencyMismatch);
+    }
+}
+
 /// `rank_candidates` reduced to the best-first `Candidate` list both pull paths
 /// consume. Shared by the cold path and the probe-cache-hit path so a change to
 /// what "ranked" means cannot apply to one and not the other.
@@ -1271,7 +1314,7 @@ async fn probe_candidate(
         return None;
     };
     let probe_ts = now_micros();
-    let (resp, resp_ext, rtt_ms) = match probe_once(
+    let (resp, resp_ext, probe_rtt) = match probe_once(
         &deps.endpoint,
         EndpointAddr::new(pk),
         hash_bytes,
@@ -1353,7 +1396,7 @@ async fn probe_candidate(
             .record_failure(peer, DhtHash::from_bytes(hash_bytes));
         return None;
     }
-    let rtt = ms_to_u32(rtt_ms);
+    let rtt = ms_to_u32(probe_rtt.ms);
     // Peer's self-attested region (ADR 030), resolved from the on-chain
     // `CapacityBond` registry projection; empty when the registry has no
     // region hint for this peer.
@@ -1362,33 +1405,14 @@ async fn probe_candidate(
         DhtNodeId::from_bytes(*peer.as_bytes()),
     )
     .unwrap_or_default();
-    // ADR 030 canonical latency-vs-claim penalty: a peer that self-attests THIS
-    // node's own region yet answers slower than the latency ceiling is spoofing
-    // its region. A local-only signal — folded straight into the local EWMA — so
-    // it self-corrects as fast as we probe and needs no new protocol surface.
-    if region_latency_penalty_applies(deps.config.own_region.as_deref(), &region, rtt) {
-        // Log with the disambiguating context (the metric alone cannot tell a
-        // spoofer from a mis-set local `identity.region`): peer, both regions,
-        // and the observed latency vs ceiling.
-        debug!(
-            peer = %pk,
-            own_region = deps.config.own_region.as_deref().unwrap_or(""),
-            claimed_region = %region,
-            rtt_ms = rtt,
-            ceiling_ms = REGION_LATENCY_MAX_MS,
-            "node-origin: same-region claim contradicted by probe latency; \
-             applying ADR 030 latency penalty"
-        );
-        deps.metrics.node_region_latency_penalty();
-        record_outcome(deps, pk, &Outcome::RegionLatencyMismatch);
-    }
+    score_probe_latency(deps, pk, &region, rtt, probe_rtt.direct);
     Some(Candidate {
         node_id: *peer.as_bytes(),
         rate_per_mb: resp.body.rate_per_mb,
         rtt_ms: rtt,
         reputation: peer_reputation(deps, pk),
         // Drives the geo-diversity tie-break tier (selection.rs) and the
-        // latency-vs-claim penalty above.
+        // latency-vs-claim penalty in `score_probe_latency`.
         region,
         // No on-chain stake lookup is wired yet (#1470 / ADR 019). `0` is a
         // placeholder here, not an observation — which is exactly why tier 2 is

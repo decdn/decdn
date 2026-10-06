@@ -28,6 +28,11 @@ pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 /// distant-region selection looks too sparse. Both the figure and the trade are ADR 001
 /// § Probe response collection.
 ///
+/// What is left of the budget after the exchange goes to `probe_once`'s wait for hole
+/// punching to select a direct path. A candidate whose answer arrives in time is kept even
+/// when that wait runs out: it ranks on its exchange RTT, which can be the relay detour, and
+/// that RTT still feeds the ADR 030 region-latency penalty.
+///
 /// Lives here, beside the deadline arithmetic that has to budget for it, rather than in
 /// `node_origin` where it is used (#1145 review). Every term of [`outer_pull_deadline`] is
 /// then visible in one file, which is what stops the next one from being guessed.

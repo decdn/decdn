@@ -442,7 +442,7 @@ async fn probe_candidate(
 ) -> anyhow::Result<(
     decdn_protocol::message::ProbeResponse,
     decdn_protocol::ProbeResponseExt,
-    f64,
+    decdn_client::probe::ProbeRtt,
 )> {
     let mut backoffs = PROBE_SHED_BACKOFFS_MS.iter();
     loop {
@@ -476,9 +476,11 @@ fn probe_shed(err: &anyhow::Error) -> bool {
 }
 
 /// How long a probe round keeps collecting answers after the first verified
-/// holder answers. A holder that answers later is either about 125 ms farther
-/// away or still connecting, and would not lead the order. One slow connect
-/// would otherwise hold the whole round for up to the probe timeout.
+/// holder answers. A holder that answers later is about 125 ms farther away,
+/// still connecting, or still waiting for hole punching to select a direct
+/// path (`probe_once` waits up to 500 ms for one after its exchange), and would
+/// not lead the order. One slow connect would otherwise hold the whole round
+/// for up to the probe timeout.
 const PROBE_SETTLE_AFTER_HOLDER: Duration = Duration::from_millis(250);
 
 /// Run `probes` concurrently and collect their outcomes until every probe has
@@ -544,15 +546,16 @@ fn log_probe_result(
     res: &anyhow::Result<(
         decdn_protocol::message::ProbeResponse,
         decdn_protocol::ProbeResponseExt,
-        f64,
+        decdn_client::probe::ProbeRtt,
     )>,
     started: std::time::Instant,
 ) {
     match res {
-        Ok((resp, _, rtt_ms)) => tracing::debug!(
+        Ok((resp, _, rtt)) => tracing::debug!(
             node = %cand.node_id,
             elapsed_ms = started.elapsed().as_millis(),
-            rtt_ms = *rtt_ms,
+            rtt_ms = rtt.ms,
+            rtt_direct = rtt.direct,
             has_blob = resp.body.has_blob,
             "probe answered"
         ),
@@ -742,13 +745,13 @@ fn classify_probe(
     res: anyhow::Result<(
         decdn_protocol::message::ProbeResponse,
         decdn_protocol::ProbeResponseExt,
-        f64,
+        decdn_client::probe::ProbeRtt,
     )>,
     hash: [u8; 32],
     timestamp_us: u64,
     slash_domain: &alloy::sol_types::Eip712Domain,
 ) -> ProbeOutcome {
-    let (resp, resp_ext, rtt_ms) = match res {
+    let (resp, resp_ext, rtt) = match res {
         Ok(answer) => answer,
         Err(e) if probe_shed(&e) => return ProbeOutcome::RateLimited,
         Err(_) => return ProbeOutcome::Unreachable,
@@ -779,6 +782,7 @@ fn classify_probe(
         );
         return ProbeOutcome::Unusable;
     }
+    let rtt_ms = rtt.ms;
     // Every verified responder contributes a probe sample, holder or not.
     let sample = (cand.node_id, rtt_ms, resp.body.rate_per_mb);
     if resp.body.has_blob {
