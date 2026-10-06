@@ -74,7 +74,7 @@ pub async fn probe(
     // Transport and RTT measurement live in `probe_once`.
     let result = probe_once(&endpoint, target, hash, timestamp_us, timeout).await;
     endpoint.close().await;
-    let (resp, resp_ext, rtt_ms) = result?;
+    let (resp, resp_ext, rtt) = result?;
 
     // Correlation: the node echoes both the queried hash and the
     // requester timestamp (ADR 005). A mismatch means a stale/confused
@@ -104,7 +104,7 @@ pub async fn probe(
         .map_err(|e| anyhow::anyhow!("rejecting probe response: {e}"))?;
 
     let mut stdout = std::io::stdout().lock();
-    write_probe_response(&mut stdout, &resp, &resp_ext, rtt_ms, args.json)
+    write_probe_response(&mut stdout, &resp, &resp_ext, rtt.ms, args.json)
         .map_err(|e| anyhow::anyhow!("failed to write probe response: {e}"))?;
     Ok(())
 }

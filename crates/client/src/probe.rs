@@ -27,8 +27,20 @@ use iroh::{Endpoint, EndpointAddr};
 
 use crate::rate_limited::transport_error;
 
+/// The round-trip time one probe measured.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProbeRtt {
+    /// The round-trip time in milliseconds.
+    pub ms: f64,
+    /// Whether hole punching selected a direct path before the probe ended.
+    /// When `true`, `ms` is no higher than that path's RTT. When `false`, `ms`
+    /// is the exchange RTT, and the exchange can have ridden the relay, so
+    /// `ms` says nothing about how far away the peer is.
+    pub direct: bool,
+}
+
 /// Run one probe round trip and return the decoded response together with
-/// the measured round-trip time in milliseconds.
+/// the measured round-trip time.
 ///
 /// The round-trip time is the smaller of the request/response exchange on the
 /// established connection and the estimate of the direct path hole punching
@@ -40,16 +52,16 @@ use crate::rate_limited::transport_error;
 /// `timeout` bounds the connect and the exchange. The wait for a direct path
 /// gets only what is left of `timeout`, capped at 500 ms, and it never fails a
 /// probe that already has its answer: when the wait runs out, the probe keeps
-/// the exchange RTT. A cold dial that rides the relay therefore still returns
-/// its answer to a caller with a tight budget, such as the node's upstream
-/// probe round.
+/// the exchange RTT and reports [`ProbeRtt::direct`] as `false`. A cold dial
+/// that rides the relay therefore still returns its answer to a caller with a
+/// tight budget, such as the node's upstream probe round.
 ///
 /// The decoded [`ProbeResponse`] is returned without echoed-field
 /// correlation or `slash_sig` validation: the requester-side obligations —
 /// echoed `hash`/`timestamp_us` correlation (ADR 005) and the mandatory
 /// `slash_sig` shape check (`ProbeResponse::validate`, ADR 014 §1) — are the
-/// caller's, so a future node-side probe-collection loop can apply its own
-/// policy on the same transport. The only check performed internally is the
+/// caller's, so the node's probe-collection loop and the CLI each apply their
+/// own policy on the same transport. The only check performed internally is the
 /// protocol-level one that the server sent a `Response` (not a `Request`)
 /// variant.
 ///
@@ -66,7 +78,7 @@ pub async fn probe_once(
     hash: [u8; 32],
     timestamp_us: u64,
     timeout: Duration,
-) -> anyhow::Result<(ProbeResponse, ProbeResponseExt, f64)> {
+) -> anyhow::Result<(ProbeResponse, ProbeResponseExt, ProbeRtt)> {
     let (conn, resp, rtt) = exchange_within(
         timeout,
         async {
@@ -82,27 +94,43 @@ pub async fn probe_once(
     )
     .await?;
 
-    let rtt_ms = rtt.as_secs_f64() * 1000.0;
     conn.close(0u32.into(), b"probe-done");
 
-    Ok((resp.0, resp.1, rtt_ms))
+    Ok((
+        resp.0,
+        resp.1,
+        ProbeRtt {
+            ms: rtt.rtt.as_secs_f64() * 1000.0,
+            direct: rtt.direct,
+        },
+    ))
 }
 
 /// The longest [`probe_once`] waits after its exchange for hole punching to
 /// select a direct path. The probe's `timeout` can cut the wait shorter.
 const DIRECT_PATH_GRACE: Duration = Duration::from_millis(500);
 
+/// [`ProbeRtt`] before the conversion to milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PathRtt {
+    /// The smaller of the exchange RTT and the direct-path RTT.
+    rtt: Duration,
+    /// Whether a direct path reported its RTT in time.
+    direct: bool,
+}
+
 /// Run `exchange` within `budget`, then let `direct` report a direct-path RTT
 /// for what is left of `budget`, at most [`DIRECT_PATH_GRACE`].
 ///
 /// `exchange` yields the connection, the response, and the exchange RTT. Only
 /// `exchange` can fail the probe. A `direct` that does not answer in time
-/// leaves the exchange RTT in place, and a lower direct-path RTT replaces it.
+/// leaves the exchange RTT in place. A direct-path RTT replaces the exchange
+/// RTT only when it is lower.
 async fn exchange_within<C, R>(
     budget: Duration,
     exchange: impl Future<Output = anyhow::Result<(C, R, Duration)>>,
     direct: impl AsyncFnOnce(&C) -> Option<Duration>,
-) -> anyhow::Result<(C, R, Duration)> {
+) -> anyhow::Result<(C, R, PathRtt)> {
     let deadline = tokio::time::Instant::now() + budget;
     let (conn, resp, exchanged) = tokio::time::timeout_at(deadline, exchange)
         .await
@@ -110,11 +138,20 @@ async fn exchange_within<C, R>(
     let grace = deadline
         .saturating_duration_since(tokio::time::Instant::now())
         .min(DIRECT_PATH_GRACE);
-    let rtt = tokio::time::timeout(grace, direct(&conn))
+    let rtt = match tokio::time::timeout(grace, direct(&conn))
         .await
         .ok()
         .flatten()
-        .map_or(exchanged, |direct| direct.min(exchanged));
+    {
+        Some(direct) => PathRtt {
+            rtt: direct.min(exchanged),
+            direct: true,
+        },
+        None => PathRtt {
+            rtt: exchanged,
+            direct: false,
+        },
+    };
     Ok((conn, resp, rtt))
 }
 
@@ -245,7 +282,7 @@ async fn read_response(mut recv: RecvStream) -> anyhow::Result<(ProbeResponse, P
 
 #[cfg(test)]
 mod tests {
-    use super::{exchange_within, verify_probe_response};
+    use super::{DIRECT_PATH_GRACE, PathRtt, exchange_within, verify_probe_response};
     use alloy::primitives::Address;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::Eip712Domain;
@@ -348,26 +385,53 @@ mod tests {
         Ok(((), (), rtt))
     }
 
-    /// The node probes its upstream with a 500 ms budget. A cold dial that answers
-    /// on the relay must keep its answer when hole punching does not select a
-    /// direct path before the budget runs out.
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// The node probes its upstream with a tight budget (decdn-node
+    /// `PROBE_TIMEOUT`, 500 ms). A cold dial that answers on the relay must keep
+    /// its answer when hole punching does not select a direct path before the
+    /// budget runs out.
     #[tokio::test(start_paused = true)]
     async fn an_answered_probe_survives_a_direct_path_that_never_comes() -> anyhow::Result<()> {
-        let budget = Duration::from_millis(500);
+        let budget = ms(500);
         let started = tokio::time::Instant::now();
-        let ((), (), rtt) = exchange_within(
-            budget,
-            answers(Duration::from_millis(300), Duration::from_millis(120)),
-            async |()| std::future::pending().await,
-        )
+        let ((), (), rtt) = exchange_within(budget, answers(ms(300), ms(120)), async |()| {
+            std::future::pending().await
+        })
         .await?;
+        let want = PathRtt {
+            rtt: ms(120),
+            direct: false,
+        };
+        anyhow::ensure!(rtt == want, "expected {want:?}, got {rtt:?}");
         anyhow::ensure!(
-            rtt == Duration::from_millis(120),
-            "kept the exchange RTT, got {rtt:?}"
+            started.elapsed() == budget,
+            "expected the direct-path wait to end at the budget, took {:?}",
+            started.elapsed()
         );
+        Ok(())
+    }
+
+    /// A caller with a long budget, such as the CLI's 5 s probe, still waits
+    /// at most `DIRECT_PATH_GRACE` for a direct path.
+    #[tokio::test(start_paused = true)]
+    async fn the_direct_path_wait_stops_at_the_grace_under_a_long_budget() -> anyhow::Result<()> {
+        let started = tokio::time::Instant::now();
+        let ((), (), rtt) = exchange_within(ms(5000), answers(ms(300), ms(120)), async |()| {
+            std::future::pending().await
+        })
+        .await?;
+        let want = PathRtt {
+            rtt: ms(120),
+            direct: false,
+        };
+        anyhow::ensure!(rtt == want, "expected {want:?}, got {rtt:?}");
+        let want_elapsed = ms(300) + DIRECT_PATH_GRACE;
         anyhow::ensure!(
-            started.elapsed() <= budget,
-            "the direct-path wait must stay inside the budget, took {:?}",
+            started.elapsed() == want_elapsed,
+            "expected the wait to stop at {want_elapsed:?}, took {:?}",
             started.elapsed()
         );
         Ok(())
@@ -375,35 +439,91 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_lower_direct_path_rtt_replaces_the_exchange_rtt() -> anyhow::Result<()> {
-        let ((), (), rtt) = exchange_within(
-            Duration::from_secs(5),
-            answers(Duration::from_millis(300), Duration::from_millis(250)),
-            async |()| {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                Some(Duration::from_millis(40))
-            },
-        )
+        let ((), (), rtt) = exchange_within(ms(5000), answers(ms(300), ms(250)), async |()| {
+            tokio::time::sleep(ms(100)).await;
+            Some(ms(40))
+        })
         .await?;
-        anyhow::ensure!(
-            rtt == Duration::from_millis(40),
-            "took the direct path, got {rtt:?}"
-        );
+        let want = PathRtt {
+            rtt: ms(40),
+            direct: true,
+        };
+        anyhow::ensure!(rtt == want, "expected {want:?}, got {rtt:?}");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_higher_direct_path_rtt_keeps_the_exchange_rtt() -> anyhow::Result<()> {
+        let ((), (), rtt) = exchange_within(ms(5000), answers(ms(300), ms(50)), async |()| {
+            tokio::time::sleep(ms(10)).await;
+            Some(ms(200))
+        })
+        .await?;
+        let want = PathRtt {
+            rtt: ms(50),
+            direct: true,
+        };
+        anyhow::ensure!(rtt == want, "expected {want:?}, got {rtt:?}");
+        Ok(())
+    }
+
+    /// An exchange that answers exactly at the deadline leaves no time to wait.
+    /// The probe still keeps its answer, and a direct path that is already
+    /// selected still counts, because the zero-length wait polls once.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_at_the_deadline_keeps_its_answer() -> anyhow::Result<()> {
+        let ((), (), rtt) =
+            exchange_within(ms(500), answers(ms(500), ms(120)), async |()| Some(ms(40))).await?;
+        let want = PathRtt {
+            rtt: ms(40),
+            direct: true,
+        };
+        anyhow::ensure!(rtt == want, "expected {want:?}, got {rtt:?}");
+        let ((), (), rtt) = exchange_within(ms(500), answers(ms(500), ms(120)), async |()| {
+            std::future::pending().await
+        })
+        .await?;
+        let want = PathRtt {
+            rtt: ms(120),
+            direct: false,
+        };
+        anyhow::ensure!(rtt == want, "expected {want:?}, got {rtt:?}");
         Ok(())
     }
 
     #[tokio::test(start_paused = true)]
     async fn an_exchange_past_the_budget_times_out() -> anyhow::Result<()> {
-        let err = exchange_within(
-            Duration::from_millis(500),
-            answers(Duration::from_millis(600), Duration::from_millis(1)),
-            async |()| Some(Duration::from_millis(1)),
-        )
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("an exchange past the budget must fail"))?;
+        let err = exchange_within(ms(500), answers(ms(600), ms(1)), async |()| Some(ms(1)))
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("an exchange past the budget must fail"))?;
         anyhow::ensure!(
             err.to_string().contains("probe timed out after 500 ms"),
             "expected the timeout, got: {err}"
+        );
+        Ok(())
+    }
+
+    /// Callers tell a peer that sheds the probe from an unreachable one by
+    /// downcasting the error, so the helper must pass an exchange error on
+    /// unwrapped.
+    #[tokio::test(start_paused = true)]
+    async fn an_exchange_error_keeps_the_rate_limit_sentinel() -> anyhow::Result<()> {
+        let err = exchange_within(
+            ms(500),
+            async {
+                Err::<((), (), Duration), _>(anyhow::Error::new(crate::UpstreamRateLimited {
+                    label: None,
+                }))
+            },
+            async |()| Some(ms(1)),
+        )
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("an exchange error must fail the probe"))?;
+        anyhow::ensure!(
+            err.downcast_ref::<crate::UpstreamRateLimited>().is_some(),
+            "expected the rate-limit sentinel, got: {err}"
         );
         Ok(())
     }
