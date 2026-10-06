@@ -596,6 +596,17 @@ async fn accepted_on_pool(node: &NodeFixture, pool_id: B256) -> anyhow::Result<u
         .unwrap_or(0))
 }
 
+/// Whether the node has accepted a voucher on any lane of `pool_id` since it
+/// started, from its admin `lanes()` surface.
+async fn voucher_seen_on_pool(node: &NodeFixture, pool_id: B256) -> anyhow::Result<bool> {
+    let wanted = format!("{pool_id}");
+    let resp = node.admin_client()?.lanes().await.context("admin lanes")?;
+    Ok(resp
+        .lanes
+        .iter()
+        .any(|l| l.pool_id.eq_ignore_ascii_case(&wanted) && l.seconds_since_last_voucher.is_some()))
+}
+
 /// A fresh 0o700 keystore directory for one role, returning the directory, the
 /// keystore path, and the key's address.
 fn new_keystore(role: &str) -> anyhow::Result<(tempfile::TempDir, std::path::PathBuf, Address)> {
@@ -752,10 +763,11 @@ async fn run_clamp() -> anyhow::Result<()> {
         )
         .await;
         let succeeded = matches!(&fetched, Ok(Ok(o)) if o.status.success());
-        // Retry only while the node has served nothing on the pool: a fetch that
-        // ran before the node saw the fresh pool. Once the node accepted a
-        // voucher, the outcome stands.
-        if succeeded || accepted_on_pool(&node, pool_id).await? > 0 {
+        // Retry only while the node has accepted no voucher on the pool: a fetch
+        // that ran before the node saw the fresh pool. Once the node accepted a
+        // voucher, the outcome stands; a later fetch meets a drained signer,
+        // which the node refuses at admission.
+        if succeeded || voucher_seen_on_pool(&node, pool_id).await? {
             break;
         }
         anyhow::ensure!(
