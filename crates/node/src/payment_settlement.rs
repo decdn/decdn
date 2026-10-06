@@ -3201,8 +3201,8 @@ mod tests {
 
     /// An unregistered signer (`cap == 0 && expiry == 0`) is unconstrained — it
     /// has spent nothing on-chain and admits on its presented capability — and a
-    /// second call within the TTL is served from cache with no further
-    /// `getAuthorization`.
+    /// second call within [`UNREGISTERED_AUTH_TTL`] is served from cache with no
+    /// further `getAuthorization`.
     #[tokio::test]
     async fn unregistered_signer_is_unconstrained_and_cached() -> Result<()> {
         use crate::pool_view::PoolView;
@@ -3934,7 +3934,7 @@ mod tests {
         assert_eq!(cache.len(), AUTH_CACHE_MAX, "a held key replaces in place");
     }
 
-    /// A second call within `SIGNER_AUTH_TTL` is served from cache, consuming no
+    /// A second call for a `Registered` signer is served from cache, consuming no
     /// further `getAuthorization` (proven by the single queued response and a
     /// `Some` result on the second call).
     #[tokio::test]
@@ -3964,7 +3964,7 @@ mod tests {
         assert_eq!(
             asserter.read_q().len(),
             0,
-            "no second getAuthorization within the TTL"
+            "a registered read answers with no second getAuthorization"
         );
         Ok(())
     }
