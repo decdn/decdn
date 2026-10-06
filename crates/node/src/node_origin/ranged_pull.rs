@@ -343,7 +343,7 @@ pub(crate) fn uncovered(gap: &ChunkRanges, total_bytes: u64, coverage: &[Coverag
 
 /// Plan `gap` into covered runs over the `ranked` candidate indices, returning
 /// the runs and the part of the gap none of them covers.
-fn plan_over(
+pub(super) fn plan_over(
     gap: &ChunkRanges,
     total_bytes: u64,
     coverage: &[Coverage],
