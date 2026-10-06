@@ -26,7 +26,7 @@ contract Ed25519VerifierTest is Test {
     // ===================================================================
     // AUTO-GENERATED — do not edit by hand.
     // Source: contracts/test/ed25519-vectors  (cargo run -- --write)
-    // Reference: ed25519-dalek 2.2.0 / curve25519-dalek 4.1.3
+    // Reference: ed25519-dalek 3.0.0 / curve25519-dalek 5.0.0
     // ===================================================================
 
     // The 8 canonical small-order encodings (order divides cofactor 8).
