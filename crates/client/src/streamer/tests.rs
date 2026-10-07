@@ -55,14 +55,9 @@ fn streamer<S: BlobSource>(
 ) -> anyhow::Result<Streamer<'_, StaticSources<S>, FakeFunder>> {
     let sources = StaticSources::new(candidates)?;
     let holders = sources.holders();
-    Ok(Streamer::new(
-        sources,
-        holders,
-        Arc::default(),
-        funder(),
-        drive_config(),
-        scratch,
-    ))
+    Ok(Streamer::new(sources, funder(), scratch)
+        .holders(holders)
+        .drive_config(drive_config()))
 }
 
 /// The stop a script gets: give up after [`crate::SCRIPT_GIVE_UP`].
@@ -307,7 +302,7 @@ async fn tampered_tail_fails_and_never_yields_unverified() -> anyhow::Result<()>
         .ok_or_else(|| anyhow::anyhow!("a tampered tail must surface as a read error, not EOF"))?;
     // The reader flattens the drive's error into its message.
     let gave_up = crate::GaveUp {
-        idle: crate::SCRIPT_GIVE_UP,
+        idle: crate::stop::SCRIPT_GIVE_UP,
     };
     anyhow::ensure!(
         err.to_string().contains(&gave_up.to_string()),

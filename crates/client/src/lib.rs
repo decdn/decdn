@@ -12,9 +12,8 @@
 //! |---|---|
 //! | Save one blob, or a set of blobs, to files as fast as possible, and resume a partial download | [`Downloader`] |
 //! | Read one blob in order, and pay only for what your reader reaches | [`Streamer`] |
-//! | Drive the pull loop yourself (a node, or a custom scheduler) | [`driver::drive`], [`acquire`], [`first_open()`], [`open_progressive_pull`] |
 //!
-//! Most callers want one of the two faces. The [`Downloader`] stripes a blob
+//! The [`Downloader`] stripes a blob
 //! across every holder at once, and writes each verified range at its offset in
 //! a `.partial` file beside the destination. A rerun fetches only the ranges
 //! that file does not hold yet. The [`Streamer`] fetches at most one read-ahead
@@ -43,16 +42,20 @@
 //!    whose `has_blob` and coverage disagree. A probe answer's size
 //!    ([`discovery::Probed::total_bytes`]) is an unsigned hint: pass it as the
 //!    fetch's first size claim, which the fetch grows or shrinks as verified
-//!    bytes land. Without one, open one pull and read its header
-//!    ([`first_open()`] does this with recovery).
+//!    bytes land.
 //! 5. **Build one lane per holder.** Pin a [`PoolContext`] to the holder's
 //!    provider address with [`buyer_pool::self_owned_lane_ctx`], resuming at
-//!    what the lane has already paid. Create its ledger with
+//!    what the lane has already paid, and bind it to your endpoint
+//!    ([`PoolContext::bind_endpoint`]). A node that misses the blob in its
+//!    cache serves an unbound lane nothing. Create its ledger with
 //!    [`PoolContext::new_ledger`], and wrap both in a [`PeerSource`] inside a
-//!    [`StreamCandidate`]. Cap the lane's rate at the rate the node signed in
-//!    its probe answer ([`effective_rate_ceiling`]).
+//!    [`StreamCandidate::new`]. Cap the lane's rate at the rate the node signed
+//!    in its probe answer ([`effective_rate_ceiling`]). A lane that pays under a
+//!    delegated capability also checks its signer
+//!    ([`PeerSource::with_signer_check`]).
 //! 6. **Fetch** with [`Downloader::fetch_to_paths`] or [`Streamer::open`], over
-//!    a [`StaticSources`] of the lanes and its [`StaticSources::holders`].
+//!    a [`StaticSources`] of the lanes. Every lane streams at once unless
+//!    [`Downloader::max_lanes`] caps it.
 //! 7. **Record what each lane paid**, whatever the outcome: build a
 //!    [`VoucherProgress`] from the ledger's settlement, and apply the
 //!    [`buyer_pool::ProgressWrite`] it calls for to the buyer store.
@@ -72,7 +75,7 @@
 //!   refused before any payment ([`RateAboveCeiling`]).
 //! - **Recovery is free.** Every lane draws on one shared pool. A source that
 //!   faults cools and returns, and its range goes to another holder meanwhile.
-//!   [`acquire`] ends on done, a fatal fault, or the stop policy
+//!   A fetch ends on done, a fatal fault, or the stop policy
 //!   ([`StopPolicy`]). No delivered byte is fetched or paid for twice.
 //!
 //! # What stays yours
@@ -80,11 +83,14 @@
 //! - **Persistence.** The faces never write the buyer store. Record every
 //!   lane's payment after each fetch (step 7). A lane you do not record resumes
 //!   from a stale watermark next time, and its provider rejects the vouchers.
-//! - **Funding policy.** A [`source::Funder`] decides whether a fetch that runs
-//!   the pool low tops it up. One whose [`max_topups`](source::Funder::max_topups)
-//!   is `0` never does. A source whose next voucher the deposit cannot cover
-//!   then waits for the deposit to rise, and once every known source waits
-//!   the fetch fails with a [`NoAffordableSource`].
+//! - **Funding policy.** Reactive top-up is off until you give a face a
+//!   working deposit ([`Downloader::working_deposit`],
+//!   [`Streamer::working_deposit`]). A [`Funder`] then decides whether a fetch
+//!   that runs the pool low tops it up. One whose
+//!   [`max_topups`](Funder::max_topups) is `0` never does. A source whose next
+//!   voucher the deposit cannot cover then waits for the deposit to rise, and
+//!   once every known source waits the fetch fails with a
+//!   [`NoAffordableSource`].
 //! - **Which holders to use.** Discovery gives candidates; ordering and
 //!   admission ([`discovery::admit_sources`]) are the caller's choice.
 //!
@@ -110,19 +116,25 @@
 //!
 //! # How delivery works
 //!
-//! [`open_progressive_pull`] sends a [`StreamRequest`], verifies the signed
-//! [`StreamResponse`], and returns an [`UpstreamPull`]: the one receive loop.
-//! It reads `ChunkData` and pays as it goes. It releases one hash-chain preimage
-//! per delivered `CHUNK_BYTES` chunk, and signs a voucher to open a chain, to
-//! roll one, and to settle a residual shorter than a chunk.
+//! Each lane sends a [`StreamRequest`], verifies the signed [`StreamResponse`],
+//! and then reads `ChunkData` and pays as it goes. It releases one hash-chain
+//! preimage per delivered `CHUNK_BYTES` chunk, and signs a voucher to open a
+//! chain, to roll one, and to settle a residual shorter than a chunk.
 //!
 //! The `ChunkData` payload is bao's interleaved verified-stream encoding, not
 //! raw bytes. Every consumer feeds it to a `bao-tree` verifying decoder as it
-//! arrives, through a [`sink::PullReader`] over the live pull: the ranged
-//! store's [`ClientRangedStore::ingest_stream`], the node's cache admit, or the
-//! `test-util` in-memory decoder. The decoder checks every chunk group against
-//! the requested root. A range fetched from any offset therefore verifies on
-//! its own, with no dependency on earlier bytes (ADR 038).
+//! arrives. The decoder checks every chunk group against the requested root. A
+//! range fetched from any offset therefore verifies on its own, with no
+//! dependency on earlier bytes (ADR 038).
+//!
+//! # Stability
+//!
+//! The documented items are the SDK, and the public-API snapshot in
+//! `tests/public_api.rs` guards them. Their enums and the error types a fetch
+//! returns are `#[non_exhaustive]`, so a new variant or field is not a
+//! breaking change. Items hidden from these docs are the pull engine's seams
+//! that the node and the `decdn` CLI drive directly. They carry no stability
+//! promise.
 
 /// Buyer-side `PaymentPool` open kernel (#940), shared by the node service
 /// and the CLI.
@@ -147,8 +159,8 @@ pub(crate) mod coverage_plan;
 pub mod discovery;
 /// The `Downloader` consumption face (#1848): fetch a set of content-addressed
 /// blobs (a bundle, or a single blob) to files in a directory, out-of-order and
-/// at full throughput, reusing [`ClientRangedStore`] + [`driver::drive`] so every
-/// byte is bao-verified and a resumed fetch re-pulls only the missing ranges.
+/// at full throughput, so every byte is bao-verified and a resumed fetch
+/// re-pulls only the missing ranges.
 pub mod downloader;
 /// The #1608 gap-driven fetch driver: [`driver::drive`] fills only the
 /// [`missing_ranges`](decdn_bao_range::RangedStore::missing_ranges) of a request,
@@ -161,22 +173,27 @@ pub mod endpoint;
 /// What a failed lane, lane build, or discovery means for the acquire loop
 /// (ADR 039 § Failure handling: reassign-only tail): a pure classifier over
 /// `anyhow::Error`.
+#[doc(hidden)]
 pub mod fault;
 mod first_open;
 /// Command-wide health of each provider (ADR 039 § Failure handling:
 /// reassign-only tail): cooling backoff on a delivery fault, parking on an
 /// unaffordable price.
+#[doc(hidden)]
 pub mod health;
 mod ledger;
 /// Run-scoped registry of live per-lane voucher ledgers:
 /// [`ledgers::LaneLedgers`] maps each `(pool_id, signer, provider)` lane to
 /// the one [`ledgers::LaneHandle`] every concurrent fetch on that lane shares.
+#[doc(hidden)]
 pub mod ledgers;
 /// The pure pacing axis (#1608): [`pacer::Pacer`] / [`pacer::BudgetPacer`] decide
 /// draw / top-up / wait / done / refuse for the gap-driven driver, with no I/O.
+#[doc(hidden)]
 pub mod pacer;
 /// Persisted per-peer knowledge base: registry-fed identity plus interaction-fed
 /// latency and price, keyed by iroh [`iroh::PublicKey`], one JSON file per peer.
+#[doc(hidden)]
 pub mod peer_store;
 /// Reusable `cdn/probe/v1` client.
 pub mod probe;
@@ -188,6 +205,7 @@ mod progress;
 pub mod provider;
 /// Client-side [`decdn_bao_range::RangedStore`] backend (#1621): a
 /// `.partial` + sidecar store built on `bao-tree`/`decdn-bao-range` only.
+#[doc(hidden)]
 pub mod ranged_store;
 /// The `APP_ERR_RATE_LIMITED` (`0x10`) transport shed, typed for the pull
 /// orchestrator (ADR 013 §Application Error Codes).
@@ -219,41 +237,66 @@ pub mod source;
 /// [`source_set::SourceProvider`] seam.
 pub mod source_set;
 
+// The SDK surface: the two faces, the setup sequence the crate guide walks
+// through, and every type their signatures name.
 pub use config::PullConfig;
-pub use connection::{Connections, WarmConnection};
-pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
-pub use decdn_bao_range::RangedStore;
+pub use connection::Connections;
 pub use downloader::{DownloadTarget, Downloader};
+pub use driver::PoolExhausted;
+pub use ledger::{Cumulative, PoolLedger};
+pub use sink::{BlobCache, NoCache, SinkFuture};
+pub use source::{Funder, PeerSource, SignerCapDrained, SignerRegistry, SourceFuture};
+pub use source_set::{
+    Holder, NoAffordableSource, NoSourceHasBlob, NoSourceServesSigner, StaticSources,
+};
+pub use stop::{ClockHold, GaveUp, ProgressClock, StopPolicy};
+pub use streamer::{LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader};
+
+// The engine seams the node and the `decdn` CLI drive directly. They are
+// public so those crates can reach them, hidden from the docs and the
+// public-API snapshot, and carry no stability promise.
+#[doc(hidden)]
+pub use connection::WarmConnection;
+#[doc(hidden)]
+pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
+#[doc(hidden)]
+pub use decdn_bao_range::RangedStore;
+#[doc(hidden)]
 pub use driver::{
-    LegNoProgress, PacingWait, PoolExhausted, SharedPool, WaitReason, drive, first_leg,
+    DriveConfig, LegNoProgress, PacingWait, SharedPool, WaitReason, drive, first_leg,
 };
+#[doc(hidden)]
 pub use fault::{FatalScope, Fault, HealExhausted, LaneBuildFault, classify};
+#[doc(hidden)]
 pub use first_open::first_open;
+#[doc(hidden)]
 pub use health::{Health, PeerHealth};
-pub use ledger::{ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Rebase, Released};
+#[doc(hidden)]
+pub use ledger::{ChainCommit, EpochAction, Metered, Rebase, Released};
+#[doc(hidden)]
 pub use ledgers::{LaneHandle, LaneLedgers};
+#[doc(hidden)]
 pub use pacer::{
-    BudgetPacer, DownstreamFrontier, MIN_DRAW_WINDOW, PULL_WINDOW_FLOOR, PaceDecision, PaceState,
-    Pacer, RampPacer, WindowPacer,
+    BudgetPacer, DownstreamFrontier, PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, RampPacer,
+    WindowPacer,
 };
+#[doc(hidden)]
 pub use peer_store::{PeerRecord, PeerStore, StoreConfig};
+#[doc(hidden)]
 pub use ranged_store::ClientRangedStore;
+#[doc(hidden)]
 pub use rate_limited::UpstreamRateLimited;
+#[doc(hidden)]
 pub use scheduler::{
     AcquireEnv, AcquireTarget, ConsumptionPacing, GROWTH_RETRY, GrowFor, LANE_WATCHDOG, LaneLease,
     LaneWiden, acquire,
 };
-pub use sink::{BlobCache, NoCache, SinkFuture};
+#[doc(hidden)]
 pub use source::{
-    BaoRangeReader, BlobSource, Funder, IngestEnd, IngestFuture, IngestStore, PRIMED_MAX_IDLE,
-    PeerSource, PrimedSource, SignerCapDrained, SignerRegistry, SourceFuture, SourceStream,
+    BaoRangeReader, BlobSource, IngestEnd, IngestFuture, IngestStore, PrimedSource, SourceStream,
 };
-pub use source_set::{
-    Holder, LaneRange, NoAffordableSource, NoSourceHasBlob, NoSourceServesSigner, SourceProvider,
-    SourceSet, StaticSources,
-};
-pub use stop::{ClockHold, GaveUp, ProgressClock, SCRIPT_GIVE_UP, StopPolicy};
-pub use streamer::{LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader};
+#[doc(hidden)]
+pub use source_set::{LaneRange, SourceProvider, SourceSet};
 
 pub(crate) use ledger::StreamProof;
 
@@ -308,7 +351,11 @@ use sink::{PullReader, StashedFault};
 /// non-zero after the first stream. Starting a fresh stream from zero would be
 /// rejected (`AmountRegression` / `BytesRegression`). For a brand-new lane pass
 /// `U256::ZERO` for both.
+///
+/// Build one with [`Self::new`] or [`Self::for_pool`], then pin it with
+/// [`Self::with_provider`] and bind it with [`Self::bind_endpoint`].
 #[derive(Clone)]
+#[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct PoolContext {
     /// On-chain `poolId` the vouchers draw from.
     pub pool_id: B256,
@@ -349,25 +396,25 @@ pub struct PoolContext {
 }
 
 impl PoolContext {
-    /// Build a context for a buyer-held pool, resuming from its persisted
-    /// cumulative voucher state on the `(signer, provider)` lane (#744). Pass the
-    /// `provider` this stream pays and the lane's prior `(bytes, amount)` so the
-    /// next voucher continues the lane rather than restarting from zero (which
-    /// the upstream node would reject). For a freshly-opened pool with an
-    /// untouched lane, pass `U256::ZERO` for both priors — [`Self::for_pool`]
-    /// does exactly that.
+    /// A context that signs vouchers on `pool_id` with `client_signer` under
+    /// `voucher_domain`, against a deposit of `deposit`. It pays no provider
+    /// yet, starts its lane at zero, and carries no binding or capability:
+    /// [`Self::with_provider`], [`Self::bind_endpoint`] and
+    /// [`Self::with_capability`] add each. A delegated signer, which holds no
+    /// pool row of its own, starts here.
     #[must_use]
-    pub const fn for_pool(
-        state: &BuyerPoolState,
+    pub const fn new(
+        pool_id: B256,
+        deposit: U256,
         client_signer: Arc<PrivateKeySigner>,
         voucher_domain: Eip712Domain,
     ) -> Self {
         Self {
-            pool_id: state.pool_id,
+            pool_id,
             // A pool fans out to many providers; the fetch target is pinned
             // per-pull via [`Self::with_provider`], not stored in the pool.
             provider: Address::ZERO,
-            deposit: state.deposit,
+            deposit,
             client_signer,
             voucher_domain,
             prior_bytes_delivered: U256::ZERO,
@@ -375,6 +422,17 @@ impl PoolContext {
             client_binding: None,
             capability: None,
         }
+    }
+
+    /// [`Self::new`] for a pool the buyer store records: its `pool_id` and
+    /// committed deposit.
+    #[must_use]
+    pub const fn for_pool(
+        state: &BuyerPoolState,
+        client_signer: Arc<PrivateKeySigner>,
+        voucher_domain: Eip712Domain,
+    ) -> Self {
+        Self::new(state.pool_id, state.deposit, client_signer, voucher_domain)
     }
 
     /// Pin the delivering node this context pays (the voucher's `provider`) and
@@ -422,8 +480,9 @@ impl PoolContext {
 
     /// Attach an ADR 005 client identity binding so this context's
     /// `cdn/client/v1` requests prove pool ownership to the serving node,
-    /// enabling reactive cache-miss origin pull-through (#1115). Pass a binding
-    /// produced by [`sign_client_binding`]; a hand-built `ClientBinding` whose
+    /// enabling reactive cache-miss origin pull-through (#1115).
+    /// [`Self::bind_endpoint`] signs and attaches one in a single call. A
+    /// hand-built `ClientBinding` whose
     /// `ethereum_address` and signature don't correspond (or that doesn't own the
     /// pool) is rejected by the serving node, so this only ever hurts the caller
     /// itself.
@@ -431,6 +490,24 @@ impl PoolContext {
     pub fn with_client_binding(mut self, binding: ClientBinding) -> Self {
         self.client_binding = Some(binding);
         self
+    }
+
+    /// Bind `endpoint` to this context's signer, so a node that misses the blob
+    /// in its cache may pull it from its origin for this buyer. Without a
+    /// binding, such a node refuses the open as `NotFound`. `bind_domain` is
+    /// `decdn_incentive::bind_node_id_domain(chain_id, capacity_bond)`.
+    ///
+    /// # Errors
+    ///
+    /// A signing error from `client_signer`.
+    pub fn bind_endpoint(
+        self,
+        endpoint: &Endpoint,
+        bind_domain: &Eip712Domain,
+    ) -> anyhow::Result<Self> {
+        let own_node_id = B256::from(*endpoint.id().as_bytes());
+        let binding = sign_client_binding(&self.client_signer, own_node_id, bind_domain)?;
+        Ok(self.with_client_binding(binding))
     }
 
     /// Attach a pool owner capability so this context's `cdn/client/v1`
@@ -464,6 +541,7 @@ impl PoolContext {
 /// # Errors
 ///
 /// Propagates a signing error from the buyer signer.
+#[doc(hidden)]
 pub fn sign_client_binding(
     signer: &PrivateKeySigner,
     own_node_id: B256,
@@ -682,6 +760,7 @@ pub(crate) fn reject_empty_claim_for_nonempty_root(
 /// present and no leg proved a size within it. Every one is a faithful "the
 /// byte position crossed the ceiling" report.
 #[derive(Debug)]
+#[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct BlobTooLarge {
     /// The byte position that crossed `ceiling` — wire bytes taken off the stream
     /// (receive loop), the store's content frontier (gap-driven driver), or a
@@ -710,6 +789,7 @@ pub struct BlobTooLarge {
 /// [`Fault::Source`]: the source cools and its range
 /// moves to other sources.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct ResumeOffsetPastEnd {
     /// Whole-blob size the node signed for.
     pub total_bytes: u64,
@@ -883,6 +963,7 @@ pub const fn effective_rate_ceiling(probe_relative: u64, config_absolute: u64) -
 /// `buyer_side_sentinels_survive_anyhow_downcast` in `decdn-node`'s `node_origin.rs`,
 /// not in this crate.
 #[derive(Debug)]
+#[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct PullTimeout {
     /// How long the pull ran before the budget elapsed.
     pub after: Duration,
@@ -922,6 +1003,7 @@ impl std::error::Error for PullTimeout {}
 /// watermark-gated (no bundle is ever attached) and are always terminal —
 /// the fix is a fresh capability or an owner top-up, not a resync.
 #[derive(Debug)]
+#[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct UpstreamVoucherRejected {
     /// Why the seller refused the voucher.
     pub reason: VoucherRejectReason,
@@ -1187,6 +1269,7 @@ impl std::error::Error for UpstreamRefused {}
 /// review). Without that split, a 1 GiB blob off a cold disk would score an honest server as
 /// unreachable for the crime of being big.
 #[derive(Debug)]
+#[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct PullStalled {
     /// The inactivity budget that elapsed after bytes had been flowing.
     pub after: Duration,
@@ -1231,6 +1314,7 @@ impl std::error::Error for PullStalled {}
 ///
 /// It is a marker, so it composes: `.context(LocalPullFault)` on any error.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct LocalPullFault;
 
 impl std::fmt::Display for LocalPullFault {
@@ -1307,6 +1391,7 @@ pub struct PullDeadlines {
 /// A [`PullDeadlines`] whose bounds cannot do their job. Carries the values so a CLI
 /// can render the arithmetic back to the user rather than just saying "invalid".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeadlineError {
     /// A zero budget elapses on its first poll, so the stage it bounds can never run.
     ZeroBudget,
@@ -1918,6 +2003,7 @@ async fn open_stream(
 /// Public because the STREAMING fetch (#1120) drives its own reopen loop — it
 /// owns the output file and must rewind it before each retry, which this crate
 /// cannot do for it — and both loops must agree on the bound.
+#[doc(hidden)]
 pub const MAX_RESUME_ATTEMPTS: u32 = 3;
 
 /// Reactive graduation (#1497): the maximum number of times the STREAMING fetch
@@ -1930,6 +2016,7 @@ pub const MAX_RESUME_ATTEMPTS: u32 = 3;
 /// cannot fund, an allowance that fails to land), not a wallet-less resume, so
 /// it is bounded on its own budget rather than sharing/competing with the resume
 /// attempts.
+#[doc(hidden)]
 pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
 
 /// In-memory fetch with wallet-less resume (issue #1481 §5): if a mid-stream
@@ -2656,6 +2743,7 @@ fn frontier_is_proved(bundle: &WatermarkBundle) -> bool {
 /// knows about a voucher we do not, which reseeding can heal. A bundle that merely echoes back
 /// our OWN already-committed watermark (at or behind `committed`) proves nothing about desync;
 /// it is the node correctly reporting the state we already agree on, and the exhaustion is real.
+#[doc(hidden)]
 pub fn genuine_exhaustion(
     err: &anyhow::Error,
     ctx: &PoolContext,
@@ -2709,6 +2797,7 @@ pub fn genuine_exhaustion(
 /// Everything else — stalls, resets, hash mismatches, local flush failures — must
 /// NOT qualify. Those say nothing about the offset.
 #[must_use]
+#[doc(hidden)]
 pub fn resume_may_be_stale(err: &anyhow::Error) -> bool {
     if err.downcast_ref::<ResumeOffsetPastEnd>().is_some() {
         return true;
@@ -2739,7 +2828,7 @@ pub fn resume_may_be_stale(err: &anyhow::Error) -> bool {
 /// how much a (possibly lying) node can make us escrow, so trusting the owner-only
 /// refusal is money-safe.
 #[must_use]
-pub fn is_insufficient_deposit(err: &anyhow::Error) -> bool {
+pub(crate) fn is_insufficient_deposit(err: &anyhow::Error) -> bool {
     err.downcast_ref::<UpstreamRefused>()
         .is_some_and(|refused| {
             matches!(refused.error(), StreamError::InsufficientDeposit)
@@ -2760,6 +2849,7 @@ pub fn is_insufficient_deposit(err: &anyhow::Error) -> bool {
 /// asks for the whole blob on these, and treats every other failure as the
 /// open's own outcome (#2063).
 #[must_use]
+#[doc(hidden)]
 pub fn is_range_past_end(err: &anyhow::Error) -> bool {
     let refused_not_found = err
         .downcast_ref::<UpstreamRefused>()
@@ -2874,6 +2964,7 @@ fn log_proof_stall(
 /// (#856) knows `total_bytes` up front — it must sign its OWN downstream
 /// `StreamResponse` (which commits to a `total_bytes`) before forwarding a byte.
 #[derive(Debug, Clone, Copy)]
+#[doc(hidden)]
 pub struct UpstreamPullHeader {
     /// Whole-blob size the upstream promised (echoed into our downstream
     /// `StreamResponse`).
@@ -2927,6 +3018,7 @@ pub struct UpstreamPullHeader {
 /// stream blobs of any size, so any fixed deadline would either kill a healthy
 /// large transfer or be too loose to catch a dead one. A byte-throughput floor is
 /// indifferent to size and link speed, and frame-size-independent.
+#[doc(hidden)]
 pub struct UpstreamPull {
     conn: iroh::endpoint::Connection,
     /// What this pull owns of its connection: a one-shot dial it closes on its
@@ -3052,6 +3144,7 @@ impl std::fmt::Debug for UpstreamPull {
         byte_len = byte_len,
     )
 )]
+#[doc(hidden)]
 pub async fn open_progressive_pull(
     endpoint: &Endpoint,
     target: EndpointAddr,

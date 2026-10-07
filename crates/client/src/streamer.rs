@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use alloy::primitives::U256;
 use anyhow::Context as _;
 use bytes::Bytes;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -165,6 +166,10 @@ impl PacingWait for ConsumedWait {
 /// from another lane meanwhile, resuming from the store's verified frontier so
 /// no delivered byte is re-pulled or re-paid. Every lane names a distinct
 /// on-chain provider (one voucher stream per `(signer, provider)` lane).
+///
+/// Build one with [`Self::new`], and set [`Self::coverage`] for a partial
+/// holder.
+#[non_exhaustive]
 pub struct StreamCandidate<S> {
     /// The paid source — one provider's `cdn/client/v1` requester.
     pub source: S,
@@ -187,6 +192,7 @@ pub struct StreamCandidate<S> {
     /// lane's own worker ends; it is released at the latest when the fetch
     /// returns. Like `coverage`, set it only on a single-target fetch: the
     /// first target's fetch releases it.
+    #[doc(hidden)]
     pub lease: LaneLease,
     /// How this lane takes a stream beyond its `lease` ([`crate::LaneWiden`]),
     /// or `None` to stay at one stream: an extra stream for each queued range
@@ -194,7 +200,24 @@ pub struct StreamCandidate<S> {
     /// it gave its `lease` back. Each granted stream is given back as its
     /// worker stops, so it serves every target of a [`crate::Downloader`]
     /// alike.
+    #[doc(hidden)]
     pub widen: Option<crate::LaneWiden>,
+}
+
+impl<S> StreamCandidate<S> {
+    /// A whole-blob holder's lane: `source` paid from `ctx` through `ledger`,
+    /// holding no lease and staying at one stream.
+    #[must_use]
+    pub fn new(source: S, ctx: Arc<Mutex<PoolContext>>, ledger: Arc<PoolLedger>) -> Self {
+        Self {
+            source,
+            ctx,
+            ledger,
+            coverage: None,
+            lease: LaneLease::default(),
+            widen: None,
+        }
+    }
 }
 
 impl<S> std::fmt::Debug for StreamCandidate<S> {
@@ -335,10 +358,10 @@ where
 /// use std::path::Path;
 /// use std::sync::Arc;
 ///
-/// use decdn_client::driver::DriveConfig;
-/// use decdn_client::source::{BlobSource, Funder};
+/// use decdn_client::source::BlobSource;
 /// use decdn_client::{
-///     NoCache, ProgressClock, PullConfig, StaticSources, StopPolicy, StreamCandidate, Streamer,
+///     Funder, NoCache, ProgressClock, PullConfig, StaticSources, StopPolicy, StreamCandidate,
+///     Streamer,
 /// };
 ///
 /// async fn stream<S: BlobSource, F: Funder>(
@@ -348,10 +371,7 @@ where
 ///     total_bytes: u64,
 ///     scratch: &Path,
 /// ) -> anyhow::Result<()> {
-///     let sources = StaticSources::new(candidates)?;
-///     let holders = sources.holders();
-///     let drive = DriveConfig::cli(Default::default());
-///     let streamer = Streamer::new(sources, holders, Default::default(), funder, drive, scratch);
+///     let streamer = Streamer::new(StaticSources::new(candidates)?, funder, scratch);
 ///     let stop = StopPolicy::new(true, None, Arc::new(ProgressClock::new()));
 ///     let (mut reader, mut drive) = streamer
 ///         .open(hash, total_bytes, &PullConfig::new(), Arc::new(NoCache), stop)
@@ -389,27 +409,58 @@ impl<P, F> std::fmt::Debug for Streamer<'_, P, F> {
 }
 
 impl<'a, P, F> Streamer<'a, P, F> {
-    /// Build a streamer over `holders`, whose lanes `provider` builds, filling
-    /// into `scratch`. `health` is the command-wide health the stream's sources
-    /// record into.
+    /// Build a streamer whose holders and lanes `provider` finds and builds,
+    /// funded through `funder`, filling into `scratch`.
+    ///
+    /// The stream starts by discovering its holders, and reactive top-up is
+    /// off. The builder methods change both.
     #[must_use]
-    pub const fn new(
-        provider: P,
-        holders: Vec<Holder>,
-        health: Arc<PeerHealth>,
-        funder: F,
-        drive_config: DriveConfig,
-        scratch: &'a Path,
-    ) -> Self {
+    pub fn new(provider: P, funder: F, scratch: &'a Path) -> Self {
         Self {
             provider,
-            holders,
-            health,
+            holders: Vec::new(),
+            health: Arc::default(),
             funder,
-            drive_config,
+            drive_config: DriveConfig::cli(U256::ZERO),
             scratch,
             max_blob_bytes: 0,
         }
+    }
+
+    /// Start the stream from `holders`, in preference order, instead of
+    /// discovering them. A probe's measured holders go here.
+    #[must_use]
+    pub fn holders(mut self, holders: Vec<Holder>) -> Self {
+        self.holders = holders;
+        self
+    }
+
+    /// Top the pool up through the funder, back to `working_deposit`, when the
+    /// stream runs the deposit low. `U256::ZERO` turns reactive top-up off: a
+    /// stream the deposit cannot cover then ends with
+    /// [`crate::NoAffordableSource`].
+    #[must_use]
+    pub const fn working_deposit(mut self, working_deposit: U256) -> Self {
+        self.drive_config.working_deposit = working_deposit;
+        self
+    }
+
+    /// Record source faults into `health`, which a command shares across its
+    /// fetches so a holder that faulted on one stays cooled on the next.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn health(mut self, health: Arc<PeerHealth>) -> Self {
+        self.health = health;
+        self
+    }
+
+    /// Replace the whole funding and settle policy, the working deposit
+    /// included.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn drive_config(mut self, drive_config: DriveConfig) -> Self {
+        self.drive_config = drive_config;
+        self
     }
 
     /// Cap the stream at `max_blob_bytes` (`0` for no cap). A size claim above
@@ -646,6 +697,7 @@ impl Drop for StreamDrive<'_> {
 /// An [`AsyncRead`] over a blob's verified contiguous front, clamped to the
 /// verified frontier by construction (it only reads bytes the engine has already
 /// bao-verified). Its cursor paces the paired [`StreamDrive`].
+#[non_exhaustive]
 pub enum VerifiedReader {
     /// A whole-blob cache hit: served straight from memory, no fetch.
     Cached {

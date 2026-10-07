@@ -99,7 +99,6 @@ use super::ordered_writes::OrderedWrites;
 use super::pull_progress::{self, PullProgress};
 use decdn_bao_range::CHUNK_GROUP_BYTES;
 use decdn_client::discovery::{self, NodeCandidate};
-use decdn_client::driver::DriveConfig;
 use decdn_client::endpoint as client_endpoint;
 use decdn_client::provider;
 use decdn_client::{
@@ -2537,23 +2536,20 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             };
             // `--max-sources` caps the lanes the entry stripes across at
             // once; every other holder waits as a reserve.
-            let downloader = Downloader::new(
-                &sources,
-                holders,
-                Arc::clone(&self.health),
-                sources.funder(),
-                DriveConfig::cli(self.chain.working_deposit),
-                self.common.max_sources,
-            )
-            .max_blob_bytes(max_blob_bytes);
-            Box::pin(downloader.fetch_to_paths_until(
+            let downloader = Downloader::new(&sources, sources.funder())
+                .holders(holders)
+                .health(Arc::clone(&self.health))
+                .working_deposit(self.chain.working_deposit)
+                .max_lanes(self.common.max_sources)
+                .max_blob_bytes(max_blob_bytes);
+            Box::pin(downloader.fetch_to_paths_shared(
                 &[DownloadTarget {
                     hash,
                     total_bytes,
                     dest: staging,
                     ranges,
                 }],
-                Some(&self.ledgers),
+                &self.ledgers,
                 progress,
                 &self.stop,
             ))

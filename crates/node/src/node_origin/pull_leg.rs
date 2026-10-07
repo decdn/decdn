@@ -1691,22 +1691,16 @@ impl Funder for NullFunder {
 /// resume. `U256::MAX` is used, not a merely-large value, so no blob size can ever
 /// bring the gap headroom below the (zero) voucher cost.
 fn local_bookkeeping_ctx() -> PoolContext {
-    PoolContext {
-        pool_id: B256::ZERO,
-        // No provider is paid: rate 0 means no voucher is ever signed, so the
-        // ZERO-provider signing guard is never reached on this local leg.
-        provider: Address::ZERO,
-        deposit: U256::MAX,
-        client_signer: Arc::new(PrivateKeySigner::random()),
-        // Chain 0 / zero contract: this domain is never used to sign, because rate
-        // 0 means no voucher is ever produced. It exists only to satisfy the struct.
-        voucher_domain: decdn_incentive::voucher_domain(0, Address::ZERO),
-        prior_bytes_delivered: U256::ZERO,
-        prior_amount: U256::ZERO,
-        // No chain either: rate 0 means nothing is ever metered on this leg.
-        client_binding: None,
-        capability: None,
-    }
+    // No provider is paid: rate 0 means no voucher is ever signed, so the
+    // ZERO-provider signing guard is never reached on this local leg. Chain 0 /
+    // zero contract: the domain is never used to sign either. It exists only to
+    // build the context.
+    PoolContext::new(
+        B256::ZERO,
+        U256::MAX,
+        Arc::new(PrivateKeySigner::random()),
+        decdn_incentive::voucher_domain(0, Address::ZERO),
+    )
 }
 
 /// Run the range-minimized OWN-ORIGIN pull for `[offset, offset + len)` of `hash`

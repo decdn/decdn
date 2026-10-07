@@ -43,7 +43,6 @@ use decdn_client::buyer_pool::{
     ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool, refill_amount,
     self_owned_lane_ctx, top_up, topped_up_effect,
 };
-use decdn_client::driver::DriveConfig;
 use decdn_client::source::{Funder, SourceFuture};
 use decdn_client::{
     Connections, Cumulative, DownloadTarget, Downloader, Holder, LaneHandle, LaneLedgers,
@@ -1791,6 +1790,7 @@ fn persist_watermark(
     let label = match write {
         ProgressWrite::Rebase { .. } => "rebased",
         ProgressWrite::Advance { .. } => "advanced",
+        _ => "recorded",
     };
     let outcome = write.apply(store, owner, pool_id, lane);
     // A non-`Advanced` outcome (unknown pool / replaced owner slot / regression)
@@ -2590,22 +2590,17 @@ where
         ..PullConfig::new()
     };
     let funder = sources.funder();
-    let drive_config = DriveConfig::cli(deps.chain.working_deposit);
 
     // The fill store's `.partial` lives here for the stream's lifetime; a streamed
     // blob is not kept, so a temp dir (removed on drop) under the data dir is its
     // natural home.
     let scratch = tempfile::tempdir_in(&deps.chain.data_dir)
         .map_err(|e| anyhow::anyhow!("open stream scratch dir: {e}"))?;
-    let streamer = Streamer::new(
-        sources,
-        holders,
-        health,
-        funder,
-        drive_config,
-        scratch.path(),
-    )
-    .max_blob_bytes(deps.max_blob_bytes);
+    let streamer = Streamer::new(sources, funder, scratch.path())
+        .holders(holders)
+        .health(health)
+        .working_deposit(deps.chain.working_deposit)
+        .max_blob_bytes(deps.max_blob_bytes);
     let (mut reader, mut drive) = streamer
         .open(hash, total_bytes, &pull_config, Arc::new(NoCache), stop)
         .await?;
@@ -2682,17 +2677,14 @@ where
         }
         on_bar(received, expected);
     };
-    let downloader = Downloader::new(
-        sources,
-        holders,
-        health,
-        sources.funder(),
-        DriveConfig::cli(deps.chain.working_deposit),
-        max_sources,
-    )
-    .max_blob_bytes(deps.max_blob_bytes);
+    let downloader = Downloader::new(sources, sources.funder())
+        .holders(holders)
+        .health(health)
+        .working_deposit(deps.chain.working_deposit)
+        .max_lanes(max_sources)
+        .max_blob_bytes(deps.max_blob_bytes);
     let result =
-        Box::pin(downloader.fetch_to_paths_until(&[target], None, Some(&on_progress), stop)).await;
+        Box::pin(downloader.fetch_to_paths_until(&[target], Some(&on_progress), stop)).await;
     bar.finish_and_clear();
     result?;
     // The finished file holds exactly the proven size, which can differ from
@@ -3004,7 +2996,7 @@ where
             .await;
             // A failure before any receipt names its cause once: a wallet
             // short of USDC is recorded for the run's closing warning.
-            let ToppedUpPool { credited, tx } = match escrowed {
+            let ToppedUpPool { credited, tx, .. } = match escrowed {
                 Ok(topped_up) => topped_up,
                 Err(err) if err.downcast_ref::<TopUpUnconfirmed>().is_some() => return Err(err),
                 Err(err) => {
@@ -3809,7 +3801,7 @@ where
     }
     .await;
     let err = match escrowed {
-        Ok(ToppedUpPool { credited, tx }) => {
+        Ok(ToppedUpPool { credited, tx, .. }) => {
             // The USDC is escrowed the moment `topUp` mines. A local credit that
             // does not land leaves the deposit untracked, and continuing would
             // fetch on a `state.deposit` that understates the chain — so the

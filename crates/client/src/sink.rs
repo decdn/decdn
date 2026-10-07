@@ -39,6 +39,7 @@ use crate::{HashMismatch, UpstreamPull};
 /// in-memory decoder) checks `fault` first and returns the real error, using the
 /// decoder's complaint only when there is no parked fault.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct PullReader {
     pull: UpstreamPull,
     /// Wire bytes received but not yet consumed by the decoder.
@@ -123,6 +124,7 @@ impl iroh_io::AsyncStreamReader for PullReader {
 /// Public because it is a supertrait of [`crate::source::BaoRangeReader`]: a
 /// [`crate::source::BlobSource`]'s reader must preserve the pull's typed faults
 /// so the gap-driven driver (#1608) surfaces them for scoring.
+#[doc(hidden)]
 pub trait StashedFault {
     /// Take the parked typed fault, if any. Returns `None` on a source whose
     /// bytes carry the whole story (an in-memory buffer, a scripted double).
@@ -208,6 +210,7 @@ pub(crate) fn classify_decode_error(err: DecodeError) -> anyhow::Error {
 /// `0`, or a `total_bytes` of `0`, yields `fetch_start` (nothing paid on this leg
 /// ⇒ resume where it began).
 #[must_use]
+#[doc(hidden)]
 pub fn content_paid_frontier(fetch_start: u64, total_bytes: u64, paid_wire: u64) -> u64 {
     // Wire cost of content `[fetch_start, c)` over the full `total_bytes` tree.
     // `align_range` bound-checks and snaps to groups; `wire_len` is

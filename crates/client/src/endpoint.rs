@@ -95,6 +95,7 @@ pub fn resolve_relays(
 /// are configured, else disabled (the client dials a direct `--addr`). Mirrors
 /// the client commands' prior behaviour, just sourced from the resolved list.
 #[must_use]
+#[doc(hidden)]
 pub fn relay_mode(relays: &[RelayUrl]) -> RelayMode {
     if relays.is_empty() {
         RelayMode::Disabled

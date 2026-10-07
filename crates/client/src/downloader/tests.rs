@@ -61,15 +61,9 @@ fn downloader<S: BlobSource>(
 ) -> anyhow::Result<Downloader<StaticSources<S>, FakeFunder>> {
     let sources = StaticSources::new(candidates)?;
     let holders = sources.holders();
-    let lanes = holders.len();
-    Ok(Downloader::new(
-        sources,
-        holders,
-        Arc::default(),
-        funder(),
-        drive_config(),
-        lanes,
-    ))
+    Ok(Downloader::new(sources, funder())
+        .holders(holders)
+        .drive_config(drive_config()))
 }
 
 /// The lane cap is the caller's, not the holder count: two holders under
@@ -89,14 +83,10 @@ async fn a_downloader_streams_at_most_max_lanes() -> anyhow::Result<()> {
         candidate(src_b, ledger_b, 0xB2),
     ])?;
     let holders = sources.holders();
-    let downloader = Downloader::new(
-        sources,
-        holders,
-        Arc::default(),
-        funder(),
-        drive_config(),
-        1,
-    );
+    let downloader = Downloader::new(sources, funder())
+        .holders(holders)
+        .drive_config(drive_config())
+        .max_lanes(1);
     let dir = tempfile::tempdir()?;
     downloader
         .fetch_to_dir(&[(root, total)], dir.path(), None)
@@ -231,7 +221,6 @@ async fn fetch_to_paths_writes_each_blob_to_its_named_dest() -> anyhow::Result<(
                 ranges: None,
             }],
             None,
-            None,
         )
         .await?;
 
@@ -271,7 +260,6 @@ async fn a_ranged_target_is_promoted_only_when_its_store_completes() -> anyhow::
                 ranges: Some(&half),
             }],
             None,
-            None,
         )
         .await?;
     anyhow::ensure!(paths.is_empty(), "an incomplete target is not returned");
@@ -290,7 +278,6 @@ async fn a_ranged_target_is_promoted_only_when_its_store_completes() -> anyhow::
                 ranges: Some(&all),
             }],
             None,
-            None,
         )
         .await?;
     anyhow::ensure!(
@@ -304,9 +291,9 @@ async fn a_ranged_target_is_promoted_only_when_its_store_completes() -> anyhow::
     Ok(())
 }
 
-/// `fetch_to_paths` threads a shared `LaneLedgers` registry (a bundle run's
-/// pool-wide committed view) into the loop and still fetches byte-identically
-/// (#1848 4a).
+/// `fetch_to_paths_shared` threads a shared `LaneLedgers` registry (a
+/// bundle run's pool-wide committed view) into the loop and still fetches
+/// byte-identically (#1848 4a).
 #[tokio::test]
 async fn fetch_to_paths_threads_a_shared_ledger_registry() -> anyhow::Result<()> {
     let blob = payload(1_500_000);
@@ -319,17 +306,19 @@ async fn fetch_to_paths_threads_a_shared_ledger_registry() -> anyhow::Result<()>
     let dir = tempfile::tempdir()?;
     let dest = dir.path().join("shared-ledger.bin");
     let registry = crate::LaneLedgers::new();
+    let stop = StopPolicy::new(true, None, Arc::new(ProgressClock::new()));
 
     let paths = downloader
-        .fetch_to_paths(
+        .fetch_to_paths_shared(
             &[DownloadTarget {
                 hash: root,
                 total_bytes: total,
                 dest: &dest,
                 ranges: None,
             }],
-            Some(&registry),
+            &registry,
             None,
+            &stop,
         )
         .await?;
 
@@ -441,7 +430,6 @@ async fn fetch_ranges(
                 ranges,
             }],
             None,
-            None,
         )
         .await?;
     Ok((probe, paths))
@@ -527,7 +515,7 @@ async fn a_finalize_hash_mismatch_fetches_again_and_completes() -> anyhow::Resul
         dest: &dest,
         ranges: None,
     };
-    let paths = downloader.fetch_to_paths(&[target], None, None).await?;
+    let paths = downloader.fetch_to_paths(&[target], None).await?;
     anyhow::ensure!(paths == vec![dest.clone()], "the fetch promotes");
     anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
     anyhow::ensure!(
@@ -567,7 +555,6 @@ async fn a_lone_stalled_source_recovers_after_it_cools() -> anyhow::Result<()> {
                 ranges: None,
             }],
             None,
-            None,
             &stop,
         )
         .await?;
@@ -601,7 +588,6 @@ async fn a_download_with_no_progress_gives_up() -> anyhow::Result<()> {
                 dest: &dest,
                 ranges: None,
             }],
-            None,
             None,
             &stop,
         )
@@ -643,7 +629,7 @@ async fn a_dropped_download_records_the_landed_prefix() -> anyhow::Result<()> {
     // Well inside the first periodic flush, so only the drop can record.
     let dropped = tokio::time::timeout(
         crate::driver::PRESENT_RECORD_FLUSH_INTERVAL / 5,
-        downloader.fetch_to_paths(&targets, None, None),
+        downloader.fetch_to_paths(&targets, None),
     )
     .await;
     anyhow::ensure!(
@@ -678,7 +664,8 @@ async fn empty_static_sources_are_a_clear_error() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A downloader that starts with no holder discovers them and fetches.
+/// A downloader built with no setting at all discovers its holders and
+/// fetches.
 #[tokio::test(start_paused = true)]
 async fn a_downloader_with_no_holder_discovers_them() -> anyhow::Result<()> {
     let blob = payload(1_500_000);
@@ -687,14 +674,7 @@ async fn a_downloader_with_no_holder_discovers_them() -> anyhow::Result<()> {
     let root = source.root();
     let total = u64::try_from(blob.len())?;
     let sources = StaticSources::new(vec![candidate(source, ledger, 0xA1)])?;
-    let downloader = Downloader::new(
-        sources,
-        Vec::new(),
-        Arc::default(),
-        funder(),
-        drive_config(),
-        1,
-    );
+    let downloader = Downloader::new(sources, funder());
     let dir = tempfile::tempdir()?;
     let paths = downloader
         .fetch_to_dir(&[(root, total)], dir.path(), None)

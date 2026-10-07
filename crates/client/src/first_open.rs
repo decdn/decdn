@@ -34,7 +34,8 @@ use crate::streamer::StreamCandidate;
 /// off and never blames the source. An `open` error is classified
 /// ([`crate::classify`]) and recorded on the source: a fatal fault ends the
 /// open with that error, any other fault moves on to the next source. A
-/// transient `open` error holds that source off for [`BUILD_RETRY_BASE`].
+/// transient `open` error holds that source off for the first lane-build
+/// retry wait (`BUILD_RETRY_BASE`).
 /// When no source can start, discovery runs, with backoff, beside the open: a
 /// source whose cooldown ends while a discovery is in flight is tried at once.
 /// A set that starts with no holder at all discovers until one appears. An

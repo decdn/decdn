@@ -1,10 +1,14 @@
 //! Public-API surface snapshot for `decdn-client`, the client SDK (#1150).
 //!
-//! The CLI and the node's cache-miss leg both build on this crate, and a third
-//! party builds on the same surface. The snapshot below captures that surface;
-//! any diff to it fails CI and shows up as a reviewable `.snap` change. An item
-//! earns a place in it only when a caller outside the crate needs it. Anything
-//! else stays `pub(crate)`.
+//! A third party builds on the SDK surface: the two faces, the setup sequence
+//! the crate guide walks through, and every type their signatures name. The
+//! snapshot below captures that surface; any diff to it fails CI and shows up as
+//! a reviewable `.snap` change.
+//!
+//! The CLI and the node's cache-miss leg also reach the pull engine's seams.
+//! Those items are `#[doc(hidden)]`, so rustdoc and this snapshot leave them
+//! out, and they carry no stability promise. An item no other crate uses stays
+//! `pub(crate)`.
 //!
 //! The snapshot renders the default feature set. The `test-util` doubles are not
 //! part of the SDK contract, so they stay out of it.

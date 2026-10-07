@@ -4481,9 +4481,9 @@ fn scripted_holder(
             anyhow!("connection reset")
         });
     }
-    Ok(decdn_client::StreamCandidate {
+    Ok(decdn_client::StreamCandidate::new(
         source,
-        ctx: Arc::new(std::sync::Mutex::new(decdn_client::PoolContext {
+        Arc::new(std::sync::Mutex::new(decdn_client::PoolContext {
             pool_id: alloy::primitives::B256::ZERO,
             provider: Address::repeat_byte(provider),
             deposit: alloy::primitives::U256::from(u128::MAX),
@@ -4495,10 +4495,7 @@ fn scripted_holder(
             capability: None,
         })),
         ledger,
-        coverage: None,
-        lease: decdn_client::LaneLease::default(),
-        widen: None,
-    })
+    ))
 }
 
 /// Two scripted holders of `blob`; the first (0xA1) blips once and sets
@@ -4527,8 +4524,8 @@ fn no_topups() -> decdn_client::source::FakeFunder {
 }
 
 /// A drive config whose working deposit never gates a scripted fetch.
-fn drive_config() -> DriveConfig {
-    DriveConfig {
+fn drive_config() -> decdn_client::DriveConfig {
+    decdn_client::DriveConfig {
         working_deposit: alloy::primitives::U256::from(u128::MAX),
         seller_reserve: alloy::primitives::U256::ZERO,
         max_settle_waits: 2,
@@ -4563,14 +4560,10 @@ async fn a_range_entry_survives_a_holder_blip() -> anyhow::Result<()> {
     let (provider, holders) = two_scripted_holders(&blob, Some(Arc::clone(&blipped)))?;
     let staging = tempfile::tempdir()?;
     let dest = staging.path().join("entry");
-    let downloader = Downloader::new(
-        &provider,
-        holders,
-        Arc::default(),
-        no_topups(),
-        drive_config(),
-        2,
-    );
+    let downloader = Downloader::new(&provider, no_topups())
+        .holders(holders)
+        .drive_config(drive_config())
+        .max_lanes(2);
     let stop = StopPolicy::new(
         false,
         Some(std::time::Duration::from_mins(1)),
@@ -4584,7 +4577,6 @@ async fn a_range_entry_survives_a_holder_blip() -> anyhow::Result<()> {
                 dest: &dest,
                 ranges: Some(&ranges),
             }],
-            None,
             None,
             &stop,
         )

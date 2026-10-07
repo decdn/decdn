@@ -14,9 +14,7 @@ mod common;
 
 use std::path::PathBuf;
 
-use alloy::primitives::U256;
 use anyhow::{Context, Result};
-use decdn_client::driver::DriveConfig;
 use decdn_client::{DownloadTarget, Downloader, StaticSources};
 
 use common::{Buyer, Env, NoTopUp};
@@ -34,19 +32,8 @@ async fn main() -> Result<()> {
     let (holders, total_bytes) = buyer.holders(*hash.as_bytes()).await?;
     let (candidates, lanes) = buyer.lanes(holders).await?;
 
-    // `U256::ZERO` as the working deposit turns reactive top-up off, which
-    // matches the `NoTopUp` funder.
-    let sources = StaticSources::new(candidates)?;
-    let holders = sources.holders();
-    let max_lanes = holders.len();
-    let downloader = Downloader::new(
-        sources,
-        holders,
-        std::sync::Arc::default(),
-        NoTopUp,
-        DriveConfig::cli(U256::ZERO),
-        max_lanes,
-    );
+    // Reactive top-up stays off, which matches the `NoTopUp` funder.
+    let downloader = Downloader::new(StaticSources::new(candidates)?, NoTopUp);
     let result = downloader
         .fetch_to_paths(
             &[DownloadTarget {
@@ -55,7 +42,6 @@ async fn main() -> Result<()> {
                 dest: &dest,
                 ranges: None,
             }],
-            None,
             None,
         )
         .await;

@@ -247,7 +247,7 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
         .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
     ensure_allowance(&rpc, token, owner, chain.payment_pool, Some(additional)).await?;
 
-    let ToppedUpPool { credited, tx } = top_up(&contract, owner, pool_id, additional).await?;
+    let ToppedUpPool { credited, tx, .. } = top_up(&contract, owner, pool_id, additional).await?;
 
     // `add_deposit` reports a backend fault as `Err` and a committed-row
     // mismatch as a non-`Added` `Ok` (the row vanished or now tracks a
