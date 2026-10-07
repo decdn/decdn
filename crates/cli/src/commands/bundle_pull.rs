@@ -1305,12 +1305,18 @@ impl Transfer {
     }
 }
 
-/// Read the registry once. Each entry draws its own candidate sample from the
-/// whole list ([`entry_candidates`]), so no registered node is hidden from every
-/// entry by one draw.
+/// The run's candidate list: every active registered node. Each entry draws its
+/// own candidate sample from the whole list ([`entry_candidates`]), so no
+/// registered node is hidden from every entry by one draw.
+///
+/// The peer store's identity-fresh records serve as that list when enough of
+/// them qualify ([`cached_registry`]), and the run issues no
+/// `getRegisteredNodes`. Otherwise the registry is read once. A cached list that
+/// runs out of holders falls back to a live read through the in-run
+/// rediscovery ([`CliSources`](super::cli_sources)).
 async fn discover_candidates(
     chain: &fetch::ResolvedChain,
-    registry_cap: std::time::Duration,
+    common: &ClientFetchArgs,
 ) -> anyhow::Result<Vec<discovery::NodeCandidate>> {
     let capacity_bond = chain.capacity_bond.ok_or_else(|| {
         anyhow!(
@@ -1318,6 +1324,12 @@ async fn discover_candidates(
              blockchain.capacity_bond_address), or pass --node-id to pull from one node"
         )
     })?;
+    if !common.rediscover
+        && let Some(cached) = cached_registry(&chain.data_dir, fetch::now_secs_cli())
+    {
+        return Ok(cached);
+    }
+    let registry_cap = common.discovery_cap();
     let bootstrap =
         discovery::bootstrap_nodes(&chain.rpc_url, capacity_bond, &chain.data_dir, registry_cap)
             .await?;
@@ -1331,6 +1343,19 @@ async fn discover_candidates(
         bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
     }
     Ok(all)
+}
+
+/// The peer store's identity-fresh records under `data_dir`, or `None` when
+/// fewer than [`decdn_client::StoreConfig::min_fresh_candidates`] qualify. The
+/// records are the last live registry read, confirmed within
+/// [`decdn_client::StoreConfig::identity_refresh_secs`]. The run only reads
+/// them: identity refreshes on a live registry read alone, so the refresh
+/// horizon still expires.
+fn cached_registry(data_dir: &Path, now_secs: u64) -> Option<Vec<NodeCandidate>> {
+    let store = decdn_client::PeerStore::open(data_dir);
+    let cfg = decdn_client::StoreConfig::default();
+    let cached = fetch::identity_fresh_candidates(&store, &cfg, now_secs);
+    (cached.len() >= cfg.min_fresh_candidates).then_some(cached)
 }
 
 /// One entry's probe candidates: a fresh sample of `registry`, same-region
@@ -1366,7 +1391,8 @@ struct Selection {
     /// `Some((node, provider))` pins every entry to one node; `None` discovers per
     /// entry against a sample of `registry`.
     explicit: Option<FetchTarget>,
-    /// Every active registered node, read once for the run.
+    /// Every active registered node, resolved once for the run
+    /// ([`discover_candidates`]).
     registry: Option<Vec<NodeCandidate>>,
     signer: Arc<PrivateKeySigner>,
     self_address: Address,
@@ -1380,16 +1406,16 @@ async fn resolve_selection(
     common: &ClientFetchArgs,
     chain: &fetch::ResolvedChain,
 ) -> anyhow::Result<Selection> {
-    // Explicit single node for every entry, or the registry read from
-    // `CapacityBond` once, which each entry samples.
+    // Explicit single node for every entry, or the active set (cached or read
+    // from `CapacityBond` once), which each entry samples.
     let explicit = explicit_target(common)?;
     let registry = match explicit {
         Some(_) => None,
-        // The registry read is bounded by `--timeout-ms` (#1349), inside
+        // A registry read is bounded by `--timeout-ms` (#1349), inside
         // `bootstrap_nodes` so a timeout still falls through to the peer store.
         // No sampling or probing happens here: each entry samples and probes
         // its own candidates (`PullCtx::entry_candidates`).
-        None => Some(discover_candidates(chain, common.discovery_cap()).await?),
+        None => Some(discover_candidates(chain, common).await?),
     };
     let (signer, self_address) = load_buyer_signer(chain)?;
     Ok(Selection {
@@ -5289,6 +5315,103 @@ mod tests {
         }
         assert_eq!(seen.len(), registry.len(), "every node reaches some entry");
         assert!(draws.len() > 1, "entries draw different samples");
+    }
+
+    /// A peer store holding `n` identities confirmed at `now`.
+    fn store_with_fresh_identities(dir: &Path, n: u8, now: u64) -> anyhow::Result<()> {
+        let store = decdn_client::PeerStore::open(dir);
+        for b in 1..=n {
+            store.upsert_identity(&stripe_candidate(b, b), now)?;
+        }
+        Ok(())
+    }
+
+    /// Enough identity-fresh records stand in for the registry; too few, or
+    /// records past the refresh horizon, leave the run to a live read.
+    #[test]
+    fn cached_registry_needs_enough_fresh_identities() -> anyhow::Result<()> {
+        let cfg = decdn_client::StoreConfig::default();
+        let min = u8::try_from(cfg.min_fresh_candidates)?;
+        let now = 1_000_000;
+
+        let enough = tempfile::tempdir()?;
+        store_with_fresh_identities(enough.path(), min, now)?;
+        let cached = cached_registry(enough.path(), now).map(|c| c.len());
+        assert_eq!(cached, Some(cfg.min_fresh_candidates));
+
+        let few = tempfile::tempdir()?;
+        store_with_fresh_identities(few.path(), min - 1, now)?;
+        assert!(cached_registry(few.path(), now).is_none());
+
+        let later = now + cfg.identity_refresh_secs + 1;
+        assert!(cached_registry(enough.path(), later).is_none());
+        Ok(())
+    }
+
+    /// A local listener stands in for the RPC endpoint, and a pull's resolved
+    /// chain points at it, with `extra` flags appended.
+    fn chain_against(
+        rpc: &std::net::TcpListener,
+        data_dir: &Path,
+        extra: &[&str],
+    ) -> anyhow::Result<(ClientFetchArgs, fetch::ResolvedChain)> {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(flatten)]
+            args: BundlePullArgs,
+        }
+        let rpc_url = format!("http://{}", rpc.local_addr()?);
+        let data_dir = data_dir.display().to_string();
+        let base = [
+            "t",
+            "-o",
+            "out",
+            "--hash",
+            "b3:aa",
+            "--rpc-url",
+            &rpc_url,
+            "--payment-pool-address",
+            "0x3333333333333333333333333333333333333333",
+            "--slash-judge-address",
+            "0x4444444444444444444444444444444444444444",
+            "--capacity-bond-address",
+            "0x5555555555555555555555555555555555555555",
+            "--data-dir",
+            &data_dir,
+            "--timeout-ms",
+            "200",
+        ];
+        let common = T::try_parse_from(base.iter().chain(extra))?.args.common;
+        let chain = fetch::resolve_chain(&common, &decdn_common::config::FileConfig::default())?;
+        Ok((common, chain))
+    }
+
+    /// With fresh identities cached, discovery opens no connection to the RPC
+    /// endpoint. `--rediscover` forces the live read.
+    #[tokio::test]
+    async fn discover_candidates_skips_the_registry_read_on_fresh_identities() -> anyhow::Result<()>
+    {
+        let min = u8::try_from(decdn_client::StoreConfig::default().min_fresh_candidates)?;
+        let dir = tempfile::tempdir()?;
+        store_with_fresh_identities(dir.path(), min, fetch::now_secs_cli())?;
+        let rpc = std::net::TcpListener::bind("127.0.0.1:0")?;
+        rpc.set_nonblocking(true)?;
+
+        let (common, chain) = chain_against(&rpc, dir.path(), &[])?;
+        let found = discover_candidates(&chain, &common).await?;
+        assert_eq!(found.len(), usize::from(min));
+        assert!(
+            matches!(rpc.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "a cached run must not reach the RPC endpoint"
+        );
+
+        let (common, chain) = chain_against(&rpc, dir.path(), &["--rediscover"])?;
+        // The listener never answers, so the read times out and falls back to
+        // the same store. Only the connection attempt matters here.
+        drop(discover_candidates(&chain, &common).await);
+        assert!(rpc.accept().is_ok(), "--rediscover reads the registry");
+        Ok(())
     }
 
     /// A blob no provider holds is its entry's fault: it fails its own entry

@@ -28,7 +28,8 @@ pub decdn_client::buyer_pool::OpenedPool::ctx: decdn_client::PoolContext
 pub decdn_client::buyer_pool::OpenedPool::state: decdn_incentive::buyer_pool::BuyerPoolState
 pub decdn_client::buyer_pool::OpenedPool::tx: alloy_primitives::aliases::TxHash
 pub struct decdn_client::buyer_pool::TopUpUnconfirmed
-pub decdn_client::buyer_pool::TopUpUnconfirmed::tx: alloy_primitives::aliases::TxHash
+pub decdn_client::buyer_pool::TopUpUnconfirmed::nonce: u64
+pub decdn_client::buyer_pool::TopUpUnconfirmed::tx: core::option::Option<alloy_primitives::aliases::TxHash>
 impl core::error::Error for decdn_client::buyer_pool::TopUpUnconfirmed
 impl core::fmt::Display for decdn_client::buyer_pool::TopUpUnconfirmed
 pub fn decdn_client::buyer_pool::TopUpUnconfirmed::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -44,7 +45,7 @@ pub fn decdn_client::buyer_pool::escrowed_but_untracked(&str, alloy_primitives::
 pub fn decdn_client::buyer_pool::grade_deposit_credit(anyhow::Result<decdn_incentive::buyer_pool::DepositOutcome, decdn_incentive::store::StoreError>, &str, alloy_primitives::aliases::TxHash) -> anyhow::Result<alloy_primitives::aliases::U256>
 pub async fn decdn_client::buyer_pool::open_pool<P: alloy_provider::provider::trait::Provider + core::clone::Clone>(&decdn_incentive::payment_pool::sol_types::PaymentPool::PaymentPoolInstance<P>, alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::deployment::Deployment, alloy_primitives::bits::address::Address, alloy_primitives::bits::address::Address, alloy_primitives::aliases::U256) -> anyhow::Result<decdn_client::buyer_pool::OpenedPool>
 pub fn decdn_client::buyer_pool::self_owned_lane_ctx(&decdn_incentive::buyer_pool::BuyerPoolState, &alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, &alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, alloy_primitives::aliases::U256, alloy_primitives::aliases::U256) -> anyhow::Result<decdn_client::PoolContext>
-pub async fn decdn_client::buyer_pool::top_up<P: alloy_provider::provider::trait::Provider + core::clone::Clone>(&decdn_incentive::payment_pool::sol_types::PaymentPool::PaymentPoolInstance<P>, alloy_primitives::aliases::B256, alloy_primitives::aliases::U256) -> anyhow::Result<decdn_client::buyer_pool::ToppedUpPool>
+pub async fn decdn_client::buyer_pool::top_up<P: alloy_provider::provider::trait::Provider + core::clone::Clone>(&decdn_incentive::payment_pool::sol_types::PaymentPool::PaymentPoolInstance<P>, alloy_primitives::bits::address::Address, alloy_primitives::aliases::B256, alloy_primitives::aliases::U256) -> anyhow::Result<decdn_client::buyer_pool::ToppedUpPool>
 pub fn decdn_client::buyer_pool::topped_up_effect(alloy_primitives::aliases::B256, alloy_primitives::aliases::U256) -> alloc::string::String
 pub mod decdn_client::config
 pub struct decdn_client::config::PullConfig

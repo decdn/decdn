@@ -481,7 +481,7 @@ async fn fund_pool<P: Provider + Clone + 'static>(
     // just-in-time `approve` and retry once — so the happy path issues zero
     // allowance reads per top-up.
     let ToppedUpPool { credited, tx, .. } = match top_up_recovering_allowance(
-        || pool_top_up(&handles.contract, pool_id, additional),
+        || pool_top_up(&handles.contract, handles.owner, pool_id, additional),
         || {
             ensure_allowance(
                 &handles.rpc,
