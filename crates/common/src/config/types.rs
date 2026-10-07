@@ -452,9 +452,8 @@ pub struct CacheConfig {
     /// defaults from [`decdn_config_types::CircuitBreakerPolicy::default`]
     /// (enabled, trip after 5 failures, 30s cooldown, 1 half-open trial).
     /// Set `enabled = false` (or `failure_threshold = 0`) to opt out and
-    /// run every miss through the full retry
-    /// loop regardless of origin health. Set once at startup; changes
-    /// require a restart.
+    /// run every miss through the full retry loop regardless of origin
+    /// health. Set once at startup; changes require a restart.
     ///
     /// `CircuitBreakerPolicy` carries `#[serde(default)]` so partial
     /// sections (e.g. just `cooldown_ms = 60000`) get the rest of the

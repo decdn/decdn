@@ -57,8 +57,8 @@ pub enum ConfigNoticeLevel {
     /// A deliberate, documented opt-out. Nothing is wrong.
     Info,
     /// The value warrants attention: it weakens a safety property, or it is
-    /// inert and should be removed. Resolution still succeeds — the operator
-    /// asked for it.
+    /// likely a mistake. Resolution still succeeds — the operator asked for
+    /// it.
     Warn,
 }
 

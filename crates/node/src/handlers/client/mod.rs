@@ -1119,16 +1119,15 @@ pub struct ClientHandlerDeps {
     /// Origin-only policy (#1759). When `false`, `serve_stream` declines any
     /// hash its own backend does not hold — including a cache HIT for a
     /// foreign hash — before any discovery, lane accounting, or spend. `true`
-    /// (the default) preserves today's relay behavior.
+    /// (the default) serves and relays foreign hashes as well.
     pub relay_foreign_namespaces: bool,
     /// Coarse wall clock for the two reads the voucher-accept path takes under
     /// the per-lane lock — the capability-expiry gate and the `last_voucher_at`
     /// stamp (issue #1792 item 4). `None` (the default and every test) means the
     /// handler builds its own unrefreshed clock, which reads the live wall clock
-    /// on every call. The runtime sets
-    /// `Some` with a refresher running, so each of those two reads becomes a
-    /// relaxed atomic load instead of a `SystemTime::now()` syscall in the
-    /// critical section.
+    /// on every call. The runtime sets `Some` with a refresher running, so each
+    /// of those two reads becomes a relaxed atomic load instead of a
+    /// `SystemTime::now()` syscall in the critical section.
     pub coarse_clock: Option<Arc<crate::coarse_clock::CoarseClock>>,
     /// The redeemer's self-tick interval in seconds
     /// (`blockchain.redeem_interval_secs`). The voucher-accept path stops

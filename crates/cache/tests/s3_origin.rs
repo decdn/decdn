@@ -452,8 +452,8 @@ async fn fetch_with_content_encoding_zstd_is_decompressed() -> anyhow::Result<()
 }
 
 /// `DecompressMode::Strict` refuses a known encoding before any body
-/// bytes are read — a reject-every-encoding posture
-/// for operators whose origin is guaranteed to serve canonical bytes.
+/// bytes are read — a reject-every-non-identity-encoding posture for
+/// operators whose origin is guaranteed to serve canonical bytes.
 #[tokio::test]
 async fn fetch_with_strict_mode_rejects_gzip_encoding() -> anyhow::Result<()> {
     let hash = Hash::new(b"gzipped-strict");

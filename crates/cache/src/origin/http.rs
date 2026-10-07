@@ -320,7 +320,8 @@ impl Origin for HttpOrigin {
             //      poll loop and the per-chunk idle timer)
             //   2. wrap with per-chunk idle timeout + cap on the encoded
             //      size (defense against unbounded slow-trickle / lying
-            //      origins; same `max_bytes` cap as before, applied to
+            //      origins; the same `max_bytes` cap the advertised-length
+            //      check above uses, applied to
             //      encoded bytes for compressed responses — compression
             //      ratios < 1 mean this is also a sound bound on the
             //      decoded size).

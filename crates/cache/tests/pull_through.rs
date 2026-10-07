@@ -2262,10 +2262,9 @@ async fn http_origin_rejects_307_redirect() -> anyhow::Result<()> {
 #[tokio::test]
 async fn http_origin_redirect_to_404_origin_surfaces_redirect_error() -> anyhow::Result<()> {
     // The 3xx itself is terminal (the redirect is not followed) — the
-    // downstream 404 server should
-    // see zero requests, and the caller surfaces `OriginError`, not
-    // `NotFound`. This pins that we don't treat a 3xx as a possible
-    // NotFound shape.
+    // downstream 404 server should see zero requests, and the caller
+    // surfaces `OriginError`, not `NotFound`. This pins that we don't
+    // treat a 3xx as a possible NotFound shape.
     let hash = Hash::new(b"absent at the would-be redirect target");
 
     let final_server = MockServer::start().await;
@@ -2675,8 +2674,8 @@ async fn retry_skips_not_found_responses() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn retry_disabled_policy_makes_a_single_attempt() -> anyhow::Result<()> {
-    // RetryPolicy::disabled() makes a single attempt: a
-    // transient failure surfaces immediately without retrying.
+    // RetryPolicy::disabled() makes a single attempt: a transient
+    // failure surfaces immediately without retrying.
     let payload: &[u8] = b"unreached";
     let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, usize::MAX));
     let (engine, _tmp) =
@@ -4673,7 +4672,7 @@ async fn export_bao_range_stream_empty_blob_yields_no_items() -> anyhow::Result<
 }
 
 /// `populate` must fill a blob that takes the STREAMING commit path — the one
-/// whose post-commit read-back was removed (#1132). The blob is well above
+/// with no post-commit read-back (#1132). The blob is well above
 /// `buffered_max_bytes`, so `should_buffer` routes it to `import_and_verify_stream`
 /// and the new `PullThroughOutcome::Committed` arm is what carries the result
 /// back.

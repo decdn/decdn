@@ -2126,9 +2126,10 @@ async fn separate_poisonings_each_count_while_the_log_latches() -> anyhow::Resul
 }
 
 /// `populate_inner`'s coalescing loop is a near-verbatim *copy* of `get`'s,
-/// not a shared helper, and the #1517 poison fall-through is per-copy —
-/// each copy can carry its own. So covering `get` does not cover this, and a
-/// mutation that reverts only `populate_inner` survives a `get`-only suite.
+/// not a shared helper, and the poison handling #1517 requires lives in each
+/// copy separately, so each copy can regress on its own. Covering `get`
+/// therefore does not cover this, and a mutation that reverts only
+/// `populate_inner` survives a `get`-only suite.
 ///
 /// This is also the copy that matters most: `populate` (unlike
 /// `populate_local`) walks the `Peer` origin, so a lost claim here is the

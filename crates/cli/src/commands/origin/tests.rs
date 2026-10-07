@@ -74,6 +74,14 @@ fn parse_target_http_is_not_a_write_target() {
 }
 
 #[test]
+fn parse_target_rejects_fs_prefix() {
+    // `fs` is the config `kind` name; as a `--to` prefix it would otherwise
+    // seed a relative directory named `fs:...` that the node never reads.
+    let err = parse_target(Path::new("fs:/var/lib/decdn/origin")).unwrap_err();
+    assert!(format!("{err:#}").contains("not an `fs:` URI"));
+}
+
+#[test]
 fn parse_target_non_utf8_path_is_filesystem() {
     // A non-UTF-8 Unix path can be none of the ASCII schemes, so it must
     // fall through to the filesystem arm rather than erroring.

@@ -56,10 +56,17 @@ use crate::store::StoreError;
 /// `schema_version` refuses a row in any other layout, and a point lookup that
 /// errors fails the fetch, where a missing table reads as no row.
 ///
+/// **A layout change bumps [`BUYER_SUPPORTED_SCHEMA_VERSION`] and this
+/// table-name suffix together**, an appended field included. Bumping the
+/// version alone leaves every existing row in place to fail its point lookup,
+/// which stops the buyer path until the store is moved aside; renaming the
+/// table makes the old rows unreachable instead.
+///
 /// A file that holds no table of this name reads as empty: `open_table`
 /// reports `TableDoesNotExist` and every read path treats the store as having
-/// no rows. The node then re-adopts any pool on the configured contract from
-/// chain.
+/// no rows. The caller (the node, or `decdn fetch` / `bundle pull`) then
+/// re-adopts a live pool on the configured contract from chain where its
+/// adoption rules allow.
 const BUYER_POOL_TABLE: TableDefinition<'static, &'static [u8; 32], &'static [u8]> =
     TableDefinition::new("buyer_pool_state_v1");
 
@@ -85,7 +92,8 @@ const BUYER_OWNER_INDEX_TABLE: TableDefinition<'static, &'static [u8; 20], &'sta
 const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 /// Sanity ceiling on trailing bytes per record. Trailing bytes are tolerated
-/// (forward-compat with additive schema changes), but a `remainder.len()`
+/// so decode does not fail on padding (a layout change still bumps
+/// `schema_version`), but a `remainder.len()`
 /// above this is logged so an honest schema-skew incident or a malicious
 /// padding attempt is observable in operator logs without re-introducing
 /// the strict-decoding regression issue #527's reviewers warned against.
@@ -106,10 +114,11 @@ struct StoredLane {
 /// versions; `lanes` is the one variable-length part, encoded as a postcard
 /// `Vec` (length-prefixed).
 /// `schema_version` lives in the value, not the key, and decode uses
-/// [`postcard::take_from_bytes`], which tolerates trailing bytes. The
-/// exact-match version check refuses a row in any other layout, and a refused
-/// row fails the point lookup. A field inserted anywhere but the end shifts
-/// every field after it.
+/// [`postcard::take_from_bytes`], which tolerates trailing bytes. Any layout
+/// change, an appended field included, bumps `schema_version` and the
+/// table-name suffix (see [`BUYER_POOL_TABLE`]): the exact-match version check
+/// refuses a row in any other layout, and a refused row fails the point
+/// lookup. A field inserted anywhere but the end shifts every field after it.
 ///
 /// **The field order is the wire order.** Postcard encodes struct fields
 /// positionally and unnamed, so reordering or retyping a field silently

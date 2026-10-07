@@ -359,14 +359,16 @@ pub async fn drain(args: &cli::DrainArgs, global_config: Option<&Path>) -> anyho
     // that case — otherwise the imminent ECONNREFUSED from the early
     // admin tear-down would be misread as drain completion while
     // in-flight streams are still running, defeating the
-    // zero-payment-loss guarantee.
+    // zero-payment-loss guarantee. An ack of `true` covers admin-RPC
+    // races only: a SIGINT/SIGTERM that wins the runtime's shutdown
+    // select still takes the early ordering (`admin_stop_order`).
     if !resp.wait_admin_honored {
         // The drain is already underway server-side and cannot be
         // undone; the actionable advice is to observe completion via
         // process exit or health-until-ECONNREFUSED.
         return Err(anyhow::anyhow!(
             "admin at {url} did not honor --wait (wait_admin_honored=false): \
-             an earlier drain without --wait already started shutdown, so the \
+             an earlier drain without wait_admin already started shutdown, so the \
              admin server closes before in-flight streams finish. Observe \
              completion via process exit or `decdn node health` until \
              ECONNREFUSED",

@@ -4881,7 +4881,8 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
 /// code away. The resulting error matches no sentinel in `classify_pull_failure` and
 /// lands in the catch-all, scoring the peer `Unreachable` — so a node that honestly
 /// reports `NotFound` after an eviction race mid-delivery is punished exactly as hard as
-/// a dead one. That is the bug #1144 fixed at the open stage, one stage downstream.
+/// a dead one. It is the same failure #1144 fixed at the open stage, one stage further
+/// downstream.
 ///
 /// Driven through the REAL receive loop against a real upstream that opens honestly and
 /// then errors, so the assertion is on what the loop actually raises. Asserting on
@@ -5680,7 +5681,8 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
     anyhow::ensure!(
         elapsed > SLOW_PULL_OPEN_BUDGET,
         "the paced transfer finished in {elapsed:?}, inside the {SLOW_PULL_OPEN_BUDGET:?} \
-         budget; a whole-blob deadline would not trip — the test cannot detect the regression"
+         budget, so a whole-blob deadline at that budget would not trip and this test \
+         cannot detect the regression"
     );
     // No deadline fired: not the open budget (the transfer outran it, and it must
     // not apply past the open), not the inactivity budget (every gap was healthy).

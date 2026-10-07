@@ -19,8 +19,8 @@
 //!   recognises typed `BlobTooLargeMarker` and `OriginError::*` as
 //!   Permanent, treats `io::ErrorKind::{ConnectionReset, TimedOut,
 //!   UnexpectedEof, …}` and the catch-all `Other` as Transient) and
-//!   re-fed to the loop — mid-stream retries for small
-//!   blobs at a bounded memory cost.
+//!   re-fed to the loop, so small blobs get mid-stream retries at a
+//!   bounded memory cost.
 //! - **Abort + restart (large blobs):** the engine's per-attempt closure
 //!   commits to `iroh-blobs::add_stream` directly. On mid-stream
 //!   `io::Error`, the partial `TempTag` is dropped (iroh-blobs GC
@@ -264,12 +264,12 @@ pub(crate) async fn drain_to_bytes(
 ///    catch-all `Other`. `UnexpectedEof` is the load-bearing kind
 ///    for mid-body resets behind a flaky LB — reqwest surfaces
 ///    truncated Content-Length responses through it. `Other`
-///    defaults to Transient because all three origin adapters wrap
-///    reqwest / SDK body errors via `io::Error::other(...)` —
-///    the wrapped `reqwest::Error`s are transient body failures
-///    worth retrying. Anything not in the Transient set is classified
-///    Permanent (fail-fast over retry-storm for unrecognised
-///    modes).
+///    defaults to Transient because the HTTP and S3 origin adapters
+///    wrap reqwest / SDK body errors via `io::Error::other(...)` —
+///    mostly network/body failures (resets, timeouts, truncation), so
+///    Transient is the safer default for them.
+///    Anything not in the Transient set is classified Permanent
+///    (fail-fast over retry-storm for unrecognised modes).
 pub(crate) fn classify_io_error(e: io::Error) -> OriginPullError {
     // Peek the inner *without* consuming so we can preserve the
     // original `e` (and its `raw_os_error` / Display) when no typed

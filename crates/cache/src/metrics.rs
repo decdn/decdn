@@ -115,8 +115,8 @@ pub struct CacheMetrics {
     /// the operator-configured fallback chain (#284). One bump per
     /// chain-walk step, *not* per per-origin retry — the latter is
     /// covered by `origin_retry_exhausted`. Bumped only when there is
-    /// a next entry to try, so a single-origin chain (the
-    /// common case) keeps this counter flat at zero. The denominator
+    /// a next entry to try, so a single-origin chain (the common case)
+    /// keeps this counter flat at zero. The denominator
     /// for a "what fraction of misses needed fallback" alert is
     /// `decdn_cache_origin_fetches_total`. Sustained nonzero against
     /// a healthy primary backend suggests the chain is masking an
@@ -379,10 +379,10 @@ pub struct CacheMetrics {
     /// the poison, and keeps coalescing — so this is a report, not a
     /// degradation: it does not mean duplicate origin pulls happened, and
     /// it does not call for a restart. It is metered because the
-    /// alternative — discarding the error —
-    /// silently disables coalescing for the life of the process, and the
-    /// only observable is `decdn_cache_pull_through_bytes_total` rising
-    /// faster than request volume.
+    /// alternative — discarding the error — silently disables coalescing
+    /// for the life of the process, and the only observable is
+    /// `decdn_cache_pull_through_bytes_total` rising faster than request
+    /// volume.
     ///
     /// **Counts poisonings, not locks-since-a-poisoning.** Because the
     /// engine clears the poison, one panic bumps this exactly once; a

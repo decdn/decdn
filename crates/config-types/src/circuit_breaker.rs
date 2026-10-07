@@ -45,8 +45,8 @@ const DEFAULT_HALF_OPEN_MAX_CALLS: u32 = 1;
 #[serde(default, deny_unknown_fields)]
 pub struct CircuitBreakerPolicy {
     /// Master switch. `false` disables the breaker, so every cache miss
-    /// runs the full retry/backoff loop. The
-    /// thresholds below are ignored while disabled.
+    /// runs the full retry/backoff loop. The thresholds below are
+    /// ignored while disabled.
     pub enabled: bool,
     /// Consecutive transient/origin-unavailable failures that trip the
     /// breaker from CLOSED to OPEN. `0` is treated as "disabled" (same
@@ -88,8 +88,8 @@ impl Default for CircuitBreakerPolicy {
 
 impl CircuitBreakerPolicy {
     /// A policy with the breaker disabled — every miss runs the full
-    /// retry/backoff loop. Useful in tests and for
-    /// operators who want to opt out.
+    /// retry/backoff loop. Useful in tests and for operators who want to
+    /// opt out.
     #[must_use]
     pub const fn disabled() -> Self {
         Self {

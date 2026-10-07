@@ -5338,11 +5338,11 @@ async fn client_rejects_zero_rate_response() -> anyhow::Result<()> {
 
 /// #327 boundary + #848 free-egress: a stream request for a channel the node has
 /// never persisted is refused *pre-serve* — the node signs `ok: false` with the
-/// delivery-side `NotFound` code and ships zero bytes. It does not serve up to
-/// one chunk (or the whole blob, if smaller) for free and only then
-/// reject the voucher mid-stream with `VoucherRejected { WrongChannel }`. The
-/// 1.5 MiB blob (larger than the chunk) proves the gate fires
-/// independent of blob size — not just for sub-interval blobs. Asserting on the
+/// delivery-side `NotFound` code and ships zero bytes. It never serves a free
+/// first chunk (or the whole blob, if smaller) and then rejects the voucher
+/// mid-stream with `VoucherRejected { WrongChannel }`. The 1.5 MiB blob (larger
+/// than the chunk) proves the gate fires independent of blob size — not just
+/// for sub-interval blobs. Asserting on the
 /// server's `StreamResponse` (rather than the buyer's error string) proves the
 /// success path was never entered: an `ok: true` would have streamed bytes.
 #[tokio::test(flavor = "multi_thread")]

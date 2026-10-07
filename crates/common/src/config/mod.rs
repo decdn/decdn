@@ -409,14 +409,15 @@ pub const DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC: u64 = 3600;
 /// Default maximum concurrently held (eviction-exempt) blobs for the
 /// probe-triggered hold (ADR 005 §Hold budget, #318). Per-blob holds: many
 /// peers probing one hash share a single slot. Re-exported from the
-/// `decdn_config_types` leaf crate (the canonical home since #578) so
+/// `decdn_config_types` leaf crate (its canonical home, #578) so
 /// the config default and the cache engine's own default (used by
 /// direct `CacheEngine::open` callers) cannot drift apart.
 pub const DEFAULT_MAX_PROBE_HOLDS: usize = decdn_config_types::DEFAULT_MAX_PROBE_HOLDS;
 
 /// Default probe-hold slots reserved for the stake lane (#757). `0` keeps
-/// the stake-lane reservation off by default, so a single-lane node behaves
-/// exactly as before — the reservation is strictly operator opt-in.
+/// the stake-lane reservation off by default, so a node that does not opt in
+/// shares every probe-hold slot across all peers — the reservation is strictly
+/// operator opt-in.
 pub const DEFAULT_STAKE_LANE_RESERVED_HOLDS: usize = 0;
 
 /// Default providers probed before ranking on a node-to-node cache-miss pull

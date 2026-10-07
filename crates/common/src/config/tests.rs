@@ -785,8 +785,8 @@ fn expand_env_substitutes_cache_origin_fs_path() -> anyhow::Result<()> {
 /// A zero throughput-floor window wedges this node's pull path (#1797): the floor demands
 /// progress over no time at all, so it trips on the first poll of every streaming read and
 /// abandons every upstream before a byte can arrive. The abort is non-attributable, so it
-/// does not defame peers — but a node that can never
-/// complete a pull is still a broken node, so the window must be rejected at load.
+/// does not defame peers — but a node that can never complete a pull is still a broken
+/// node, so the window must be rejected at load.
 #[test]
 fn resolve_cache_rejects_zero_stall_window() {
     let cli = empty_cache_args();
@@ -1372,9 +1372,9 @@ fn resolve_cache_origin_singular_resolves_to_one_element_vec() -> anyhow::Result
 
 #[test]
 fn resolve_cache_no_origin_resolves_to_empty_vec() -> anyhow::Result<()> {
-    // Absent both `[cache.origin]` and `[[cache.origins]]`
-    // means "no pull-through configured". The resolver returns an
-    // empty vec; engine's `pull_through` short-circuits to NoOrigin.
+    // Absent both `[cache.origin]` and `[[cache.origins]]` means "no
+    // pull-through configured". The resolver returns an empty vec;
+    // engine's `pull_through` short-circuits to NoOrigin.
     let cli = empty_cache_args();
     let toml = types::CacheConfig::default();
     let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
@@ -5408,8 +5408,8 @@ fn resolve_blockchain_rejects_zero_capacity_bond_address() -> anyhow::Result<()>
 #[test]
 fn resolve_blockchain_rejects_zero_origin_assignment_address() -> anyhow::Result<()> {
     // Only origin_assignment is zeroed, to exercise its zero-address guard in
-    // isolation; publisher_registry carries a valid address (the two are now
-    // independent — the both-or-neither pairing was removed).
+    // isolation; publisher_registry carries a valid address (the two are
+    // validated independently, with no both-or-neither pairing).
     let dir = data_dir_with_keystore()?;
     let cli = BlockchainArgs {
         origin_assignment_address: Some("0x0000000000000000000000000000000000000000".to_string()),

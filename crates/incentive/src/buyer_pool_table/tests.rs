@@ -344,7 +344,6 @@ fn forget_removes_entry_and_is_noop_when_absent() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A buyer record stamped with a future schema version must NOT fail
 /// An OLDER record is rejected, not decoded.
 ///
 /// This is why the version is matched exactly rather than as a ceiling. The

@@ -52,7 +52,10 @@ enum ImportTarget {
 
 /// Parse a `--to <dir>` target. The target is a local filesystem directory —
 /// the default and only write backend. An `s3://` or `http(s)://` target is not
-/// a write target and produces an error that spells out the supported path.
+/// a write target and produces an error that spells out the supported path. An
+/// `fs:` prefix (the config `kind` name, not a URI scheme here) is rejected too,
+/// so a typo does not silently seed a relative directory literally named `fs:…`
+/// that the node never reads.
 ///
 /// The scheme checks run on the path's UTF-8 view. A non-UTF-8 path (valid on
 /// Unix) can be none of those ASCII schemes, so it falls straight through to
@@ -75,6 +78,12 @@ fn parse_target(raw: &Path) -> anyhow::Result<ImportTarget> {
             bail!(
                 "--to {s} is not a write target: an HTTP origin is a read-only static \
                  server — seed a local directory and serve it from that disk instead"
+            );
+        }
+        if s.starts_with("fs:") {
+            bail!(
+                "--to takes a directory path, not an `fs:` URI: pass the path directly, \
+                 e.g. --to /var/lib/decdn/origin"
             );
         }
     }

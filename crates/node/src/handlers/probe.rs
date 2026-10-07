@@ -69,7 +69,7 @@ const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
 ///
 /// Construction is gated by the operator: the runtime only builds this when
 /// `cache.stake_lane_reserved_holds > 0`, so a single-lane deployment passes
-/// `None` and the handler's hot path is unchanged.
+/// `None` and the handler skips the stake-lane check entirely.
 #[derive(Clone)]
 pub struct StakeLanePolicy {
     /// Chain-followed active-staker set, keyed by iroh `NodeId`. The probe

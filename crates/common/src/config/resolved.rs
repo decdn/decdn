@@ -227,9 +227,9 @@ pub struct ResolvedCache {
     /// Resolved ordered list of origin backends (#437, #284). Empty
     /// vec => no pull-through; cache misses return `NoOrigin`. A
     /// single-element vec is the single-origin case and is also the
-    /// form produced from a `[cache.origin]`
-    /// (singular) TOML table — both wire forms (singular and plural
-    /// `[[cache.origins]]`) collapse here so downstream wiring sees
+    /// form produced from a `[cache.origin]` (singular) TOML table —
+    /// both wire forms (singular and plural `[[cache.origins]]`)
+    /// collapse here so downstream wiring sees
     /// one canonical representation. Per-variant validation (URL
     /// parse, S3 bucket/region/prefix shape) has already run at
     /// resolution time — the wiring layer can construct the concrete

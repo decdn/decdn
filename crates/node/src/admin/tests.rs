@@ -582,11 +582,11 @@ async fn admin_drain_fires_trigger_and_returns_initiated() {
     // that fired did not opt in.
     assert!(
         !trigger.wait_admin(),
-        "default DrainRequest must not enable wait_admin"
+        "wait_admin=false must not enable wait_admin"
     );
     assert!(
         !resp.wait_admin_honored,
-        "default DrainRequest must report wait_admin_honored=false"
+        "wait_admin=false must report wait_admin_honored=false"
     );
 
     // Verify the trigger actually fired: `wait()` should resolve
@@ -595,6 +595,47 @@ async fn admin_drain_fires_trigger_and_returns_initiated() {
     assert!(
         waited.is_ok(),
         "drain RPC did not fire the underlying DrainTrigger"
+    );
+}
+
+/// The drain ack reports the trigger's *effective* value, not the request:
+/// the trigger is first-writer-wins, so a `wait_admin: true` drain that
+/// arrives after a plain drain already fired must get
+/// `wait_admin_honored=false`. An ack that echoed the request would send
+/// `decdn node drain --wait` into a polling loop against an admin server
+/// that closes early, and read the ECONNREFUSED as drain completion.
+#[tokio::test]
+async fn admin_drain_ack_reports_the_first_writers_wait_admin() {
+    let trigger = Arc::new(DrainTrigger::new());
+    let (cache, _tmp) = test_cache().await;
+    let state = AdminState::new(
+        [0u8; 32],
+        Instant::now(),
+        cache,
+        None,
+        Arc::clone(&trigger),
+        Arc::new(crate::metrics::Metrics::new()),
+    );
+    let rpc = AdminRpcImpl::new(state);
+
+    let first = rpc
+        .drain(DrainRequest { wait_admin: false })
+        .await
+        .expect("first drain ok");
+    assert!(!first.wait_admin_honored);
+
+    let second = rpc
+        .drain(DrainRequest { wait_admin: true })
+        .await
+        .expect("second drain ok");
+    assert!(second.initiated, "the losing drain still reports initiated");
+    assert!(
+        !second.wait_admin_honored,
+        "a wait_admin=true drain that lost the race must not be acked as honored"
+    );
+    assert!(
+        !trigger.wait_admin(),
+        "the first writer's wait_admin=false must stand"
     );
 }
 

@@ -53,8 +53,7 @@
 //! 2. **Run every `fallible_commit`.** The log-level filter swap is the
 //!    only currently-fallible commit. This phase is the rollback
 //!    boundary: commits already applied stay applied; a later failure
-//!    aborts the rest. (The old monolithic body had the same property,
-//!    documented inline; the trait makes it explicit.)
+//!    aborts the rest. The trait makes this boundary explicit.
 //! 3. **Run every `infallible_swap`.** Atomic stores, `ArcSwap` swaps,
 //!    `ConnectionLimiter::reload`, and the per-section "applied"
 //!    tracing event live here. None can fail.
@@ -160,8 +159,8 @@ pub(crate) trait ReloadableSection: Send + Sync {
     /// across sections is the same registration order as `resolve` and
     /// `infallible_swap`. **Rollback boundary:** once one section's
     /// `fallible_commit` returns `Ok`, that side-effect stays applied
-    /// even if a later section's `fallible_commit` fails. This matches
-    /// the old monolithic behaviour; the trait just makes it explicit.
+    /// even if a later section's `fallible_commit` fails. The trait makes
+    /// this boundary explicit.
     fn fallible_commit(&self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -1122,8 +1121,8 @@ impl RuntimeReloadState {
     /// 2. **Fallible commit.** The log-level filter swap is the only
     ///    currently-fallible commit. **Rollback boundary:** commits
     ///    that already succeeded stay applied even if a later section's
-    ///    `fallible_commit` fails. This matches the old monolithic
-    ///    behaviour; the trait makes it explicit.
+    ///    `fallible_commit` fails. The trait makes this boundary
+    ///    explicit.
     /// 3. **Infallible swap.** Atomic stores, `Arc` swaps, and
     ///    `ConnectionLimiter::reload`. Each section also emits a
     ///    `config reload section applied` tracing event keyed by
@@ -1235,9 +1234,8 @@ impl RuntimeReloadState {
                 // Sections that already committed in this loop stay
                 // applied — that's the rollback boundary. We do *not*
                 // run any infallible_swap to avoid driving sections
-                // partway through a phase. This matches the old
-                // monolithic body's behaviour where a setter failure
-                // returned before the rate atomic swap.
+                // partway through a phase, so a setter failure returns
+                // before any atomic swap (e.g. the rate swap) runs.
                 tracing::warn!(
                     error = %err,
                     section = section.name(),

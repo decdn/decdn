@@ -151,7 +151,8 @@ fn an_empty_password_file_creates_an_empty_password_keystore() {
 /// A variable that is SET but not valid UTF-8 is present-and-unreadable, so it
 /// is fatal rather than a fall-through to the password file beside it. Without
 /// this, a revert to a catch-all `Err(_) => skipped.push(...)` would silently
-/// restore the old fall-through with a green suite.
+/// let an unreadable variable fall through to the password file with a green
+/// suite.
 #[test]
 fn a_non_utf8_env_password_is_fatal_and_does_not_echo_the_value() {
     let (home, out) = dirs();

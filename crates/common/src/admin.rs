@@ -247,7 +247,9 @@ pub struct DrainRequest {
 /// a `wait_admin: true` request that loses the race to an earlier drain
 /// without it gets `false` here. The `decdn node drain --wait` client
 /// then refuses to enter the polling loop instead of treating the
-/// imminent ECONNREFUSED as drain completion.
+/// imminent ECONNREFUSED as drain completion. A `true` ack covers
+/// admin-RPC races only: a SIGINT/SIGTERM that wins the runtime's
+/// shutdown select still closes admin early.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DrainResponse {
     /// `true` once the trigger has been fired and the runtime's

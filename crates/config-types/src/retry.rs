@@ -17,11 +17,10 @@ const DEFAULT_JITTER_RATIO: f64 = 0.1;
 /// At or below this advertised `size_hint`, the engine's per-attempt
 /// closure drains the origin body into a `BytesMut` before handing
 /// it to iroh-blobs, so mid-stream transient `io::Error`s can be
-/// retried. Above the threshold
-/// the engine takes the streaming path and uses abort + restart
-/// instead — no memory amplification, but disk-amp cost per failed
-/// attempt until iroh-blobs GC sweeps. 4 MiB covers typical web
-/// assets while keeping per-fetch RSS predictable.
+/// retried. Above the threshold the engine takes the streaming path
+/// and uses abort + restart instead — no memory amplification, but
+/// disk-amp cost per failed attempt until iroh-blobs GC sweeps. 4 MiB
+/// covers typical web assets while keeping per-fetch RSS predictable.
 const DEFAULT_BUFFERED_MAX_BYTES: u64 = 4 << 20;
 
 /// `#[serde(default = ...)]` shim — `Default::default()` on the whole
@@ -64,9 +63,9 @@ pub struct RetryPolicy {
     /// below this value, the engine drains the stream into a
     /// `BytesMut` before committing — drain errors get classified
     /// and re-feed the retry loop, so small blobs get mid-stream
-    /// retries. Above the threshold (or
-    /// when `size_hint` is `None`) the engine uses streaming
-    /// abort+restart instead; memory stays bounded but each failed
+    /// retries. Above the threshold (or when `size_hint` is `None`) the
+    /// engine uses streaming abort+restart instead; memory stays
+    /// bounded but each failed
     /// attempt strands up to `max_blob_bytes` of partial-import bytes
     /// until iroh-blobs GC reclaims them.
     ///
