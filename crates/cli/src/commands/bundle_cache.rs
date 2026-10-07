@@ -6,13 +6,17 @@
 //!
 //! The cache is content-addressed and self-verifying: a load re-hashes the bytes
 //! and returns them only when the digest still equals the requested hash, so a
-//! corrupt or tampered file is ignored (the manifest is fetched fresh) rather
-//! than trusted. It is advisory — a missing, unreadable, or mismatched file only
-//! costs one manifest fetch — so a write failure is logged and never fails the
-//! pull, and a real pull under `--overwrite` skips the read to force a fresh
-//! fetch. The cache also lets `bundle pull --hash --dry-run` list a bundle's
-//! entries with no network; the dry run reads it even under `--overwrite`,
-//! because verified bytes equal what a fresh fetch returns.
+//! corrupt or tampered file is never trusted. A load tells its three misses
+//! apart: a missing file is a plain miss, a file whose bytes fail the hash check
+//! is a miss with a warning that names it, and a file that cannot be read is an
+//! error naming the path, for the caller to act on. A real pull is fail-open: it
+//! warns on an unreadable file and fetches the manifest fresh, so a bad cache
+//! file only costs one manifest fetch. A write failure prints a warning and
+//! never fails the pull. A real pull under `--overwrite` skips the read to force
+//! a fresh fetch. The cache also lets `bundle pull --hash --dry-run` list a
+//! bundle's entries with no network; the dry run reads it even under
+//! `--overwrite`, because verified bytes equal what a fresh fetch returns, and
+//! it fails on an unreadable file, because the cache is its whole answer.
 //!
 //! Only the `--hash` path uses it: an `-i` local manifest is already on disk for
 //! free, with nothing to cache or re-pay.
@@ -31,21 +35,39 @@ pub(crate) fn cache_path(out_root: &Path, hash: [u8; 32]) -> PathBuf {
     out_root.join(CACHE_DIR).join(format!("{name}.json"))
 }
 
-/// Load the cached manifest bytes for `hash`, or `None` when there is no usable
-/// cache hit. A missing or unreadable file, or bytes whose BLAKE3 digest no
-/// longer equals `hash`, all yield `None` — the caller then fetches the manifest
-/// fresh. The returned bytes are guaranteed to hash to `hash`.
-pub(crate) fn load(out_root: &Path, hash: [u8; 32]) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(cache_path(out_root, hash)).ok()?;
-    (*blake3::hash(&bytes).as_bytes() == hash).then_some(bytes)
+/// Load the cached manifest bytes for `hash`. Returns `Ok(None)` when no cache
+/// file exists, and also when the file's BLAKE3 digest does not equal `hash`;
+/// a mismatch prints a warning that names the file. Returns an error that names
+/// the path when the file exists but cannot be read. The returned bytes always
+/// hash to `hash`.
+pub(crate) fn load(out_root: &Path, hash: [u8; 32]) -> anyhow::Result<Option<Vec<u8>>> {
+    use anyhow::Context as _;
+
+    let path = cache_path(out_root, hash);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("read cached bundle manifest {}", path.display()));
+        }
+    };
+    if *blake3::hash(&bytes).as_bytes() != hash {
+        eprintln!(
+            "warning: cached bundle manifest {} does not hash to the bundle; ignoring it",
+            path.display()
+        );
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 /// Cache `bytes` (a verified bundle manifest with content address `hash`) under
-/// `out_root`. Best-effort and advisory: any filesystem error is logged and
-/// swallowed, because a pull must not fail over a caching miss.
+/// `out_root`. Best-effort and advisory: a filesystem error prints a warning and
+/// is swallowed, because a pull must not fail over a caching miss.
 pub(crate) fn store(out_root: &Path, hash: [u8; 32], bytes: &[u8]) {
     if let Err(e) = try_store(out_root, hash, bytes) {
-        tracing::debug!("bundle manifest cache write skipped: {e:#}");
+        eprintln!("warning: bundle manifest cache not written: {e:#}");
     }
 }
 

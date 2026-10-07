@@ -4137,6 +4137,26 @@ async fn dry_run_fails_on_a_cached_manifest_that_does_not_parse() {
     assert!(msg.contains(bundle_cache::CACHE_DIR), "{msg}");
 }
 
+/// A cached manifest file that exists but cannot be read fails the dry run,
+/// naming the file, rather than reporting that no manifest is cached (#2361).
+#[tokio::test]
+async fn dry_run_fails_naming_an_unreadable_cached_manifest() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let out = tmp.path().to_str().expect("utf-8 tmp path");
+    let raw = [0xab_u8; 32];
+    let hex = blake3::Hash::from_bytes(raw).to_hex();
+    // A directory at the cache path is unreadable as a file, even as root.
+    std::fs::create_dir_all(bundle_cache::cache_path(tmp.path(), raw)).expect("mkdir");
+    let hash = format!("b3:{hex}");
+    let args = pull_args(&["-o", out, "--hash", &hash, "--dry-run"]);
+    let err = super::bundle_pull(&args, None)
+        .await
+        .expect_err("an unreadable cached manifest fails the dry run");
+    let msg = format!("{err:#}");
+    assert!(msg.contains(bundle_cache::CACHE_DIR), "{msg}");
+    assert!(msg.contains(hex.as_str()), "{msg}");
+}
+
 /// A malformed `--hash` fails the dry run, as it fails a real pull.
 #[tokio::test]
 async fn dry_run_rejects_a_malformed_hash() {

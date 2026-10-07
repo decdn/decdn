@@ -1804,10 +1804,16 @@ async fn obtain_manifest<P: Provider + Clone>(
     // "Don't pay again": a prior pull of this bundle into the same output dir
     // cached the manifest blob, keyed by its hash and self-verifying on read, so a
     // repeat run skips the paid `cdn/client/v1` fetch. `--overwrite` forces a fresh
-    // fetch, consistent with how it bypasses the file skip-cache.
-    let cached = (!args.overwrite)
-        .then(|| bundle_cache::load(&args.output, hash))
-        .flatten();
+    // fetch, consistent with how it bypasses the file skip-cache. An unreadable
+    // cache file is fail-open: warn and fetch.
+    let cached = if args.overwrite {
+        None
+    } else {
+        bundle_cache::load(&args.output, hash).unwrap_or_else(|e| {
+            eprintln!("warning: {e:#}; fetching the bundle manifest");
+            None
+        })
+    };
     let bytes = if let Some(cached) = cached {
         cached
     } else {
@@ -4925,8 +4931,9 @@ fn report_nothing_to_fetch(reason: NothingReason) {
 
 /// The manifest a dry run can read with no network: the `-i` file, or the
 /// `--hash` bundle's copy in the output root's [`bundle_cache`]. `None` when
-/// `--hash` has no usable cached copy (missing, unreadable, or failing its hash
-/// check). Errors on a malformed `--hash`, an unreadable `-i` file, or bytes
+/// `--hash` has no cached copy, or a copy that fails its hash check (which
+/// prints a warning naming the file). Errors on a malformed `--hash`, an
+/// unreadable `-i` file, an unreadable cache file (naming its path), or bytes
 /// that do not parse as a v1 manifest. The cache is read even under
 /// `--overwrite`, which makes a real pull fetch the manifest again: the cache
 /// is content-addressed, so its bytes are exactly what that fetch returns.
@@ -4935,7 +4942,7 @@ fn dry_run_manifest(args: &BundlePullArgs) -> anyhow::Result<Option<Manifest>> {
         (Some(path), _) => read_local_manifest(path).map(Some),
         (None, Some(h)) => {
             let hash = fetch::parse_hash(h)?;
-            bundle_cache::load(&args.output, hash)
+            bundle_cache::load(&args.output, hash)?
                 .map(|bytes| {
                     parse_manifest(&bytes).with_context(|| {
                         format!(
