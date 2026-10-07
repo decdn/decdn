@@ -2793,6 +2793,7 @@ dependencies = [
  "decdn-incentive",
  "decdn-node",
  "decdn-protocol",
+ "globset",
  "iroh",
  "jsonrpsee",
  "nix",

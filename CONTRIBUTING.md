@@ -101,6 +101,11 @@ reaches only `pub` items. `crates/e2e/tests/no_inline_test_modules.rs` parses ev
 under `crates/` and fails on any test module with an inline body. It runs in the default
 `cargo nextest run`.
 
+CodeQL skips these files by name (`.github/codeql/codeql-config.yml`): `tests.rs`, `*_tests.rs`,
+`proptests.rs`, `test_support.rs` and `tests_support.rs` under `src/`. Name a new test module to
+match, or its fixture secrets raise alerts. The same test fails if a file with one of those names
+is not a `#[cfg(test)]` module, so a production file never drops out of the analysis.
+
 ### Public API snapshot
 
 `decdn-protocol` and `decdn-client` each carry a [`public_api`](https://crates.io/crates/public_api) +

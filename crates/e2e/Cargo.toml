@@ -73,7 +73,9 @@ nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
-# `tests/no_inline_test_modules.rs` parses every source file under `crates/`.
+# `tests/no_inline_test_modules.rs` parses every source file under `crates/`
+# and matches them against the CodeQL `paths-ignore` globs.
+globset = { workspace = true }
 syn = { workspace = true }
 walkdir = { workspace = true }
 
