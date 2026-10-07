@@ -48,8 +48,8 @@ use decdn_client::source::{Funder, SourceFuture};
 use decdn_client::{
     Connections, Cumulative, DownloadTarget, Downloader, Holder, LaneHandle, LaneLedgers,
     NoAffordableSource, NoCache, NoSourceHasBlob, PeerHealth, PeerSource, PoolContext, PoolLedger,
-    ProgressClock, PullConfig, PullDeadlines, StopPolicy, Streamer, UpstreamRefused,
-    UpstreamVoucherRejected, VoucherProgress, sign_client_binding,
+    ProgressClock, PullConfig, PullDeadlines, SignerCapDrained, StopPolicy, Streamer,
+    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, sign_client_binding,
 };
 
 use super::cli_sources::CliSources;
@@ -2076,8 +2076,12 @@ async fn fetch_over(
 /// owner-side remedy: the delegate holds no wallet on this pool, so it cannot
 /// `topUp`, raise its own cap, or mint itself a fresh capability. A
 /// [`NoAffordableSource`] — no provider's next voucher fits the pool — gets the
-/// same owner-side remedy. A terminal `Underpaid` — the resync budget ran
-/// out — gets its own next step. Any other
+/// same owner-side remedy. A drained signer registration (a mid-stream
+/// `SignerCapExhausted`), or a drained or expired one (a [`SignerCapDrained`]
+/// the lane read from chain after a node refused it at admission), gets the
+/// remedy a write-once registration leaves: a capability for a new signer key.
+/// A terminal `Underpaid` — the resync budget ran out — gets its own next
+/// step. Any other
 /// error passes through verbatim (a stall, a transport fault, or a `NotFound`
 /// already annotated by [`annotate_unbound_cache_miss`]).
 pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error {
@@ -2096,7 +2100,19 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
     let underpaid = err
         .downcast_ref::<UpstreamVoucherRejected>()
         .is_some_and(|rejected| rejected.reason == VoucherRejectReason::Underpaid);
-    if err.downcast_ref::<NoAffordableSource>().is_some() {
+    let signer_drained = err.downcast_ref::<SignerCapDrained>().is_some()
+        || err
+            .downcast_ref::<UpstreamVoucherRejected>()
+            .is_some_and(|rejected| rejected.reason == VoucherRejectReason::SignerCapExhausted);
+    if signer_drained {
+        err.context(
+            "this capability's signer key has too little of its registered cap left to pay the \
+             providers of this blob, or its registration expired, so no node can be paid for \
+             serving it. The registered cap and expiry are write-once on-chain: a new token for \
+             the same key does not raise them. Ask the pool owner to issue a capability for a \
+             new signer key",
+        )
+    } else if err.downcast_ref::<NoAffordableSource>().is_some() {
         err.context(
             "no provider's next voucher fits what the delegated pool holds. Ask the pool \
              owner to top up the pool (a delegated client cannot top up a pool it does not own)",
@@ -2104,8 +2120,10 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
     } else if needs_owner {
         err.context(
             "capability cap exhausted, capability expired, or pool balance exhausted. Ask the \
-             pool owner to top up the pool or issue a fresh, higher-cap capability (a delegated \
-             client cannot top up a pool it does not own)",
+             pool owner to top up the pool or issue a fresh, higher-cap capability; once this \
+             signer key is registered on-chain its terms are write-once, so the fresh capability \
+             must name a new signer key (a delegated client cannot top up a pool it does not \
+             own)",
         )
     } else if underpaid {
         err.context(
@@ -2321,6 +2339,15 @@ where
         Arc::clone(&ledger),
         provider,
     );
+    // A delegated signer the node refuses at admission for a drained or
+    // expired registration gets a plain `NotFound`; the chain read tells it
+    // apart from a cache miss, so the fetch bars that node, or stops when no
+    // node can serve the signer, instead of retrying (#2338).
+    let source = if grant.is_some() {
+        source.with_signer_check(deps.contract)
+    } else {
+        source
+    };
     if let Some(timings) = deps.timings {
         timings.mark(Mark::Lane);
     }
@@ -5045,10 +5072,45 @@ mod tests {
         );
     }
 
-    /// Any other error passes through the delegated-exhaustion annotator
-    /// untouched — only the three owner-remedy reasons
-    /// (`SpendingCapExhausted`, `CapabilityExpired`, `PoolExhausted`) name the
-    /// owner-side remedy.
+    /// A drained signer registration, read from chain after an admission
+    /// refusal (alone, or under the stop when every provider refused it) or
+    /// rejected mid-stream, names the remedy a write-once registration leaves:
+    /// a capability for a new signer key (#2338).
+    #[test]
+    fn delegated_drained_signer_gets_the_new_key_remedy() {
+        let read = anyhow::Error::new(decdn_client::SignerCapDrained {
+            pool_id: alloy::primitives::B256::ZERO,
+            signer: Address::repeat_byte(0xd1),
+            provider: Address::repeat_byte(0xa1),
+            remaining: 5,
+            rate_per_mb: 10,
+            expired: false,
+        });
+        let midstream = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: decdn_protocol::client::VoucherRejectReason::SignerCapExhausted,
+            bundle: None,
+            proof_generation: None,
+        });
+        let everywhere = anyhow::Error::new(decdn_client::SignerCapDrained {
+            pool_id: alloy::primitives::B256::ZERO,
+            signer: Address::repeat_byte(0xd1),
+            provider: Address::repeat_byte(0xa1),
+            remaining: 5,
+            rate_per_mb: 10,
+            expired: false,
+        })
+        .context(decdn_client::NoSourceServesSigner);
+        for err in [read, midstream, everywhere] {
+            let annotated = format!("{:#}", super::annotate_delegated_exhaustion(err));
+            assert!(
+                annotated.contains("new signer key"),
+                "expected the new-key remedy, got: {annotated}"
+            );
+        }
+    }
+
+    /// Any error the delegated-exhaustion annotator does not name passes
+    /// through untouched.
     #[test]
     fn delegated_non_cap_error_is_untouched() {
         let annotated = super::annotate_delegated_exhaustion(anyhow::anyhow!("stalled"));

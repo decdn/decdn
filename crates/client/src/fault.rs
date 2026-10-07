@@ -10,7 +10,9 @@ use decdn_protocol::client::StreamError;
 
 use crate::buyer_pool::{EscrowUntracked, TopUpUnconfirmed, WalletShortfall};
 use crate::driver::{PoolExhausted, TopUpFailed};
-use crate::{BlobTooLarge, LocalPullFault, UpstreamRefused, UpstreamVoucherRejected};
+use crate::{
+    BlobTooLarge, LocalPullFault, SignerCapDrained, UpstreamRefused, UpstreamVoucherRejected,
+};
 
 /// What a failed lane, lane build, or discovery means for the acquire loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,8 +94,21 @@ pub fn classify(err: &anyhow::Error) -> Fault {
     if err
         .downcast_ref::<crate::source_set::NoSourceHasBlob>()
         .is_some()
+        || err
+            .downcast_ref::<crate::source_set::NoSourceServesSigner>()
+            .is_some()
     {
         return Fault::Fatal(FatalScope::Item);
+    }
+    // A drained capability signer: every provider refuses it once its
+    // registration expired or nothing is left of its cap. Otherwise a
+    // cheaper provider can still serve it, so only this source is barred.
+    if let Some(drained) = err.downcast_ref::<SignerCapDrained>() {
+        return if drained.at_every_rate() {
+            Fault::Fatal(FatalScope::Command)
+        } else {
+            Fault::Source
+        };
     }
     if err.downcast_ref::<HealExhausted>().is_some()
         || err
@@ -212,6 +227,40 @@ mod tests {
         );
         let local = anyhow::anyhow!("store write").context(LocalPullFault);
         assert_eq!(classify(&local), Fault::Fatal(FatalScope::Command));
+    }
+
+    fn drained(remaining: u64, expired: bool) -> crate::SignerCapDrained {
+        crate::SignerCapDrained {
+            pool_id: alloy::primitives::B256::ZERO,
+            signer: alloy::primitives::Address::ZERO,
+            provider: alloy::primitives::Address::ZERO,
+            remaining,
+            rate_per_mb: 10,
+            expired,
+        }
+    }
+
+    /// A drained signer ends the command only when no provider at any rate
+    /// can serve it: its registration expired, or nothing is left of its cap.
+    /// With some headroom left, a cheaper provider still can, so only the
+    /// refusing source is barred, and the stop once every source is ends the
+    /// item (#2338).
+    #[test]
+    fn a_drained_signer_ends_the_command_only_at_every_rate() {
+        for (remaining, expired) in [(0, false), (5, true)] {
+            assert_eq!(
+                classify(&anyhow::Error::new(drained(remaining, expired))),
+                Fault::Fatal(FatalScope::Command),
+                "remaining {remaining}, expired {expired}"
+            );
+        }
+        assert_eq!(
+            classify(&anyhow::Error::new(drained(5, false))),
+            Fault::Source
+        );
+        let stop =
+            anyhow::Error::new(drained(5, false)).context(crate::source_set::NoSourceServesSigner);
+        assert_eq!(classify(&stop), Fault::Fatal(FatalScope::Item));
     }
 
     /// A watermark rejection that healed the lane ledger after the lane spent

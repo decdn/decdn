@@ -246,11 +246,11 @@ pub use scheduler::{
 pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{
     BaoRangeReader, BlobSource, Funder, IngestEnd, IngestFuture, IngestStore, PRIMED_MAX_IDLE,
-    PeerSource, PrimedSource, SourceFuture, SourceStream,
+    PeerSource, PrimedSource, SignerCapDrained, SignerRegistry, SourceFuture, SourceStream,
 };
 pub use source_set::{
-    Holder, LaneRange, NoAffordableSource, NoSourceHasBlob, SourceProvider, SourceSet,
-    StaticSources,
+    Holder, LaneRange, NoAffordableSource, NoSourceHasBlob, NoSourceServesSigner, SourceProvider,
+    SourceSet, StaticSources,
 };
 pub use stop::{ClockHold, GaveUp, ProgressClock, SCRIPT_GIVE_UP, StopPolicy};
 pub use streamer::{LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader};

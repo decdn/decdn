@@ -392,6 +392,7 @@ impl<'a> decdn_client::source::PeerSource<'a>
 pub const fn decdn_client::source::PeerSource<'a>::new(&'a iroh::endpoint::Endpoint, iroh_base::endpoint_addr::EndpointAddr, alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, alloc::sync::Arc<decdn_client::PoolLedger>, &'a alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, [u8; 32], u64, u64, decdn_client::PullDeadlines, core::option::Option<decdn_client::connection::Connections>) -> Self
 pub fn decdn_client::source::PeerSource<'a>::open_whole(&self, [u8; 32]) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, decdn_client::sink::PullReader)>
 pub fn decdn_client::source::PeerSource<'a>::with_dial_runtime(self, tokio::runtime::handle::Handle) -> Self
+pub fn decdn_client::source::PeerSource<'a>::with_signer_check(self, &'a dyn decdn_client::source::SignerRegistry) -> Self
 impl core::fmt::Debug for decdn_client::source::PeerSource<'_>
 pub fn decdn_client::source::PeerSource<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl decdn_client::source::BlobSource for decdn_client::source::PeerSource<'_>
@@ -414,6 +415,19 @@ pub fn decdn_client::source::PrimedSource<S>::finish(&self, Self::Reader) -> dec
 pub fn decdn_client::source::PrimedSource<S>::max_blob_size_bytes(&self) -> u64
 pub fn decdn_client::source::PrimedSource<S>::open(&self, [u8; 32], decdn_bao_range::AlignedRange) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, Self::Reader)>
 pub fn decdn_client::source::PrimedSource<S>::stop(&self, Self::Reader) -> decdn_client::source::SourceFuture<'_, decdn_client::VoucherProgress>
+pub struct decdn_client::source::SignerCapDrained
+pub decdn_client::source::SignerCapDrained::expired: bool
+pub decdn_client::source::SignerCapDrained::pool_id: alloy_primitives::aliases::B256
+pub decdn_client::source::SignerCapDrained::provider: alloy_primitives::bits::address::Address
+pub decdn_client::source::SignerCapDrained::rate_per_mb: u64
+pub decdn_client::source::SignerCapDrained::remaining: u64
+pub decdn_client::source::SignerCapDrained::signer: alloy_primitives::bits::address::Address
+impl decdn_client::source::SignerCapDrained
+pub const fn decdn_client::source::SignerCapDrained::at_every_rate(&self) -> bool
+pub fn decdn_client::source::SignerCapDrained::floor(&self) -> alloy_primitives::aliases::U256
+impl core::error::Error for decdn_client::source::SignerCapDrained
+impl core::fmt::Display for decdn_client::source::SignerCapDrained
+pub fn decdn_client::source::SignerCapDrained::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub const decdn_client::source::PRIMED_MAX_IDLE: core::time::Duration
 pub trait decdn_client::source::BaoRangeReader: iroh_io::AsyncStreamReader + decdn_client::sink::StashedFault + core::marker::Send
 impl<T> decdn_client::source::BaoRangeReader for T where T: iroh_io::AsyncStreamReader + decdn_client::sink::StashedFault + core::marker::Send
@@ -449,6 +463,10 @@ pub fn decdn_client::ranged_store::ClientRangedStore::flush_present_record(&self
 pub fn decdn_client::ranged_store::ClientRangedStore::ingest_stream<'a, R>(&'a self, &'a decdn_bao_range::AlignedRange, R, core::option::Option<&'a (dyn core::ops::function::Fn(u64) + core::marker::Send + core::marker::Sync)>, u64, core::option::Option<&'a core::sync::atomic::AtomicU64>) -> decdn_client::source::IngestFuture<'a, R> where R: decdn_client::source::BaoRangeReader + 'a
 pub fn decdn_client::ranged_store::ClientRangedStore::proven(&self) -> core::option::Option<u64>
 pub fn decdn_client::ranged_store::ClientRangedStore::set_bound(&self, u64)
+pub trait decdn_client::source::SignerRegistry: core::marker::Send + core::marker::Sync
+pub fn decdn_client::source::SignerRegistry::read(&self, alloy_primitives::aliases::B256, alloy_primitives::bits::address::Address) -> decdn_client::source::SourceFuture<'_, decdn_incentive::payment_pool::SignerAuthorization>
+impl<P> decdn_client::source::SignerRegistry for decdn_incentive::payment_pool::sol_types::PaymentPool::PaymentPoolInstance<P> where P: alloy_provider::provider::trait::Provider
+pub fn decdn_incentive::payment_pool::sol_types::PaymentPool::PaymentPoolInstance<P>::read(&self, alloy_primitives::aliases::B256, alloy_primitives::bits::address::Address) -> decdn_client::source::SourceFuture<'_, decdn_incentive::payment_pool::SignerAuthorization>
 pub type decdn_client::source::IngestFuture<'a, R> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<(R, decdn_client::source::IngestEnd)>> + 'a)>>
 pub type decdn_client::source::SourceFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>
 pub type decdn_client::source::SourceStream<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn futures_core::stream::Stream<Item = T> + core::marker::Send + 'a)>>
@@ -473,6 +491,10 @@ pub struct decdn_client::source_set::NoSourceHasBlob
 impl core::error::Error for decdn_client::source_set::NoSourceHasBlob
 impl core::fmt::Display for decdn_client::source_set::NoSourceHasBlob
 pub fn decdn_client::source_set::NoSourceHasBlob::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::source_set::NoSourceServesSigner
+impl core::error::Error for decdn_client::source_set::NoSourceServesSigner
+impl core::fmt::Display for decdn_client::source_set::NoSourceServesSigner
+pub fn decdn_client::source_set::NoSourceServesSigner::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::source_set::SourceSet<'p, P: decdn_client::source_set::SourceProvider>
 impl<'p, P: decdn_client::source_set::SourceProvider> decdn_client::source_set::SourceSet<'p, P>
 pub fn decdn_client::source_set::SourceSet<'p, P>::cached_lane(&self, alloy_primitives::bits::address::Address) -> core::option::Option<alloc::sync::Arc<decdn_client::streamer::StreamCandidate<<P as decdn_client::source_set::SourceProvider>::Source>>>
@@ -844,6 +866,10 @@ pub struct decdn_client::NoSourceHasBlob
 impl core::error::Error for decdn_client::source_set::NoSourceHasBlob
 impl core::fmt::Display for decdn_client::source_set::NoSourceHasBlob
 pub fn decdn_client::source_set::NoSourceHasBlob::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::NoSourceServesSigner
+impl core::error::Error for decdn_client::source_set::NoSourceServesSigner
+impl core::fmt::Display for decdn_client::source_set::NoSourceServesSigner
+pub fn decdn_client::source_set::NoSourceServesSigner::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::PaceState
 pub decdn_client::PaceState::cleared_bytes: u64
 pub decdn_client::PaceState::downstream: decdn_client::pacer::DownstreamFrontier
@@ -886,6 +912,7 @@ impl<'a> decdn_client::source::PeerSource<'a>
 pub const fn decdn_client::source::PeerSource<'a>::new(&'a iroh::endpoint::Endpoint, iroh_base::endpoint_addr::EndpointAddr, alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, alloc::sync::Arc<decdn_client::PoolLedger>, &'a alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, [u8; 32], u64, u64, decdn_client::PullDeadlines, core::option::Option<decdn_client::connection::Connections>) -> Self
 pub fn decdn_client::source::PeerSource<'a>::open_whole(&self, [u8; 32]) -> decdn_client::source::SourceFuture<'_, (decdn_client::UpstreamPullHeader, decdn_client::sink::PullReader)>
 pub fn decdn_client::source::PeerSource<'a>::with_dial_runtime(self, tokio::runtime::handle::Handle) -> Self
+pub fn decdn_client::source::PeerSource<'a>::with_signer_check(self, &'a dyn decdn_client::source::SignerRegistry) -> Self
 impl core::fmt::Debug for decdn_client::source::PeerSource<'_>
 pub fn decdn_client::source::PeerSource<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl decdn_client::source::BlobSource for decdn_client::source::PeerSource<'_>
@@ -1023,6 +1050,19 @@ pub decdn_client::SharedPool::topup_lock: &'a tokio::sync::mutex::Mutex<()>
 pub decdn_client::SharedPool::topups_used: &'a core::sync::atomic::AtomicU32
 impl core::fmt::Debug for decdn_client::driver::SharedPool<'_>
 pub fn decdn_client::driver::SharedPool<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::SignerCapDrained
+pub decdn_client::SignerCapDrained::expired: bool
+pub decdn_client::SignerCapDrained::pool_id: alloy_primitives::aliases::B256
+pub decdn_client::SignerCapDrained::provider: alloy_primitives::bits::address::Address
+pub decdn_client::SignerCapDrained::rate_per_mb: u64
+pub decdn_client::SignerCapDrained::remaining: u64
+pub decdn_client::SignerCapDrained::signer: alloy_primitives::bits::address::Address
+impl decdn_client::source::SignerCapDrained
+pub const fn decdn_client::source::SignerCapDrained::at_every_rate(&self) -> bool
+pub fn decdn_client::source::SignerCapDrained::floor(&self) -> alloy_primitives::aliases::U256
+impl core::error::Error for decdn_client::source::SignerCapDrained
+impl core::fmt::Display for decdn_client::source::SignerCapDrained
+pub fn decdn_client::source::SignerCapDrained::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::SourceCoverage
 pub decdn_client::SourceCoverage::coverage: decdn_protocol::coverage::Coverage
 pub decdn_client::SourceCoverage::source_ix: usize
@@ -1222,6 +1262,10 @@ impl decdn_client::pacer::Pacer for decdn_client::pacer::WindowPacer
 pub fn decdn_client::pacer::WindowPacer::decide(&self, &decdn_client::pacer::PaceState) -> decdn_client::pacer::PaceDecision
 pub trait decdn_client::PacingWait: core::marker::Send + core::marker::Sync
 pub fn decdn_client::PacingWait::wait(&self, decdn_client::pacer::DownstreamFrontier, decdn_client::driver::WaitReason) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + '_)>>
+pub trait decdn_client::SignerRegistry: core::marker::Send + core::marker::Sync
+pub fn decdn_client::SignerRegistry::read(&self, alloy_primitives::aliases::B256, alloy_primitives::bits::address::Address) -> decdn_client::source::SourceFuture<'_, decdn_incentive::payment_pool::SignerAuthorization>
+impl<P> decdn_client::source::SignerRegistry for decdn_incentive::payment_pool::sol_types::PaymentPool::PaymentPoolInstance<P> where P: alloy_provider::provider::trait::Provider
+pub fn decdn_incentive::payment_pool::sol_types::PaymentPool::PaymentPoolInstance<P>::read(&self, alloy_primitives::aliases::B256, alloy_primitives::bits::address::Address) -> decdn_client::source::SourceFuture<'_, decdn_incentive::payment_pool::SignerAuthorization>
 pub trait decdn_client::SourceProvider: core::marker::Send + core::marker::Sync
 pub type decdn_client::SourceProvider::Source: decdn_client::source::BlobSource
 pub fn decdn_client::SourceProvider::arrivals(&self) -> core::option::Option<decdn_client::source::SourceStream<'_, decdn_client::source_set::Holder>>

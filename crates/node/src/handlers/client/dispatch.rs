@@ -19,7 +19,7 @@ use tracing::Instrument as _;
 use super::outcome::{ErrEnd, ResetCause, ServeEnd};
 use crate::load_shed::RequestClass;
 use crate::metrics::FirstByteClock;
-use crate::pool_view::SignerAuthorization;
+use decdn_incentive::payment_pool::SignerAuthorization;
 
 /// The root span for one inbound serve stream.
 ///

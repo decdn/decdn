@@ -6222,6 +6222,152 @@ impl decdn_node::pool_view::PoolView for FixedRemainingPoolView {
     }
 }
 
+/// A [`PoolView`](decdn_node::pool_view::PoolView) for an open, well-funded
+/// pool whose every signer reads as registered with `spent == cap`: the node
+/// refuses the signer at admission (`SignerCapExhausted`), which reaches the
+/// wire as `NotFound`.
+#[derive(Debug)]
+struct DrainedSignerPoolView {
+    owner: Address,
+    cap: u64,
+}
+
+#[async_trait]
+impl decdn_node::pool_view::PoolView for DrainedSignerPoolView {
+    async fn status(&self, _pool_id: B256) -> Option<decdn_node::pool_view::PoolStatus> {
+        Some(decdn_node::pool_view::PoolStatus {
+            owner: self.owner,
+            remaining: U256::from(50_000_000u64),
+            lifecycle: decdn_node::pool_view::Lifecycle::Open,
+        })
+    }
+
+    async fn signer_authorization(
+        &self,
+        _pool_id: B256,
+        _signer: Address,
+    ) -> Option<decdn_incentive::payment_pool::SignerAuthorization> {
+        Some(self.registered())
+    }
+}
+
+impl DrainedSignerPoolView {
+    /// The drained registration both the node and the client's chain read see.
+    const fn registered(&self) -> decdn_incentive::payment_pool::SignerAuthorization {
+        decdn_incentive::payment_pool::SignerAuthorization::Registered {
+            cap: self.cap,
+            expiry: u64::MAX,
+            spent: self.cap,
+        }
+    }
+}
+
+impl decdn_client::SignerRegistry for DrainedSignerPoolView {
+    fn read(
+        &self,
+        _pool_id: B256,
+        _signer: Address,
+    ) -> decdn_client::SourceFuture<'_, decdn_incentive::payment_pool::SignerAuthorization> {
+        let auth = self.registered();
+        Box::pin(async move { Ok(auth) })
+    }
+}
+
+/// A node that refuses a drained capability signer at admission answers with
+/// a `NotFound` whose signed body carries its rate. A lane with a signer check
+/// reads the registration and fails the open with `SignerCapDrained`, naming
+/// the node and its rate; a lane without one keeps the plain `NotFound`
+/// (#2338).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drained_signer_refused_at_admission_is_named_by_the_signer_check() -> anyhow::Result<()>
+{
+    use decdn_client::PeerSource;
+    use decdn_client::source::BlobSource as _;
+
+    let payload = vec![0x5Du8; 300_000];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(50_000_000u64);
+    let pool_store = Arc::new(MemoryPoolStateStore::new());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn PoolStateStore> = pool_store;
+    let view = Arc::new(DrainedSignerPoolView {
+        owner: operator_addr(),
+        cap: 40,
+    });
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        |deps| deps.pool_view = Some(Arc::clone(&view) as _),
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ledger = Arc::new(ctx.new_ledger());
+    let ctx = Arc::new(std::sync::Mutex::new(ctx));
+    let slash = slash_domain();
+    let deadlines = PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?;
+    let source = || {
+        PeerSource::new(
+            &client_ep,
+            target.clone(),
+            Arc::clone(&ctx),
+            Arc::clone(&ledger),
+            &slash,
+            server_eth.address(),
+            decdn_protocol::client::NO_NAMESPACE,
+            0,
+            u64::MAX,
+            deadlines,
+            None,
+        )
+    };
+    let range = decdn_bao_range::align_range(0, 0, u64::try_from(payload.len())?)?;
+
+    let unchecked = source()
+        .open(*hash.as_bytes(), range.clone())
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("the node must refuse the drained signer"))?;
+    anyhow::ensure!(
+        unchecked
+            .downcast_ref::<decdn_client::UpstreamRefused>()
+            .is_some_and(|r| *r.error() == StreamError::NotFound),
+        "without a check the refusal is a plain NotFound, got: {unchecked:#}"
+    );
+
+    let checked = source()
+        .with_signer_check(view.as_ref())
+        .open(*hash.as_bytes(), range)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("the node must refuse the drained signer"))?;
+    let drained = checked
+        .downcast_ref::<decdn_client::SignerCapDrained>()
+        .ok_or_else(|| anyhow::anyhow!("expected SignerCapDrained, got: {checked:#}"))?;
+    anyhow::ensure!(drained.provider == operator_addr(), "{drained:?}");
+    anyhow::ensure!(drained.rate_per_mb == RATE_PER_MB, "{drained:?}");
+    anyhow::ensure!(
+        drained.remaining == 0 && drained.at_every_rate(),
+        "{drained:?}"
+    );
+
+    shutdown([server_task], [&server_ep, &client_ep]).await?;
+    Ok(())
+}
+
 /// The harness's fixed one-chunk floor cost — `credit_window(chunk, paid = 0)`
 /// collapses to one [`decdn_protocol::client::CHUNK_BYTES`] (1 MiB) regardless
 /// of `credit_max` whenever `credit_ramp_divisor` is non-zero (ADR 003 §Credit

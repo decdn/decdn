@@ -472,6 +472,59 @@ where
     Ok(None)
 }
 
+/// A voucher signer's on-chain authorization in one pool, as a node's admit path
+/// and a capability client read it from `getAuthorization` (ADR 003 §Capability delegation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignerAuthorization {
+    /// The signer holds no registration (the all-zero `Authorization`). Its first
+    /// redemption registers whichever owner-signed capability lands first.
+    Unregistered,
+    /// The signer is registered. `cap` and `expiry` are write-once on-chain, so
+    /// they never change for this `(pool, signer)`; `spent` only grows.
+    Registered {
+        /// The registered spending cap, in micro-USDC.
+        cap: u64,
+        /// The registered expiry, in Unix seconds. The chain treats a voucher at
+        /// or past it as unredeemable.
+        expiry: u64,
+        /// What the signer has redeemed across every provider, in micro-USDC.
+        spent: u64,
+    },
+}
+
+impl SignerAuthorization {
+    /// Classify a raw `getAuthorization` result. The contract marks a signer
+    /// registered when `cap != 0 || expiry != 0`, so a registration with a zero
+    /// `cap` but a non-zero `expiry` is registered with no headroom.
+    #[must_use]
+    pub const fn from_onchain(auth: &PaymentPool::Authorization) -> Self {
+        if auth.cap == 0 && auth.expiry == 0 {
+            Self::Unregistered
+        } else {
+            Self::Registered {
+                cap: auth.cap,
+                expiry: auth.expiry,
+                spent: auth.spent,
+            }
+        }
+    }
+
+    /// Whether the signer can still pay at least `floor_micro` at Unix time `now`.
+    /// An unregistered signer always can: it admits on its presented capability.
+    /// A registered signer needs a live registration and `cap − spent` headroom
+    /// of at least `floor_micro`.
+    #[must_use]
+    pub fn covers(self, floor_micro: alloy::primitives::U256, now: u64) -> bool {
+        match self {
+            Self::Unregistered => true,
+            Self::Registered { cap, expiry, spent } => {
+                now < expiry
+                    && alloy::primitives::U256::from(cap.saturating_sub(spent)) >= floor_micro
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -816,5 +869,41 @@ mod tests {
             PaymentPool::getWatermarksCall::SIGNATURE,
             "getWatermarks(bytes32[],address[],address[])"
         );
+    }
+
+    /// The all-zero row is unregistered; any non-zero `cap` or `expiry` is a
+    /// registration, a zero-cap one included.
+    #[test]
+    fn signer_authorization_reads_registration_from_cap_or_expiry() {
+        use super::SignerAuthorization;
+        let row = |cap, expiry, spent| PaymentPool::Authorization { cap, expiry, spent };
+        assert_eq!(
+            SignerAuthorization::from_onchain(&row(0, 0, 0)),
+            SignerAuthorization::Unregistered
+        );
+        assert_eq!(
+            SignerAuthorization::from_onchain(&row(0, 9, 0)),
+            SignerAuthorization::Registered {
+                cap: 0,
+                expiry: 9,
+                spent: 0
+            }
+        );
+    }
+
+    /// A registration covers a floor while it is live and `cap − spent`
+    /// reaches the floor; an unregistered signer always covers.
+    #[test]
+    fn signer_authorization_covers_a_floor_within_headroom_and_expiry() {
+        use super::SignerAuthorization;
+        let auth = SignerAuthorization::Registered {
+            cap: 40,
+            expiry: 100,
+            spent: 30,
+        };
+        assert!(auth.covers(U256::from(10u64), 99));
+        assert!(!auth.covers(U256::from(11u64), 99));
+        assert!(!auth.covers(U256::from(1u64), 100), "expired at its expiry");
+        assert!(SignerAuthorization::Unregistered.covers(U256::MAX, u64::MAX));
     }
 }
