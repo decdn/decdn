@@ -4138,7 +4138,7 @@ async fn dry_run_fails_on_a_cached_manifest_that_does_not_parse() {
 }
 
 /// A cached manifest file that exists but cannot be read fails the dry run,
-/// naming the file, rather than reporting that no manifest is cached (#2361).
+/// naming the file and the OS error (#2361).
 #[tokio::test]
 async fn dry_run_fails_naming_an_unreadable_cached_manifest() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -4155,6 +4155,62 @@ async fn dry_run_fails_naming_an_unreadable_cached_manifest() {
     let msg = format!("{err:#}");
     assert!(msg.contains(bundle_cache::CACHE_DIR), "{msg}");
     assert!(msg.contains(hex.as_str()), "{msg}");
+    assert!(msg.contains("os error"), "{msg}");
+}
+
+/// A cached manifest file whose bytes fail the hash check fails the dry run,
+/// naming the file, so its filters are never reported as unchecked for want of
+/// a cache (#2361).
+#[tokio::test]
+async fn dry_run_fails_naming_a_cached_manifest_that_fails_its_hash_check() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let out = tmp.path().to_str().expect("utf-8 tmp path");
+    let hash = cache_manifest(
+        tmp.path(),
+        &serde_json::json!({"version": 1, "entries": []}),
+    );
+    let raw = fetch::parse_hash(&hash).expect("hash");
+    std::fs::write(bundle_cache::cache_path(tmp.path(), raw), b"tampered").expect("tamper");
+    let args = pull_args(&["-o", out, "--hash", &hash, "--dry-run"]);
+    let err = super::bundle_pull(&args, None)
+        .await
+        .expect_err("a tampered cached manifest fails the dry run");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("does not hash to the bundle"), "{msg}");
+    assert!(msg.contains(bundle_cache::CACHE_DIR), "{msg}");
+}
+
+/// A real pull reads a cached manifest instead of fetching it, and
+/// `--overwrite` skips the cache to force a fresh fetch.
+#[test]
+fn cached_manifest_reads_the_cache_unless_overwrite() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let out = tmp.path().to_str().expect("utf-8 tmp path");
+    let manifest = serde_json::json!({"version": 1, "entries": []});
+    let hash = cache_manifest(tmp.path(), &manifest);
+    let raw = fetch::parse_hash(&hash).expect("hash");
+
+    let cached = cached_manifest(&pull_args(&["-o", out, "--hash", &hash]), raw);
+    assert_eq!(cached, Some(serde_json::to_vec(&manifest).unwrap()));
+
+    let args = pull_args(&["-o", out, "--hash", &hash, "--overwrite"]);
+    assert_eq!(cached_manifest(&args, raw), None);
+}
+
+/// A real pull is fail-open on a cache file it cannot read: it fetches the
+/// manifest instead of failing (#2361).
+#[test]
+fn cached_manifest_falls_back_to_a_fetch_on_an_unreadable_cache_file() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let out = tmp.path().to_str().expect("utf-8 tmp path");
+    let raw = [0xcd_u8; 32];
+    std::fs::create_dir_all(bundle_cache::cache_path(tmp.path(), raw)).expect("mkdir");
+    let hash = format!("b3:{}", blake3::Hash::from_bytes(raw).to_hex());
+
+    assert_eq!(
+        cached_manifest(&pull_args(&["-o", out, "--hash", &hash]), raw),
+        None
+    );
 }
 
 /// A malformed `--hash` fails the dry run, as it fails a real pull.

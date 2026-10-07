@@ -19,22 +19,28 @@ fn load_is_none_when_no_cache_file_exists() {
     assert_eq!(load(dir.path(), hash).unwrap(), None);
 }
 
+/// A cached file whose bytes do not hash to the key is an error that names the
+/// path (#2361).
 #[test]
-fn load_rejects_bytes_that_do_not_hash_to_the_key() {
+fn load_errors_naming_the_path_when_bytes_do_not_hash_to_the_key() {
     let dir = tempfile::tempdir().unwrap();
     let bytes = b"original".to_vec();
     let hash = *blake3::hash(&bytes).as_bytes();
     store(dir.path(), hash, &bytes);
 
     // Corrupt the cached file in place; its bytes no longer match `hash`.
-    std::fs::write(cache_path(dir.path(), hash), b"tampered").unwrap();
+    let path = cache_path(dir.path(), hash);
+    std::fs::write(&path, b"tampered").unwrap();
 
-    assert_eq!(load(dir.path(), hash).unwrap(), None);
+    let err = load(dir.path(), hash).expect_err("a mismatched cache file is an error");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("does not hash to the bundle"), "{msg}");
+    assert!(msg.contains(&path.display().to_string()), "{msg}");
 }
 
-/// A cache file that exists but cannot be read is an error that names the
-/// path, not a silent miss (#2361). A directory at the cache path stands in for
-/// an unreadable file, so the test also holds when it runs as root.
+/// A cache file that exists but cannot be read is an error that names the path
+/// (#2361). A directory at the cache path stands in for an unreadable file, so
+/// the test also holds when it runs as root.
 #[test]
 fn load_errors_naming_the_path_when_the_cache_file_is_unreadable() {
     let dir = tempfile::tempdir().unwrap();
@@ -48,8 +54,7 @@ fn load_errors_naming_the_path_when_the_cache_file_is_unreadable() {
     assert!(msg.contains(&path.display().to_string()), "{msg}");
 }
 
-/// A cache write that fails reports an error naming the cache directory, which
-/// `store` prints as a warning.
+/// When the cache directory cannot be created, the write error names it.
 #[test]
 fn try_store_errors_naming_the_cache_dir_when_it_is_a_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -60,6 +65,25 @@ fn try_store_errors_naming_the_cache_dir_when_it_is_a_file() {
     let err = try_store(dir.path(), hash, &bytes).expect_err("the cache dir is a file");
 
     assert!(format!("{err:#}").contains(CACHE_DIR), "{err:#}");
+}
+
+/// When the final rename fails, the write error names the destination file. A
+/// directory at the cache path makes the rename fail.
+#[test]
+fn try_store_errors_naming_the_file_when_the_rename_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = b"manifest".to_vec();
+    let hash = *blake3::hash(&bytes).as_bytes();
+    let path = cache_path(dir.path(), hash);
+    std::fs::create_dir_all(&path).unwrap();
+
+    let err = try_store(dir.path(), hash, &bytes).expect_err("a directory blocks the rename");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(&format!("persist {}", path.display())),
+        "{msg}"
+    );
 }
 
 #[test]

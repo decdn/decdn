@@ -3192,11 +3192,10 @@ since project inception and will roll into the first tagged release.
   would pull into; under `--json` it prints `count` and `entries` as `null`.
   A malformed `--hash` fails the dry run, as it fails a real pull.
 - **`bundle pull --hash` names a cached manifest it cannot use (#2361).** A
-  cache file under `.decdn-bundles/` that exists but cannot be read fails
-  `--dry-run` with the file path and the OS error, instead of reporting that
-  no manifest is cached. A real pull warns with the same reason and fetches
-  the manifest fresh. A cache file that fails its hash check, and a cache
-  write that fails, each print a warning that names the file.
+  cache file under `.decdn-bundles/` that cannot be read, or whose bytes fail
+  the hash check, fails `--dry-run` with the file path and the reason. A real
+  pull prints the same reason as a warning and fetches the manifest fresh. A
+  cache write that fails prints a warning that names the path.
 
 - **Paid-leg diagnostics at `debug` (#2211).** Each paid leg's open logs its
   peer, hash, `byte_offset` and `byte_len`. A throughput-floor trip logs the
