@@ -5504,14 +5504,13 @@ mod tests {
         Ok(())
     }
 
-    /// #2348: a slow-victim steal whose node refuses the blob as larger than
-    /// its size ceiling puts the tail back in the queue and bars the lane
-    /// from pull-through, so it is asked for that tail once. The slow lane,
-    /// which covers it, finishes the fetch.
+    /// #2348: a slow-victim steal whose node refuses `Declined` puts the tail
+    /// back in the queue and bars the lane from pull-through, so it is asked
+    /// for that tail once. The slow lane, which covers it, finishes the fetch.
     #[tokio::test(start_paused = true)]
     async fn a_refused_slow_victim_steal_requeues_and_bars_the_lane() -> anyhow::Result<()> {
         fn too_large() -> anyhow::Error {
-            anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::BlobTooLarge))
+            anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Declined))
         }
         let (fast, slow, data, provider, store, dir) =
             slow_leg_fixture(Some(too_large), None, None)?;
