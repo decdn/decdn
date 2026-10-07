@@ -316,7 +316,8 @@ as `decdn fetch`):
   plan lists entries only when an earlier pull into the same `-o`
   directory cached the bundle manifest under `.decdn-bundles/`. Without
   that cache, the dry run prints only the bundle hash and the output
-  directory. A pull caches each manifest it fetches, keyed by its hash.
+  directory. A cache file that the dry run cannot read, or that fails its
+  hash check, fails the dry run. A pull caches each manifest it fetches, keyed by its hash.
   A later pull of the same bundle into the same directory reads the
   cache. `--overwrite` makes a real pull fetch the manifest again.
 

@@ -1782,6 +1782,23 @@ fn namespace_id(namespace: Option<u64>) -> [u8; 32] {
     })
 }
 
+/// The `--hash` bundle manifest bytes a real pull reads from the output root's
+/// [`bundle_cache`] instead of paying for a fetch, or `None` to fetch them.
+/// "Don't pay again": a prior pull of this bundle into the same output dir cached
+/// the manifest blob, keyed by its hash and self-verifying on read. `--overwrite`
+/// returns `None` to force a fresh fetch, as it bypasses the file skip-cache. A
+/// cache file that cannot be read or fails its hash check is fail-open: the error
+/// prints as a warning and the pull fetches.
+fn cached_manifest(args: &BundlePullArgs, hash: [u8; 32]) -> Option<Vec<u8>> {
+    if args.overwrite {
+        return None;
+    }
+    bundle_cache::load(&args.output, hash).unwrap_or_else(|e| {
+        eprintln!("warning: {e:#}; fetching the bundle manifest");
+        None
+    })
+}
+
 /// The kept manifest for the run: the pre-read local one (already filtered up
 /// front), or the `--hash` bundle blob fetched into memory and filtered here.
 /// `Ok(None)` means the manifest is empty after filtering — [`report_nothing_to_fetch`]
@@ -1801,21 +1818,14 @@ async fn obtain_manifest<P: Provider + Clone>(
         .as_deref()
         .ok_or_else(|| anyhow!("no bundle source (expected -i or --hash)"))?;
     let hash = fetch::parse_hash(raw)?;
-    // "Don't pay again": a prior pull of this bundle into the same output dir
-    // cached the manifest blob, keyed by its hash and self-verifying on read, so a
-    // repeat run skips the paid `cdn/client/v1` fetch. `--overwrite` forces a fresh
-    // fetch, consistent with how it bypasses the file skip-cache.
-    let cached = (!args.overwrite)
-        .then(|| bundle_cache::load(&args.output, hash))
-        .flatten();
-    let bytes = if let Some(cached) = cached {
+    let bytes = if let Some(cached) = cached_manifest(args, hash) {
         cached
     } else {
         let fetched = ctx
             .fetch_to_memory(hash, &args.output)
             .await
             .context("fetch bundle manifest blob")?;
-        // Advisory: a write failure is logged, never fatal.
+        // Advisory: a write failure prints a warning, never fails the pull.
         bundle_cache::store(&args.output, hash, &fetched);
         fetched
     };
@@ -4925,9 +4935,9 @@ fn report_nothing_to_fetch(reason: NothingReason) {
 
 /// The manifest a dry run can read with no network: the `-i` file, or the
 /// `--hash` bundle's copy in the output root's [`bundle_cache`]. `None` when
-/// `--hash` has no usable cached copy (missing, unreadable, or failing its hash
-/// check). Errors on a malformed `--hash`, an unreadable `-i` file, or bytes
-/// that do not parse as a v1 manifest. The cache is read even under
+/// `--hash` has no cached copy. Errors on a malformed `--hash`, an unreadable
+/// `-i` file, a cache file that cannot be read or fails its hash check (naming
+/// its path), or bytes that do not parse as a v1 manifest. The cache is read even under
 /// `--overwrite`, which makes a real pull fetch the manifest again: the cache
 /// is content-addressed, so its bytes are exactly what that fetch returns.
 fn dry_run_manifest(args: &BundlePullArgs) -> anyhow::Result<Option<Manifest>> {
@@ -4935,7 +4945,7 @@ fn dry_run_manifest(args: &BundlePullArgs) -> anyhow::Result<Option<Manifest>> {
         (Some(path), _) => read_local_manifest(path).map(Some),
         (None, Some(h)) => {
             let hash = fetch::parse_hash(h)?;
-            bundle_cache::load(&args.output, hash)
+            bundle_cache::load(&args.output, hash)?
                 .map(|bytes| {
                     parse_manifest(&bytes).with_context(|| {
                         format!(

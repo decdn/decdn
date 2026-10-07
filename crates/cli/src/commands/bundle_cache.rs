@@ -6,13 +6,17 @@
 //!
 //! The cache is content-addressed and self-verifying: a load re-hashes the bytes
 //! and returns them only when the digest still equals the requested hash, so a
-//! corrupt or tampered file is ignored (the manifest is fetched fresh) rather
-//! than trusted. It is advisory — a missing, unreadable, or mismatched file only
-//! costs one manifest fetch — so a write failure is logged and never fails the
-//! pull, and a real pull under `--overwrite` skips the read to force a fresh
+//! corrupt or tampered file is never trusted. A load tells two cases apart: a
+//! missing file is a plain miss, and any other failure (a read error, or bytes
+//! that fail the hash check) is an error that names the path, for the caller to
+//! act on. A real pull is fail-open: it prints that error as a warning and
+//! fetches the manifest fresh, so a bad cache file only costs one manifest
+//! fetch. A write failure prints a warning that names the path and never fails
+//! the pull. A real pull under `--overwrite` skips the read to force a fresh
 //! fetch. The cache also lets `bundle pull --hash --dry-run` list a bundle's
 //! entries with no network; the dry run reads it even under `--overwrite`,
-//! because verified bytes equal what a fresh fetch returns.
+//! because verified bytes equal what a fresh fetch returns, and it fails on a
+//! cache file it cannot use, because the cache is its whole answer.
 //!
 //! Only the `--hash` path uses it: an `-i` local manifest is already on disk for
 //! free, with nothing to cache or re-pay.
@@ -31,27 +35,45 @@ pub(crate) fn cache_path(out_root: &Path, hash: [u8; 32]) -> PathBuf {
     out_root.join(CACHE_DIR).join(format!("{name}.json"))
 }
 
-/// Load the cached manifest bytes for `hash`, or `None` when there is no usable
-/// cache hit. A missing or unreadable file, or bytes whose BLAKE3 digest no
-/// longer equals `hash`, all yield `None` — the caller then fetches the manifest
-/// fresh. The returned bytes are guaranteed to hash to `hash`.
-pub(crate) fn load(out_root: &Path, hash: [u8; 32]) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(cache_path(out_root, hash)).ok()?;
-    (*blake3::hash(&bytes).as_bytes() == hash).then_some(bytes)
+/// Load the cached manifest bytes for `hash`. Returns `Ok(None)` when no cache
+/// file exists. Returns an error that names the path for any other read failure
+/// (for example permission denied, or a directory in the way) and when the
+/// file's BLAKE3 digest does not equal `hash`. The returned bytes always hash
+/// to `hash`.
+pub(crate) fn load(out_root: &Path, hash: [u8; 32]) -> anyhow::Result<Option<Vec<u8>>> {
+    use anyhow::Context as _;
+
+    let path = cache_path(out_root, hash);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("read cached bundle manifest {}", path.display()));
+        }
+    };
+    if *blake3::hash(&bytes).as_bytes() != hash {
+        anyhow::bail!(
+            "cached bundle manifest {} does not hash to the bundle",
+            path.display()
+        );
+    }
+    Ok(Some(bytes))
 }
 
 /// Cache `bytes` (a verified bundle manifest with content address `hash`) under
-/// `out_root`. Best-effort and advisory: any filesystem error is logged and
-/// swallowed, because a pull must not fail over a caching miss.
+/// `out_root`. Best-effort and advisory: a filesystem error prints a warning and
+/// is swallowed, because a pull must not fail over a cache write.
 pub(crate) fn store(out_root: &Path, hash: [u8; 32], bytes: &[u8]) {
     if let Err(e) = try_store(out_root, hash, bytes) {
-        tracing::debug!("bundle manifest cache write skipped: {e:#}");
+        eprintln!("warning: bundle manifest cache not written: {e:#}");
     }
 }
 
 /// The fallible core of [`store`]: create the cache directory and write the
 /// manifest bytes atomically (temp file in the same directory, `sync_all`, then
-/// rename), so a reader never sees a partial file.
+/// rename), so a reader never sees a partial file. Every error names the cache
+/// directory or the destination file.
 fn try_store(out_root: &Path, hash: [u8; 32], bytes: &[u8]) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
@@ -59,14 +81,16 @@ fn try_store(out_root: &Path, hash: [u8; 32], bytes: &[u8]) -> anyhow::Result<()
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let mut tmp = super::fetch::temp_in_parent(&dest).context("stage bundle manifest cache")?;
-    std::io::Write::write_all(tmp.as_file_mut(), bytes).context("write bundle manifest cache")?;
+    let shown = dest.display();
+    let mut tmp = super::fetch::temp_in_parent(&dest).with_context(|| format!("stage {shown}"))?;
+    std::io::Write::write_all(tmp.as_file_mut(), bytes)
+        .with_context(|| format!("write {shown}"))?;
     tmp.as_file()
         .sync_all()
-        .context("sync bundle manifest cache")?;
+        .with_context(|| format!("sync {shown}"))?;
     tmp.persist(&dest)
         .map_err(|e| e.error)
-        .context("persist bundle manifest cache")?;
+        .with_context(|| format!("persist {shown}"))?;
     Ok(())
 }
 
