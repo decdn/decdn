@@ -4104,7 +4104,10 @@ impl CacheEngine {
     /// ARE the outboard proof nodes, so they are captured into the shared session
     /// in the SAME decode pass — no post-admit `export_bao` read-back that would
     /// re-stream the whole range through the store actor a second time (#1790 item
-    /// 4). Front-to-back admits union to the whole tree.
+    /// 4). Each leaf's run of proof nodes goes into the session in one batch just
+    /// before that leaf goes to the store, so a parked serve leg encodes its first
+    /// frame after the first leaf, not after the whole range, and wakes at most once
+    /// per leaf. Front-to-back admits union to the whole tree.
     ///
     /// # Errors
     ///
@@ -4154,7 +4157,7 @@ impl CacheEngine {
             ));
         };
         let tree = bao_tree::BaoTree::new(total_bytes, crate::range_pull::IROH_BLOCK_SIZE);
-        let capture = session.is_some();
+        let capture_into = session.cloned();
         let admitted = chunk_ranges.clone();
 
         let handle = match self
@@ -4196,9 +4199,16 @@ impl CacheEngine {
                         };
                         // The `Parent` items ARE the outboard proof nodes; capture
                         // them for the serve leg here, in the one decode pass, rather
-                        // than re-reading them back out of the store afterwards.
-                        if capture && let BaoContentItem::Parent(parent) = &item {
-                            pairs.push((parent.node, parent.pair));
+                        // than re-reading them back out of the store afterwards. The
+                        // decoder yields a leaf's proof nodes, already verified, right
+                        // before that leaf, so each run is published in one batch as
+                        // its leaf arrives.
+                        if let Some(session) = &capture_into {
+                            if let BaoContentItem::Parent(parent) = &item {
+                                pairs.push((parent.node, parent.pair));
+                            } else if !pairs.is_empty() {
+                                session.capture_many(pairs.drain(..));
+                            }
                         }
                         if tx.send(item).await.is_err() {
                             // The store import ended before this item landed — its
@@ -4257,10 +4267,8 @@ impl CacheEngine {
             // never reaches `observe_hit`), so the bytes `size_snapshot` counts can
             // be released.
             self.record_access(hash);
-            // Wake parked serve legs once for the whole admit, not per node: a
-            // large range carries many proof nodes, and a per-node notify storm
-            // scales the wakeups with proof-node count for no gain. `pairs` is
-            // empty when no serve leg shares this fill.
+            // Capture any proof nodes left after the last leaf. `pairs` is empty
+            // when no serve leg shares this fill.
             if let Some(session) = session {
                 session.capture_many(pairs);
             }
@@ -11211,6 +11219,71 @@ mod tests {
                 assert!(err.to_string().contains("upstream pull failed"), "{err}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn admit_bao_stream_captures_a_leafs_proof_before_the_admit_finishes() {
+        // A serve leg sharing the fill reads the first leaf's proof nodes as soon
+        // as that leaf arrives, while the rest of the draw is still in flight.
+        // The feed stalls for good after the first leaf, so the admit never
+        // finishes, yet the root proof node is already in the session.
+        use bao_tree::io::fsm::Outboard;
+
+        /// Header-less bao wire reader that yields its bytes, then parks forever.
+        struct StallingReader(bytes::Bytes);
+        impl iroh_io::AsyncStreamReader for StallingReader {
+            async fn read_bytes(&mut self, len: usize) -> std::io::Result<bytes::Bytes> {
+                if self.0.is_empty() {
+                    std::future::pending::<()>().await;
+                }
+                Ok(self.0.split_to(self.0.len().min(len)))
+            }
+            async fn read<const L: usize>(&mut self) -> std::io::Result<[u8; L]> {
+                if self.0.len() < L {
+                    std::future::pending::<()>().await;
+                }
+                let g = self.0.split_to(L);
+                let mut out = [0u8; L];
+                out.copy_from_slice(&g);
+                Ok(out)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
+        let wire = bao.slice(8..);
+
+        // The pre-order wire for four leaves opens with the root pair and the left
+        // child pair, then leaf 0. Feed exactly that much.
+        let first_leaf_end = 2 * 64 + usize::try_from(group).unwrap();
+        let reader = StallingReader(wire.slice(..first_leaf_end));
+        let root_pair = (
+            bao_tree::blake3::Hash::from_bytes(wire[..32].try_into().unwrap()),
+            bao_tree::blake3::Hash::from_bytes(wire[32..64].try_into().unwrap()),
+        );
+        let root_node = bao_tree::BaoTree::new(total, crate::range_pull::IROH_BLOCK_SIZE).root();
+
+        let session = crate::FillSession::new(bao_tree::blake3::Hash::from(root), total);
+        let mut outboard_reader = session.outboard_reader();
+        let admit = engine.admit_bao_stream(hash, ranges, total, reader, Some(&session));
+        tokio::pin!(admit);
+        let loaded = tokio::select! {
+            _ = &mut admit => panic!("a stalled feed cannot finish the admit"),
+            loaded = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                outboard_reader.load(root_node),
+            ) => loaded,
+        };
+        assert_eq!(
+            loaded
+                .expect("the root proof node is captured while the admit is in flight")
+                .unwrap(),
+            Some(root_pair),
+        );
     }
 
     #[tokio::test]
