@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use alloy::primitives::U256;
 use anyhow::Context as _;
 use bytes::Bytes;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -357,10 +358,10 @@ where
 /// use std::path::Path;
 /// use std::sync::Arc;
 ///
-/// use decdn_client::driver::DriveConfig;
-/// use decdn_client::source::{BlobSource, Funder};
+/// use decdn_client::source::BlobSource;
 /// use decdn_client::{
-///     NoCache, ProgressClock, PullConfig, StaticSources, StopPolicy, StreamCandidate, Streamer,
+///     Funder, NoCache, ProgressClock, PullConfig, StaticSources, StopPolicy, StreamCandidate,
+///     Streamer,
 /// };
 ///
 /// async fn stream<S: BlobSource, F: Funder>(
@@ -370,10 +371,7 @@ where
 ///     total_bytes: u64,
 ///     scratch: &Path,
 /// ) -> anyhow::Result<()> {
-///     let sources = StaticSources::new(candidates)?;
-///     let holders = sources.holders();
-///     let drive = DriveConfig::cli(Default::default());
-///     let streamer = Streamer::new(sources, holders, Default::default(), funder, drive, scratch);
+///     let streamer = Streamer::new(StaticSources::new(candidates)?, funder, scratch);
 ///     let stop = StopPolicy::new(true, None, Arc::new(ProgressClock::new()));
 ///     let (mut reader, mut drive) = streamer
 ///         .open(hash, total_bytes, &PullConfig::new(), Arc::new(NoCache), stop)
@@ -411,27 +409,58 @@ impl<P, F> std::fmt::Debug for Streamer<'_, P, F> {
 }
 
 impl<'a, P, F> Streamer<'a, P, F> {
-    /// Build a streamer over `holders`, whose lanes `provider` builds, filling
-    /// into `scratch`. `health` is the command-wide health the stream's sources
-    /// record into.
+    /// Build a streamer whose holders and lanes `provider` finds and builds,
+    /// funded through `funder`, filling into `scratch`.
+    ///
+    /// The stream starts by discovering its holders, and reactive top-up is
+    /// off. The builder methods change both.
     #[must_use]
-    pub const fn new(
-        provider: P,
-        holders: Vec<Holder>,
-        health: Arc<PeerHealth>,
-        funder: F,
-        drive_config: DriveConfig,
-        scratch: &'a Path,
-    ) -> Self {
+    pub fn new(provider: P, funder: F, scratch: &'a Path) -> Self {
         Self {
             provider,
-            holders,
-            health,
+            holders: Vec::new(),
+            health: Arc::default(),
             funder,
-            drive_config,
+            drive_config: DriveConfig::cli(U256::ZERO),
             scratch,
             max_blob_bytes: 0,
         }
+    }
+
+    /// Start the stream from `holders`, in preference order, instead of
+    /// discovering them. A probe's measured holders go here.
+    #[must_use]
+    pub fn holders(mut self, holders: Vec<Holder>) -> Self {
+        self.holders = holders;
+        self
+    }
+
+    /// Top the pool up through the funder, back to `working_deposit`, when the
+    /// stream runs the deposit low. `U256::ZERO` turns reactive top-up off: a
+    /// stream the deposit cannot cover then ends with
+    /// [`crate::NoAffordableSource`].
+    #[must_use]
+    pub const fn working_deposit(mut self, working_deposit: U256) -> Self {
+        self.drive_config.working_deposit = working_deposit;
+        self
+    }
+
+    /// Record source faults into `health`, which a command shares across its
+    /// fetches so a holder that faulted on one stays cooled on the next.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn health(mut self, health: Arc<PeerHealth>) -> Self {
+        self.health = health;
+        self
+    }
+
+    /// Replace the whole funding and settle policy, the working deposit
+    /// included.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn drive_config(mut self, drive_config: DriveConfig) -> Self {
+        self.drive_config = drive_config;
+        self
     }
 
     /// Cap the stream at `max_blob_bytes` (`0` for no cap). A size claim above
@@ -925,14 +954,9 @@ mod tests {
     ) -> anyhow::Result<Streamer<'_, StaticSources<S>, FakeFunder>> {
         let sources = StaticSources::new(candidates)?;
         let holders = sources.holders();
-        Ok(Streamer::new(
-            sources,
-            holders,
-            Arc::default(),
-            funder(),
-            drive_config(),
-            scratch,
-        ))
+        Ok(Streamer::new(sources, funder(), scratch)
+            .holders(holders)
+            .drive_config(drive_config()))
     }
 
     /// The stop a script gets: give up after [`crate::SCRIPT_GIVE_UP`].
