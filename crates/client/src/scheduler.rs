@@ -158,8 +158,8 @@ const FIRST_BYTE_GRACE: Duration = Duration::from_secs(30);
 /// wait after a pass that found no lane to ask for a queued range while a
 /// running lane has a [`LaneWiden`]: an own worker that takes its next range
 /// wakes nothing, so the loop looks again on this clock. It is also the
-/// first wait before a lane is asked again after a node refused its extra
-/// stream, a wait that doubles up to a cap, and the wait before a lane that
+/// first wait, which doubles up to a cap, before a lane is asked again after
+/// a node refused its extra stream. And it is the wait before a lane that
 /// found no free stream tries to start again.
 pub const GROWTH_RETRY: Duration = Duration::from_secs(1);
 
@@ -361,9 +361,10 @@ pub enum GrowFor {
 /// stream's worker stops for any reason.
 ///
 /// In turn, the acquire asks a `grow` that refused again within
-/// [`GROWTH_RETRY`] while it still wants that stream. A caller can so hold a
-/// freed stream for a lane that waits, and let the hold lapse once the lane
-/// stops asking.
+/// [`GROWTH_RETRY`] while it still wants that stream, unless the lane's node
+/// refused its extra streams and the lane waits out that refusal. So a
+/// caller can hold a freed stream for a lane that waits, and let the hold
+/// lapse once the lane stops asking.
 pub struct LaneWiden {
     /// Grants one stream of the given [`GrowFor`] now, without waiting, and
     /// returns whether it did.
@@ -8580,6 +8581,89 @@ mod tests {
         }
         assert!(count.granted() >= 1, "B grew an extra stream");
         assert_eq!(count.released(), count.granted());
+        Ok(())
+    }
+
+    /// While a queued range waits and every `grow` for it is refused, the
+    /// loop asks again at least once per [`GROWTH_RETRY`], never on a wait
+    /// that grows. A caller that holds a freed stream for a lane that waits
+    /// lets the hold lapse once the lane stops asking (#2341), so a longer
+    /// wait between asks would drop a hold the lane still needs.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_grow_is_asked_again_every_growth_retry() -> anyhow::Result<()> {
+        use std::sync::PoisonError;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let data = blob(32 * MIB as usize);
+        let la = Arc::new(PoolLedger::new(Cumulative::default()));
+        let lb = Arc::new(PoolLedger::new(Cumulative::default()));
+        let a = dead_after_first_mib(&data, &la)?;
+        let b = busy(&data, &lb)?;
+        let free = Arc::new(AtomicBool::new(false));
+        let asks = Arc::new(Mutex::new(Vec::new()));
+        let (grant, on_ask) = (Arc::clone(&free), Arc::clone(&asks));
+        let widen = super::LaneWiden::new(
+            move |kind| {
+                let granted = match kind {
+                    super::GrowFor::Restart => true,
+                    super::GrowFor::Extra => grant.swap(false, Ordering::SeqCst),
+                };
+                if kind == super::GrowFor::Extra {
+                    on_ask
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((tokio::time::Instant::now(), granted));
+                }
+                granted
+            },
+            || {},
+        );
+        let mut cand_b = candidate(b.clone(), Arc::clone(&lb), 0xB2, None);
+        cand_b.widen = Some(widen);
+        let lanes = StaticSources::new(vec![candidate(a.clone(), la, 0xA1, None), cand_b])?;
+        let provider = FaultLog {
+            inner: &lanes,
+            faulted: Mutex::new(Vec::new()),
+        };
+        let (root, total) = (a.root(), a.total_bytes());
+        let (store, dir) = fresh_store(root, total);
+        // A's remainder waits for a stream for 4 s, inside B's 5 s range, so
+        // only the retry clock asks for it meanwhile.
+        let release = async {
+            while faults_of(&provider, 0xA1) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            free.store(true, Ordering::SeqCst);
+        };
+        acquire_gated(&store, &provider, root, release).await?;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+        let asks = asks.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let refused: Vec<_> = asks
+            .iter()
+            .take_while(|(_, granted)| !granted)
+            .map(|(at, _)| *at)
+            .collect();
+        assert!(
+            refused.len() >= 4,
+            "the remainder was asked for each second while it waited: {asks:?}"
+        );
+        for pair in refused.windows(2) {
+            if let [before, after] = pair {
+                assert!(
+                    after.saturating_duration_since(*before)
+                        <= super::GROWTH_RETRY + Duration::from_millis(10),
+                    "a refused grow was asked again only after {:?}",
+                    after.saturating_duration_since(*before)
+                );
+            }
+        }
+        assert!(
+            asks.iter().any(|(_, granted)| *granted),
+            "the freed stream took the remainder"
+        );
         Ok(())
     }
 
