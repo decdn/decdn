@@ -78,10 +78,12 @@ pub struct LaneRange {
     /// such a piece is an overshoot refusal: it cools the provider and never
     /// counts toward marking it absent ([`ABSENT_AFTER_NOT_FOUND`]).
     pub past_end: bool,
-    /// The range lies wholly outside the coverage of the lane that held it:
-    /// the lane took it for its node to serve by pull-through. A `NotFound`
-    /// for such a range from a probed partial holder counts toward barring
-    /// that holder from pull-through ([`SourceSet::no_pull_through`]).
+    /// The range holds a chunk outside the coverage of the lane that held
+    /// it: the lane took it for its node to serve that part by pull-through,
+    /// as a pending chunk no running lane covers or as a slow-victim steal's
+    /// tail. A `NotFound` for such a range from a probed partial holder
+    /// counts toward barring that holder from pull-through
+    /// ([`SourceSet::no_pull_through`]).
     ///
     /// Only a lane built with measured coverage can hold an uncovered range.
     /// A lane built without it (a pinned holder, or a provider the probe did
@@ -643,11 +645,11 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// knows ([`LaneRange::past_end`]). A provider that is not a probed
     /// holder is marked absent once its count reaches
     /// [`ABSENT_AFTER_NOT_FOUND`]. A probed holder is never marked absent.
-    /// For a partial holder, an answer for a range outside its coverage
-    /// ([`LaneRange::uncovered`]) counts toward barring it from pull-through,
-    /// and one for a range inside it counts toward dropping each block the
-    /// refused part of the range touches from its coverage. To a whole holder the answer is a
-    /// delivery fault only.
+    /// For a partial holder, an answer for a range that holds a chunk outside
+    /// its coverage ([`LaneRange::uncovered`]) counts toward barring it from
+    /// pull-through, and one for a range wholly inside it counts toward
+    /// dropping each block the refused part of the range touches from its
+    /// coverage. To a whole holder the answer is a delivery fault only.
     fn record_not_found(
         &mut self,
         provider: Address,

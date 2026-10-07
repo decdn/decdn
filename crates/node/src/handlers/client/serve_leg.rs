@@ -59,6 +59,7 @@ use super::MAX_PROOFS_PER_CHUNK;
 use super::outcome::{ServeEnd, ServeStop};
 use super::proof_wait::{ChunkProofs, ProofWaitFault};
 use super::ramp::RampCarry;
+use super::serve_waits::{ServeWaits, Wait};
 use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked};
 use super::wire::chunk_frame_bufs;
 use super::{
@@ -282,6 +283,9 @@ impl ClientHandler {
         // the pull would never learn its client left, and would hold its lease and
         // the pull alive (#2194).
         let mut client_left = std::pin::pin!(send.stopped());
+        // Splits the span's idle time by what this loop waits on, and records
+        // the path's state, at every exit (#2348).
+        let mut waits = ServeWaits::start(conn);
 
         // The first frame — awaiting the pull leg if `R` opens on a gap. A pull
         // that ends `Err` here fails the serve rather than hanging. It is small,
@@ -291,10 +295,14 @@ impl ClientHandler {
         // forfeits its ramp credit (ADR 003 §Credit window).
         carry.start_delivery();
         let opening_window = self.credit_window(chunk_bytes, carry.ramp_paid(0));
-        let mut next_chunk = self
-            .frame_unless_client_left(
-                producer.next_frame_chunks(self.first_frame_target(chunk_bytes, opening_window)),
-                client_left.as_mut(),
+        let mut next_chunk = waits
+            .time(
+                Wait::Store,
+                self.frame_unless_client_left(
+                    producer
+                        .next_frame_chunks(self.first_frame_target(chunk_bytes, opening_window)),
+                    client_left.as_mut(),
+                ),
             )
             .await?;
 
@@ -343,7 +351,10 @@ impl ClientHandler {
                 // a stream this node already closed carries no marker: the dispatch
                 // sink meters it as a node fault instead. Either way, propagate so
                 // the caller drops the pull leg.
-                if let Err(e) = self.write_chunk_bufs(send, bufs).await {
+                if let Err(e) = waits
+                    .time(Wait::Send, self.write_chunk_bufs(send, bufs))
+                    .await
+                {
                     if super::wire::is_peer_attributable(&e) {
                         self.metrics.node_pull_through_client_abandoned();
                     }
@@ -365,14 +376,17 @@ impl ClientHandler {
                 // what keeps this from parking on upstream bytes that this loop must
                 // exit to recoup before they can be pulled.
                 let room = window.saturating_sub(delivered.saturating_sub(*paid));
-                next_chunk = self
-                    .frame_unless_client_left(
-                        producer.next_frame_chunks(self.frame_target(
-                            unvouchered,
-                            chunk_bytes,
-                            room,
-                        )),
-                        client_left.as_mut(),
+                next_chunk = waits
+                    .time(
+                        Wait::Store,
+                        self.frame_unless_client_left(
+                            producer.next_frame_chunks(self.frame_target(
+                                unvouchered,
+                                chunk_bytes,
+                                room,
+                            )),
+                            client_left.as_mut(),
+                        ),
                     )
                     .await?;
             }
@@ -404,7 +418,10 @@ impl ClientHandler {
                 let mut proofs = ChunkProofs::start();
                 loop {
                     let attempt = proofs.next_attempt();
-                    let stop = match self
+                    // Timed by hand, as in `deliver_loop`: the wait ends before
+                    // the error arm, so a proof that times out still counts.
+                    waits.begin(Wait::Proof);
+                    let committed = self
                         .commit_one_proof(
                             conn,
                             send,
@@ -419,8 +436,9 @@ impl ClientHandler {
                             owed,
                             &proofs,
                         )
-                        .await
-                    {
+                        .await;
+                    waits.end();
+                    let stop = match committed {
                         Ok(stop) => stop,
                         Err(e) => {
                             // A peer-attributable error (a transport drop, a stalled
@@ -671,7 +689,12 @@ impl ClientHandler {
         // window this one earned (ADR 003 §Credit window). Any other exit after
         // the first byte drops the carry and forfeits it.
         carry.return_paid(super::dispatch::aligned_span(offset, len, total_bytes));
-        self.write_message(send, &ClientMessage::StreamEnd).await?;
+        waits
+            .time(
+                Wait::Send,
+                self.write_message(send, &ClientMessage::StreamEnd),
+            )
+            .await?;
         let _ = send.finish();
         // Drain the client's send half to its FIN before `recv` drops, so the
         // client's finish is not stopped by the implicit `STOP_SENDING(0)` a

@@ -937,6 +937,16 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **`decdn fetch` / `bundle pull` steal a slow leg's tail by pull-through
+  (#2348).** A lane could steal only inside a range's covered suffix, so a
+  range whose last block only one lane covered ran on that lane to the end,
+  however slow it was: one 0.5 MiB/s leg ran alone for 35 min while every
+  other lane sat idle. When no covered steal is due, a lane not barred from
+  pull-through now steals the rate-weighted tail of a range on another lane
+  that runs at a quarter of its rate or less, measured over at least 30 s.
+  Its node serves the part outside its coverage by pull-through. A parked
+  lane looks for such a steal every 5 s, and the steal logs at `info`
+  (`kind="slow_victim"`).
 - **`decdn fetch` / `bundle pull` with a spent capability stops with the
   owner-side remedy instead of retrying until it gives up (#2338).** A node
   refuses a registered signer whose `cap − spent` cannot cover its serve floor
@@ -3147,6 +3157,14 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **`serve_stream` spans time their serve loop's waits by cause (#2348).** A
+  serve loop records `store_wait_ns`, `send_wait_ns` and `proof_wait_ns` as
+  it ends, with the QUIC path's state: `path_kind`, `path_rtt_us`,
+  `path_cwnd`, `path_congestion_events`, and the connection's
+  `conn_lost_packets`, `conn_lost_bytes` and `conn_sent_bytes` over the
+  loop. A slow stream's trace now says whether the store, the path, the
+  client's receive window, or the client's proofs hold it back
+  ([appendix-observability § Trace Spans](adr/appendix-observability.md#trace-spans)).
 - **`bundle pull` warns on a filter glob that matches no entry, and on
   leftover partials (#2190).** Each `--include`/`--exclude` pattern that
   matches no manifest entry prints one `warning:` line on stderr, in a real

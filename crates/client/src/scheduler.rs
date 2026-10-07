@@ -26,7 +26,7 @@
 //! preference (#2225): a lane takes what it covers first, and a block no
 //! running lane covers goes to any lane, whose node serves it by pull-through,
 //! while discovery keeps looking for a node that covers it. A lane with nothing
-//! queued *steals* from a range in flight ([`steal_split`]). It steals only
+//! queued *steals* from a range in flight ([`steal_split`]). It steals first
 //! inside the range's covered suffix: the blocks it covers, from the range's
 //! end back to, but not including, the nearest block it does not cover. Of
 //! the ranges in flight, it picks the one whose covered suffix misses the
@@ -40,6 +40,15 @@
 //! the front of the rest, so it still has work after the steal. It keeps its
 //! open stream: the steal lowers the victim's end to the split
 //! ([`Work::pick`]), and the victim stops there.
+//!
+//! One steal reaches outside the stealer's coverage (#2348). When no range has
+//! a covered suffix worth a stream, a lane not barred from pull-through steals
+//! from a range whose lane runs at no more than a quarter of its own rate
+//! ([`SLOW_VICTIM_FACTOR`]), measured over at least [`SLOW_VICTIM_EVIDENCE`].
+//! It splits that whole range by the two rates, and its node serves the part
+//! of the tail it does not cover by pull-through. So one lane behind a slow
+//! path does not set the blob's finish time alone. A lane's own worker parked
+//! with nothing to take looks for such a steal every [`STEAL_RECHECK`].
 //!
 //! # Lane correctness: one unit per worker, one worker per lane by default
 //!
@@ -169,6 +178,32 @@ pub const GROWTH_RETRY: Duration = Duration::from_secs(1);
 /// extra stream of the lane ends it.
 const EXTRA_RETRY_CAP: Duration = Duration::from_secs(30);
 
+/// How many times faster than a range's lane a freed lane must run to steal
+/// that range's tail outside its own coverage, by pull-through (#2348). A
+/// pull-through adds an upstream hop and its own payment ramp, so the
+/// stealer's rate on its last unit can overstate what it fetches by
+/// pull-through: at a gap of four, even at half that rate, the two lanes
+/// finish the remainder more than twice as soon as the victim would alone.
+/// The split by rate leaves the victim about a fifth of the remainder, and
+/// at least [`crate::segment::MIN_VICTIM_KEEP`]. The gap is set well above
+/// the spread of healthy lanes in #2348 (5–11 MiB/s) and well below the slow
+/// lane's (10–24 times slower).
+const SLOW_VICTIM_FACTOR: u64 = 4;
+
+/// The least active time a range's rate must be measured over before a
+/// slow-victim steal trusts it ([`Unit::rate_sample`]). A leg's credit window
+/// starts at one payment interval and grows with what it pays, and its path
+/// starts in slow start, so a few seconds of rate read as slow on any cold
+/// leg. It equals [`FIRST_BYTE_GRACE`].
+const SLOW_VICTIM_EVIDENCE: Duration = FIRST_BYTE_GRACE;
+
+/// How often a lane's own worker, parked with nothing to take, plans a steal
+/// again while a range is in flight. A slow-victim steal turns due as the
+/// victim's rate gathers evidence, and a victim's progress wakes no parked
+/// worker, so the parked worker looks again on this clock. A check that
+/// finds no steal due takes no stream.
+const STEAL_RECHECK: Duration = Duration::from_secs(5);
+
 /// The refusals in a row of a lane's extra streams at which the loop logs
 /// them at info, once per run of refusals.
 const EXTRA_REFUSALS_LOGGED: u32 = 3;
@@ -229,6 +264,40 @@ where
     crate::driver::missing_below_bound(store, start, len)
         .await
         .map(|(missing, _bound)| missing)
+}
+
+/// Resolve once worker `i`, parked with nothing to take, has a steal due
+/// ([`Work::steal_due`]), looking every [`STEAL_RECHECK`] (#2348). Each look
+/// reads its inputs the way the pick does, so the two disagree only when the
+/// work state moves in between. A look takes no stream.
+///
+/// # Errors
+///
+/// A store error ([`store_missing`]): this process's fault, not the source's.
+/// Or the plan's alignment error ([`Work::steal_due`]), which the pick would
+/// raise too.
+async fn steal_recheck<St>(
+    store: &St,
+    work: &AsyncMutex<Work>,
+    i: usize,
+    coverage: &Coverage,
+) -> anyhow::Result<()>
+where
+    St: IngestStore,
+{
+    loop {
+        tokio::time::sleep(STEAL_RECHECK).await;
+        let total_bytes = store.total_bytes();
+        let missing =
+            contiguous_byte_ranges(&store_missing(store, 0, total_bytes).await?, total_bytes);
+        if work
+            .lock()
+            .await
+            .steal_due(i, total_bytes, coverage, &missing)?
+        {
+            return Ok(());
+        }
+    }
 }
 
 /// What one [`acquire`] fills: byte ranges of one blob, in one store.
@@ -494,8 +563,9 @@ impl<S> Hold<S> {
 }
 
 /// A range [`Work::pick`] handed to a worker. `uncovered` is set when the
-/// range lies wholly outside the worker's coverage, for its node to serve by
-/// pull-through. `unit` is the unit's own live state ([`Work::live`]).
+/// range holds a chunk outside the worker's coverage, for its node to serve by
+/// pull-through: a pending chunk no running lane covers, or a slow-victim
+/// steal's tail. `unit` is the unit's own live state ([`Work::live`]).
 struct Picked {
     range: AlignedRange,
     uncovered: bool,
@@ -514,8 +584,13 @@ struct Unit {
     /// unit's leg then stops there on its open stream ([`fill_gap`]).
     stop_at: AtomicU64,
     /// Nanoseconds the unit spent parked on the consumer after its first
-    /// verified byte ([`ParkedWait`]).
+    /// verified byte, over the parks that have ended ([`ParkedWait`]).
     parked: AtomicU64,
+    /// When the park in progress began, in nanoseconds after the unit's
+    /// first verified byte; `u64::MAX` while the unit is not parked. The
+    /// unit's rate leaves out this park too, so a lane parked on the consumer
+    /// now does not read as slow.
+    park_open_at: AtomicU64,
 }
 
 impl Unit {
@@ -524,6 +599,7 @@ impl Unit {
             progress: UnitProgress::default(),
             stop_at: AtomicU64::new(u64::MAX),
             parked: AtomicU64::new(0),
+            park_open_at: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -532,15 +608,65 @@ impl Unit {
     /// unit spent parked on the consumer, so a leg's open, a cold first
     /// byte, and the consumer's pace stay out of it.
     fn rate(&self) -> Option<u64> {
+        self.rate_sample().map(|(rate, _)| rate)
+    }
+
+    /// The unit's rate so far ([`Unit::rate`]) and the active time it is
+    /// measured over: the time since its first verified byte, less the time
+    /// it spent parked on the consumer, the park in progress included. A
+    /// slow-victim steal trusts a rate only over [`SLOW_VICTIM_EVIDENCE`] of
+    /// that time.
+    fn rate_sample(&self) -> Option<(u64, Duration)> {
         let first = self.progress.first_byte.get()?;
         let verified = self.progress.verified.load(Ordering::Relaxed);
+        let since_first = first.elapsed();
         let parked = Duration::from_nanos(self.parked.load(Ordering::Relaxed));
-        let millis = first.elapsed().saturating_sub(parked).as_millis();
+        let open = match self.park_open_at.load(Ordering::Relaxed) {
+            u64::MAX => Duration::ZERO,
+            at => since_first.saturating_sub(Duration::from_nanos(at)),
+        };
+        let active = since_first.saturating_sub(parked).saturating_sub(open);
+        let millis = active.as_millis();
         if verified == 0 || millis == 0 {
             return None;
         }
-        u64::try_from(u128::from(verified).saturating_mul(1000) / millis).ok()
+        let rate = u64::try_from(u128::from(verified).saturating_mul(1000) / millis).ok()?;
+        Some((rate, active))
     }
+}
+
+/// Which rule a steal took its tail by ([`Work::plan_steal`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StealKind {
+    /// The tail lies in the victim range's covered suffix
+    /// ([`covered_suffix_start`], #2303).
+    CoveredSuffix,
+    /// The victim runs at a small fraction of the stealer's rate
+    /// ([`SLOW_VICTIM_FACTOR`]), and the stealer's node serves the part of
+    /// the tail outside its coverage by pull-through (#2348).
+    SlowVictim,
+}
+
+impl StealKind {
+    /// The kind's name in a steal's log line.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CoveredSuffix => "covered_suffix",
+            Self::SlowVictim => "slow_victim",
+        }
+    }
+}
+
+/// A steal [`Work::plan_steal`] would make: the victim's worker slot, the
+/// aligned tail the stealer takes, and the rule it takes it by.
+#[derive(Debug)]
+struct PlannedSteal {
+    /// The victim's worker slot.
+    victim: usize,
+    /// The aligned tail of the victim's range ([`steal_split`]).
+    tail: AlignedRange,
+    /// The rule the steal takes the tail by.
+    kind: StealKind,
 }
 
 /// Per-lane interrupt: an edge-triggered wakeup ([`Notify`]) plus a `flag`
@@ -713,11 +839,11 @@ struct WorkerEnd {
     end: LaneEnd,
     /// Whether the worker verified any byte.
     delivered: bool,
-    /// When the worker last verified a byte of a range outside its coverage:
-    /// its node serves such ranges by pull-through.
+    /// When the worker last verified a byte of a range that holds a chunk
+    /// outside its coverage: its node serves that part by pull-through.
     pulled_through: Option<Instant>,
-    /// The `(offset, len)` pieces inside its coverage in which the worker
-    /// verified bytes: its node holds those blocks
+    /// The `(offset, len)` pieces of ranges wholly inside its coverage in
+    /// which the worker verified bytes: its node holds those blocks
     /// ([`SourceSet::record_covered_served`]).
     covered_served: Vec<(u64, u64)>,
     /// Whether it was an extra worker ([`Work::add_extra`]): its end touches
@@ -1099,7 +1225,9 @@ impl Work {
     /// range in flight it would steal from now ([`Work::plan_steal`], #2303).
     /// That check counts every byte in flight past its victim's received
     /// frontier as missing, and gives the lane no rate, so it declines only a
-    /// steal that the size floors or the lane's coverage rule out.
+    /// steal that the size floors or the lane's coverage rule out. With no
+    /// rate, it never counts a slow-victim steal (#2348): only a running
+    /// lane's parked worker makes one, so the loop starts no lane for it.
     fn has_work_for(&self, coverage: &Coverage, total_bytes: u64, take_uncovered: bool) -> bool {
         if self
             .pending
@@ -1114,9 +1242,59 @@ impl Work {
         // The ranges in flight are valid ranges of the blob, so the plan
         // raises no alignment error; an error reads as no work.
         matches!(
-            self.plan_steal(total_bytes, coverage, &in_flight, None),
+            self.plan_steal(total_bytes, coverage, &in_flight, None, None),
             Ok(Some(_))
         )
+    }
+
+    /// Whether worker `i`, parked with nothing to take, has a steal due now
+    /// ([`Work::plan_steal`]) at its rate over its last unit, with the
+    /// slow-victim rule open unless its lane is barred from pull-through.
+    /// `missing` is the store's missing byte runs. Changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`steal_split`]: the error [`Work::pick`] would raise on the same
+    /// plan.
+    fn steal_due(
+        &self,
+        i: usize,
+        total_bytes: u64,
+        coverage: &Coverage,
+        missing: &[(u64, u64)],
+    ) -> anyhow::Result<bool> {
+        let (stealer_rate, slow_from) = self.stealer(i);
+        Ok(self
+            .plan_steal(total_bytes, coverage, missing, stealer_rate, slow_from)?
+            .is_some())
+    }
+
+    /// What worker `i` steals with: its rate over its last unit, and its slot
+    /// as `slow_from` unless its lane is barred from pull-through
+    /// ([`Work::plan_steal`]).
+    fn stealer(&self, i: usize) -> (Option<u64>, Option<usize>) {
+        let stealer_rate = self.rates.get(i).copied().flatten();
+        (stealer_rate, (!self.barred(i)).then_some(i))
+    }
+
+    /// Whether the range worker `owner` runs is slow beside worker `i`'s
+    /// `stealer_rate` (#2348): `owner` fetches for another lane, its unit's
+    /// rate is measured over at least [`SLOW_VICTIM_EVIDENCE`], and
+    /// [`SLOW_VICTIM_FACTOR`] times that rate is at most `stealer_rate`. A
+    /// lane's extra worker shares the lane's node and path, so a lane never
+    /// counts its own as slow.
+    fn slow_victim(&self, owner: usize, i: usize, stealer_rate: u64) -> bool {
+        let (Some(lane), Some(own_lane)) = (self.lane_of.get(owner), self.lane_of.get(i)) else {
+            return false;
+        };
+        if lane == own_lane {
+            return false;
+        }
+        let Some((rate, over)) = self.live.get(owner).and_then(|unit| unit.rate_sample()) else {
+            return false;
+        };
+        over >= SLOW_VICTIM_EVIDENCE
+            && rate.max(1).saturating_mul(SLOW_VICTIM_FACTOR) <= stealer_rate
     }
 
     /// The chunks of `seg` no running lane covers.
@@ -1186,8 +1364,10 @@ impl Work {
     /// worker's lane is barred from those ([`Work::barred`]); when none remain,
     /// steal the aligned tail of the missing remainder of the range in flight
     /// whose covered suffix ([`covered_suffix_start`]) misses the most, split
-    /// by the two lanes' rates ([`steal_split`]). The split lies past the
-    /// victim's received frontier.
+    /// by the two lanes' rates ([`steal_split`]), or, with none, of a range
+    /// whose lane is slow beside this worker's ([`Work::slow_victim`]), whose
+    /// tail its node serves by pull-through where it does not cover it. The
+    /// split lies past the victim's received frontier.
     /// The steal trims the victim to end at that split, so no other freed
     /// worker can re-steal the same tail, and lowers the victim's end
     /// (`Unit::stop_at`, [`Work::live`]) to the split, so the victim stops its
@@ -1291,19 +1471,26 @@ impl Work {
     }
 
     /// The steal a worker over `coverage` that runs at `stealer_rate` would
-    /// make now: the index in `in_flight` of its victim, and the aligned tail
-    /// it takes ([`steal_split`]). `None` when no range in flight has a
-    /// covered suffix worth a fresh stream. Changes nothing.
+    /// make now ([`PlannedSteal`]): its victim's slot in `in_flight`, the
+    /// aligned tail it takes ([`steal_split`]), and the rule it takes it by.
+    /// `None` when no range in flight has a tail worth a fresh stream.
+    /// Changes nothing.
     ///
     /// Each candidate victim's received prefix reads as delivered, not
     /// missing: its checkpoints may not be durable yet, but its open stream
     /// already carried those bytes, and a split behind them would hand them
     /// to the stealer too. `steal_split` returns WHICH remaining range it
     /// split, so the caller trims that exact victim: no second argmax to agree
-    /// with. The stealer steals only inside a range's covered suffix (#2303),
-    /// and the split declines a steal that would leave the victim no missing
+    /// with. The split declines a steal that would leave the victim no missing
     /// byte: that steal takes the victim's whole remaining work, and the
     /// victim, with nothing left, would steal it straight back.
+    ///
+    /// The stealer steals inside a range's covered suffix first (#2303).
+    /// When no range has one worth a stream, and `slow_from` names the
+    /// stealer's slot (its lane is not barred from pull-through), it steals
+    /// from a range whose lane is slow beside its own rate
+    /// ([`Work::slow_victim`], #2348): the tail may then lie outside its
+    /// coverage, and its node serves that part by pull-through.
     ///
     /// # Errors
     ///
@@ -1314,7 +1501,8 @@ impl Work {
         coverage: &Coverage,
         missing: &[(u64, u64)],
         stealer_rate: Option<u64>,
-    ) -> anyhow::Result<Option<(usize, AlignedRange)>> {
+        slow_from: Option<usize>,
+    ) -> anyhow::Result<Option<PlannedSteal>> {
         let (owners, remaining): (Vec<usize>, Vec<(u64, u64)>) = self
             .in_flight
             .iter()
@@ -1341,7 +1529,7 @@ impl Work {
                 .and_then(|&owner| self.live.get(owner))
                 .and_then(|unit| unit.rate())
         };
-        let planned = steal_split(
+        let covered = steal_split(
             &remaining,
             &missing,
             total_bytes,
@@ -1349,7 +1537,43 @@ impl Work {
             stealer_rate,
             victim_rate,
         )?;
-        Ok(planned.and_then(|(v, tail)| Some((*owners.get(v)?, tail))))
+        if let Some((k, tail)) = covered {
+            return Ok(owners.get(k).map(|&victim| PlannedSteal {
+                victim,
+                tail,
+                kind: StealKind::CoveredSuffix,
+            }));
+        }
+        let (Some(i), Some(rate)) = (slow_from, stealer_rate) else {
+            return Ok(None);
+        };
+        // Only the slow ranges, whole: the stealer's node serves what it does
+        // not cover by pull-through. Each keeps its index into `owners`, in
+        // one list, so the split's index maps back to its own victim.
+        let slow: Vec<(usize, (u64, u64))> = owners
+            .iter()
+            .zip(&remaining)
+            .enumerate()
+            .filter(|&(_, (&owner, _))| self.slow_victim(owner, i, rate))
+            .map(|(k, (_, &range))| (k, range))
+            .collect();
+        let slow_remaining: Vec<(u64, u64)> = slow.iter().map(|&(_, range)| range).collect();
+        let planned = steal_split(
+            &slow_remaining,
+            &missing,
+            total_bytes,
+            |s, _| Some(s),
+            stealer_rate,
+            |j| slow.get(j).and_then(|&(k, _)| victim_rate(k)),
+        )?;
+        Ok(planned.and_then(|(j, tail)| {
+            let victim = *owners.get(slow.get(j)?.0)?;
+            Some(PlannedSteal {
+                victim,
+                tail,
+                kind: StealKind::SlowVictim,
+            })
+        }))
     }
 
     /// The steal arm of [`Work::pick`]: nothing pending worker `i` can serve.
@@ -1369,14 +1593,16 @@ impl Work {
         // Nothing pending this worker can serve: every remaining byte is
         // either in flight on a busy worker or outside this worker's own
         // coverage. Steal the aligned tail of the missing remainder of the
-        // range in flight whose covered suffix misses the most (#2303).
-        // `in_flight[i]` is `None` here (cleared before this pick), so this
-        // worker is excluded from the remaining set and never steals from
-        // itself. The split weighs the remainder by the two lanes' rates:
-        // this worker's over its last unit, and the victim's on its unit so
-        // far.
-        let stealer_rate = self.rates.get(i).copied().flatten();
-        let Some((victim, tail)) = self.plan_steal(total_bytes, coverage, missing, stealer_rate)?
+        // range in flight whose covered suffix misses the most (#2303), or,
+        // with none and the lane free to pull through, of a range whose lane
+        // is slow beside this one (#2348). `in_flight[i]` is `None` here
+        // (cleared before this pick), so this worker is excluded from the
+        // remaining set and never steals from itself. The split weighs the
+        // remainder by the two lanes' rates: this worker's over its last
+        // unit, and the victim's on its unit so far.
+        let (stealer_rate, slow_from) = self.stealer(i);
+        let Some(PlannedSteal { victim, tail, kind }) =
+            self.plan_steal(total_bytes, coverage, missing, stealer_rate, slow_from)?
         else {
             *self.slot_mut(i)? = None;
             return Ok(None);
@@ -1438,22 +1664,48 @@ impl Work {
             }
             align_range(frontier, tail.fetch_end() - frontier, total_bytes)?
         };
-        tracing::debug!(
-            stealer = ?self.providers.get(i).copied().flatten(),
-            victim = ?self.providers.get(victim).copied().flatten(),
-            split = tail.fetch_start(),
-            stolen = tail.fetch_len(),
-            victim_range = ?self.in_flight.get(victim).copied().flatten(),
-            victim_frontier = frontier,
-            stealer_rate,
-            victim_rate = victim_unit.rate(),
-            "stole the tail of a lane's missing remainder"
-        );
+        let stealer = self.providers.get(i).copied().flatten();
+        let victim_provider = self.providers.get(victim).copied().flatten();
+        let victim_range = self.in_flight.get(victim).copied().flatten();
+        let victim_rate = victim_unit.rate();
+        match kind {
+            StealKind::CoveredSuffix => tracing::debug!(
+                stealer = ?stealer,
+                victim = ?victim_provider,
+                kind = kind.as_str(),
+                split = tail.fetch_start(),
+                stolen = tail.fetch_len(),
+                victim_range = ?victim_range,
+                victim_frontier = frontier,
+                stealer_rate,
+                victim_rate,
+                "stole the tail of a lane's missing remainder"
+            ),
+            // Rare, and the cure for a tail one slow lane would set alone:
+            // visible without debug logs.
+            StealKind::SlowVictim => tracing::info!(
+                stealer = ?stealer,
+                victim = ?victim_provider,
+                kind = kind.as_str(),
+                split = tail.fetch_start(),
+                stolen = tail.fetch_len(),
+                victim_range = ?victim_range,
+                victim_frontier = frontier,
+                stealer_rate,
+                victim_rate,
+                "stole the tail of a lane's missing remainder"
+            ),
+        }
 
+        // A covered-suffix tail lies inside the stealer's coverage; a
+        // slow-victim tail may not, and its node serves that part by
+        // pull-through.
+        let uncovered =
+            !covers_byte_range(coverage, tail.fetch_start(), tail.fetch_len(), total_bytes);
         *self.slot_mut(i)? = Some((tail.fetch_start(), tail.fetch_len()));
         Ok(Some(Picked {
             range: tail,
-            uncovered: false,
+            uncovered,
             unit,
         }))
     }
@@ -1722,6 +1974,24 @@ struct ParkedWait<'a> {
     unit: &'a Unit,
 }
 
+/// Ends a unit's park when its wait ends or is dropped: adds the park to the
+/// unit's parked time when the unit's rate clock ran at its start, then
+/// clears the park in progress. Added first, so a rate read between the two
+/// steps leaves the park out twice and reads the unit as faster, never as
+/// slower.
+struct ClosePark<'a>(&'a Unit, Instant, bool);
+
+impl Drop for ClosePark<'_> {
+    fn drop(&mut self) {
+        let Self(unit, parked_at, counted) = *self;
+        if counted {
+            let nanos = u64::try_from(parked_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            unit.parked.fetch_add(nanos, Ordering::Relaxed);
+        }
+        unit.park_open_at.store(u64::MAX, Ordering::Relaxed);
+    }
+}
+
 /// Clears a worker's parked flag when its wait ends or is dropped.
 struct Unpark<'a>(&'a AtomicBool);
 
@@ -1742,14 +2012,17 @@ impl PacingWait for ParkedWait<'_> {
             let _unpark = Unpark(self.parked);
             self.parked_wake.notify_waiters();
             let parked_at = Instant::now();
-            self.inner.wait(observed, reason).await;
             // A parked worker holds no open leg, so it verifies nothing while
             // parked: the whole wait stays out of the unit's rate, once its
-            // rate clock runs.
-            if self.unit.progress.first_byte.get().is_some() {
-                let nanos = u64::try_from(parked_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                self.unit.parked.fetch_add(nanos, Ordering::Relaxed);
+            // rate clock runs, both while it lasts and after it ends.
+            let first_byte = self.unit.progress.first_byte.get().copied();
+            if let Some(first) = first_byte {
+                let open_at = u64::try_from(parked_at.saturating_duration_since(first).as_nanos())
+                    .unwrap_or(u64::MAX - 1);
+                self.unit.park_open_at.store(open_at, Ordering::Relaxed);
             }
+            let _closed = ClosePark(self.unit, parked_at, first_byte.is_some());
+            self.inner.wait(observed, reason).await;
         })
     }
 }
@@ -1963,7 +2236,10 @@ where
             // Nothing to start right now. An extra worker ends here. A lane's
             // own worker ends only when no lane holds work; otherwise it
             // parks: a peer's range is still draining toward a requeue or a
-            // splittable size.
+            // splittable size. It wakes on a peer's change to the work state,
+            // or once a steal turns due on the `STEAL_RECHECK` clock (#2348):
+            // a slow victim's rate gathers evidence as it streams, and its
+            // progress wakes nothing.
             {
                 let mut w = work.lock().await;
                 if extra {
@@ -1979,7 +2255,10 @@ where
                     return Ok(idle());
                 }
             }
-            parked.await;
+            tokio::select! {
+                () = parked.as_mut() => {}
+                res = steal_recheck(store, work, i, &my_coverage) => res?,
+            }
             continue;
         };
         let (r_start, r_len) = (range.fetch_start(), range.fetch_len());
@@ -4702,6 +4981,211 @@ mod tests {
         Ok(())
     }
 
+    /// A three-block work-state for #2348's slow-victim steal: lane 0 runs
+    /// the whole blob at `victim_mib_s` MiB/s over `over` since its first
+    /// byte, its frontier at what it verified; lane 1 covers blocks 0 and 1
+    /// only, so it does not cover the victim range's last block, and
+    /// ran its last unit at `stealer_mib_s` MiB/s. Returns the work-state,
+    /// the stealer's coverage and the victim's frontier.
+    async fn slow_victim_work(
+        victim_mib_s: u64,
+        over: Duration,
+        stealer_mib_s: Option<u64>,
+    ) -> (super::Work, Coverage, u64) {
+        use std::sync::atomic::Ordering;
+
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        let mut work = one_victim_work(total, &cov(3, &[0, 1, 2]));
+        let verified = victim_mib_s * MIB * over.as_secs();
+        if let Some(unit) = work.live.first() {
+            unit.progress
+                .first_byte
+                .get_or_init(tokio::time::Instant::now);
+        }
+        tokio::time::advance(over).await;
+        if let Some(unit) = work.live.first() {
+            unit.progress.verified.store(verified, Ordering::Relaxed);
+            unit.progress.frontier.store(verified, Ordering::Release);
+        }
+        work.record_rate(1, stealer_mib_s.map(|r| r * MIB));
+        (work, cov(3, &[0, 1]), verified)
+    }
+
+    /// #2348: a lane that covers no block of a busy range's covered suffix
+    /// steals that range's tail when the range's lane runs at a quarter of
+    /// its rate or less. The split is by the two rates, past the victim's
+    /// frontier; the victim is trimmed and stops at the split; and the tail
+    /// is marked uncovered, for the stealer's node to serve by pull-through.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_victim_outside_the_covered_suffix_is_stolen_by_pull_through()
+    -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        let (mut work, stealer, frontier) =
+            slow_victim_work(1, Duration::from_secs(40), Some(8)).await;
+        let missing = [(frontier, total - frontier)];
+        assert!(
+            !work.has_work_for(&stealer, total, true),
+            "a lane that is not running has no rate, so it starts on no slow victim"
+        );
+        assert!(work.steal_due(1, total, &stealer, &missing)?);
+        let picked = work
+            .pick(1, total, &stealer, true, &missing)?
+            .ok_or_else(|| anyhow::anyhow!("worker 1 must steal the slow victim's tail"))?;
+        assert!(
+            picked.uncovered,
+            "the tail lies outside the stealer's coverage"
+        );
+        assert_eq!(picked.range.fetch_end(), total);
+        // The victim keeps a ninth of its missing remainder (1 : 8), rounded
+        // down to a group.
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+        let keep = (total - frontier) / 9;
+        assert_eq!(
+            picked.range.fetch_start(),
+            (frontier + keep) / group * group
+        );
+        let split = picked.range.fetch_start();
+        assert_eq!(work.in_flight.first().copied().flatten(), Some((0, split)));
+        assert_eq!(
+            work.live
+                .first()
+                .map(|unit| unit.stop_at.load(Ordering::Acquire)),
+            Some(split),
+            "the victim stops at the split"
+        );
+        Ok(())
+    }
+
+    /// #2348: a lane barred from pull-through steals no slow victim's tail
+    /// outside its coverage.
+    #[tokio::test(start_paused = true)]
+    async fn a_barred_lane_does_not_steal_a_slow_victim() -> anyhow::Result<()> {
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        let (mut work, stealer, frontier) =
+            slow_victim_work(1, Duration::from_secs(40), Some(8)).await;
+        let missing = [(frontier, total - frontier)];
+        work.set_no_uncovered(1, true);
+        assert!(!work.steal_due(1, total, &stealer, &missing)?);
+        assert!(work.pick(1, total, &stealer, true, &missing)?.is_none());
+        Ok(())
+    }
+
+    /// #2348: a victim is slow only at [`super::SLOW_VICTIM_FACTOR`] times
+    /// slower than the stealer or more, over at least
+    /// [`super::SLOW_VICTIM_EVIDENCE`] of rate, and only against a stealer
+    /// with a rate.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_victim_steal_needs_the_rate_gap_and_the_evidence() -> anyhow::Result<()> {
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        let steals = |work: &mut super::Work, stealer: &Coverage, frontier: u64| {
+            work.pick(1, total, stealer, true, &[(frontier, total - frontier)])
+                .map(|p| p.is_some())
+        };
+        let (mut work, stealer, frontier) =
+            slow_victim_work(1, Duration::from_secs(40), Some(2)).await;
+        assert!(
+            !steals(&mut work, &stealer, frontier)?,
+            "a 2x gap is no slow victim"
+        );
+        let (mut work, stealer, frontier) =
+            slow_victim_work(1, Duration::from_secs(40), Some(4)).await;
+        assert!(steals(&mut work, &stealer, frontier)?, "a 4x gap is one");
+        let (mut work, stealer, frontier) =
+            slow_victim_work(1, Duration::from_secs(20), Some(8)).await;
+        assert!(
+            !steals(&mut work, &stealer, frontier)?,
+            "20 s of rate is too little evidence"
+        );
+        let (mut work, stealer, frontier) =
+            slow_victim_work(1, Duration::from_secs(40), None).await;
+        assert!(
+            !steals(&mut work, &stealer, frontier)?,
+            "a stealer with no rate has nothing to compare"
+        );
+        Ok(())
+    }
+
+    /// #2348: a victim parked on the consumer now does not read as slow. Its
+    /// park in progress stays out of its rate's active time, as an ended park
+    /// does, so a long park does not stretch a short rate into evidence.
+    #[tokio::test(start_paused = true)]
+    async fn a_victim_parked_on_the_consumer_now_is_not_a_slow_victim() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        // 10 MiB/s for 5 s, then parked on the consumer for 60 s and counting.
+        let (mut work, stealer, frontier) =
+            slow_victim_work(10, Duration::from_secs(5), Some(8)).await;
+        if let Some(unit) = work.live.first() {
+            let at = u64::try_from(Duration::from_secs(5).as_nanos()).unwrap_or(u64::MAX);
+            unit.park_open_at.store(at, Ordering::Relaxed);
+        }
+        tokio::time::advance(Duration::from_mins(1)).await;
+        let sample = work.live.first().and_then(|unit| unit.rate_sample());
+        assert_eq!(
+            sample,
+            Some((10 * MIB, Duration::from_secs(5))),
+            "the open park stays out of the rate"
+        );
+        let missing = [(frontier, total - frontier)];
+        assert!(!work.steal_due(1, total, &stealer, &missing)?);
+        assert!(work.pick(1, total, &stealer, true, &missing)?.is_none());
+        Ok(())
+    }
+
+    /// #2348: a lane never counts its own extra worker as a slow victim: the
+    /// two share one node and one path.
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_does_not_steal_from_its_own_extra_as_a_slow_victim() -> anyhow::Result<()> {
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        let (mut work, stealer, frontier) =
+            slow_victim_work(1, Duration::from_secs(40), Some(8)).await;
+        // Slot 0 is now lane 1's extra worker.
+        if let Some(lane) = work.lane_of.first_mut() {
+            *lane = 1;
+        }
+        if let Some(extra) = work.extra.first_mut() {
+            *extra = true;
+        }
+        let missing = [(frontier, total - frontier)];
+        assert!(work.pick(1, total, &stealer, true, &missing)?.is_none());
+        Ok(())
+    }
+
+    /// #2348: a covered-suffix steal comes first. With a slow victim and a
+    /// range the stealer covers at its end both in flight, the stealer takes
+    /// the covered one, inside its coverage.
+    #[tokio::test(start_paused = true)]
+    async fn a_covered_suffix_steal_is_preferred_over_a_slow_victim() -> anyhow::Result<()> {
+        const B: u64 = DISCOVERY_BLOCK_BYTES;
+        let total = 3 * B;
+        let (mut work, _, frontier) = slow_victim_work(1, Duration::from_secs(40), Some(8)).await;
+        // Lane 0 (slow) now holds blocks 0-1; lane 2 holds block 2, which the
+        // stealer covers.
+        if let Some(slot) = work.in_flight.first_mut() {
+            *slot = Some((0, 2 * B));
+        }
+        if let Some(slot) = work.in_flight.get_mut(2) {
+            *slot = Some((2 * B, B));
+        }
+        let stealer = cov(3, &[2]);
+        let missing = [(frontier, total - frontier)];
+        let picked = work
+            .pick(1, total, &stealer, true, &missing)?
+            .ok_or_else(|| anyhow::anyhow!("worker 1 must steal block 2's tail"))?;
+        assert!(!picked.uncovered);
+        assert!(picked.range.fetch_start() >= 2 * B);
+        assert_eq!(picked.range.fetch_end(), total);
+        assert_eq!(
+            work.in_flight.first().copied().flatten(),
+            Some((0, 2 * B)),
+            "the slow victim keeps its range"
+        );
+        Ok(())
+    }
+
     /// #2303: a lane that covers only the last block of a busy lane's range
     /// steals from that block's start when the split by rate lies before it,
     /// past the split by rate when that lies inside it, and not at all when
@@ -4902,6 +5386,275 @@ mod tests {
             delivered <= total + 2 * MIB,
             "no byte is fetched twice: delivered {delivered} of {total}"
         );
+        Ok(())
+    }
+
+    /// #2348's shape over a three-block blob: a fast partial holder F covers
+    /// block 0 only; a slow partial holder S covers blocks 1 and 2 and runs
+    /// at a twentieth of F's rate, or at F's per-read delay times
+    /// `slow_per_read` ms when given. Each holder gets its own blocks; F
+    /// finishes block 0 in a few seconds and parks, since it does not cover
+    /// S's last block. `refuse` makes F refuse blocks 1 and 2 with that
+    /// fault; `widen` gives F's lane its stream hooks. Returns F, S, the
+    /// blob, the sources, and the store and its directory.
+    #[allow(clippy::type_complexity, reason = "a test fixture's one return tuple")]
+    fn slow_leg_fixture(
+        refuse: Option<fn() -> anyhow::Error>,
+        slow_per_read: Option<u64>,
+        widen: Option<super::LaneWiden>,
+    ) -> anyhow::Result<(
+        ScriptedSource,
+        ScriptedSource,
+        Vec<u8>,
+        StaticSources<ScriptedSource>,
+        ClientRangedStore,
+        tempfile::TempDir,
+    )> {
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        let data = blob(total as usize);
+        let n = num_blocks(total);
+        let ledger_fast = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_slow = Arc::new(PoolLedger::new(Cumulative::default()));
+        let mut fast = ScriptedSource::new(data.clone())?
+            .throttled(Duration::from_millis(1))
+            .paying(Arc::clone(&ledger_fast));
+        if let Some(make) = refuse {
+            fast = fast.refusing_blocks(&[1, 2], make);
+        }
+        let slow = ScriptedSource::new(data.clone())?
+            .throttled(Duration::from_millis(slow_per_read.unwrap_or(20)))
+            .paying(Arc::clone(&ledger_slow));
+        let root = fast.root();
+        let (store, dir) = fresh_store(root, total);
+        let mut fast_lane = candidate(fast.clone(), ledger_fast, 0xA1, Some(cov(n, &[0])));
+        fast_lane.widen = widen;
+        let provider = StaticSources::new(vec![
+            fast_lane,
+            candidate(slow.clone(), ledger_slow, 0xB2, Some(cov(n, &[1, 2]))),
+        ])?;
+        Ok((fast, slow, data, provider, store, dir))
+    }
+
+    /// #2348: a parked lane steals a slow leg's tail outside its own
+    /// coverage, by pull-through, once the slow leg's rate holds over
+    /// `SLOW_VICTIM_EVIDENCE`. Its parked worker finds the steal on the
+    /// `STEAL_RECHECK` clock: no peer event wakes it. The slow lane keeps its
+    /// one stream and stops it at the split, and no byte is fetched twice.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_lane_steals_a_slow_legs_tail_after_the_recheck() -> anyhow::Result<()> {
+        let (fast, slow, data, provider, store, dir) = slow_leg_fixture(None, None, None)?;
+        let total = data.len() as u64;
+        let root = fast.root();
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_mins(10),
+            run_acquire(
+                &store,
+                &provider,
+                root,
+                total,
+                &BudgetPacer::new(),
+                &no_topups(),
+                2,
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the fetch stalled"))??;
+        let took = started.elapsed();
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+        let slow_first = slow
+            .timeline()
+            .first()
+            .map(|&(_, opened, _)| opened)
+            .ok_or_else(|| anyhow::anyhow!("the slow source opened no leg"))?;
+        let stolen: Vec<_> = fast
+            .timeline()
+            .into_iter()
+            .filter(|&(start, _, _)| start >= DISCOVERY_BLOCK_BYTES)
+            .collect();
+        assert_eq!(
+            stolen.len(),
+            1,
+            "F steals S's tail once: {:?} / {:?}",
+            fast.opened_ranges(),
+            slow.opened_ranges()
+        );
+        let steal_at = stolen.first().map(|&(_, opened, _)| opened);
+        assert!(
+            steal_at.is_some_and(|at| at >= slow_first + super::SLOW_VICTIM_EVIDENCE),
+            "the steal waits for the slow leg's evidence"
+        );
+        assert_eq!(slow.opened_ranges().len(), 1, "S keeps its one stream");
+        assert_eq!(slow.stopped_pulls(), 1, "S stops at the split");
+        let delivered = fast.delivered_bytes() + slow.delivered_bytes();
+        assert!(
+            delivered <= total + 2 * MIB,
+            "no byte is fetched twice: delivered {delivered} of {total}"
+        );
+        // S alone would take 128 MiB at its rate: 160 s.
+        assert!(took < Duration::from_secs(80), "the fetch took {took:?}");
+        Ok(())
+    }
+
+    /// #2348: a slow-victim steal whose node refuses the blob as larger than
+    /// its size ceiling puts the tail back in the queue and bars the lane
+    /// from pull-through, so it is asked for that tail once. The slow lane,
+    /// which covers it, finishes the fetch.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_slow_victim_steal_requeues_and_bars_the_lane() -> anyhow::Result<()> {
+        fn too_large() -> anyhow::Error {
+            anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::BlobTooLarge))
+        }
+        let (fast, slow, data, provider, store, dir) =
+            slow_leg_fixture(Some(too_large), None, None)?;
+        let total = data.len() as u64;
+        let root = fast.root();
+        tokio::time::timeout(
+            Duration::from_mins(10),
+            run_acquire(
+                &store,
+                &provider,
+                root,
+                total,
+                &BudgetPacer::new(),
+                &no_topups(),
+                2,
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the fetch stalled"))??;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        let asked = fast
+            .opened_ranges()
+            .into_iter()
+            .filter(|&(start, _)| start >= DISCOVERY_BLOCK_BYTES)
+            .count();
+        assert_eq!(
+            asked,
+            1,
+            "F is asked for S's tail once: {:?}",
+            fast.opened_ranges()
+        );
+        assert!(
+            slow.opened_ranges().len() >= 2,
+            "S takes the re-queued tail on a new leg: {:?}",
+            slow.opened_ranges()
+        );
+        Ok(())
+    }
+
+    /// #2348: a slow-victim steal refused with `NotFound` puts the tail back
+    /// in the queue each time, and the lane is barred from pull-through after
+    /// `ABSENT_AFTER_NOT_FOUND` such answers. The lane keeps its own covered
+    /// block, the fetch completes, and no byte is fetched twice.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_victim_steal_refused_as_not_found_is_bounded() -> anyhow::Result<()> {
+        fn not_found() -> anyhow::Error {
+            anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::NotFound))
+        }
+        let (fast, slow, data, provider, store, dir) =
+            slow_leg_fixture(Some(not_found), None, None)?;
+        let total = data.len() as u64;
+        let root = fast.root();
+        tokio::time::timeout(
+            Duration::from_mins(10),
+            run_acquire(
+                &store,
+                &provider,
+                root,
+                total,
+                &BudgetPacer::new(),
+                &no_topups(),
+                2,
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the fetch stalled"))??;
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        let opened = fast.opened_ranges();
+        let asked = opened
+            .iter()
+            .filter(|&&(start, _)| start >= DISCOVERY_BLOCK_BYTES)
+            .count();
+        assert!(
+            (1..=crate::source_set::ABSENT_AFTER_NOT_FOUND as usize).contains(&asked),
+            "F is asked for S's tail {asked} times: {opened:?}"
+        );
+        assert!(
+            opened
+                .iter()
+                .any(|&(start, _)| start < DISCOVERY_BLOCK_BYTES),
+            "F serves its own block: {opened:?}"
+        );
+        let delivered = fast.delivered_bytes() + slow.delivered_bytes();
+        assert!(
+            delivered <= total + 2 * MIB,
+            "no byte is fetched twice: delivered {delivered} of {total}"
+        );
+        Ok(())
+    }
+
+    /// #2348: while no slow-victim steal is due, a parked lane's steal
+    /// re-check takes no stream. S runs at a third of F's rate, under the
+    /// slow-victim gap, so F parks through several re-checks; its lane asks
+    /// for a stream to start again only on a peer's wake, and gives back
+    /// every stream it takes.
+    #[tokio::test(start_paused = true)]
+    async fn a_steal_recheck_takes_no_stream_while_no_steal_is_due() -> anyhow::Result<()> {
+        let (widen, count) = counting_widen(1);
+        let (fast, slow, data, provider, store, dir) =
+            slow_leg_fixture(None, Some(3), Some(widen))?;
+        let total = data.len() as u64;
+        let root = fast.root();
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_mins(10),
+            run_acquire(
+                &store,
+                &provider,
+                root,
+                total,
+                &BudgetPacer::new(),
+                &no_topups(),
+                2,
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the fetch stalled"))??;
+        let took = started.elapsed();
+        store.finalize().await?;
+        assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+        assert!(
+            fast.opened_ranges()
+                .iter()
+                .all(|&(start, _)| start < DISCOVERY_BLOCK_BYTES),
+            "no steal is due at a 3x gap: {:?}",
+            fast.opened_ranges()
+        );
+        assert!(
+            took >= 3 * super::STEAL_RECHECK,
+            "F parks through several re-checks: {took:?}"
+        );
+        let restarts = count
+            .calls()
+            .iter()
+            .filter(|(kind, _)| *kind == super::GrowFor::Restart)
+            .count();
+        assert!(
+            restarts <= 2,
+            "a re-check with no steal due asks for no stream: {restarts} asks, {:?}",
+            count.calls()
+        );
+        assert_eq!(count.released(), count.granted());
+        drop(slow);
         Ok(())
     }
 

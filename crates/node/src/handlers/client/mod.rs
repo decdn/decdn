@@ -75,6 +75,7 @@ mod proof_wait;
 mod ramp;
 mod serve_encoder;
 mod serve_leg;
+mod serve_waits;
 mod voucher;
 mod window;
 mod wire;

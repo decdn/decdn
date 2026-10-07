@@ -30,7 +30,10 @@ use decdn_incentive::payment_pool::SignerAuthorization;
 /// `peer` and `local_node_id` render as lowercase-hex iroh ids, the same as the
 /// requester's `open_progressive_pull` span records them, so one trace query
 /// joins the two sides of a transfer on `hash`, `pool_id`, `byte_offset` and
-/// the swapped ids.
+/// the swapped ids. The wait totals and the path's state
+/// (`store_wait_ns` … `path_congestion_events`) are recorded as the serve
+/// loop ends ([`super::serve_waits`]); a stream refused before its serve loop
+/// has none.
 pub(super) fn serve_stream_span(peer: PublicKey, local_node_id: PublicKey) -> tracing::Span {
     tracing::info_span!(
         "serve_stream",
@@ -47,6 +50,16 @@ pub(super) fn serve_stream_span(peer: PublicKey, local_node_id: PublicKey) -> tr
         reason = tracing::field::Empty,
         error = tracing::field::Empty,
         bytes = tracing::field::Empty,
+        store_wait_ns = tracing::field::Empty,
+        send_wait_ns = tracing::field::Empty,
+        proof_wait_ns = tracing::field::Empty,
+        conn_lost_packets = tracing::field::Empty,
+        conn_lost_bytes = tracing::field::Empty,
+        conn_sent_bytes = tracing::field::Empty,
+        path_kind = tracing::field::Empty,
+        path_rtt_us = tracing::field::Empty,
+        path_cwnd = tracing::field::Empty,
+        path_congestion_events = tracing::field::Empty,
     )
 }
 
