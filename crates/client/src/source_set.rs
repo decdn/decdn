@@ -191,6 +191,8 @@ impl std::error::Error for NoSourceHasBlob {}
 /// Every known source can serve none of the work left, at least one of them
 /// because it refused the lane's capability signer as drained at its rate
 /// ([`SignerCapDrained`]), and a fresh discovery found no other holder. The
+/// others may be barred for another reason (absence, size), so the stop does
+/// not prove the signer drained at every provider. The
 /// acquire loop raises it as context on the last such refusal, so the error
 /// chain also holds that [`SignerCapDrained`].
 #[derive(Debug)]
@@ -199,8 +201,8 @@ pub struct NoSourceServesSigner;
 impl std::fmt::Display for NoSourceServesSigner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
-            "no provider of this blob serves the capability signer: what is left of its \
-             registered cap is below one chunk at each refusing provider's rate",
+            "no known provider of this blob can serve it: at least one refused the capability \
+             signer, whose registered cap left is below one chunk at that provider's rate",
         )
     }
 }

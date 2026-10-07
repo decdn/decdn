@@ -2076,10 +2076,13 @@ async fn fetch_over(
 /// owner-side remedy: the delegate holds no wallet on this pool, so it cannot
 /// `topUp`, raise its own cap, or mint itself a fresh capability. A
 /// [`NoAffordableSource`] — no provider's next voucher fits the pool — gets the
-/// same owner-side remedy. A drained signer registration (a mid-stream
-/// `SignerCapExhausted`), or a drained or expired one (a [`SignerCapDrained`]
-/// the lane read from chain after a node refused it at admission), gets the
-/// remedy a write-once registration leaves: a capability for a new signer key.
+/// same owner-side remedy. A drained or expired signer registration (a
+/// [`SignerCapDrained`] the lane read from chain after a node refused it at
+/// admission, or a mid-stream `SignerCapExhausted`) gets the remedy a
+/// write-once registration leaves: a capability for a new signer key. Only an
+/// expired registration, or one with nothing left of its cap, is named as
+/// shutting out every provider; any other drain is measured against the
+/// refusing provider's rate.
 /// A terminal `Underpaid` — the resync budget ran out — gets its own next
 /// step. Any other
 /// error passes through verbatim (a stall, a transport fault, or a `NotFound`
@@ -2100,17 +2103,30 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
     let underpaid = err
         .downcast_ref::<UpstreamVoucherRejected>()
         .is_some_and(|rejected| rejected.reason == VoucherRejectReason::Underpaid);
-    let signer_drained = err.downcast_ref::<SignerCapDrained>().is_some()
+    // Only an expired registration, or one with nothing left of its cap,
+    // shuts out every provider. Any other drain is measured against the
+    // refusing provider's rate, and a provider at a lower rate may still
+    // serve while headroom remains.
+    let drained = err.downcast_ref::<SignerCapDrained>();
+    let drained_everywhere = drained.is_some_and(SignerCapDrained::at_every_rate);
+    let drained_at_rate = (drained.is_some() && !drained_everywhere)
         || err
             .downcast_ref::<UpstreamVoucherRejected>()
             .is_some_and(|rejected| rejected.reason == VoucherRejectReason::SignerCapExhausted);
-    if signer_drained {
+    if drained_everywhere {
         err.context(
-            "this capability's signer key has too little of its registered cap left to pay the \
-             providers of this blob, or its registration expired, so no node can be paid for \
-             serving it. The registered cap and expiry are write-once on-chain: a new token for \
-             the same key does not raise them. Ask the pool owner to issue a capability for a \
-             new signer key",
+            "this capability's signer key has spent its whole registered cap, or its \
+             registration expired, so no node can be paid for serving it. The registered cap \
+             and expiry are write-once on-chain: a new token for the same key does not raise \
+             them. Ask the pool owner to issue a capability for a new signer key",
+        )
+    } else if drained_at_rate {
+        err.context(
+            "this capability's signer key has less of its registered cap left than the \
+             refusing provider reserves at its rate; a provider at a lower rate may still serve \
+             it while headroom remains. The registered cap and expiry are write-once on-chain: \
+             a new token for the same key does not raise them. To raise the limit, ask the pool \
+             owner to issue a capability for a new signer key",
         )
     } else if err.downcast_ref::<NoAffordableSource>().is_some() {
         err.context(
@@ -5072,39 +5088,49 @@ mod tests {
         );
     }
 
-    /// A drained signer registration, read from chain after an admission
-    /// refusal (alone, or under the stop when every provider refused it) or
-    /// rejected mid-stream, names the remedy a write-once registration leaves:
-    /// a capability for a new signer key (#2338).
+    /// A drained signer registration names the remedy a write-once
+    /// registration leaves: a capability for a new signer key (#2338). Only a
+    /// registration expired or with nothing left of its cap is named as
+    /// shutting out every provider. A drain read at one provider's rate (alone,
+    /// or under the stop once every known provider is barred) and a mid-stream
+    /// `SignerCapExhausted` are measured against the refusing provider's rate,
+    /// so the text says a cheaper provider may still serve.
     #[test]
     fn delegated_drained_signer_gets_the_new_key_remedy() {
-        let read = anyhow::Error::new(decdn_client::SignerCapDrained {
+        let drained = |remaining, expired| decdn_client::SignerCapDrained {
             pool_id: alloy::primitives::B256::ZERO,
             signer: Address::repeat_byte(0xd1),
             provider: Address::repeat_byte(0xa1),
-            remaining: 5,
+            remaining,
             rate_per_mb: 10,
-            expired: false,
-        });
-        let midstream = anyhow::Error::new(UpstreamVoucherRejected {
-            reason: decdn_protocol::client::VoucherRejectReason::SignerCapExhausted,
-            bundle: None,
-            proof_generation: None,
-        });
-        let everywhere = anyhow::Error::new(decdn_client::SignerCapDrained {
-            pool_id: alloy::primitives::B256::ZERO,
-            signer: Address::repeat_byte(0xd1),
-            provider: Address::repeat_byte(0xa1),
-            remaining: 5,
-            rate_per_mb: 10,
-            expired: false,
-        })
-        .context(decdn_client::NoSourceServesSigner);
-        for err in [read, midstream, everywhere] {
+            expired,
+        };
+        let at_rate = [
+            anyhow::Error::new(drained(5, false)),
+            anyhow::Error::new(drained(5, false)).context(decdn_client::NoSourceServesSigner),
+            anyhow::Error::new(UpstreamVoucherRejected {
+                reason: decdn_protocol::client::VoucherRejectReason::SignerCapExhausted,
+                bundle: None,
+                proof_generation: None,
+            }),
+        ];
+        for err in at_rate {
             let annotated = format!("{:#}", super::annotate_delegated_exhaustion(err));
             assert!(
-                annotated.contains("new signer key"),
-                "expected the new-key remedy, got: {annotated}"
+                annotated.contains("new signer key")
+                    && annotated.contains("lower rate may still serve")
+                    && !annotated.contains("no node can be paid"),
+                "expected the rate-relative new-key remedy, got: {annotated}"
+            );
+        }
+        for err in [
+            anyhow::Error::new(drained(0, false)),
+            anyhow::Error::new(drained(5, true)),
+        ] {
+            let annotated = format!("{:#}", super::annotate_delegated_exhaustion(err));
+            assert!(
+                annotated.contains("new signer key") && annotated.contains("no node can be paid"),
+                "expected the every-provider new-key remedy, got: {annotated}"
             );
         }
     }
