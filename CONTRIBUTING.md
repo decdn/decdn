@@ -333,7 +333,7 @@ The `cdn/<name>/v<n>` shape and the version suffix are mandatory — version bum
 
 #### 2. Add wire types to `crates/protocol/src/message.rs`
 
-Define a top-level enum (e.g. `FooMessage`) wrapping per-direction structs. Variant order is **frozen** — postcard encodes each variant by its declaration index, so reordering is a wire-breaking change. Add a discriminant-locking test alongside the existing `probe_message_request_discriminant_is_zero` pattern:
+Define a top-level enum (e.g. `FooMessage`) wrapping per-direction structs. Variant order is **frozen** — postcard encodes each variant by its declaration index, so reordering is a wire-breaking change. Add a discriminant-locking test beside the existing `probe_message_request_discriminant_is_zero` pattern. The enum goes in `message.rs`:
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,26 +341,27 @@ pub enum FooMessage {
     Request(FooRequest),   // discriminant 0 — locked by test
     Response(FooResponse), // discriminant 1 — locked by test
 }
+```
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+The tests go in the existing child file `crates/protocol/src/message/tests.rs` (see [Unit test placement](#unit-test-placement)):
 
-    #[test]
-    fn foo_message_request_discriminant_is_zero() -> Result<(), postcard::Error> {
-        let msg = FooMessage::Request(FooRequest { /* ... */ });
-        let bytes = postcard::to_allocvec(&msg)?;
-        assert_eq!(bytes.first().copied(), Some(0u8));
-        Ok(())
-    }
+```rust
+use super::*;
 
-    #[test]
-    fn foo_message_response_discriminant_is_one() -> Result<(), postcard::Error> {
-        let msg = FooMessage::Response(FooResponse { /* ... */ });
-        let bytes = postcard::to_allocvec(&msg)?;
-        assert_eq!(bytes.first().copied(), Some(1u8));
-        Ok(())
-    }
+#[test]
+fn foo_message_request_discriminant_is_zero() -> Result<(), postcard::Error> {
+    let msg = FooMessage::Request(FooRequest { /* ... */ });
+    let bytes = postcard::to_allocvec(&msg)?;
+    assert_eq!(bytes.first().copied(), Some(0u8));
+    Ok(())
+}
+
+#[test]
+fn foo_message_response_discriminant_is_one() -> Result<(), postcard::Error> {
+    let msg = FooMessage::Response(FooResponse { /* ... */ });
+    let bytes = postcard::to_allocvec(&msg)?;
+    assert_eq!(bytes.first().copied(), Some(1u8));
+    Ok(())
 }
 ```
 
