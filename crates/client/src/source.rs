@@ -2093,7 +2093,7 @@ mod tests {
             ),
             (open_refusal(StreamError::NotFound, 10), None, 1),
             (
-                open_refusal(StreamError::Overloaded, 10),
+                open_refusal(StreamError::Declined, 10),
                 Some(registered(40, 40)),
                 0,
             ),

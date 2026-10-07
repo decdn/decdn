@@ -7125,16 +7125,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_cheaper_source_takes_over_after_one_is_priced_out() -> anyhow::Result<()> {
-        // Source A refuses with InsufficientDeposit on open; B serves.
+        // Source A refuses with Unfunded on open; B serves.
         let data = blob(4 * 1024 * 1024);
         let la = Arc::new(PoolLedger::new(Cumulative::default()));
         let lb = Arc::new(PoolLedger::new(Cumulative::default()));
         let a = ScriptedSource::new(data.clone())?
             .paying(Arc::clone(&la))
             .with_fault_after(0, || {
-                anyhow::Error::new(UpstreamRefused::mid_stream(
-                    StreamError::InsufficientDeposit,
-                ))
+                anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Unfunded))
             });
         let b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&lb));
         let (root, total) = (a.root(), a.total_bytes());

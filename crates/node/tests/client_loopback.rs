@@ -3231,7 +3231,7 @@ async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Res
     anyhow::ensure!(
         matches!(
             refusal_ext.error,
-            Some(decdn_protocol::client::StreamError::InsufficientDeposit)
+            Some(decdn_protocol::client::StreamError::Unfunded)
         ),
         "expected the owner-facing InsufficientDeposit wire code, got {:?}",
         refusal_ext.error
@@ -5475,7 +5475,7 @@ async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()>
             anyhow::ensure!(
                 matches!(
                     resp_ext.error,
-                    Some(decdn_protocol::client::StreamError::InsufficientDeposit)
+                    Some(decdn_protocol::client::StreamError::Unfunded)
                 ),
                 "expected the owner-facing InsufficientDeposit wire code, got {:?}",
                 resp_ext.error
@@ -6977,7 +6977,7 @@ async fn concurrent_distinct_lanes_bounded_to_pool_deposit() -> anyhow::Result<(
     anyhow::ensure!(
         matches!(
             refusal_ext.error,
-            Some(decdn_protocol::client::StreamError::InsufficientDeposit)
+            Some(decdn_protocol::client::StreamError::Unfunded)
         ),
         "expected the owner-facing InsufficientDeposit wire code, got {:?}",
         refusal_ext.error
@@ -7748,8 +7748,8 @@ async fn denylisted_hash_is_refused_even_when_held() -> anyhow::Result<()> {
     .err()
     .ok_or_else(|| anyhow::anyhow!("a denylisted blob must be refused even when held"))?;
     anyhow::ensure!(
-        err.to_string().contains("HashBlacklisted") || err.to_string().contains("refused"),
-        "error should surface HashBlacklisted: {err}"
+        err.to_string().contains("Declined"),
+        "error should surface Declined: {err}"
     );
     support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
@@ -7808,8 +7808,8 @@ async fn governance_denied_hash_is_refused_as_hash_blacklisted() -> anyhow::Resu
     .err()
     .ok_or_else(|| anyhow::anyhow!("a governance-blacklisted blob must be refused"))?;
     anyhow::ensure!(
-        err.to_string().contains("HashBlacklisted") || err.to_string().contains("refused"),
-        "a governance takedown must sign HashBlacklisted, NOT EvictedSinceProbe: {err}"
+        err.to_string().contains("Declined"),
+        "a governance takedown must sign Declined: {err}"
     );
     let encoded = metrics.encode()?;
     anyhow::ensure!(
@@ -7957,8 +7957,8 @@ async fn blacklisted_funder_is_refused_on_a_cache_miss() -> anyhow::Result<()> {
     .err()
     .ok_or_else(|| anyhow::anyhow!("a blacklisted funder must be refused"))?;
     anyhow::ensure!(
-        err.to_string().contains("OriginBlacklisted") || err.to_string().contains("refused"),
-        "error should surface OriginBlacklisted, not NotFound: {err}"
+        err.to_string().contains("Declined"),
+        "error should surface Declined, not NotFound: {err}"
     );
     anyhow::ensure!(
         metric_line_present(
@@ -8000,8 +8000,8 @@ async fn client_evicted_since_probe_is_refused() -> anyhow::Result<()> {
     .err()
     .ok_or_else(|| anyhow::anyhow!("evicted blob must be refused"))?;
     anyhow::ensure!(
-        err.to_string().contains("EvictedSinceProbe") || err.to_string().contains("refused"),
-        "error should surface EvictedSinceProbe: {err}"
+        err.to_string().contains("Declined"),
+        "error should surface Declined: {err}"
     );
     anyhow::ensure!(
         metric_line_present(
@@ -8312,9 +8312,9 @@ async fn blacklisted_funder_is_refused_even_behind_a_clean_delegate() -> anyhow:
             anyhow::ensure!(
                 matches!(
                     resp_ext.error,
-                    Some(decdn_protocol::client::StreamError::OriginBlacklisted)
+                    Some(decdn_protocol::client::StreamError::Declined)
                 ),
-                "expected OriginBlacklisted, got {:?}",
+                "expected Declined, got {:?}",
                 resp_ext.error
             );
         }
@@ -9269,7 +9269,7 @@ async fn underfunded_channel_never_reaches_the_paid_pull() -> anyhow::Result<()>
             anyhow::ensure!(
                 matches!(
                     resp_ext.error,
-                    Some(decdn_protocol::client::StreamError::InsufficientDeposit)
+                    Some(decdn_protocol::client::StreamError::Unfunded)
                 ),
                 "expected the owner-facing InsufficientDeposit wire code, got {:?}",
                 resp_ext.error
@@ -9897,7 +9897,7 @@ async fn origin_only_node_fault_is_internal_error_not_signed_not_found() -> anyh
         Err(e) => {
             let msg = e.to_string();
             anyhow::ensure!(
-                msg.contains("InternalError"),
+                msg.contains("Declined"),
                 "a faulting backend probe must surface as InternalError, got: {e}"
             );
             anyhow::ensure!(
@@ -11314,7 +11314,7 @@ async fn local_origin_hard_fault_is_internal_error_not_signed_not_found() -> any
         Err(e) => {
             let msg = e.to_string();
             anyhow::ensure!(
-                msg.contains("InternalError"),
+                msg.contains("Declined"),
                 "a hard origin fault must surface as a retryable InternalError, got: {e}"
             );
             anyhow::ensure!(
@@ -11377,7 +11377,7 @@ async fn local_hard_fault_survives_fallthrough_to_the_window_tier() -> anyhow::R
         Err(e) => {
             let msg = e.to_string();
             anyhow::ensure!(
-                msg.contains("InternalError"),
+                msg.contains("Declined"),
                 "a local hard fault must still surface as InternalError after the \
                  node→node tier cleanly misses, got: {e}"
             );
@@ -11445,7 +11445,7 @@ async fn buffered_pull_through_hard_fault_is_internal_error() -> anyhow::Result<
         Err(e) => {
             let msg = e.to_string();
             anyhow::ensure!(
-                msg.contains("InternalError"),
+                msg.contains("Declined"),
                 "a buffered-tier hard fault must surface as InternalError, got: {e}"
             );
             anyhow::ensure!(

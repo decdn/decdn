@@ -6,8 +6,8 @@
 //! - **Global compliance (`global_blacklist_compliance`):** a node holds and
 //!   serves blob `H`; governance adds `H` to `ContentBlacklist`; the node's
 //!   blacklist watcher evicts `H` (asserted via admin `evict` dry-run flipping
-//!   `was_present` true→false), then refuses paid delivery *with the blacklist
-//!   reason* (`HashBlacklisted`, not a bare error), and its probe handler
+//!   `was_present` true→false), then refuses paid delivery `Declined` *for the
+//!   blacklist reason* (its `chain_hash_denied` counter), and its probe handler
 //!   reports `has_blob: false`. Eviction is durable across a daemon restart.
 //!   Finally, a signed post-entry `ProbeResponse` for `H` is driven through the
 //!   `SlashJudge` commit-reveal to prove serving-after-blacklist is slashable.
@@ -24,9 +24,9 @@
 //!
 //! - **Removal reversal (`removal_lifts_the_deny_but_eviction_is_sticky`):** the
 //!   `removeHashGlobal` slow path (an appeal / wrongful-entry reversal) lifts the
-//!   node's governance deny, so the refusal *code* reverts from `HashBlacklisted`
-//!   to the sticky-eviction `EvictedSinceProbe` — but the blob stays evicted, and
-//!   the probe still reports `has_blob: false`. Content un-eviction is not a
+//!   node's governance deny, so the refusal *reason* moves from `chain_hash_denied`
+//!   to the sticky eviction — but the wire code stays `Declined`, the blob stays
+//!   evicted, and the probe still reports `has_blob: false`. Content un-eviction is not a
 //!   watcher action (eviction is durable and one-way, `evicted.log`); appeal
 //!   restitution is financial, through `SlashAppeal` (ADR 028).
 //! - **Probe-hold interplay (`takedown_evicts_a_probe_held_blob`):** a probe
@@ -36,7 +36,8 @@
 //!   which is the cross-layer half of the engine's `try_probe_hold` TOCTOU test.
 //!
 //! **Coverage.** The journey exercises all three serving seams end-to-end
-//! against the daemon — delivery refusal (matched to `HashBlacklisted`), the
+//! against the daemon — delivery refusal (`Declined`, pinned to the governance
+//! deny by the node's per-reason counter), the
 //! probe handler (`has_blob: false`), and on-chain slashability. DHT
 //! announce-suppression stays delegated to `crates/node/src/dht/publish.rs`
 //! unit tests (its `refuses` gate). `SlashJudge` enforces slashability from
@@ -86,6 +87,11 @@ const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 /// the `2×120s=240s` deploy ladder inside `STANDARD 300s` under
 /// `--test-threads 2` contention.
 const REMOVAL_OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::HEAVY;
+
+/// The node's refusal counter for a governance hash deny.
+const CHAIN_HASH_DENIED: &str = "decdn_serve_stream_rejected_chain_hash_denied_total";
+/// The node's refusal counter for a blob it no longer holds after a probe.
+const EVICTED_SINCE_PROBE: &str = "decdn_serve_stream_rejected_evicted_since_probe_total";
 
 /// `OffenseType.Blacklist` discriminant (`ISlashJudge` enum: Rate, Blacklist).
 const OFFENSE_BLACKLIST: u8 = 1;
@@ -183,9 +189,8 @@ async fn run_global() -> anyhow::Result<()> {
 
     // Eviction is durable across a daemon restart — and so is its *cause*. The
     // refusal assertion below is the cross-layer proof of the governance deny
-    // projection: `evicted.log` alone would bring the node back up answering
-    // `EvictedSinceProbe`, silently re-opening the wire-code fingerprint that
-    // distinguishes a governance takedown from this operator's private denylist.
+    // projection: `evicted.log` alone would bring the node back up refusing for
+    // the plain eviction, with the governance deny lost.
     node.restart().await?;
     assert!(
         !evict_was_present(&admin, hash).await?,
@@ -200,14 +205,16 @@ async fn run_global() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Assert a paid fetch of `hash` from `node` is refused *for the blacklist
-/// reason* — matching `HashBlacklisted` so a channel/connect/payment
-/// regression that also fails the fetch cannot green this check.
+/// Assert a paid fetch of `hash` from `node` is refused `Declined` *for the
+/// blacklist reason*. The node's `chain_hash_denied` counter pins the cause, so
+/// a channel/connect/payment regression that also fails the fetch cannot green
+/// this check.
 async fn assert_refused_as_blacklisted(
     chain: &ChainFixture,
     node: &NodeFixture,
     hash: Hash,
 ) -> anyhow::Result<()> {
+    let before = node.scrape_metric(CHAIN_HASH_DENIED).await?;
     let err = ClientFixture::new(chain)
         .await?
         .fetch(chain, node, hash, alloy::primitives::U256::ZERO)
@@ -215,41 +222,50 @@ async fn assert_refused_as_blacklisted(
         .err()
         .ok_or_else(|| anyhow::anyhow!("fetch of an evicted blacklisted blob must fail"))?;
     let msg = format!("{err:#}");
-    // `HashBlacklisted`, NOT `EvictedSinceProbe`. A governance takedown and this
-    // operator's own `[content] denied_hashes` must be one wire code (ADR 011
-    // §`StreamRequest` Response) — answering governance from the eviction arm
-    // made the local-denylist code a unique fingerprint for an operator's
-    // private legal exposure. This assertion is the cross-layer half of the unit
-    // test `local_and_governance_hash_denials_share_one_wire_code`: it proves the
-    // watcher's deny actually reaches the wire on a real deployment, which is
-    // where the earlier version of this feature broke.
+    // A governance takedown and this operator's own `[content] denied_hashes`
+    // share the one wire code `Declined` (ADR 011 §`StreamRequest` Response), so
+    // a client cannot fingerprint an operator's private legal exposure. The
+    // counter proves the watcher's governance deny reaches the serve path on a
+    // real deployment, not only the eviction.
     anyhow::ensure!(
-        msg.contains("HashBlacklisted"),
-        "refusal must be the blacklist reason, got: {msg}"
+        msg.contains("Declined"),
+        "refusal must be Declined, got: {msg}"
+    );
+    let after = node.scrape_metric(CHAIN_HASH_DENIED).await?;
+    anyhow::ensure!(
+        after > before,
+        "the refusal must count on {CHAIN_HASH_DENIED} ({before} -> {after}); got: {msg}"
     );
     Ok(())
 }
 
 /// Poll a reused pool session until a single-attempt fetch of `hash` is refused
-/// with a code whose `Display` contains `needle` and (if given) not `excludes`,
-/// or `budget` elapses. Returns whether it converged.
+/// `Declined` and the attempt bumps the node's `metric` refusal counter, or
+/// `budget` elapses. Returns the last refusal message on convergence, `None`
+/// otherwise. `each_round` runs before every attempt.
 ///
 /// Uses [`ClientFixture::fetch_once`], not [`ClientFixture::fetch`]: `fetch`
-/// retries a *retryable* refusal (and `EvictedSinceProbe` is one) for 45s and
 /// opens a fresh on-chain pool each call, so polling it would burn the budget
-/// before a code transition could ever be observed. `fetch_once` is one attempt
+/// before a reason transition could ever be observed. `fetch_once` is one attempt
 /// on the existing session — an open-time refusal advances no watermark, so the
 /// session stays reusable across attempts.
-async fn poll_refusal_contains(
+async fn poll_refusal_reason<F, Fut>(
     client: &ClientFixture,
     session: &mut PoolSession,
+    node: &NodeFixture,
     hash: Hash,
-    needle: &str,
-    excludes: Option<&str>,
+    metric: &str,
     budget: Duration,
-) -> anyhow::Result<bool> {
+    mut each_round: F,
+) -> anyhow::Result<Result<String, String>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
     let deadline = tokio::time::Instant::now() + budget;
     loop {
+        each_round().await?;
+        let before = node.scrape_metric(metric).await?;
         let msg = match client
             .fetch_once(session, hash, 0, alloy::primitives::U256::ZERO)
             .await
@@ -257,19 +273,23 @@ async fn poll_refusal_contains(
             Ok(_) => anyhow::bail!("fetch of a refused blob unexpectedly succeeded"),
             Err(e) => format!("{e:#}"),
         };
-        if msg.contains(needle) && excludes.is_none_or(|x| !msg.contains(x)) {
-            return Ok(true);
+        anyhow::ensure!(
+            msg.contains("Declined"),
+            "refusal must be Declined, got: {msg}"
+        );
+        if node.scrape_metric(metric).await? > before {
+            return Ok(Ok(msg));
         }
         if tokio::time::Instant::now() >= deadline {
-            return Ok(false);
+            return Ok(Err(msg));
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
 /// The `removeHashGlobal` reversal (an appeal / wrongful-entry override) lifts the
-/// governance deny but not the eviction: the refusal stops being `HashBlacklisted`
-/// (it returns to the sticky-eviction code), yet the blob stays evicted and the
+/// governance deny but not the eviction: the refusal stays `Declined` but its
+/// reason moves to the sticky eviction, the blob stays evicted, and the
 /// probe still reports `has_blob: false`. Content un-eviction is never a watcher
 /// action — `evicted.log` is durable and one-way, and appeal restitution is
 /// financial (`SlashAppeal`, ADR 028), not a re-serve.
@@ -312,64 +332,48 @@ async fn run_removal_reversal() -> anyhow::Result<()> {
         "node never evicted the blacklisted blob H"
     );
 
-    // While the entry stands, delivery is refused with the blacklist code.
-    assert!(
-        poll_refusal_contains(
-            &client,
-            &mut session,
-            hash,
-            "HashBlacklisted",
-            None,
-            Duration::from_secs(30),
-        )
-        .await?,
-        "delivery must be refused as HashBlacklisted while the entry stands"
-    );
+    // While the entry stands, delivery is refused for the governance deny.
+    let denied = poll_refusal_reason(
+        &client,
+        &mut session,
+        &node,
+        hash,
+        CHAIN_HASH_DENIED,
+        Duration::from_secs(30),
+        || async { Ok(()) },
+    )
+    .await?;
+    if let Err(last) = denied {
+        panic!("delivery must be refused for the governance deny while the entry stands: {last}");
+    }
 
     // Governance removes the entry (the appeal / wrongful-entry slow path). The
     // watcher lifts the governance deny on the `HashRemoved` tail event, moving
-    // the refusal off `HashBlacklisted` while the eviction stays sticky
-    // (`undeny_hash`: the code returns to the plain-evicted one).
+    // the refusal reason to the sticky eviction (`undeny_hash`).
     chain.remove_hash_global(hash_key).await?;
 
     // Mine across the poll. The log poller only sees the `HashRemoved` event once
     // the chain head has advanced past its block (the add→evict path got that for
     // free from its `increase_time`; a lone removal tx does not), and mining each
-    // round also keeps the watcher's periodic re-scope ticking. The assertion is
-    // the robust half — the refusal stops being `HashBlacklisted` while the blob
-    // stays refused — not the exact post-deny code. `180s` covers the `10s`
-    // `isHashBlacklistedForOperator` RPC timeout plus `eth_getLogs` poll jitter
-    // under `--test-threads 2` contention (#1826).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
-    // Carries the last refusal into the post-loop assert, so an exhausted deadline
-    // names the code the node actually returned.
-    let mut last_msg = String::new();
-    let mut reverted = false;
-    loop {
-        time::mine(chain.admin()).await?;
-        let msg = match client
-            .fetch_once(&mut session, hash, 0, alloy::primitives::U256::ZERO)
-            .await
-        {
-            Ok(_) => anyhow::bail!("fetch of a removed-but-evicted blob unexpectedly succeeded"),
-            Err(e) => format!("{e:#}"),
-        };
-        last_msg.clone_from(&msg);
-        if !msg.contains("HashBlacklisted") {
-            reverted = true;
-            break;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    // round also keeps the watcher's periodic re-scope ticking. `180s` covers the
+    // `10s` `isHashBlacklistedForOperator` RPC timeout plus `eth_getLogs` poll
+    // jitter under `--test-threads 2` contention (#1826).
+    let reverted = poll_refusal_reason(
+        &client,
+        &mut session,
+        &node,
+        hash,
+        EVICTED_SINCE_PROBE,
+        Duration::from_secs(180),
+        || time::mine(chain.admin()),
+    )
+    .await?;
+    if let Err(last) = reverted {
+        panic!(
+            "removal must lift the governance deny — the refusal must move to the \
+             sticky eviction once the entry is gone; last refusal was: {last}"
+        );
     }
-    assert!(
-        reverted,
-        "removal must lift the governance deny — the refusal must stop being HashBlacklisted \
-         (it returns to the sticky-eviction code) once the entry is gone; last refusal was: \
-         {last_msg}"
-    );
 
     // The eviction itself is sticky and one-way: the blob is still gone and the
     // probe still declines it, even though the hash is no longer blacklisted.

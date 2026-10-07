@@ -17,14 +17,9 @@ pub const fn decdn_protocol::client::ClientMessage::validate(&self) -> core::res
 impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::client::ClientMessage
 pub const decdn_protocol::client::ClientMessage::VARIANT_COUNT: u32
 pub enum decdn_protocol::client::StreamError
-pub decdn_protocol::client::StreamError::BlobTooLarge
-pub decdn_protocol::client::StreamError::EvictedSinceProbe
-pub decdn_protocol::client::StreamError::HashBlacklisted
-pub decdn_protocol::client::StreamError::InsufficientDeposit
-pub decdn_protocol::client::StreamError::InternalError
+pub decdn_protocol::client::StreamError::Declined
 pub decdn_protocol::client::StreamError::NotFound
-pub decdn_protocol::client::StreamError::OriginBlacklisted
-pub decdn_protocol::client::StreamError::Overloaded
+pub decdn_protocol::client::StreamError::Unfunded
 pub decdn_protocol::client::StreamError::VoucherRejected
 pub decdn_protocol::client::StreamError::VoucherRejected::bundle: core::option::Option<decdn_protocol::client::WatermarkBundle>
 pub decdn_protocol::client::StreamError::VoucherRejected::reason: decdn_protocol::client::VoucherRejectReason
@@ -377,14 +372,9 @@ pub decdn_protocol::ProbeMessage::Response(decdn_protocol::message::ProbeRespons
 impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::message::ProbeMessage
 pub const decdn_protocol::message::ProbeMessage::VARIANT_COUNT: u32
 pub enum decdn_protocol::StreamError
-pub decdn_protocol::StreamError::BlobTooLarge
-pub decdn_protocol::StreamError::EvictedSinceProbe
-pub decdn_protocol::StreamError::HashBlacklisted
-pub decdn_protocol::StreamError::InsufficientDeposit
-pub decdn_protocol::StreamError::InternalError
+pub decdn_protocol::StreamError::Declined
 pub decdn_protocol::StreamError::NotFound
-pub decdn_protocol::StreamError::OriginBlacklisted
-pub decdn_protocol::StreamError::Overloaded
+pub decdn_protocol::StreamError::Unfunded
 pub decdn_protocol::StreamError::VoucherRejected
 pub decdn_protocol::StreamError::VoucherRejected::bundle: core::option::Option<decdn_protocol::client::WatermarkBundle>
 pub decdn_protocol::StreamError::VoucherRejected::reason: decdn_protocol::client::VoucherRejectReason

@@ -934,9 +934,7 @@ fn signed_to_wire_capability(signed: &SignedCapability) -> WireCapability {
 /// Retrying cannot fix any of those, so we fail fast and surface the real cause.
 ///
 /// The refusal arm is only this precise because the wire code now survives as a
-/// typed `UpstreamRefused` (#1144); before that a refusal was an opaque string and
-/// every one of them — including a hard `InternalError` — was retried to the
-/// deadline.
+/// typed `UpstreamRefused` (#1144).
 fn is_retryable(err: &anyhow::Error) -> bool {
     if err.downcast_ref::<HashMismatch>().is_some() || err.downcast_ref::<BlobTooLarge>().is_some()
     {
@@ -949,22 +947,11 @@ fn is_retryable(err: &anyhow::Error) -> bool {
         return false;
     }
     if let Some(refused) = err.downcast_ref::<UpstreamRefused>() {
-        // Allowlist the genuinely transient refusals: `NotFound` is the readiness
-        // window this loop exists for (and, more broadly, a node that may hold the
-        // blob on a later attempt); `EvictedSinceProbe` / `Overloaded` are
-        // likewise transient. Everything else is terminal and says the same thing
-        // on every attempt — a node that reports itself degraded
-        // (`InternalError`), the blob as over its ceiling (`BlobTooLarge`), or a
-        // governance/legal takedown of the content (`HashBlacklisted` /
-        // `OriginBlacklisted`). Retrying those only spins the loop to its
-        // deadline, so fail fast and surface the real cause.
-        //
-        // This is an allowlist rather than a denylist of terminal codes so a new
-        // terminal `StreamError` variant defaults to fail-fast, not retry-to-45s.
-        return matches!(
-            refused.error(),
-            StreamError::NotFound | StreamError::EvictedSinceProbe | StreamError::Overloaded
-        );
+        // Only `NotFound` is transient: it is the readiness window this loop
+        // exists for, and a node that may serve on a later attempt. `Declined`
+        // and `Unfunded` say the same thing on every attempt of this fetch, so
+        // fail fast and surface the real cause.
+        return matches!(refused.error(), StreamError::NotFound);
     }
     true
 }

@@ -145,11 +145,9 @@ pub fn classify(err: &anyhow::Error) -> Fault {
     }
     if let Some(refused) = err.downcast_ref::<UpstreamRefused>() {
         return match refused.error() {
-            StreamError::OriginBlacklisted | StreamError::VoucherRejected { .. } => {
-                Fault::Fatal(FatalScope::Command)
-            }
-            StreamError::InsufficientDeposit => Fault::Unaffordable,
-            _ => Fault::Source,
+            StreamError::VoucherRejected { .. } => Fault::Fatal(FatalScope::Command),
+            StreamError::Unfunded => Fault::Unaffordable,
+            StreamError::NotFound | StreamError::Declined => Fault::Source,
         };
     }
     Fault::Source
@@ -162,12 +160,7 @@ pub fn classify(err: &anyhow::Error) -> Fault {
 #[must_use]
 pub fn says_absent(err: &anyhow::Error) -> bool {
     err.downcast_ref::<UpstreamRefused>()
-        .is_some_and(|refused| {
-            matches!(
-                refused.error(),
-                StreamError::NotFound | StreamError::EvictedSinceProbe
-            )
-        })
+        .is_some_and(|refused| matches!(refused.error(), StreamError::NotFound))
 }
 
 /// Whether `err`'s chain holds an I/O error only this machine can fix.
@@ -221,10 +214,6 @@ mod tests {
                 "{reason:?}"
             );
         }
-        assert_eq!(
-            classify(&refusal(StreamError::OriginBlacklisted)),
-            Fault::Fatal(FatalScope::Command)
-        );
         let local = anyhow::anyhow!("store write").context(LocalPullFault);
         assert_eq!(classify(&local), Fault::Fatal(FatalScope::Command));
     }
@@ -326,7 +315,7 @@ mod tests {
         });
         assert_eq!(classify(&dry), Fault::Unaffordable);
         assert_eq!(
-            classify(&refusal(StreamError::InsufficientDeposit)),
+            classify(&refusal(StreamError::Unfunded)),
             Fault::Unaffordable
         );
     }
@@ -418,14 +407,7 @@ mod tests {
 
     #[test]
     fn delivery_faults_are_the_sources() {
-        for error in [
-            StreamError::NotFound,
-            StreamError::Overloaded,
-            StreamError::BlobTooLarge,
-            StreamError::InternalError,
-            StreamError::EvictedSinceProbe,
-            StreamError::HashBlacklisted,
-        ] {
+        for error in [StreamError::NotFound, StreamError::Declined] {
             assert_eq!(
                 classify(&refusal(error.clone())),
                 Fault::Source,
@@ -443,7 +425,7 @@ mod tests {
         let err = refusal(StreamError::NotFound);
         assert_eq!(classify(&err), Fault::Source);
         assert!(super::says_absent(&err));
-        assert!(!super::says_absent(&refusal(StreamError::Overloaded)));
+        assert!(!super::says_absent(&refusal(StreamError::Unfunded)));
     }
 
     #[test]

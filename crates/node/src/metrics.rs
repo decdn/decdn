@@ -1093,23 +1093,6 @@ pub struct DecdnMetrics {
     /// and that then probes origin-directory candidates, records two (#2195).
     #[default(Histogram::new(PROBE_COLLECTION_BUCKETS.to_vec()))]
     pub probe_collection_latency_seconds: Histogram,
-    /// `decdn_probe_post_eviction_failures_total` (ADR 001 §Probe cache,
-    /// ADR 005 §`EvictedSinceProbe` semantics; #1165): an upstream answered
-    /// `StreamError::EvictedSinceProbe` — it held the blob when it signed
-    /// `has_blob: true` and lost it to cache pressure before we opened the
-    /// stream.
-    ///
-    /// ADR 001 mandates tracking this rate; ADR 005 says why it matters more than
-    /// "a candidate failed": a node using probe-triggered eviction holds
-    /// correctly should *rarely* emit this, because a held blob is invisible to
-    /// the LRU driver. A sustained rate above ~1% therefore indicates a remote
-    /// hold-mechanism FAILURE — an implementation bug or resource exhaustion —
-    /// not a budget-configuration issue, which would surface as `has_blob: false`
-    /// at probe time and never reach a stream request.
-    ///
-    /// Narrower than the `RefusalVerdict::DurableMiss` arm that fires it, which
-    /// also covers `BlobTooLarge` — hence `DurableMissCause`.
-    pub probe_post_eviction_failures: Counter,
     /// `decdn_dht_lookup_round_ceiling_total` (#1145 review): a `find_providers` lookup was
     /// TRUNCATED at `MAX_LOOKUP_ROUNDS` while still finding closer nodes.
     ///
@@ -3130,10 +3113,6 @@ recorders! {
     /// open started.
     node_pull_first_byte(elapsed: Duration) =>
         node_pull_first_byte_seconds.observe(elapsed.as_secs_f64());
-
-    /// An upstream refused a stream with `EvictedSinceProbe` after answering
-    /// `has_blob: true` at probe (ADR 001 §Probe cache; #1165).
-    probe_post_eviction_failure => probe_post_eviction_failures.inc();
 
     /// A DHT lookup was truncated at `MAX_LOOKUP_ROUNDS` while still finding closer nodes
     /// (#1145 review). A sustained rate means the ceiling is too low for the network size.

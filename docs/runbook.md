@@ -403,10 +403,12 @@ the DHT republisher dropping the hash on its next tick, the probe handler no
 longer signing `has_blob: true`, and the client handler refusing to re-pull-fill
 it. `evict` is sticky and works on absent hashes, so a hash blacklisted while the
 node was offline is pre-blocked. The separate deny
-records *why*, which `evicted.log` cannot express — otherwise a governance
-takedown would answer `EvictedSinceProbe` while a local `[content] denied_hashes`
-entry answers `HashBlacklisted`, and the difference tells a client which list a
-hash is on (the fingerprint ADR 011 § `StreamRequest` Response forecloses). A
+records *why*, which `evicted.log` cannot express. Every one of these refusals
+reaches the client as the one class `Declined`, so a client cannot tell which
+list a hash is on (ADR 011 § `StreamRequest` Response); the deny keeps the
+cause on the node's own per-reason counters
+(`decdn_serve_stream_rejected_chain_hash_denied_total`,
+`..._hash_denied_total`, `..._evicted_since_probe_total`). A
 fail-closed readiness gate keeps every ALPN listener shut until the first
 enumeration + enforcement pass completes, so a node refuses to serve rather than
 serve un-enforced.

@@ -2850,9 +2850,7 @@ mod assembly_fault_tests {
     /// end it.
     #[test]
     fn insufficient_deposit_reassigns_and_a_dry_pool_ends_the_assembly() {
-        assert!(!ends_the_assembly(&refusal(
-            StreamError::InsufficientDeposit
-        )));
+        assert!(!ends_the_assembly(&refusal(StreamError::Unfunded)));
         assert!(ends_the_assembly(&anyhow::Error::new(PoolExhausted {
             gap_start: 0,
             gap_len: 1 << 20,
@@ -2871,7 +2869,7 @@ mod assembly_fault_tests {
         assert!(!ends_the_assembly(
             &rejected(VoucherRejectReason::UnderFold).context(HealExhausted)
         ));
-        assert!(ends_the_assembly(&refusal(StreamError::OriginBlacklisted)));
+        assert!(!ends_the_assembly(&refusal(StreamError::Declined)));
         assert!(!ends_the_assembly(&refusal(StreamError::NotFound)));
         assert!(!ends_the_assembly(&anyhow::anyhow!("connection reset")));
     }

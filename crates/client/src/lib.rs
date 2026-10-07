@@ -1002,27 +1002,25 @@ impl std::error::Error for UpstreamVoucherRejected {}
 /// folding every one into "unreachable".
 ///
 /// That distinction is the whole point. A refusal is proof the peer is *reachable
-/// and answering*, so most codes are no evidence at all that it is degraded:
+/// and answering*, so no class is evidence that it is degraded (ADR 005 §Open-time
+/// refusal classes):
 ///
-/// - `NotFound` — the honest, empty-provider answer, and it is NODE-scoped, not
-///   blob-scoped (`ServeRejectReason::wire_error` deliberately collapses seven
-///   reasons onto it so channel existence cannot be probed). Scoring it as
-///   `Unreachable` punished a node for truthfully saying it lacks a blob.
-/// - `EvictedSinceProbe` / `BlobTooLarge` — likewise honest, and DURABLE for this
-///   (peer, hash): asking again soon gets the same answer, so the consumer suppresses
-///   the pair for the full negative-cache TTL rather than burning a candidate slot on it.
-/// - `Overloaded` — honest but transient. Backpressure is to be respected, not punished,
-///   so it earns only the short `REFUSAL_SUPPRESSION_TTL`.
-/// - `VoucherRejected` — OUR payment fault, not the peer's. Listed because it genuinely
+/// - `NotFound` — "not now". It is NODE-scoped, not blob-scoped
+///   (`ServeRejectReason::wire_error` collapses a miss, a load shed, and several
+///   pool and signer states onto it), so it earns only a short suppression.
+/// - `Declined` — "not this hash during this fetch", DURABLE for this (peer, hash):
+///   asking again soon gets the same answer, so the consumer drops the peer for the
+///   hash rather than burning a candidate slot on it.
+/// - `Unfunded` — "not at the requester's current funding". It says nothing about
+///   the peer; it counts toward the requester's funding recovery.
+/// - `VoucherRejected` — a payment fault on this lane. Listed because it genuinely
 ///   arrives here: it is the code designated for MID-stream, and the mid-stream receive
 ///   arms wrap any `StreamError` into this sentinel (#1145 review).
-/// - `InternalError` — the one code that IS evidence of a degraded peer; it means
-///   "unexpected failure, do not retry THIS node" (#1129).
 ///
 /// `node_origin::classify_refusal` is the consumer and matches this exhaustively, so a new
 /// wire code breaks that build rather than silently inheriting a verdict.
 ///
-/// Only the wire code is recoverable here, never the finer server-side
+/// Only the wire class is recoverable here, never the finer server-side
 /// `ServeRejectReason` — that collapse is intentional and must not be reversed.
 /// `Display` keeps the stable `delivery refused: {code}` text that logs, the CLI's
 /// cache-miss annotation, and the loopback tests match on.
@@ -1266,8 +1264,8 @@ impl std::error::Error for PullStalled {}
 /// Reputation is not the only consequence. A second consumer — the node crate's
 /// `record_pool_open_failure` — reads this marker to choose between answering a
 /// downstream client `StreamError::NotFound` ("we could not obtain this blob") and
-/// `InternalError` ("unexpected failure; do not retry this node"). That path involves no
-/// peer and no reputation at all.
+/// `Declined` ("this node will not serve this hash during this fetch"). That path
+/// involves no peer and no reputation at all.
 ///
 /// So attaching this marker at a NEW site changes serve-path refusals, not just scoring.
 /// Attach it when the failure means *this node* cannot serve anyone — a broken signer, an
@@ -2770,17 +2768,15 @@ pub fn resume_may_be_stale(err: &anyhow::Error) -> bool {
         .is_some_and(|refused| matches!(refused.error(), StreamError::NotFound))
 }
 
-/// Whether `err` is an **open-time** [`StreamError::InsufficientDeposit`] refusal
-/// (ADR 003 §Pool solvency, option 2 / #2013): the serving node proved us the
-/// authenticated pool owner and told us its refundable floor `M` outruns our
-/// pool's remaining deposit, so the pool cannot cover a credit window here.
+/// Whether `err` is an **open-time** [`StreamError::Unfunded`] refusal
+/// (ADR 003 §Pool solvency): the serving node proved us a requester with lane
+/// authorization and will not serve at our current funding.
 ///
-/// `InsufficientDeposit` is a delivery-side code — a legitimate one rides ONLY in
-/// the signed open-stage `StreamResponse { ok: false }`, never mid-stream. So this
-/// gates on open-stage evidence ([`UpstreamRefused::evidence`] present): a
-/// protocol-violating peer that emits a bare mid-stream `StreamError::InsufficientDeposit`
-/// (no signed response) is NOT honored as a floor refusal and never drives the
-/// top-up loop.
+/// `Unfunded` is an open-time code: a legitimate one rides ONLY in the signed
+/// open-stage `StreamResponse { ok: false }`, never mid-stream. So this gates on
+/// open-stage evidence ([`UpstreamRefused::evidence`] present): a
+/// protocol-violating peer that emits a bare mid-stream `StreamError::Unfunded`
+/// (no signed response) is NOT honored as a funding refusal.
 ///
 /// The driver routes an open-stage refusal into its fund-and-retry loop the same
 /// way it routes a ledger-corroborated exhaustion: it tops the deposit up toward
@@ -2795,8 +2791,7 @@ pub fn resume_may_be_stale(err: &anyhow::Error) -> bool {
 pub(crate) fn is_insufficient_deposit(err: &anyhow::Error) -> bool {
     err.downcast_ref::<UpstreamRefused>()
         .is_some_and(|refused| {
-            matches!(refused.error(), StreamError::InsufficientDeposit)
-                && refused.evidence().is_some()
+            matches!(refused.error(), StreamError::Unfunded) && refused.evidence().is_some()
         })
 }
 
@@ -2806,22 +2801,17 @@ pub(crate) fn is_insufficient_deposit(err: &anyhow::Error) -> bool {
 /// a start with no bytes to serve.
 ///
 /// A holder refuses such a range before it signs (`RangeNotSatisfiable`, which
-/// reaches the wire as [`StreamError::NotFound`]). A relay signs its own size
-/// instead, and the range then fails to align against it here
-/// ([`decdn_bao_range::RangeVerifyError::RangeOutOfBounds`] or
+/// reaches the wire as [`StreamError::Declined`]). That refusal names only the
+/// class, so it removes the holder for this fetch and does not qualify here. A
+/// relay signs its own size instead, and the range then fails to align against
+/// it here ([`decdn_bao_range::RangeVerifyError::RangeOutOfBounds`] or
 /// [`ResumeOffsetPastEnd`]). A caller that cut the range from an unsigned size
 /// asks for the whole blob on these, and treats every other failure as the
 /// open's own outcome (#2063).
 #[must_use]
 #[doc(hidden)]
 pub fn is_range_past_end(err: &anyhow::Error) -> bool {
-    let refused_not_found = err
-        .downcast_ref::<UpstreamRefused>()
-        .is_some_and(|refused| {
-            matches!(refused.error(), StreamError::NotFound) && refused.evidence().is_some()
-        });
-    refused_not_found
-        || err.downcast_ref::<ResumeOffsetPastEnd>().is_some()
+    err.downcast_ref::<ResumeOffsetPastEnd>().is_some()
         || err.chain().any(|cause| {
             matches!(
                 cause.downcast_ref::<decdn_bao_range::RangeVerifyError>(),
@@ -4272,8 +4262,8 @@ impl StreamMeter {
 /// `test-util` `fetch_inner`) can self-heal from an authenticated watermark
 /// instead of treating the rejection as terminal. Any
 /// OTHER `StreamError` is the upstream refusing mid-stream; carry the typed wire
-/// code as [`UpstreamRefused`] so an honest `Overloaded`/`NotFound` peer is scored
-/// on its real code rather than the `Unreachable` catch-all (#1145 review).
+/// class as [`UpstreamRefused`] so a refusing peer is scored on its real class
+/// rather than the `Unreachable` catch-all (#1145 review).
 fn voucher_rejection(
     ledger: &PoolLedger,
     meter: &StreamMeter,
@@ -5853,7 +5843,7 @@ mod tests {
             slash_sig: sig.as_bytes().to_vec(),
         };
         let response_ext = decdn_protocol::StreamResponseExt {
-            error: Some(StreamError::EvictedSinceProbe),
+            error: Some(StreamError::Declined),
         };
         // Preconditions the real open stage enforces before ever calling `open`.
         response.validate()?;
@@ -5864,7 +5854,7 @@ mod tests {
             .downcast_ref::<UpstreamRefused>()
             .ok_or_else(|| anyhow::anyhow!("open() must stay a typed UpstreamRefused: {err:#}"))?;
         anyhow::ensure!(
-            *refused.error() == StreamError::EvictedSinceProbe,
+            *refused.error() == StreamError::Declined,
             "the wire code must survive unchanged, got {:?}",
             refused.error()
         );
@@ -5894,11 +5884,10 @@ mod tests {
         Ok(())
     }
 
-    /// Option 2 / #2013: `is_insufficient_deposit` recognises an open-stage
-    /// `InsufficientDeposit` (the node signed `ok: false` with the code in the ext),
-    /// which is the only shape a legitimate floor refusal takes, and REJECTS a bare
-    /// mid-stream `StreamError::InsufficientDeposit` — a protocol violation that must
-    /// not drive the top-up loop.
+    /// `is_insufficient_deposit` recognises an open-stage `Unfunded` (the node
+    /// signed `ok: false` with the code in the ext), which is the only shape a
+    /// legitimate funding refusal takes, and rejects a bare mid-stream
+    /// `StreamError::Unfunded`, a protocol violation.
     #[test]
     fn is_insufficient_deposit_matches_only_the_open_stage_refusal() -> anyhow::Result<()> {
         use decdn_protocol::client::{StreamError, StreamResponse, StreamResponseBody};
@@ -5918,20 +5907,18 @@ mod tests {
             slash_sig: vec![0u8; decdn_protocol::message::SLASH_SIG_LEN],
         };
         let ext = decdn_protocol::StreamResponseExt {
-            error: Some(StreamError::InsufficientDeposit),
+            error: Some(StreamError::Unfunded),
         };
         let open = UpstreamRefused::open(response, &ext);
         anyhow::ensure!(
             is_insufficient_deposit(&open),
-            "an open-stage InsufficientDeposit must be recognised"
+            "an open-stage Unfunded must be recognised"
         );
 
-        let mid = anyhow::Error::new(UpstreamRefused::mid_stream(
-            StreamError::InsufficientDeposit,
-        ));
+        let mid = anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Unfunded));
         anyhow::ensure!(
             !is_insufficient_deposit(&mid),
-            "a mid-stream InsufficientDeposit is protocol-violating and must NOT be honored"
+            "a mid-stream Unfunded is protocol-violating and must NOT be honored"
         );
 
         // A different open-stage code is not a floor refusal either.
@@ -6025,14 +6012,14 @@ mod tests {
 
         use super::UpstreamRefused;
 
-        let refused = UpstreamRefused::mid_stream(StreamError::Overloaded);
+        let refused = UpstreamRefused::mid_stream(StreamError::Declined);
         assert!(
             refused.evidence().is_none(),
             "a mid-stream refusal has no signed response to carry"
         );
         assert_eq!(
             *refused.error(),
-            StreamError::Overloaded,
+            StreamError::Declined,
             "the mid-stream wire code must survive unchanged"
         );
     }

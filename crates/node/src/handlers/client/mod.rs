@@ -556,10 +556,9 @@ impl Drop for FloorReservation {
 /// Which floor gate refused an admission
 /// ([`ClientHandler::try_reserve_floor`]). They stay distinct here so the
 /// per-reason metric separates "this pool cannot pay" from the node-local
-/// per-signer live cap, and they part on the wire too: the pool arm speaks the
-/// owner-only [`StreamError::InsufficientDeposit`] (both floor gates run past the
-/// lane-ownership proof — option 2 / #2013), while the signer arm stays a plain
-/// `NotFound`.
+/// per-signer live cap, and they part on the wire too: the pool arm speaks
+/// [`StreamError::Unfunded`] to the proven requester (both floor gates run past
+/// the lane-ownership proof), while the signer arm stays a plain `NotFound`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FloorRefusal {
     /// The pool-wide ceiling: `remaining − M` cannot cover the live floor
@@ -623,7 +622,7 @@ enum ServeRejectReason {
     /// reachable only past the lane-ownership proof (a known lane keyed to a
     /// verified signer holding an owner-signed capability), so its audience is the
     /// proven pool owner — never an unauthenticated prober — and it ships the true
-    /// wire [`StreamError::InsufficientDeposit`] so that owner's reactive top-up
+    /// wire [`StreamError::Unfunded`] so that owner's reactive top-up
     /// loop can fund past the node's `M` and re-open (option 2 / #2013, see
     /// [`Self::wire_error`]).
     InsufficientDeposit,
@@ -679,7 +678,7 @@ enum ServeRejectReason {
     /// buyer-side `max_blob_size` ceiling (ADR 005 §`BlobTooLarge` enforcement).
     /// The gate reads only the requester's `byte_offset`, never the upstream's
     /// unverified `total_bytes` claim (#1895), and fires before the node commits
-    /// to the stream. Ships the true wire [`StreamError::BlobTooLarge`] (see
+    /// to the stream. Ships the wire [`StreamError::Declined`] (see
     /// [`Self::wire_error`]), so the requester drops this node for the blob.
     BlobTooLarge,
     /// The blob is on this operator's local denylist (ADR 011 §Local Denylist).
@@ -742,7 +741,7 @@ impl ServeRejectReason {
             // ambiguous `NotFound`. `SignerCapExhausted`, `SignerFloorAtCap`, and
             // `PoolUnconfirmed` stay collapsed below: each keys on a different quantity
             // than the pool floor this signal names.
-            Self::InsufficientDeposit => StreamError::InsufficientDeposit,
+            Self::InsufficientDeposit => StreamError::Unfunded,
             // `RangeNotSatisfiable` collapses to
             // `NotFound` alongside the other "won't serve this" reasons: an
             // out-of-bounds bounded range is a client error, but signalling it as
@@ -762,32 +761,18 @@ impl ServeRejectReason {
             | Self::RangeNotSatisfiable
             | Self::ForeignNamespaceDeclined
             | Self::ChainStale => StreamError::NotFound,
-            Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
-            Self::InternalError => StreamError::InternalError,
-            // `BlobTooLarge` does not collapse to `NotFound`. ADR 005 gives it its
-            // own retry rule: the ceiling is a stable node policy, so the requester
-            // must not ask this node for the same blob again. A `NotFound` would
-            // send the requester back here for each range. The code reveals only
-            // this node's own ceiling, which is no secret.
-            Self::BlobTooLarge => StreamError::BlobTooLarge,
-            // The two takedown refusals do NOT collapse to `NotFound`. ADR 011
-            // §`StreamRequest` Response names distinct codes because the retry
-            // advice differs and a miss-shaped answer would be actively
-            // misleading: a client told `NotFound` retries elsewhere and pays
-            // again, when for `OriginBlacklisted` every node will refuse it.
-            //
-            // They are still each other's privacy floor. `HashBlacklisted` does
-            // not say whether the entry is governance or local — that is the ADR's
-            // explicit requirement, since a client able to tell them apart could
-            // map an operator's private legal exposure by probing. It is why the
-            // two reasons below converge here and why the governance one is NOT
-            // allowed to fall through to `EvictedSinceProbe`: a hash refused
-            // under a code no on-chain entry explains is a hash this operator
-            // denied privately, which is that map. And neither says anything
-            // about a channel's balance, which is what the `NotFound` collapse
-            // above exists to protect.
-            Self::HashDenied | Self::ChainHashDenied => StreamError::HashBlacklisted,
-            Self::OriginDenied => StreamError::OriginBlacklisted,
+            // Every "this node will not serve this hash during this fetch" reason
+            // is one `Declined` (ADR 005 §Open-time refusal classes). The
+            // requester drops this node for the hash and asks no further. One
+            // code for all of them means a client cannot tell a local denylist
+            // from a governance entry or a withdrawn blob, so it cannot map an
+            // operator's private legal exposure (ADR 011 §StreamRequest Response).
+            Self::EvictedSinceProbe
+            | Self::InternalError
+            | Self::BlobTooLarge
+            | Self::HashDenied
+            | Self::ChainHashDenied
+            | Self::OriginDenied => StreamError::Declined,
         }
     }
 }
@@ -3522,22 +3507,24 @@ mod tests {
         assert!(at_floor.saturating_sub(floor).is_zero());
     }
 
-    /// ADR 011 §`StreamRequest` Response names distinct refusal codes for the two
-    /// takedown reasons. They must NOT join the `NotFound` collapse:
-    /// a client told `NotFound` retries elsewhere and pays again, which for
-    /// `OriginBlacklisted` is advice that can never succeed.
+    /// Every takedown and withdrawal reason is one `Declined` (ADR 005
+    /// §Open-time refusal classes): the requester drops this node for the hash.
     #[test]
-    fn takedown_reject_reasons_do_not_collapse_to_not_found() {
-        assert_eq!(
-            ServeRejectReason::HashDenied.wire_error(),
-            decdn_protocol::StreamError::HashBlacklisted
-        );
-        assert_eq!(
-            ServeRejectReason::OriginDenied.wire_error(),
-            decdn_protocol::StreamError::OriginBlacklisted
-        );
-        // The collapse itself is unchanged — it is a privacy property, not an
-        // oversight, and widening it was never the point of #1179.
+    fn takedown_reject_reasons_are_declined() {
+        for reason in [
+            ServeRejectReason::HashDenied,
+            ServeRejectReason::ChainHashDenied,
+            ServeRejectReason::OriginDenied,
+            ServeRejectReason::EvictedSinceProbe,
+            ServeRejectReason::InternalError,
+            ServeRejectReason::BlobTooLarge,
+        ] {
+            assert_eq!(
+                reason.wire_error(),
+                decdn_protocol::StreamError::Declined,
+                "{reason:?}"
+            );
+        }
         for reason in [
             ServeRejectReason::CacheMiss,
             ServeRejectReason::UnknownChannel,
@@ -3557,62 +3544,13 @@ mod tests {
         }
     }
 
-    /// Option 2 / #2013: the pool-floor refusal is the ONE floor gate that does not
-    /// collapse to `NotFound`. It is reachable only past the lane-ownership proof —
-    /// the floor reservation fires behind a known lane keyed to a verified signer
-    /// holding an owner-signed capability — so its audience is the proven pool
-    /// owner, never an unauthenticated prober, and it ships the true reason so the
-    /// owner's reactive top-up loop can recover it. The per-signer floor gates
-    /// (`SignerFloorAtCap`, `SignerCapExhausted`) and the unconfirmed-pool gate stay
-    /// collapsed: each keys on a different quantity than the pool floor.
+    /// The pool-floor refusal is `Unfunded`: it is reachable only past the
+    /// lane-ownership proof, so its audience is a proven requester.
     #[test]
-    fn insufficient_deposit_speaks_its_true_code_but_signer_gates_stay_collapsed() {
+    fn the_pool_floor_refusal_is_unfunded() {
         assert_eq!(
             ServeRejectReason::InsufficientDeposit.wire_error(),
-            decdn_protocol::StreamError::InsufficientDeposit,
-            "the pool floor refusal is spoken to the proven owner"
-        );
-        for reason in [
-            ServeRejectReason::SignerFloorAtCap,
-            ServeRejectReason::SignerCapExhausted,
-            ServeRejectReason::PoolUnconfirmed,
-        ] {
-            assert_eq!(
-                reason.wire_error(),
-                decdn_protocol::StreamError::NotFound,
-                "{reason:?} keys on a per-signer/confirm quantity and stays a plain miss"
-            );
-        }
-    }
-
-    /// The privacy invariant ADR 011 §`StreamRequest` Response actually asks
-    /// for: a governance takedown and this operator's own denylist entry are one
-    /// wire code. They stay distinct *reasons* only so the operator's own
-    /// metrics can tell them apart, which no client can read.
-    ///
-    /// Without this, governance entries reaching the serve path only as cache
-    /// evictions would answer `EvictedSinceProbe`, making `HashBlacklisted` a unique
-    /// fingerprint for "this operator privately denied it": exactly the map of an
-    /// operator's legal exposure the ADR forecloses.
-    #[test]
-    fn local_and_governance_hash_denials_share_one_wire_code() {
-        assert_eq!(
-            ServeRejectReason::HashDenied.wire_error(),
-            ServeRejectReason::ChainHashDenied.wire_error(),
-            "a client must not be able to tell a governance takedown from a local one"
-        );
-    }
-
-    /// ...while an eviction with no blacklist entry behind it (corruption
-    /// recovery, a manual `decdn node evict`) keeps its own code. Collapsing
-    /// that one too would cost the probe-then-gone race its distinct answer for
-    /// no privacy gain: nobody can infer a legal exposure from a hash this node
-    /// simply no longer holds.
-    #[test]
-    fn plain_eviction_keeps_its_own_wire_code() {
-        assert_ne!(
-            ServeRejectReason::EvictedSinceProbe.wire_error(),
-            ServeRejectReason::HashDenied.wire_error()
+            decdn_protocol::StreamError::Unfunded,
         );
     }
 

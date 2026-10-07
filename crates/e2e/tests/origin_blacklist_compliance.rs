@@ -5,8 +5,8 @@
 //! calls `ContentBlacklist.setOriginBlacklist(origin, true)`; the node's
 //! blacklist watcher projects the `OriginBlacklistUpdated` event into its
 //! `ContentDenylist`, and the delivery path then refuses any paid stream whose
-//! channel is funded by that address — with the `OriginBlacklisted` wire reason,
-//! not a bare channel/connect failure. Un-blacklisting re-opens the gate.
+//! pool is funded by that address, with the `Declined` wire class, not a bare
+//! pool/connect failure. Un-blacklisting re-opens the gate.
 //!
 //! Two further legs guard the parts of that path with the WEAKEST primitives:
 //!
@@ -55,10 +55,8 @@ const MIB: usize = 1024 * 1024;
 /// standard tier. Cleanup (anvil kill, daemon kill) runs on drop even on timeout.
 const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::HEAVY;
 
-/// Budget for each catch-up poll. Generous because a *refused* `fetch` retries
-/// its (transient-classified) `OriginBlacklisted` reject to its own ~45s internal
-/// deadline before surfacing the error, so a single projected attempt already
-/// costs that much; the watcher itself catches up in ~1s.
+/// Budget for each catch-up poll. The watcher itself catches up in ~1s; the
+/// budget also covers a fetch that still waits on its own internal deadline.
 const CATCHUP_BUDGET: Duration = Duration::from_secs(180);
 
 #[tokio::test(flavor = "multi_thread")]
@@ -160,7 +158,7 @@ async fn run_operator_leg() -> anyhow::Result<()> {
         "addOperator must NOT set the origin mapping — that separation is the point"
     );
 
-    poll_until_refused(&chain, &node, &client, hash, StreamError::OriginBlacklisted).await?;
+    poll_until_refused(&chain, &node, &client, hash, StreamError::Declined).await?;
 
     // `removeOperator` re-opens the gate.
     chain.set_operator_blacklist(funder, false).await?;
@@ -194,14 +192,14 @@ async fn run_restart_leg() -> anyhow::Result<()> {
     let funder = client.address();
 
     chain.set_origin_blacklist(funder, true).await?;
-    poll_until_refused(&chain, &node, &client, hash, StreamError::OriginBlacklisted).await?;
+    poll_until_refused(&chain, &node, &client, hash, StreamError::Declined).await?;
 
     // Restart. From the new process's view the deny-set must be re-established
     // from scratch — whether by replaying the event tail or by reading chain
     // state, the observable contract is the same: it must still refuse.
     node.restart().await?;
 
-    poll_until_refused(&chain, &node, &client, hash, StreamError::OriginBlacklisted).await?;
+    poll_until_refused(&chain, &node, &client, hash, StreamError::Declined).await?;
 
     Ok(())
 }
@@ -236,7 +234,7 @@ async fn run() -> anyhow::Result<()> {
 
     // The watcher projects `OriginBlacklistUpdated` into the delivery gate; a
     // fresh fetch from the SAME funder is then refused for the origin-blacklist
-    // reason specifically (`OriginBlacklisted`), not a bare channel/connect/
+    // class specifically (`Declined`), not a bare channel/connect/
     // payment failure that a regression could also produce. During the brief
     // window before the watcher catches up the fetch may still succeed — treat
     // that as "not yet projected" and retry.
@@ -257,7 +255,7 @@ async fn run() -> anyhow::Result<()> {
                     .map(|r| r.error().clone())
                     .with_context(|| format!("expected a signed refusal, got: {err:#}"))?;
                 anyhow::ensure!(
-                    code == StreamError::OriginBlacklisted,
+                    code == StreamError::Declined,
                     "refusal must be the origin-blacklist reason, got: {code:?}"
                 );
                 Ok(Some(()))

@@ -309,7 +309,7 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// the blocks it covers.
     too_large_pull_through: HashSet<Address>,
     /// Providers other than partial holders that refused the blob as larger
-    /// than their size ceiling (`StreamError::BlobTooLarge`). The ceiling is a
+    /// than their size ceiling (`StreamError::Declined`). The ceiling is a
     /// stable node policy (ADR 005), so none of them starts again for this
     /// blob, and a rediscovery does not lift it. A node applies the ceiling
     /// only to a pull-through, so the same refusal from a partial holder bars
@@ -537,7 +537,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         if crate::fault::says_absent(err) && !range.past_end {
             self.record_not_found(provider, refused, Some(&range), at);
         }
-        if matches!(refused.error(), StreamError::BlobTooLarge) {
+        if matches!(refused.error(), StreamError::Declined) {
             self.record_too_large(provider, refused);
         }
     }
@@ -637,7 +637,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             self.record_not_found(provider, refused, range, now);
         }
         if let Some(refused) = err.downcast_ref::<UpstreamRefused>()
-            && matches!(refused.error(), StreamError::BlobTooLarge)
+            && matches!(refused.error(), StreamError::Declined)
         {
             self.record_too_large(provider, refused);
         }
@@ -2159,7 +2159,7 @@ mod tests {
 
     fn too_large() -> anyhow::Error {
         anyhow::Error::new(crate::UpstreamRefused::mid_stream(
-            decdn_protocol::client::StreamError::BlobTooLarge,
+            decdn_protocol::client::StreamError::Declined,
         ))
     }
 
@@ -2214,7 +2214,7 @@ mod tests {
             err.downcast_ref::<crate::UpstreamRefused>()
                 .is_some_and(|r| matches!(
                     r.error(),
-                    decdn_protocol::client::StreamError::BlobTooLarge
+                    decdn_protocol::client::StreamError::Declined
                 )),
             "{err:#}"
         );

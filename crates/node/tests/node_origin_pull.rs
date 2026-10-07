@@ -5023,7 +5023,7 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
         payload.clone(),
         total_bytes,
         RATE,
-        StreamError::Overloaded,
+        StreamError::NotFound,
     );
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
@@ -6038,7 +6038,7 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
 /// even attributable to the peer (`ServeRejectReason::wire_error` collapses seven reasons
 /// onto it, three of them ours), so it gets `REFUSAL_SUPPRESSION_TTL` — 30 s, long enough to
 /// stop a retry burst re-probing a peer that just said no, short enough not to blackhole it.
-/// An `EvictedSinceProbe` is a durable, honest fact about this (peer, hash), so it earns the
+/// A `Declined` is a durable, honest fact about this (peer, hash), so it earns the
 /// full cache TTL.
 ///
 /// Nothing guarded the mapping. `only_a_durable_refusal_earns_the_full_suppression_ttL`
@@ -6062,12 +6062,12 @@ async fn a_transient_refusal_is_suppressed_briefly_and_a_durable_one_for_the_ful
          upstream for five minutes over one dry deposit"
     );
 
-    // 2. `EvictedSinceProbe` — a durable, honest fact about this (peer, hash). It must be
+    // 2. `Declined` — a durable, honest fact about this (peer, hash). It must be
     //    suppressed AT ALL. Without this, deleting the durable arm's `suppress(None)`
     //    outright is invisible: with a tiny cache TTL, "never suppressed" and "suppression
     //    already expired" look identical after any wait.
     anyhow::ensure!(
-        refusal_suppression_after(StreamError::EvictedSinceProbe, Duration::ZERO).await?,
+        refusal_suppression_after(StreamError::Declined, Duration::ZERO).await?,
         "a durable refusal must suppress the (peer, hash) pair — otherwise a peer that \
          advertises everything and serves nothing keeps winning the ranker and burns a \
          MAX_PROVIDER_ATTEMPTS slot on every miss, forever"
@@ -6077,120 +6077,15 @@ async fn a_transient_refusal_is_suppressed_briefly_and_a_durable_one_for_the_ful
     //    budget. Together with (1) this pins the two arms to different calls: no single
     //    implementation satisfies both.
     anyhow::ensure!(
-        !refusal_suppression_after(StreamError::EvictedSinceProbe, PAST_THE_TINY_TTL).await?,
+        !refusal_suppression_after(StreamError::Declined, PAST_THE_TINY_TTL).await?,
         "a durable refusal must ride the cache-wide TTL; outliving one this long means it is \
          being given the transient budget instead"
     );
     Ok(())
 }
 
-/// Refuse one pull with `error` and report what `decdn_probe_post_eviction_failures_total`
-/// reads afterwards. Modelled on [`refusal_suppression_after`], but the instrument is the
-/// metric, not the suppression; asserts the refusal actually happened
-/// (`node_pull_refused_total == 1`) so a returned `0` can never mean "the pull never
-/// reached the classifier".
-async fn post_eviction_failures_after_a_refusal(error: StreamError) -> Result<u64> {
-    let payload = vec![0x4Eu8; 4096];
-    let hash = Hash::new(&payload);
-    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-
-    let a_sk = fresh_key();
-    let a_id = a_sk.public();
-    let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_refusing_server(
-        ep_a.clone(),
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-        error,
-    );
-
-    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
-
-    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let b_metrics = Arc::new(Metrics::new());
-    let b_buyer = Arc::new(PrivateKeySigner::random());
-    let (providers, addr_map) =
-        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let buyer = Arc::new(StubOpener {
-        pool_id: B256::repeat_byte(0x4E),
-        deposit: U256::from(DEPOSIT_MICRO_USDC),
-        signer: Arc::clone(&b_buyer),
-        voucher_domain: voucher_dom(),
-        recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
-    }) as Arc<dyn PoolOpener>;
-    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
-        &ep_b,
-        DhtNodeId::from_bytes(*b_id.as_bytes()),
-        hash,
-        buyer,
-        &local_rep,
-        &b_metrics,
-        providers,
-        addr_map,
-        Duration::from_secs(20),
-        Duration::from_secs(20),
-        0,
-    )
-    .await;
-
-    let got = Origin::fetch(&origin, hash, u64::MAX)
-        .await
-        .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
-    anyhow::ensure!(
-        matches!(got, OriginFetch::NotFound),
-        "a refused pull must not surface bytes"
-    );
-    assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
-    let count = counter_value(&b_metrics, "probe_post_eviction_failures_total")?;
-
-    shutdown([task_a], [&ep_b, &ep_a]).await?;
-    Ok(count)
-}
-
-/// `decdn_probe_post_eviction_failures_total` must fire for an `EvictedSinceProbe` refusal
-/// and ONLY for it — the whole point of `DurableMissCause` (#1165, #1223 review).
-///
-/// The `monitoring/grafana-dashboard.json` panel scraping this metric predates the emitter,
-/// and the unit test on `pull_verdict` (`only_an_eviction_carries_the_post_eviction_cause`)
-/// pins the *classification*, not the emission: rerouting the metric call, or firing it for
-/// both `DurableMiss` causes, passes that test while the panel silently counts blob-ceiling
-/// rejections as hold-mechanism failures. This drives both causes through the real wire +
-/// classification path and reads the counter itself. `BlobTooLarge` is the load-bearing
-/// zero: it takes the SAME `DurableMiss` arm, so it is the one code that can tell "metric
-/// keyed on the cause" from "metric keyed on the verdict".
 #[tokio::test(flavor = "multi_thread")]
-async fn only_an_eviction_refusal_fires_the_post_eviction_metric() -> Result<()> {
-    anyhow::ensure!(
-        post_eviction_failures_after_a_refusal(StreamError::EvictedSinceProbe).await? == 1,
-        "an EvictedSinceProbe refusal must increment \
-         decdn_probe_post_eviction_failures_total — ADR 001 §Probe cache mandates tracking \
-         this rate, and the Grafana panel scraping it predates the emitter"
-    );
-    anyhow::ensure!(
-        post_eviction_failures_after_a_refusal(StreamError::BlobTooLarge).await? == 0,
-        "a BlobTooLarge refusal is a static fact about the blob, not a hold-mechanism \
-         failure — counting it as one is exactly the conflation DurableMissCause exists to \
-         prevent"
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
+async fn node_origin_declined_refusal_is_not_scored() -> Result<()> {
     let payload = vec![0x1Eu8; 4096];
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
@@ -6206,7 +6101,7 @@ async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
         slash_domain(),
         total_bytes,
         RATE,
-        StreamError::InternalError,
+        StreamError::Declined,
     );
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
@@ -6246,12 +6141,13 @@ async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
         "a refused delivery must not surface bytes (NotFound)"
     );
 
-    // Metered as a refusal (it IS one) AND scored (this one is the peer's fault).
+    // Metered as a refusal (it IS one) and never scored: a refusal proves the
+    // peer answered, whatever its class.
     assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
-    assert_counter(&b_metrics, "node_pull_unreachable_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
     anyhow::ensure!(
-        local_rep.score(a_id) < 0.5,
-        "an InternalError refusal must drop the local score below neutral, got {}",
+        (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
+        "a Declined refusal must leave the local score neutral, got {}",
         local_rep.score(a_id)
     );
 
@@ -8073,7 +7969,7 @@ async fn window_pull_through_funder_blacklisted_mid_stream_cuts_off_a_delegated_
 }
 
 /// #1560 END TO END, over the wire the client actually reads: when B cannot open its
-/// upstream pull because of a fault in B, the leaf must be refused `InternalError` — not the
+/// upstream pull because of a fault in B, the leaf must be refused `Declined` — not the
 /// signed `NotFound` that says the content does not exist.
 ///
 /// This is the claim the issue makes, and the only test that can settle it. Everything
@@ -8145,8 +8041,8 @@ async fn window_pull_through_local_fault_refuses_internal_error_not_not_found() 
     .ok_or_else(|| anyhow::anyhow!("B cannot pay for the upstream pull, so it cannot serve"))?;
     let refusal = refusal.to_string();
     anyhow::ensure!(
-        refusal.contains("InternalError"),
-        "B's own broken deadline config must be reported as B being broken, got: {refusal}"
+        refusal.contains("Declined"),
+        "B's own broken deadline config must be reported as B declining, got: {refusal}"
     );
     anyhow::ensure!(
         !refusal.contains("NotFound"),
@@ -8172,7 +8068,7 @@ async fn window_pull_through_local_fault_refuses_internal_error_not_not_found() 
 /// Without this the fix is only pinned in one direction. `window.rs`'s
 /// `miss_reason(fault_seen || miss.is_local_fault())` is the line #1560 changed, and
 /// mutating it to a flat `miss_reason(true)` passes every other test in this file — the node
-/// would answer `InternalError` for every ordinary cache miss on the network, permanently
+/// would answer `Declined` for every ordinary cache miss on the network, permanently
 /// steering clients off healthy nodes. That is a worse failure than the bug being fixed,
 /// because it fires constantly rather than only when a node is broken.
 ///
@@ -8249,9 +8145,9 @@ async fn window_pull_through_honest_upstream_miss_still_refuses_not_found() -> R
         "an honest network-wide miss is exactly what a wire `NotFound` is for, got: {refusal}"
     );
     anyhow::ensure!(
-        !refusal.contains("InternalError"),
-        "B is healthy — reporting itself broken for an ordinary miss would steer clients \
-         off a working node on every cache miss, got: {refusal}"
+        !refusal.contains("Declined"),
+        "B is healthy — declining an ordinary miss would steer clients off a working \
+         node on every cache miss, got: {refusal}"
     );
 
     assert_counter(&b_metrics, "serve_stream_rejected_cache_miss_total", 1)?;
@@ -8679,8 +8575,8 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
         "concurrent same-lane MISS must be refused while budget covers only one floor"
     );
     anyhow::ensure!(
-        matches!(resp2_ext.error, Some(StreamError::InsufficientDeposit)),
-        "expected the owner-facing InsufficientDeposit wire code for the pool-ceiling refusal, \
+        matches!(resp2_ext.error, Some(StreamError::Unfunded)),
+        "expected the Unfunded wire code for the pool-ceiling refusal, \
          got {:?}",
         resp2_ext.error
     );
@@ -10952,7 +10848,7 @@ async fn ranged_pull_under_ceiling(
     })
 }
 
-/// Assert `run` is a `BlobTooLarge` refusal the leaf read before any byte, metered
+/// Assert `run` is a `Declined` size-ceiling refusal the leaf read before any byte, metered
 /// once on its own reason and never on the received-byte abort.
 async fn assert_refused_too_large(run: &CeilingRun) -> Result<()> {
     let err = match &run.leaf {
@@ -10963,8 +10859,8 @@ async fn assert_refused_too_large(run: &CeilingRun) -> Result<()> {
         Err(e) => format!("{e:#}"),
     };
     anyhow::ensure!(
-        err.contains("delivery refused: Some(BlobTooLarge)"),
-        "the leaf must read a signed BlobTooLarge refusal, got: {err}"
+        err.contains("delivery refused: Some(Declined)"),
+        "the leaf must read a signed Declined refusal, got: {err}"
     );
     assert_counter(
         &run.b_metrics,
@@ -10981,8 +10877,8 @@ async fn assert_refused_too_large(run: &CeilingRun) -> Result<()> {
     Ok(())
 }
 
-/// A request that starts at B's size ceiling is refused with `BlobTooLarge`
-/// before B commits (#2256). The gate reads the request's own offset, so B skips
+/// A request that starts at B's size ceiling is refused `Declined` for its
+/// size ceiling before B commits (#2256). The gate reads the request's own offset, so B skips
 /// discovery and the upstream handshake: A serves no stream and B pays nothing.
 /// A start exactly AT the ceiling is already past it, as the client's resume
 /// guard draws the line.
@@ -11650,9 +11546,10 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
     let streams = Arc::new(AtomicUsize::new(0));
 
     // --- Three providers: reachable, honest at probe, refuse the pull with
-    //     `InternalError` — reported node-fault, so NOT negative-cached and NOT
-    //     wedged, which is exactly what lets all three remain in the cache for
-    //     the second fetch to spend its budget on. -----------------------------
+    //     `Declined`. B's negative cache runs a zero cache-wide TTL, so the
+    //     durable suppression a `Declined` earns lapses at once and all three
+    //     remain in the probe cache for the second fetch to spend its budget on.
+    //     -----------------------------------------------------------------------
     let n0_sk = fresh_key();
     let n0_id = n0_sk.public();
     let n0_eth = Arc::new(PrivateKeySigner::random());
@@ -11664,7 +11561,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         slash_domain(),
         total_bytes,
         RATE,
-        StreamError::InternalError,
+        StreamError::Declined,
         Arc::clone(&probes),
         Arc::clone(&streams),
     );
@@ -11680,7 +11577,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         slash_domain(),
         total_bytes,
         RATE,
-        StreamError::InternalError,
+        StreamError::Declined,
         Arc::clone(&probes),
         Arc::clone(&streams),
     );
@@ -11696,7 +11593,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         slash_domain(),
         total_bytes,
         RATE,
-        StreamError::InternalError,
+        StreamError::Declined,
         Arc::clone(&probes),
         Arc::clone(&streams),
     );
@@ -11740,7 +11637,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
-    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_negative_cache(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -11752,6 +11649,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
+        NegativeProbeCache::with_capacity_and_ttl(64, Duration::ZERO),
     )
     .await;
 
@@ -11773,7 +11671,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
     assert_counter(&b_metrics, "node_pull_refused_total", 3)?;
 
     // Fetch #2: the probe-cache hit walks the SAME three cached candidates (none
-    // negative-cached or wedged by an `InternalError` refusal). It must spend
+    // still negative-cached, none wedged). It must spend
     // exactly the fetch-wide budget of 3 — not hand a fresh lookup three MORE —
     // and must not re-probe anyone.
     let second = Origin::fetch(&origin, hash, u64::MAX)
@@ -11797,7 +11695,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
 
     // Fetch #3: fetch #2 disproved the cached entry by spending the whole budget
     // on it, so it must have been INVALIDATED — none of the three refusers is
-    // negative-cached or wedged (`InternalError`), so only the invalidate stands
+    // still negative-cached or wedged, so only the invalidate stands
     // between this fetch and a second hit on the same dead list. It must go COLD:
     // a fresh lookup that re-probes all three at the wire.
     let third = Origin::fetch(&origin, hash, u64::MAX)
@@ -11851,8 +11749,8 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     // --- Provider N: reachable, honest at probe, refuses the pull with
-    //     `InternalError` — reported node-fault, so NOT negative-cached and NOT
-    //     wedged, exactly like the shared-budget test's three refusers. -----------
+    //     `Declined`. As in the shared-budget test, B's negative cache runs a
+    //     zero cache-wide TTL, so N stays a cached candidate. ---------------------
     let probes_n = Arc::new(AtomicUsize::new(0));
     let streams_n = Arc::new(AtomicUsize::new(0));
     let n_sk = fresh_key();
@@ -11866,7 +11764,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         slash_domain(),
         total_bytes,
         RANK_LAST_RATE,
-        StreamError::InternalError,
+        StreamError::Declined,
         Arc::clone(&probes_n),
         Arc::clone(&streams_n),
     );
@@ -11917,7 +11815,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
-    let (origin, engine, _engine_tmp) = build_origin_with_timeout(
+    let (origin, engine, _engine_tmp) = build_origin_with_negative_cache(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -11929,6 +11827,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
+        NegativeProbeCache::with_capacity_and_ttl(64, Duration::ZERO),
     )
     .await;
 
@@ -11954,12 +11853,9 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
     );
     assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
     assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
-    // 2, not 1: H's failed probe scores Unreachable, AND N's `InternalError` refusal is
-    // classified `RefusalVerdict::NodeFault`, which — per `classify_pull_failure` — ALSO
-    // scores `Outcome::Unreachable` on top of incrementing `node_pull_refused_total` (a
-    // refusal proves reachability at the wire but is still reputation-scored as
-    // unreachable). This is why the shared-budget test above never asserts this counter.
-    assert_counter(&b_metrics, "node_pull_unreachable_total", 2)?;
+    // H's failed probe scores Unreachable; N's refusal proves it reachable and
+    // scores nothing.
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 1)?;
     assert_counter(&b_metrics, "node_pull_attempts_total", 1)?;
 
     // --- Bring H online between the two fetches: a real, healthy upstream
@@ -12056,10 +11952,9 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
     assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
     assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
     assert_counter(&b_metrics, "node_pull_refused_total", 2)?;
-    // 3, not 2: the 2 from fetch #1 (H unreachable + N's NodeFault refusal) plus one more
-    // from N's second (cached-phase) refusal. H's successful cold-path probe and delivery
-    // add none.
-    assert_counter(&b_metrics, "node_pull_unreachable_total", 3)?;
+    // Still only fetch #1's unreachable H: N's second refusal and H's successful
+    // cold-path probe and delivery add none.
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 1)?;
     // THE property under test: one orchestration per fetch, however many
     // candidate lists it walks THIS TIME — 2, not 3. A regressed
     // `if !attempt_metered` guard that always fires would double-count fetch
@@ -12297,7 +12192,7 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
         slash_domain(),
         total_bytes,
         RATE,
-        StreamError::EvictedSinceProbe,
+        StreamError::Declined,
         Arc::clone(&probes_n),
         Arc::clone(&streams_n),
     );

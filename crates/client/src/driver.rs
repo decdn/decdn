@@ -121,7 +121,7 @@ impl std::fmt::Display for PoolExhausted {
 
 impl std::error::Error for PoolExhausted {}
 
-/// A source kept refusing a new stream as `InsufficientDeposit` while the pool's
+/// A source kept refusing a new stream as `Unfunded` while the pool's
 /// remaining deposit already sat within the low water of the working deposit,
 /// past the settle budget ([`DriveConfig::max_settle_waits`]).
 ///
@@ -1485,7 +1485,7 @@ where
                     // 1. A stale-resume refusal while we are waiting out a top-up:
                     //    the node's watcher has not caught up yet. Sleep and retry
                     //    the same sub-range, bounded by the settle budget. An
-                    //    `InsufficientDeposit` re-open (option 2 / #2013) qualifies for
+                    //    `Unfunded` re-open qualifies for
                     //    the same wait: right after a `topUp` the node's chain watcher
                     //    may still read the pre-top-up `remaining − M` and refuse the
                     //    authenticated owner with this code, exactly as an honest node's
@@ -1500,7 +1500,7 @@ where
                     }
                     awaiting_settle = false;
 
-                    // 1b. An open-time `InsufficientDeposit` refusal (option 2 / #2013):
+                    // 1b. An open-time `Unfunded` refusal:
                     //     the serving node proved us the authenticated pool owner and
                     //     told us its refundable floor `M` outruns our pool's remaining
                     //     deposit. Our own ledger says we can still afford the next
@@ -3161,8 +3161,8 @@ mod tests {
     }
 
     /// A [`BlobSource`] that refuses its FIRST open with an owner-only
-    /// [`StreamError::InsufficientDeposit`] (ADR 003 §Pool solvency, option 2 /
-    /// #2013) — the serving node's floor `M` beyond the buyer's estimate — and
+    /// [`StreamError::Unfunded`] (ADR 003 §Pool solvency): the serving node's
+    /// floor `M` beyond the buyer's estimate, and
     /// serves every later open from the inner [`ScriptedSource`]. The refusal
     /// arrives at the open (the node signed `ok: false`, so there is no header and
     /// no reader), exactly as a real one does.
@@ -3185,11 +3185,11 @@ mod tests {
             Box::pin(async move {
                 if n < self.refusals {
                     // A real open-stage refusal: the node signs `StreamResponse
-                    // { ok: false }` with the delivery-side `InsufficientDeposit` in
+                    // { ok: false }` with the delivery-side `Unfunded` in
                     // the trailing ext, exactly the shape `open_progressive_pull`
                     // builds via the crate-private `UpstreamRefused::open`. Built here
                     // (rather than `mid_stream`) so the refusal carries open-stage
-                    // evidence — which is what `is_insufficient_deposit` now requires.
+                    // evidence — which is what `is_insufficient_deposit` requires.
                     let body = StreamResponseBody {
                         hash,
                         ok: false,
@@ -3207,7 +3207,7 @@ mod tests {
                         slash_sig: vec![0u8; 65],
                     };
                     let ext = StreamResponseExt {
-                        error: Some(StreamError::InsufficientDeposit),
+                        error: Some(StreamError::Unfunded),
                     };
                     return Err(UpstreamRefused::open(resp, &ext));
                 }
@@ -3230,9 +3230,9 @@ mod tests {
         // deposit sits well above the voucher cost — so `genuine_exhaustion` rejects
         // the refusal. Only the node's private floor `M` is higher than the buyer
         // estimated, and the buyer cannot compute it. The driver must trust the
-        // owner-only `InsufficientDeposit` signal, top the deposit up toward its own
+        // owner-only `Unfunded` signal, top the deposit up toward its own
         // `working_deposit` ceiling, and re-open — rather than dead-end as it would
-        // on the ambiguous `NotFound` this refusal used to collapse to.
+        // on an ambiguous `NotFound`.
         let total = 2 * GROUP;
         let (root, plaintext, _outboard) = synth_blob(total as usize);
         let store = fresh_store(root, total);
@@ -3254,7 +3254,7 @@ mod tests {
         let mut ctx = healthy_ctx();
         // Affordable next voucher (deposit ≫ cost), so the refusal is NOT a
         // ledger-corroborated exhaustion; the recovery is driven purely by the
-        // dedicated `InsufficientDeposit` route.
+        // dedicated `Unfunded` route.
         ctx.deposit = U256::from(1_000u64);
         let ctx = Arc::new(Mutex::new(ctx));
 
@@ -3283,7 +3283,7 @@ mod tests {
             None,
         )
         .await
-        .expect("drive recovers an InsufficientDeposit refusal via one top-up");
+        .expect("drive recovers an Unfunded refusal via one top-up");
 
         assert_eq!(
             source.opens.load(std::sync::atomic::Ordering::SeqCst),

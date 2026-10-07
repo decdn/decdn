@@ -301,7 +301,7 @@ fn topup_fetch_argv_with_deposits(
 
 // ---- Multi-interval reactive top-up: no double-pay, no under-pay ----
 //
-// The test above bakes the pool's very FIRST voucher into `InsufficientDeposit`
+// The test above bakes the pool's very FIRST voucher into an `Unfunded` refusal
 // on a fresh pool — no prior accepted voucher exists, so this is the shallowest
 // possible exercise of the reactive branch. This test drives the deeper case:
 // several whole chunks get delivered AND ACCEPTED first, and only the

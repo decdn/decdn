@@ -5231,10 +5231,10 @@ mod tests {
 
     /// A refusal that is NOT `NotFound` gets no binding hint even when unbound: a
     /// client binding authorizes reactive pull-through, so it cannot fix a node
-    /// that is degraded (`InternalError`) or a blob that is over the ceiling.
+    /// that declines the blob or one the requester cannot fund.
     #[test]
     fn unbound_non_notfound_refusal_is_untouched() {
-        for error in [StreamError::InternalError, StreamError::BlobTooLarge] {
+        for error in [StreamError::Declined, StreamError::Unfunded] {
             let annotated = annotate_unbound_cache_miss(refusal(error.clone()), &ctx_with(None));
             assert!(
                 !annotated.to_string().contains("capacity_bond_address"),

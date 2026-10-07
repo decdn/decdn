@@ -21,7 +21,7 @@ use iroh::endpoint::{ApplicationClose, ConnectionError, ReadError, VarInt, Write
 ///
 /// Proof the peer is reachable and answering — it chose to refuse work, it did
 /// not fail to receive it — so it is no evidence of degradation. A consumer
-/// treats it the way it treats the handler-level `StreamError::Overloaded`:
+/// treats it the way it treats a handler-level `StreamError::NotFound`:
 /// suppress the `(peer, hash)` pair briefly and record no reputation outcome.
 /// Backpressure is respected, never punished (ADR 041 §Refusing is not
 /// slashable; ADR 013 says a peer receiving `0x10` MUST NOT treat it as a
