@@ -228,6 +228,54 @@ impl PrimeLeg {
         }
         align_range(start, draw, total_bytes).ok()
     }
+
+    /// The index into `coverages` of the source the pull leg's first run uses,
+    /// planned as [`super::ranged_pull::assemble`] plans its first round over
+    /// the ranked candidates' `coverages` of a `total_bytes` blob, or `None`
+    /// when no candidate covers the pull's first block. It assumes the node
+    /// holds none of the range, as [`Self::predicted_leg`] does.
+    fn first_run_source(
+        &self,
+        total_bytes: u64,
+        coverages: &[decdn_protocol::Coverage],
+    ) -> Option<usize> {
+        let end = if self.len == 0 {
+            total_bytes
+        } else {
+            self.offset.saturating_add(self.len).min(total_bytes)
+        };
+        if self.offset >= end {
+            return None;
+        }
+        let gap = whole_range_chunks(self.offset, end - self.offset);
+        let rank: Vec<usize> = (0..coverages.len()).collect();
+        let (runs, _) = super::ranged_pull::plan_over(&gap, total_bytes, coverages, &rank);
+        let run = runs.first()?;
+        let block_bytes = decdn_protocol::discovery_block_bytes();
+        (run.offset / block_bytes == self.offset / block_bytes).then_some(run.source_ix)
+    }
+}
+
+/// The order the header handshake visits the ranked candidates, as indices
+/// into them: with a `prime` and a blob size, the candidate the pull leg's
+/// first run uses ([`PrimeLeg::first_run_source`]) comes first, so the
+/// handshake's primed pull is the one that run adopts; the rest follow in rank
+/// order. Without a prime, a size, or a candidate covering the prime's first
+/// block, the order is the rank order.
+fn handshake_order(
+    coverages: &[decdn_protocol::Coverage],
+    total_bytes: Option<u64>,
+    prime: Option<PrimeLeg>,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..coverages.len()).collect();
+    let first = prime
+        .zip(total_bytes)
+        .and_then(|(prime, total)| prime.first_run_source(total, coverages));
+    if let Some(first) = first {
+        order.retain(|&ix| ix != first);
+        order.insert(0, first);
+    }
+    order
 }
 
 /// The header handshake's range for a candidate advertising `coverage` of a
@@ -633,6 +681,12 @@ impl NodeOrigin {
     /// primed pull, if any. Discovery already ranked the candidates; this learns
     /// the blob geometry the serve response commits to. The ranged pull opens its
     /// own per-run lanes later, and its first run may adopt the primed pull.
+    ///
+    /// The walk visits first the candidate the pull's first run uses for
+    /// `prime`, then the rest in rank order ([`handshake_order`]), so a
+    /// top-ranked holder that lacks the request's first block does not take the
+    /// handshake from the holder whose primed pull that run adopts. Each
+    /// candidate keeps its index into `ranked` as its `candidate_ix`.
     async fn handshake_from_candidates(
         &self,
         deps: &NodeOriginDeps,
@@ -644,7 +698,15 @@ impl NodeOrigin {
     ) -> PullOutcome<(u64, Option<PrimedHandshake>)> {
         let mut attempts = 0;
         let mut miss = PullMiss::Clean;
-        for (candidate_ix, candidate) in ranked.iter().enumerate().take(budget) {
+        let coverages: Vec<decdn_protocol::Coverage> =
+            ranked.iter().map(|c| c.coverage.clone()).collect();
+        // The size the order plans over is a probe hint; each candidate's own
+        // hint cuts its primed leg in `handshake_total_bytes`.
+        let total_hint = ranked.iter().find_map(|c| c.total_bytes_hint);
+        let visits = handshake_order(&coverages, total_hint, prime)
+            .into_iter()
+            .filter_map(|ix| ranked.get(ix).map(|candidate| (ix, candidate)));
+        for (candidate_ix, candidate) in visits.take(budget) {
             attempts += 1;
             match self
                 .handshake_total_bytes(
@@ -2501,7 +2563,7 @@ mod prime_tests {
     use decdn_client::{Cumulative, PULL_WINDOW_FLOOR, PoolLedger};
     use decdn_protocol::{Coverage, DISCOVERY_BLOCK_BYTES, num_blocks};
 
-    use super::{PrimeKey, PrimeLeg};
+    use super::{PrimeKey, PrimeLeg, handshake_order};
 
     const MIB: u64 = 1024 * 1024;
 
@@ -2659,6 +2721,50 @@ mod prime_tests {
                  carried {carried}"
             );
         }
+    }
+
+    /// The handshake visits first the holder of the request's first block,
+    /// the one the first run uses, and keeps each candidate's ranked index.
+    #[test]
+    fn the_handshake_visits_the_first_runs_holder_first() {
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        let blocks = num_blocks(total);
+        let later = Coverage::from_block_indices(blocks, [1, 2].into_iter());
+        let head = Coverage::from_block_indices(blocks, [0].into_iter());
+        let prime = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 0);
+        assert_eq!(
+            handshake_order(&[later, head], Some(total), Some(prime)),
+            vec![1, 0]
+        );
+    }
+
+    /// Without a prime, or without a size to plan over, the handshake walks
+    /// the rank order.
+    #[test]
+    fn without_a_prime_the_handshake_walks_the_rank_order() {
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        let blocks = num_blocks(total);
+        let later = Coverage::from_block_indices(blocks, [1, 2].into_iter());
+        let head = Coverage::from_block_indices(blocks, [0].into_iter());
+        let coverages = [later, head];
+        assert_eq!(handshake_order(&coverages, Some(total), None), vec![0, 1]);
+        let prime = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 0);
+        assert_eq!(handshake_order(&coverages, None, Some(prime)), vec![0, 1]);
+    }
+
+    /// When no candidate covers the prime's first block, the handshake walks
+    /// the rank order, even though a later block has a holder.
+    #[test]
+    fn with_no_holder_of_the_first_block_the_handshake_walks_the_rank_order() {
+        let total = 3 * DISCOVERY_BLOCK_BYTES;
+        let blocks = num_blocks(total);
+        let last = Coverage::from_block_indices(blocks, [2].into_iter());
+        let middle = Coverage::from_block_indices(blocks, [1].into_iter());
+        let prime = PrimeLeg::new(0, 0, 2, PULL_WINDOW_FLOOR, 64 * MIB, 0);
+        assert_eq!(
+            handshake_order(&[last, middle], Some(total), Some(prime)),
+            vec![0, 1]
+        );
     }
 
     /// A run adopts the pull only on its own source, pool, and lane ledger,

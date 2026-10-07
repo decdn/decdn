@@ -15964,6 +15964,9 @@ struct HolderPull {
     /// The leaf pulls from the first-ranked holder's own endpoint, so it is the
     /// requester S discovers.
     leaf_is_first: bool,
+    /// How many `cdn/client/v1` connections the full holder O answers with a
+    /// signed `NotFound` before it serves.
+    full_holder_refusals: usize,
 }
 
 /// What [`holder_pull_case`] observed at the first-ranked holder.
@@ -15972,6 +15975,25 @@ struct FirstHolderSeen {
     refused_misses: u64,
     /// Bytes S's lane paid it for.
     paid_bytes: U256,
+    /// `cdn/client/v1` streams it ended, completed or failed.
+    inbound_streams: u64,
+    /// `cdn/client/v1` streams the full holder ended, completed or failed.
+    full_holder_streams: u64,
+}
+
+/// Inbound `cdn/client/v1` streams `metrics` counts as ended, completed or failed.
+fn inbound_streams_ended(metrics: &Arc<Metrics>) -> Result<u64> {
+    let text = metrics
+        .encode()
+        .map_err(|e| anyhow::anyhow!("encode metrics: {e}"))?;
+    let count = |name: &str| {
+        let prefix = format!("decdn_{name}{{direction=\"inbound\"}} ");
+        text.lines()
+            .find_map(|l| l.strip_prefix(&prefix))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    Ok(count("streams_completed_total") + count("streams_failed_total"))
 }
 
 /// Run one [`HolderPull`]: the leaf pulls the whole blob through S, which must
@@ -15984,12 +16006,16 @@ async fn holder_pull_case(case: HolderPull) -> Result<FirstHolderSeen> {
     let s_buyer = Arc::new(PrivateKeySigner::random());
     let (f_id, f_addr, f_eth, ep_f, task_f, store_f, metrics_f) =
         spawn_block_holder(&payload, ab_pool_id, s_buyer.address(), case.first_blocks).await?;
-    let (o_id, o_addr, o_eth, ep_o, task_o, store_o) = spawn_partial_holder(
+    let (cache_o, hash_o, tmp_o) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_o == hash, "full holder fixture hash mismatch");
+    std::mem::forget(tmp_o);
+    let (o_id, o_addr, o_eth, ep_o, task_o, store_o, metrics_o) = spawn_holder_on(
+        cache_o,
         &payload,
         ab_pool_id,
         s_buyer.address(),
         Coverage::full(2),
-        0,
+        case.full_holder_refusals,
     )
     .await?;
     let f_dht = DhtNodeId::from_bytes(*f_id.as_bytes());
@@ -16078,6 +16104,8 @@ async fn holder_pull_case(case: HolderPull) -> Result<FirstHolderSeen> {
     let seen = FirstHolderSeen {
         refused_misses: counter_value(&metrics_f, "serve_stream_rejected_cache_miss_total")?,
         paid_bytes: paid(&store_f, f_eth)?,
+        inbound_streams: inbound_streams_ended(&metrics_f)?,
+        full_holder_streams: inbound_streams_ended(&metrics_o)?,
     };
     if own_leaf {
         shutdown([task_s, task_f, task_o], [&leaf_ep, &ep_s, &ep_f, &ep_o]).await?;
@@ -16097,12 +16125,69 @@ async fn a_serve_miss_asks_a_partial_holder_only_for_blocks_it_holds() -> Result
     let seen = holder_pull_case(HolderPull {
         first_blocks: &[1],
         leaf_is_first: false,
+        full_holder_refusals: 0,
     })
     .await?;
     anyhow::ensure!(
         seen.refused_misses == 0,
         "the partial holder was asked for bytes it does not hold ({} refused misses)",
         seen.refused_misses
+    );
+    Ok(())
+}
+
+/// When the first run's holder refuses the header handshake, the walk moves on
+/// to the first-ranked partial holder, which lacks block 0, where the pull
+/// starts. Learning the blob's size from it asks only for a block it holds, so
+/// it refuses nothing as a miss.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_first_run_handshake_asks_the_partial_holder_only_for_blocks_it_holds()
+-> Result<()> {
+    // The full holder refuses two connections: a signed `NotFound` on the
+    // primed open reads as a range past the blob's end, so the handshake asks
+    // the full holder again for the whole blob, and that refusal fails it.
+    let seen = holder_pull_case(HolderPull {
+        first_blocks: &[1],
+        leaf_is_first: false,
+        full_holder_refusals: 2,
+    })
+    .await?;
+    anyhow::ensure!(
+        seen.inbound_streams > 0,
+        "the handshake never reached the partial holder after the full holder refused"
+    );
+    anyhow::ensure!(
+        seen.refused_misses == 0,
+        "the partial holder was asked for bytes it does not hold ({} refused misses)",
+        seen.refused_misses
+    );
+    Ok(())
+}
+
+/// A serve-miss runs its header handshake against the holder its first run
+/// uses, so that run adopts the handshake's primed pull. The first-ranked
+/// holder lacks block 0, where the pull starts, and the whole pull goes to the
+/// full holder, so S opens no stream to the first-ranked holder at all and one
+/// stream to the full holder.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_serve_miss_handshakes_with_the_first_runs_holder() -> Result<()> {
+    let seen = holder_pull_case(HolderPull {
+        first_blocks: &[1],
+        leaf_is_first: false,
+        full_holder_refusals: 0,
+    })
+    .await?;
+    anyhow::ensure!(
+        seen.inbound_streams == 0,
+        "S opened {} streams to the first-ranked holder, which the first run does not use",
+        seen.inbound_streams
+    );
+    // One stream at the full holder: the handshake's primed pull, which the
+    // first run adopts. A run that opened its own pull would make it two.
+    anyhow::ensure!(
+        seen.full_holder_streams == 1,
+        "the full holder ended {} streams; the first run must adopt the handshake's pull",
+        seen.full_holder_streams
     );
     Ok(())
 }
@@ -16116,6 +16201,7 @@ async fn a_serve_miss_never_pulls_from_its_requester() -> Result<()> {
     let seen = holder_pull_case(HolderPull {
         first_blocks: &[0, 1],
         leaf_is_first: true,
+        full_holder_refusals: 0,
     })
     .await?;
     anyhow::ensure!(
