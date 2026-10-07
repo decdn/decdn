@@ -2999,7 +2999,7 @@ where
                     },
                 )
                 .await?;
-                top_up(self.contract, pool_id, additional).await
+                top_up(self.contract, self.owner, pool_id, additional).await
             }
             .await;
             // A failure before any receipt names its cause once: a wallet
@@ -3753,8 +3753,8 @@ fn cannot_pay(state: &BuyerPoolState, shortfall: &str) -> anyhow::Error {
 /// recorded on `funding` for the run's closing `warning:` line, and no later
 /// lane build of the run tries the refill again. Any other failure of the
 /// allowance or `topUp` leg fails the lane build, which the acquire loop
-/// retries with backoff. A `topUp` that was broadcast but returned no receipt
-/// ([`TopUpUnconfirmed`]) may have escrowed, and once `topUp` returns a
+/// retries with backoff. A `topUp` that may have been broadcast but returned no
+/// receipt ([`TopUpUnconfirmed`]) may have escrowed, and once `topUp` returns a
 /// receipt the escrow has moved, so a failure to credit or re-read the local
 /// row ([`escrowed_but_untracked`]) is fatal: the acquire loop ends the
 /// command instead of retrying, because a retry escrows again.
@@ -3805,7 +3805,7 @@ where
             if max_approve { None } else { Some(additional) },
         )
         .await?;
-        top_up(contract, state.pool_id, additional).await
+        top_up(contract, self_address, state.pool_id, additional).await
     }
     .await;
     let err = match escrowed {
