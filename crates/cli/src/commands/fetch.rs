@@ -1790,6 +1790,7 @@ fn persist_watermark(
     let label = match write {
         ProgressWrite::Rebase { .. } => "rebased",
         ProgressWrite::Advance { .. } => "advanced",
+        _ => "recorded",
     };
     let outcome = write.apply(store, owner, pool_id, lane);
     // A non-`Advanced` outcome (unknown pool / replaced owner slot / regression)
@@ -3003,7 +3004,7 @@ where
             .await;
             // A failure before any receipt names its cause once: a wallet
             // short of USDC is recorded for the run's closing warning.
-            let ToppedUpPool { credited, tx } = match escrowed {
+            let ToppedUpPool { credited, tx, .. } = match escrowed {
                 Ok(topped_up) => topped_up,
                 Err(err) if err.downcast_ref::<TopUpUnconfirmed>().is_some() => return Err(err),
                 Err(err) => {
@@ -3808,7 +3809,7 @@ where
     }
     .await;
     let err = match escrowed {
-        Ok(ToppedUpPool { credited, tx }) => {
+        Ok(ToppedUpPool { credited, tx, .. }) => {
             // The USDC is escrowed the moment `topUp` mines. A local credit that
             // does not land leaves the deposit untracked, and continuing would
             // fetch on a `state.deposit` that understates the chain — so the

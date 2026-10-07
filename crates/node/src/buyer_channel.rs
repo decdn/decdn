@@ -480,7 +480,7 @@ async fn fund_pool<P: Provider + Clone + 'static>(
     // an allowance shortfall (the approval was revoked or never granted) do a
     // just-in-time `approve` and retry once — so the happy path issues zero
     // allowance reads per top-up.
-    let ToppedUpPool { credited, tx } = match top_up_recovering_allowance(
+    let ToppedUpPool { credited, tx, .. } = match top_up_recovering_allowance(
         || pool_top_up(&handles.contract, pool_id, additional),
         || {
             ensure_allowance(
@@ -1287,6 +1287,10 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
                 ),
                 ProgressWrite::Advance { .. } => format!(
                     "advance buyer pool lane progress to (amount {}, bytes {})",
+                    totals.last_amount, totals.last_bytes
+                ),
+                _ => format!(
+                    "record buyer pool lane progress at (amount {}, bytes {})",
                     totals.last_amount, totals.last_bytes
                 ),
             });

@@ -9671,9 +9671,9 @@ mod tests {
                 anyhow!("connection reset")
             });
         }
-        Ok(decdn_client::StreamCandidate {
+        Ok(decdn_client::StreamCandidate::new(
             source,
-            ctx: Arc::new(std::sync::Mutex::new(decdn_client::PoolContext {
+            Arc::new(std::sync::Mutex::new(decdn_client::PoolContext {
                 pool_id: alloy::primitives::B256::ZERO,
                 provider: Address::repeat_byte(provider),
                 deposit: alloy::primitives::U256::from(u128::MAX),
@@ -9685,10 +9685,7 @@ mod tests {
                 capability: None,
             })),
             ledger,
-            coverage: None,
-            lease: decdn_client::LaneLease::default(),
-            widen: None,
-        })
+        ))
     }
 
     /// Two scripted holders of `blob`; the first (0xA1) blips once and sets

@@ -31,13 +31,14 @@ use crate::streamer::StreamCandidate;
 use crate::{SignerCapDrained, UpstreamRefused};
 
 /// The first wait before a failed lane build is retried.
+#[doc(hidden)]
 pub const BUILD_RETRY_BASE: Duration = Duration::from_secs(1);
 /// The longest wait before a failed lane build is retried.
-pub const BUILD_RETRY_CAP: Duration = Duration::from_secs(30);
+pub(crate) const BUILD_RETRY_CAP: Duration = Duration::from_secs(30);
 /// The first wait between discoveries.
-pub const DISCOVERY_BASE: Duration = Duration::from_secs(5);
+pub(crate) const DISCOVERY_BASE: Duration = Duration::from_secs(5);
 /// The longest wait between discoveries.
-pub const DISCOVERY_CAP: Duration = Duration::from_mins(5);
+pub(crate) const DISCOVERY_CAP: Duration = Duration::from_mins(5);
 
 /// One provider that holds (part of) the blob.
 #[derive(Debug, Clone)]
@@ -65,6 +66,7 @@ pub struct Holder {
 
 /// The range a lane held when it faulted ([`SourceSet::record_fault`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
 pub struct LaneRange {
     /// The range's first byte.
     pub offset: u64,
@@ -103,9 +105,10 @@ pub const ABSENT_AFTER_NOT_FOUND: u32 = 3;
 /// uncovered range again as a probe. It is also how long a block dropped from
 /// a partial holder's coverage stays out, and the quiet time after which a
 /// block's count of covered refusals starts again.
-pub const PULL_THROUGH_BAR: Duration = crate::health::COOL_CAP;
+pub(crate) const PULL_THROUGH_BAR: Duration = crate::health::COOL_CAP;
 
 /// Where a [`SourceSet`] finds holders and builds their lanes.
+#[doc(hidden)]
 pub trait SourceProvider: Send + Sync {
     /// The paid source a built lane fetches from.
     type Source: BlobSource;
@@ -178,6 +181,7 @@ impl std::error::Error for NoAffordableSource {}
 /// refusal that marked a source absent, so the error chain also holds that
 /// [`UpstreamRefused`].
 #[derive(Debug)]
+#[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct NoSourceHasBlob;
 
 impl std::fmt::Display for NoSourceHasBlob {
@@ -196,6 +200,7 @@ impl std::error::Error for NoSourceHasBlob {}
 /// acquire loop raises it as context on the last such refusal, so the error
 /// chain also holds that [`SignerCapDrained`].
 #[derive(Debug)]
+#[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct NoSourceServesSigner;
 
 impl std::fmt::Display for NoSourceServesSigner {
@@ -242,6 +247,7 @@ impl Backoff {
 }
 
 /// The sources of one blob.
+#[doc(hidden)]
 pub struct SourceSet<'p, P: SourceProvider> {
     provider: &'p P,
     hash: [u8; 32],

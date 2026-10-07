@@ -165,6 +165,10 @@ impl PacingWait for ConsumedWait {
 /// from another lane meanwhile, resuming from the store's verified frontier so
 /// no delivered byte is re-pulled or re-paid. Every lane names a distinct
 /// on-chain provider (one voucher stream per `(signer, provider)` lane).
+///
+/// Build one with [`Self::new`], and set [`Self::coverage`] for a partial
+/// holder.
+#[non_exhaustive]
 pub struct StreamCandidate<S> {
     /// The paid source — one provider's `cdn/client/v1` requester.
     pub source: S,
@@ -187,6 +191,7 @@ pub struct StreamCandidate<S> {
     /// lane's own worker ends; it is released at the latest when the fetch
     /// returns. Like `coverage`, set it only on a single-target fetch: the
     /// first target's fetch releases it.
+    #[doc(hidden)]
     pub lease: LaneLease,
     /// How this lane takes a stream beyond its `lease` ([`crate::LaneWiden`]),
     /// or `None` to stay at one stream: an extra stream for each queued range
@@ -194,7 +199,24 @@ pub struct StreamCandidate<S> {
     /// it gave its `lease` back. Each granted stream is given back as its
     /// worker stops, so it serves every target of a [`crate::Downloader`]
     /// alike.
+    #[doc(hidden)]
     pub widen: Option<crate::LaneWiden>,
+}
+
+impl<S> StreamCandidate<S> {
+    /// A whole-blob holder's lane: `source` paid from `ctx` through `ledger`,
+    /// holding no lease and staying at one stream.
+    #[must_use]
+    pub fn new(source: S, ctx: Arc<Mutex<PoolContext>>, ledger: Arc<PoolLedger>) -> Self {
+        Self {
+            source,
+            ctx,
+            ledger,
+            coverage: None,
+            lease: LaneLease::default(),
+            widen: None,
+        }
+    }
 }
 
 impl<S> std::fmt::Debug for StreamCandidate<S> {
@@ -646,6 +668,7 @@ impl Drop for StreamDrive<'_> {
 /// An [`AsyncRead`] over a blob's verified contiguous front, clamped to the
 /// verified frontier by construction (it only reads bytes the engine has already
 /// bao-verified). Its cursor paces the paired [`StreamDrive`].
+#[non_exhaustive]
 pub enum VerifiedReader {
     /// A whole-blob cache hit: served straight from memory, no fetch.
     Cached {
@@ -1154,7 +1177,7 @@ mod tests {
         })?;
         // The reader flattens the drive's error into its message.
         let gave_up = crate::GaveUp {
-            idle: crate::SCRIPT_GIVE_UP,
+            idle: crate::stop::SCRIPT_GIVE_UP,
         };
         anyhow::ensure!(
             err.to_string().contains(&gave_up.to_string()),

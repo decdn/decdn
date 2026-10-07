@@ -87,6 +87,7 @@ pub(crate) async fn dial(
 /// borrows the connection (`open_progressive_pull_on`) tears down only
 /// its own stream and leaves the connection open for the next hash.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct WarmConnection {
     /// The live QUIC connection. Cloned into each pull, which leaves it open on
     /// its own teardown; this handle owns the single close.
@@ -198,6 +199,7 @@ impl Connections {
     ///
     /// A connect or transport fault from the dial, as
     /// `connect failed: {err}` (a rate-limit shed keeps its typed sentinel).
+    #[doc(hidden)]
     pub async fn get(&self, target: &EndpointAddr) -> anyhow::Result<Arc<WarmConnection>> {
         let slot = Arc::clone(
             self.inner
@@ -225,6 +227,7 @@ impl Connections {
     /// again. Only that instance is unpinned: when another caller has already
     /// dialled a newer connection into the slot, the newer one stays. Pulls
     /// that still hold `conn` keep it; it closes when the last of them ends.
+    #[doc(hidden)]
     pub async fn invalidate(&self, node: PublicKey, conn: &Arc<WarmConnection>) {
         let slot = self
             .inner

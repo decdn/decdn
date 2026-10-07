@@ -15,10 +15,9 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use decdn_client::buyer_pool::{ProgressWrite, ensure_allowance, open_pool, self_owned_lane_ctx};
 use decdn_client::discovery::{self, NodeCandidate};
-use decdn_client::source::{Funder, SourceFuture};
 use decdn_client::{
-    PeerSource, PoolContext, PoolLedger, PullDeadlines, StreamCandidate, VoucherProgress,
-    effective_rate_ceiling, endpoint, probe, provider,
+    Funder, PeerSource, PoolContext, PoolLedger, PullDeadlines, SourceFuture, StreamCandidate,
+    VoucherProgress, effective_rate_ceiling, endpoint, probe, provider,
 };
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity::load_signer;
@@ -259,14 +258,9 @@ impl Buyer {
                 prior_amount,
                 ledger: Arc::clone(&ledger),
             });
-            candidates.push(StreamCandidate {
-                source,
-                ctx,
-                ledger,
-                coverage: Some(holder.coverage),
-                lease: decdn_client::LaneLease::default(),
-                widen: None,
-            });
+            let mut candidate = StreamCandidate::new(source, ctx, ledger);
+            candidate.coverage = Some(holder.coverage);
+            candidates.push(candidate);
         }
         Ok((candidates, lanes))
     }

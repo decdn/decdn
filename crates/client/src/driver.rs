@@ -100,6 +100,7 @@ use crate::{
 /// provider (ADR 003), so moving the range to another lane cannot fund it. The
 /// source waits for the deposit to rise instead of cooling.
 #[derive(Debug)]
+#[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct PoolExhausted {
     /// Start of the gap that could not be funded.
     pub gap_start: u64,
@@ -164,6 +165,7 @@ impl std::error::Error for StaleDepositView {}
 /// [`crate::buyer_pool::EscrowUntracked`]) stays fatal, whatever marker it
 /// carries.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct TopUpFailed;
 
 impl std::fmt::Display for TopUpFailed {
@@ -193,6 +195,7 @@ impl std::error::Error for TopUpFailed {}
 /// source, and each further source costs at most one more leg before it ends the
 /// same way.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct LegNoProgress {
     /// Start of the range the leg opened.
     pub offset: u64,
@@ -288,6 +291,7 @@ impl CleanLeg {
 ///   only through this lane's `ctx`, it is invisible to the others, whose gate
 ///   still subtracts the aggregate spend from a stale deposit and walks to a
 ///   false exhaustion.
+#[doc(hidden)]
 pub struct SharedPool<'a> {
     /// Sum, across every lane, of the committed voucher amount — the pool's
     /// total spend so far.
@@ -317,6 +321,7 @@ impl std::fmt::Debug for SharedPool<'_> {
 /// Why a window-bounded pacer paused the pull, handed to [`PacingWait::wait`]
 /// so the caller can meter the two pauses apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
 pub enum WaitReason {
     /// [`PaceDecision::Wait`]: the pull has run its full window ahead of the
     /// downstream paid frontier.
@@ -331,6 +336,7 @@ pub enum WaitReason {
 /// node hands in an implementor that resolves once its serve leg's paid frontier
 /// or demand frontier has advanced (so a re-decide has a chance of finding room);
 /// the client path never needs one, since `BudgetPacer` never returns `Wait`.
+#[doc(hidden)]
 pub trait PacingWait: Send + Sync {
     /// Resolve once the caller judges it worth re-deciding (e.g. a downstream
     /// frontier advanced, or a bounded poll interval elapsed).
@@ -741,6 +747,7 @@ where
 /// that moved neither frontier ([`LegNoProgress`]), an escrowed-but-untracked
 /// top-up outcome, or a `finalize` failure.
 #[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
 pub async fn drive<St, S, P, F>(
     store: &St,
     source: &S,
@@ -940,6 +947,7 @@ async fn range_set_gaps<St: RangedStore + ?Sized>(
 /// # Errors
 ///
 /// A store query failure, or a range that does not align against the blob.
+#[doc(hidden)]
 pub async fn first_leg<St: RangedStore + ?Sized>(
     store: &St,
     ranges: &[(u64, u64)],
