@@ -23,7 +23,8 @@ use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity::load_signer;
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{
-    BuyerPoolState, BuyerPoolStore, Deployment, DepositOutcome, LaneKey, slash_judge_domain,
+    BuyerPoolState, BuyerPoolStore, Deployment, DepositOutcome, LaneKey, bind_node_id_domain,
+    slash_judge_domain,
 };
 use decdn_protocol::Coverage;
 use iroh::{Endpoint, EndpointAddr};
@@ -85,6 +86,7 @@ pub(crate) struct Buyer {
     pool: BuyerPoolState,
     voucher_domain: Eip712Domain,
     slash_domain: Eip712Domain,
+    bind_domain: Eip712Domain,
     endpoint: Endpoint,
 }
 
@@ -102,6 +104,7 @@ impl Buyer {
         };
         let voucher_domain = deployment.voucher_domain();
         let slash_domain = slash_judge_domain(env.chain_id, env.slash_judge);
+        let bind_domain = bind_node_id_domain(env.chain_id, env.capacity_bond);
 
         // The store is the buyer's only record of its pool and of what each lane
         // has paid. Keep it for the life of the pool.
@@ -143,6 +146,7 @@ impl Buyer {
             pool,
             voucher_domain,
             slash_domain,
+            bind_domain,
             endpoint,
         })
     }
@@ -227,6 +231,9 @@ impl Buyer {
                 provider,
             };
             let (prior_bytes, prior_amount) = prior_payment(&self.pool, &contract, lane).await?;
+            // The binding proves this endpoint pays from the buyer's pool, so a
+            // node that misses the blob in its cache may pull it from its
+            // origin for us. Without it, such a node refuses the open.
             let ctx = self_owned_lane_ctx(
                 &self.pool,
                 &self.signer,
@@ -234,7 +241,8 @@ impl Buyer {
                 provider,
                 prior_bytes,
                 prior_amount,
-            )?;
+            )?
+            .bind_endpoint(&self.endpoint, &self.bind_domain)?;
             let ledger = Arc::new(ctx.new_ledger());
             let ctx: Arc<Mutex<PoolContext>> = Arc::new(Mutex::new(ctx));
             let source = PeerSource::new(

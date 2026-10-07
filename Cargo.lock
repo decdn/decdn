@@ -2793,16 +2793,19 @@ dependencies = [
  "decdn-incentive",
  "decdn-node",
  "decdn-protocol",
+ "globset",
  "iroh",
  "jsonrpsee",
  "nix",
  "reqwest",
  "serde_json",
+ "syn 2.0.117",
  "tempfile",
  "tokio",
  "toml 1.1.3+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
 ]
 
 [[package]]

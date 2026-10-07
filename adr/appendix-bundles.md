@@ -316,9 +316,15 @@ as `decdn fetch`):
   resume), and `--overwrite` forces a re-fetch. The skip check accepts a
   file by its hash. A saved record whose size and mtime match is a fast
   path. Without a match, the pull hashes the file against the manifest.
-- **`--dry-run`** reports the plan without any network/chain activity
-  (entries are only enumerable for the `-i` form; `--hash` cannot list
-  them without first fetching the manifest).
+- **`--dry-run`** reports the plan without any network/chain activity.
+  With `-i`, the plan lists the entries of the file. With `--hash`, the
+  plan lists entries only when an earlier pull into the same `-o`
+  directory cached the bundle manifest under `.decdn-bundles/`. Without
+  that cache, the dry run prints only the bundle hash and the output
+  directory. A cache file that the dry run cannot read, or that fails its
+  hash check, fails the dry run. A pull caches each manifest it fetches, keyed by its hash.
+  A later pull of the same bundle into the same directory reads the
+  cache. `--overwrite` makes a real pull fetch the manifest again.
 
 Verification is intrinsic: content addressing means every fetched blob
 is BLAKE3-checked against its `entries[].hash` by the fetch path, so

@@ -28,6 +28,14 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Monitoring-breaking: `monitoring/` moves to
+  [`decdn/devops`](https://github.com/decdn/devops/tree/main/charts/decdn-node/files/monitoring).**
+  The four Grafana dashboards and `prometheus-alerts.yml` live in
+  `charts/decdn-node/files/monitoring/` there, and this repository no longer
+  ships them. The four `decdn-node` tests that checked the dashboards and
+  rules against the exporter are deleted, and nothing checks them in CI now.
+  `adr_registry_names_are_exported` still gates the ADR metric registry. Import dashboards and load alert rules from
+  the devops repository instead.
 - **`decdn-cache` network origins bind to the runtime they are built on
   (#1675).** `HttpOrigin::new`, `HttpOrigin::new_with_user_agent`,
   `HttpOrigin::parse`, `S3Origin::new` and `S3Origin::from_parts` capture the
@@ -3175,6 +3183,19 @@ since project inception and will roll into the first tagged release.
   select (a partial an earlier run left for an entry this run excluded) print
   one warning with their count and size. The pull keeps them for a later run
   that selects the entry again.
+- **`bundle pull --hash --dry-run` checks the filters against a cached
+  manifest (#2327).** When an earlier pull into the same output directory
+  cached the bundle manifest, the dry run lists the filtered plan and warns
+  on each `--include`/`--exclude` pattern that matches no entry, as
+  `-i --dry-run` does. The dry run reads the cache even under `--overwrite`.
+  With no cached manifest, it prints the bundle hash and output directory it
+  would pull into; under `--json` it prints `count` and `entries` as `null`.
+  A malformed `--hash` fails the dry run, as it fails a real pull.
+- **`bundle pull --hash` names a cached manifest it cannot use (#2361).** A
+  cache file under `.decdn-bundles/` that cannot be read, or whose bytes fail
+  the hash check, fails `--dry-run` with the file path and the reason. A real
+  pull prints the same reason as a warning and fetches the manifest fresh. A
+  cache write that fails prints a warning that names the path.
 
 - **Paid-leg diagnostics at `debug` (#2211).** Each paid leg's open logs its
   peer, hash, `byte_offset` and `byte_len`. A throughput-floor trip logs the

@@ -83,6 +83,29 @@ The `--all-features` run is the only one that reaches anything behind an off-by-
 the `anvil-e2e` targets (journeys and the two `decdn-node` anvil tests), `public-api-test`. Run it
 before pushing a change that touches gated code, or the first thing that tells you is a red CI.
 
+### Unit test placement
+
+Every unit-test module lives in its own file. Declare it in the source file and put the body in a
+child file — `foo/tests.rs` for `foo.rs`, or `tests.rs` beside a `lib.rs`, `main.rs` or `mod.rs`:
+
+```rust
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests;
+```
+
+The rule has no size threshold, and it covers every `#[cfg(test)]` or `#[cfg(all(test, …))]`
+module, whatever its name (`tests`, `prop_tests`, `test_support`, …). The tests stay child modules,
+so they keep access to private items. Do not move them to `crates/*/tests/`: an integration test
+reaches only `pub` items. `crates/e2e/tests/no_inline_test_modules.rs` parses every source file
+under `crates/` and fails on any test module with an inline body. It runs in the default
+`cargo nextest run`.
+
+CodeQL skips these files by name (`.github/codeql/codeql-config.yml`): `tests.rs`, `*_tests.rs`,
+`proptests.rs`, `test_support.rs` and `tests_support.rs` under `src/`. Name a new test module to
+match, or its fixture secrets raise alerts. The same test fails if a file with one of those names
+is not a `#[cfg(test)]` module, so a production file never drops out of the analysis.
+
 ### Public API snapshot
 
 `decdn-protocol` and `decdn-client` each carry a [`public_api`](https://crates.io/crates/public_api) +
@@ -315,7 +338,7 @@ The `cdn/<name>/v<n>` shape and the version suffix are mandatory — version bum
 
 #### 2. Add wire types to `crates/protocol/src/message.rs`
 
-Define a top-level enum (e.g. `FooMessage`) wrapping per-direction structs. Variant order is **frozen** — postcard encodes each variant by its declaration index, so reordering is a wire-breaking change. Add a discriminant-locking test alongside the existing `probe_message_request_discriminant_is_zero` pattern:
+Define a top-level enum (e.g. `FooMessage`) wrapping per-direction structs. Variant order is **frozen** — postcard encodes each variant by its declaration index, so reordering is a wire-breaking change. Add a discriminant-locking test beside the existing `probe_message_request_discriminant_is_zero` pattern. The enum goes in `message.rs`:
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,26 +346,27 @@ pub enum FooMessage {
     Request(FooRequest),   // discriminant 0 — locked by test
     Response(FooResponse), // discriminant 1 — locked by test
 }
+```
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+The tests go in the existing child file `crates/protocol/src/message/tests.rs` (see [Unit test placement](#unit-test-placement)):
 
-    #[test]
-    fn foo_message_request_discriminant_is_zero() -> Result<(), postcard::Error> {
-        let msg = FooMessage::Request(FooRequest { /* ... */ });
-        let bytes = postcard::to_allocvec(&msg)?;
-        assert_eq!(bytes.first().copied(), Some(0u8));
-        Ok(())
-    }
+```rust
+use super::*;
 
-    #[test]
-    fn foo_message_response_discriminant_is_one() -> Result<(), postcard::Error> {
-        let msg = FooMessage::Response(FooResponse { /* ... */ });
-        let bytes = postcard::to_allocvec(&msg)?;
-        assert_eq!(bytes.first().copied(), Some(1u8));
-        Ok(())
-    }
+#[test]
+fn foo_message_request_discriminant_is_zero() -> Result<(), postcard::Error> {
+    let msg = FooMessage::Request(FooRequest { /* ... */ });
+    let bytes = postcard::to_allocvec(&msg)?;
+    assert_eq!(bytes.first().copied(), Some(0u8));
+    Ok(())
+}
+
+#[test]
+fn foo_message_response_discriminant_is_one() -> Result<(), postcard::Error> {
+    let msg = FooMessage::Response(FooResponse { /* ... */ });
+    let bytes = postcard::to_allocvec(&msg)?;
+    assert_eq!(bytes.first().copied(), Some(1u8));
+    Ok(())
 }
 ```
 

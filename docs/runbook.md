@@ -5,17 +5,18 @@ names the symptom an operator sees first, then the metric or alert that
 surfaces it, then the action to take. For the underlying protocol semantics,
 follow the ADR cross-references.
 
-Companion assets:
+Companion assets (the four dashboards and the alert rules live in
+[`decdn/devops`](https://github.com/decdn/devops/tree/main/charts/decdn-node/files/monitoring)):
 
-- [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) —
+- [`grafana-dashboard.json`](https://github.com/decdn/devops/blob/main/charts/decdn-node/files/monitoring/grafana-dashboard.json) —
   fleet overview. Start here.
-- [`monitoring/dashboard-delivery.json`](../monitoring/dashboard-delivery.json) —
+- [`dashboard-delivery.json`](https://github.com/decdn/devops/blob/main/charts/decdn-node/files/monitoring/dashboard-delivery.json) —
   serve leg, pull leg, cache and origin. Every refusal and failure reason.
-- [`monitoring/dashboard-chain.json`](../monitoring/dashboard-chain.json) —
+- [`dashboard-chain.json`](https://github.com/decdn/devops/blob/main/charts/decdn-node/files/monitoring/dashboard-chain.json) —
   watcher liveness, registries, and both sides of the payment flow.
-- [`monitoring/dashboard-node.json`](../monitoring/dashboard-node.json) —
+- [`dashboard-node.json`](https://github.com/decdn/devops/blob/main/charts/decdn-node/files/monitoring/dashboard-node.json) —
   one node at a time: host, transport, DHT, logs and traces.
-- [`monitoring/prometheus-alerts.yml`](../monitoring/prometheus-alerts.yml) —
+- [`prometheus-alerts.yml`](https://github.com/decdn/devops/blob/main/charts/decdn-node/files/monitoring/prometheus-alerts.yml) —
   every rule carries a `component` label and, where a section below matches, a
   `runbook_url` annotation pointing straight at it.
 - [`adr/architecture.md`](../adr/architecture.md)
@@ -36,7 +37,7 @@ new content cannot be admitted.
   ceiling) shows headroom, and `decdn_cache_gc_bytes_reclaimed_total` shows
   eviction keeping up. A footprint pinned at the ceiling with reclaim flat
   means eviction is starved — confirm `cache.gc_interval_sec` is non-zero.
-- Existing alert `DecdnHighStreamErrorRate` will fire downstream once
+- Existing alert `DecdnServeInternalErrorRate` will fire downstream once
   origin writes start to fail, but it is not capacity-specific.
 
 **Remediate:**
@@ -81,7 +82,7 @@ becomes scrapeable once boot completes.
 
 **Detect:**
 
-- Existing alerts in `monitoring/prometheus-alerts.yml`: a dead endpoint stalls
+- Existing alerts in `prometheus-alerts.yml`: a dead endpoint stalls
   every chain-event watcher at once, so expect up to five stalled alerts to
   fire together — `DecdnBlacklistWatcherStalled`, `DecdnSlashWatcherStalled`,
   `DecdnStakerSetWatcherStalled`, `DecdnFeeSharesWatcherStalled` (only where
@@ -97,7 +98,7 @@ becomes scrapeable once boot completes.
   requests fail for 15 minutes, which catches a provider that is reachable but
   unreliable. `decdn_rpc_requests_total{method,outcome}` counts every request
   the node's providers send, and the "Chain RPC provider" row in
-  `monitoring/dashboard-chain.json` plots the rate, the error ratio and the p95
+  `dashboard-chain.json` plots the rate, the error ratio and the p95
   latency by method, plus the failures by outcome. `rate_limited` means the
   provider plan is too small for the node's poll cadence; `transport_error`
   and `timeout` mean the provider is unreachable or overloaded; `rpc_error`
@@ -126,7 +127,7 @@ becomes scrapeable once boot completes.
   back after 32 accepted windows, up to the ceiling. `decdn_chain_get_logs_span`
   shows the current span and `decdn_chain_get_logs_range_rejections_total` the
   rejections; the "eth_getLogs window span" panel in
-  `monitoring/dashboard-chain.json` plots both. One old rejection is a
+  `dashboard-chain.json` plots both. One old rejection is a
   transient: the span climbs back on its own. Rejections that keep coming mean
   a cap. Then set `blockchain.get_logs_max_block_span` to the lowest span the
   gauge (or the shrink `warn!`) reaches while they come, **not** to the number
@@ -290,7 +291,7 @@ slashed by an external adversary.
 
 **Detect:**
 
-- Alerts in `monitoring/prometheus-alerts.yml` (verbatim names):
+- Alerts in `prometheus-alerts.yml` (verbatim names):
   - `DecdnProbeHoldViolations` (critical) — hold budget exhausted, so
     present blobs are being advertised without an eviction hold and may be
     evicted before the pull arrives. Budget pressure and lost deliveries,
@@ -304,12 +305,7 @@ slashed by an external adversary.
   - `DecdnBlacklistEnforcementFailing` (critical) — a re-scope could not
     re-verify or evict every known deny-set entry, so a blacklisted hash may
     still be servable.
-  - `DecdnRateBoundsClamp` (warning) — your configured `rate_per_mb` sits
-    *below* the governance `deliveryFloor`, so every quote is being raised to
-    the floor before signing. The clamp is raise-only; there is no ceiling. Not
-    directly slashable, but it means you are not charging what you configured.
-    Raise `payment.rate_per_mb` to at least the on-chain floor.
-- Grafana: the slash-safety row in `monitoring/grafana-dashboard.json`.
+- Grafana: the slash-safety row in `grafana-dashboard.json`.
 
 **Remediate:**
 
@@ -433,7 +429,7 @@ action is required.
 
 **Detect:**
 
-- Alerts in `monitoring/prometheus-alerts.yml` (verbatim names):
+- Alerts in `prometheus-alerts.yml` (verbatim names):
   - `DecdnBlacklistWatcherStalled` (critical) — no successful poll tick for
     several intervals; fires on the age of
     `decdn_blacklist_watcher_last_tick_timestamp_seconds`, or on
@@ -443,8 +439,8 @@ action is required.
     servable even while `decdn_blacklist_watcher_down_seconds` reads 0. The two
     answer different questions: deny-set enforced vs chain readable.
 - Grafana: the "Oldest watcher tick" panel in
-  `monitoring/grafana-dashboard.json`, and the per-watcher "Watcher tick age"
-  table in `monitoring/dashboard-chain.json`.
+  `grafana-dashboard.json`, and the per-watcher "Watcher tick age"
+  table in `dashboard-chain.json`.
 - There is no sync-lag or version-delta coverage: the watcher rebuilds the
   deny-set by full enumeration and keeps no version cursor
   (`adr/011-content-takedown.md` § Node Behavior), so no such gauge exists. The
@@ -843,8 +839,9 @@ that do not hash to the requested root.
   with `BlobTooLarge` / `VerifyFailed` / `EvictionLimitExceeded`, so a rise here
   is a hint rather than a diagnosis.
 
-None of the three has an alert or a panel in `monitoring/`. That is the
-actionable gap.
+The reference `DecdnNodePullCorruption` alert fires on any increase of
+`decdn_node_pull_corruption_total` in an hour. The reference delivery
+dashboard plots all three.
 
 **Attribute:** `decdn_node_pull_{success,unreachable,corruption}_total` carry no
 peer label. To find the peer behind a rise, run with
@@ -866,7 +863,7 @@ inside the noisiest benign counter on the serve path
 cannot fire on it either. Closing that needs a dedicated serve-side counter, not
 a rule.
 
-`monitoring/` carried a `DecdnHashMismatchAppearing` alert until #1513. It
+The reference alert rules carried a `DecdnHashMismatchAppearing` alert until #1513. It
 queried `decdn_streams_failed_total{reason="hash_mismatch"}` — a series the
 exporter has never emitted, and there is no outcome-labelled stream family to
 rebuild it from — so it never fired. It was deleted rather than repointed at one
@@ -884,11 +881,6 @@ are data-integrity faults — see [ADR 002](../adr/002-content-addressing.md).
 
 **Detect:**
 
-- `DecdnPeerTableThin` (warning) — `decdn_gossip_peer_table_size < 3` for
-  10 minutes. Until #1513 the alert queried `decdn_peer_table_size`, a name
-  nothing has ever exported, so it could not fire; if you run a forked copy of
-  `monitoring/prometheus-alerts.yml`, check that its `expr` carries the
-  `gossip_` prefix.
 - `DecdnNoActiveStreams` (warning) — `decdn_streams_active == 0` across all
   directions for 15 minutes (gossip degradation is one of several causes).
 - `decdn_iroh_*` transport-level metrics for connection failures (registered
@@ -915,7 +907,7 @@ identity rotation, host clock skew breaking TLS.
    key orphans its entry rather than bridging the rotation); follow
    [`adr/appendix-operator-key-rotation.md`](../adr/appendix-operator-key-rotation.md)
    for the staged-rotation procedure that keeps connectivity continuous.
-3. Inspect `decdn_iroh_magicsock_*` metrics for connect failures; high
+3. Inspect `decdn_iroh_socket_*` metrics for connect failures; high
    failure rates with low success rates indicate NAT/firewall problems
    rather than gossip-layer issues.
 4. Verify host time is synchronised (`chronyc tracking` /
@@ -1013,6 +1005,5 @@ campaign.
   [`adr/architecture.md`](../adr/architecture.md).
 - Observability metric catalogue:
   [`adr/appendix-observability.md`](../adr/appendix-observability.md).
-- Monitoring assets:
-  [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json),
-  [`monitoring/prometheus-alerts.yml`](../monitoring/prometheus-alerts.yml).
+- Monitoring assets: the reference dashboards and alert rules in
+  [`decdn/devops`](https://github.com/decdn/devops/tree/main/charts/decdn-node/files/monitoring).
