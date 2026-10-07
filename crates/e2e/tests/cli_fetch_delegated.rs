@@ -829,12 +829,12 @@ async fn run_clamp() -> anyhow::Result<()> {
     );
 
     // A fetch on the spent signer stops at once with the new-key remedy. A
-    // node that reads the signer as spent refuses it at admission as a plain
-    // `NotFound`; the client reads the registration from chain and stops,
-    // rather than retrying a cache miss until it gives up (#2338). A node whose
-    // projection has not folded the last redemption yet admits the stream and
-    // rejects its first voucher past the registered cap instead; that remedy
-    // names a new signer key too.
+    // node that reads the signer as spent refuses it at admission `Unfunded`,
+    // and a delegated client with no funder ends "funding needed" rather than
+    // retrying until it gives up (#2338). A node whose projection has not
+    // folded the last redemption yet admits the stream and rejects its first
+    // voucher past the registered cap instead; that remedy names a new signer
+    // key too.
     let headroom = after.cap.saturating_sub(after.spent);
     anyhow::ensure!(
         U256::from(headroom) < decdn_incentive::floor_micro(NODE_RATE_PER_MB),

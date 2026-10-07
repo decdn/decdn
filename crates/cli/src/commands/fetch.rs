@@ -2131,8 +2131,10 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
         )
     } else if err.downcast_ref::<NoAffordableSource>().is_some() {
         err.context(
-            "no provider's next voucher fits what the delegated pool holds. Ask the pool \
-             owner to top up the pool (a delegated client cannot top up a pool it does not own)",
+            "funding needed: no provider serves this capability at its current funding. Ask \
+             the pool owner to top up the pool or issue a fresh capability; once this signer \
+             key is registered on-chain its terms are write-once, so the fresh capability must \
+             name a new signer key (a delegated client cannot top up a pool it does not own)",
         )
     } else if needs_owner {
         err.context(
