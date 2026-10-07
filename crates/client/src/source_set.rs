@@ -24,11 +24,11 @@ use decdn_protocol::Coverage;
 use decdn_protocol::client::StreamError;
 use tokio::time::{Duration, Instant};
 
-use crate::UpstreamRefused;
 use crate::fault::{Fault, LaneBuildFault, classify};
 use crate::health::PeerHealth;
 use crate::source::{BlobSource, SourceFuture, SourceStream};
 use crate::streamer::StreamCandidate;
+use crate::{SignerCapDrained, UpstreamRefused};
 
 /// The first wait before a failed lane build is retried.
 pub const BUILD_RETRY_BASE: Duration = Duration::from_secs(1);
@@ -188,6 +188,27 @@ impl std::fmt::Display for NoSourceHasBlob {
 
 impl std::error::Error for NoSourceHasBlob {}
 
+/// Every known source can serve none of the work left, at least one of them
+/// because it refused the lane's capability signer as drained at its rate
+/// ([`SignerCapDrained`]), and a fresh discovery found no other holder. The
+/// others may be barred for another reason (absence, size), so the stop does
+/// not prove the signer drained at every provider. The
+/// acquire loop raises it as context on the last such refusal, so the error
+/// chain also holds that [`SignerCapDrained`].
+#[derive(Debug)]
+pub struct NoSourceServesSigner;
+
+impl std::fmt::Display for NoSourceServesSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "no known provider of this blob can serve it: at least one refused the capability \
+             signer, whose registered cap left is below one chunk at that provider's rate",
+        )
+    }
+}
+
+impl std::error::Error for NoSourceServesSigner {}
+
 /// A backoff that doubles from `base` to `cap`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Backoff {
@@ -287,13 +308,21 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// only to a pull-through, so the same refusal from a partial holder bars
     /// only its pull-through ([`Self::no_pull_through`]).
     too_large: HashSet<Address>,
+    /// Providers that refused the lane's capability signer as drained at
+    /// their rate ([`SignerCapDrained`]). A registration's `spent` only grows,
+    /// so none of them starts again for this blob, and neither a verified
+    /// byte nor a rediscovery lifts the bar.
+    signer_drained: HashSet<Address>,
+    /// The refusal that last barred a provider for a drained signer: the
+    /// cause the [`NoSourceServesSigner`] stop carries.
+    last_drained: Option<SignerCapDrained>,
     /// The refusal that last marked a source absent, barred it from
     /// pull-through or excluded it as too small for the blob: the cause the
     /// [`NoSourceHasBlob`] stop carries.
     last_absent: Option<UpstreamRefused>,
     discovery: Option<Backoff>,
     /// Bumped each time a source newly joins `absent`, `no_pull_through`,
-    /// `too_large_pull_through` or `too_large`.
+    /// `too_large_pull_through`, `too_large` or `signer_drained`.
     mark_epoch: u64,
     /// The deposit and mark epoch of the last successful discovery. A
     /// unanimous stop needs a discovery at the current pair.
@@ -342,6 +371,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             pull_through_bars: HashMap::new(),
             too_large_pull_through: HashSet::new(),
             too_large: HashSet::new(),
+            signer_drained: HashSet::new(),
+            last_drained: None,
             last_absent: None,
             discovery: None,
             mark_epoch: 0,
@@ -384,7 +415,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// The nearest source that may start now and is not already `running`. A
-    /// source that refused the blob as too large never starts again.
+    /// source that refused the blob as too large, or refused the lane's signer
+    /// as drained, never starts again.
     #[must_use]
     pub fn next_to_start(
         &self,
@@ -396,6 +428,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             .iter()
             .filter(|h| !running.contains(&h.provider))
             .filter(|h| !self.too_large.contains(&h.provider))
+            .filter(|h| !self.signer_drained.contains(&h.provider))
             .filter(|h| {
                 self.build_retry
                     .get(&h.provider)
@@ -477,7 +510,9 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// a probed partial holder counts toward barring it from pull-through,
     /// and a size-ceiling refusal bars it at once, as on its own stream. The
     /// scheduler passes only uncovered ranges here: an extra stream's covered
-    /// `NotFound` is most often the node's per-signer live cap.
+    /// `NotFound` is most often the node's per-signer live cap. A drained
+    /// signer ([`SignerCapDrained`]) bars the node at once, as on its own
+    /// stream.
     pub(crate) fn record_extra_refusal(
         &mut self,
         provider: Address,
@@ -485,6 +520,10 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         range: LaneRange,
         at: Instant,
     ) {
+        if let Some(drained) = err.downcast_ref::<SignerCapDrained>() {
+            self.record_signer_drained(provider, drained);
+            return;
+        }
         let Some(refused) = err.downcast_ref::<UpstreamRefused>() else {
             return;
         };
@@ -562,26 +601,42 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             );
         }
         match fault {
-            Fault::Source => {
-                if crate::fault::says_absent(err)
-                    && !range.is_some_and(|r| r.past_end)
-                    && let Some(refused) = err.downcast_ref::<UpstreamRefused>()
-                {
-                    self.record_not_found(provider, refused, range.as_ref(), now);
-                }
-                if let Some(refused) = err.downcast_ref::<UpstreamRefused>()
-                    && matches!(refused.error(), StreamError::BlobTooLarge)
-                {
-                    self.record_too_large(provider, refused);
-                }
-                if let Some(holder) = self.holder(provider) {
-                    self.provider.on_source_fault(holder);
-                }
-            }
+            // The signer's fault, not the node's: the node is barred for this
+            // blob, and its peer-store record keeps no failure stamp.
+            Fault::Source => match err.downcast_ref::<SignerCapDrained>() {
+                Some(drained) => self.record_signer_drained(provider, drained),
+                None => self.record_source_fault(provider, err, range.as_ref(), now),
+            },
             Fault::Fatal(_) | Fault::Unaffordable | Fault::Transient => {}
         }
         self.health.record(provider, fault, now, deposit);
         fault
+    }
+
+    /// Record a delivery fault of `provider`'s: a `NotFound` toward marking it
+    /// absent, a size-ceiling refusal as a bar, and a failure stamp in its
+    /// peer-store record.
+    fn record_source_fault(
+        &mut self,
+        provider: Address,
+        err: &anyhow::Error,
+        range: Option<&LaneRange>,
+        now: Instant,
+    ) {
+        if crate::fault::says_absent(err)
+            && !range.is_some_and(|r| r.past_end)
+            && let Some(refused) = err.downcast_ref::<UpstreamRefused>()
+        {
+            self.record_not_found(provider, refused, range, now);
+        }
+        if let Some(refused) = err.downcast_ref::<UpstreamRefused>()
+            && matches!(refused.error(), StreamError::BlobTooLarge)
+        {
+            self.record_too_large(provider, refused);
+        }
+        if let Some(holder) = self.holder(provider) {
+            self.provider.on_source_fault(holder);
+        }
     }
 
     /// Count a `NotFound` from `provider` for a piece below the end the fetch
@@ -810,6 +865,15 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         }
     }
 
+    /// Bar `provider` for the lane's signer it refused as `drained`
+    /// ([`Self::signer_drained`]).
+    fn record_signer_drained(&mut self, provider: Address, drained: &SignerCapDrained) {
+        self.last_drained = Some(drained.clone());
+        if self.signer_drained.insert(provider) {
+            self.mark_epoch = self.mark_epoch.saturating_add(1);
+        }
+    }
+
     /// Record `refused` as the cause of a mark that excludes a source, and
     /// bump the mark epoch when the mark is `newly` set.
     fn marked(&mut self, newly: bool, refused: &UpstreamRefused) {
@@ -973,7 +1037,9 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// ends).
     ///
     /// A source can serve none of the work left when it says the blob is
-    /// absent, when it refused the blob as too large, or when it is barred
+    /// absent, when it refused the blob as too large, when it refused the
+    /// lane's signer as drained ([`NoSourceServesSigner`] when any did), or
+    /// when it is barred
     /// from pull-through
     /// ([`Self::no_pull_through`]) and `only_uncovered_left` says no work left
     /// lies inside the coverage of a barred holder.
@@ -988,9 +1054,14 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             return None;
         }
         if self.all_item_marked(only_uncovered_left) {
-            return Some(match &self.last_absent {
-                Some(refused) => anyhow::Error::new(refused.clone()).context(NoSourceHasBlob),
-                None => anyhow::Error::new(NoSourceHasBlob),
+            return Some(match (&self.last_drained, &self.last_absent) {
+                (Some(drained), _) => {
+                    anyhow::Error::new(drained.clone()).context(NoSourceServesSigner)
+                }
+                (None, Some(refused)) => {
+                    anyhow::Error::new(refused.clone()).context(NoSourceHasBlob)
+                }
+                (None, None) => anyhow::Error::new(NoSourceHasBlob),
             });
         }
         if !self.all_excluded(deposit, only_uncovered_left) {
@@ -1027,7 +1098,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// Whether `provider` can serve none of the work left: it says the blob is
-    /// absent, it refused the blob as too large, or `only_uncovered_left` says
+    /// absent, it refused the blob as too large, it refused the lane's signer
+    /// as drained, or `only_uncovered_left` says
     /// no work left lies inside the coverage of a barred holder and the holder
     /// is barred for good: by a size-ceiling refusal, or by `NotFound` again
     /// after the probe that followed its first bar.
@@ -1040,6 +1112,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                     .is_some_and(|bars| *bars >= 2));
         self.absent.contains(&provider)
             || self.too_large.contains(&provider)
+            || self.signer_drained.contains(&provider)
             || (only_uncovered_left && barred_for_good)
     }
 
@@ -1558,6 +1631,68 @@ mod tests {
         set.discovery_done(Ok(vec![]), now, U256::ZERO);
         let err = set.exhausted(U256::ZERO, true, false);
         assert!(err.is_some_and(|e| e.downcast_ref::<super::NoSourceHasBlob>().is_some()));
+    }
+
+    /// A refusal the chain explains as a drained capability signer at the
+    /// refusing provider's rate.
+    fn drained(provider: Address, remaining: u64, rate_per_mb: u64) -> anyhow::Error {
+        anyhow::Error::new(crate::SignerCapDrained {
+            pool_id: alloy::primitives::B256::ZERO,
+            signer: Address::ZERO,
+            provider,
+            remaining,
+            rate_per_mb,
+            expired: false,
+        })
+    }
+
+    /// A probed holder that refuses the lane's signer as drained at its rate is
+    /// barred for the blob, with no peer-store failure stamp, while a cheaper
+    /// holder still starts. Once every holder is barred, the item ends with
+    /// the drained cause in the chain (#2338).
+    #[tokio::test(start_paused = true)]
+    async fn a_drained_signer_bars_each_refusing_holder_until_none_is_left() -> anyhow::Result<()> {
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(
+            &p,
+            [0; 32],
+            Arc::default(),
+            vec![holder(A, 10.0), holder(B, 20.0)],
+        );
+        let now = Instant::now();
+        let fault = set.record_fault(A, &drained(A, 5, 10), None, now, U256::ZERO);
+        assert_eq!(fault, Fault::Source);
+        assert!(
+            p.faults.lock().is_ok_and(|f| f.is_empty()),
+            "no failure stamp"
+        );
+        let later = now + Duration::from_hours(1);
+        assert_eq!(
+            set.next_to_start(later, U256::ZERO, &HashSet::new())
+                .map(|h| h.provider),
+            Some(B),
+            "the barred holder never starts again"
+        );
+        set.discovery_done(Ok(vec![holder(A, 10.0)]), now, U256::ZERO);
+        assert!(
+            set.exhausted(U256::ZERO, true, false).is_none(),
+            "B is left"
+        );
+
+        set.record_fault(B, &drained(B, 5, 20), None, now, U256::ZERO);
+        set.discovery_done(Ok(vec![]), now, U256::ZERO);
+        let err = set
+            .exhausted(U256::ZERO, true, false)
+            .ok_or_else(|| anyhow::anyhow!("every holder is barred"))?;
+        assert!(err.downcast_ref::<super::NoSourceServesSigner>().is_some());
+        assert_eq!(
+            err.downcast_ref::<crate::SignerCapDrained>()
+                .map(|d| d.provider),
+            Some(B),
+            "the last refusal is the cause"
+        );
+        assert_eq!(crate::classify(&err), Fault::Fatal(crate::FatalScope::Item));
+        Ok(())
     }
 
     /// A probed holder's `NotFound` is a delivery fault only: it may mean load

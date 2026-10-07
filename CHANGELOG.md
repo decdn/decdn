@@ -937,6 +937,24 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **`decdn fetch` / `bundle pull` with a spent capability stops with the
+  owner-side remedy instead of retrying until it gives up (#2338).** A node
+  refuses a registered signer whose `cap − spent` cannot cover its serve floor
+  at admission, and answers with the same `NotFound` code as a cache miss. The
+  client cooled the holder and retried until its stop policy gave up. A
+  delegated lane now reads its signer's `getAuthorization` row when a node
+  refuses it with `NotFound`, bounded by the open deadline. An expired
+  registration, or one with nothing left of its cap, ends the command with
+  `SignerCapDrained`. A `cap − spent` below one chunk at the refusing node's
+  signed rate bars that node for the blob, since a cheaper node can still
+  serve; once every node is barred the item ends with `NoSourceServesSigner`.
+  Both ask the pool owner for a capability for a new signer key, as do a
+  mid-stream `SignerCapExhausted` and, for a registered signer, a
+  `SpendingCapExhausted`. A failed or slow read leaves the refusal as it was
+  and logs at info. `SignerAuthorization` moves from `decdn-node` to
+  `decdn_incentive::payment_pool`, so the client and the node test a
+  registration with one predicate.
+
 - **`bundle pull`: a freed provider stream goes to the lane that waited for it
   first, so one entry's queued range no longer waits minutes behind a sibling
   entry's short legs (#2341).** Entries share each provider's

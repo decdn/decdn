@@ -5313,6 +5313,30 @@ mod tests {
         assert!(ends_the_pull(&err));
     }
 
+    /// A capability signer every provider refuses, whatever its rate, ends
+    /// the whole pull: every entry would meet it. One that only the providers
+    /// of an entry refuse at their rates fails that entry alone, since a
+    /// cheaper provider of another entry can still serve it (#2338).
+    #[test]
+    fn a_drained_signer_ends_the_pull_only_at_every_rate() {
+        let drained = |remaining| decdn_client::SignerCapDrained {
+            pool_id: alloy::primitives::B256::ZERO,
+            signer: Address::ZERO,
+            provider: Address::ZERO,
+            remaining,
+            rate_per_mb: 10,
+            expired: false,
+        };
+        let everywhere = anyhow::Error::new(drained(0)).context("entry");
+        assert_eq!(entry_scope(&everywhere), decdn_client::FatalScope::Command);
+        assert!(ends_the_pull(&everywhere));
+        let here = anyhow::Error::new(drained(5))
+            .context(decdn_client::NoSourceServesSigner)
+            .context("entry");
+        assert_eq!(entry_scope(&here), decdn_client::FatalScope::Item);
+        assert!(!ends_the_pull(&here));
+    }
+
     /// A blob over the client's cap fails only its own entry.
     #[test]
     fn an_over_cap_blob_fails_only_its_entry() {

@@ -31,15 +31,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use decdn_bao_range::AlignedRange;
 use decdn_incentive::DepositOutcome;
+use decdn_incentive::payment_pool::SignerAuthorization;
+use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, EndpointAddr};
 
 use crate::sink::{PullReader, StashedFault};
 use crate::{
     Connections, PoolContext, PoolLedger, PullDeadlines, UpstreamPull, UpstreamPullHeader,
-    VoucherProgress,
+    UpstreamRefused, VoucherProgress,
 };
 
 /// A boxed, `Send` future returned by the async trait methods in this module —
@@ -280,6 +282,200 @@ pub trait Funder: Send + Sync {
     }
 }
 
+/// The chain read a capability lane confirms a `NotFound` with
+/// ([`PeerSource::with_signer_check`]): the signer's `getAuthorization` row in
+/// one pool. A node refuses a registered signer that cannot cover its serve
+/// floor at admission, and it answers that refusal with the same `NotFound`
+/// code as a cache miss. Only the chain tells the two apart.
+pub trait SignerRegistry: Send + Sync {
+    /// The `getAuthorization(pool_id, signer)` row.
+    ///
+    /// # Errors
+    ///
+    /// The chain read failed.
+    fn read(&self, pool_id: B256, signer: Address) -> SourceFuture<'_, SignerAuthorization>;
+}
+
+impl<P> SignerRegistry for decdn_incentive::payment_pool::PaymentPool::PaymentPoolInstance<P>
+where
+    P: alloy::providers::Provider,
+{
+    fn read(&self, pool_id: B256, signer: Address) -> SourceFuture<'_, SignerAuthorization> {
+        use anyhow::Context as _;
+        Box::pin(async move {
+            let auth = self
+                .getAuthorization(pool_id, signer)
+                .call()
+                .await
+                .map_err(anyhow::Error::from)
+                .with_context(|| format!("getAuthorization({pool_id}, {signer})"))?;
+            Ok(SignerAuthorization::from_onchain(&auth))
+        })
+    }
+}
+
+/// A capability lane's `NotFound` that the chain explains: the lane's signer is
+/// registered on the pool, and its registration has expired or its
+/// `cap − spent` is below one chunk at the rate the refusal is signed with
+/// ([`PeerSource::with_signer_check`]). No provider at that rate or above can
+/// be paid for serving the signer, so a node with a current read refuses it at
+/// admission.
+///
+/// A verdict that holds at every rate ([`Self::at_every_rate`]: the
+/// registration expired, or nothing is left of its cap) ends the command. A
+/// cheaper provider can still serve a signer with some headroom left, so
+/// otherwise only the refusing provider is barred, and the item ends once every
+/// known provider is ([`crate::NoSourceServesSigner`], [`crate::classify`]).
+///
+/// The floor ([`Self::floor`]) is a lower bound on what the node reserves
+/// before it serves: one chunk at the signed rate. A node with a wider first
+/// credit window, or one whose projection counts `spent` high, can refuse a
+/// signer with more headroom than this. The lane then keeps that refusal as a
+/// plain `NotFound`. `expired` is judged on the client's clock, not chain time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignerCapDrained {
+    /// The pool the lane pays from.
+    pub pool_id: B256,
+    /// The lane's voucher signer.
+    pub signer: Address,
+    /// The provider that refused the lane.
+    pub provider: Address,
+    /// The signer's registered `cap − spent`, in micro-USDC.
+    pub remaining: u64,
+    /// The per-MB rate the refusal is signed with, in micro-USDC.
+    pub rate_per_mb: u64,
+    /// The signer's registration has expired.
+    pub expired: bool,
+}
+
+impl SignerCapDrained {
+    /// One chunk at [`Self::rate_per_mb`], in micro-USDC: the least the
+    /// refusing node reserves before it serves.
+    #[must_use]
+    pub fn floor(&self) -> U256 {
+        decdn_incentive::floor_micro(self.rate_per_mb)
+    }
+
+    /// Whether every provider refuses the signer, whatever its rate: the
+    /// registration expired, or nothing is left of its cap.
+    #[must_use]
+    pub const fn at_every_rate(&self) -> bool {
+        self.expired || self.remaining == 0
+    }
+}
+
+impl std::fmt::Display for SignerCapDrained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.expired {
+            write!(
+                f,
+                "the capability signer {} is registered on pool {} with an expiry that has \
+                 passed, so provider {} refuses it",
+                self.signer, self.pool_id, self.provider
+            )
+        } else {
+            write!(
+                f,
+                "the capability signer {} has {} micro-USDC of its registered cap left on pool \
+                 {}, below the {} micro-USDC provider {} reserves before it serves at its signed \
+                 rate of {} micro-USDC per MB",
+                self.signer,
+                self.remaining,
+                self.pool_id,
+                self.floor(),
+                self.provider,
+                self.rate_per_mb
+            )
+        }
+    }
+}
+
+impl std::error::Error for SignerCapDrained {}
+
+/// The per-MB rate of `err` when it is an open-stage `NotFound` refusal whose
+/// signed body carries a non-zero rate. A drained signer's admission refusal
+/// has this shape, and so does a cache miss. A zero rate has no chunk floor to
+/// test, so the caller skips it.
+fn signed_not_found_rate(err: &anyhow::Error) -> Option<u64> {
+    let refused = err.downcast_ref::<UpstreamRefused>()?;
+    if !matches!(refused.error(), StreamError::NotFound) {
+        return None;
+    }
+    let rate = refused.evidence()?.body.rate_per_mb;
+    (rate > 0).then_some(rate)
+}
+
+/// The [`SignerCapDrained`] for `ctx`'s lane when `auth` is a registration
+/// that cannot pay one chunk at `rate_per_mb` at Unix time `now`. It tests the
+/// predicate a node admits by ([`SignerAuthorization::covers`]) at the
+/// one-chunk floor. `None` when the signer still covers or is unregistered.
+fn signer_cap_drained(
+    auth: SignerAuthorization,
+    rate_per_mb: u64,
+    now: u64,
+    ctx: &PoolContext,
+) -> Option<SignerCapDrained> {
+    if auth.covers(decdn_incentive::floor_micro(rate_per_mb), now) {
+        return None;
+    }
+    let SignerAuthorization::Registered { cap, expiry, spent } = auth else {
+        return None;
+    };
+    Some(SignerCapDrained {
+        pool_id: ctx.pool_id,
+        signer: ctx.client_signer.address(),
+        provider: ctx.provider,
+        remaining: cap.saturating_sub(spent),
+        rate_per_mb,
+        expired: now >= expiry,
+    })
+}
+
+/// `err`, or [`SignerCapDrained`] when `err` is an open-stage `NotFound`
+/// signed at a non-zero rate and `check` reads a registration of `ctx`'s
+/// signer that cannot pay one chunk at that rate at Unix time `now`
+/// ([`PeerSource::with_signer_check`]). The read is bounded by `deadline`. A
+/// read that fails or runs past it leaves `err` as it is, and is logged.
+async fn confirm_refusal(
+    check: Option<&dyn SignerRegistry>,
+    err: anyhow::Error,
+    ctx: &PoolContext,
+    now: u64,
+    deadline: Duration,
+) -> anyhow::Error {
+    let (Some(check), Some(rate_per_mb)) = (check, signed_not_found_rate(&err)) else {
+        return err;
+    };
+    let signer = ctx.client_signer.address();
+    let read = match tokio::time::timeout(deadline, check.read(ctx.pool_id, signer)).await {
+        Ok(read) => read,
+        Err(_) => Err(anyhow::anyhow!("no answer within {deadline:?}")),
+    };
+    match read {
+        Ok(auth) => signer_cap_drained(auth, rate_per_mb, now, ctx).map_or(err, anyhow::Error::new),
+        Err(read_err) => {
+            tracing::info!(
+                pool_id = %ctx.pool_id,
+                %signer,
+                provider = %ctx.provider,
+                error = %decdn_common::redact::sanitize_err_chain(&read_err),
+                "could not read the capability signer's registration to explain a NotFound; \
+                 the refusal stands"
+            );
+            err
+        }
+    }
+}
+
+/// Current Unix time in seconds on the client's clock, which a registration's
+/// expiry is read against. A clock before the epoch reads as 0, which never
+/// judges a registration expired.
+fn unix_secs_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Current unix time in microseconds (the requester-echoed
 /// [`decdn_protocol::client::StreamRequest::timestamp_us`]). Mirrors the CLI's
 /// `micros_now` (`crates/cli/src/commands/fetch.rs`) and the node's `now_micros`
@@ -343,6 +539,10 @@ pub struct PeerSource<'a> {
     dial_runtime: Option<tokio::runtime::Handle>,
     /// The command's shared connection per node, or `None` to dial per open.
     connections: Option<Connections>,
+    /// The chain read that confirms a `NotFound` against the lane signer's
+    /// registration, or `None` to return every refusal as it arrives. See
+    /// [`with_signer_check`](Self::with_signer_check).
+    signer_check: Option<&'a dyn SignerRegistry>,
 }
 
 impl std::fmt::Debug for PeerSource<'_> {
@@ -402,6 +602,7 @@ impl<'a> PeerSource<'a> {
             deadlines,
             dial_runtime: None,
             connections,
+            signer_check: None,
         }
     }
 
@@ -421,6 +622,21 @@ impl<'a> PeerSource<'a> {
     #[must_use]
     pub fn with_dial_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {
         self.dial_runtime = Some(runtime);
+        self
+    }
+
+    /// Confirm every open-stage `NotFound` this source gets, when its signed
+    /// body carries a non-zero rate, against `check`: a read of the lane
+    /// signer's `getAuthorization` row. When the signer is registered and
+    /// expired, or its `cap − spent` is below one chunk at the signed rate,
+    /// the open fails with [`SignerCapDrained`]. Every other refusal, and a
+    /// refusal whose read fails or outruns the open deadline, comes back as it
+    /// arrived. Use it on a lane that pays under a capability. Without it, a
+    /// drained signer's refusal looks like a cache miss, and the command
+    /// retries until its stop policy gives up.
+    #[must_use]
+    pub fn with_signer_check(mut self, check: &'a dyn SignerRegistry) -> Self {
+        self.signer_check = Some(check);
         self
     }
 
@@ -459,29 +675,40 @@ impl<'a> PeerSource<'a> {
                 .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
                 .clone()
         };
-        if let Some(connections) = &self.connections {
-            return self
-                .open_shared(connections, &ctx, hash, byte_offset, byte_len)
-                .await;
+        let opened = if let Some(connections) = &self.connections {
+            self.open_shared(connections, &ctx, hash, byte_offset, byte_len)
+                .await
+        } else {
+            crate::open_progressive_pull(
+                self.endpoint,
+                self.target.clone(),
+                &ctx,
+                Arc::clone(&self.ledger),
+                self.slash_domain,
+                self.expected_signer,
+                hash,
+                self.namespace_id,
+                byte_offset,
+                micros_now(),
+                self.max_blob_size_bytes,
+                self.max_rate_per_mb,
+                self.deadlines,
+                byte_len,
+                self.dial_runtime.as_ref(),
+            )
+            .await
+        };
+        match opened {
+            Ok(opened) => Ok(opened),
+            Err(err) => Err(confirm_refusal(
+                self.signer_check,
+                err,
+                &ctx,
+                unix_secs_now(),
+                self.deadlines.open(),
+            )
+            .await),
         }
-        crate::open_progressive_pull(
-            self.endpoint,
-            self.target.clone(),
-            &ctx,
-            Arc::clone(&self.ledger),
-            self.slash_domain,
-            self.expected_signer,
-            hash,
-            self.namespace_id,
-            byte_offset,
-            micros_now(),
-            self.max_blob_size_bytes,
-            self.max_rate_per_mb,
-            self.deadlines,
-            byte_len,
-            self.dial_runtime.as_ref(),
-        )
-        .await
     }
 
     /// Open the pull on the target's connection in `connections`, dialling
@@ -1703,5 +1930,217 @@ mod tests {
         assert_eq!(out, DepositOutcome::Added(U256::from(100u64)));
         assert_eq!(funder.calls(), vec![U256::from(40u64)]);
         Ok(())
+    }
+
+    /// A signer registry that answers every read with the authorization it
+    /// holds, or fails it when it holds `None`, and counts its reads.
+    #[derive(Default)]
+    struct FixedAuthorization {
+        auth: Option<decdn_incentive::payment_pool::SignerAuthorization>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl super::SignerRegistry for FixedAuthorization {
+        fn read(
+            &self,
+            _pool_id: alloy::primitives::B256,
+            _signer: alloy::primitives::Address,
+        ) -> super::SourceFuture<'_, decdn_incentive::payment_pool::SignerAuthorization> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let auth = self.auth;
+            Box::pin(async move { auth.ok_or_else(|| anyhow::anyhow!("rpc down")) })
+        }
+    }
+
+    /// A signer registry whose read never answers.
+    struct SilentRegistry;
+
+    impl super::SignerRegistry for SilentRegistry {
+        fn read(
+            &self,
+            _pool_id: alloy::primitives::B256,
+            _signer: alloy::primitives::Address,
+        ) -> super::SourceFuture<'_, decdn_incentive::payment_pool::SignerAuthorization> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    const NOW: u64 = 1_700_000_000;
+
+    /// An open-stage refusal with `error`, signed at `rate_per_mb`.
+    fn open_refusal(error: decdn_protocol::client::StreamError, rate_per_mb: u64) -> anyhow::Error {
+        use decdn_protocol::client::{StreamResponse, StreamResponseBody};
+        crate::UpstreamRefused::open(
+            StreamResponse {
+                body: StreamResponseBody {
+                    hash: [0x5Au8; 32],
+                    ok: false,
+                    rate_per_mb,
+                    total_bytes: 0,
+                    pool_id: [0x77u8; 32],
+                    timestamp_us: 0,
+                },
+                slash_sig: vec![0u8; decdn_protocol::message::SLASH_SIG_LEN],
+            },
+            &decdn_protocol::StreamResponseExt { error: Some(error) },
+        )
+    }
+
+    fn registered(cap: u64, spent: u64) -> decdn_incentive::payment_pool::SignerAuthorization {
+        decdn_incentive::payment_pool::SignerAuthorization::Registered {
+            cap,
+            expiry: NOW + 3_600,
+            spent,
+        }
+    }
+
+    /// Run `confirm_refusal` for `err` against a registry answering `auth`.
+    /// Returns the result and how many reads it made.
+    async fn confirm(
+        err: anyhow::Error,
+        auth: Option<decdn_incentive::payment_pool::SignerAuthorization>,
+    ) -> (anyhow::Error, usize) {
+        let ctx = super::ctx_with(0xa1, U256::from(1_000u64));
+        let check = FixedAuthorization {
+            auth,
+            ..FixedAuthorization::default()
+        };
+        let err = super::confirm_refusal(Some(&check), err, &ctx, NOW, DEADLINE).await;
+        (err, check.reads.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// A signed `NotFound` to a signer whose `cap − spent` is one below a
+    /// chunk at the signed rate ends as `SignerCapDrained`, with the numbers
+    /// the node refused on (#2338).
+    #[tokio::test]
+    async fn a_not_found_to_a_drained_signer_becomes_signer_cap_drained() -> anyhow::Result<()> {
+        let (err, _) = confirm(
+            open_refusal(decdn_protocol::client::StreamError::NotFound, 10),
+            Some(registered(40, 31)),
+        )
+        .await;
+        let drained = err
+            .downcast_ref::<super::SignerCapDrained>()
+            .ok_or_else(|| anyhow::anyhow!("a drained signer is named: {err:#}"))?;
+        assert_eq!(drained.remaining, 9);
+        assert_eq!(drained.floor(), U256::from(10u64));
+        assert_eq!(drained.rate_per_mb, 10);
+        assert!(!drained.expired);
+        assert_eq!(
+            crate::classify(&err),
+            crate::Fault::Source,
+            "a cheaper provider can still serve 9 µUSDC of headroom"
+        );
+        Ok(())
+    }
+
+    /// A registration past its expiry is drained whatever its headroom.
+    #[tokio::test]
+    async fn a_not_found_to_an_expired_signer_becomes_signer_cap_drained() -> anyhow::Result<()> {
+        let expired = decdn_incentive::payment_pool::SignerAuthorization::Registered {
+            cap: 1_000,
+            expiry: NOW,
+            spent: 0,
+        };
+        let (err, _) = confirm(
+            open_refusal(decdn_protocol::client::StreamError::NotFound, 10),
+            Some(expired),
+        )
+        .await;
+        let drained = err
+            .downcast_ref::<super::SignerCapDrained>()
+            .ok_or_else(|| anyhow::anyhow!("an expired signer is named: {err:#}"))?;
+        assert!(drained.expired);
+        assert_eq!(
+            crate::classify(&err),
+            crate::Fault::Fatal(crate::FatalScope::Command)
+        );
+        Ok(())
+    }
+
+    /// Every refusal the chain does not explain comes back as it arrived: a
+    /// signer that still covers one chunk, an unregistered signer, a failed
+    /// read, a refusal other than `NotFound`, an unsigned mid-stream
+    /// `NotFound`, and a refusal signed at a zero rate. Only an open-stage
+    /// `NotFound` signed at a non-zero rate costs a read.
+    #[tokio::test]
+    async fn an_unexplained_refusal_stands() {
+        use decdn_protocol::client::StreamError;
+        let cases = [
+            (
+                open_refusal(StreamError::NotFound, 10),
+                Some(registered(40, 30)),
+                1,
+            ),
+            (
+                open_refusal(StreamError::NotFound, 10),
+                Some(decdn_incentive::payment_pool::SignerAuthorization::Unregistered),
+                1,
+            ),
+            (open_refusal(StreamError::NotFound, 10), None, 1),
+            (
+                open_refusal(StreamError::Overloaded, 10),
+                Some(registered(40, 40)),
+                0,
+            ),
+            (
+                anyhow::Error::new(crate::UpstreamRefused::mid_stream(StreamError::NotFound)),
+                Some(registered(40, 40)),
+                0,
+            ),
+            (
+                open_refusal(StreamError::NotFound, 0),
+                Some(registered(40, 40)),
+                0,
+            ),
+        ];
+        for (i, (err, auth, want_reads)) in cases.into_iter().enumerate() {
+            let (err, reads) = confirm(err, auth).await;
+            assert_eq!(reads, want_reads, "case {i} reads");
+            assert!(
+                err.downcast_ref::<super::SignerCapDrained>().is_none(),
+                "case {i}: {err:#}"
+            );
+            assert!(
+                err.downcast_ref::<crate::UpstreamRefused>().is_some(),
+                "case {i} keeps the refusal: {err:#}"
+            );
+        }
+    }
+
+    /// A source with no signer check keeps the refusal.
+    #[tokio::test]
+    async fn no_check_leaves_the_refusal() {
+        let ctx = super::ctx_with(0xa1, U256::from(1_000u64));
+        let err = super::confirm_refusal(
+            None,
+            open_refusal(decdn_protocol::client::StreamError::NotFound, 10),
+            &ctx,
+            NOW,
+            DEADLINE,
+        )
+        .await;
+        assert!(err.downcast_ref::<crate::UpstreamRefused>().is_some());
+    }
+
+    /// A read that never answers gives way at the deadline, and the refusal
+    /// stands: a stalled RPC cannot hold the lane's open.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_read_gives_way_at_the_deadline() {
+        let ctx = super::ctx_with(0xa1, U256::from(1_000u64));
+        let started = tokio::time::Instant::now();
+        let err = super::confirm_refusal(
+            Some(&SilentRegistry),
+            open_refusal(decdn_protocol::client::StreamError::NotFound, 10),
+            &ctx,
+            NOW,
+            DEADLINE,
+        )
+        .await;
+        assert_eq!(started.elapsed(), DEADLINE);
+        assert!(err.downcast_ref::<crate::UpstreamRefused>().is_some());
     }
 }

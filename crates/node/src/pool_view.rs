@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, B256, U256};
 use arc_swap::ArcSwap;
-use decdn_incentive::payment_pool::PaymentPool;
+use decdn_incentive::payment_pool::{PaymentPool, SignerAuthorization};
 
 /// Wall-clock cadence for the serve loops' mid-stream pool-solvency re-check
 /// (ADR 003 §Pool solvency policy).
@@ -88,58 +88,6 @@ pub struct PoolStatus {
     pub remaining: U256,
     /// The pool's lifecycle: `Open`, or `Closing` with its dispute deadline.
     pub lifecycle: Lifecycle,
-}
-
-/// A voucher signer's on-chain authorization in one pool, as the admit path reads
-/// it from `getAuthorization` (ADR 003 §Capability delegation).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SignerAuthorization {
-    /// The signer holds no registration (the all-zero `Authorization`). Its first
-    /// redemption registers whichever owner-signed capability lands first.
-    Unregistered,
-    /// The signer is registered. `cap` and `expiry` are write-once on-chain, so
-    /// they never change for this `(pool, signer)`; `spent` only grows.
-    Registered {
-        /// The registered spending cap, in micro-USDC.
-        cap: u64,
-        /// The registered expiry, in Unix seconds. The chain treats a voucher at
-        /// or past it as unredeemable.
-        expiry: u64,
-        /// What the signer has redeemed across every provider, in micro-USDC.
-        spent: u64,
-    },
-}
-
-impl SignerAuthorization {
-    /// Classify a raw `getAuthorization` result. The contract marks a signer
-    /// registered when `cap != 0 || expiry != 0`, so a registration with a zero
-    /// `cap` but a non-zero `expiry` is registered with no headroom.
-    #[must_use]
-    pub const fn from_onchain(auth: &PaymentPool::Authorization) -> Self {
-        if auth.cap == 0 && auth.expiry == 0 {
-            Self::Unregistered
-        } else {
-            Self::Registered {
-                cap: auth.cap,
-                expiry: auth.expiry,
-                spent: auth.spent,
-            }
-        }
-    }
-
-    /// Whether the signer can still pay at least `floor_micro` at Unix time `now`.
-    /// An unregistered signer always can: it admits on its presented capability.
-    /// A registered signer needs a live registration and `cap − spent` headroom
-    /// of at least `floor_micro`.
-    #[must_use]
-    pub fn covers(self, floor_micro: U256, now: u64) -> bool {
-        match self {
-            Self::Unregistered => true,
-            Self::Registered { cap, expiry, spent } => {
-                now < expiry && U256::from(cap.saturating_sub(spent)) >= floor_micro
-            }
-        }
-    }
 }
 
 /// A per-request source of [`PoolStatus`]. Trait so the handler holds it behind an

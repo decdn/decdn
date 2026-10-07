@@ -96,7 +96,8 @@ use crate::chain_events::{REORG_MARGIN_BLOCKS, timed};
 use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, metric_hook};
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
-use crate::pool_view::{Lifecycle, PoolProjection, PoolStatus, SignerAuthorization};
+use crate::pool_view::{Lifecycle, PoolProjection, PoolStatus};
+use decdn_incentive::payment_pool::SignerAuthorization;
 
 /// Capacity of the redeem-hint channel. Hints are advisory (a missed hint only
 /// delays a redemption until the next voucher or self-tick sweep), so a bounded

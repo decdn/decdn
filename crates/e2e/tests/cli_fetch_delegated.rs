@@ -573,6 +573,8 @@ fn delegate_fetch_argv(
 const REGISTERED_CAP_MICRO_USDC: u64 = 40;
 /// The presented capability B's cap: 5 USDC, far above the blob's cost.
 const PRESENTED_CAP_MICRO_USDC: u64 = 5_000_000;
+/// The fixture node's quoted rate, in micro-USDC per MiB.
+const NODE_RATE_PER_MB: u64 = 10;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn presented_capability_is_clamped_to_the_signers_registered_terms() -> anyhow::Result<()> {
@@ -824,6 +826,39 @@ async fn run_clamp() -> anyhow::Result<()> {
     anyhow::ensure!(
         after.cap == grant_a.spending_cap && after.expiry == grant_a.expiry,
         "the registered terms must stay capability A's"
+    );
+
+    // A fetch on the spent signer stops at once with the new-key remedy. A
+    // node that reads the signer as spent refuses it at admission as a plain
+    // `NotFound`; the client reads the registration from chain and stops,
+    // rather than retrying a cache miss until it gives up (#2338). A node whose
+    // projection has not folded the last redemption yet admits the stream and
+    // rejects its first voucher past the registered cap instead; that remedy
+    // names a new signer key too.
+    let headroom = after.cap.saturating_sub(after.spent);
+    anyhow::ensure!(
+        U256::from(headroom) < decdn_incentive::floor_micro(NODE_RATE_PER_MB),
+        "precondition: the signer must be spent below one chunk, but {headroom} µUSDC of its \
+         registered cap is left"
+    );
+    let started = tokio::time::Instant::now();
+    let drained = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::from(decdn_command(delegate_dir.path(), KEYSTORE_PASSWORD)?)
+            .arg("fetch")
+            .args(&fetch_args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("a fetch on the spent signer must stop, not retry until its timeout")?
+    .context("run the fetch on the spent signer")?;
+    let stderr = String::from_utf8_lossy(&drained.stderr);
+    anyhow::ensure!(
+        !drained.status.success() && stderr.contains("new signer key"),
+        "a fetch on a signer with {headroom} µUSDC of headroom must fail with the new-key \
+         remedy (took {:?}): {stderr}",
+        started.elapsed()
     );
 
     drop(node);
