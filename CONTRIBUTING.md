@@ -83,6 +83,24 @@ The `--all-features` run is the only one that reaches anything behind an off-by-
 the `anvil-e2e` targets (journeys and the two `decdn-node` anvil tests), `public-api-test`. Run it
 before pushing a change that touches gated code, or the first thing that tells you is a red CI.
 
+### Unit test placement
+
+Every unit-test module lives in its own file. Declare it in the source file and put the body in a
+child file — `foo/tests.rs` for `foo.rs`, or `tests.rs` beside a `lib.rs`, `main.rs` or `mod.rs`:
+
+```rust
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests;
+```
+
+The rule has no size threshold, and it covers every `#[cfg(test)]` or `#[cfg(all(test, …))]`
+module, whatever its name (`tests`, `prop_tests`, `test_support`, …). The tests stay child modules,
+so they keep access to private items. Do not move them to `crates/*/tests/`: an integration test
+reaches only `pub` items. `crates/e2e/tests/no_inline_test_modules.rs` parses every source file
+under `crates/` and fails on any test module with an inline body. It runs in the default
+`cargo nextest run`.
+
 ### Public API snapshot
 
 `decdn-protocol` and `decdn-client` each carry a [`public_api`](https://crates.io/crates/public_api) +
