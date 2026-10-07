@@ -90,6 +90,7 @@ where
 /// including a pending-transaction error, which a write path must judge on its
 /// own.
 #[must_use]
+#[doc(hidden)]
 pub fn is_permanent_contract_error(err: &alloy::contract::Error) -> bool {
     match err {
         alloy::contract::Error::TransportError(e) => is_permanent_rpc_error(e),
@@ -125,6 +126,7 @@ pub fn is_permanent_contract_error(err: &alloy::contract::Error) -> bool {
 /// only a few transport kinds, so it rejects an ordinary refused connection or
 /// reset.
 #[must_use]
+#[doc(hidden)]
 pub fn is_permanent_rpc_error(err: &alloy::transports::TransportError) -> bool {
     use alloy::transports::{RpcError, TransportErrorKind};
 

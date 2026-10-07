@@ -308,6 +308,7 @@ where
 ///
 /// Fails if `rpc_url` is not a valid URL (before any retry is attempted) or a
 /// `getRegisteredNodes` page call fails permanently or past its retries.
+#[doc(hidden)]
 pub async fn active_nodes(
     rpc_url: &str,
     capacity_bond_addr: Address,
@@ -425,6 +426,7 @@ fn resolve_bootstrap(
 /// old" — exactly what a user must not miss. Callers log [`Self::warning`] and
 /// then take [`Self::into_peers`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Bootstrap {
     /// Read live from the on-chain registry.
     Live {
@@ -554,6 +556,7 @@ pub async fn bootstrap_nodes(
 /// Candidates probed before ranking (decision 3): shuffle, order region-first,
 /// take K, then probe those K for liveness + blob-holding. At `PoC` scale a
 /// small K keeps the probe fan-out cheap while still giving the ranker a choice.
+#[doc(hidden)]
 pub const SELECT_K: usize = 5;
 
 /// Pick `candidates` for probing (decision 3): shuffle, then same-region
@@ -612,6 +615,7 @@ pub fn select_candidates(
 /// ranking key) — this only narrows which candidates are eligible to be
 /// probed/discovered at all, independent of the peer store.
 #[must_use]
+#[doc(hidden)]
 pub fn select_candidates_filtered(
     candidates: Vec<NodeCandidate>,
     client_region: Option<&str>,
@@ -710,6 +714,7 @@ pub struct Probed {
 /// warming request through (ADR 037 § Candidate pool). Distinct from
 /// [`Probed`], which is a confirmed blob-holder.
 #[derive(Debug, Clone)]
+#[doc(hidden)]
 pub struct WarmingCandidate {
     /// The candidate proxy's iroh id.
     pub node_id: PublicKey,
@@ -753,6 +758,7 @@ pub struct WarmingCandidate {
 /// on-chain deposit and resumes the partial it already has. Proxy warming is
 /// therefore default-on, and a declining proxy never regresses a fetch.
 #[must_use]
+#[doc(hidden)]
 pub fn proxy_warming_order(
     best_holder_rtt_ms: f64,
     rtt_threshold_ms: f64,

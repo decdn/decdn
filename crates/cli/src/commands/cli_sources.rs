@@ -399,14 +399,9 @@ where
                 ledger: Arc::clone(&lane.ledger),
                 ctx: Arc::clone(&lane.ctx),
             });
-        Ok(StreamCandidate {
-            source: lane.source,
-            ctx: lane.ctx,
-            ledger: lane.ledger,
-            coverage: holder.coverage.clone(),
-            lease: LaneLease::default(),
-            widen: None,
-        })
+        let mut candidate = StreamCandidate::new(lane.source, lane.ctx, lane.ledger);
+        candidate.coverage.clone_from(&holder.coverage);
+        Ok(candidate)
     }
 }
 

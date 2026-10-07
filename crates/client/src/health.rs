@@ -15,12 +15,13 @@ use tokio::time::{Duration, Instant};
 use crate::fault::Fault;
 
 /// The first cooldown after a delivery fault.
-pub const COOL_BASE: Duration = Duration::from_secs(2);
+pub(crate) const COOL_BASE: Duration = Duration::from_secs(2);
 /// The longest cooldown, reached after consecutive faults.
-pub const COOL_CAP: Duration = Duration::from_mins(1);
+pub(crate) const COOL_CAP: Duration = Duration::from_mins(1);
 
 /// One provider's health.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
 pub enum Health {
     /// Usable. `streak` counts delivery faults since its last verified byte.
     Healthy {
@@ -59,6 +60,7 @@ pub struct PeerHealth {
 impl PeerHealth {
     /// `provider`'s health. An unseen provider is healthy.
     #[must_use]
+    #[doc(hidden)]
     pub fn health(&self, provider: Address) -> Health {
         self.lock()
             .get(&provider)
@@ -68,6 +70,7 @@ impl PeerHealth {
 
     /// Whether `provider` may take work at `now` against `deposit`.
     #[must_use]
+    #[doc(hidden)]
     pub fn usable(&self, provider: Address, now: Instant, deposit: U256) -> bool {
         match self.health(provider) {
             Health::Healthy { .. } => true,
@@ -77,6 +80,7 @@ impl PeerHealth {
     }
 
     /// Record a fault `provider` raised at `now` while the deposit was `deposit`.
+    #[doc(hidden)]
     pub fn record(&self, provider: Address, fault: Fault, now: Instant, deposit: U256) {
         let mut map = self.lock();
         let current = map
@@ -100,12 +104,14 @@ impl PeerHealth {
     }
 
     /// Record a verified byte from `provider`: it is healthy with no streak.
+    #[doc(hidden)]
     pub fn record_progress(&self, provider: Address) {
         self.lock().insert(provider, Health::Healthy { streak: 0 });
     }
 
     /// When `provider` stops cooling, if it is cooling at `now`.
     #[must_use]
+    #[doc(hidden)]
     pub fn cooling_until(&self, provider: Address, now: Instant) -> Option<Instant> {
         match self.health(provider) {
             Health::Cooling { until, .. } if until > now => Some(until),

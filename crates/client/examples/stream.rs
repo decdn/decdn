@@ -15,8 +15,9 @@ use std::sync::Arc;
 
 use alloy::primitives::U256;
 use anyhow::{Context, Result};
-use decdn_client::driver::DriveConfig;
-use decdn_client::{NoCache, ProgressClock, PullConfig, StaticSources, StopPolicy, Streamer};
+use decdn_client::{
+    DriveConfig, NoCache, ProgressClock, PullConfig, StaticSources, StopPolicy, Streamer,
+};
 
 use common::{Buyer, Env, NoTopUp};
 

@@ -615,6 +615,7 @@ impl PoolLedger {
     /// `exchange` receives the next [`Cumulative`] (the values to sign and send);
     /// the caller owns signing + framing so this module stays free of EIP-712 /
     /// wire types.
+    #[doc(hidden)]
     pub async fn issue<F, Fut>(
         &self,
         delta_bytes: u64,
@@ -848,6 +849,7 @@ impl PoolLedger {
     /// The root of the live chain, or `None` on a lane metering nothing. A stream
     /// compares this against the chain it last anchored itself to.
     #[must_use]
+    #[doc(hidden)]
     pub fn chain_root(&self) -> Option<B256> {
         self.epoch().as_ref().map(ChainEpoch::root)
     }
@@ -885,6 +887,7 @@ impl PoolLedger {
     /// Propagates an `exchange` failure. The index is NOT consumed on a failed
     /// send: an unreleased preimage proves nothing, so re-releasing the same
     /// index later is both safe and correct.
+    #[doc(hidden)]
     pub async fn meter<F, Fut>(
         &self,
         anchored: Option<B256>,
@@ -966,6 +969,7 @@ impl PoolLedger {
     /// here rather than only at the call sites because monotonicity is the ledger's invariant to
     /// keep.
     #[must_use]
+    #[doc(hidden)]
     pub fn reseed(&self, cum: Cumulative) -> bool {
         {
             let mut pipeline = self.pipeline();
@@ -1012,6 +1016,7 @@ impl PoolLedger {
     /// is ahead of the committed watermark's `amount` (that is
     /// [`Self::reseed`]'s case) or equal to the committed watermark (an echo).
     /// A `cum` equal on `amount` but behind on `bytes` rebases.
+    #[doc(hidden)]
     pub async fn rebase(&self, cum: Cumulative, proof_generation: Option<u64>) -> Rebase {
         // A watermark ahead on `amount` is `reseed`'s case, and one equal to
         // ours is an echo that proves nothing. Anything else is the node's
@@ -1082,6 +1087,7 @@ impl PoolLedger {
     /// The generation vouchers are currently signed under: how many times
     /// a rebase has moved this ledger to a node's watermark.
     #[must_use]
+    #[doc(hidden)]
     pub fn generation(&self) -> u64 {
         self.pipeline().generation
     }

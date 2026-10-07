@@ -78,6 +78,7 @@ const APPROVE_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
 /// `store.record` fails names that tx for manual reconciliation — an error in the
 /// CLI, an `error!` in the daemon.
 #[derive(Debug)]
+#[non_exhaustive]
 #[must_use = "the open tx is the only handle to an escrowed-but-untracked deposit"]
 pub struct OpenedPool {
     /// Persist this via `BuyerPoolStore::record`.
@@ -101,6 +102,7 @@ pub struct OpenedPool {
 /// then fails has to name the transaction an operator reconciles against — see
 /// [`escrowed_but_untracked`].
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 #[must_use = "the top-up tx is the only handle to an escrowed-but-untracked deposit"]
 pub struct ToppedUpPool {
     /// The amount the contract credited, read back from the receipt.
@@ -208,6 +210,7 @@ pub fn grade_deposit_credit(
 /// # Errors
 ///
 /// Propagates a signing error from the owner signer.
+#[doc(hidden)]
 pub fn issue_self_capability(
     owner_signer: &PrivateKeySigner,
     pool_id: B256,
@@ -276,6 +279,7 @@ pub fn self_owned_lane_ctx(
 /// reuse or a restart resumes the lane at the right cumulative `bytes` /
 /// `amount`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProgressWrite {
     /// The lane's ledger rebased to the upstream's authenticated watermark
     /// `anchor`, behind the record on `amount` (`PoolLedger::rebase`), and no write has recorded it yet. The
@@ -578,6 +582,7 @@ const SELF_CAPABILITY_EXPIRY: u64 = u64::MAX;
 /// bound is the deposit: redemption pays `min(desired, cap - spent, remaining)`.
 /// A `u64` by type, matching the contract field exactly, so it can never sign a
 /// cap the narrower on-chain field cannot reconstruct.
+#[doc(hidden)]
 pub const SELF_CAPABILITY_CAP: u64 = u64::MAX;
 
 /// Typed marker attached to a `top_up` submit error whose revert is an
@@ -798,6 +803,7 @@ pub async fn top_up<P: Provider + Clone>(
 ///
 /// Shared by the CLI fetch auto-refill (#1103) and the node's node-to-node reuse
 /// path (#1146), so the refill policy has a single source of truth.
+#[doc(hidden)]
 pub const LOW_WATER_DIVISOR: u64 = 5;
 
 /// Decide how much USDC to add to a reused pool so a sustained series of fetches
@@ -817,6 +823,7 @@ pub const LOW_WATER_DIVISOR: u64 = 5;
 /// uses a rate-independent low-water refill: keep at least `low_water` of headroom,
 /// and refill to a full `target_deposit` when it runs low.
 #[must_use]
+#[doc(hidden)]
 pub fn refill_amount(
     deposit: U256,
     prior_amount: U256,

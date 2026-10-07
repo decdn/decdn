@@ -52,6 +52,7 @@ pub type SourceFuture<'a, T> =
 
 /// A boxed, `Send` stream returned by the streaming methods in this module,
 /// the stream sibling of [`SourceFuture`].
+#[doc(hidden)]
 pub type SourceStream<'a, T> = core::pin::Pin<Box<dyn futures_util::Stream<Item = T> + Send + 'a>>;
 
 /// A reader over the raw interleaved bao encoding of one range.
@@ -61,6 +62,7 @@ pub type SourceStream<'a, T> = core::pin::Pin<Box<dyn futures_util::Stream<Item 
 /// rejection) is preserved through [`StashedFault`] so it beats the decoder's
 /// generic "bytes stopped arriving". Blanket-implemented, so any reader that is
 /// both is a `BaoRangeReader` with no extra code.
+#[doc(hidden)]
 pub trait BaoRangeReader: iroh_io::AsyncStreamReader + StashedFault + Send {}
 
 impl<T> BaoRangeReader for T where T: iroh_io::AsyncStreamReader + StashedFault + Send {}
@@ -77,6 +79,7 @@ impl<T> BaoRangeReader for T where T: iroh_io::AsyncStreamReader + StashedFault 
 ///
 /// [`open`]: BlobSource::open
 /// [`finish`]: BlobSource::finish
+#[doc(hidden)]
 pub trait BlobSource: Send + Sync {
     /// The reader this source yields — raw bao bytes plus preserved typed faults.
     type Reader: BaoRangeReader;
@@ -138,11 +141,13 @@ pub trait BlobSource: Send + Sync {
 
 /// The future [`IngestStore::ingest_stream`] returns: the reader back, and how
 /// the ingest ended.
+#[doc(hidden)]
 pub type IngestFuture<'a, R> =
     core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<(R, IngestEnd)>> + 'a>>;
 
 /// How an [`IngestStore::ingest_stream`] ended without a fault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
 pub enum IngestEnd {
     /// The decoder reached the end of the range: the source
     /// [`finish`](BlobSource::finish)es the pull.
@@ -168,6 +173,7 @@ pub enum IngestEnd {
 /// non-generic instantiation could. `drive`/`fill_gap` only ever `.await` this
 /// future in place (never spawn it across a task boundary), so dropping `Send`
 /// here is behavior-preserving.
+#[doc(hidden)]
 pub trait IngestStore: decdn_bao_range::RangedStore {
     /// Decode-and-admit the raw bao bytes in `reader` as `range`'s content,
     /// verifying against the store's rooted hash as it streams. Returns the
@@ -334,6 +340,7 @@ where
 /// signer with more headroom than this. The lane then keeps that refusal as a
 /// plain `NotFound`. `expired` is judged on the client's clock, not chain time.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct SignerCapDrained {
     /// The pool the lane pays from.
     pub pool_id: B256,
@@ -621,6 +628,7 @@ impl<'a> PeerSource<'a> {
     /// [`Connections`] map dials through the map instead, on the caller's
     /// runtime.
     #[must_use]
+    #[doc(hidden)]
     pub fn with_dial_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {
         self.dial_runtime = Some(runtime);
         self
@@ -651,6 +659,7 @@ impl<'a> PeerSource<'a> {
     /// # Errors
     ///
     /// The same faults as [`BlobSource::open`].
+    #[doc(hidden)]
     pub fn open_whole(&self, hash: [u8; 32]) -> SourceFuture<'_, (UpstreamPullHeader, PullReader)> {
         Box::pin(async move {
             let pull = self.open_pull(hash, 0, 0).await?;
@@ -802,7 +811,7 @@ impl BlobSource for PeerSource<'_> {
 /// drops it. A primed pull older than this is dropped and the open goes to the
 /// wrapped source. The age runs from when the pull opened, which the caller
 /// passes to [`PrimedSource::prime`].
-pub const PRIMED_MAX_IDLE: Duration = Duration::from_secs(2);
+pub(crate) const PRIMED_MAX_IDLE: Duration = Duration::from_secs(2);
 
 /// A pull opened ahead of the drive, waiting for the open it answers.
 struct Primed<R> {
@@ -830,6 +839,7 @@ struct Primed<R> {
 /// longer pull in place of a shorter leg would pay for bytes the leg never asked
 /// for. Call [`clear`](Self::clear) once the drive returns, so a pull no open
 /// took is closed at once rather than left idle.
+#[doc(hidden)]
 pub struct PrimedSource<S: BlobSource> {
     inner: S,
     primed: Mutex<Option<Primed<S::Reader>>>,
