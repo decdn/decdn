@@ -114,9 +114,9 @@ impl ClientHandler {
     ///
     /// The channel-class refusals (`UnknownChannel`, `InsufficientDeposit`) keep
     /// their own reasons: they are client-attributable and would have refused
-    /// regardless of origin health, and they collapse to `NotFound` deliberately so
-    /// a prober cannot map out other clients' channel balances
-    /// ([`ServeRejectReason::wire_error`]).
+    /// regardless of origin health. `UnknownChannel` collapses to `NotFound` so a
+    /// prober cannot map out lanes, and `InsufficientDeposit` reaches only a
+    /// proven requester as `Unfunded` ([`ServeRejectReason::wire_error`]).
     // The numbered steps (1)–(7) are one ordered sequence whose refusals must all
     // land before the signed `ok: true`; splitting a step out would hide that order.
     #[allow(

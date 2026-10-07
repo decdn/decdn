@@ -65,11 +65,10 @@
 //! hashes, so a hash blacklisted while the node was offline (and not yet held) is
 //! still pre-blocked.
 //!
-//! The deny is what `evicted.log` cannot express: *why*. Without it the client
-//! handler answers a governance takedown with `EvictedSinceProbe` while a local
-//! `[content] denied_hashes` entry answers `HashBlacklisted`, so one request tells
-//! a client which list a hash is on — the fingerprint ADR 011 §`StreamRequest`
-//! Response forecloses. The governance deny-set the delivery path reads
+//! The deny is what `evicted.log` cannot express: *why*. Every one of these
+//! refusals signs the one class `Declined`, so no client learns which list a
+//! hash is on (ADR 011 §`StreamRequest` Response); the deny keeps the cause on
+//! the operator's per-reason metric. The governance deny-set the delivery path reads
 //! (`CacheEngine::set_chain_denied_one`) is rebuilt each boot by re-checking every
 //! enumerated hash through the same `isHashBlacklistedForOperator` liveness the
 //! tail uses, so a lapsed entry is not enforced.
@@ -1012,15 +1011,16 @@ enum RecheckFailure {
 
 /// Record that `hash` is refused because *governance* blacklisted it, and publish
 /// that to the live deny-set the delivery path reads. This is what selects the
-/// `HashBlacklisted` wire refusal code over the local-eviction `EvictedSinceProbe`.
+/// `chain_hash_denied` refusal reason over the local-eviction one; both sign
+/// `Declined`.
 fn deny_hash(cache: &CacheEngine, hash: Hash) {
     cache.set_chain_denied_one(hash, true);
 }
 
 /// Stop treating `hash` as governance-denied. The hash stays *refused* — eviction
-/// is sticky and one-way — so this only moves its wire code from `HashBlacklisted`
-/// back to `EvictedSinceProbe`, which is what any other evicted hash answers,
-/// leaking nothing.
+/// is sticky and one-way — so this only moves its refusal reason from
+/// `chain_hash_denied` back to the eviction, which is what any other evicted hash
+/// answers. The wire class stays `Declined`.
 fn undeny_hash(cache: &CacheEngine, hash: Hash) {
     cache.set_chain_denied_one(hash, false);
 }

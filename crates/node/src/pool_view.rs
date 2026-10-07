@@ -5,8 +5,8 @@
 //!
 //! - **Floor-`M` solvency** — the pool's **remaining** balance
 //!   (`getPool.deposit − getPool.totalRedeemed`) minus the refundable floor `M`
-//!   must still cover the credit window, or the node refuses `InsufficientDeposit`
-//!   before signing `ok: true`.
+//!   must still cover the credit window, or the node refuses `Unfunded` before
+//!   signing `ok: true`.
 //! - **ADR 011 funder gate** — the pool **owner** (`getPool.owner`) is the funding
 //!   address the origin-blacklist gate evaluates, at open time and mid-stream.
 //!

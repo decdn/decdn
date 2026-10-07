@@ -1396,9 +1396,11 @@ impl PeerRunSink<'_> {
             // is per-provider (a revert, an RPC blip): drop this source and re-plan.
             Err(err) => {
                 return match record_pool_open_failure(self.deps, provider_addr, &err) {
-                    PullMiss::LocalFault => RunOutcome::Terminal(FillError::new(format!(
-                        "node-origin ranged pull: local buyer fault opening a lane: {err:#}"
-                    ))),
+                    PullMiss::LocalFault | PullMiss::FundingNeeded => {
+                        RunOutcome::Terminal(FillError::new(format!(
+                            "node-origin ranged pull: local buyer fault opening a lane: {err:#}"
+                        )))
+                    }
                     _ => RunOutcome::Reassign,
                 };
             }
@@ -1624,7 +1626,7 @@ impl PeerRunSink<'_> {
 /// another lane, and neither can a fault of this node's own store
 /// ([`super::is_local_store_fault`]): every holder's bytes land in it. Nor can the
 /// pacer's [`PoolExhausted`]: the node's one shared pool funds every holder, so
-/// once it is dry no holder can be paid. An open-time `InsufficientDeposit` is
+/// once it is dry no holder can be paid. An open-time `Unfunded` is
 /// this holder's reservation floor outrunning the pool, and a different holder
 /// may reserve a smaller one, so it moves on. So does a rejection that healed
 /// the lane ledger after the lane spent its resume budget

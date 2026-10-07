@@ -89,9 +89,8 @@ impl ClientHandler {
     /// Send a signed `StreamResponse { ok: false, error }` (delivery-side
     /// failure), then finish the stream. `reason` is the single source of truth:
     /// the returned `Refused(reason)` selects the per-reason metric in the
-    /// dispatch sink (finer-grained than the wire for the reasons that collapse to
-    /// `NotFound`, which share one code to avoid leaking channel existence), and
-    /// `wire_error()` derives the wire `StreamError` (#876).
+    /// dispatch sink (finer-grained than the wire, which carries only the three
+    /// refusal classes), and `wire_error()` derives the wire `StreamError` (#876).
     ///
     /// A signing or encoding fault is this node's own: it returns the error, and
     /// the dispatch sink counts it as a node fault. A write that fails because the
@@ -134,7 +133,7 @@ impl ClientHandler {
     /// log it once at info. The log line names the exit that refused (`path`),
     /// which the wire answer and the per-reason metric do not carry, so an
     /// operator can see why this node answered a request `NotFound` or
-    /// `InternalError`. A [`MissPath::NoLane`] line passes the
+    /// `Declined`. A [`MissPath::NoLane`] line passes the
     /// `no_lane_miss_log` throttle first, because a remote peer reaches that
     /// path at will.
     ///

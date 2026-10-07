@@ -76,6 +76,7 @@ pub(super) const fn refusal_reason(reason: ServeRejectReason) -> &'static str {
         ServeRejectReason::OwnerMismatch => "owner_mismatch",
         ServeRejectReason::InsufficientDeposit => "insufficient_deposit",
         ServeRejectReason::PoolUnconfirmed => "pool_unconfirmed",
+        ServeRejectReason::PoolClosing { .. } => "pool_closing",
         ServeRejectReason::SignerCapExhausted => "signer_cap_exhausted",
         ServeRejectReason::SignerFloorAtCap => "signer_floor_at_cap",
         ServeRejectReason::PullLoopGuard => "pull_loop_guard",
@@ -195,6 +196,7 @@ fn meter_refusal(metrics: &Metrics, reason: ServeRejectReason) {
         ServeRejectReason::PoolUnconfirmed => {
             metrics.serve_stream_rejected_pool_unconfirmed();
         }
+        ServeRejectReason::PoolClosing { .. } => metrics.serve_stream_rejected_pool_closing(),
         ServeRejectReason::SignerCapExhausted => {
             metrics.serve_stream_rejected_signer_cap_exhausted();
         }
@@ -434,7 +436,8 @@ mod tests {
             | ServeRejectReason::ChainHashDenied
             | ServeRejectReason::OriginDenied
             | ServeRejectReason::ForeignNamespaceDeclined
-            | ServeRejectReason::ChainStale => {}
+            | ServeRejectReason::ChainStale
+            | ServeRejectReason::PoolClosing { .. } => {}
         }
     }
 
@@ -464,6 +467,7 @@ mod tests {
             ServeRejectReason::OriginDenied,
             ServeRejectReason::ForeignNamespaceDeclined,
             ServeRejectReason::ChainStale,
+            ServeRejectReason::PoolClosing { proven: true },
         ];
         let stops = [
             ServeStop::VoucherRejected,

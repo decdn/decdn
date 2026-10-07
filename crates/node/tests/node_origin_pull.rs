@@ -5243,7 +5243,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
     let a_eth = Arc::new(PrivateKeySigner::random());
     let (ep_a, addr_a) =
         local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    // `InsufficientDeposit` OUTSIDE a voucher round trip: the same code the drained-channel
+    // `Unfunded` OUTSIDE a voucher round trip: the same code the drained-channel
     // test drives through the ack wait, arriving on the other road.
     let task_a = spawn_a_mid_stream_error_server(
         ep_a.clone(),
@@ -5325,7 +5325,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
             .lock()
             .map_err(|_| anyhow::anyhow!("retired lock poisoned"))?
             .is_empty(),
-        "an `InsufficientDeposit` channel must keep its row so the deposit can be reclaimed"
+        "an `Unfunded` channel must keep its row so the deposit can be reclaimed"
     );
 
     // Our payment fault, not the peer's: it is not scored.
@@ -8424,8 +8424,8 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
 
 /// The per-pool floor ceiling covers the window pull-through MISS path, not only
 /// the cache-hit path: a same-lane stream already in flight makes a concurrent
-/// same-lane MISS refuse — with the owner-facing `InsufficientDeposit` wire code
-/// (option 2 / #2013), since the bound leaf is a proven lane owner — before it
+/// same-lane MISS refuse — with the `Unfunded` wire code, since the bound leaf
+/// is a proven lane owner — before it
 /// ever opens a second upstream pull.
 ///
 /// Both leaves share ONE lane — same `pool_id` (the gated upstream's channel id
@@ -8524,8 +8524,8 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
 
     // Leaf 2: same lane, concurrent with leaf 1 still in flight. Drive the
     // request by hand (rather than `leaf_paced_pull`, which bails on a refusal)
-    // so the refusal itself — the owner-facing `InsufficientDeposit` wire code
-    // (option 2 / #2013), spoken because this bound leaf is a proven lane owner —
+    // so the refusal itself — the `Unfunded` wire code, spoken because this
+    // bound leaf is a proven lane owner —
     // is asserted.
     let leaf2_sk = fresh_key();
     let leaf2_node_id = B256::from(*leaf2_sk.public().as_bytes());
@@ -13078,7 +13078,7 @@ impl PoolOpener for FundingOpener {
 /// `byte_offset`, and REFUSE any voucher the shared deposit cannot cover.
 ///
 /// The upstream half of the reactive-top-up round trip, and the only fixture in this
-/// file that can produce a mid-blob `InsufficientDeposit`: `serve_then_reject_voucher`
+/// file that can produce a mid-blob `Unfunded`: `serve_then_reject_voucher`
 /// refuses the CLOSING voucher over a raw payload, so nothing is ever delivered and
 /// resumed. Here the buyer is paid for what it received, told it cannot afford the
 /// next interval, and — once the deposit rises — served the remainder from wherever
@@ -13802,7 +13802,7 @@ async fn the_resumed_leg_does_not_re_pay_for_delivered_bytes() -> Result<()> {
     Ok(())
 }
 
-/// An upstream claiming `InsufficientDeposit` while OUR ledger still covers the next
+/// An upstream claiming `Unfunded` while OUR ledger still covers the next
 /// voucher is lying or broken, and must not be funded.
 ///
 /// This is the whole reason `genuine_exhaustion` validates the claim against the

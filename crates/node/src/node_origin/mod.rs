@@ -185,6 +185,10 @@ enum PoolOpenArm {
     /// [`PoolOpenPending`]: the open outlived the caller's budget and continues
     /// in the background. Not a failure.
     Pending,
+    /// `PoolOpenFailureReason::InsufficientDeposit`: this node's wallet cannot
+    /// fund a deposit, so it can pay no provider and the fill ends "funding
+    /// needed".
+    FundingNeeded,
     /// [`LocalPullFault`]: node-wide — this node can pay no provider.
     LocalFault,
     /// [`OpenReported`] without [`LocalPullFault`]: the open task already logged
@@ -198,10 +202,17 @@ enum PoolOpenArm {
 ///
 /// Order is load-bearing: [`LocalPullFault`] is checked before [`OpenReported`]
 /// because the node-wide faults carry both, and letting `OpenReported` win would
-/// answer a client `NotFound` from a node that cannot pay anyone (#1560).
+/// answer a client `NotFound` from a node that cannot pay anyone (#1560). An
+/// unfundable wallet carries [`LocalPullFault`] too, and is checked first: its
+/// fill ends "funding needed", which the client hears as `NotFound` (ADR 005
+/// §Open-time refusal classes).
 fn classify_pool_open_arm(err: &anyhow::Error) -> PoolOpenArm {
     if err.downcast_ref::<PoolOpenPending>().is_some() {
         PoolOpenArm::Pending
+    } else if err.downcast_ref::<PoolOpenFailureReason>()
+        == Some(&PoolOpenFailureReason::InsufficientDeposit)
+    {
+        PoolOpenArm::FundingNeeded
     } else if err.downcast_ref::<LocalPullFault>().is_some() {
         PoolOpenArm::LocalFault
     } else if err.downcast_ref::<OpenReported>().is_some() {
@@ -255,9 +266,10 @@ fn classify_pool_open_arm(err: &anyhow::Error) -> PoolOpenArm {
 /// which is also where the full error chain is still intact to log.
 ///
 /// Consequently the `LocalPullFault`-marked legs are the node-wide ones: the store and
-/// lock faults, and an `InsufficientDeposit` — a wallet that cannot fund a deposit
-/// cannot pay any provider, so walking to the next candidate is futile and a `NotFound`
-/// would misdescribe this node. The unmarked legs are the deliberate `Clean` ones: a
+/// lock faults, and an `InsufficientDeposit`. The store and lock faults answer the
+/// client `Declined`. A wallet that cannot fund a deposit cannot pay any provider
+/// either, but its fill ends "funding needed", a funding problem of this node and
+/// not of the requester, so it answers `NotFound`. The unmarked legs are the deliberate `Clean` ones: a
 /// pending open and a `ContractRevert` — deterministic on-chain state that says
 /// nothing about this node's ability to pay, so another candidate may still deliver.
 /// Refusing `Declined` for that would steer clients off a node that is fine.
@@ -300,6 +312,15 @@ fn record_pool_open_failure(
     // It also logs despite `OpenReported`, which normally means "already reported, stay
     // quiet". Deliberate: the raising site's line says what broke, and this one says what it
     // COST — that a client was refused rather than told the blob is missing.
+    if arm == PoolOpenArm::FundingNeeded {
+        deps.metrics.node_pull_local_fault();
+        warn!(
+            %provider_addr, error = %sanitize_err_chain(err),
+            "node-origin: this node's wallet cannot fund a buyer pool — it cannot pay \
+             any provider; exonerating the upstream and answering a miss"
+        );
+        return PullMiss::FundingNeeded;
+    }
     if arm == PoolOpenArm::LocalFault {
         deps.metrics.node_pull_local_fault();
         warn!(
@@ -987,10 +1008,14 @@ impl Origin for NodeOrigin {
 /// A [`PullMiss::BelowMargin`] answers the same `NotFound` as [`PullMiss::Clean`]:
 /// this node's serve-economics buy ceiling is a local policy decision, not a fact
 /// about the content, and it must never reach the wire as a distinct code — that
-/// would let a client fingerprint this node's pricing floor by probing for it.
+/// would let a client fingerprint this node's pricing floor by probing for it. A
+/// [`PullMiss::FundingNeeded`] answers it too: this node's own funding gap is not
+/// the requester's to recover.
 fn miss_answer(miss: PullMiss) -> Result<OriginFetch, OriginPullError> {
     match miss {
-        PullMiss::Clean | PullMiss::BelowMargin => Ok(OriginFetch::NotFound),
+        PullMiss::Clean | PullMiss::BelowMargin | PullMiss::FundingNeeded => {
+            Ok(OriginFetch::NotFound)
+        }
         PullMiss::LocalFault => Err(OriginPullError::Permanent(anyhow::anyhow!(
             "node-origin: a LOCAL fault hit at least one attempted candidate and none \
              delivered; this node cannot complete the pull, so it refuses rather than \
@@ -1587,6 +1612,11 @@ pub enum PullMiss {
     /// ceiling; the node declined an unprofitable relay. Wire-identical to
     /// [`Self::Clean`].
     BelowMargin,
+    /// This node's own wallet cannot fund a buyer pool, so it can pay no
+    /// provider and the fill ends "funding needed". The funding problem is this
+    /// node's, not the requester's, so it is wire-identical to [`Self::Clean`]
+    /// (ADR 005 §Open-time refusal classes).
+    FundingNeeded,
 }
 
 impl PullMiss {
@@ -1597,6 +1627,7 @@ impl PullMiss {
             Self::Clean => "clean_miss",
             Self::LocalFault => "local_fault",
             Self::BelowMargin => "below_margin",
+            Self::FundingNeeded => "funding_needed",
         }
     }
 
@@ -1655,10 +1686,13 @@ impl PullMiss {
     /// economics refusal happened somewhere in this walk" signal so the buy loop
     /// can tell a below-margin miss apart from a genuinely empty one, rather than
     /// letting a later candidate's honest miss erase the fact that an earlier one
-    /// quoted above this node's buy ceiling.
+    /// quoted above this node's buy ceiling. A [`Self::FundingNeeded`] sits
+    /// between the two: every attempt hits the same wallet, so it names the walk
+    /// whatever an attempt's quote was.
     const fn or(self, other: Self) -> Self {
         match (self, other) {
             (Self::LocalFault, _) | (_, Self::LocalFault) => Self::LocalFault,
+            (Self::FundingNeeded, _) | (_, Self::FundingNeeded) => Self::FundingNeeded,
             (Self::BelowMargin, _) | (_, Self::BelowMargin) => Self::BelowMargin,
             (Self::Clean, Self::Clean) => Self::Clean,
         }
@@ -3419,20 +3453,6 @@ mod tests {
         }
     }
 
-    /// A wallet that cannot fund the deposit is node-wide: it can pay no provider,
-    /// so the open task marks it [`LocalPullFault`] as well and the classifier
-    /// refuses rather than signing the client a clean `NotFound`. An unmarked leg
-    /// would fall to the residual arm instead, which both double-counts it and
-    /// blames the local store for a chain fault (#2072).
-    #[test]
-    fn an_insufficient_deposit_is_a_local_fault() {
-        let err = anyhow::anyhow!("submit openPool: ERC20: transfer amount exceeds balance")
-            .context(PoolOpenFailureReason::InsufficientDeposit)
-            .context(OpenReported)
-            .context(LocalPullFault);
-        assert_eq!(classify_pool_open_arm(&err), PoolOpenArm::LocalFault);
-    }
-
     /// The node-wide faults carry both markers, and `LocalPullFault` must win: an
     /// `OpenReported` verdict here would answer `NotFound` from a node that cannot
     /// pay anyone (#1560).
@@ -3449,6 +3469,31 @@ mod tests {
             .context(LocalPullFault)
             .context(OpenReported);
         assert_eq!(classify_pool_open_arm(&err), PoolOpenArm::LocalFault);
+    }
+
+    /// An unfundable wallet carries `LocalPullFault` and `OpenReported` like the
+    /// other node-wide faults, but its fill ends "funding needed": the arm is its
+    /// own, and its miss answers the client `NotFound`, not `Declined`.
+    #[test]
+    fn an_unfundable_wallet_is_funding_needed_and_answers_not_found() {
+        let err = anyhow::anyhow!("openPool would revert: balance too low")
+            .context(PoolOpenFailureReason::InsufficientDeposit)
+            .context(OpenReported)
+            .context(LocalPullFault);
+        assert_eq!(classify_pool_open_arm(&err), PoolOpenArm::FundingNeeded);
+        assert!(matches!(
+            miss_answer(PullMiss::FundingNeeded),
+            Ok(OriginFetch::NotFound)
+        ));
+        assert_eq!(
+            PullMiss::Clean.or(PullMiss::FundingNeeded),
+            PullMiss::FundingNeeded
+        );
+        assert_eq!(
+            PullMiss::FundingNeeded.or(PullMiss::LocalFault),
+            PullMiss::LocalFault
+        );
+        assert!(!PullMiss::FundingNeeded.is_local_fault());
     }
 
     /// A pending open outranks everything: it is not a failure at all, so it must

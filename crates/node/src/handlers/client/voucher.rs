@@ -597,8 +597,9 @@ impl ClientHandler {
 
     /// Whether a capability that expires at `expiry` is inside this node's
     /// expiry margin now, read off the coarse clock. Both proof paths refuse a
-    /// proof inside the margin with `CapabilityExpired`.
-    fn inside_expiry_margin(&self, expiry: u64) -> bool {
+    /// proof inside the margin with `CapabilityExpired`, and admission refuses
+    /// a lane inside it.
+    pub(super) fn inside_expiry_margin(&self, expiry: u64) -> bool {
         decdn_common::config::inside_capability_expiry_margin(
             expiry,
             self.capability_expiry_margin_secs,

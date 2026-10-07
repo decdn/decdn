@@ -281,10 +281,33 @@ where
             return Ok(Ok(msg));
         }
         if tokio::time::Instant::now() >= deadline {
-            return Ok(Err(msg));
+            return Ok(Err(format!(
+                "{msg}; refusal counters: {}",
+                declined_counters(node).await?
+            )));
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// The node's per-reason counters behind a `Declined` refusal, for a failure
+/// message that names the reason the node actually refused for.
+async fn declined_counters(node: &NodeFixture) -> anyhow::Result<String> {
+    let mut out = Vec::new();
+    for reason in [
+        "chain_hash_denied",
+        "hash_denied",
+        "evicted_since_probe",
+        "foreign_declined",
+        "internal_error",
+        "range_not_satisfiable",
+        "blob_too_large",
+        "origin_denied",
+    ] {
+        let name = format!("decdn_serve_stream_rejected_{reason}_total");
+        out.push(format!("{reason}={}", node.scrape_metric(&name).await?));
+    }
+    Ok(out.join(" "))
 }
 
 /// The `removeHashGlobal` reversal (an appeal / wrongful-entry override) lifts the

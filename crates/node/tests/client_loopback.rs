@@ -3220,8 +3220,8 @@ async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Res
         stall_delivery_at_closing_voucher(&conn, *hash_a.as_bytes(), wire_a, Some(&ext)).await?;
 
     // Second concurrent same-lane stream: refused by the pool ceiling. This lane
-    // is a proven owner, so the refusal speaks the owner-facing
-    // `InsufficientDeposit` (option 2 / #2013), not the prober-facing `NotFound`.
+    // is a proven requester, so the refusal is `Unfunded`, not the prober-facing
+    // `NotFound`.
     let (refusal, refusal_ext) =
         open_expecting_refusal(&conn, *hash_b.as_bytes(), Some(&ext)).await?;
     anyhow::ensure!(
@@ -3233,7 +3233,7 @@ async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Res
             refusal_ext.error,
             Some(decdn_protocol::client::StreamError::Unfunded)
         ),
-        "expected the owner-facing InsufficientDeposit wire code, got {:?}",
+        "expected the Unfunded wire code, got {:?}",
         refusal_ext.error
     );
 
@@ -5468,16 +5468,16 @@ async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()>
                 !resp.body.ok,
                 "an underfunded channel must be refused pre-serve, not served"
             );
-            // Option 2 / #2013: this requester seeded a KNOWN, OWNED lane and proved
-            // it with a client binding, so it reaches the floor gate as a proven pool
-            // owner — and the node speaks the true `InsufficientDeposit` (not the
-            // prober-facing `NotFound`) so the owner's reactive top-up loop can recover.
+            // This requester seeded a KNOWN, OWNED lane and proved it with a client
+            // binding, so it reaches the floor gate as a proven requester — and the
+            // node speaks `Unfunded` (not the prober-facing `NotFound`) so its
+            // funding recovery can run.
             anyhow::ensure!(
                 matches!(
                     resp_ext.error,
                     Some(decdn_protocol::client::StreamError::Unfunded)
                 ),
-                "expected the owner-facing InsufficientDeposit wire code, got {:?}",
+                "expected the Unfunded wire code, got {:?}",
                 resp_ext.error
             );
         }
@@ -6073,40 +6073,38 @@ fn unix_now() -> anyhow::Result<u64> {
         .as_secs())
 }
 
-/// A lane whose capability `expiry` is already in the past is refused in-band and
-/// the stream finishes cleanly (no QUIC reset) — the client reads an actionable
-/// reason instead of an opaque drop (#751). An expired grant surfaces as
-/// `VoucherRejected { CapabilityExpired }`, distinct from a cap-exhausted
-/// `SpendingCapExhausted` — the fix is a fresh capability, not a cap raise.
+/// A lane whose capability `expiry` is already in the past is refused at
+/// admission with a signed `Unfunded` (#751): the requester holds the lane, so
+/// it is proven, and the fix is a fresh capability (ADR 005 §Open-time refusal
+/// classes).
 #[tokio::test(flavor = "multi_thread")]
-async fn client_expired_channel_is_rejected_with_expired() -> anyhow::Result<()> {
-    // Unix second `1`: long past, so the serve gate refuses the first voucher.
+async fn client_expired_channel_is_refused_unfunded() -> anyhow::Result<()> {
+    // Unix second `1`: long past, so admission refuses the lane.
     let err = fetch_on_a_lane_expiring_at(1)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("expired channel must reject the voucher"))?;
+        .ok_or_else(|| anyhow::anyhow!("an expired lane must be refused"))?;
     anyhow::ensure!(
-        err.contains("CapabilityExpired"),
-        "error should surface the expired grant as CapabilityExpired: {err}"
+        err.contains("Unfunded"),
+        "an expired grant should be refused Unfunded: {err}"
     );
     Ok(())
 }
 
 /// A capability that has not yet expired, but expires within the node's margin
-/// (one redeem interval plus the redeemer's landing slack), is refused with
-/// `CapabilityExpired` (#2242). A voucher accepted that close to expiry could miss
-/// the next sweep and redeem for 0.
+/// (one redeem interval plus the redeemer's landing slack), is refused at
+/// admission with `Unfunded` (#2242). A voucher accepted that close to expiry
+/// could miss the next sweep and redeem for 0.
 #[tokio::test(flavor = "multi_thread")]
-async fn client_capability_inside_the_expiry_margin_is_rejected_with_expired() -> anyhow::Result<()>
-{
+async fn client_capability_inside_the_expiry_margin_is_refused_unfunded() -> anyhow::Result<()> {
     let expiry = unix_now()?
         .saturating_add(DEFAULT_EXPIRY_MARGIN)
         .saturating_sub(1);
     let err = fetch_on_a_lane_expiring_at(expiry)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("a capability inside the margin must be rejected"))?;
+        .ok_or_else(|| anyhow::anyhow!("a capability inside the margin must be refused"))?;
     anyhow::ensure!(
-        err.contains("CapabilityExpired"),
-        "a capability inside the margin should surface as CapabilityExpired: {err}"
+        err.contains("Unfunded"),
+        "a capability inside the margin should be refused Unfunded: {err}"
     );
     Ok(())
 }
@@ -6226,7 +6224,7 @@ impl decdn_node::pool_view::PoolView for FixedRemainingPoolView {
 /// A [`PoolView`](decdn_node::pool_view::PoolView) for an open, well-funded
 /// pool whose every signer reads as registered with `spent == cap`: the node
 /// refuses the signer at admission (`SignerCapExhausted`), which reaches the
-/// wire as `NotFound`.
+/// wire as `Unfunded`.
 #[derive(Debug)]
 struct DrainedSignerPoolView {
     owner: Address,
@@ -6274,14 +6272,12 @@ impl decdn_client::SignerRegistry for DrainedSignerPoolView {
     }
 }
 
-/// A node that refuses a drained capability signer at admission answers with
-/// a `NotFound` whose signed body carries its rate. A lane with a signer check
-/// reads the registration and fails the open with `SignerCapDrained`, naming
-/// the node and its rate; a lane without one keeps the plain `NotFound`
-/// (#2338).
+/// A node that refuses a drained capability signer at admission answers
+/// `Unfunded`: the requester holds a verified binding for a registered signer,
+/// so it is proven, and the class alone tells it to recover its funding (ADR 005
+/// §Open-time refusal classes, #2338).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_drained_signer_refused_at_admission_is_named_by_the_signer_check() -> anyhow::Result<()>
-{
+async fn a_drained_signer_refused_at_admission_is_unfunded() -> anyhow::Result<()> {
     use decdn_client::PeerSource;
     use decdn_client::source::BlobSource as _;
 
@@ -6337,35 +6333,130 @@ async fn a_drained_signer_refused_at_admission_is_named_by_the_signer_check() ->
     };
     let range = decdn_bao_range::align_range(0, 0, u64::try_from(payload.len())?)?;
 
-    let unchecked = source()
-        .open(*hash.as_bytes(), range.clone())
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("the node must refuse the drained signer"))?;
-    anyhow::ensure!(
-        unchecked
-            .downcast_ref::<decdn_client::UpstreamRefused>()
-            .is_some_and(|r| *r.error() == StreamError::NotFound),
-        "without a check the refusal is a plain NotFound, got: {unchecked:#}"
-    );
-
-    let checked = source()
-        .with_signer_check(view.as_ref())
+    let refused = source()
         .open(*hash.as_bytes(), range)
         .await
         .err()
         .ok_or_else(|| anyhow::anyhow!("the node must refuse the drained signer"))?;
-    let drained = checked
-        .downcast_ref::<decdn_client::SignerCapDrained>()
-        .ok_or_else(|| anyhow::anyhow!("expected SignerCapDrained, got: {checked:#}"))?;
-    anyhow::ensure!(drained.provider == operator_addr(), "{drained:?}");
-    anyhow::ensure!(drained.rate_per_mb == RATE_PER_MB, "{drained:?}");
     anyhow::ensure!(
-        drained.remaining == 0 && drained.at_every_rate(),
-        "{drained:?}"
+        refused
+            .downcast_ref::<decdn_client::UpstreamRefused>()
+            .is_some_and(|r| *r.error() == StreamError::Unfunded),
+        "a drained signer's admission refusal is Unfunded, got: {refused:#}"
+    );
+    let encoded = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(
+            &encoded,
+            "decdn_serve_stream_rejected_signer_cap_exhausted_total 1"
+        ),
+        "the refusal must count as signer_cap_exhausted:\n{encoded}"
     );
 
     shutdown([server_task], [&server_ep, &client_ep]).await?;
+    Ok(())
+}
+
+/// A [`PoolView`](decdn_node::pool_view::PoolView) for a funded pool that is
+/// `Closing` on-chain.
+#[derive(Debug)]
+struct ClosingPoolView {
+    owner: Address,
+}
+
+#[async_trait]
+impl decdn_node::pool_view::PoolView for ClosingPoolView {
+    async fn status(&self, _pool_id: B256) -> Option<decdn_node::pool_view::PoolStatus> {
+        Some(decdn_node::pool_view::PoolStatus {
+            owner: self.owner,
+            remaining: U256::from(50_000_000u64),
+            lifecycle: decdn_node::pool_view::Lifecycle::Closing { deadline: u64::MAX },
+        })
+    }
+}
+
+/// A node does not serve on a `Closing` pool (ADR 003 §Pool solvency). It
+/// answers a requester that holds a lane on the pool `Unfunded`, so the owner
+/// opens a new pool, and an unbound requester `NotFound`, so the pool's state
+/// stays unmappable (ADR 005 §Open-time refusal classes).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closing_pool_is_unfunded_to_its_lane_and_not_found_to_anyone_else() -> anyhow::Result<()>
+{
+    let payload = vec![0x6Cu8; 300_000];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id(),
+        signer.address(),
+        operator_addr(),
+        U256::from(10_000_000u64),
+        u64::MAX,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+    let store_dyn: Arc<dyn PoolStateStore> = store;
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let owner = operator_addr();
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        |deps| deps.pool_view = Some(Arc::new(ClosingPoolView { owner })),
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    let ext = binding_ext(&signer, client_node_id)?;
+    let (proven, proven_ext) = open_expecting_refusal(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    anyhow::ensure!(!proven.body.ok, "a closing pool must not be served");
+    anyhow::ensure!(
+        matches!(proven_ext.error, Some(StreamError::Unfunded)),
+        "the lane's requester must hear Unfunded, got {:?}",
+        proven_ext.error
+    );
+
+    // A binding verifies once per connection, so the unbound request goes on a
+    // fresh one.
+    conn.close(0u32.into(), b"done");
+    let stranger = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (unbound, unbound_ext) = open_expecting_refusal(&stranger, *hash.as_bytes(), None).await?;
+    anyhow::ensure!(!unbound.body.ok, "a closing pool must not be served");
+    anyhow::ensure!(
+        matches!(unbound_ext.error, Some(StreamError::NotFound)),
+        "an unbound requester must hear NotFound, got {:?}",
+        unbound_ext.error
+    );
+    let encoded = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(&encoded, "decdn_serve_stream_rejected_pool_closing_total 2"),
+        "both refusals must count as pool_closing:\n{encoded}"
+    );
+
+    stranger.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -6972,14 +7063,14 @@ async fn concurrent_distinct_lanes_bounded_to_pool_deposit() -> anyhow::Result<(
         !refusal.body.ok,
         "the fourth concurrent lane must be refused while three live floors are held"
     );
-    // A proven-owner lane refused by the pool ceiling gets the owner-facing
-    // `InsufficientDeposit` (option 2 / #2013), not the prober-facing `NotFound`.
+    // A proven-owner lane refused by the pool ceiling gets `Unfunded`, not the
+    // prober-facing `NotFound`.
     anyhow::ensure!(
         matches!(
             refusal_ext.error,
             Some(decdn_protocol::client::StreamError::Unfunded)
         ),
-        "expected the owner-facing InsufficientDeposit wire code, got {:?}",
+        "expected the Unfunded wire code, got {:?}",
         refusal_ext.error
     );
 
@@ -7707,8 +7798,8 @@ async fn spawn_handler_server_with_deny(
 /// Two properties in one test. `CacheEngine::refuses` makes the blob report
 /// absent everywhere (defence in depth — this is what also suppresses the probe
 /// `has_blob` signature and DHT republish), while the serve gate above the
-/// availability check is what turns that into `HashBlacklisted` with its own
-/// metric rather than an indistinguishable `NotFound`.
+/// availability check is what turns that into a `Declined` with its own
+/// metric rather than a `NotFound`.
 ///
 /// Without a test at this level the whole gate could be deleted and every other
 /// test in the suite would stay green — which is exactly what happened.
@@ -7767,13 +7858,10 @@ async fn denylisted_hash_is_refused_even_when_held() -> anyhow::Result<()> {
 /// ADR 011 §`StreamRequest` Response: a GOVERNANCE takedown must answer the
 /// same wire code as the operator's own denylist entry above.
 ///
-/// The failure this pins shipped once already. Governance entries reached the
-/// serve path only as cache evictions, so they answered `EvictedSinceProbe`
-/// while local entries answered `HashBlacklisted` — one request told a client
-/// which list a hash was on, and since the governance list is public on-chain,
-/// that made `HashBlacklisted` a unique fingerprint for "this operator denied it
-/// privately". Precisely the map of an operator's legal exposure the ADR
-/// forecloses.
+/// A distinct code for either list would tell a client which list a hash is
+/// on, and since the governance list is public on-chain, the local code would
+/// be a unique fingerprint for "this operator denied it privately". Precisely
+/// the map of an operator's legal exposure the ADR forecloses.
 ///
 /// The metric split is the part that MAY differ, and does: it is the operator's
 /// own gauge and no client can read it.
@@ -7921,9 +8009,8 @@ async fn takedown_mid_stream_terminates_the_delivery() -> anyhow::Result<()> {
 }
 
 /// ADR 011 §On Blacklist Event. A channel funded by a blacklisted origin is
-/// refused with `OriginBlacklisted` — including on a CACHE MISS, which is the
-/// path that previously fell through to a plain `NotFound` because every miss
-/// arm returns before the gate's old position.
+/// refused `Declined` for `origin_denied` — including on a CACHE MISS, whose
+/// miss arms would otherwise answer a plain `NotFound`.
 ///
 /// `NotFound` is the one answer that must never be given here: it tells the
 /// client to retry elsewhere and pay again, when every node will refuse it.
@@ -8273,7 +8360,7 @@ async fn binding_matching_only_the_funder_is_refused() -> anyhow::Result<()> {
 /// COMPLIANCE REGRESSION GUARD (ADR 011 §On Blacklist Event). The takedown gate
 /// keys on the channel's FUNDER, never on its voucher signer. A blacklisted
 /// funder that delegates signing to a clean throwaway key must still be refused
-/// with `OriginBlacklisted`.
+/// for `origin_denied`.
 ///
 /// This test fails the moment any blacklist / `content_deny` check is re-keyed
 /// onto `voucher_signer` — which is exactly the silent compliance break a
@@ -9264,14 +9351,13 @@ async fn underfunded_channel_never_reaches_the_paid_pull() -> anyhow::Result<()>
         (ClientMessage::StreamResponse(resp), resp_ext) => {
             anyhow::ensure!(!resp.body.ok, "an underfunded miss must be refused");
             // Bound + known lane → the pre-spend floor gate refuses a proven owner,
-            // so the wire code is the owner-facing `InsufficientDeposit` (option 2 /
-            // #2013), not the prober-facing `NotFound`.
+            // so the wire code is `Unfunded`, not the prober-facing `NotFound`.
             anyhow::ensure!(
                 matches!(
                     resp_ext.error,
                     Some(decdn_protocol::client::StreamError::Unfunded)
                 ),
-                "expected the owner-facing InsufficientDeposit wire code, got {:?}",
+                "expected the Unfunded wire code, got {:?}",
                 resp_ext.error
             );
         }
@@ -11146,8 +11232,8 @@ async fn spawn_fault_server_with_handler(
 
 /// Assert the serve-reject counters recorded exactly one refusal, of `reason`.
 /// Pins BOTH directions — the reason fired and its sibling did not — so a change
-/// that over-promotes clean misses to `InternalError` (which would steer clients
-/// off a healthy node) fails just as loudly as one that under-reports a fault.
+/// that over-promotes clean misses to `InternalError` (which would decline
+/// every miss on a healthy node) fails just as loudly as one that under-reports a fault.
 fn assert_reject_reason(
     metrics: &Arc<Metrics>,
     internal_error: u64,
