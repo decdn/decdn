@@ -1666,10 +1666,15 @@ mod tests {
         let peers = vec![candidate(7, "US")];
         seed_store(dir.path(), &peers, now_secs());
 
-        // An unroutable address, so the read cannot finish inside the budget.
-        // Paused time makes the 5 s deadline instant.
+        // A listener that is never accepted: the kernel completes the
+        // handshake into the backlog and buffers the request, so the RPC call
+        // can never get a reply or an error. With no error there is no retry
+        // backoff, and with no reply there is no result, so the 5 s cap is the
+        // only way out. Paused time makes that cap instant.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
         let out = bootstrap_nodes(
-            "http://127.0.0.1:1",
+            &rpc_url,
             Address::repeat_byte(0x11),
             dir.path(),
             Duration::from_secs(5),
