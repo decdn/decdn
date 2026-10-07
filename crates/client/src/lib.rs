@@ -45,7 +45,9 @@
 //!    bytes land.
 //! 5. **Build one lane per holder.** Pin a [`PoolContext`] to the holder's
 //!    provider address with [`buyer_pool::self_owned_lane_ctx`], resuming at
-//!    what the lane has already paid. Create its ledger with
+//!    what the lane has already paid, and bind it to your endpoint
+//!    ([`PoolContext::bind_endpoint`]). A node that misses the blob in its
+//!    cache serves an unbound lane nothing. Create its ledger with
 //!    [`PoolContext::new_ledger`], and wrap both in a [`PeerSource`] inside a
 //!    [`StreamCandidate::new`]. Cap the lane's rate at the rate the node signed
 //!    in its probe answer ([`effective_rate_ceiling`]). A lane that pays under a
@@ -349,7 +351,11 @@ use sink::{PullReader, StashedFault};
 /// non-zero after the first stream. Starting a fresh stream from zero would be
 /// rejected (`AmountRegression` / `BytesRegression`). For a brand-new lane pass
 /// `U256::ZERO` for both.
+///
+/// Build one with [`Self::new`] or [`Self::for_pool`], then pin it with
+/// [`Self::with_provider`] and bind it with [`Self::bind_endpoint`].
 #[derive(Clone)]
+#[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct PoolContext {
     /// On-chain `poolId` the vouchers draw from.
     pub pool_id: B256,
@@ -390,25 +396,25 @@ pub struct PoolContext {
 }
 
 impl PoolContext {
-    /// Build a context for a buyer-held pool, resuming from its persisted
-    /// cumulative voucher state on the `(signer, provider)` lane (#744). Pass the
-    /// `provider` this stream pays and the lane's prior `(bytes, amount)` so the
-    /// next voucher continues the lane rather than restarting from zero (which
-    /// the upstream node would reject). For a freshly-opened pool with an
-    /// untouched lane, pass `U256::ZERO` for both priors — [`Self::for_pool`]
-    /// does exactly that.
+    /// A context that signs vouchers on `pool_id` with `client_signer` under
+    /// `voucher_domain`, against a deposit of `deposit`. It pays no provider
+    /// yet, starts its lane at zero, and carries no binding or capability:
+    /// [`Self::with_provider`], [`Self::bind_endpoint`] and
+    /// [`Self::with_capability`] add each. A delegated signer, which holds no
+    /// pool row of its own, starts here.
     #[must_use]
-    pub const fn for_pool(
-        state: &BuyerPoolState,
+    pub const fn new(
+        pool_id: B256,
+        deposit: U256,
         client_signer: Arc<PrivateKeySigner>,
         voucher_domain: Eip712Domain,
     ) -> Self {
         Self {
-            pool_id: state.pool_id,
+            pool_id,
             // A pool fans out to many providers; the fetch target is pinned
             // per-pull via [`Self::with_provider`], not stored in the pool.
             provider: Address::ZERO,
-            deposit: state.deposit,
+            deposit,
             client_signer,
             voucher_domain,
             prior_bytes_delivered: U256::ZERO,
@@ -416,6 +422,17 @@ impl PoolContext {
             client_binding: None,
             capability: None,
         }
+    }
+
+    /// [`Self::new`] for a pool the buyer store records: its `pool_id` and
+    /// committed deposit.
+    #[must_use]
+    pub const fn for_pool(
+        state: &BuyerPoolState,
+        client_signer: Arc<PrivateKeySigner>,
+        voucher_domain: Eip712Domain,
+    ) -> Self {
+        Self::new(state.pool_id, state.deposit, client_signer, voucher_domain)
     }
 
     /// Pin the delivering node this context pays (the voucher's `provider`) and
@@ -463,8 +480,9 @@ impl PoolContext {
 
     /// Attach an ADR 005 client identity binding so this context's
     /// `cdn/client/v1` requests prove pool ownership to the serving node,
-    /// enabling reactive cache-miss origin pull-through (#1115). Pass a binding
-    /// produced by [`sign_client_binding`]; a hand-built `ClientBinding` whose
+    /// enabling reactive cache-miss origin pull-through (#1115).
+    /// [`Self::bind_endpoint`] signs and attaches one in a single call. A
+    /// hand-built `ClientBinding` whose
     /// `ethereum_address` and signature don't correspond (or that doesn't own the
     /// pool) is rejected by the serving node, so this only ever hurts the caller
     /// itself.
@@ -472,6 +490,24 @@ impl PoolContext {
     pub fn with_client_binding(mut self, binding: ClientBinding) -> Self {
         self.client_binding = Some(binding);
         self
+    }
+
+    /// Bind `endpoint` to this context's signer, so a node that misses the blob
+    /// in its cache may pull it from its origin for this buyer. Without a
+    /// binding, such a node refuses the open as `NotFound`. `bind_domain` is
+    /// `decdn_incentive::bind_node_id_domain(chain_id, capacity_bond)`.
+    ///
+    /// # Errors
+    ///
+    /// A signing error from `client_signer`.
+    pub fn bind_endpoint(
+        self,
+        endpoint: &Endpoint,
+        bind_domain: &Eip712Domain,
+    ) -> anyhow::Result<Self> {
+        let own_node_id = B256::from(*endpoint.id().as_bytes());
+        let binding = sign_client_binding(&self.client_signer, own_node_id, bind_domain)?;
+        Ok(self.with_client_binding(binding))
     }
 
     /// Attach a pool owner capability so this context's `cdn/client/v1`
