@@ -411,7 +411,7 @@ The node sets `service.name = "decdn"` and `service.version` on the OTLP resourc
 
 | Span | Covers | Fields |
 |------|--------|--------|
-| `serve_stream` | One inbound `cdn/client/v1` stream | `peer`, `local_node_id`, `hash`, `pool_id`, `byte_offset`, `byte_len`, `direction`, `outcome`, `reason`, `bytes`, `error` |
+| `serve_stream` | One inbound `cdn/client/v1` stream | `peer`, `local_node_id`, `hash`, `pool_id`, `byte_offset`, `byte_len`, `direction`, `outcome`, `reason`, `bytes`, `error`, `store_wait_ns`, `send_wait_ns`, `proof_wait_ns`, `conn_lost_packets`, `conn_lost_bytes`, `conn_sent_bytes`, `path_kind`, `path_rtt_us`, `path_cwnd`, `path_congestion_events` |
 | `pull_through` | One buffered cache-fill tier for a serve miss | `tier`, `hash`, `outcome` |
 | `serve_miss_pull` | The streaming pull thread for a serve miss | `tier`, `hash` |
 | `origin_pull` | One walk of the origin chain | `hash`, `local_only`, `outcome`, `error` |
@@ -434,6 +434,21 @@ The node sets `service.name = "decdn"` and `service.version` on the OTLP resourc
 A `refused` or `stopped` stream keeps its `reason` when the peer leaves before it reads the frame. Then `error` holds the write error.
 
 A failed request read, a full stream cap, and a bad binding end before the node reads the request fields, so those spans have no `hash`.
+
+The serve loop of `serve_stream` records where its time goes when it ends. These fields give the waits of the serve loop by cause. Their sum is not `idle_ns`. `idle_ns` also counts the time before and after the serve loop, and the waits include some poll time that `busy_ns` counts.
+
+- `store_wait_ns`: the time that the loop waits for the bytes of the next frame. On a hit, this is the store read. On a miss, it includes the upstream pull that fills the range.
+- `send_wait_ns`: the time that the loop waits to write a frame to the QUIC send stream.
+- `proof_wait_ns`: the time that the loop waits to read and commit the client's proofs.
+
+The loop also records the state of the QUIC path. `path_kind`, `path_rtt_us`, and `path_cwnd` describe the selected path at the end of the loop. `path_congestion_events` is the lifetime total of that path. `path_kind` is `none` when no path is selected. The `conn_*` fields are connection deltas over the serve loop. Streams on the same connection share them.
+
+A high `send_wait_ns` has more than one cause:
+
+- A small `path_cwnd`, or a rise in `conn_lost_packets`, shows that the path limits the stream.
+- A large `path_cwnd` with no loss shows that the receive window of the client limits the stream. The client reads slowly, or its window is smaller than the bandwidth-delay product of the path.
+
+A high `proof_wait_ns` has these causes: the client pays slowly, the round trip of the path is long, or other streams of the same lane hold the lane lock. A stream that ends before its serve loop has none of these fields.
 
 `upstream_stream` records one `outcome`. On a buffered miss, the values are `filled`, `clean_miss`, `local_fault`, and `below_margin`. On a streaming miss, the values are `filled`, `reassigned`, `terminal`, and `cancelled`. `reassigned` means that the run stops and the node drops this candidate. The node then plans the missing bytes again over the other candidates. A limit applies to the number of dropped candidates.
 

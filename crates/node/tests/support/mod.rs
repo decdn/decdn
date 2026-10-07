@@ -1041,6 +1041,45 @@ where
     }
 }
 
+/// #2348: a serve loop records where its time went and the path's state on
+/// its `serve_stream` span: every wait, connection count and path number as
+/// a `u64`, a non-zero proof wait, a connection that carried at least
+/// `payload_len` bytes, and a direct path.
+pub(crate) fn assert_serve_waits_recorded(
+    span: &CapturedSpan,
+    payload_len: u64,
+) -> anyhow::Result<()> {
+    let count = |field: &str| span.fields.get(field).and_then(|v| v.parse::<u64>().ok());
+    for field in [
+        "store_wait_ns",
+        "send_wait_ns",
+        "proof_wait_ns",
+        "conn_lost_packets",
+        "conn_lost_bytes",
+        "conn_sent_bytes",
+        "path_rtt_us",
+        "path_cwnd",
+        "path_congestion_events",
+    ] {
+        anyhow::ensure!(count(field).is_some(), "{field}: {span:?}");
+    }
+    anyhow::ensure!(
+        count("proof_wait_ns").is_some_and(|ns| ns > 0),
+        "the client's proofs took some wait: {span:?}"
+    );
+    anyhow::ensure!(
+        count("conn_sent_bytes").is_some_and(|b| b >= payload_len),
+        "the connection carried the payload: {span:?}"
+    );
+    anyhow::ensure!(
+        span.fields
+            .get("path_kind")
+            .is_some_and(|k| k.starts_with("direct")),
+        "path_kind: {span:?}"
+    );
+    Ok(())
+}
+
 /// Install a process-wide span and event capture once and return it. Global, not
 /// thread-local, because the serve and pull tasks run on runtime worker and
 /// pull threads. Shared across the tests of one binary, so each test filters

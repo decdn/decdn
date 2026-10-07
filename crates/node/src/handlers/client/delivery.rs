@@ -11,6 +11,7 @@ use super::MAX_PROOFS_PER_CHUNK;
 use super::outcome::{ServeEnd, ServeStop};
 use super::proof_wait::ChunkProofs;
 use super::ramp::RampCarry;
+use super::serve_waits::{ServeWaits, Wait};
 use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked};
 use super::wire::{FrameAccountingFault, FrameChunks, FrameQueue};
 use super::{
@@ -309,9 +310,16 @@ impl ClientHandler {
         // range pull reported). The export needs it to build the BaoTree;
         // the store cannot be relied on for it because an origin-tier range pull
         // imports a *partial* blob whose `status()` size is `None` (#823).
-        let data = self
-            .cache
-            .export_bao_range_stream(hash, byte_offset, byte_len, total_bytes)
+        // Splits the span's idle time by what this loop waits on, and records
+        // the path's state, at every exit (#2348), the export's setup
+        // included.
+        let mut waits = ServeWaits::start(conn);
+        let data = waits
+            .time(
+                Wait::Store,
+                self.cache
+                    .export_bao_range_stream(hash, byte_offset, byte_len, total_bytes),
+            )
             .await
             .map_err(|e| anyhow::Error::from(e).context("cache export_bao_range_stream failed"))?;
 
@@ -360,8 +368,11 @@ impl ClientHandler {
         // forfeits its ramp credit (ADR 003 §Credit window).
         carry.start_delivery();
         let opening_window = self.credit_window(chunk_bytes, carry.ramp_paid(0));
-        let mut next_chunk = chunks
-            .next_frame_chunks(self.first_frame_target(chunk_bytes, opening_window))
+        let mut next_chunk = waits
+            .time(
+                Wait::Store,
+                chunks.next_frame_chunks(self.first_frame_target(chunk_bytes, opening_window)),
+            )
             .await
             .map_err(|e| self.meter_frame_fault(e))?;
 
@@ -415,7 +426,9 @@ impl ClientHandler {
                     break;
                 };
                 let len = frame.total() as u64;
-                self.write_chunk_payload_multi(send, &frame).await?;
+                waits
+                    .time(Wait::Send, self.write_chunk_payload_multi(send, &frame))
+                    .await?;
                 if let Some(clock) = first_byte.take() {
                     clock.record(&self.metrics);
                 }
@@ -431,8 +444,11 @@ impl ClientHandler {
                 // against what remains AFTER the send that just happened — both
                 // counters are already updated.
                 let room = window.saturating_sub(delivered.saturating_sub(*paid));
-                next_chunk = chunks
-                    .next_frame_chunks(self.frame_target(unvouchered, chunk_bytes, room))
+                next_chunk = waits
+                    .time(
+                        Wait::Store,
+                        chunks.next_frame_chunks(self.frame_target(unvouchered, chunk_bytes, room)),
+                    )
                     .await
                     .map_err(|e| self.meter_frame_fault(e))?;
             }
@@ -468,7 +484,12 @@ impl ClientHandler {
                 let mut proofs = ChunkProofs::start();
                 loop {
                     let attempt = proofs.next_attempt();
-                    let stop = self
+                    // Timed by hand, not through `ServeWaits::time`: nesting
+                    // this large future in another trips `large_futures`. The
+                    // wait ends before `?`, so a proof that times out still
+                    // counts, and a cancel counts it on the guard's drop.
+                    waits.begin(Wait::Proof);
+                    let committed = self
                         .commit_one_proof(
                             conn,
                             send,
@@ -483,16 +504,17 @@ impl ClientHandler {
                             owed,
                             &proofs,
                         )
-                        .await
-                        .map_err(|e| {
-                            e.context(format!(
-                                "proof {attempt} of at most {MAX_PROOFS_PER_CHUNK} for a {}-byte \
+                        .await;
+                    waits.end();
+                    let stop = committed.map_err(|e| {
+                        e.context(format!(
+                            "proof {attempt} of at most {MAX_PROOFS_PER_CHUNK} for a {}-byte \
                                  chunk ({} bytes owed, {} more queued)",
-                                owed.len(),
-                                owed.remaining(),
-                                pending.len()
-                            ))
-                        })?;
+                            owed.len(),
+                            owed.remaining(),
+                            pending.len()
+                        ))
+                    })?;
                     match stop {
                         // Advance `paid` by the watermark-capped credit (rule #1),
                         // not the raw delivered chunk: a benign already-satisfied
@@ -701,7 +723,12 @@ impl ClientHandler {
             byte_len,
             total_bytes,
         ));
-        self.write_message(send, &ClientMessage::StreamEnd).await?;
+        waits
+            .time(
+                Wait::Send,
+                self.write_message(send, &ClientMessage::StreamEnd),
+            )
+            .await?;
         let _ = send.finish();
         // Drain the client's send half to its FIN before `recv` drops, so the
         // client's finish is not stopped by the implicit `STOP_SENDING(0)` a
