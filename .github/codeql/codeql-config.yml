@@ -1,10 +1,20 @@
 name: decdn CodeQL config
 
-# Integration-test targets and the `decdn-e2e` fixture crate hold fixture
-# passwords, salts and nonces by design, and every alert they raise is noise.
-# Rust runs with `build-mode: none`, which honours `paths-ignore`. Inline
-# `#[cfg(test)]` modules in `src/` are still analysed; their alerts are
-# dismissed as "used in tests".
+# Test code holds fixture passwords, salts and nonces by design, and every
+# alert it raises is noise. Rust runs with `build-mode: none`, which honours
+# `paths-ignore`. The list skips integration-test targets, the `decdn-e2e`
+# fixture crate, and the unit-test modules, which each live in their own file
+# under `src/` (#2352).
+#
+# The `src/` patterns match by file name, so
+# `crates/e2e/tests/no_inline_test_modules.rs` fails the test run on any file
+# they match that is not declared as a `#[cfg(test)]` module. A production
+# file never drops out of the analysis because of its name.
 paths-ignore:
   - crates/*/tests/**
   - crates/e2e/**
+  - crates/*/src/**/tests.rs
+  - crates/*/src/**/*_tests.rs
+  - crates/*/src/**/proptests.rs
+  - crates/*/src/**/test_support.rs
+  - crates/*/src/**/tests_support.rs

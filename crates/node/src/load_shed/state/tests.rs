@@ -1,0 +1,61 @@
+use super::*;
+use alloy::primitives::B256;
+
+fn client(n: u8) -> B256 {
+    B256::from([n; 32])
+}
+
+#[test]
+fn acquire_increments_and_drop_decrements_both_counters() {
+    let state = ShedState::new();
+    assert_eq!(state.counts(client(1)), (0, 0));
+    assert_eq!(state.node_in_flight(), 0);
+    let a = state.acquire(client(1));
+    let b = state.acquire(client(1));
+    let c = state.acquire(client(2));
+    assert_eq!(state.counts(client(1)), (3, 2)); // node=3, client(1)=2
+    assert_eq!(state.counts(client(2)), (3, 1));
+    // The node-wide accessor matches the first element of `counts`, without
+    // needing a client key (it feeds the load-shed in-flight gauge).
+    assert_eq!(state.node_in_flight(), 3);
+    drop(b);
+    assert_eq!(state.counts(client(1)), (2, 1));
+    assert_eq!(state.node_in_flight(), 2);
+    drop(a);
+    drop(c);
+    assert_eq!(state.counts(client(1)), (0, 0));
+    assert_eq!(state.counts(client(2)), (0, 0));
+    assert_eq!(state.node_in_flight(), 0);
+}
+
+#[test]
+fn zeroed_client_entry_is_pruned() {
+    let state = ShedState::new();
+    let a = state.acquire(client(9));
+    assert_eq!(state.per_client.len(), 1);
+    drop(a);
+    assert_eq!(
+        state.per_client.len(),
+        0,
+        "per-client map must not leak zeroed entries"
+    );
+}
+
+#[test]
+fn reacquire_after_prune_counts_the_new_slot_only() {
+    let state = ShedState::new();
+    let a = state.acquire(client(7));
+    assert_eq!(state.counts(client(7)), (1, 1));
+    assert_eq!(state.per_client.len(), 1);
+    drop(a);
+    assert_eq!(state.counts(client(7)), (0, 0));
+    assert_eq!(state.per_client.len(), 0, "entry must be pruned after drop");
+
+    // Reacquire for the same client: gets a fresh entry, counts only the new slot.
+    let b = state.acquire(client(7));
+    assert_eq!(state.counts(client(7)), (1, 1));
+    assert_eq!(state.per_client.len(), 1);
+    drop(b);
+    assert_eq!(state.counts(client(7)), (0, 0));
+    assert_eq!(state.per_client.len(), 0);
+}
