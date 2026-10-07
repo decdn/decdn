@@ -9,7 +9,10 @@
 //! corrupt or tampered file is ignored (the manifest is fetched fresh) rather
 //! than trusted. It is advisory — a missing, unreadable, or mismatched file only
 //! costs one manifest fetch — so a write failure is logged and never fails the
-//! pull, and `--overwrite` skips the read to force a fresh fetch.
+//! pull, and a real pull under `--overwrite` skips the read to force a fresh
+//! fetch. The cache also lets `bundle pull --hash --dry-run` list a bundle's
+//! entries with no network; the dry run reads it even under `--overwrite`,
+//! because verified bytes equal what a fresh fetch returns.
 //!
 //! Only the `--hash` path uses it: an `-i` local manifest is already on disk for
 //! free, with nothing to cache or re-pay.
