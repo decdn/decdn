@@ -604,26 +604,42 @@ impl std::fmt::Display for AllowanceShortfall {
 
 impl std::error::Error for AllowanceShortfall {}
 
-/// Typed marker on a [`top_up`] error raised after the `topUp` was broadcast:
-/// its receipt could not be read. The
-/// transaction may still mine, so the escrow may have moved while no local
-/// record credits it. A caller must not treat it as "nothing escrowed"; the
-/// acquire loop classifies it as fatal to the command
+/// Typed marker on a [`top_up`] error raised when the `topUp` may have been
+/// broadcast but is not known to have mined: its submit failed in transport
+/// (a timeout, a reset, an HTTP 5xx), or it was broadcast and its receipt
+/// could not be read. The transaction may still mine, so the escrow may have
+/// moved while no local record credits it. A caller must not treat it as
+/// "nothing escrowed"; the acquire loop classifies it as fatal to the command
 /// ([`crate::Fault::Fatal`]).
 #[derive(Debug, Clone, Copy)]
 pub struct TopUpUnconfirmed {
-    /// The broadcast `topUp` transaction, which an operator reconciles against.
-    pub tx: TxHash,
+    /// The broadcast `topUp` transaction, which an operator reconciles
+    /// against. `None` when the submit failed in transport: the RPC node may
+    /// have broadcast the transaction without returning its hash.
+    pub tx: Option<TxHash>,
+    /// The nonce the `topUp` was sent with. Once the account's confirmed nonce
+    /// passes it, the `topUp` has either mined or can never mine.
+    pub nonce: u64,
 }
 
 impl std::fmt::Display for TopUpUnconfirmed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "topUp tx {} was broadcast but its receipt was not read, so it may have mined; \
-             reconcile against the tx before retrying, because a retry escrows again",
-            self.tx
-        )
+        match self.tx {
+            Some(tx) => write!(
+                f,
+                "topUp tx {tx} (nonce {}) was broadcast but its receipt was not read, so it \
+                 may have mined; reconcile against the tx before retrying, because a retry \
+                 escrows again",
+                self.nonce
+            ),
+            None => write!(
+                f,
+                "topUp submit (nonce {}) failed in transport, so the RPC node may have \
+                 broadcast it and it may mine; reconcile against the account's nonce before \
+                 retrying, because a retry escrows again",
+                self.nonce
+            ),
+        }
     }
 }
 
@@ -668,27 +684,43 @@ const TOPUP_NONCE_BACKOFF: Duration = Duration::from_millis(250);
 /// fallback is logged — an over-stated local row is the mirror of the hazard
 /// [`escrowed_but_untracked`] guards, so it must not be reached silently.
 ///
+/// `owner` is the pool owner, which signs the `topUp` (`topUp` is owner-only
+/// on-chain). `top_up` reads `owner`'s pending nonce and sends the `topUp` with
+/// it, so an unconfirmed `topUp` names the nonce it holds. The provider's own
+/// nonce manager does not see that nonce, so `contract`'s provider must read
+/// the pending nonce on every send (alloy's `with_simple_nonce_management`).
+///
 /// A submit rejected as a same-account nonce collision
 /// ([`decdn_incentive::tx::is_nonce_collision`]) broadcast nothing, so it is
-/// re-sent up to three more times, a quarter second apart.
+/// re-sent up to three more times, a quarter second apart, each time on a fresh
+/// pending nonce.
 /// A node signs its sellers' redemptions and its buyer top-ups with one key, so a
 /// top-up can lose its nonce to a redemption sent at the same moment.
 ///
 /// # Errors
 ///
-/// Errors if the `topUp` transaction fails (submit, revert, or receipt). A
-/// receipt that cannot be read carries [`TopUpUnconfirmed`] naming the
-/// broadcast transaction.
+/// Errors if the nonce read or the `topUp` transaction fails (submit, revert, or
+/// receipt). A submit that fails in transport
+/// ([`decdn_incentive::tx::send_broadcast_unknown`]) and a receipt that cannot be
+/// read both carry [`TopUpUnconfirmed`], because the `topUp` may still mine.
 pub async fn top_up<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
+    owner: Address,
     pool_id: B256,
     additional: U256,
 ) -> Result<ToppedUpPool> {
     let amount = to_pool_u64(additional, "top-up")?;
     let mut nonce_retries = 0u32;
-    let pending = loop {
-        let err = match contract.topUp(pool_id, amount).send().await {
-            Ok(pending) => break pending,
+    let (pending, nonce) = loop {
+        let nonce = contract
+            .provider()
+            .get_transaction_count(owner)
+            .pending()
+            .await
+            .context("read the pending nonce for topUp")?;
+        let call = contract.topUp(pool_id, amount).from(owner).nonce(nonce);
+        let err = match call.send().await {
+            Ok(pending) => break (pending, nonce),
             Err(err) => err,
         };
         if nonce_retries < TOPUP_NONCE_RETRIES && decdn_incentive::tx::is_nonce_collision(&err) {
@@ -699,6 +731,13 @@ pub async fn top_up<P: Provider + Clone>(
             );
             tokio::time::sleep(TOPUP_NONCE_BACKOFF).await;
             continue;
+        }
+        // A transport failure may have reached the node and broadcast the
+        // `topUp` before the response was lost, so a retry may escrow twice.
+        if decdn_incentive::tx::send_broadcast_unknown(&err) {
+            return Err(anyhow::Error::new(err)
+                .context("submit topUp")
+                .context(TopUpUnconfirmed { tx: None, nonce }));
         }
         // A deterministic allowance shortfall is caught at gas estimation and
         // surfaces here with ABI revert data attached. Match it so the node can
@@ -723,7 +762,10 @@ pub async fn top_up<P: Provider + Clone>(
     let receipt = pending.get_receipt().await.map_err(|err| {
         anyhow::Error::new(err)
             .context("await topUp receipt")
-            .context(TopUpUnconfirmed { tx })
+            .context(TopUpUnconfirmed {
+                tx: Some(tx),
+                nonce,
+            })
     })?;
     if !receipt.status() {
         anyhow::bail!("topUp reverted for pool {pool_id}");
@@ -804,12 +846,13 @@ pub fn refill_amount(
 )]
 mod tests {
     use super::{
-        AllowanceShortfall, LOW_WATER_DIVISOR, approval_floor, approve_decision,
-        escrowed_but_untracked, grade_deposit_credit, issue_self_capability, open_pool,
-        refill_amount, top_up,
+        AllowanceShortfall, LOW_WATER_DIVISOR, PaymentPool, TopUpUnconfirmed, approval_floor,
+        approve_decision, escrowed_but_untracked, grade_deposit_credit, issue_self_capability,
+        open_pool, refill_amount, top_up,
     };
     use alloy::dyn_abi::Eip712Domain;
     use alloy::primitives::{Address, B256, TxHash, U256};
+    use alloy::providers::Provider;
     use alloy::signers::local::PrivateKeySigner;
     use decdn_incentive::{DepositOutcome, StoreError};
     use decdn_incentive::{SignedCapability, voucher_domain};
@@ -832,12 +875,61 @@ mod tests {
         let _ = open_pool::<alloy::providers::RootProvider>;
     }
 
-    /// Compile-time signature check that `top_up` takes `(contract, pool_id,
-    /// additional)` — no store, no provider — mirroring the pool contract's own
-    /// `topUp(poolId, additionalDeposit)`.
+    /// Compile-time signature check that `top_up` takes `(contract, owner,
+    /// pool_id, additional)` — no store, no provider — mirroring the pool
+    /// contract's own `topUp(poolId, additionalDeposit)` sent by its owner.
     #[test]
     fn top_up_signature_takes_pool_id_and_amount() {
         let _ = top_up::<alloy::providers::RootProvider>;
+    }
+
+    /// A `PaymentPool` on a filler-free provider whose RPC calls are answered
+    /// in order by `asserter`; a call past the queue fails in transport.
+    fn mocked_pool(
+        asserter: alloy::providers::mock::Asserter,
+    ) -> PaymentPool::PaymentPoolInstance<impl Provider + Clone> {
+        PaymentPool::new(
+            Address::repeat_byte(0x01),
+            alloy::providers::ProviderBuilder::default().connect_mocked_client(asserter),
+        )
+    }
+
+    /// A `topUp` submit that fails in transport may have been broadcast, so it
+    /// carries [`TopUpUnconfirmed`] with no hash and the nonce it was sent with.
+    #[tokio::test]
+    async fn a_transport_failed_top_up_submit_is_unconfirmed_with_its_nonce() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&U256::from(5u64));
+        let err = top_up(
+            &mocked_pool(asserter),
+            Address::repeat_byte(0x22),
+            B256::repeat_byte(0x33),
+            U256::from(1_000u64),
+        )
+        .await
+        .unwrap_err();
+        let marker = err.downcast_ref::<TopUpUnconfirmed>().unwrap();
+        assert_eq!(marker.tx, None);
+        assert_eq!(marker.nonce, 5);
+        assert!(format!("{err:#}").contains("nonce 5"), "{err:#}");
+    }
+
+    /// A `topUp` submit the RPC node rejects broadcast nothing, so it carries
+    /// no [`TopUpUnconfirmed`] and a caller may retry it.
+    #[tokio::test]
+    async fn a_rejected_top_up_submit_is_not_unconfirmed() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&U256::from(5u64));
+        asserter.push_failure_msg("insufficient funds for gas");
+        let err = top_up(
+            &mocked_pool(asserter),
+            Address::repeat_byte(0x22),
+            B256::repeat_byte(0x33),
+            U256::from(1_000u64),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.downcast_ref::<TopUpUnconfirmed>().is_none(), "{err:#}");
     }
 
     // ---- self-owned capability (#966 / ADR 003 §Capability delegation) ---

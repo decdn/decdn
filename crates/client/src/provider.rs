@@ -17,7 +17,9 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 
 /// Build a wallet-filled HTTP provider that signs and sends transactions as
-/// `signer`.
+/// `signer`. It reads the pending nonce on every send, so it stays correct
+/// after a send that pins its own nonce ([`crate::buyer_pool::top_up`]) or a
+/// transaction sent from elsewhere.
 ///
 /// # Errors
 ///
@@ -33,6 +35,7 @@ pub fn build_provider(
     signer: &PrivateKeySigner,
 ) -> anyhow::Result<impl Provider + Clone + use<>> {
     Ok(ProviderBuilder::new()
+        .with_simple_nonce_management()
         .wallet(EthereumWallet::from(signer.clone()))
         .connect_http(parse_rpc_url(rpc_url)?))
 }

@@ -126,7 +126,8 @@ impl SendOutcome {
 ///
 /// `const` because the workspace `missing_const_for_fn` clippy lint requires it —
 /// the body is a pure classification with no non-const calls.
-const fn send_broadcast_unknown(err: &ContractError) -> bool {
+#[must_use]
+pub const fn send_broadcast_unknown(err: &ContractError) -> bool {
     use alloy::transports::{RpcError, TransportErrorKind};
 
     let ContractError::TransportError(rpc) = err else {

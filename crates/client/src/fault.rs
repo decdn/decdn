@@ -380,11 +380,17 @@ mod tests {
             crate::buyer_pool::escrowed_but_untracked("pool 0x01 topped up by 5 µUSDC", tx, "disk")
         };
         let unconfirmed = || {
-            anyhow::anyhow!("receipt timed out").context(crate::buyer_pool::TopUpUnconfirmed { tx })
+            anyhow::anyhow!("receipt timed out").context(crate::buyer_pool::TopUpUnconfirmed {
+                tx: Some(tx),
+                nonce: 7,
+            })
         };
+        let maybe_broadcast = anyhow::anyhow!("submit topUp: connection reset")
+            .context(crate::buyer_pool::TopUpUnconfirmed { tx: None, nonce: 7 });
         for (name, err) in [
             ("untracked", untracked()),
             ("unconfirmed", unconfirmed()),
+            ("maybe broadcast", maybe_broadcast),
             (
                 "untracked lane build",
                 anyhow::Error::new(LaneBuildFault(untracked())),
