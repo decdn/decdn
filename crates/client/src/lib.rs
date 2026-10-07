@@ -249,6 +249,7 @@ pub use streamer::{LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedR
 // The engine seams the node and the `decdn` CLI drive directly. They are
 // public so those crates can reach them, hidden from the docs and the
 // public-API snapshot, and carry no stability promise.
+#[doc(hidden)]
 pub use connection::WarmConnection;
 #[doc(hidden)]
 pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};

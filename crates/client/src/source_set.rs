@@ -31,8 +31,7 @@ use crate::streamer::StreamCandidate;
 use crate::{SignerCapDrained, UpstreamRefused};
 
 /// The first wait before a failed lane build is retried.
-#[doc(hidden)]
-pub const BUILD_RETRY_BASE: Duration = Duration::from_secs(1);
+pub(crate) const BUILD_RETRY_BASE: Duration = Duration::from_secs(1);
 /// The longest wait before a failed lane build is retried.
 pub(crate) const BUILD_RETRY_CAP: Duration = Duration::from_secs(30);
 /// The first wait between discoveries.
