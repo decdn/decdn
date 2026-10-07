@@ -310,9 +310,16 @@ impl ClientHandler {
         // range pull reported). The export needs it to build the BaoTree;
         // the store cannot be relied on for it because an origin-tier range pull
         // imports a *partial* blob whose `status()` size is `None` (#823).
-        let data = self
-            .cache
-            .export_bao_range_stream(hash, byte_offset, byte_len, total_bytes)
+        // Splits the span's idle time by what this loop waits on, and records
+        // the path's state, at every exit (#2348), the export's setup
+        // included.
+        let mut waits = ServeWaits::start(conn);
+        let data = waits
+            .time(
+                Wait::Store,
+                self.cache
+                    .export_bao_range_stream(hash, byte_offset, byte_len, total_bytes),
+            )
             .await
             .map_err(|e| anyhow::Error::from(e).context("cache export_bao_range_stream failed"))?;
 
@@ -354,9 +361,6 @@ impl ClientHandler {
         // live — that is where a mid-export store fault or the truncation refusal
         // surfaces, because the export streams (#1132).
         let mut chunks = ChunkFramer::new(data, hash);
-        // Splits the span's idle time by what this loop waits on, and records
-        // the path's state, at every exit (#2348).
-        let mut waits = ServeWaits::start(conn);
         // The opening frame is small, so the first byte leaves after a few chunk
         // groups of store read rather than a whole interval
         // ([`ClientHandler::first_frame_target`]).

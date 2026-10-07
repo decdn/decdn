@@ -620,11 +620,16 @@ impl Unit {
         let first = self.progress.first_byte.get()?;
         let verified = self.progress.verified.load(Ordering::Relaxed);
         let since_first = first.elapsed();
-        let parked = Duration::from_nanos(self.parked.load(Ordering::Relaxed));
-        let open = match self.park_open_at.load(Ordering::Relaxed) {
+        // The open park first, then the ended ones: the reverse of the order
+        // `ClosePark` writes them in. A cleared marker (`Acquire`, paired with
+        // its `Release`) shows the ended park in `parked` too, so a park that
+        // closes between the two reads is left out once or twice, never not
+        // at all.
+        let open = match self.park_open_at.load(Ordering::Acquire) {
             u64::MAX => Duration::ZERO,
             at => since_first.saturating_sub(Duration::from_nanos(at)),
         };
+        let parked = Duration::from_nanos(self.parked.load(Ordering::Relaxed));
         let active = since_first.saturating_sub(parked).saturating_sub(open);
         let millis = active.as_millis();
         if verified == 0 || millis == 0 {
@@ -1976,9 +1981,9 @@ struct ParkedWait<'a> {
 
 /// Ends a unit's park when its wait ends or is dropped: adds the park to the
 /// unit's parked time when the unit's rate clock ran at its start, then
-/// clears the park in progress. Added first, so a rate read between the two
-/// steps leaves the park out twice and reads the unit as faster, never as
-/// slower.
+/// clears the park in progress with `Release`. [`Unit::rate_sample`] reads
+/// the two in the reverse order, so a read between the two steps leaves the
+/// park out twice and reads the unit as faster, never as slower.
 struct ClosePark<'a>(&'a Unit, Instant, bool);
 
 impl Drop for ClosePark<'_> {
@@ -1988,7 +1993,7 @@ impl Drop for ClosePark<'_> {
             let nanos = u64::try_from(parked_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
             unit.parked.fetch_add(nanos, Ordering::Relaxed);
         }
-        unit.park_open_at.store(u64::MAX, Ordering::Relaxed);
+        unit.park_open_at.store(u64::MAX, Ordering::Release);
     }
 }
 

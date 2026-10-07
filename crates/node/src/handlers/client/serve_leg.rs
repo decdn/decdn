@@ -243,6 +243,9 @@ impl ClientHandler {
         // pool owner, `getPool.owner`), resolved from the cached pool-view. `None`
         // (no view wired or a read fault) falls back to the open-time gates + the
         // hash-denylist re-check.
+        // Records the loop's waits and the path's state at every exit
+        // (#2348), from the loop's first await on.
+        let mut waits = ServeWaits::start(conn);
         let funder: Option<super::Address> = self.pool_funder(lane_key.pool_id).await;
 
         // Bytes written to the wire, and bytes an accepted voucher covered — both
@@ -283,9 +286,6 @@ impl ClientHandler {
         // the pull would never learn its client left, and would hold its lease and
         // the pull alive (#2194).
         let mut client_left = std::pin::pin!(send.stopped());
-        // Splits the span's idle time by what this loop waits on, and records
-        // the path's state, at every exit (#2348).
-        let mut waits = ServeWaits::start(conn);
 
         // The first frame — awaiting the pull leg if `R` opens on a gap. A pull
         // that ends `Err` here fails the serve rather than hanging. It is small,
