@@ -60,9 +60,10 @@ const MAX_METRICS_CONNECTIONS: usize = 32;
 /// Every counter that names why an inbound `cdn/client/v1` stream failed. Each
 /// failed inbound stream counts on exactly one of them, so
 /// `decdn_streams_failed_total{direction="inbound"}` minus their sum is zero. The
-/// "Unattributed stream failures" dashboard panels subtract exactly this list, and
-/// a test holds them to it. The serve handler counts every end in one place, so a
-/// scrape never sees a failure before its reason.
+/// serve handler counts every end in one place, so a scrape never sees a failure
+/// before its reason. The "Unattributed stream failures" panels of the reference
+/// dashboards in `decdn/devops` subtract this list by hand, so a new reason here
+/// needs the same edit there.
 pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_rejected_bad_binding_total",
     "decdn_serve_stream_rejected_blob_too_large_total",
@@ -128,7 +129,7 @@ struct StreamLabels {
 /// `has_blob: false`" — `exhausted` and `stake_lane_reserved` still advertise.
 ///
 /// The three values are not interchangeable — each has a different operator
-/// remedy, which is why the alert in `monitoring/prometheus-alerts.yml` filters
+/// remedy, which is why the reference `DecdnProbeHoldViolations` alert filters
 /// on `reason="exhausted"` alone. The derive renders variants in `snake_case`, so
 /// these encode as `reason="exhausted"` / `"disabled"` / `"stake_lane_reserved"`.
 ///
@@ -2560,8 +2561,8 @@ impl Metrics {
     }
 
     /// Register iroh's transport metrics under the `decdn_iroh_` prefix so
-    /// `magicsock_*`, `net_report_*`, etc. come out as
-    /// `decdn_iroh_magicsock_*`, matching `adr/appendix-observability.md`'s naming convention.
+    /// `socket_*`, `net_report_*`, etc. come out as
+    /// `decdn_iroh_socket_*`, matching `adr/appendix-observability.md`'s naming convention.
     ///
     /// # Errors
     ///
@@ -2572,11 +2573,11 @@ impl Metrics {
 
     /// Register an [`EndpointMetrics`] set under the `decdn_iroh_` prefix.
     ///
-    /// Split out from [`Self::register_iroh_endpoint`] so the name gate can
-    /// register the same group from an `EndpointMetrics::default()` and see the
-    /// `decdn_iroh_*` names without standing up a socket. Without it those
-    /// series are absent from `Metrics::new().encode()` and every panel naming
-    /// one reads as a series the exporter does not emit.
+    /// Split out from [`Self::register_iroh_endpoint`] so
+    /// `iroh_metrics_export_under_the_decdn_iroh_prefix` can register
+    /// the same group from an `EndpointMetrics::default()` and pin the
+    /// `decdn_iroh_*` names without standing up a socket. Without an endpoint
+    /// those series are absent from `Metrics::new().encode()`.
     ///
     /// # Errors
     ///

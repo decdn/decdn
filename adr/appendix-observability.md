@@ -44,7 +44,7 @@ Several subsystems classify a failure into a small closed set of reasons. The co
 
 Siblings are the default because each reason in these families has an **unrelated operator remedy**, so no single alert spans the family and a shared label buys nothing; a sibling also needs no typed `EncodeLabelSet` and no pre-materialization to keep a series exporting at zero.
 
-**`decdn_probe_hold_unavailable_total{reason}` is the first deliberate exception among reason splits.** Its three values share one *aggregate* and one budget axis (all three derive from `max_probe_holds`), so operators query the aggregate first and drill in on the label second — the shape a label serves well. They pointedly do **not** share an alert: the alert filters to `reason="exhausted"`, because `disabled` is an intentional operator choice and `stake_lane_reserved` has its own knob; being able to express that filter is part of what the label buys. Note that a labelled reason split is not the only kind of labelled metric — `decdn_streams_active{direction}` and `decdn_staker_set_active_by_region{node_region}` are labelled on other axes. `decdn_rpc_requests_total{method,outcome}` meets the same bar. Its outcomes share one aggregate, the request total, and the error ratio is a sum over `outcome` divided by that total. The ratio is the reason the metric exists. A new split should follow the sibling convention unless it meets that same bar. Either way the invariant is absolute: **no metric may silently stop exporting at zero**, and an alert whose remedy applies to only one reason must carry the corresponding filter. `decdn_staker_set_active_by_region{node_region}` is the one exception. A region with no active node has no series, so the world map shows no empty country. The name is absent when no active node has a valid region. `decdn_staker_set_active_unknown_region` and `decdn_staker_set_active_count` always export, and they show the zero case.
+**`decdn_probe_hold_unavailable_total{reason}` is the first deliberate exception among reason splits.** Its three values share one *aggregate* and one budget axis (all three derive from `max_probe_holds`), so operators query the aggregate first and drill in on the label second — the shape a label serves well. They pointedly do **not** share an alert: the reference `DecdnProbeHoldViolations` alert filters to `reason="exhausted"`, because `disabled` is an intentional operator choice and `stake_lane_reserved` has its own knob; being able to express that filter is part of what the label buys. Note that a labelled reason split is not the only kind of labelled metric — `decdn_streams_active{direction}` and `decdn_staker_set_active_by_region{node_region}` are labelled on other axes. `decdn_rpc_requests_total{method,outcome}` meets the same bar. Its outcomes share one aggregate, the request total, and the error ratio is a sum over `outcome` divided by that total. The ratio is the reason the metric exists. A new split should follow the sibling convention unless it meets that same bar. Either way the invariant is absolute: **no metric may silently stop exporting at zero**, and an alert whose remedy applies to only one reason must carry the corresponding filter. `decdn_staker_set_active_by_region{node_region}` is the one exception. A region with no active node has no series, so the world map shows no empty country. The name is absent when no active node has a valid region. `decdn_staker_set_active_unknown_region` and `decdn_staker_set_active_count` always export, and they show the zero case.
 
 All metrics are exported in **Prometheus text format 0.0.4** on a configurable HTTP port (default `9090`) at `/metrics`. Health is separate: it is the `admin_v1_health` JSON-RPC method on the admin listener, not a route on this port (see [Health](#health)). The port MUST be operator-configurable and MUST NOT be publicly accessible without authentication in production (firewall or auth proxy).
 
@@ -62,7 +62,7 @@ Status is `live` or `planned`:
 
 **`live`:** `decdn-node` exports this series today. Safe to put on a dashboard or in an alert.
 
-**`planned`:** specified here, not yet implemented. **Nothing emits it**, so a panel or alert built on it will render `(no data)` and a threshold rule will never fire. Do not add it to `monitoring/`.
+**`planned`:** specified here, not yet implemented. **Nothing emits it**, so a panel or alert built on it will render `(no data)` and a threshold rule will never fire. Do not put it on a dashboard or in an alert.
 
 The `live` rows are enforced: `crates/node/src/metrics.rs`'s `adr_registry_names_are_exported` test asserts every one of them appears in the encoder's output, so a `live` row naming a series the node does not emit fails CI. Two limits worth knowing. The gate skips rows whose metric cell carries a label or a `<placeholder>` (`decdn_probe_hold_unavailable_total{reason}` and the two `decdn_<watcher>_*` templates), so those three are documented but unenforced. And it runs in one direction only — it proves no documented row is fiction, **not** that every exported series is documented. The registry is a curated subset of roughly 180 exported series, so absence from this table is not evidence that a metric does not exist; grep `crates/node/src/metrics.rs` and `crates/cache/src/metrics.rs` before concluding that. `planned` is the allowlist that gate skips — which is why marking a row `planned` is a deliberate act: it keeps an unbuilt series out of the enforced set while still documenting it.
 
@@ -70,7 +70,7 @@ Adding a metric therefore means editing this table in the same change, not after
 
 #### Slash-Safety Metrics (all Mandatory)
 
-These give early warning for the two slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), grouped here with the closely-related probe-hold capacity metrics. Blacklist-watcher liveness is monitored through `decdn_blacklist_watcher_last_tick_timestamp_seconds` and `decdn_blacklist_watcher_down_seconds` (the `DecdnBlacklistWatcherStalled` rule in `monitoring/` reads both); the watcher rebuilds the deny-set by full enumeration and keeps no version cursor, so there is no sync-lag gauge to alert on. The probe-hold gauges (`decdn_probe_hold_slots_used`/`_max`) are live and normally non-zero — alert on the thresholds/rates in the table below, not on presence. `decdn_probe_hold_unavailable_total` is an availability signal, not a slash risk — see its row, and alert only on `reason="exhausted"`, the budget-pressure value.
+These give early warning for the two slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), grouped here with the closely-related probe-hold capacity metrics. Blacklist-watcher liveness is monitored through `decdn_blacklist_watcher_last_tick_timestamp_seconds` and `decdn_blacklist_watcher_down_seconds` (the `DecdnBlacklistWatcherStalled` rule in the [reference alerts](#reference-dashboards-and-alerts) reads both); the watcher rebuilds the deny-set by full enumeration and keeps no version cursor, so there is no sync-lag gauge to alert on. The probe-hold gauges (`decdn_probe_hold_slots_used`/`_max`) are live and normally non-zero — alert on the thresholds/rates in the table below, not on presence. `decdn_probe_hold_unavailable_total` is an availability signal, not a slash risk — see its row, and alert only on `reason="exhausted"`, the budget-pressure value.
 
 | Metric | Type | Tier | Status | Description |
 |--------|------|------|--------|-------------|
@@ -482,40 +482,9 @@ Each metric series has one canonical `decdn_`-prefixed name; informal short name
 
 ### Reference dashboards and alerts
 
-Four Grafana dashboards and starter Prometheus alerting rules ship in the top-level [`monitoring/`](../monitoring/) directory. They are an operator starting point, not a normative deliverable.
+Reference Grafana dashboards and Prometheus alert rules live in the [`decdn/devops`](https://github.com/decdn/devops/tree/main/charts/decdn-node/files/monitoring) repository, under `charts/decdn-node/files/monitoring/`. They are an operator starting point, not a normative deliverable. This repository does not ship them.
 
-The panels draw on the whole exported surface, not only the [§ Metric Registry](#metric-registry) subset. The registry is a curated view of roughly 180 exported series, so a panel may name a series this appendix does not list. What it may never name is a series the exporter does not emit, and `crates/node/src/metrics.rs` enforces that: `monitoring_selectors_are_exported` sweeps every `.yml` and `.json` in `monitoring/` and fails on any `decdn_*` token absent from a live scrape, including the `decdn_iroh_*` transport sub-registry. Adding a file to the directory therefore gates it; no list needs updating.
-
-| File | Purpose |
-|------|---------|
-| [`monitoring/prometheus-alerts.yml`](../monitoring/prometheus-alerts.yml) | Three rule groups: `decdn-slash-safety` (thresholds copied verbatim from [§ Slash-Safety Metrics (all Mandatory)](#slash-safety-metrics-all-mandatory)), `decdn-liveness`, `decdn-delivery`. Every rule carries a `component` label for routing, and a `runbook_url` annotation where [`docs/runbook.md`](../docs/runbook.md) has a matching section. |
-| [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) | Fleet overview (`uid: decdn-poc-overview`): status, delivery funnel, slash safety, and the logs and traces that explain them. |
-| [`monitoring/dashboard-delivery.json`](../monitoring/dashboard-delivery.json) | Delivery and cache (`uid: decdn-delivery`): the serve leg, the paying pull leg, cache, origin and warming. Every serve-refusal and pull-failure reason gets its own series. |
-| [`monitoring/dashboard-chain.json`](../monitoring/dashboard-chain.json) | Chain, payments and slash safety (`uid: decdn-chain`): watcher liveness for all five watchers, the chain RPC provider's request rate, error ratio and latency by method, the capacity-bond and active-staker registries with a world map of active nodes by declared region, and both sides of the payment flow. |
-| [`monitoring/dashboard-node.json`](../monitoring/dashboard-node.json) | Single-node drilldown (`uid: decdn-node`): host resources, process state, iroh transport, DHT and probe, plus that node's logs and traces. |
-
-All four share a datasource variable per signal — `${DS_PROMETHEUS}`, `${DS_LOKI}`, `${DS_TEMPO}`. The `$env`, `$region` and `$instance` variables read the Prometheus labels `deployment_environment`, `region` and `instance`. The Loki selectors use `unit="decdn-node.service"` and `instance`. They do not use `job`, because the log streams keep the host job for the Linux Server integration. The Loki `instance` label must equal the Prometheus `instance` label. The dashboards cross-link through a dashboard link on the `decdn` tag.
-
-#### Two query shapes worth knowing
-
-`rate()` and `increase()` drop `__name__`. A family panel written as `sum by (__name__) (rate({__name__=~"decdn_x_.+_total"}[5m]))` does not evaluate at all — the per-reason series collapse to identical label sets and Prometheus refuses the vector. So:
-
-- Rate panels name each series explicitly, one target per metric. This also puts every name under the gate; a `__name__` regex scans as the wildcard token `decdn_x_` and is skipped.
-- Instant panels over a family call `label_replace` on the raw selector, before any operator strips the name. The watcher-liveness table and the `DecdnWatcherTaskPanicked` rule are both built this way.
-
-#### Importing the dashboards
-
-In Grafana, *Dashboards → New → Import*; upload or paste each JSON. The datasource variables carry a saved value but re-resolve on load, so an import into another Grafana falls back to the picker. The `instance` variable auto-populates from `decdn_node_uptime_seconds`.
-
-#### Using the alerts
-
-Add the file via Prometheus `rule_files:` and reload. Validate with `promtool check rules monitoring/prometheus-alerts.yml`. Tune `for:` durations and thresholds for your fleet size before paging.
-
-On Grafana Cloud the hosted ruler does not accept writes through the stack's service-account token, so the rules are translated into Grafana-managed rules instead. The translation is not a literal one: each rule's PromQL already contains its own comparison, so the result set is empty when the rule should not fire but the surviving values are not usable as a threshold — `up == 0` fires at value 0. The condition therefore counts datapoints rather than testing them, with `noDataState: OK` carrying the not-firing case.
-
-#### Scope
-
-Covers M-tier slash-safety metrics, the full delivery and pull surface, and the chain and payment paths. Deliberately not exhaustive.
+A dashboard or alert may name any series that `decdn-node` exports, also a series that the [§ Metric Registry](#metric-registry) does not list. It must not name a series that `decdn-node` does not export, for example a `planned` series. No test in this repository checks the reference dashboards or alerts.
 
 ## Consequences
 

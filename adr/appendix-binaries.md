@@ -78,8 +78,8 @@ The Prometheus metric prefix in `crates/node/src/metrics.rs` and the
 OTLP `service.name` in `crates/node/src/commands/otlp.rs` both read
 `decdn` (not `decdn-node`) for dashboard and alert continuity. A
 reviewer asking "shouldn't `decdn_*` be `decdn_node_*`?" should
-consult this appendix and `monitoring/prometheus-alerts.yml` /
-`monitoring/grafana-dashboard.json` — those rules match `decdn_*`
+consult this appendix and the reference alert rules and dashboards in
+[`decdn/devops`](https://github.com/decdn/devops/tree/main/charts/decdn-node/files/monitoring) — those rules match `decdn_*`
 and would silently miss data on a prefix rename.
 
 ## Distribution

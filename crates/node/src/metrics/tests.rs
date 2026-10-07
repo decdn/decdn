@@ -202,10 +202,7 @@ fn probe_hold_unavailable_exports_every_reason_at_zero() {
     // `decdn_probe_hold_unavailable_total` read absent instead of zero, and
     // a silent hole in the `DecdnProbeHoldViolations` alert's
     // input. Also pins the rendered series text (label name, snake_case
-    // value encoding, and the `_total` suffix the encoder appends). Note
-    // that pinning it *here* does not tie it to the copies in
-    // `monitoring/` — that is what
-    // `alert_and_dashboard_selectors_match_the_exported_series` below does.
+    // value encoding, and the `_total` suffix the encoder appends).
     let metrics = Metrics::new();
     let text = metrics.encode().unwrap();
 
@@ -316,8 +313,7 @@ fn rpc_request_buckets_reach_the_per_call_deadline() {
 /// Histograms get their `_bucket`/`_sum`/`_count` samples folded back to
 /// the base name too. A histogram has no bare `name` sample, so without
 /// this every `live` histogram row would fail the registry gate. The raw
-/// sample names stay in the set as well, so a dashboard selector on
-/// `<name>_bucket` resolves.
+/// sample names stay in the set as well.
 fn exported_series(text: &str) -> std::collections::HashSet<String> {
     text.lines()
         .filter(|l| !l.starts_with('#') && !l.is_empty())
@@ -333,179 +329,6 @@ fn exported_series(text: &str) -> std::collections::HashSet<String> {
             std::iter::once(name).chain(base)
         })
         .collect()
-}
-
-/// Scan free-form text (YAML, JSON, markdown) for `decdn_`-prefixed
-/// identifiers. Hand-rolled rather than regex: the node crate has no
-/// `regex` dependency and this is a two-line character scan.
-fn decdn_names_in(text: &str) -> std::collections::BTreeSet<String> {
-    let bytes = text.as_bytes();
-    let mut out = std::collections::BTreeSet::new();
-    let mut i = 0usize;
-    while let Some(rel) = text.get(i..).and_then(|s| s.find("decdn_")) {
-        let start = i + rel;
-        let mut end = start;
-        while bytes
-            .get(end)
-            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
-        {
-            end += 1;
-        }
-        if let Some(name) = text.get(start..end) {
-            out.insert(name.to_string());
-        }
-        i = end.max(start + 1);
-    }
-    out
-}
-
-/// The exporter's full surface as a running node presents it: everything
-/// `Metrics::new()` registers, plus the iroh transport sub-registry that
-/// `register_iroh_endpoint` only attaches once an `Endpoint` exists.
-/// `EndpointMetrics` is `Default`, so the gate covers `decdn_iroh_*`
-/// without a socket — and a typo in one of those names still fails.
-///
-/// It also publishes one region: a labelled family with no child emits
-/// nothing, and a running node has a child once an active staker declares
-/// a valid region.
-fn full_scrape() -> String {
-    let metrics = Metrics::new();
-    metrics
-        .register_iroh_metrics(&EndpointMetrics::default())
-        .unwrap();
-    let de = Region::parse("DE").unwrap();
-    metrics.staker_set_active_by_region(&BTreeMap::from([(de, 1)]), 0);
-    metrics.encode().unwrap()
-}
-
-/// Every `decdn_*` name in `monitoring/` must resolve to a real exported
-/// series. This is the blanket assertion the single-selector test below
-/// could not carry until #1513: `DecdnHighStreamErrorRate` divided by
-/// `decdn_streams_completed_total`, which no field produces, shipped as a
-/// rule that could never fire.
-///
-/// The scan covers every `.yml` and `.json` in the directory, so a new
-/// dashboard is gated the day it lands rather than the day someone
-/// remembers to add it to a list.
-///
-/// **What this does not prove.** A name that resolves may still sit at a
-/// permanent zero because nothing increments it; the gate is about the
-/// name, not the wiring. `docs/runbook.md § ContentBlacklist compliance` is the live example.
-/// `DecdnChainWatcherFlapping` selects its counters by the name pattern
-/// `decdn_.+_watcher_restarts_total`, which the literal-name gate above
-/// cannot check. Pin what the pattern matches: exactly the five chain
-/// watchers, so a renamed counter cannot drop out of the rule unseen.
-#[test]
-fn flapping_rule_pattern_matches_the_five_watcher_restart_counters() {
-    let mut matched: Vec<String> = exported_series(&full_scrape())
-        .into_iter()
-        .filter(|name| {
-            name.strip_prefix("decdn_")
-                .and_then(|rest| rest.strip_suffix("_watcher_restarts_total"))
-                .is_some_and(|watcher| !watcher.is_empty())
-        })
-        .collect();
-    matched.sort();
-    assert_eq!(
-        matched,
-        [
-            "decdn_blacklist_watcher_restarts_total",
-            "decdn_fee_shares_watcher_restarts_total",
-            "decdn_settlement_watcher_restarts_total",
-            "decdn_slash_watcher_restarts_total",
-            "decdn_staker_set_watcher_restarts_total",
-        ]
-    );
-    let rules = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../monitoring/prometheus-alerts.yml"
-    ))
-    .unwrap_or_default();
-    assert!(
-        rules.contains(r#"{__name__=~"decdn_.+_watcher_restarts_total"}"#),
-        "the flapping rule's selector changed; update this test with it"
-    );
-}
-
-#[test]
-fn monitoring_selectors_are_exported() {
-    // Names ending in `_` are filtered below: no exported series ends with
-    // an underscore, so a trailing one means the scan stopped at a
-    // wildcard — a prose `decdn_serve_stream_rejected_*`, or the inner
-    // pattern of the `{__name__=~"decdn_.+_task_panicked_total"}` matcher.
-    //
-    // Belt-and-braces against a name that is not a series at all. Only
-    // `decdn_health` qualifies today (a Prometheus `job=` label in the
-    // blackbox-probe example at prometheus-alerts.yml's watcher group), and
-    // it currently sits on a `#` line that the strip below already removes
-    // — so this is unreachable unless that example migrates out of a
-    // comment. Kept rather than deleted because a `job=` label is a
-    // legitimate non-series `decdn_*` token that the scanner cannot
-    // distinguish structurally.
-    const NOT_SERIES: [&str; 1] = ["decdn_health"];
-
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let exported = exported_series(&full_scrape());
-
-    // Sweep the directory rather than a fixed list: a new dashboard file
-    // that no test reads is the same silent-coverage hole the name floor
-    // below guards against within a file.
-    let mut files: Vec<String> = fs::read_dir(root.join("monitoring"))
-        .unwrap()
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            let ext = path.extension()?.to_str()?;
-            matches!(ext, "yml" | "json")
-                .then(|| path.file_name()?.to_str().map(str::to_owned))
-                .flatten()
-        })
-        .collect();
-    files.sort();
-    assert!(
-        files.len() >= 5,
-        "monitoring/ yielded only {} scannable files — the directory moved or \
-         the suite shrank",
-        files.len()
-    );
-
-    for name in &files {
-        let file = format!("monitoring/{name}");
-        let text = fs::read_to_string(root.join(&file)).unwrap();
-        // Drop whole-line YAML comments before scanning. A retired series
-        // has to stay nameable in prose — the comments explaining why
-        // `decdn_streams_failed_total` was removed are the record of that
-        // decision, and a gate that forbade writing the name down would
-        // push the next maintainer to delete the explanation instead of
-        // the rule. Everything YAML actually evaluates survives the strip,
-        // including block-scalar `expr: |` bodies. JSON has no comments, so
-        // this is a no-op for the dashboard.
-        let live: String = text
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let names = decdn_names_in(&live);
-        // Floor sized just under the smallest file's real count. A loose
-        // floor is the same failure this gate exists to stop: a shape
-        // change that silently drops most of the coverage while the test
-        // stays green.
-        assert!(
-            names.len() >= 15,
-            "{file} yielded only {} names — the scanner or the file shape changed",
-            names.len()
-        );
-        let stale: Vec<&String> = names
-            .iter()
-            .filter(|n| !n.ends_with('_'))
-            .filter(|n| !NOT_SERIES.contains(&n.as_str()) && !exported.contains(*n))
-            .collect();
-        assert!(
-            stale.is_empty(),
-            "{file} references series the exporter does not emit: {stale:?}\n\
-             Rename them to the real field, or delete the alert/panel — do not \
-             add a waiver."
-        );
-    }
 }
 
 /// Every `live` row in the ADR metric registry must resolve to an exported
@@ -578,56 +401,6 @@ fn adr_registry_names_are_exported() {
         "adr/appendix-observability.md documents series the exporter does not emit: \
          {stale:?}\nEither correct the name or mark the row `planned` in its Status \
          column."
-    );
-}
-
-#[test]
-fn alert_and_dashboard_selectors_match_the_exported_series() {
-    // Nothing in CI validates `monitoring/` against the code — there is no
-    // promtool step and no reference to the directory in any workflow — so
-    // the alert and the dashboard hard-code a series name that only this
-    // test ties back to the encoder. Without it, renaming the metric, the
-    // `reason` label key, or the `Exhausted` variant updates the tests
-    // above, passes CI green, and leaves `DecdnProbeHoldViolations`
-    // querying a series that no longer exists: the page for probe-hold
-    // budget pressure then silently never fires again.
-    //
-    // Scoped to the one series — it asserts the *query line*, which the blanket
-    // name gate below cannot. The blanket "every `decdn_*` in monitoring/ is
-    // exported" check lives in `monitoring_selectors_are_exported`.
-    const SELECTOR: &str = "decdn_probe_hold_unavailable_total{reason=\"exhausted\"";
-
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let alerts = fs::read_to_string(root.join("monitoring/prometheus-alerts.yml")).unwrap();
-    let dashboard = fs::read_to_string(root.join("monitoring/grafana-dashboard.json")).unwrap();
-
-    // Match the query line specifically, not the file. Both files also
-    // name the series in prose (the alert's `description`, the dashboard's
-    // `legendFormat`), and a whole-file `contains` would let that prose
-    // mask a rename of the actual query — verified: mutating only the
-    // `expr:` left a file-wide check green.
-    assert!(
-        alerts
-            .lines()
-            .any(|line| line.contains("expr:") && line.contains(SELECTOR)),
-        "no `expr:` in monitoring/prometheus-alerts.yml queries {SELECTOR}"
-    );
-    // Grafana stores the query inside a JSON string, so the quotes around
-    // the label value arrive backslash-escaped.
-    let escaped = SELECTOR.replace('"', "\\\"");
-    assert!(
-        dashboard
-            .lines()
-            .any(|line| line.contains("\"expr\":") && line.contains(&escaped)),
-        "no `expr` in monitoring/grafana-dashboard.json queries {SELECTOR}"
-    );
-    assert!(
-        Metrics::new()
-            .encode()
-            .unwrap()
-            .lines()
-            .any(|line| line.starts_with(SELECTOR)),
-        "the exporter no longer produces {SELECTOR}"
     );
 }
 
@@ -1169,8 +942,8 @@ fn inbound_failure_reasons_export_at_zero() {
 }
 
 /// Every exported `decdn_serve_stream_*_total` counter is an inbound failure
-/// reason. A new serve-stream counter lands in [`INBOUND_FAILURE_REASONS`], and
-/// through it on the dashboards, or this test names it.
+/// reason. A new serve-stream counter lands in [`INBOUND_FAILURE_REASONS`], or
+/// this test names it.
 #[test]
 fn every_serve_stream_counter_is_an_inbound_failure_reason() {
     let exported = exported_series(&Metrics::new().encode().unwrap());
@@ -1183,80 +956,6 @@ fn every_serve_stream_counter_is_an_inbound_failure_reason() {
         missing.is_empty(),
         "serve-stream counters missing from INBOUND_FAILURE_REASONS: {missing:?}"
     );
-}
-
-/// Both "Unattributed stream failures" panels subtract exactly
-/// [`INBOUND_FAILURE_REASONS`] from the inbound failed count, so a reason
-/// added to that list cannot be missed on the dashboard, and the reverse.
-#[test]
-fn unattributed_panels_subtract_every_inbound_failure_reason() {
-    fn find_exprs(panel: &serde_json::Value, out: &mut Vec<String>) {
-        if panel.get("title").and_then(serde_json::Value::as_str)
-            == Some("Unattributed stream failures")
-        {
-            for target in panel
-                .get("targets")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if let Some(expr) = target.get("expr").and_then(serde_json::Value::as_str) {
-                    out.push(expr.to_owned());
-                }
-            }
-        }
-        for child in panel
-            .get("panels")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            find_exprs(child, out);
-        }
-    }
-
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut want: std::collections::BTreeSet<String> = INBOUND_FAILURE_REASONS
-        .iter()
-        .map(|n| (*n).to_owned())
-        .collect();
-    want.insert("decdn_streams_failed_total".to_owned());
-    for file in [
-        "monitoring/grafana-dashboard.json",
-        "monitoring/dashboard-delivery.json",
-    ] {
-        let dashboard: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(root.join(file)).unwrap()).unwrap();
-        let mut exprs = Vec::new();
-        for panel in dashboard
-            .get("panels")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            find_exprs(panel, &mut exprs);
-        }
-        assert_eq!(
-            exprs.len(),
-            1,
-            "{file}: expected one Unattributed panel target"
-        );
-        let expr = exprs.first().unwrap();
-        assert!(
-            expr.starts_with("sum(rate(decdn_streams_failed_total{direction=\"inbound\","),
-            "{file}: the residual must start from the inbound failed count"
-        );
-        assert_eq!(
-            decdn_names_in(expr),
-            want,
-            "{file}: the Unattributed panel must subtract exactly INBOUND_FAILURE_REASONS"
-        );
-        assert_eq!(
-            expr.matches("\n  - sum(rate(").count(),
-            INBOUND_FAILURE_REASONS.len(),
-            "{file}: each reason is subtracted once"
-        );
-    }
 }
 
 /// Both directions of both stream-outcome families export at zero, and
@@ -1935,4 +1634,51 @@ fn pool_open_failures_by_reason_label_distinct_counters() {
         has_metric_line(&text, "decdn_node_pull_pool_open_failures_total", 0),
         "unlabeled total must not move when only the by-reason helper is called:\n{text}"
     );
+}
+
+/// iroh's transport metrics export under the `decdn_iroh_` prefix once an
+/// endpoint registers them, and not before. The runbook points operators at
+/// `decdn_iroh_socket_*`, so a changed prefix or a renamed iroh group fails
+/// here rather than on a blank panel.
+#[test]
+fn iroh_metrics_export_under_the_decdn_iroh_prefix() {
+    let metrics = Metrics::new();
+    let before = exported_series(&metrics.encode().unwrap());
+    assert!(
+        !before.iter().any(|n| n.starts_with("decdn_iroh_")),
+        "decdn_iroh_* exported before any endpoint registered"
+    );
+
+    metrics
+        .register_iroh_metrics(&EndpointMetrics::default())
+        .unwrap();
+    let after = exported_series(&metrics.encode().unwrap());
+    let socket: Vec<&String> = after
+        .iter()
+        .filter(|n| n.starts_with("decdn_iroh_socket_"))
+        .collect();
+    assert!(
+        !socket.is_empty(),
+        "no decdn_iroh_socket_* series after registering EndpointMetrics; \
+         decdn_iroh_* exported: {:?}",
+        after
+            .iter()
+            .filter(|n| n.starts_with("decdn_iroh_"))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|n| n.starts_with("decdn_iroh_decdn_iroh_")),
+        "iroh metrics carry a doubled prefix"
+    );
+}
+
+/// Each failed inbound stream counts on exactly one entry of
+/// [`INBOUND_FAILURE_REASONS`], so a duplicate entry would double-count it.
+#[test]
+fn inbound_failure_reasons_hold_no_duplicate() {
+    let unique: std::collections::BTreeSet<&str> =
+        INBOUND_FAILURE_REASONS.iter().copied().collect();
+    assert_eq!(unique.len(), INBOUND_FAILURE_REASONS.len());
 }

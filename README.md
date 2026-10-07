@@ -259,7 +259,7 @@ and [`adr/architecture.md`](adr/architecture.md) is the living overview.
 |-------|-------|
 | Protocol specification (ADRs) and glossary | [`adr/`](adr/), [`adr/glossary.md`](adr/glossary.md) |
 | Operating a node | [Operator runbook](docs/runbook.md), [key rotation](adr/appendix-operator-key-rotation.md), [upgrade path](adr/appendix-operator-upgrade-path.md) |
-| Monitoring | [`monitoring/`](monitoring/) dashboards and alert rules; [metric surface](adr/appendix-observability.md) |
+| Monitoring | [Dashboards and alert rules](https://github.com/decdn/devops/tree/main/charts/decdn-node/files/monitoring) (in `decdn/devops`); [metric surface](adr/appendix-observability.md) |
 | Contracts | [`contracts/README.md`](contracts/README.md) |
 | Contributing | [CONTRIBUTING.md](CONTRIBUTING.md): environment, build, test, code style, ADR conventions |
 | Releases | [RELEASING.md](RELEASING.md): cutting, signing, and publishing a release |
