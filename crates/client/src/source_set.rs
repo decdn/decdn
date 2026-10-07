@@ -6,11 +6,12 @@
 //! refusal parks it until the deposit rises, and a lane-build or discovery
 //! error backs off and retries. A partial holder that keeps refusing ranges
 //! outside its coverage is barred from pull-through and serves only the
-//! blocks it covers. A source that refuses the blob as larger than its size
-//! ceiling is excluded for this blob. It ends a fetch only on a unanimous
-//! verdict: every known source is priced out, or every one says it does not
-//! hold the blob, refused it as too large, or is barred from the only work
-//! left, and a fresh discovery found nothing new.
+//! blocks it covers. A source that declines this fetch is excluded for this
+//! blob. A refusal never ends a fetch on its own (ADR 039 §Failure handling):
+//! the fetch ends when every known source declined it, or on a unanimous
+//! verdict after a fresh discovery found nothing new: every known source is
+//! priced out (funding needed), or every one says it does not hold the blob,
+//! declined it, or is barred from the only work left (not-found).
 //!
 //! The state is synchronous. The acquire loop runs the `connect` and `discover`
 //! futures itself, so lanes keep streaming while a lane builds or discovery
@@ -21,14 +22,14 @@ use std::sync::Arc;
 
 use alloy::primitives::{Address, U256};
 use decdn_protocol::Coverage;
-use decdn_protocol::client::StreamError;
+use decdn_protocol::client::{StreamError, VoucherRejectReason};
 use tokio::time::{Duration, Instant};
 
+use crate::UpstreamRefused;
 use crate::fault::{Fault, LaneBuildFault, classify};
 use crate::health::PeerHealth;
 use crate::source::{BlobSource, SourceFuture, SourceStream};
 use crate::streamer::StreamCandidate;
-use crate::{SignerCapDrained, UpstreamRefused};
 
 /// The first wait before a failed lane build is retried.
 pub(crate) const BUILD_RETRY_BASE: Duration = Duration::from_secs(1);
@@ -193,27 +194,57 @@ impl std::fmt::Display for NoSourceHasBlob {
 
 impl std::error::Error for NoSourceHasBlob {}
 
-/// Every known source can serve none of the work left, at least one of them
-/// because it refused the lane's capability signer as drained at its rate
-/// ([`SignerCapDrained`]), and a fresh discovery found no other holder. The
-/// others may be barred for another reason (absence, size), so the stop does
-/// not prove the signer drained at every provider. The
-/// acquire loop raises it as context on the last such refusal, so the error
-/// chain also holds that [`SignerCapDrained`].
-#[derive(Debug)]
-#[cfg_attr(not(feature = "test-util"), non_exhaustive)]
-pub struct NoSourceServesSigner;
+/// Why one source declined this fetch (ADR 005 §Open-time refusal classes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclineReason {
+    /// The node refused the stream `Declined`.
+    Refused,
+    /// The node rejected this client's voucher mid-stream for a reason no
+    /// watermark bundle heals, and that is not a funding reason.
+    Voucher(VoucherRejectReason),
+}
 
-impl std::fmt::Display for NoSourceServesSigner {
+/// Every known source declined this fetch (ADR 039 §Failure handling). The
+/// fetch ends at once, without a fresh discovery. `reasons` are the reasons the
+/// client collected, each once, in the order it first saw them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(feature = "test-util"), non_exhaustive)]
+pub struct NoNodeWillServe {
+    /// The reasons the sources declined, each once.
+    pub reasons: Vec<DeclineReason>,
+}
+
+impl std::fmt::Display for NoNodeWillServe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(
-            "no known provider of this blob can serve it: at least one refused the capability \
-             signer, whose registered cap left is below one chunk at that provider's rate",
-        )
+        let vouchers: Vec<String> = self
+            .reasons
+            .iter()
+            .filter_map(|r| match r {
+                DeclineReason::Voucher(reason) => Some(format!("{reason:?}")),
+                DeclineReason::Refused => None,
+            })
+            .collect();
+        let refused = self.reasons.contains(&DeclineReason::Refused);
+        match (refused, vouchers.is_empty()) {
+            (_, true) => {
+                f.write_str("no node will serve this: every node declined this blob for this fetch")
+            }
+            (false, false) => write!(
+                f,
+                "no node will serve this: every node rejected this client's vouchers ({})",
+                vouchers.join(", ")
+            ),
+            (true, false) => write!(
+                f,
+                "no node will serve this: every node declined this blob or rejected this \
+                 client's vouchers ({})",
+                vouchers.join(", ")
+            ),
+        }
     }
 }
 
-impl std::error::Error for NoSourceServesSigner {}
+impl std::error::Error for NoNodeWillServe {}
 
 /// A backoff that doubles from `base` to `cap`.
 #[derive(Debug, Clone, Copy)]
@@ -303,33 +334,28 @@ pub struct SourceSet<'p, P: SourceProvider> {
     /// holder barred again after its probe counts as one that cannot serve
     /// the work left.
     pull_through_bars: HashMap<Address, u32>,
-    /// Probed partial holders that refused the blob as larger than their size
-    /// ceiling. The ceiling is a stable node policy (ADR 005), so neither a
-    /// verified byte nor a rediscovery lifts this bar. Each one serves only
-    /// the blocks it covers.
-    too_large_pull_through: HashSet<Address>,
-    /// Providers other than partial holders that refused the blob as larger
-    /// than their size ceiling (`StreamError::Declined`). The ceiling is a
-    /// stable node policy (ADR 005), so none of them starts again for this
-    /// blob, and a rediscovery does not lift it. A node applies the ceiling
-    /// only to a pull-through, so the same refusal from a partial holder bars
-    /// only its pull-through ([`Self::no_pull_through`]).
-    too_large: HashSet<Address>,
-    /// Providers that refused the lane's capability signer as drained at
-    /// their rate ([`SignerCapDrained`]). A registration's `spent` only grows,
-    /// so none of them starts again for this blob, and neither a verified
-    /// byte nor a rediscovery lifts the bar.
-    signer_drained: HashSet<Address>,
-    /// The refusal that last barred a provider for a drained signer: the
-    /// cause the [`NoSourceServesSigner`] stop carries.
-    last_drained: Option<SignerCapDrained>,
+    /// Probed partial holders that refused a range outside their coverage
+    /// `Declined` (ADR 005 §Open-time refusal classes), most often for their
+    /// size ceiling, which a node applies only to a pull-through. Neither a
+    /// verified byte nor a rediscovery lifts this bar for the fetch. Each one
+    /// serves only the blocks it covers.
+    declined_pull_through: HashSet<Address>,
+    /// Providers that declined this fetch: other than a partial holder's
+    /// pull-through refusal, a `Declined` refusal, or a mid-stream voucher
+    /// rejection that no bundle heals and that names no funding reason. None
+    /// of them starts again for this blob in this fetch, and a rediscovery
+    /// does not lift it (ADR 039 §Failure handling).
+    declined: HashSet<Address>,
+    /// The reasons the declining providers gave, each once: what the
+    /// [`NoNodeWillServe`] stop names.
+    decline_reasons: Vec<DeclineReason>,
     /// The refusal that last marked a source absent, barred it from
-    /// pull-through or excluded it as too small for the blob: the cause the
+    /// pull-through or declined the fetch: the cause the
     /// [`NoSourceHasBlob`] stop carries.
     last_absent: Option<UpstreamRefused>,
     discovery: Option<Backoff>,
     /// Bumped each time a source newly joins `absent`, `no_pull_through`,
-    /// `too_large_pull_through`, `too_large` or `signer_drained`.
+    /// `declined_pull_through` or `declined`.
     mark_epoch: u64,
     /// The deposit and mark epoch of the last successful discovery. A
     /// unanimous stop needs a discovery at the current pair.
@@ -376,10 +402,9 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             stale_blocks: HashMap::new(),
             advertised: HashMap::new(),
             pull_through_bars: HashMap::new(),
-            too_large_pull_through: HashSet::new(),
-            too_large: HashSet::new(),
-            signer_drained: HashSet::new(),
-            last_drained: None,
+            declined_pull_through: HashSet::new(),
+            declined: HashSet::new(),
+            decline_reasons: Vec::new(),
             last_absent: None,
             discovery: None,
             mark_epoch: 0,
@@ -422,8 +447,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// The nearest source that may start now and is not already `running`. A
-    /// source that refused the blob as too large, or refused the lane's signer
-    /// as drained, never starts again.
+    /// source that declined this fetch never starts again.
     #[must_use]
     pub fn next_to_start(
         &self,
@@ -434,8 +458,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         self.holders
             .iter()
             .filter(|h| !running.contains(&h.provider))
-            .filter(|h| !self.too_large.contains(&h.provider))
-            .filter(|h| !self.signer_drained.contains(&h.provider))
+            .filter(|h| !self.declined.contains(&h.provider))
             .filter(|h| {
                 self.build_retry
                     .get(&h.provider)
@@ -515,11 +538,10 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// worker runs or the node is already charged for this outage. The node
     /// does not cool for it. A `NotFound` for a range outside the coverage of
     /// a probed partial holder counts toward barring it from pull-through,
-    /// and a size-ceiling refusal bars it at once, as on its own stream. The
-    /// scheduler passes only uncovered ranges here: an extra stream's covered
-    /// `NotFound` is most often the node's per-signer live cap. A drained
-    /// signer ([`SignerCapDrained`]) bars the node at once, as on its own
-    /// stream.
+    /// and a `Declined` refusal or an unhealed voucher rejection declines it
+    /// at once, as on its own stream. The scheduler passes only uncovered
+    /// ranges here: an extra stream's covered `NotFound` is most often the
+    /// node's per-signer live cap.
     pub(crate) fn record_extra_refusal(
         &mut self,
         provider: Address,
@@ -527,8 +549,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         range: LaneRange,
         at: Instant,
     ) {
-        if let Some(drained) = err.downcast_ref::<SignerCapDrained>() {
-            self.record_signer_drained(provider, drained);
+        if let Some(reason) = crate::fault::declining_rejection(err) {
+            self.record_declined(provider, DeclineReason::Voucher(reason), None);
             return;
         }
         let Some(refused) = err.downcast_ref::<UpstreamRefused>() else {
@@ -538,7 +560,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             self.record_not_found(provider, refused, Some(&range), at);
         }
         if matches!(refused.error(), StreamError::Declined) {
-            self.record_too_large(provider, refused);
+            self.record_declined(provider, DeclineReason::Refused, Some(refused));
         }
     }
 
@@ -608,10 +630,12 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             );
         }
         match fault {
-            // The signer's fault, not the node's: the node is barred for this
-            // blob, and its peer-store record keeps no failure stamp.
-            Fault::Source => match err.downcast_ref::<SignerCapDrained>() {
-                Some(drained) => self.record_signer_drained(provider, drained),
+            // This client's voucher, not the node's delivery: the node declines
+            // this fetch, and its peer-store record keeps no failure stamp.
+            Fault::Source => match crate::fault::declining_rejection(err) {
+                Some(reason) => {
+                    self.record_declined(provider, DeclineReason::Voucher(reason), None);
+                }
                 None => self.record_source_fault(provider, err, range.as_ref(), now),
             },
             Fault::Fatal(_) | Fault::Unaffordable | Fault::Transient => {}
@@ -621,7 +645,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// Record a delivery fault of `provider`'s: a `NotFound` toward marking it
-    /// absent, a size-ceiling refusal as a bar, and a failure stamp in its
+    /// absent, a `Declined` refusal as a bar, and a failure stamp in its
     /// peer-store record.
     fn record_source_fault(
         &mut self,
@@ -639,7 +663,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         if let Some(refused) = err.downcast_ref::<UpstreamRefused>()
             && matches!(refused.error(), StreamError::Declined)
         {
-            self.record_too_large(provider, refused);
+            self.record_declined(provider, DeclineReason::Refused, Some(refused));
         }
         if let Some(holder) = self.holder(provider) {
             self.provider.on_source_fault(holder);
@@ -686,21 +710,35 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         self.marked(newly, refused);
     }
 
-    /// Record that `provider` refused the blob as larger than its size
-    /// ceiling. A node applies the ceiling only when it pulls the blob
-    /// through, and serves the blocks it holds without it. So a partial
-    /// holder is barred from pull-through only, and keeps the blocks it
-    /// covers. Any other source never starts again for this blob.
-    fn record_too_large(&mut self, provider: Address, refused: &UpstreamRefused) {
+    /// Record that `provider` declined this fetch for `reason`. A partial
+    /// holder's `Declined` refusal is most often its size ceiling, which a
+    /// node applies only when it pulls the blob through, so a partial holder
+    /// is barred from pull-through only and keeps the blocks it covers. Any
+    /// other source, and any source that rejected this client's voucher,
+    /// never starts again for this blob in this fetch.
+    fn record_declined(
+        &mut self,
+        provider: Address,
+        reason: DeclineReason,
+        refused: Option<&UpstreamRefused>,
+    ) {
         let partial = self
             .holder(provider)
             .is_some_and(|holder| holder.coverage.is_some());
-        let newly = if partial {
-            self.too_large_pull_through.insert(provider)
+        let newly = if partial && reason == DeclineReason::Refused {
+            self.declined_pull_through.insert(provider)
         } else {
-            self.too_large.insert(provider)
+            self.declined.insert(provider)
         };
-        self.marked(newly, refused);
+        if !self.decline_reasons.contains(&reason) {
+            self.decline_reasons.push(reason);
+        }
+        if newly {
+            self.mark_epoch = self.mark_epoch.saturating_add(1);
+        }
+        if let Some(refused) = refused {
+            self.last_absent = Some(refused.clone());
+        }
     }
 
     /// Count a `NotFound` from probed partial holder `provider` for `range`,
@@ -872,15 +910,6 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         }
     }
 
-    /// Bar `provider` for the lane's signer it refused as `drained`
-    /// ([`Self::signer_drained`]).
-    fn record_signer_drained(&mut self, provider: Address, drained: &SignerCapDrained) {
-        self.last_drained = Some(drained.clone());
-        if self.signer_drained.insert(provider) {
-            self.mark_epoch = self.mark_epoch.saturating_add(1);
-        }
-    }
-
     /// Record `refused` as the cause of a mark that excludes a source, and
     /// bump the mark epoch when the mark is `newly` set.
     fn marked(&mut self, newly: bool, refused: &UpstreamRefused) {
@@ -903,7 +932,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// coverage: it serves such ranges by pull-through after all, so its
     /// count of `NotFound` answers for them clears, and so does the bar they
     /// set. A byte verified no later than its last such answer changes
-    /// nothing. A bar from a size-ceiling refusal stays.
+    /// nothing. A bar from a `Declined` refusal stays.
     pub fn record_pull_through(&mut self, provider: Address, at: Instant) {
         let served_at = self.pull_through_served_at.entry(provider).or_insert(at);
         *served_at = (*served_at).max(at);
@@ -923,14 +952,14 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// Whether `provider` is barred from pull-through: a probed partial
     /// holder that said `NotFound` to [`ABSENT_AFTER_NOT_FOUND`] ranges
     /// outside its coverage, with no such range served since and its bar not
-    /// yet ended ([`Self::expire_pull_through_bars`]), or that refused the
-    /// blob as too large. It still serves the blocks it covers and takes no
+    /// yet ended ([`Self::expire_pull_through_bars`]), or that refused such a
+    /// range `Declined`. It still serves the blocks it covers and takes no
     /// range outside them. A discovery that reports wider coverage for it
-    /// clears a `NotFound` bar; a size-ceiling bar stays for the blob.
+    /// clears a `NotFound` bar; a `Declined` bar stays for the fetch.
     #[must_use]
     pub fn no_pull_through(&self, provider: Address) -> bool {
         self.no_pull_through.contains_key(&provider)
-            || self.too_large_pull_through.contains(&provider)
+            || self.declined_pull_through.contains(&provider)
     }
 
     /// Whether a discovery should run now.
@@ -1037,19 +1066,22 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         cooling.chain(builds).chain(discovery).chain(bars).min()
     }
 
-    /// The unanimous stop, if a discovery ran at this deposit and mark epoch and:
-    /// every known source can serve none of the work left (the item ends), or
-    /// every known source is priced out or can serve none of it, with at least
-    /// one priced out, and the top-up budget cannot change that (the command
-    /// ends).
+    /// The stop for an exhausted candidate set (ADR 039 §Failure handling), by
+    /// the first rule that applies:
+    ///
+    /// 1. Every known source declined this fetch: [`NoNodeWillServe`] at once,
+    ///    with no fresh discovery.
+    /// 2. After a discovery at this deposit and mark epoch, every known source
+    ///    is priced out or can serve none of the work left, with at least one
+    ///    priced out, and the top-up budget cannot change that:
+    ///    [`NoAffordableSource`], "funding needed".
+    /// 3. After such a discovery, every known source can serve none of the
+    ///    work left: [`NoSourceHasBlob`], not-found.
     ///
     /// A source can serve none of the work left when it says the blob is
-    /// absent, when it refused the blob as too large, when it refused the
-    /// lane's signer as drained ([`NoSourceServesSigner`] when any did), or
-    /// when it is barred
-    /// from pull-through
-    /// ([`Self::no_pull_through`]) and `only_uncovered_left` says no work left
-    /// lies inside the coverage of a barred holder.
+    /// absent, when it declined this fetch, or when it is barred from
+    /// pull-through ([`Self::no_pull_through`]) and `only_uncovered_left` says
+    /// no work left lies inside the coverage of a barred holder.
     #[must_use]
     pub fn exhausted(
         &self,
@@ -1057,24 +1089,35 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         topups_left: bool,
         only_uncovered_left: bool,
     ) -> Option<anyhow::Error> {
+        if self.all_declined(only_uncovered_left) {
+            return Some(anyhow::Error::new(NoNodeWillServe {
+                reasons: self.decline_reasons.clone(),
+            }));
+        }
         if self.holders.is_empty() || self.discovered_at != Some((deposit, self.mark_epoch)) {
             return None;
         }
+        if self.all_excluded(deposit, only_uncovered_left) {
+            return (!topups_left).then(|| anyhow::Error::new(NoAffordableSource { deposit }));
+        }
         if self.all_item_marked(only_uncovered_left) {
-            return Some(match (&self.last_drained, &self.last_absent) {
-                (Some(drained), _) => {
-                    anyhow::Error::new(drained.clone()).context(NoSourceServesSigner)
-                }
-                (None, Some(refused)) => {
-                    anyhow::Error::new(refused.clone()).context(NoSourceHasBlob)
-                }
-                (None, None) => anyhow::Error::new(NoSourceHasBlob),
+            return Some(match &self.last_absent {
+                Some(refused) => anyhow::Error::new(refused.clone()).context(NoSourceHasBlob),
+                None => anyhow::Error::new(NoSourceHasBlob),
             });
         }
-        if !self.all_excluded(deposit, only_uncovered_left) {
-            return None;
-        }
-        (!topups_left).then(|| anyhow::Error::new(NoAffordableSource { deposit }))
+        None
+    }
+
+    /// Whether every known source declined this fetch: a `Declined` refusal
+    /// or an unhealed voucher rejection, or, with `only_uncovered_left`, a
+    /// partial holder's `Declined` pull-through refusal.
+    fn all_declined(&self, only_uncovered_left: bool) -> bool {
+        !self.holders.is_empty()
+            && self.holders.iter().all(|h| {
+                self.declined.contains(&h.provider)
+                    || (only_uncovered_left && self.declined_pull_through.contains(&h.provider))
+            })
     }
 
     /// Whether every known source can serve none of the work left
@@ -1105,21 +1148,19 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// Whether `provider` can serve none of the work left: it says the blob is
-    /// absent, it refused the blob as too large, it refused the lane's signer
-    /// as drained, or `only_uncovered_left` says
+    /// absent, it declined this fetch, or `only_uncovered_left` says
     /// no work left lies inside the coverage of a barred holder and the holder
-    /// is barred for good: by a size-ceiling refusal, or by `NotFound` again
+    /// is barred for good: by a `Declined` refusal, or by `NotFound` again
     /// after the probe that followed its first bar.
     fn cannot_serve(&self, provider: Address, only_uncovered_left: bool) -> bool {
-        let barred_for_good = self.too_large_pull_through.contains(&provider)
+        let barred_for_good = self.declined_pull_through.contains(&provider)
             || (self.no_pull_through.contains_key(&provider)
                 && self
                     .pull_through_bars
                     .get(&provider)
                     .is_some_and(|bars| *bars >= 2));
         self.absent.contains(&provider)
-            || self.too_large.contains(&provider)
-            || self.signer_drained.contains(&provider)
+            || self.declined.contains(&provider)
             || (only_uncovered_left && barred_for_good)
     }
 
@@ -1640,25 +1681,23 @@ mod tests {
         assert!(err.is_some_and(|e| e.downcast_ref::<super::NoSourceHasBlob>().is_some()));
     }
 
-    /// A refusal the chain explains as a drained capability signer at the
-    /// refusing provider's rate.
-    fn drained(provider: Address, remaining: u64, rate_per_mb: u64) -> anyhow::Error {
-        anyhow::Error::new(crate::SignerCapDrained {
-            pool_id: alloy::primitives::B256::ZERO,
-            signer: Address::ZERO,
-            provider,
-            remaining,
-            rate_per_mb,
-            expired: false,
+    /// An unhealed voucher rejection with no funding reason.
+    fn rejected(reason: decdn_protocol::client::VoucherRejectReason) -> anyhow::Error {
+        anyhow::Error::new(crate::UpstreamVoucherRejected {
+            reason,
+            bundle: None,
+            proof_generation: None,
         })
     }
 
-    /// A probed holder that refuses the lane's signer as drained at its rate is
-    /// barred for the blob, with no peer-store failure stamp, while a cheaper
-    /// holder still starts. Once every holder is barred, the item ends with
-    /// the drained cause in the chain (#2338).
+    /// A holder that rejects this client's vouchers declines the fetch: it is
+    /// barred for the blob with no peer-store failure stamp, while another
+    /// holder still starts. Once every holder declined, the item ends at once,
+    /// with no fresh discovery, naming the reasons collected (ADR 039 §Failure
+    /// handling).
     #[tokio::test(start_paused = true)]
-    async fn a_drained_signer_bars_each_refusing_holder_until_none_is_left() -> anyhow::Result<()> {
+    async fn every_holder_declining_ends_the_item_with_its_reasons() -> anyhow::Result<()> {
+        use decdn_protocol::client::VoucherRejectReason;
         let p = provider(vec![]);
         let mut set = SourceSet::new(
             &p,
@@ -1667,7 +1706,13 @@ mod tests {
             vec![holder(A, 10.0), holder(B, 20.0)],
         );
         let now = Instant::now();
-        let fault = set.record_fault(A, &drained(A, 5, 10), None, now, U256::ZERO);
+        let fault = set.record_fault(
+            A,
+            &rejected(VoucherRejectReason::BadSignature),
+            None,
+            now,
+            U256::ZERO,
+        );
         assert_eq!(fault, Fault::Source);
         assert!(
             p.faults.lock().is_ok_and(|f| f.is_empty()),
@@ -1678,28 +1723,72 @@ mod tests {
             set.next_to_start(later, U256::ZERO, &HashSet::new())
                 .map(|h| h.provider),
             Some(B),
-            "the barred holder never starts again"
+            "the declining holder never starts again"
         );
-        set.discovery_done(Ok(vec![holder(A, 10.0)]), now, U256::ZERO);
         assert!(
             set.exhausted(U256::ZERO, true, false).is_none(),
             "B is left"
         );
 
-        set.record_fault(B, &drained(B, 5, 20), None, now, U256::ZERO);
-        set.discovery_done(Ok(vec![]), now, U256::ZERO);
+        set.record_fault(
+            B,
+            &rejected(VoucherRejectReason::BadSignature),
+            None,
+            now,
+            U256::ZERO,
+        );
         let err = set
             .exhausted(U256::ZERO, true, false)
-            .ok_or_else(|| anyhow::anyhow!("every holder is barred"))?;
-        assert!(err.downcast_ref::<super::NoSourceServesSigner>().is_some());
+            .ok_or_else(|| anyhow::anyhow!("every holder declined"))?;
+        let stop = err
+            .downcast_ref::<super::NoNodeWillServe>()
+            .ok_or_else(|| anyhow::anyhow!("expected NoNodeWillServe, got {err:#}"))?;
         assert_eq!(
-            err.downcast_ref::<crate::SignerCapDrained>()
-                .map(|d| d.provider),
-            Some(B),
-            "the last refusal is the cause"
+            stop.reasons,
+            vec![super::DeclineReason::Voucher(
+                VoucherRejectReason::BadSignature
+            )]
+        );
+        assert_eq!(
+            err.to_string(),
+            "no node will serve this: every node rejected this client's vouchers (BadSignature)"
         );
         assert_eq!(crate::classify(&err), Fault::Fatal(crate::FatalScope::Item));
         Ok(())
+    }
+
+    /// A `Declined` refusal from one holder and a funding refusal from the
+    /// other: the set is not all-declined, so the funding rule decides.
+    #[tokio::test(start_paused = true)]
+    async fn a_funding_refusal_outranks_a_decline() {
+        use crate::UpstreamRefused;
+        use decdn_protocol::client::StreamError;
+        let p = provider(vec![]);
+        let mut set = SourceSet::new(
+            &p,
+            [0; 32],
+            Arc::default(),
+            vec![holder(A, 10.0), holder(B, 20.0)],
+        );
+        let now = Instant::now();
+        let declined = anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Declined));
+        set.record_fault(A, &declined, None, now, U256::ZERO);
+        let unfunded = anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Unfunded));
+        assert_eq!(
+            set.record_fault(B, &unfunded, None, now, U256::ZERO),
+            Fault::Unaffordable
+        );
+        assert!(
+            set.exhausted(U256::ZERO, false, false).is_none(),
+            "funding needs a fresh discovery first"
+        );
+        set.discovery_done(Ok(vec![]), now, U256::ZERO);
+        assert!(
+            set.exhausted(U256::ZERO, true, false).is_none(),
+            "a funding step is still allowed"
+        );
+        let err = set.exhausted(U256::ZERO, false, false);
+        assert!(err.is_some_and(|e| e.downcast_ref::<super::NoAffordableSource>().is_some()));
     }
 
     /// A probed holder's `NotFound` is a delivery fault only: it may mean load
@@ -2163,10 +2252,10 @@ mod tests {
         ))
     }
 
-    /// A proxy that refuses the blob as larger than its size ceiling never
-    /// starts again for this blob, even once its cooldown ends and a
-    /// discovery reports it again, while the holder still starts. A set where
-    /// every source refused the blob as too large ends the item.
+    /// A proxy that refuses `Declined` never starts again for this blob, even
+    /// once its cooldown ends and a discovery reports it again, while the
+    /// holder still starts. A set where every source declined ends the item
+    /// with "no node will serve this".
     #[tokio::test(start_paused = true)]
     async fn a_proxy_refusing_the_blob_as_too_large_is_excluded() -> anyhow::Result<()> {
         let p = provider(vec![]);
@@ -2202,20 +2291,13 @@ mod tests {
         );
 
         set.record_fault(B, &too_large(), None, later, U256::ZERO);
-        set.discovery_done(Ok(vec![]), later, U256::ZERO);
         let err = set
             .exhausted(U256::ZERO, true, false)
-            .ok_or_else(|| anyhow::anyhow!("every source refused the blob as too large"))?;
-        assert!(
-            err.downcast_ref::<super::NoSourceHasBlob>().is_some(),
-            "{err:#}"
-        );
-        assert!(
-            err.downcast_ref::<crate::UpstreamRefused>()
-                .is_some_and(|r| matches!(
-                    r.error(),
-                    decdn_protocol::client::StreamError::Declined
-                )),
+            .ok_or_else(|| anyhow::anyhow!("every source declined"))?;
+        assert_eq!(
+            err.downcast_ref::<super::NoNodeWillServe>()
+                .map(|stop| stop.reasons.clone()),
+            Some(vec![super::DeclineReason::Refused]),
             "{err:#}"
         );
         Ok(())

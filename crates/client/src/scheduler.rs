@@ -5976,28 +5976,19 @@ mod tests {
 
     /// A fatal fault ends the whole acquire with THAT typed error and does NOT
     /// reassign the failed source's range to a peer. `src_terminal` (lane 0)
-    /// owns the first segment and faults at byte 0 with a typed
-    /// [`UpstreamVoucherRejected`]: a payment-layer rejection the shared pool
-    /// hits against every provider, so no other lane can fix it. `src_peer`
-    /// (lane 1) is slow to start, so it is still on its OWN second segment when
-    /// the fatal fault ends the acquire.
+    /// owns the first segment and faults at byte 0 with a local fault
+    /// ([`crate::LocalPullFault`]): only the user can fix it, so no other lane
+    /// can. `src_peer` (lane 1) is slow to start, so it is still on its OWN
+    /// second segment when the fatal fault ends the acquire.
     #[tokio::test]
     async fn terminal_fault_propagates_and_is_not_reassigned() -> anyhow::Result<()> {
-        use decdn_protocol::client::VoucherRejectReason;
-
         let data = blob(64 * 1024 * 1024);
         let total = data.len() as u64;
         let ledger_terminal = Arc::new(PoolLedger::new(Cumulative::default()));
         let ledger_peer = Arc::new(PoolLedger::new(Cumulative::default()));
-        // A non-`SpendingCapExhausted` reason, so the driver's exhaustion /
-        // reseed self-heal does not intercept it: `fill_gap` returns it verbatim.
         let src_terminal = ScriptedSource::new(data.clone())?
             .with_fault_after(0, || {
-                anyhow::Error::new(UpstreamVoucherRejected {
-                    reason: VoucherRejectReason::CapabilityExpired,
-                    bundle: None,
-                    proof_generation: None,
-                })
+                anyhow::anyhow!("keystore unreadable").context(crate::LocalPullFault)
             })
             .paying(Arc::clone(&ledger_terminal));
         let src_peer = ScriptedSource::new(data.clone())?
@@ -6027,7 +6018,7 @@ mod tests {
 
         let err = result.expect_err("a fatal fault must fail the acquire");
         assert!(
-            err.downcast_ref::<UpstreamVoucherRejected>().is_some(),
+            err.downcast_ref::<crate::LocalPullFault>().is_some(),
             "the fatal error must propagate verbatim, not be masked: {err:#}"
         );
 
@@ -7190,18 +7181,16 @@ mod tests {
         Ok(())
     }
 
-    /// A node's `SpendingCapExhausted` refusal is genuine only when the pool's
-    /// own accounting agrees, and that accounting takes the funder's view of
-    /// the whole pool ([`Funder::pool_spent`]). With no spend beyond the loop's
-    /// lanes, they have touched almost none of the deposit, so the refusal is a
-    /// lie that ends the command. With the deposit spent outside
-    /// the loop, the refusal is genuine: with no top-up left, the acquire stops
-    /// with the top-up remedy.
+    /// A node's `SpendingCapExhausted` refusal acts as `Unfunded` from that
+    /// node whatever the pool's own accounting says (ADR 005 §`VoucherRejected`
+    /// semantics): a lying node costs at most one funding recovery step, never
+    /// the fetch. With no top-up left, the acquire stops "funding needed",
+    /// whether or not the deposit was spent outside the loop
+    /// ([`Funder::pool_spent`]).
     #[tokio::test(start_paused = true)]
-    async fn a_cap_refusal_is_genuine_once_the_outside_spend_drains_the_deposit()
-    -> anyhow::Result<()> {
+    async fn a_cap_refusal_acts_as_unfunded_from_its_node() -> anyhow::Result<()> {
         let deposit = U256::from(1_000_000_000u64);
-        for (outside, genuine) in [(U256::ZERO, false), (deposit, true)] {
+        for (outside, genuine) in [(U256::ZERO, true), (deposit, true)] {
             let la = Arc::new(PoolLedger::new(Cumulative::default()));
             let a = ScriptedSource::new(blob(1024 * 1024))?
                 .paying(Arc::clone(&la))

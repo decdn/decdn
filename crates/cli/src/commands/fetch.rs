@@ -47,8 +47,8 @@ use decdn_client::source::{Funder, SourceFuture};
 use decdn_client::{
     Connections, Cumulative, DownloadTarget, Downloader, Holder, LaneHandle, LaneLedgers,
     NoAffordableSource, NoCache, NoSourceHasBlob, PeerHealth, PeerSource, PoolContext, PoolLedger,
-    ProgressClock, PullConfig, PullDeadlines, SignerCapDrained, StopPolicy, Streamer,
-    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, sign_client_binding,
+    ProgressClock, PullConfig, PullDeadlines, StopPolicy, Streamer, UpstreamRefused,
+    UpstreamVoucherRejected, VoucherProgress, sign_client_binding,
 };
 
 use super::cli_sources::CliSources;
@@ -2072,26 +2072,20 @@ async fn fetch_over(
     result.map_err(|err| sources.annotate(err))
 }
 
-/// Reconnect a delegated fetch's terminal owner-remedy voucher rejection
-/// (`SpendingCapExhausted`, `CapabilityExpired`, `PoolExhausted`) to the
-/// owner-side remedy: the delegate holds no wallet on this pool, so it cannot
-/// `topUp`, raise its own cap, or mint itself a fresh capability. A
-/// [`NoAffordableSource`] — no provider's next voucher fits the pool — gets the
-/// same owner-side remedy. A drained or expired signer registration (a
-/// [`SignerCapDrained`] the lane read from chain after a node refused it at
-/// admission, or a mid-stream `SignerCapExhausted`) gets the remedy a
-/// write-once registration leaves: a capability for a new signer key. Only an
-/// expired registration, or one with nothing left of its cap, is named as
-/// shutting out every provider; any other drain is measured against the
-/// refusing provider's rate.
-/// A terminal `Underpaid` — the resync budget ran out — gets its own next
-/// step. Any other
-/// error passes through verbatim (a stall, a transport fault, or a `NotFound`
-/// already annotated by [`annotate_unbound_cache_miss`]).
+/// Reconnect a delegated fetch that ended "funding needed" (ADR 003 §Funding
+/// recovery) to the owner-side remedy: the delegate holds no wallet on this
+/// pool, so it cannot `topUp`, raise its own cap, or mint itself a fresh
+/// capability. That is a [`NoAffordableSource`] stop, or a funding voucher
+/// rejection (`SpendingCapExhausted`, `CapabilityExpired`, `PoolExhausted`,
+/// `SignerCapExhausted`). The remedy names a new signer key, because a
+/// registered signer's terms are write-once. A terminal `Underpaid` — the
+/// resync budget ran out — gets its own next step. Any other error passes
+/// through verbatim (a stall, a transport fault, a "no node will serve this",
+/// or a `NotFound` already annotated by [`annotate_unbound_cache_miss`]).
 pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error {
     use decdn_protocol::client::VoucherRejectReason;
 
-    let needs_owner = err
+    let funding_rejection = err
         .downcast_ref::<UpstreamVoucherRejected>()
         .is_some_and(|rejected| {
             matches!(
@@ -2099,50 +2093,18 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
                 VoucherRejectReason::SpendingCapExhausted
                     | VoucherRejectReason::CapabilityExpired
                     | VoucherRejectReason::PoolExhausted
+                    | VoucherRejectReason::SignerCapExhausted
             )
         });
     let underpaid = err
         .downcast_ref::<UpstreamVoucherRejected>()
         .is_some_and(|rejected| rejected.reason == VoucherRejectReason::Underpaid);
-    // Only an expired registration, or one with nothing left of its cap,
-    // shuts out every provider. Any other drain is measured against the
-    // refusing provider's rate, and a provider at a lower rate may still
-    // serve while headroom remains.
-    let drained = err.downcast_ref::<SignerCapDrained>();
-    let drained_everywhere = drained.is_some_and(SignerCapDrained::at_every_rate);
-    let drained_at_rate = (drained.is_some() && !drained_everywhere)
-        || err
-            .downcast_ref::<UpstreamVoucherRejected>()
-            .is_some_and(|rejected| rejected.reason == VoucherRejectReason::SignerCapExhausted);
-    if drained_everywhere {
-        err.context(
-            "this capability's signer key has spent its whole registered cap, or its \
-             registration expired, so no node can be paid for serving it. The registered cap \
-             and expiry are write-once on-chain: a new token for the same key does not raise \
-             them. Ask the pool owner to issue a capability for a new signer key",
-        )
-    } else if drained_at_rate {
-        err.context(
-            "this capability's signer key has less of its registered cap left than the \
-             refusing provider reserves at its rate; a provider at a lower rate may still serve \
-             it while headroom remains. The registered cap and expiry are write-once on-chain: \
-             a new token for the same key does not raise them. To raise the limit, ask the pool \
-             owner to issue a capability for a new signer key",
-        )
-    } else if err.downcast_ref::<NoAffordableSource>().is_some() {
+    if funding_rejection || err.downcast_ref::<NoAffordableSource>().is_some() {
         err.context(
             "funding needed: no provider serves this capability at its current funding. Ask \
              the pool owner to top up the pool or issue a fresh capability; once this signer \
              key is registered on-chain its terms are write-once, so the fresh capability must \
              name a new signer key (a delegated client cannot top up a pool it does not own)",
-        )
-    } else if needs_owner {
-        err.context(
-            "capability cap exhausted, capability expired, or pool balance exhausted. Ask the \
-             pool owner to top up the pool or issue a fresh, higher-cap capability; once this \
-             signer key is registered on-chain its terms are write-once, so the fresh capability \
-             must name a new signer key (a delegated client cannot top up a pool it does not \
-             own)",
         )
     } else if underpaid {
         err.context(
@@ -2358,15 +2320,6 @@ where
         Arc::clone(&ledger),
         provider,
     );
-    // A delegated signer the node refuses at admission for a drained or
-    // expired registration gets a plain `NotFound`; the chain read tells it
-    // apart from a cache miss, so the fetch bars that node, or stops when no
-    // node can serve the signer, instead of retrying (#2338).
-    let source = if grant.is_some() {
-        source.with_signer_check(deps.contract)
-    } else {
-        source
-    };
     if let Some(timings) = deps.timings {
         timings.mark(Mark::Lane);
     }
@@ -5078,54 +5031,32 @@ mod tests {
         });
         let annotated = super::annotate_delegated_exhaustion(err);
         assert!(
-            annotated.to_string().contains("exhausted"),
-            "expected the exhaustion remedy, got: {annotated}"
+            annotated.to_string().contains("funding needed"),
+            "expected the funding remedy, got: {annotated}"
         );
     }
 
     /// A drained signer registration names the remedy a write-once
     /// registration leaves: a capability for a new signer key (#2338). Only a
-    /// registration expired or with nothing left of its cap is named as
-    /// shutting out every provider. A drain read at one provider's rate (alone,
-    /// or under the stop once every known provider is barred) and a mid-stream
-    /// `SignerCapExhausted` are measured against the refusing provider's rate,
-    /// so the text says a cheaper provider may still serve.
+    /// registration leaves: a capability for a new signer key (#2338), whether
+    /// the fetch ended "funding needed" or on a mid-stream
+    /// `SignerCapExhausted`.
     #[test]
     fn delegated_drained_signer_gets_the_new_key_remedy() {
-        let drained = |remaining, expired| decdn_client::SignerCapDrained {
-            pool_id: alloy::primitives::B256::ZERO,
-            signer: Address::repeat_byte(0xd1),
-            provider: Address::repeat_byte(0xa1),
-            remaining,
-            rate_per_mb: 10,
-            expired,
-        };
-        let at_rate = [
-            anyhow::Error::new(drained(5, false)),
-            anyhow::Error::new(drained(5, false)).context(decdn_client::NoSourceServesSigner),
+        for err in [
+            anyhow::Error::new(NoAffordableSource {
+                deposit: U256::from(5u32),
+            }),
             anyhow::Error::new(UpstreamVoucherRejected {
                 reason: decdn_protocol::client::VoucherRejectReason::SignerCapExhausted,
                 bundle: None,
                 proof_generation: None,
             }),
-        ];
-        for err in at_rate {
-            let annotated = format!("{:#}", super::annotate_delegated_exhaustion(err));
-            assert!(
-                annotated.contains("new signer key")
-                    && annotated.contains("lower rate may still serve")
-                    && !annotated.contains("no node can be paid"),
-                "expected the rate-relative new-key remedy, got: {annotated}"
-            );
-        }
-        for err in [
-            anyhow::Error::new(drained(0, false)),
-            anyhow::Error::new(drained(5, true)),
         ] {
             let annotated = format!("{:#}", super::annotate_delegated_exhaustion(err));
             assert!(
-                annotated.contains("new signer key") && annotated.contains("no node can be paid"),
-                "expected the every-provider new-key remedy, got: {annotated}"
+                annotated.contains("funding needed") && annotated.contains("new signer key"),
+                "expected the new-key remedy, got: {annotated}"
             );
         }
     }
@@ -5149,8 +5080,8 @@ mod tests {
         });
         let annotated = super::annotate_delegated_exhaustion(err);
         assert!(
-            annotated.to_string().contains("expired"),
-            "expected the expiry remedy, got: {annotated}"
+            annotated.to_string().contains("funding needed"),
+            "expected the funding remedy, got: {annotated}"
         );
     }
 
@@ -5165,8 +5096,8 @@ mod tests {
         });
         let annotated = super::annotate_delegated_exhaustion(err);
         assert!(
-            annotated.to_string().contains("exhausted"),
-            "expected the exhaustion remedy, got: {annotated}"
+            annotated.to_string().contains("funding needed"),
+            "expected the funding remedy, got: {annotated}"
         );
     }
 

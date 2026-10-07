@@ -6,13 +6,11 @@
 //! chain side of building a lane. The acquire loop acts on the class; it never
 //! inspects the error further.
 
-use decdn_protocol::client::StreamError;
+use decdn_protocol::client::{StreamError, VoucherRejectReason};
 
 use crate::buyer_pool::{EscrowUntracked, TopUpUnconfirmed, WalletShortfall};
 use crate::driver::{PoolExhausted, TopUpFailed};
-use crate::{
-    BlobTooLarge, LocalPullFault, SignerCapDrained, UpstreamRefused, UpstreamVoucherRejected,
-};
+use crate::{BlobTooLarge, LocalPullFault, UpstreamRefused, UpstreamVoucherRejected};
 
 /// What a failed lane, lane build, or discovery means for the acquire loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +57,8 @@ impl std::error::Error for LaneBuildFault {}
 ///
 /// It is a marker on the rejection, so it composes:
 /// `.context(HealExhausted)` keeps the [`UpstreamVoucherRejected`] in the
-/// chain. A bare rejection, which no heal took, ends the command.
+/// chain. A bare rejection, which no heal took, acts as `Unfunded` or
+/// `Declined` from its source ([`classify`]).
 #[derive(Debug)]
 pub struct HealExhausted;
 
@@ -79,7 +78,46 @@ fn escrow_untracked(err: &anyhow::Error) -> bool {
         || err.downcast_ref::<TopUpUnconfirmed>().is_some()
 }
 
-/// Classify `err` for the acquire loop.
+/// Whether a mid-stream voucher rejection for `reason` acts as `Unfunded`
+/// from its source: the pool's deposit or the signer's capability no longer
+/// covers the stream (ADR 005 §`VoucherRejected` semantics).
+const fn is_funding_reason(reason: VoucherRejectReason) -> bool {
+    matches!(
+        reason,
+        VoucherRejectReason::PoolExhausted
+            | VoucherRejectReason::SpendingCapExhausted
+            | VoucherRejectReason::SignerCapExhausted
+            | VoucherRejectReason::CapabilityExpired
+    )
+}
+
+/// The reason of the mid-stream voucher rejection `err` carries, when no
+/// watermark heal took it ([`HealExhausted`] marks one that did).
+fn unhealed_rejection(err: &anyhow::Error) -> Option<VoucherRejectReason> {
+    if err.downcast_ref::<HealExhausted>().is_some() {
+        return None;
+    }
+    if let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() {
+        return Some(rejected.reason);
+    }
+    match err.downcast_ref::<UpstreamRefused>()?.error() {
+        StreamError::VoucherRejected { reason, .. } => Some(*reason),
+        StreamError::NotFound | StreamError::Declined | StreamError::Unfunded => None,
+    }
+}
+
+/// The reason of an unhealed mid-stream voucher rejection in `err` that acts
+/// as `Declined` from its source: one no bundle heals and that names no
+/// funding reason. A dishonest node can send any reason, so it declines only
+/// that node for this fetch (ADR 005 §`VoucherRejected` semantics).
+#[must_use]
+pub(crate) fn declining_rejection(err: &anyhow::Error) -> Option<VoucherRejectReason> {
+    unhealed_rejection(err).filter(|reason| !is_funding_reason(*reason))
+}
+
+/// Classify `err` for the acquire loop. A node's refusal never ends the
+/// fetch on its own (ADR 039 §Failure handling): only a local fault, or a
+/// stop the candidate set reached, is fatal.
 #[must_use]
 pub fn classify(err: &anyhow::Error) -> Fault {
     if escrow_untracked(err) {
@@ -95,20 +133,10 @@ pub fn classify(err: &anyhow::Error) -> Fault {
         .downcast_ref::<crate::source_set::NoSourceHasBlob>()
         .is_some()
         || err
-            .downcast_ref::<crate::source_set::NoSourceServesSigner>()
+            .downcast_ref::<crate::source_set::NoNodeWillServe>()
             .is_some()
     {
         return Fault::Fatal(FatalScope::Item);
-    }
-    // A drained capability signer: every provider refuses it once its
-    // registration expired or nothing is left of its cap. Otherwise a
-    // cheaper provider can still serve it, so only this source is barred.
-    if let Some(drained) = err.downcast_ref::<SignerCapDrained>() {
-        return if drained.at_every_rate() {
-            Fault::Fatal(FatalScope::Command)
-        } else {
-            Fault::Source
-        };
     }
     if err.downcast_ref::<HealExhausted>().is_some()
         || err
@@ -117,14 +145,20 @@ pub fn classify(err: &anyhow::Error) -> Fault {
     {
         return Fault::Source;
     }
-    if err.downcast_ref::<UpstreamVoucherRejected>().is_some() {
-        return Fault::Fatal(FatalScope::Command);
-    }
     if err.downcast_ref::<LocalPullFault>().is_some() || is_local_disk_fault(err) {
         return Fault::Fatal(FatalScope::Command);
     }
     if err.downcast_ref::<BlobTooLarge>().is_some() {
         return Fault::Fatal(FatalScope::Item);
+    }
+    // An unhealed voucher rejection acts as `Unfunded` from its source when it
+    // names a funding reason, and as `Declined` otherwise.
+    if let Some(reason) = unhealed_rejection(err) {
+        return if is_funding_reason(reason) {
+            Fault::Unaffordable
+        } else {
+            Fault::Source
+        };
     }
     if err.downcast_ref::<PoolExhausted>().is_some()
         || err.downcast_ref::<WalletShortfall>().is_some()
@@ -145,9 +179,10 @@ pub fn classify(err: &anyhow::Error) -> Fault {
     }
     if let Some(refused) = err.downcast_ref::<UpstreamRefused>() {
         return match refused.error() {
-            StreamError::VoucherRejected { .. } => Fault::Fatal(FatalScope::Command),
             StreamError::Unfunded => Fault::Unaffordable,
-            StreamError::NotFound | StreamError::Declined => Fault::Source,
+            StreamError::NotFound | StreamError::Declined | StreamError::VoucherRejected { .. } => {
+                Fault::Source
+            }
         };
     }
     Fault::Source
@@ -200,61 +235,58 @@ mod tests {
         })
     }
 
+    /// Only a local fault ends the command; no node's refusal does.
     #[test]
-    fn payment_and_blacklist_faults_end_the_command() {
-        for reason in [
-            VoucherRejectReason::SpendingCapExhausted,
-            VoucherRejectReason::CapabilityExpired,
-            VoucherRejectReason::BadSignature,
-            VoucherRejectReason::WrongSigner,
-        ] {
-            assert_eq!(
-                classify(&rejected(reason)),
-                Fault::Fatal(FatalScope::Command),
-                "{reason:?}"
-            );
-        }
+    fn a_local_fault_ends_the_command() {
         let local = anyhow::anyhow!("store write").context(LocalPullFault);
         assert_eq!(classify(&local), Fault::Fatal(FatalScope::Command));
     }
 
-    fn drained(remaining: u64, expired: bool) -> crate::SignerCapDrained {
-        crate::SignerCapDrained {
-            pool_id: alloy::primitives::B256::ZERO,
-            signer: alloy::primitives::Address::ZERO,
-            provider: alloy::primitives::Address::ZERO,
-            remaining,
-            rate_per_mb: 10,
-            expired,
-        }
-    }
-
-    /// A drained signer ends the command only when no provider at any rate
-    /// can serve it: its registration expired, or nothing is left of its cap.
-    /// With some headroom left, a cheaper provider still can, so only the
-    /// refusing source is barred, and the stop once every source is ends the
-    /// item (#2338).
+    /// An unhealed funding rejection acts as `Unfunded` from its source; every
+    /// other unhealed rejection acts as `Declined` (ADR 005 §`VoucherRejected`
+    /// semantics). Neither ends the fetch on its own.
     #[test]
-    fn a_drained_signer_ends_the_command_only_at_every_rate() {
-        for (remaining, expired) in [(0, false), (5, true)] {
+    fn an_unhealed_rejection_scopes_to_its_source() {
+        for reason in [
+            VoucherRejectReason::SpendingCapExhausted,
+            VoucherRejectReason::CapabilityExpired,
+            VoucherRejectReason::PoolExhausted,
+            VoucherRejectReason::SignerCapExhausted,
+        ] {
             assert_eq!(
-                classify(&anyhow::Error::new(drained(remaining, expired))),
-                Fault::Fatal(FatalScope::Command),
-                "remaining {remaining}, expired {expired}"
+                classify(&rejected(reason)),
+                Fault::Unaffordable,
+                "{reason:?}"
             );
+            assert_eq!(super::declining_rejection(&rejected(reason)), None);
         }
-        assert_eq!(
-            classify(&anyhow::Error::new(drained(5, false))),
-            Fault::Source
-        );
-        let stop =
-            anyhow::Error::new(drained(5, false)).context(crate::source_set::NoSourceServesSigner);
+        for reason in [
+            VoucherRejectReason::BadSignature,
+            VoucherRejectReason::WrongSigner,
+            VoucherRejectReason::BytesRegression,
+            VoucherRejectReason::Underpaid,
+            VoucherRejectReason::UnderFold,
+            VoucherRejectReason::AmountRegression,
+        ] {
+            assert_eq!(classify(&rejected(reason)), Fault::Source, "{reason:?}");
+            assert_eq!(
+                super::declining_rejection(&rejected(reason)),
+                Some(reason),
+                "{reason:?}"
+            );
+            let mid_stream = refusal(StreamError::VoucherRejected {
+                reason,
+                bundle: None,
+            });
+            assert_eq!(super::declining_rejection(&mid_stream), Some(reason));
+        }
+        let stop = anyhow::Error::new(crate::source_set::NoNodeWillServe { reasons: vec![] });
         assert_eq!(classify(&stop), Fault::Fatal(FatalScope::Item));
     }
 
     /// A watermark rejection that healed the lane ledger after the lane spent
-    /// its resume budget (#2257) is this source's, so the range moves on and
-    /// the rest of the bundle continues.
+    /// its resume budget (#2257) only cools its source: the range moves on,
+    /// and the source does not decline the fetch.
     #[test]
     fn a_rejection_healed_past_the_resume_budget_is_the_sources() {
         for reason in [
@@ -264,29 +296,10 @@ mod tests {
         ] {
             let err = rejected(reason).context(HealExhausted);
             assert_eq!(classify(&err), Fault::Source, "{reason:?}");
+            assert_eq!(super::declining_rejection(&err), None, "{reason:?}");
             assert!(
                 err.downcast_ref::<UpstreamVoucherRejected>().is_some(),
                 "the marker keeps the rejection in the chain"
-            );
-        }
-    }
-
-    /// A watermark rejection that no heal took ends the command, as ADR 005
-    /// says: a `BytesRegression` with no bundle is a single-signer fault, and
-    /// an `Underpaid` or a trailing proof that no bundle heals has nothing to
-    /// retry from.
-    #[test]
-    fn a_rejection_no_heal_took_ends_the_command() {
-        for reason in [
-            VoucherRejectReason::BytesRegression,
-            VoucherRejectReason::Underpaid,
-            VoucherRejectReason::UnderFold,
-            VoucherRejectReason::AmountRegression,
-        ] {
-            assert_eq!(
-                classify(&rejected(reason)),
-                Fault::Fatal(FatalScope::Command),
-                "{reason:?}"
             );
         }
     }

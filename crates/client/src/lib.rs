@@ -48,9 +48,7 @@
 //!    what the lane has already paid. Create its ledger with
 //!    [`PoolContext::new_ledger`], and wrap both in a [`PeerSource`] inside a
 //!    [`StreamCandidate::new`]. Cap the lane's rate at the rate the node signed
-//!    in its probe answer ([`effective_rate_ceiling`]). A lane that pays under a
-//!    delegated capability also checks its signer
-//!    ([`PeerSource::with_signer_check`]).
+//!    in its probe answer ([`effective_rate_ceiling`]).
 //! 6. **Fetch** with [`Downloader::fetch_to_paths`] or [`Streamer::open`], over
 //!    a [`StaticSources`] of the lanes. Every lane streams at once unless
 //!    [`Downloader::max_lanes`] caps it.
@@ -243,10 +241,8 @@ pub use downloader::{DownloadTarget, Downloader};
 pub use driver::PoolExhausted;
 pub use ledger::{Cumulative, PoolLedger};
 pub use sink::{BlobCache, NoCache, SinkFuture};
-pub use source::{Funder, PeerSource, SignerCapDrained, SignerRegistry, SourceFuture};
-pub use source_set::{
-    Holder, NoAffordableSource, NoSourceHasBlob, NoSourceServesSigner, StaticSources,
-};
+pub use source::{Funder, PeerSource, SourceFuture};
+pub use source_set::{Holder, NoAffordableSource, NoNodeWillServe, NoSourceHasBlob, StaticSources};
 pub use stop::{ClockHold, GaveUp, ProgressClock, StopPolicy};
 pub use streamer::{LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader};
 

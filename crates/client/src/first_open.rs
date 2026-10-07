@@ -365,24 +365,27 @@ mod tests {
         })
     }
 
-    /// A capability rejection, and a watermark rejection that no heal took,
-    /// end the open.
+    /// A rejection that no heal took declines its source only. Once every
+    /// source declined, the open ends with "no node will serve this", naming
+    /// the reason (ADR 039 §Failure handling).
     #[tokio::test(start_paused = true)]
-    async fn a_fatal_fault_ends_the_open() -> anyhow::Result<()> {
-        for reason in [
-            VoucherRejectReason::CapabilityExpired,
-            VoucherRejectReason::AmountRegression,
-        ] {
-            let sources = StaticSources::new(vec![lane(0xA1), lane(0xB2)])?;
-            let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
-            let err = first_open(&mut set, &policy(None), |_lane| async move {
-                Err::<(), _>(rejected(reason))
-            })
-            .await
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("{reason:?} must end the open"))?;
-            assert!(err.downcast_ref::<UpstreamVoucherRejected>().is_some());
-        }
+    async fn every_source_declining_ends_the_open() -> anyhow::Result<()> {
+        let reason = VoucherRejectReason::AmountRegression;
+        let sources = StaticSources::new(vec![lane(0xA1), lane(0xB2)])?;
+        let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
+        let err = first_open(&mut set, &policy(None), |_lane| async move {
+            Err::<(), _>(rejected(reason))
+        })
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("{reason:?} from every source must end the open"))?;
+        let stop = err
+            .downcast_ref::<crate::NoNodeWillServe>()
+            .ok_or_else(|| anyhow::anyhow!("expected NoNodeWillServe, got {err:#}"))?;
+        assert_eq!(
+            stop.reasons,
+            vec![crate::source_set::DeclineReason::Voucher(reason)]
+        );
         Ok(())
     }
 

@@ -1621,9 +1621,8 @@ impl PeerRunSink<'_> {
 /// Whether a run's fault ends the whole assembly rather than moving its range
 /// to another holder.
 ///
-/// A fatal fault ([`classify`]: a voucher rejection that no heal took, an
-/// origin blacklist, an over-cap blob, a local fault) cannot be fixed by
-/// another lane, and neither can a fault of this node's own store
+/// A fatal fault ([`classify`]: an over-cap blob, a local fault) cannot be
+/// fixed by another lane, and neither can a fault of this node's own store
 /// ([`super::is_local_store_fault`]): every holder's bytes land in it. Nor can the
 /// pacer's [`PoolExhausted`]: the node's one shared pool funds every holder, so
 /// once it is dry no holder can be paid. An open-time `Unfunded` is
@@ -2846,12 +2845,12 @@ mod assembly_fault_tests {
         anyhow::Error::new(UpstreamRefused::mid_stream(error))
     }
 
-    /// A holder's reservation floor above the pool moves the range to another
-    /// holder, which may reserve less, and so does a rejection healed past the
-    /// resume budget; a dry pool, a fatal fault, and a rejection no heal took
-    /// end it.
+    /// A holder's refusal or voucher rejection scopes to that holder (ADR 039
+    /// §Failure handling): its range moves to another holder, which may
+    /// reserve less or accept the voucher. Only this node's dry pool ends the
+    /// assembly: it funds every holder.
     #[test]
-    fn insufficient_deposit_reassigns_and_a_dry_pool_ends_the_assembly() {
+    fn a_refusal_reassigns_and_a_dry_pool_ends_the_assembly() {
         assert!(!ends_the_assembly(&refusal(StreamError::Unfunded)));
         assert!(ends_the_assembly(&anyhow::Error::new(PoolExhausted {
             gap_start: 0,
@@ -2864,10 +2863,12 @@ mod assembly_fault_tests {
                 proof_generation: None,
             })
         };
-        assert!(ends_the_assembly(&rejected(
+        assert!(!ends_the_assembly(&rejected(
             VoucherRejectReason::CapabilityExpired
         )));
-        assert!(ends_the_assembly(&rejected(VoucherRejectReason::UnderFold)));
+        assert!(!ends_the_assembly(&rejected(
+            VoucherRejectReason::UnderFold
+        )));
         assert!(!ends_the_assembly(
             &rejected(VoucherRejectReason::UnderFold).context(HealExhausted)
         ));

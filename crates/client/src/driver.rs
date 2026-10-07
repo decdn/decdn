@@ -2978,9 +2978,9 @@ mod tests {
     }
 
     /// A spending-cap rejection whose bundle keeps reseeding the ledger is
-    /// healed within the resume budget, and past it ends the command bare: it
-    /// is not a lane-watermark fault, so it never carries the marker that
-    /// scopes a fault to one source.
+    /// healed within the resume budget, and past it ends the drive bare: it is
+    /// not a lane-watermark fault, so it never carries the heal marker, and it
+    /// acts as `Unfunded` from its source.
     #[tokio::test]
     async fn a_non_lane_rejection_past_the_budget_is_never_scoped_to_the_source() {
         let reason = VoucherRejectReason::SpendingCapExhausted;
@@ -3009,7 +3009,7 @@ mod tests {
         );
         assert_eq!(
             crate::classify(&err),
-            crate::Fault::Fatal(crate::FatalScope::Command),
+            crate::Fault::Unaffordable,
             "{reason:?}"
         );
         let budget = usize::try_from(crate::MAX_RESUME_ATTEMPTS).unwrap_or(usize::MAX);
@@ -3021,12 +3021,12 @@ mod tests {
     }
 
     /// A voucher rejection that no heal takes ends the drive on the first open
-    /// and stays fatal for the command (ADR 005): an `Underpaid` with no bundle
-    /// has no watermark to rebase to, a `BytesRegression` with no bundle is a
-    /// single-signer fault, and a trailing proof whose bundle the ledger covers on amount but
-    /// not on bytes cannot heal.
+    /// and acts as `Declined` from its source (ADR 005): an `Underpaid` with no
+    /// bundle has no watermark to rebase to, a `BytesRegression` with no bundle
+    /// is a single-signer fault, and a trailing proof whose bundle the ledger
+    /// covers on amount but not on bytes cannot heal.
     #[tokio::test]
-    async fn a_rejection_no_heal_takes_ends_the_command() {
+    async fn a_rejection_no_heal_takes_declines_its_source() {
         fn bare(reason: VoucherRejectReason) -> anyhow::Error {
             anyhow::Error::new(UpstreamVoucherRejected {
                 reason,
@@ -3065,8 +3065,12 @@ mod tests {
             );
             assert_eq!(
                 crate::classify(&err),
-                crate::Fault::Fatal(crate::FatalScope::Command),
-                "{name}"
+                crate::Fault::Source,
+                "{name}: the source declines this fetch"
+            );
+            assert!(
+                crate::fault::declining_rejection(&err).is_some(),
+                "{name}: acts as Declined"
             );
             assert_eq!(opens, 1, "{name}: no retry");
         }

@@ -6251,24 +6251,13 @@ impl decdn_node::pool_view::PoolView for DrainedSignerPoolView {
 }
 
 impl DrainedSignerPoolView {
-    /// The drained registration both the node and the client's chain read see.
+    /// The drained registration the node reads.
     const fn registered(&self) -> decdn_incentive::payment_pool::SignerAuthorization {
         decdn_incentive::payment_pool::SignerAuthorization::Registered {
             cap: self.cap,
             expiry: u64::MAX,
             spent: self.cap,
         }
-    }
-}
-
-impl decdn_client::SignerRegistry for DrainedSignerPoolView {
-    fn read(
-        &self,
-        _pool_id: B256,
-        _signer: Address,
-    ) -> decdn_client::SourceFuture<'_, decdn_incentive::payment_pool::SignerAuthorization> {
-        let auth = self.registered();
-        Box::pin(async move { Ok(auth) })
     }
 }
 
