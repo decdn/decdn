@@ -1311,8 +1311,9 @@ fn store_fast_path(
 /// [`store_fast_path`] rejects; the caller re-probes these records for a fresh
 /// RTT. Returns them projected to [`NodeCandidate`], unranked (the probe orders
 /// them); empty when none qualify, letting the caller fall through to the
-/// registry read.
-fn identity_fresh_candidates(
+/// registry read. `bundle pull` reads its run-wide candidate list from the same
+/// set ([`super::bundle_pull`]).
+pub(crate) fn identity_fresh_candidates(
     store: &decdn_client::PeerStore,
     cfg: &decdn_client::StoreConfig,
     now_secs: u64,
