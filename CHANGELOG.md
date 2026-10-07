@@ -937,6 +937,22 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **`bundle pull`: a freed provider stream goes to the lane that waited for it
+  first, so one entry's queued range no longer waits minutes behind a sibling
+  entry's short legs (#2341).** Entries share each provider's
+  `--max-lane-streams` permits. A lane asks for an extra stream for a queued
+  range once per growth pass, at most once a second after a refusal. A sibling
+  lane whose short legs restart, or whose leg ends ask for growth, asked the
+  instant a permit freed and so took every one. On testnet a bcl-only 1 GB
+  range waited 450 s while a sibling entry opened 54 legs to bcl. A lane that
+  `grow` refuses now claims the provider's next free permit. Each claim holds
+  back one free permit from every later `grow` ask, and the largest kept
+  permit count stays free after them. A lane that runs no stream goes ahead of
+  the claims of lanes that run one, so every lane gets its first stream before
+  any lane gets a second. A grant or the lane's end clears the claim, and a
+  claim not renewed for 3 s lapses. A lane's first stream still takes any free
+  permit.
+
 - **Every voucher rejection logs its cause at `info` (#2342).** A rejected
   voucher or chunk preimage ends a paid stream and counts on
   `decdn_serve_stream_voucher_rejected_total`, which has no reason split. The
