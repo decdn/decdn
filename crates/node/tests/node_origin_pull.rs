@@ -7638,6 +7638,38 @@ async fn await_run_outcome(
     }
 }
 
+/// #2348: the miss serve loop to `peer` records its waits and its path on its
+/// `serve_stream` span for `hash`. Its first frame waits on the upstream
+/// pull, so its store wait is not zero.
+async fn assert_miss_serve_waits(
+    spans: &support::SpanCapture,
+    peer: &str,
+    hash: Hash,
+    payload_len: u64,
+) -> Result<()> {
+    let key = hash.to_string();
+    let serve = || {
+        spans
+            .matching("serve_stream", "peer", peer)
+            .into_iter()
+            .find(|s| s.fields.get("hash") == Some(&key) && s.fields.contains_key("store_wait_ns"))
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while serve().is_none() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let span = serve().ok_or_else(|| anyhow::anyhow!("no serve_stream span to {peer}"))?;
+    support::assert_serve_waits_recorded(&span, payload_len)?;
+    anyhow::ensure!(
+        span.fields
+            .get("store_wait_ns")
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|ns| ns > 0),
+        "the miss waits on the pull: {span:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
     let spans = support::capture_spans();
@@ -7750,6 +7782,8 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
     // Two upstream legs: the primed handshake pull, then the open after the window
     // pause (the two-leg watermark above).
     assert_relay_counted(&b_metrics, u64::try_from(payload.len())?, 2).await?;
+
+    assert_miss_serve_waits(&spans, &leaf_ep.id().to_string(), hash, total_bytes).await?;
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
 

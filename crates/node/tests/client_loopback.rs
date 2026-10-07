@@ -412,6 +412,7 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
         span.fields.get("peer").map(String::as_str) == Some(client_ep.id().to_string().as_str()),
         "peer: {span:?}"
     );
+    support::assert_serve_waits_recorded(span, payload.len() as u64)?;
     Ok(())
 }
 

@@ -38,7 +38,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use iroh::TransportAddr;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, PathStats};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use super::{MAX_PROOFS_PER_CHUNK, VOUCHER_READ_TIMEOUT};
@@ -270,19 +270,10 @@ fn stream_frames_sent(conn: &Connection) -> u64 {
 /// and black holes detected. The remote address itself stays out of the
 /// report.
 fn describe_path(conn: &Connection) -> String {
-    let paths = conn.paths();
-    let open = paths.len();
-    let Some(path) = paths.iter().find(iroh::endpoint::Path::is_selected) else {
+    let (open, selected) = selected_path(conn);
+    let Some((kind, stats)) = selected else {
         return format!("no selected path, {open} open");
     };
-    let kind = match path.remote_addr() {
-        TransportAddr::Relay(_) => "relay",
-        TransportAddr::Ip(SocketAddr::V4(_)) => "direct IPv4",
-        TransportAddr::Ip(SocketAddr::V6(v6)) if v6.ip().to_canonical().is_ipv4() => "direct IPv4",
-        TransportAddr::Ip(SocketAddr::V6(_)) => "direct IPv6",
-        _ => "custom transport",
-    };
-    let stats = path.stats();
     format!(
         "selected path {kind} of {open} open: rtt {:?}, cwnd {} bytes; path lifetime totals: \
          {} packets lost, {} congestion events, {} black holes detected",
@@ -292,6 +283,26 @@ fn describe_path(conn: &Connection) -> String {
         stats.congestion_events,
         stats.black_holes_detected
     )
+}
+
+/// The count of open paths of `conn`, and its selected path's kind and
+/// stats: relay, direct IPv4, direct IPv6, or a custom transport. The remote
+/// address itself stays out.
+/// `None` for the selected path when no path is selected.
+pub(super) fn selected_path(conn: &Connection) -> (usize, Option<(&'static str, PathStats)>) {
+    let paths = conn.paths();
+    let open = paths.len();
+    let Some(path) = paths.iter().find(iroh::endpoint::Path::is_selected) else {
+        return (open, None);
+    };
+    let kind = match path.remote_addr() {
+        TransportAddr::Relay(_) => "relay",
+        TransportAddr::Ip(SocketAddr::V4(_)) => "direct IPv4",
+        TransportAddr::Ip(SocketAddr::V6(v6)) if v6.ip().to_canonical().is_ipv4() => "direct IPv4",
+        TransportAddr::Ip(SocketAddr::V6(_)) => "direct IPv6",
+        _ => "custom transport",
+    };
+    (open, Some((kind, path.stats())))
 }
 
 #[cfg(test)]
