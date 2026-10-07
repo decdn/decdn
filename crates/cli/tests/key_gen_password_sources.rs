@@ -88,7 +88,7 @@ fn creating_under_an_empty_env_password_is_refused_naming_the_source() {
 }
 
 /// A `--keystore-password-file` shadowed by a set `DECDN_KEYSTORE_PASSWORD`
-/// warns that the file was not used (#1934) — a previously silent inert flag —
+/// warns that the file was not used (#1934) — never a silently inert flag —
 /// while the env var still wins per precedence.
 #[test]
 fn a_shadowed_password_file_warns_and_env_still_wins() {

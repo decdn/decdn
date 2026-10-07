@@ -66,9 +66,9 @@ pub struct OriginImportArgs {
     /// Required unless `--dry-run`.
     ///
     /// A `PathBuf`, not a `String`, so a non-UTF-8 directory path is accepted
-    /// on Unix like `--input` is. Scheme sniffing (`s3://` / `http(s)://` /
-    /// legacy `fs:`) runs on the UTF-8 view; a non-UTF-8 path cannot be one of
-    /// those, so it is unambiguously a filesystem directory.
+    /// on Unix like `--input` is. Scheme sniffing (`s3://` / `http(s)://`)
+    /// runs on the UTF-8 view; a non-UTF-8 path cannot be one of those, so it
+    /// is unambiguously a filesystem directory.
     #[arg(long, value_name = "DIR")]
     pub to: Option<PathBuf>,
 

@@ -23,7 +23,7 @@ Method set (the `AdminRpc` trait in `decdn-common` is the canonical surface):
 | ------------------ | ----------------------- | ----------------- |
 | `admin_v1_health`  | none                    | `HealthResponse`  |
 | `admin_v1_status`  | none                    | `StatusResponse`  |
-| `admin_v1_drain`   | `DrainRequest` (optional) | `DrainResponse`   |
+| `admin_v1_drain`   | `DrainRequest`          | `DrainResponse`   |
 | `admin_v1_evict`   | `EvictRequest`          | `EvictResponse`   |
 | `admin_v1_reload`  | none                    | `ReloadResponse`  |
 | `admin_v1_lanes`   | none                    | `LanesResponse`   |

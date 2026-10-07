@@ -1266,10 +1266,9 @@ impl RuntimeReloadState {
             section.infallible_swap();
         }
 
-        // Final summary line, retained for backwards compatibility
-        // with any operators / log scrapers that grep for it. The
+        // The single completion marker for the whole reload. The
         // per-section `config reload section applied` events carry
-        // the structured fields; this one is the "all done" marker.
+        // the structured fields; this one says every section landed.
         tracing::info!("config reload applied");
         Ok(())
     }

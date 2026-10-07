@@ -107,7 +107,7 @@ pub(super) fn mutate_gauged<T, S>(
 /// The shared state behind a chain-backed projection. Cheap to build via
 /// [`from_parts`](ChainProjection::from_parts). The background loop that keeps
 /// the state fresh is the single [`multiplexed_poller`] task the runtime owns
-/// and shuts down; the projection no longer holds a per-watcher handle.
+/// and shuts down; the projection holds no per-watcher handle.
 ///
 /// [`multiplexed_poller`]: crate::chain_events::multiplexed_poller
 #[derive(Debug)]

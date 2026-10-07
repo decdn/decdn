@@ -14,7 +14,7 @@
 //!
 //! [`ConfigNotice`] carries the other half: a value that resolves fine but
 //! that the operator should know about (a disabled cap, an unbounded map, a
-//! retired env var). A notice never fails resolution. It rides the same bag
+//! privileged port). A notice never fails resolution. It rides the same bag
 //! because the bag already reaches every resolver on both the startup and the
 //! SIGHUP path, so the caller — which is the only layer that knows whether a
 //! `tracing` subscriber exists yet — decides how to render it.
@@ -45,7 +45,7 @@ pub(crate) const IDENTITY_DATA_DIR: &str = "identity.data_dir";
 ///
 /// As a guide, `Warn` fits a value that weakens a safety property (an
 /// unbounded bookkeeping map, a collapsed failover list) or a setting that is
-/// inert and needs removing (a retired environment variable). `Info` fits a
+/// likely a mistake (a privileged port). `Info` fits a
 /// deliberate opt-out working exactly as configured, where paging someone
 /// would only teach them to ignore the channel.
 ///
@@ -65,22 +65,17 @@ pub enum ConfigNoticeLevel {
 /// One non-fatal resolve-time notice: a severity, the label of whatever the
 /// operator wrote, and the operator-facing message text.
 ///
-/// `field` names the **source**, not always a config key: usually a dotted
-/// config label (`security.max_tracked_sources`), matching the problem-label
-/// convention so a notice and a problem about the same field read the same
-/// way, but a notice about a retired environment variable carries the bare var
-/// name (`DECDN_DELIVERY_CEILING`) because that is the thing the operator set
-/// and must unset. A consumer that filters on `field` — the JSON log stream,
-/// a `doctor` finding — must not assume a dotted shape.
+/// `field` is the dotted config label (`security.max_tracked_sources`),
+/// matching the problem-label convention so a notice and a problem about the
+/// same field read the same way.
 ///
-/// Either way `field` is kept out of the message text, so a consumer can
+/// `field` is kept out of the message text, so a consumer can
 /// render or filter on it independently of what it says.
 #[derive(Debug, Clone)]
 pub struct ConfigNotice {
     /// How loud this notice is.
     pub level: ConfigNoticeLevel,
-    /// What the operator wrote: a dotted config label, or an environment
-    /// variable name for a notice about one.
+    /// What the operator wrote: a dotted config label.
     pub field: String,
     /// Operator-facing message text, without a severity prefix.
     pub message: String,

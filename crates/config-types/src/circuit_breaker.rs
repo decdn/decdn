@@ -39,13 +39,13 @@ const DEFAULT_HALF_OPEN_MAX_CALLS: u32 = 1;
 /// is perfectly able to serve.
 ///
 /// `enabled == false` (or `failure_threshold == 0`) disables the breaker
-/// entirely, reproducing the pre-#963 behaviour exactly — every miss
-/// runs the full retry/backoff loop regardless of origin health.
+/// entirely — every miss runs the full retry/backoff loop regardless of
+/// origin health.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CircuitBreakerPolicy {
     /// Master switch. `false` disables the breaker, so every cache miss
-    /// runs the full retry/backoff loop (pre-#963 behaviour). The
+    /// runs the full retry/backoff loop. The
     /// thresholds below are ignored while disabled.
     pub enabled: bool,
     /// Consecutive transient/origin-unavailable failures that trip the
@@ -88,7 +88,7 @@ impl Default for CircuitBreakerPolicy {
 
 impl CircuitBreakerPolicy {
     /// A policy with the breaker disabled — every miss runs the full
-    /// retry/backoff loop (pre-#963 behaviour). Useful in tests and for
+    /// retry/backoff loop. Useful in tests and for
     /// operators who want to opt out.
     #[must_use]
     pub const fn disabled() -> Self {

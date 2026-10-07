@@ -572,14 +572,14 @@ async fn admin_drain_fires_trigger_and_returns_initiated() {
     let rpc = AdminRpcImpl::new(state);
 
     let resp = rpc
-        .drain(Some(DrainRequest::default()))
+        .drain(DrainRequest { wait_admin: false })
         .await
         .expect("drain ok");
     assert!(resp.initiated, "expected initiated=true");
-    // Default DrainRequest leaves `wait_admin` at false, matching
-    // SIGTERM-equivalent ordering. `wait_admin_honored` therefore
-    // mirrors the request and is also `false` — the CLI uses this
-    // to refuse polling against a server that didn't opt in.
+    // `wait_admin: false` matches the SIGTERM-equivalent ordering.
+    // `wait_admin_honored` therefore mirrors the request and is also
+    // `false` — the CLI uses this to refuse polling when the drain
+    // that fired did not opt in.
     assert!(
         !trigger.wait_admin(),
         "default DrainRequest must not enable wait_admin"
@@ -624,7 +624,7 @@ async fn admin_drain_with_wait_admin_sets_flag_before_fire() {
     );
 
     let resp = rpc
-        .drain(Some(DrainRequest { wait_admin: true }))
+        .drain(DrainRequest { wait_admin: true })
         .await
         .expect("drain ok");
     assert!(resp.initiated, "expected initiated=true");
@@ -644,48 +644,6 @@ async fn admin_drain_with_wait_admin_sets_flag_before_fire() {
     assert!(
         waited.is_ok(),
         "drain RPC with wait_admin=true must still fire the trigger"
-    );
-}
-
-/// Regression for the wire-compat hole the reviewers flagged
-/// (#662): when an older client (or a curl/python script) calls
-/// `admin_v1_drain` with no `params` field, the RPC must still
-/// trigger drain and return the default response. Per
-/// `crates/common/src/admin.rs` the trait declares `req:
-/// Option<DrainRequest>`, so jsonrpsee's proc-macro uses
-/// `optional_next()` and decodes a missing parameter to `None`;
-/// the impl normalizes to `DrainRequest::default()`. This test
-/// asserts that the `None` path produces the same observable
-/// effects as `Some(DrainRequest::default())`.
-#[tokio::test]
-async fn admin_drain_with_no_params_still_triggers() {
-    let trigger = Arc::new(DrainTrigger::new());
-    let (cache, _tmp) = test_cache().await;
-    let state = AdminState::new(
-        [0u8; 32],
-        Instant::now(),
-        cache,
-        None,
-        Arc::clone(&trigger),
-        Arc::new(crate::metrics::Metrics::new()),
-    );
-    let rpc = AdminRpcImpl::new(state);
-
-    let resp = rpc.drain(None).await.expect("drain ok");
-    assert!(resp.initiated, "expected initiated=true");
-    assert!(
-        !resp.wait_admin_honored,
-        "no-params drain must report wait_admin_honored=false"
-    );
-    assert!(
-        !trigger.wait_admin(),
-        "no-params drain must keep wait_admin=false"
-    );
-
-    let waited = tokio::time::timeout(std::time::Duration::from_millis(100), trigger.wait()).await;
-    assert!(
-        waited.is_ok(),
-        "no-params drain must still fire the underlying trigger"
     );
 }
 

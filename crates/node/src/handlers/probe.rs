@@ -144,8 +144,8 @@ pub struct ProbeHandler {
     /// `blockchain.{slash_judge_address,chain_id}`.
     slash_domain: Eip712Domain,
     /// Optional stake-lane probe-acceptance reservation (#757). `None` (the
-    /// single-lane default) makes the hold-admission path identical to
-    /// pre-#757 behaviour; `Some` reserves hold headroom for registered
+    /// single-lane default) admits every hold from one shared budget with no
+    /// reserved headroom; `Some` reserves hold headroom for registered
     /// node-to-node requesters under budget pressure.
     stake_lane: Option<StakeLanePolicy>,
     /// Mirrors `ResolvedCache::relay_foreign_namespaces` (ADR 002 origin-only

@@ -129,11 +129,8 @@ pub struct EvictRequest {
     pub hash: String,
     /// If `true`, return only the pre-evict snapshot (size, last access,
     /// pin status, already-evicted flag) without mutating cache state
-    /// (issue #379). Backs `decdn node evict --dry-run`. Defaulted via
-    /// `serde(default)` so older clients sending `{ "hash": "..." }`
-    /// continue to parse cleanly with no flag, preserving the prior
-    /// "real evict" behaviour.
-    #[serde(default)]
+    /// (issue #379). Backs `decdn node evict --dry-run`. Required: a caller
+    /// states whether it wants the real evict.
     pub dry_run: bool,
 }
 
@@ -142,8 +139,6 @@ pub struct EvictRequest {
 /// Carries both the pre-evict snapshot (always populated, so an operator's
 /// audit log captures size and pin status at the moment of evict) and a
 /// `dry_run` flag indicating whether the cache state was actually mutated.
-/// Older clients that only deserialize `was_present` are unaffected — the
-/// new fields are silently dropped on their side.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EvictResponse {
     /// Whether the hash would have been served by the cache before this
@@ -199,19 +194,15 @@ pub struct EvictPreview {
     /// Ordered list of origin backends the node would consult on a
     /// post-eviction miss (#439, #284). Empty when the engine has no
     /// origin configured (cache-only mode); a single-element vec is
-    /// the pre-#284 common case. Operators running DMCA takedowns or
+    /// the common single-origin case. Operators running DMCA takedowns or
     /// LRU sweeps use this to estimate worst-case origin egress cost
     /// — re-pulling from a `Filesystem` origin is a local read;
     /// re-pulling through a chain of `Http`/`S3` mirrors multiplies
     /// the metered-bandwidth bill on a deep fallback.
     ///
     /// `skip_serializing_if = "Vec::is_empty"` elides the field
-    /// entirely in cache-only mode, keeping the JSON output minimal.
-    /// Origin-mode responses always carry the field, so any
-    /// deserialiser using `deny_unknown_fields` pinned to a pre-#284
-    /// schema (which expected `origin_kind: Option<…>`) will see a
-    /// surface change — back-compat here only covers the cache-only
-    /// path.
+    /// entirely in cache-only mode, keeping the JSON output minimal;
+    /// `default` reads that elided field back as the empty list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub origin_kinds: Vec<decdn_config_types::OriginKind>,
 }
@@ -235,45 +226,35 @@ pub struct ReloadResponse {
     pub log_level: String,
 }
 
-/// Request body for `admin_v1_drain` (issue #244).
-///
-/// Per-field `#[serde(default)]` lets a caller send `{}` (object with
-/// no keys) and get the SIGTERM-equivalent default. Older clients that
-/// omit the `params` field entirely are handled separately by the RPC
-/// signature: the trait declares `req: Option<DrainRequest>` so
-/// jsonrpsee's proc-macro uses `optional_next()` and decodes a missing
-/// parameter to `None`, which the server impl normalizes to
-/// `DrainRequest::default()`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Request body for `admin_v1_drain` (issue #244). Required, as is its
+/// one field: a caller states which shutdown ordering it wants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DrainRequest {
     /// When `true`, ask the runtime to keep the admin server alive
     /// *through* `router.shutdown` instead of closing it early (issue
     /// #604). This is the opt-in seam for `decdn node drain --wait`: the
     /// CLI polls `admin_v1_health` for `in_flight_streams == 0` and the
     /// admin port must stay open long enough for that loop to observe
-    /// completion. Default `false` preserves the deliberate
-    /// SIGTERM ordering (admin closes before `router.shutdown`); setting
-    /// `true` only reorders that single drain.
-    #[serde(default)]
+    /// completion. `false` keeps the SIGTERM ordering (admin closes
+    /// before `router.shutdown`); `true` only reorders that single drain.
     pub wait_admin: bool,
 }
 
 /// Response body for `admin_v1_drain` (issue #244). `initiated: true`
 /// reports that the trigger fired; `wait_admin_honored` reports
 /// whether the server actually plans to keep admin alive through
-/// `router.shutdown` (issue #604). The `decdn node drain --wait`
-/// client uses `wait_admin_honored` as a cross-version safety check:
-/// against an older server (or any handler that doesn't propagate the
-/// flag) the field deserializes to its serde default of `false`, and
-/// the client refuses to enter the polling loop instead of treating
-/// the imminent ECONNREFUSED as drain completion.
+/// `router.shutdown` (issue #604). The trigger is first-writer-wins, so
+/// a `wait_admin: true` request that loses the race to an earlier drain
+/// without it gets `false` here. The `decdn node drain --wait` client
+/// then refuses to enter the polling loop instead of treating the
+/// imminent ECONNREFUSED as drain completion.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DrainResponse {
     /// `true` once the trigger has been fired and the runtime's
     /// shutdown sequence is underway. "Initiated", not "completed":
     /// when `wait_admin_honored` is `false`, the admin server may
-    /// close before the response itself is delivered (the original
-    /// default ordering).
+    /// close before the response itself is delivered (the SIGTERM
+    /// ordering).
     pub initiated: bool,
     /// `true` when the server received `wait_admin: true` *and* is
     /// keeping admin alive through `router.shutdown` on this drain.
@@ -719,19 +700,13 @@ pub trait AdminRpc {
     /// trigger lands, not when shutdown completes. Equivalent to `kill
     /// -TERM <pid>` for operators who'd rather not stat the PID.
     ///
-    /// Send `{"wait_admin": true}` as `params` (issue #604) — or
-    /// from Rust, `Some(DrainRequest { wait_admin: true })` — to ask
-    /// the runtime to keep the admin server alive through
-    /// `router.shutdown` so a polling client can observe
-    /// `admin_v1_health.in_flight_streams` reach 0. The parameter is
-    /// `Option<DrainRequest>`: jsonrpsee's proc-macro maps
-    /// `Option<T>` arguments to `optional_next()` in its server
-    /// renderer, so older clients that omit the `params` field
-    /// entirely decode to `None` rather than `InvalidParams`. The
-    /// server impl normalizes `None` to `DrainRequest::default()` and
-    /// gets the original SIGTERM-equivalent shutdown order.
+    /// The [`DrainRequest`] parameter is required. `wait_admin: false`
+    /// gets the SIGTERM-equivalent shutdown order. `wait_admin: true`
+    /// (issue #604) asks the runtime to keep the admin server alive
+    /// through `router.shutdown` so a polling client can observe
+    /// `admin_v1_health.in_flight_streams` reach 0.
     #[method(name = "drain")]
-    async fn drain(&self, req: Option<DrainRequest>) -> RpcResult<DrainResponse>;
+    async fn drain(&self, req: DrainRequest) -> RpcResult<DrainResponse>;
 
     /// Return a snapshot of this node's DHT participation health (issue
     /// #741): routing-table bucket fill rates, the network-wide last

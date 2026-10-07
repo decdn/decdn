@@ -1494,9 +1494,7 @@ async fn serve_encoded(encoding: &'static str, body: Vec<u8>, canonical_hash: Ha
 /// the decoded byte count would be a memory-exhaustion `DoS` via a
 /// malicious origin.
 ///
-/// Pre-#271 this was caught by `read_capped` inside `decompress_body`
-/// (a typed `OriginError::DecompressionFailed`). Post-#271 the
-/// engine's `count_and_cap_stream` is the single cap layer — it
+/// The engine's `count_and_cap_stream` is the single cap layer — it
 /// enforces `max_blob_bytes` on the **decoded** stream regardless of
 /// how the encoded bytes arrived (gzip, zstd, identity), so the bomb
 /// surfaces as a generic `CacheError::OriginError` whose message
@@ -2263,9 +2261,8 @@ async fn http_origin_rejects_307_redirect() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn http_origin_redirect_to_404_origin_surfaces_redirect_error() -> anyhow::Result<()> {
-    // Pre-#579 this returned `NotFound` because the 302 was followed
-    // and the downstream 404 became the terminal status. Post-#579
-    // the 3xx itself is terminal — the downstream 404 server should
+    // The 3xx itself is terminal (the redirect is not followed) — the
+    // downstream 404 server should
     // see zero requests, and the caller surfaces `OriginError`, not
     // `NotFound`. This pins that we don't treat a 3xx as a possible
     // NotFound shape.
@@ -2678,7 +2675,7 @@ async fn retry_skips_not_found_responses() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn retry_disabled_policy_makes_a_single_attempt() -> anyhow::Result<()> {
-    // RetryPolicy::disabled() reproduces the pre-#285 behaviour: a
+    // RetryPolicy::disabled() makes a single attempt: a
     // transient failure surfaces immediately without retrying.
     let payload: &[u8] = b"unreached";
     let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, usize::MAX));
@@ -3199,9 +3196,9 @@ async fn drain_http_request_headers(sock: &mut tokio::net::TcpStream) -> std::io
 }
 
 /// Small-blob mid-stream reset (`size_hint` <= 4 MiB) — exercises the
-/// buffer-then-commit path. Pre-#519: a single `io::Error` and the engine
-/// surfaces `OriginError` after one dispatch. Post-#519: the drain
-/// path classifies the error as Transient and re-enters the retry loop.
+/// buffer-then-commit path. The drain path classifies a mid-stream
+/// `io::Error` as Transient and re-enters the retry loop, rather than
+/// surfacing `OriginError` after one dispatch.
 #[tokio::test]
 async fn mid_stream_transient_retries_small_blob() -> anyhow::Result<()> {
     let payload = bytes::Bytes::from_static(b"a small blob that fits in the buffered drain path");
@@ -3392,9 +3389,8 @@ async fn decompression_failure_is_permanent_under_threshold() -> anyhow::Result<
         "expected OriginError from truncated gzip, got: {err:?}"
     );
     // The typed variant must survive the body-phase classification
-    // path — pre-#519 a similar test pinned this through the streaming
-    // side channel; post-#519 the drain branch routes through the
-    // same `classify_io_error` typed-inner downcast.
+    // path — the drain branch routes through the same
+    // `classify_io_error` typed-inner downcast.
     anyhow::ensure!(
         matches!(
             err.origin_error_kind(),

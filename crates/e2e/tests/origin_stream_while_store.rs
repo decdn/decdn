@@ -21,7 +21,7 @@
 //! 3. **Corrupt-safe.** A tampered `{H}.obao4` (a flipped byte in the middle,
 //!    so the outboard's length is unchanged and the tamper is only caught by
 //!    bao verification, not a length pre-check) must fail the client's fetch
-//!    without panicking the daemon or leaving it unhealthy — post-#1512 this
+//!    without panicking the daemon or leaving it unhealthy — this
 //!    path carries no slash consequence, only a client-side rejection and node
 //!    liveness matter.
 //!
@@ -210,7 +210,7 @@ async fn run_no_outboard_fallback() -> anyhow::Result<()> {
 /// middle, so its length is unchanged and the tamper is caught by bao
 /// verification rather than a cheap length check). The client's fetch must
 /// fail; the daemon must neither panic nor become unhealthy afterward. No
-/// slash surface is touched post-#1512 — this is a pure client-side rejection
+/// slash surface is touched — this is a pure client-side rejection
 /// plus a node-liveness assertion.
 async fn run_corrupt_outboard() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()

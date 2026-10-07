@@ -1501,7 +1501,7 @@ impl<P: Provider + Clone + 'static> PoolOpener for BuyerPoolService<P> {
 /// second half of the job: every open pool beside the one in use is a deposit
 /// this node is not spending, and [`report_stranded_pools`] is the only thing
 /// that names them. Reporting them solely after an adoption would leave the
-/// steady state — an intact store and a deposit stranded by an earlier build —
+/// steady state — an intact store and a deposit the store does not track —
 /// permanently silent.
 ///
 /// Adopting is deliberately softer than the rest of bootstrap. A failure here
@@ -1589,8 +1589,8 @@ async fn reconcile_owned_pool<P: Provider + Clone>(
 /// chain could not be asked at all.
 ///
 /// Runs on BOTH reconciliation paths, not only when adopting. A node whose
-/// store is intact is the steady state, and it is exactly the state in which an
-/// older build's stranded deposit sits unnoticed: nothing else ever asks the
+/// store is intact is the steady state, and it is exactly the state in which a
+/// deposit the store does not track sits unnoticed: nothing else ever asks the
 /// chain what this owner holds, so nothing ever names it (#2078).
 ///
 /// `adopting` decides how a failure is reported, and the distinction matters:

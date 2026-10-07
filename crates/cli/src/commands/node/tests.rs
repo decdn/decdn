@@ -26,7 +26,7 @@ fn health_lines(resp: &HealthResponse) -> String {
     String::from_utf8(buf).expect("output is ASCII")
 }
 
-/// The pre-#1034 two-line contract still holds — operator scripts grep
+/// The two-line contract holds — operator scripts grep
 /// these — and the binding line is additive.
 #[test]
 fn health_keeps_node_id_and_uptime_lines() {
@@ -507,8 +507,8 @@ fn mk_lane(
     LaneSnapshot {
         pool_id: pool_id.to_string(),
         counterparty: counterparty.to_string(),
-        // Self-signing default; the delegated and legacy-empty renderings
-        // get their own dedicated test rather than an eighth parameter.
+        // Self-signing default; the delegated rendering gets its own
+        // dedicated test rather than an eighth parameter.
         voucher_signer: counterparty.to_string(),
         last_nonce,
         outstanding_micro_usdc: outstanding,
@@ -661,9 +661,8 @@ fn write_slashes_table_renders_header_and_rows() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The SIGNER column: a delegated lane renders the delegate (not the
-/// funder), and a pre-delegation server — which omits `voucher_signer`
-/// entirely — renders `?` rather than echoing the funder.
+/// The SIGNER column: a delegated lane renders the delegate, not the
+/// funder.
 #[test]
 fn write_lanes_table_renders_the_voucher_signer_column() -> anyhow::Result<()> {
     let funder = format!("0x{}", "1".repeat(40));
@@ -678,44 +677,29 @@ fn write_lanes_table_renders_the_voucher_signer_column() -> anyhow::Result<()> {
         false,
     );
     delegated.voucher_signer = delegate.clone();
-    let mut legacy = mk_lane(
-        &format!("0x{}", "b".repeat(64)),
-        &funder,
-        1,
-        1,
-        2,
-        Some(1),
-        false,
-    );
-    legacy.voucher_signer = String::new();
 
     let mut buf = Vec::<u8>::new();
     write_lanes_table(
         &mut buf,
         &LanesResponse {
             redeem_threshold_micro_usdc: 1_000_000,
-            lanes: vec![delegated, legacy],
+            lanes: vec![delegated],
         },
     )?;
     let s = String::from_utf8(buf)?;
     assert!(s.contains("SIGNER"), "SIGNER header missing: {s}");
-    assert!(
-        s.contains(&short_node_id(&delegate)),
-        "delegate signer preview missing: {s}"
-    );
-    let legacy_row = s
+    let row = s
         .lines()
-        .find(|l| l.starts_with("0xbbbbbbbbbb"))
+        .find(|l| l.starts_with("0xaaaaaaaaaa"))
         .unwrap_or_default();
     assert!(
-        legacy_row.contains(" ? "),
-        "an omitted voucher_signer must render as `?`: {legacy_row}"
+        row.contains(&short_node_id(&delegate)),
+        "delegate signer preview missing: {row}"
     );
     assert_eq!(
-        legacy_row.matches(&short_node_id(&funder)).count(),
+        row.matches(&short_node_id(&funder)).count(),
         1,
-        "the funder must appear once (COUNTERPARTY only) — an omitted \
-         voucher_signer must not be echoed into SIGNER: {legacy_row}"
+        "the funder must appear once (COUNTERPARTY only), never in SIGNER: {row}"
     );
     Ok(())
 }

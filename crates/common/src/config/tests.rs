@@ -785,7 +785,7 @@ fn expand_env_substitutes_cache_origin_fs_path() -> anyhow::Result<()> {
 /// A zero throughput-floor window wedges this node's pull path (#1797): the floor demands
 /// progress over no time at all, so it trips on the first poll of every streaming read and
 /// abandons every upstream before a byte can arrive. The abort is non-attributable, so it
-/// no longer defames peers the way a zero stall once did — but a node that can never
+/// does not defame peers — but a node that can never
 /// complete a pull is still a broken node, so the window must be rejected at load.
 #[test]
 fn resolve_cache_rejects_zero_stall_window() {
@@ -1342,10 +1342,10 @@ fn resolve_cache_rejects_empty_origins_array() -> anyhow::Result<()> {
 
 #[test]
 fn resolve_cache_origin_singular_resolves_to_one_element_vec() -> anyhow::Result<()> {
-    // Back-compat: pre-#284 operators with a single `[cache.origin]`
-    // table must observe identical behaviour after the resolver
-    // collapses both wire forms into a vec. A length-1 vec is the
-    // canonical representation of the singular form.
+    // The singular `[cache.origin]` table resolves to the same
+    // one-element vec as a single `[[cache.origins]]` entry: the
+    // resolver collapses both wire forms into a vec, and a length-1
+    // vec is the canonical representation of the singular form.
     let cli = empty_cache_args();
     let toml = types::CacheConfig {
         origin: Some(types::OriginConfig::Http {
@@ -1372,7 +1372,7 @@ fn resolve_cache_origin_singular_resolves_to_one_element_vec() -> anyhow::Result
 
 #[test]
 fn resolve_cache_no_origin_resolves_to_empty_vec() -> anyhow::Result<()> {
-    // Back-compat: absent both `[cache.origin]` and `[[cache.origins]]`
+    // Absent both `[cache.origin]` and `[[cache.origins]]`
     // means "no pull-through configured". The resolver returns an
     // empty vec; engine's `pull_through` short-circuits to NoOrigin.
     let cli = empty_cache_args();
@@ -1594,67 +1594,6 @@ fn resolve_payment_rejects_zero_from_cli() -> anyhow::Result<()> {
         "error lacked context: {err}"
     );
     Ok(())
-}
-
-/// A retired env var must warn rather than be silently ignored — and must
-/// NOT fail the resolve, since it is often inherited from an orchestrator
-/// the operator does not control. Asserts the table is wired and that a
-/// set-but-retired var leaves resolution intact.
-#[test]
-fn retired_env_vars_are_listed_and_do_not_break_resolution() {
-    assert!(
-        RETIRED_ENV_VARS
-            .iter()
-            .any(|(n, _)| *n == "DECDN_DELIVERY_CEILING"),
-        "the knob removed in #1441 must be listed so a stale env var warns"
-    );
-    for (name, why) in RETIRED_ENV_VARS {
-        assert!(name.starts_with("DECDN_"), "{name} is not a decdn env var");
-        assert!(
-            !why.is_empty(),
-            "{name} needs a reason operators can act on"
-        );
-    }
-}
-
-/// The regression this guard exists for: the first implementation used
-/// `tracing::warn!`, which `resolve_config` reaches *before* `init_tracing`
-/// installs a subscriber — so it compiled, passed CI, and emitted nothing.
-/// The recorded notice is what reaches an operator, so it carries the bulk
-/// of the assertions; the returned names are what separate "the loop ran
-/// and matched nothing" from "the loop never ran".
-#[test]
-fn retired_env_var_that_is_set_is_actually_reported() {
-    let mut bag = ConfigDiagnostics::new();
-    let warned = warn_retired_env_vars_with(|n| n == "DECDN_DELIVERY_CEILING", &mut bag);
-    assert_eq!(
-        warned,
-        vec!["DECDN_DELIVERY_CEILING"],
-        "a set retired var must be reported"
-    );
-    let notices = bag.take_notices();
-    assert_eq!(notices.len(), 1, "one notice per reported var");
-    let notice = notices.first().expect("one notice");
-    assert_eq!(
-        notice.field, "DECDN_DELIVERY_CEILING",
-        "the label names what the operator set — an env var here, not a dotted config key"
-    );
-    assert_eq!(notice.level, ConfigNoticeLevel::Warn);
-    assert!(
-        notice.message.contains("no longer does anything"),
-        "notice must say the var is inert: {}",
-        notice.message
-    );
-
-    let mut clean = ConfigDiagnostics::new();
-    assert!(
-        warn_retired_env_vars_with(|_| false, &mut clean).is_empty(),
-        "nothing set => nothing reported"
-    );
-    assert!(
-        clean.take_notices().is_empty(),
-        "nothing set => no notice recorded"
-    );
 }
 
 // Origin variant from TOML resolves into a typed `ResolvedOrigin::Http`
@@ -2333,7 +2272,7 @@ fn resolve_cache_gc_interval_zero_disables() -> anyhow::Result<()> {
 #[test]
 fn resolve_cache_stake_lane_reserved_holds_defaults_to_zero() -> anyhow::Result<()> {
     // Absent everywhere => reservation off (#757). The default MUST be 0
-    // so a node that never opted in behaves exactly as pre-#757.
+    // so a node that never opted in reserves no stake-lane holds.
     let cli = cache_cli(None, None);
     let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
     anyhow::ensure!(
@@ -3280,13 +3219,13 @@ fn expand_secret_error_on_missing_env_var_does_not_leak_partial_value() -> anyho
     Ok(())
 }
 
-// ----- #437: legacy decompress field rejection -----
+// ----- flat decompress field rejection -----
 
 #[test]
-fn http_origin_legacy_top_level_decompress_field_rejected() -> anyhow::Result<()> {
-    // Pre-#437 schemas put `decompress` at `[cache]` directly.
-    // Sibling of the legacy `origin_url`/`origin_path`
-    // rejection tests below.
+fn http_origin_flat_top_level_decompress_field_rejected() -> anyhow::Result<()> {
+    // A flat `decompress` field directly under `[cache]` is rejected
+    // by `deny_unknown_fields`. Sibling of the flat
+    // `origin_url`/`origin_path` rejection tests below.
     let toml_body = format!(
         "{}\n\n[cache]\ndecompress = \"strict\"\n",
         complete_toml_body()
@@ -3300,7 +3239,7 @@ fn http_origin_legacy_top_level_decompress_field_rejected() -> anyhow::Result<()
     let msg = format!("{err:#}");
     anyhow::ensure!(
         msg.contains("decompress") && msg.contains("unknown field"),
-        "error must call out the legacy `decompress` key: {msg}"
+        "error must call out the flat `decompress` key: {msg}"
     );
     Ok(())
 }
@@ -6973,13 +6912,12 @@ rate_per_mb = 0
 }
 
 #[test]
-fn resolve_config_errors_on_legacy_origin_url_field() -> anyhow::Result<()> {
-    // Pre-#437 schemas placed `origin_url` directly under `[cache]`.
-    // The new schema lives under the tagged `[cache.origin]` table
-    // and `CacheConfig` has `deny_unknown_fields`, so an operator
-    // who hasn't migrated their TOML must get a clear "unknown
-    // field" error at config load instead of silently dropping the
-    // origin and missing every cache pull.
+fn resolve_config_errors_on_flat_origin_url_field() -> anyhow::Result<()> {
+    // A flat `origin_url` field directly under `[cache]` is rejected
+    // by `deny_unknown_fields`: origins live under the tagged
+    // `[cache.origin]` table, so a flat field must get a clear
+    // "unknown field" error at config load instead of silently
+    // dropping the origin and missing every cache pull.
     let dir = data_dir_with_keystore()?;
     let toml_body = format!(
         "{}\n\n[cache]\norigin_url = \"https://origin.example/\"\n",
@@ -6988,20 +6926,20 @@ fn resolve_config_errors_on_legacy_origin_url_field() -> anyhow::Result<()> {
     let path = write_minimal_toml(&dir, &toml_body)?;
     let args = run_args_with_data_dir(dir.path());
     let Err(err) = resolve_config(Some(&path), &args) else {
-        anyhow::bail!("expected unknown-field error for legacy origin_url");
+        anyhow::bail!("expected unknown-field error for a flat origin_url");
     };
     let msg = format!("{err:#}");
     assert!(
         msg.contains("origin_url") && msg.contains("unknown field"),
-        "error should call out the legacy `origin_url` key: {msg}"
+        "error should call out the flat `origin_url` key: {msg}"
     );
     Ok(())
 }
 
 #[test]
-fn resolve_config_errors_on_legacy_origin_path_field() -> anyhow::Result<()> {
-    // Sibling of the above: the second pre-#437 flat field also
-    // gets the loud `deny_unknown_fields` rejection.
+fn resolve_config_errors_on_flat_origin_path_field() -> anyhow::Result<()> {
+    // Sibling of the above: a flat `origin_path` field directly under
+    // `[cache]` is rejected by `deny_unknown_fields`.
     let dir = data_dir_with_keystore()?;
     let toml_body = format!(
         "{}\n\n[cache]\norigin_path = \"/var/cache/decdn/origin\"\n",
@@ -7010,12 +6948,12 @@ fn resolve_config_errors_on_legacy_origin_path_field() -> anyhow::Result<()> {
     let path = write_minimal_toml(&dir, &toml_body)?;
     let args = run_args_with_data_dir(dir.path());
     let Err(err) = resolve_config(Some(&path), &args) else {
-        anyhow::bail!("expected unknown-field error for legacy origin_path");
+        anyhow::bail!("expected unknown-field error for a flat origin_path");
     };
     let msg = format!("{err:#}");
     assert!(
         msg.contains("origin_path") && msg.contains("unknown field"),
-        "error should call out the legacy `origin_path` key: {msg}"
+        "error should call out the flat `origin_path` key: {msg}"
     );
     Ok(())
 }

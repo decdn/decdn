@@ -226,8 +226,8 @@ pub struct ResolvedCache {
     pub max_rate_per_mb: u64,
     /// Resolved ordered list of origin backends (#437, #284). Empty
     /// vec => no pull-through; cache misses return `NoOrigin`. A
-    /// single-element vec preserves the pre-#284 single-origin
-    /// semantics and is also the form produced from a `[cache.origin]`
+    /// single-element vec is the single-origin case and is also the
+    /// form produced from a `[cache.origin]`
     /// (singular) TOML table — both wire forms (singular and plural
     /// `[[cache.origins]]`) collapse here so downstream wiring sees
     /// one canonical representation. Per-variant validation (URL

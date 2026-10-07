@@ -147,7 +147,7 @@ impl HashOutboard {
     /// O(1): the `tree.outboard_size()`-byte buffer is NOT allocated here — the
     /// first [`Self::write_pair`] sizes it under the per-hash `state` lock. This
     /// keeps a session's outboard construction under the global [`FillRegistry`]
-    /// lock free of MB-scale zeroing, so one large-blob claim no longer stalls
+    /// lock free of MB-scale zeroing, so one large-blob claim does not stall
     /// every other hash's claim/wakeup for the allocation duration, and a session
     /// that only adopts the canonical outboard allocates nothing to discard.
     #[must_use]

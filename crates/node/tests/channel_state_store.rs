@@ -123,8 +123,8 @@ fn replay_after_restart_is_rejected() -> anyhow::Result<()> {
 
     // Phase 2: simulate the restart. Reopen the store, rebuild `state` from
     // the persisted lane (which is what the runtime does at bring-up), then
-    // attempt a replay of amount=3000. Pre-#527 this would be accepted because
-    // the fresh in-memory state had `last_amount = 0`.
+    // attempt a replay of amount=3000. A store that rebuilt fresh in-memory
+    // state with `last_amount = 0` would accept it.
     let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
     let mut state = hydrate(&store, POOL_ID, &signer)?;
     anyhow::ensure!(

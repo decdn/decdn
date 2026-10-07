@@ -1154,8 +1154,8 @@ pub enum StreamError {
     ///
     /// Recovery: the pool **owner tops up the deposit** and re-opens. The buyer's
     /// reactive top-up loop routes this into a fund-and-retry against its own
-    /// `working_deposit` ceiling, so a node's larger-than-estimated `M` no longer
-    /// dead-ends the fetch. Terminal only once the buyer's ceiling or top-up
+    /// `working_deposit` ceiling, so a node's larger-than-estimated `M` does not
+    /// dead-end the fetch. Terminal only once the buyer's ceiling or top-up
     /// budget is spent. Distinct from the mid-stream
     /// [`VoucherRejectReason::PoolExhausted`], which fires after the node has
     /// already committed to serving; this is the open-time equivalent.

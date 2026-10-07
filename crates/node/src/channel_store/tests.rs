@@ -749,65 +749,6 @@ fn a_buyer_pool_row_survives_a_seller_side_drop() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A store carrying either superseded capability table drops both at open:
-/// the owner-signed material now rides the lane record itself, so the side
-/// tables are dead. The migration deletes them without reading a row. The
-/// lane frontier in the same file is untouched.
-#[test]
-fn superseded_capability_tables_are_dropped_at_open() -> anyhow::Result<()> {
-    let dir = data_dir()?;
-    let recorded = sample(9);
-    {
-        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
-        store.record(&recorded)?;
-        store.flush()?;
-    }
-
-    // Inject legacy `capability_v1` AND `capability_v2` rows directly, with
-    // arbitrary bytes — the migration never decodes them, it deletes both
-    // whole tables.
-    let path = dir.path().join(LANES_DB_FILE);
-    let key = pool_signer_key_bytes(B256::repeat_byte(0x51), Address::repeat_byte(0x52));
-    {
-        let db =
-            Database::create(&path).map_err(|e| anyhow::anyhow!("open lanes.redb raw: {e}"))?;
-        let txn = db.begin_write()?;
-        {
-            let mut v1 = txn.open_table(SUPERSEDED_CAPABILITY_TABLE_V1)?;
-            v1.insert(&key, [0xAAu8; 40].as_slice())?;
-            let mut v2 = txn.open_table(SUPERSEDED_CAPABILITY_TABLE_V2)?;
-            v2.insert(&key, [0xBBu8; 17].as_slice())?;
-        }
-        txn.commit()?;
-    }
-
-    // Reopen through the store — the drop runs — then close it so the raw
-    // read below can take the file.
-    {
-        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
-        let lanes = store.load_all()?;
-        anyhow::ensure!(lanes.len() == 1, "the lane frontier survives the migration");
-    }
-
-    let db = Database::create(&path).map_err(|e| anyhow::anyhow!("reopen raw: {e}"))?;
-    let read_txn = db.begin_read()?;
-    anyhow::ensure!(
-        matches!(
-            read_txn.open_table(SUPERSEDED_CAPABILITY_TABLE_V1),
-            Err(redb::TableError::TableDoesNotExist(_))
-        ),
-        "the superseded capability_v1 table must be gone after open"
-    );
-    anyhow::ensure!(
-        matches!(
-            read_txn.open_table(SUPERSEDED_CAPABILITY_TABLE_V2),
-            Err(redb::TableError::TableDoesNotExist(_))
-        ),
-        "the superseded capability_v2 table must be gone after open"
-    );
-    Ok(())
-}
-
 /// A record carrying a `schema_version` higher than this binary supports —
 /// `load_all` MUST refuse to decode it (per ADR 003: silently dropping
 /// unknown fields is unsafe because we cannot honour the persistence

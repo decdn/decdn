@@ -330,9 +330,9 @@ pub async fn drain(args: &cli::DrainArgs, global_config: Option<&Path>) -> anyho
         .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
 
     let resp: DrainResponse = client
-        .drain(Some(DrainRequest {
+        .drain(DrainRequest {
             wait_admin: args.wait,
-        }))
+        })
         .await
         .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
 
@@ -351,29 +351,25 @@ pub async fn drain(args: &cli::DrainArgs, global_config: Option<&Path>) -> anyho
         return Ok(());
     }
 
-    // Cross-version safety: `--wait` is only safe when the server is
-    // actually keeping admin alive through `router.shutdown`. A server
-    // that doesn't honor `wait_admin` (older binary, future bug,
-    // anything in between) lacks the `wait_admin_honored` field, which
-    // serde-defaults to `false` on this side. Refuse to enter the
-    // polling loop in that case — otherwise the imminent ECONNREFUSED
-    // from the early admin tear-down would be misread as drain
-    // completion while in-flight streams are still running, defeating
-    // the zero-payment-loss guarantee.
+    // `--wait` is only safe when the server is actually keeping admin
+    // alive through `router.shutdown`. The drain trigger is
+    // first-writer-wins, so when another caller's drain without
+    // `wait_admin` fired first, the server reports
+    // `wait_admin_honored=false`. Refuse to enter the polling loop in
+    // that case — otherwise the imminent ECONNREFUSED from the early
+    // admin tear-down would be misread as drain completion while
+    // in-flight streams are still running, defeating the
+    // zero-payment-loss guarantee.
     if !resp.wait_admin_honored {
-        // The drain has *already fired* server-side at this point —
-        // fire-and-forget semantics, so the node is now mid-shutdown
-        // via the legacy SIGTERM-equivalent ordering. The operator
-        // can't undo that; the actionable advice is to either let it
-        // finish via the legacy path (process exit / health-until-
-        // ECONNREFUSED) or upgrade the node so `--wait` works next time.
+        // The drain is already underway server-side and cannot be
+        // undone; the actionable advice is to observe completion via
+        // process exit or health-until-ECONNREFUSED.
         return Err(anyhow::anyhow!(
-            "admin at {url} did not honor --wait (wait_admin_honored=false). \
-             Drain has already been initiated server-side and the node is \
-             shutting down via the legacy SIGTERM-equivalent path; observe \
+            "admin at {url} did not honor --wait (wait_admin_honored=false): \
+             an earlier drain without --wait already started shutdown, so the \
+             admin server closes before in-flight streams finish. Observe \
              completion via process exit or `decdn node health` until \
-             ECONNREFUSED. The server is likely older than the CLI or does \
-             not implement #604 — upgrade the node to use --wait safely",
+             ECONNREFUSED",
         ));
     }
 
@@ -634,14 +630,7 @@ fn write_lanes_table(w: &mut impl io::Write, resp: &LanesResponse) -> io::Result
 fn write_lane_row(w: &mut impl io::Write, c: &LaneSnapshot) -> io::Result<()> {
     let lane = short_node_id(&c.pool_id);
     let counterparty = short_node_id(&c.counterparty);
-    // A pre-delegation server omits `voucher_signer` entirely (the DTO field is
-    // `#[serde(default)]`), so an empty string means "this node cannot tell" —
-    // rendered as `?` rather than silently echoing the funder.
-    let signer = if c.voucher_signer.is_empty() {
-        "?".to_string()
-    } else {
-        short_node_id(&c.voucher_signer)
-    };
+    let signer = short_node_id(&c.voucher_signer);
     let last_voucher = match c.seconds_since_last_voucher {
         // No voucher seen since this process started — distinct from
         // "<1s ago" so operators know the activity clock has no record

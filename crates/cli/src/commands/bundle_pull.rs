@@ -3786,8 +3786,7 @@ async fn sweep_donor_sources(index: &ChunkIndex) {
 /// path — so the copy goes through a unique temp file beside `dest` and an
 /// atomic rename, the same source-must-survive shape [`link_or_copy_atomic`]
 /// uses for every later duplicate — built from `fetch::temp_in_parent`, the
-/// same staging primitive `fetch`'s single-blob path used to build its own
-/// atomic writer from.
+/// staging primitive the bundle cache and manifest writers share.
 fn materialize(staging: &Path, dest: &Path) -> anyhow::Result<u64> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;

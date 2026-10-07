@@ -607,17 +607,16 @@ async fn admin_v1_drain_returns_initiated_true() -> anyhow::Result<()> {
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
-    let resp = client.drain(Some(DrainRequest::default())).await?;
+    let resp = client.drain(DrainRequest { wait_admin: false }).await?;
     assert!(resp.initiated, "expected initiated=true");
     assert!(
         !resp.wait_admin_honored,
-        "default DrainRequest must report wait_admin_honored=false"
+        "wait_admin=false must report wait_admin_honored=false"
     );
-    // Default request leaves wait_admin false → SIGTERM-equivalent
-    // ordering preserved.
+    // wait_admin=false keeps the SIGTERM-equivalent ordering.
     assert!(
         !drain_trigger.wait_admin(),
-        "default DrainRequest must not flip wait_admin on"
+        "wait_admin=false must not flip wait_admin on"
     );
 
     // The RPC handler should have fired the trigger.
@@ -681,15 +680,14 @@ async fn cli_drain_rejects_zero_timeout() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A caller (`curl`, a Python script) that invokes `admin_v1_drain`
-/// with no `params` field at all must still trigger drain and return
-/// the default response. Without `req: Option<DrainRequest>` on the
-/// trait, jsonrpsee's proc-macro uses `next()` and would return
-/// JSON-RPC `-32602 Invalid params`. We bypass the generated client
-/// (which always sends `Some(...)`) and call the raw `request` method
-/// with `rpc_params![]` to reproduce the parameter-less wire shape.
+/// `admin_v1_drain` takes a required `DrainRequest`: a call with no
+/// `params` (`curl`, a Python script) is refused with JSON-RPC
+/// `-32602 Invalid params` and must NOT fire the drain. We bypass the
+/// generated client (which always sends the request) and call the raw
+/// `request` method with `rpc_params![]` to reproduce the
+/// parameter-less wire shape.
 #[tokio::test]
-async fn admin_v1_drain_with_empty_params_still_triggers() -> anyhow::Result<()> {
+async fn admin_v1_drain_without_params_is_rejected() -> anyhow::Result<()> {
     let (cache, _tmp) = test_cache().await?;
     let drain_trigger = Arc::new(DrainTrigger::new());
     let state = AdminState::new(
@@ -703,27 +701,18 @@ async fn admin_v1_drain_with_empty_params_still_triggers() -> anyhow::Result<()>
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
-    // Raw call: `rpc_params![]` serializes as `"params":[]`, which
-    // is how a pre-#604 client invokes a parameter-less method.
-    let resp: decdn_common::admin::DrainResponse =
-        client.request("admin_v1_drain", rpc_params![]).await?;
-    assert!(resp.initiated, "expected initiated=true on no-params drain");
+    let res: Result<decdn_common::admin::DrainResponse, _> =
+        client.request("admin_v1_drain", rpc_params![]).await;
+    let err = res
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a no-params drain must be refused"))?;
     assert!(
-        !resp.wait_admin_honored,
-        "no-params drain must report wait_admin_honored=false"
-    );
-    // Server-side observable effect: trigger fired and wait_admin
-    // stayed false.
-    assert!(
-        !drain_trigger.wait_admin(),
-        "no-params drain must keep wait_admin=false"
+        matches!(&err, ClientError::Call(obj) if obj.code() == -32602),
+        "expected -32602 Invalid params, got {err:?}"
     );
     let waited =
         tokio::time::timeout(std::time::Duration::from_millis(100), drain_trigger.wait()).await;
-    assert!(
-        waited.is_ok(),
-        "no-params drain must still fire the trigger"
-    );
+    assert!(waited.is_err(), "a refused drain must not fire the trigger");
 
     let _ = stop_tx.send(());
     join.await?;
@@ -770,9 +759,9 @@ async fn cli_drain_wait_returns_immediately_when_idle() -> anyhow::Result<()> {
 }
 
 /// `decdn node drain --wait` fails fast (no polling) when the server
-/// responds with `wait_admin_honored: false` — a server that can't keep
-/// admin alive through the drain, or a future regression where the
-/// runtime ordering wasn't reapplied. Without this guard, the imminent
+/// responds with `wait_admin_honored: false` — an earlier drain without
+/// `wait_admin` won the first-writer-wins trigger, or a regression where
+/// the runtime ordering wasn't reapplied. Without this guard, the imminent
 /// ECONNREFUSED from the early admin tear-down would be misread as drain
 /// completion while in-flight streams keep running — exactly the
 /// false-success the reviewer flagged.

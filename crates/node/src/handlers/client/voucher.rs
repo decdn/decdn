@@ -670,7 +670,7 @@ impl ClientHandler {
         // lock, run the up-to-255-keccak `verify_forward` with no lane contention,
         // then re-lock and apply. `advance_preimage_verified` trusts that walk
         // while the frontier is unchanged and re-hashes under the lock on the rare
-        // same-lane race, so a payer releasing sparse indices can no longer make
+        // same-lane race, so a payer releasing sparse indices cannot make
         // sibling streams wait out its keccak walk (ADR 005 §Payment lanes). A
         // reveal at or below the frontier hashes nothing at all, on either path.
         let index = preimage.index;

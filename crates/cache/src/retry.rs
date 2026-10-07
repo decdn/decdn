@@ -19,7 +19,7 @@
 //!   recognises typed `BlobTooLargeMarker` and `OriginError::*` as
 //!   Permanent, treats `io::ErrorKind::{ConnectionReset, TimedOut,
 //!   UnexpectedEof, …}` and the catch-all `Other` as Transient) and
-//!   re-fed to the loop — restoring pre-#271 retry semantics for small
+//!   re-fed to the loop — mid-stream retries for small
 //!   blobs at a bounded memory cost.
 //! - **Abort + restart (large blobs):** the engine's per-attempt closure
 //!   commits to `iroh-blobs::add_stream` directly. On mid-stream
@@ -266,8 +266,8 @@ pub(crate) async fn drain_to_bytes(
 ///    truncated Content-Length responses through it. `Other`
 ///    defaults to Transient because all three origin adapters wrap
 ///    reqwest / SDK body errors via `io::Error::other(...)` —
-///    pre-#271 those would have been transient `reqwest::Error`s
-///    and retried. Anything not in the Transient set is classified
+///    the wrapped `reqwest::Error`s are transient body failures
+///    worth retrying. Anything not in the Transient set is classified
 ///    Permanent (fail-fast over retry-storm for unrecognised
 ///    modes).
 pub(crate) fn classify_io_error(e: io::Error) -> OriginPullError {
