@@ -3163,8 +3163,7 @@ fn classify_pull_failure(
                         // ADR 001 §Probe cache mandates tracking this rate; ADR
                         // 005 says a correct hold mechanism should make it rare,
                         // so a sustained rate is a remote implementation bug, not
-                        // a tuning knob. The `monitoring/grafana-dashboard.json`
-                        // panel scraping this metric predates the emitter (#1165).
+                        // a tuning knob.
                         DurableMissCause::EvictedSinceProbe => {
                             deps.metrics.probe_post_eviction_failure();
                         }

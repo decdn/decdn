@@ -6164,10 +6164,9 @@ async fn post_eviction_failures_after_a_refusal(error: StreamError) -> Result<u6
 /// `decdn_probe_post_eviction_failures_total` must fire for an `EvictedSinceProbe` refusal
 /// and ONLY for it — the whole point of `DurableMissCause` (#1165, #1223 review).
 ///
-/// The `monitoring/grafana-dashboard.json` panel scraping this metric predates the emitter,
-/// and the unit test on `pull_verdict` (`only_an_eviction_carries_the_post_eviction_cause`)
+/// The unit test on `pull_verdict` (`only_an_eviction_carries_the_post_eviction_cause`)
 /// pins the *classification*, not the emission: rerouting the metric call, or firing it for
-/// both `DurableMiss` causes, passes that test while the panel silently counts blob-ceiling
+/// both `DurableMiss` causes, passes that test while the metric silently counts blob-ceiling
 /// rejections as hold-mechanism failures. This drives both causes through the real wire +
 /// classification path and reads the counter itself. `BlobTooLarge` is the load-bearing
 /// zero: it takes the SAME `DurableMiss` arm, so it is the one code that can tell "metric
@@ -6178,7 +6177,7 @@ async fn only_an_eviction_refusal_fires_the_post_eviction_metric() -> Result<()>
         post_eviction_failures_after_a_refusal(StreamError::EvictedSinceProbe).await? == 1,
         "an EvictedSinceProbe refusal must increment \
          decdn_probe_post_eviction_failures_total — ADR 001 §Probe cache mandates tracking \
-         this rate, and the Grafana panel scraping it predates the emitter"
+         this rate"
     );
     anyhow::ensure!(
         post_eviction_failures_after_a_refusal(StreamError::BlobTooLarge).await? == 0,

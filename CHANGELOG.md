@@ -28,6 +28,14 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Monitoring-breaking: `monitoring/` moves to
+  [`decdn/devops`](https://github.com/decdn/devops/tree/main/charts/decdn-node/files/monitoring).**
+  The four Grafana dashboards and `prometheus-alerts.yml` live in
+  `charts/decdn-node/files/monitoring/` there, and this repository no longer
+  ships them. The four `decdn-node` tests that checked the dashboards and
+  rules against the exporter are deleted, and nothing checks them in CI now.
+  `adr_registry_names_are_exported` still gates the ADR metric registry. Import dashboards and load alert rules from
+  the devops repository instead.
 - **`decdn-cache` network origins bind to the runtime they are built on
   (#1675).** `HttpOrigin::new`, `HttpOrigin::new_with_user_agent`,
   `HttpOrigin::parse`, `S3Origin::new` and `S3Origin::from_parts` capture the
