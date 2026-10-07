@@ -420,6 +420,7 @@ const CHUNK_BYTES: u64 = 1024;
 /// `MAX_TOPUP_SETTLE_WAITS` / `TOPUP_SETTLE_BACKOFF`; node: its own smaller
 /// budgets). Kept minimal — progress and deadlines stay with the caller.
 #[derive(Debug, Clone, Copy)]
+#[doc(hidden)]
 pub struct DriveConfig {
     /// The reactive top-up target passed to the pacer as
     /// [`PaceState::working_deposit`]. `U256::ZERO` disables reactive top-up.

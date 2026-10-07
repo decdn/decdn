@@ -13,11 +13,8 @@ mod common;
 
 use std::sync::Arc;
 
-use alloy::primitives::U256;
 use anyhow::{Context, Result};
-use decdn_client::{
-    DriveConfig, NoCache, ProgressClock, PullConfig, StaticSources, StopPolicy, Streamer,
-};
+use decdn_client::{NoCache, ProgressClock, PullConfig, StaticSources, StopPolicy, Streamer};
 
 use common::{Buyer, Env, NoTopUp};
 
@@ -39,16 +36,7 @@ async fn main() -> Result<()> {
     // The streamer keeps its verified range store in a scratch directory. It is
     // not a resumable download: the directory goes when the stream ends.
     let scratch = tempfile::tempdir()?;
-    let sources = StaticSources::new(candidates)?;
-    let holders = sources.holders();
-    let streamer = Streamer::new(
-        sources,
-        holders,
-        Arc::default(),
-        NoTopUp,
-        DriveConfig::cli(U256::ZERO),
-        scratch.path(),
-    );
+    let streamer = Streamer::new(StaticSources::new(candidates)?, NoTopUp, scratch.path());
     // A terminal waits until Ctrl-C; a script gives up after ten minutes
     // without a verified byte.
     let stop = StopPolicy::new(

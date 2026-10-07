@@ -52,7 +52,8 @@
 //!    delegated capability also checks its signer
 //!    ([`PeerSource::with_signer_check`]).
 //! 6. **Fetch** with [`Downloader::fetch_to_paths`] or [`Streamer::open`], over
-//!    a [`StaticSources`] of the lanes and its [`StaticSources::holders`].
+//!    a [`StaticSources`] of the lanes. Every lane streams at once unless
+//!    [`Downloader::max_lanes`] caps it.
 //! 7. **Record what each lane paid**, whatever the outcome: build a
 //!    [`VoucherProgress`] from the ledger's settlement, and apply the
 //!    [`buyer_pool::ProgressWrite`] it calls for to the buyer store.
@@ -80,11 +81,14 @@
 //! - **Persistence.** The faces never write the buyer store. Record every
 //!   lane's payment after each fetch (step 7). A lane you do not record resumes
 //!   from a stale watermark next time, and its provider rejects the vouchers.
-//! - **Funding policy.** A [`Funder`] decides whether a fetch that runs
-//!   the pool low tops it up. One whose [`max_topups`](Funder::max_topups)
-//!   is `0` never does. A source whose next voucher the deposit cannot cover
-//!   then waits for the deposit to rise, and once every known source waits
-//!   the fetch fails with a [`NoAffordableSource`].
+//! - **Funding policy.** Reactive top-up is off until you give a face a
+//!   working deposit ([`Downloader::working_deposit`],
+//!   [`Streamer::working_deposit`]). A [`Funder`] then decides whether a fetch
+//!   that runs the pool low tops it up. One whose
+//!   [`max_topups`](Funder::max_topups) is `0` never does. A source whose next
+//!   voucher the deposit cannot cover then waits for the deposit to rise, and
+//!   once every known source waits the fetch fails with a
+//!   [`NoAffordableSource`].
 //! - **Which holders to use.** Discovery gives candidates; ordering and
 //!   admission ([`discovery::admit_sources`]) are the caller's choice.
 //!
@@ -173,6 +177,7 @@ mod first_open;
 /// Command-wide health of each provider (ADR 039 § Failure handling:
 /// reassign-only tail): cooling backoff on a delivery fault, parking on an
 /// unaffordable price.
+#[doc(hidden)]
 pub mod health;
 mod ledger;
 /// Run-scoped registry of live per-lane voucher ledgers:
@@ -235,8 +240,7 @@ pub mod source_set;
 pub use config::PullConfig;
 pub use connection::Connections;
 pub use downloader::{DownloadTarget, Downloader};
-pub use driver::{DriveConfig, PoolExhausted};
-pub use health::PeerHealth;
+pub use driver::PoolExhausted;
 pub use ledger::{Cumulative, PoolLedger};
 pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{Funder, PeerSource, SignerCapDrained, SignerRegistry, SourceFuture};
@@ -256,13 +260,15 @@ pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
 #[doc(hidden)]
 pub use decdn_bao_range::RangedStore;
 #[doc(hidden)]
-pub use driver::{LegNoProgress, PacingWait, SharedPool, WaitReason, drive, first_leg};
+pub use driver::{
+    DriveConfig, LegNoProgress, PacingWait, SharedPool, WaitReason, drive, first_leg,
+};
 #[doc(hidden)]
 pub use fault::{FatalScope, Fault, HealExhausted, LaneBuildFault, classify};
 #[doc(hidden)]
 pub use first_open::first_open;
 #[doc(hidden)]
-pub use health::Health;
+pub use health::{Health, PeerHealth};
 #[doc(hidden)]
 pub use ledger::{ChainCommit, EpochAction, Metered, Rebase, Released};
 #[doc(hidden)]

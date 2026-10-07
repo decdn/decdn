@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use alloy::primitives::U256;
+
 use crate::driver::DriveConfig;
 use crate::health::PeerHealth;
 use crate::ledgers::LaneLedgers;
@@ -81,9 +83,8 @@ pub struct DownloadTarget<'a> {
 /// ```no_run
 /// use std::path::Path;
 ///
-/// use decdn_client::driver::DriveConfig;
-/// use decdn_client::source::{BlobSource, Funder};
-/// use decdn_client::{DownloadTarget, Downloader, StaticSources, StreamCandidate};
+/// use decdn_client::source::BlobSource;
+/// use decdn_client::{DownloadTarget, Downloader, Funder, StaticSources, StreamCandidate};
 ///
 /// async fn download<S: BlobSource, F: Funder>(
 ///     candidates: Vec<StreamCandidate<S>>,
@@ -92,16 +93,9 @@ pub struct DownloadTarget<'a> {
 ///     total_bytes: u64,
 ///     dest: &Path,
 /// ) -> anyhow::Result<()> {
-///     let sources = StaticSources::new(candidates)?;
-///     let holders = sources.holders();
-///     let lanes = holders.len();
-///     let drive = DriveConfig::cli(Default::default());
-///     let downloader =
-///         Downloader::new(sources, holders, Default::default(), funder, drive, lanes);
+///     let downloader = Downloader::new(StaticSources::new(candidates)?, funder);
 ///     let target = DownloadTarget { hash, total_bytes, dest, ranges: None };
-///     downloader
-///         .fetch_to_paths(&[target], None, None)
-///         .await?;
+///     downloader.fetch_to_paths(&[target], None).await?;
 ///     Ok(())
 /// }
 /// ```
@@ -138,30 +132,69 @@ impl<P, F> std::fmt::Debug for Downloader<P, F> {
 }
 
 impl<P, F> Downloader<P, F> {
-    /// Build a downloader over `holders`, whose lanes `provider` builds. The
-    /// same holders start every target a later `fetch_to_dir` fetches, and
-    /// `health` is shared across all of them. With no holder, each target
-    /// starts by discovering them. At most `max_lanes` holders (at least one)
-    /// stream at once.
+    /// Build a downloader whose holders and lanes `provider` finds and builds,
+    /// funded through `funder`.
+    ///
+    /// Each target starts by discovering its holders, every holder streams at
+    /// once, and reactive top-up is off. The builder methods change each of
+    /// these.
     #[must_use]
-    pub const fn new(
-        provider: P,
-        holders: Vec<Holder>,
-        health: Arc<PeerHealth>,
-        funder: F,
-        drive_config: DriveConfig,
-        max_lanes: usize,
-    ) -> Self {
+    pub fn new(provider: P, funder: F) -> Self {
         Self {
             provider,
-            holders,
-            health,
+            holders: Vec::new(),
+            health: Arc::default(),
             funder,
-            drive_config,
-            max_lanes,
+            drive_config: DriveConfig::cli(U256::ZERO),
+            max_lanes: usize::MAX,
             max_blob_bytes: 0,
             refetched: AtomicU64::new(0),
         }
+    }
+
+    /// Start every target from `holders`, in preference order, instead of
+    /// discovering them. A probe's measured holders go here.
+    #[must_use]
+    pub fn holders(mut self, holders: Vec<Holder>) -> Self {
+        self.holders = holders;
+        self
+    }
+
+    /// Stream from at most `max_lanes` holders at once (at least one). The
+    /// other holders wait as reserves, and a holder that discovery adds later
+    /// can take a free lane.
+    #[must_use]
+    pub const fn max_lanes(mut self, max_lanes: usize) -> Self {
+        self.max_lanes = max_lanes;
+        self
+    }
+
+    /// Top the pool up through the funder, back to `working_deposit`, when a
+    /// fetch runs the deposit low. `U256::ZERO` turns reactive top-up off: a
+    /// fetch the deposit cannot cover then fails with
+    /// [`crate::NoAffordableSource`].
+    #[must_use]
+    pub const fn working_deposit(mut self, working_deposit: U256) -> Self {
+        self.drive_config.working_deposit = working_deposit;
+        self
+    }
+
+    /// Record source faults into `health`, which a command shares across its
+    /// fetches so a holder that faulted on one stays cooled on the next.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn health(mut self, health: Arc<PeerHealth>) -> Self {
+        self.health = health;
+        self
+    }
+
+    /// Replace the whole funding and settle policy, the working deposit
+    /// included.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn drive_config(mut self, drive_config: DriveConfig) -> Self {
+        self.drive_config = drive_config;
+        self
     }
 
     /// How many targets this downloader fetched again from scratch because
@@ -223,7 +256,7 @@ where
                 ranges: None,
             })
             .collect();
-        self.fetch_to_paths(&targets, None, on_progress).await
+        self.fetch_to_paths(&targets, on_progress).await
     }
 
     /// [`Self::fetch_to_paths_until`] under a stop policy with no limit: the
@@ -235,12 +268,10 @@ where
     pub async fn fetch_to_paths(
         &self,
         targets: &[DownloadTarget<'_>],
-        ledgers: Option<&LaneLedgers>,
         on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
     ) -> anyhow::Result<Vec<PathBuf>> {
         let stop = StopPolicy::new(true, None, Arc::new(ProgressClock::new()));
-        self.fetch_to_paths_until(targets, ledgers, on_progress, &stop)
-            .await
+        self.fetch_to_paths_until(targets, on_progress, &stop).await
     }
 
     /// Fetch every [`DownloadTarget`] to its own `dest` path, returning the
@@ -270,12 +301,6 @@ where
     /// (bytes that drifted on disk after they verified) fetches the target
     /// once more.
     ///
-    /// `ledgers`, when set, is a shared voucher-ledger registry (a bundle run's
-    /// `LaneLedgers`): the loop reads and credits EVERY lane registered across
-    /// the run for its deposit-solvency view, so concurrent entries sharing one
-    /// on-chain pool cannot jointly over-draw it. `None` folds only this fetch's
-    /// own lanes, the right view for a solo download.
-    ///
     /// `stop` decides when a target that makes no verified progress gives up.
     /// A target that gives up or fails keeps its landed bytes recorded in its
     /// `.partial` for a resume, and is not finalized.
@@ -284,11 +309,40 @@ where
     ///
     /// A `dest` with no file name, a store
     /// open/create/finalize I/O error, a second [`crate::HashMismatch`] at
-    /// finalize, or the error [`crate::acquire`] ends a target with: a fatal
-    /// fault, a unanimous verdict of the sources, or [`crate::GaveUp`]. The
-    /// first failing target aborts the batch; targets already written stay on
-    /// disk.
+    /// finalize, or the error the fetch ends a target with: a fatal fault, a
+    /// unanimous verdict of the sources, or [`crate::GaveUp`]. The first failing
+    /// target aborts the batch; targets already written stay on disk.
     pub async fn fetch_to_paths_until(
+        &self,
+        targets: &[DownloadTarget<'_>],
+        on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
+        stop: &StopPolicy,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        self.fetch(targets, None, on_progress, stop).await
+    }
+
+    /// [`Self::fetch_to_paths_until`] over a run-wide voucher-ledger registry
+    /// (a bundle run's [`LaneLedgers`]). The loop reads and credits every lane
+    /// registered across the run for its deposit-solvency view, so concurrent
+    /// entries that share one on-chain pool cannot jointly over-draw it.
+    ///
+    /// # Errors
+    ///
+    /// Any error [`Self::fetch_to_paths_until`] returns.
+    #[doc(hidden)]
+    pub async fn fetch_to_paths_shared(
+        &self,
+        targets: &[DownloadTarget<'_>],
+        ledgers: &LaneLedgers,
+        on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
+        stop: &StopPolicy,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        self.fetch(targets, Some(ledgers), on_progress, stop).await
+    }
+
+    /// The fetch behind both entry points. `ledgers` of `None` folds only this
+    /// fetch's own lanes, the right view for a solo download.
+    async fn fetch(
         &self,
         targets: &[DownloadTarget<'_>],
         ledgers: Option<&LaneLedgers>,
@@ -480,15 +534,9 @@ mod tests {
     ) -> anyhow::Result<Downloader<StaticSources<S>, FakeFunder>> {
         let sources = StaticSources::new(candidates)?;
         let holders = sources.holders();
-        let lanes = holders.len();
-        Ok(Downloader::new(
-            sources,
-            holders,
-            Arc::default(),
-            funder(),
-            drive_config(),
-            lanes,
-        ))
+        Ok(Downloader::new(sources, funder())
+            .holders(holders)
+            .drive_config(drive_config()))
     }
 
     /// The lane cap is the caller's, not the holder count: two holders under
@@ -508,14 +556,10 @@ mod tests {
             candidate(src_b, ledger_b, 0xB2),
         ])?;
         let holders = sources.holders();
-        let downloader = Downloader::new(
-            sources,
-            holders,
-            Arc::default(),
-            funder(),
-            drive_config(),
-            1,
-        );
+        let downloader = Downloader::new(sources, funder())
+            .holders(holders)
+            .drive_config(drive_config())
+            .max_lanes(1);
         let dir = tempfile::tempdir()?;
         downloader
             .fetch_to_dir(&[(root, total)], dir.path(), None)
@@ -650,7 +694,6 @@ mod tests {
                     ranges: None,
                 }],
                 None,
-                None,
             )
             .await?;
 
@@ -690,7 +733,6 @@ mod tests {
                     ranges: Some(&half),
                 }],
                 None,
-                None,
             )
             .await?;
         anyhow::ensure!(paths.is_empty(), "an incomplete target is not returned");
@@ -709,7 +751,6 @@ mod tests {
                     ranges: Some(&all),
                 }],
                 None,
-                None,
             )
             .await?;
         anyhow::ensure!(
@@ -723,9 +764,9 @@ mod tests {
         Ok(())
     }
 
-    /// `fetch_to_paths` threads a shared `LaneLedgers` registry (a bundle run's
-    /// pool-wide committed view) into the loop and still fetches byte-identically
-    /// (#1848 4a).
+    /// `fetch_to_paths_shared` threads a shared `LaneLedgers` registry (a
+    /// bundle run's pool-wide committed view) into the loop and still fetches
+    /// byte-identically (#1848 4a).
     #[tokio::test]
     async fn fetch_to_paths_threads_a_shared_ledger_registry() -> anyhow::Result<()> {
         let blob = payload(1_500_000);
@@ -738,17 +779,19 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let dest = dir.path().join("shared-ledger.bin");
         let registry = crate::LaneLedgers::new();
+        let stop = StopPolicy::new(true, None, Arc::new(ProgressClock::new()));
 
         let paths = downloader
-            .fetch_to_paths(
+            .fetch_to_paths_shared(
                 &[DownloadTarget {
                     hash: root,
                     total_bytes: total,
                     dest: &dest,
                     ranges: None,
                 }],
-                Some(&registry),
+                &registry,
                 None,
+                &stop,
             )
             .await?;
 
@@ -865,7 +908,6 @@ mod tests {
                     ranges,
                 }],
                 None,
-                None,
             )
             .await?;
         Ok((probe, paths))
@@ -951,7 +993,7 @@ mod tests {
             dest: &dest,
             ranges: None,
         };
-        let paths = downloader.fetch_to_paths(&[target], None, None).await?;
+        let paths = downloader.fetch_to_paths(&[target], None).await?;
         anyhow::ensure!(paths == vec![dest.clone()], "the fetch promotes");
         anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
         anyhow::ensure!(
@@ -991,7 +1033,6 @@ mod tests {
                     ranges: None,
                 }],
                 None,
-                None,
                 &stop,
             )
             .await?;
@@ -1025,7 +1066,6 @@ mod tests {
                     dest: &dest,
                     ranges: None,
                 }],
-                None,
                 None,
                 &stop,
             )
@@ -1067,7 +1107,7 @@ mod tests {
         // Well inside the first periodic flush, so only the drop can record.
         let dropped = tokio::time::timeout(
             crate::driver::PRESENT_RECORD_FLUSH_INTERVAL / 5,
-            downloader.fetch_to_paths(&targets, None, None),
+            downloader.fetch_to_paths(&targets, None),
         )
         .await;
         anyhow::ensure!(
@@ -1102,7 +1142,8 @@ mod tests {
         Ok(())
     }
 
-    /// A downloader that starts with no holder discovers them and fetches.
+    /// A downloader built with no setting at all discovers its holders and
+    /// fetches.
     #[tokio::test(start_paused = true)]
     async fn a_downloader_with_no_holder_discovers_them() -> anyhow::Result<()> {
         let blob = payload(1_500_000);
@@ -1111,14 +1152,7 @@ mod tests {
         let root = source.root();
         let total = u64::try_from(blob.len())?;
         let sources = StaticSources::new(vec![candidate(source, ledger, 0xA1)])?;
-        let downloader = Downloader::new(
-            sources,
-            Vec::new(),
-            Arc::default(),
-            funder(),
-            drive_config(),
-            1,
-        );
+        let downloader = Downloader::new(sources, funder());
         let dir = tempfile::tempdir()?;
         let paths = downloader
             .fetch_to_dir(&[(root, total)], dir.path(), None)

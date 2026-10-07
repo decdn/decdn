@@ -99,7 +99,6 @@ use super::ordered_writes::OrderedWrites;
 use super::pull_progress::{self, PullProgress};
 use decdn_bao_range::CHUNK_GROUP_BYTES;
 use decdn_client::discovery::{self, NodeCandidate};
-use decdn_client::driver::DriveConfig;
 use decdn_client::endpoint as client_endpoint;
 use decdn_client::provider;
 use decdn_client::{
@@ -2537,23 +2536,20 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             };
             // `--max-sources` caps the lanes the entry stripes across at
             // once; every other holder waits as a reserve.
-            let downloader = Downloader::new(
-                &sources,
-                holders,
-                Arc::clone(&self.health),
-                sources.funder(),
-                DriveConfig::cli(self.chain.working_deposit),
-                self.common.max_sources,
-            )
-            .max_blob_bytes(max_blob_bytes);
-            Box::pin(downloader.fetch_to_paths_until(
+            let downloader = Downloader::new(&sources, sources.funder())
+                .holders(holders)
+                .health(Arc::clone(&self.health))
+                .working_deposit(self.chain.working_deposit)
+                .max_lanes(self.common.max_sources)
+                .max_blob_bytes(max_blob_bytes);
+            Box::pin(downloader.fetch_to_paths_shared(
                 &[DownloadTarget {
                     hash,
                     total_bytes,
                     dest: staging,
                     ranges,
                 }],
-                Some(&self.ledgers),
+                &self.ledgers,
                 progress,
                 &self.stop,
             ))
@@ -9837,8 +9833,8 @@ mod tests {
     }
 
     /// A drive config whose working deposit never gates a scripted fetch.
-    fn drive_config() -> DriveConfig {
-        DriveConfig {
+    fn drive_config() -> decdn_client::DriveConfig {
+        decdn_client::DriveConfig {
             working_deposit: alloy::primitives::U256::from(u128::MAX),
             seller_reserve: alloy::primitives::U256::ZERO,
             max_settle_waits: 2,
@@ -9873,14 +9869,10 @@ mod tests {
         let (provider, holders) = two_scripted_holders(&blob, Some(Arc::clone(&blipped)))?;
         let staging = tempfile::tempdir()?;
         let dest = staging.path().join("entry");
-        let downloader = Downloader::new(
-            &provider,
-            holders,
-            Arc::default(),
-            no_topups(),
-            drive_config(),
-            2,
-        );
+        let downloader = Downloader::new(&provider, no_topups())
+            .holders(holders)
+            .drive_config(drive_config())
+            .max_lanes(2);
         let stop = StopPolicy::new(
             false,
             Some(std::time::Duration::from_mins(1)),
@@ -9894,7 +9886,6 @@ mod tests {
                     dest: &dest,
                     ranges: Some(&ranges),
                 }],
-                None,
                 None,
                 &stop,
             )
