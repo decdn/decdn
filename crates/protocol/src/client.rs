@@ -1094,8 +1094,9 @@ pub enum StreamError {
     BlobTooLarge,
     /// Unexpected failure; do not retry this node.
     InternalError,
-    /// The node withdrew the blob between probe and stream request. WARNING: still
-    /// slashable after a signed `has_blob: true` probe (ADR 005).
+    /// The node withdrew the blob between probe and stream request. It is not
+    /// slash evidence: no slashable offense pairs a probe with a later refusal
+    /// (ADR 005).
     ///
     /// A withdrawal with no blacklist entry behind it — a manual
     /// `decdn node evict`, or a quarantine after a serve found the stored copy

@@ -76,7 +76,7 @@ A fetch that has no usable source waits for one. When a fetch stops, it reports 
 
 An item is one blob that the command fetches. In a bundle pull, each entry is one item, and an item that ends does not stop the other entries. In `decdn fetch`, the item is the whole fetch.
 
-**A node's refusal is never fatal to the fetch.** Every refusal scopes to the node that sent it, for this fetch. The client never ends a fetch on the word of one node, and it classifies a refusal from its code alone, with no chain read. These rules hold for `decdn fetch`, for a bundle pull, and for the node's own pull leg when it buys upstream.
+**A node's refusal is never fatal to the fetch.** Every refusal scopes to the node that sent it, for this fetch. The client never ends a fetch on the word of one node, and it classifies a refusal from its code alone, with no chain read. These rules hold for `decdn fetch`, for a bundle pull, and for the node's own pull leg when it buys upstream. A bundle pull is one fetch for every entry. On the node pull leg, one fetch is one serve-miss fill.
 
 Local faults end the fetch, because only the user can fix them:
 
@@ -93,8 +93,8 @@ On the wire, `NotFound` means "not now": a miss, load shed, the signer's live fl
 
 **The exhausted candidate set.** The candidate set is exhausted when every known source is absent or removed, and a fresh discovery finds no new holder. The fetch then ends by the first rule that applies:
 
-1. At least one candidate refused `Unfunded`. The client runs one [funding recovery](003-payments.md#funding-recovery) step for the fetch, then one more pass over the `Unfunded` candidates. If they still refuse `Unfunded`, the fetch ends with "funding needed".
-2. Every candidate refused `Declined`. The fetch ends early with "no node will serve this". It ends as soon as every known candidate refused `Declined`, and it does not run the fresh discovery.
+1. At least one candidate refused `Unfunded`. The client runs a [funding recovery](003-payments.md#funding-recovery) step, if the progress rule allows one, then one more pass over the `Unfunded` candidates. A further step needs at least one new BLAKE3-verified byte since the previous step. If no step is allowed, or the candidates still refuse `Unfunded`, the fetch ends with "funding needed".
+2. Every candidate refused `Declined`. The fetch ends early with "no node will serve this". It ends as soon as every known candidate refused `Declined`, and it does not run the fresh discovery. The final error names the reasons that the client collected locally. For example, when every node rejected the client's vouchers mid-stream, the error says "every node rejected this client's vouchers (BadSignature)". The client already holds each mid-stream reason, so this needs no wire field.
 3. Otherwise, the fetch ends with not-found.
 
 No other fault ends the fetch. The loop keeps trying.
@@ -105,7 +105,7 @@ Speculative duplicate requests are out of scope **by decision, not by sequencing
 
 ### Payment
 
-Each source is paid from the client's single pool via node-addressed vouchers on its own `(signer, provider)` lane ([ADR 003 § Payment Model](003-payments.md#adr-003-payment-model)), for verified bytes only. There is **no channel per source**: one deposit backs every source, so the payer holds no per-source deposit and there is no fragmentation to size. The pool must hold enough deposit to cover the value in flight across the whole source set at once; each source stops serving when the pool's remaining balance nears its reserved floor `M` ([ADR 003 § Pool solvency and the refundable floor `M`](003-payments.md#pool-solvency-and-the-refundable-floor-m)) — the payer-side counterpart of the node's pre-flight deposit guard. The one [funding recovery](003-payments.md#funding-recovery) step of a fetch heals a mid-fetch exhaustion for every lane at once: the client credits the new deposit to every lane. Three facts belong to the pool and not to a lane — the deposit, the spend that gates it, and the one recovery step. A per-lane copy of any of them lets N lanes each spend what one pool holds. Each segment is a bounded aligned request, so the node reserves, delivers, and bills exactly that span: no over-delivery, no client overpay, no lost credit window. Each lane is redeemed independently by its node; there is no cross-source settlement, and redeem cost is the node's, not the client's.
+Each source is paid from the client's single pool via node-addressed vouchers on its own `(signer, provider)` lane ([ADR 003 § Payment Model](003-payments.md#adr-003-payment-model)), for verified bytes only. There is **no channel per source**: one deposit backs every source, so the payer holds no per-source deposit and there is no fragmentation to size. The pool must hold enough deposit to cover the value in flight across the whole source set at once; each source stops serving when the pool's remaining balance nears its reserved floor `M` ([ADR 003 § Pool solvency and the refundable floor `M`](003-payments.md#pool-solvency-and-the-refundable-floor-m)) — the payer-side counterpart of the node's pre-flight deposit guard. A [funding recovery](003-payments.md#funding-recovery) step heals a mid-fetch exhaustion for every lane at once: the client credits the new deposit to every lane. Three facts belong to the pool and not to a lane — the deposit, the spend that gates it, and the funding recovery state of the fetch. A per-lane copy of any of them lets N lanes each spend what one pool holds. Each segment is a bounded aligned request, so the node reserves, delivers, and bills exactly that span: no over-delivery, no client overpay, no lost credit window. Each lane is redeemed independently by its node; there is no cross-source settlement, and redeem cost is the node's, not the client's.
 
 ### Source diversity and per-peer memory
 
@@ -162,7 +162,7 @@ The same scheduler drives two consumers over one shared code path: the client fe
 
 - **Parameter drift.** `max_sources` set too high wastes connections and deposit on marginal throughput. `min_split_size` too small inflates proof overhead and request count near the tail; too large coarsens load-balancing near completion. Defaults are pinned above and are meant to need no operator tuning.
 - **Source collusion / eclipse.** A set dominated by one operator concentrates failure and pricing power. One-per-operator admission mitigates this, but the client depends on accurate operator identity in the registry to spread the set.
-- **Under-sized pool.** One pool backs all sources, so there is no deposit fragmentation; the residual is that the single deposit must cover the value in flight across all sources at once, each source bounded by the node-side floor `M`. Mitigated by sizing the deposit to the admitted set and one funding recovery step per fetch rather than over-committing up front ([ADR 003 § Pool solvency and the refundable floor `M`](003-payments.md#pool-solvency-and-the-refundable-floor-m)).
+- **Under-sized pool.** One pool backs all sources, so there is no deposit fragmentation; the residual is that the single deposit must cover the value in flight across all sources at once, each source bounded by the node-side floor `M`. Mitigated by sizing the deposit to the admitted set and progress-gated funding recovery rather than over-committing up front ([ADR 003 § Pool solvency and the refundable floor `M`](003-payments.md#pool-solvency-and-the-refundable-floor-m)).
 
 ## Cross-ADR Impact
 
