@@ -264,8 +264,9 @@ pub trait Funder: Send + Sync {
     /// # Errors
     ///
     /// If the on-chain `topUp` fails to submit or reverts — the funds did not
-    /// move. If its receipt is not obtained, the funds may have moved and the
-    /// error carries [`crate::buyer_pool::TopUpUnconfirmed`]. If a mined `topUp`
+    /// move. If its submit fails in transport or its receipt is not obtained,
+    /// the funds may have moved and the error carries
+    /// [`crate::buyer_pool::TopUpUnconfirmed`]. If a mined `topUp`
     /// cannot be credited locally, the funds **are** escrowed and the error
     /// names the tx ([`crate::buyer_pool::escrowed_but_untracked`]).
     fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome>;
