@@ -75,6 +75,13 @@ pub async fn pull(
         session.save_capability(&token)?;
     }
 
+    let data_dir = session.reserve_decdn_data_dir()?;
+    if !data_dir.is_shared() {
+        eprintln!(
+            "decdn-sponsored: another download is running; this one starts \
+             without the shared peer cache"
+        );
+    }
     let args = PullArgs {
         hash,
         output: output.to_path_buf(),
@@ -82,7 +89,7 @@ pub async fn pull(
         capability_file: session.capability_path(),
         keystore: session.keystore_path(),
         password_file: session.password_path(),
-        data_dir: session.dir().to_path_buf(),
+        data_dir: data_dir.path().to_path_buf(),
         rpc_url: profile.rpc_url,
         payment_pool: profile.payment_pool,
         capacity_bond: Some(profile.capacity_bond),
@@ -91,6 +98,7 @@ pub async fn pull(
     };
 
     let status = decdn::run_pull(&cfg.decdn_bin, &args).await?;
+    drop(data_dir);
     if !status.success() {
         anyhow::bail!(
             "download did not finish. Re-run the same command to resume: downloaded \

@@ -47,7 +47,10 @@ That is why:
    holds the token for the CLI.
 5. **Pull.** The CLI saves the token and runs `decdn bundle pull` with it.
    `decdn` finds nodes, pays them with vouchers signed by the throwaway key,
-   and verifies every byte against the hash.
+   and verifies every byte against the hash. Its `--data-dir` is
+   `~/.decdn/sponsored/decdn/`, shared across downloads, so peers cached by
+   one download spare the next its registry read. A download started while
+   another holds that dir runs in its own directory instead.
 6. **Done.** On success the download's state is deleted. On failure it is
    kept, so re-running the same command resumes with the same key and
    capability, without the gate.

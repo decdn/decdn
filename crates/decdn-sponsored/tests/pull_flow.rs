@@ -150,7 +150,21 @@ async fn success_runs_bundle_pull_and_discards_state() {
         "--payment-pool-address {}",
         Address::repeat_byte(0x01)
     )));
+    // Windows quotes path arguments to a `.cmd` stub, and its echo keeps them.
+    let unquoted = calls.replace('"', "");
+    assert!(
+        unquoted.contains(&format!("--data-dir {}", data.join("decdn").display())),
+        "{calls}"
+    );
+    assert!(
+        unquoted.contains(&format!("--keystore {}", state_dir(&data).display())),
+        "{calls}"
+    );
     assert!(!state_dir(&data).exists());
+    assert!(
+        data.join("decdn").is_dir(),
+        "the shared data dir outlives it"
+    );
 }
 
 #[tokio::test]

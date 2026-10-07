@@ -36,7 +36,9 @@ pub struct PullArgs {
     pub keystore: PathBuf,
     /// `--keystore-password-file`: that key's random password.
     pub password_file: PathBuf,
-    /// `--data-dir`: this download's state dir (buyer-channel store).
+    /// `--data-dir`: the `decdn` data dir downloads share (peer store,
+    /// buyer-channel store), or the download's own dir while another
+    /// download holds the shared one. The key above stays per download.
     pub data_dir: PathBuf,
     /// `--rpc-url`: JSON-RPC endpoint for on-chain reads.
     pub rpc_url: String,
@@ -121,7 +123,7 @@ mod tests {
             capability_file: PathBuf::from("/s/capability"),
             keystore: PathBuf::from("/s/keystore.json"),
             password_file: PathBuf::from("/s/password"),
-            data_dir: PathBuf::from("/s"),
+            data_dir: PathBuf::from("/root/decdn"),
             rpc_url: "http://rpc".into(),
             payment_pool: Address::repeat_byte(0x01),
             capacity_bond: Some(Address::repeat_byte(0x02)),
@@ -155,6 +157,11 @@ mod tests {
         );
         assert!(!args.iter().any(|a| a == "--capability"));
         assert_eq!(value_after(&args, "--namespace").unwrap(), "1");
+        assert_eq!(value_after(&args, "--data-dir").unwrap(), "/root/decdn");
+        assert_eq!(
+            value_after(&args, "--keystore").unwrap(),
+            "/s/keystore.json"
+        );
         assert!(!args.iter().any(|a| a == "--slash-judge-address"));
     }
 }

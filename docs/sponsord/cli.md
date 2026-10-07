@@ -38,8 +38,12 @@ is harmless and upgrades to whatever release the onramp pins.
    prints a link (and opens it in the browser) to the gate page, then waits
    up to 10 minutes for the person to pass it.
 4. Runs `decdn bundle pull` with the capability and key. `decdn`'s own
-   progress and errors show as they are.
-5. On success, deletes the download's state. On failure, keeps it: running
+   progress and errors show as they are. `decdn` keeps its peer cache in
+   `~/.decdn/sponsored/decdn/`, which downloads share, so a later download
+   finds nodes faster. Downloads run one at a time in that directory; one
+   started while another runs gets a directory of its own.
+5. On success, deletes the download's state (the shared peer cache stays).
+   On failure, keeps it: running
    the same command again resumes with the same key and capability, and
    `decdn` resumes from its `.partial` files. A resumed download works even
    if the onramp is down, using the profile it saved.

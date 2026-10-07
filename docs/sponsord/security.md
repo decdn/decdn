@@ -60,6 +60,11 @@ by the per-address rate limits (`ONRAMP_FUND_RATE_PER_MIN`).
 `decdn-sponsored` keeps each download's key, password, capability and
 profile under `~/.decdn/sponsored/downloads/<hash>/`, created `0700` with
 files `0600` on Unix. The key holds no funds and is deleted once the
-download succeeds. `decdn` verifies every byte against the content hash, so
+download succeeds. Every download signs with a fresh key, and `decdn`
+generates a fresh iroh node key per run, so nodes can't link one download to
+another by identity. `decdn`'s data dir, `~/.decdn/sponsored/decdn/`, is
+shared across downloads and holds only public facts about nodes (addresses,
+latency, recent failures); sponsored pulls write no buyer-channel rows there.
+`decdn` verifies every byte against the content hash, so
 a malicious node or onramp can't change what is downloaded; a malicious
 onramp could only point the CLI at a different pool or chain.

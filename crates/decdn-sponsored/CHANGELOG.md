@@ -32,6 +32,11 @@ release.
 
 ### Changed
 
+- **One shared `decdn` data dir.** `decdn bundle pull` gets
+  `--data-dir <data_dir>/decdn/`, kept across downloads, so its peer cache
+  carries over. The voucher key stays per download under
+  `downloads/<hash>/`. A download started while another holds the shared dir
+  (`<data_dir>/decdn.lock`) runs in its own directory.
 - **No redb, no geth-compat keystores.** Each download key's address is
   written beside it instead of read out of the keystore.
 - **Requests carry a timeout and a `User-Agent`** (`decdn-sponsored/<version>`).
