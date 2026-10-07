@@ -3175,6 +3175,14 @@ since project inception and will roll into the first tagged release.
   select (a partial an earlier run left for an entry this run excluded) print
   one warning with their count and size. The pull keeps them for a later run
   that selects the entry again.
+- **`bundle pull --hash --dry-run` checks the filters against a cached
+  manifest (#2327).** When an earlier pull into the same output directory
+  cached the bundle manifest, the dry run lists the filtered plan and warns
+  on each `--include`/`--exclude` pattern that matches no entry, as
+  `-i --dry-run` does. The dry run reads the cache even under `--overwrite`.
+  With no cached manifest, it prints the bundle hash and output directory it
+  would pull into; under `--json` it prints `count` and `entries` as `null`.
+  A malformed `--hash` fails the dry run, as it fails a real pull.
 
 - **Paid-leg diagnostics at `debug` (#2211).** Each paid leg's open logs its
   peer, hash, `byte_offset` and `byte_len`. A throughput-floor trip logs the

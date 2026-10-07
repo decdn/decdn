@@ -140,8 +140,11 @@ pub struct BundlePullArgs {
     #[arg(long)]
     pub overwrite: bool,
 
-    /// Print what would be fetched (paths + sizes) and exit without any network
-    /// or chain activity.
+    /// Print the entries the run would pull (paths + sizes, after
+    /// `--include`/`--exclude`; files already present are still listed) and exit
+    /// without any network or chain activity. With `--hash`, entries are listed
+    /// only when an earlier pull into the same output directory cached the
+    /// bundle manifest.
     #[arg(long)]
     pub dry_run: bool,
 

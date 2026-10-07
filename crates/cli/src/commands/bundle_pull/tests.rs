@@ -4046,6 +4046,109 @@ async fn dry_run_still_rejects_a_dangling_provider_address() {
     );
 }
 
+/// Parse `bundle pull` args from `extra`, behind a placeholder program name.
+fn pull_args(extra: &[&str]) -> BundlePullArgs {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct T {
+        #[command(flatten)]
+        a: decdn_common::cli::BundlePullArgs,
+    }
+    T::parse_from(std::iter::once("t").chain(extra.iter().copied())).a
+}
+
+/// Cache `manifest` under `out` as `bundle pull --hash` caches it, and return
+/// the bundle's `b3:` hash.
+fn cache_manifest(out: &Path, manifest: &serde_json::Value) -> String {
+    let bytes = serde_json::to_vec(manifest).unwrap();
+    let hash = *blake3::hash(&bytes).as_bytes();
+    bundle_cache::store(out, hash, &bytes);
+    format!("b3:{}", blake3::Hash::from_bytes(hash).to_hex())
+}
+
+/// `--hash --dry-run` reads the bundle's cached manifest, even under
+/// `--overwrite`, so the filters run against its entries (#2327).
+#[test]
+fn dry_run_reads_a_cached_hash_manifest() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let out = tmp.path().to_str().expect("utf-8 tmp path");
+    let hash = cache_manifest(
+        tmp.path(),
+        &serde_json::json!({
+            "version": 1,
+            "entries": [
+                {"path": "openai-gpt-oss-20b/config.json", "hash": "b3:aa", "size": 10},
+                {"path": "openai-gpt-oss-20b/metal/model.bin", "hash": "b3:bb", "size": 20},
+            ],
+        }),
+    );
+    for overwrite in [false, true] {
+        let mut argv = vec!["-o", out, "--hash", &hash, "--dry-run"];
+        if overwrite {
+            argv.push("--overwrite");
+        }
+        let manifest = dry_run_manifest(&pull_args(&argv))
+            .unwrap()
+            .expect("the cached manifest is read");
+        assert_eq!(
+            manifest
+                .entries
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "openai-gpt-oss-20b/config.json",
+                "openai-gpt-oss-20b/metal/model.bin"
+            ],
+            "overwrite={overwrite}"
+        );
+    }
+}
+
+/// `--hash --dry-run` with no cached manifest has no entries to list, and the
+/// full dry run still finishes with no endpoint, chain, or keystore.
+#[tokio::test]
+async fn dry_run_has_no_manifest_for_an_uncached_hash() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let out = tmp.path().to_str().expect("utf-8 tmp path");
+    let hash = format!("b3:{}", "ab".repeat(32));
+    let args = pull_args(&["-o", out, "--hash", &hash, "--dry-run"]);
+    assert!(dry_run_manifest(&args).unwrap().is_none());
+    super::bundle_pull(&args, None).await.unwrap();
+}
+
+/// The full `bundle_pull --dry-run` reads the cached `--hash` manifest: a
+/// cached blob that hashes to the bundle but is not a v1 manifest fails the
+/// dry run, naming the cache file, as it would fail a real pull.
+#[tokio::test]
+async fn dry_run_fails_on_a_cached_manifest_that_does_not_parse() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let out = tmp.path().to_str().expect("utf-8 tmp path");
+    let hash = cache_manifest(
+        tmp.path(),
+        &serde_json::json!({"version": 2, "entries": []}),
+    );
+    let args = pull_args(&["-o", out, "--hash", &hash, "--dry-run"]);
+    let err = super::bundle_pull(&args, None)
+        .await
+        .expect_err("a cached non-v1 manifest fails the dry run");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("unsupported bundle version 2"), "{msg}");
+    assert!(msg.contains(bundle_cache::CACHE_DIR), "{msg}");
+}
+
+/// A malformed `--hash` fails the dry run, as it fails a real pull.
+#[tokio::test]
+async fn dry_run_rejects_a_malformed_hash() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let out = tmp.path().to_str().expect("utf-8 tmp path");
+    let args = pull_args(&["-o", out, "--hash", "b3:aa", "--dry-run"]);
+    let err = super::bundle_pull(&args, None)
+        .await
+        .expect_err("a malformed --hash fails the dry run");
+    assert!(format!("{err:#}").contains("invalid hash"), "{err:#}");
+}
+
 /// A candidate on node `node` run by operator `operator`.
 fn stripe_candidate(node: u8, operator: u8) -> NodeCandidate {
     NodeCandidate {

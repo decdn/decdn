@@ -4923,64 +4923,104 @@ fn report_nothing_to_fetch(reason: NothingReason) {
     println!("{msg}");
 }
 
-/// Print the would-fetch plan and exit (no network/chain/keystore activity).
-/// With `--hash` the entries can't be enumerated offline, so only the intent is
-/// reported. The `--include`/`--exclude` `filter` is applied to a local
-/// manifest's entries so the plan reflects exactly what a real run would fetch.
-fn dry_run(args: &BundlePullArgs, filter: &EntryFilter, filters_given: bool) -> anyhow::Result<()> {
-    let out = args.output.display();
+/// The manifest a dry run can read with no network: the `-i` file, or the
+/// `--hash` bundle's copy in the output root's [`bundle_cache`]. `None` when
+/// `--hash` has no usable cached copy (missing, unreadable, or failing its hash
+/// check). Errors on a malformed `--hash`, an unreadable `-i` file, or bytes
+/// that do not parse as a v1 manifest. The cache is read even under
+/// `--overwrite`, which makes a real pull fetch the manifest again: the cache
+/// is content-addressed, so its bytes are exactly what that fetch returns.
+fn dry_run_manifest(args: &BundlePullArgs) -> anyhow::Result<Option<Manifest>> {
     match (&args.input, &args.hash) {
-        (Some(path), _) => {
-            let mut manifest = read_local_manifest(path)?;
-            let raw_empty = manifest.entries.is_empty();
-            manifest.entries = filter.apply_and_warn(manifest.entries).0;
-            if args.json {
-                // The `--json` plan stays machine-readable — an empty set is
-                // `count: 0` with an empty `entries` array, no prose line.
-                let plan = serde_json::json!({
-                    "output": args.output.display().to_string(),
-                    "count": manifest.entries.len(),
-                    "entries": manifest.entries.iter().map(|e| serde_json::json!({
-                        "path": e.path, "hash": e.hash, "size": e.size,
-                        "chunks": e.chunks.as_ref().map(Vec::len),
-                    })).collect::<Vec<_>>(),
-                });
-                println!("{plan}");
-            } else if manifest.entries.is_empty() {
-                // Match the real run's empty-result message rather than printing a
-                // "would fetch 0 entr(ies)" plan, so `--dry-run` and a live pull
-                // agree on what an emptied set looks like.
-                report_nothing_to_fetch(NothingReason::from_filter(filters_given, raw_empty));
-            } else {
-                println!(
-                    "would fetch {} entr(ies) into {out}:",
-                    manifest.entries.len()
-                );
-                for e in &manifest.entries {
-                    let chunks = e
-                        .chunks
-                        .as_ref()
-                        .map(|c| format!(", {} chunks", c.len()))
-                        .unwrap_or_default();
-                    match e.size {
-                        Some(n) => println!("  {} ({n} bytes{chunks})", e.path),
-                        None => println!("  {}{}", e.path, chunks),
-                    }
-                }
-            }
-        }
+        (Some(path), _) => read_local_manifest(path).map(Some),
         (None, Some(h)) => {
-            let filter_note = if filters_given {
-                " (the include/exclude filters then apply)"
-            } else {
-                ""
-            };
-            println!(
-                "--dry-run with --hash: would fetch bundle {h} then its entries into {out} \
-                 (entries are not enumerable without fetching the manifest){filter_note}"
-            );
+            let hash = fetch::parse_hash(h)?;
+            bundle_cache::load(&args.output, hash)
+                .map(|bytes| {
+                    parse_manifest(&bytes).with_context(|| {
+                        format!(
+                            "cached bundle manifest {}",
+                            bundle_cache::cache_path(&args.output, hash).display()
+                        )
+                    })
+                })
+                .transpose()
         }
         (None, None) => bail!("no bundle source (expected -i or --hash)"),
+    }
+}
+
+/// Print the would-fetch plan and exit (no network/chain/keystore activity).
+/// The plan lists the entries of the manifest [`dry_run_manifest`] reads: the
+/// `-i` file, or a `--hash` bundle's cached manifest. The `--include`/`--exclude`
+/// `filter` applies to those entries, so the plan is the entry set a real run
+/// starts from and the unmatched-pattern warnings are the ones it prints. A real
+/// run then skips files already present in the output root (unless
+/// `--overwrite`) and warns on leftover partials; the dry run does neither. A
+/// `--hash` bundle with no cached manifest reports only the bundle and the
+/// output root, with `entries: null` under `--json`.
+fn dry_run(args: &BundlePullArgs, filter: &EntryFilter, filters_given: bool) -> anyhow::Result<()> {
+    let out = args.output.display();
+    let Some(mut manifest) = dry_run_manifest(args)? else {
+        let h = args.hash.as_deref().unwrap_or_default();
+        if args.json {
+            let plan = serde_json::json!({
+                "output": out.to_string(),
+                "hash": h,
+                "count": null,
+                "entries": null,
+            });
+            println!("{plan}");
+            return Ok(());
+        }
+        let filter_note = if filters_given {
+            "; the include/exclude patterns are matched against them then"
+        } else {
+            ""
+        };
+        println!(
+            "--dry-run with --hash: would fetch bundle {h} then its entries into {out} \
+             (no cached manifest: entries are listed once a pull into this directory \
+             caches it{filter_note})"
+        );
+        return Ok(());
+    };
+    let raw_empty = manifest.entries.is_empty();
+    manifest.entries = filter.apply_and_warn(manifest.entries).0;
+    if args.json {
+        // The `--json` plan stays machine-readable — an empty set is
+        // `count: 0` with an empty `entries` array, no prose line. A `--hash`
+        // bundle with no cached manifest gives `count`/`entries` of `null`.
+        let plan = serde_json::json!({
+            "output": args.output.display().to_string(),
+            "count": manifest.entries.len(),
+            "entries": manifest.entries.iter().map(|e| serde_json::json!({
+                "path": e.path, "hash": e.hash, "size": e.size,
+                "chunks": e.chunks.as_ref().map(Vec::len),
+            })).collect::<Vec<_>>(),
+        });
+        println!("{plan}");
+    } else if manifest.entries.is_empty() {
+        // Match the real run's empty-result message rather than printing a
+        // "would fetch 0 entr(ies)" plan, so `--dry-run` and a live pull
+        // agree on what an emptied set looks like.
+        report_nothing_to_fetch(NothingReason::from_filter(filters_given, raw_empty));
+    } else {
+        println!(
+            "would fetch {} entr(ies) into {out}:",
+            manifest.entries.len()
+        );
+        for e in &manifest.entries {
+            let chunks = e
+                .chunks
+                .as_ref()
+                .map(|c| format!(", {} chunks", c.len()))
+                .unwrap_or_default();
+            match e.size {
+                Some(n) => println!("  {} ({n} bytes{chunks})", e.path),
+                None => println!("  {}{}", e.path, chunks),
+            }
+        }
     }
     Ok(())
 }
