@@ -360,7 +360,7 @@ pub const fn decdn_client::source::PeerSource<'a>::new(&'a iroh::endpoint::Endpo
 pub fn decdn_client::source::PeerSource<'a>::with_signer_check(self, &'a dyn decdn_client::source::SignerRegistry) -> Self
 impl core::fmt::Debug for decdn_client::source::PeerSource<'_>
 pub fn decdn_client::source::PeerSource<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct decdn_client::PoolContext
+#[non_exhaustive] pub struct decdn_client::PoolContext
 pub decdn_client::PoolContext::capability: core::option::Option<decdn_incentive::capability::SignedCapability>
 pub decdn_client::PoolContext::client_binding: core::option::Option<decdn_protocol::client::ClientBinding>
 pub decdn_client::PoolContext::client_signer: alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>
@@ -371,8 +371,10 @@ pub decdn_client::PoolContext::prior_bytes_delivered: alloy_primitives::aliases:
 pub decdn_client::PoolContext::provider: alloy_primitives::bits::address::Address
 pub decdn_client::PoolContext::voucher_domain: alloy_sol_types::eip712::Eip712Domain
 impl decdn_client::PoolContext
+pub fn decdn_client::PoolContext::bind_endpoint(self, &iroh::endpoint::Endpoint, &alloy_sol_types::eip712::Eip712Domain) -> anyhow::Result<Self>
 pub const fn decdn_client::PoolContext::for_pool(&decdn_incentive::buyer_pool::BuyerPoolState, alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, alloy_sol_types::eip712::Eip712Domain) -> Self
 pub fn decdn_client::PoolContext::lane(&self) -> decdn_incentive::lane::LaneKey
+pub const fn decdn_client::PoolContext::new(alloy_primitives::aliases::B256, alloy_primitives::aliases::U256, alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, alloy_sol_types::eip712::Eip712Domain) -> Self
 pub fn decdn_client::PoolContext::new_ledger(&self) -> decdn_client::PoolLedger
 pub const fn decdn_client::PoolContext::with_capability(self, decdn_incentive::capability::SignedCapability) -> Self
 pub fn decdn_client::PoolContext::with_client_binding(self, decdn_protocol::client::ClientBinding) -> Self
