@@ -418,8 +418,14 @@ jobs:
       # cache restore is actually useful.
       #
       # --cobertura: GitHub Code Quality reads Cobertura XML only.
+      #
+      # --ignore-filename-regex: cargo-llvm-cov already skips `tests.rs` and
+      # `*_tests.rs` by default. The flag adds to that default and drops the
+      # other unit-test module names that `.github/codeql/codeql-config.yml`
+      # skips (`proptests.rs`, `test_support.rs`, `tests_support.rs`), so the
+      # report measures production code only. Keep the two lists in sync.
       - name: Run tests (with coverage instrumentation)
-        run: cargo llvm-cov nextest --workspace --cobertura --output-path cobertura.xml --no-tests=pass --no-clean
+        run: cargo llvm-cov nextest --workspace --cobertura --output-path cobertura.xml --no-tests=pass --no-clean --ignore-filename-regex '(^|/)(proptests|tests?_support)\.rs$'
 
       # Disk headroom after the profraw merge, logged even when the tests fail,
       # so an ENOSPC regression shows up as a number rather than a guess.
