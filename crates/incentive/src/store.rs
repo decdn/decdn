@@ -184,8 +184,8 @@ pub trait PendingSettleStore: Send + Sync {
 ///
 /// The [`as_str`](CheckpointKey::as_str) literals are **on-disk identifiers**:
 /// renaming one silently forfeits that watcher's resume (its next boot re-scans
-/// from the configured floor instead of the stored block), so they are frozen
-/// for backward compatibility.
+/// from the configured floor instead of the stored block), so each one stays
+/// fixed for as long as the on-disk format does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CheckpointKey {
     /// Redemption watcher `PoolOpened` high-water block.
@@ -193,8 +193,7 @@ pub enum CheckpointKey {
 }
 
 impl CheckpointKey {
-    /// The stable on-disk key for this checkpoint. Frozen for backward
-    /// compatibility — see the type-level doc.
+    /// The stable on-disk key for this checkpoint — see the type-level doc.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

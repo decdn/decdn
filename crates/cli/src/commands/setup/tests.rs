@@ -39,8 +39,8 @@ fn registration_status_same_node_active_is_already_registered() {
 fn registration_status_same_node_inactive_is_due() {
     let local = B256::repeat_byte(0xAA);
     // Deregistered: the binding to this key survives but `active` is false,
-    // so a re-registration is due rather than skipped. This is the case the
-    // guard previously mis-handled, stranding the node inactive.
+    // so a re-registration is due rather than skipped. Skipping it would
+    // strand the node inactive.
     assert!(matches!(
         registration_status(local, false, local),
         RegistrationStatus::Due

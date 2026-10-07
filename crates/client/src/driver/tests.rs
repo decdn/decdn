@@ -1558,7 +1558,7 @@ async fn an_insufficient_deposit_open_refusal_tops_up_and_reopens() {
     // estimated, and the buyer cannot compute it. The driver must trust the
     // owner-only `InsufficientDeposit` signal, top the deposit up toward its own
     // `working_deposit` ceiling, and re-open — rather than dead-end as it would
-    // on the ambiguous `NotFound` this refusal used to collapse to.
+    // on an ambiguous `NotFound`.
     let total = 2 * GROUP;
     let (root, plaintext, _outboard) = synth_blob(total as usize);
     let store = fresh_store(root, total);

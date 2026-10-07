@@ -81,12 +81,9 @@ const CHUNK_GROUP: usize = 16 * 1024;
 /// market regime while a higher one would be refused as below-margin.
 ///
 /// The rate, the seeder's refundable floor `M` ([`SEEDER_MIN_REMAINING`]), and
-/// the SERVER's working deposit ([`SERVER_WORKING_DEPOSIT`]) are all a factor of
-/// 500 below the pre-#2036 sizing (rate `500_000`, M `1_000_000`, deposit
-/// `4_000_000`) so this whole node-to-node exhaust-mid-pull scenario is preserved
-/// unchanged under the lowered `MAX_RATE_PER_MB` (1000): every `µUSDC` quantity in
-/// the open-gate and exhaust-mid-blob inequalities scales by the same factor, and
-/// the blob is byte-identical.
+/// the SERVER's working deposit ([`SERVER_WORKING_DEPOSIT`]) are sized together
+/// under `MAX_RATE_PER_MB` (1000) so the open-gate and exhaust-mid-blob
+/// inequalities hold for this node-to-node exhaust-mid-pull scenario.
 const RATE_PER_MB: u64 = 1000;
 
 /// The SERVER's node-to-node buyer working deposit, shrunk to 8000 `µUSDC` — far
@@ -100,9 +97,9 @@ const RATE_PER_MB: u64 = 1000;
 /// reservations the gap-driven pull holds on the seeder side at once.
 const SERVER_WORKING_DEPOSIT: u64 = 8_000;
 
-/// The refundable floor `M` for this journey, scaled down by the same factor of
-/// 500 as the rate and deposit so the open-gate headroom (`working − M ≥ one
-/// chunk`) is preserved: 8000 − 2000 = 6000 ≥ 1000. It is set on BOTH nodes,
+/// The refundable floor `M` for this journey, sized with the rate and deposit so
+/// the open-gate headroom (`working − M ≥ one chunk`) holds:
+/// 8000 − 2000 = 6000 ≥ 1000. It is set on BOTH nodes,
 /// because `M` has two roles here that must agree at the same value:
 ///
 ///   * On the SEEDER it is the seller-side pre-serve floor: the seeder admits the

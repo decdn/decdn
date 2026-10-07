@@ -15,7 +15,7 @@ Neither fits when a same-host operator must **read live internal state** (readin
 
 A running deCDN node exposes a **loopback-only JSON-RPC 2.0 server** on a configurable port (`observability.admin_port`, default `9191`), dispatched over HTTP `POST /`, framed per <https://www.jsonrpc.org/specification>.
 
-The surface version lives in the namespace prefix (`admin_v1_...`), not a URL path segment, since JSON-RPC dispatches on the envelope's `method` field. Within `v1`, routes accrete fields backwards-compatibly; a breaking change cuts over to `admin_v2_...`.
+The surface version lives in the namespace prefix (`admin_v1_...`), not a URL path segment, since JSON-RPC dispatches on the envelope's `method` field. Within `v1`, routes accrete fields backwards-compatibly; a breaking change cuts over to `admin_v2_...`. This rule applies from the first public deployment. Before that, a breaking change edits the `v1` method in place.
 
 Method set (the `AdminRpc` trait in `decdn-common` is the canonical surface):
 
@@ -23,12 +23,14 @@ Method set (the `AdminRpc` trait in `decdn-common` is the canonical surface):
 | ------------------ | ----------------------- | ----------------- |
 | `admin_v1_health`  | none                    | `HealthResponse`  |
 | `admin_v1_status`  | none                    | `StatusResponse`  |
-| `admin_v1_drain`   | `DrainRequest` (optional) | `DrainResponse`   |
+| `admin_v1_drain`   | `DrainRequest`          | `DrainResponse`   |
 | `admin_v1_evict`   | `EvictRequest`          | `EvictResponse`   |
 | `admin_v1_reload`  | none                    | `ReloadResponse`  |
 | `admin_v1_lanes`   | none                    | `LanesResponse`   |
 | `admin_v1_slashes` | none                    | `SlashesResponse` |
 | `admin_v1_pools`   | none                    | `BuyerPoolsResponse` |
+
+Every parameter is required. A caller sends it as a one-element positional array, for example `"params":[{"wait_admin":false}]` for `admin_v1_drain`. A call without it gets `-32602 Invalid params`.
 
 `admin_v1_pools` reports the node's buyer-side `PaymentPool` state. This is the only read path to that state on a running node. The daemon keeps it in `<data_dir>/buyer.redb`, and `redb` holds a process-exclusive lock on that file for the daemon's lifetime, so no other process can open it — not even read-only. A CLI that reads the client store (`buyer-pools.redb`) in the same directory reads a different, unrelated file.
 

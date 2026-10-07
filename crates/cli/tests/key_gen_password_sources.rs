@@ -88,7 +88,7 @@ fn creating_under_an_empty_env_password_is_refused_naming_the_source() {
 }
 
 /// A `--keystore-password-file` shadowed by a set `DECDN_KEYSTORE_PASSWORD`
-/// warns that the file was not used (#1934) — a previously silent inert flag —
+/// warns that the file was not used (#1934) — never a silently inert flag —
 /// while the env var still wins per precedence.
 #[test]
 fn a_shadowed_password_file_warns_and_env_still_wins() {
@@ -151,7 +151,8 @@ fn an_empty_password_file_creates_an_empty_password_keystore() {
 /// A variable that is SET but not valid UTF-8 is present-and-unreadable, so it
 /// is fatal rather than a fall-through to the password file beside it. Without
 /// this, a revert to a catch-all `Err(_) => skipped.push(...)` would silently
-/// restore the old fall-through with a green suite.
+/// let an unreadable variable fall through to the password file with a green
+/// suite.
 #[test]
 fn a_non_utf8_env_password_is_fatal_and_does_not_echo_the_value() {
     let (home, out) = dirs();

@@ -212,7 +212,7 @@ fn build_handler_limited(
 }
 
 /// [`build_handler`] with a construction-time `configure` hook for the optional
-/// deps that tests used to `attach_*` onto the built handler (#1254).
+/// deps the handler takes at construction (#1254).
 #[allow(clippy::too_many_arguments)]
 fn build_handler_configured(
     server_id: iroh::PublicKey,
@@ -3456,10 +3456,10 @@ async fn concurrent_opens_admit_exactly_one() -> anyhow::Result<()> {
 /// WIRE (ADR 005 §Voucher wire format), self-described and signed by the
 /// client, so the node verifies it directly against the lane's pinned signer
 /// instead of reconstructing a per-stream cumulative from the shared lane
-/// counter plus this stream's delivered delta. That reconstruction was what
-/// made a skip-ahead voucher recover a different address than it was signed
-/// under; with the wire value verified directly, settlement no longer depends
-/// on the order concurrent same-lane streams pay in.
+/// counter plus this stream's delivered delta. Such a reconstruction would make
+/// a skip-ahead voucher recover a different address than it was signed under;
+/// with the wire value verified directly, settlement does not depend on the
+/// order concurrent same-lane streams pay in.
 #[tokio::test(flavor = "multi_thread")]
 async fn skip_ahead_voucher_on_a_concurrent_lane_is_accepted() -> anyhow::Result<()> {
     // Both blobs sit under one chunk, so each stream has a single
@@ -3726,9 +3726,8 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
 /// been accepted, including a genuinely exhausted one). `PoolLedger::reseed`
 /// refuses a non-advancing cumulative, so `fetch_inner` surfaces the real cause
 /// instead of spending a resume attempt re-sending a voucher the node has already
-/// refused for lack of deposit. The counter assertion below pins that: pre-#1516
-/// each futile attempt was served a fresh free window, and now there is no futile
-/// attempt to serve.
+/// refused for lack of deposit. The counter assertion below pins that: there is
+/// no futile resume attempt, so the node serves no fresh free window for one.
 #[tokio::test(flavor = "multi_thread")]
 async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
     // 6 MiB — several whole chunks plus a closing remainder, so the transfer
@@ -4101,8 +4100,8 @@ fn assert_receipts_cover_the_delivery(
 /// Issue #803: receipt-log I/O must never back-pressure paid delivery. Wired
 /// through the REAL `ChannelReceiptSink` + background writer (not the inline
 /// `DirectReceiptSink`), with the underlying log stalled on every `append`, the
-/// full blob must still deliver and hash-verify — the buggy pre-#803 code
-/// awaited the append inline before continuing delivery, so it would hang here. After
+/// full blob must still deliver and hash-verify — an implementation that awaits
+/// the append inline before continuing delivery would hang here. After
 /// releasing the stall and draining the writer, every receipt is recovered,
 /// proving the decoupling loses nothing on a clean shutdown.
 #[tokio::test(flavor = "multi_thread")]
@@ -4160,7 +4159,7 @@ async fn delivery_completes_while_receipt_writer_is_stalled() -> anyhow::Result<
     let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
 
     // Delivery must complete while every receipt `append` is stalled. The outer
-    // timeout is the real assertion: the pre-#803 inline-await would hang.
+    // timeout is the real assertion: an inline-await implementation would hang.
     let got = tokio::time::timeout(
         Duration::from_secs(20),
         stream_fetch(
@@ -5339,11 +5338,11 @@ async fn client_rejects_zero_rate_response() -> anyhow::Result<()> {
 
 /// #327 boundary + #848 free-egress: a stream request for a channel the node has
 /// never persisted is refused *pre-serve* — the node signs `ok: false` with the
-/// delivery-side `NotFound` code and ships zero bytes. Previously it served up to
-/// one chunk (or the whole blob, if smaller) for free and only
-/// rejected the voucher mid-stream with `VoucherRejected { WrongChannel }`. The
-/// 1.5 MiB blob (larger than the chunk) proves the gate fires
-/// independent of blob size — not just for sub-interval blobs. Asserting on the
+/// delivery-side `NotFound` code and ships zero bytes. It never serves a free
+/// first chunk (or the whole blob, if smaller) and then rejects the voucher
+/// mid-stream with `VoucherRejected { WrongChannel }`. The 1.5 MiB blob (larger
+/// than the chunk) proves the gate fires independent of blob size — not just
+/// for sub-interval blobs. Asserting on the
 /// server's `StreamResponse` (rather than the buyer's error string) proves the
 /// success path was never entered: an `ok: true` would have streamed bytes.
 #[tokio::test(flavor = "multi_thread")]
@@ -5568,7 +5567,7 @@ async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Re
 /// prices at `paid = 0` — the floor, one chunk — not the fully-ramped
 /// `credit_max` ceiling. A deposit that covers exactly the floor's cost clears
 /// the gate even though `credit_max` is configured far larger: unlike the
-/// pre-ramp flat window, a big ceiling no longer means the node fronts that much
+/// flat window (a zero divisor), a big ceiling does not mean the node fronts that much
 /// before the first voucher.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_deposit_gate_reserves_only_the_floor_by_default() -> anyhow::Result<()> {
@@ -7155,8 +7154,8 @@ async fn buyer_aborts_oversized_small_blob_without_paying() -> anyhow::Result<()
 /// Buyer-side received-byte cap, payment leg (#1895): a blob genuinely larger than
 /// the ceiling is streamed and PAID for up to roughly one ceiling's worth before
 /// the cumulative RECEIVED bytes trip the cap — the "honest giant" residual cost.
-/// The pre-#1895 up-front claim gate paid nothing here; this test pins that the
-/// buyer now (a) enters the receive loop despite an over-ceiling `total_bytes`,
+/// An up-front claim gate would pay nothing here; this test pins that the
+/// buyer (a) enters the receive loop despite an over-ceiling `total_bytes`,
 /// (b) pays for the bytes it actually took, and (c) never pays past the ceiling.
 #[tokio::test(flavor = "multi_thread")]
 async fn buyer_pays_for_received_bytes_then_aborts_over_ceiling() -> anyhow::Result<()> {
@@ -7199,7 +7198,7 @@ async fn buyer_pays_for_received_bytes_then_aborts_over_ceiling() -> anyhow::Res
         "the received-byte cap must surface BlobTooLarge: {err}"
     );
     // The cap fires on RECEIVED bytes, so the buyer paid for the prefix it took —
-    // never the inflated claim, and (unlike the pre-#1895 up-front gate) never
+    // never the inflated claim, and (unlike an up-front claim gate) never
     // nothing: the watermark advanced.
     let (bytes, _amount) = progress.advanced().ok_or_else(|| {
         anyhow::anyhow!("the buyer must pay for the bytes it actually received before aborting")
@@ -7922,8 +7921,8 @@ async fn takedown_mid_stream_terminates_the_delivery() -> anyhow::Result<()> {
 
 /// ADR 011 §On Blacklist Event. A channel funded by a blacklisted origin is
 /// refused with `OriginBlacklisted` — including on a CACHE MISS, which is the
-/// path that previously fell through to a plain `NotFound` because every miss
-/// arm returns before the gate's old position.
+/// path a late gate misses: every miss arm returns a plain `NotFound` before
+/// a gate placed after it runs.
 ///
 /// `NotFound` is the one answer that must never be given here: it tells the
 /// client to retry elsewhere and pay again, when every node will refuse it.
@@ -9646,7 +9645,7 @@ async fn pull_through_fills_under_deadline(
 }
 
 /// #859 regression: a slow pull (1.5s) exceeding one 1s per-candidate budget is
-/// abandoned by an outer deadline equal to that budget (the pre-#859 wiring), but
+/// abandoned by an outer deadline equal to that budget (the #859 bug), but
 /// completes under the derived `outer_pull_deadline`. This is the only test in
 /// the suite that fails if the `pull_through` deadline is re-wired to the per-candidate
 /// value (re-introducing #859).
@@ -9656,7 +9655,7 @@ async fn pull_through_outer_deadline_accommodates_a_slow_pull() -> anyhow::Resul
     let stall = Duration::from_secs(1);
     let slow = Duration::from_millis(1500); // > per, well under outer_pull_deadline(per, stall)
 
-    // Pre-#859 wiring: outer == per_candidate cancels the slow pull → store empty.
+    // Buggy wiring (#859): outer == per_candidate cancels the slow pull → store empty.
     anyhow::ensure!(
         !pull_through_fills_under_deadline(per, slow).await?,
         "an outer deadline equal to the per-candidate budget must abandon the slow pull (the #859 bug)"
@@ -10432,17 +10431,17 @@ async fn unbound_client_fetch_is_refused_on_origin_only_blob() -> anyhow::Result
 /// A serve miss on a hash the node **advertises as origin-held** answers with a
 /// signed `StreamResponse{ok: false}` rather than dropping the stream.
 ///
-/// This is the path the #1130 fail-silent gate used to suppress. That gate
-/// existed because a signed `has_blob: true` probe plus a signed `ok: false`
-/// stream was phantom-announcement evidence; with the phantom offense retired
-/// the refusal is inert (rate manipulation requires `ok == true`, blacklist
-/// violation requires a served claim — ADR 014), so the accountable answer is to
-/// sign it. Dropping instead cost the requester a full open-stage timeout.
+/// A fail-silent gate (#1130) would suppress this path. A signed
+/// `has_blob: true` probe plus a signed `ok: false` stream is not
+/// phantom-announcement evidence: the refusal is inert (rate manipulation
+/// requires `ok == true`, blacklist violation requires a served claim — ADR
+/// 014), so the accountable answer is to sign it. Dropping instead costs the
+/// requester a full open-stage timeout.
 ///
 /// The setup is the [`unbound_client_fetch_is_refused_on_origin_only_blob`]
 /// control plus the one thing it lacks: `rescan_origins()`, which populates the
 /// `origin_held` index so `origin_held_size(hash)` is `Some`. Without that call
-/// the suppressed branch was unreachable, which is why no test ever covered it.
+/// the branch is unreachable.
 #[tokio::test(flavor = "multi_thread")]
 async fn origin_held_serve_miss_signs_a_refusal_rather_than_dropping() -> anyhow::Result<()> {
     let payload = vec![0x3Cu8; 32 * 1024];
@@ -11282,7 +11281,7 @@ async fn empty_cache_with_failing_origin(
 /// tells paying clients to stop asking for a blob the node will serve fine once
 /// the origin recovers. The blob's absence from the store is indistinguishable
 /// from a clean miss without the engine's error classification — which is exactly
-/// what the bare-`bool` fill helpers used to discard.
+/// what a bare-`bool` fill helper would discard.
 #[tokio::test(flavor = "multi_thread")]
 async fn local_origin_hard_fault_is_internal_error_not_signed_not_found() -> anyhow::Result<()> {
     let payload = vec![0x7Eu8; 64 * 1024];

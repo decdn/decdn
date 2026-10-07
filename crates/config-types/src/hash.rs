@@ -4,7 +4,8 @@
 //! (that needs `blake3`, which stays where blobs are handled). Its serde
 //! and `Display`/`FromStr` forms are the lowercase 64-char hex string,
 //! byte-identical to `iroh_blobs::Hash`'s hex form, so admin JSON-RPC and
-//! config TOML stay wire-compatible after the #578 extraction.
+//! config TOML carry the same hex string whether a hash is typed as this or
+//! as `iroh_blobs::Hash`.
 
 use std::collections::HashSet;
 use std::collections::hash_set::Iter;

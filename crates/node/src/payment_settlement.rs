@@ -461,8 +461,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             topic0s: settlement_route_topic0s(),
             // The durable `PoolOpened` checkpoint resumes across restarts; a
             // first-ever boot (cold store) anchors at head. The poller flushes
-            // this checkpoint on shutdown (via `CursorStart::flush`), the same
-            // flush the service used to perform itself.
+            // this checkpoint on shutdown (via `CursorStart::flush`).
             start: cursor_start(Arc::clone(&checkpoint_store)),
             // This sink observes no shutdown token, so it registers a `Ready`
             // sink; its own follow-up reads/writes ride the wallet contract it

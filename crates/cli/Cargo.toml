@@ -59,10 +59,10 @@ rand = { workspace = true }
 # `decdn origin import --dry-run` (issue #391): directory walk + glob
 # exclude + streaming BLAKE3. `blake3` is used directly for the bundle
 # digest.
-# Post-#578 the *entire* CLI is free of iroh-blobs / the AWS SDK: the
-# config-vocabulary types `decdn-common` needs were extracted into the
-# `decdn-config-types` leaf crate, so `cli → common → config-types` no
-# longer drags in `decdn-cache` (see `appendix-binaries.md` §
+# The *entire* CLI is free of iroh-blobs / the AWS SDK: the
+# config-vocabulary types `decdn-common` needs live in the
+# `decdn-config-types` leaf crate, so `cli → common → config-types`
+# does not drag in `decdn-cache` (see `appendix-binaries.md` §
 # binary-size). Verify with
 # `cargo tree -p decdn-cli -e normal -i iroh-blobs` (must be empty).
 # `tempfile` is also a runtime dep here because writing a bundle manifest

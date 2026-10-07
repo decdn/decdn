@@ -118,7 +118,7 @@ pub fn init(log_level: Option<LogLevel>) {
 /// and the bar coexist on stderr.
 ///
 /// On the default path (no subscriber) the bar is returned untouched and draws
-/// straight to stderr exactly as before.
+/// straight to stderr.
 pub fn attach_progress_bar(bar: indicatif::ProgressBar) -> indicatif::ProgressBar {
     match PROGRESS.get() {
         Some(progress) => progress.add(bar),

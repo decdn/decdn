@@ -331,11 +331,11 @@ pub struct BlockchainConfig {
 
 /// Cache section of the config file.
 ///
-/// `deny_unknown_fields` is set so that operators upgrading from the
-/// pre-#437 schema (flat `origin_url` / `origin_path` / `decompress`
-/// fields) get a clear "unknown field" error at config load instead of
-/// a silent "no origin configured" surprise at the first cache miss.
-/// The new schema lives under the tagged `[cache.origin]` table — see
+/// `deny_unknown_fields` is set so that a misplaced origin field (a flat
+/// `origin_url` / `origin_path` / `decompress` directly under `[cache]`)
+/// gets a clear "unknown field" error at config load instead of a silent
+/// "no origin configured" surprise at the first cache miss. Origin
+/// settings live under the tagged `[cache.origin]` table — see
 /// [`OriginConfig`].
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -419,7 +419,7 @@ pub struct CacheConfig {
     /// [`decdn_config_types::RetryPolicy::default`] (3 retries, 100ms
     /// initial backoff doubling to 10s cap, 10% jitter,
     /// `buffered_max_bytes = 4 MiB`). `max_retries = 0` opts out and
-    /// reproduces pre-#285 behaviour; `buffered_max_bytes = 0`
+    /// makes one attempt with no retry; `buffered_max_bytes = 0`
     /// independently disables the body-phase buffer path so all
     /// body-phase failures route through the streaming abort+restart
     /// path. Set once at startup; changes require a restart.
@@ -452,9 +452,8 @@ pub struct CacheConfig {
     /// defaults from [`decdn_config_types::CircuitBreakerPolicy::default`]
     /// (enabled, trip after 5 failures, 30s cooldown, 1 half-open trial).
     /// Set `enabled = false` (or `failure_threshold = 0`) to opt out and
-    /// reproduce pre-#963 behaviour where every miss runs the full retry
-    /// loop regardless of origin health. Set once at startup; changes
-    /// require a restart.
+    /// run every miss through the full retry loop regardless of origin
+    /// health. Set once at startup; changes require a restart.
     ///
     /// `CircuitBreakerPolicy` carries `#[serde(default)]` so partial
     /// sections (e.g. just `cooldown_ms = 60000`) get the rest of the
@@ -513,7 +512,7 @@ pub struct CacheConfig {
     /// Per-probe ceiling, in milliseconds, on the live-origin `HEAD`/`HeadObject`
     /// (#1130 pt3). Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]
     /// (2000). A slow origin must never stall the probe hot path; on timeout the
-    /// probe answers `has_blob: false` (safe — never slashable post-#1512) and
+    /// probe answers `has_blob: false` (safe — never slashable) and
     /// the miss is memoised as absent for one TTL.
     pub origin_probe_timeout_ms: Option<u64>,
     /// Maximum distinct hashes held in the live-origin probe memo (#1130 pt3).

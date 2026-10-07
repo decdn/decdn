@@ -117,7 +117,7 @@ fn golden_state() -> anyhow::Result<BuyerPoolState> {
 
 use alloy::primitives::B256;
 
-/// Postcard encoding of [`golden_state`] (schema v4). Two lanes, sorted
+/// Postcard encoding of [`golden_state`] (schema 1). Two lanes, sorted
 /// by `(signer, provider)` for a deterministic encoding regardless of
 /// `HashMap` iteration order.
 ///
@@ -126,7 +126,7 @@ use alloy::primitives::B256;
 /// `last_amount` already says which chain the lane resumes on — there is no
 /// counter here to keep, and none to get wrong.
 const GOLDEN_RECORD_HEX: &str = concat!(
-    "04",                                                               // schema_version (varint)
+    "01",                                                               // schema_version (varint)
     "1111111111111111111111111111111111111111111111111111111111111111", // pool_id
     "5555555555555555",                                                 // chain_id (big-endian)
     "9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c",                         // payment_pool
@@ -163,8 +163,8 @@ fn hex_of(bytes: &[u8]) -> String {
 /// encodes struct fields positionally and unnamed, so reordering,
 /// retyping, or inserting a field rewrites the bytes with no compile
 /// error and no other test failure — every store the suites build is a
-/// fresh tempdir, so they would all still pass while every record an
-/// older binary wrote was silently orphaned.
+/// fresh tempdir, so they would all still pass while the bytes on disk
+/// silently changed meaning.
 ///
 /// This golden is the tripwire for that, and the only test here that
 /// would fail on such a change.
@@ -180,7 +180,7 @@ fn encode_is_byte_stable() -> anyhow::Result<()> {
 }
 
 /// The frozen bytes must also *decode* back to the fixture — the
-/// direction that actually matters (an older binary's record still
+/// direction that actually matters (a record already on disk still
 /// loads).
 #[test]
 fn golden_bytes_still_decode() -> anyhow::Result<()> {
@@ -344,15 +344,11 @@ fn forget_removes_entry_and_is_noop_when_absent() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A buyer record stamped with a future schema version must NOT fail
-/// hydration — that would disable the whole buyer path and the reclaim
-/// sweep (PR #753 review). `load_all` skips it; the point lookup still
-/// surfaces the precise error.
 /// An OLDER record is rejected, not decoded.
 ///
 /// This is why the version is matched exactly rather than as a ceiling. The
-/// fields are positional and `chain_id` sits third, so a v2 record — which
-/// has no such field — would decode the first 8 bytes of its `payment_pool`
+/// fields are positional, so a record in a different layout — one without
+/// `chain_id`, say — would decode the first 8 bytes of its `payment_pool`
 /// into `chain_id`, and every field after it would shift, with no error. A
 /// silently wrong deployment tag is the one outcome the tag exists to
 /// prevent, so the reader refuses it instead.
@@ -361,7 +357,7 @@ fn older_schema_version_is_rejected_not_misdecoded() -> anyhow::Result<()> {
     let (_d, db) = db()?;
     let s = state(1);
     let mut stored = StoredBuyerPoolState::from(&s);
-    stored.schema_version = 2;
+    stored.schema_version = 0;
     let encoded = postcard::to_allocvec(&stored)?;
     tbl(&db).insert_raw(s.pool_id, &encoded)?;
 
@@ -379,13 +375,17 @@ fn older_schema_version_is_rejected_not_misdecoded() -> anyhow::Result<()> {
         matches!(
             err,
             StoreError::UnsupportedSchema { found, supported }
-                if found == 2 && supported == BUYER_SUPPORTED_SCHEMA_VERSION
+                if found == 0 && supported == BUYER_SUPPORTED_SCHEMA_VERSION
         ),
         "expected UnsupportedSchema for the older record, got {err:?}"
     );
     Ok(())
 }
 
+/// A buyer record stamped with a future schema version must NOT fail
+/// hydration — that would disable the whole buyer path and the reclaim
+/// sweep. `load_all` skips it; the point lookup still surfaces the precise
+/// error.
 #[test]
 fn future_schema_version_skipped_on_hydration() -> anyhow::Result<()> {
     let (_d, db) = db()?;

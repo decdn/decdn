@@ -452,8 +452,8 @@ async fn fetch_with_content_encoding_zstd_is_decompressed() -> anyhow::Result<()
 }
 
 /// `DecompressMode::Strict` refuses a known encoding before any body
-/// bytes are read — equivalent to the pre-#804 reject-everything posture,
-/// for operators whose origin is guaranteed to serve canonical bytes.
+/// bytes are read — a reject-every-non-identity-encoding posture for
+/// operators whose origin is guaranteed to serve canonical bytes.
 #[tokio::test]
 async fn fetch_with_strict_mode_rejects_gzip_encoding() -> anyhow::Result<()> {
     let hash = Hash::new(b"gzipped-strict");
@@ -551,8 +551,8 @@ async fn fetch_with_content_encoding_identity_is_accepted() -> anyhow::Result<()
 }
 
 /// The S3 adapter's body stream produces every byte the wire
-/// emits — no in-adapter cap, no silent truncation. Post-#271 the
-/// `max_bytes` enforcement moved to the engine's
+/// emits — no in-adapter cap, no silent truncation. The
+/// `max_bytes` enforcement lives in the engine's
 /// `count_and_cap_stream`, so this test confirms only the adapter
 /// half of the contract: the bytes flow through verbatim. The
 /// **engine-level** rejection of oversized bodies is covered

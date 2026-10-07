@@ -238,7 +238,7 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
     ensure_owned(pool.owner, owner, pool_id)?;
 
     let additional = U256::from(args.amount_micro_usdc);
-    // The pool no longer stores its token — it is the contract's immutable
+    // The pool does not store its token — it is the contract's immutable
     // `usdc()`, the same address the open path reads.
     let token = contract
         .usdc()

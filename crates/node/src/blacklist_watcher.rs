@@ -1042,9 +1042,10 @@ where
 {
     if cache.is_evicted(hash) {
         // Back-fill the governance deny-set for a hash that is already evicted but
-        // not yet recorded as governance-denied: `evicted.log` records no cause, so
-        // takedowns discharged by an older build (or a prior boot's eviction) would
-        // otherwise keep answering `EvictedSinceProbe` forever.
+        // not yet recorded as governance-denied. `evicted.log` persists the eviction
+        // but records no cause, and the deny-set lives only in memory, so after a
+        // restart every takedown evicted on a prior boot would otherwise keep
+        // answering `EvictedSinceProbe` forever.
         if !cache.is_chain_denied(hash) {
             match scope_check(contract, operator, hash).await {
                 Ok(true) => deny_hash(cache, hash),

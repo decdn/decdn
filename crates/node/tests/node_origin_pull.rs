@@ -1281,7 +1281,7 @@ async fn cache_with_fs_origin_only(
 /// an ADR 005 client identity binding (over B's OWN node id, signed with the
 /// channel's buyer key). B receiving the bytes, and A's origin fetching exactly
 /// once, proves the binding propagated across the hop and authorized the chained
-/// pull. Pre-#1117 (B sent no binding) A refused with `NotFound`.
+/// pull. Without the binding, A refuses with `NotFound`.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<()> {
@@ -2451,7 +2451,7 @@ fn spawn_a_counting_stalling_server(
 /// serves bytes), the per-candidate `pull_timeout` must abandon it and the loop
 /// must fall through to the next ranked candidate, which delivers. This proves
 /// the mechanism the fix relies on — a per-candidate budget that the (separately
-/// derived) outer deadline can no longer preempt.
+/// derived) outer deadline cannot preempt.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)]
 async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
@@ -2572,8 +2572,8 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         &b_metrics,
         &[(s_dht, STALL_RATE), (a_dht, RATE)],
         addr_map,
-        // Short per-candidate budget so the stall is abandoned quickly. With the
-        // pre-#859 wiring an equal outer deadline would have cancelled the whole
+        // Short per-candidate budget so the stall is abandoned quickly. An equal
+        // outer deadline (the #859 bug) would cancel the whole
         // fetch here; at the `NodeOrigin` level there is no outer wrapper, so this
         // exercises the per-candidate fallthrough the fix preserves.
         Duration::from_secs(1),
@@ -4877,11 +4877,12 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
 /// #1145 review — a `StreamError` that arrives MID-STREAM must be judged by its wire code,
 /// exactly as one that arrives at the open is (#1144).
 ///
-/// The three mid-stream receive sites used to `bail!("stream failed: {e:?}")`, throwing the
-/// typed code away. The resulting error matched no sentinel in `classify_pull_failure` and
-/// landed in the catch-all, scoring the peer `Unreachable` — so a node that honestly
-/// reported `NotFound` after an eviction race mid-delivery was punished exactly as hard as
-/// a dead one. That is the bug #1144 fixed at the open stage, alive one stage downstream.
+/// A mid-stream receive site that does `bail!("stream failed: {e:?}")` throws the typed
+/// code away. The resulting error matches no sentinel in `classify_pull_failure` and
+/// lands in the catch-all, scoring the peer `Unreachable` — so a node that honestly
+/// reports `NotFound` after an eviction race mid-delivery is punished exactly as hard as
+/// a dead one. It is the same failure #1144 fixed at the open stage, one stage further
+/// downstream.
 ///
 /// Driven through the REAL receive loop against a real upstream that opens honestly and
 /// then errors, so the assertion is on what the loop actually raises. Asserting on
@@ -5014,8 +5015,8 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
     let a_eth = Arc::new(PrivateKeySigner::random());
     let (ep_a, addr_a) =
         local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    // `Overloaded` in reply to the voucher: backpressure from a reachable peer, the code the
-    // ack-wait catch-all used to stringify into `Unreachable`.
+    // `Overloaded` in reply to the voucher: backpressure from a reachable peer, the code a
+    // stringifying ack-wait catch-all would misread as `Unreachable`.
     let task_a = spawn_a_voucher_erroring_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
@@ -5341,7 +5342,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
 }
 
 /// #1145 review — the deadline formula must budget the STALL stage, or a peer that goes
-/// silent mid-stream starves the fallback loop exactly as a wedged channel open used to.
+/// silent mid-stream starves the fallback loop exactly as an unbudgeted channel open would.
 ///
 /// This is the third time the same hole has been dug. A candidate costs three sequential
 /// stages — channel open, stream open, then streaming — and each time a stage was left out
@@ -5666,7 +5667,7 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
     anyhow::ensure!(
         matches!(fetched, OriginFetch::AlreadyAdmitted),
         "a slow-but-healthy pull returned NotFound: the transfer was killed by a \
-         whole-blob deadline it should no longer have (#1134)"
+         whole-blob deadline it must not have (#1134)"
     );
     let bytes = engine.get(hash).await?;
     let elapsed = started.elapsed();
@@ -5674,16 +5675,17 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
         bytes.as_ref() == payload.as_slice(),
         "slow-pull bytes mismatch"
     );
-    // Self-check: the transfer really did outrun the old whole-blob deadline. Without
+    // Self-check: the transfer really did outrun the open budget. Without
     // this the test could pass on a machine fast enough to make the pacing moot, and
     // would then guard nothing.
     anyhow::ensure!(
         elapsed > SLOW_PULL_OPEN_BUDGET,
         "the paced transfer finished in {elapsed:?}, inside the {SLOW_PULL_OPEN_BUDGET:?} \
-         budget that used to bound the whole blob — this test would not detect the regression"
+         budget, so a whole-blob deadline at that budget would not trip and this test \
+         cannot detect the regression"
     );
     // No deadline fired: not the open budget (the transfer outran it, and it must
-    // no longer apply), not the inactivity budget (every gap was healthy).
+    // not apply past the open), not the inactivity budget (every gap was healthy).
     assert_counter(&b_metrics, "node_pull_timeout_total", 0)?;
     assert_counter(&b_metrics, "node_pull_stalled_total", 0)?;
     assert_counter(&b_metrics, "node_pull_success_total", 1)?;
@@ -5700,7 +5702,7 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
 /// classifies what it actually receives. Candidate #2 holds the blob and serves
 /// it.
 ///
-/// Every refusal used to score `Outcome::Unreachable`, which punished a healthy,
+/// Scoring every refusal `Outcome::Unreachable` would punish a healthy,
 /// answering node exactly as hard for truthfully saying it lacks a blob as for
 /// being dead in its local reputation score. (`NotFound` is
 /// NODE-scoped, not blob-scoped: seven `ServeRejectReason`s collapse onto it so
@@ -10748,7 +10750,7 @@ async fn window_pull_through_leaf_drop_after_paying_is_a_serve_abandon() -> Resu
 
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_oversized_upstream_aborts_on_received_bytes() -> Result<()> {
-    // #1895: the fused serve no longer refuses on the upstream's signed `total_bytes`
+    // #1895: the fused serve does not refuse on the upstream's signed `total_bytes`
     // claim. B signs `ok: true`, opens the upstream pull, and forwards while filling —
     // but the pull leg's receive loop enforces `max_blob_size_bytes` on the bytes that
     // ACTUALLY arrive, so it ABORTS once cumulative received bytes cross the ceiling.

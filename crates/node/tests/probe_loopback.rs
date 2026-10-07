@@ -1505,8 +1505,7 @@ async fn probe_has_blob_true_and_partial_coverage_for_cached_partial_holder() ->
 /// probe) that holds NOTHING in its local cache signs `has_blob: true` with
 /// all-ones `coverage` — an origin serves every block and already knows the
 /// size. This is the origin all-ones case: distinct from the cached-partial
-/// case above, and from the pre-#1506 behavior (which never populated
-/// `coverage` at all).
+/// case above, and from a probe answer that leaves `coverage` unset.
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_origin_held_advertises_full_coverage_without_caching() -> anyhow::Result<()> {
     let payload = b"origin-held content this node has never pulled into its own cache";

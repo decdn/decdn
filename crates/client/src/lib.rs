@@ -1969,8 +1969,8 @@ async fn open_stream(
         };
         // Two-phase encode (ADR 005): attach the client identity binding when the
         // context carries one, so the serving node can prove channel ownership and
-        // authorize a cache-miss origin pull (#1115). Absent ⇒ no ext bytes, exactly
-        // the pre-#1115 wire (unbound node-to-node / registered-client path).
+        // authorize a cache-miss origin pull (#1115). Absent ⇒ no ext bytes: the
+        // base frame alone (unbound node-to-node / registered-client path).
         let ext = client_binding_ext(ctx);
         let payload = decdn_protocol::encode_stream_request(&req, ext.as_ref())
             .map_err(|e| anyhow::anyhow!("encode stream request: {e}").context(LocalPullFault))?;
@@ -2821,7 +2821,7 @@ pub fn resume_may_be_stale(err: &anyhow::Error) -> bool {
 /// The driver routes an open-stage refusal into its fund-and-retry loop the same
 /// way it routes a ledger-corroborated exhaustion: it tops the deposit up toward
 /// the buyer's own `working_deposit` ceiling and re-opens, so a node's
-/// larger-than-estimated `M` no longer dead-ends a fetch on an ambiguous
+/// larger-than-estimated `M` does not dead-end a fetch on an ambiguous
 /// `NotFound`. Unlike [`genuine_exhaustion`], this needs no ledger corroboration —
 /// our own numbers say we CAN afford the next voucher; only the node's private `M`
 /// (which we cannot compute) is higher. The buyer's ceiling is the sole clamp on
@@ -3275,10 +3275,10 @@ async fn open_progressive_pull_impl(
     max_rate_per_mb: u64,
     deadlines: PullDeadlines,
     // Upper bound on the requested range: `[byte_offset, byte_offset + byte_len)`.
-    // `0` means "to end" (the pre-#1608 whole-tail behavior, unchanged for every
-    // existing caller). A gap-driven caller (`source::PeerSource`, #1608) passes
-    // the exact gap length so the server scopes both the serve and the payment
-    // to it, rather than streaming the whole remainder.
+    // `0` means "to end" (the whole tail, which every non-gap caller requests).
+    // A gap-driven caller (`source::PeerSource`, #1608) passes the exact gap
+    // length so the server scopes both the serve and the payment to it, rather
+    // than streaming the whole remainder.
     byte_len: u64,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
     let result: anyhow::Result<(UpstreamPullHeader, UpstreamPull)> = async {

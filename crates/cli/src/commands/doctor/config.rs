@@ -66,16 +66,8 @@ fn push_notice_findings(report: &mut Report, notices: &[ConfigNotice]) {
             ConfigNoticeLevel::Warn => Severity::Warn,
             ConfigNoticeLevel::Info => Severity::Pass,
         };
-        // `field` is a dotted config label or a bare env var name, and that
-        // decides the fix: one is edited in the file, the other unset in the
-        // environment. Nothing else about the notice says which.
-        let remediation = (severity == Severity::Warn).then(|| {
-            if notice.field.contains('.') {
-                format!("review {} in the config file", notice.field)
-            } else {
-                format!("unset {} in the daemon's environment", notice.field)
-            }
-        });
+        let remediation = (severity == Severity::Warn)
+            .then(|| format!("review {} in the config file", notice.field));
         report.push(Finding {
             group: "Config",
             id: "config.notice",

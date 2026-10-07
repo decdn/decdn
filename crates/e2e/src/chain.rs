@@ -104,8 +104,8 @@ const BUILD_ATTEMPTS: usize = 3;
 // CPU starvation that made a per-journey deploy flaky (#1384) cannot occur here.
 // `run_deploy_script` still reverts anvil to a pre-deploy snapshot between its
 // own retry attempts (#785), and the budget is still scaled up under `ci_scaled`
-// for a slow shared runner, but the base is the pre-#1384 value again: one
-// uncontended deploy is comfortably fast.
+// for a slow shared runner, but the base budget is short: one uncontended deploy
+// is comfortably fast.
 //
 // The deploy ladder is still the binding in-test retry ladder the per-journey
 // ceilings must contain (see `crate::timeout` and #1620): whichever journeys

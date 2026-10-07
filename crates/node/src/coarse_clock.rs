@@ -16,8 +16,8 @@
 //! **Fallback.** Until a refresher runs the cell holds `0`, and every read falls
 //! back to a live `SystemTime::now()`. So a clock with no refresher attached
 //! (every unit and loopback test, which build a handler without one) reports the
-//! exact wall clock and behaves precisely as the pre-#1792 code did — the
-//! coarsening is a production-only optimization, not a semantic change. `0` is a
+//! exact wall clock on every read — the coarsening is a production-only
+//! optimization, not a semantic change. `0` is a
 //! safe sentinel: a live millisecond reading is `0` only at the Unix epoch
 //! itself, which a running node's clock is not at, so a `0` in the cell means
 //! "unrefreshed", not "midnight 1970". Even a stray `0` (a refresher that wrote

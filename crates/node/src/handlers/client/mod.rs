@@ -1119,16 +1119,15 @@ pub struct ClientHandlerDeps {
     /// Origin-only policy (#1759). When `false`, `serve_stream` declines any
     /// hash its own backend does not hold — including a cache HIT for a
     /// foreign hash — before any discovery, lane accounting, or spend. `true`
-    /// (the default) preserves today's relay behavior.
+    /// (the default) serves and relays foreign hashes as well.
     pub relay_foreign_namespaces: bool,
     /// Coarse wall clock for the two reads the voucher-accept path takes under
     /// the per-lane lock — the capability-expiry gate and the `last_voucher_at`
     /// stamp (issue #1792 item 4). `None` (the default and every test) means the
     /// handler builds its own unrefreshed clock, which reads the live wall clock
-    /// on every call — identical to the pre-#1792 behavior. The runtime sets
-    /// `Some` with a refresher running, so each of those two reads becomes a
-    /// relaxed atomic load instead of a `SystemTime::now()` syscall in the
-    /// critical section.
+    /// on every call. The runtime sets `Some` with a refresher running, so each
+    /// of those two reads becomes a relaxed atomic load instead of a
+    /// `SystemTime::now()` syscall in the critical section.
     pub coarse_clock: Option<Arc<crate::coarse_clock::CoarseClock>>,
     /// The redeemer's self-tick interval in seconds
     /// (`blockchain.redeem_interval_secs`). The voucher-accept path stops
@@ -1404,7 +1403,7 @@ pub struct ClientHandler {
     redeem_hint: Option<mpsc::Sender<LaneKey>>,
     /// Node-to-node cache-miss pull-through deadline (#831), set at construction
     /// via [`ClientHandlerDeps`]. `None` (the default — feature off, and in
-    /// tests) keeps the pre-#831 behaviour: a cache miss returns `NotFound`. When
+    /// tests) disables pull-through: a cache miss returns `NotFound`. When
     /// `Some`, a miss *from a request that proves ownership of the named channel*
     /// (see [`Self::pull_authorized`]) triggers `cache.populate` (the engine's
     /// `NodeOrigin` discovers, pays, pulls, and fills the store), bounded by this
@@ -1420,7 +1419,7 @@ pub struct ClientHandler {
     /// fs/http/s3 origin (`CacheEngine::populate_local`, which never touches the
     /// paid `Peer` origin), so a cache-only operator can reactively serve its own
     /// content and a local origin is preferred over the paid peer window path.
-    /// `None` keeps the pre-#1116 behavior (miss ⇒ node→node path or a plain
+    /// `None` disables local populate (miss ⇒ node→node path or a plain
     /// `NotFound`).
     local_populate: Option<Duration>,
     /// Window-paced node→node pull-through provider (#856), set at construction

@@ -28,6 +28,24 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Pre-launch compatibility shims removed (#2367).**
+  - Admin wire: `admin_v1_drain` requires its `DrainRequest` parameter with
+    `wait_admin` set, and `admin_v1_evict` requires `dry_run`. A call without
+    them gets `-32602 Invalid params`, and a refused drain does not fire.
+    The positional wire form is `"params":[{"wait_admin":false}]`.
+    `decdn node drain --wait` still refuses to poll when another drain without
+    `wait_admin` fired first.
+  - Storage: both buyer tables move to `buyer_pool_state_v1` /
+    `buyer_pool_owner_index_v1` (record schema 1). **Existing buyer rows are
+    not read:** on first run the store reads as empty. A node re-adopts its
+    live pool from chain, and so does a `decdn fetch` / `bundle pull` client
+    whose store and keystore are its own. A client whose store or keystore sits
+    in a node's data dir does not adopt: its next buy opens a second pool, and
+    the old one keeps its deposit. Recover it with `decdn pool list --all`, then
+    `decdn pool close` and `reclaim`. The node no longer drops the
+    `capability_v1` / `capability_v2` tables from `lanes.redb` at open.
+  - Config: the startup warning for a set `DECDN_DELIVERY_CEILING` is removed.
+    `decdn node doctor` no longer suggests unsetting an environment variable.
 - **Monitoring-breaking: `monitoring/` moves to
   [`decdn/devops`](https://github.com/decdn/devops/tree/main/charts/decdn-node/files/monitoring).**
   The four Grafana dashboards and `prometheus-alerts.yml` live in

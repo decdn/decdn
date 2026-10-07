@@ -1436,9 +1436,7 @@ where
                         // A new leg has opened: re-anchor the paid-frontier baseline
                         // to THIS open's start and the committed watermark BEFORE it
                         // streams, so a later top-up on this leg prices its paid
-                        // frontier against this leg's own wire spend alone (the
-                        // pre-#1608 CLI loop re-anchored `fetch_start_offset` /
-                        // `fetch_start_committed_bytes` identically on every open).
+                        // frontier against this leg's own wire spend alone.
                         leg_anchor = Some((resume_start, ledger.committed().bytes));
                         // The store is keyed by offset: the leg verifies under
                         // the size its own sender signs, whatever the bound.
