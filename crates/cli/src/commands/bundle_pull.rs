@@ -1903,12 +1903,14 @@ where
 /// single ordered voucher sequence per lane. Cross-lane parallelism (distinct
 /// providers) is never bounded here — only by `--jobs`.
 pub(crate) struct LaneStreamCap {
-    /// Per-provider semaphores, created on first use. The `tokio::sync::Mutex`
+    /// Per-provider streams, created on first use. The `tokio::sync::Mutex`
     /// guards the map so the cap is `Sync` and shareable across the entry futures.
-    map: tokio::sync::Mutex<HashMap<Address, Arc<tokio::sync::Semaphore>>>,
+    map: tokio::sync::Mutex<HashMap<Address, Arc<ProviderStreams>>>,
     /// Concurrent-stream permits per provider (at least 1). At 1 a `Semaphore(1)`
     /// serializes same-lane streams exactly like a mutex.
     n: usize,
+    /// The id the next lane's [`ExtraPermits`] gets.
+    next_lane: AtomicU64,
 }
 
 impl LaneStreamCap {
@@ -1917,26 +1919,34 @@ impl LaneStreamCap {
         Self {
             map: tokio::sync::Mutex::new(HashMap::new()),
             n: n.max(1),
+            next_lane: AtomicU64::new(0),
         }
     }
 
-    /// The per-provider semaphore, created on first use.
-    async fn semaphore(&self, provider: Address) -> Arc<tokio::sync::Semaphore> {
+    /// The per-provider streams, created on first use.
+    async fn streams(&self, provider: Address) -> Arc<ProviderStreams> {
         let mut map = self.map.lock().await;
-        Arc::clone(
-            map.entry(provider)
-                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.n))),
-        )
+        Arc::clone(map.entry(provider).or_insert_with(|| {
+            Arc::new(ProviderStreams {
+                semaphore: Arc::new(tokio::sync::Semaphore::new(self.n)),
+                claims: std::sync::Mutex::new(Vec::new()),
+            })
+        }))
     }
 
     /// One stream permit for `provider` if one is free now, else `None`. It
     /// never waits, so a caller that already holds another provider's permit
-    /// cannot deadlock against a sibling that holds this one.
+    /// cannot deadlock against a sibling that holds this one. It does not
+    /// look at the provider's claims ([`ExtraPermits::grant`]): a lane's first
+    /// stream takes any free permit, and a lane that finds none backs off and
+    /// holds nothing.
     pub(crate) async fn try_permit(
         &self,
         provider: Address,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.semaphore(provider).await.try_acquire_owned().ok()
+        Arc::clone(&self.streams(provider).await.semaphore)
+            .try_acquire_owned()
+            .ok()
     }
 
     /// How a lane to `provider` takes a stream beyond its lease
@@ -1951,16 +1961,24 @@ impl LaneStreamCap {
     /// for both, and an extra stream takes any free permit. The acquire gives
     /// the lease back when the lane's own worker ends, and the lane starts
     /// again only on a permit `grow` takes; that start may take the last
-    /// permit, as a first stream does.
+    /// permit, as a first stream does. A lane that `grow` refused claims the
+    /// next permit that frees, ahead of every lane that asks after it
+    /// (#2341).
     pub(crate) async fn widen(&self, provider: Address) -> decdn_client::LaneWiden {
-        let extras = Arc::new(ExtraPermits::new(
-            self.semaphore(provider).await,
-            self.extra_keep(),
-        ));
+        let extras = Arc::new(self.extra_permits(provider).await);
         let released = Arc::clone(&extras);
         decdn_client::LaneWiden::new(
             move |kind| extras.grant(kind),
             move || released.release_one(),
+        )
+    }
+
+    /// A new lane's grants of `provider`'s permits beside its lease.
+    async fn extra_permits(&self, provider: Address) -> ExtraPermits {
+        ExtraPermits::new(
+            self.streams(provider).await,
+            self.extra_keep(),
+            self.next_lane.fetch_add(1, Ordering::Relaxed),
         )
     }
 
@@ -1972,43 +1990,111 @@ impl LaneStreamCap {
     }
 }
 
+/// How long a lane's claim on a provider's next free permit holds without a
+/// new ask. The acquire asks a refused `grow` again within
+/// [`decdn_client::GROWTH_RETRY`] while it still wants the stream, and each
+/// ask renews the claim. So a lane that still waits keeps its claim, and the
+/// claim of a lane that stopped asking, such as one whose own worker took
+/// the range, ends soon after.
+const CLAIM_TTL: std::time::Duration = decdn_client::GROWTH_RETRY.saturating_mul(3);
+
+/// One provider's stream permits and the claims of the lanes that wait for
+/// one ([`ExtraPermits::grant`]).
+struct ProviderStreams {
+    /// The provider's per-lane stream semaphore.
+    semaphore: Arc<tokio::sync::Semaphore>,
+    /// The lanes `grow` refused, oldest first.
+    claims: std::sync::Mutex<Vec<Claim>>,
+}
+
+/// A lane's claim on its provider's next free permit.
+struct Claim {
+    /// The claiming lane's [`ExtraPermits::lane`].
+    lane: u64,
+    /// The free permits the lane's last ask leaves after its own.
+    keep: usize,
+    /// When the lane last asked.
+    at: tokio::time::Instant,
+}
+
 /// The stream permits one lane holds beside its lease: its extra streams',
 /// and its own stream's once it starts again without the lease
 /// ([`LaneStreamCap::widen`]).
 struct ExtraPermits {
-    /// The provider's per-lane stream semaphore.
-    semaphore: Arc<tokio::sync::Semaphore>,
+    /// The provider's permits and claims.
+    streams: Arc<ProviderStreams>,
     /// The free permits an extra stream leaves for a sibling entry's first
     /// stream.
     keep: usize,
+    /// The lane's id in its provider's claims.
+    lane: u64,
     /// The permits granted and not yet given back.
     held: std::sync::Mutex<Vec<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 impl ExtraPermits {
-    const fn new(semaphore: Arc<tokio::sync::Semaphore>, keep: usize) -> Self {
+    const fn new(streams: Arc<ProviderStreams>, keep: usize, lane: u64) -> Self {
         Self {
-            semaphore,
+            streams,
             keep,
+            lane,
             held: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     /// Take one permit if it is free now, never waiting, and return whether
     /// one was taken. An extra stream leaves `keep` free permits for a
-    /// sibling entry's first stream; a restart may take the last one. Every
-    /// entry is polled on one task and this never awaits, so no sibling takes
-    /// a permit between the count and the take.
+    /// sibling entry's first stream; a restart may take the last one.
+    ///
+    /// A refused lane claims the next free permit. Each claim ahead of this
+    /// lane's own, or every claim when the lane has none, holds back one
+    /// free permit, and the kept permits stay free after them. So a lane
+    /// that asks the instant a permit frees, such as one whose short legs
+    /// restart at once, cannot take it from a lane that asks only once per
+    /// growth pass (#2341). A grant ends the lane's claim. Claims older than
+    /// [`CLAIM_TTL`] no longer count. Every entry is polled on one task and
+    /// this never awaits, so no sibling takes a permit between the count and
+    /// the take.
     fn grant(&self, kind: decdn_client::GrowFor) -> bool {
-        let keep = match kind {
+        let own_keep = match kind {
             decdn_client::GrowFor::Restart => 0,
             decdn_client::GrowFor::Extra => self.keep,
         };
-        if self.semaphore.available_permits() <= keep {
+        let now = tokio::time::Instant::now();
+        let mut claims = self
+            .streams
+            .claims
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        claims.retain(|claim| now.saturating_duration_since(claim.at) < CLAIM_TTL);
+        let own = claims.iter().position(|claim| claim.lane == self.lane);
+        let ahead = claims
+            .get(..own.unwrap_or(claims.len()))
+            .unwrap_or_default();
+        let keep = ahead
+            .iter()
+            .map(|claim| claim.keep)
+            .fold(own_keep, usize::max);
+        let reserved = ahead.len().saturating_add(keep);
+        if self.streams.semaphore.available_permits() <= reserved {
+            match own.and_then(|i| claims.get_mut(i)) {
+                Some(claim) => {
+                    claim.keep = own_keep;
+                    claim.at = now;
+                }
+                None => claims.push(Claim {
+                    lane: self.lane,
+                    keep: own_keep,
+                    at: now,
+                }),
+            }
             return false;
         }
-        match Arc::clone(&self.semaphore).try_acquire_owned() {
+        match Arc::clone(&self.streams.semaphore).try_acquire_owned() {
             Ok(permit) => {
+                if let Some(i) = own {
+                    claims.remove(i);
+                }
                 self.held
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -2042,6 +2128,17 @@ impl ExtraPermits {
             tracing::warn!("a lane gave back a stream permit it does not hold");
         }
         drop(permit);
+    }
+}
+
+impl Drop for ExtraPermits {
+    /// An ended lane claims nothing.
+    fn drop(&mut self) {
+        self.streams
+            .claims
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|claim| claim.lane != self.lane);
     }
 }
 
@@ -9163,7 +9260,7 @@ mod tests {
         let p1 = Address::repeat_byte(1);
         let cap = LaneStreamCap::new(3);
         let lease = cap.try_permit(p1).await.expect("the lane's own permit");
-        let extras = ExtraPermits::new(cap.semaphore(p1).await, cap.extra_keep());
+        let extras = cap.extra_permits(p1).await;
         assert!(extras.grant(Extra), "one extra stream");
         assert!(!extras.grant(Extra), "the last free permit is kept back");
         assert!(extras.grant(Restart), "a restart takes the last permit");
@@ -9189,13 +9286,136 @@ mod tests {
         let p1 = Address::repeat_byte(1);
         let cap = LaneStreamCap::new(2);
         let _lease = cap.try_permit(p1).await.expect("the lane's own permit");
-        let extras = ExtraPermits::new(cap.semaphore(p1).await, cap.extra_keep());
+        let extras = cap.extra_permits(p1).await;
         assert!(
             extras.grant(decdn_client::GrowFor::Extra),
             "the extra stream"
         );
         assert!(cap.try_permit(p1).await.is_none(), "the cap is full");
         extras.release_one();
+    }
+
+    /// A lane that `grow` refused claims the provider's next free permit. A
+    /// sibling lane whose short legs restart the instant a permit frees
+    /// cannot take it, by restart or by extra stream, before the claimant's
+    /// next ask (#2341).
+    #[tokio::test]
+    async fn a_refused_lane_claims_the_next_free_permit() {
+        use decdn_client::GrowFor::{Extra, Restart};
+        let p1 = Address::repeat_byte(1);
+        let cap = LaneStreamCap::new(4);
+        let _b_lease = cap.try_permit(p1).await.expect("lane B's own permit");
+        let a_lease = cap.try_permit(p1).await.expect("lane A's own permit");
+        let a = cap.extra_permits(p1).await;
+        let b = cap.extra_permits(p1).await;
+        assert!(a.grant(Extra), "lane A's extra stream");
+        assert!(a.grant(Restart), "lane A takes the last permit");
+        assert!(!b.grant(Extra), "the cap is full: lane B claims");
+        a.release_one();
+        assert!(!a.grant(Restart), "a freed permit waits for lane B's claim");
+        assert!(!a.grant(Extra), "an extra stream waits too");
+        drop(a_lease);
+        assert!(
+            !a.grant(Restart),
+            "lane B's claim and the kept permit hold both free permits"
+        );
+        assert!(b.grant(Extra), "lane B takes the permit it claimed");
+        assert!(
+            a.grant(Restart),
+            "with lane B served, lane A's own claim comes first"
+        );
+        a.release_one();
+        b.release_one();
+    }
+
+    /// Lanes that wait are served in the order they claimed, and a lane that
+    /// asks later waits behind every claim.
+    #[tokio::test]
+    async fn claims_are_served_in_order() {
+        use decdn_client::GrowFor::{Extra, Restart};
+        let p1 = Address::repeat_byte(1);
+        let cap = LaneStreamCap::new(4);
+        let _b_lease = cap.try_permit(p1).await.expect("lane B's own permit");
+        let _c_lease = cap.try_permit(p1).await.expect("lane C's own permit");
+        let a_lease = cap.try_permit(p1).await.expect("lane A's own permit");
+        let a = cap.extra_permits(p1).await;
+        let b = cap.extra_permits(p1).await;
+        let c = cap.extra_permits(p1).await;
+        let d = cap.extra_permits(p1).await;
+        assert!(a.grant(Restart), "lane A fills the cap");
+        assert!(!b.grant(Extra), "lane B claims first");
+        assert!(!c.grant(Extra), "lane C claims second");
+        a.release_one();
+        drop(a_lease);
+        assert!(!c.grant(Extra), "lane C waits behind lane B");
+        assert!(b.grant(Extra), "lane B is served first");
+        assert!(
+            !d.grant(Restart),
+            "a lane that asks later waits behind lane C's claim"
+        );
+        b.release_one();
+        assert!(!d.grant(Restart), "lane D still waits behind lane C");
+        assert!(c.grant(Extra), "lane C is served next");
+        c.release_one();
+    }
+
+    /// A claim that is not renewed lapses after [`CLAIM_TTL`]; each ask
+    /// renews it.
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_lapses_when_its_lane_stops_asking() {
+        use decdn_client::GrowFor::{Extra, Restart};
+        let p1 = Address::repeat_byte(1);
+        let cap = LaneStreamCap::new(3);
+        let _a_lease = cap.try_permit(p1).await.expect("lane A's own permit");
+        let _b_lease = cap.try_permit(p1).await.expect("lane B's own permit");
+        let a = cap.extra_permits(p1).await;
+        let b = cap.extra_permits(p1).await;
+        assert!(!b.grant(Extra), "the kept permit is not an extra stream's");
+        assert!(!a.grant(Restart), "lane B's claim holds the free permit");
+        tokio::time::advance(CLAIM_TTL / 2).await;
+        assert!(!b.grant(Extra), "lane B asks again and renews its claim");
+        tokio::time::advance(CLAIM_TTL / 2 + std::time::Duration::from_millis(1)).await;
+        assert!(
+            !a.grant(Restart),
+            "a renewed claim holds past the first ask's lapse"
+        );
+        tokio::time::advance(CLAIM_TTL).await;
+        assert!(a.grant(Restart), "a claim not renewed lapses");
+        a.release_one();
+    }
+
+    /// A lane's claim ends with the lane.
+    #[tokio::test]
+    async fn an_ended_lane_claims_nothing() {
+        use decdn_client::GrowFor::{Extra, Restart};
+        let p1 = Address::repeat_byte(1);
+        let cap = LaneStreamCap::new(3);
+        let _a_lease = cap.try_permit(p1).await.expect("lane A's own permit");
+        let _b_lease = cap.try_permit(p1).await.expect("lane B's own permit");
+        let a = cap.extra_permits(p1).await;
+        let b = cap.extra_permits(p1).await;
+        assert!(!b.grant(Extra), "lane B claims");
+        assert!(!a.grant(Restart), "lane B's claim holds the free permit");
+        drop(b);
+        assert!(a.grant(Restart), "lane B ended, and its claim with it");
+        a.release_one();
+    }
+
+    /// A lane's own claim never holds a permit back from the lane itself.
+    #[tokio::test]
+    async fn a_lane_is_not_held_back_by_its_own_claim() {
+        use decdn_client::GrowFor::{Extra, Restart};
+        let p1 = Address::repeat_byte(1);
+        let cap = LaneStreamCap::new(3);
+        let _a_lease = cap.try_permit(p1).await.expect("lane A's own permit");
+        let _b_lease = cap.try_permit(p1).await.expect("lane B's own permit");
+        let a = cap.extra_permits(p1).await;
+        assert!(!a.grant(Extra), "the kept permit is not an extra stream's");
+        assert!(
+            a.grant(Restart),
+            "lane A's restart takes it past its own claim"
+        );
+        a.release_one();
     }
 
     #[tokio::test]

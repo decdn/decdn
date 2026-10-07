@@ -1162,6 +1162,7 @@ impl decdn_client::pacer::WindowPacer
 pub const fn decdn_client::pacer::WindowPacer::new(u64) -> Self
 impl decdn_client::pacer::Pacer for decdn_client::pacer::WindowPacer
 pub fn decdn_client::pacer::WindowPacer::decide(&self, &decdn_client::pacer::PaceState) -> decdn_client::pacer::PaceDecision
+pub const decdn_client::GROWTH_RETRY: core::time::Duration
 pub const decdn_client::LANE_WATCHDOG: core::time::Duration
 pub const decdn_client::MAX_RESUME_ATTEMPTS: u32
 pub const decdn_client::MAX_TOPUP_ATTEMPTS: u32

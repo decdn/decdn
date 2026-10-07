@@ -240,8 +240,8 @@ pub use peer_store::{PeerRecord, PeerStore, StoreConfig};
 pub use ranged_store::ClientRangedStore;
 pub use rate_limited::UpstreamRateLimited;
 pub use scheduler::{
-    AcquireEnv, AcquireTarget, ConsumptionPacing, GrowFor, LANE_WATCHDOG, LaneLease, LaneWiden,
-    acquire,
+    AcquireEnv, AcquireTarget, ConsumptionPacing, GROWTH_RETRY, GrowFor, LANE_WATCHDOG, LaneLease,
+    LaneWiden, acquire,
 };
 pub use sink::{BlobCache, NoCache, SinkFuture};
 pub use source::{

@@ -159,9 +159,9 @@ const FIRST_BYTE_GRACE: Duration = Duration::from_secs(30);
 /// running lane has a [`LaneWiden`]: an own worker that takes its next range
 /// wakes nothing, so the loop looks again on this clock. It is also the
 /// first wait before a lane is asked again after a node refused its extra
-/// stream ([`EXTRA_RETRY_CAP`]), and the wait before a lane that found no
-/// free stream tries to start again.
-const GROWTH_RETRY: Duration = Duration::from_secs(1);
+/// stream, a wait that doubles up to a cap, and the wait before a lane that
+/// found no free stream tries to start again.
+pub const GROWTH_RETRY: Duration = Duration::from_secs(1);
 
 /// The longest wait before a lane is asked for an extra stream again after
 /// its node refused extra streams in a row. The wait starts at
@@ -359,6 +359,11 @@ pub enum GrowFor {
 /// only when it can grant one now, such as a stream permit that is free. And
 /// `release` is called exactly once for each stream `grow` granted, when that
 /// stream's worker stops for any reason.
+///
+/// In turn, the acquire asks a `grow` that refused again within
+/// [`GROWTH_RETRY`] while it still wants that stream. A caller can so hold a
+/// freed stream for a lane that waits, and let the hold lapse once the lane
+/// stops asking.
 pub struct LaneWiden {
     /// Grants one stream of the given [`GrowFor`] now, without waiting, and
     /// returns whether it did.
