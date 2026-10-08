@@ -4685,20 +4685,7 @@ fn two_scripted_holders(
 
 /// A funder that is never asked: every scripted deposit is huge.
 fn no_topups() -> decdn_client::source::FakeFunder {
-    decdn_client::source::FakeFunder::new(
-        0,
-        decdn_incentive::DepositOutcome::Added(alloy::primitives::U256::ZERO),
-    )
-}
-
-/// A drive config whose working deposit never gates a scripted fetch.
-fn drive_config() -> decdn_client::DriveConfig {
-    decdn_client::DriveConfig {
-        working_deposit: alloy::primitives::U256::from(u128::MAX),
-        seller_reserve: alloy::primitives::U256::ZERO,
-        max_settle_waits: 2,
-        settle_backoff: std::time::Duration::ZERO,
-    }
+    decdn_client::source::FakeFunder::new(decdn_client::Recovery::Unavailable)
 }
 
 /// `blob`'s BLAKE3 root, the hash a scripted holder serves it under.
@@ -4730,7 +4717,6 @@ async fn a_range_entry_survives_a_holder_blip() -> anyhow::Result<()> {
     let dest = staging.path().join("entry");
     let downloader = Downloader::new(&provider, no_topups())
         .holders(holders)
-        .drive_config(drive_config())
         .max_lanes(2);
     let stop = StopPolicy::new(
         false,

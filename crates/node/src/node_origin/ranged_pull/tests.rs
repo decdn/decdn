@@ -48,12 +48,20 @@ struct FakeSink {
     backoff_completes: bool,
     /// Every `(source_ix, waits)` passed to `backpressure_exhausted`.
     exhausted: RefCell<Vec<(usize, u32)>>,
+    /// The answers `recover` gives, popped front-first. An exhausted script
+    /// answers `false`.
+    recovers: RefCell<Vec<bool>>,
+    /// Every `gap_chunks` passed to `recover`, in order.
+    recover_calls: RefCell<Vec<u64>>,
 }
 
 #[derive(Clone, Copy)]
 enum Disposition {
     /// Fill the run's blocks and report `Filled`.
     Fill,
+    /// Report `Unfunded` having admitted nothing: the source refused this
+    /// node's funding.
+    Unfunded,
     /// Fill only the run's FIRST block, then report `Reassign` (a mid-run
     /// stall that admitted a prefix).
     PartialThenReassign,
@@ -84,7 +92,14 @@ impl FakeSink {
             backoffs: RefCell::new(Vec::new()),
             backoff_completes: true,
             exhausted: RefCell::new(Vec::new()),
+            recovers: RefCell::new(Vec::new()),
+            recover_calls: RefCell::new(Vec::new()),
         }
+    }
+
+    fn recovering(self, answers: &[bool]) -> Self {
+        *self.recovers.borrow_mut() = answers.to_vec();
+        self
     }
 
     fn script(mut self, source_ix: usize, seq: &[Disposition]) -> Self {
@@ -149,6 +164,7 @@ impl RunSink for FakeSink {
                 RunOutcome::Reassign
             }
             Disposition::Reassign => RunOutcome::Reassign,
+            Disposition::Unfunded => RunOutcome::Unfunded,
             Disposition::Backpressure => RunOutcome::Backpressure,
             Disposition::PartialThenBackpressure => {
                 if let Some(&first) = blocks.first() {
@@ -176,6 +192,81 @@ impl RunSink for FakeSink {
     fn backpressure_exhausted(&self, source_ix: usize, waits: u32) {
         self.exhausted.borrow_mut().push((source_ix, waits));
     }
+
+    async fn recover(&self, gap_chunks: u64) -> bool {
+        self.recover_calls.borrow_mut().push(gap_chunks);
+        let mut answers = self.recovers.borrow_mut();
+        if answers.is_empty() {
+            false
+        } else {
+            answers.remove(0)
+        }
+    }
+}
+
+/// ADR 003 § Funding recovery: a sole holder that refuses this node's
+/// funding brings the assembly to its funding recovery step, and a step that
+/// raises the deposit asks the holder once more, which then serves.
+#[tokio::test]
+async fn a_sole_unfunded_holder_serves_after_a_recovery_step() {
+    let total = DISCOVERY_BLOCK_BYTES;
+    let sink = FakeSink::new(total)
+        .script(0, &[Disposition::Unfunded])
+        .recovering(&[true]);
+    let coverage = vec![cov(1, &[0])];
+
+    let outcome = assemble(&sink, &coverage, 0, total, total).await;
+    assert!(matches!(outcome, AssembleOutcome::Complete));
+    assert_eq!(sink.recover_calls.borrow().len(), 1, "one recovery step");
+    assert_eq!(sink.driven.borrow().len(), 2, "refused, then served");
+}
+
+/// A recovery step that cannot raise the deposit ends the assembly funding
+/// needed, not as an absent blob.
+#[tokio::test]
+async fn an_unfunded_holder_with_no_recovery_ends_funding_needed() {
+    let total = DISCOVERY_BLOCK_BYTES;
+    let sink = FakeSink::new(total).script(0, &[Disposition::Unfunded]);
+    let coverage = vec![cov(1, &[0])];
+
+    let outcome = assemble(&sink, &coverage, 0, total, total).await;
+    assert!(matches!(outcome, AssembleOutcome::FundingNeeded));
+    assert_eq!(sink.recover_calls.borrow().len(), 1);
+}
+
+/// One holder's funding refusal while another holder covers the range never
+/// reaches the funding recovery step: the refusal scopes to that holder.
+#[tokio::test]
+async fn an_unfunded_holder_beside_a_serving_one_takes_no_step() {
+    let total = DISCOVERY_BLOCK_BYTES;
+    let sink = FakeSink::new(total).script(0, &[Disposition::Unfunded]);
+    let coverage = vec![cov(1, &[0]), cov(1, &[0])];
+
+    let outcome = assemble(&sink, &coverage, 0, total, total).await;
+    assert!(matches!(outcome, AssembleOutcome::Complete));
+    assert!(
+        sink.recover_calls.borrow().is_empty(),
+        "no step while a node serves"
+    );
+    assert_eq!(sink.driven.borrow().last().unwrap().0, 1, "B served");
+}
+
+/// A funding refusal does not spend the reassign budget: an assembly whose
+/// holders all refuse for funding reaches the recovery step instead of ending
+/// on the budget.
+#[tokio::test]
+async fn funding_refusals_do_not_spend_the_reassign_budget() {
+    let total = DISCOVERY_BLOCK_BYTES;
+    let n = MAX_REASSIGN_ATTEMPTS + 1;
+    let mut sink = FakeSink::new(total);
+    for ix in 0..n {
+        sink = sink.script(ix, &[Disposition::Unfunded]);
+    }
+    let coverage = vec![cov(1, &[0]); n];
+
+    let outcome = assemble(&sink, &coverage, 0, total, total).await;
+    assert!(matches!(outcome, AssembleOutcome::FundingNeeded));
+    assert_eq!(sink.driven.borrow().len(), n, "every holder was asked");
 }
 
 /// Test A (assembly): a blob held only as A:block0 + B:block1 is assembled

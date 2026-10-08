@@ -20,9 +20,10 @@ use alloy::primitives::{Address, U256};
 use tokio::time::Instant;
 
 use crate::fault::{Fault, classify};
+use crate::recovery::{RecoveryGate, after_step};
 use crate::scheduler::{Connecting, connect_future, sleep_until_opt};
-use crate::source::SourceFuture;
-use crate::source_set::{BUILD_RETRY_BASE, Holder, SourceProvider, SourceSet};
+use crate::source::{Funder, SourceFuture};
+use crate::source_set::{BUILD_RETRY_BASE, Holder, NoAffordableSource, SourceProvider, SourceSet};
 use crate::stop::StopPolicy;
 use crate::streamer::StreamCandidate;
 
@@ -42,11 +43,12 @@ use crate::streamer::StreamCandidate;
 /// answer counts as progress: it clears the source's absent mark and ticks
 /// the stop policy's clock.
 ///
-/// The open runs no reactive top-up. A header-only open pays nothing, so a
-/// source refusing it for the deposit (`Unfunded`) is parked until
-/// the deposit rises. The pool is funded where the caller's `connect` builds
-/// the lane (the CLI's `open_or_reuse_pool` refills it below its low-water
-/// mark), and by the [`crate::acquire`] that follows.
+/// A source refusing the open for the deposit (`Unfunded`) is parked until
+/// the deposit rises. When every source is parked or cannot serve and a fresh
+/// discovery finds nothing new, the open reaches the fetch's one funding
+/// recovery point: it runs a step through `funder` under the fetch's `gate`,
+/// the same step [`crate::acquire`] runs, and asks the parked sources again
+/// at the raised deposit.
 ///
 /// # Errors
 ///
@@ -54,19 +56,23 @@ use crate::streamer::StreamCandidate;
 /// - a fatal lane build, wrapped in [`crate::LaneBuildFault`]: one that may
 ///   have escrowed USDC no record credits, which a retry would escrow again;
 /// - [`crate::NoAffordableSource`] or [`crate::NoSourceHasBlob`] on a
-///   unanimous verdict of the sources;
+///   unanimous verdict of the sources, or [`crate::PoolReplaced`] when the
+///   recovery step opened a new pool;
 /// - [`crate::GaveUp`] once the stop policy's limit passes without an answer.
-pub async fn first_open<P, T, O, Fut>(
+pub async fn first_open<P, F, T, O, Fut>(
     sources: &mut SourceSet<'_, P>,
     stop: &StopPolicy,
+    funder: &F,
+    gate: &RecoveryGate,
     open: O,
 ) -> anyhow::Result<(Address, T)>
 where
     P: SourceProvider,
+    F: Funder,
     O: Fn(Arc<StreamCandidate<P::Source>>) -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
-    let opened = open_loop(sources, &open);
+    let opened = open_loop(sources, funder, gate, &open);
     tokio::select! {
         biased;
         opened = opened => {
@@ -93,12 +99,15 @@ async fn poll_some<F: Future + Unpin>(fut: Option<&mut F>) -> F::Output {
 /// One attempt runs at a time: a lane build, then the `open` on that lane.
 /// Discovery runs beside it in the same `select!`, so a slow discovery never
 /// holds back a source whose cooldown ended.
-async fn open_loop<'p, P, T, O, Fut>(
+async fn open_loop<'p, P, F, T, O, Fut>(
     sources: &mut SourceSet<'p, P>,
+    funder: &F,
+    gate: &RecoveryGate,
     open: &O,
 ) -> anyhow::Result<(Address, T)>
 where
     P: SourceProvider,
+    F: Funder,
     O: Fn(Arc<StreamCandidate<P::Source>>) -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
@@ -127,9 +136,18 @@ where
         let attempting = connecting.is_some() || opening.is_some();
         if !attempting
             && discovering.is_none()
-            && let Some(err) = sources.exhausted(deposit, false, false)
+            && let Some(err) = sources.exhausted(deposit, false)
         {
-            return Err(err);
+            if err.downcast_ref::<NoAffordableSource>().is_none() {
+                return Err(err);
+            }
+            let spent = sources
+                .lanes_spent()
+                .max(funder.pool_spent().unwrap_or(U256::ZERO));
+            let stepped = gate.step(funder, deposit, || deposit, spent).await;
+            deposit = deposit.max(after_step(stepped, err)?);
+            sources.credit_lanes(deposit);
+            continue;
         }
         if discovering.is_none()
             && sources.wants_discovery(now, deposit, usize::from(attempting), false)
@@ -171,13 +189,19 @@ where
                         sources.record_progress(provider);
                         return Ok((provider, answer));
                     }
-                    Err(err) => match sources.record_fault(provider, &err, None, Instant::now(), deposit) {
-                        Fault::Fatal(_) => return Err(err),
-                        Fault::Transient => {
-                            held_off.insert(provider, Instant::now() + BUILD_RETRY_BASE);
+                    Err(err) => {
+                        let at = Instant::now();
+                        if gate.settling(at) && sources.hold_while_settling(provider, &err, at) {
+                            continue;
                         }
-                        Fault::Source | Fault::Unaffordable => {}
-                    },
+                        match sources.record_fault(provider, &err, None, at, deposit) {
+                            Fault::Fatal(_) => return Err(err),
+                            Fault::Transient => {
+                                held_off.insert(provider, at + BUILD_RETRY_BASE);
+                            }
+                            Fault::Source | Fault::Unaffordable => {}
+                        }
+                    }
                 }
             }
             found = poll_some(discovering.as_mut()), if discovering.is_some() => {

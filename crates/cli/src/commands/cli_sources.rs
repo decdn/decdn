@@ -16,8 +16,8 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_client::discovery::NodeCandidate;
 use decdn_client::source::{SourceFuture, SourceStream};
 use decdn_client::{
-    Holder, LaneLease, LaneLedgers, NoAffordableSource, PeerHealth, PeerSource, PoolContext,
-    SourceProvider, SourceSet, StopPolicy, StreamCandidate, first_open,
+    CredentialSlot, Holder, LaneLease, LaneLedgers, NoAffordableSource, PeerHealth, PeerSource,
+    PoolContext, RecoveryGate, SourceProvider, SourceSet, StopPolicy, StreamCandidate, first_open,
 };
 use decdn_common::cli;
 use decdn_incentive::{CapabilityGrant, PoolId};
@@ -81,6 +81,10 @@ pub(crate) struct CliSources<'a, P> {
     /// open's included, holds one of its provider's permits while its own
     /// worker runs, and takes a free one again to start again.
     lane_cap: Option<&'a LaneStreamCap>,
+    /// The fetch's funding recovery gate: the first open and the acquire loop
+    /// share it, and so does every entry of a bundle pull and a pass that runs
+    /// again against a replaced pool.
+    recovery: &'a Arc<RecoveryGate>,
     /// Every holder's node, keyed by its on-chain provider address.
     nodes: Mutex<HashMap<Address, NodeCandidate>>,
     peer_store: decdn_client::PeerStore,
@@ -116,6 +120,7 @@ where
         open_lock: Option<&'a tokio::sync::Mutex<()>>,
         ledgers: Option<&'a LaneLedgers>,
         lane_cap: Option<&'a LaneStreamCap>,
+        recovery: &'a Arc<RecoveryGate>,
     ) -> Self {
         Self {
             deps,
@@ -127,6 +132,7 @@ where
             open_lock,
             ledgers,
             lane_cap,
+            recovery,
             nodes: Mutex::new(HashMap::new()),
             peer_store: decdn_client::PeerStore::open(&deps.chain.data_dir),
             handles: Mutex::new(Vec::new()),
@@ -163,20 +169,45 @@ where
         Some(holder)
     }
 
-    /// The funder a fetch over these sources tops the pool up through: the
-    /// pool the first built lane pays from.
+    /// The funder a fetch over these sources runs its funding recovery step
+    /// through: the pool the first built lane pays from. A delegated fetch has
+    /// a zero working deposit, so its step has no funding path.
     pub(crate) fn funder(&self) -> CliFunder<'_, P> {
         CliFunder {
             contract: self.deps.contract,
             rpc: self.deps.rpc,
             store: self.deps.store,
             owner: self.deps.self_address,
+            signer: self.signer,
+            deployment: self.deps.chain.deployment(),
             pool_id: &self.pool_id,
             token: self.deps.token,
             payment_pool_addr: self.deps.chain.payment_pool,
+            working_deposit: self.deps.chain.working_deposit,
             max_approve: self.deps.chain.max_approve,
             funding: self.deps.funding,
         }
+    }
+
+    /// A delegated fetch's credential slot: the grant's capability for the
+    /// delegate key every lane signs with. The CLI swaps in no new credential,
+    /// so the slot waits for none, and an exhausted candidate set ends at
+    /// once with a typed [`decdn_client::FundingNeeded`]. `None` for a fetch
+    /// that pays from its own pool.
+    pub(crate) fn credentials(&self) -> Option<CredentialSlot> {
+        let grant = self.grant?;
+        // A grant that does not decode fails the lane build first, which
+        // names the fault; without a slot the fetch still ends funding needed.
+        let capability = grant.to_signed_capability().ok()?;
+        Some(
+            CredentialSlot::new(Arc::clone(self.signer), capability)
+                .with_swap_wait(std::time::Duration::ZERO),
+        )
+    }
+
+    /// The fetch's funding recovery gate.
+    pub(crate) const fn recovery(&self) -> &Arc<RecoveryGate> {
+        self.recovery
     }
 
     /// The fetch's first size claim (#2218): the probe's size hint when a
@@ -221,7 +252,8 @@ where
         stop: &StopPolicy,
     ) -> anyhow::Result<FirstClaim> {
         let mut set = SourceSet::new(self, hash, Arc::clone(health), holders);
-        let opened = first_open(&mut set, stop, |lane| async move {
+        let funder = self.funder();
+        let opened = first_open(&mut set, stop, &funder, self.recovery, |lane| async move {
             let (header, _whole) = lane.source.open_whole(hash).await?;
             let provider = lane
                 .ctx

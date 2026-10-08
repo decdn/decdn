@@ -531,9 +531,9 @@ async fn two_hashes_reuse_one_warm_connection() -> anyhow::Result<()> {
 )]
 #[tokio::test(flavor = "multi_thread")]
 async fn peer_source_legs_share_one_connection_across_a_refusal() -> anyhow::Result<()> {
-    use decdn_client::driver::{DriveConfig, drive};
+    use decdn_client::driver::drive;
     use decdn_client::source::BlobSource as _;
-    use decdn_client::{BudgetPacer, ClientRangedStore, Connections, FakeFunder, PeerSource};
+    use decdn_client::{BudgetPacer, ClientRangedStore, Connections, PeerSource};
 
     let payload_a = vec![0x31u8; 400_000];
     let payload_b = vec![0x42u8; 500_000];
@@ -592,12 +592,9 @@ async fn peer_source_legs_share_one_connection_across_a_refusal() -> anyhow::Res
         Some(connections.clone()),
     );
     let pacer = BudgetPacer::new();
-    let funder = FakeFunder::new(0, decdn_incentive::DepositOutcome::UnknownPool);
-    let config = DriveConfig::cli(U256::ZERO);
     let store_dir = tempfile::tempdir()?;
     let fetch = |name: &'static str, hash: Hash, len: usize| {
-        let (source, pacer, funder, ctx, ledger, config) =
-            (&source, &pacer, &funder, &ctx, &ledger, &config);
+        let (source, pacer, ctx, ledger) = (&source, &pacer, &ctx, &ledger);
         let dir = store_dir.path().to_path_buf();
         async move {
             let total = u64::try_from(len)?;
@@ -606,13 +603,11 @@ async fn peer_source_legs_share_one_connection_across_a_refusal() -> anyhow::Res
                 &store,
                 source,
                 pacer,
-                funder,
                 ctx,
                 ledger,
                 *hash.as_bytes(),
                 0,
                 0,
-                config,
                 None,
                 None,
                 None,
@@ -675,8 +670,8 @@ async fn peer_source_legs_share_one_connection_across_a_refusal() -> anyhow::Res
     reason = "one fixture: a paid handler, a lane, and the two drives it serves"
 )]
 async fn drive_scattered_as_a_restarted_payer() -> anyhow::Result<()> {
-    use decdn_client::driver::{DriveConfig, drive};
-    use decdn_client::{BudgetPacer, ClientRangedStore, FakeFunder, PeerSource, SharedPool};
+    use decdn_client::driver::drive;
+    use decdn_client::{BudgetPacer, ClientRangedStore, PeerSource, SharedPool};
 
     const GROUP: u64 = 16 * 1024;
     let payload: Vec<u8> = (0..32 * GROUP).map(|i| (i % 251) as u8).collect();
@@ -740,17 +735,10 @@ async fn drive_scattered_as_a_restarted_payer() -> anyhow::Result<()> {
 
     let spent_ledger = Arc::clone(&ledger);
     let spent = move || spent_ledger.committed().amount;
-    let credit = |_: U256| Ok(());
-    let topups = std::sync::atomic::AtomicU32::new(0);
-    let topup_lock = tokio::sync::Mutex::new(());
     let pool = SharedPool {
         spent: &spent,
-        topups_used: &topups,
-        credit: &credit,
-        topup_lock: &topup_lock,
+        quotes: None,
     };
-    let funder = FakeFunder::new(0, decdn_incentive::DepositOutcome::UnknownPool);
-    let config = DriveConfig::cli(U256::ZERO);
     let scattered: Vec<(u64, u64)> = (0..32).step_by(2).map(|g| (g * GROUP, GROUP)).collect();
     let pacer = BudgetPacer::new();
     let range = |store, (offset, len): (u64, u64)| {
@@ -758,13 +746,11 @@ async fn drive_scattered_as_a_restarted_payer() -> anyhow::Result<()> {
             store,
             &source,
             &pacer,
-            &funder,
             &ctx,
             &ledger,
             *hash.as_bytes(),
             offset,
             len,
-            &config,
             None,
             None,
             None,
@@ -13816,8 +13802,8 @@ async fn drive_against_stop_send_server(
     stop: StopPoint,
     signal: StopThenSignal,
 ) -> anyhow::Result<StopSendDrive> {
-    use decdn_client::driver::{DriveConfig, drive};
-    use decdn_client::{BudgetPacer, ClientRangedStore, FakeFunder, PeerSource};
+    use decdn_client::driver::drive;
+    use decdn_client::{BudgetPacer, ClientRangedStore, PeerSource};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let hash = Hash::new(&payload);
@@ -13865,20 +13851,16 @@ async fn drive_against_stop_send_server(
         None,
     );
     let pacer = BudgetPacer::new();
-    let funder = FakeFunder::new(0, decdn_incentive::DepositOutcome::UnknownPool);
-    let config = DriveConfig::cli(U256::ZERO);
     let (log_guard, log_buf) = capture_client_events();
     let result = drive(
         &store,
         &source,
         &pacer,
-        &funder,
         &ctx,
         &ledger,
         *hash.as_bytes(),
         0,
         0,
-        &config,
         None,
         None,
         None,

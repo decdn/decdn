@@ -9,7 +9,8 @@
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 
 use crate::buyer_pool::{EscrowUntracked, TopUpUnconfirmed, WalletShortfall};
-use crate::driver::{PoolExhausted, TopUpFailed};
+use crate::driver::PoolExhausted;
+use crate::source::PoolReplaced;
 use crate::{BlobTooLarge, LocalPullFault, UpstreamRefused, UpstreamVoucherRejected};
 
 /// What a failed lane, lane build, or discovery means for the acquire loop.
@@ -20,8 +21,9 @@ pub enum Fault {
     /// A property of this source's delivery. The source cools and its ranges
     /// move to other sources.
     Source,
-    /// This source's next voucher does not fit the pool's current deposit. The
-    /// source waits for the deposit to rise.
+    /// This source's next voucher does not fit the pool's current deposit, or
+    /// it refused the pool's funding. The source waits for the deposit to rise
+    /// (ADR 003 § Funding recovery).
     Unaffordable,
     /// A chain or RPC fault outside any source's delivery. The loop retries
     /// with backoff and the source keeps its health.
@@ -115,6 +117,20 @@ pub(crate) fn declining_rejection(err: &anyhow::Error) -> Option<VoucherRejectRe
     unhealed_rejection(err).filter(|reason| !is_funding_reason(*reason))
 }
 
+/// Whether `err` is a node's unhealed refusal of the signer's capability
+/// itself: its cap is spent or it expired, as the node sees it.
+#[must_use]
+pub(crate) fn refuses_capability(err: &anyhow::Error) -> bool {
+    unhealed_rejection(err).is_some_and(|reason| {
+        matches!(
+            reason,
+            VoucherRejectReason::SpendingCapExhausted
+                | VoucherRejectReason::SignerCapExhausted
+                | VoucherRejectReason::CapabilityExpired
+        )
+    })
+}
+
 /// Classify `err` for the acquire loop. A node's refusal never ends the
 /// fetch on its own (ADR 039 §Failure handling): only a local fault, or a
 /// stop the candidate set reached, is fatal.
@@ -126,6 +142,10 @@ pub fn classify(err: &anyhow::Error) -> Fault {
     if err
         .downcast_ref::<crate::source_set::NoAffordableSource>()
         .is_some()
+        || err.downcast_ref::<PoolReplaced>().is_some()
+        || err
+            .downcast_ref::<crate::credential::FundingNeeded>()
+            .is_some()
     {
         return Fault::Fatal(FatalScope::Command);
     }
@@ -138,11 +158,7 @@ pub fn classify(err: &anyhow::Error) -> Fault {
     {
         return Fault::Fatal(FatalScope::Item);
     }
-    if err.downcast_ref::<HealExhausted>().is_some()
-        || err
-            .downcast_ref::<crate::driver::StaleDepositView>()
-            .is_some()
-    {
+    if err.downcast_ref::<HealExhausted>().is_some() {
         return Fault::Source;
     }
     if err.downcast_ref::<LocalPullFault>().is_some() || is_local_disk_fault(err) {
@@ -164,9 +180,6 @@ pub fn classify(err: &anyhow::Error) -> Fault {
         || err.downcast_ref::<WalletShortfall>().is_some()
     {
         return Fault::Unaffordable;
-    }
-    if err.downcast_ref::<TopUpFailed>().is_some() {
-        return Fault::Transient;
     }
     // A lane build is chain-side: it never blames the source, and it retries
     // unless what failed it is fatal on its own (an escrow no record credits, a

@@ -6,14 +6,12 @@ use alloy::signers::local::PrivateKeySigner;
 use bao_tree::io::outboard::PreOrderMemOutboard;
 use bytes::Bytes;
 use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, encode_verified_range};
-use decdn_incentive::DepositOutcome;
 use tokio::io::AsyncReadExt;
 
 use super::{StreamCandidate, Streamer, VerifiedReader};
-use crate::driver::DriveConfig;
 use crate::pacer::PULL_WINDOW_FLOOR;
 use crate::sink::MemoryBlobCache;
-use crate::source::{BlobSource, FakeFunder, ScriptedSource, SourceFuture};
+use crate::source::{BlobSource, FakeFunder, Recovery, ScriptedSource, SourceFuture};
 use crate::{
     BlobCache, Cumulative, NoCache, PoolContext, PoolLedger, ProgressClock, PullConfig,
     StaticSources, StopPolicy, UpstreamPullHeader, VoucherProgress,
@@ -55,9 +53,7 @@ fn streamer<S: BlobSource>(
 ) -> anyhow::Result<Streamer<'_, StaticSources<S>, FakeFunder>> {
     let sources = StaticSources::new(candidates)?;
     let holders = sources.holders();
-    Ok(Streamer::new(sources, funder(), scratch)
-        .holders(holders)
-        .drive_config(drive_config()))
+    Ok(Streamer::new(sources, funder(), scratch).holders(holders))
 }
 
 /// The stop a script gets: give up after [`crate::SCRIPT_GIVE_UP`].
@@ -95,16 +91,7 @@ fn a_candidates_measured_coverage_reaches_its_holder() -> anyhow::Result<()> {
 }
 
 fn funder() -> FakeFunder {
-    FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX)))
-}
-
-fn drive_config() -> DriveConfig {
-    DriveConfig {
-        working_deposit: U256::from(u128::MAX),
-        seller_reserve: U256::ZERO,
-        max_settle_waits: 2,
-        settle_backoff: Duration::ZERO,
-    }
+    FakeFunder::new(Recovery::ToppedUp(U256::from(u128::MAX)))
 }
 
 fn payload(len: usize) -> Vec<u8> {

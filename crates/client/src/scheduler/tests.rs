@@ -2,17 +2,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256, U256};
-use decdn_incentive::{DepositOutcome, LaneKey};
+use decdn_incentive::LaneKey;
 use decdn_protocol::client::StreamError;
 use decdn_protocol::{Coverage, DISCOVERY_BLOCK_BYTES, num_blocks};
 
 use super::{AcquireEnv, AcquireTarget, ConsumptionPacing, LANE_WATCHDOG, LaneLease, acquire};
-use crate::driver::{DriveConfig, PoolExhausted, ranges_content_len};
+use crate::driver::{PoolExhausted, ranges_content_len};
 use crate::fault::{FatalScope, Fault, classify};
 use crate::health::{Health, PeerHealth};
 use crate::ledgers::{LaneHandle, LaneLedgers};
 use crate::pacer::{BudgetPacer, PaceDecision, PaceState, Pacer};
-use crate::source::{BlobSource, FakeFunder, Funder, ScriptedSource, ctx_with};
+use crate::recovery::RecoveryGate;
+use crate::source::{BlobSource, FakeFunder, Funder, Recovery, ScriptedSource, ctx_with};
 use crate::source_set::{NoAffordableSource, NoSourceHasBlob, SourceSet, StaticSources};
 use crate::stop::{GaveUp, StopPolicy};
 use crate::streamer::StreamCandidate;
@@ -64,17 +65,15 @@ fn candidate_ctx<S>(
     }
 }
 
-fn drive_config() -> DriveConfig {
-    DriveConfig {
-        working_deposit: U256::ZERO,
-        seller_reserve: U256::ZERO,
-        max_settle_waits: 0,
-        settle_backoff: Duration::from_millis(1),
-    }
+/// A fresh funding recovery gate for one fetch.
+fn recovery_gate() -> RecoveryGate {
+    RecoveryGate::new()
 }
 
-fn no_topups() -> FakeFunder {
-    FakeFunder::new(0, DepositOutcome::Added(U256::ZERO))
+/// A funder with no way to add funds: a funding recovery step ends the fetch
+/// "funding needed".
+fn no_funding() -> FakeFunder {
+    FakeFunder::new(Recovery::Unavailable)
 }
 
 /// A `.partial` store whose tempdir path is returned so the test can read
@@ -126,7 +125,7 @@ async fn run_acquire_with<S: BlobSource>(
         knobs.give_up_after.or(Some(Duration::from_hours(1))),
         Arc::default(),
     );
-    let drive = drive_config();
+    let gate = recovery_gate();
     acquire(
         AcquireTarget {
             store,
@@ -138,7 +137,8 @@ async fn run_acquire_with<S: BlobSource>(
         &AcquireEnv {
             pacer,
             funder,
-            drive: &drive,
+            recovery: &gate,
+            credentials: None,
             max_lanes: knobs.max_lanes,
             stop: &stop,
             on_progress: knobs.on_progress,
@@ -198,7 +198,7 @@ async fn two_sources_fetch_large_blob_byte_identical() -> anyhow::Result<()> {
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         4,
         None,
     )
@@ -262,7 +262,7 @@ async fn progress_positions_are_monotonic_across_lanes() -> anyhow::Result<()> {
         &provider,
         root,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         Knobs {
             on_progress: Some(&on_progress),
             ..Knobs::lanes(4)
@@ -349,7 +349,7 @@ async fn resume_base_is_reported_before_the_first_chunk() -> anyhow::Result<()> 
         &provider,
         root,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         Knobs {
             on_progress: Some(&on_progress),
             ..Knobs::lanes(4)
@@ -398,7 +398,7 @@ async fn large_multi_block_gap_seeds_about_one_span_per_holder() -> anyhow::Resu
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         4,
         None,
     )
@@ -471,7 +471,7 @@ async fn disjoint_coverage_routes_each_block_to_its_only_coverer() -> anyhow::Re
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         4,
         None,
     )
@@ -534,7 +534,7 @@ async fn a_block_only_the_all_ones_source_covers_is_served_by_it() -> anyhow::Re
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         4,
         None,
     )
@@ -601,7 +601,7 @@ async fn coverage_constrained_steal_parks_instead_of_taking_uncoverable_work() -
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         2,
         None,
     )
@@ -647,7 +647,7 @@ async fn one_source_below_two_holders_still_completes() -> anyhow::Result<()> {
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         4,
         None,
     )
@@ -697,7 +697,7 @@ async fn faulted_source_tail_is_reassigned_and_fetch_completes() -> anyhow::Resu
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         4,
         None,
     )
@@ -760,7 +760,7 @@ async fn a_lane_pausing_under_the_deadline_is_not_reassigned() -> anyhow::Result
         &provider,
         root,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         Knobs {
             health: Arc::clone(&health),
             ..Knobs::lanes(4)
@@ -829,7 +829,7 @@ async fn every_lease_is_released_when_acquire_returns() -> anyhow::Result<()> {
         &provider,
         root,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         Knobs {
             on_progress: Some(&on_progress),
             ..Knobs::lanes(4)
@@ -882,7 +882,7 @@ async fn a_dropped_acquire_releases_every_lease() -> anyhow::Result<()> {
     let mut lane = candidate(src, ledger, 0xA1, None);
     lane.lease = LaneLease::new(DropStamp(Arc::clone(&dropped)));
     let provider = StaticSources::new(vec![lane])?;
-    let (pacer, funder) = (BudgetPacer::new(), no_topups());
+    let (pacer, funder) = (BudgetPacer::new(), no_funding());
     let fetch = run_acquire(&store, &provider, root, total, &pacer, &funder, 4, None);
     tokio::select! {
         fetched = fetch => panic!("a wedged lane cannot finish: {fetched:?}"),
@@ -1462,7 +1462,7 @@ async fn forced_steal_does_not_double_fetch_the_stolen_tail() -> anyhow::Result<
         candidate(src_fast.clone(), ledger_fast, 0xA1, None),
         candidate(src_slow.clone(), ledger_slow, 0xB2, None),
     ])?;
-    let (pacer, funder) = (BudgetPacer::new(), no_topups());
+    let (pacer, funder) = (BudgetPacer::new(), no_funding());
     let fetch = run_acquire(&store, &provider, root, total, &pacer, &funder, 2, None);
     // Open the gate once the fast source has opened a second range: its
     // steal of the slow source's tail.
@@ -1531,7 +1531,7 @@ async fn a_slow_victim_is_stolen_from_once() -> anyhow::Result<()> {
         candidate(fast.clone(), ledger_fast, 0xA1, None),
         candidate(slow.clone(), ledger_slow, 0xB2, None),
     ])?;
-    let (pacer, funder) = (BudgetPacer::new(), no_topups());
+    let (pacer, funder) = (BudgetPacer::new(), no_funding());
     tokio::time::timeout(
         Duration::from_mins(5),
         run_acquire(&store, &provider, root, total, &pacer, &funder, 2, None),
@@ -1630,7 +1630,7 @@ async fn a_parked_lane_steals_a_slow_legs_tail_after_the_recheck() -> anyhow::Re
             root,
             total,
             &BudgetPacer::new(),
-            &no_topups(),
+            &no_funding(),
             2,
             None,
         ),
@@ -1694,7 +1694,7 @@ async fn a_refused_slow_victim_steal_requeues_and_bars_the_lane() -> anyhow::Res
             root,
             total,
             &BudgetPacer::new(),
-            &no_topups(),
+            &no_funding(),
             2,
             None,
         ),
@@ -1742,7 +1742,7 @@ async fn a_slow_victim_steal_refused_as_not_found_is_bounded() -> anyhow::Result
             root,
             total,
             &BudgetPacer::new(),
-            &no_topups(),
+            &no_funding(),
             2,
             None,
         ),
@@ -1794,7 +1794,7 @@ async fn a_steal_recheck_takes_no_stream_while_no_steal_is_due() -> anyhow::Resu
             root,
             total,
             &BudgetPacer::new(),
-            &no_topups(),
+            &no_funding(),
             2,
             None,
         ),
@@ -1880,7 +1880,7 @@ async fn steal_after_victim_frontier(
         candidate(thief.clone(), lt, 0xA1, None),
         candidate(victim.clone(), lv, 0xB2, None),
     ])?;
-    let (pacer, funder) = (BudgetPacer::new(), no_topups());
+    let (pacer, funder) = (BudgetPacer::new(), no_funding());
     let fetch = run_acquire(&store, &provider, root, total, &pacer, &funder, 2, None);
     let script = async {
         while thief.opened_ranges().is_empty() || victim.opened_ranges().is_empty() {
@@ -2049,7 +2049,7 @@ async fn forced_steal_no_double_pay_on_multi_thread_runtime() -> anyhow::Result<
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         4,
         None,
     )
@@ -2112,7 +2112,7 @@ async fn a_zero_size_signed_for_a_bounded_open_cools_only_that_node() -> anyhow:
         &provider,
         root,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         Knobs {
             health: Arc::clone(&health),
             ..Knobs::lanes(2)
@@ -2166,7 +2166,7 @@ async fn terminal_fault_propagates_and_is_not_reassigned() -> anyhow::Result<()>
             root,
             total,
             &BudgetPacer::new(),
-            &no_topups(),
+            &no_funding(),
             2,
             None,
         ),
@@ -2281,7 +2281,7 @@ async fn pool_wide_spent_gates_on_other_run_lanes() -> anyhow::Result<()> {
         &provider,
         root,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         Knobs {
             give_up_after: Some(Duration::from_mins(1)),
             ledgers: Some(&reg),
@@ -2347,7 +2347,7 @@ async fn distinct_providers_each_pay_their_own_lane() -> anyhow::Result<()> {
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         4,
         None,
     )
@@ -2439,7 +2439,7 @@ async fn concurrent_lanes_gate_on_the_shared_pool_balance() -> anyhow::Result<()
         root,
         total,
         &pacer,
-        &no_topups(),
+        &no_funding(),
         4,
         None,
     )
@@ -2531,7 +2531,7 @@ async fn shared_gate_refuses_a_second_leg_into_a_drained_pool() -> anyhow::Resul
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         2,
         Some(Duration::from_mins(1)),
     )
@@ -2803,13 +2803,14 @@ async fn acquire_bounded<St: crate::source::IngestStore>(
 ) -> anyhow::Result<()> {
     let total = store.total_bytes();
     let mut set = SourceSet::new(provider, root, Arc::default(), provider.holders());
-    let drive = drive_config();
-    let (pacer, funder) = (BudgetPacer::new(), no_topups());
+    let gate = recovery_gate();
+    let (pacer, funder) = (BudgetPacer::new(), no_funding());
     let ranges = [(0, total)];
     let env = AcquireEnv {
         pacer: &pacer,
         funder: &funder,
-        drive: &drive,
+        recovery: &gate,
+        credentials: None,
         max_lanes: 1,
         stop,
         on_progress: None,
@@ -2951,7 +2952,7 @@ async fn a_slow_first_byte_is_not_a_stall() -> anyhow::Result<()> {
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         1,
         Some(Duration::from_mins(5)),
     )
@@ -3004,7 +3005,7 @@ async fn wedged_source_is_ended_by_the_watchdog_and_its_tail_reassigned() -> any
         &provider,
         root,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         Knobs {
             health: Arc::clone(&health),
             ..Knobs::lanes(2)
@@ -3054,7 +3055,7 @@ async fn a_dropped_acquire_keeps_landed_bytes_recorded() -> anyhow::Result<()> {
         candidate(src_b, ledger_b, 0xB2, None),
     ])?;
     {
-        let (pacer, funder) = (BudgetPacer::new(), no_topups());
+        let (pacer, funder) = (BudgetPacer::new(), no_funding());
         let fetch = run_acquire(&store, &provider, root, total, &pacer, &funder, 2, None);
         // Past one present-record flush, short of the lane watchdog.
         tokio::select! {
@@ -3107,7 +3108,7 @@ async fn a_parked_worker_takes_over_a_later_faulted_peers_remainder() -> anyhow:
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         2,
         None,
     )
@@ -3181,7 +3182,7 @@ async fn window_pacing_gates_a_lane_on_the_consumer_cursor() -> anyhow::Result<(
         &provider,
         root,
         &pacer,
-        &no_topups(),
+        &no_funding(),
         Knobs {
             pacing: Some(&pacing),
             ..Knobs::lanes(1)
@@ -3223,7 +3224,7 @@ async fn one_source_one_reset_then_recovery_completes() -> anyhow::Result<()> {
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         4,
         None,
     )
@@ -3259,7 +3260,7 @@ async fn a_reserve_source_joins_when_a_lane_cools() -> anyhow::Result<()> {
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         1,
         None,
     )
@@ -3294,7 +3295,7 @@ async fn a_cheaper_source_takes_over_after_one_is_priced_out() -> anyhow::Result
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         1,
         None,
     )
@@ -3324,7 +3325,7 @@ async fn every_source_priced_out_stops_with_the_top_up_remedy() -> anyhow::Resul
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         4,
         None,
     )
@@ -3362,7 +3363,7 @@ async fn a_cap_refusal_acts_as_unfunded_from_its_node() -> anyhow::Result<()> {
         let (store, _dir) = fresh_store(root, total);
         let ctx = Arc::new(Mutex::new(ctx_with(0xA1, deposit)));
         let provider = StaticSources::new(vec![candidate_ctx(a, la, ctx, None)])?;
-        let funder = no_topups().with_pool_spent(outside);
+        let funder = no_funding().with_pool_spent(outside);
         let err = run_acquire(
             &store,
             &provider,
@@ -3422,7 +3423,7 @@ async fn a_lane_build_that_may_have_escrowed_ends_the_acquire() -> anyhow::Resul
     let mut set = SourceSet::new(&provider, root, Arc::default(), provider.0.holders());
     // A retried build would run until this gives up instead.
     let stop = StopPolicy::new(false, Some(Duration::from_mins(5)), Arc::default());
-    let drive = drive_config();
+    let gate = recovery_gate();
     let err = acquire(
         AcquireTarget {
             store: &store,
@@ -3433,8 +3434,9 @@ async fn a_lane_build_that_may_have_escrowed_ends_the_acquire() -> anyhow::Resul
         &mut set,
         &AcquireEnv {
             pacer: &BudgetPacer::new(),
-            funder: &no_topups(),
-            drive: &drive,
+            funder: &no_funding(),
+            recovery: &gate,
+            credentials: None,
             max_lanes: 1,
             stop: &stop,
             on_progress: None,
@@ -3454,43 +3456,155 @@ async fn a_lane_build_that_may_have_escrowed_ends_the_acquire() -> anyhow::Resul
     Ok(())
 }
 
-/// A source priced out at the pool's deposit stays priced out after a
-/// top-up the driver's own pacer declined, so a set top-up budget does not
-/// keep the acquire waiting: it stops with the top-up remedy.
+/// Acquire the whole `root` blob from `provider`'s holders through `funder`,
+/// under `gate`.
+async fn acquire_under<S: BlobSource>(
+    store: &ClientRangedStore,
+    provider: &StaticSources<S>,
+    root: [u8; 32],
+    funder: &FakeFunder,
+    gate: &RecoveryGate,
+) -> anyhow::Result<()> {
+    let total = store.total_bytes();
+    let mut set = SourceSet::new(provider, root, Arc::default(), provider.holders());
+    let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+    acquire(
+        AcquireTarget {
+            store,
+            hash: root,
+            total_bytes: total,
+            ranges: &[(0, total)],
+        },
+        &mut set,
+        &AcquireEnv {
+            pacer: &BudgetPacer::new(),
+            funder,
+            recovery: gate,
+            credentials: None,
+            max_lanes: 4,
+            stop: &stop,
+            on_progress: None,
+            ledgers: None,
+            pacing: None,
+            max_blob_bytes: 0,
+        },
+    )
+    .await
+}
+
+fn dry_lane() -> anyhow::Error {
+    anyhow::Error::new(PoolExhausted {
+        gap_start: 0,
+        gap_len: 1,
+    })
+}
+
+/// ADR 003 § Funding recovery: the first step of a fetch is free, but a
+/// source that stays priced out with no newly verified byte since that step
+/// gets no second one. The fetch ends "funding needed" after exactly one
+/// funding call.
 #[tokio::test(start_paused = true)]
-async fn every_source_priced_out_stops_even_with_top_ups_left() -> anyhow::Result<()> {
-    let data = blob(1024 * 1024);
+async fn no_verified_byte_since_the_last_step_ends_funding_needed() -> anyhow::Result<()> {
     let la = Arc::new(PoolLedger::new(Cumulative::default()));
-    let a = ScriptedSource::new(data)?
+    let a = ScriptedSource::new(blob(1024 * 1024))?
         .paying(Arc::clone(&la))
-        .with_fault_after(0, || {
-            anyhow::Error::new(PoolExhausted {
-                gap_start: 0,
-                gap_len: 1,
-            })
-        });
+        .with_fault_after(0, dry_lane);
     let (root, total) = (a.root(), a.total_bytes());
     let (store, _dir) = fresh_store(root, total);
     let provider = StaticSources::new(vec![candidate(a, la, 0xA1, None)])?;
-    // `run_acquire` drives with `working_deposit = 0`.
-    let funder = FakeFunder::new(1, DepositOutcome::Added(U256::ZERO));
-    let err = run_acquire(
-        &store,
-        &provider,
-        root,
-        total,
-        &BudgetPacer::new(),
-        &funder,
-        4,
-        None,
-    )
-    .await
-    .err()
-    .ok_or_else(|| anyhow::anyhow!("must stop"))?;
+    let funder = FakeFunder::new(Recovery::ToppedUp(U256::MAX));
+    let gate = RecoveryGate::with_settle(Duration::ZERO);
+    let err = acquire_under(&store, &provider, root, &funder, &gate)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("must stop"))?;
     assert!(
         err.downcast_ref::<NoAffordableSource>().is_some(),
         "{err:#}"
     );
+    assert!(
+        format!("{err:#}").contains("no byte was verified"),
+        "{err:#}"
+    );
+    assert_eq!(funder.calls().len(), 1, "one step, then the progress rule");
+    Ok(())
+}
+
+/// A source that delivers verified bytes before each exhaustion earns a step
+/// each time: a long fetch that pays for real bytes and drains the pool again
+/// recovers again, and finishes.
+#[tokio::test(start_paused = true)]
+async fn verified_bytes_since_the_last_step_allow_another() -> anyhow::Result<()> {
+    let data = blob(1024 * 1024);
+    let la = Arc::new(PoolLedger::new(Cumulative::default()));
+    let a = ScriptedSource::new(data.clone())?
+        .paying(Arc::clone(&la))
+        .fault_times_after(2, 64 * 1024, dry_lane);
+    let (root, total) = (a.root(), a.total_bytes());
+    let (store, dir) = fresh_store(root, total);
+    let provider = StaticSources::new(vec![candidate(a, la, 0xA1, None)])?;
+    let funder = FakeFunder::scripted(vec![
+        Recovery::ToppedUp(U256::from(u128::MAX) + U256::from(1u8)),
+        Recovery::ToppedUp(U256::from(u128::MAX) + U256::from(2u8)),
+    ]);
+    let gate = RecoveryGate::with_settle(Duration::ZERO);
+    acquire_under(&store, &provider, root, &funder, &gate).await?;
+    store.finalize().await?;
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    assert_eq!(funder.calls().len(), 2, "one step per drain");
+    Ok(())
+}
+
+/// A pool that no longer accepts funds is replaced, and the acquire ends this
+/// pass with the replacement so the caller runs the remaining work against
+/// the new pool.
+#[tokio::test(start_paused = true)]
+async fn a_replaced_pool_ends_the_pass_with_the_replacement() -> anyhow::Result<()> {
+    let la = Arc::new(PoolLedger::new(Cumulative::default()));
+    let a = ScriptedSource::new(blob(1024 * 1024))?
+        .paying(Arc::clone(&la))
+        .with_fault_after(0, dry_lane);
+    let (root, total) = (a.root(), a.total_bytes());
+    let (store, _dir) = fresh_store(root, total);
+    let provider = StaticSources::new(vec![candidate(a, la, 0xA1, None)])?;
+    let replaced = crate::PoolReplaced {
+        closed: B256::repeat_byte(1),
+        opened: B256::repeat_byte(2),
+    };
+    let funder = FakeFunder::new(Recovery::Replaced(replaced));
+    let err = acquire_under(&store, &provider, root, &funder, &RecoveryGate::new())
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("must stop"))?;
+    assert_eq!(err.downcast_ref::<crate::PoolReplaced>(), Some(&replaced));
+    Ok(())
+}
+
+/// One node's `Unfunded` refusal while another node serves never triggers a
+/// funding recovery step: the refusal scopes to that node.
+#[tokio::test(start_paused = true)]
+async fn one_unfunded_node_beside_a_serving_one_takes_no_step() -> anyhow::Result<()> {
+    let data = blob(1024 * 1024);
+    let (la, lb) = (
+        Arc::new(PoolLedger::new(Cumulative::default())),
+        Arc::new(PoolLedger::new(Cumulative::default())),
+    );
+    let a = ScriptedSource::new(data.clone())?
+        .paying(Arc::clone(&la))
+        .with_fault_after(0, || {
+            anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Unfunded))
+        });
+    let b = ScriptedSource::new(data)?.paying(Arc::clone(&lb));
+    let (root, total) = (a.root(), a.total_bytes());
+    let (store, _dir) = fresh_store(root, total);
+    let provider = StaticSources::new(vec![
+        candidate(a, la, 0xA1, None),
+        candidate(b.clone(), lb, 0xB2, None),
+    ])?;
+    let funder = FakeFunder::new(Recovery::ToppedUp(U256::MAX));
+    acquire_under(&store, &provider, root, &funder, &RecoveryGate::new()).await?;
+    assert!(b.delivered_bytes() > 0);
+    assert!(funder.calls().is_empty(), "no step while a node serves");
     Ok(())
 }
 
@@ -3741,7 +3855,7 @@ async fn a_partial_holder_refusing_an_uncovered_block_is_barred_from_it() -> any
     };
     let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
-    let drive = drive_config();
+    let gate = recovery_gate();
     acquire(
         AcquireTarget {
             store: &store,
@@ -3752,8 +3866,9 @@ async fn a_partial_holder_refusing_an_uncovered_block_is_barred_from_it() -> any
         &mut set,
         &AcquireEnv {
             pacer: &BudgetPacer::new(),
-            funder: &no_topups(),
-            drive: &drive,
+            funder: &no_funding(),
+            recovery: &gate,
+            credentials: None,
             max_lanes: 2,
             stop: &stop,
             on_progress: None,
@@ -3820,7 +3935,7 @@ async fn a_partial_holder_refusing_a_covered_block_loses_it_from_its_coverage() 
     };
     let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
-    let drive = drive_config();
+    let gate = recovery_gate();
     acquire(
         AcquireTarget {
             store: &store,
@@ -3831,8 +3946,9 @@ async fn a_partial_holder_refusing_a_covered_block_loses_it_from_its_coverage() 
         &mut set,
         &AcquireEnv {
             pacer: &BudgetPacer::new(),
-            funder: &no_topups(),
-            drive: &drive,
+            funder: &no_funding(),
+            recovery: &gate,
+            credentials: None,
             max_lanes: 2,
             stop: &stop,
             on_progress: None,
@@ -3898,7 +4014,7 @@ async fn a_sole_barred_partial_holder_ends_only_the_item() -> anyhow::Result<()>
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         1,
         None,
     )
@@ -3941,7 +4057,7 @@ async fn unanimous_not_found_ends_only_the_item() -> anyhow::Result<()> {
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         4,
         None,
     )
@@ -3974,7 +4090,7 @@ async fn a_probed_holder_saying_not_found_twice_then_serving_completes() -> anyh
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         4,
         None,
     )
@@ -4037,7 +4153,7 @@ async fn a_lane_build_in_flight_is_awaited_before_acquire_returns() -> anyhow::R
     };
     let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
-    let drive = drive_config();
+    let gate = recovery_gate();
     acquire(
         AcquireTarget {
             store: &store,
@@ -4048,8 +4164,9 @@ async fn a_lane_build_in_flight_is_awaited_before_acquire_returns() -> anyhow::R
         &mut set,
         &AcquireEnv {
             pacer: &BudgetPacer::new(),
-            funder: &no_topups(),
-            drive: &drive,
+            funder: &no_funding(),
+            recovery: &gate,
+            credentials: None,
             max_lanes: 2,
             stop: &stop,
             on_progress: None,
@@ -4124,7 +4241,7 @@ async fn a_sibling_top_up_on_a_shared_lane_revives_a_priced_out_source() -> anyh
     };
     let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
     let stop = StopPolicy::new(false, Some(Duration::from_mins(5)), Arc::default());
-    let drive = drive_config();
+    let gate = recovery_gate();
     acquire(
         AcquireTarget {
             store: &store,
@@ -4135,8 +4252,9 @@ async fn a_sibling_top_up_on_a_shared_lane_revives_a_priced_out_source() -> anyh
         &mut set,
         &AcquireEnv {
             pacer: &BudgetPacer::new(),
-            funder: &no_topups(),
-            drive: &drive,
+            funder: &no_funding(),
+            recovery: &gate,
+            credentials: None,
             max_lanes: 1,
             stop: &stop,
             on_progress: None,
@@ -4181,7 +4299,7 @@ async fn a_refill_a_later_lane_build_made_raises_the_running_lanes() -> anyhow::
     };
     let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
-    let drive = drive_config();
+    let gate = recovery_gate();
     acquire(
         AcquireTarget {
             store: &store,
@@ -4192,8 +4310,9 @@ async fn a_refill_a_later_lane_build_made_raises_the_running_lanes() -> anyhow::
         &mut set,
         &AcquireEnv {
             pacer: &BudgetPacer::new(),
-            funder: &no_topups(),
-            drive: &drive,
+            funder: &no_funding(),
+            recovery: &gate,
+            credentials: None,
             max_lanes: 2,
             stop: &stop,
             on_progress: None,
@@ -4242,7 +4361,7 @@ async fn a_lane_built_on_a_lower_deposit_never_lowers_the_running_lanes() -> any
     };
     let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
-    let drive = drive_config();
+    let gate = recovery_gate();
     acquire(
         AcquireTarget {
             store: &store,
@@ -4253,8 +4372,9 @@ async fn a_lane_built_on_a_lower_deposit_never_lowers_the_running_lanes() -> any
         &mut set,
         &AcquireEnv {
             pacer: &BudgetPacer::new(),
-            funder: &no_topups(),
-            drive: &drive,
+            funder: &no_funding(),
+            recovery: &gate,
+            credentials: None,
             max_lanes: 2,
             stop: &stop,
             on_progress: None,
@@ -4286,7 +4406,7 @@ async fn an_empty_set_discovers_its_holders_and_completes() -> anyhow::Result<()
     let provider = StaticSources::new(vec![candidate(a, la, 0xA1, None)])?;
     let mut set = SourceSet::new(&provider, root, Arc::default(), Vec::new());
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
-    let drive = drive_config();
+    let gate = recovery_gate();
     acquire(
         AcquireTarget {
             store: &store,
@@ -4297,8 +4417,9 @@ async fn an_empty_set_discovers_its_holders_and_completes() -> anyhow::Result<()
         &mut set,
         &AcquireEnv {
             pacer: &BudgetPacer::new(),
-            funder: &no_topups(),
-            drive: &drive,
+            funder: &no_funding(),
+            recovery: &gate,
+            credentials: None,
             max_lanes: 4,
             stop: &stop,
             on_progress: None,
@@ -4323,7 +4444,7 @@ async fn only_the_listed_ranges_are_fetched() -> anyhow::Result<()> {
     let provider = StaticSources::new(vec![candidate(a.clone(), la, 0xA1, None)])?;
     let mut set = SourceSet::new(&provider, root, Arc::default(), provider.holders());
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
-    let drive = drive_config();
+    let gate = recovery_gate();
     let mib = 1024 * 1024;
     acquire(
         AcquireTarget {
@@ -4335,8 +4456,9 @@ async fn only_the_listed_ranges_are_fetched() -> anyhow::Result<()> {
         &mut set,
         &AcquireEnv {
             pacer: &BudgetPacer::new(),
-            funder: &no_topups(),
-            drive: &drive,
+            funder: &no_funding(),
+            recovery: &gate,
+            credentials: None,
             max_lanes: 4,
             stop: &stop,
             on_progress: None,
@@ -4423,7 +4545,7 @@ async fn acquire_recording<S: BlobSource>(
         provider,
         root,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         Knobs {
             on_progress: Some(&on_progress),
             ..Knobs::lanes(lanes)
@@ -4604,7 +4726,7 @@ async fn blocks_no_lane_covers_are_taken_by_a_partial_holder() -> anyhow::Result
         root,
         total,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         2,
         None,
     )
@@ -4667,7 +4789,7 @@ async fn acquire_capped(
         &provider,
         root,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         Knobs {
             on_progress: Some(&on_progress),
             max_blob_bytes: cap,
@@ -5076,8 +5198,8 @@ async fn acquire_over<P: crate::SourceProvider>(
     let total = store.total_bytes();
     let mut set = SourceSet::new(provider, root, Arc::default(), holders);
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
-    let drive = drive_config();
-    let (pacer, funder) = (BudgetPacer::new(), no_topups());
+    let gate = recovery_gate();
+    let (pacer, funder) = (BudgetPacer::new(), no_funding());
     let whole = [(0, total)];
     acquire(
         AcquireTarget {
@@ -5090,7 +5212,8 @@ async fn acquire_over<P: crate::SourceProvider>(
         &AcquireEnv {
             pacer: &pacer,
             funder: &funder,
-            drive: &drive,
+            recovery: &gate,
+            credentials: None,
             max_lanes: lanes,
             stop: &stop,
             on_progress: None,
@@ -5615,7 +5738,7 @@ async fn a_queue_one_lane_drains_grows_an_extra_stream() -> anyhow::Result<()> {
     let (store, _dir) = fresh_store(root, total);
     let mut set = SourceSet::new(&provider, root, Arc::default(), provider.holders());
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
-    let drive = drive_config();
+    let gate = recovery_gate();
     let runs: Vec<(u64, u64)> = (0..6).map(|i| (i * 2 * MIB, MIB)).collect();
     acquire(
         AcquireTarget {
@@ -5627,8 +5750,9 @@ async fn a_queue_one_lane_drains_grows_an_extra_stream() -> anyhow::Result<()> {
         &mut set,
         &AcquireEnv {
             pacer: &BudgetPacer::new(),
-            funder: &no_topups(),
-            drive: &drive,
+            funder: &no_funding(),
+            recovery: &gate,
+            credentials: None,
             max_lanes: 1,
             stop: &stop,
             on_progress: None,
@@ -5722,7 +5846,7 @@ async fn a_lanes_lease_is_released_when_its_own_worker_ends() -> anyhow::Result<
         &provider,
         root,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         Knobs {
             on_progress: Some(&on_progress),
             ..Knobs::lanes(2)
@@ -5787,7 +5911,7 @@ async fn a_parked_lane_gives_its_stream_back() -> anyhow::Result<()> {
         &provider,
         root,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         Knobs {
             on_progress: Some(&on_progress),
             ..Knobs::lanes(2)
@@ -6142,13 +6266,14 @@ async fn a_store_read_error_in_the_watchdog_is_our_fault() -> anyhow::Result<()>
     let health: Arc<PeerHealth> = Arc::default();
     let mut set = SourceSet::new(&provider, root, Arc::clone(&health), provider.holders());
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
-    let drive = drive_config();
-    let (pacer, funder) = (BudgetPacer::new(), no_topups());
+    let gate = recovery_gate();
+    let (pacer, funder) = (BudgetPacer::new(), no_funding());
     let whole = [(0, total)];
     let env = AcquireEnv {
         pacer: &pacer,
         funder: &funder,
-        drive: &drive,
+        recovery: &gate,
+        credentials: None,
         max_lanes: 1,
         stop: &stop,
         on_progress: None,
@@ -6209,7 +6334,7 @@ async fn the_known_end_is_the_claim_or_bound_until_a_size_is_proven() -> anyhow:
         root,
         8 * MIB,
         &BudgetPacer::new(),
-        &no_topups(),
+        &no_funding(),
         1,
         None,
     )
@@ -6238,5 +6363,350 @@ async fn a_bound_that_shrinks_under_a_missing_query_clips_it() -> anyhow::Result
         .store(MIB, std::sync::atomic::Ordering::SeqCst);
     let across = super::store_missing(&store, 0, 4 * MIB).await?;
     assert_eq!(ranges_content_len(&across, store.total_bytes()), MIB);
+    Ok(())
+}
+
+/// A provider that builds its one holder's lane from the credential slot's
+/// current key, with one ledger per signer, as a run registry keys its lanes
+/// by `(pool, signer, provider)`.
+struct SlotSources {
+    slot: crate::CredentialSlot,
+    source: ScriptedSource,
+    ledgers: Mutex<std::collections::HashMap<Address, Arc<PoolLedger>>>,
+}
+
+const SLOT_PROVIDER: u8 = 0xA1;
+
+impl SlotSources {
+    fn new(slot: &crate::CredentialSlot, source: ScriptedSource) -> Self {
+        Self {
+            slot: slot.clone(),
+            source,
+            ledgers: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn holder() -> crate::Holder {
+        crate::Holder {
+            provider: Address::repeat_byte(SLOT_PROVIDER),
+            coverage: None,
+            rtt_ms: 0.0,
+            probed_holder: true,
+        }
+    }
+
+    /// Every ledger built, one per signer.
+    fn ledgers(&self) -> Vec<(Address, Arc<PoolLedger>)> {
+        self.ledgers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(signer, ledger)| (*signer, Arc::clone(ledger)))
+            .collect()
+    }
+}
+
+impl crate::SourceProvider for SlotSources {
+    type Source = ScriptedSource;
+
+    fn discover(&self, _hash: [u8; 32]) -> crate::SourceFuture<'_, Vec<crate::Holder>> {
+        Box::pin(async { Ok(vec![Self::holder()]) })
+    }
+
+    fn connect<'a>(
+        &'a self,
+        _holder: &'a crate::Holder,
+    ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
+        let credential = self.slot.current();
+        let signer = credential.signer.address();
+        let ledger = Arc::clone(
+            self.ledgers
+                .lock()
+                .unwrap()
+                .entry(signer)
+                .or_insert_with(|| Arc::new(PoolLedger::new(Cumulative::default()))),
+        );
+        let mut ctx = ctx_with(SLOT_PROVIDER, U256::from(u128::MAX));
+        ctx.client_signer = credential.signer;
+        ctx.capability = Some(credential.capability);
+        let lane = candidate_ctx(
+            self.source.clone().paying(Arc::clone(&ledger)),
+            ledger,
+            Arc::new(Mutex::new(ctx)),
+            None,
+        );
+        Box::pin(async move { Ok(lane) })
+    }
+}
+
+/// A capability for a fresh key, capped at `spending_cap`, a day from expiry.
+fn delegate(spending_cap: u64) -> crate::Credential {
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let capability = decdn_incentive::Capability {
+        signer: signer.address(),
+        spending_cap,
+        pool_id: B256::repeat_byte(0x11),
+        expiry: crate::credential::unix_now() + 24 * 60 * 60,
+    }
+    .sign(
+        &signer,
+        &decdn_incentive::bind_node_id_domain(1, Address::ZERO),
+    )
+    .unwrap();
+    crate::Credential {
+        signer: Arc::new(signer),
+        capability,
+    }
+}
+
+fn slot_for(credential: &crate::Credential, wait: Duration) -> crate::CredentialSlot {
+    crate::CredentialSlot::new(
+        Arc::clone(&credential.signer),
+        credential.capability.clone(),
+    )
+    .with_swap_wait(wait)
+}
+
+/// Acquire the whole `root` blob from `provider` as a delegate under `slot`.
+async fn acquire_delegated(
+    store: &ClientRangedStore,
+    provider: &SlotSources,
+    root: [u8; 32],
+) -> anyhow::Result<()> {
+    let total = store.total_bytes();
+    let mut set = SourceSet::new(provider, root, Arc::default(), vec![SlotSources::holder()]);
+    let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+    let gate = RecoveryGate::with_settle(Duration::ZERO);
+    acquire(
+        AcquireTarget {
+            store,
+            hash: root,
+            total_bytes: total,
+            ranges: &[(0, total)],
+        },
+        &mut set,
+        &AcquireEnv {
+            pacer: &BudgetPacer::new(),
+            funder: &no_funding(),
+            recovery: &gate,
+            credentials: Some(&provider.slot),
+            max_lanes: 1,
+            stop: &stop,
+            on_progress: None,
+            ledgers: None,
+            pacing: None,
+            max_blob_bytes: 0,
+        },
+    )
+    .await
+}
+
+fn cap_rejection() -> anyhow::Error {
+    anyhow::Error::new(UpstreamVoucherRejected {
+        reason: decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted,
+        bundle: None,
+        proof_generation: None,
+    })
+}
+
+/// A swap mid-stream ends the lane on the old key at a voucher boundary, paid
+/// for what it received. A new lane under the new key resumes at the
+/// delivered frontier, so every delivered byte is paid once and no byte is
+/// fetched twice.
+#[tokio::test(start_paused = true)]
+async fn a_swap_mid_stream_retires_the_old_lane_paid_and_resumes_under_the_new_key()
+-> anyhow::Result<()> {
+    let data = blob(4 * 1024 * 1024);
+    let source = ScriptedSource::new(data.clone())?.throttled(Duration::from_millis(5));
+    let (root, total) = (source.root(), source.total_bytes());
+    let (store, dir) = fresh_store(root, total);
+    let (old, new) = (delegate(u64::MAX), delegate(u64::MAX));
+    let slot = slot_for(&old, Duration::ZERO);
+    let provider = SlotSources::new(&slot, source.clone());
+
+    let swap = async {
+        while source.delivered_bytes() < 1024 * 1024 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        slot.swap(Arc::clone(&new.signer), new.capability.clone());
+    };
+    let (fetched, ()) = tokio::join!(acquire_delegated(&store, &provider, root), swap);
+    fetched?;
+    store.finalize().await?;
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+    let opened = source.opened_ranges();
+    assert_eq!(
+        opened.first().map(|&(start, _)| start),
+        Some(0),
+        "{opened:?}"
+    );
+    let resumed = opened.get(1).map_or(0, |&(start, _)| start);
+    assert!(
+        resumed >= 1024 * 1024 / 2 && resumed < total,
+        "the new lane resumes at the delivered frontier: {opened:?}"
+    );
+    let ledgers = provider.ledgers();
+    assert_eq!(ledgers.len(), 2, "one lane per key");
+    assert_eq!(
+        source.delivered_bytes(),
+        total,
+        "no content byte is delivered twice"
+    );
+    // One whole-blob fetch on one lane is the price of the blob's wire.
+    let baseline = {
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let once = ScriptedSource::new(data)?.paying(Arc::clone(&ledger));
+        let (single, _dir) = fresh_store(root, total);
+        let sources = StaticSources::new(vec![candidate(once, Arc::clone(&ledger), 0xB2, None)])?;
+        acquire_under(&single, &sources, root, &no_funding(), &RecoveryGate::new()).await?;
+        ledger.committed().bytes
+    };
+    let paid: U256 = ledgers
+        .iter()
+        .map(|(_, ledger)| ledger.committed().bytes)
+        .fold(U256::ZERO, U256::saturating_add);
+    assert!(paid >= baseline, "UNDER-PAY: paid {paid} of {baseline}");
+    assert!(
+        paid <= baseline + U256::from(64 * 1024),
+        "DOUBLE-PAY: paid {paid} for a blob whose wire costs {baseline}"
+    );
+    for (signer, ledger) in &ledgers {
+        assert!(
+            ledger.committed().bytes > U256::ZERO,
+            "the lane on {signer} paid for what it received"
+        );
+    }
+    Ok(())
+}
+
+/// At the exhausted candidate set a delegate waits for a swap. A swap inside
+/// the wait gives one more pass under the new key, and the fetch completes.
+#[tokio::test(start_paused = true)]
+async fn a_swap_inside_the_wait_resumes_the_fetch() -> anyhow::Result<()> {
+    let data = blob(1024 * 1024);
+    let source = ScriptedSource::new(data.clone())?.fault_once_after(0, cap_rejection);
+    let (root, total) = (source.root(), source.total_bytes());
+    let (store, dir) = fresh_store(root, total);
+    let (old, new) = (delegate(u64::MAX), delegate(u64::MAX));
+    let slot = slot_for(&old, Duration::from_mins(1));
+    let provider = SlotSources::new(&slot, source.clone());
+    let started = tokio::time::Instant::now();
+
+    let swap = async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        slot.swap(Arc::clone(&new.signer), new.capability.clone());
+    };
+    let (fetched, ()) = tokio::join!(acquire_delegated(&store, &provider, root), swap);
+    fetched?;
+    store.finalize().await?;
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    assert!(
+        started.elapsed() < Duration::from_mins(1),
+        "the swap ends the wait"
+    );
+    assert_eq!(slot.generation(), 1);
+    Ok(())
+}
+
+/// With no swap inside the wait, the delegate ends with a typed
+/// `NewCapability` once the wait runs out, naming the pool and the cause.
+#[tokio::test(start_paused = true)]
+async fn no_swap_inside_the_wait_ends_needing_a_new_capability() -> anyhow::Result<()> {
+    let source = ScriptedSource::new(blob(1024 * 1024))?.with_fault_after(0, cap_rejection);
+    let (root, total) = (source.root(), source.total_bytes());
+    let (store, _dir) = fresh_store(root, total);
+    // A cap of 1 against a 1 MiB blob at 1 per MB plus one window of 1.
+    let credential = delegate(1);
+    let slot = slot_for(&credential, Duration::from_secs(10));
+    let mut events = slot.funding_events();
+    let provider = SlotSources::new(&slot, source);
+    let started = tokio::time::Instant::now();
+
+    let err = acquire_delegated(&store, &provider, root)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("must stop"))?;
+    assert!(
+        started.elapsed() >= Duration::from_secs(10),
+        "the wait ran out"
+    );
+    assert_eq!(
+        err.downcast_ref::<crate::FundingNeeded>(),
+        Some(&crate::FundingNeeded::NewCapability {
+            pool: B256::repeat_byte(0x11),
+            cause: crate::CapabilityCause::CapSpent,
+        }),
+        "{err:#}"
+    );
+    assert_eq!(classify(&err), Fault::Fatal(FatalScope::Command));
+    assert!(
+        matches!(
+            *events.borrow_and_update(),
+            Some(crate::FundingEvent::RunningLow { .. })
+        ),
+        "the fetch signalled the capability running low"
+    );
+    Ok(())
+}
+
+/// Nodes that refuse the pool's funding while the capability still covers
+/// the work end the fetch at once with `PublisherPool`: only the pool owner
+/// can help, so the fetch waits for no swap.
+#[tokio::test(start_paused = true)]
+async fn a_pool_refusal_under_a_healthy_capability_names_the_publisher_pool() -> anyhow::Result<()>
+{
+    let source = ScriptedSource::new(blob(1024 * 1024))?.with_fault_after(0, || {
+        anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Unfunded))
+    });
+    let (root, total) = (source.root(), source.total_bytes());
+    let (store, _dir) = fresh_store(root, total);
+    let credential = delegate(u64::MAX);
+    let slot = slot_for(&credential, Duration::from_mins(1));
+    let provider = SlotSources::new(&slot, source);
+    let started = tokio::time::Instant::now();
+
+    let err = acquire_delegated(&store, &provider, root)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("must stop"))?;
+    assert!(started.elapsed() < Duration::from_mins(1), "no swap wait");
+    assert_eq!(
+        err.downcast_ref::<crate::FundingNeeded>(),
+        Some(&crate::FundingNeeded::PublisherPool {
+            pool: B256::repeat_byte(0x11),
+        }),
+        "{err:#}"
+    );
+    assert_eq!(
+        *slot.funding_events().borrow(),
+        None,
+        "the capability is fine"
+    );
+    Ok(())
+}
+
+/// A capability that nodes refuse while its local cap and expiry still cover
+/// the work reads as revoked.
+#[tokio::test(start_paused = true)]
+async fn a_capability_refused_with_headroom_left_reads_as_revoked() -> anyhow::Result<()> {
+    let source = ScriptedSource::new(blob(1024 * 1024))?.with_fault_after(0, cap_rejection);
+    let (root, total) = (source.root(), source.total_bytes());
+    let (store, _dir) = fresh_store(root, total);
+    let credential = delegate(u64::MAX);
+    let slot = slot_for(&credential, Duration::ZERO);
+    let provider = SlotSources::new(&slot, source);
+    let err = acquire_delegated(&store, &provider, root)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("must stop"))?;
+    assert_eq!(
+        err.downcast_ref::<crate::FundingNeeded>(),
+        Some(&crate::FundingNeeded::NewCapability {
+            pool: B256::repeat_byte(0x11),
+            cause: crate::CapabilityCause::Revoked,
+        }),
+        "{err:#}"
+    );
     Ok(())
 }

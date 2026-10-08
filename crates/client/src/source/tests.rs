@@ -1,8 +1,7 @@
-use super::{BlobSource, Funder};
+use super::{BlobSource, Funder, Recovery};
 use crate::sink::StashedFault;
 use alloy::primitives::U256;
 use decdn_bao_range::{AlignedRange, align_range};
-use decdn_incentive::DepositOutcome;
 use iroh_io::AsyncStreamReader;
 
 fn blob(len: usize) -> Vec<u8> {
@@ -82,13 +81,29 @@ fn peer_source_is_a_blob_source() {
     assert_impl::<super::PeerSource<'static>>();
 }
 
-/// The fake funder records amounts and echoes its scripted outcome.
+/// The fake funder records the remaining deposits it was asked to recover
+/// from and answers its script in order, repeating the last outcome.
 #[tokio::test]
-async fn fake_funder_records_and_returns() -> anyhow::Result<()> {
-    let funder = super::FakeFunder::new(3, DepositOutcome::Added(U256::from(100u64)));
-    assert_eq!(funder.max_topups(), 3);
-    let out = funder.top_up(U256::from(40u64)).await?;
-    assert_eq!(out, DepositOutcome::Added(U256::from(100u64)));
-    assert_eq!(funder.calls(), vec![U256::from(40u64)]);
+async fn fake_funder_records_and_answers_its_script() -> anyhow::Result<()> {
+    let funder = super::FakeFunder::scripted(vec![
+        Recovery::ToppedUp(U256::from(100u64)),
+        Recovery::Unavailable,
+    ]);
+    assert_eq!(
+        funder.recover(U256::from(40u64)).await?,
+        Recovery::ToppedUp(U256::from(100u64))
+    );
+    assert_eq!(
+        funder.recover(U256::from(5u64)).await?,
+        Recovery::Unavailable
+    );
+    assert_eq!(
+        funder.recover(U256::from(5u64)).await?,
+        Recovery::Unavailable
+    );
+    assert_eq!(
+        funder.calls(),
+        vec![U256::from(40u64), U256::from(5u64), U256::from(5u64)]
+    );
     Ok(())
 }

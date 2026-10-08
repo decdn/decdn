@@ -16,15 +16,14 @@ use anyhow::{Context, Result};
 use decdn_client::buyer_pool::{ProgressWrite, ensure_allowance, open_pool, self_owned_lane_ctx};
 use decdn_client::discovery::{self, NodeCandidate};
 use decdn_client::{
-    Funder, PeerSource, PoolContext, PoolLedger, PullDeadlines, SourceFuture, StreamCandidate,
-    VoucherProgress, effective_rate_ceiling, endpoint, probe, provider,
+    Funder, PeerSource, PoolContext, PoolLedger, PullDeadlines, Recovery, SourceFuture,
+    StreamCandidate, VoucherProgress, effective_rate_ceiling, endpoint, probe, provider,
 };
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity::load_signer;
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{
-    BuyerPoolState, BuyerPoolStore, Deployment, DepositOutcome, LaneKey, bind_node_id_domain,
-    slash_judge_domain,
+    BuyerPoolState, BuyerPoolStore, Deployment, LaneKey, bind_node_id_domain, slash_judge_domain,
 };
 use decdn_protocol::Coverage;
 use iroh::{Endpoint, EndpointAddr};
@@ -303,18 +302,15 @@ pub(crate) struct Lane {
     ledger: Arc<PoolLedger>,
 }
 
-/// A [`Funder`] that never tops the pool up: a fetch that runs the deposit dry
-/// fails with [`decdn_client::PoolExhausted`]. A caller that wants reactive
-/// top-ups implements `top_up` with `decdn_client::buyer_pool::top_up`.
-pub(crate) struct NoTopUp;
+/// A [`Funder`] that never adds funds: a fetch whose sources all refuse the
+/// deposit fails "funding needed" ([`decdn_client::NoAffordableSource`]). A
+/// caller that wants funding recovery implements `recover` with
+/// `decdn_client::buyer_pool::top_up`.
+pub(crate) struct NoFunding;
 
-impl Funder for NoTopUp {
-    fn max_topups(&self) -> u32 {
-        0
-    }
-
-    fn top_up(&self, _additional: U256) -> SourceFuture<'_, DepositOutcome> {
-        Box::pin(async { anyhow::bail!("this buyer does not top up its pool") })
+impl Funder for NoFunding {
+    fn recover(&self, _remaining: U256) -> SourceFuture<'_, Recovery> {
+        Box::pin(async { Ok(Recovery::Unavailable) })
     }
 }
 

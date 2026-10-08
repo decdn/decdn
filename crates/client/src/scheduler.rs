@@ -115,7 +115,7 @@
 //!   Verified bytes already stored are never refetched.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -132,17 +132,21 @@ use tokio::time::Instant;
 use crate::coverage_plan::{
     SourceCoverage, covered_part, covered_suffix_start, covers_byte_range, spread_segments,
 };
+use crate::credential::{
+    CapabilityCause, CredentialSlot, CredentialView, FundingNeeded, QuoteMax, unix_now,
+};
 use crate::driver::{
-    DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PacingWait, SharedPool,
-    UnitProgress, WaitReason, contiguous_byte_ranges, fill_gap, ranges_content_len,
+    DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PacingWait, SharedPool, UnitProgress, WaitReason,
+    contiguous_byte_ranges, fill_gap, ranges_content_len,
 };
 use crate::fault::Fault;
 use crate::health::PeerHealth;
 use crate::ledgers::LaneLedgers;
 use crate::pacer::DownstreamFrontier;
+use crate::recovery::{RecoveryGate, SwapStep, after_step};
 use crate::segment::{split_evenly, steal_split, without_runs};
 use crate::source::{BlobSource, Funder, IngestStore, SourceFuture, SourceStream};
-use crate::source_set::{Holder, SourceProvider, SourceSet};
+use crate::source_set::{Holder, NoAffordableSource, SourceProvider, SourceSet};
 use crate::stop::StopPolicy;
 use crate::streamer::StreamCandidate;
 use crate::{Pacer, PoolContext, PoolLedger};
@@ -331,10 +335,18 @@ pub struct AcquireEnv<'a, Pc, F> {
     /// Decides each leg's draw against the pool's budget (or, under
     /// consumption pacing, against the consumer's window).
     pub pacer: &'a Pc,
-    /// Tops the pool's deposit up when a lane's pacer asks for it.
+    /// Runs the funding recovery step when the candidate set is exhausted with
+    /// a source priced out (ADR 003 § Funding recovery).
     pub funder: &'a F,
-    /// The driver's payment knobs.
-    pub drive: &'a DriveConfig,
+    /// The fetch's funding recovery state: the progress rule and the settle
+    /// window after a top-up. Shared by every entry of a bundle pull and by a
+    /// pass that runs again against a replaced pool.
+    pub recovery: &'a RecoveryGate,
+    /// A delegated fetch's voucher credential, or `None` for a fetch that pays
+    /// from its own pool. With a slot, the loop retires the lanes on a swapped
+    /// key, publishes the running-low signal, and at the exhausted candidate
+    /// set waits for a swap instead of topping up ([`CredentialSlot`]).
+    pub credentials: Option<&'a CredentialSlot>,
     /// The most lanes that stream at once.
     pub max_lanes: usize,
     /// When the acquire gives up for lack of progress. Every verified byte
@@ -834,6 +846,11 @@ enum LaneEnd {
         piece_at: u64,
         at: Instant,
     },
+    /// The lane signs under a key the credential slot no longer holds. The
+    /// worker paid for what it received, ended at that voucher boundary, and
+    /// re-queued the rest. The loop drops the lane and builds a new one under
+    /// the current credential.
+    Retired,
 }
 
 /// What [`run_worker`] hands back to the loop.
@@ -2069,15 +2086,13 @@ async fn yield_to_front(
 
 /// Everything a worker shares with the loop and its peers, borrowed from
 /// [`acquire`]'s frame.
-struct Engine<'a, St, Pc, F> {
+struct Engine<'a, St, Pc> {
     /// The store every lane writes. Its bound is the planner's size, read
     /// fresh at each use: it grows while no size is proven and shrinks to a
     /// proven size.
     store: &'a St,
     hash: [u8; 32],
     pacer: &'a Pc,
-    funder: &'a F,
-    drive: &'a DriveConfig,
     work: &'a AsyncMutex<Work>,
     /// Wakes workers parked because nothing was pickable, whenever a peer
     /// frees, re-queues, or ends.
@@ -2091,6 +2106,9 @@ struct Engine<'a, St, Pc, F> {
     /// The lane watchdog's window; zero turns it off.
     watchdog: Duration,
     pacing: Option<&'a ConsumptionPacing<'a>>,
+    /// The delegated fetch's credential: a worker on a lane whose key it no
+    /// longer holds ends at its next voucher boundary.
+    credentials: Option<&'a CredentialSlot>,
 }
 
 /// One lane's worker: loop picking a range and driving `fill_gap` over it,
@@ -2119,8 +2137,8 @@ struct Engine<'a, St, Pc, F> {
 // money-relevant decision against the loop state they act on, and an extra
 // worker's one-piece exits sit beside them; splitting them out would separate
 // the decisions from that state.
-async fn run_worker<St, S, Pc, F>(
-    engine: &Engine<'_, St, Pc, F>,
+async fn run_worker<St, S, Pc>(
+    engine: &Engine<'_, St, Pc>,
     i: usize,
     lane: Arc<StreamCandidate<S>>,
     provider: Address,
@@ -2131,7 +2149,6 @@ where
     St: IngestStore,
     S: BlobSource,
     Pc: Pacer,
-    F: Funder,
 {
     let extra = matches!(hold, Hold::Extra(_));
     let Engine {
@@ -2161,8 +2178,8 @@ where
                 .unwrap_or_else(PoisonError::into_inner),
         )
     };
-    // Per-worker resume/quote state. The reactive-top-up budget is NOT in here:
-    // it is a property of the one shared pool and lives in `pool`.
+    // Per-worker resume/quote state. The pool's spend is NOT in here: it is a
+    // property of the one shared pool and lives in `pool`.
     let mut counters = DriveCounters::new();
     // Wake every parked peer: this worker changed the work state.
     let wake = || progress_wake.notify_waiters();
@@ -2170,7 +2187,95 @@ where
     // `yield_to_front` can move it to an earlier re-queued range.
     let lane_parked = AtomicBool::new(false);
     let lane_parked_wake = Notify::new();
+    // The spans this lane delivered and did not pay for when a funding refusal
+    // ended its last worker. The lane owes them, so its own worker bills them
+    // first, although the store holds the bytes (ADR 003 § Funding recovery).
+    if !extra && !retired(engine.credentials, &lane) {
+        let owed = lane.ledger.take_unpaid(hash);
+        for (index, &(start, len)) in owed.iter().enumerate() {
+            let settled = tokio::select! {
+                biased;
+                res = fill_gap(
+                    store,
+                    &lane.source,
+                    engine.pacer,
+                    &lane.ctx,
+                    &lane.ledger,
+                    hash,
+                    start,
+                    len,
+                    &mut counters,
+                    // The bytes are present: the bar already counts them.
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(engine.pool),
+                    None,
+                ) => res.map(Some),
+                () = cancelled(&handle) => Ok(None),
+            };
+            let (unreached, err) = match settled {
+                Ok(Some(())) => continue,
+                // A cancel leaves this span and the rest owed.
+                Ok(None) => (index, None),
+                // The failed fill recorded what it still owes in this span.
+                Err(err) => (index.saturating_add(1), Some(err)),
+            };
+            // The spans this worker did not reach stay owed.
+            for &(rest, rest_len) in owed.iter().skip(unreached) {
+                lane.ledger
+                    .note_unpaid(hash, rest, rest.saturating_add(rest_len));
+            }
+            let Some(err) = err else { break };
+            work.lock().await.park(i);
+            wake();
+            return Ok(WorkerEnd {
+                provider,
+                end: LaneEnd::Faulted {
+                    err: Some(err),
+                    range: crate::source_set::LaneRange {
+                        offset: start,
+                        len,
+                        landed: 0,
+                        past_end: false,
+                        uncovered: false,
+                    },
+                    piece_at: start,
+                    at: Instant::now(),
+                },
+                delivered,
+                pulled_through,
+                covered_served: take_served(),
+                extra,
+            });
+        }
+    }
     loop {
+        // A swapped credential retires this lane: its last unit stopped at a
+        // voucher boundary, paid for what it received. The rest goes back to
+        // the queue, and the loop builds a lane under the new key.
+        if retired(engine.credentials, &lane) {
+            requeue_missing(store, work, i).await?;
+            {
+                let mut w = work.lock().await;
+                if extra {
+                    w.end_extra(i);
+                } else {
+                    w.park(i);
+                }
+            }
+            wake();
+            return Ok(WorkerEnd {
+                provider,
+                end: LaneEnd::Retired,
+                delivered,
+                pulled_through,
+                covered_served: take_served(),
+                extra,
+            });
+        }
         // Register for the peer-progress wakeup BEFORE reading the work state, so
         // a peer that changes it between this read and the park below cannot slip
         // between the two and leave this worker asleep on work it could take.
@@ -2314,6 +2419,10 @@ where
             unit: &unit,
         });
         for (g_start, g_len) in gaps {
+            // A retired lane opens no new leg.
+            if retired(engine.credentials, &lane) {
+                break;
+            }
             piece_at = g_start;
             let verified = &unit.progress.verified;
             let before = verified.load(Ordering::Relaxed);
@@ -2322,13 +2431,11 @@ where
                     store,
                     &lane.source,
                     engine.pacer,
-                    engine.funder,
                     &lane.ctx,
                     &lane.ledger,
                     hash,
                     g_start,
                     g_len,
-                    engine.drive,
                     &mut counters,
                     Some(engine.on_progress),
                     // The shared whole-blob delivered counter: every lane folds its
@@ -2343,10 +2450,8 @@ where
                     // `None` keeps the eager, unbounded fan-out.
                     lane_wait.as_ref().map(|w| w as &dyn PacingWait),
                     engine.pacing.map(|p| p.downstream),
-                    // Everything this lane must not treat as its own: the
-                    // aggregate spend the deposit gate subtracts, the fetch-wide
-                    // top-up budget, and the credit path that shows a landed
-                    // top-up to EVERY lane.
+                    // The aggregate spend the deposit gate subtracts, which
+                    // this lane must not treat as its own.
                     Some(engine.pool),
                     // The end a peer's steal lowers to its split.
                     Some(&unit.stop_at),
@@ -2376,6 +2481,11 @@ where
                     // error while it checks is ours (#2213).
                     err = watchdog(store, g_start, g_len, engine.watchdog, verified) => {
                         UnitOutcome::Faulted(err)
+                    }
+                    // Never ends: on a swap it lowers the unit's end, and the
+                    // leg stops at its next voucher boundary.
+                    () = retire_on_swap(engine.credentials, &lane, &unit, g_start) => {
+                        UnitOutcome::Cancelled
                     }
                 }
             };
@@ -2419,7 +2529,11 @@ where
                         "a lane stopped its stream at a steal split"
                     );
                 }
-                work.lock().await.clear(i)?;
+                // A retired lane keeps its range for the loop top, which
+                // re-queues what it did not receive.
+                if !retired(engine.credentials, &lane) {
+                    work.lock().await.clear(i)?;
+                }
             }
             // Cancelled: re-queue the remainder and stay live. The
             // credit-window tail [paid_frontier, checkpointed_frontier) is NOT
@@ -2475,8 +2589,9 @@ where
                 });
             }
         }
-        // An extra worker takes one piece, then gives its stream back.
-        if extra {
+        // An extra worker takes one piece, then gives its stream back. A
+        // retired one first re-queues what it did not receive (loop top).
+        if extra && !retired(engine.credentials, &lane) {
             work.lock().await.end_extra(i);
             wake();
             return Ok(WorkerEnd {
@@ -2492,11 +2607,44 @@ where
     }
 }
 
+/// Whether `lane` signs under a key `slot` no longer holds.
+fn retired<S>(slot: Option<&CredentialSlot>, lane: &StreamCandidate<S>) -> bool {
+    slot.is_some_and(|slot| slot.is_stale(&lane.ctx))
+}
+
+/// Retire `unit` at its next voucher boundary once `slot` no longer holds
+/// `lane`'s key: lower its end to the chunk group its frontier reaches, at or
+/// past `start`. The leg in flight stops there on its open stream, paid for
+/// what it received ([`crate::BlobSource::stop`]). Never completes.
+async fn retire_on_swap<S>(
+    slot: Option<&CredentialSlot>,
+    lane: &StreamCandidate<S>,
+    unit: &Unit,
+    start: u64,
+) {
+    if let Some(slot) = slot {
+        loop {
+            // The generation first: a swap after it wakes the wait below.
+            let generation = slot.generation();
+            if slot.is_stale(&lane.ctx) {
+                // `SeqCst`, as a steal orders its end against the frontier.
+                let frontier = unit.progress.frontier.load(Ordering::SeqCst).max(start);
+                let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+                let end = frontier.div_ceil(group).saturating_mul(group);
+                unit.stop_at.fetch_min(end, Ordering::SeqCst);
+                break;
+            }
+            slot.swapped_since(generation).await;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
 /// One worker's future: [`run_worker`], holding `hold`, what its stream
 /// holds ([`Hold`]): a lane's own worker releases the lane's lease as it
 /// ends, and every grant a [`LaneWiden`] made for it is given back.
-async fn worker<St, S, Pc, F>(
-    engine: &Engine<'_, St, Pc, F>,
+async fn worker<St, S, Pc>(
+    engine: &Engine<'_, St, Pc>,
     i: usize,
     lane: Arc<StreamCandidate<S>>,
     provider: Address,
@@ -2507,7 +2655,6 @@ where
     St: IngestStore,
     S: BlobSource,
     Pc: Pacer,
-    F: Funder,
 {
     let mut hold = hold;
     run_worker(engine, i, lane, provider, health, &mut hold).await
@@ -3002,6 +3149,57 @@ fn raise_to_lane<S>(raise: &dyn Fn(U256), lane: &StreamCandidate<S>) {
     raise(seen);
 }
 
+/// Wait until `slot` takes a swap past `generation`; never, without a slot.
+async fn swap_after(slot: Option<&CredentialSlot>, generation: u64) {
+    match slot {
+        Some(slot) => slot.swapped_since(generation).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The local view of `slot`'s current capability against the work left
+/// ([`CredentialView`]): what this fetch signed under its key, from the run
+/// registry's lanes when there is one and from `lanes` otherwise, and the
+/// missing bytes of `ranges` at the highest quote.
+///
+/// # Errors
+///
+/// A store query failure.
+async fn credential_view<St, S>(
+    slot: &CredentialSlot,
+    store: &St,
+    ranges: &[(u64, u64)],
+    lanes: &[Arc<StreamCandidate<S>>],
+    ledgers: Option<&LaneLedgers>,
+    quotes: &QuoteMax,
+) -> anyhow::Result<CredentialView>
+where
+    St: IngestStore,
+{
+    let credential = slot.current();
+    let signer = credential.signer.address();
+    let spent_by_key = match ledgers {
+        Some(reg) => reg.committed_by(signer),
+        None => lanes
+            .iter()
+            .filter(|lane| {
+                lane.ctx
+                    .lock()
+                    .is_ok_and(|ctx| ctx.client_signer.address() == signer)
+            })
+            .map(|lane| lane.ledger.committed().amount)
+            .fold(U256::ZERO, U256::saturating_add),
+    };
+    let remaining = ranges_content_len(&missing_chunks(store, ranges).await?, store.total_bytes());
+    Ok(CredentialView::of(
+        &credential,
+        spent_by_key,
+        remaining,
+        quotes,
+        unix_now(),
+    ))
+}
+
 /// Fill `target.ranges` of one blob from `sources` (ADR 039 § Dynamic
 /// segmentation and tail-stealing).
 ///
@@ -3045,11 +3243,20 @@ fn raise_to_lane<S>(raise: &dyn Fn(U256), lane: &StreamCandidate<S>) {
 /// lane this acquire has started; `Some(reg)` subtracts `reg.total_committed()`,
 /// the sum over every lane a `bundle pull` run has registered. Either way the
 /// funder's view of the whole pool ([`crate::Funder::pool_spent`]) wins when it
-/// is larger, and the
-/// reactive-top-up budget is counted once for the acquire rather than once per
-/// lane, and a landed top-up is credited to every lane the view covers. The gate
-/// is evaluated at each `fill_gap` leg boundary; the hard backstop against a
-/// node redeeming past the deposit stays on-chain.
+/// is larger. The gate is evaluated at each `fill_gap` leg boundary; the hard
+/// backstop against a node redeeming past the deposit stays on-chain.
+///
+/// # Funding recovery (ADR 003 § Funding recovery)
+///
+/// A lane never adds funds. A source whose next voucher the deposit cannot
+/// cover, or that refuses the pool `Unfunded`, is priced out at the current
+/// deposit while other sources keep serving. Only when the candidate set is
+/// exhausted with a source priced out does the loop run one step through
+/// [`AcquireEnv::funder`], under [`AcquireEnv::recovery`]'s progress rule. A
+/// step that raises the deposit credits it to every lane the view covers, and
+/// the priced-out sources become usable again for one more pass. During the
+/// settle window after a top-up, a source's funding refusal holds it briefly
+/// instead of pricing it out again.
 ///
 /// Finalization is the caller's job: this only flushes the present record
 /// (its single-writer flush point), periodically and once more when it
@@ -3068,7 +3275,10 @@ fn raise_to_lane<S>(raise: &dyn Fn(U256), lane: &StreamCandidate<S>) {
 /// - [`crate::GaveUp`] once the stop policy's limit passes without a verified
 ///   byte;
 /// - [`crate::NoAffordableSource`] or [`crate::NoSourceHasBlob`] on a
-///   unanimous verdict of the sources;
+///   unanimous verdict of the sources, the former once no recovery step can
+///   raise the deposit;
+/// - [`crate::PoolReplaced`] when the recovery step opened a new pool: the
+///   caller runs the remaining work again against it;
 /// - a store I/O failure or a segmentation alignment error.
 pub async fn acquire<St, P, Pc, F>(
     target: AcquireTarget<'_, St>,
@@ -3143,8 +3353,8 @@ where
 
     // The pool deposit every lane draws on, as the loop last saw it. Each built
     // lane raises it to the deposit its row read (the first names it, a later
-    // one carries any refill its build made); a landed top-up publishes the new
-    // value.
+    // one carries any refill its build made); a funding recovery step
+    // publishes the new value.
     let (deposit_tx, mut deposit_rx) = tokio::sync::watch::channel(U256::ZERO);
     // Every started lane's `(ctx, ledger)`: the pool-wide view when there is no
     // run registry.
@@ -3210,16 +3420,17 @@ where
             raised
         });
     };
-    let topups_used = AtomicU32::new(0);
-    // With a run registry every fetch of the run tops up the one deposit, so
-    // they share the run's lock; a solo acquire serializes only its own lanes.
-    let own_topup_lock = tokio::sync::Mutex::new(());
+    // The highest rate and voucher interval any lane was quoted: the price of
+    // the work left, for a delegated fetch's running-low signal.
+    let quotes = QuoteMax::default();
     let pool = SharedPool {
         spent: &spent,
-        topups_used: &topups_used,
-        credit: &*credit,
-        topup_lock: env.ledgers.map_or(&own_topup_lock, LaneLedgers::topup_lock),
+        quotes: Some(&quotes),
     };
+    // The credential generation the loop's lanes were built under, and
+    // whether a node refused the capability itself since then.
+    let mut generation_seen = env.credentials.map_or(0, CredentialSlot::generation);
+    let mut capability_refused = false;
 
     // Seeded with the bytes already present, so a resumed fetch's bar starts
     // where the last run left off; each lane folds in its own leg deltas.
@@ -3234,8 +3445,16 @@ where
     // the loop to clip the work.
     let bound_seen = AtomicU64::new(first_bound);
     let bound_moved = Notify::new();
-    // Every verified byte ticks the stop clock, then reaches the caller.
+    // The highest position reported so far: each rise is newly verified bytes
+    // for the recovery gate's progress rule.
+    let verified_seen = AtomicU64::new(base_present);
+    // Every verified byte ticks the stop clock and the recovery gate, then
+    // reaches the caller.
     let on_progress = |position: u64, total: u64| {
+        let before = verified_seen.fetch_max(position, Ordering::AcqRel);
+        if position > before {
+            env.recovery.record_verified(position - before);
+        }
         env.stop.clock.tick();
         if store.total_bytes() != bound_seen.load(Ordering::Acquire) {
             bound_moved.notify_one();
@@ -3248,8 +3467,6 @@ where
         store,
         hash,
         pacer: env.pacer,
-        funder: env.funder,
-        drive: env.drive,
         work: &work,
         progress_wake: &progress_wake,
         progress_agg: &progress_agg,
@@ -3257,6 +3474,7 @@ where
         pool: &pool,
         watchdog,
         pacing: env.pacing,
+        credentials: env.credentials,
     };
 
     let max_lanes = env.max_lanes.max(1);
@@ -3367,6 +3585,24 @@ where
             let total_bytes = bound;
             let now = Instant::now();
             let deposit = pool_deposit(&deposit_rx, &started.0);
+
+            // A swapped credential: every built lane on the old key drops, so
+            // each provider's next start builds a lane under the new one. The
+            // running lanes retire themselves at their next voucher boundary.
+            // What the sources refused under the old key says nothing about
+            // the new one.
+            if let Some(slot) = env.credentials
+                && slot.generation() != generation_seen
+            {
+                generation_seen = slot.generation();
+                sources.drop_lanes(|lane| slot.is_stale(&lane.ctx));
+                ready.retain(|(_, lane)| !slot.is_stale(&lane.ctx));
+                health.clear_unaffordable();
+                capability_refused = false;
+                let view = credential_view(slot, store, &want.ranges, &started.0, env.ledgers, &quotes)
+                    .await?;
+                slot.report(view.event());
+            }
 
             // Start lanes up to the cap, nearest first, for sources that cover work
             // still to do: cached lanes at once, the rest through `connect`.
@@ -3559,12 +3795,63 @@ where
                 growth.passed(now, hash, pass);
             }
 
-            // A lane ends priced out only once its driver's own top-up path has
-            // declined, so the top-up budget cannot revive a source at this deposit.
+            // The exhausted candidate set: no lane runs or builds, and a fresh
+            // discovery found nothing new. With a source priced out, this is the
+            // one place the loop adds funds (ADR 003 § Funding recovery). A
+            // raised deposit makes the priced-out sources usable for one more
+            // pass.
             if running.is_empty() && connecting.is_empty() && discovering.is_none() {
                 let only_uncovered = only_uncovered_left(sources, &*work.lock().await, total_bytes);
-                if let Some(err) = sources.exhausted(deposit, false, only_uncovered) {
-                    return Err(err);
+                if let Some(err) = sources.exhausted(deposit, only_uncovered) {
+                    if err.downcast_ref::<NoAffordableSource>().is_none() {
+                        return Err(err);
+                    }
+                    // A delegated fetch cannot add funds. When its capability
+                    // no longer pays, it waits for the application to swap
+                    // in a new one; when the capability still pays, only the
+                    // pool owner can help.
+                    if let Some(slot) = env.credentials {
+                        let view = credential_view(
+                            slot,
+                            store,
+                            &want.ranges,
+                            &started.0,
+                            env.ledgers,
+                            &quotes,
+                        )
+                        .await?;
+                        slot.report(view.event());
+                        let pool = slot.pool_id();
+                        let Some(cause) = view
+                            .cause()
+                            .or(capability_refused.then_some(CapabilityCause::Revoked))
+                        else {
+                            return Err(err.context(FundingNeeded::PublisherPool { pool }));
+                        };
+                        match env.recovery.swap_step(slot, generation_seen).await {
+                            // The loop top rebuilds the lanes under it.
+                            SwapStep::Swapped => continue,
+                            SwapStep::NoProgress | SwapStep::TimedOut => {
+                                return Err(
+                                    err.context(FundingNeeded::NewCapability { pool, cause })
+                                );
+                            }
+                        }
+                    }
+                    let stepped = env
+                        .recovery
+                        .step(
+                            env.funder,
+                            deposit,
+                            || pool_deposit(&deposit_rx, &started.0),
+                            spent(),
+                        )
+                        .await;
+                    let raised = after_step(stepped, err)?;
+                    if raised > deposit {
+                        credit(raised)?;
+                    }
+                    continue;
                 }
             }
             let uncovered = work.lock().await.uncovered(total_bytes);
@@ -3611,6 +3898,16 @@ where
                     }
                     if let Some(at) = pulled_through {
                         sources.record_pull_through(provider, at);
+                    }
+                    // A retired lane drops; its provider's next start builds a
+                    // lane under the current credential.
+                    if let (LaneEnd::Retired, Some(slot)) = (&end, env.credentials) {
+                        sources.drop_lanes(|lane| slot.is_stale(&lane.ctx));
+                    }
+                    if let LaneEnd::Faulted { err: Some(err), .. } = &end
+                        && crate::fault::refuses_capability(err)
+                    {
+                        capability_refused = true;
                     }
                     if let LaneEnd::Faulted {
                         err,
@@ -3672,7 +3969,9 @@ where
                                     );
                                 }
                             }
-                        } else {
+                        } else if !(env.recovery.settling(at)
+                            && sources.hold_while_settling(provider, &err, at))
+                        {
                             let deposit = pool_deposit(&deposit_rx, &started.0);
                             charged.insert(provider);
                             if let Fault::Fatal(_) =
@@ -3734,6 +4033,8 @@ where
                 }
                 () = sleep_until_opt(wake) => {}
                 Ok(()) = deposit_rx.changed() => {}
+                // A swapped credential: the loop top rebuilds the lanes.
+                () = swap_after(env.credentials, generation_seen) => {}
                 // A leg proved a size: the loop top clips the work to it.
                 () = bound_moved.notified() => {}
                 flushed = poll_opt(&mut record), if record.is_some() => {
@@ -3741,6 +4042,18 @@ where
                     flushed?;
                 }
                 _ = flush.tick() => {
+                    if let Some(slot) = env.credentials {
+                        let view = credential_view(
+                            slot,
+                            store,
+                            &want.ranges,
+                            &started.0,
+                            env.ledgers,
+                            &quotes,
+                        )
+                        .await?;
+                        slot.report(view.event());
+                    }
                     if record.is_none() {
                         record = Some(store.flush_present_record());
                     } else {

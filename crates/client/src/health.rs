@@ -103,6 +103,27 @@ impl PeerHealth {
         map.insert(provider, next);
     }
 
+    /// Hold `provider` off until `until` without counting a fault: its streak
+    /// stays. The acquire loop holds a source that refuses the pool's funding
+    /// while a funding recovery step's top-up settles.
+    #[doc(hidden)]
+    pub fn hold(&self, provider: Address, until: Instant) {
+        let mut map = self.lock();
+        let streak = map.get(&provider).copied().map_or(0, Health::streak);
+        map.insert(provider, Health::Cooling { until, streak });
+    }
+
+    /// Make every source priced out at the current funding usable again: a
+    /// swapped credential changes what the sources refused.
+    #[doc(hidden)]
+    pub fn clear_unaffordable(&self) {
+        for health in self.lock().values_mut() {
+            if matches!(health, Health::Unaffordable { .. }) {
+                *health = Health::Healthy { streak: 0 };
+            }
+        }
+    }
+
     /// Record a verified byte from `provider`: it is healthy with no streak.
     #[doc(hidden)]
     pub fn record_progress(&self, provider: Address) {

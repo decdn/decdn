@@ -103,7 +103,7 @@ use decdn_client::endpoint as client_endpoint;
 use decdn_client::provider;
 use decdn_client::{
     ClientRangedStore, Connections, DownloadTarget, Downloader, LaneLedgers, PeerHealth,
-    ProgressCallback, ProgressClock, PullDeadlines, StopPolicy,
+    PoolReplaced, ProgressCallback, ProgressClock, PullDeadlines, RecoveryGate, StopPolicy,
 };
 
 use super::cli_sources::CliSources;
@@ -1482,8 +1482,8 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     // Delegated adoption: `--capability`/`--capability-file` names a pool the
     // caller does NOT own and a capability authorizing this client's key to
     // spend against it (every entry pulls from that one pool). `None` => the
-    // unchanged self-owned pool path; a delegated grant also disables reactive
-    // top-up in `chain`.
+    // unchanged self-owned pool path; a delegated grant also zeroes the working
+    // deposit in `chain`, so its funding recovery step has nothing to add.
     let grant = fetch::resolve_delegation_grant(common, &mut chain)?;
 
     // Same guard as `decdn fetch`, for the same reason and before the same
@@ -1576,6 +1576,7 @@ async fn pull_over(
         grant,
         ledgers: LaneLedgers::new(),
         funding: fetch::RunFunding::default(),
+        recovery: Arc::new(RecoveryGate::new()),
         dedup_stats: DedupStats::default(),
         open_lock: tokio::sync::Mutex::new(()),
         gate: JobGate::new(args.jobs.max(1)),
@@ -1656,13 +1657,7 @@ async fn pull_manifest<P: Provider + Clone>(
     // Watched from here on: a Ctrl-C during the pull stops it gracefully (see
     // `pull_plain`), and the summary below still reports what landed.
     let mut interrupt = Interrupt::watch();
-    let PullRun {
-        outcomes,
-        mut warnings,
-        transfer,
-        interrupted,
-        stopped,
-    } = ctx
+    let mut run = ctx
         .pull_all(
             &manifest.entries,
             &args.output,
@@ -1671,6 +1666,48 @@ async fn pull_manifest<P: Provider + Clone>(
             &mut interrupt,
         )
         .await;
+    // A funding recovery step that replaced the pool ends the first pass. The
+    // remaining entries run once more against the new pool: lanes key on the
+    // pool, so the pass starts with fresh ledgers and funding facts, and each
+    // entry resumes the partial data it holds (ADR 003 § Funding recovery).
+    let replaced = replaced_pool(&run);
+    if let Some(new) = replaced {
+        eprintln!("note: {new}");
+        ctx.ledgers = LaneLedgers::new();
+        ctx.funding = fetch::RunFunding::default();
+        ctx.recovery.start_next_pass();
+        let saved = bundle_manifest::load(&args.output);
+        let second = ctx
+            .pull_all(
+                &manifest.entries,
+                &args.output,
+                args.overwrite,
+                saved,
+                &mut interrupt,
+            )
+            .await;
+        run = merge_passes(run, second);
+        eprintln!(
+            "note: pool {} accepts no more funds and may still hold a balance; once its \
+             dispute window ends, reclaim it with: decdn pool reclaim --pool {}",
+            new.closed, new.closed
+        );
+    }
+    let PullRun {
+        outcomes,
+        mut warnings,
+        transfer,
+        interrupted,
+        stopped,
+    } = run;
+    // A second replacement in one command ends it "funding needed".
+    let stopped = stopped.map(|err| match (replaced, err.downcast_ref::<PoolReplaced>()) {
+        (Some(_), Some(_)) => err.context(
+            "funding needed: the pool this pull opened accepts no more funds either; run the \
+             pull again",
+        ),
+        _ => err,
+    });
     ctx.progress.finish();
     warn_leftover_partials(&args.output, &manifest.entries, args.hash.as_deref());
     warnings.extend(ctx.funding.shortfall());
@@ -1771,6 +1808,51 @@ struct PullRun {
     interrupted: bool,
     /// The fault that ended the whole pull ([`ends_the_pull`]), if one did.
     stopped: Option<anyhow::Error>,
+}
+
+/// The pool replacement that ended `run`, when a funding recovery step opened
+/// a new pool and the pass was not interrupted.
+fn replaced_pool(run: &PullRun) -> Option<PoolReplaced> {
+    if run.interrupted {
+        return None;
+    }
+    run.stopped
+        .as_ref()
+        .and_then(|err| err.downcast_ref::<PoolReplaced>())
+        .copied()
+}
+
+/// One run's result from its `first` pass, which a pool replacement ended,
+/// and its `second` pass against the new pool. Both passes walk the same
+/// entries in the same order, so an entry the first pass landed and the
+/// second found present keeps the first pass's outcome; every other entry
+/// takes the second's. The two transfers add up.
+fn merge_passes(first: PullRun, second: PullRun) -> PullRun {
+    let outcomes = if first.outcomes.len() == second.outcomes.len() {
+        first
+            .outcomes
+            .into_iter()
+            .zip(second.outcomes)
+            .map(|(was, now)| match (&was, &now) {
+                (
+                    EntryOutcome::Fetched(_) | EntryOutcome::Linked | EntryOutcome::Deduped(_),
+                    EntryOutcome::Skipped,
+                ) => was,
+                _ => now,
+            })
+            .collect()
+    } else {
+        second.outcomes
+    };
+    let mut warnings = first.warnings;
+    warnings.extend(second.warnings);
+    PullRun {
+        outcomes,
+        warnings,
+        transfer: first.transfer.add(second.transfer),
+        interrupted: second.interrupted,
+        stopped: second.stopped,
+    }
 }
 
 /// The bundle-level namespace id (ADR 002) every paid pull in the run carries:
@@ -2327,7 +2409,8 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// Delegated capability adopted for every entry (`--capability`), or `None`
     /// for the self-owned pool path. When `Some`, every entry presents this
     /// owner-signed grant instead of opening/reusing the caller's own pool, and
-    /// reactive top-up is disabled (the delegate owns no pool to fund).
+    /// a funding recovery step has no funding path (the delegate owns no pool
+    /// to fund).
     grant: Option<decdn_incentive::CapabilityGrant>,
     /// Bundle-level namespace id (ADR 002) applied to every paid pull in the run —
     /// `--namespace <id>` as a big-endian `uint256`; `NO_NAMESPACE` when the flag
@@ -2341,6 +2424,11 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// The run's funding facts ([`fetch::RunFunding`]): the pool's spend
     /// outside the run's lanes, and a wallet too short of USDC to top it up.
     funding: fetch::RunFunding,
+    /// The run's funding recovery gate (ADR 003 § Funding recovery). A bundle
+    /// pull is one fetch for every entry, so its entries share one progress
+    /// rule, and so does the pass that runs the remaining entries again
+    /// against a replaced pool.
+    recovery: Arc<RecoveryGate>,
     /// Run-scoped range-dedup counters (bytes spliced from disk, hints dropped by
     /// a fault), accumulated by every entry and reported once the pull finishes.
     dedup_stats: DedupStats,
@@ -2528,6 +2616,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             Some(&self.open_lock),
             Some(&self.ledgers),
             Some(&self.lane_cap),
+            &self.recovery,
         );
         let holders = sources.holders_from(targets);
         // A fetch dropped by Ctrl-C, or by a sibling's command-wide fault,
@@ -2546,12 +2635,15 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             };
             // `--max-sources` caps the lanes the entry stripes across at
             // once; every other holder waits as a reserve.
-            let downloader = Downloader::new(&sources, sources.funder())
+            let mut downloader = Downloader::new(&sources, sources.funder())
                 .holders(holders)
                 .health(Arc::clone(&self.health))
-                .working_deposit(self.chain.working_deposit)
+                .recovery(Arc::clone(&self.recovery))
                 .max_lanes(self.common.max_sources)
                 .max_blob_bytes(max_blob_bytes);
+            if let Some(slot) = sources.credentials() {
+                downloader = downloader.credentials(slot);
+            }
             Box::pin(downloader.fetch_to_paths_shared(
                 &[DownloadTarget {
                     hash,

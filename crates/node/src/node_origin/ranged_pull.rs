@@ -37,6 +37,16 @@
 //! ([`RunSink::backoff`]), and drives it again. A source that still refuses after
 //! [`MAX_BACKPRESSURE_RETRIES`] waits without gap progress ends the assembly
 //! [`AssembleOutcome::Backpressured`], after [`RunSink::backpressure_exhausted`].
+//!
+//! # Funding recovery
+//!
+//! A source that refuses this node's funding ([`RunOutcome::Unfunded`]) leaves
+//! the plan, and the other survivors carry on: the refusal scopes to that
+//! source. Only when no survivor can fill a still-missing range does the
+//! assembly run its funding recovery step ([`RunSink::recover`], ADR 003
+//! § Funding recovery). A step that raises the deposit brings the refusing
+//! sources back for one more pass; a step that cannot ends the assembly
+//! [`AssembleOutcome::FundingNeeded`].
 
 use bao_tree::ChunkRanges;
 use decdn_cache::FillError;
@@ -71,19 +81,23 @@ pub(crate) const MAX_BACKPRESSURE_RETRIES: u32 = 6;
 pub(crate) enum RunOutcome {
     /// The run's `[offset, offset+len)` is fully present in the store now.
     Filled,
-    /// A fault of this source (a delivery fault, or its reservation floor above
-    /// the pool): drop this run's source and re-plan its still-missing
-    /// remainder against the surviving candidates. The reassign-only tail.
+    /// A delivery fault of this source: drop this run's source and re-plan its
+    /// still-missing remainder against the surviving candidates. The
+    /// reassign-only tail.
     Reassign,
+    /// The source refused this node's funding: an `Unfunded` refusal, a funding
+    /// rejection, or this node's pool short of the next voucher. The source
+    /// leaves the plan like a reassigned one, and comes back if the assembly's
+    /// funding recovery step raises the deposit ([`RunSink::recover`]).
+    Unfunded,
     /// The source refused to open this run for a reason that usually clears with
     /// time — most often a per-signer live cap, or a load shed (#2178). It says
     /// nothing about whether the source can serve the range. The loop reassigns
     /// when another survivor covers the gap, and otherwise keeps the source and
     /// drives it again after a [`RunSink::backoff`].
     Backpressure,
-    /// The whole assembly is over — a fatal fault or a dry shared pool that
-    /// another lane cannot fix (a voucher rejection, an origin blacklist, an
-    /// over-cap blob, the pacer's `PoolExhausted`). Propagate it.
+    /// The whole assembly is over: a fatal fault another lane cannot fix (a
+    /// local fault, an origin blacklist, an over-cap blob). Propagate it.
     Terminal(FillError),
     /// Cooperative cancellation: the serve leg finished first (client
     /// disconnect / shutdown), so the whole pull stops.
@@ -96,6 +110,7 @@ impl RunOutcome {
         match self {
             Self::Filled => "filled",
             Self::Reassign => "reassigned",
+            Self::Unfunded => "unfunded",
             Self::Backpressure => "backpressure",
             Self::Terminal(_) => "terminal",
             Self::Cancelled => "cancelled",
@@ -157,6 +172,12 @@ pub(crate) enum AssembleOutcome {
     /// way as [`Self::Unavailable`] — a truncated stream — but names a different
     /// cause for the operator: the holder was reachable and refused, not absent.
     Backpressured,
+    /// Funding needed: the only sources of a still-missing range refused this
+    /// node's funding, and no funding recovery step can raise the deposit
+    /// (ADR 003 § Funding recovery). Surfaces to the client like
+    /// [`Self::Unavailable`] (a truncated stream) and names this node's own
+    /// funding as the cause for the operator.
+    FundingNeeded,
     /// A run faulted terminally; propagate the fault to the serve leg.
     Terminal(FillError),
     /// The pull was cancelled mid-assembly.
@@ -194,6 +215,13 @@ pub(crate) trait RunSink {
     /// without gap progress, and the assembly ends
     /// [`AssembleOutcome::Backpressured`]. The sink records it for the operator.
     fn backpressure_exhausted(&self, source_ix: usize, waits: u32);
+
+    /// Run the assembly's funding recovery step: no surviving source can fill
+    /// a still-missing range of `gap_chunks` chunks, and at least one dropped
+    /// source refused this node's funding. Returns `true` when the deposit
+    /// rose (or is settling after a rise), so those sources may be asked
+    /// again; `false` ends the assembly [`AssembleOutcome::FundingNeeded`].
+    async fn recover(&self, gap_chunks: u64) -> bool;
 }
 
 /// Assemble `[offset, offset+len)` of a `total_bytes` blob across the ranked
@@ -203,10 +231,14 @@ pub(crate) trait RunSink {
 /// offset order, and on a non-terminal run fault drop that source and re-plan
 /// the remainder. A backpressure refusal from a source no survivor can replace
 /// waits and re-drives that source instead (see the module's `# Backpressure`).
+/// A source that refuses this node's funding leaves the plan; once no survivor
+/// can fill the gap, the funding recovery step decides whether those sources
+/// are asked again (see the module's `# Funding recovery`).
 /// Terminates on a fully-present gap ([`AssembleOutcome::Complete`]),
 /// an uncovered range ([`AssembleOutcome::Unavailable`]), a sole source that
-/// outlasts the wait budget ([`AssembleOutcome::Backpressured`]), a terminal
-/// fault, or cancellation.
+/// outlasts the wait budget ([`AssembleOutcome::Backpressured`]), funding
+/// needed ([`AssembleOutcome::FundingNeeded`]), a terminal fault, or
+/// cancellation.
 ///
 /// Two guards keep the loop finite even under a driver that violates the
 /// reassign-only completion contract:
@@ -230,6 +262,9 @@ pub(crate) async fn assemble<S: RunSink>(
     // Surviving candidate indices, best-first. A source that faults
     // non-terminally is dropped from here and never re-planned.
     let mut surviving: Vec<usize> = (0..coverage.len()).collect();
+    // Sources dropped because they refused this node's funding. They come back
+    // only after a funding recovery step raises the deposit.
+    let mut unfunded: Vec<usize> = Vec::new();
     // The prior round's gap measure and whether it dropped a source or waited
     // out a backpressure refusal — the two inputs the no-progress guard reads.
     let mut prev_gap_chunks: Option<u64> = None;
@@ -244,12 +279,23 @@ pub(crate) async fn assemble<S: RunSink>(
         if gap.is_empty() {
             return AssembleOutcome::Complete;
         }
-        if surviving.is_empty() {
-            // Every candidate that covered a still-missing range faulted; nothing
-            // left to try. Wire-identical to the no-provider miss.
-            return AssembleOutcome::Unavailable(UnavailableCause::NoSurvivors);
-        }
         let gap_chunks = chunk_count(&gap);
+        if surviving.is_empty() {
+            // Every candidate that covered a still-missing range faulted. When
+            // some refused this node's funding, the funding recovery step
+            // decides; otherwise nothing is left to try. Wire-identical to the
+            // no-provider miss.
+            if unfunded.is_empty() {
+                return AssembleOutcome::Unavailable(UnavailableCause::NoSurvivors);
+            }
+            if !sink.recover(gap_chunks).await {
+                return AssembleOutcome::FundingNeeded;
+            }
+            surviving.append(&mut unfunded);
+            surviving.sort_unstable();
+            prev_gap_chunks = None;
+            continue;
+        }
         if let Some(prev) = prev_gap_chunks {
             // Progress restores the whole backpressure budget: the budget bounds
             // a source that refuses every retry, not a long pull that meets
@@ -269,34 +315,52 @@ pub(crate) async fn assemble<S: RunSink>(
         // planner ties-breaks on.
         let (runs, uncovered) = plan_over(&gap, total_bytes, coverage, &surviving);
         if !uncovered.is_empty() {
-            return AssembleOutcome::Unavailable(UnavailableCause::Uncovered);
+            // No survivor covers a still-missing range. A source dropped for
+            // refusing this node's funding may: the funding recovery step
+            // decides whether it is asked again.
+            if unfunded.is_empty() {
+                return AssembleOutcome::Unavailable(UnavailableCause::Uncovered);
+            }
+            if !sink.recover(gap_chunks).await {
+                return AssembleOutcome::FundingNeeded;
+            }
+            surviving.append(&mut unfunded);
+            surviving.sort_unstable();
+            prev_gap_chunks = None;
+            continue;
         }
-        let mut faulted: Option<(usize, bool)> = None;
+        let mut faulted: Option<(usize, RunOutcome)> = None;
         for run in &runs {
             match sink.drive_run(*run).await {
                 RunOutcome::Filled => {}
+                RunOutcome::Terminal(err) => return AssembleOutcome::Terminal(err),
+                RunOutcome::Cancelled => return AssembleOutcome::Cancelled,
                 // Stop this round at the first fault: the faulted source may also
                 // own later planned runs, so re-plan the whole remainder rather
                 // than press on with a plan built around a dead source.
-                RunOutcome::Reassign => {
-                    faulted = Some((run.source_ix, false));
+                outcome @ (RunOutcome::Reassign
+                | RunOutcome::Unfunded
+                | RunOutcome::Backpressure) => {
+                    faulted = Some((run.source_ix, outcome));
                     break;
                 }
-                RunOutcome::Backpressure => {
-                    faulted = Some((run.source_ix, true));
-                    break;
-                }
-                RunOutcome::Terminal(err) => return AssembleOutcome::Terminal(err),
-                RunOutcome::Cancelled => return AssembleOutcome::Cancelled,
             }
         }
-        let Some((ix, backpressure)) = faulted else {
+        let Some((ix, outcome)) = faulted else {
             // Every planned run filled its range; the runs partition the gap, so
             // the next `missing` is empty and the loop returns `Complete`.
             repaired_last_round = false;
             continue;
         };
         repaired_last_round = true;
+        // A funding refusal scopes to its source: it leaves the plan without
+        // spending the reassign budget, and the other survivors carry on.
+        if matches!(outcome, RunOutcome::Unfunded) {
+            surviving.retain(|&s| s != ix);
+            unfunded.push(ix);
+            continue;
+        }
+        let backpressure = matches!(outcome, RunOutcome::Backpressure);
         // A backpressure refusal keeps its source when no survivor can take over
         // the still-missing gap: dropping it would end the assembly over a cap
         // that usually clears with time. Past the wait budget the assembly ends

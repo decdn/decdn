@@ -158,8 +158,9 @@ impl<P: SourceProvider> SourceProvider for &P {
     }
 }
 
-/// No known source can be paid from the pool's deposit, the top-up budget is
-/// spent, and a fresh discovery found no cheaper source.
+/// Funding needed: no known source serves at the pool's current funding, a
+/// fresh discovery found no other source, and no funding recovery step could
+/// raise the deposit (ADR 003 § Funding recovery).
 #[derive(Debug)]
 pub struct NoAffordableSource {
     /// The pool deposit every source refused at.
@@ -170,7 +171,7 @@ impl std::fmt::Display for NoAffordableSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "no provider's next voucher fits the pool's deposit of {} (micro-USDC); top up the pool",
+            "funding needed: no provider serves at the pool's deposit of {} (micro-USDC)",
             self.deposit
         )
     }
@@ -480,6 +481,13 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         self.lanes.get(&provider).cloned()
     }
 
+    /// Drop every built lane `stale` names, so the next start of its provider
+    /// builds a new one. A swapped credential retires the lanes on the old key
+    /// this way.
+    pub(crate) fn drop_lanes(&mut self, stale: impl Fn(&StreamCandidate<P::Source>) -> bool) {
+        self.lanes.retain(|_, lane| !stale(lane));
+    }
+
     /// Take every built lane out of the set, keyed by provider. A caller that
     /// ran [`crate::first_open()`] on this set hands the lanes on to the set its
     /// fetch builds, so the fetch reuses them instead of building them again.
@@ -642,6 +650,53 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         }
         self.health.record(provider, fault, now, deposit);
         fault
+    }
+
+    /// Hold `provider` off briefly instead of pricing it out, when `err` is a
+    /// funding refusal that arrives while a funding recovery step's top-up
+    /// settles ([`crate::RecoveryGate::settling`]): the node's chain watcher
+    /// may not have seen the new deposit yet. Returns whether it held the
+    /// source; any other fault is the caller's to record.
+    pub fn hold_while_settling(
+        &mut self,
+        provider: Address,
+        err: &anyhow::Error,
+        now: Instant,
+    ) -> bool {
+        if classify(err) != Fault::Unaffordable {
+            return false;
+        }
+        tracing::info!(
+            %provider,
+            hash = %blake3::Hash::from_bytes(self.hash).to_hex(),
+            error = %format_args!("{err:#}"),
+            "a source refused the pool's funding while a funding recovery step settles; \
+             asking it again"
+        );
+        self.health
+            .hold(provider, now + crate::recovery::SETTLE_STEP);
+        true
+    }
+
+    /// The pool spend the built lanes committed, summed.
+    #[must_use]
+    pub(crate) fn lanes_spent(&self) -> U256 {
+        self.lanes
+            .values()
+            .map(|lane| lane.ledger.committed().amount)
+            .fold(U256::ZERO, U256::saturating_add)
+    }
+
+    /// Raise every built lane's pool context to at least `deposit`, after a
+    /// funding recovery step.
+    pub(crate) fn credit_lanes(&self, deposit: U256) {
+        for lane in self.lanes.values() {
+            let mut ctx = lane
+                .ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ctx.deposit = ctx.deposit.max(deposit);
+        }
     }
 
     /// Record a delivery fault of `provider`'s: a `NotFound` toward marking it
@@ -1073,8 +1128,9 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     ///    with no fresh discovery.
     /// 2. After a discovery at this deposit and mark epoch, every known source
     ///    is priced out or can serve none of the work left, with at least one
-    ///    priced out, and the top-up budget cannot change that:
-    ///    [`NoAffordableSource`], "funding needed".
+    ///    priced out: [`NoAffordableSource`]. The caller runs its funding
+    ///    recovery step ([`crate::RecoveryGate::step`]) before it ends the fetch
+    ///    "funding needed".
     /// 3. After such a discovery, every known source can serve none of the
     ///    work left: [`NoSourceHasBlob`], not-found.
     ///
@@ -1083,12 +1139,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// pull-through ([`Self::no_pull_through`]) and `only_uncovered_left` says
     /// no work left lies inside the coverage of a barred holder.
     #[must_use]
-    pub fn exhausted(
-        &self,
-        deposit: U256,
-        topups_left: bool,
-        only_uncovered_left: bool,
-    ) -> Option<anyhow::Error> {
+    pub fn exhausted(&self, deposit: U256, only_uncovered_left: bool) -> Option<anyhow::Error> {
         if self.all_declined(only_uncovered_left) {
             return Some(anyhow::Error::new(NoNodeWillServe {
                 reasons: self.decline_reasons.clone(),
@@ -1098,7 +1149,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             return None;
         }
         if self.all_excluded(deposit, only_uncovered_left) {
-            return (!topups_left).then(|| anyhow::Error::new(NoAffordableSource { deposit }));
+            return Some(anyhow::Error::new(NoAffordableSource { deposit }));
         }
         if self.all_item_marked(only_uncovered_left) {
             return Some(match &self.last_absent {

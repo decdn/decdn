@@ -1,6 +1,6 @@
-//! The two *sourcing* axes of the gap-driven, range-minimized pull driver
-//! (#1608): [`BlobSource`] — a dumb producer of raw interleaved bao bytes for a
-//! contiguous range — and [`Funder`] — the injected pool top-up seam.
+//! The sourcing and funding seams of a fetch (#1608): [`BlobSource`], a dumb
+//! producer of raw interleaved bao bytes for a contiguous range, and
+//! [`Funder`], the injected funding recovery seam.
 //!
 //! # Why "dumb"
 //!
@@ -19,12 +19,11 @@
 //!
 //! # The `Funder` seam
 //!
-//! A mid-fetch top-up goes through the injected [`Funder`] trait so the driver
-//! and `PeerSource` stay chain-handle-agnostic: each deployment supplies its own
-//! implementation (the CLI's `CliFunder`, the node's `NodeFunder`) rather than
-//! the driver naming a contract instance directly. The reactive-top-up budget is
-//! deployment-specific and travels on the funder ([`Funder::max_topups`] — CLI 3,
-//! node 1).
+//! The funding recovery step (ADR 003 § Funding recovery) goes through the
+//! injected [`Funder`] trait so the acquire loop and `PeerSource` stay
+//! chain-handle-agnostic: each deployment supplies its own implementation (the
+//! CLI's `CliFunder`, the node's `NodeFunder`) rather than the loop naming a
+//! contract instance directly.
 
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
@@ -33,7 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, U256};
 use decdn_bao_range::AlignedRange;
-use decdn_incentive::DepositOutcome;
+use decdn_incentive::PoolId;
 use iroh::{Endpoint, EndpointAddr};
 
 use crate::sink::{PullReader, StashedFault};
@@ -242,38 +241,79 @@ pub trait IngestStore: decdn_bao_range::RangedStore {
     }
 }
 
-/// The injected pool top-up seam. Wraps the deployment's funding path — the
-/// CLI's `CliFunder` and the node's `NodeFunder`, both driving
-/// `PoolOpener::top_up_pool_by` over their own chain handle — so the driver and
+/// The current pool no longer accepts funds, and the funding recovery step
+/// opened a new pool and made it the current pool in the buyer's local pool
+/// store (ADR 003 § Funding recovery).
+///
+/// Lanes key on the pool, so no lane of the fetch can pay from the new pool.
+/// The caller runs the remaining work again against it, resuming the partial
+/// data it holds, so the second pass pays only for missing bytes. The closed
+/// pool keeps whatever balance it held until its owner reclaims it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolReplaced {
+    /// The pool that refused the top-up (`Closing` or `Closed`). It may still
+    /// hold a balance to reclaim.
+    pub closed: PoolId,
+    /// The new pool, now the current pool in the local pool store.
+    pub opened: PoolId,
+}
+
+impl std::fmt::Display for PoolReplaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pool {} no longer accepts funds, so new pool {} replaces it; the remaining work \
+             runs again against the new pool",
+            self.closed, self.opened
+        )
+    }
+}
+
+impl std::error::Error for PoolReplaced {}
+
+/// What one funding recovery step did ([`Funder::recover`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Recovery {
+    /// The current pool's deposit rose to this total, in micro-USDC.
+    ToppedUp(U256),
+    /// The current pool no longer accepts funds, and a new pool replaces it.
+    Replaced(PoolReplaced),
+    /// The buyer has no way to add funds: the pool already holds its sized
+    /// deposit, or the buyer is a delegated signer with no funder to ask. The
+    /// fetch ends "funding needed".
+    Unavailable,
+}
+
+/// The injected funding recovery seam (ADR 003 § Funding recovery). Wraps the
+/// deployment's funding path (the CLI's `CliFunder` and the node's
+/// `NodeFunder`, each over its own chain handle), so the acquire loop and
 /// [`BlobSource`] never name a contract instance.
 ///
-/// A top-up is only ever attempted after a [`crate::pacer::Pacer`] returns
-/// [`crate::pacer::PaceDecision::TopUp`] — i.e. a genuine, ledger-corroborated
-/// mid-fetch exhaustion — so [`max_topups`](Funder::max_topups) is the sole bound
-/// on how many times one fetch will escrow more USDC.
+/// The acquire loop calls [`recover`](Funder::recover) only when its candidate
+/// set is exhausted with at least one source priced out, and only when the
+/// progress rule allows a step: the first step of a fetch always, a further
+/// step only after a newly verified byte. That rule, not the funder, bounds how
+/// often one fetch adds funds.
 pub trait Funder: Send + Sync {
-    /// How many reactive top-ups this deployment allows for one fetch. CLI = 3
-    /// ([`crate::MAX_TOPUP_ATTEMPTS`]), node = 1. The driver copies this into the
-    /// pacer's [`PaceState::max_topups`](crate::pacer::PaceState::max_topups).
-    fn max_topups(&self) -> u32;
-
-    /// Add `additional` micro-USDC to the channel on-chain and credit the local record.
+    /// Run one funding recovery step. `remaining` is the pool's spendable
+    /// deposit as the caller sees it (deposit less every lane's spend).
     ///
-    /// Returns the [`DepositOutcome`] of crediting the row: `Added(new_total)` on
-    /// the clean path — the driver updates its channel deposit from it — or the
-    /// escrowed-but-untracked variants (`UnknownPool` / `PoolMismatch`),
-    /// which the driver treats as terminal (the USDC is on-chain but the local
-    /// record is gone; reconcile against the tx).
+    /// A self-funded owner tops its current pool up toward its sized deposit.
+    /// A pool that is `Closing` or `Closed` refuses the top-up, and the owner
+    /// opens a new pool at its normal deposit and makes it current instead
+    /// ([`Recovery::Replaced`]). A buyer with no way to add funds returns
+    /// [`Recovery::Unavailable`].
     ///
     /// # Errors
     ///
-    /// If the on-chain `topUp` fails to submit or reverts — the funds did not
-    /// move. If its submit fails in transport or its receipt is not obtained,
-    /// the funds may have moved and the error carries
-    /// [`crate::buyer_pool::TopUpUnconfirmed`]. If a mined `topUp`
-    /// cannot be credited locally, the funds **are** escrowed and the error
-    /// names the tx ([`crate::buyer_pool::escrowed_but_untracked`]).
-    fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome>;
+    /// If the on-chain `topUp` or `openPool` fails to submit or reverts: the
+    /// funds did not move. If a `topUp` submit fails in transport or its
+    /// receipt is not obtained, the funds may have moved and the error carries
+    /// [`crate::buyer_pool::TopUpUnconfirmed`]. If a mined transaction cannot be
+    /// credited locally, the funds **are** escrowed and the error names the tx
+    /// ([`crate::buyer_pool::escrowed_but_untracked`]).
+    fn recover(&self, remaining: U256) -> SourceFuture<'_, Recovery>;
 
     /// The funder's own view of what the pool has spent across every lane,
     /// including lanes the acquire loop does not drive: vouchers to providers
@@ -310,25 +350,19 @@ fn micros_now() -> u64 {
 ///
 /// One `PeerSource` serves one gap-driven fetch against one upstream peer — it
 /// holds the pull context (`endpoint`, `target`, `ctx`, `ledger`, …) but not a
-/// [`Funder`]: reactive top-up is the driver's concern (it holds the `Funder`
-/// separately and calls it directly), not the source's.
+/// [`Funder`]: funding recovery is the acquire loop's concern, not the source's.
 ///
 /// Borrows its `endpoint`/`slash_domain` (the driver, which owns these for the
 /// whole fetch, outlives every `open`/`finish` call), but holds the channel
 /// context behind a SHARED `Arc<Mutex<PoolContext>>` rather than a `&'a`
 /// borrow. That shared handle is what resolves the #1608 borrow conflict: the
-/// driver mutates the context (crediting a mid-fetch top-up's new deposit)
-/// while this source also reads it to open each pull. A `&'a PoolContext`
-/// borrow would freeze it for the whole fetch and forbid the driver's `&mut`;
-/// the `Arc<Mutex<..>>` lets both see one state. `open` locks it only to CLONE
-/// the context out, then drops the guard before awaiting, so no lock is ever
-/// held across an `.await`. Concurrent lanes pay from one pool, so one lane
-/// can open while another lane tops the pool up, and an open's snapshot can
-/// predate a deposit that is about to land: it under-states the deposit, never
-/// over-states it. The lane that topped up waits out the node's view of the
-/// new deposit; a lane refused on the stale view takes its own fund-and-retry
-/// path, and the pool's top-up lock ([`crate::SharedPool::topup_lock`]) makes
-/// it re-read the raised deposit instead of escrowing again.
+/// acquire loop mutates the context (crediting a funding recovery step's new
+/// deposit) while this source also reads it to open each pull. A
+/// `&'a PoolContext` borrow would freeze it for the whole fetch and forbid that
+/// write; the `Arc<Mutex<..>>` lets both see one state. `open` locks it only to
+/// CLONE the context out, then drops the guard before awaiting, so no lock is
+/// ever held across an `.await`. An open's snapshot can predate a deposit that
+/// is about to land: it under-states the deposit, never over-states it.
 ///
 /// With a [`Connections`] map, every open takes a new stream on the target's
 /// shared connection. Without one, every open dials its own connection.
@@ -743,14 +777,12 @@ mod doubles {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use super::{Recovery, SourceFuture, StashedFault};
+    use crate::{UpstreamPullHeader, VoucherProgress};
     use alloy::primitives::U256;
     use bao_tree::io::outboard::PreOrderMemOutboard;
     use bytes::Bytes;
     use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, encode_verified_range};
-    use decdn_incentive::DepositOutcome;
-
-    use super::{SourceFuture, StashedFault};
-    use crate::{UpstreamPullHeader, VoucherProgress};
 
     /// Fixed quote a [`ScriptedSource`] reports so the driver can price vouchers
     /// deterministically in tests.
@@ -1424,24 +1456,33 @@ mod doubles {
         }
     }
 
-    /// A fake [`Funder`](super::Funder): records each requested top-up amount and
-    /// returns a scripted [`DepositOutcome`], so the driver's top-up branch is
-    /// testable without a chain handle.
+    /// A fake [`Funder`](super::Funder): records the `remaining` deposit of each
+    /// recovery step and answers with scripted [`Recovery`] outcomes, so the
+    /// funding recovery step is testable without a chain handle.
     #[derive(Debug)]
     pub struct FakeFunder {
-        max_topups: u32,
-        outcome: DepositOutcome,
+        /// The outcomes still to answer, in order. The last one repeats.
+        script: Mutex<Vec<Recovery>>,
         calls: Mutex<Vec<U256>>,
         pool_spent: Option<U256>,
     }
 
     impl FakeFunder {
-        /// A funder allowing `max_topups` top-ups, each returning `outcome`.
+        /// A funder whose every recovery step returns `outcome`.
         #[must_use]
-        pub const fn new(max_topups: u32, outcome: DepositOutcome) -> Self {
+        pub fn new(outcome: Recovery) -> Self {
+            Self::scripted(vec![outcome])
+        }
+
+        /// A funder that answers its recovery steps with `outcomes` in order,
+        /// then repeats the last one. An empty script answers
+        /// [`Recovery::Unavailable`].
+        #[must_use]
+        pub fn scripted(outcomes: Vec<Recovery>) -> Self {
+            let mut script = outcomes;
+            script.reverse();
             Self {
-                max_topups,
-                outcome,
+                script: Mutex::new(script),
                 calls: Mutex::new(Vec::new()),
                 pool_spent: None,
             }
@@ -1455,8 +1496,8 @@ mod doubles {
             self
         }
 
-        /// The `additional` amounts passed to [`Funder::top_up`](super::Funder::top_up),
-        /// in call order.
+        /// The `remaining` deposits passed to
+        /// [`Funder::recover`](super::Funder::recover), in call order.
         #[must_use]
         pub fn calls(&self) -> Vec<U256> {
             self.calls.lock().map(|c| c.clone()).unwrap_or_default()
@@ -1464,16 +1505,17 @@ mod doubles {
     }
 
     impl super::Funder for FakeFunder {
-        fn max_topups(&self) -> u32 {
-            self.max_topups
-        }
-
-        fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
+        fn recover(&self, remaining: U256) -> SourceFuture<'_, Recovery> {
             Box::pin(async move {
                 if let Ok(mut calls) = self.calls.lock() {
-                    calls.push(additional);
+                    calls.push(remaining);
                 }
-                Ok(self.outcome)
+                let outcome = match self.script.lock() {
+                    Ok(mut script) if script.len() > 1 => script.pop(),
+                    Ok(script) => script.last().copied(),
+                    Err(_) => None,
+                };
+                Ok(outcome.unwrap_or(Recovery::Unavailable))
             })
         }
 

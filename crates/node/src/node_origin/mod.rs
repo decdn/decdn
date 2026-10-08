@@ -50,7 +50,7 @@ mod timed_source;
 pub(crate) use admit_store::NodeAdmitStore;
 pub(crate) use backend_source::BackendSource;
 pub(crate) use funder::NodeFunder;
-use funder::{SETTLE_POLL_STEP, settle_wait_budget};
+use funder::{SETTLE_POLL_STEP, settle_window};
 pub(crate) use pull_leg::{PrimeLeg, PullLegTarget, run_local_pull_leg, run_pull_leg};
 
 use std::collections::HashMap;
@@ -65,14 +65,15 @@ use alloy::primitives::{Address, B256, U256};
 use decdn_bao_range::align_range;
 use decdn_cache::origin::{Origin, OriginFetch};
 use decdn_cache::{Hash, OriginKind, OriginPullError};
-use decdn_client::driver::DriveConfig;
-use decdn_client::{BudgetPacer, PeerSource, PrimedSource, drive, first_leg};
+use decdn_client::{
+    BudgetPacer, PeerSource, PrimedSource, RecoveryGate, Stepped, drive, first_leg,
+};
 use decdn_common::redact::sanitize_err_chain;
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use timed_source::{TimedSource, timed_open};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument as _, debug, warn};
+use tracing::{Instrument as _, debug, info, warn};
 
 use decdn_reputation::{LocalReputation, Outcome};
 
@@ -430,28 +431,9 @@ pub struct NodeOriginConfig {
     /// refuses a stream quote that exceeds the lower of the two before paying — and
     /// retains the signed over-quote as rate-manipulation evidence.
     pub max_rate_per_mb: u64,
-    /// The deposit a freshly-opened buyer channel escrows, and the target a
-    /// mid-pull reactive top-up raises an exhausted channel toward
-    /// (`blockchain.buyer_working_deposit_micro_usdc`, #1530). The proactive
-    /// low-water refill (`crate::buyer_channel::refill_decision`) targets the
-    /// same deposit; the two legs differ only in what triggers them.
-    ///
-    /// `U256::ZERO` disables the reactive top-up entirely. Config never resolves
-    /// to zero (the resolver rejects it), but the value flows into the paid leg's
-    /// [`decdn_client::driver::DriveConfig`], where zero switches the
-    /// pacer's reactive arm off.
-    pub working_deposit: U256,
-    /// This node's estimate of an upstream's refundable floor `M` (ADR 003 § Pool
-    /// solvency): its own `blockchain.pool_min_remaining_deposit_micro_usdc`, the
-    /// floor it keeps on the pools it serves. An upstream refuses a new stream once
-    /// the pool's remaining deposit, less its `M`, cannot cover a window, and the
-    /// refusal reads as a plain miss. The pull leg's pacer therefore tops up while
-    /// the deposit still covers this floor plus the next voucher, so a mid-pull
-    /// re-open is not refused. It only triggers a top-up; it never refuses a draw.
-    pub seller_reserve: U256,
     /// How often this node's chain watcher polls for events
-    /// (`blockchain.event_poll_interval_ms`), used to size the post-top-up settle
-    /// wait (#1530).
+    /// (`blockchain.event_poll_interval_ms`), used to size the settle window
+    /// after a funding recovery step's top-up (#1530).
     ///
     /// The wait is for the UPSTREAM's watcher, not ours, but every node in the
     /// network runs the same default cadence and this is the only local reading of
@@ -886,6 +868,13 @@ impl Origin for NodeOrigin {
                 // Latched across BOTH walks, like `attempt_metered` — see
                 // `miss_answer` for what it buys.
                 let mut miss = PullMiss::Clean;
+                // The fill's funding recovery state (ADR 003 § Funding recovery),
+                // and the candidates of both walks that refused this node's
+                // funding: the ones the step asks again.
+                let gate = Arc::new(RecoveryGate::with_settle(settle_window(
+                    deps.config.event_poll_interval,
+                )));
+                let mut unfunded: Vec<Candidate> = Vec::new();
 
                 // ADR 001 §Probe cache: "On a cache miss the requester checks the probe
                 // cache first; if a valid entry exists, it skips DHT lookup and goes
@@ -894,11 +883,13 @@ impl Origin for NodeOrigin {
                     deps.metrics.probe_cache_hit();
                     deps.metrics.node_pull_attempt();
                     attempt_metered = true;
-                    let outcome = try_pull(&deps_lock, deps, &cached, hash_bytes, budget).await;
+                    let outcome =
+                        try_pull(&deps_lock, deps, &cached, hash_bytes, budget, &gate).await;
                     match outcome.payload {
                         Ok(()) => return Ok(OriginFetch::AlreadyAdmitted),
                         Err(failed) => miss = miss.or(failed),
                     }
+                    unfunded.extend(outcome.unfunded);
                     budget = budget.saturating_sub(outcome.attempts);
                     // Every cached provider we had budget to try failed to deliver.
                     // The entry has been disproved by the only evidence that outranks
@@ -918,7 +909,10 @@ impl Origin for NodeOrigin {
                         // so an exhausted budget spent on OUR faults is not signed to a
                         // client as an absent blob (#1560).
                         debug!(%hash, "node-origin: probe-cache candidates exhausted the attempt budget");
-                        return miss_answer(miss);
+                        return recover_unfunded(
+                            &deps_lock, deps, hash_bytes, unfunded, miss, &gate,
+                        )
+                        .await;
                     }
                 } else {
                     deps.metrics.probe_cache_miss();
@@ -941,7 +935,8 @@ impl Origin for NodeOrigin {
                         deps.metrics.node_pull_no_providers();
                     }
                     debug!(%hash, "node-origin: no providers discovered for cache-miss pull");
-                    return miss_answer(miss);
+                    return recover_unfunded(&deps_lock, deps, hash_bytes, unfunded, miss, &gate)
+                        .await;
                 }
                 if !attempt_metered {
                     deps.metrics.node_pull_attempt();
@@ -956,12 +951,24 @@ impl Origin for NodeOrigin {
                     U256::ZERO,
                 )
                 .await;
-                match try_pull(&deps_lock, deps, &ranked, hash_bytes, budget)
-                    .await
-                    .payload
-                {
+                let outcome = try_pull(&deps_lock, deps, &ranked, hash_bytes, budget, &gate).await;
+                match outcome.payload {
                     Ok(()) => Ok(OriginFetch::AlreadyAdmitted),
-                    Err(failed) => miss_answer(miss.or(failed)),
+                    Err(failed) => {
+                        // The exhausted candidate set: both walks and a fresh
+                        // discovery delivered nothing. Funding recovery for the
+                        // candidates that refused this node's funding.
+                        unfunded.extend(outcome.unfunded);
+                        recover_unfunded(
+                            &deps_lock,
+                            deps,
+                            hash_bytes,
+                            unfunded,
+                            miss.or(failed),
+                            &gate,
+                        )
+                        .await
+                    }
                 }
             }
             .instrument(span.clone())
@@ -1009,11 +1016,11 @@ impl Origin for NodeOrigin {
 /// this node's serve-economics buy ceiling is a local policy decision, not a fact
 /// about the content, and it must never reach the wire as a distinct code — that
 /// would let a client fingerprint this node's pricing floor by probing for it. A
-/// [`PullMiss::FundingNeeded`] answers it too: this node's own funding gap is not
-/// the requester's to recover.
+/// [`PullMiss::FundingNeeded`] and [`PullMiss::Unfunded`] answer it too: this
+/// node's own funding gap is not the requester's to recover.
 fn miss_answer(miss: PullMiss) -> Result<OriginFetch, OriginPullError> {
     match miss {
-        PullMiss::Clean | PullMiss::BelowMargin | PullMiss::FundingNeeded => {
+        PullMiss::Clean | PullMiss::BelowMargin | PullMiss::FundingNeeded | PullMiss::Unfunded => {
             Ok(OriginFetch::NotFound)
         }
         PullMiss::LocalFault => Err(OriginPullError::Permanent(anyhow::anyhow!(
@@ -1571,6 +1578,9 @@ struct PullOutcome<T> {
     /// Candidates actually TRIED — i.e. per-candidate attempts, whether or
     /// not they delivered. Never exceeds the `budget` passed in.
     attempts: usize,
+    /// The tried candidates that refused this node's funding
+    /// ([`PullMiss::Unfunded`]): the ones a funding recovery step asks again.
+    unfunded: Vec<Candidate>,
 }
 
 /// Why an attempt — one candidate, or a whole walk of them — produced no payload
@@ -1617,6 +1627,12 @@ pub enum PullMiss {
     /// node's, not the requester's, so it is wire-identical to [`Self::Clean`]
     /// (ADR 005 §Open-time refusal classes).
     FundingNeeded,
+    /// The candidate refused this node's funding: an `Unfunded` refusal, a
+    /// funding voucher rejection, or this node's pool short of the next
+    /// voucher. The refusal scopes to that candidate; a walk that delivers
+    /// nothing runs its funding recovery step for such candidates (ADR 003
+    /// § Funding recovery). Wire-identical to [`Self::Clean`].
+    Unfunded,
 }
 
 impl PullMiss {
@@ -1628,6 +1644,7 @@ impl PullMiss {
             Self::LocalFault => "local_fault",
             Self::BelowMargin => "below_margin",
             Self::FundingNeeded => "funding_needed",
+            Self::Unfunded => "unfunded",
         }
     }
 
@@ -1688,11 +1705,14 @@ impl PullMiss {
     /// letting a later candidate's honest miss erase the fact that an earlier one
     /// quoted above this node's buy ceiling. A [`Self::FundingNeeded`] sits
     /// between the two: every attempt hits the same wallet, so it names the walk
-    /// whatever an attempt's quote was.
+    /// whatever an attempt's quote was. An [`Self::Unfunded`] candidate ranks
+    /// just below it: the walk's funding recovery step decides whether it
+    /// becomes funding needed.
     const fn or(self, other: Self) -> Self {
         match (self, other) {
             (Self::LocalFault, _) | (_, Self::LocalFault) => Self::LocalFault,
             (Self::FundingNeeded, _) | (_, Self::FundingNeeded) => Self::FundingNeeded,
+            (Self::Unfunded, _) | (_, Self::Unfunded) => Self::Unfunded,
             (Self::BelowMargin, _) | (_, Self::BelowMargin) => Self::BelowMargin,
             (Self::Clean, Self::Clean) => Self::Clean,
         }
@@ -1836,31 +1856,119 @@ fn heat_of(deps: &NodeOriginDeps, hash_bytes: [u8; 32]) -> u32 {
 /// candidates skipped earlier for an unresolvable operator address or a local
 /// channel-open failure are intentionally not scored (neither is the provider's
 /// fault). `budget` is the fetch-wide [`MAX_PROVIDER_ATTEMPTS`] remainder rather
-/// than the constant itself — see [`PullOutcome`].
+/// than the constant itself (see [`PullOutcome`]). Every verified byte counts
+/// toward the fill's funding recovery `gate`.
 async fn try_pull(
     deps_lock: &Arc<OnceLock<NodeOriginDeps>>,
     deps: &NodeOriginDeps,
     ranked: &[Candidate],
     hash_bytes: [u8; 32],
     budget: usize,
+    gate: &Arc<RecoveryGate>,
 ) -> PullOutcome<()> {
     let mut attempts = 0;
     let mut miss = PullMiss::Clean;
+    let mut unfunded = Vec::new();
     for candidate in ranked.iter().take(budget) {
         attempts += 1;
-        match pull_from_candidate(deps_lock, deps, candidate, hash_bytes).await {
+        match pull_from_candidate(deps_lock, deps, candidate, hash_bytes, gate).await {
             Ok(()) => {
                 return PullOutcome {
                     payload: Ok(()),
                     attempts,
+                    unfunded,
                 };
             }
-            Err(failed) => miss = miss.or(failed),
+            Err(failed) => {
+                if failed == PullMiss::Unfunded {
+                    unfunded.push(candidate.clone());
+                }
+                miss = miss.or(failed);
+            }
         }
     }
     PullOutcome {
         payload: Err(miss),
         attempts,
+        unfunded,
+    }
+}
+
+/// The end of a fill whose walks delivered nothing: when some candidates
+/// refused this node's funding, run the fill's funding recovery step (ADR 003
+/// § Funding recovery) and ask those candidates once more, else answer `miss`.
+///
+/// The first step of a fill is always allowed; a further step only after a
+/// byte verified since the last one. A step that tops the pool up opens the
+/// gate's settle window: a candidate that still refuses inside it is the
+/// upstream's chain watcher lagging the new deposit, so the fill waits a
+/// [`SETTLE_POLL_STEP`] and asks again instead of taking another step. A fill
+/// that can take no step ends "funding needed" ([`PullMiss::FundingNeeded`]),
+/// which still answers the client `NotFound`.
+async fn recover_unfunded(
+    deps_lock: &Arc<OnceLock<NodeOriginDeps>>,
+    deps: &NodeOriginDeps,
+    hash_bytes: [u8; 32],
+    mut unfunded: Vec<Candidate>,
+    mut miss: PullMiss,
+    gate: &Arc<RecoveryGate>,
+) -> Result<OriginFetch, OriginPullError> {
+    let funder = NodeFunder::new(Arc::clone(&deps.buyer), Arc::clone(&deps.metrics));
+    while !unfunded.is_empty() {
+        if gate.settling(tokio::time::Instant::now()) {
+            tokio::time::sleep(SETTLE_POLL_STEP).await;
+        } else if let Err(end) = node_step(gate, &funder, unfunded.len()).await {
+            return miss_answer(miss.or(end));
+        }
+        let outcome = try_pull(deps_lock, deps, &unfunded, hash_bytes, unfunded.len(), gate).await;
+        match outcome.payload {
+            Ok(()) => return Ok(OriginFetch::AlreadyAdmitted),
+            Err(failed) => miss = miss.or(failed),
+        }
+        unfunded = outcome.unfunded;
+    }
+    miss_answer(miss)
+}
+
+/// Run one funding recovery step of a fill under `gate`, through `funder`,
+/// for `candidates` candidates that refused this node's funding. `Err` names
+/// the fill's end: no step allowed or possible, or a step that failed.
+async fn node_step(
+    gate: &RecoveryGate,
+    funder: &NodeFunder,
+    candidates: usize,
+) -> Result<(), PullMiss> {
+    // The node's step sizes itself from its pool row, so the deposit view it
+    // is handed is not read.
+    match gate
+        .step(funder, U256::ZERO, || U256::ZERO, U256::ZERO)
+        .await
+    {
+        Stepped::Raised(_) => Ok(()),
+        Stepped::Replaced(replaced) => {
+            info!(
+                closed = %replaced.closed,
+                opened = %replaced.opened,
+                "node-origin: the buyer pool accepts no more funds; a new pool replaces it"
+            );
+            gate.start_next_pass();
+            Ok(())
+        }
+        Stepped::NoProgress | Stepped::Unavailable => {
+            info!(
+                candidates,
+                "node-origin: no candidate serves at this node's funding and no recovery step \
+                 is allowed; the fill ends funding needed"
+            );
+            Err(PullMiss::FundingNeeded)
+        }
+        Stepped::Failed(err) => {
+            warn!(
+                error = %sanitize_err_chain(&err),
+                "node-origin: the funding recovery step failed"
+            );
+            Err(PullMiss::LocalFault)
+        }
     }
 }
 
@@ -1933,6 +2041,7 @@ async fn pull_from_candidate(
     deps: &NodeOriginDeps,
     candidate: &Candidate,
     hash_bytes: [u8; 32],
+    gate: &Arc<RecoveryGate>,
 ) -> Result<(), PullMiss> {
     let span = tracing::info_span!(
         "upstream_stream",
@@ -1945,7 +2054,7 @@ async fn pull_from_candidate(
         outcome = tracing::field::Empty,
     );
     let opened = AtomicBool::new(false);
-    let result = pull_from_candidate_in_span(deps_lock, deps, candidate, hash_bytes, &opened)
+    let result = pull_from_candidate_in_span(deps_lock, deps, candidate, hash_bytes, &opened, gate)
         .instrument(span.clone())
         .await;
     // Only a candidate the pull opened a stream to has a stream outcome; one
@@ -1976,6 +2085,7 @@ async fn pull_from_candidate_in_span(
     candidate: &Candidate,
     hash_bytes: [u8; 32],
     opened: &AtomicBool,
+    gate: &Arc<RecoveryGate>,
 ) -> Result<(), PullMiss> {
     let Ok(pk) = PublicKey::from_bytes(&candidate.node_id) else {
         return Err(PullMiss::Clean);
@@ -2111,9 +2221,14 @@ async fn pull_from_candidate_in_span(
         Ok(pair) => pair,
         Err(err) => {
             // No bytes pulled, no voucher paid — nothing to settle.
-            let verdict =
-                classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(ctx.pool_id), &err);
-            return Err(PullMiss::for_verdict(verdict));
+            return Err(candidate_miss(
+                deps,
+                pk,
+                provider_addr,
+                hash_bytes,
+                ctx.pool_id,
+                &err,
+            ));
         }
     };
     // The drive adopts the pull only while it is fresh, measured from here: the
@@ -2156,29 +2271,18 @@ async fn pull_from_candidate_in_span(
     let dial_runtime = deps.dial_runtime.clone();
     let slash_domain = deps.slash_domain.clone();
     let engine = deps.engine.clone();
-    let buyer = Arc::clone(&deps.buyer);
     let metrics = Arc::clone(&deps.metrics);
     let ledger_for_drive = Arc::clone(&ledger);
     let deps_for_thread = Arc::clone(deps_lock);
     let max_blob_size_bytes = deps.config.max_blob_size_bytes;
-    let drive_config = DriveConfig {
-        working_deposit: deps.config.working_deposit,
-        seller_reserve: deps.config.seller_reserve,
-        max_settle_waits: settle_wait_budget(deps.config.event_poll_interval),
-        settle_backoff: SETTLE_POLL_STEP,
-    };
+    // Every newly verified byte counts toward the fill's funding recovery gate.
+    let gate_for_thread = Arc::clone(gate);
     // The outer `fetch`-side future owns the drop guard: dropping this future (deadline
     // expiry / disconnect / shutdown) cancels the token, which the pull thread selects
     // on to stop the drive.
     let cancel = CancellationToken::new();
     let cancel_for_thread = cancel.clone();
     let _cancel_guard = cancel.drop_guard();
-    // Set on the drive thread the first time a reactive top-up escrows any headroom, so
-    // the refuse-metering below can tell a pull that never funded itself (an extortion
-    // `SpendingCapExhausted` to meter) from one that did (already metered by `NodeFunder`,
-    // as a success or as a short landing).
-    let reactive_funded = Arc::new(AtomicBool::new(false));
-    let reactive_funded_for_thread = Arc::clone(&reactive_funded);
     // The pull runs on its own thread and runtime, which starts with no span.
     // Carry the caller's span across so the pull's events stay in its trace.
     let pull_span = tracing::Span::current();
@@ -2235,17 +2339,27 @@ async fn pull_from_candidate_in_span(
                 _ => drop((header, whole)),
             }
             let pacer = BudgetPacer::new();
-            let funder = NodeFunder::new(
-                buyer,
-                Arc::clone(&ctx),
-                Arc::clone(&metrics),
-                reactive_funded_for_thread,
-            );
+            // Each rise of the reported position is newly verified bytes for the
+            // fill's funding recovery gate. The first report is the resume base.
+            let last_position = std::sync::Mutex::new(None::<u64>);
+            let on_progress = move |position: u64, _total: u64| {
+                let mut last = last_position
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match *last {
+                    Some(prev) if position > prev => {
+                        gate_for_thread.record_verified(position - prev);
+                        *last = Some(position);
+                    }
+                    Some(_) => {}
+                    None => *last = Some(position),
+                }
+            };
             // Whole blob: offset 0, len `total_bytes`. `drive` derives missing ranges
-            // from the ranged store, so a mid-pull top-up resumes by re-deriving gaps
-            // — no truncate, no rewind buffer. `drive` finalizes the store when the
-            // whole blob is present, so the caller holds no whole-blob buffer of its
-            // own on success.
+            // from the ranged store, so a later pull of the same blob resumes by
+            // re-deriving gaps: no truncate, no rewind buffer. `drive` finalizes the
+            // store when the whole blob is present, so the caller holds no whole-blob
+            // buffer of its own on success.
             let cancelled;
             let result = tokio::select! {
                 biased;
@@ -2253,14 +2367,12 @@ async fn pull_from_candidate_in_span(
                     &store,
                     &source,
                     &pacer,
-                    &funder,
                     &ctx,
                     &ledger_for_drive,
                     hash_bytes,
                     0,
                     total_bytes,
-                    &drive_config,
-                    None,
+                    Some(&on_progress),
                     None,
                     None,
                     // Single-source candidate pull: one lane is the whole pool.
@@ -2329,32 +2441,37 @@ async fn pull_from_candidate_in_span(
             );
             Ok(())
         }
-        Err(err) => {
-            // Meter a refused reactive top-up (#1600): the upstream ended the pull with
-            // `SpendingCapExhausted` while OUR ledger still had headroom — an attempt to make us
-            // escrow more USDC on its unsupported word. The driver's `genuine_exhaustion`
-            // saw the contradiction and never issued a `TopUp`, so `NodeFunder` was never
-            // called and nothing else meters this; without it, a lying peer is invisible.
-            // Guarded on `working_deposit != 0` (reactive top-up enabled) and on this pull
-            // NOT having funded itself — a pull that escrowed any headroom was already
-            // metered by `NodeFunder` (`node_pull_reactive_topup`, or
-            // `node_pull_reactive_topup_refused` for a short landing) and is not being
-            // extorted. A pull whose every top-up failed or added nothing stays unfunded;
-            // its refusal here counts the upstream's claim, a separate event from the
-            // funding outcome `NodeFunder` metered. No escrow, no bytes: the fetch still
-            // misses.
-            if !deps.config.working_deposit.is_zero()
-                && !reactive_funded.load(Ordering::Relaxed)
-                && err
-                    .downcast_ref::<UpstreamVoucherRejected>()
-                    .is_some_and(|r| r.reason == VoucherRejectReason::SpendingCapExhausted)
-            {
-                deps.metrics.node_pull_reactive_topup_refused();
-            }
-            let verdict =
-                classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(pool_id), &err);
-            Err(PullMiss::for_verdict(verdict))
+        Err(err) => Err(candidate_miss(
+            deps,
+            pk,
+            provider_addr,
+            hash_bytes,
+            pool_id,
+            &err,
+        )),
+    }
+}
+
+/// The miss one candidate's failed pull is, after [`classify_pull_failure`]
+/// scored and metered it. A failure that names no fault of this node and that
+/// refused this node's funding ([`decdn_client::Fault::Unaffordable`]: an
+/// `Unfunded` refusal, a funding voucher rejection, or this node's pool short
+/// of the next voucher) is [`PullMiss::Unfunded`], so the walk's funding
+/// recovery step can ask the candidate again (ADR 003 § Funding recovery).
+fn candidate_miss(
+    deps: &NodeOriginDeps,
+    pk: PublicKey,
+    provider_addr: Address,
+    hash_bytes: [u8; 32],
+    pool_id: B256,
+    err: &anyhow::Error,
+) -> PullMiss {
+    let verdict = classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(pool_id), err);
+    match PullMiss::for_verdict(verdict) {
+        PullMiss::Clean if decdn_client::classify(err) == decdn_client::Fault::Unaffordable => {
+            PullMiss::Unfunded
         }
+        miss => miss,
     }
 }
 
@@ -2683,16 +2800,15 @@ const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 ///   bounded window and the pool row is KEPT rather than deleted.
 /// - **Try again.** `PoolExhausted` — the pool WE fund the upstream from can no longer
 ///   cover further credit (ADR 003 §Pool solvency). Every upstream returns it, so it is a
-///   statement about us, not the peer. Top up our pool (see `genuine_exhaustion`) and
-///   retry rather than suppress a healthy peer.
+///   statement about us, not the peer. The fill's funding recovery step tops our pool up
+///   (ADR 003 § Funding recovery) and asks again, rather than suppress a healthy peer.
 ///
 /// Wallet-less resume: this classifier does NOT special-case a bundled
 /// `SpendingCapExhausted`/`AmountRegression`/`BytesRegression`/`UnderFold`/`Underpaid`, and it does
 /// not need to. The gap-driven `decdn_client::drive` loop (this node's own cache-miss buyer leg)
 /// already retries a resumable rejection in its own loop before it can ever surface here: it
 /// reseeds the pool's ledger and reopens the pull, transparently, and this classifier sees only the
-/// FINAL outcome. The loop also answers a genuine `SpendingCapExhausted` with an on-chain top-up
-/// (via [`NodeFunder`]) rather than a terminal error. So by the time `pull_verdict` downcasts an
+/// FINAL outcome. So by the time `pull_verdict` downcasts an
 /// error to `UpstreamVoucherRejected` and reaches this function, the rejection is genuinely
 /// terminal: either the reason was never gated, it carried no bundle, the bundle failed shape
 /// validation or authentication, the bundle did not advance our ledger (an echo, or a bytes-only
@@ -2724,8 +2840,8 @@ const fn voucher_verdict(reason: VoucherRejectReason, has_bundle: bool) -> PullV
         // `PoolExhausted` says the pool WE fund the upstream from can no longer cover
         // further credit; it is a statement about us, so every upstream returns it and
         // routing it to `OurDeadLane` would walk the candidate list suppressing each
-        // healthy peer for an hour, outliving any top-up. The remedy is a top-up of our
-        // pool (see `genuine_exhaustion`) and a retry, so keep the peer and try again.
+        // healthy peer for an hour, outliving any top-up. The remedy is the fill's
+        // funding recovery step on our pool and one more ask, so keep the peer.
         // Not fatal, and not the peer's fault: this stream had not carried the
         // current epoch's `chain_root` voucher before its first reveal. The fix
         // is to re-anchor and resend, which is what a retry does — and the
@@ -2796,6 +2912,12 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
     }
     if let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() {
         return voucher_verdict(rejected.reason, rejected.bundle.is_some());
+    }
+    // This node's own pool cannot cover the next voucher (the pacer refused the
+    // leg): a statement about us, never the peer, exactly like an upstream's
+    // `PoolExhausted`. Ahead of the catch-all, which would score the peer.
+    if err.downcast_ref::<decdn_client::PoolExhausted>().is_some() {
+        return PullVerdict::OurVoucherRetryable(VoucherRejectReason::PoolExhausted);
     }
     // Ahead of `UpstreamRefused` and the catch-all, deliberately: a local signing or encode
     // fault surfaces while we are talking to a peer, and every arm below this one blames

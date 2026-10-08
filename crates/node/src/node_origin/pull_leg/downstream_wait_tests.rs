@@ -140,11 +140,6 @@ async fn a_full_window_draws_for_its_parked_leg_despite_a_far_sibling() {
         requested_bytes: 512 * G,
         remaining_deposit: alloy::primitives::U256::from(1_000_000u64),
         next_voucher_cost: alloy::primitives::U256::from(1u64),
-        working_deposit: alloy::primitives::U256::ZERO,
-        seller_reserve: alloy::primitives::U256::ZERO,
-        topups_used: 0,
-        max_topups: 1,
-        exhaustion_confirmed: false,
         pulled_frontier: pulled,
         gap_remaining: 512 * G - pulled,
         downstream: DownstreamFrontier {

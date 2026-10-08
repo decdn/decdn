@@ -30,7 +30,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use alloy::primitives::U256;
 use anyhow::Context as _;
 use bytes::Bytes;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -38,9 +37,11 @@ use tokio::sync::Notify;
 
 use decdn_protocol::Coverage;
 
-use crate::driver::{DriveConfig, PacingWait, WaitReason};
+use crate::credential::CredentialSlot;
+use crate::driver::{PacingWait, WaitReason};
 use crate::health::PeerHealth;
 use crate::pacer::{DownstreamFrontier, PULL_WINDOW_FLOOR, WindowPacer};
+use crate::recovery::RecoveryGate;
 use crate::scheduler::{AcquireEnv, AcquireTarget, ConsumptionPacing, LaneLease, acquire};
 use crate::sink::BlobCache;
 use crate::source::Funder;
@@ -174,7 +175,8 @@ pub struct StreamCandidate<S> {
     /// The paid source — one provider's `cdn/client/v1` requester.
     pub source: S,
     /// The buyer context paying this candidate's provider (shared behind
-    /// interior mutability so a mid-stream top-up is visible to its next open).
+    /// interior mutability so a funding recovery step's deposit is visible to
+    /// its next open).
     pub ctx: Arc<Mutex<PoolContext>>,
     /// This candidate's per-`(signer, provider)` voucher ledger.
     pub ledger: Arc<PoolLedger>,
@@ -233,7 +235,8 @@ struct DriveInputs<P, F> {
     holders: Vec<Holder>,
     health: Arc<PeerHealth>,
     funder: F,
-    drive_config: DriveConfig,
+    recovery: Arc<RecoveryGate>,
+    credentials: Option<CredentialSlot>,
     stop: StopPolicy,
     /// The largest blob accepted, or `0` for no cap.
     max_blob_bytes: u64,
@@ -264,7 +267,8 @@ where
         holders,
         health,
         funder,
-        drive_config,
+        recovery,
+        credentials,
         stop,
         max_blob_bytes,
     } = inputs;
@@ -301,7 +305,8 @@ where
     let env = AcquireEnv {
         pacer: &pacer,
         funder: &funder,
-        drive: &drive_config,
+        recovery: &recovery,
+        credentials: credentials.as_ref(),
         // Small, bounded front parallelism: a paced stream wants a little
         // same-region fan-out, not a full download's striping.
         max_lanes: lane_cap.max(1),
@@ -386,7 +391,9 @@ pub struct Streamer<'a, P, F> {
     holders: Vec<Holder>,
     health: Arc<PeerHealth>,
     funder: F,
-    drive_config: DriveConfig,
+    recovery: Arc<RecoveryGate>,
+    /// A delegated stream's swappable voucher credential.
+    credentials: Option<CredentialSlot>,
     /// A scratch directory the fill store's `.partial` lives in for the stream's
     /// lifetime. The caller owns it (and its cleanup); a streamed blob is not
     /// kept, so a temporary directory is the usual choice. The `.partial` grows
@@ -402,7 +409,7 @@ impl<P, F> std::fmt::Debug for Streamer<'_, P, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Streamer")
             .field("holders", &self.holders.len())
-            .field("drive_config", &self.drive_config)
+            .field("recovery", &self.recovery)
             .field("scratch", &self.scratch)
             .finish_non_exhaustive()
     }
@@ -412,8 +419,8 @@ impl<'a, P, F> Streamer<'a, P, F> {
     /// Build a streamer whose holders and lanes `provider` finds and builds,
     /// funded through `funder`, filling into `scratch`.
     ///
-    /// The stream starts by discovering its holders, and reactive top-up is
-    /// off. The builder methods change both.
+    /// The stream starts by discovering its holders, under a fresh
+    /// [`RecoveryGate`]. The builder methods change both.
     #[must_use]
     pub fn new(provider: P, funder: F, scratch: &'a Path) -> Self {
         Self {
@@ -421,7 +428,8 @@ impl<'a, P, F> Streamer<'a, P, F> {
             holders: Vec::new(),
             health: Arc::default(),
             funder,
-            drive_config: DriveConfig::cli(U256::ZERO),
+            recovery: Arc::default(),
+            credentials: None,
             scratch,
             max_blob_bytes: 0,
         }
@@ -435,13 +443,21 @@ impl<'a, P, F> Streamer<'a, P, F> {
         self
     }
 
-    /// Top the pool up through the funder, back to `working_deposit`, when the
-    /// stream runs the deposit low. `U256::ZERO` turns reactive top-up off: a
-    /// stream the deposit cannot cover then ends with
-    /// [`crate::NoAffordableSource`].
+    /// Run the funding recovery step under `recovery`, the fetch's gate. A
+    /// caller that has already run part of the fetch under a gate (a first
+    /// open, an earlier pass) passes that gate, so the progress rule spans the
+    /// whole fetch.
     #[must_use]
-    pub const fn working_deposit(mut self, working_deposit: U256) -> Self {
-        self.drive_config.working_deposit = working_deposit;
+    pub fn recovery(mut self, recovery: Arc<RecoveryGate>) -> Self {
+        self.recovery = recovery;
+        self
+    }
+
+    /// Pay as a delegate under `slot`'s credential, as
+    /// [`crate::Downloader::credentials`] does.
+    #[must_use]
+    pub fn credentials(mut self, slot: CredentialSlot) -> Self {
+        self.credentials = Some(slot);
         self
     }
 
@@ -451,15 +467,6 @@ impl<'a, P, F> Streamer<'a, P, F> {
     #[must_use]
     pub fn health(mut self, health: Arc<PeerHealth>) -> Self {
         self.health = health;
-        self
-    }
-
-    /// Replace the whole funding and settle policy, the working deposit
-    /// included.
-    #[doc(hidden)]
-    #[must_use]
-    pub const fn drive_config(mut self, drive_config: DriveConfig) -> Self {
-        self.drive_config = drive_config;
         self
     }
 
@@ -575,7 +582,8 @@ where
                 holders: self.holders,
                 health: self.health,
                 funder: self.funder,
-                drive_config: self.drive_config,
+                recovery: self.recovery,
+                credentials: self.credentials,
                 stop,
                 max_blob_bytes: self.max_blob_bytes,
             },

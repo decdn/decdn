@@ -93,7 +93,7 @@ On the wire, `NotFound` means "not now": a miss, load shed, the signer's live fl
 
 **The exhausted candidate set.** The candidate set is exhausted when every known source is absent or removed, and a fresh discovery finds no new holder. The fetch then ends by the first rule that applies:
 
-1. At least one candidate refused `Unfunded`. The client runs a [funding recovery](003-payments.md#funding-recovery) step, if the progress rule allows one, then one more pass over the `Unfunded` candidates. A further step needs at least one new BLAKE3-verified byte since the previous step. If no step is allowed, or the candidates still refuse `Unfunded`, the fetch ends with "funding needed".
+1. At least one candidate refused `Unfunded`. The client runs a [funding recovery](003-payments.md#funding-recovery) step, if the progress rule allows one, then one more pass over the `Unfunded` candidates. A further step needs at least one new BLAKE3-verified byte since the previous step. If no step is allowed, or the candidates still refuse `Unfunded`, the fetch ends with "funding needed". For a delegated signer, the step is a bounded wait for a swapped credential ([§ Client SDK funding signal](#client-sdk-funding-signal)).
 2. Every candidate refused `Declined`. The fetch ends early with "no node will serve this". It ends as soon as every known candidate refused `Declined`, and it does not run the fresh discovery. The final error names the reasons that the client collected locally. For example, when every node rejected the client's vouchers mid-stream, the error says "every node rejected this client's vouchers (BadSignature)". The client already holds each mid-stream reason, so this needs no wire field.
 3. Otherwise, the fetch ends with not-found.
 
@@ -106,6 +106,24 @@ Speculative duplicate requests are out of scope **by decision, not by sequencing
 ### Payment
 
 Each source is paid from the client's single pool via node-addressed vouchers on its own `(signer, provider)` lane ([ADR 003 § Payment Model](003-payments.md#adr-003-payment-model)), for verified bytes only. There is **no channel per source**: one deposit backs every source, so the payer holds no per-source deposit and there is no fragmentation to size. The pool must hold enough deposit to cover the value in flight across the whole source set at once; each source stops serving when the pool's remaining balance nears its reserved floor `M` ([ADR 003 § Pool solvency and the refundable floor `M`](003-payments.md#pool-solvency-and-the-refundable-floor-m)) — the payer-side counterpart of the node's pre-flight deposit guard. A [funding recovery](003-payments.md#funding-recovery) step heals a mid-fetch exhaustion for every lane at once: the client credits the new deposit to every lane. Three facts belong to the pool and not to a lane — the deposit, the spend that gates it, and the funding recovery state of the fetch. A per-lane copy of any of them lets N lanes each spend what one pool holds. Each segment is a bounded aligned request, so the node reserves, delivers, and bills exactly that span: no over-delivery, no client overpay, no lost credit window. Each lane is redeemed independently by its node; there is no cross-source settlement, and redeem cost is the node's, not the client's.
+
+### Client SDK funding signal
+
+A delegated client pays from a pool it does not own, so it cannot top the pool up. Its application gets new capabilities from the pool owner, for example from a sponsor gateway. The client SDK gives the application three things for this.
+
+**The credential slot.** A delegated fetch holds its voucher credential in a `CredentialSlot`: the voucher-signing key and the owner-signed `dcap1` capability for it. The application can swap a new key and capability into the slot at any time. The SDK only receives credentials. It does not ask for them. A source provider reads the current credential when it builds a lane.
+
+**Retire at a voucher boundary.** After a swap, each live lane on the old key stops its open stream at its next voucher boundary. It pays for what it received and ends. The client then builds a new lane under the new key, and the lane resumes from the delivered frontier. The client fetches no byte twice and pays for no byte twice.
+
+**The running-low signal.** The client computes the signal locally, with no chain read:
+
+- The headroom is the capability's spending cap less the sum of the vouchers that this fetch signed under the key, across all lanes.
+- The projected need is the bytes of work left, at the highest rate that a node quoted.
+- One credit window is one voucher interval at that rate.
+
+The client emits `RunningLow` when the headroom is less than the projected need plus one credit window. It also emits `RunningLow` when the capability expires inside the node expiry margin: one redeem interval plus the redeem landing slack. The application swaps in a new credential before the fetch stalls.
+
+At the exhausted candidate set, a delegated fetch waits for a swap for a bounded time (60 s by default). A swap in the wait is a recovery step, under the [progress rule](003-payments.md#funding-recovery). The fetch then makes one more pass under the new key. With no swap, the fetch ends with `FundingNeeded::NewCapability`, which names the pool and the cause: the cap is spent, the capability expired, or nodes revoked it. When the capability still covers the work and nodes refuse `Unfunded`, the fetch ends at once with `FundingNeeded::PublisherPool`, which names the pool. Only the pool owner can fix that.
 
 ### Source diversity and per-peer memory
 

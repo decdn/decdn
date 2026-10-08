@@ -262,18 +262,16 @@ async fn every_source_unaffordable_stops_only_after_a_fresh_discovery() {
     };
     set.record_fault(A, &dry(), None, now, dep);
     set.record_fault(B, &dry(), None, now, dep);
-    assert!(set.exhausted(dep, true, false).is_none(), "top-ups left");
     assert!(
-        set.exhausted(dep, false, false).is_none(),
+        set.exhausted(dep, false).is_none(),
         "no discovery at this deposit yet"
     );
     assert!(set.wants_discovery(now, dep, 0, false));
     set.discovery_done(Ok(vec![]), now, dep);
-    let err = set.exhausted(dep, false, false);
+    let err = set.exhausted(dep, false);
     assert!(err.is_some_and(|e| e.downcast_ref::<NoAffordableSource>().is_some()));
     assert!(
-        set.exhausted(dep + U256::from(1u64), false, false)
-            .is_none(),
+        set.exhausted(dep + U256::from(1u64), false).is_none(),
         "a top-up revives"
     );
 }
@@ -308,12 +306,12 @@ async fn every_source_saying_not_found_ends_the_item() {
     let now = Instant::now();
     say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
     assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
+        set.exhausted(U256::ZERO, false).is_none(),
         "B has not answered"
     );
     say_not_found(&mut set, B, super::ABSENT_AFTER_NOT_FOUND, now);
     assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
+        set.exhausted(U256::ZERO, false).is_none(),
         "no discovery since the last mark"
     );
     assert!(
@@ -321,7 +319,7 @@ async fn every_source_saying_not_found_ends_the_item() {
         "unanimity skips the backoff"
     );
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
-    let err = set.exhausted(U256::ZERO, true, false);
+    let err = set.exhausted(U256::ZERO, false);
     assert!(err.is_some_and(|e| e.downcast_ref::<super::NoSourceHasBlob>().is_some()));
 }
 
@@ -369,10 +367,7 @@ async fn every_holder_declining_ends_the_item_with_its_reasons() -> anyhow::Resu
         Some(B),
         "the declining holder never starts again"
     );
-    assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
-        "B is left"
-    );
+    assert!(set.exhausted(U256::ZERO, false).is_none(), "B is left");
 
     set.record_fault(
         B,
@@ -382,7 +377,7 @@ async fn every_holder_declining_ends_the_item_with_its_reasons() -> anyhow::Resu
         U256::ZERO,
     );
     let err = set
-        .exhausted(U256::ZERO, true, false)
+        .exhausted(U256::ZERO, false)
         .ok_or_else(|| anyhow::anyhow!("every holder declined"))?;
     let stop = err
         .downcast_ref::<super::NoNodeWillServe>()
@@ -423,15 +418,11 @@ async fn a_funding_refusal_outranks_a_decline() {
         Fault::Unaffordable
     );
     assert!(
-        set.exhausted(U256::ZERO, false, false).is_none(),
+        set.exhausted(U256::ZERO, false).is_none(),
         "funding needs a fresh discovery first"
     );
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
-    assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
-        "a funding step is still allowed"
-    );
-    let err = set.exhausted(U256::ZERO, false, false);
+    let err = set.exhausted(U256::ZERO, false);
     assert!(err.is_some_and(|e| e.downcast_ref::<super::NoAffordableSource>().is_some()));
 }
 
@@ -444,7 +435,7 @@ async fn a_probed_holder_saying_not_found_is_never_absent() {
     let now = Instant::now();
     say_not_found(&mut set, A, 10, now);
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
-    assert!(set.exhausted(U256::ZERO, true, false).is_none());
+    assert!(set.exhausted(U256::ZERO, false).is_none());
     let cooled = set.health().cooling_until(A, now).is_some_and(|until| {
         set.next_to_start(until, U256::ZERO, &HashSet::new())
             .is_some()
@@ -852,12 +843,12 @@ async fn a_barred_holder_with_only_uncovered_work_left_ends_the_item() -> anyhow
         now,
     );
     assert!(
-        set.exhausted(U256::ZERO, true, true).is_none(),
+        set.exhausted(U256::ZERO, true).is_none(),
         "no discovery since the bar"
     );
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
     assert!(
-        set.exhausted(U256::ZERO, true, true).is_none(),
+        set.exhausted(U256::ZERO, true).is_none(),
         "a first bar may come from load shed: the holder gets its probe"
     );
     let later = now + super::PULL_THROUGH_BAR;
@@ -872,11 +863,11 @@ async fn a_barred_holder_with_only_uncovered_work_left_ends_the_item() -> anyhow
     );
     set.discovery_done(Ok(vec![]), later, U256::ZERO);
     assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
+        set.exhausted(U256::ZERO, false).is_none(),
         "work inside its coverage is left"
     );
     let err = set
-        .exhausted(U256::ZERO, true, true)
+        .exhausted(U256::ZERO, true)
         .ok_or_else(|| anyhow::anyhow!("only uncovered work is left"))?;
     assert!(
         err.downcast_ref::<super::NoSourceHasBlob>().is_some(),
@@ -928,14 +919,11 @@ async fn a_proxy_refusing_the_blob_as_too_large_is_excluded() -> anyhow::Result<
             .is_none(),
         "the proxy never starts again"
     );
-    assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
-        "B is left"
-    );
+    assert!(set.exhausted(U256::ZERO, false).is_none(), "B is left");
 
     set.record_fault(B, &too_large(), None, later, U256::ZERO);
     let err = set
-        .exhausted(U256::ZERO, true, false)
+        .exhausted(U256::ZERO, false)
         .ok_or_else(|| anyhow::anyhow!("every source declined"))?;
     assert_eq!(
         err.downcast_ref::<super::NoNodeWillServe>()
@@ -973,7 +961,7 @@ async fn a_partial_holder_refusing_the_blob_as_too_large_loses_only_pull_through
     );
     set.discovery_done(Ok(vec![]), later, U256::ZERO);
     assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
+        set.exhausted(U256::ZERO, false).is_none(),
         "work inside its coverage is left"
     );
 
@@ -1072,7 +1060,7 @@ async fn overshoot_refusals_never_mark_a_non_holder_absent() {
     }
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
     assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
+        set.exhausted(U256::ZERO, false).is_none(),
         "overshoot refusals never mark the node absent"
     );
     assert!(
@@ -1091,13 +1079,13 @@ async fn a_non_holder_saying_not_found_three_times_ends_the_item() -> anyhow::Re
     say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND - 1, now);
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
     assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
+        set.exhausted(U256::ZERO, false).is_none(),
         "two answers are not enough"
     );
     say_not_found(&mut set, A, 1, now);
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
     let err = set
-        .exhausted(U256::ZERO, true, false)
+        .exhausted(U256::ZERO, false)
         .ok_or_else(|| anyhow::anyhow!("three answers end the item"))?;
     assert!(
         err.downcast_ref::<super::NoSourceHasBlob>().is_some(),
@@ -1124,7 +1112,7 @@ async fn a_byte_between_not_found_answers_resets_the_count() {
     set.record_progress(A);
     say_not_found(&mut set, A, 2, now);
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
-    assert!(set.exhausted(U256::ZERO, true, false).is_none());
+    assert!(set.exhausted(U256::ZERO, false).is_none());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1134,7 +1122,7 @@ async fn a_new_holder_from_discovery_keeps_the_item_alive() {
     let now = Instant::now();
     say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
     set.discovery_done(Ok(vec![holder(B, 5.0)]), now, U256::ZERO);
-    assert!(set.exhausted(U256::ZERO, true, false).is_none());
+    assert!(set.exhausted(U256::ZERO, false).is_none());
 }
 
 /// A discovery whose probe now reports an absent provider as a holder
@@ -1146,7 +1134,7 @@ async fn a_probe_that_reports_the_blob_clears_an_absent_mark() {
     let now = Instant::now();
     say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
     set.discovery_done(Ok(vec![holder(A, 10.0)]), now, U256::ZERO);
-    assert!(set.exhausted(U256::ZERO, true, false).is_none());
+    assert!(set.exhausted(U256::ZERO, false).is_none());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1157,7 +1145,7 @@ async fn progress_clears_a_not_found_mark() {
     say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
     set.record_progress(A);
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
-    assert!(set.exhausted(U256::ZERO, true, false).is_none());
+    assert!(set.exhausted(U256::ZERO, false).is_none());
 }
 
 /// A discovery that fails while the set is unanimous must still back off:
@@ -1210,13 +1198,13 @@ async fn a_unanimous_absent_set_still_wants_discovery_once_cooldowns_clear() {
     );
 }
 
-/// A mixed set — one source priced out, another saying it does not hold
-/// the blob — still ends the command once the top-up budget is spent: an
-/// absent source is excluded from the affordability verdict too, and at
-/// least one source being priced out is what makes it a command-ending
-/// `NoAffordableSource` rather than the pure "nobody has it" case.
+/// A mixed set (one source priced out, another saying it does not hold
+/// the blob) reaches the funding verdict: an absent source is excluded from
+/// the affordability verdict too, and at least one source being priced out
+/// is what makes it `NoAffordableSource` (the funding recovery point) rather
+/// than the pure "nobody has it" case.
 #[tokio::test(start_paused = true)]
-async fn a_mixed_unaffordable_and_absent_set_stops_once_topups_are_spent() {
+async fn a_mixed_unaffordable_and_absent_set_reaches_the_funding_verdict() {
     let p = provider(vec![]);
     let mut set = SourceSet::new(
         &p,
@@ -1235,8 +1223,7 @@ async fn a_mixed_unaffordable_and_absent_set_stops_once_topups_are_spent() {
         set.record_fault(B, &not_found(), None, now, dep);
     }
     set.discovery_done(Ok(vec![]), now, dep);
-    assert!(set.exhausted(dep, true, false).is_none(), "top-ups left");
-    let err = set.exhausted(dep, false, false);
+    let err = set.exhausted(dep, false);
     assert!(err.is_some_and(|e| e.downcast_ref::<NoAffordableSource>().is_some()));
 }
 

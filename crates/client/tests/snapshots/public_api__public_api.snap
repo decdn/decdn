@@ -27,6 +27,10 @@ pub decdn_client::buyer_pool::OpenedPool::capability: decdn_incentive::capabilit
 pub decdn_client::buyer_pool::OpenedPool::ctx: decdn_client::PoolContext
 pub decdn_client::buyer_pool::OpenedPool::state: decdn_incentive::buyer_pool::BuyerPoolState
 pub decdn_client::buyer_pool::OpenedPool::tx: alloy_primitives::aliases::TxHash
+pub struct decdn_client::buyer_pool::PoolNotOpen
+impl core::error::Error for decdn_client::buyer_pool::PoolNotOpen
+impl core::fmt::Display for decdn_client::buyer_pool::PoolNotOpen
+pub fn decdn_client::buyer_pool::PoolNotOpen::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::buyer_pool::TopUpUnconfirmed
 pub decdn_client::buyer_pool::TopUpUnconfirmed::nonce: u64
 pub decdn_client::buyer_pool::TopUpUnconfirmed::tx: core::option::Option<alloy_primitives::aliases::TxHash>
@@ -59,6 +63,41 @@ pub mod decdn_client::connection
 pub struct decdn_client::connection::Connections
 impl decdn_client::connection::Connections
 pub fn decdn_client::connection::Connections::new(iroh::endpoint::Endpoint) -> Self
+pub mod decdn_client::credential
+#[non_exhaustive] pub enum decdn_client::credential::CapabilityCause
+pub decdn_client::credential::CapabilityCause::CapSpent
+pub decdn_client::credential::CapabilityCause::Expired
+pub decdn_client::credential::CapabilityCause::Revoked
+impl core::fmt::Display for decdn_client::credential::CapabilityCause
+pub fn decdn_client::credential::CapabilityCause::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum decdn_client::credential::FundingEvent
+pub decdn_client::credential::FundingEvent::RunningLow
+pub decdn_client::credential::FundingEvent::RunningLow::expires_at: u64
+pub decdn_client::credential::FundingEvent::RunningLow::headroom: alloy_primitives::aliases::U256
+pub decdn_client::credential::FundingEvent::RunningLow::projected_need: alloy_primitives::aliases::U256
+#[non_exhaustive] pub enum decdn_client::credential::FundingNeeded
+pub decdn_client::credential::FundingNeeded::NewCapability
+pub decdn_client::credential::FundingNeeded::NewCapability::cause: decdn_client::credential::CapabilityCause
+pub decdn_client::credential::FundingNeeded::NewCapability::pool: alloy_primitives::aliases::B256
+pub decdn_client::credential::FundingNeeded::PublisherPool
+pub decdn_client::credential::FundingNeeded::PublisherPool::pool: alloy_primitives::aliases::B256
+impl core::error::Error for decdn_client::credential::FundingNeeded
+impl core::fmt::Display for decdn_client::credential::FundingNeeded
+pub fn decdn_client::credential::FundingNeeded::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::credential::Credential
+pub decdn_client::credential::Credential::capability: decdn_incentive::capability::SignedCapability
+pub decdn_client::credential::Credential::signer: alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>
+pub struct decdn_client::credential::CredentialSlot
+impl decdn_client::credential::CredentialSlot
+pub fn decdn_client::credential::CredentialSlot::current(&self) -> decdn_client::credential::Credential
+pub fn decdn_client::credential::CredentialSlot::funding_events(&self) -> tokio::sync::watch::Receiver<core::option::Option<decdn_client::credential::FundingEvent>>
+pub fn decdn_client::credential::CredentialSlot::generation(&self) -> u64
+pub fn decdn_client::credential::CredentialSlot::new(alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::capability::SignedCapability) -> Self
+pub fn decdn_client::credential::CredentialSlot::pool_id(&self) -> alloy_primitives::aliases::B256
+pub fn decdn_client::credential::CredentialSlot::swap(&self, alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::capability::SignedCapability)
+pub fn decdn_client::credential::CredentialSlot::swap_wait(&self) -> core::time::Duration
+pub fn decdn_client::credential::CredentialSlot::with_swap_wait(self, core::time::Duration) -> Self
+pub const decdn_client::credential::CREDENTIAL_SWAP_WAIT: core::time::Duration
 pub mod decdn_client::discovery
 #[non_exhaustive] pub enum decdn_client::discovery::Bootstrap
 pub decdn_client::discovery::Bootstrap::Cached
@@ -100,12 +139,13 @@ pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_dir(&self, &[(
 pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths(&self, &[decdn_client::downloader::DownloadTarget<'_>], core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
 pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths_until(&self, &[decdn_client::downloader::DownloadTarget<'_>], core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, &decdn_client::stop::StopPolicy) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
 impl<P, F> decdn_client::downloader::Downloader<P, F>
+pub fn decdn_client::downloader::Downloader<P, F>::credentials(self, decdn_client::credential::CredentialSlot) -> Self
 pub fn decdn_client::downloader::Downloader<P, F>::holders(self, alloc::vec::Vec<decdn_client::source_set::Holder>) -> Self
 pub const fn decdn_client::downloader::Downloader<P, F>::max_blob_bytes(self, u64) -> Self
 pub const fn decdn_client::downloader::Downloader<P, F>::max_lanes(self, usize) -> Self
 pub fn decdn_client::downloader::Downloader<P, F>::new(P, F) -> Self
+pub fn decdn_client::downloader::Downloader<P, F>::recovery(self, alloc::sync::Arc<decdn_client::recovery::RecoveryGate>) -> Self
 pub fn decdn_client::downloader::Downloader<P, F>::refetched_targets(&self) -> u64
-pub const fn decdn_client::downloader::Downloader<P, F>::working_deposit(self, alloy_primitives::aliases::U256) -> Self
 impl<P, F> core::fmt::Debug for decdn_client::downloader::Downloader<P, F>
 pub fn decdn_client::downloader::Downloader<P, F>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub mod decdn_client::driver
@@ -128,6 +168,15 @@ pub fn decdn_client::probe::verify_probe_response(&decdn_protocol::message::Prob
 pub mod decdn_client::provider
 pub fn decdn_client::provider::build_provider(&str, &alloy_signer_local::PrivateKeySigner) -> anyhow::Result<impl alloy_provider::provider::trait::Provider + core::clone::Clone + use<>>
 pub fn decdn_client::provider::build_read_provider(&str) -> anyhow::Result<impl alloy_provider::provider::trait::Provider + core::clone::Clone + use<>>
+pub mod decdn_client::recovery
+pub struct decdn_client::recovery::RecoveryGate
+impl decdn_client::recovery::RecoveryGate
+pub fn decdn_client::recovery::RecoveryGate::new() -> Self
+pub fn decdn_client::recovery::RecoveryGate::start_next_pass(&self)
+pub fn decdn_client::recovery::RecoveryGate::with_settle(core::time::Duration) -> Self
+impl core::default::Default for decdn_client::recovery::RecoveryGate
+pub fn decdn_client::recovery::RecoveryGate::default() -> Self
+pub const decdn_client::recovery::RECOVERY_SETTLE: core::time::Duration
 pub mod decdn_client::sink
 pub struct decdn_client::sink::NoCache
 impl decdn_client::sink::BlobCache for decdn_client::sink::NoCache
@@ -144,15 +193,24 @@ pub fn decdn_client::sink::NoCache::get(&self, [u8; 32], u64, u64) -> decdn_clie
 pub fn decdn_client::sink::NoCache::put(&self, [u8; 32], u64, bytes::bytes::Bytes) -> decdn_client::sink::SinkFuture<'_, ()>
 pub type decdn_client::sink::SinkFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>
 pub mod decdn_client::source
+#[non_exhaustive] pub enum decdn_client::source::Recovery
+pub decdn_client::source::Recovery::Replaced(decdn_client::source::PoolReplaced)
+pub decdn_client::source::Recovery::ToppedUp(alloy_primitives::aliases::U256)
+pub decdn_client::source::Recovery::Unavailable
 pub struct decdn_client::source::PeerSource<'a>
 impl<'a> decdn_client::source::PeerSource<'a>
 pub const fn decdn_client::source::PeerSource<'a>::new(&'a iroh::endpoint::Endpoint, iroh_base::endpoint_addr::EndpointAddr, alloc::sync::Arc<std::sync::poison::mutex::Mutex<decdn_client::PoolContext>>, alloc::sync::Arc<decdn_client::PoolLedger>, &'a alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, [u8; 32], u64, u64, decdn_client::PullDeadlines, core::option::Option<decdn_client::connection::Connections>) -> Self
 impl core::fmt::Debug for decdn_client::source::PeerSource<'_>
 pub fn decdn_client::source::PeerSource<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::source::PoolReplaced
+pub decdn_client::source::PoolReplaced::closed: decdn_incentive::lane::PoolId
+pub decdn_client::source::PoolReplaced::opened: decdn_incentive::lane::PoolId
+impl core::error::Error for decdn_client::source::PoolReplaced
+impl core::fmt::Display for decdn_client::source::PoolReplaced
+pub fn decdn_client::source::PoolReplaced::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub trait decdn_client::source::Funder: core::marker::Send + core::marker::Sync
-pub fn decdn_client::source::Funder::max_topups(&self) -> u32
 pub fn decdn_client::source::Funder::pool_spent(&self) -> core::option::Option<alloy_primitives::aliases::U256>
-pub fn decdn_client::source::Funder::top_up(&self, alloy_primitives::aliases::U256) -> decdn_client::source::SourceFuture<'_, decdn_incentive::buyer_pool::DepositOutcome>
+pub fn decdn_client::source::Funder::recover(&self, alloy_primitives::aliases::U256) -> decdn_client::source::SourceFuture<'_, decdn_client::source::Recovery>
 pub type decdn_client::source::SourceFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>
 pub mod decdn_client::source_set
 pub enum decdn_client::source_set::DeclineReason
@@ -243,14 +301,21 @@ impl core::ops::drop::Drop for decdn_client::streamer::StreamDrive<'_>
 pub fn decdn_client::streamer::StreamDrive<'_>::drop(&mut self)
 pub struct decdn_client::streamer::Streamer<'a, P, F>
 impl<'a, P, F> decdn_client::streamer::Streamer<'a, P, F>
+pub fn decdn_client::streamer::Streamer<'a, P, F>::credentials(self, decdn_client::credential::CredentialSlot) -> Self
 pub fn decdn_client::streamer::Streamer<'a, P, F>::holders(self, alloc::vec::Vec<decdn_client::source_set::Holder>) -> Self
 pub const fn decdn_client::streamer::Streamer<'a, P, F>::max_blob_bytes(self, u64) -> Self
 pub fn decdn_client::streamer::Streamer<'a, P, F>::new(P, F, &'a std::path::Path) -> Self
-pub const fn decdn_client::streamer::Streamer<'a, P, F>::working_deposit(self, alloy_primitives::aliases::U256) -> Self
+pub fn decdn_client::streamer::Streamer<'a, P, F>::recovery(self, alloc::sync::Arc<decdn_client::recovery::RecoveryGate>) -> Self
 impl<P, F> decdn_client::streamer::Streamer<'_, P, F> where P: SourceProvider, F: decdn_client::source::Funder
 pub async fn decdn_client::streamer::Streamer<'_, P, F>::open<'a>(self, [u8; 32], u64, &decdn_client::config::PullConfig, alloc::sync::Arc<dyn decdn_client::sink::BlobCache>, decdn_client::stop::StopPolicy) -> anyhow::Result<(decdn_client::streamer::VerifiedReader, decdn_client::streamer::StreamDrive<'a>)> where P: 'a, F: 'a
 impl<P, F> core::fmt::Debug for decdn_client::streamer::Streamer<'_, P, F>
 pub fn decdn_client::streamer::Streamer<'_, P, F>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum decdn_client::CapabilityCause
+pub decdn_client::CapabilityCause::CapSpent
+pub decdn_client::CapabilityCause::Expired
+pub decdn_client::CapabilityCause::Revoked
+impl core::fmt::Display for decdn_client::credential::CapabilityCause
+pub fn decdn_client::credential::CapabilityCause::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub enum decdn_client::DeadlineError
 pub decdn_client::DeadlineError::CapCannotOutlastItsStages
 pub decdn_client::DeadlineError::CapCannotOutlastItsStages::hard_cap: core::time::Duration
@@ -260,6 +325,24 @@ pub decdn_client::DeadlineError::ZeroBudget
 impl core::error::Error for decdn_client::DeadlineError
 impl core::fmt::Display for decdn_client::DeadlineError
 pub fn decdn_client::DeadlineError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum decdn_client::FundingEvent
+pub decdn_client::FundingEvent::RunningLow
+pub decdn_client::FundingEvent::RunningLow::expires_at: u64
+pub decdn_client::FundingEvent::RunningLow::headroom: alloy_primitives::aliases::U256
+pub decdn_client::FundingEvent::RunningLow::projected_need: alloy_primitives::aliases::U256
+#[non_exhaustive] pub enum decdn_client::FundingNeeded
+pub decdn_client::FundingNeeded::NewCapability
+pub decdn_client::FundingNeeded::NewCapability::cause: decdn_client::credential::CapabilityCause
+pub decdn_client::FundingNeeded::NewCapability::pool: alloy_primitives::aliases::B256
+pub decdn_client::FundingNeeded::PublisherPool
+pub decdn_client::FundingNeeded::PublisherPool::pool: alloy_primitives::aliases::B256
+impl core::error::Error for decdn_client::credential::FundingNeeded
+impl core::fmt::Display for decdn_client::credential::FundingNeeded
+pub fn decdn_client::credential::FundingNeeded::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum decdn_client::Recovery
+pub decdn_client::Recovery::Replaced(decdn_client::source::PoolReplaced)
+pub decdn_client::Recovery::ToppedUp(alloy_primitives::aliases::U256)
+pub decdn_client::Recovery::Unavailable
 #[non_exhaustive] pub enum decdn_client::VerifiedReader
 pub decdn_client::VerifiedReader::Cached
 pub decdn_client::VerifiedReader::Cached::data: bytes::bytes::Bytes
@@ -281,6 +364,19 @@ pub fn decdn_client::stop::ClockHold<'_>::drop(&mut self)
 pub struct decdn_client::Connections
 impl decdn_client::connection::Connections
 pub fn decdn_client::connection::Connections::new(iroh::endpoint::Endpoint) -> Self
+pub struct decdn_client::Credential
+pub decdn_client::Credential::capability: decdn_incentive::capability::SignedCapability
+pub decdn_client::Credential::signer: alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>
+pub struct decdn_client::CredentialSlot
+impl decdn_client::credential::CredentialSlot
+pub fn decdn_client::credential::CredentialSlot::current(&self) -> decdn_client::credential::Credential
+pub fn decdn_client::credential::CredentialSlot::funding_events(&self) -> tokio::sync::watch::Receiver<core::option::Option<decdn_client::credential::FundingEvent>>
+pub fn decdn_client::credential::CredentialSlot::generation(&self) -> u64
+pub fn decdn_client::credential::CredentialSlot::new(alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::capability::SignedCapability) -> Self
+pub fn decdn_client::credential::CredentialSlot::pool_id(&self) -> alloy_primitives::aliases::B256
+pub fn decdn_client::credential::CredentialSlot::swap(&self, alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::capability::SignedCapability)
+pub fn decdn_client::credential::CredentialSlot::swap_wait(&self) -> core::time::Duration
+pub fn decdn_client::credential::CredentialSlot::with_swap_wait(self, core::time::Duration) -> Self
 pub struct decdn_client::Cumulative
 pub decdn_client::Cumulative::amount: alloy_primitives::aliases::U256
 pub decdn_client::Cumulative::bytes: alloy_primitives::aliases::U256
@@ -297,12 +393,13 @@ pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_dir(&self, &[(
 pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths(&self, &[decdn_client::downloader::DownloadTarget<'_>], core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
 pub async fn decdn_client::downloader::Downloader<P, F>::fetch_to_paths_until(&self, &[decdn_client::downloader::DownloadTarget<'_>], core::option::Option<&(dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync + '_)>, &decdn_client::stop::StopPolicy) -> anyhow::Result<alloc::vec::Vec<std::path::PathBuf>>
 impl<P, F> decdn_client::downloader::Downloader<P, F>
+pub fn decdn_client::downloader::Downloader<P, F>::credentials(self, decdn_client::credential::CredentialSlot) -> Self
 pub fn decdn_client::downloader::Downloader<P, F>::holders(self, alloc::vec::Vec<decdn_client::source_set::Holder>) -> Self
 pub const fn decdn_client::downloader::Downloader<P, F>::max_blob_bytes(self, u64) -> Self
 pub const fn decdn_client::downloader::Downloader<P, F>::max_lanes(self, usize) -> Self
 pub fn decdn_client::downloader::Downloader<P, F>::new(P, F) -> Self
+pub fn decdn_client::downloader::Downloader<P, F>::recovery(self, alloc::sync::Arc<decdn_client::recovery::RecoveryGate>) -> Self
 pub fn decdn_client::downloader::Downloader<P, F>::refetched_targets(&self) -> u64
-pub const fn decdn_client::downloader::Downloader<P, F>::working_deposit(self, alloy_primitives::aliases::U256) -> Self
 impl<P, F> core::fmt::Debug for decdn_client::downloader::Downloader<P, F>
 pub fn decdn_client::downloader::Downloader<P, F>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::GaveUp
@@ -379,6 +476,12 @@ pub fn decdn_client::PoolLedger::committed(&self) -> decdn_client::Cumulative
 pub fn decdn_client::PoolLedger::new(decdn_client::Cumulative) -> Self
 pub fn decdn_client::PoolLedger::settlement(&self) -> decdn_client::Cumulative
 pub fn decdn_client::PoolLedger::take_unsaved_rebase(&self) -> core::option::Option<decdn_client::Cumulative>
+pub struct decdn_client::PoolReplaced
+pub decdn_client::PoolReplaced::closed: decdn_incentive::lane::PoolId
+pub decdn_client::PoolReplaced::opened: decdn_incentive::lane::PoolId
+impl core::error::Error for decdn_client::source::PoolReplaced
+impl core::fmt::Display for decdn_client::source::PoolReplaced
+pub fn decdn_client::source::PoolReplaced::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::ProgressClock
 impl decdn_client::stop::ProgressClock
 pub fn decdn_client::stop::ProgressClock::hold(&self) -> decdn_client::stop::ClockHold<'_>
@@ -422,6 +525,13 @@ impl core::fmt::Debug for decdn_client::RateAboveCeiling
 pub fn decdn_client::RateAboveCeiling::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for decdn_client::RateAboveCeiling
 pub fn decdn_client::RateAboveCeiling::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::RecoveryGate
+impl decdn_client::recovery::RecoveryGate
+pub fn decdn_client::recovery::RecoveryGate::new() -> Self
+pub fn decdn_client::recovery::RecoveryGate::start_next_pass(&self)
+pub fn decdn_client::recovery::RecoveryGate::with_settle(core::time::Duration) -> Self
+impl core::default::Default for decdn_client::recovery::RecoveryGate
+pub fn decdn_client::recovery::RecoveryGate::default() -> Self
 pub struct decdn_client::StaticSources<S>
 impl<S> decdn_client::source_set::StaticSources<S>
 pub fn decdn_client::source_set::StaticSources<S>::holders(&self) -> alloc::vec::Vec<decdn_client::source_set::Holder>
@@ -456,10 +566,11 @@ impl core::ops::drop::Drop for decdn_client::streamer::StreamDrive<'_>
 pub fn decdn_client::streamer::StreamDrive<'_>::drop(&mut self)
 pub struct decdn_client::Streamer<'a, P, F>
 impl<'a, P, F> decdn_client::streamer::Streamer<'a, P, F>
+pub fn decdn_client::streamer::Streamer<'a, P, F>::credentials(self, decdn_client::credential::CredentialSlot) -> Self
 pub fn decdn_client::streamer::Streamer<'a, P, F>::holders(self, alloc::vec::Vec<decdn_client::source_set::Holder>) -> Self
 pub const fn decdn_client::streamer::Streamer<'a, P, F>::max_blob_bytes(self, u64) -> Self
 pub fn decdn_client::streamer::Streamer<'a, P, F>::new(P, F, &'a std::path::Path) -> Self
-pub const fn decdn_client::streamer::Streamer<'a, P, F>::working_deposit(self, alloy_primitives::aliases::U256) -> Self
+pub fn decdn_client::streamer::Streamer<'a, P, F>::recovery(self, alloc::sync::Arc<decdn_client::recovery::RecoveryGate>) -> Self
 impl<P, F> decdn_client::streamer::Streamer<'_, P, F> where P: SourceProvider, F: decdn_client::source::Funder
 pub async fn decdn_client::streamer::Streamer<'_, P, F>::open<'a>(self, [u8; 32], u64, &decdn_client::config::PullConfig, alloc::sync::Arc<dyn decdn_client::sink::BlobCache>, decdn_client::stop::StopPolicy) -> anyhow::Result<(decdn_client::streamer::VerifiedReader, decdn_client::streamer::StreamDrive<'a>)> where P: 'a, F: 'a
 impl<P, F> core::fmt::Debug for decdn_client::streamer::Streamer<'_, P, F>
@@ -489,6 +600,7 @@ pub fn decdn_client::VoucherProgress::from_ledger(&decdn_client::PoolLedger, all
 pub const fn decdn_client::VoucherProgress::rebase_anchor(&self) -> core::option::Option<decdn_client::Cumulative>
 pub const fn decdn_client::VoucherProgress::totals(&self) -> (alloy_primitives::aliases::U256, alloy_primitives::aliases::U256)
 pub const fn decdn_client::VoucherProgress::with_rebase_anchor(self, core::option::Option<decdn_client::Cumulative>) -> Self
+pub const decdn_client::CREDENTIAL_SWAP_WAIT: core::time::Duration
 pub trait decdn_client::BlobCache: core::marker::Send + core::marker::Sync
 pub fn decdn_client::BlobCache::caches(&self) -> bool
 pub fn decdn_client::BlobCache::get(&self, [u8; 32], u64, u64) -> decdn_client::sink::SinkFuture<'_, core::option::Option<bytes::bytes::Bytes>>
@@ -498,9 +610,8 @@ pub fn decdn_client::sink::NoCache::caches(&self) -> bool
 pub fn decdn_client::sink::NoCache::get(&self, [u8; 32], u64, u64) -> decdn_client::sink::SinkFuture<'_, core::option::Option<bytes::bytes::Bytes>>
 pub fn decdn_client::sink::NoCache::put(&self, [u8; 32], u64, bytes::bytes::Bytes) -> decdn_client::sink::SinkFuture<'_, ()>
 pub trait decdn_client::Funder: core::marker::Send + core::marker::Sync
-pub fn decdn_client::Funder::max_topups(&self) -> u32
 pub fn decdn_client::Funder::pool_spent(&self) -> core::option::Option<alloy_primitives::aliases::U256>
-pub fn decdn_client::Funder::top_up(&self, alloy_primitives::aliases::U256) -> decdn_client::source::SourceFuture<'_, decdn_incentive::buyer_pool::DepositOutcome>
+pub fn decdn_client::Funder::recover(&self, alloy_primitives::aliases::U256) -> decdn_client::source::SourceFuture<'_, decdn_client::source::Recovery>
 pub const fn decdn_client::effective_rate_ceiling(u64, u64) -> u64
 pub type decdn_client::ProgressCallback = (dyn core::ops::function::Fn(u64, u64) + core::marker::Send + core::marker::Sync)
 pub type decdn_client::SinkFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>

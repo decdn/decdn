@@ -27,7 +27,7 @@
 //! The chain/discovery/delivery seams (`resolve_chain`, `resolve_target_node`,
 //! `probe_and_order`, `open_or_reuse_pool`, `build_multi_lane`/`DriveFetchDeps`,
 //! `temp_in_parent`) are `pub(crate)` so `decdn bundle pull` (#391) reuses the
-//! same acquire loop and reactive top-up across a bundle's many entries.
+//! same acquire loop and funding recovery across a bundle's many entries.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,7 +39,7 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client::buyer_pool::{
-    LOW_WATER_DIVISOR, ProgressWrite, TopUpUnconfirmed, ToppedUpPool, WalletShortfall,
+    LOW_WATER_DIVISOR, PoolNotOpen, ProgressWrite, TopUpUnconfirmed, ToppedUpPool, WalletShortfall,
     ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool, refill_amount,
     self_owned_lane_ctx, top_up, topped_up_effect,
 };
@@ -47,14 +47,14 @@ use decdn_client::source::{Funder, SourceFuture};
 use decdn_client::{
     Connections, Cumulative, DownloadTarget, Downloader, Holder, LaneHandle, LaneLedgers,
     NoAffordableSource, NoCache, NoSourceHasBlob, PeerHealth, PeerSource, PoolContext, PoolLedger,
-    ProgressClock, PullConfig, PullDeadlines, StopPolicy, Streamer, UpstreamRefused,
-    UpstreamVoucherRejected, VoucherProgress, sign_client_binding,
+    PoolReplaced, ProgressClock, PullConfig, PullDeadlines, Recovery, RecoveryGate, StopPolicy,
+    Streamer, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, sign_client_binding,
 };
 
 use super::cli_sources::CliSources;
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
-use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore, DepositOutcome};
+use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity::{self, PasswordUse, load_signer};
 use decdn_incentive::payment_pool::{PaymentPool, newest_solvent_owned_pool};
@@ -1853,8 +1853,8 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
 
     // Delegated adoption: `--capability`/`--capability-file` names a pool the
     // caller does NOT own and a capability authorizing this client's key to
-    // spend against it. `None` => the unchanged self-owned pool path. Disables
-    // reactive top-up in `chain` (a delegate cannot fund an owner's pool).
+    // spend against it. `None` => the unchanged self-owned pool path. Zeroes
+    // the working deposit in `chain` (a delegate cannot fund an owner's pool).
     let grant = resolve_delegation_grant(common, &mut chain)?;
 
     // The buyer-pool store, opened once and recorded into by open-or-reuse.
@@ -1983,27 +1983,6 @@ async fn fetch_over(
     // One connection per node for the whole fetch: every lane and leg opens
     // its streams on it.
     let connections = Connections::new(endpoint.clone());
-    let funding = RunFunding::default();
-
-    // The shared pull/funding deps every lane borrows for the whole fetch.
-    let deps = DriveFetchDeps {
-        endpoint,
-        store,
-        contract: &contract,
-        rpc: &rpc,
-        slash_dom: &slash_dom,
-        self_address,
-        token,
-        chain,
-        namespace_id,
-        max_rate_per_mb: common.max_rate_per_mb,
-        max_blob_bytes,
-        deadlines,
-        connections: &connections,
-        writes,
-        funding: &funding,
-        timings: Some(timings),
-    };
 
     let clock = Arc::new(ProgressClock::new());
     let stop = StopPolicy::new(
@@ -2012,74 +1991,159 @@ async fn fetch_over(
         clock,
     );
     let health = Arc::new(PeerHealth::default());
-    // The fetch's lanes build concurrently and every one opens or reuses the
-    // one pool on-chain, so the open-or-reuse runs one lane at a time, as it
-    // does across a bundle pull's entries.
-    let open_lock = tokio::sync::Mutex::new(());
-    let sources = CliSources::new(
-        &deps,
-        common,
-        relays,
-        grant.as_ref(),
-        &signer,
-        &voucher_dom,
-        Some(&open_lock),
-        None,
-        None,
-    );
-    let holders = sources.holders_from(&resolved);
-    timings.set_holders_start(holders.len());
-    // A fetch dropped by Ctrl-C queues every lane's vouchers for recording too.
-    let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
-    let result = async {
-        // The first size claim: the probe's hint, or a header-only open.
-        let claim = sources.first_claim(hash, holders, &health, &stop).await?;
-        if wants_stdout(&args.output) {
-            return stream_to_stdout(
+    // One funding recovery state for the whole fetch, both passes included.
+    let recovery = Arc::new(RecoveryGate::new());
+    // Set once a funding recovery step replaced the pool: the second pass then
+    // runs the remaining work against the new pool, and resumes the `.partial`.
+    let mut replaced: Option<PoolReplaced> = None;
+    loop {
+        // Per pass: the funding facts, the lanes and their handles all name the
+        // pool the pass pays from.
+        let funding = RunFunding::default();
+        // The shared pull/funding deps every lane borrows for the whole pass.
+        let deps = DriveFetchDeps {
+            endpoint,
+            store,
+            contract: &contract,
+            rpc: &rpc,
+            slash_dom: &slash_dom,
+            self_address,
+            token,
+            chain,
+            namespace_id,
+            max_rate_per_mb: common.max_rate_per_mb,
+            max_blob_bytes,
+            deadlines,
+            connections: &connections,
+            writes,
+            funding: &funding,
+            timings: Some(timings),
+        };
+        // The fetch's lanes build concurrently and every one opens or reuses the
+        // one pool on-chain, so the open-or-reuse runs one lane at a time, as it
+        // does across a bundle pull's entries.
+        let open_lock = tokio::sync::Mutex::new(());
+        let sources = CliSources::new(
+            &deps,
+            common,
+            relays,
+            grant.as_ref(),
+            &signer,
+            &voucher_dom,
+            Some(&open_lock),
+            None,
+            None,
+            &recovery,
+        );
+        let holders = sources.holders_from(&resolved);
+        if replaced.is_none() {
+            timings.set_holders_start(holders.len());
+        }
+        // A fetch dropped by Ctrl-C queues every lane's vouchers for recording too.
+        let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
+        let result = async {
+            // The first size claim: the probe's hint, or a header-only open.
+            let claim = sources.first_claim(hash, holders, &health, &stop).await?;
+            if wants_stdout(&args.output) {
+                return stream_to_stdout(
+                    &deps,
+                    &sources,
+                    claim.holders,
+                    Arc::clone(&health),
+                    hash,
+                    claim.total_bytes,
+                    stop.clone(),
+                    common.max_sources,
+                )
+                .await;
+            }
+            download_to_file(
                 &deps,
                 &sources,
                 claim.holders,
-                health,
-                hash,
-                claim.total_bytes,
-                stop,
+                Arc::clone(&health),
+                DownloadTarget {
+                    hash,
+                    total_bytes: claim.total_bytes,
+                    dest: &args.output,
+                    ranges: None,
+                },
+                &stop,
                 common.max_sources,
             )
-            .await;
+            .await
         }
-        download_to_file(
-            &deps,
-            &sources,
-            claim.holders,
-            Arc::clone(&health),
-            DownloadTarget {
-                hash,
-                total_bytes: claim.total_bytes,
-                dest: &args.output,
-                ranges: None,
-            },
-            &stop,
-            common.max_sources,
-        )
-        .await
+        .await;
+        on_drop.disarm();
+        sources.persist_watermarks().await;
+        if let Some(shortfall) = funding.shortfall() {
+            eprintln!("warning: {shortfall}");
+        }
+        let result = result.map_err(|err| sources.annotate(err));
+        match next_pass(result, &mut replaced, wants_stdout(&args.output)) {
+            Some(pass_result) => return pass_result,
+            None => recovery.start_next_pass(),
+        }
     }
-    .await;
-    on_drop.disarm();
-    sources.persist_watermarks().await;
-    if let Some(shortfall) = funding.shortfall() {
-        eprintln!("warning: {shortfall}");
+}
+
+/// What a fetch pass that ended with `result` does next: `None` to run the
+/// remaining work again against the pool a funding recovery step just opened,
+/// or the command's result (ADR 003 § Funding recovery).
+///
+/// A pass runs again at most once: a second replacement in one command ends it
+/// "funding needed". A stream to stdout never runs again, because the bytes it
+/// already wrote cannot be taken back; its replacement ends the command with
+/// the new pool named. Once a pass replaced the pool, the closed pool's
+/// remaining balance is named on stderr, with the reclaim command.
+fn next_pass(
+    result: anyhow::Result<()>,
+    replaced: &mut Option<PoolReplaced>,
+    to_stdout: bool,
+) -> Option<anyhow::Result<()>> {
+    let now_replaced = result
+        .as_ref()
+        .err()
+        .and_then(|err| err.downcast_ref::<PoolReplaced>().copied());
+    if let Some(new) = now_replaced
+        && replaced.is_none()
+        && !to_stdout
+    {
+        eprintln!("note: {new}");
+        *replaced = Some(new);
+        return None;
     }
-    result.map_err(|err| sources.annotate(err))
+    if let Some(earlier) = (*replaced).or(now_replaced) {
+        eprintln!(
+            "note: pool {} accepts no more funds and may still hold a balance; once its \
+             dispute window ends, reclaim it with: decdn pool reclaim --pool {}",
+            earlier.closed, earlier.closed
+        );
+    }
+    Some(result.map_err(|err| match (now_replaced, *replaced) {
+        (Some(_), Some(_)) => err.context(
+            "funding needed: the pool this command opened accepts no more funds either; run \
+             the command again",
+        ),
+        (Some(new), None) => err.context(format!(
+            "pool {} is now the current pool; run the command again to stream from it",
+            new.opened
+        )),
+        _ => err,
+    }))
 }
 
 /// Reconnect a delegated fetch that ended "funding needed" (ADR 003 §Funding
 /// recovery) to the owner-side remedy: the delegate holds no wallet on this
 /// pool, so it cannot `topUp`, raise its own cap, or mint itself a fresh
-/// capability. That is a [`NoAffordableSource`] stop, or a funding voucher
-/// rejection (`SpendingCapExhausted`, `CapabilityExpired`, `PoolExhausted`,
-/// `SignerCapExhausted`). The remedy names a new signer key, because a
-/// registered signer's terms are write-once. A terminal `Underpaid` — the
-/// resync budget ran out — gets its own next step. Any other error passes
+/// capability. A [`decdn_client::FundingNeeded::PublisherPool`] stop names the
+/// pool owner's top-up: the capability still covers the fetch. A
+/// [`decdn_client::FundingNeeded::NewCapability`] stop, any other
+/// [`NoAffordableSource`] stop, or a funding voucher rejection
+/// (`SpendingCapExhausted`, `CapabilityExpired`, `PoolExhausted`,
+/// `SignerCapExhausted`) names a fresh capability for a new signer key,
+/// because a registered signer's terms are write-once. A terminal `Underpaid`
+/// (the resync budget ran out) gets its own next step. Any other error passes
 /// through verbatim (a stall, a transport fault, a "no node will serve this",
 /// or a `NotFound` already annotated by [`annotate_unbound_cache_miss`]).
 pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error {
@@ -2099,7 +2163,16 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
     let underpaid = err
         .downcast_ref::<UpstreamVoucherRejected>()
         .is_some_and(|rejected| rejected.reason == VoucherRejectReason::Underpaid);
-    if funding_rejection || err.downcast_ref::<NoAffordableSource>().is_some() {
+    if let Some(&decdn_client::FundingNeeded::PublisherPool { pool }) = err.downcast_ref() {
+        return err.context(format!(
+            "ask the owner of pool {pool} to top it up: the capability still covers the fetch, \
+             and a delegated client cannot top up a pool it does not own"
+        ));
+    }
+    if funding_rejection
+        || err.downcast_ref::<NoAffordableSource>().is_some()
+        || err.downcast_ref::<decdn_client::FundingNeeded>().is_some()
+    {
         err.context(
             "funding needed: no provider serves this capability at its current funding. Ask \
              the pool owner to top up the pool or issue a fresh capability; once this signer \
@@ -2551,11 +2624,14 @@ where
     // natural home.
     let scratch = tempfile::tempdir_in(&deps.chain.data_dir)
         .map_err(|e| anyhow::anyhow!("open stream scratch dir: {e}"))?;
-    let streamer = Streamer::new(sources, funder, scratch.path())
+    let mut streamer = Streamer::new(sources, funder, scratch.path())
         .holders(holders)
         .health(health)
-        .working_deposit(deps.chain.working_deposit)
+        .recovery(Arc::clone(sources.recovery()))
         .max_blob_bytes(deps.max_blob_bytes);
+    if let Some(slot) = sources.credentials() {
+        streamer = streamer.credentials(slot);
+    }
     let (mut reader, mut drive) = streamer
         .open(hash, total_bytes, &pull_config, Arc::new(NoCache), stop)
         .await?;
@@ -2632,12 +2708,15 @@ where
         }
         on_bar(received, expected);
     };
-    let downloader = Downloader::new(sources, sources.funder())
+    let mut downloader = Downloader::new(sources, sources.funder())
         .holders(holders)
         .health(health)
-        .working_deposit(deps.chain.working_deposit)
+        .recovery(Arc::clone(sources.recovery()))
         .max_lanes(max_sources)
         .max_blob_bytes(deps.max_blob_bytes);
+    if let Some(slot) = sources.credentials() {
+        downloader = downloader.credentials(slot);
+    }
     let result =
         Box::pin(downloader.fetch_to_paths_until(&[target], Some(&on_progress), stop)).await;
     bar.finish_and_clear();
@@ -2712,8 +2791,8 @@ fn multi_lane_watermarks(
 /// ([`Funder::pool_spent`]), so a pool shared across many providers gates on its
 /// true remaining deposit whichever lanes the acquire loop starts. The second
 /// is a wallet that holds too little USDC to top the pool up: once seen, no
-/// later lane build of the run tries the proactive refill again, a reactive
-/// top-up fails without a transaction, and the command ends with one
+/// later lane build of the run tries the proactive refill again, a funding
+/// recovery step fails without a transaction, and the command ends with one
 /// `warning:` line naming it.
 #[derive(Debug, Default)]
 pub(crate) struct RunFunding {
@@ -2875,31 +2954,43 @@ impl RunFunding {
     }
 }
 
-/// The CLI's [`Funder`]: a mid-fetch reactive top-up runs the same
-/// `ensure_allowance -> top_up -> add_deposit` path as the proactive low-water
-/// refill ([`refill_if_low`]), behind the driver's [`Funder`] seam so the gap
-/// driver stays chain-handle-agnostic. Unlike the proactive refill, every
-/// failure here returns to the driver, which rules it unaffordable or, when the
-/// escrow may have moved, fatal. The driver decides
-/// WHETHER to fund (its pacer confirms a genuine, ledger-corroborated
-/// exhaustion and that budget/attempts remain); this only executes the
-/// on-chain move and returns the [`DepositOutcome`] for the driver to credit.
+/// The CLI's [`Funder`]: the funding recovery step (ADR 003 § Funding
+/// recovery). A self-funded owner tops its current pool up toward the working
+/// deposit through the same `ensure_allowance -> top_up -> add_deposit` path
+/// as the proactive low-water refill ([`refill_if_low`]). A pool that is
+/// `Closing` or `Closed` reverts that `topUp` with `PoolNotOpen`; the owner
+/// then opens a new pool at the working deposit and records it as the current
+/// pool in the buyer store, and the step reports [`Recovery::Replaced`]. The
+/// old pool is not reclaimed here.
 ///
-/// There is no funder-vs-delegate split here: the CLI fetcher is always its
-/// own pool owner, so `top_up` is unconditionally authorized (`topUp` is
-/// owner-only on-chain, and owner == signer on this path).
+/// A delegated signer (`--capability`) has no funder this command can ask, so
+/// its working deposit is zero and every step reports
+/// [`Recovery::Unavailable`]: the fetch ends "funding needed" with the
+/// new-signer-key remedy ([`annotate_delegated_exhaustion`]).
+///
+/// The acquire loop decides WHETHER to fund (its candidate set is exhausted
+/// and the progress rule allows a step); this only executes the on-chain move.
+/// Every failure returns to the loop, which ends the fetch "funding needed",
+/// or, when the escrow may have moved, fatally.
 pub(crate) struct CliFunder<'a, P> {
     pub(crate) contract: &'a PaymentPool::PaymentPoolInstance<P>,
     pub(crate) rpc: &'a P,
     pub(crate) store: &'a RedbBuyerPoolStore,
     pub(crate) owner: Address,
+    /// Signs a replacement pool's `openPool` and its self-issued capability.
+    pub(crate) signer: &'a Arc<PrivateKeySigner>,
+    /// The chain and `PaymentPool` a replacement pool opens on.
+    pub(crate) deployment: Deployment,
     /// The pool to top up: the one the first lane a
     /// [`super::cli_sources::CliSources`] builds opens or reuses. Every lane
-    /// pays from the one pool, and a top-up runs only from a running lane, so
-    /// it is set by then.
+    /// pays from the one pool, and a recovery step runs only once a lane
+    /// priced its source out, so it is set by then.
     pub(crate) pool_id: &'a std::sync::OnceLock<PoolId>,
     pub(crate) token: Address,
     pub(crate) payment_pool_addr: Address,
+    /// The deposit a step tops up toward and a replacement pool opens at.
+    /// Zero for a delegated signer, which has no funding path.
+    pub(crate) working_deposit: U256,
     pub(crate) max_approve: bool,
     /// The run's funding facts: its outside spend, and a wallet shortfall that
     /// makes a further top-up pointless.
@@ -2910,16 +3001,16 @@ impl<P> Funder for CliFunder<'_, P>
 where
     P: alloy::providers::Provider + Clone,
 {
-    fn max_topups(&self) -> u32 {
-        decdn_client::MAX_TOPUP_ATTEMPTS
-    }
-
     fn pool_spent(&self) -> Option<U256> {
         self.funding.pool_spent()
     }
 
-    fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
+    fn recover(&self, remaining: U256) -> SourceFuture<'_, Recovery> {
         Box::pin(async move {
+            let additional = self.working_deposit.saturating_sub(remaining);
+            if additional.is_zero() {
+                return Ok(Recovery::Unavailable);
+            }
             let pool_id =
                 self.pool_id.get().copied().ok_or_else(|| {
                     anyhow::anyhow!("no payment lane is built, so no pool to top up")
@@ -2954,6 +3045,19 @@ where
             let ToppedUpPool { credited, tx, .. } = match escrowed {
                 Ok(topped_up) => topped_up,
                 Err(err) if err.downcast_ref::<TopUpUnconfirmed>().is_some() => return Err(err),
+                // The gas estimate reverted `PoolNotOpen`: the pool is closing
+                // or closed, and a pool is never reopened. Open its successor.
+                Err(err) if err.downcast_ref::<PoolNotOpen>().is_some() => {
+                    tracing::info!(
+                        %pool_id,
+                        "the current buyer pool no longer accepts funds; opening a new pool"
+                    );
+                    let opened = self.open_replacement().await?;
+                    return Ok(Recovery::Replaced(PoolReplaced {
+                        closed: pool_id,
+                        opened,
+                    }));
+                }
                 Err(err) => {
                     let short = self
                         .funding
@@ -2965,19 +3069,60 @@ where
                     });
                 }
             };
-            // Grade here rather than handing the escrowed-but-untracked
-            // outcomes back for the driver to bail on. The driver treats them
-            // as terminal either way, but `DepositOutcome` has nowhere to carry
-            // the tx or the pool, so its bail names neither — and this is the
-            // one leg where the escrow has already moved.
+            // The escrow has moved: a credit that does not land names the tx
+            // and the pool, and is fatal ([`grade_deposit_credit`]).
             let effect = topped_up_effect(pool_id, credited);
             let new_deposit = grade_deposit_credit(
                 self.store.add_deposit(self.owner, pool_id, credited),
                 &effect,
                 tx,
             )?;
-            Ok(DepositOutcome::Added(new_deposit))
+            Ok(Recovery::ToppedUp(new_deposit))
         })
+    }
+}
+
+impl<P> CliFunder<'_, P>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    /// Open a new pool at the working deposit and record it as the owner's
+    /// current pool in the buyer store, where the next lane build reuses it.
+    /// The closed pool's row stays in the store, so `decdn pool reclaim` and
+    /// `pool list` still find it.
+    ///
+    /// # Errors
+    ///
+    /// The allowance or `openPool` fails (nothing escrowed), or the opened
+    /// pool cannot be recorded (escrowed and untracked: fatal).
+    async fn open_replacement(&self) -> anyhow::Result<PoolId> {
+        let deposit = self.working_deposit;
+        ensure_allowance(
+            self.rpc,
+            self.token,
+            self.owner,
+            self.payment_pool_addr,
+            if self.max_approve {
+                None
+            } else {
+                Some(deposit)
+            },
+        )
+        .await?;
+        let opened = open_pool(
+            self.contract,
+            Arc::clone(self.signer),
+            self.deployment,
+            self.token,
+            self.owner,
+            deposit,
+        )
+        .await?;
+        self.store
+            .record(&opened.state)
+            .map_err(|e| escrowed_but_untracked("buyer pool opened", opened.tx, e))?;
+        tracing::info!(pool_id = %opened.state.pool_id, %deposit, "opened a new buyer pool");
+        Ok(opened.state.pool_id)
     }
 }
 
@@ -3217,8 +3362,9 @@ fn print_fetch_summary(content_bytes: u64, meter: &DeliveryMeter, output: &Path)
 }
 
 /// Resolve the delegated `--capability`/`--capability-file` token into a
-/// [`CapabilityGrant`], and — when one is present — disable reactive top-up in
-/// `chain` (a delegate owns no pool it could `topUp`). `None` selects the
+/// [`CapabilityGrant`], and, when one is present, zero the working deposit
+/// in `chain`: a delegate owns no pool it could `topUp`, so its funding
+/// recovery step has nothing to add ([`CliFunder`]). `None` selects the
 /// unchanged self-owned pool path. Shared by `decdn fetch` and `bundle pull`.
 ///
 /// # Errors
@@ -3765,8 +3911,8 @@ where
             // yet — `bundle pull` reaches this once per entry, through
             // `open_or_reuse_pool`, so earlier entries may already be paid for and
             // written — and only the escrow moved, so failing here strands nothing
-            // in flight. The reactive mid-fetch leg takes the same disposition
-            // (`CliFunder::top_up`).
+            // in flight. The funding recovery step takes the same disposition
+            // (`CliFunder::recover`).
             let effect = topped_up_effect(state.pool_id, credited);
             grade_deposit_credit(
                 store.add_deposit(self_address, state.pool_id, credited),

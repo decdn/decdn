@@ -848,12 +848,14 @@ async fn a_lane_build_reports_the_pools_other_spend() {
     );
 }
 
-/// The run's funder reports the pool's spend to the deposit gate. A
-/// reactive top-up that fails for another reason is not a shortfall; after
-/// a wallet shortfall, a reactive top-up fails without a chain call and
-/// says so ([`WalletShortfall`]).
+/// The run's funder reports the pool's spend to the deposit gate. A funding
+/// recovery step that fails for another reason is not a shortfall; after a
+/// wallet shortfall, a step fails without a chain call and says so
+/// ([`WalletShortfall`]). A delegated signer's zero working deposit leaves
+/// the step no funding path.
 #[tokio::test]
 async fn the_cli_funder_reads_the_run_funding() {
+    let signer = Arc::new(PrivateKeySigner::random());
     let dir = tempfile::tempdir().unwrap();
     let store = client_store(&dir);
     let rpc = ProviderBuilder::new().connect_mocked_client(Asserter::new());
@@ -875,24 +877,36 @@ async fn the_cli_funder_reads_the_run_funding() {
         rpc: &rpc,
         store: &store,
         owner: Address::repeat_byte(0x01),
+        signer: &signer,
+        deployment: DEPLOYMENT,
         pool_id: &pool_id,
         token: TOKEN,
         payment_pool_addr: PP,
+        working_deposit: U256::from(WORKING),
         max_approve: false,
         funding: &funding,
     };
     assert_eq!(funder.pool_spent(), Some(U256::from(700u64)));
 
-    // No answers are queued, so the wallet read faults: not a shortfall.
-    let err = funder.top_up(U256::from(5u64)).await.unwrap_err();
+    // No answers are queued, so the allowance read faults: not a shortfall.
+    let err = funder.recover(U256::from(5u64)).await.unwrap_err();
     assert!(funding.shortfall().is_none(), "{err:#}");
     assert!(err.downcast_ref::<WalletShortfall>().is_none(), "{err:#}");
 
     *funding.shortfall.lock().unwrap() = Some("wallet 0x01 holds 0 µUSDC".to_owned());
-    let err = funder.top_up(U256::from(5u64)).await.unwrap_err();
+    let err = funder.recover(U256::from(5u64)).await.unwrap_err();
     assert!(
         format!("{err:#}").contains("the wallet cannot fund a top-up: wallet 0x01 holds 0"),
         "{err:#}"
     );
     assert!(err.downcast_ref::<WalletShortfall>().is_some(), "{err:#}");
+
+    let delegated = CliFunder {
+        working_deposit: U256::ZERO,
+        ..funder
+    };
+    assert!(matches!(
+        delegated.recover(U256::ZERO).await,
+        Ok(Recovery::Unavailable)
+    ));
 }

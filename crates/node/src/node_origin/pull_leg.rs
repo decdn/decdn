@@ -38,7 +38,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -48,15 +47,13 @@ use bao_tree::ChunkRanges;
 use decdn_bao_range::RangedStore;
 use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, align_range};
 use decdn_cache::{CacheEngine, CacheError, DownstreamWatch, FillError, FillSession, Hash};
-use decdn_client::driver::DriveConfig;
 use decdn_client::sink::PullReader;
-use decdn_client::source::{BlobSource as _, Funder, SourceFuture};
+use decdn_client::source::BlobSource as _;
 use decdn_client::{
     CoveredRun, DownstreamFrontier, Fault, HashMismatch as ClientPullHashMismatch, LegNoProgress,
-    PacingWait, PeerSource, PoolExhausted, PoolLedger, PrimedSource, RampPacer, SharedPool,
+    PacingWait, PeerSource, PoolLedger, PrimedSource, RampPacer, RecoveryGate, SharedPool, Stepped,
     UpstreamPullHeader, WaitReason, classify, drive, first_leg,
 };
-use decdn_incentive::DepositOutcome;
 
 use decdn_reputation::Outcome;
 use iroh::{EndpointAddr, PublicKey};
@@ -66,7 +63,7 @@ use tracing::{Instrument as _, debug, warn};
 use super::admit_store::NodeAdmitStore;
 use super::backend_source::BackendSource;
 use super::funder::NodeFunder;
-use super::funder::{SETTLE_POLL_STEP, settle_wait_budget};
+use super::funder::{SETTLE_POLL_STEP, settle_window};
 use super::ranged_pull::{AssembleOutcome, RunOutcome, RunSink, assemble};
 use super::timed_source::{TimedReader, TimedSource, timed_open};
 use super::{
@@ -723,14 +720,18 @@ impl NodeOrigin {
                     return PullOutcome {
                         payload: Ok(answer),
                         attempts,
+                        unfunded: Vec::new(),
                     };
                 }
                 Err(failed) => miss = miss.or(failed),
             }
         }
+        // The handshake pays nothing, so it runs no funding recovery step; the
+        // assembly that follows runs its own ([`assemble`]).
         PullOutcome {
             payload: Err(miss),
             attempts,
+            unfunded: Vec::new(),
         }
     }
 
@@ -986,9 +987,10 @@ fn handshake_verdict(
 /// ([`ends_the_assembly`]) drops that source and re-plans the still-missing
 /// remainder against the survivors — the loop-level reassign-only tail. The
 /// store keeps the verified bytes, so the replacement lane resumes at the gap
-/// and re-pays nothing (#1682). A fatal fault or a dry shared pool (a voucher
-/// rejection, an origin blacklist, an over-cap blob, [`PoolExhausted`]) ends
-/// the whole assembly. The assembly also ends `Unavailable`
+/// and re-pays nothing (#1682). A fatal fault (an over-cap blob, a fault of
+/// this node's own store) ends the whole assembly. A funding refusal drops
+/// only its source, and the assembly's funding recovery step decides once no
+/// other holder serves. The assembly also ends `Unavailable`
 /// when every covering candidate faulted, when a round made no progress, when the
 /// reassign budget ran out, or when no surviving candidate covers a still-missing
 /// range ([`super::ranged_pull::UnavailableCause`]). The serve leg refuses before
@@ -1077,12 +1079,6 @@ pub(crate) async fn run_pull_leg(
         paid_base: session.served_start(),
         paid_carried,
     };
-    let config = DriveConfig {
-        working_deposit: deps.config.working_deposit,
-        seller_reserve: deps.config.seller_reserve,
-        max_settle_waits: settle_wait_budget(deps.config.event_poll_interval),
-        settle_backoff: SETTLE_POLL_STEP,
-    };
     // The downstream pacing wait and frontier reader, SHARED across every run's lane
     // so the window is continuous — keyed on the session's downstream frontiers, not
     // on the run.
@@ -1101,10 +1097,9 @@ pub(crate) async fn run_pull_leg(
         deadlines,
         admit_store: &admit_store,
         pacer: &pacer,
-        config: &config,
         pacing_wait: &pacing_wait,
-        topups_used: AtomicU32::new(0),
-        topup_lock: tokio::sync::Mutex::new(()),
+        recovery: RecoveryGate::with_settle(settle_window(deps.config.event_poll_interval)),
+        gap_seen: std::sync::Mutex::new(None),
         cancel: &cancel,
         primed: std::sync::Mutex::new(primed),
     };
@@ -1116,6 +1111,7 @@ pub(crate) async fn run_pull_leg(
         AssembleOutcome::Complete => deps.metrics.outbound_stream_ended(true),
         AssembleOutcome::Unavailable(_)
         | AssembleOutcome::Backpressured
+        | AssembleOutcome::FundingNeeded
         | AssembleOutcome::Terminal(_) => {
             deps.metrics.outbound_stream_ended(false);
         }
@@ -1148,6 +1144,18 @@ pub(crate) async fn run_pull_leg(
             "node-origin ranged pull: the only holder of a still-missing range kept refusing \
              for backpressure",
         )),
+        AssembleOutcome::FundingNeeded => {
+            warn!(
+                %hash,
+                offset,
+                len,
+                "node-origin ranged pull ended funding needed: the holders of a still-missing \
+                 range refuse this node's funding and no recovery step can raise it"
+            );
+            Err(FillError::new(
+                "node-origin ranged pull: funding needed (this node's buyer pool)",
+            ))
+        }
         AssembleOutcome::Terminal(err) => Err(err),
     };
     session.mark_ended(result);
@@ -1174,19 +1182,15 @@ struct PeerRunSink<'a> {
     deadlines: PullDeadlines,
     admit_store: &'a NodeAdmitStore,
     pacer: &'a RampPacer,
-    config: &'a DriveConfig,
     /// The shared downstream wait, which is also the frontier reader every run's
     /// `drive` paces against, so the demand window is continuous across runs.
     pacing_wait: &'a DownstreamWait,
-    /// Reactive top-ups this assembly has escrowed, across EVERY run's lane
-    /// (#1506). One pool deposit backs the whole set, so [`Funder::max_topups`]
-    /// bounds the assembly, not each run — counting per-run would let a K-source
-    /// miss escrow K on-chain `topUp` txs for one serve. Built once here and
-    /// shared into every run's [`SharedPool`].
-    topups_used: AtomicU32,
-    /// Serializes the runs' reactive top-ups on the one deposit
-    /// ([`SharedPool::topup_lock`]).
-    topup_lock: tokio::sync::Mutex<()>,
+    /// The assembly's funding recovery state (ADR 003 § Funding recovery). One
+    /// assembly is one fill, so its runs share one progress rule.
+    recovery: RecoveryGate,
+    /// The still-missing chunk count at the last recovery check, so the
+    /// gap's shrink since then counts as verified progress ([`RunSink::recover`]).
+    gap_seen: std::sync::Mutex<Option<u64>>,
     cancel: &'a CancellationToken,
     /// The handshake's primed pull, taken by the first run (#2063). That run
     /// adopts it when it opens exactly its leg on its lane; otherwise it closes.
@@ -1295,6 +1299,61 @@ impl RunSink for PeerRunSink<'_> {
             return;
         };
         record_backpressure_exhausted(self.deps, pk, self.hash_bytes, waits);
+    }
+
+    /// The assembly's funding recovery step, under its gate. The gap's shrink
+    /// since the last check is the verified progress the gate counts: the store
+    /// admits only bao-verified bytes. Inside the settle window after a top-up,
+    /// a source that still refuses is the upstream's chain watcher lagging the
+    /// new deposit, so the assembly waits a [`SETTLE_POLL_STEP`] and asks again
+    /// without a step.
+    async fn recover(&self, gap_chunks: u64) -> bool {
+        {
+            let mut seen = self
+                .gap_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(prev) = *seen
+                && gap_chunks < prev
+            {
+                self.recovery
+                    .record_verified((prev - gap_chunks).saturating_mul(CHUNK_BYTES));
+            }
+            *seen = Some(gap_chunks);
+        }
+        if self.recovery.settling(tokio::time::Instant::now()) {
+            return tokio::select! {
+                () = self.cancel.cancelled() => false,
+                () = tokio::time::sleep(SETTLE_POLL_STEP) => true,
+            };
+        }
+        let funder = NodeFunder::new(Arc::clone(&self.deps.buyer), Arc::clone(&self.deps.metrics));
+        // The node's step sizes itself from its pool row, so the deposit view it
+        // is handed is not read.
+        match self
+            .recovery
+            .step(&funder, U256::ZERO, || U256::ZERO, U256::ZERO)
+            .await
+        {
+            Stepped::Raised(_) => true,
+            Stepped::Replaced(replaced) => {
+                debug!(
+                    closed = %replaced.closed,
+                    opened = %replaced.opened,
+                    "node-origin: the buyer pool accepts no more funds; a new pool replaces it"
+                );
+                self.recovery.start_next_pass();
+                true
+            }
+            Stepped::NoProgress | Stepped::Unavailable => false,
+            Stepped::Failed(err) => {
+                warn!(
+                    error = %format!("{err:#}"),
+                    "node-origin: the ranged pull's funding recovery step failed"
+                );
+                false
+            }
+        }
     }
 
     async fn missing(&self, offset: u64, len: u64) -> ChunkRanges {
@@ -1470,48 +1529,24 @@ impl PeerRunSink<'_> {
         ));
         self.adopt_primed(&peer_source, &run, pool_id, &ledger)
             .await;
-        let node_funder = NodeFunder::new(
-            Arc::clone(&self.deps.buyer),
-            Arc::clone(&ctx),
-            Arc::clone(&self.deps.metrics),
-            // The window-paced serve-miss leg does not derive a refuse-metering
-            // signal from this flag; `NodeFunder` records its own metrics.
-            Arc::new(AtomicBool::new(false)),
-        );
         // The SAME shared downstream frontiers every run reads, so the demand
         // window is continuous across the sequential lanes.
         let pacing_wait = self.pacing_wait;
         let downstream_reader = move || pacing_wait.frontier();
 
-        // The shared-pool view this run's `drive` gates on (#1506). One deposit
-        // backs every run's lane, so the three pool facts are read across ALL of
-        // them, not this one lane:
-        // - `spent`: the whole-pool committed spend — the sum over every live
-        //   lane ledger for `pool_id`, INCLUDING this run's own (seeded above via
-        //   `lane_ledger`). Without it, a later run whose lane has spent nothing
-        //   sees `committed == 0` and believes the whole deposit is unspent, then
-        //   signs a voucher the pool cannot back → mid-stream `SpendingCapExhausted`.
-        // - `topups_used`: the assembly-wide reactive-top-up budget, shared so K
-        //   runs cannot each escrow `Funder::max_topups` on-chain `topUp` txs.
-        // - `credit`: a landed top-up's new deposit, written to THIS run's `ctx`
-        //   so its own gate stops reading the stale pre-top-up value; a later run
-        //   re-reads the deposit from the persisted pool row `open_or_reuse_pool`
-        //   already refreshed.
+        // The shared-pool spend this run's `drive` gates on (#1506): the
+        // whole-pool committed spend: the sum over every live lane ledger for
+        // `pool_id`, INCLUDING this run's own (seeded above via `lane_ledger`).
+        // Without it, a later run whose lane has spent nothing sees
+        // `committed == 0` and believes the whole deposit is unspent, then signs
+        // a voucher the pool cannot back. The deposit itself rises only through
+        // the assembly's funding recovery step, which a later run's lane reads
+        // from the pool row `open_or_reuse_pool` refreshes.
         let ledgers = &self.deps.ledgers;
         let spent = move || ledgers.pool_committed(pool_id);
-        let credit_ctx = Arc::clone(&ctx);
-        let credit = move |new_deposit: U256| -> anyhow::Result<()> {
-            credit_ctx
-                .lock()
-                .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
-                .deposit = new_deposit;
-            Ok(())
-        };
         let pool = SharedPool {
             spent: &spent,
-            topups_used: &self.topups_used,
-            credit: &credit,
-            topup_lock: &self.topup_lock,
+            quotes: None,
         };
 
         let started = Instant::now();
@@ -1526,13 +1561,11 @@ impl PeerRunSink<'_> {
                 self.admit_store,
                 &peer_source,
                 self.pacer,
-                &node_funder,
                 &ctx,
                 &ledger,
                 self.hash_bytes,
                 run.offset,
                 run.len,
-                self.config,
                 None,
                 Some(self.pacing_wait),
                 Some(&downstream_reader),
@@ -1610,6 +1643,8 @@ impl PeerRunSink<'_> {
                 }
                 if ends_the_assembly(&err) {
                     RunOutcome::Terminal(FillError::new(format!("{err:#}")))
+                } else if classify(&err) == Fault::Unaffordable {
+                    RunOutcome::Unfunded
                 } else {
                     RunOutcome::Reassign
                 }
@@ -1623,22 +1658,21 @@ impl PeerRunSink<'_> {
 ///
 /// A fatal fault ([`classify`]: an over-cap blob, a local fault) cannot be
 /// fixed by another lane, and neither can a fault of this node's own store
-/// ([`super::is_local_store_fault`]): every holder's bytes land in it. Nor can the
-/// pacer's [`PoolExhausted`]: the node's one shared pool funds every holder, so
-/// once it is dry no holder can be paid. An open-time `Unfunded` is
-/// this holder's reservation floor outrunning the pool, and a different holder
-/// may reserve a smaller one, so it moves on. So does a rejection that healed
+/// ([`super::is_local_store_fault`]): every holder's bytes land in it. A
+/// funding refusal never ends the assembly: an open-time `Unfunded`, a funding
+/// rejection and the pacer's [`decdn_client::PoolExhausted`] scope to the
+/// source that met them ([`RunOutcome::Unfunded`]), and the assembly's funding
+/// recovery step decides once no other holder serves. A rejection that healed
 /// the lane ledger after the lane spent its resume budget
-/// ([`decdn_client::HealExhausted`]). Anything else is a property of this
-/// source's delivery.
+/// ([`decdn_client::HealExhausted`]) moves on too. Anything else is a property
+/// of this source's delivery.
 fn ends_the_assembly(err: &anyhow::Error) -> bool {
     if super::is_local_store_fault(err) {
         return true;
     }
     match classify(err) {
         Fault::Fatal(_) => true,
-        Fault::Unaffordable => err.downcast_ref::<PoolExhausted>().is_some(),
-        Fault::Source | Fault::Transient => false,
+        Fault::Unaffordable | Fault::Source | Fault::Transient => false,
     }
 }
 
@@ -1655,31 +1689,6 @@ fn whole_range_chunks(offset: u64, len: u64) -> ChunkRanges {
 // The UNPAID own-origin twin of the pull leg.
 // ===========================================================================
 
-/// The [`Funder`] for the UNPAID local leg. There is no channel to fund, so it
-/// permits zero reactive top-ups and its [`Funder::top_up`] is unreachable.
-///
-/// Rate 0 keeps `next_voucher_cost` at 0 and `DriveConfig::working_deposit` is
-/// [`U256::ZERO`], so the pacer's exhaustion arm never fires and never returns a
-/// top-up decision — the only thing that would call `top_up`. It errs
-/// defensively (rather than escrow anything, which it could not do anyway) so a
-/// hypothetical future regression that reached it fails loudly instead of hanging.
-struct NullFunder;
-
-impl Funder for NullFunder {
-    fn max_topups(&self) -> u32 {
-        0
-    }
-
-    fn top_up(&self, _additional: U256) -> SourceFuture<'_, DepositOutcome> {
-        Box::pin(async {
-            Err(anyhow::anyhow!(
-                "local own-origin pull leg has no channel to top up \
-                 (unreachable: rate 0, working_deposit 0)"
-            ))
-        })
-    }
-}
-
 /// Build the benign LOCAL [`PoolContext`] the driver carries as pure
 /// bookkeeping for the unpaid leg (THE CRUX).
 ///
@@ -1688,7 +1697,7 @@ impl Funder for NullFunder {
 /// large `deposit` keeps the pacer's `remaining_deposit` (`deposit −
 /// committed.amount`, and `committed.amount` stays 0 at rate 0) permanently above
 /// `next_voucher_cost` (also 0), so [`crate::pacer` `BudgetPacer`] never reaches
-/// its exhaustion/top-up arm. Fresh priors — there is no prior pool state to
+/// its refuse arm. Fresh priors: there is no prior pool state to
 /// resume. `U256::MAX` is used, not a merely-large value, so no blob size can ever
 /// bring the gap headroom below the (zero) voucher cost.
 fn local_bookkeeping_ctx() -> PoolContext {
@@ -1736,7 +1745,7 @@ fn local_bookkeeping_ctx() -> PoolContext {
 /// re-draw forever. So the [`BackendSource`] carries a LOCAL bookkeeping
 /// [`PoolLedger`] and, on `finish`, advances its `bytes` by exactly the leg's
 /// drained wire (at amount 0). We hand `drive` that SAME ledger ([`BackendSource::ledger`])
-/// plus a benign [`local_bookkeeping_ctx`] and a [`NullFunder`], so the completion
+/// plus a benign [`local_bookkeeping_ctx`], so the completion
 /// counter the source moves is the one the gap loop reads. This is NOT payment — no
 /// channel, no voucher, no chain, no counterparty; see the [`BackendSource`] module
 /// docs.
@@ -1778,11 +1787,9 @@ pub(crate) async fn run_local_pull_leg(
     // The LOCAL bookkeeping axes (THE CRUX). The `ledger` is the SAME `Arc` the
     // source advances on `finish`, so the paid-frontier the gap loop reads for
     // completion tracks the wire this leg actually drained. The `ctx` is a benign
-    // large-deposit / throwaway-signer context (never used to sign, rate 0), and the
-    // funder is a no-op — there is no channel to top up.
+    // large-deposit / throwaway-signer context (never used to sign, rate 0).
     let ledger = source.ledger();
     let ctx = Arc::new(std::sync::Mutex::new(local_bookkeeping_ctx()));
-    let null_funder = NullFunder;
 
     // The ramped credit-window pacer (ADR 003 §Credit window / ADR 037), IDENTICAL
     // to the paid leg's: bound on `served_paid` (#1610 + storage/egress exposure),
@@ -1793,14 +1800,6 @@ pub(crate) async fn run_local_pull_leg(
         credit_max,
         paid_base: session.served_start(),
         paid_carried,
-    };
-    // `working_deposit == ZERO` disables the pacer's reactive top-up arm entirely, so
-    // the settle-wait budget is inert here; keep the smallest sane values.
-    let config = DriveConfig {
-        working_deposit: U256::ZERO,
-        seller_reserve: U256::ZERO,
-        max_settle_waits: 0,
-        settle_backoff: SETTLE_POLL_STEP,
     };
     let pacing_wait = DownstreamWait::for_session(&session, hash, Arc::clone(&metrics));
     let downstream_reader = || pacing_wait.frontier();
@@ -1815,13 +1814,11 @@ pub(crate) async fn run_local_pull_leg(
             &admit_store,
             &source,
             &pacer,
-            &null_funder,
             &ctx,
             &ledger,
             hash_bytes,
             offset,
             len,
-            &config,
             None,
             Some(&pacing_wait),
             Some(&downstream_reader),

@@ -1091,6 +1091,7 @@ async fn the_open_recheck_ignores_a_row_from_another_deployment() {
             Address::repeat_byte(2),
             owner,
             U256::from(10_000_000u64),
+            None,
             &Arc::new(Metrics::new()),
         )
         .await;
@@ -1105,6 +1106,44 @@ async fn the_open_recheck_ignores_a_row_from_another_deployment() {
             assert_eq!(asserter.read_q().len(), 1, "no open was attempted");
         }
     }
+}
+
+/// A tracked pool that no longer accepts funds does not suppress the open of
+/// its replacement (ADR 003 § Funding recovery): the funding recovery step
+/// names it, and the open goes ahead although the store still tracks it.
+#[tokio::test]
+async fn a_replacement_open_runs_past_the_closed_pool_it_replaces() {
+    let owner = Address::repeat_byte(1);
+    let closed = PoolId::from([0xAA; 32]);
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    store
+        .record(&BuyerPoolState::new(
+            closed,
+            DEPLOYMENT,
+            owner,
+            Address::repeat_byte(2),
+            U256::from(10_000_000u64),
+        ))
+        .expect("seed the row");
+    // One faulting call: an open that goes ahead spends it and fails.
+    let (contract, asserter) = mocked_pool_contract_with(vec![MockCall::Err]);
+    let result = run_open(
+        &contract,
+        &store,
+        Arc::new(PrivateKeySigner::random()),
+        DEPLOYMENT,
+        Address::repeat_byte(2),
+        owner,
+        U256::from(10_000_000u64),
+        Some(closed),
+        &Arc::new(Metrics::new()),
+    )
+    .await;
+    assert!(result.is_err(), "the replacement open reached the chain");
+    assert!(
+        asserter.read_q().is_empty(),
+        "the open spent the scripted call"
+    );
 }
 
 /// A lane this node has been paid on, but has no local record of, resumes
@@ -2141,18 +2180,18 @@ fn in_flight(amount: u64, funder: TopUpFunder) -> InFlightTopUp {
 fn in_flight_refill_is_claimed_at_most_once() {
     let mut slot = in_flight(100, TopUpFunder::Refill);
 
-    assert_eq!(slot.join(u(60), TopUpFunder::Reactive).1, joined(60, 100));
-    assert_eq!(slot.join(u(60), TopUpFunder::Reactive).1, joined(40, 100));
-    assert_eq!(slot.join(u(60), TopUpFunder::Reactive).1, joined(0, 100));
+    assert_eq!(slot.join(u(60), TopUpFunder::Recovery).1, joined(60, 100));
+    assert_eq!(slot.join(u(60), TopUpFunder::Recovery).1, joined(40, 100));
+    assert_eq!(slot.join(u(60), TopUpFunder::Recovery).1, joined(0, 100));
 }
 
 /// A reactive top-up's amount is its spawner's: a second reactive top-up that
 /// joins it claims nothing (#2012).
 #[test]
 fn in_flight_reactive_topup_leaves_nothing_to_claim() {
-    let mut slot = in_flight(100, TopUpFunder::Reactive);
+    let mut slot = in_flight(100, TopUpFunder::Recovery);
 
-    assert_eq!(slot.join(u(100), TopUpFunder::Reactive).1, joined(0, 100));
+    assert_eq!(slot.join(u(100), TopUpFunder::Recovery).1, joined(0, 100));
 }
 
 /// A refill that joins claims nothing, so it cannot take headroom a reactive
@@ -2162,7 +2201,7 @@ fn in_flight_refill_joiner_claims_nothing() {
     let mut slot = in_flight(100, TopUpFunder::Refill);
 
     assert_eq!(slot.join(u(100), TopUpFunder::Refill).1, joined(0, 100));
-    assert_eq!(slot.join(u(100), TopUpFunder::Reactive).1, joined(100, 100));
+    assert_eq!(slot.join(u(100), TopUpFunder::Recovery).1, joined(100, 100));
 }
 
 #[test]

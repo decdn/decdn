@@ -1096,6 +1096,43 @@ fn delegated_drained_signer_gets_the_new_key_remedy() {
     }
 }
 
+/// The SDK's typed delegated stops render as the CLI's remedies: a capability
+/// that no longer pays names a new signer key, and a pool that cannot pay
+/// under a healthy capability names the owner's top-up.
+#[test]
+fn delegated_typed_funding_stops_render_their_remedies() {
+    let pool = alloy::primitives::B256::repeat_byte(0x11);
+    let exhausted = || {
+        anyhow::Error::new(NoAffordableSource {
+            deposit: U256::from(5u32),
+        })
+    };
+    let new_capability = format!(
+        "{:#}",
+        super::annotate_delegated_exhaustion(exhausted().context(
+            decdn_client::FundingNeeded::NewCapability {
+                pool,
+                cause: decdn_client::CapabilityCause::CapSpent,
+            }
+        ))
+    );
+    assert!(
+        new_capability.contains("new signer key") && new_capability.contains("spent its cap"),
+        "{new_capability}"
+    );
+    let publisher = format!(
+        "{:#}",
+        super::annotate_delegated_exhaustion(
+            exhausted().context(decdn_client::FundingNeeded::PublisherPool { pool })
+        )
+    );
+    assert!(
+        publisher.contains(&format!("ask the owner of pool {pool} to top it up"))
+            && !publisher.contains("new signer key"),
+        "{publisher}"
+    );
+}
+
 /// Any error the delegated-exhaustion annotator does not name passes
 /// through untouched.
 #[test]

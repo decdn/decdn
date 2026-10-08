@@ -1424,41 +1424,30 @@ pub struct DecdnMetrics {
     /// `node_pull_progress_persist_failures_total` (a real store-write failure that leaves the
     /// watermark lagging) so ordinary settle races do not drown out a genuine persist fault.
     pub node_pull_progress_superseded: Counter,
-    /// `decdn_node_pull_reactive_topup_total` (#1530): a node→node miss pull hit its
-    /// channel's deposit ceiling mid-stream, funded the shortfall on-chain, and
-    /// resumed at the paid frontier.
+    /// `decdn_node_pull_reactive_topup_total` (#1530): a node→node miss fill's
+    /// funding recovery step (ADR 003 § Funding recovery) added funds: every
+    /// candidate refused this node's funding, so the step topped the buyer pool
+    /// up, or opened a new pool in place of one that accepts no more funds.
     ///
     /// Expected to be RARE once `buyer_working_deposit_micro_usdc` is sized for the
     /// blobs this node pulls — the proactive low-water refill should refill a
-    /// channel long before a single pull outruns it. A sustained rate means the
-    /// working deposit is too small for the blob sizes in play, and every tick is a
+    /// pool long before a fill runs it dry. A sustained rate means the working
+    /// deposit is too small for the blob sizes in play, and every tick is a
     /// transaction plus a settlement wait a client sat through.
     ///
     /// Distinct from `decdn_buyer_topup_ok_total`, which counts on-chain top-ups from
-    /// BOTH legs: this one isolates the reactive leg, so the proactive refill's
+    /// BOTH legs: this one isolates the recovery step, so the proactive refill's
     /// routine traffic cannot hide it.
     pub node_pull_reactive_topup: Counter,
-    /// `decdn_node_pull_reactive_topup_refused_total` (#1530): a mid-pull top-up was
-    /// NOT performed, or was performed and added less than the pull asked for.
+    /// `decdn_node_pull_reactive_topup_refused_total` (#1530): a fill's funding
+    /// recovery step added nothing: the pool already holds the working deposit,
+    /// or the funding transaction failed (allowance, revert, RPC, or a mined
+    /// `topUp` the local pool row could not credit).
     ///
-    /// Three causes, one adversarial and two operational:
-    ///
-    /// - an upstream claiming `Unfunded` while our OWN ledger still covers
-    ///   the next voucher — a lying or buggy peer trying to make us escrow more USDC
-    ///   than we owe. `genuine_exhaustion` validates every claim against our own
-    ///   accounting and we decline to fund an uncorroborated one; this counter is the
-    ///   only place that becomes visible, so a sustained rate against one provider is
-    ///   worth alerting on;
-    /// - a funding transaction that failed (allowance, revert, RPC, or a mined
-    ///   `topUp` the local pool row could not credit);
-    /// - a top-up that landed less than the requested amount, or nothing (#2012).
-    ///
-    /// The three share a counter because the pull runs short of what it asked for,
-    /// but only the first says anything about the peer. A failed funding transaction
-    /// also ticks `decdn_buyer_topup_failure_total`. A short landing ticks neither
-    /// that nor this counter's success sibling, and logs a `warn!` with the requested
-    /// and landed amounts; the pull keeps what landed and continues until that
-    /// headroom runs out.
+    /// A pool already at the working deposit means an upstream's refundable floor
+    /// `M` exceeds what this node's working deposit covers; a sustained rate
+    /// against one provider is worth a look. A failed funding transaction also
+    /// ticks `decdn_buyer_topup_failure_total`.
     pub node_pull_reactive_topup_refused: Counter,
     /// `decdn_node_pull_through_timeouts_total` (#831): cache-miss pull-through
     /// attempts the delivery handler abandoned at its deadline. Distinguishes a
@@ -3403,13 +3392,11 @@ recorders! {
     /// this write was superseded (benign under `BuyerLedgers`; #1145 review).
     node_pull_progress_superseded => node_pull_progress_superseded.inc();
 
-    /// A miss pull funded its exhausted channel mid-stream and resumed at the paid
-    /// frontier (#1530).
+    /// A miss fill's funding recovery step added funds (#1530).
     node_pull_reactive_topup => node_pull_reactive_topup.inc();
 
-    /// A mid-pull top-up was declined or added less than requested: an upstream
-    /// claiming exhaustion our own ledger contradicts, a failed funding tx, or a
-    /// top-up that landed short (#1530, #2012).
+    /// A miss fill's funding recovery step added nothing: the pool already held
+    /// the working deposit, or the funding tx failed (#1530).
     node_pull_reactive_topup_refused => node_pull_reactive_topup_refused.inc();
 
     /// The delivery handler abandoned a pull-through at its deadline (#831).

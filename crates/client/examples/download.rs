@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use decdn_client::{DownloadTarget, Downloader, StaticSources};
 
-use common::{Buyer, Env, NoTopUp};
+use common::{Buyer, Env, NoFunding};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,8 +32,9 @@ async fn main() -> Result<()> {
     let (holders, total_bytes) = buyer.holders(*hash.as_bytes()).await?;
     let (candidates, lanes) = buyer.lanes(holders).await?;
 
-    // Reactive top-up stays off, which matches the `NoTopUp` funder.
-    let downloader = Downloader::new(StaticSources::new(candidates)?, NoTopUp);
+    // The `NoFunding` funder never adds funds: a fetch no holder serves at
+    // the pool's deposit ends "funding needed".
+    let downloader = Downloader::new(StaticSources::new(candidates)?, NoFunding);
     let result = downloader
         .fetch_to_paths(
             &[DownloadTarget {

@@ -119,17 +119,37 @@ fn a_lane_build_error_is_transient() {
     assert_eq!(classify(&err), Fault::Transient);
 }
 
-/// A failed reactive top-up is the buyer's funding, never the source's
-/// delivery: it is transient, so the source keeps its health and the loop
-/// retries. A wallet short of USDC is not fixed by a retry, so the source
-/// waits for the deposit like a dry pool.
+/// A wallet short of USDC is not fixed by a retry, so it reads like a dry
+/// pool: the funding recovery step that meets it ends "funding needed".
 #[test]
-fn a_failed_reactive_top_up_is_transient_unless_the_wallet_is_short() {
-    let failed =
-        || anyhow::anyhow!("submit topUp: rpc timed out").context(crate::driver::TopUpFailed);
-    assert_eq!(classify(&failed()), Fault::Transient);
-    let short = failed().context(crate::buyer_pool::WalletShortfall);
+fn a_wallet_shortfall_is_unaffordable() {
+    let short = anyhow::anyhow!("submit topUp: transfer amount exceeds balance")
+        .context(crate::buyer_pool::WalletShortfall);
     assert_eq!(classify(&short), Fault::Unaffordable);
+}
+
+/// A recovery step that opened a new pool ends this pass of the command: no
+/// lane can pay from the new pool, and the caller runs the remaining work
+/// again against it.
+#[test]
+fn a_replaced_pool_ends_the_command_pass() {
+    let replaced = anyhow::Error::new(crate::PoolReplaced {
+        closed: alloy::primitives::B256::repeat_byte(1),
+        opened: alloy::primitives::B256::repeat_byte(2),
+    });
+    assert_eq!(classify(&replaced), Fault::Fatal(FatalScope::Command));
+}
+
+/// The pacer's refusal of a lane whose deposit cannot cover the next voucher
+/// prices the source out at the current deposit, like a node's `Unfunded`
+/// refusal: it never cools the source as a delivery fault.
+#[test]
+fn a_dry_lane_is_unaffordable() {
+    let dry = anyhow::Error::new(crate::PoolExhausted {
+        gap_start: 0,
+        gap_len: 1,
+    });
+    assert_eq!(classify(&dry), Fault::Unaffordable);
 }
 
 /// A lane build never blames its source and retries, unless what failed
@@ -153,8 +173,7 @@ fn a_lane_build_takes_its_cause_only_when_fatal() {
 
 /// A `topUp` that may have escrowed USDC no record credits ends the
 /// command, whether it surfaces from a lane build (which otherwise retries)
-/// or from a reactive top-up (which is otherwise unaffordable): a retry
-/// escrows again.
+/// or from a funding recovery step: a retry escrows again.
 #[test]
 fn a_possibly_escrowed_top_up_ends_the_command() {
     let tx = alloy::primitives::TxHash::repeat_byte(0xab);
@@ -179,14 +198,6 @@ fn a_possibly_escrowed_top_up_ends_the_command() {
         (
             "unconfirmed lane build",
             anyhow::Error::new(LaneBuildFault(unconfirmed())),
-        ),
-        (
-            "untracked reactive",
-            untracked().context(crate::driver::TopUpFailed),
-        ),
-        (
-            "unconfirmed reactive",
-            unconfirmed().context(crate::driver::TopUpFailed),
         ),
     ] {
         assert_eq!(

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use decdn_client::{NoCache, ProgressClock, PullConfig, StaticSources, StopPolicy, Streamer};
 
-use common::{Buyer, Env, NoTopUp};
+use common::{Buyer, Env, NoFunding};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     // The streamer keeps its verified range store in a scratch directory. It is
     // not a resumable download: the directory goes when the stream ends.
     let scratch = tempfile::tempdir()?;
-    let streamer = Streamer::new(StaticSources::new(candidates)?, NoTopUp, scratch.path());
+    let streamer = Streamer::new(StaticSources::new(candidates)?, NoFunding, scratch.path());
     // A terminal waits until Ctrl-C; a script gives up after ten minutes
     // without a verified byte.
     let stop = StopPolicy::new(

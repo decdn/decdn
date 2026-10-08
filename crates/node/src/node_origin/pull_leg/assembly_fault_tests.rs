@@ -9,12 +9,13 @@ fn refusal(error: StreamError) -> anyhow::Error {
 
 /// A holder's refusal or voucher rejection scopes to that holder (ADR 039
 /// §Failure handling): its range moves to another holder, which may
-/// reserve less or accept the voucher. Only this node's dry pool ends the
-/// assembly: it funds every holder.
+/// reserve less or accept the voucher. This node's own dry pool does not end
+/// the assembly either: the assembly's funding recovery step decides once no
+/// holder serves (ADR 003 § Funding recovery).
 #[test]
-fn a_refusal_reassigns_and_a_dry_pool_ends_the_assembly() {
+fn no_refusal_and_no_dry_pool_ends_the_assembly() {
     assert!(!ends_the_assembly(&refusal(StreamError::Unfunded)));
-    assert!(ends_the_assembly(&anyhow::Error::new(PoolExhausted {
+    assert!(!ends_the_assembly(&anyhow::Error::new(PoolExhausted {
         gap_start: 0,
         gap_len: 1 << 20,
     })));
