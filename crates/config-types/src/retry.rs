@@ -17,11 +17,10 @@ const DEFAULT_JITTER_RATIO: f64 = 0.1;
 /// At or below this advertised `size_hint`, the engine's per-attempt
 /// closure drains the origin body into a `BytesMut` before handing
 /// it to iroh-blobs, so mid-stream transient `io::Error`s can be
-/// retried (pre-#271 semantics for small blobs). Above the threshold
-/// the engine takes the streaming path and uses abort + restart
-/// instead — no memory amplification, but disk-amp cost per failed
-/// attempt until iroh-blobs GC sweeps. 4 MiB covers typical web
-/// assets while keeping per-fetch RSS predictable.
+/// retried. Above the threshold the engine takes the streaming path
+/// and uses abort + restart instead — no memory amplification, but
+/// disk-amp cost per failed attempt until iroh-blobs GC sweeps. 4 MiB
+/// covers typical web assets while keeping per-fetch RSS predictable.
 const DEFAULT_BUFFERED_MAX_BYTES: u64 = 4 << 20;
 
 /// `#[serde(default = ...)]` shim — `Default::default()` on the whole
@@ -63,10 +62,10 @@ pub struct RetryPolicy {
     /// retry path. When the origin advertises a `size_hint` at or
     /// below this value, the engine drains the stream into a
     /// `BytesMut` before committing — drain errors get classified
-    /// and re-feed the retry loop, restoring pre-#271 mid-stream
-    /// retry semantics for small blobs. Above the threshold (or
-    /// when `size_hint` is `None`) the engine uses streaming
-    /// abort+restart instead; memory stays bounded but each failed
+    /// and re-feed the retry loop, so small blobs get mid-stream
+    /// retries. Above the threshold (or when `size_hint` is `None`) the
+    /// engine uses streaming abort+restart instead; memory stays
+    /// bounded but each failed
     /// attempt strands up to `max_blob_bytes` of partial-import bytes
     /// until iroh-blobs GC reclaims them.
     ///
@@ -95,8 +94,8 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
-    /// A policy that performs no retries — equivalent to the pre-#285
-    /// behaviour. Useful in tests and for operators who want to opt out.
+    /// A policy that performs no retries: one attempt per origin.
+    /// Useful in tests and for operators who want to opt out.
     /// Also sets `buffered_max_bytes = 0` so the body-phase buffer path
     /// is disabled in lock-step (a `disabled()` policy that still
     /// buffered would surprise operators reading the field name).

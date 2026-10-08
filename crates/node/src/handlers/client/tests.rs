@@ -337,8 +337,8 @@ async fn distinct_lanes_register_resolve_and_forget_concurrently() {
     let metrics = Arc::new(Metrics::new());
     let (handler, _dir) = handler_for_tests(&metrics).await;
 
-    // Distinct lanes differ only by signer — the independent-lane case the
-    // single mutex used to serialize regardless of how they shard.
+    // Distinct lanes differ only by signer — the independent-lane case a
+    // single mutex would serialize regardless of how they shard.
     let keys: Vec<LaneKey> = (0u8..32)
         .map(|i| LaneKey {
             pool_id: B256::repeat_byte(0xC0),

@@ -185,9 +185,9 @@ struct Inner {
     /// Ordered list of origin backends consulted on cache misses
     /// (#284). Empty vec => no pull-through configured; `pull_through`
     /// short-circuits to `CacheError::NoOrigin`. A single-element vec
-    /// preserves the pre-#284 single-origin semantics. Entries are
-    /// tried in operator-supplied order; the next entry is consulted
-    /// on `NotFound`, permanent error, or retry-budget exhaustion.
+    /// is the single-origin case. Entries are tried in operator-supplied
+    /// order; the next entry is consulted on `NotFound`, permanent error,
+    /// or retry-budget exhaustion.
     /// Deterministic per-origin failures (`HashMismatch`,
     /// `BlobTooLarge`, and local-store errors classified as
     /// `Store`) deliberately do not fall back — they indicate a
@@ -1738,10 +1738,10 @@ impl CacheEngine {
     /// [`PinnedHashes`] (config-vocabulary hash) from the engine-internal
     /// store-hash set.
     ///
-    /// **Cost:** O(n) — unlike the pre-#578 single `Arc::clone`, this
-    /// allocates a fresh `HashSet` and converts every hash across the
-    /// store↔leaf boundary. Call it off the hot path (it backs SIGHUP
-    /// reload logging and admin snapshots, not per-request lookups).
+    /// **Cost:** O(n) — this allocates a fresh `HashSet` and converts
+    /// every hash across the store↔leaf boundary. Call it off the hot
+    /// path (it backs SIGHUP reload logging and admin snapshots, not
+    /// per-request lookups).
     pub fn pinned_snapshot(&self) -> PinnedHashes {
         let set = self
             .inner

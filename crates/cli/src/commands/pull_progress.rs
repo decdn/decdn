@@ -40,7 +40,7 @@
 //!
 //! The whole renderer is silent — every bar a no-op, every file's delivery
 //! callback `None` — when stderr is not a terminal or the run is `--json`, so
-//! piped and scripted output is byte-for-byte what it was before per-file bars.
+//! piped and scripted output carries no progress-bar bytes.
 
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -288,8 +288,7 @@ impl PullProgress {
     /// download progress also folds into the total bar's download meter.
     ///
     /// When disabled the returned [`FileBar`] is silent and its
-    /// [`FileBar::callback`] is `None`, so the fetch path runs byte-bar-free exactly
-    /// as it did before per-file bars.
+    /// [`FileBar::callback`] is `None`, so the fetch path runs byte-bar-free.
     pub(crate) fn file_bar(
         &self,
         label: &str,
@@ -456,7 +455,7 @@ impl FileBar {
     }
 
     /// The delivery callback to hand the fetch path, or `None` when disabled (the
-    /// fetch path then runs byte-bar-free, as before per-file bars).
+    /// fetch path then runs byte-bar-free).
     pub(crate) fn callback(&self) -> Option<&ProgressCallback> {
         self.cb.as_deref()
     }
@@ -479,7 +478,7 @@ impl FileBar {
     /// Enter the `reconstructing…` verify and return a progress reporter to feed the
     /// running byte count of the whole-file hash into, so the bar keeps moving
     /// through the verify instead of freezing. `None` when disabled — the hash then
-    /// runs without a progress callback, as before.
+    /// runs without a progress callback.
     pub(crate) fn reconstruct_reporter(&self) -> Option<Box<dyn Fn(u64) + Send + Sync>> {
         let p = self.phase.as_ref()?;
         p.start_reconstructing();

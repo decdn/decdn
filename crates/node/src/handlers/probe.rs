@@ -69,7 +69,7 @@ const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
 ///
 /// Construction is gated by the operator: the runtime only builds this when
 /// `cache.stake_lane_reserved_holds > 0`, so a single-lane deployment passes
-/// `None` and the handler's hot path is unchanged.
+/// `None` and the handler skips the stake-lane check entirely.
 #[derive(Clone)]
 pub struct StakeLanePolicy {
     /// Chain-followed active-staker set, keyed by iroh `NodeId`. The probe
@@ -144,8 +144,8 @@ pub struct ProbeHandler {
     /// `blockchain.{slash_judge_address,chain_id}`.
     slash_domain: Eip712Domain,
     /// Optional stake-lane probe-acceptance reservation (#757). `None` (the
-    /// single-lane default) makes the hold-admission path identical to
-    /// pre-#757 behaviour; `Some` reserves hold headroom for registered
+    /// single-lane default) admits every hold from one shared budget with no
+    /// reserved headroom; `Some` reserves hold headroom for registered
     /// node-to-node requesters under budget pressure.
     stake_lane: Option<StakeLanePolicy>,
     /// Mirrors `ResolvedCache::relay_foreign_namespaces` (ADR 002 origin-only

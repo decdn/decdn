@@ -26,7 +26,7 @@ impl Origin for StubOrigin {
     fn kind(&self) -> OriginKind {
         // Stand in for an HTTP origin in tests so callers reasoning
         // about preview-side `origin_kinds` behaviour see a
-        // non-empty `Vec<OriginKind>` entry (post-#284 the field is
+        // non-empty `Vec<OriginKind>` entry (the field is
         // a vec, not an `Option`). The choice is arbitrary —
         // `Origin::kind` is a tag, not a behavioural switch.
         OriginKind::Http
@@ -387,7 +387,7 @@ async fn origin_probe_size_refused_never_probes() -> anyhow::Result<()> {
 
 /// A slow origin must not stall the probe: the live HEAD is bounded by
 /// `origin_probe_timeout_ms` and a timeout folds to `None` (safe — never
-/// slashable post-#1512).
+/// slashable).
 #[tokio::test]
 async fn origin_probe_size_times_out_to_absent() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -2126,9 +2126,10 @@ async fn separate_poisonings_each_count_while_the_log_latches() -> anyhow::Resul
 }
 
 /// `populate_inner`'s coalescing loop is a near-verbatim *copy* of `get`'s,
-/// not a shared helper, and the pre-#1517 defect was per-copy — each had its
-/// own poison fall-through. So covering `get` does not cover this, and a
-/// mutation that reverts only `populate_inner` survives a `get`-only suite.
+/// not a shared helper, and the poison handling #1517 requires lives in each
+/// copy separately, so each copy can regress on its own. Covering `get`
+/// therefore does not cover this, and a mutation that reverts only
+/// `populate_inner` survives a `get`-only suite.
 ///
 /// This is also the copy that matters most: `populate` (unlike
 /// `populate_local`) walks the `Peer` origin, so a lost claim here is the
@@ -2222,7 +2223,7 @@ async fn poisoned_mutex_does_not_orphan_inflight_entry() -> anyhow::Result<()> {
     // released. Without this the test passes vacuously whenever the 50 ms
     // timeout lands before the pull starts — `get` does `refuses()` and
     // `has()` (fs store I/O) first — and an empty map then proves nothing,
-    // even under the pre-#1517 drop impl. A loaded CI box makes that a
+    // even under a leaking drop impl (#1517). A loaded CI box makes that a
     // silent false pass rather than a visible flake.
     let claimed = origin_handle.fetch_count.load(Ordering::SeqCst);
     anyhow::ensure!(
@@ -2231,7 +2232,7 @@ async fn poisoned_mutex_does_not_orphan_inflight_entry() -> anyhow::Result<()> {
     );
 
     // An empty map is the assertion proper, and it reads through
-    // `into_inner` so poison cannot fake it. Under the pre-#1517 drop impl
+    // `into_inner` so poison cannot fake it. Under a leaking drop impl (#1517)
     // the entry survives here and `len == 1`. There is deliberately no
     // "now issue another get and time it" probe: this origin sleeps for ten
     // seconds by design, so any such timeout would measure the stub rather
@@ -6152,7 +6153,7 @@ async fn tagged_partial_survives_gc_untagged_is_reclaimed() {
     let (ha, ra, ba) = bao_for(root_a, &pt_a, ob_a, group, group, total);
     engine.admit_bao(ha, ra, ba).await.unwrap();
 
-    // Control: same shape, distinct hash, imported WITHOUT a tag (pre-#1607).
+    // Control: same shape, distinct hash, imported WITHOUT a tag.
     let (root_b, pt_b, ob_b) = synth_blob((total + group) as usize); // different len -> different root
     let (hb, rb, bb) = bao_for(root_b, &pt_b, ob_b, group, group, total + group);
     engine

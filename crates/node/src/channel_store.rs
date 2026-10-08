@@ -194,35 +194,6 @@ const DEPLOYMENT_TABLE: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(
 /// The one key of [`DEPLOYMENT_TABLE`].
 const DEPLOYMENT_KEY: &str = "payment_pool";
 
-/// Byte width of a `(pool_id, signer)` key on disk: `32 + 20`. The superseded
-/// owner-signed capability tables use this shape. The pool id leads, so every row
-/// of one pool shares a 32-byte prefix and a range scan selects exactly that
-/// pool's rows.
-const POOL_SIGNER_KEY_LEN: usize = 52;
-
-/// The two superseded owner-signed capability tables, keyed by `pool_id ‖ signer`
-/// (`[u8; 52]`). Both are retired: the owner signature now rides the lane record
-/// itself (`StoredLaneState::owner_sig`), so it commits in the same transaction
-/// as the frontier it backs and can never be durable-out-of-step with it (#1906).
-/// Nothing reads these; [`PersistentPoolStateStore::drop_superseded_capability_tables`]
-/// deletes both at open so a development store carrying them does not keep dead
-/// rows. Pre-launch there is nothing to migrate.
-const SUPERSEDED_CAPABILITY_TABLE_V2: TableDefinition<'_, &[u8; POOL_SIGNER_KEY_LEN], &[u8]> =
-    TableDefinition::new("capability_v2");
-const SUPERSEDED_CAPABILITY_TABLE_V1: TableDefinition<'_, &[u8; POOL_SIGNER_KEY_LEN], &[u8]> =
-    TableDefinition::new("capability_v1");
-
-/// Encode a `(pool_id, signer)` pair into its `[u8; 52]` table key. The live
-/// tables no longer use this shape; the superseded-capability drop test builds
-/// keys with it to inject legacy rows.
-#[cfg(test)]
-fn pool_signer_key_bytes(pool_id: B256, signer: Address) -> [u8; POOL_SIGNER_KEY_LEN] {
-    let mut out = [0u8; POOL_SIGNER_KEY_LEN];
-    out[..32].copy_from_slice(pool_id.as_slice());
-    out[32..].copy_from_slice(signer.as_slice());
-    out
-}
-
 /// Encode a [`LaneKey`] into its `[u8; 72]` table key: `pool_id ‖ signer ‖
 /// provider`.
 fn lane_key_bytes(key: &LaneKey) -> [u8; LANE_KEY_LEN] {
@@ -450,10 +421,9 @@ enum LaneSlot {
 ///
 /// The working set is a [`DashMap`] rather than one mutex-guarded map, so a
 /// `record` on the paid-delivery path locks only its own lane's shard — no lane
-/// serialises on another, and settlement's `load_all`/`get` no longer contend
+/// serialises on another, and settlement's `load_all`/`get` do not contend
 /// with `record` (issue #1792 item 1). Each entry's shard lock is the per-lane
-/// critical section that keeps a `record`/`forget` race decidable, the role the
-/// single buffer mutex played for the whole map.
+/// critical section that keeps a `record`/`forget` race decidable.
 #[derive(Debug)]
 pub struct PersistentPoolStateStore {
     /// Seller lane frontier (`lanes.redb`). The owner-signed capability material
@@ -546,7 +516,6 @@ impl PersistentPoolStateStore {
 
         Self::bind_deployment(&lanes_db, &settle_db, &checkpoint_db, deployment)?;
         let lanes = Self::hydrate_lanes(&lanes_db)?;
-        Self::drop_superseded_capability_tables(&lanes_db)?;
         Ok(Self {
             lanes_db,
             settle_db,
@@ -896,70 +865,6 @@ impl PersistentPoolStateStore {
             out.insert(state.key(), LaneSlot::Live(state));
         }
         Ok(out)
-    }
-
-    /// Delete the superseded `capability_v1` / `capability_v2` tables if the
-    /// store still carries them. The owner-signed material each row held now rides
-    /// the lane record itself ([`StoredLaneState::owner_sig`]), so it commits in
-    /// the same transaction as the frontier it backs (#1906) and there is no
-    /// side table to keep. Pre-launch there is no migration to run, so the rows
-    /// are dropped — but loudly, because they are registration material a signer
-    /// would then re-send on its next request rather than silently lose.
-    ///
-    /// Each table lives in the shared `lanes.redb` file, so a presence check runs
-    /// in a READ transaction first and a write transaction opens ONLY when a table
-    /// is actually there. A blind `begin_write`/`commit` on every boot would grow
-    /// the lane file with an empty commit and break the #527 file-stability
-    /// guarantee that `pre_existing_file_chmod_failure_preserves_file` pins.
-    ///
-    /// # Errors
-    /// [`StoreError::Backend`] when a presence check or delete transaction fails.
-    fn drop_superseded_capability_tables(db: &Database) -> Result<(), StoreError> {
-        Self::drop_superseded_capability_table(
-            db,
-            SUPERSEDED_CAPABILITY_TABLE_V2,
-            "capability_v2",
-        )?;
-        Self::drop_superseded_capability_table(db, SUPERSEDED_CAPABILITY_TABLE_V1, "capability_v1")
-    }
-
-    /// Delete one superseded capability table by definition + name, presence-
-    /// checked in a read transaction so a store without it takes no write.
-    fn drop_superseded_capability_table(
-        db: &Database,
-        table: TableDefinition<'_, &[u8; POOL_SIGNER_KEY_LEN], &[u8]>,
-        name: &str,
-    ) -> Result<(), StoreError> {
-        let read_txn = db
-            .begin_read()
-            .map_err(|err| StoreError::Backend(format!("begin_read ({name} probe): {err}")))?;
-        match read_txn.open_table(table) {
-            Ok(_) => {}
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-            Err(err) => {
-                return Err(StoreError::Backend(format!(
-                    "open_table ({name} probe): {err}"
-                )));
-            }
-        }
-        drop(read_txn);
-        let txn = db
-            .begin_write()
-            .map_err(|err| StoreError::Backend(format!("begin_write ({name} drop): {err}")))?;
-        let dropped = txn
-            .delete_table(table)
-            .map_err(|err| StoreError::Backend(format!("delete_table ({name}): {err}")))?;
-        txn.commit()
-            .map_err(|err| StoreError::Backend(format!("commit ({name} drop): {err}")))?;
-        if dropped {
-            tracing::warn!(
-                table = name,
-                "dropped the superseded capability table; its owner-signed registration \
-                 material now rides the lane record and is re-sent by each client on its \
-                 next request"
-            );
-        }
-        Ok(())
     }
 
     /// Operator-facing logging for the chmod-failure cleanup branch. Extracted

@@ -232,8 +232,8 @@ fn aligned_wire_len_clamps_when_the_response_total_is_smaller_than_the_requested
 }
 
 /// `client_binding_ext` maps an unbound context to `None` (so
-/// `encode_stream_request` appends no ext bytes — byte-for-byte the pre-#1115
-/// wire) and a bound one to `Some` carrying exactly the binding at the default
+/// `encode_stream_request` appends no ext bytes — the base frame
+/// alone) and a bound one to `Some` carrying exactly the binding at the default
 /// voucher cadence. This is the mapping the single request site
 /// (`open_stream`) relies on, so it guards a refactor that would silently
 /// drop the ext (#1115).

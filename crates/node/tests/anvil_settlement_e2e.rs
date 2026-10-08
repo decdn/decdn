@@ -696,8 +696,8 @@ async fn run_e2e() -> anyhow::Result<()> {
         voucher: voucher_dom.clone(),
         binding: bind_domain.clone(),
     };
-    // Redeem-hint channel, created by the caller (the settlement service no longer
-    // mints it): the sender is wired into the handler at construction, the
+    // Redeem-hint channel, created by the caller (the settlement service does not
+    // mint it): the sender is wired into the handler at construction, the
     // receiver drives the service's redeemer loop.
     let (redeem_tx, redeem_rx) =
         tokio::sync::mpsc::channel(decdn_node::payment_settlement::REDEEM_HINT_CAPACITY);

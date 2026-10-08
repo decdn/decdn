@@ -74,11 +74,11 @@ fn parse_target_http_is_not_a_write_target() {
 }
 
 #[test]
-fn parse_target_rejects_legacy_fs_prefix() {
-    // `fs:` is gone; rejecting it (rather than treating it as a path) keeps
-    // an operator from silently seeding a directory named `fs:...`.
+fn parse_target_rejects_fs_prefix() {
+    // `fs` is the config `kind` name; as a `--to` prefix it would otherwise
+    // seed a relative directory named `fs:...` that the node never reads.
     let err = parse_target(Path::new("fs:/var/lib/decdn/origin")).unwrap_err();
-    assert!(format!("{err:#}").contains("no longer takes an `fs:` prefix"));
+    assert!(format!("{err:#}").contains("not an `fs:` URI"));
 }
 
 #[test]

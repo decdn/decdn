@@ -499,7 +499,7 @@ impl ReceiptLog for FailingReceiptLog {
 /// called, recording what it eventually appends. Lets a test prove the
 /// paid-delivery hot path never waits on receipt-log I/O (#803): wired behind
 /// the real background-writer sink, delivery must complete even while every
-/// `append` is stalled here (the buggy pre-#803 code awaited the append inline).
+/// `append` is stalled here (an implementation that awaits the append inline hangs).
 #[derive(Default)]
 pub(crate) struct BlockingReceiptLog {
     state: std::sync::Mutex<BlockingReceiptState>,

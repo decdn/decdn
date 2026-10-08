@@ -65,7 +65,7 @@ pub(crate) fn resolve_encoding(
         Some(Err(unsupported)) => return Err(unsupported),
     };
     // Strict mode rejects any non-identity encoding even when we know the
-    // decoder. Equivalent to the pre-#312 reject-everything behaviour.
+    // decoder.
     if matches!(mode, DecompressMode::Strict) {
         return Err(OriginError::UnsupportedEncoding {
             encoding: trimmed.into(),

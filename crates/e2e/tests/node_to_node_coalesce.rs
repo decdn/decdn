@@ -120,7 +120,7 @@ async fn settled_outstanding(node: &NodeFixture, pool_id: B256) -> anyhow::Resul
 }
 
 /// How long the server gets to exit after SIGTERM. Far below systemd's 5-minute
-/// stop timeout that a stuck shutdown used to run into, and generous enough for
+/// stop timeout that a stuck shutdown would run into, and generous enough for
 /// the bounded stages a healthy stop runs through (the final redeem sweep against
 /// anvil, the lane and receipt flushes, the cache close) on a loaded runner.
 const SERVER_STOP_BUDGET: Duration = Duration::from_secs(60);

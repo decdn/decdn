@@ -847,7 +847,7 @@ impl Origin for NodeOrigin {
                 let Some(deps) = deps_lock.get() else {
                     // Pull-through not provisioned (feature disabled or the buyer
                     // bootstrap failed). A clean miss — the engine surfaces NotFound
-                    // to the handler, which behaves as it did pre-#831. The engine
+                    // to the handler, which returns it to the client. The engine
                     // enforces `max_bytes` on whatever any provisioned pull returns,
                     // so it is not consulted here.
                     return Ok(OriginFetch::NotFound);

@@ -409,14 +409,15 @@ pub const DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC: u64 = 3600;
 /// Default maximum concurrently held (eviction-exempt) blobs for the
 /// probe-triggered hold (ADR 005 §Hold budget, #318). Per-blob holds: many
 /// peers probing one hash share a single slot. Re-exported from the
-/// `decdn_config_types` leaf crate (the canonical home since #578) so
+/// `decdn_config_types` leaf crate (its canonical home, #578) so
 /// the config default and the cache engine's own default (used by
 /// direct `CacheEngine::open` callers) cannot drift apart.
 pub const DEFAULT_MAX_PROBE_HOLDS: usize = decdn_config_types::DEFAULT_MAX_PROBE_HOLDS;
 
 /// Default probe-hold slots reserved for the stake lane (#757). `0` keeps
-/// the stake-lane reservation off by default, so a single-lane node behaves
-/// exactly as before — the reservation is strictly operator opt-in.
+/// the stake-lane reservation off by default, so a node that does not opt in
+/// shares every probe-hold slot across all peers — the reservation is strictly
+/// operator opt-in.
 pub const DEFAULT_STAKE_LANE_RESERVED_HOLDS: usize = 0;
 
 /// Default providers probed before ranking on a node-to-node cache-miss pull
@@ -518,71 +519,6 @@ pub const MAX_RECEIPT_RETAINED_FILES: u32 = 100;
 /// the surfaced path can't drift from where the log actually lands.
 pub const RECEIPT_LOG_FILE: &str = "download_receipts.jsonl";
 
-/// Env vars that once configured a knob and now configure nothing.
-///
-/// The other two surfaces of a removed knob fail loudly on their own: a stale
-/// TOML key trips `deny_unknown_fields`, and a stale `--flag` trips clap's
-/// unknown-argument error. An env var has no such backstop — `clap` simply
-/// stops reading it — so an operator whose systemd unit or container env still
-/// carries one upgrades cleanly and silently loses the setting. Warn instead.
-///
-/// Entries are appended when a knob is removed and may be pruned once the
-/// removal is far enough back that no live deployment could still set it.
-const RETIRED_ENV_VARS: &[(&str, &str)] = &[(
-    "DECDN_DELIVERY_CEILING",
-    "the advisory delivery-rate ceiling was removed (#1441); the node no longer \
-     clamps its quote downward at all, and the wire cap MAX_RATE_PER_MB is the \
-     only upper bound",
-)];
-
-/// Record one notice per retired env var that is still set. Deliberately not a
-/// hard error: unlike a stale TOML key, an env var is often inherited from an
-/// orchestrator the operator does not directly control, and refusing to boot
-/// over one would be a worse failure than the silent ignore it replaces.
-///
-/// Notices go on the bag rather than straight to a sink. stderr is reachable
-/// here but is not the operator's structured log stream, and `tracing` is not
-/// an option either: `resolve_config` runs *before* `init_tracing` in the
-/// daemon (`decdn-node`'s `commands::run`), so an event at this point has no
-/// global subscriber and is discarded, while `decdn` (the CLI, which reaches
-/// this via `config validate` and `node doctor`) does not depend on `tracing`
-/// at all. Only the caller knows which sink it owns, so only the caller can
-/// render.
-///
-/// Returns the names it recorded. The notice on the bag is what reaches an
-/// operator; the return value exists for the unit test, which needs to tell
-/// "the loop ran and matched nothing" from "the loop never ran".
-fn warn_retired_env_vars(bag: &mut ConfigDiagnostics) -> Vec<&'static str> {
-    warn_retired_env_vars_with(|name| std::env::var_os(name).is_some(), bag)
-}
-
-/// [`warn_retired_env_vars`] with the environment lookup injected.
-///
-/// Split out purely for testability: `unsafe` is forbidden workspace-wide
-/// (`-F unsafe-code`) and `std::env::set_var` is `unsafe` since edition 2024,
-/// so a test cannot set a variable to observe the behaviour. Injecting the
-/// predicate exercises the "var is set" branch directly — the branch that was
-/// silently broken before.
-fn warn_retired_env_vars_with(
-    is_set: impl Fn(&str) -> bool,
-    bag: &mut ConfigDiagnostics,
-) -> Vec<&'static str> {
-    let mut warned = Vec::new();
-    for (name, why) in RETIRED_ENV_VARS {
-        if is_set(name) {
-            bag.warn(
-                *name,
-                format!(
-                    "set but no longer does anything: {why}. Remove it from the environment \
-                     to silence this notice."
-                ),
-            );
-            warned.push(*name);
-        }
-    }
-    warned
-}
-
 /// Load config from file (if present) and merge with CLI args.
 ///
 /// CLI args take precedence over file values; defaults fill gaps.
@@ -613,8 +549,6 @@ pub fn resolve_config(
     let file = load_file_config(config_path)?;
 
     let mut bag = ConfigDiagnostics::new();
-
-    let _retired = warn_retired_env_vars(&mut bag);
 
     let identity = resolve_identity_into(&cli.identity, file.identity.as_ref(), &mut bag);
     // A region that was supplied but failed `normalize_region` is already
@@ -2023,8 +1957,8 @@ fn resolve_cache_into(
     // A 0 window makes the throughput floor demand progress over no time at all, so it
     // trips on the first poll of every streaming read and abandons every upstream before a
     // byte can arrive. The abort is non-attributable (#1797), so a fat-fingered value here
-    // does not defame peers the way the pre-#1797 zero stall did — but it still wedges this
-    // node's pull path, so it is rejected at load.
+    // does not defame peers — but it still wedges this node's pull path, so it is rejected
+    // at load.
     bag.check(
         node_pull_stall_window_sec > 0,
         "cache.node_pull_stall_window_sec",

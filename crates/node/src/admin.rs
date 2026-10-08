@@ -671,20 +671,13 @@ impl AdminRpcServer for AdminRpcImpl {
         })
     }
 
-    async fn drain(&self, req: Option<DrainRequest>) -> RpcResult<DrainResponse> {
-        // Normalize the optional wire param to the resolved-form
-        // `DrainRequest` so the runtime logic operates on a single
-        // canonical type. `None` (caller sent no `params`) is
-        // indistinguishable from `Some(DrainRequest::default())` from
-        // here on — both mean "SIGTERM-equivalent drain".
-        let req = req.unwrap_or_default();
+    async fn drain(&self, req: DrainRequest) -> RpcResult<DrainResponse> {
         // Atomic fire-with-wait_admin: returns the *effective* value
         // the runtime will see. First writer wins, so a concurrent
         // drain race cannot produce a response that lies about
         // what the runtime will do (issue #604 review). The CLI reads
-        // this ack to refuse polling against any server that didn't
-        // honor `wait_admin` — older binary, future regression, or a
-        // race where another caller's `wait_admin: false` won.
+        // this ack and refuses to poll when another caller's
+        // `wait_admin: false` won the race.
         let honored = self.state.drain_trigger.fire(req.wait_admin);
         Ok(DrainResponse {
             initiated: true,

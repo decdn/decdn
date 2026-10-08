@@ -60,27 +60,6 @@ fn warn_notice_becomes_a_warn_finding() {
     assert!(report.has_warn());
 }
 
-/// A notice about a retired env var carries a bare var name, not a dotted
-/// key, and the fix is in the environment rather than the file. Doctor has
-/// only `field`'s shape to tell the two apart.
-#[test]
-fn env_var_notice_points_at_the_environment_not_the_file() {
-    let mut report = Report::default();
-    push_notice_findings(
-        &mut report,
-        &[ConfigNotice {
-            level: ConfigNoticeLevel::Warn,
-            field: "DECDN_DELIVERY_CEILING".into(),
-            message: "set but no longer does anything".into(),
-        }],
-    );
-    let finding = report.findings.last().unwrap();
-    assert_eq!(
-        finding.remediation.as_deref(),
-        Some("unset DECDN_DELIVERY_CEILING in the daemon's environment")
-    );
-}
-
 /// An `Info` notice stays visible but must not move the exit status: a
 /// deliberately disabled rate limit is working as configured, and a doctor
 /// that warns about it trains the operator to ignore doctor.

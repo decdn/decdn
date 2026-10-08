@@ -391,9 +391,9 @@ async fn sighup_applies_security_changes() {
 ///
 /// The unit tests in `runtime::reload::tests` exercise the section notice
 /// emitter directly and the other tests in this file only ever feed
-/// reloadable sections, so nothing here previously drove a real SIGHUP that
-/// carried *both* a mutable and a restart-required change in the same file.
-/// A regression that wrongly classified a restart-required section as
+/// reloadable sections, so this is the only test that drives a real SIGHUP
+/// carrying *both* a mutable and a restart-required change in the same file.
+/// Without it, a regression that wrongly classified a restart-required section as
 /// reloadable (applying it silently) would go uncaught.
 ///
 /// For every section but `[observability]` the notice is unconditional

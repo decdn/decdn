@@ -356,12 +356,9 @@ fn topup_fetch_argv_with_deposits(
 // the low-water trigger (working / LOW_WATER_DIVISOR = 1800 µUSDC), so no
 // low-water refill pre-empts the recovery top-up under test.
 //
-// The rate, the refundable floor `M`, and the working deposit are all a factor of
-// 2000 below the pre-#2036 sizing (rate 2_000_000, M 1_000_000, deposit 18_000_000)
-// so this whole economic scenario is preserved unchanged under the lowered
-// `MAX_RATE_PER_MB` (1000): every µUSDC quantity in the open-gate and
-// exhaust-mid-blob inequalities scales by the same factor, and the blob is byte-
-// identical, so the same nine-chunks-then-exhaust structure holds.
+// The rate, the refundable floor `M`, and the working deposit are sized together
+// under `MAX_RATE_PER_MB` (1000) so the open-gate and exhaust-mid-blob
+// inequalities above hold, giving the nine-chunks-then-exhaust structure.
 //
 // A daemon restart between the pool's on-chain open and this test's later
 // on-chain `topUp` was observed to make the daemon's settlement watcher stop
@@ -372,9 +369,9 @@ fn topup_fetch_argv_with_deposits(
 // for this fix; avoiding any daemon restart in this test sidesteps it entirely.
 const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 9000;
 const MULTI_RATE_PER_MB: u64 = 1000; // 0.001 USDC/MB — at the wire cap MAX_RATE_PER_MB
-/// The node's refundable floor `M` for this journey, scaled down by the same 2000x
-/// factor as the rate and deposit so the open-gate headroom (`working − M ≥ one
-/// chunk`) is preserved: 9000 − 500 = 8500 ≥ 1000.
+/// The node's refundable floor `M` for this journey, sized with the rate and
+/// deposit so the open-gate headroom (`working − M ≥ one chunk`) holds:
+/// 9000 − 500 = 8500 ≥ 1000.
 const MULTI_POOL_MIN_REMAINING_MICRO_USDC: u64 = 500;
 
 // A single-invocation recovery top-up extends a fetch past its
@@ -695,12 +692,11 @@ const DEPOSIT_SHORT_RATE_PER_MB: u64 = 1000; // 0.001 USDC/MB — at the wire ca
 // floor is one chunk, `1 * 1000` µUSDC at the rate above, and the deposit must
 // cover that floor plus the refundable floor `M`. 8000 µUSDC clears it with headroom,
 // and stays far below the blob's ~20000 µUSDC wire cost so the fetch runs
-// deposit-short. Rate, `M`, and deposit are all a factor of 2000 below the pre-#2036
-// sizing (rate 2_000_000, M 1_000_000, deposit 16_000_000), so the same ~2.5x
-// deposit-short scenario holds byte-identically under the lowered `MAX_RATE_PER_MB`.
+// deposit-short (~2.5x). Rate, `M`, and deposit are sized together under
+// `MAX_RATE_PER_MB`.
 const DEPOSIT_SHORT_WORKING_MICRO_USDC: u64 = 8000;
-/// The node's refundable floor `M`, scaled down by the same 2000x factor as the
-/// rate and deposit so the open-gate headroom is preserved: 8000 − 500 = 7500 ≥ 1000.
+/// The node's refundable floor `M`, sized with the rate and deposit so the
+/// open-gate headroom holds: 8000 − 500 = 7500 ≥ 1000.
 const DEPOSIT_SHORT_POOL_MIN_REMAINING_MICRO_USDC: u64 = 500;
 /// Just over 20 MiB: its whole-blob wire cost (~0.02 USDC) is ~2.5x the opening
 /// deposit, so the fetch spends well past the deposit in one leg.

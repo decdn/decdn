@@ -621,7 +621,7 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
     // test harness. `wait_admin=false` returns as soon as the drain trigger is
     // queued; the runtime then walks its teardown and `run()` returns.
     let drain = client
-        .drain(Some(DrainRequest { wait_admin: false }))
+        .drain(DrainRequest { wait_admin: false })
         .await
         .context("admin_v1_drain call failed")?;
     anyhow::ensure!(drain.initiated, "drain must report initiated=true");

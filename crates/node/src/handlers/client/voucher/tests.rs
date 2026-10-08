@@ -700,7 +700,7 @@ fn a_rollover_short_on_bytes_is_rejected_with_the_resume_bundle() {
 /// #1735: signature validity is hoisted OUT of the per-lane lock. A voucher
 /// signed by the wrong key is rejected by the (lock-free) signature recovery
 /// — `verify_signer` against the lane's pinned signer — while the inside-lock
-/// `advance_presigned` no longer inspects the signature at all: it would
+/// `advance_presigned` does not inspect the signature at all: it would
 /// happily advance the same voucher. This is exactly what lets concurrent
 /// same-lane streams recover in parallel and only briefly serialize on the
 /// advance.

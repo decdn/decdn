@@ -1982,8 +1982,8 @@ async fn open_stream(
         };
         // Two-phase encode (ADR 005): attach the client identity binding when the
         // context carries one, so the serving node can prove channel ownership and
-        // authorize a cache-miss origin pull (#1115). Absent ⇒ no ext bytes, exactly
-        // the pre-#1115 wire (unbound node-to-node / registered-client path).
+        // authorize a cache-miss origin pull (#1115). Absent ⇒ no ext bytes: the
+        // base frame alone (unbound node-to-node / registered-client path).
         let ext = client_binding_ext(ctx);
         let payload = decdn_protocol::encode_stream_request(&req, ext.as_ref())
             .map_err(|e| anyhow::anyhow!("encode stream request: {e}").context(LocalPullFault))?;
@@ -3153,10 +3153,10 @@ async fn open_progressive_pull_impl(
     max_rate_per_mb: u64,
     deadlines: PullDeadlines,
     // Upper bound on the requested range: `[byte_offset, byte_offset + byte_len)`.
-    // `0` means "to end" (the pre-#1608 whole-tail behavior, unchanged for every
-    // existing caller). A gap-driven caller (`source::PeerSource`, #1608) passes
-    // the exact gap length so the server scopes both the serve and the payment
-    // to it, rather than streaming the whole remainder.
+    // `0` means "to end" (the whole tail, which every non-gap caller requests).
+    // A gap-driven caller (`source::PeerSource`, #1608) passes the exact gap
+    // length so the server scopes both the serve and the payment to it, rather
+    // than streaming the whole remainder.
     byte_len: u64,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
     let result: anyhow::Result<(UpstreamPullHeader, UpstreamPull)> = async {

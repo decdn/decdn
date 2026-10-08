@@ -49,24 +49,26 @@ use crate::store::StoreError;
 /// Callers supply the `Database` (the one thing they legitimately differ
 /// on) and nothing else.
 ///
-/// **`_v6`**: the primary key is `pool_id` (32 bytes); the value carries the
+/// The primary key is `pool_id` (32 bytes); the value carries the
 /// [`Deployment`] the pool lives on (chain id and `PaymentPool` address), a
 /// variable-length per-lane progress table, and the redeemed spend no tracked
-/// lane accounts for ([`BuyerPoolState::redeemed_elsewhere`]). Every layout
-/// change bumps this suffix, a trailing addition too: the exact-match
-/// `schema_version` refuses an older row, and a point lookup that errors fails
-/// the fetch, where a missing table reads as no row.
+/// lane accounts for ([`BuyerPoolState::redeemed_elsewhere`]). The exact-match
+/// `schema_version` refuses a row in any other layout, and a point lookup that
+/// errors fails the fetch, where a missing table reads as no row.
 ///
-/// A file written under an older suffix holds no table of this name, so
-/// `open_table` reports `TableDoesNotExist` and every read path treats the
-/// store as empty: the old rows are ignored, never misread and never
-/// live-migrated. **A suffix bump therefore orphans every row written before
-/// it** — including rows for pools on the configured contract, which the node
-/// then re-adopts from chain. (The key/value *type-name* check `redb` persists
-/// per table is a separate guard, and it fires on a type change, not on this
-/// rename: the key/value types here are unchanged.)
+/// **A layout change bumps [`BUYER_SUPPORTED_SCHEMA_VERSION`] and this
+/// table-name suffix together**, an appended field included. Bumping the
+/// version alone leaves every existing row in place to fail its point lookup,
+/// which stops the buyer path until the store is moved aside; renaming the
+/// table makes the old rows unreachable instead.
+///
+/// A file that holds no table of this name reads as empty: `open_table`
+/// reports `TableDoesNotExist` and every read path treats the store as having
+/// no rows. The caller (the node, or `decdn fetch` / `bundle pull`) then
+/// re-adopts a live pool on the configured contract from chain where its
+/// adoption rules allow.
 const BUYER_POOL_TABLE: TableDefinition<'static, &'static [u8; 32], &'static [u8]> =
-    TableDefinition::new("buyer_pool_state_v6");
+    TableDefinition::new("buyer_pool_state_v1");
 
 /// Secondary index: `owner (20 bytes) → pool_id (32 bytes)`. Maintained
 /// alongside [`BUYER_POOL_TABLE`] on every `record`/`forget`/
@@ -79,7 +81,7 @@ const BUYER_POOL_TABLE: TableDefinition<'static, &'static [u8; 32], &'static [u8
 /// only visible via [`BuyerPoolTable::load_all`] (the reclaim sweep's path)
 /// — never via [`BuyerPoolTable::get_by_owner`].
 const BUYER_OWNER_INDEX_TABLE: TableDefinition<'static, &'static [u8; 20], &'static [u8; 32]> =
-    TableDefinition::new("buyer_pool_owner_index_v6");
+    TableDefinition::new("buyer_pool_owner_index_v1");
 
 /// The buyer-record `schema_version` this binary reads and writes.
 ///
@@ -87,10 +89,11 @@ const BUYER_OWNER_INDEX_TABLE: TableDefinition<'static, &'static [u8; 20], &'sta
 /// written under a different version does not decode into these fields — it
 /// decodes into the wrong ones, silently. Refusing anything that is not this
 /// exact layout is the only answer that cannot mis-map.
-const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 4;
+const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 /// Sanity ceiling on trailing bytes per record. Trailing bytes are tolerated
-/// (forward-compat with additive schema changes), but a `remainder.len()`
+/// so decode does not fail on padding (a layout change still bumps
+/// `schema_version`), but a `remainder.len()`
 /// above this is logged so an honest schema-skew incident or a malicious
 /// padding attempt is observable in operator logs without re-introducing
 /// the strict-decoding regression issue #527's reviewers warned against.
@@ -111,11 +114,11 @@ struct StoredLane {
 /// versions; `lanes` is the one variable-length part, encoded as a postcard
 /// `Vec` (length-prefixed).
 /// `schema_version` lives in the value, not the key, and decode uses
-/// [`postcard::take_from_bytes`], which tolerates trailing bytes. Any field
-/// change, appended or not, bumps `schema_version` and the table-name suffix:
-/// the exact-match version check refuses an older row, a refused row fails the
-/// point lookup, and a missing table reads as empty. A field inserted anywhere
-/// but the end also shifts every field after it.
+/// [`postcard::take_from_bytes`], which tolerates trailing bytes. Any layout
+/// change, an appended field included, bumps `schema_version` and the
+/// table-name suffix (see [`BUYER_POOL_TABLE`]): the exact-match version check
+/// refuses a row in any other layout, and a refused row fails the point
+/// lookup. A field inserted anywhere but the end shifts every field after it.
 ///
 /// **The field order is the wire order.** Postcard encodes struct fields
 /// positionally and unnamed, so reordering or retyping a field silently

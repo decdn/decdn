@@ -3608,7 +3608,7 @@ where
 
     // A transient state carrying the informational pool facts the context reads
     // (`pool_id`, `deposit`); it is not persisted (the delegate owns no pool row).
-    // The pool no longer stores its token — it is the contract's immutable
+    // The pool does not store its token — it is the contract's immutable
     // `usdc()`, so read it there rather than duplicating it per pool.
     let token = contract
         .usdc()
