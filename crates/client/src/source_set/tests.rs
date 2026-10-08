@@ -986,8 +986,12 @@ async fn the_lane_fault_line_names_the_holder_record() {
         set.record_fault(A, &not_found(), Some(block0()), now, U256::ZERO);
         set.record_fault(B, &not_found(), Some(block0()), now, U256::ZERO);
         set.record_fault(B, &anyhow::anyhow!("reset"), None, now, U256::ZERO);
-        let retry = anyhow::anyhow!("rpc timed out").context(crate::driver::TopUpFailed);
+        // A top-up's chain error names the RPC URL, whose path may carry a key.
+        let retry =
+            anyhow::anyhow!("error sending request for url (https://rpc.example/v3/secret)")
+                .context(crate::driver::TopUpFailed);
         set.record_fault(A, &retry, None, now, U256::ZERO);
+        set.record_fault(A, &retry, Some(block0()), now, U256::ZERO);
     });
     let text = String::from_utf8_lossy(
         &log.0
@@ -1000,7 +1004,8 @@ async fn the_lane_fault_line_names_the_holder_record() {
     let b_line = lines.next().unwrap_or_default();
     let b_source_line = lines.next().unwrap_or_default();
     let a_retry_line = lines.next().unwrap_or_default();
-    assert!(lines.next().is_none(), "four fault lines: {text}");
+    let a_retry_lane_line = lines.next().unwrap_or_default();
+    assert!(lines.next().is_none(), "five fault lines: {text}");
     // A source fault is what an operator watches for (#2331); a chain-side
     // retry is not the source's fault.
     for line in [a_line, b_line, b_source_line] {
@@ -1008,6 +1013,14 @@ async fn the_lane_fault_line_names_the_holder_record() {
     }
     assert!(a_retry_line.contains(" INFO "), "{text}");
     assert!(a_retry_line.contains("fault=Transient"), "{text}");
+    assert!(a_retry_lane_line.contains("a lane faulted"), "{text}");
+    assert!(a_retry_lane_line.contains(" INFO "), "{text}");
+    // Both line shapes strip the URL (#2331 moves these lines towards WARN).
+    assert!(!text.contains("secret"), "the RPC URL is stripped: {text}");
+    assert!(
+        !text.contains("rpc.example"),
+        "the RPC URL is stripped: {text}"
+    );
     assert!(a_line.contains("a lane faulted"), "{text}");
     assert!(a_line.contains(&format!("provider={A}")), "{text}");
     assert!(a_line.contains("uncovered=false"), "{text}");
