@@ -263,3 +263,14 @@ fn unanimous_stops_are_fatal_with_their_scope() {
     let absent = anyhow::Error::new(crate::source_set::NoSourceHasBlob);
     assert_eq!(classify(&absent), Fault::Fatal(FatalScope::Item));
 }
+
+/// A source failing or a stop only the human can fix logs at warn; a deposit
+/// wait and a chain-side retry log at info (#2331).
+#[test]
+fn only_source_and_fatal_faults_warn() {
+    assert!(Fault::Source.warns());
+    assert!(Fault::Fatal(FatalScope::Command).warns());
+    assert!(Fault::Fatal(FatalScope::Item).warns());
+    assert!(!Fault::Unaffordable.warns());
+    assert!(!Fault::Transient.warns());
+}

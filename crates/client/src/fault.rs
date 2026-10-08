@@ -30,6 +30,32 @@ pub enum Fault {
     Transient,
 }
 
+impl Fault {
+    /// Whether the fault is one an operator watches for, so its log line is at
+    /// warn: a source failing its delivery, or a fault only the human can fix.
+    /// A deposit wait ([`Fault::Unaffordable`]) and a chain-side retry
+    /// ([`Fault::Transient`]) leave the source's health untouched and log at
+    /// info.
+    #[must_use]
+    pub(crate) const fn warns(self) -> bool {
+        matches!(self, Self::Source | Self::Fatal(_))
+    }
+}
+
+/// Emit one `tracing` event at warn when `$warn` holds and at info otherwise.
+/// A `tracing` level must be a constant, so the choice is two calls that
+/// share one field list.
+macro_rules! warn_or_info {
+    ($warn:expr, $($event:tt)+) => {
+        if $warn {
+            tracing::warn!($($event)+);
+        } else {
+            tracing::info!($($event)+);
+        }
+    };
+}
+pub(crate) use warn_or_info;
+
 /// What a [`Fault::Fatal`] stops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FatalScope {

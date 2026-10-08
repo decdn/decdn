@@ -544,14 +544,17 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
 
     /// Record the fault `provider`'s lane ended with, and return its class.
     ///
-    /// Each fault is logged at info where it is recorded: the provider, the
-    /// blob, the lane's `range` and the bytes of it that landed when the lane
-    /// held one, the error, and the provider's record in the set when the
-    /// fault is logged: `probed_holder` and its `coverage` as block runs
-    /// (`whole blob` with none measured, `unknown` for a provider the set has
-    /// no record of). A rediscovery can change the record after the lane
+    /// Each fault is logged where it is recorded, at warn for a fault an
+    /// operator watches for ([`Fault::Source`], [`Fault::Fatal`]) and at info
+    /// for a deposit wait or a chain-side retry. The line carries the
+    /// provider, the blob, the lane's `range` and the bytes of it that landed
+    /// when the lane held one, the error, and the provider's record in the set
+    /// when the fault is logged: `probed_holder` and its `coverage` as block
+    /// runs (`whole blob` with none measured, `unknown` for a provider the set
+    /// has no record of). A rediscovery can change the record after the lane
     /// started. A fetch that recovers reports no lane fault, so this line is
     /// the record of it.
+    #[allow(clippy::cognitive_complexity)] // Two log lines, each expanded at two levels.
     pub fn record_fault(
         &mut self,
         provider: Address,
@@ -582,7 +585,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             uncovered,
         }) = range
         {
-            tracing::info!(
+            crate::fault::warn_or_info!(
+                fault.warns(),
                 %provider,
                 %hash,
                 offset,
@@ -597,7 +601,8 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 "a lane faulted; its remainder goes to the other lanes"
             );
         } else {
-            tracing::info!(
+            crate::fault::warn_or_info!(
+                fault.warns(),
                 %provider,
                 %hash,
                 probed_holder,
