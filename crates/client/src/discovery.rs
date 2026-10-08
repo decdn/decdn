@@ -32,7 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::ProviderBuilder;
 use anyhow::Context;
-use decdn_common::redact::{sanitize_err_chain, sanitize_rpc_display};
+use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_protocol::{Coverage, Region};
 use iroh::PublicKey;
@@ -255,7 +255,7 @@ where
                         offset,
                         attempt,
                         backoff_ms = backoff.as_millis(),
-                        error = %sanitize_rpc_display(&e),
+                        error = %sanitize_error_sources(&e),
                         "CapacityBond.getRegisteredNodes page failed; retrying"
                     );
                     tokio::time::sleep(backoff).await;

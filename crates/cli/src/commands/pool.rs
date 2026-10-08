@@ -26,7 +26,7 @@ use decdn_common::config::{
     DEFAULT_CHAIN_ID, DEFAULT_REDEEM_INTERVAL_SECS, FileConfig, capability_expiry_margin_secs,
     load_file_config,
 };
-use decdn_common::redact::sanitize_rpc_display;
+use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::buyer_pool::{BuyerLoad, BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::buyer_pool_redb::{ReadOnlyBuyerPoolStore, RedbBuyerPoolStore};
 use decdn_incentive::eth_identity::{self, PasswordUse, load_signer};
@@ -592,7 +592,7 @@ where
                 Ok(p) => format!("after Unix {}", p.disputeDeadline),
                 Err(e) => format!(
                     "after the dispute window (couldn't read the exact deadline: {})",
-                    sanitize_rpc_display(e)
+                    sanitize_error_sources(&e)
                 ),
             };
             // One note for both the success line and the failure, so the two
@@ -726,7 +726,7 @@ where
             Err(e) => {
                 eprintln!(
                     "failed to read pool {pool_id}: {}",
-                    decdn_common::redact::sanitize_err_chain(&anyhow::anyhow!("{e}"))
+                    sanitize_error_sources(&e)
                 );
                 tally.failed += 1;
                 continue;
@@ -739,10 +739,7 @@ where
                     tally.acted += 1;
                 }
                 Err(e) => {
-                    eprintln!(
-                        "failed to close pool {pool_id}: {}",
-                        decdn_common::redact::sanitize_err_chain(&e)
-                    );
+                    eprintln!("failed to close pool {pool_id}: {}", sanitize_err_chain(&e));
                     tally.failed += 1;
                 }
             },
@@ -836,7 +833,7 @@ where
             Err(e) => {
                 eprintln!(
                     "failed to read pool {pool_id}: {}",
-                    decdn_common::redact::sanitize_err_chain(&anyhow::anyhow!("{e}"))
+                    sanitize_error_sources(&e)
                 );
                 tally.failed += 1;
                 continue;
@@ -854,7 +851,7 @@ where
                     Err(e) => {
                         eprintln!(
                             "failed to reclaim pool {pool_id}: {}",
-                            decdn_common::redact::sanitize_err_chain(&e)
+                            sanitize_err_chain(&e)
                         );
                         tally.failed += 1;
                     }
@@ -970,7 +967,7 @@ async fn issuance_now(rpc_url: &str, timeout: Duration) -> anyhow::Result<u64> {
             eprintln!(
                 "warning: could not read the chain head time ({}); checking the capability \
                  expiry against the local clock instead",
-                decdn_common::redact::sanitize_err_chain(&e)
+                sanitize_err_chain(&e)
             );
             unix_now()
         }
@@ -1052,7 +1049,7 @@ async fn assign(args: &cli::PoolAssignArgs, config_path: Option<&Path>) -> anyho
         Err(e) => eprintln!(
             "warning: could not build an RPC provider to check the on-chain owner of pool \
              {pool_id} ({}); issuing anyway — the node verifies the owner signature at redemption",
-            sanitize_rpc_display(e)
+            sanitize_err_chain(&e)
         ),
     }
 
@@ -1102,7 +1099,7 @@ where
             eprintln!(
                 "warning: could not read pool {pool_id} on-chain to confirm ownership ({}); \
                  issuing anyway — the node verifies the owner signature at redemption",
-                sanitize_rpc_display(e)
+                sanitize_error_sources(&e)
             );
             Ok(())
         }
@@ -1227,10 +1224,7 @@ async fn list_all(
     let mut rows = Vec::with_capacity(ids.len());
     for pool_id in ids {
         let pool = contract.getPool(pool_id).call().await.map_err(|e| {
-            anyhow::anyhow!(
-                "getPool({pool_id}) failed: {}",
-                decdn_common::redact::sanitize_err_chain(&anyhow::anyhow!("{e}"))
-            )
+            anyhow::anyhow!("getPool({pool_id}) failed: {}", sanitize_error_sources(&e))
         })?;
         rows.push(ChainPoolRow {
             pool_id,
