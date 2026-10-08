@@ -3546,7 +3546,7 @@ impl UpstreamPull {
     /// receive loop, so a raw voucher-write failure — the end-of-stream
     /// `STOP_SENDING(0)` a node emits when it finishes and drops `recv` — would
     /// otherwise mask that terminal signal and abort a complete, paid fetch (or
-    /// swallow a typed rejection the reactive top-up path keys on). Read the terminal
+    /// swallow a typed rejection the fault classification keys on). Read the terminal
     /// signal, briefly, and prefer it.
     ///
     /// A `StreamEnd` marks the stream ended: the chunk that triggered the write is

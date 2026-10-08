@@ -686,10 +686,11 @@ alone cannot tell the first two apart — this is why the log line exists:
 A fourth, rarer cause: the operator's own
 `blockchain.buyer_working_deposit_micro_usdc` is too small for the *upstream*
 rate, in which case this node is the one being refused. (The node opens
-node-to-node channels at the working deposit and the proactive low-water refill
-tops them back up on reuse, so a channel that runs short mid-pull reactively
-tops up — see
-[ADR 003 § Deposit Economics](../adr/003-payments.md#deposit-economics).) Look for
+node-to-node channels at the working deposit and the low-water refill tops them
+back up on reuse. When no upstream serves a pull at the current deposit, the
+fill runs one funding recovery step, which `decdn_node_pull_recovery_step_total`
+counts; see
+[ADR 003 § Funding recovery](../adr/003-payments.md#funding-recovery).) Look for
 `decdn_node_pull_refused_unattributable_total` climbing toward
 `decdn_node_pull_refused_total` instead.
 

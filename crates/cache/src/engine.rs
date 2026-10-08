@@ -336,12 +336,11 @@ struct Inner {
     ///
     /// Membership is not what stops the serving — the watcher also
     /// [`CacheEngine::evict`]s, which is sticky and durable. What this set adds
-    /// is the *reason*, and the reason picks the wire refusal code. ADR 011
-    /// §`StreamRequest` Response requires a governance takedown and this
-    /// operator's own denylist to be indistinguishable on the wire, so both must
-    /// answer `HashBlacklisted`; without this slot a governance entry falls
-    /// through to the eviction arm and answers `EvictedSinceProbe` instead,
-    /// which uniquely fingerprints a local entry by elimination.
+    /// is the *reason*, and the reason picks the refusal reason the node
+    /// meters: a denied hash rather than `EvictedSinceProbe`, the reason the
+    /// eviction arm reports without this slot. On the wire every one of these
+    /// refusals is `Declined`, so a governance takedown and this operator's own
+    /// denylist stay indistinguishable (ADR 011 §`StreamRequest` Response).
     ///
     /// It is also the earlier of the two gates: the watcher denies *before* it
     /// evicts, so a takedown whose durable eviction fails still stops serving on

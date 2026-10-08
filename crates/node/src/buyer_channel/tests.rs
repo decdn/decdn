@@ -2021,7 +2021,7 @@ async fn top_up_at_least_short_join_funds_the_remainder() {
     assert_eq!(*asked.borrow(), vec![u(100), u(60)]);
 }
 
-/// Two concurrent reactive top-ups: the joiner claims none of the spawner's
+/// Two concurrent recovery top-ups: the joiner claims none of the spawner's
 /// escrow, so it funds its whole request itself instead of counting the
 /// spawner's deposit growth as its own.
 #[tokio::test]
@@ -2185,10 +2185,10 @@ fn in_flight_refill_is_claimed_at_most_once() {
     assert_eq!(slot.join(u(60), TopUpFunder::Recovery).1, joined(0, 100));
 }
 
-/// A reactive top-up's amount is its spawner's: a second reactive top-up that
+/// A recovery top-up's amount is its spawner's: a second recovery top-up that
 /// joins it claims nothing (#2012).
 #[test]
-fn in_flight_reactive_topup_leaves_nothing_to_claim() {
+fn in_flight_recovery_topup_leaves_nothing_to_claim() {
     let mut slot = in_flight(100, TopUpFunder::Recovery);
 
     assert_eq!(slot.join(u(100), TopUpFunder::Recovery).1, joined(0, 100));

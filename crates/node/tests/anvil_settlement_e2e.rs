@@ -1297,7 +1297,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         landed.added
     );
 
-    // Two concurrent reactive top-ups (#2012): the second joins the first's
+    // Two concurrent recovery top-ups (#2012): the second joins the first's
     // in-flight `topUp`, claims none of it, and funds its own amount after. The
     // chain must hold BOTH escrows — one shared escrow counted by two pulls is the
     // under-fund this guards — and never more than both.
@@ -1310,7 +1310,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     anyhow::ensure!(
         first.added == U256::from(TOPUP_MICRO_USDC)
             && second.added == U256::from(TOPUP_MICRO_USDC / 2),
-        "each concurrent reactive top-up must report its own amount as added: \
+        "each concurrent recovery top-up must report its own amount as added: \
          first {}, second {}",
         first.added,
         second.added
@@ -1318,7 +1318,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     anyhow::ensure!(
         U256::from(buyer_pool.getPool(buyer_pool_id).call().await?.deposit)
             == deposit_before + U256::from(TOPUP_MICRO_USDC + TOPUP_MICRO_USDC / 2),
-        "concurrent reactive top-ups must escrow both amounts exactly once"
+        "concurrent recovery top-ups must escrow both amounts exactly once"
     );
 
     // Reclaim: the buyer closes its own pool, the chain is warped past the grace

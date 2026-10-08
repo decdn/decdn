@@ -272,11 +272,10 @@ pub struct BlockchainConfig {
     /// toward once it is reused or runs short mid-transfer. The shared pool is
     /// fully withdrawable, so the buyer opens at this amount directly rather
     /// than escrowing a smaller first-contact lock. Both refill legs target
-    /// it: the proactive low-water refill, which both binaries run on pool
-    /// reuse, and the reactive mid-transfer top-up, which the `decdn fetch`
-    /// streaming path and the daemon's node-to-node cache-miss pull both run
-    /// (#1530). `decdn bundle pull` is the one remaining fetch path with the
-    /// proactive leg only. Larger values amortize gas across more delivery at
+    /// it: the low-water refill, which both binaries run on pool reuse, and
+    /// the funding recovery step, which every fetch path (`decdn fetch`,
+    /// `decdn bundle pull`, and the daemon's node-to-node cache-miss pull)
+    /// runs once no node serves at the current deposit (#1530). Larger values amortize gas across more delivery at
     /// the cost of more capital locked. Absent => default (10 USDC =
     /// `10_000_000`). Must be nonzero (the pool's `openPool` reverts on a zero
     /// deposit).

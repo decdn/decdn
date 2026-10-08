@@ -296,9 +296,14 @@ as `decdn fetch`):
   that signs a different size stays a holder of the entry. An entry
   whose proven size differs from its manifest size succeeds with a warning
   line. A blob over the client's size cap fails only its entry.
-  A node's refusal never stops the pull. It removes or cools that holder by
-  the rules of
+  A node's refusal never stops the pull. It removes, parks, or cools that
+  holder by the rules of
   [ADR 039 § Failure handling](039-multi-source-parallel-fetch.md#failure-handling-reassign-only-tail).
+  A `Declined` refusal removes the holder for that entry's hash only. For the
+  other entries the holder only cools, as for any delivery fault, and stays
+  a candidate. An `Unfunded` refusal
+  parks the holder in the shared health table for every entry until a
+  funding recovery step.
   A local fault that only the user can fix stops all entries: an escrow
   that no local record credits, a local store or disk fault, or a keystore
   failure. "Funding needed" also stops all entries. The pull then starts no new entry, stops the entries that run,

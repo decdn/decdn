@@ -1939,6 +1939,21 @@ async fn recover_unfunded(
     miss_answer(miss)
 }
 
+/// The content bytes `store` holds of its `total_bytes` blob, or `None` when
+/// the store cannot answer.
+async fn held_bytes(store: &NodeAdmitStore, total_bytes: u64) -> Option<u64> {
+    use decdn_client::RangedStore as _;
+    let missing = store.missing_ranges(0, total_bytes).await.ok()?;
+    let chunk = |n: bao_tree::ChunkNum| n.0.saturating_mul(1024).min(total_bytes);
+    let mut bounds = missing.boundaries().iter().copied();
+    let mut missing_bytes = 0u64;
+    while let Some(start) = bounds.next() {
+        let end = bounds.next().map_or(total_bytes, chunk);
+        missing_bytes = missing_bytes.saturating_add(end.saturating_sub(chunk(start)));
+    }
+    Some(total_bytes.saturating_sub(missing_bytes))
+}
+
 /// Run one funding recovery step of a fill under `gate`, for `candidates`
 /// candidates that refused this node's funding. `seen` is the deposit the fill
 /// last saw. A pool row above it is a sibling fill's step: the gate takes it as
@@ -2351,22 +2366,11 @@ async fn pull_from_candidate_in_span(
                 _ => drop((header, whole)),
             }
             let pacer = BudgetPacer::new();
-            // Each rise of the reported position is newly verified bytes for the
-            // fill's funding recovery gate. The first report is the resume base.
-            let last_position = std::sync::Mutex::new(None::<u64>);
-            let on_progress = move |position: u64, _total: u64| {
-                let mut last = last_position
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match *last {
-                    Some(prev) if position > prev => {
-                        gate_for_thread.record_verified(position - prev);
-                        *last = Some(position);
-                    }
-                    Some(_) => {}
-                    None => *last = Some(position),
-                }
-            };
+            // The bytes the store holds before the drive: what it holds after,
+            // less these, is the newly verified bytes the fill's funding
+            // recovery gate counts. Bytes a leg re-delivers to bill them are
+            // already held, so they count nothing.
+            let held_before = held_bytes(&store, total_bytes).await;
             // Whole blob: offset 0, len `total_bytes`. `drive` derives missing ranges
             // from the ranged store, so a later pull of the same blob resumes by
             // re-deriving gaps: no truncate, no rewind buffer. `drive` finalizes the
@@ -2384,7 +2388,7 @@ async fn pull_from_candidate_in_span(
                     hash_bytes,
                     0,
                     total_bytes,
-                    Some(&on_progress),
+                    None,
                     None,
                     None,
                     // Single-source candidate pull: one lane is the whole pool.
@@ -2398,6 +2402,12 @@ async fn pull_from_candidate_in_span(
                     Ok(())
                 }
             };
+            if let (Some(before), Some(after)) =
+                (held_before, held_bytes(&store, total_bytes).await)
+                && after > before
+            {
+                gate_for_thread.record_verified(after - before);
+            }
             // A primed pull the drive never opened closes now.
             source.clear();
             (result, pool_id, cancelled)

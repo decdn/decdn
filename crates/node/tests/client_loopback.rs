@@ -11,8 +11,8 @@
 //! on a fresh stream.
 //!
 //! Delivery/authorization gates also covered: the buyer-side received-byte
-//! ceiling (#1895, `BlobTooLarge` on bytes that actually arrive),
-//! `EvictedSinceProbe` (evicted between probe and stream), the client-binding
+//! ceiling (#1895, `BlobTooLarge` on bytes that actually arrive), the
+//! `Declined` refusal of a blob evicted between probe and stream, the client-binding
 //! mismatch reset and the binding-does-not-own-channel `NotFound` (both driven
 //! by a small [`raw_request`] client, since the honest requester never sends a
 //! binding), and per-channel voucher serialization under concurrency.
@@ -8034,8 +8034,8 @@ async fn blacklisted_funder_is_refused_on_a_cache_miss() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A blob evicted between probe and stream request is refused with
-/// `EvictedSinceProbe` (distinct from never-had-it `NotFound`).
+/// A blob evicted between probe and stream request is refused `Declined`
+/// (reason `EvictedSinceProbe`), distinct from a never-had-it `NotFound`.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_evicted_since_probe_is_refused() -> anyhow::Result<()> {
     let payload = b"evicted between probe and stream".to_vec();
@@ -9959,7 +9959,7 @@ async fn origin_only_node_fault_is_internal_error_not_signed_not_found() -> anyh
             let msg = e.to_string();
             anyhow::ensure!(
                 msg.contains("Declined"),
-                "a faulting backend probe must surface as InternalError, got: {e}"
+                "a faulting backend probe must surface as Declined (InternalError), got: {e}"
             );
             anyhow::ensure!(
                 !msg.contains("NotFound"),
@@ -11336,7 +11336,7 @@ async fn empty_cache_with_failing_origin(
 }
 
 /// #1129: a cache-only operator (node→node OFF) whose OWN origin hard-faults must
-/// refuse with a retryable `InternalError` — NOT a signed `NotFound`.
+/// refuse `Declined` (reason `InternalError`), NOT a signed `NotFound`.
 ///
 /// The refusal is EIP-712 signed, so `NotFound` is an authoritative, attributable
 /// claim that the blob does not exist. Signing it during a transient S3 outage
@@ -11376,7 +11376,7 @@ async fn local_origin_hard_fault_is_internal_error_not_signed_not_found() -> any
             let msg = e.to_string();
             anyhow::ensure!(
                 msg.contains("Declined"),
-                "a hard origin fault must surface as a retryable InternalError, got: {e}"
+                "a hard origin fault must surface as Declined (InternalError), got: {e}"
             );
             anyhow::ensure!(
                 !msg.contains("NotFound"),
@@ -13598,8 +13598,8 @@ async fn client_completes_when_its_send_is_stopped_before_the_closing_voucher() 
 /// A buyer whose closing-voucher write is stopped surfaces the node's typed
 /// `StreamError` — not an opaque write failure. When a node rejects a payer (a
 /// spent pool) it writes `VoucherRejected` and resets; the reset otherwise masks
-/// the typed reason as "write failed", and the exhaustion / reactive-top-up path
-/// keys on [`UpstreamVoucherRejected`]. Under one chunk, so the only voucher is the
+/// the typed reason as "write failed", and the fault classification that sends
+/// a funding rejection to the recovery step keys on [`UpstreamVoucherRejected`]. Under one chunk, so the only voucher is the
 /// closing one — the same end-of-stream write the sibling test covers, with a
 /// rejection terminal in place of a clean `StreamEnd`. A write that fails mid-
 /// delivery, with frames still in flight ahead of the terminal, is

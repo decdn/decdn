@@ -87,7 +87,7 @@ async fn a_topped_up_step_passes_the_deposit_through_and_meters_it() {
     assert_eq!(*opener.seen.lock().unwrap(), Some(U256::from(700u64)));
     let text = metrics.encode().expect("metrics should encode");
     assert!(
-        text.contains("decdn_node_pull_reactive_topup_total 1"),
+        text.contains("decdn_node_pull_recovery_step_total 1"),
         "expected a funded step to bump the success counter: {text}"
     );
 }
@@ -123,7 +123,7 @@ async fn a_step_with_no_funding_path_is_metered_as_refused() {
     );
     let text = metrics.encode().expect("metrics should encode");
     assert!(
-        text.contains("decdn_node_pull_reactive_topup_refused_total 1"),
+        text.contains("decdn_node_pull_recovery_step_refused_total 1"),
         "expected a step with no funding path to bump the refused counter: {text}"
     );
 }

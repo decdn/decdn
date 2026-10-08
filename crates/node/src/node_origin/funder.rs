@@ -69,8 +69,8 @@ const MAX_SETTLE_WAITS: u32 = 60;
 /// `remaining` deposit [`Funder::recover`] receives is not read. `seen` is the
 /// deposit the fill saw: a row above it is a sibling fill's step, which this
 /// fill shares instead of funding its own ([`PoolOpener::recover_pool`]). It
-/// records `node_pull_reactive_topup` on a step that funds or settles and
-/// `node_pull_reactive_topup_refused` on a step that cannot, or fails.
+/// records `node_pull_recovery_step` on a step that funds or settles and
+/// `node_pull_recovery_step_refused` on a step that cannot, or fails.
 pub(crate) struct NodeFunder {
     opener: Arc<dyn PoolOpener>,
     metrics: Arc<crate::metrics::Metrics>,
@@ -104,22 +104,22 @@ impl Funder for NodeFunder {
         Box::pin(async move {
             match self.opener.recover_pool(self.seen).await {
                 Ok(Recovery::ToppedUp(deposit)) => {
-                    self.metrics.node_pull_reactive_topup();
+                    self.metrics.node_pull_recovery_step();
                     Ok(Recovery::ToppedUp(deposit))
                 }
                 Ok(Recovery::Replaced(replaced)) => {
-                    self.metrics.node_pull_reactive_topup();
+                    self.metrics.node_pull_recovery_step();
                     Ok(Recovery::Replaced(replaced))
                 }
                 Ok(other) => {
-                    self.metrics.node_pull_reactive_topup_refused();
+                    self.metrics.node_pull_recovery_step_refused();
                     Ok(other)
                 }
                 // A funding failure is ours (allowance, RPC, a row we cannot
                 // credit), never the upstream's. Typed `LocalPullFault` so the
                 // fill does not score an honest provider for it.
                 Err(err) => {
-                    self.metrics.node_pull_reactive_topup_refused();
+                    self.metrics.node_pull_recovery_step_refused();
                     Err(err.context(LocalPullFault))
                 }
             }

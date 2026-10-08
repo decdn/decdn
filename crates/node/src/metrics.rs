@@ -1424,31 +1424,31 @@ pub struct DecdnMetrics {
     /// `node_pull_progress_persist_failures_total` (a real store-write failure that leaves the
     /// watermark lagging) so ordinary settle races do not drown out a genuine persist fault.
     pub node_pull_progress_superseded: Counter,
-    /// `decdn_node_pull_reactive_topup_total` (#1530): a node→node miss fill's
-    /// funding recovery step (ADR 003 § Funding recovery) added funds: every
-    /// candidate refused this node's funding, so the step topped the buyer pool
-    /// up, or opened a new pool in place of one that accepts no more funds.
+    /// `decdn_node_pull_recovery_step_total` (#1530): a node→node miss fill ran a
+    /// funding recovery step (ADR 003 § Funding recovery) that funds the next
+    /// pass: every candidate refused this node's funding, so the step topped the
+    /// buyer pool up, opened a new pool in place of one that accepts no more
+    /// funds, or settled a pool that already holds its working deposit while the
+    /// upstreams catch up.
     ///
     /// Expected to be RARE once `buyer_working_deposit_micro_usdc` is sized for the
-    /// blobs this node pulls — the proactive low-water refill should refill a
+    /// blobs this node pulls: the low-water refill should refill a
     /// pool long before a fill runs it dry. A sustained rate means the working
     /// deposit is too small for the blob sizes in play, and every tick is a
     /// transaction plus a settlement wait a client sat through.
     ///
     /// Distinct from `decdn_buyer_topup_ok_total`, which counts on-chain top-ups from
-    /// BOTH legs: this one isolates the recovery step, so the proactive refill's
+    /// BOTH legs: this one isolates the recovery step, so the low-water refill's
     /// routine traffic cannot hide it.
-    pub node_pull_reactive_topup: Counter,
-    /// `decdn_node_pull_reactive_topup_refused_total` (#1530): a fill's funding
-    /// recovery step added nothing: the pool already holds the working deposit,
-    /// or the funding transaction failed (allowance, revert, RPC, or a mined
-    /// `topUp` the local pool row could not credit).
+    pub node_pull_recovery_step: Counter,
+    /// `decdn_node_pull_recovery_step_refused_total` (#1530): a fill's funding
+    /// recovery step had no way to fund the next pass: the working deposit is
+    /// zero (funding off), the top-up landed nothing, or the funding
+    /// transaction failed (allowance, revert, RPC, or a mined `topUp` the local
+    /// pool row could not credit).
     ///
-    /// A pool already at the working deposit means an upstream's refundable floor
-    /// `M` exceeds what this node's working deposit covers; a sustained rate
-    /// against one provider is worth a look. A failed funding transaction also
-    /// ticks `decdn_buyer_topup_failure_total`.
-    pub node_pull_reactive_topup_refused: Counter,
+    /// A failed funding transaction also ticks `decdn_buyer_topup_failure_total`.
+    pub node_pull_recovery_step_refused: Counter,
     /// `decdn_node_pull_through_timeouts_total` (#831): cache-miss pull-through
     /// attempts the delivery handler abandoned at its deadline. Distinguishes a
     /// slow/wedged upstream from a genuine miss (both otherwise return
@@ -3392,12 +3392,12 @@ recorders! {
     /// this write was superseded (benign under `BuyerLedgers`; #1145 review).
     node_pull_progress_superseded => node_pull_progress_superseded.inc();
 
-    /// A miss fill's funding recovery step added funds (#1530).
-    node_pull_reactive_topup => node_pull_reactive_topup.inc();
+    /// A miss fill's funding recovery step funded the next pass (#1530).
+    node_pull_recovery_step => node_pull_recovery_step.inc();
 
-    /// A miss fill's funding recovery step added nothing: the pool already held
-    /// the working deposit, or the funding tx failed (#1530).
-    node_pull_reactive_topup_refused => node_pull_reactive_topup_refused.inc();
+    /// A miss fill's funding recovery step had no way to fund the next pass,
+    /// or its funding tx failed (#1530).
+    node_pull_recovery_step_refused => node_pull_recovery_step_refused.inc();
 
     /// The delivery handler abandoned a pull-through at its deadline (#831).
     node_pull_through_timeout => node_pull_through_timeouts.inc();
