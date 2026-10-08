@@ -6255,12 +6255,11 @@ async fn a_bound_that_shrinks_under_a_missing_query_clips_it() -> anyhow::Result
     Ok(())
 }
 
-/// An extra stream's fault line is at debug only for a refusal before any
-/// verified byte. Any other fault follows its class, so a stall before the
-/// first byte still reaches warn (#2331). The error field is sanitized: a
+/// An extra stream's fault line is at debug when nothing landed. Otherwise
+/// it follows the fault's class (#2331). The error field is sanitized: a
 /// chain error under a top-up names the RPC URL, which may carry a key.
 #[test]
-fn extra_stream_fault_level_follows_refusal_and_class() {
+fn extra_stream_fault_level_follows_landed_and_class() {
     #[derive(Clone, Default)]
     struct CapturedLog(Arc<Mutex<Vec<u8>>>);
     impl std::io::Write for CapturedLog {
@@ -6311,10 +6310,7 @@ fn extra_stream_fault_level_follows_refusal_and_class() {
     assert_eq!(lines.len(), 4, "{text}");
     let level = |i: usize| lines.get(i).copied().unwrap_or_default();
     assert!(level(0).contains(" DEBUG "), "a refusal is routine: {text}");
-    assert!(
-        level(1).contains(" WARN "),
-        "a stall is a source fault: {text}"
-    );
+    assert!(level(1).contains(" DEBUG "), "nothing landed: {text}");
     assert!(level(2).contains(" WARN "), "{text}");
     assert!(level(3).contains(" INFO "), "a chain-side retry: {text}");
     assert!(level(3).contains("fault=Transient"), "{text}");

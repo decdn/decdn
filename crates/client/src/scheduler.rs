@@ -2516,9 +2516,9 @@ where
 /// Log, where it happens, that an extra worker's stream faulted on `range`
 /// while the lane's own worker runs, or while the node is already charged
 /// for this outage. Such a fault is most often a refusal of the additional
-/// stream before any verified byte, which is routine, so that line is at
-/// debug. Any other fault is at warn when [`Fault::warns`] holds and at info
-/// otherwise. Such a fault does not cool the node.
+/// stream, which is routine, so the line is at debug when nothing landed.
+/// Otherwise it is at warn when [`Fault::warns`] holds and at info for a
+/// deposit wait or a chain-side retry. Such a fault does not cool the node.
 fn log_extra_fault(
     provider: Address,
     hash: [u8; 32],
@@ -2534,18 +2534,7 @@ fn log_extra_fault(
         uncovered,
     } = range;
     let error = decdn_common::redact::sanitize_err_chain(err);
-    if landed == 0 && err.downcast_ref::<crate::UpstreamRefused>().is_some() {
-        tracing::debug!(
-            %provider,
-            %hash,
-            offset,
-            len,
-            uncovered,
-            %error,
-            "an extra stream of a lane was refused before any verified byte; its range goes \
-             back to the queue"
-        );
-    } else {
+    if landed > 0 {
         let fault = crate::fault::classify(err);
         crate::fault::warn_or_info!(
             fault.warns(),
@@ -2558,6 +2547,17 @@ fn log_extra_fault(
             ?fault,
             %error,
             "an extra stream of a lane faulted; its remainder goes back to the queue"
+        );
+    } else {
+        tracing::debug!(
+            %provider,
+            %hash,
+            offset,
+            len,
+            uncovered,
+            %error,
+            "an extra stream of a lane faulted before any verified byte; its range goes back \
+             to the queue"
         );
     }
 }
