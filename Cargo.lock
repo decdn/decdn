@@ -2682,6 +2682,7 @@ name = "decdn-cli"
 version = "0.0.0"
 dependencies = [
  "alloy",
+ "alloy-json-rpc",
  "anstyle-progress",
  "anyhow",
  "blake3",

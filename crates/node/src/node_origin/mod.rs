@@ -874,6 +874,9 @@ impl Origin for NodeOrigin {
                 let gate = Arc::new(RecoveryGate::with_settle(settle_window(
                     deps.config.event_poll_interval,
                 )));
+                // The deposit this fill starts at. A sibling fill's step that
+                // lands above it serves this fill too.
+                let seen = deps.buyer.pool_deposit().unwrap_or(U256::ZERO);
                 let mut unfunded: Vec<Candidate> = Vec::new();
 
                 // ADR 001 §Probe cache: "On a cache miss the requester checks the probe
@@ -910,7 +913,7 @@ impl Origin for NodeOrigin {
                         // client as an absent blob (#1560).
                         debug!(%hash, "node-origin: probe-cache candidates exhausted the attempt budget");
                         return recover_unfunded(
-                            &deps_lock, deps, hash_bytes, unfunded, miss, &gate,
+                            &deps_lock, deps, hash_bytes, unfunded, miss, &gate, seen,
                         )
                         .await;
                     }
@@ -935,8 +938,10 @@ impl Origin for NodeOrigin {
                         deps.metrics.node_pull_no_providers();
                     }
                     debug!(%hash, "node-origin: no providers discovered for cache-miss pull");
-                    return recover_unfunded(&deps_lock, deps, hash_bytes, unfunded, miss, &gate)
-                        .await;
+                    return recover_unfunded(
+                        &deps_lock, deps, hash_bytes, unfunded, miss, &gate, seen,
+                    )
+                    .await;
                 }
                 if !attempt_metered {
                     deps.metrics.node_pull_attempt();
@@ -966,6 +971,7 @@ impl Origin for NodeOrigin {
                             unfunded,
                             miss.or(failed),
                             &gate,
+                            seen,
                         )
                         .await
                     }
@@ -1912,13 +1918,16 @@ async fn recover_unfunded(
     mut unfunded: Vec<Candidate>,
     mut miss: PullMiss,
     gate: &Arc<RecoveryGate>,
+    mut seen: U256,
 ) -> Result<OriginFetch, OriginPullError> {
-    let funder = NodeFunder::new(Arc::clone(&deps.buyer), Arc::clone(&deps.metrics));
     while !unfunded.is_empty() {
         if gate.settling(tokio::time::Instant::now()) {
             tokio::time::sleep(SETTLE_POLL_STEP).await;
-        } else if let Err(end) = node_step(gate, &funder, unfunded.len()).await {
-            return miss_answer(miss.or(end));
+        } else {
+            match node_step(gate, deps, seen, unfunded.len()).await {
+                Ok(deposit) => seen = deposit,
+                Err(end) => return miss_answer(miss.or(end)),
+            }
         }
         let outcome = try_pull(deps_lock, deps, &unfunded, hash_bytes, unfunded.len(), gate).await;
         match outcome.payload {
@@ -1930,21 +1939,24 @@ async fn recover_unfunded(
     miss_answer(miss)
 }
 
-/// Run one funding recovery step of a fill under `gate`, through `funder`,
-/// for `candidates` candidates that refused this node's funding. `Err` names
-/// the fill's end: no step allowed or possible, or a step that failed.
-async fn node_step(
+/// Run one funding recovery step of a fill under `gate`, for `candidates`
+/// candidates that refused this node's funding. `seen` is the deposit the fill
+/// last saw. A pool row above it is a sibling fill's step: the gate takes it as
+/// raised and runs no step of its own. `Ok` is the deposit the fill sees next;
+/// `Err` names the fill's end: no step allowed or possible, or a step that
+/// failed.
+pub(super) async fn node_step(
     gate: &RecoveryGate,
-    funder: &NodeFunder,
+    deps: &NodeOriginDeps,
+    seen: U256,
     candidates: usize,
-) -> Result<(), PullMiss> {
-    // The node's step sizes itself from its pool row, so the deposit view it
-    // is handed is not read.
-    match gate
-        .step(funder, U256::ZERO, || U256::ZERO, U256::ZERO)
-        .await
-    {
-        Stepped::Raised(_) => Ok(()),
+) -> Result<U256, PullMiss> {
+    let funder = NodeFunder::new(Arc::clone(&deps.buyer), Arc::clone(&deps.metrics), seen);
+    // The node's step sizes itself from its pool row, so the spend it is
+    // handed is not read.
+    let current = || deps.buyer.pool_deposit().unwrap_or(seen);
+    match gate.step(&funder, seen, current, U256::ZERO).await {
+        Stepped::Raised(deposit) => Ok(deposit),
         Stepped::Replaced(replaced) => {
             info!(
                 closed = %replaced.closed,
@@ -1952,7 +1964,7 @@ async fn node_step(
                 "node-origin: the buyer pool accepts no more funds; a new pool replaces it"
             );
             gate.start_next_pass();
-            Ok(())
+            Ok(deps.buyer.pool_deposit().unwrap_or(seen))
         }
         Stepped::NoProgress | Stepped::Unavailable => {
             info!(

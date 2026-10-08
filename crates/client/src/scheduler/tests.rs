@@ -3555,6 +3555,102 @@ async fn verified_bytes_since_the_last_step_allow_another() -> anyhow::Result<()
     Ok(())
 }
 
+/// A fetch that completes on other lanes, without the refused lane running
+/// again, leaves that lane's owed span unpaid: the node's credit-window loss,
+/// as for any client that ends mid-stream. No pass runs only to bill it.
+#[tokio::test(start_paused = true)]
+async fn a_fetch_finished_by_other_lanes_leaves_the_owed_span_unpaid() -> anyhow::Result<()> {
+    let data = blob(1024 * 1024);
+    let (la, lb) = (
+        Arc::new(PoolLedger::new(Cumulative::default())),
+        Arc::new(PoolLedger::new(Cumulative::default())),
+    );
+    let a = ScriptedSource::new(data.clone())?
+        .paying(Arc::clone(&la))
+        .with_fault_after(128 * 1024, || {
+            anyhow::Error::new(UpstreamVoucherRejected {
+                reason: decdn_protocol::client::VoucherRejectReason::PoolExhausted,
+                bundle: None,
+                proof_generation: None,
+            })
+        });
+    let b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&lb));
+    let (root, total) = (a.root(), a.total_bytes());
+    let (store, dir) = fresh_store(root, total);
+    let provider = StaticSources::new(vec![
+        candidate(a.clone(), Arc::clone(&la), 0xA1, None),
+        candidate(b, lb, 0xB2, None),
+    ])?;
+    acquire_under(&store, &provider, root, &no_funding(), &RecoveryGate::new()).await?;
+    store.finalize().await?;
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    assert_eq!(a.opened_ranges().len(), 1, "no pass runs only to bill");
+    assert!(
+        !la.take_unpaid(root).is_empty(),
+        "the refused lane's span stays unpaid"
+    );
+    Ok(())
+}
+
+/// An owed span whose bill fails on a delivery fault (not a funding one) stays
+/// owed: the lane bills it when its worker starts again.
+#[tokio::test(start_paused = true)]
+async fn an_owed_span_whose_bill_faults_stays_owed() -> anyhow::Result<()> {
+    let data = blob(1024 * 1024);
+    let half = 512 * 1024;
+    let la = Arc::new(PoolLedger::new(Cumulative::default()));
+    let a = ScriptedSource::new(data.clone())?
+        .paying(Arc::clone(&la))
+        .refusing_open(0, || anyhow::anyhow!("connection reset"));
+    let (root, total) = (a.root(), a.total_bytes());
+    let (store, dir) = fresh_store(root, total);
+    // The first half is present and owed: an earlier worker delivered it
+    // unpaid before a funding refusal ended it.
+    {
+        let once = ScriptedSource::new(data.clone())?;
+        let range = decdn_bao_range::align_range(0, half, total)?;
+        let (_header, reader) = once.open(root, range.clone()).await?;
+        store.ingest_stream(&range, reader, None, total).await?;
+    }
+    la.note_unpaid(root, 0, half);
+    let provider = StaticSources::new(vec![candidate(a.clone(), Arc::clone(&la), 0xA1, None)])?;
+    acquire_under(&store, &provider, root, &no_funding(), &RecoveryGate::new()).await?;
+    store.finalize().await?;
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    let opened = a.opened_ranges();
+    assert_eq!(
+        opened.iter().filter(|&&(start, _)| start == 0).count(),
+        2,
+        "the faulted bill and the bill on the restart: {opened:?}"
+    );
+    assert!(la.take_unpaid(root).is_empty(), "the span is billed");
+    Ok(())
+}
+
+/// A step that settles (the pool already holds its deposit, and the sources
+/// have not seen it yet) leaves the deposit where it is, and still asks the
+/// priced-out source again: its refusal was its stale view of the pool.
+#[tokio::test(start_paused = true)]
+async fn a_settling_step_asks_the_priced_out_source_again() -> anyhow::Result<()> {
+    let data = blob(1024 * 1024);
+    let la = Arc::new(PoolLedger::new(Cumulative::default()));
+    let a = ScriptedSource::new(data.clone())?
+        .paying(Arc::clone(&la))
+        .fault_once_after(0, || {
+            anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Unfunded))
+        });
+    let (root, total) = (a.root(), a.total_bytes());
+    let (store, dir) = fresh_store(root, total);
+    let provider = StaticSources::new(vec![candidate(a, la, 0xA1, None)])?;
+    // The deposit the context already holds: nothing rises.
+    let funder = FakeFunder::new(Recovery::ToppedUp(U256::from(u128::MAX)));
+    acquire_under(&store, &provider, root, &funder, &RecoveryGate::new()).await?;
+    store.finalize().await?;
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    assert_eq!(funder.calls().len(), 1, "one settling step");
+    Ok(())
+}
+
 /// A pool that no longer accepts funds is replaced, and the acquire ends this
 /// pass with the replacement so the caller runs the remaining work against
 /// the new pool.
@@ -6682,6 +6778,35 @@ async fn a_pool_refusal_under_a_healthy_capability_names_the_publisher_pool() ->
         *slot.funding_events().borrow(),
         None,
         "the capability is fine"
+    );
+    Ok(())
+}
+
+/// The capability's spend counts every lane the local records hold for its
+/// key, not only this fetch's: a key whose cap an earlier fetch at another
+/// provider mostly spent ends needing a new capability, not blaming the pool.
+#[tokio::test(start_paused = true)]
+async fn spend_recorded_at_another_provider_counts_toward_the_cap() -> anyhow::Result<()> {
+    let source = ScriptedSource::new(blob(1024 * 1024))?.with_fault_after(0, || {
+        anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Unfunded))
+    });
+    let (root, total) = (source.root(), source.total_bytes());
+    let (store, _dir) = fresh_store(root, total);
+    let credential = delegate(1_000);
+    let slot = slot_for(&credential, Duration::ZERO);
+    slot.record_spend(credential.signer.address(), U256::from(999u64));
+    let provider = SlotSources::new(&slot, source);
+    let err = acquire_delegated(&store, &provider, root)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("must stop"))?;
+    assert_eq!(
+        err.downcast_ref::<crate::FundingNeeded>(),
+        Some(&crate::FundingNeeded::NewCapability {
+            pool: B256::repeat_byte(0x11),
+            cause: crate::CapabilityCause::CapSpent,
+        }),
+        "{err:#}"
     );
     Ok(())
 }

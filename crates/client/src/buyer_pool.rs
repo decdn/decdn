@@ -675,6 +675,26 @@ impl std::fmt::Display for PoolNotOpen {
 
 impl std::error::Error for PoolNotOpen {}
 
+/// Whether `pool_id` still accepts funds: the gas estimate of a one-unit
+/// `topUp` from `owner`, with no transaction sent. Only a `PoolNotOpen` revert
+/// says no. Any other estimate failure (an allowance or balance short of one
+/// unit, a transport fault) says nothing about the pool's status, so it reads
+/// as open.
+///
+/// The funding recovery step checks this when the pool already holds its
+/// working deposit and there is nothing to add: a full pool that is `Closing`
+/// or `Closed` still needs a replacement.
+pub async fn pool_accepts_funds<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    owner: Address,
+    pool_id: B256,
+) -> bool {
+    match contract.topUp(pool_id, 1).from(owner).estimate_gas().await {
+        Ok(_) => true,
+        Err(err) => !decdn_incentive::is_pool_not_open(err.as_revert_data().as_ref()),
+    }
+}
+
 /// How many times [`top_up`] re-sends a submit rejected as a nonce collision.
 const TOPUP_NONCE_RETRIES: u32 = 3;
 

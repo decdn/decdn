@@ -48,8 +48,8 @@ use tracing::{debug, error, info, warn};
 use crate::metrics::Metrics;
 use decdn_client::buyer_pool::{
     LOW_WATER_DIVISOR, PoolNotOpen, ProgressWrite, ToppedUpPool, ensure_allowance,
-    grade_deposit_credit, open_pool, refill_amount, self_owned_lane_ctx, top_up as pool_top_up,
-    topped_up_effect,
+    grade_deposit_credit, open_pool, pool_accepts_funds, refill_amount, self_owned_lane_ctx,
+    top_up as pool_top_up, topped_up_effect,
 };
 use decdn_client::{LocalPullFault, PoolContext, PoolReplaced, Recovery};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
@@ -203,6 +203,8 @@ struct InFlightTopUp {
     /// Headroom this `topUp` adds that no pull relies on yet. A refill starts with
     /// its full amount; a recovery top-up starts with zero.
     unclaimed: U256,
+    /// Who started it.
+    funder: TopUpFunder,
 }
 
 impl InFlightTopUp {
@@ -215,6 +217,7 @@ impl InFlightTopUp {
             fut,
             requested,
             unclaimed,
+            funder,
         }
     }
 
@@ -1348,24 +1351,47 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// is not reclaimed here; the reclaim sweep recovers it once its dispute window
     /// ends.
     ///
+    /// Concurrent fills share one pool, so one step funds them all.
+    /// `seen_deposit` is the deposit the calling fill saw. A row that already
+    /// holds more is a sibling's step that landed: the call returns the row's
+    /// deposit and escrows nothing. A recovery top-up still in flight is a
+    /// sibling's step too: the call waits for it and returns its deposit.
+    ///
     /// The step sizes itself from the pool row: the deposit less the spend its
     /// lanes recorded. A fill runs the step only once its own pulls ended, and
     /// each pull records its progress as it ends, so the row holds that spend.
-    /// A pool that already holds the working deposit has nothing to add:
-    /// [`Recovery::Unavailable`].
+    /// A pool that already holds the working deposit has nothing to add. A
+    /// `topUp` gas estimate (no transaction) then tells a closing or closed
+    /// pool, which a new pool replaces. An open pool is the upstreams' stale
+    /// view of a deposit they have not seen yet: the step settles and returns
+    /// the row's deposit, so the fill's settle window asks them again.
     ///
     /// # Errors
     ///
-    /// No pool is tracked, the `topUp` or replacement `openPool` fails, or a
-    /// mined transaction cannot be recorded (escrowed and untracked).
-    pub async fn recover_pool(&self) -> Result<Recovery> {
+    /// No pool is tracked, the `topUp` or replacement `openPool` fails, a
+    /// joined top-up fails, or a mined transaction cannot be recorded
+    /// (escrowed and untracked).
+    pub async fn recover_pool(&self, seen_deposit: U256) -> Result<Recovery> {
         let state = self
             .reuse_or_report()?
             .with_context(|| "no buyer pool tracked to recover")?;
+        if state.deposit > seen_deposit {
+            return Ok(Recovery::ToppedUp(state.deposit));
+        }
+        if let Some(in_flight) = self.recovery_in_flight() {
+            let landed = in_flight
+                .await
+                .map_err(|err| anyhow::anyhow!("a sibling's recovery top-up failed: {err:#}"))?;
+            return Ok(Recovery::ToppedUp(landed.new_deposit));
+        }
+        // A zero working deposit turns the node's funding off.
+        if self.working_deposit.is_zero() {
+            return Ok(Recovery::Unavailable);
+        }
         let remaining = state.deposit.saturating_sub(state.pool_spend());
         let additional = self.working_deposit.saturating_sub(remaining);
         if additional.is_zero() {
-            return Ok(Recovery::Unavailable);
+            return self.settle_or_replace(state.pool_id, state.deposit).await;
         }
         match self.top_up_pool_by(additional).await {
             Ok(landed) if landed.added.is_zero() => Ok(Recovery::Unavailable),
@@ -1383,6 +1409,56 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// The recovery step for pool `pool_id`, which already holds its working
+    /// deposit `deposit`: a `topUp` gas estimate (no transaction) tells a
+    /// closing or closed pool, which a new pool replaces. An open pool
+    /// settles at `deposit`.
+    ///
+    /// # Errors
+    ///
+    /// The replacement open fails.
+    async fn settle_or_replace(&self, pool_id: PoolId, deposit: U256) -> Result<Recovery> {
+        if pool_accepts_funds(&self.contract, self.owner, pool_id).await {
+            info!(
+                %pool_id,
+                %deposit,
+                "buyer pool already holds its working deposit; waiting for the upstreams to \
+                 see it"
+            );
+            return Ok(Recovery::ToppedUp(deposit));
+        }
+        info!(
+            %pool_id,
+            "buyer pool holds its working deposit but accepts no more funds; opening a new pool"
+        );
+        let opened = self.open_replacement(pool_id).await?;
+        Ok(Recovery::Replaced(PoolReplaced {
+            closed: pool_id,
+            opened,
+        }))
+    }
+
+    /// The recovery top-up in flight, if one is: a sibling fill's step, which
+    /// this fill waits for instead of funding its own.
+    fn recovery_in_flight(&self) -> Option<SharedTopUp> {
+        self.topup_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|in_flight| in_flight.funder == TopUpFunder::Recovery)
+            .map(|in_flight| in_flight.fut.clone())
+    }
+
+    /// The deposit the store's pool row records, or `None` with no pool
+    /// tracked: the deposit a fill sees.
+    pub fn pool_deposit(&self) -> Option<U256> {
+        self.store
+            .get_by_owner(self.owner)
+            .ok()
+            .flatten()
+            .map(|state| state.deposit)
     }
 
     /// Open a new pool in place of `closed`, the pool the store tracks now, and
@@ -1500,8 +1576,8 @@ pub trait PoolOpener: Send + Sync + std::fmt::Debug {
         write: ProgressWrite,
     ) -> Result<()>;
 
-    /// Run the node's funding recovery step on its buyer pool. See
-    /// [`BuyerPoolService::recover_pool`].
+    /// Run the node's funding recovery step on its buyer pool, for a fill that
+    /// saw `seen_deposit`. See [`BuyerPoolService::recover_pool`].
     ///
     /// Defaults to "funding not supported", so a read-only or test double need
     /// not override it: [`Recovery::Unavailable`].
@@ -1511,8 +1587,14 @@ pub trait PoolOpener: Send + Sync + std::fmt::Debug {
     /// Implementations error when no pool is tracked, when the allowance,
     /// `topUp` or replacement `openPool` fails, or when a transaction lands but
     /// the local row can no longer record it.
-    async fn recover_pool(&self) -> Result<Recovery> {
+    async fn recover_pool(&self, _seen_deposit: U256) -> Result<Recovery> {
         Ok(Recovery::Unavailable)
+    }
+
+    /// The deposit the node's pool row records now, or `None` with no pool
+    /// tracked. See [`BuyerPoolService::pool_deposit`].
+    fn pool_deposit(&self) -> Option<U256> {
+        None
     }
 }
 
@@ -1535,8 +1617,12 @@ impl<P: Provider + Clone + 'static> PoolOpener for BuyerPoolService<P> {
         BuyerPoolService::record_progress(self, provider_addr, pool_id, write)
     }
 
-    async fn recover_pool(&self) -> Result<Recovery> {
-        BuyerPoolService::recover_pool(self).await
+    async fn recover_pool(&self, seen_deposit: U256) -> Result<Recovery> {
+        BuyerPoolService::recover_pool(self, seen_deposit).await
+    }
+
+    fn pool_deposit(&self) -> Option<U256> {
+        BuyerPoolService::pool_deposit(self)
     }
 }
 

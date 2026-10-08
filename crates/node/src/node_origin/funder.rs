@@ -66,30 +66,43 @@ const MAX_SETTLE_WAITS: u32 = 60;
 /// through an injected [`PoolOpener`].
 ///
 /// The step sizes itself from the pool row the opener holds, so the
-/// `remaining` deposit [`Funder::recover`] receives is not read. It records
-/// `node_pull_reactive_topup` on a step that adds funds and
+/// `remaining` deposit [`Funder::recover`] receives is not read. `seen` is the
+/// deposit the fill saw: a row above it is a sibling fill's step, which this
+/// fill shares instead of funding its own ([`PoolOpener::recover_pool`]). It
+/// records `node_pull_reactive_topup` on a step that funds or settles and
 /// `node_pull_reactive_topup_refused` on a step that cannot, or fails.
 pub(crate) struct NodeFunder {
     opener: Arc<dyn PoolOpener>,
     metrics: Arc<crate::metrics::Metrics>,
+    seen: U256,
 }
 
 impl std::fmt::Debug for NodeFunder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NodeFunder").finish_non_exhaustive()
+        f.debug_struct("NodeFunder")
+            .field("seen", &self.seen)
+            .finish_non_exhaustive()
     }
 }
 
 impl NodeFunder {
-    pub(crate) fn new(opener: Arc<dyn PoolOpener>, metrics: Arc<crate::metrics::Metrics>) -> Self {
-        Self { opener, metrics }
+    pub(crate) fn new(
+        opener: Arc<dyn PoolOpener>,
+        metrics: Arc<crate::metrics::Metrics>,
+        seen: U256,
+    ) -> Self {
+        Self {
+            opener,
+            metrics,
+            seen,
+        }
     }
 }
 
 impl Funder for NodeFunder {
     fn recover(&self, _remaining: U256) -> SourceFuture<'_, Recovery> {
         Box::pin(async move {
-            match self.opener.recover_pool().await {
+            match self.opener.recover_pool(self.seen).await {
                 Ok(Recovery::ToppedUp(deposit)) => {
                     self.metrics.node_pull_reactive_topup();
                     Ok(Recovery::ToppedUp(deposit))

@@ -687,6 +687,23 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             .fold(U256::ZERO, U256::saturating_add)
     }
 
+    /// The highest deposit any built lane's pool context holds now. A lane
+    /// shares its context with sibling entries through the run's lane
+    /// registry, so a sibling's funding recovery step shows here.
+    #[must_use]
+    pub(crate) fn lanes_deposit(&self) -> U256 {
+        self.lanes
+            .values()
+            .filter_map(|lane| lane.ctx.lock().ok().map(|ctx| ctx.deposit))
+            .fold(U256::ZERO, U256::max)
+    }
+
+    /// Every built lane.
+    #[must_use]
+    pub(crate) fn built_lanes(&self) -> Vec<Arc<StreamCandidate<P::Source>>> {
+        self.lanes.values().cloned().collect()
+    }
+
     /// Raise every built lane's pool context to at least `deposit`, after a
     /// funding recovery step.
     pub(crate) fn credit_lanes(&self, deposit: U256) {

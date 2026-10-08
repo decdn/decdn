@@ -22,7 +22,7 @@
 //!   ranged-drive loop (#1506): it plans the missing range into runs by coverage
 //!   ([`decdn_client::plan_covered_runs`]) and drives them in offset order,
 //!   opening ONE payment lane ([`NodeAdmitStore`] sink, [`PeerSource`],
-//!   [`RampPacer`], [`NodeFunder`]) per run and re-planning a non-terminal run
+//!   [`RampPacer`], [`super::funder::NodeFunder`]) per run and re-planning a non-terminal run
 //!   fault onto the survivors. It scores each provider as its run ends and records
 //!   the assembly's terminal outcome via the shared
 //!   [`decdn_cache::FillSession::mark_ended`]. A per-lane [`SettleOnDrop`] guard
@@ -51,7 +51,7 @@ use decdn_client::sink::PullReader;
 use decdn_client::source::BlobSource as _;
 use decdn_client::{
     CoveredRun, DownstreamFrontier, Fault, HashMismatch as ClientPullHashMismatch, LegNoProgress,
-    PacingWait, PeerSource, PoolLedger, PrimedSource, RampPacer, RecoveryGate, SharedPool, Stepped,
+    PacingWait, PeerSource, PoolLedger, PrimedSource, RampPacer, RecoveryGate, SharedPool,
     UpstreamPullHeader, WaitReason, classify, drive, first_leg,
 };
 
@@ -62,7 +62,6 @@ use tracing::{Instrument as _, debug, warn};
 
 use super::admit_store::NodeAdmitStore;
 use super::backend_source::BackendSource;
-use super::funder::NodeFunder;
 use super::funder::{SETTLE_POLL_STEP, settle_window};
 use super::ranged_pull::{AssembleOutcome, RunOutcome, RunSink, assemble};
 use super::timed_source::{TimedReader, TimedSource, timed_open};
@@ -1100,6 +1099,7 @@ pub(crate) async fn run_pull_leg(
         pacing_wait: &pacing_wait,
         recovery: RecoveryGate::with_settle(settle_window(deps.config.event_poll_interval)),
         gap_seen: std::sync::Mutex::new(None),
+        seen_deposit: std::sync::Mutex::new(deps.buyer.pool_deposit().unwrap_or(U256::ZERO)),
         cancel: &cancel,
         primed: std::sync::Mutex::new(primed),
     };
@@ -1191,6 +1191,9 @@ struct PeerRunSink<'a> {
     /// The still-missing chunk count at the last recovery check, so the
     /// gap's shrink since then counts as verified progress ([`RunSink::recover`]).
     gap_seen: std::sync::Mutex<Option<u64>>,
+    /// The buyer pool deposit the assembly last saw: at its start, then after
+    /// each recovery step. A pool row above it is a sibling fill's step.
+    seen_deposit: std::sync::Mutex<U256>,
     cancel: &'a CancellationToken,
     /// The handshake's primed pull, taken by the first run (#2063). That run
     /// adopts it when it opens exactly its leg on its lane; otherwise it closes.
@@ -1327,32 +1330,19 @@ impl RunSink for PeerRunSink<'_> {
                 () = tokio::time::sleep(SETTLE_POLL_STEP) => true,
             };
         }
-        let funder = NodeFunder::new(Arc::clone(&self.deps.buyer), Arc::clone(&self.deps.metrics));
-        // The node's step sizes itself from its pool row, so the deposit view it
-        // is handed is not read.
-        match self
-            .recovery
-            .step(&funder, U256::ZERO, || U256::ZERO, U256::ZERO)
-            .await
-        {
-            Stepped::Raised(_) => true,
-            Stepped::Replaced(replaced) => {
-                debug!(
-                    closed = %replaced.closed,
-                    opened = %replaced.opened,
-                    "node-origin: the buyer pool accepts no more funds; a new pool replaces it"
-                );
-                self.recovery.start_next_pass();
+        let seen = *self
+            .seen_deposit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match super::node_step(&self.recovery, self.deps, seen, self.candidates.len()).await {
+            Ok(deposit) => {
+                *self
+                    .seen_deposit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = deposit;
                 true
             }
-            Stepped::NoProgress | Stepped::Unavailable => false,
-            Stepped::Failed(err) => {
-                warn!(
-                    error = %format!("{err:#}"),
-                    "node-origin: the ranged pull's funding recovery step failed"
-                );
-                false
-            }
+            Err(_) => false,
         }
     }
 
@@ -1727,7 +1717,7 @@ fn local_bookkeeping_ctx() -> PoolContext {
 /// counterparty, so every paid-path axis is absent — and each absence is load-bearing,
 /// not an omission:
 ///
-/// - **No discovery / channel open / [`PeerSource`] / [`NodeFunder`].** The bytes
+/// - **No discovery / channel open / [`PeerSource`] / [`super::funder::NodeFunder`].** The bytes
 ///   are already reachable locally, so there is nothing to dial, no channel to open,
 ///   and nothing to pay. The source is handed in by the orchestration, already built.
 /// - **No provider scoring.** There is no provider: a fault here is OUR own

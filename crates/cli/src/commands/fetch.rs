@@ -40,8 +40,8 @@ use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client::buyer_pool::{
     LOW_WATER_DIVISOR, PoolNotOpen, ProgressWrite, TopUpUnconfirmed, ToppedUpPool, WalletShortfall,
-    ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool, refill_amount,
-    self_owned_lane_ctx, top_up, topped_up_effect,
+    ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool, pool_accepts_funds,
+    refill_amount, self_owned_lane_ctx, top_up, topped_up_effect,
 };
 use decdn_client::source::{Funder, SourceFuture};
 use decdn_client::{
@@ -2166,7 +2166,10 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
     if let Some(&decdn_client::FundingNeeded::PublisherPool { pool }) = err.downcast_ref() {
         return err.context(format!(
             "ask the owner of pool {pool} to top it up: the capability still covers the fetch, \
-             and a delegated client cannot top up a pool it does not own"
+             and a delegated client cannot top up a pool it does not own. A node refuses a \
+             signer whose registered terms are spent the same way; once this signer key is \
+             registered on-chain its terms are write-once, so the owner then issues a \
+             capability for a new signer key"
         ));
     }
     if funding_rejection
@@ -3007,14 +3010,18 @@ where
 
     fn recover(&self, remaining: U256) -> SourceFuture<'_, Recovery> {
         Box::pin(async move {
-            let additional = self.working_deposit.saturating_sub(remaining);
-            if additional.is_zero() {
+            // A delegated signer owns no pool it could fund.
+            if self.working_deposit.is_zero() {
                 return Ok(Recovery::Unavailable);
             }
             let pool_id =
                 self.pool_id.get().copied().ok_or_else(|| {
                     anyhow::anyhow!("no payment lane is built, so no pool to top up")
                 })?;
+            let additional = self.working_deposit.saturating_sub(remaining);
+            if additional.is_zero() {
+                return self.settle_or_replace(pool_id, remaining).await;
+            }
             if let Some(shortfall) = self.funding.shortfall() {
                 return Err(
                     anyhow::anyhow!("the wallet cannot fund a top-up: {shortfall}")
@@ -3086,6 +3093,45 @@ impl<P> CliFunder<'_, P>
 where
     P: alloy::providers::Provider + Clone,
 {
+    /// The recovery step for a pool that already holds its working deposit,
+    /// so a top-up has nothing to add. A `topUp` gas estimate (no transaction)
+    /// tells a closing or closed pool, which a new pool replaces. An open pool
+    /// is the nodes' stale view of a deposit they have not yet seen: the step
+    /// settles, so the gate's settle window holds those nodes' refusals and
+    /// asks them again ([`Recovery::ToppedUp`] at the current deposit).
+    ///
+    /// # Errors
+    ///
+    /// The replacement open fails.
+    async fn settle_or_replace(
+        &self,
+        pool_id: PoolId,
+        remaining: U256,
+    ) -> anyhow::Result<Recovery> {
+        if !pool_accepts_funds(self.contract, self.owner, pool_id).await {
+            tracing::info!(
+                %pool_id,
+                "the current buyer pool holds its working deposit but accepts no more funds; \
+                 opening a new pool"
+            );
+            let opened = self.open_replacement().await?;
+            return Ok(Recovery::Replaced(PoolReplaced {
+                closed: pool_id,
+                opened,
+            }));
+        }
+        let deposit = match self.store.get_by_pool_id(pool_id) {
+            Ok(Some(row)) => row.deposit,
+            _ => remaining.saturating_add(self.funding.pool_spent().unwrap_or(U256::ZERO)),
+        };
+        tracing::info!(
+            %pool_id,
+            %deposit,
+            "the buyer pool already holds its working deposit; waiting for the nodes to see it"
+        );
+        Ok(Recovery::ToppedUp(deposit))
+    }
+
     /// Open a new pool at the working deposit and record it as the owner's
     /// current pool in the buyer store, where the next lane build reuses it.
     /// The closed pool's row stays in the store, so `decdn pool reclaim` and

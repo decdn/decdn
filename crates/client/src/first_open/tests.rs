@@ -42,7 +42,7 @@ where
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
     let funder = FakeFunder::new(Recovery::Unavailable);
-    first_open(sources, stop, &funder, &RecoveryGate::new(), open).await
+    first_open(sources, stop, &funder, &RecoveryGate::new(), None, open).await
 }
 
 fn provider_of(lane: &StreamCandidate<ScriptedSource>) -> Address {
@@ -291,12 +291,19 @@ async fn an_unfunded_sole_source_answers_after_a_recovery_step() -> anyhow::Resu
     let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
     let funder = FakeFunder::new(Recovery::ToppedUp(U256::from(2_000u32)));
     let gate = RecoveryGate::new();
-    let (provider, ()) = first_open(&mut set, &policy(None), &funder, &gate, |lane| async move {
-        if lane.ctx.lock().unwrap().deposit < U256::from(2_000u32) {
-            return Err(unfunded());
-        }
-        Ok(())
-    })
+    let (provider, ()) = first_open(
+        &mut set,
+        &policy(None),
+        &funder,
+        &gate,
+        None,
+        |lane| async move {
+            if lane.ctx.lock().unwrap().deposit < U256::from(2_000u32) {
+                return Err(unfunded());
+            }
+            Ok(())
+        },
+    )
     .await?;
     assert_eq!(provider, A);
     assert_eq!(funder.calls(), vec![U256::from(1_000u32)]);
@@ -319,5 +326,98 @@ async fn an_unfunded_source_with_no_funding_path_ends_funding_needed() -> anyhow
         err.downcast_ref::<crate::NoAffordableSource>().is_some(),
         "{err:#}"
     );
+    Ok(())
+}
+
+/// A bundle entry's first open sees a sibling entry's step: the sibling
+/// raised the deposit on the lane context the run's registry shares, so the
+/// open takes no step of its own and asks the source again at the new
+/// deposit.
+#[tokio::test(start_paused = true)]
+async fn a_first_open_sees_a_sibling_entrys_step() -> anyhow::Result<()> {
+    let sources = StaticSources::new(vec![lane(0xA1)])?;
+    let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
+    let funder = FakeFunder::new(Recovery::Unavailable);
+    let gate = RecoveryGate::new();
+    let (provider, ()) = first_open(&mut set, &policy(None), &funder, &gate, None, |lane| {
+        async move {
+            let mut ctx = lane.ctx.lock().unwrap();
+            if ctx.deposit < U256::from(2_000u32) {
+                // The sibling's step lands while this open is refused.
+                ctx.deposit = U256::from(2_000u32);
+                return Err(unfunded());
+            }
+            Ok(())
+        }
+    })
+    .await?;
+    assert_eq!(provider, A);
+    assert!(funder.calls().is_empty(), "no step of its own");
+    Ok(())
+}
+
+/// A slot holding a fresh key's capability, capped at `spending_cap`, a day
+/// from expiry, with no wait for a swap.
+fn delegate_slot(spending_cap: u64) -> crate::CredentialSlot {
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let capability = decdn_incentive::Capability {
+        signer: signer.address(),
+        spending_cap,
+        pool_id: alloy::primitives::B256::repeat_byte(0x11),
+        expiry: crate::credential::unix_now() + 24 * 60 * 60,
+    }
+    .sign(
+        &signer,
+        &decdn_incentive::bind_node_id_domain(1, Address::ZERO),
+    )
+    .unwrap();
+    crate::CredentialSlot::new(Arc::new(signer), capability).with_swap_wait(Duration::ZERO)
+}
+
+/// A delegated first open (a pinned node, no size hint) ends with the same
+/// typed outcome as the acquire loop: a refused capability needs a new one,
+/// and a refused pool under a healthy capability names the publisher's pool.
+#[tokio::test(start_paused = true)]
+async fn a_delegated_first_open_ends_with_a_typed_funding_needed() -> anyhow::Result<()> {
+    let pool = alloy::primitives::B256::repeat_byte(0x11);
+    let cases: [(fn() -> anyhow::Error, crate::FundingNeeded); 2] = [
+        (
+            || {
+                anyhow::Error::new(UpstreamVoucherRejected {
+                    reason: VoucherRejectReason::SpendingCapExhausted,
+                    bundle: None,
+                    proof_generation: None,
+                })
+            },
+            crate::FundingNeeded::NewCapability {
+                pool,
+                cause: crate::CapabilityCause::Revoked,
+            },
+        ),
+        (unfunded, crate::FundingNeeded::PublisherPool { pool }),
+    ];
+    for (refusal, expected) in cases {
+        let sources = StaticSources::new(vec![lane(0xA1)])?;
+        let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
+        let funder = FakeFunder::new(Recovery::Unavailable);
+        let slot = delegate_slot(1_000);
+        let err = first_open(
+            &mut set,
+            &policy(None),
+            &funder,
+            &RecoveryGate::new(),
+            Some(&slot),
+            |_lane| async move { Err::<(), _>(refusal()) },
+        )
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a refused delegate must end the open"))?;
+        assert_eq!(
+            err.downcast_ref::<crate::FundingNeeded>(),
+            Some(&expected),
+            "{err:#}"
+        );
+        assert!(funder.calls().is_empty(), "a delegate tops nothing up");
+    }
     Ok(())
 }

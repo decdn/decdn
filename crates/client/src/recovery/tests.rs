@@ -168,3 +168,49 @@ async fn a_top_up_opens_the_settle_window_and_nothing_else_does() {
     let _ = gate.step(&funder, DEPOSIT, || DEPOSIT, U256::ZERO).await;
     assert!(!gate.settling(Instant::now()));
 }
+
+/// A slot holding a fresh capability for a fresh key, waiting `wait`.
+fn slot(wait: Duration) -> crate::CredentialSlot {
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let capability = decdn_incentive::Capability {
+        signer: signer.address(),
+        spending_cap: 1,
+        pool_id: B256::repeat_byte(0x11),
+        expiry: 0,
+    }
+    .sign(
+        &signer,
+        &decdn_incentive::bind_node_id_domain(1, alloy::primitives::Address::ZERO),
+    )
+    .expect("sign");
+    crate::CredentialSlot::new(std::sync::Arc::new(signer), capability).with_swap_wait(wait)
+}
+
+/// A swap that came before the step counts as a step under the progress rule:
+/// the first is allowed, and a second with no byte verified since is not,
+/// even though the slot already holds a newer credential.
+#[tokio::test(start_paused = true)]
+async fn a_swap_that_came_before_the_step_counts_under_the_progress_rule() {
+    let gate = RecoveryGate::new();
+    let slot = slot(Duration::ZERO);
+    let swap = |slot: &crate::CredentialSlot| {
+        let next = self::slot(Duration::ZERO).current();
+        slot.swap(next.signer, next.capability);
+    };
+    swap(&slot);
+    assert_eq!(gate.swap_step(&slot, 0).await, SwapStep::Swapped);
+    swap(&slot);
+    assert_eq!(gate.swap_step(&slot, 1).await, SwapStep::NoProgress);
+    gate.record_verified(1);
+    assert_eq!(gate.swap_step(&slot, 1).await, SwapStep::Swapped);
+}
+
+/// With no swap inside the wait, the step times out.
+#[tokio::test(start_paused = true)]
+async fn no_swap_inside_the_wait_times_out() {
+    let gate = RecoveryGate::new();
+    let slot = slot(Duration::from_secs(5));
+    let started = Instant::now();
+    assert_eq!(gate.swap_step(&slot, 0).await, SwapStep::TimedOut);
+    assert!(started.elapsed() >= Duration::from_secs(5));
+}

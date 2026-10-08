@@ -19,9 +19,12 @@ use std::sync::Arc;
 use alloy::primitives::{Address, U256};
 use tokio::time::Instant;
 
+use crate::credential::{
+    CapabilityCause, CredentialSlot, CredentialView, FundingNeeded, QuoteMax, unix_now,
+};
 use crate::fault::{Fault, classify};
-use crate::recovery::{RecoveryGate, after_step};
-use crate::scheduler::{Connecting, connect_future, sleep_until_opt};
+use crate::recovery::{RecoveryGate, SwapStep, after_step};
+use crate::scheduler::{Connecting, connect_future, key_spend, sleep_until_opt};
 use crate::source::{Funder, SourceFuture};
 use crate::source_set::{BUILD_RETRY_BASE, Holder, NoAffordableSource, SourceProvider, SourceSet};
 use crate::stop::StopPolicy;
@@ -48,7 +51,10 @@ use crate::streamer::StreamCandidate;
 /// discovery finds nothing new, the open reaches the fetch's one funding
 /// recovery point: it runs a step through `funder` under the fetch's `gate`,
 /// the same step [`crate::acquire`] runs, and asks the parked sources again
-/// at the raised deposit.
+/// at the raised deposit, or at the same deposit after a step that settles.
+/// A delegated fetch passes its `credentials`: the step is then the bounded
+/// wait for a swapped credential, and the open ends with a typed
+/// [`crate::FundingNeeded`], as [`crate::acquire`] does.
 ///
 /// # Errors
 ///
@@ -64,6 +70,7 @@ pub async fn first_open<P, F, T, O, Fut>(
     stop: &StopPolicy,
     funder: &F,
     gate: &RecoveryGate,
+    credentials: Option<&CredentialSlot>,
     open: O,
 ) -> anyhow::Result<(Address, T)>
 where
@@ -72,7 +79,7 @@ where
     O: Fn(Arc<StreamCandidate<P::Source>>) -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
-    let opened = open_loop(sources, funder, gate, &open);
+    let opened = open_loop(sources, funder, gate, credentials, &open);
     tokio::select! {
         biased;
         opened = opened => {
@@ -103,6 +110,7 @@ async fn open_loop<'p, P, F, T, O, Fut>(
     sources: &mut SourceSet<'p, P>,
     funder: &F,
     gate: &RecoveryGate,
+    credentials: Option<&CredentialSlot>,
     open: &O,
 ) -> anyhow::Result<(Address, T)>
 where
@@ -113,6 +121,7 @@ where
 {
     // The pool deposit the built lanes report, ZERO before any lane exists.
     let mut deposit = U256::ZERO;
+    let mut delegate = Delegate::new(credentials);
     // Sources a transient `open` error holds off, until the instant given.
     let mut held_off: HashMap<Address, Instant> = HashMap::new();
     let mut connecting: Option<Connecting<'p, P::Source>> = None;
@@ -133,6 +142,7 @@ where
                 }
             }
         }
+        delegate.follow_swap(sources);
         let attempting = connecting.is_some() || opening.is_some();
         if !attempting
             && discovering.is_none()
@@ -141,12 +151,11 @@ where
             if err.downcast_ref::<NoAffordableSource>().is_none() {
                 return Err(err);
             }
-            let spent = sources
-                .lanes_spent()
-                .max(funder.pool_spent().unwrap_or(U256::ZERO));
-            let stepped = gate.step(funder, deposit, || deposit, spent).await;
-            deposit = deposit.max(after_step(stepped, err)?);
-            sources.credit_lanes(deposit);
+            // A delegated fetch waits for a swapped credential, as
+            // [`crate::acquire`] does.
+            if let Some(err) = delegate.step(sources, gate, err).await? {
+                deposit = owner_step(sources, funder, gate, deposit, err).await?;
+            }
             continue;
         }
         if discovering.is_none()
@@ -191,6 +200,7 @@ where
                     }
                     Err(err) => {
                         let at = Instant::now();
+                        delegate.saw(&err);
                         if gate.settling(at) && sources.hold_while_settling(provider, &err, at) {
                             continue;
                         }
@@ -209,6 +219,121 @@ where
                 sources.discovery_done(found, Instant::now(), deposit);
             }
             () = sleep_until_opt(wake) => {}
+        }
+    }
+}
+
+/// The first open's recovery step for a pool owner at the exhausted set
+/// `exhausted`: a top-up, a replacement, or a settle, through `funder` under
+/// `gate`. Returns the deposit the open asks the sources again at.
+///
+/// # Errors
+///
+/// Every end [`after_step`] names.
+async fn owner_step<P, F>(
+    sources: &SourceSet<'_, P>,
+    funder: &F,
+    gate: &RecoveryGate,
+    deposit: U256,
+    exhausted: anyhow::Error,
+) -> anyhow::Result<U256>
+where
+    P: SourceProvider,
+    F: Funder,
+{
+    let spent = sources
+        .lanes_spent()
+        .max(funder.pool_spent().unwrap_or(U256::ZERO));
+    // The deposit now, as the lane contexts hold it: a sibling bundle entry's
+    // step reaches them through the run's lane registry.
+    let current = || sources.lanes_deposit();
+    let raised = after_step(gate.step(funder, deposit, current, spent).await, exhausted)?;
+    if raised > deposit {
+        sources.credit_lanes(raised);
+        return Ok(raised);
+    }
+    // A settling step: ask the priced-out sources again.
+    sources.health().clear_unaffordable();
+    Ok(deposit)
+}
+
+/// A first open's delegated credential: the slot, the generation its built
+/// lanes sign under, and whether a node refused the capability itself since.
+struct Delegate<'a> {
+    slot: Option<&'a CredentialSlot>,
+    generation_seen: u64,
+    capability_refused: bool,
+}
+
+impl<'a> Delegate<'a> {
+    fn new(slot: Option<&'a CredentialSlot>) -> Self {
+        Self {
+            slot,
+            generation_seen: slot.map_or(0, CredentialSlot::generation),
+            capability_refused: false,
+        }
+    }
+
+    /// Note a source's open error.
+    fn saw(&mut self, err: &anyhow::Error) {
+        if crate::fault::refuses_capability(err) {
+            self.capability_refused = true;
+        }
+    }
+
+    /// After a swap, drop the built lanes on the old key. What the sources
+    /// refused under it says nothing about the new one.
+    fn follow_swap<P: SourceProvider>(&mut self, sources: &mut SourceSet<'_, P>) {
+        let Some(slot) = self.slot else { return };
+        if slot.generation() == self.generation_seen {
+            return;
+        }
+        self.generation_seen = slot.generation();
+        sources.drop_lanes(|lane| slot.is_stale(&lane.ctx));
+        sources.health().clear_unaffordable();
+        self.capability_refused = false;
+    }
+
+    /// The recovery step at the exhausted set `exhausted` for a delegate: the
+    /// bounded wait for a swapped credential. `Ok(None)` after a swap. A
+    /// fetch with no slot gets `exhausted` back, for the owner's step.
+    ///
+    /// # Errors
+    ///
+    /// [`FundingNeeded::PublisherPool`] when the capability still covers the
+    /// work, and [`FundingNeeded::NewCapability`] when no swap comes.
+    async fn step<P: SourceProvider>(
+        &self,
+        sources: &SourceSet<'_, P>,
+        gate: &RecoveryGate,
+        exhausted: anyhow::Error,
+    ) -> anyhow::Result<Option<anyhow::Error>> {
+        let Some(slot) = self.slot else {
+            return Ok(Some(exhausted));
+        };
+        let view = CredentialView::of(
+            &slot.current(),
+            key_spend(slot, &sources.built_lanes(), None),
+            0,
+            &QuoteMax::default(),
+            unix_now(),
+        );
+        slot.report(view.event());
+        // No size is known yet, so no work is priced: a cap with nothing left
+        // is spent.
+        let cause = view
+            .cause()
+            .or(view.headroom.is_zero().then_some(CapabilityCause::CapSpent))
+            .or(self.capability_refused.then_some(CapabilityCause::Revoked));
+        let pool = slot.pool_id();
+        let Some(cause) = cause else {
+            return Err(exhausted.context(FundingNeeded::PublisherPool { pool }));
+        };
+        match gate.swap_step(slot, self.generation_seen).await {
+            SwapStep::Swapped => Ok(None),
+            SwapStep::NoProgress | SwapStep::TimedOut => {
+                Err(exhausted.context(FundingNeeded::NewCapability { pool, cause }))
+            }
         }
     }
 }

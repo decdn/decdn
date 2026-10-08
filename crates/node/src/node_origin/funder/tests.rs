@@ -17,6 +17,8 @@ use crate::buyer_channel::PoolOpener;
 struct MockOpener {
     outcome: StdMutex<Option<Result<Recovery, String>>>,
     calls: AtomicU32,
+    /// The deposit the last call said its fill saw.
+    seen: StdMutex<Option<U256>>,
 }
 
 impl MockOpener {
@@ -24,6 +26,7 @@ impl MockOpener {
         Self {
             outcome: StdMutex::new(Some(outcome)),
             calls: AtomicU32::new(0),
+            seen: StdMutex::new(None),
         }
     }
 
@@ -51,8 +54,12 @@ impl PoolOpener for MockOpener {
         unreachable!("not exercised by NodeFunder tests")
     }
 
-    async fn recover_pool(&self) -> Result<Recovery> {
+    async fn recover_pool(&self, seen_deposit: U256) -> Result<Recovery> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        *self
+            .seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seen_deposit);
         let outcome = self
             .outcome
             .lock()
@@ -64,19 +71,20 @@ impl PoolOpener for MockOpener {
 }
 
 /// A step that tops the pool up passes the new deposit through and meters a
-/// funded step.
+/// funded step. The opener learns the deposit the fill saw.
 #[tokio::test]
 async fn a_topped_up_step_passes_the_deposit_through_and_meters_it() {
     let opener = Arc::new(MockOpener::new(Ok(Recovery::ToppedUp(U256::from(
         1_250u64,
     )))));
     let metrics = Arc::new(crate::metrics::Metrics::new());
-    let f = NodeFunder::new(opener.clone(), Arc::clone(&metrics));
+    let f = NodeFunder::new(opener.clone(), Arc::clone(&metrics), U256::from(700u64));
 
     let outcome = f.recover(U256::ZERO).await.expect("the step lands");
 
     assert_eq!(outcome, Recovery::ToppedUp(U256::from(1_250u64)));
     assert_eq!(opener.call_count(), 1);
+    assert_eq!(*opener.seen.lock().unwrap(), Some(U256::from(700u64)));
     let text = metrics.encode().expect("metrics should encode");
     assert!(
         text.contains("decdn_node_pull_reactive_topup_total 1"),
@@ -94,7 +102,7 @@ async fn a_replaced_pool_reaches_the_fill() {
     };
     let opener = Arc::new(MockOpener::new(Ok(Recovery::Replaced(replaced))));
     let metrics = Arc::new(crate::metrics::Metrics::new());
-    let f = NodeFunder::new(opener, metrics);
+    let f = NodeFunder::new(opener, metrics, U256::ZERO);
 
     assert_eq!(
         f.recover(U256::ZERO).await.expect("the step lands"),
@@ -107,7 +115,7 @@ async fn a_replaced_pool_reaches_the_fill() {
 async fn a_step_with_no_funding_path_is_metered_as_refused() {
     let opener = Arc::new(MockOpener::new(Ok(Recovery::Unavailable)));
     let metrics = Arc::new(crate::metrics::Metrics::new());
-    let f = NodeFunder::new(opener, Arc::clone(&metrics));
+    let f = NodeFunder::new(opener, Arc::clone(&metrics), U256::ZERO);
 
     assert_eq!(
         f.recover(U256::ZERO).await.expect("no error"),
@@ -126,7 +134,7 @@ async fn a_step_with_no_funding_path_is_metered_as_refused() {
 async fn a_failed_step_is_a_local_fault() {
     let opener = Arc::new(MockOpener::new(Err("chain rejected".to_string())));
     let metrics = Arc::new(crate::metrics::Metrics::new());
-    let f = NodeFunder::new(opener, metrics);
+    let f = NodeFunder::new(opener, metrics, U256::ZERO);
 
     let err = f.recover(U256::ZERO).await.unwrap_err();
 

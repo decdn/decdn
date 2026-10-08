@@ -20,6 +20,7 @@ use decdn_client::{
     PoolContext, RecoveryGate, SourceProvider, SourceSet, StopPolicy, StreamCandidate, first_open,
 };
 use decdn_common::cli;
+use decdn_incentive::buyer_pool::BuyerPoolStore as _;
 use decdn_incentive::{CapabilityGrant, PoolId};
 use iroh::RelayUrl;
 
@@ -199,10 +200,26 @@ where
         // A grant that does not decode fails the lane build first, which
         // names the fault; without a slot the fetch still ends funding needed.
         let capability = grant.to_signed_capability().ok()?;
-        Some(
-            CredentialSlot::new(Arc::clone(self.signer), capability)
-                .with_swap_wait(std::time::Duration::ZERO),
-        )
+        let slot = CredentialSlot::new(Arc::clone(self.signer), capability)
+            .with_swap_wait(std::time::Duration::ZERO);
+        // What earlier fetches signed under this key, at every provider the
+        // buyer store holds a lane for: the capability's spend so far.
+        let signer = self.signer.address();
+        let recorded = self
+            .deps
+            .store
+            .get_by_pool_id(grant.pool_id)
+            .ok()
+            .flatten()
+            .map_or(alloy::primitives::U256::ZERO, |row| {
+                row.lanes()
+                    .filter(|(lane, _)| lane.signer == signer)
+                    .fold(alloy::primitives::U256::ZERO, |acc, (_, progress)| {
+                        acc.saturating_add(progress.last_amount)
+                    })
+            });
+        slot.record_spend(signer, recorded);
+        Some(slot)
     }
 
     /// The fetch's funding recovery gate.
@@ -253,16 +270,24 @@ where
     ) -> anyhow::Result<FirstClaim> {
         let mut set = SourceSet::new(self, hash, Arc::clone(health), holders);
         let funder = self.funder();
-        let opened = first_open(&mut set, stop, &funder, self.recovery, |lane| async move {
-            let (header, _whole) = lane.source.open_whole(hash).await?;
-            let provider = lane
-                .ctx
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .provider;
-            self.record_open(provider, header.rate_per_mb);
-            Ok(header.total_bytes)
-        })
+        let credentials = self.credentials();
+        let opened = first_open(
+            &mut set,
+            stop,
+            &funder,
+            self.recovery,
+            credentials.as_ref(),
+            |lane| async move {
+                let (header, _whole) = lane.source.open_whole(hash).await?;
+                let provider = lane
+                    .ctx
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .provider;
+                self.record_open(provider, header.rate_per_mb);
+                Ok(header.total_bytes)
+            },
+        )
         .await;
         let answered = opened.as_ref().ok().map(|&(provider, _)| provider);
         if let Some((provider, lane)) = keep_answering(set.take_lanes(), answered) {

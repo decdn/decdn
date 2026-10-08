@@ -13017,7 +13017,19 @@ impl PoolOpener for FundingOpener {
         Ok(())
     }
 
-    async fn recover_pool(&self) -> Result<Recovery> {
+    fn pool_deposit(&self) -> Option<U256> {
+        read_deposit(&self.deposit).ok()
+    }
+
+    async fn recover_pool(&self, seen_deposit: U256) -> Result<Recovery> {
+        // A deposit above what the fill saw is a sibling fill's step.
+        let now = read_deposit(&self.deposit)?;
+        if now > seen_deposit {
+            return Ok(Recovery::ToppedUp(now));
+        }
+        if self.working.is_zero() {
+            return Ok(Recovery::Unavailable);
+        }
         // The pool's spend as its row records it: the latest amount per provider.
         let spent = {
             let recorded = self
@@ -13037,8 +13049,9 @@ impl PoolOpener for FundingOpener {
             .lock()
             .map_err(|_| anyhow::anyhow!("deposit lock poisoned"))?;
         let additional = self.working.saturating_sub(deposit.saturating_sub(spent));
+        // A full open pool settles: the upstream has not seen it yet.
         if additional.is_zero() {
-            return Ok(Recovery::Unavailable);
+            return Ok(Recovery::ToppedUp(*deposit));
         }
         self.topups
             .lock()
@@ -13992,6 +14005,58 @@ async fn a_short_landing_keeps_what_landed_and_completes_the_pull() -> Result<()
         "the pull must spend the headroom the landing added: paid {paid}"
     );
     assert_counter(&fixture.metrics, "node_pull_reactive_topup_total", steps)?;
+
+    fixture.shutdown().await?;
+    Ok(())
+}
+
+/// A pool that already holds its working deposit, refused by an upstream whose
+/// chain watcher has not seen that deposit yet, settles instead of ending
+/// "funding needed": the step escrows nothing, the settle window asks the
+/// upstream again, and the pull completes once the upstream catches up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_pool_refused_by_a_stale_upstream_settles_then_is_served() -> Result<()> {
+    let payload = multi_interval_payload();
+    let fixture = top_up_fixture(
+        Arc::clone(&payload),
+        TopUpSetup {
+            // The upstream enforces two MiB of the 200 the pool holds.
+            ceiling_micro_usdc: Some(2 * RATE),
+            ..TopUpSetup::honest(200 * RATE, 100 * RATE, true)
+        },
+    )
+    .await?;
+    // The upstream catches up once the refused leg has recorded its progress.
+    let ceiling = Arc::clone(&fixture.opener.ceiling);
+    let recorded = Arc::clone(&fixture.recorded);
+    let catch_up = tokio::spawn(async move {
+        while recorded.lock().map_or(true, |log| log.is_empty()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(mut ceiling) = ceiling.lock() {
+            *ceiling = U256::from(200 * RATE);
+        }
+    });
+
+    let got = tokio::time::timeout(
+        Duration::from_mins(1),
+        Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("a settling pull must not hang"))?
+    .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    catch_up.await?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::AlreadyAdmitted),
+        "the upstream serves once it sees the deposit"
+    );
+    anyhow::ensure!(
+        topup_log(&fixture.opener)?.is_empty(),
+        "a full pool escrows nothing"
+    );
+    // The one step was the settle.
+    assert_counter(&fixture.metrics, "node_pull_reactive_topup_total", 1)?;
 
     fixture.shutdown().await?;
     Ok(())

@@ -64,17 +64,26 @@ impl LaneLedgers {
             .fold(U256::ZERO, U256::saturating_add)
     }
 
-    /// Σ over every registered lane `signer` signs of its committed voucher
-    /// amount: what the run signed under `signer`'s capability.
+    /// Σ over every registered lane `signer` signs of what it committed past
+    /// its recorded prior: what the run signed under `signer`'s capability
+    /// beyond the application's local records. The handles are cloned out
+    /// under the map lock, which is released before any `ctx` lock is taken
+    /// (the lock order [`Self::credit_all`] keeps).
     #[must_use]
-    pub(crate) fn committed_by(&self, signer: alloy::primitives::Address) -> U256 {
-        let map = self
-            .map
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.iter()
-            .filter(|(lane, _)| lane.signer == signer)
-            .map(|(_, h)| h.ledger.committed().amount)
+    pub(crate) fn signed_by(&self, signer: alloy::primitives::Address) -> U256 {
+        let handles: Vec<LaneHandle> = {
+            let map = self
+                .map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.iter()
+                .filter(|(lane, _)| lane.signer == signer)
+                .map(|(_, h)| h.clone())
+                .collect()
+        };
+        handles
+            .iter()
+            .map(|h| crate::credential::signed_past_prior(&h.ctx, &h.ledger))
             .fold(U256::ZERO, U256::saturating_add)
     }
 

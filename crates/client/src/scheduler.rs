@@ -2188,8 +2188,9 @@ where
     let lane_parked = AtomicBool::new(false);
     let lane_parked_wake = Notify::new();
     // The spans this lane delivered and did not pay for when a funding refusal
-    // ended its last worker. The lane owes them, so its own worker bills them
-    // first, although the store holds the bytes (ADR 003 § Funding recovery).
+    // ended its last worker. The lane owes them, so when it runs again its own
+    // worker bills them first, although the store holds the bytes (ADR 003 §
+    // Funding recovery).
     if !extra && !retired(engine.credentials, &lane) {
         let owed = lane.ledger.take_unpaid(hash);
         for (index, &(start, len)) in owed.iter().enumerate() {
@@ -2220,8 +2221,15 @@ where
                 Ok(Some(())) => continue,
                 // A cancel leaves this span and the rest owed.
                 Ok(None) => (index, None),
-                // The failed fill recorded what it still owes in this span.
-                Err(err) => (index.saturating_add(1), Some(err)),
+                // Whatever ended the fill, this span stays owed from the
+                // gap's paid frontier on. `take_unpaid` merges, so a part the
+                // fill's own funding refusal also noted bills once.
+                Err(err) => {
+                    let end = start.saturating_add(len);
+                    let paid = counters.gap_paid_frontier.unwrap_or(start).max(start);
+                    lane.ledger.note_unpaid(hash, paid, end);
+                    (index.saturating_add(1), Some(err))
+                }
             };
             // The spans this worker did not reach stay owed.
             for &(rest, rest_len) in owed.iter().skip(unreached) {
@@ -3157,10 +3165,34 @@ async fn swap_after(slot: Option<&CredentialSlot>, generation: u64) {
     }
 }
 
+/// Everything signed under `slot`'s current key: what earlier fetches signed,
+/// from the application's local lane records ([`CredentialSlot::record_spend`]),
+/// plus what this fetch's lanes signed past their recorded priors, from the
+/// run registry's lanes when there is one and from `lanes` otherwise.
+pub(crate) fn key_spend<S>(
+    slot: &CredentialSlot,
+    lanes: &[Arc<StreamCandidate<S>>],
+    ledgers: Option<&LaneLedgers>,
+) -> U256 {
+    let signer = slot.current().signer.address();
+    let this_fetch = match ledgers {
+        Some(reg) => reg.signed_by(signer),
+        None => lanes
+            .iter()
+            .filter(|lane| {
+                lane.ctx
+                    .lock()
+                    .is_ok_and(|ctx| ctx.client_signer.address() == signer)
+            })
+            .map(|lane| crate::credential::signed_past_prior(&lane.ctx, &lane.ledger))
+            .fold(U256::ZERO, U256::saturating_add),
+    };
+    slot.recorded_spend(signer).saturating_add(this_fetch)
+}
+
 /// The local view of `slot`'s current capability against the work left
-/// ([`CredentialView`]): what this fetch signed under its key, from the run
-/// registry's lanes when there is one and from `lanes` otherwise, and the
-/// missing bytes of `ranges` at the highest quote.
+/// ([`CredentialView`]): everything signed under its key ([`key_spend`]),
+/// and the missing bytes of `ranges` at the highest quote.
 ///
 /// # Errors
 ///
@@ -3177,19 +3209,7 @@ where
     St: IngestStore,
 {
     let credential = slot.current();
-    let signer = credential.signer.address();
-    let spent_by_key = match ledgers {
-        Some(reg) => reg.committed_by(signer),
-        None => lanes
-            .iter()
-            .filter(|lane| {
-                lane.ctx
-                    .lock()
-                    .is_ok_and(|ctx| ctx.client_signer.address() == signer)
-            })
-            .map(|lane| lane.ledger.committed().amount)
-            .fold(U256::ZERO, U256::saturating_add),
-    };
+    let spent_by_key = key_spend(slot, lanes, ledgers);
     let remaining = ranges_content_len(&missing_chunks(store, ranges).await?, store.total_bytes());
     Ok(CredentialView::of(
         &credential,
@@ -3850,6 +3870,13 @@ where
                     let raised = after_step(stepped, err)?;
                     if raised > deposit {
                         credit(raised)?;
+                    } else {
+                        // A step that settles leaves the deposit where it is:
+                        // the pool already held it, and the sources' refusals
+                        // were their stale view of it. Ask them again; the
+                        // settle window holds a refusal that comes back
+                        // before their chain watchers catch up.
+                        health.clear_unaffordable();
                     }
                     continue;
                 }

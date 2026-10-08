@@ -397,6 +397,11 @@ pub(crate) struct DriveCounters {
     /// gate open so the first draw always proceeds (an exhaustion can only follow
     /// an open).
     next_voucher_cost: U256,
+    /// The paid content frontier of the gap [`fill_gap`] ran last: each
+    /// pass's, then the one read after a leg that ended the gap with an error.
+    /// A caller whose gap failed re-notes the spans the lane owes from there.
+    /// `None` before the first pass.
+    pub(crate) gap_paid_frontier: Option<u64>,
 }
 
 impl DriveCounters {
@@ -406,6 +411,7 @@ impl DriveCounters {
         Self {
             resume_attempts: 0,
             next_voucher_cost: U256::ZERO,
+            gap_paid_frontier: None,
         }
     }
 }
@@ -675,10 +681,15 @@ where
             )
             .await
             .inspect_err(|_| {
-                // The owed spans past the failed gap stay owed.
-                let gap_end = gap_start.saturating_add(gap_len);
-                for &(start, len) in owed.iter().filter(|&&(start, _)| start >= gap_end) {
-                    ledger.note_unpaid(hash, start, start.saturating_add(len));
+                // Every owed span that ends past the failed gap's start stays
+                // owed from the gap's paid frontier on. `take_unpaid` merges,
+                // so a span the gap's own failure also noted bills once.
+                let paid = counters.gap_paid_frontier.unwrap_or(gap_start);
+                for &(start, len) in &owed {
+                    let end = start.saturating_add(len);
+                    if end > gap_start {
+                        ledger.note_unpaid(hash, start.max(paid), end);
+                    }
                 }
             })?;
         }
@@ -837,23 +848,21 @@ fn warn_on_new_hole(
     );
 }
 
-/// Record on `ledger` the span of `[gap_start, asked_end)` the lane delivered
-/// and did not pay for: from the leg's paid frontier to the store's delivered
-/// frontier, both read after the leg ended. A store that cannot answer records
-/// nothing; the span is then the node's credit-window loss.
-async fn note_unpaid_tail<St: RangedStore + ?Sized>(
+/// The paid and delivered frontiers of the gap `[gap_start, asked_end)`, read
+/// after its last leg ended: the leg's paid frontier, clamped to the store's
+/// contiguous delivered frontier, and that delivered frontier. `None` when the
+/// store cannot answer.
+async fn ended_frontiers<St: RangedStore + ?Sized>(
     store: &St,
     ledger: &PoolLedger,
-    hash: [u8; 32],
     gap_start: u64,
     asked_end: u64,
     leg_anchor: Option<(u64, U256)>,
-) {
-    let Ok((still_missing, total_bytes)) =
-        missing_below_bound(store, gap_start, asked_end.saturating_sub(gap_start)).await
-    else {
-        return;
-    };
+) -> Option<(u64, u64)> {
+    let (still_missing, total_bytes) =
+        missing_below_bound(store, gap_start, asked_end.saturating_sub(gap_start))
+            .await
+            .ok()?;
     let gap_end = asked_end.min(total_bytes);
     let delivered = contiguous_frontier(&still_missing, total_bytes, gap_start, gap_end);
     let (leg_start, baseline) = leg_anchor.unwrap_or((gap_start, ledger.committed().bytes));
@@ -862,7 +871,7 @@ async fn note_unpaid_tail<St: RangedStore + ?Sized>(
     let paid = crate::sink::content_paid_frontier(leg_start, total_bytes, paid_wire)
         .min(gap_end)
         .min(delivered);
-    ledger.note_unpaid(hash, paid, delivered);
+    Some((paid, delivered))
 }
 
 /// The per-gap resume/pay loop. Fills the contiguous content span
@@ -922,6 +931,7 @@ where
     // amount subtracted for the deposit gate — the per-leg paid-frontier math below
     // still reads THIS lane's own `committed.bytes`.
     let spent = move |own_amount: U256| pool.map_or(own_amount, |p| (p.spent)());
+    counters.gap_paid_frontier = None;
 
     // Paid-frontier anchor (PER-LEG, not per-gap). A "leg" is one contiguous
     // delivery from one successful open. `leg_anchor` records `(content offset the
@@ -1045,6 +1055,7 @@ where
                 .min(gap_end)
                 .min(delivered_frontier);
         let paid_cleared = paid_frontier.saturating_sub(gap_start);
+        counters.gap_paid_frontier = Some(paid_frontier);
 
         // A clean leg's payment moves the paid frontier to the end of what it
         // delivered, and its bytes land in the store, so this pass sees one of the
@@ -1119,8 +1130,9 @@ where
             }
             PaceDecision::Refuse => {
                 // The lane keeps what it delivered and did not pay for, so
-                // its next drive after a recovery step bills it.
+                // its next drive, if it runs again, bills it.
                 ledger.note_unpaid(hash, paid_frontier, delivered_frontier);
+                counters.gap_paid_frontier = Some(paid_frontier);
                 return Err(anyhow::Error::new(PoolExhausted { gap_start, gap_len }));
             }
             // Honors `up_to_bytes` (#1608):
@@ -1184,22 +1196,28 @@ where
                             .fetch_max(leg_start.saturating_add(received), Ordering::SeqCst);
                     }
                     let Some(cb) = on_progress else { return };
+                    // Only bytes past the delivered frontier this pass read are
+                    // new. A leg that opens at the paid frontier re-delivers the
+                    // present bytes below it to bill them, and those add nothing
+                    // to the position, so the funding recovery gate never counts
+                    // them as verified progress.
+                    let end = leg_start.saturating_add(received);
+                    let prev_end = leg_start.saturating_add(received.saturating_sub(delta));
+                    let fresh = end.saturating_sub(prev_end.max(delivered_frontier));
                     let position = match progress_agg {
-                        // Multi-source: fold this leg's monotonic per-leg `received`
-                        // into the shared whole-blob total as deltas, so the bar
-                        // reads one non-decreasing position across concurrent lanes.
-                        // Clamp the readout to the blob size — a bounded, idempotent
-                        // tail re-fetch can re-deliver a few already-counted bytes,
-                        // and the bar must never exceed 100%.
+                        // Multi-source: fold this leg's new bytes into the shared
+                        // whole-blob total as deltas, so the bar reads one
+                        // non-decreasing position across concurrent lanes. The
+                        // readout clamps to the blob size.
                         Some(delivered) => delivered
-                            .fetch_add(delta, Ordering::Relaxed)
-                            .saturating_add(delta)
+                            .fetch_add(fresh, Ordering::Relaxed)
+                            .saturating_add(fresh)
                             .min(total_bytes),
-                        // Single-source: this one lane's present base plus its leg
-                        // progress is already the whole-blob position. A leg
-                        // that bills present bytes again re-delivers them, so
-                        // the readout clamps to the blob size.
-                        None => base_present.saturating_add(received).min(total_bytes),
+                        // Single-source: this one lane's present base plus the
+                        // leg's new bytes is the whole-blob position.
+                        None => base_present
+                            .saturating_add(end.saturating_sub(delivered_frontier.max(leg_start)))
+                            .min(total_bytes),
                     };
                     cb(position, total_bytes);
                 };
@@ -1320,11 +1338,15 @@ where
                     //    rejection no heal takes) ends the lane. The acquire
                     //    loop classifies it ([`crate::classify`]). A lane that
                     //    a funding refusal ends keeps the span it delivered and
-                    //    did not pay for, so its next drive after a recovery
-                    //    step bills it.
-                    if crate::classify(&err) == crate::Fault::Unaffordable {
-                        note_unpaid_tail(store, ledger, hash, gap_start, asked_end, leg_anchor)
-                            .await;
+                    //    did not pay for, so its next drive, if it runs again,
+                    //    bills it.
+                    if let Some((paid, delivered)) =
+                        ended_frontiers(store, ledger, gap_start, asked_end, leg_anchor).await
+                    {
+                        counters.gap_paid_frontier = Some(paid);
+                        if crate::classify(&err) == crate::Fault::Unaffordable {
+                            ledger.note_unpaid(hash, paid, delivered);
+                        }
                     }
                     return Err(err);
                 }

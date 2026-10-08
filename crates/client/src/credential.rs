@@ -9,7 +9,8 @@
 //! key, from the delivered frontier. Nothing is fetched or paid twice.
 //!
 //! The fetch computes the signal itself, with no chain read: the capability's
-//! headroom against the vouchers this run signed under it, the money the
+//! headroom against every voucher signed under its key (earlier fetches'
+//! recorded spend at any provider, plus this fetch's lanes), the money the
 //! remaining work needs at the highest rate a node quoted, and the time to the
 //! capability's expiry ([`FundingEvent::RunningLow`]).
 
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use alloy::primitives::{B256, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_incentive::SignedCapability;
 
@@ -59,6 +60,9 @@ struct SlotInner {
     current: tokio::sync::watch::Sender<Current>,
     events: tokio::sync::watch::Sender<Option<FundingEvent>>,
     swap_wait: Duration,
+    /// What earlier fetches signed under a key, from the application's local
+    /// lane records ([`CredentialSlot::record_spend`]).
+    recorded: std::sync::Mutex<Option<(Address, U256)>>,
 }
 
 /// A delegated fetch's voucher credential, which the application can swap at
@@ -87,7 +91,9 @@ impl CredentialSlot {
     /// the exhausted candidate set. Clones of this slot stay on this slot.
     #[must_use]
     pub fn with_swap_wait(self, wait: Duration) -> Self {
-        Self::build(self.current(), wait)
+        let slot = Self::build(self.current(), wait);
+        *slot.recorded_lock() = *self.recorded_lock();
+        slot
     }
 
     fn build(credential: Credential, swap_wait: Duration) -> Self {
@@ -101,8 +107,33 @@ impl CredentialSlot {
                 current,
                 events,
                 swap_wait,
+                recorded: std::sync::Mutex::new(None),
             }),
         }
+    }
+
+    fn recorded_lock(&self) -> std::sync::MutexGuard<'_, Option<(Address, U256)>> {
+        self.inner
+            .recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record that earlier fetches signed `spent` micro-USDC of vouchers under
+    /// `signer`, across every lane the application's local records hold for
+    /// it, at any provider. The fetch counts it toward the capability's spend
+    /// for the running-low signal and the [`FundingNeeded`] cause, on top of
+    /// what its own lanes sign past their recorded priors. One key's record
+    /// is held at a time; a key with no record counts from zero.
+    pub fn record_spend(&self, signer: Address, spent: U256) {
+        *self.recorded_lock() = Some((signer, spent));
+    }
+
+    /// What earlier fetches signed under `signer` ([`Self::record_spend`]).
+    pub(crate) fn recorded_spend(&self, signer: Address) -> U256 {
+        self.recorded_lock()
+            .filter(|(recorded, _)| *recorded == signer)
+            .map_or(U256::ZERO, |(_, spent)| spent)
     }
 
     /// Put `capability` for `signer` in the slot. Every fetch that holds the
@@ -186,8 +217,9 @@ pub enum FundingEvent {
     /// remaining work plus one credit window, or its expiry is inside the
     /// node's expiry margin. The application swaps in a new credential.
     RunningLow {
-        /// The capability's spending cap less every voucher this run signed
-        /// under it, in micro-USDC.
+        /// The capability's spending cap less every voucher signed under its
+        /// key: earlier fetches' recorded spend and this fetch's, in
+        /// micro-USDC.
         headroom: U256,
         /// The remaining work's bytes at the highest rate a node quoted, in
         /// micro-USDC.
@@ -232,8 +264,10 @@ pub enum FundingNeeded {
         /// Why the capability no longer pays.
         cause: CapabilityCause,
     },
-    /// The capability still covers the work, but nodes refuse the pool's
-    /// funding. Only the pool owner can top the pool up.
+    /// The capability still covers the work, but nodes refuse the funding
+    /// `Unfunded`. Only the pool owner can fix it: by a top-up, or, when the
+    /// signer's registered on-chain terms are spent (a node refuses those the
+    /// same way), by a capability for a new signer key.
     PublisherPool {
         /// The pool that cannot pay.
         pool: B256,
@@ -296,7 +330,7 @@ fn cost(bytes: u64, rate_per_mb: u64) -> U256 {
 /// The local view of one capability against the work left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CredentialView {
-    /// The capability's spending cap less what this run signed under it.
+    /// The capability's spending cap less everything signed under its key.
     pub(crate) headroom: U256,
     /// The remaining work at the highest quoted rate.
     pub(crate) projected_need: U256,
@@ -361,6 +395,16 @@ impl CredentialView {
             None
         }
     }
+}
+
+/// What a lane signed past the prior its context was built with: its
+/// committed amount less the recorded amount it resumed from.
+pub(crate) fn signed_past_prior(
+    ctx: &std::sync::Mutex<PoolContext>,
+    ledger: &crate::PoolLedger,
+) -> U256 {
+    let prior = ctx.lock().map_or(U256::ZERO, |ctx| ctx.prior_amount);
+    ledger.committed().amount.saturating_sub(prior)
 }
 
 /// The current Unix second, or `0` when the clock reads before the epoch.

@@ -2385,3 +2385,128 @@ async fn retry_still_shortfall_stops_after_one_retry() {
         "one retry only, then give up"
     );
 }
+
+/// A service whose chain calls answer from `asserter`, over a pool row of
+/// `deposit` with no spend, at a working deposit of 10 USDC.
+fn recovery_service(
+    asserter: &alloy::providers::mock::Asserter,
+    deposit: u64,
+) -> BuyerPoolService<impl Provider + Clone + 'static> {
+    use alloy::providers::ProviderBuilder;
+
+    let owner = Address::repeat_byte(1);
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    store
+        .record(&BuyerPoolState::new(
+            PoolId::from([0x5A; 32]),
+            DEPLOYMENT,
+            owner,
+            Address::repeat_byte(2),
+            U256::from(deposit),
+        ))
+        .expect("seed the row");
+    BuyerPoolService {
+        contract: PaymentPool::new(
+            Address::ZERO,
+            ProviderBuilder::new().connect_mocked_client(asserter.clone()),
+        ),
+        store,
+        signer: signer(),
+        deployment: DEPLOYMENT,
+        voucher_domain: Eip712Domain::default(),
+        token: Address::repeat_byte(2),
+        owner,
+        working_deposit: U256::from(10_000_000u64),
+        open_in_flight: Arc::new(Mutex::new(None)),
+        topup_in_flight: Arc::new(Mutex::new(None)),
+        seed_slots: Mutex::new(HashMap::new()),
+        metrics: Arc::new(Metrics::new()),
+        _reclaimer: AbortOnDropHandle::new(tokio::spawn(std::future::pending())),
+    }
+}
+
+/// A row above the deposit the fill saw is a sibling fill's step that landed:
+/// the step shares it and makes no chain call.
+#[tokio::test]
+async fn a_recovery_step_shares_a_siblings_landed_top_up() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    let svc = recovery_service(&asserter, 10_000_000);
+    let stepped = svc
+        .recover_pool(U256::from(4_000_000u64))
+        .await
+        .expect("no chain call");
+    assert_eq!(stepped, Recovery::ToppedUp(U256::from(10_000_000u64)));
+}
+
+/// Concurrent fills that reach the step while one recovery top-up is in
+/// flight all wait for it: the pool escrows once, and every fill proceeds at
+/// the deposit it landed.
+#[tokio::test]
+async fn concurrent_steps_share_one_recovery_top_up() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    let svc = recovery_service(&asserter, 4_000_000);
+    let landed: BoxFuture<'static, TopUpOutcome> = Box::pin(async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Ok(TopUpLanded {
+            new_deposit: U256::from(10_000_000u64),
+            added: U256::from(6_000_000u64),
+        })
+    });
+    *svc.topup_in_flight.lock().unwrap() = Some(InFlightTopUp::new(
+        landed.shared(),
+        U256::from(6_000_000u64),
+        TopUpFunder::Recovery,
+    ));
+    let steps =
+        futures_util::future::join_all((0..4).map(|_| svc.recover_pool(U256::from(4_000_000u64))))
+            .await;
+    for stepped in steps {
+        assert_eq!(
+            stepped.expect("no chain call"),
+            Recovery::ToppedUp(U256::from(10_000_000u64))
+        );
+    }
+}
+
+/// A pool that already holds its working deposit and still accepts funds
+/// settles: the upstreams have not seen the deposit yet, so the step returns
+/// it and the fill's settle window asks them again. Only a gas estimate runs.
+#[tokio::test]
+async fn a_full_open_pool_settles_without_a_top_up() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&alloy::primitives::U64::from(50_000u64));
+    let svc = recovery_service(&asserter, 10_000_000);
+    let stepped = svc
+        .recover_pool(U256::from(10_000_000u64))
+        .await
+        .expect("the estimate answers");
+    assert_eq!(stepped, Recovery::ToppedUp(U256::from(10_000_000u64)));
+    assert!(asserter.read_q().is_empty(), "the estimate ran");
+}
+
+/// A pool that already holds its working deposit but is closing or closed
+/// still needs a replacement: the `topUp` estimate reverts `PoolNotOpen`, and
+/// the step goes on to open a new pool.
+#[tokio::test]
+async fn a_full_closing_pool_is_replaced() {
+    let selector = alloy::primitives::keccak256("PoolNotOpen()");
+    let revert = format!("0x{}", alloy::primitives::hex::encode(&selector[..4]));
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_failure(
+        serde_json::from_value::<alloy_json_rpc::ErrorPayload>(serde_json::json!({
+            "code": 3,
+            "message": "execution reverted",
+            "data": revert,
+        }))
+        .unwrap(),
+    );
+    let svc = recovery_service(&asserter, 10_000_000);
+    let stepped = svc.recover_pool(U256::from(10_000_000u64)).await;
+    // The replacement open reaches the chain, which has no answer left.
+    let err = stepped.expect_err("the replacement open runs");
+    assert!(
+        !format!("{err:#}").contains("topUp"),
+        "the step opened a pool, not a top-up: {err:#}"
+    );
+    assert!(asserter.read_q().is_empty(), "the estimate ran");
+}

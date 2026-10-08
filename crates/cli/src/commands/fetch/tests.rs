@@ -1128,7 +1128,7 @@ fn delegated_typed_funding_stops_render_their_remedies() {
     );
     assert!(
         publisher.contains(&format!("ask the owner of pool {pool} to top it up"))
-            && !publisher.contains("new signer key"),
+            && publisher.contains("registered terms are spent"),
         "{publisher}"
     );
 }

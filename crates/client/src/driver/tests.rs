@@ -2783,6 +2783,82 @@ async fn a_new_lane_resumes_at_the_delivered_frontier_and_owes_nothing() {
     );
 }
 
+/// A missing range `[a, b)` and an owed span `[b, c)` merge into one gap. A
+/// drive whose gap fails before it reaches `b` keeps the whole owed span: the
+/// gap's paid frontier never passed `a`.
+#[tokio::test(start_paused = true)]
+async fn an_owed_span_behind_a_failed_missing_range_stays_owed() {
+    let total = 6 * GROUP;
+    let (root, plaintext, outboard) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+    let (b, c) = (3 * GROUP, total);
+    let held = align_range(b, c - b, total).expect("align");
+    preadmit(&store, &plaintext, &outboard, &held).await;
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    ledger.note_unpaid(root, b, c);
+    let source = ScriptedSource::new(plaintext)
+        .expect("source")
+        .paying(Arc::clone(&ledger))
+        .refusing_open(0, || {
+            anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Unfunded))
+        });
+
+    drive_whole(&store, &source, &ledger, root)
+        .await
+        .expect_err("the open is refused");
+    assert_eq!(
+        ledger.take_unpaid(root),
+        vec![(b, c - b)],
+        "the owed span survives the failed gap"
+    );
+}
+
+/// A leg that re-delivers present bytes to bill them reports no progress for
+/// them: the position counts only bytes past the delivered frontier, so the
+/// funding recovery gate never takes a re-billed byte for a new one.
+#[tokio::test(start_paused = true)]
+async fn re_delivered_bytes_report_no_progress() {
+    let total = 6 * GROUP;
+    let (root, plaintext, outboard) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+    let owed_end = 3 * GROUP;
+    let held = align_range(0, owed_end, total).expect("align");
+    preadmit(&store, &plaintext, &outboard, &held).await;
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    ledger.note_unpaid(root, 0, owed_end);
+    // The leg re-delivers most of the owed span, then resets.
+    let source = ScriptedSource::new(plaintext)
+        .expect("source")
+        .paying(Arc::clone(&ledger))
+        .fault_once_after(2 * GROUP as usize, || anyhow::anyhow!("connection reset"));
+    let highest = std::sync::atomic::AtomicU64::new(0);
+    let on_progress = |position: u64, _total: u64| {
+        highest.fetch_max(position, std::sync::atomic::Ordering::Relaxed);
+    };
+    let ctx = Arc::new(Mutex::new(healthy_ctx()));
+    drive(
+        &store,
+        &source,
+        &BudgetPacer::new(),
+        &ctx,
+        &ledger,
+        root,
+        0,
+        0,
+        Some(&on_progress),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect_err("the leg resets");
+    assert_eq!(
+        highest.load(std::sync::atomic::Ordering::Relaxed),
+        owed_end,
+        "the re-delivered bytes moved the position past the present base"
+    );
+}
+
 /// Owed spans merge into disjoint ascending ranges.
 #[test]
 fn owed_spans_merge_and_are_taken_once() {

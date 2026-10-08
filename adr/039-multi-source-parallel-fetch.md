@@ -117,13 +117,13 @@ A delegated client pays from a pool it does not own, so it cannot top the pool u
 
 **The running-low signal.** The client computes the signal locally, with no chain read:
 
-- The headroom is the capability's spending cap less the sum of the vouchers that this fetch signed under the key, across all lanes.
+- The headroom is the capability's spending cap less the sum of the vouchers signed under the key, across all lanes. The sum covers every lane that the client's local records hold for the key, at any provider and from earlier fetches too, plus what this fetch signed since.
 - The projected need is the bytes of work left, at the highest rate that a node quoted.
 - One credit window is one voucher interval at that rate.
 
 The client emits `RunningLow` when the headroom is less than the projected need plus one credit window. It also emits `RunningLow` when the capability expires inside the node expiry margin: one redeem interval plus the redeem landing slack. The application swaps in a new credential before the fetch stalls.
 
-At the exhausted candidate set, a delegated fetch waits for a swap for a bounded time (60 s by default). A swap in the wait is a recovery step, under the [progress rule](003-payments.md#funding-recovery). The fetch then makes one more pass under the new key. With no swap, the fetch ends with `FundingNeeded::NewCapability`, which names the pool and the cause: the cap is spent, the capability expired, or nodes revoked it. When the capability still covers the work and nodes refuse `Unfunded`, the fetch ends at once with `FundingNeeded::PublisherPool`, which names the pool. Only the pool owner can fix that.
+At the exhausted candidate set, a delegated fetch waits for a swap for a bounded time (60 s by default). A swap in the wait is a recovery step, under the [progress rule](003-payments.md#funding-recovery). The fetch then makes one more pass under the new key. With no swap, the fetch ends with `FundingNeeded::NewCapability`, which names the pool and the cause: the cap is spent, the capability expired, or nodes revoked it. When the capability still covers the work and nodes refuse `Unfunded`, the fetch ends at once with `FundingNeeded::PublisherPool`, which names the pool. Only the pool owner can fix that. A node also refuses `Unfunded` when the signer's registered on-chain terms are spent, and the client cannot read those terms locally. So the owner's fix is a top-up, or a capability for a new signer key.
 
 ### Source diversity and per-peer memory
 

@@ -910,3 +910,69 @@ async fn the_cli_funder_reads_the_run_funding() {
         Ok(Recovery::Unavailable)
     ));
 }
+
+/// Run a recovery step for a self-funded pool that already holds its working
+/// deposit, with the chain's `topUp` estimate answered by `estimate`.
+async fn step_on_a_full_pool(asserter: Asserter) -> anyhow::Result<Recovery> {
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    let id = B256::repeat_byte(0xEE);
+    store
+        .record(&tracked_row(id, signer.address(), WORKING, &[]))
+        .unwrap();
+    let rpc = ProviderBuilder::new().connect_mocked_client(asserter);
+    let contract = PaymentPool::new(PP, rpc.clone());
+    let funding = RunFunding::default();
+    let pool_id = std::sync::OnceLock::new();
+    pool_id.set(id).unwrap();
+    let funder = CliFunder {
+        contract: &contract,
+        rpc: &rpc,
+        store: &store,
+        owner: signer.address(),
+        signer: &signer,
+        deployment: DEPLOYMENT,
+        pool_id: &pool_id,
+        token: TOKEN,
+        payment_pool_addr: PP,
+        working_deposit: U256::from(WORKING),
+        max_approve: false,
+        funding: &funding,
+    };
+    funder.recover(U256::from(WORKING)).await
+}
+
+/// A full pool that still accepts funds settles: the step escrows nothing and
+/// reports the deposit the nodes have yet to see, so the settle window asks
+/// them again.
+#[tokio::test]
+async fn a_full_open_pool_settles_without_a_top_up() {
+    let asserter = Asserter::new();
+    asserter.push_success(&alloy::primitives::U64::from(50_000u64));
+    let stepped = step_on_a_full_pool(asserter.clone()).await.unwrap();
+    assert!(matches!(stepped, Recovery::ToppedUp(d) if d == U256::from(WORKING)));
+    assert!(asserter.read_q().is_empty(), "only the estimate ran");
+}
+
+/// A full pool that is closing or closed still needs a replacement: its
+/// `topUp` estimate reverts `PoolNotOpen`, and the step goes on to open a new
+/// pool (whose chain calls this mock leaves unanswered).
+#[tokio::test]
+async fn a_full_closing_pool_is_replaced() {
+    let selector = alloy::primitives::keccak256("PoolNotOpen()");
+    let asserter = Asserter::new();
+    asserter.push_failure(
+        serde_json::from_value::<alloy_json_rpc::ErrorPayload>(serde_json::json!({
+            "code": 3,
+            "message": "execution reverted",
+            "data": format!("0x{}", alloy::primitives::hex::encode(&selector[..4])),
+        }))
+        .unwrap(),
+    );
+    let err = step_on_a_full_pool(asserter.clone())
+        .await
+        .expect_err("the replacement open reaches the chain");
+    assert!(!format!("{err:#}").contains("topUp"), "{err:#}");
+    assert!(asserter.read_q().is_empty(), "the estimate ran");
+}

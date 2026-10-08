@@ -189,20 +189,20 @@ impl RecoveryGate {
 
     /// Run one delegated recovery step: wait up to the slot's swap wait for
     /// the application to swap in a new credential past `seen_generation`.
-    /// A swap that already came counts at once. The wait is a step under the
-    /// same progress rule as a top-up, so a pass under a swapped credential
-    /// that verifies no byte ends the next wait before it starts.
+    /// The step is under the same progress rule as a top-up, whether the swap
+    /// came before the call or during the wait: a pass under a swapped
+    /// credential that verifies no byte allows no further step.
     pub(crate) async fn swap_step(
         &self,
         slot: &crate::CredentialSlot,
         seen_generation: u64,
     ) -> SwapStep {
         let _one_step = self.step_lock.lock().await;
-        if slot.generation() > seen_generation {
-            return SwapStep::Swapped;
-        }
         if !self.take_step() {
             return SwapStep::NoProgress;
+        }
+        if slot.generation() > seen_generation {
+            return SwapStep::Swapped;
         }
         tracing::info!(
             wait = ?slot.swap_wait(),
