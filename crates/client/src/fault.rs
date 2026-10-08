@@ -31,11 +31,11 @@ pub enum Fault {
 }
 
 impl Fault {
-    /// Whether the fault is one an operator watches for, so its log line is at
-    /// warn: a source failing its delivery, or a fault only the human can fix.
-    /// A deposit wait ([`Fault::Unaffordable`]) and a chain-side retry
-    /// ([`Fault::Transient`]) leave the source's health untouched and log at
-    /// info.
+    /// Whether the fault is one an operator watches for, so a lane-fault line
+    /// whose level follows the class is at warn: a source failing its
+    /// delivery, or a fault only the human can fix. A deposit wait
+    /// ([`Fault::Unaffordable`]) and a chain-side retry ([`Fault::Transient`])
+    /// are neither, so they log at info.
     #[must_use]
     pub(crate) const fn warns(self) -> bool {
         matches!(self, Self::Source | Self::Fatal(_))

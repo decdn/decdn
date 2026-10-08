@@ -1551,7 +1551,7 @@ async fn pull_over(
         .usdc()
         .call()
         .await
-        .map_err(|e| anyhow!("read PaymentPool.usdc(): {e}"))?;
+        .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?;
 
     // `--namespace <id>` → big-endian `uint256`; absent => `NO_NAMESPACE`
     // (best-effort cache/DHT). Same conversion as `decdn fetch`.

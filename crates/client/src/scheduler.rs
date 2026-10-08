@@ -2516,10 +2516,9 @@ where
 /// Log, where it happens, that an extra worker's stream faulted on `range`
 /// while the lane's own worker runs, or while the node is already charged
 /// for this outage. Such a fault is most often a refusal of the additional
-/// stream, which is routine, so the line is at debug when nothing landed.
-/// Otherwise it is at warn for a fault an operator watches for
-/// ([`Fault::warns`]) and at info for a deposit wait or a chain-side retry.
-/// Such a fault does not cool the node.
+/// stream before any verified byte, which is routine, so that line is at
+/// debug. Any other fault is at warn when [`Fault::warns`] holds and at info
+/// otherwise. Such a fault does not cool the node.
 fn log_extra_fault(
     provider: Address,
     hash: [u8; 32],
@@ -2534,28 +2533,31 @@ fn log_extra_fault(
         past_end: _,
         uncovered,
     } = range;
-    if landed > 0 {
-        crate::fault::warn_or_info!(
-            crate::fault::classify(err).warns(),
-            %provider,
-            %hash,
-            offset,
-            len,
-            landed,
-            uncovered,
-            error = %format_args!("{err:#}"),
-            "an extra stream of a lane faulted; its remainder goes back to the queue"
-        );
-    } else {
+    let error = decdn_common::redact::sanitize_err_chain(err);
+    if landed == 0 && err.downcast_ref::<crate::UpstreamRefused>().is_some() {
         tracing::debug!(
             %provider,
             %hash,
             offset,
             len,
             uncovered,
-            error = %format_args!("{err:#}"),
-            "an extra stream of a lane faulted before any verified byte; its range goes back \
-             to the queue"
+            %error,
+            "an extra stream of a lane was refused before any verified byte; its range goes \
+             back to the queue"
+        );
+    } else {
+        let fault = crate::fault::classify(err);
+        crate::fault::warn_or_info!(
+            fault.warns(),
+            %provider,
+            %hash,
+            offset,
+            len,
+            landed,
+            uncovered,
+            ?fault,
+            %error,
+            "an extra stream of a lane faulted; its remainder goes back to the queue"
         );
     }
 }
@@ -3669,7 +3671,7 @@ where
                                         len = range.len,
                                         uncovered = range.uncovered,
                                         refusals,
-                                        error = %format_args!("{err:#}"),
+                                        error = %decdn_common::redact::sanitize_err_chain(&err),
                                         "a node refuses a lane's extra streams; the lane is \
                                          asked less often until one serves"
                                     );

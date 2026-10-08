@@ -414,7 +414,9 @@ where
             .getPools(owner, U256::from(offset), U256::from(OWNED_POOLS_PAGE))
             .call()
             .await
-            .map_err(|e| anyhow::anyhow!("getPools(offset={offset}) failed: {e}"))?;
+            .map_err(|e| {
+                anyhow::Error::new(e).context(format!("getPools(offset={offset}) failed"))
+            })?;
         let n = page.len();
         ids.extend(page);
         if n < OWNED_POOLS_PAGE {

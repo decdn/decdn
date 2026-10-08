@@ -946,10 +946,11 @@ async fn a_partial_holder_refusing_the_blob_as_too_large_loses_only_pull_through
     );
 }
 
-/// The lane-fault line names the provider's record, and its level follows the
-/// fault's class (#2331), because
+/// The lane-fault line names the provider's record, because
 /// `uncovered=false` alone does not say that the node holds the range: a
-/// non-holder's lane covers the whole blob (#2339).
+/// non-holder's lane covers the whole blob (#2339). Its level follows the
+/// fault's class: warn for a source fault, info for a chain-side retry
+/// (#2331).
 #[tokio::test(start_paused = true)]
 async fn the_lane_fault_line_names_the_holder_record() {
     #[derive(Clone, Default)]
@@ -1001,7 +1002,7 @@ async fn the_lane_fault_line_names_the_holder_record() {
     let a_retry_line = lines.next().unwrap_or_default();
     assert!(lines.next().is_none(), "four fault lines: {text}");
     // A source fault is what an operator watches for (#2331); a chain-side
-    // retry leaves the source's health untouched.
+    // retry is not the source's fault.
     for line in [a_line, b_line, b_source_line] {
         assert!(line.contains(" WARN "), "{text}");
     }

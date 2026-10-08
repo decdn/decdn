@@ -127,6 +127,11 @@ async fn reclaim_pool_reads_chain_before_store_or_keystore() {
         .expect_err("an unreachable RPC must fail the pre-check");
     let msg = format!("{err:#}");
     assert!(msg.contains("getPool failed"), "{msg}");
+    // The transport class stays in the chain beneath the context (#2277).
+    assert!(
+        msg.to_lowercase().contains("connection refused"),
+        "the failure class must survive: {msg}"
+    );
     assert!(
         !msg.contains("keystore") && !msg.contains("password"),
         "the pre-check must run before the keystore unlock: {msg}"

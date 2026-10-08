@@ -546,7 +546,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     ///
     /// Each fault is logged where it is recorded, at warn for a fault an
     /// operator watches for ([`Fault::Source`], [`Fault::Fatal`]) and at info
-    /// for a deposit wait or a chain-side retry. The line carries the
+    /// for a deposit wait or a chain-side retry (see `Fault::warns`). The line carries the
     /// provider, the blob, the lane's `range` and the bytes of it that landed
     /// when the lane held one, the error, and the provider's record in the set
     /// when the fault is logged: `probed_holder` and its `coverage` as block
@@ -597,7 +597,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 probed_holder,
                 %coverage,
                 ?fault,
-                error = %format_args!("{err:#}"),
+                error = %decdn_common::redact::sanitize_err_chain(err),
                 "a lane faulted; its remainder goes to the other lanes"
             );
         } else {
@@ -608,7 +608,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 probed_holder,
                 %coverage,
                 ?fault,
-                error = %format_args!("{err:#}"),
+                error = %decdn_common::redact::sanitize_err_chain(err),
                 "a source faulted"
             );
         }

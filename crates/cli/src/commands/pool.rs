@@ -182,7 +182,7 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
         .usdc()
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
+        .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?;
     let deposit = U256::from(args.deposit_micro_usdc);
 
     ensure_allowance(&rpc, token, owner, chain.payment_pool, Some(deposit)).await?;
@@ -234,7 +234,7 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
         .getPool(pool_id)
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("getPool failed: {e}"))?;
+        .map_err(|e| anyhow::Error::new(e).context("getPool failed"))?;
     ensure_owned(pool.owner, owner, pool_id)?;
 
     let additional = U256::from(args.amount_micro_usdc);
@@ -244,7 +244,7 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
         .usdc()
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
+        .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?;
     ensure_allowance(&rpc, token, owner, chain.payment_pool, Some(additional)).await?;
 
     let ToppedUpPool { credited, tx, .. } = top_up(&contract, owner, pool_id, additional).await?;
@@ -573,12 +573,12 @@ where
         Err(e) if e.as_revert_data().is_some() => {
             anyhow::bail!("closePool reverted on-chain for pool {pool_id}")
         }
-        Err(e) => anyhow::bail!("closePool send failed: {e}"),
+        Err(e) => return Err(anyhow::Error::new(e).context("closePool send failed")),
     };
     let receipt = pending
         .get_receipt()
         .await
-        .map_err(|e| anyhow::anyhow!("closePool receipt failed: {e}"))?;
+        .map_err(|e| anyhow::Error::new(e).context("closePool receipt failed"))?;
 
     match receipt_outcome(receipt.status()) {
         TxOutcome::Landed => {
@@ -631,12 +631,12 @@ where
     let pending = match contract.reclaim(pool_id).send().await {
         Ok(pending) => pending,
         Err(e) if e.as_revert_data().is_some() => anyhow::bail!(reclaim_reverted(pool_id)),
-        Err(e) => anyhow::bail!("reclaim send failed: {e}"),
+        Err(e) => return Err(anyhow::Error::new(e).context("reclaim send failed")),
     };
     let receipt = pending
         .get_receipt()
         .await
-        .map_err(|e| anyhow::anyhow!("reclaim receipt failed: {e}"))?;
+        .map_err(|e| anyhow::Error::new(e).context("reclaim receipt failed"))?;
 
     match receipt_outcome(receipt.status()) {
         TxOutcome::Landed => {
@@ -690,7 +690,7 @@ async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow:
         .getPool(pool_id)
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("getPool failed: {e}"))?;
+        .map_err(|e| anyhow::Error::new(e).context("getPool failed"))?;
     ensure_owned(pool.owner, owner, pool_id)?;
     anyhow::ensure!(
         matches!(pool.status, PaymentPool::Status::Open),
@@ -785,7 +785,7 @@ async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> any
             .getPool(pool_id)
             .call()
             .await
-            .map_err(|e| anyhow::anyhow!("getPool failed: {e}"))?;
+            .map_err(|e| anyhow::Error::new(e).context("getPool failed"))?;
         let now = chain_ctx::head_timestamp(reader.provider()).await?;
         single_reclaim_gate(pool_id, pool.owner, pool.status, pool.disputeDeadline, now)?;
     }

@@ -250,7 +250,9 @@ where
                     // forwards reqwest's ` for url (<url>)` tail, and an
                     // `rpc_url` commonly carries an API key in its path/query
                     // (issue #954). The `main()` boundary only sanitizes the
-                    // error chain, never a `tracing` field.
+                    // error chain, never a `tracing` field. The helper walks
+                    // `source()`, where the transport class (timeout, refused,
+                    // TLS) sits beneath the top-level Display.
                     tracing::warn!(
                         offset,
                         attempt,
