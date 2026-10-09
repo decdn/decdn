@@ -1053,7 +1053,9 @@ async fn a_partial_holder_refusing_the_blob_as_too_large_loses_only_pull_through
 
 /// The lane-fault line names the provider's record, because
 /// `uncovered=false` alone does not say that the node holds the range: a
-/// non-holder's lane covers the whole blob (#2339).
+/// non-holder's lane covers the whole blob (#2339). Its level follows the
+/// fault's class: warn for a source fault, info for a chain-side retry
+/// (#2331).
 #[tokio::test(start_paused = true)]
 async fn the_lane_fault_line_names_the_holder_record() {
     #[derive(Clone, Default)]
@@ -1089,6 +1091,12 @@ async fn the_lane_fault_line_names_the_holder_record() {
         set.record_fault(A, &not_found(), Some(block0()), now, U256::ZERO);
         set.record_fault(B, &not_found(), Some(block0()), now, U256::ZERO);
         set.record_fault(B, &anyhow::anyhow!("reset"), None, now, U256::ZERO);
+        // A lane build's chain error names the RPC URL, whose path may carry a key.
+        let retry = anyhow::Error::new(crate::fault::LaneBuildFault(anyhow::anyhow!(
+            "error sending request for url (https://rpc.example/v3/secret)"
+        )));
+        set.record_fault(A, &retry, None, now, U256::ZERO);
+        set.record_fault(A, &retry, Some(block0()), now, U256::ZERO);
     });
     let text = String::from_utf8_lossy(
         &log.0
@@ -1100,7 +1108,24 @@ async fn the_lane_fault_line_names_the_holder_record() {
     let a_line = lines.next().unwrap_or_default();
     let b_line = lines.next().unwrap_or_default();
     let b_source_line = lines.next().unwrap_or_default();
-    assert!(lines.next().is_none(), "three fault lines: {text}");
+    let a_retry_line = lines.next().unwrap_or_default();
+    let a_retry_lane_line = lines.next().unwrap_or_default();
+    assert!(lines.next().is_none(), "five fault lines: {text}");
+    // A source fault is what an operator watches for (#2331); a chain-side
+    // retry is not the source's fault.
+    for line in [a_line, b_line, b_source_line] {
+        assert!(line.contains(" WARN "), "{text}");
+    }
+    assert!(a_retry_line.contains(" INFO "), "{text}");
+    assert!(a_retry_line.contains("fault=Transient"), "{text}");
+    assert!(a_retry_lane_line.contains("a lane faulted"), "{text}");
+    assert!(a_retry_lane_line.contains(" INFO "), "{text}");
+    // Both line shapes strip the URL (#2331 moves these lines towards WARN).
+    assert!(!text.contains("secret"), "the RPC URL is stripped: {text}");
+    assert!(
+        !text.contains("rpc.example"),
+        "the RPC URL is stripped: {text}"
+    );
     assert!(a_line.contains("a lane faulted"), "{text}");
     assert!(a_line.contains(&format!("provider={A}")), "{text}");
     assert!(a_line.contains("uncovered=false"), "{text}");

@@ -1964,7 +1964,7 @@ async fn fetch_over(
             .usdc()
             .call()
             .await
-            .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?,
+            .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?,
     };
 
     let max_blob_bytes = common.max_blob_mb.saturating_mul(1024 * 1024);
@@ -3603,11 +3603,9 @@ where
     })?;
 
     let pool_id = grant.pool_id;
-    let pool = contract
-        .getPool(pool_id)
-        .call()
-        .await
-        .map_err(|e| anyhow::anyhow!("read on-chain pool {pool_id} for the capability: {e}"))?;
+    let pool = contract.getPool(pool_id).call().await.map_err(|e| {
+        anyhow::Error::new(e).context(format!("read on-chain pool {pool_id} for the capability"))
+    })?;
     anyhow::ensure!(
         pool.owner != Address::ZERO,
         "pool {pool_id} named by the capability does not exist on this PaymentPool contract \
@@ -3635,7 +3633,7 @@ where
         .usdc()
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
+        .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?;
     let state = BuyerPoolState::new(
         pool_id,
         chain.deployment(),
@@ -4170,7 +4168,7 @@ where
         .usdc()
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
+        .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?;
     // Escrowed as configured — there is no on-chain floor to clamp up to,
     // only a non-zero requirement (`openPool` reverts `ZeroAmount`). The shared
     // pool is fully withdrawable, so the buyer opens at the working deposit

@@ -32,7 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::ProviderBuilder;
 use anyhow::Context;
-use decdn_common::redact::{sanitize_err_chain, sanitize_rpc_display};
+use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_protocol::{Coverage, Region};
 use iroh::PublicKey;
@@ -250,12 +250,14 @@ where
                     // forwards reqwest's ` for url (<url>)` tail, and an
                     // `rpc_url` commonly carries an API key in its path/query
                     // (issue #954). The `main()` boundary only sanitizes the
-                    // error chain, never a `tracing` field.
+                    // error chain, never a `tracing` field. The helper walks
+                    // `source()`, where the transport class (timeout, refused,
+                    // TLS) sits beneath the top-level Display.
                     tracing::warn!(
                         offset,
                         attempt,
                         backoff_ms = backoff.as_millis(),
-                        error = %sanitize_rpc_display(&e),
+                        error = %sanitize_error_sources(&e),
                         "CapacityBond.getRegisteredNodes page failed; retrying"
                     );
                     tokio::time::sleep(backoff).await;

@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use decdn_common::config::{ResolvedConfig, ResolvedOrigin};
-use decdn_common::redact::{redact_userinfo, sanitize_rpc_display};
+use decdn_common::redact::{redact_userinfo, sanitize_error_sources};
 
 use super::{Finding, Report, Severity};
 
@@ -88,7 +88,7 @@ pub(crate) async fn check_origins(report: &mut Report, cfg: &ResolvedConfig, tim
                         id: "origin.http",
                         severity: Severity::Warn,
                         title: format!("http origin #{i} unreachable"),
-                        detail: Some(format!("url={logged} err={}", sanitize_rpc_display(e))),
+                        detail: Some(format!("url={logged} err={}", sanitize_error_sources(&e))),
                         remediation: Some(
                             "verify the origin host is reachable from this node".into(),
                         ),

@@ -259,3 +259,14 @@ fn stacked_markers_classify_in_a_fixed_order() {
         .context(UpstreamRefused::mid_stream(StreamError::Declined));
     assert_eq!(classify(&funding_inside_a_decline), Fault::Unaffordable);
 }
+
+/// A source failing or a stop only the human can fix `warns()`; a deposit wait
+/// and a chain-side retry do not (#2331).
+#[test]
+fn only_source_and_fatal_faults_warn() {
+    assert!(Fault::Source.warns());
+    assert!(Fault::Fatal(FatalScope::Command).warns());
+    assert!(Fault::Fatal(FatalScope::Item).warns());
+    assert!(!Fault::Unaffordable.warns());
+    assert!(!Fault::Transient.warns());
+}

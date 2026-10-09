@@ -6838,3 +6838,65 @@ async fn a_capability_refused_with_headroom_left_reads_as_revoked() -> anyhow::R
     );
     Ok(())
 }
+
+/// An extra stream's fault line is at debug when nothing landed. Otherwise
+/// it follows the fault's class (#2331). The error field is sanitized: a
+/// lane build's chain error names the RPC URL, which may carry a key.
+#[test]
+fn extra_stream_fault_level_follows_landed_and_class() {
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let range = |landed| crate::source_set::LaneRange {
+        offset: 0,
+        len: 1024,
+        landed,
+        past_end: false,
+        uncovered: true,
+    };
+    let log = CapturedLog::default();
+    let sink = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let refused = anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::NotFound));
+        super::log_extra_fault(Address::ZERO, [0; 32], range(0), &refused);
+        let stall = anyhow::anyhow!("no verified progress for 10s");
+        super::log_extra_fault(Address::ZERO, [0; 32], range(0), &stall);
+        let reset = anyhow::anyhow!("connection reset");
+        super::log_extra_fault(Address::ZERO, [0; 32], range(1), &reset);
+        let retry = anyhow::Error::new(crate::fault::LaneBuildFault(anyhow::anyhow!(
+            "error sending request for url (https://rpc.example/v3/secret)"
+        )));
+        super::log_extra_fault(Address::ZERO, [0; 32], range(1), &retry);
+    });
+    let text = String::from_utf8_lossy(
+        &log.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 4, "{text}");
+    let level = |i: usize| lines.get(i).copied().unwrap_or_default();
+    assert!(level(0).contains(" DEBUG "), "a refusal is routine: {text}");
+    assert!(level(1).contains(" DEBUG "), "nothing landed: {text}");
+    assert!(level(2).contains(" WARN "), "{text}");
+    assert!(level(3).contains(" INFO "), "a chain-side retry: {text}");
+    assert!(level(3).contains("fault=Transient"), "{text}");
+    assert!(!text.contains("secret"), "the RPC URL is stripped: {text}");
+}

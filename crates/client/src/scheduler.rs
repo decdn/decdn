@@ -2669,8 +2669,9 @@ where
 /// Log, where it happens, that an extra worker's stream faulted on `range`
 /// while the lane's own worker runs, or while the node is already charged
 /// for this outage. Such a fault is most often a refusal of the additional
-/// stream, which is routine, so the line is at debug when nothing landed and
-/// at info otherwise. Such a fault does not cool the node.
+/// stream, which is routine, so the line is at debug when nothing landed.
+/// Otherwise it is at warn when [`Fault::warns`] holds and at info for a
+/// deposit wait or a chain-side retry. Such a fault does not cool the node.
 fn log_extra_fault(
     provider: Address,
     hash: [u8; 32],
@@ -2685,15 +2686,19 @@ fn log_extra_fault(
         past_end: _,
         uncovered,
     } = range;
+    let error = decdn_common::redact::sanitize_err_chain(err);
     if landed > 0 {
-        tracing::info!(
+        let fault = crate::fault::classify(err);
+        crate::fault::warn_or_info!(
+            fault.warns(),
             %provider,
             %hash,
             offset,
             len,
             landed,
             uncovered,
-            error = %format_args!("{err:#}"),
+            ?fault,
+            %error,
             "an extra stream of a lane faulted; its remainder goes back to the queue"
         );
     } else {
@@ -2703,7 +2708,7 @@ fn log_extra_fault(
             offset,
             len,
             uncovered,
-            error = %format_args!("{err:#}"),
+            %error,
             "an extra stream of a lane faulted before any verified byte; its range goes back \
              to the queue"
         );
@@ -3994,7 +3999,7 @@ where
                                         len = range.len,
                                         uncovered = range.uncovered,
                                         refusals,
-                                        error = %format_args!("{err:#}"),
+                                        error = %decdn_common::redact::sanitize_err_chain(&err),
                                         "a node refuses a lane's extra streams; the lane is \
                                          asked less often until one serves"
                                     );
