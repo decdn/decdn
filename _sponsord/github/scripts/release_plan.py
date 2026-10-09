@@ -18,6 +18,9 @@ Usage:
   release_plan.py <tag> --get KEY    one value (crate, version, dir, image,
                                      archives, onramp_pin, prerelease,
                                      latest, matrix)
+  release_plan.py <tag> --baseline   the tag cargo semver-checks compares
+                                     against, from this repository's tags
+                                     (nothing for a crate's first release)
   release_plan.py --images           every image name, one per line
   release_plan.py --tag-pattern      an ERE matching every release tag
 
@@ -28,7 +31,9 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
+from collections.abc import Iterable
 
 LINUX = [
     ("x86_64-unknown-linux-gnu", "ubuntu-22.04"),
@@ -117,6 +122,35 @@ def plan(tag: str) -> dict[str, str]:
     }
 
 
+def _precedence(version: str) -> tuple:
+    """A sort key in SemVer 2.0.0 precedence: a pre-release sorts below its
+    release, numeric identifiers numerically and below alphanumeric ones."""
+    core, _, pre = version.partition("-")
+    numbers = tuple(int(n) for n in core.split("."))
+    if not pre:
+        return (numbers, 1, ())
+    ids = tuple((0, int(i), "") if i.isdigit() else (1, 0, i) for i in pre.split("."))
+    return (numbers, 0, ids)
+
+
+def baseline(tag: str, tags: Iterable[str]) -> str | None:
+    """The release `tag` is checked against by cargo semver-checks: its crate's
+    highest release tag below it, or None for a first release.
+
+    Below the tag, not merely the newest tag: re-running a release's workflow
+    and cutting a maintenance release under a newer one are both supported, and
+    a newer baseline would run the check backwards.
+    """
+    crate, version = parse_tag(tag)
+    current = _precedence(version)
+    below = []
+    for t in tags:
+        m = TAG.match(t)
+        if m and m.group(1) == crate and _precedence(m.group(2)) < current:
+            below.append((_precedence(m.group(2)), t))
+    return max(below)[1] if below else None
+
+
 def images() -> list[str]:
     return sorted(spec["image"] for spec in CRATES.values() if spec["image"])
 
@@ -132,6 +166,18 @@ def main(argv: list[str]) -> int:
         return 0
     if argv == ["--tag-pattern"]:
         print(tag_pattern())
+        return 0
+    if len(argv) == 2 and argv[1] == "--baseline":
+        tags = subprocess.run(
+            ["git", "tag", "--list"], capture_output=True, text=True, check=True
+        ).stdout.split()
+        try:
+            prev = baseline(argv[0], tags)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        if prev:
+            print(prev)
         return 0
     if len(argv) not in (1, 3) or (len(argv) == 3 and argv[1] != "--get"):
         print(__doc__.split("\n\n")[-2], file=sys.stderr)

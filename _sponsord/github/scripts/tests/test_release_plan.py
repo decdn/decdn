@@ -161,3 +161,82 @@ def test_cli_output_and_errors():
 def test_prerelease_is_flagged_and_never_latest(tag, prerelease, latest):
     p = rp.plan(tag)
     assert (p["prerelease"], p["latest"]) == (prerelease, latest)
+
+
+# The semver-checks baseline. Re-running a release's workflow is supported
+# (RELEASING.md), and so is a maintenance release under a newer one, so the
+# baseline is the crate's highest release *below* the tag, never merely the
+# newest tag: comparing against a newer release runs the check backwards.
+SPONSORD_TAGS = [
+    "sponsord-v0.1.0",
+    "sponsord-v0.2.0-rc.1",
+    "sponsord-v0.2.0",
+    "sponsord-v0.3.0",
+    "sponsord-v1.0.0",
+    "sponsord-v1.1.0",
+    # Other crates and odd tags are never a sponsord baseline.
+    "sponsord-core-v0.9.9",
+    "sponsord-onramp-v0.2.5",
+    "sponsord-v0-wip",
+    "sponsord-v0.2.9.1",
+]
+
+
+@pytest.mark.parametrize(
+    ("tag", "expected"),
+    [
+        ("sponsord-v0.3.0", "sponsord-v0.2.0"),
+        # A rerun of 1.0.0 after 1.1.0 exists still checks against 0.3.0.
+        ("sponsord-v1.0.0", "sponsord-v0.3.0"),
+        # A maintenance release below a newer one.
+        ("sponsord-v1.0.1", "sponsord-v1.0.0"),
+        # A release candidate sorts below its release.
+        ("sponsord-v0.2.0", "sponsord-v0.2.0-rc.1"),
+        ("sponsord-v0.2.0-rc.1", "sponsord-v0.1.0"),
+        ("sponsord-v0.2.1", "sponsord-v0.2.0"),
+        # A first release has nothing to compare against.
+        ("sponsord-v0.1.0", None),
+        ("sponsord-v0.0.1", None),
+    ],
+)
+def test_baseline_is_the_highest_release_below_the_tag(tag, expected):
+    assert rp.baseline(tag, SPONSORD_TAGS) == expected
+
+
+@pytest.mark.parametrize(
+    ("lower", "higher"),
+    [
+        ("1.0.0-alpha", "1.0.0-alpha.1"),
+        ("1.0.0-alpha.1", "1.0.0-alpha.beta"),
+        ("1.0.0-alpha.beta", "1.0.0-beta"),
+        ("1.0.0-beta.2", "1.0.0-beta.11"),
+        ("1.0.0-rc.1", "1.0.0"),
+        ("1.9.0", "1.10.0"),
+        ("0.9.9", "1.0.0"),
+    ],
+)
+def test_baseline_follows_semver_precedence(lower, higher):
+    tags = [f"sponsord-v{lower}", f"sponsord-v{higher}"]
+    assert rp.baseline(f"sponsord-v{higher}", tags) == f"sponsord-v{lower}"
+    assert rp.baseline(f"sponsord-v{lower}", tags) is None
+
+
+def test_baseline_cli_reads_the_repository_tags(tmp_path):
+    # Signing off and an identity set: a developer's global config may sign
+    # every commit and tag with a key this scratch repository cannot reach.
+    config = ["-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false"]
+    config += ["-c", "user.name=t", "-c", "user.email=t@t"]
+    git = lambda *a: subprocess.run(
+        ["git", "-C", str(tmp_path), *config, *a], check=True, capture_output=True, text=True
+    )
+    git("init", "-q")
+    git("commit", "-q", "--allow-empty", "-m", "c")
+    for tag in ("sponsord-v0.1.0", "sponsord-v0.2.0", "sponsord-v0.3.0"):
+        git("tag", tag)
+    run = lambda *a: subprocess.run(
+        [sys.executable, str(MODULE_PATH), *a], capture_output=True, text=True, cwd=tmp_path
+    )
+    assert run("sponsord-v0.2.0", "--baseline").stdout == "sponsord-v0.1.0\n"
+    none = run("sponsord-v0.1.0", "--baseline")
+    assert (none.returncode, none.stdout) == (0, "")
+    assert run("v0.2.0", "--baseline").returncode == 1

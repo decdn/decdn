@@ -8,11 +8,12 @@ name: Release
 #
 #   release        parse the tag, verify its signature against KEYS on main,
 #                  check it against the crate's version and the decdn lock, run
-#                  the checks, and create a DRAFT GitHub Release with git-cliff
-#                  notes for that crate
+#                  the checks and cargo semver-checks against the crate's
+#                  previous release, and create a DRAFT GitHub Release with
+#                  git-cliff notes for that crate
 #   build          the crate's archives: decdn-sponsored for every platform the
 #                  installers support, sponsord / sponsord-onramp for Linux,
-#                  none for sponsord-core
+#                  none for sponsord-api or sponsord-core
 #   upload-assets  those archives plus SHA256SUMS onto the draft, and for
 #                  decdn-sponsored the onramp pin values into its notes
 #   docker         for sponsord / sponsord-onramp, the multi-arch image, pushed
@@ -40,6 +41,7 @@ name: Release
 on:
   push:
     tags:
+      - 'sponsord-api-v[0-9]*'
       - 'sponsord-core-v[0-9]*'
       - 'sponsord-v[0-9]*'
       - 'sponsord-onramp-v[0-9]*'
@@ -160,7 +162,7 @@ jobs:
       - name: Install tools
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          tool: git-cliff,cargo-nextest
+          tool: git-cliff,cargo-nextest,cargo-semver-checks
 
       - name: Pre-release verification
         run: |
@@ -174,6 +176,43 @@ jobs:
       # Not here, unlike decdn: `cargo publish --dry-run` resolves the decdn
       # crates from crates.io, where they are not published yet.
       # publish-crates.sh runs the dry run at publish time.
+
+      # The tagged crate's public Rust API against its previous release, so a
+      # breaking change cannot ship under a non-breaking version. The tool
+      # reads the version on each side from its manifest: a major bump, or a
+      # minor bump while the major is 0, may break, and anything else may not.
+      # Default features, as decdn checks, so the `test-support` fakes are not
+      # held to semver. The baseline is the crate's highest release below this
+      # tag; a first release has none and skips the check. Its signature is checked
+      # like this tag's, because building it runs its build scripts here.
+      # Installed through install-action rather than a third-party action,
+      # because this job holds `contents: write`.
+      - name: cargo semver-checks against the previous release
+        shell: bash
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          CRATE: ${{ steps.plan.outputs.crate }}
+          # The keyring "Verify tag signature" built from KEYS on main.
+          GNUPGHOME: ${{ runner.temp }}/keys-gnupg
+        run: |
+          set -euo pipefail
+          # The crate's highest release below this tag, in semver order, so a
+          # re-run after a newer release, or a maintenance release under one,
+          # never compares against a newer version (release_plan.py).
+          PREV=$(python3 .github/scripts/release_plan.py "$TAG" --baseline)
+          if [ -z "$PREV" ]; then
+            echo "No previous $CRATE release; skipping semver-checks."
+            exit 0
+          fi
+          # Building the baseline runs its build scripts in this job, so it
+          # must be a release a maintainer signed, as the tag being released is.
+          if ! git verify-tag "$PREV"; then
+            echo "::error::baseline $PREV is not signed by a key in KEYS on main;" \
+                 "delete the stray tag or sign it before releasing $CRATE."
+            exit 1
+          fi
+          echo "Checking $CRATE against $PREV."
+          cargo semver-checks --package "$CRATE" --baseline-rev "$PREV" --default-features
 
       # Notes for this crate only: the conventional commits that touched its
       # directory since its own previous tag.
