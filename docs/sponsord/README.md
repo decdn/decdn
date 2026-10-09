@@ -1,10 +1,15 @@
 # sponsord
 
-[![CI](https://github.com/decdn/sponsord/actions/workflows/ci.yml/badge.svg)](https://github.com/decdn/sponsord/actions/workflows/ci.yml)
-[![Security](https://github.com/decdn/sponsord/actions/workflows/security.yml/badge.svg)](https://github.com/decdn/sponsord/actions/workflows/security.yml)
-[![CodeQL](https://github.com/decdn/sponsord/actions/workflows/codeql.yml/badge.svg)](https://github.com/decdn/sponsord/actions/workflows/codeql.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![MSRV](https://img.shields.io/badge/MSRV-1.99.0-orange.svg)](rust-toolchain.toml)
+[![CI](https://img.shields.io/github/actions/workflow/status/decdn/sponsord/ci.yml?branch=main&label=CI&logo=github)](https://github.com/decdn/sponsord/actions/workflows/ci.yml?query=branch%3Amain)
+[![Security](https://img.shields.io/github/actions/workflow/status/decdn/sponsord/security.yml?branch=main&label=security&logo=github)](https://github.com/decdn/sponsord/actions/workflows/security.yml?query=branch%3Amain)
+[![CodeQL](https://img.shields.io/github/actions/workflow/status/decdn/sponsord/codeql.yml?branch=main&label=CodeQL&logo=github)](https://github.com/decdn/sponsord/actions/workflows/codeql.yml?query=branch%3Amain)
+[![Release](https://img.shields.io/github/v/release/decdn/sponsord?sort=semver&logo=github)](https://github.com/decdn/sponsord/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/sponsord?logo=rust&label=crates.io)](https://crates.io/crates/sponsord)
+[![docs.rs](https://img.shields.io/docsrs/sponsord-api?logo=docs.rs&label=docs.rs)](https://docs.rs/sponsord-api)
+[![Docker: sponsord](https://img.shields.io/docker/v/decdn/sponsord?sort=semver&logo=docker&label=sponsord)](https://hub.docker.com/r/decdn/sponsord)
+[![Docker: sponsord-onramp](https://img.shields.io/docker/v/decdn/sponsord-onramp?sort=semver&logo=docker&label=sponsord-onramp)](https://hub.docker.com/r/decdn/sponsord-onramp)
+[![MSRV](https://img.shields.io/badge/MSRV-1.99.0-orange?logo=rust)](rust-toolchain.toml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
 Sponsored downloads for [deCDN](https://github.com/decdn/decdn): your users
 download content from deCDN, and you pay for it. They run one command,
