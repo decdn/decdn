@@ -15,6 +15,8 @@ release.
 
 ## [Unreleased]
 
+## [0.0.1] - 2026-10-09
+
 ### Changed (BREAKING)
 
 - **API under `/v1`.** `POST /v1/fund` (body `{"client", "proof"}`; was

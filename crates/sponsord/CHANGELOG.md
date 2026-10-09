@@ -15,6 +15,8 @@ release.
 
 ## [Unreleased]
 
+## [0.0.1] - 2026-10-09
+
 ### Changed (BREAKING)
 
 - **Flags as well as environment variables.** Every `SPONSORD_*` setting is

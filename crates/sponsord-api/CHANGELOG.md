@@ -15,6 +15,8 @@ release.
 
 ## [Unreleased]
 
+## [0.0.1] - 2026-10-09
+
 ### Added
 
 - **New crate: the wire contracts of both servers.** Request and response

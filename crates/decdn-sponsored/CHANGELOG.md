@@ -15,6 +15,8 @@ release.
 
 ## [Unreleased]
 
+## [0.0.1] - 2026-10-09
+
 ### Changed (BREAKING)
 
 - **`~/.decdn/sponsor.toml` names only the onramp.** It holds `onramp_url`
