@@ -14081,14 +14081,16 @@ async fn a_full_pool_refused_by_a_stale_upstream_settles_then_is_served() -> Res
         },
     )
     .await?;
-    // The upstream catches up once the refused leg has recorded its progress.
+    // The upstream catches up as soon as the refused leg has recorded its
+    // progress. The refused leg verified every byte before its refusal, so the
+    // re-ask after the settle step is the pull's last chance: the catch-up
+    // must land before it. The step and the re-ask both follow the record.
     let ceiling = Arc::clone(&fixture.opener.ceiling);
     let recorded = Arc::clone(&fixture.recorded);
     let catch_up = tokio::spawn(async move {
         while recorded.lock().map_or(true, |log| log.is_empty()) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
         if let Ok(mut ceiling) = ceiling.lock() {
             *ceiling = U256::from(200 * RATE);
         }
