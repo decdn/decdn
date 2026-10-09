@@ -63,7 +63,7 @@ use tracing::{Instrument as _, debug, warn};
 use super::admit_store::NodeAdmitStore;
 use super::backend_source::BackendSource;
 use super::funder::{SETTLE_POLL_STEP, settle_window};
-use super::ranged_pull::{AssembleOutcome, RunOutcome, RunSink, assemble};
+use super::ranged_pull::{AssembleOutcome, RecoveryEnd, RunOutcome, RunSink, assemble};
 use super::timed_source::{TimedReader, TimedSource, timed_open};
 use super::{
     EconGate, NodeOrigin, NodeOriginDeps, ProbeGather, PullMiss, PullOutcome, PullVerdict,
@@ -1112,16 +1112,36 @@ pub(crate) async fn run_pull_leg(
         AssembleOutcome::Unavailable(_)
         | AssembleOutcome::Backpressured
         | AssembleOutcome::FundingNeeded
+        | AssembleOutcome::RecoveryFailed
         | AssembleOutcome::Terminal(_) => {
             deps.metrics.outbound_stream_ended(false);
         }
         AssembleOutcome::Cancelled => {}
     }
-    // On cancel the serve leg has already finished and nobody reads this, but set a
-    // terminal outcome regardless. A cancelled assembly is not a fault (Ok), matching
-    // a single-source pull's own Cancelled outcome; a range no holder covers is the
-    // existing miss.
-    let result = match outcome {
+    session.mark_ended(assembly_result(
+        outcome,
+        hash,
+        offset,
+        len,
+        candidates.len(),
+    ));
+    // Each run's per-lane `SettleOnDrop` already persisted its buyer watermark (#852)
+    // as that run ended.
+}
+
+/// The fill session's end for an assembly `outcome` over `[offset, offset+len)`
+/// of `hash`, from `candidates` candidates. A cancelled assembly (the serve leg
+/// finished first, so nobody reads the end) is not a fault, matching a
+/// single-source pull's own `Cancelled` outcome; a range no holder covers is the
+/// existing miss.
+fn assembly_result(
+    outcome: AssembleOutcome,
+    hash: Hash,
+    offset: u64,
+    len: u64,
+    candidates: usize,
+) -> Result<(), FillError> {
+    match outcome {
         AssembleOutcome::Complete | AssembleOutcome::Cancelled => Ok(()),
         AssembleOutcome::Unavailable(cause) => {
             // Signed `ok: true` is already out, so this is a truncated stream. Name
@@ -1131,7 +1151,7 @@ pub(crate) async fn run_pull_leg(
                 %hash,
                 offset,
                 len,
-                candidates = candidates.len(),
+                candidates,
                 cause = cause.as_str(),
                 "node-origin ranged pull ended before the range was filled"
             );
@@ -1142,7 +1162,7 @@ pub(crate) async fn run_pull_leg(
         }
         AssembleOutcome::Backpressured => Err(FillError::new(
             "node-origin ranged pull: the only holder of a still-missing range kept refusing \
-             for backpressure",
+         for backpressure",
         )),
         AssembleOutcome::FundingNeeded => {
             warn!(
@@ -1156,11 +1176,12 @@ pub(crate) async fn run_pull_leg(
                 "node-origin ranged pull: funding needed (this node's buyer pool)",
             ))
         }
+        // `node_step` logged the step's cause.
+        AssembleOutcome::RecoveryFailed => Err(FillError::new(
+            "node-origin ranged pull: the funding recovery step failed (this node's buyer pool)",
+        )),
         AssembleOutcome::Terminal(err) => Err(err),
-    };
-    session.mark_ended(result);
-    // Each run's per-lane `SettleOnDrop` already persisted its buyer watermark (#852)
-    // as that run ended.
+    }
 }
 
 /// The real [`RunSink`]: opens one buyer lane per planned run, drives it with
@@ -1310,7 +1331,7 @@ impl RunSink for PeerRunSink<'_> {
     /// a source that still refuses is the upstream's chain watcher lagging the
     /// new deposit, so the assembly waits a [`SETTLE_POLL_STEP`] and asks again
     /// without a step.
-    async fn recover(&self, gap_chunks: u64) -> bool {
+    async fn recover(&self, gap_chunks: u64) -> Result<(), RecoveryEnd> {
         {
             let mut seen = self
                 .gap_seen
@@ -1326,8 +1347,8 @@ impl RunSink for PeerRunSink<'_> {
         }
         if self.recovery.settling(tokio::time::Instant::now()) {
             return tokio::select! {
-                () = self.cancel.cancelled() => false,
-                () = tokio::time::sleep(SETTLE_POLL_STEP) => true,
+                () = self.cancel.cancelled() => Err(RecoveryEnd::FundingNeeded),
+                () = tokio::time::sleep(SETTLE_POLL_STEP) => Ok(()),
             };
         }
         let seen = *self
@@ -1340,9 +1361,10 @@ impl RunSink for PeerRunSink<'_> {
                     .seen_deposit
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = deposit;
-                true
+                Ok(())
             }
-            Err(_) => false,
+            Err(super::PullMiss::LocalFault) => Err(RecoveryEnd::Failed),
+            Err(_) => Err(RecoveryEnd::FundingNeeded),
         }
     }
 

@@ -1987,11 +1987,12 @@ pub(super) async fn node_step(
             gate.start_next_pass();
             Ok(deps.buyer.pool_deposit().unwrap_or(seen))
         }
-        Stepped::NoProgress | Stepped::Unavailable => {
+        end @ (Stepped::NoProgress | Stepped::Unavailable) => {
             info!(
                 candidates,
-                "node-origin: no candidate serves at this node's funding and no recovery step \
-                 is allowed; the fill ends funding needed"
+                why = no_step_why(&end),
+                "node-origin: no candidate serves at this node's funding; the fill ends funding \
+                 needed"
             );
             Err(PullMiss::FundingNeeded)
         }
@@ -2002,6 +2003,17 @@ pub(super) async fn node_step(
             );
             Err(PullMiss::LocalFault)
         }
+    }
+}
+
+/// Why a fill's funding recovery step let no candidate be asked again: the
+/// progress rule allowed no step, or the step could not add funds (which the
+/// funder counted as `node_pull_recovery_step_refused`).
+const fn no_step_why(stepped: &Stepped) -> &'static str {
+    if matches!(stepped, Stepped::NoProgress) {
+        "no byte was verified since the last recovery step"
+    } else {
+        "the recovery step could not add funds"
     }
 }
 

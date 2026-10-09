@@ -5,8 +5,8 @@ use decdn_client::CoveredRun;
 use decdn_protocol::{Coverage, DISCOVERY_BLOCK_BYTES, num_blocks};
 
 use super::{
-    AssembleOutcome, MAX_BACKPRESSURE_RETRIES, MAX_REASSIGN_ATTEMPTS, RunOutcome, RunSink,
-    UnavailableCause, assemble,
+    AssembleOutcome, MAX_BACKPRESSURE_RETRIES, MAX_REASSIGN_ATTEMPTS, RecoveryEnd, RunOutcome,
+    RunSink, UnavailableCause, assemble,
 };
 
 const BAO_CHUNK_BYTES: u64 = 1024;
@@ -50,7 +50,7 @@ struct FakeSink {
     exhausted: RefCell<Vec<(usize, u32)>>,
     /// The answers `recover` gives, popped front-first. An exhausted script
     /// answers `false`.
-    recovers: RefCell<Vec<bool>>,
+    recovers: RefCell<Vec<Result<(), RecoveryEnd>>>,
     /// Every `gap_chunks` passed to `recover`, in order.
     recover_calls: RefCell<Vec<u64>>,
 }
@@ -97,7 +97,7 @@ impl FakeSink {
         }
     }
 
-    fn recovering(self, answers: &[bool]) -> Self {
+    fn recovering(self, answers: &[Result<(), RecoveryEnd>]) -> Self {
         *self.recovers.borrow_mut() = answers.to_vec();
         self
     }
@@ -193,11 +193,11 @@ impl RunSink for FakeSink {
         self.exhausted.borrow_mut().push((source_ix, waits));
     }
 
-    async fn recover(&self, gap_chunks: u64) -> bool {
+    async fn recover(&self, gap_chunks: u64) -> Result<(), RecoveryEnd> {
         self.recover_calls.borrow_mut().push(gap_chunks);
         let mut answers = self.recovers.borrow_mut();
         if answers.is_empty() {
-            false
+            Err(RecoveryEnd::FundingNeeded)
         } else {
             answers.remove(0)
         }
@@ -212,7 +212,7 @@ async fn a_sole_unfunded_holder_serves_after_a_recovery_step() {
     let total = DISCOVERY_BLOCK_BYTES;
     let sink = FakeSink::new(total)
         .script(0, &[Disposition::Unfunded])
-        .recovering(&[true]);
+        .recovering(&[Ok(())]);
     let coverage = vec![cov(1, &[0])];
 
     let outcome = assemble(&sink, &coverage, 0, total, total).await;
@@ -234,6 +234,20 @@ async fn an_unfunded_holder_with_no_recovery_ends_funding_needed() {
     assert_eq!(sink.recover_calls.borrow().len(), 1);
 }
 
+/// A recovery step that fails on this node's own fault ends the assembly as a
+/// failed step, so the operator is not told no step could raise the deposit.
+#[tokio::test]
+async fn a_failed_recovery_step_ends_the_assembly_as_failed() {
+    let total = DISCOVERY_BLOCK_BYTES;
+    let sink = FakeSink::new(total)
+        .script(0, &[Disposition::Unfunded])
+        .recovering(&[Err(RecoveryEnd::Failed)]);
+    let coverage = vec![cov(1, &[0])];
+
+    let outcome = assemble(&sink, &coverage, 0, total, total).await;
+    assert!(matches!(outcome, AssembleOutcome::RecoveryFailed));
+}
+
 /// One holder's funding refusal while another holder covers the range never
 /// reaches the funding recovery step: the refusal scopes to that holder.
 #[tokio::test]
@@ -249,6 +263,28 @@ async fn an_unfunded_holder_beside_a_serving_one_takes_no_step() {
         "no step while a node serves"
     );
     assert_eq!(sink.driven.borrow().last().unwrap().0, 1, "B served");
+}
+
+/// A survivor that serves its own block cannot fill a block only the source
+/// dropped for refusing this node's funding covers. The assembly runs its
+/// recovery step for that block and asks the dropped source again, rather
+/// than ending with the block uncovered.
+#[tokio::test]
+async fn a_block_only_an_unfunded_source_covers_takes_a_recovery_step() {
+    let total = 2 * DISCOVERY_BLOCK_BYTES;
+    let sink = FakeSink::new(total)
+        .script(1, &[Disposition::Unfunded, Disposition::Fill])
+        .recovering(&[Ok(())]);
+    let coverage = vec![cov(2, &[0]), cov(2, &[1])];
+
+    let outcome = assemble(&sink, &coverage, 0, total, total).await;
+    assert!(matches!(outcome, AssembleOutcome::Complete));
+    assert_eq!(sink.recover_calls.borrow().len(), 1, "one recovery step");
+    assert_eq!(
+        sink.driven.borrow().last().unwrap().0,
+        1,
+        "B served block 1"
+    );
 }
 
 /// A funding refusal does not spend the reassign budget: an assembly whose

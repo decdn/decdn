@@ -1830,3 +1830,67 @@ fn summary_is_none_before_any_delivery() {
     };
     assert!(meter.summary().is_none());
 }
+
+fn replacement(closed: u8, opened: u8) -> PoolReplaced {
+    PoolReplaced {
+        closed: B256::repeat_byte(closed),
+        opened: B256::repeat_byte(opened),
+    }
+}
+
+/// A pass that a funding recovery step ended by opening a new pool runs the
+/// remaining work again, once. A second replacement in the same command ends
+/// it "funding needed"; a pass that ends any other way ends the command.
+#[test]
+fn a_replaced_pool_runs_the_work_again_at_most_once() {
+    let mut replaced = None;
+    let first = replacement(1, 2);
+    assert!(
+        next_pass(Err(anyhow::Error::new(first)), &mut replaced, false).is_none(),
+        "the first replacement runs the work again"
+    );
+    assert_eq!(replaced, Some(first));
+
+    let err = next_pass(
+        Err(anyhow::Error::new(replacement(2, 3))),
+        &mut replaced,
+        false,
+    )
+    .expect("a second replacement ends the command")
+    .expect_err("it ends funding needed");
+    assert!(
+        format!("{err:#}").contains("accepts no more funds either"),
+        "{err:#}"
+    );
+
+    let mut replaced = Some(first);
+    assert!(
+        matches!(next_pass(Ok(()), &mut replaced, false), Some(Ok(()))),
+        "the second pass completes"
+    );
+    let mut replaced = None;
+    let err = next_pass(Err(anyhow::anyhow!("not found")), &mut replaced, false)
+        .expect("any other end ends the command")
+        .expect_err("with its own error");
+    assert_eq!(format!("{err}"), "not found");
+    assert_eq!(replaced, None);
+}
+
+/// A stream to stdout never runs again: the bytes it wrote cannot be taken
+/// back. Its replacement ends the command and names the new pool.
+#[test]
+fn a_stdout_stream_names_the_new_pool_and_does_not_run_again() {
+    let mut replaced = None;
+    let err = next_pass(
+        Err(anyhow::Error::new(replacement(1, 2))),
+        &mut replaced,
+        true,
+    )
+    .expect("a stdout stream ends the command")
+    .expect_err("with the replacement");
+    assert!(
+        format!("{err:#}").contains(&B256::repeat_byte(2).to_string()),
+        "{err:#}"
+    );
+    assert_eq!(replaced, None);
+}

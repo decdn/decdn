@@ -3130,9 +3130,20 @@ where
                 opened,
             }));
         }
+        // The settle step escrows nothing, so an estimate is safe here: it only
+        // names the deposit the nodes are asked again at.
+        let estimate = || remaining.saturating_add(self.funding.pool_spent().unwrap_or(U256::ZERO));
         let deposit = match self.store.get_by_pool_id(pool_id) {
             Ok(Some(row)) => row.deposit,
-            _ => remaining.saturating_add(self.funding.pool_spent().unwrap_or(U256::ZERO)),
+            Ok(None) => estimate(),
+            Err(error) => {
+                tracing::warn!(
+                    %pool_id,
+                    %error,
+                    "could not read the buyer pool's row; estimating its deposit from the run"
+                );
+                estimate()
+            }
         };
         tracing::info!(
             %pool_id,

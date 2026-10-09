@@ -178,6 +178,10 @@ pub(crate) enum AssembleOutcome {
     /// [`Self::Unavailable`] (a truncated stream) and names this node's own
     /// funding as the cause for the operator.
     FundingNeeded,
+    /// The funding recovery step ran and failed on a fault in this node (an
+    /// RPC, allowance or escrow fault). Surfaces to the client like
+    /// [`Self::Unavailable`]; the step logged its cause for the operator.
+    RecoveryFailed,
     /// A run faulted terminally; propagate the fault to the serve leg.
     Terminal(FillError),
     /// The pull was cancelled mid-assembly.
@@ -220,8 +224,28 @@ pub(crate) trait RunSink {
     /// a still-missing range of `gap_chunks` chunks, and at least one dropped
     /// source refused this node's funding. Returns `true` when the deposit
     /// rose (or is settling after a rise), so those sources may be asked
-    /// again; `false` ends the assembly [`AssembleOutcome::FundingNeeded`].
-    async fn recover(&self, gap_chunks: u64) -> bool;
+    /// again. `Err` names the assembly's end.
+    async fn recover(&self, gap_chunks: u64) -> Result<(), RecoveryEnd>;
+}
+
+/// Why the assembly's funding recovery step lets no dropped source be asked
+/// again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryEnd {
+    /// No step is allowed or possible: [`AssembleOutcome::FundingNeeded`].
+    FundingNeeded,
+    /// The step failed on a fault in this node:
+    /// [`AssembleOutcome::RecoveryFailed`].
+    Failed,
+}
+
+impl From<RecoveryEnd> for AssembleOutcome {
+    fn from(end: RecoveryEnd) -> Self {
+        match end {
+            RecoveryEnd::FundingNeeded => Self::FundingNeeded,
+            RecoveryEnd::Failed => Self::RecoveryFailed,
+        }
+    }
 }
 
 /// Assemble `[offset, offset+len)` of a `total_bytes` blob across the ranked
@@ -288,8 +312,8 @@ pub(crate) async fn assemble<S: RunSink>(
             if unfunded.is_empty() {
                 return AssembleOutcome::Unavailable(UnavailableCause::NoSurvivors);
             }
-            if !sink.recover(gap_chunks).await {
-                return AssembleOutcome::FundingNeeded;
+            if let Err(end) = sink.recover(gap_chunks).await {
+                return end.into();
             }
             surviving.append(&mut unfunded);
             surviving.sort_unstable();
@@ -321,8 +345,8 @@ pub(crate) async fn assemble<S: RunSink>(
             if unfunded.is_empty() {
                 return AssembleOutcome::Unavailable(UnavailableCause::Uncovered);
             }
-            if !sink.recover(gap_chunks).await {
-                return AssembleOutcome::FundingNeeded;
+            if let Err(end) = sink.recover(gap_chunks).await {
+                return end.into();
             }
             surviving.append(&mut unfunded);
             surviving.sort_unstable();

@@ -2582,12 +2582,31 @@ async fn a_full_closing_pool_is_replaced() {
         .unwrap(),
     );
     let svc = recovery_service(&asserter, 10_000_000);
-    let stepped = svc.recover_pool(U256::from(10_000_000u64)).await;
-    // The replacement open reaches the chain, which has no answer left.
-    let err = stepped.expect_err("the replacement open runs");
-    assert!(
-        !format!("{err:#}").contains("topUp"),
-        "the step opened a pool, not a top-up: {err:#}"
+    // The replacement open the step joins records the new pool as current.
+    let opened = PoolId::from([0x6B; 32]);
+    let store = Arc::clone(&svc.store);
+    let replacement: BoxFuture<'static, OpenOutcome> = Box::pin(async move {
+        store
+            .record(&BuyerPoolState::new(
+                opened,
+                DEPLOYMENT,
+                Address::repeat_byte(1),
+                Address::repeat_byte(2),
+                U256::from(10_000_000u64),
+            ))
+            .map_err(|err| Arc::new(anyhow::Error::new(err)))
+    });
+    *svc.open_in_flight.lock().unwrap() = Some(replacement.shared());
+    let stepped = svc
+        .recover_pool(U256::from(10_000_000u64))
+        .await
+        .expect("the step joins the replacement open");
+    assert_eq!(
+        stepped,
+        Recovery::Replaced(PoolReplaced {
+            closed: PoolId::from([0x5A; 32]),
+            opened,
+        })
     );
     assert!(asserter.read_q().is_empty(), "the estimate ran");
 }

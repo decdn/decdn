@@ -653,6 +653,11 @@ fn takedown_reject_reasons_are_declined() {
         // reconstruct `remaining − M`, the pool-balance map this collapse exists
         // to hide.
         ServeRejectReason::SignerFloorAtCap,
+        // "Not now" states of this node: a later request can be served.
+        ServeRejectReason::PullLoopGuard,
+        ServeRejectReason::LoadShedHit,
+        ServeRejectReason::LoadShedMiss,
+        ServeRejectReason::ChainStale,
     ] {
         assert_eq!(
             reason.wire_error(),

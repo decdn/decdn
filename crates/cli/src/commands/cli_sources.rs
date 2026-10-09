@@ -204,19 +204,27 @@ where
         // What earlier fetches signed under this key, at every provider the
         // buyer store holds a lane for: the capability's spend so far.
         let signer = self.signer.address();
-        let recorded = self
+        let row = self
             .deps
             .store
             .get_by_pool_id(grant.pool_id)
-            .ok()
-            .flatten()
-            .map_or(alloy::primitives::U256::ZERO, |row| {
-                row.lanes()
-                    .filter(|(lane, _)| lane.signer == signer)
-                    .fold(alloy::primitives::U256::ZERO, |acc, (_, progress)| {
-                        acc.saturating_add(progress.last_amount)
-                    })
+            .unwrap_or_else(|error| {
+                // Counting from zero overstates the headroom, so a spent cap
+                // can read as the publisher's pool needing funds.
+                tracing::warn!(
+                    pool_id = %grant.pool_id,
+                    %error,
+                    "could not read the buyer store; this key's earlier spend counts as zero"
+                );
+                None
             });
+        let recorded = row.map_or(alloy::primitives::U256::ZERO, |row| {
+            row.lanes()
+                .filter(|(lane, _)| lane.signer == signer)
+                .fold(alloy::primitives::U256::ZERO, |acc, (_, progress)| {
+                    acc.saturating_add(progress.last_amount)
+                })
+        });
         slot.record_spend(signer, recorded);
         Some(slot)
     }
