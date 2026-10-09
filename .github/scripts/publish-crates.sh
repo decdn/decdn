@@ -422,6 +422,14 @@ fi
 # even when a crate above is not served yet. Its cargo is yours too: rustup
 # installs the toolchain sponsord's rust-toolchain.toml names. A fork or a
 # DECDN_REPO test run opens nothing.
+#
+# This runs sponsord's main as you, so it trusts that branch the way running
+# the script by hand would: sponsord's ruleset puts every change to main
+# through a reviewed PR. It gets nothing it does not need: the crates.io
+# tokens this run may hold in the environment are unset first. Files that are
+# yours, such as ~/.cargo/credentials.toml, stay readable to any code you run;
+# skip the step with DECDN_SKIP_SPONSORD_BUMP=1 to run it from a checkout you
+# have reviewed.
 BUMP_HINT="(cd <a decdn/sponsord checkout> && .github/scripts/open-decdn-bump.sh $TAG)"
 if [[ -n "$SKIP_SPONSORD_BUMP" ]]; then
   echo
@@ -438,7 +446,13 @@ else
     echo "warning: could not clone decdn/sponsord. Open the bump PR with:" >&2
     echo "  $BUMP_HINT" >&2
   else
-    (cd "$SPONSORD_DIR" && .github/scripts/open-decdn-bump.sh "$TAG") || rc=$?
+    (
+      unset CARGO_REGISTRY_TOKEN
+      while read -r var; do
+        [[ "$var" == CARGO_REGISTRIES_*_TOKEN ]] && unset "$var"
+      done < <(compgen -e)
+      cd "$SPONSORD_DIR" && .github/scripts/open-decdn-bump.sh "$TAG"
+    ) || rc=$?
     case "$rc" in
       0) ;;
       3)

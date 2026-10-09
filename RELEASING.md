@@ -262,8 +262,10 @@ sponsord into a temporary directory and runs its
 the release and opens the PR with your `gh` login and git identity. That
 needs write access to decdn/sponsord, and uses your cargo (rustup installs
 sponsord's pinned toolchain). If it fails, the script prints the command to
-run later from a sponsord checkout; it never fails the publish. Set
-`DECDN_SKIP_SPONSORD_BUMP=1` to skip it.
+run later from a sponsord checkout; it never fails the publish. It runs
+sponsord's `main` as you, without the crates.io tokens in the environment;
+set `DECDN_SKIP_SPONSORD_BUMP=1` to skip it and run the script from a
+checkout you have reviewed instead.
 
 ### Crate ownership
 
