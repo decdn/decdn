@@ -28,6 +28,29 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **The `decdn` CLI ships as a container image, and the `decdn-node` image
+  carries it too.** A release publishes two images, built as two stages of
+  one `Dockerfile` from the same signed Linux archives:
+  - `ghcr.io/decdn/decdn` / `decdn/decdn` (new): the CLI only, with `decdn`
+    as entrypoint. Mount `~/.decdn` at `/home/decdn/.decdn`. The name was
+    unused by any release; a local script still pinning it for the daemon
+    now gets the CLI.
+  - `ghcr.io/decdn/decdn-node` / `decdn/decdn-node`: the daemon as before,
+    plus `/usr/local/bin/decdn`, so `docker exec <container> decdn node
+    status` reaches the loopback admin port.
+  - Release assets are per image. `image-digest.txt` becomes
+    `decdn-node-image-digest.txt` and `decdn-image-digest.txt`; the SBOM
+    `decdn-<version>-sbom.spdx.json` becomes `decdn-node-<version>-sbom.spdx.json`,
+    and `decdn-<version>-sbom.spdx.json` now describes the CLI image. Each
+    file has its own `.asc`.
+  - `sign-release.sh`: `DECDN_DOCKERHUB_REPO` is the Docker Hub counterpart
+    of `DECDN_REPO` (default `DECDN_REPO`), and both Hub names derive from it
+    — set it to `decdn/decdn`, not `decdn/decdn-node`; the script refuses a
+    value ending in `-node`. The Docker Hub repository `decdn/decdn` must
+    exist before the next release.
+  - `sign-release.sh` checks every promoted repository without credentials
+    and refuses to publish while one is private. GHCR creates a package
+    private on its first push, so each package must be made public once.
 - **Pre-launch compatibility shims removed (#2367).**
   - Admin wire: `admin_v1_drain` requires its `DrainRequest` parameter with
     `wait_admin` set, and `admin_v1_evict` requires `dry_run`. A call without
@@ -455,18 +478,18 @@ since project inception and will roll into the first tagged release.
 - **Container image renamed to `decdn-node`, and now published to Docker Hub as
   well as GHCR.** `ghcr.io/decdn/decdn` becomes `ghcr.io/decdn/decdn-node`, and
   the same image is published as `decdn/decdn-node` on Docker Hub. The image
-  ships the daemon only — the `decdn` CLI is deliberately not in it — so it is
-  no longer named after the repository. No release had been cut under the old
-  name, so nothing existing breaks; any local script pinning
-  `ghcr.io/decdn/decdn` must be updated.
+  runs the daemon, so it is not named after the repository. No release had
+  been cut under the old name, so nothing existing breaks. The repository
+  name `decdn` now belongs to the CLI image (see the container-image entry
+  above).
   - The mirror is a manifest copy, not a second build: `sign-release.sh` uses
     `docker buildx imagetools create`, which copies the manifest bytes verbatim,
     so both registries serve one identical digest and the existing GPG signature
-    over `image-digest.txt` covers both. The script re-reads every tag on both
-    registries and refuses to publish the release if any resolves to a different
-    digest. `image-digest.txt` still records a single GHCR reference.
+    over the image's digest file covers both. The script re-reads every tag on
+    both registries and refuses to publish the release if any resolves to a
+    different digest. The digest file records the GHCR reference.
   - New env overrides: `DECDN_SKIP_DOCKERHUB=1` (tag on GHCR only) and
-    `DECDN_DOCKERHUB_REPO`. No new Actions secret — the mirror happens on the
+    `DECDN_DOCKERHUB_REPO` (meaning as in the container-image entry above). No new Actions secret — the mirror happens on the
     maintainer's machine at signing time, keeping "no publish credential in CI".
 - **`TERMS.md` and `TERMS_README.md` moved from the repo root to
   `crates/cli/`.** The terms text is embedded by `decdn-cli` with

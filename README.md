@@ -166,13 +166,28 @@ Install the latest release:
 
 ```bash
 cargo install --locked decdn-cli decdn-node
-docker pull ghcr.io/decdn/decdn-node     # mirrored to docker.io/decdn/decdn-node
+docker pull ghcr.io/decdn/decdn-node     # daemon + CLI; mirrored to docker.io/decdn/decdn-node
+docker pull ghcr.io/decdn/decdn          # CLI only; mirrored to docker.io/decdn/decdn
 ```
+
+The `decdn-node` image runs the daemon and also carries the CLI, so
+`docker exec <container> decdn node status` reaches the daemon's local admin
+port. The `decdn` image runs the CLI. Mount your key directory and a working
+directory:
+
+```bash
+docker run --rm -it -v ~/.decdn:/home/decdn/.decdn -v "$PWD":/work -w /work \
+  ghcr.io/decdn/decdn fetch <hash>
+```
+
+Both images run as uid 1000. If your user has another uid, add
+`--user "$(id -u):$(id -g)" -e HOME=/home/decdn`. Without a TTY, mount a file
+that holds the keystore password and point `DECDN_KEYSTORE_PASSWORD_FILE` at it.
 
 Each [GitHub release](https://github.com/decdn/decdn/releases) also carries
 `decdn-${VERSION}-${TARGET}` and `decdn-node-${VERSION}-${TARGET}` archives (`.tar.gz`,
 or `.zip` on Windows). A maintainer signs the `SHA256SUMS` manifest that covers the
-archives and the digest that names the container image. crates.io artifacts carry no
+archives, and each container image's digest file and SBOM. crates.io artifacts carry no
 maintainer signature. [SECURITY.md](SECURITY.md) explains how to verify each channel.
 
 ## Commands

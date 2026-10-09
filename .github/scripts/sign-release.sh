@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Signs and publishes a release draft staged by .github/workflows/release.yml.
 #
-# The workflow builds the archives, the container image and the SBOM, but signs
-# nothing and publishes nothing — the GitHub Release is left as a draft and the
-# image manifest is pushed untagged. This script is the human step: a maintainer
-# verifies what CI produced, signs it with their own GPG key, promotes the image
-# tags, and publishes. There is no signing key in Actions secrets.
+# The workflow builds the archives, the two container images and their SBOMs,
+# but signs nothing and publishes nothing — the GitHub Release is left as a
+# draft and both image manifests are pushed untagged. This script is the human
+# step: a maintainer verifies what CI produced, signs it with their own GPG key,
+# promotes the image tags, and publishes. There is no signing key in Actions
+# secrets.
 #
 # Usage:  .github/scripts/sign-release.sh v0.1.2
 #
@@ -19,11 +20,11 @@
 #                         resolves to must be published in KEYS.
 #   DECDN_SKIP_IMAGE_TAGS set to 1 to publish without creating ANY pullable
 #                         image tag — the release then ships with only the
-#                         signed digest in image-digest.txt
+#                         signed digests in the *-image-digest.txt files
 #   DECDN_SKIP_DOCKERHUB  set to 1 to tag on GHCR only, skipping the Docker Hub
 #                         mirror (implied by DECDN_SKIP_IMAGE_TAGS)
-#   DECDN_DOCKERHUB_REPO  override the Docker Hub repository
-#                         (default: decdn/decdn-node)
+#   DECDN_DOCKERHUB_REPO  the Docker Hub counterpart of DECDN_REPO (default:
+#                         DECDN_REPO). The images are <it>-node and <it>.
 #
 # Re-running is safe at any point before the release is published: signatures
 # are re-uploaded with --clobber and the tag promotion is idempotent. Once the
@@ -33,25 +34,57 @@ set -euo pipefail
 TAG="${1:?tag required, e.g. v0.1.2}"
 VERSION="${TAG#v}"
 REPO="${DECDN_REPO:-decdn/decdn}"
-# `-node`: the image carries the daemon only, so it is not named after the repo.
-# Must match release.yml's IMAGE_NAME, which is what wrote image-digest.txt.
-IMAGE="ghcr.io/${REPO}-node"
-# Derived from $REPO, exactly like $IMAGE. Hard-defaulting this to
-# `decdn/decdn-node` would mean a DECDN_REPO=<fork> rehearsal promotes GHCR tags
-# on the fork while pushing `latest` to the PRODUCTION Docker Hub repository —
-# which the maintainer is logged in to, so it would succeed silently.
-DOCKERHUB_IMAGE="docker.io/${DECDN_DOCKERHUB_REPO:-${REPO}-node}"
+# Derived from $REPO by default. Hard-defaulting this to `decdn/decdn` would
+# mean a DECDN_REPO=<fork> rehearsal promotes GHCR tags on the fork while
+# pushing `latest` to the PRODUCTION Docker Hub repositories — which the
+# maintainer is logged in to, so it would succeed silently.
+DOCKERHUB_REPO="${DECDN_DOCKERHUB_REPO:-${REPO}}"
 SIGNING_KEY="${DECDN_SIGNING_KEY:-}"
 
-# The three files a signature covers. SHA256SUMS transitively covers every
-# archive, so the archives carry no individual .asc.
-SIGN_TARGETS=(
-  "SHA256SUMS"
-  "image-digest.txt"
-  "decdn-${VERSION}-sbom.spdx.json"
+# The images, keyed by Dockerfile stage. The stage name is also the prefix of
+# the image's release assets: <stage>-image-digest.txt and
+# <stage>-<version>-sbom.spdx.json. `decdn-node` (daemon + CLI) carries a
+# `-node` suffix; `decdn` (CLI only) takes the repository's own name, as the
+# binary does. IMAGES and GHCR_IMAGE must match the `target:` / `image:` pairs
+# of release.yml's docker matrix, which is what wrote the digest files;
+# .github/scripts/check-image-name.sh enforces that.
+IMAGES=( "decdn-node" "decdn" )
+declare -A GHCR_IMAGE=(
+  [decdn-node]="ghcr.io/${REPO}-node"
+  [decdn]="ghcr.io/${REPO}"
+)
+declare -A DOCKERHUB_IMAGE=(
+  [decdn-node]="docker.io/${DOCKERHUB_REPO}-node"
+  [decdn]="docker.io/${DOCKERHUB_REPO}"
 )
 
+# The files a signature covers. SHA256SUMS transitively covers every archive,
+# so the archives carry no individual .asc.
+SIGN_TARGETS=( "SHA256SUMS" )
+for img in "${IMAGES[@]}"; do
+  SIGN_TARGETS+=( "${img}-image-digest.txt" "${img}-${VERSION}-sbom.spdx.json" )
+done
+
 die() { echo "error: $*" >&2; exit 1; }
+
+# DECDN_DOCKERHUB_REPO names the base repository, and the node image appends
+# `-node` to it. A value that already ends in `-node` would mirror the node
+# image to `<it>-node` and the CLI image onto the node repository's `latest`,
+# and the digest check would pass, because it compares against what was just
+# pushed.
+[[ "$DOCKERHUB_REPO" != *-node ]] || die \
+  "DECDN_DOCKERHUB_REPO is the base repository (e.g. decdn/decdn), not the -node one: got '$DOCKERHUB_REPO'"
+
+# Every image needs a name on both registries, and no two images may share one.
+declare -A SEEN_TARGET=()
+for img in "${IMAGES[@]}"; do
+  [[ -n "${GHCR_IMAGE[$img]:-}" && -n "${DOCKERHUB_IMAGE[$img]:-}" ]] ||
+    die "no registry mapping for image $img"
+  for t in "${GHCR_IMAGE[$img]}" "${DOCKERHUB_IMAGE[$img]}"; do
+    [[ -z "${SEEN_TARGET[$t]:-}" ]] || die "two images map to $t"
+    SEEN_TARGET[$t]=1
+  done
+done
 
 # `1`/`true`/`yes` enable, `0`/`false`/`no`/empty do not, anything else is a
 # typo and stops the script. A bare `[[ -n ]]` test would make
@@ -338,7 +371,10 @@ gh release download "$TAG" --repo "$REPO" --dir "$WORKDIR" ||
 cd "$WORKDIR"
 
 for f in "${SIGN_TARGETS[@]}"; do
-  [[ -f "$f" ]] || die "expected asset $f is missing from the draft"
+  [[ -f "$f" ]] || die "expected asset $f is missing from the draft.
+A *-image-digest.txt or *-sbom.spdx.json comes from the release workflow's
+\`Docker image (<stage>)\` job; SHA256SUMS from \`upload-assets\`. Re-run
+that job, then retry."
 done
 
 # --strict, because without it a malformed line is only a warning: a truncated
@@ -365,16 +401,23 @@ done
 Signing would vouch for a release whose manifest is incomplete.
 Re-run the upload-assets job, then retry."
 
-# Anchored match, not a prefix glob: a prefix test passes on a multi-line file
-# whose second line names a different registry, and on a truncated digest.
-DIGEST_REF=$(tr -d '\r' < image-digest.txt | head -n1)
-# `grep -c ''`, not `wc -l`: wc counts newlines, so a two-line file with no
-# trailing newline reports 1 and sails through — which is exactly the
-# "second line names a different registry" case this guard exists to catch.
-[[ $(grep -c '' image-digest.txt) -le 1 ]] ||
-  die "image-digest.txt has more than one line"
-[[ "$DIGEST_REF" =~ ^"${IMAGE}"@sha256:[0-9a-f]{64}$ ]] ||
-  die "image-digest.txt is not a single $IMAGE digest reference: $DIGEST_REF"
+# Each image's signed digest, keyed by stage.
+declare -A DIGEST=()
+for img in "${IMAGES[@]}"; do
+  digest_file="${img}-image-digest.txt"
+  # Anchored match, not a prefix glob: a prefix test passes on a multi-line
+  # file whose second line names a different registry, and on a truncated
+  # digest.
+  digest_ref=$(tr -d '\r' < "$digest_file" | head -n1)
+  # `grep -c ''`, not `wc -l`: wc counts newlines, so a two-line file with no
+  # trailing newline reports 1 and sails through — which is exactly the
+  # "second line names a different registry" case this guard exists to catch.
+  [[ $(grep -c '' "$digest_file") -le 1 ]] ||
+    die "$digest_file has more than one line"
+  [[ "$digest_ref" =~ ^"${GHCR_IMAGE[$img]}"@sha256:[0-9a-f]{64}$ ]] ||
+    die "$digest_file is not a single ${GHCR_IMAGE[$img]} digest reference: $digest_ref"
+  DIGEST[$img]="${digest_ref#*@}"
+done
 
 # ---- sign ----------------------------------------------------------------
 
@@ -422,33 +465,34 @@ else
     PROMOTE_TAGS=( "latest" "$VERSION" "${VERSION%.*}" )
   fi
 
-  DIGEST="${DIGEST_REF#*@}"
+  # Every registry repository whose tags are live, so a later failure can say
+  # so. Once a repository is in here, its tags ALREADY resolve to the new
+  # digest while the release is still a draft — an operator who hits an auth
+  # wall and stops for the day must be told that, not just "re-run".
+  PROMOTED=()
 
-  # Points every tag in PROMOTE_TAGS at the signed digest, in $1.
+  # Points every tag in PROMOTE_TAGS on $1 at the signed digest $3 of $2. $4 is
+  # the registry host the failure hint tells the operator to `docker login` to.
   #
   # `imagetools create` copies the source manifest verbatim, so this both
   # promotes within GHCR and copies to another registry without a rebuild or a
   # local pull — and the copy keeps the same digest, which is what lets one
-  # signature over image-digest.txt vouch for the mirror too. The inspect loop
+  # signature over the digest file vouch for the mirror too. The inspect loop
   # is what PROVES that rather than assuming it: if a future buildx ever
   # rewrote the manifest, the digest would move and this would refuse to go on.
-  # Set once the GHCR tags are live, so a later failure can say so. By the time
-  # the Docker Hub leg runs, `ghcr.io/...:latest` ALREADY resolves to the new
-  # digest while the release is still a draft — an operator who hits a Docker
-  # Hub auth wall and stops for the day must be told that, not just "re-run".
-  GHCR_PROMOTED=""
-
   promote_to() {
-    local target="$1" login_hint="$2" t got create_args=() already=""
-    if [[ -n "$GHCR_PROMOTED" ]]; then
+    local target="$1" source="$2" digest="$3" login_hint="$4"
+    local t got create_args=() already=""
+    if (( ${#PROMOTED[@]} > 0 )); then
       already="
-${IMAGE} tags are ALREADY promoted — :latest now serves an unpublished release.
-Either finish this script, or re-point the ${IMAGE} tags at the previous digest."
+These repositories' tags are ALREADY promoted and serve an unpublished release:
+$(printf '  %s\n' "${PROMOTED[@]}")
+Either finish this script, or re-point those tags at the previous digests."
     fi
     for t in "${PROMOTE_TAGS[@]}"; do
       create_args+=( -t "${target}:${t}" )
     done
-    docker buildx imagetools create "${create_args[@]}" "${IMAGE}@${DIGEST}" || die \
+    docker buildx imagetools create "${create_args[@]}" "${source}@${digest}" || die \
       "failed to promote image tags on ${target} (registry auth? run \`docker login ${login_hint}\`).
 Signatures are uploaded and the release is still a draft.
 Fix the problem and re-run this script — it is idempotent.${already}"
@@ -456,17 +500,22 @@ Fix the problem and re-run this script — it is idempotent.${already}"
     for t in "${PROMOTE_TAGS[@]}"; do
       got=$(docker buildx imagetools inspect "${target}:${t}" \
         --format '{{.Manifest.Digest}}' 2>/dev/null) || got=""
-      [[ "$got" == "$DIGEST" ]] ||
-        die "${target}:${t} resolves to '${got}', not the signed digest ${DIGEST}${already}"
-      echo "    ${target}:${t} -> ${DIGEST}"
+      [[ "$got" == "$digest" ]] ||
+        die "${target}:${t} resolves to '${got}', not the signed digest ${digest}.
+imagetools create succeeded, so ${target} tags may already have moved.${already}"
+      echo "    ${target}:${t} -> ${digest}"
     done
   }
 
-  # Tags the untagged manifest CI already pushed — no rebuild, no pull — so
-  # every tag a user can pull resolves to the digest signed above.
-  echo "==> Promoting image tags to the signed digest: ${PROMOTE_TAGS[*]}"
-  promote_to "$IMAGE" "ghcr.io"
-  GHCR_PROMOTED=1
+  # Tags the untagged manifests CI already pushed — no rebuild, no pull — so
+  # every tag a user can pull resolves to a digest signed above. Every GHCR
+  # image goes first, then every mirror, so the mirror leg never runs against
+  # a half-promoted GHCR.
+  echo "==> Promoting image tags to the signed digests: ${PROMOTE_TAGS[*]}"
+  for img in "${IMAGES[@]}"; do
+    promote_to "${GHCR_IMAGE[$img]}" "${GHCR_IMAGE[$img]}" "${DIGEST[$img]}" "ghcr.io"
+    PROMOTED+=( "${GHCR_IMAGE[$img]}" )
+  done
 
   if [[ -n "$SKIP_DOCKERHUB" ]]; then
     echo "==> Skipping the Docker Hub mirror (DECDN_SKIP_DOCKERHUB set)"
@@ -474,15 +523,40 @@ Fix the problem and re-run this script — it is idempotent.${already}"
     # Before the release leaves draft, not after: the two registries are
     # advertised as interchangeable, so publishing with only one populated
     # would send half of `docker pull` users to a tag that does not exist.
-    echo "==> Mirroring the signed digest to $DOCKERHUB_IMAGE"
-    promote_to "$DOCKERHUB_IMAGE" "docker.io"
+    for img in "${IMAGES[@]}"; do
+      echo "==> Mirroring the signed digest to ${DOCKERHUB_IMAGE[$img]}"
+      promote_to "${DOCKERHUB_IMAGE[$img]}" "${GHCR_IMAGE[$img]}" "${DIGEST[$img]}" "docker.io"
+      PROMOTED+=( "${DOCKERHUB_IMAGE[$img]}" )
+    done
   fi
+
+  # The checks above run with the maintainer's registry credentials, so they
+  # pass on a private repository. GHCR creates a package private on its first
+  # push, and a private package leaves every advertised `docker pull` denied.
+  # An empty docker config makes this lookup anonymous, as a user's would be.
+  echo "==> Checking every promoted repository is publicly pullable"
+  ANON_CONFIG=$(mktemp -d)
+  private=()
+  for target in "${PROMOTED[@]}"; do
+    DOCKER_CONFIG="$ANON_CONFIG" docker buildx imagetools inspect \
+      "${target}:${PROMOTE_TAGS[0]}" >/dev/null 2>&1 || private+=( "$target" )
+  done
+  rm -rf "$ANON_CONFIG"
+  (( ${#private[@]} == 0 )) || die \
+    "these repositories are not pullable without credentials:
+$(printf '  %s\n' "${private[@]}")
+Make each one public (GHCR: the package's settings page, Change visibility),
+then re-run this script. Their tags ALREADY serve an unpublished release."
 fi
 
 echo "==> Publishing $TAG"
+if [[ -n "$SKIP_IMAGE_TAGS" ]]; then
+  PROMOTED_NOTE="no image tag was promoted"
+else
+  PROMOTED_NOTE="the image tags on $(printf '%s ' "${PROMOTED[@]}")already serve it"
+fi
 gh release edit "$TAG" --repo "$REPO" --draft=false || die \
-  "signatures are uploaded and the image tags are promoted on every registry,
-but the release is STILL A DRAFT — :latest now serves an unpublished release.
+  "signatures are uploaded, but the release is STILL A DRAFT; ${PROMOTED_NOTE}.
 Re-run this script, or publish manually:
 gh release edit $TAG --repo $REPO --draft=false"
 
