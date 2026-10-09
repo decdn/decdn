@@ -3376,6 +3376,10 @@ where
     // one carries any refill its build made); a funding recovery step
     // publishes the new value.
     let (deposit_tx, mut deposit_rx) = tokio::sync::watch::channel(U256::ZERO);
+    // The recovery steps that topped up or settled, as this loop last saw
+    // them: a later one a sibling entry takes answers this loop's exhausted
+    // set too.
+    let mut top_ups_seen = env.recovery.top_ups();
     // Every started lane's `(ctx, ledger)`: the pool-wide view when there is no
     // run registry.
     let pool_lanes: Mutex<PoolLanes> = Mutex::new(Vec::new());
@@ -3858,11 +3862,15 @@ where
                             }
                         }
                     }
+                    // A sibling entry may have priced a shared source out
+                    // at a deposit above this loop's view of it.
+                    let seen = sources.priced_out_at(deposit);
                     let stepped = env
                         .recovery
                         .step(
                             env.funder,
-                            deposit,
+                            seen,
+                            &mut top_ups_seen,
                             || pool_deposit(&deposit_rx, &started.0),
                             spent(),
                         )
@@ -3870,7 +3878,8 @@ where
                     let raised = after_step(stepped, err)?;
                     if raised > deposit {
                         credit(raised)?;
-                    } else {
+                    }
+                    if raised <= seen {
                         // A step that settles leaves the deposit where it is:
                         // the pool already held it, and the sources' refusals
                         // were their stale view of it. Ask them again; the

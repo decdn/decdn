@@ -1970,7 +1970,13 @@ pub(super) async fn node_step(
     // The node's step sizes itself from its pool row, so the spend it is
     // handed is not read.
     let current = || deps.buyer.pool_deposit().unwrap_or(seen);
-    match gate.step(&funder, seen, current, U256::ZERO).await {
+    // One fill runs its steps one after another, so it has seen every top-up
+    // its gate took; a sibling fill's step reaches it through the pool row.
+    let mut top_ups = gate.top_ups();
+    match gate
+        .step(&funder, seen, &mut top_ups, current, U256::ZERO)
+        .await
+    {
         Stepped::Raised(deposit) => Ok(deposit),
         Stepped::Replaced(replaced) => {
             info!(

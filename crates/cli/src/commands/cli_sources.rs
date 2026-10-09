@@ -8,7 +8,7 @@
 //! the next run's fast path reads.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::Address;
@@ -94,8 +94,6 @@ pub(crate) struct CliSources<'a, P> {
     /// The lane that answered the first open, handed to the fetch's first
     /// `connect` for its provider.
     parked: Mutex<HashMap<Address, StreamCandidate<PeerSource<'a>>>>,
-    /// The pool the first built lane pays from.
-    pool_id: OnceLock<PoolId>,
     /// The size hint of the last probe that gave one
     /// ([`ResolvedTargets::size_hint`]): the fetch's first claim.
     size_hint: Mutex<Option<u64>>,
@@ -138,7 +136,6 @@ where
             peer_store: decdn_client::PeerStore::open(&deps.chain.data_dir),
             handles: Mutex::new(Vec::new()),
             parked: Mutex::new(HashMap::new()),
-            pool_id: OnceLock::new(),
             size_hint: Mutex::new(None),
             late: Mutex::new(None),
         }
@@ -171,7 +168,7 @@ where
     }
 
     /// The funder a fetch over these sources runs its funding recovery step
-    /// through: the pool the first built lane pays from. A delegated fetch has
+    /// through: the pool the run's first built lane pays from. A delegated fetch has
     /// a zero working deposit, so its step has no funding path.
     pub(crate) fn funder(&self) -> CliFunder<'_, P> {
         CliFunder {
@@ -181,7 +178,6 @@ where
             owner: self.deps.self_address,
             signer: self.signer,
             deployment: self.deps.chain.deployment(),
-            pool_id: &self.pool_id,
             token: self.deps.token,
             payment_pool_addr: self.deps.chain.payment_pool,
             working_deposit: self.deps.chain.working_deposit,
@@ -364,7 +360,7 @@ where
         if self.grant.is_some() {
             return fetch::annotate_delegated_exhaustion(err);
         }
-        with_top_up_hint(err, self.pool_id.get().copied())
+        with_top_up_hint(err, self.deps.funding.pool_id())
     }
 
     /// File a lane's first answer in the peer store: its quoted rate, with the
@@ -445,7 +441,7 @@ where
             self.ledgers,
         )
         .await?;
-        let _ = self.pool_id.set(lane.pool_id);
+        self.deps.funding.note_pool(lane.pool_id);
         self.handles
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

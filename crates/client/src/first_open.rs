@@ -121,6 +121,9 @@ where
 {
     // The pool deposit the built lanes report, ZERO before any lane exists.
     let mut deposit = U256::ZERO;
+    // The recovery steps that topped up or settled, as this open last saw
+    // them ([`RecoveryGate::step`]).
+    let mut top_ups_seen = gate.top_ups();
     let mut delegate = Delegate::new(credentials);
     // Sources a transient `open` error holds off, until the instant given.
     let mut held_off: HashMap<Address, Instant> = HashMap::new();
@@ -154,7 +157,8 @@ where
             // A delegated fetch waits for a swapped credential, as
             // [`crate::acquire`] does.
             if let Some(err) = delegate.step(sources, gate, err).await? {
-                deposit = owner_step(sources, funder, gate, deposit, err).await?;
+                deposit =
+                    owner_step(sources, funder, gate, deposit, &mut top_ups_seen, err).await?;
             }
             continue;
         }
@@ -225,7 +229,9 @@ where
 
 /// The first open's recovery step for a pool owner at the exhausted set
 /// `exhausted`: a top-up, a replacement, or a settle, through `funder` under
-/// `gate`. Returns the deposit the open asks the sources again at.
+/// `gate`. `top_ups_seen` is the open's count of the gate's top-ups, which
+/// the step brings up to date. Returns the deposit the open asks the sources
+/// again at.
 ///
 /// # Errors
 ///
@@ -235,6 +241,7 @@ async fn owner_step<P, F>(
     funder: &F,
     gate: &RecoveryGate,
     deposit: U256,
+    top_ups_seen: &mut u64,
     exhausted: anyhow::Error,
 ) -> anyhow::Result<U256>
 where
@@ -247,14 +254,21 @@ where
     // The deposit now, as the lane contexts hold it: a sibling bundle entry's
     // step reaches them through the run's lane registry.
     let current = || sources.lanes_deposit();
-    let raised = after_step(gate.step(funder, deposit, current, spent).await, exhausted)?;
+    // A sibling entry may have priced a shared source out at a deposit above
+    // this open's view of it.
+    let seen = sources.priced_out_at(deposit);
+    let raised = after_step(
+        gate.step(funder, seen, top_ups_seen, current, spent).await,
+        exhausted,
+    )?;
     if raised > deposit {
         sources.credit_lanes(raised);
-        return Ok(raised);
     }
-    // A settling step: ask the priced-out sources again.
-    sources.health().clear_unaffordable();
-    Ok(deposit)
+    if raised <= seen {
+        // A settling step: ask the priced-out sources again.
+        sources.health().clear_unaffordable();
+    }
+    Ok(raised.max(deposit))
 }
 
 /// A first open's delegated credential: the slot, the generation its built

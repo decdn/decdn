@@ -870,8 +870,7 @@ async fn the_cli_funder_reads_the_run_funding() {
         spend(700, 0, false, false),
         &ledger_at(0),
     );
-    let pool_id = std::sync::OnceLock::new();
-    pool_id.set(B256::repeat_byte(0xEE)).unwrap();
+    funding.note_pool(B256::repeat_byte(0xEE));
     let funder = CliFunder {
         contract: &contract,
         rpc: &rpc,
@@ -879,7 +878,6 @@ async fn the_cli_funder_reads_the_run_funding() {
         owner: Address::repeat_byte(0x01),
         signer: &signer,
         deployment: DEPLOYMENT,
-        pool_id: &pool_id,
         token: TOKEN,
         payment_pool_addr: PP,
         working_deposit: U256::from(WORKING),
@@ -924,8 +922,7 @@ async fn step_on_a_full_pool(asserter: Asserter) -> anyhow::Result<Recovery> {
     let rpc = ProviderBuilder::new().connect_mocked_client(asserter);
     let contract = PaymentPool::new(PP, rpc.clone());
     let funding = RunFunding::default();
-    let pool_id = std::sync::OnceLock::new();
-    pool_id.set(id).unwrap();
+    funding.note_pool(id);
     let funder = CliFunder {
         contract: &contract,
         rpc: &rpc,
@@ -933,7 +930,6 @@ async fn step_on_a_full_pool(asserter: Asserter) -> anyhow::Result<Recovery> {
         owner: signer.address(),
         signer: &signer,
         deployment: DEPLOYMENT,
-        pool_id: &pool_id,
         token: TOKEN,
         payment_pool_addr: PP,
         working_deposit: U256::from(WORKING),

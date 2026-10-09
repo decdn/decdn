@@ -698,6 +698,24 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             .fold(U256::ZERO, U256::max)
     }
 
+    /// The deposit this set is exhausted at: `deposit`, or the highest deposit
+    /// a known source is priced out at when that is higher. Bundle entries
+    /// share their sources' health, so a sibling entry's lane can price a
+    /// source out at a deposit above the one this set's own lanes report, and
+    /// before this set builds a lane at all.
+    #[must_use]
+    pub(crate) fn priced_out_at(&self, deposit: U256) -> U256 {
+        self.holders
+            .iter()
+            .filter_map(|h| match self.health.health(h.provider) {
+                crate::health::Health::Unaffordable { at_deposit } => Some(at_deposit),
+                crate::health::Health::Healthy { .. } | crate::health::Health::Cooling { .. } => {
+                    None
+                }
+            })
+            .fold(deposit, U256::max)
+    }
+
     /// Every built lane.
     #[must_use]
     pub(crate) fn built_lanes(&self) -> Vec<Arc<StreamCandidate<P::Source>>> {

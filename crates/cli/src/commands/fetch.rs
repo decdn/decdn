@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
@@ -2796,11 +2796,14 @@ fn multi_lane_watermarks(
 /// is a wallet that holds too little USDC to top the pool up: once seen, no
 /// later lane build of the run tries the proactive refill again, a funding
 /// recovery step fails without a transaction, and the command ends with one
-/// `warning:` line naming it.
+/// `warning:` line naming it. It also names the pool the run's first built
+/// lane pays from, which a funding recovery step tops up: every entry of a
+/// bundle pull shares it, the entries that have built no lane yet included.
 #[derive(Debug, Default)]
 pub(crate) struct RunFunding {
     spend: Mutex<RunSpend>,
     shortfall: Mutex<Option<String>>,
+    pool_id: OnceLock<PoolId>,
 }
 
 /// What a lane build learned about the pool's spend, for
@@ -2836,6 +2839,17 @@ struct RunSpend {
 }
 
 impl RunFunding {
+    /// Name `pool_id` as the pool the run's lanes pay from. The first lane
+    /// built names it; every later lane pays from the same pool.
+    pub(crate) fn note_pool(&self, pool_id: PoolId) {
+        let _ = self.pool_id.set(pool_id);
+    }
+
+    /// The pool the run's lanes pay from, once a lane is built.
+    pub(crate) fn pool_id(&self) -> Option<PoolId> {
+        self.pool_id.get().copied()
+    }
+
     /// Record that `lane` joins the run, paying through `ledger`.
     ///
     /// The first lane sets the baseline to its `outside`. Each later lane
@@ -2984,19 +2998,15 @@ pub(crate) struct CliFunder<'a, P> {
     pub(crate) signer: &'a Arc<PrivateKeySigner>,
     /// The chain and `PaymentPool` a replacement pool opens on.
     pub(crate) deployment: Deployment,
-    /// The pool to top up: the one the first lane a
-    /// [`super::cli_sources::CliSources`] builds opens or reuses. Every lane
-    /// pays from the one pool, and a recovery step runs only once a lane
-    /// priced its source out, so it is set by then.
-    pub(crate) pool_id: &'a std::sync::OnceLock<PoolId>,
     pub(crate) token: Address,
     pub(crate) payment_pool_addr: Address,
     /// The deposit a step tops up toward and a replacement pool opens at.
     /// Zero for a delegated signer, which has no funding path.
     pub(crate) working_deposit: U256,
     pub(crate) max_approve: bool,
-    /// The run's funding facts: its outside spend, and a wallet shortfall that
-    /// makes a further top-up pointless.
+    /// The run's funding facts: its outside spend, a wallet shortfall that
+    /// makes a further top-up pointless, and the pool to top up
+    /// ([`RunFunding::pool_id`]).
     pub(crate) funding: &'a RunFunding,
 }
 
@@ -3014,10 +3024,10 @@ where
             if self.working_deposit.is_zero() {
                 return Ok(Recovery::Unavailable);
             }
-            let pool_id =
-                self.pool_id.get().copied().ok_or_else(|| {
-                    anyhow::anyhow!("no payment lane is built, so no pool to top up")
-                })?;
+            let pool_id = self
+                .funding
+                .pool_id()
+                .ok_or_else(|| anyhow::anyhow!("no payment lane is built, so no pool to top up"))?;
             let additional = self.working_deposit.saturating_sub(remaining);
             if additional.is_zero() {
                 return self.settle_or_replace(pool_id, remaining).await;

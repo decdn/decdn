@@ -356,6 +356,72 @@ async fn a_first_open_sees_a_sibling_entrys_step() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A sibling bundle entry's lane priced source A out at `1_000`. This entry has
+/// built no lane, so its own view of the deposit is zero.
+fn priced_out_by_a_sibling() -> Arc<crate::PeerHealth> {
+    let health = Arc::new(crate::PeerHealth::default());
+    health.record(
+        A,
+        crate::Fault::Unaffordable,
+        tokio::time::Instant::now(),
+        U256::from(1_000u32),
+    );
+    health
+}
+
+/// A bundle entry that has built no lane finds its only source priced out by
+/// a sibling entry, whose step already topped the pool up. The entry takes
+/// that step as its own pass, and runs no step: the run's step is spent.
+#[tokio::test(start_paused = true)]
+async fn an_entry_with_no_lane_takes_a_siblings_top_up() -> anyhow::Result<()> {
+    let gate = RecoveryGate::new();
+    let sibling = FakeFunder::new(Recovery::ToppedUp(U256::from(2_000u32)));
+    let mut top_ups = gate.top_ups();
+    let seen = U256::from(1_000u32);
+    let _ = gate
+        .step(&sibling, seen, &mut top_ups, || seen, U256::ZERO)
+        .await;
+
+    let sources = StaticSources::new(vec![lane(0xA1)])?;
+    let mut set = SourceSet::new(
+        &sources,
+        [0; 32],
+        priced_out_by_a_sibling(),
+        sources.holders(),
+    );
+    let funder = FakeFunder::new(Recovery::Unavailable);
+    let (provider, ()) = first_open(&mut set, &policy(None), &funder, &gate, None, |_| async {
+        Ok(())
+    })
+    .await?;
+    assert_eq!(provider, A);
+    assert!(funder.calls().is_empty(), "no step of its own");
+    Ok(())
+}
+
+/// A bundle entry that has built no lane runs the run's first step at the
+/// deposit a sibling priced its source out at, not at its own zero view: the
+/// step tops up against that deposit's remainder.
+#[tokio::test(start_paused = true)]
+async fn an_entry_with_no_lane_steps_at_the_siblings_deposit() -> anyhow::Result<()> {
+    let sources = StaticSources::new(vec![lane(0xA1)])?;
+    let mut set = SourceSet::new(
+        &sources,
+        [0; 32],
+        priced_out_by_a_sibling(),
+        sources.holders(),
+    );
+    let funder = FakeFunder::new(Recovery::ToppedUp(U256::from(2_000u32)));
+    let gate = RecoveryGate::new();
+    let (provider, ()) = first_open(&mut set, &policy(None), &funder, &gate, None, |_| async {
+        Ok(())
+    })
+    .await?;
+    assert_eq!(provider, A);
+    assert_eq!(funder.calls(), vec![U256::from(1_000u32)]);
+    Ok(())
+}
+
 /// A slot holding a fresh key's capability, capped at `spending_cap`, a day
 /// from expiry, with no wait for a swap.
 fn delegate_slot(spending_cap: u64) -> crate::CredentialSlot {
