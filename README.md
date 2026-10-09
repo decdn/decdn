@@ -85,8 +85,7 @@ What you need:
   `cache.node_to_node_pull_through_enabled = true`, which is off by default. With it off,
   a cache miss the node cannot serve from its own backend returns not-found
   ([runbook](docs/runbook.md#node-to-node-pulls-never-succeed-buyer-wallet-or-pool)).
-  Circle's [testnet faucet](https://developers.circle.com/stablecoins/docs/usdc-on-testnet)
-  dispenses it.
+  Circle's [testnet faucet](https://faucet.circle.com) dispenses it.
 - **A keystore password source** for the headless daemon: `DECDN_KEYSTORE_PASSWORD` or
   `--keystore-password-file` ([runbook](docs/runbook.md#keystore-will-not-unlock)).
 
