@@ -10,7 +10,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use alloy::primitives::Address;
+use alloy_primitives::Address;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::ConnectInfo;

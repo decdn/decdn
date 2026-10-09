@@ -61,3 +61,6 @@ release.
 - **HTTPS through rustls.** reqwest 0.13 replaces OpenSSL (native-tls)
   with rustls and checks certificates with the platform verifier, so the
   binary no longer links `libssl` on Linux.
+- **Lighter dependency tree.** The onramp depends on `alloy-primitives`
+  instead of all of `alloy`, whose `Address` was the only thing it used. That
+  cuts its build from 394 crates to 201.

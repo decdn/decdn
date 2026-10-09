@@ -10,7 +10,7 @@ pub mod turnstile;
 
 use std::net::IpAddr;
 
-use alloy::primitives::Address;
+use alloy_primitives::Address;
 use async_trait::async_trait;
 
 pub use turnstile::TurnstileGate;

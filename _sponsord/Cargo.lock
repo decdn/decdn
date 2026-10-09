@@ -7566,7 +7566,7 @@ dependencies = [
 name = "sponsord-onramp"
 version = "0.1.0"
 dependencies = [
- "alloy",
+ "alloy-primitives",
  "anyhow",
  "async-trait",
  "axum",

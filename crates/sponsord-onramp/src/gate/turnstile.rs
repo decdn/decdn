@@ -2,7 +2,7 @@
 
 use std::net::IpAddr;
 
-use alloy::primitives::Address;
+use alloy_primitives::Address;
 use async_trait::async_trait;
 use serde::Deserialize;
 use sponsord_api::secret::Secret;

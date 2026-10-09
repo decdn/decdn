@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use alloy::primitives::Address;
+use alloy_primitives::Address;
 use sponsord_api::IssuedCapability;
 
 /// How long a capability stays here after it is issued. The CLI polls for

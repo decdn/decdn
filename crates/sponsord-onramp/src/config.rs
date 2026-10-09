@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use alloy::primitives::Address;
+use alloy_primitives::Address;
 use axum::http::HeaderName;
 use clap::{ArgGroup, Parser, ValueEnum};
 use sponsord_api::secret::Secret;

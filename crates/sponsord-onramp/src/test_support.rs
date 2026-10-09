@@ -14,7 +14,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use alloy::primitives::Address;
+use alloy_primitives::Address;
 use async_trait::async_trait;
 use sponsord_api::client::DaemonError;
 use sponsord_api::daemon::{Info, IssueRequest, IssueResponse};
