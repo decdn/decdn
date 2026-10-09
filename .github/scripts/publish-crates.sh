@@ -17,7 +17,7 @@
 #   DECDN_ALLOW_RATE_LIMIT set to 1 to publish more than 5 brand-new crates in
 #                          one run — only once crates.io has raised this repo's
 #                          publish-new limit (see the check below)
-#   DECDN_SKIP_SPONSORD_BUMP set to 1 to not start decdn/sponsord's bump-decdn
+#   DECDN_SKIP_SPONSORD_BUMP set to 1/true/yes to not start decdn/sponsord's bump-decdn
 #                          workflow after the upload
 #
 # Unlike sign-release.sh this is NOT freely re-runnable: a crates.io version is
@@ -31,9 +31,27 @@ VERSION="${TAG#v}"
 REPO="${DECDN_REPO:-decdn/decdn}"
 SIGNING_KEY="${DECDN_SIGNING_KEY:-}"
 ALLOW_RATE_LIMIT="${DECDN_ALLOW_RATE_LIMIT:-}"
-SKIP_SPONSORD_BUMP="${DECDN_SKIP_SPONSORD_BUMP:-}"
 
 die() { echo "error: $*" >&2; exit 1; }
+
+# `1`/`true`/`yes` enable, `0`/`false`/`no`/empty do not, anything else is a
+# typo and stops the script — the same rule as sign-release.sh. A bare
+# `[[ -n ]]` test would make DECDN_SKIP_SPONSORD_BUMP=0 mean "skip".
+enabled() {
+  local name="$1" value="${2:-}"
+  case "${value,,}" in
+    ''|0|false|no) return 1 ;;
+    1|true|yes)    return 0 ;;
+    *) die "$name must be 1/true/yes or 0/false/no, got '$value'" ;;
+  esac
+}
+
+# Parsed here, before anything is uploaded: the section that reads it runs
+# after the publish and must not exit non-zero.
+SKIP_SPONSORD_BUMP=""
+if enabled DECDN_SKIP_SPONSORD_BUMP "${DECDN_SKIP_SPONSORD_BUMP:-}"; then
+  SKIP_SPONSORD_BUMP=1
+fi
 
 # ---- preconditions -------------------------------------------------------
 
