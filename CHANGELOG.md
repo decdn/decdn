@@ -29,7 +29,7 @@ since project inception and will roll into the first tagged release.
 ### Changed (BREAKING)
 
 - **The `decdn` CLI ships as a container image, and the `decdn-node` image
-  carries it too.** A release publishes two images, built as two stages of
+  carries it too (#2398).** A release publishes two images, built as two stages of
   one `Dockerfile` from the same signed Linux archives:
   - `ghcr.io/decdn/decdn` / `decdn/decdn` (new): the CLI only, with `decdn`
     as entrypoint. Mount `~/.decdn` at `/home/decdn/.decdn`. The name was
