@@ -33,7 +33,7 @@ exclude = ["contracts"]
 # under cargo-release from then on. check_workspace_manifests.py refuses a
 # member that restates the version and an internal alias below that disagrees
 # with it, so a hand edit anywhere else fails before it ships.
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 # Three parts, not two: this string, `rust-toolchain.toml`'s channel and every
@@ -57,15 +57,15 @@ categories = ["network-programming", "web-programming"]
 # a path dependency with no version specifier, because a published crate has no
 # path to follow. Locally the `path` still wins; the version only applies to the
 # manifest cargo uploads.
-decdn-protocol = { path = "crates/protocol", version = "0.0.1" }
-decdn-config-types = { path = "crates/config-types", version = "0.0.1" }
-decdn-bao-range = { path = "crates/bao-range", version = "0.0.1" }
-decdn-cache = { path = "crates/cache", version = "0.0.1" }
-decdn-incentive = { path = "crates/incentive", version = "0.0.1" }
-decdn-reputation = { path = "crates/reputation", version = "0.0.1" }
-decdn-common = { path = "crates/common", version = "0.0.1" }
-decdn-client = { path = "crates/client", version = "0.0.1" }
-decdn-node = { path = "crates/node", version = "0.0.1" }
+decdn-protocol = { path = "crates/protocol", version = "0.0.2" }
+decdn-config-types = { path = "crates/config-types", version = "0.0.2" }
+decdn-bao-range = { path = "crates/bao-range", version = "0.0.2" }
+decdn-cache = { path = "crates/cache", version = "0.0.2" }
+decdn-incentive = { path = "crates/incentive", version = "0.0.2" }
+decdn-reputation = { path = "crates/reputation", version = "0.0.2" }
+decdn-common = { path = "crates/common", version = "0.0.2" }
+decdn-client = { path = "crates/client", version = "0.0.2" }
+decdn-node = { path = "crates/node", version = "0.0.2" }
 # No `decdn-cli` entry: it is a bin crate and a workspace *member*, but nothing
 # in the workspace depends on it, so it needs no `[workspace.dependencies]`
 # alias. Add one back only alongside a real dependant.
