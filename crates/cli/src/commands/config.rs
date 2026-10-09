@@ -1044,7 +1044,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [payment]
 # rate_per_mb = 10
-# credit_max = 67108864                    # downstream credit-window ceiling in bytes (ADR 003 §Credit window); the window ramps toward this cap as the stream pays; default 64 MiB; floored at one chunk (1 MiB)
+# credit_max = 67108864                    # downstream credit-window ceiling in bytes (ADR 003 §Credit window); the window ramps toward this cap as the stream pays; default 64 MiB; floored at one chunk plus one chunk group (1 MiB + 16 KiB)
 # credit_ramp_divisor = 2                  # ramp divisor (ADR 003 §Credit window); window is paid/credit_ramp_divisor, capped at credit_max; 0 opens the full ceiling immediately
 # frame_target_bytes = 1048576              # serve-path wire-frame target in bytes (ADR 005 §cdn/client/v1); node-local, never negotiated; clamped down to the credit window's remaining room; must be in 1..=1048576 (one payment chunk); default 1 MiB
 # voucher_commit_interval_ms = 5000        # background flush period (ms) for durable voucher persistence (ADR 003); must be > 0; default 5000 (5s)

@@ -23,6 +23,7 @@ use super::{
     WatermarkBundle, verify_rate, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_incentive::{PoolError, VoucherError};
+use std::collections::VecDeque;
 
 /// One stream's hash-chain anchor: the `chain_root` it has been told about
 /// (ADR 003 §Concurrent Streams, Rule 1).
@@ -213,13 +214,35 @@ impl OwedChunk {
     }
 }
 
+/// Take the next owed chunk the payer can pay for now, or `None` when there is
+/// none.
+///
+/// The payer pays only for bytes it has verified, and it verifies a chunk's last
+/// byte only with the whole bao leaf that holds it. That leaf can run up to
+/// [`decdn_client::VERIFY_LAG_BYTES`] past the chunk's end. So the newest owed
+/// chunk is payable only once that many bytes have gone out after it, or once
+/// the whole range is on the wire. Every older chunk has a whole chunk after it.
+/// A recoup phase that waited on the newest chunk before then would wait for a
+/// proof the payer cannot send. The credit window's floor of one chunk plus
+/// that lag keeps a payable chunk at the front whenever the window is shut.
+pub(super) fn pop_payable(
+    pending: &mut VecDeque<OwedChunk>,
+    unvouchered: u64,
+    done_delivering: bool,
+) -> Option<OwedChunk> {
+    let payable =
+        pending.len() > 1 || unvouchered >= decdn_client::VERIFY_LAG_BYTES || done_delivering;
+    if payable { pending.pop_front() } else { None }
+}
+
 /// Check the serve loop's byte accounting after a recoup phase.
 ///
-/// The recoup phase pays every owed chunk before it returns, so the only unpaid
-/// bytes left are the ones not yet cut into a chunk: `delivered − paid` must equal
-/// `unvouchered`. A mismatch is a node accounting fault. A shortfall would let the
-/// stream end with bytes nobody paid for, or fill the credit window with nothing
-/// left to collect. An excess would let `paid` run ahead of `delivered`.
+/// The recoup phase pays every payable owed chunk before it returns
+/// ([`pop_payable`]), so the only unpaid bytes left are the chunks it holds back
+/// and the bytes not yet cut into a chunk: `delivered − paid` must equal their
+/// sum. A mismatch is a node accounting fault. A shortfall would let the stream
+/// end with bytes nobody paid for, or fill the credit window with nothing left to
+/// collect. An excess would let `paid` run ahead of `delivered`.
 ///
 /// # Errors
 ///
@@ -228,13 +251,15 @@ pub(super) fn ensure_unpaid_bytes_tracked(
     delivered: u64,
     paid: u64,
     unvouchered: u64,
+    pending: &VecDeque<OwedChunk>,
 ) -> anyhow::Result<()> {
-    if delivered.checked_sub(paid) == Some(unvouchered) {
+    let held: u64 = pending.iter().map(|owed| owed.remaining()).sum();
+    if delivered.checked_sub(paid) == Some(unvouchered.saturating_add(held)) {
         Ok(())
     } else {
         Err(anyhow::anyhow!(
             "serve accounting broke: {delivered} bytes delivered, {paid} paid, \
-             {unvouchered} not yet cut into a chunk"
+             {held} held in owed chunks, {unvouchered} not yet cut into a chunk"
         ))
     }
 }

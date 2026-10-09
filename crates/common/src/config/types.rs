@@ -305,8 +305,9 @@ pub struct BlockchainConfig {
     /// (ADR 003 § Pool solvency, per-signer floor isolation): the most live
     /// un-vouchered floor reservation any ONE capability signer may hold against a
     /// pool, `k · one credit window`, underneath the pool-wide `remaining − M`
-    /// ceiling. The credit window is one chunk normally, and at
-    /// `credit_ramp_divisor == 0` it is `credit_max` raised to one chunk.
+    /// ceiling. The credit window is its floor (one chunk plus one chunk group)
+    /// normally, and at `credit_ramp_divisor == 0` it is `credit_max` raised to
+    /// that floor.
     ///
     /// This bounds concurrency, not paid throughput: a signer that pays its vouchers
     /// releases that stream's reservation, so its cap recycles and a stream already
@@ -922,7 +923,7 @@ pub struct PaymentConfig {
     /// contract holds a delivery-cadence value.
     pub credit_max: Option<decdn_config_types::Bytes>,
     /// Ramp divisor for the credit window (ADR 003 §Credit window): the window is
-    /// `paid / credit_ramp_divisor`, floored at one chunk and capped at
+    /// `paid / credit_ramp_divisor`, floored at one chunk plus one chunk group and capped at
     /// [`Self::credit_max`]. Absent => [`crate::config::DEFAULT_CREDIT_RAMP_DIVISOR`]
     /// (2). `0` opens the full ceiling immediately, reproducing the flat-window
     /// behavior. It is node-local config, not a governance-owned parameter.

@@ -52,6 +52,8 @@ The receiver feeds the stream to a bao verifying decoder as it arrives. A corrup
 
 Paid bytes are the bytes on the wire — content data **plus** interleaved proof nodes. The proof is real bandwidth the operator serves, and metering the raw stream keeps payment a single byte count. Excluding proof bytes would force payer and node to agree on how many proof bytes were interleaved — a dispute surface for a `~0.4%` overhead (one 64-byte node per 16 KiB group ≈ 1/256 of content). The delivered byte count is adopted.
 
+The payer pays only for wire bytes its decoder has verified against the root. The decoder checks each parent pair and each leaf before it reads the next item, so payment follows verification by at most one leaf (one chunk group). A byte that fails verification, or that arrives past the point where the payer stops a stream, is never paid for. The node's credit window floor carries that one-group lag ([ADR 003 § Credit Window](003-payments.md#credit-window)).
+
 ### Scope boundary
 
 This ADR specifies **verification only** — that any range is independently checkable against the content address. The **multi-source fetch scheduler** (range splitting across peers, concurrency and reassembly, deadline-based re-dispatch, voucher accounting across sources) is a separate, larger subsystem in [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1). Verified ranges are its safety prerequisite but are independently valuable, since they also close the resumed-tail gap on the single-source path.

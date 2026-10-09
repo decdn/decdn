@@ -8,7 +8,7 @@
 //! and the pull leg's `RampPacer` uses it directly against its content
 //! frontiers. A new stream takes the whole pool as a [`RampCarry`], so a payer
 //! that pulls many ranges back to back keeps its ramp instead of starting each
-//! request at the one-chunk floor.
+//! request at the floor.
 //!
 //! Only a stream that ends fully paid returns credit: its carry plus the content
 //! of its request, just before its `StreamEnd`. A stream that ends any other

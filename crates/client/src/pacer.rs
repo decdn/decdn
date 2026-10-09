@@ -25,13 +25,14 @@ use decdn_protocol::client::CHUNK_BYTES;
 /// WIRE by flooring to a chunk-group boundary; [`WindowPacer`] then floors its own
 /// room to whole groups. Two group-sized roundings therefore sit between what the
 /// client has paid for and what the pull may fetch next, while the client releases
-/// its next proof only once a whole [`CHUNK_BYTES`] of WIRE has arrived.
+/// its next proof only once a whole [`CHUNK_BYTES`] of WIRE has verified, which
+/// takes up to [`VERIFY_LAG_BYTES`] more past the chunk.
 ///
 /// A window of exactly one chunk loses more to those roundings than the wire's
 /// interleaved proof bytes hand back, so the pull parks with the client short of
-/// the chunk it must complete to pay — a payment that can then never come. Carrying
-/// both roundings on top of the chunk closes that gap at every window size, because
-/// the ramp only ever widens the window above this floor.
+/// the chunk it must verify to pay — a payment that can then never come. Carrying
+/// the verify lag and both roundings on top of the chunk closes that gap at every
+/// window size, because the ramp only ever widens the window above this floor.
 ///
 /// A **third** group covers the serving node's prefetch. A serve leg reads one frame
 /// ahead of its own credit-window check, so once that window shuts it still asks its
@@ -45,7 +46,15 @@ use decdn_protocol::client::CHUNK_BYTES;
 /// the serve leg ramps on paid wire, this pacer on the smaller paid content
 /// frontier. There, liveness rests on [`DownstreamFrontier::serve_demand`], which
 /// lets the pull fetch one more floor when a serve leg is parked at its frontier.
-pub const PULL_WINDOW_FLOOR: u64 = CHUNK_BYTES + 3 * CHUNK_GROUP_BYTES;
+pub const PULL_WINDOW_FLOOR: u64 = CHUNK_BYTES + VERIFY_LAG_BYTES + 3 * CHUNK_GROUP_BYTES;
+
+/// The most wire bytes a payer receives past a chunk boundary before it has
+/// verified that boundary and pays for the chunk: one bao chunk group, the
+/// largest item (a leaf) the decoder checks in one step. A payer pays only for
+/// verified bytes, so the node's credit window floors at one chunk plus this
+/// lag (ADR 003 § Credit Window): a stream at the floor then delivers the leaf
+/// that straddles the boundary, and the payer can verify it and pay.
+pub const VERIFY_LAG_BYTES: u64 = CHUNK_GROUP_BYTES;
 
 /// The node's downstream content frontiers the pull leg paces against (ADR
 /// 037): what the downstream client has paid for, and how far the serve leg waits

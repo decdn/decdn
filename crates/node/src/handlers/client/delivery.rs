@@ -12,7 +12,7 @@ use super::outcome::{ServeEnd, ServeStop};
 use super::proof_wait::ChunkProofs;
 use super::ramp::RampCarry;
 use super::serve_waits::{ServeWaits, Wait};
-use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked};
+use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked, pop_payable};
 use super::wire::{FrameAccountingFault, FrameChunks, FrameQueue};
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, Connection,
@@ -477,8 +477,9 @@ impl ClientHandler {
             // watermark by a sliver. Hence the loop reads proofs for a chunk until
             // they have credited all of it, and `MAX_PROOFS_PER_CHUNK` bounds how
             // many proofs a payer may send without settling it.
-            let collected_any = !pending.is_empty();
-            while let Some(mut owed) = pending.pop_front() {
+            let mut collected_any = false;
+            while let Some(mut owed) = pop_payable(&mut pending, unvouchered, done_delivering) {
+                collected_any = true;
                 // One proof budget and one proof-wait ceiling for every proof
                 // this chunk takes.
                 let mut proofs = ChunkProofs::start();
@@ -557,7 +558,7 @@ impl ClientHandler {
                     }
                 }
             }
-            ensure_unpaid_bytes_tracked(delivered, *paid, unvouchered)?;
+            ensure_unpaid_bytes_tracked(delivered, *paid, unvouchered, &pending)?;
 
             // Reconcile the pool floor reservation against this stream's live
             // balance (ADR 003 §Pool solvency). `paid` and `delivered` are BYTE

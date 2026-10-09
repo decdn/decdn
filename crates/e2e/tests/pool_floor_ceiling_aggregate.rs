@@ -92,7 +92,7 @@ use decdn_e2e::client::ClientFixture;
 use decdn_e2e::node::NodeFixture;
 use decdn_incentive::buyer_pool::BuyerPoolState;
 use decdn_incentive::payment_pool::PaymentPool;
-use decdn_incentive::{Capability, Deployment, SignedCapability, bind_node_id_domain, floor_micro};
+use decdn_incentive::{Capability, Deployment, SignedCapability, bind_node_id_domain, min_payment};
 use decdn_protocol::client::{
     CHUNK_BYTES, ClientMessage, StreamError, StreamRequestExt, WireCapability,
 };
@@ -172,13 +172,16 @@ async fn pool_ceiling_bounds_aggregate_live_reservation_across_distinct_signers(
 /// The pool deposit: `M` plus exactly [`HELD_STREAMS`] one-window floors, so
 /// `remaining − M` covers precisely the held set and the very next window
 /// overflows it. `M` = [`DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC`] (1 USDC),
-/// never overridden. One window at [`RATE_PER_MB`] is `floor_micro(RATE_PER_MB)`
-/// (`credit_window(CHUNK_BYTES, 0) == CHUNK_BYTES` at ramp start, priced per MB),
-/// which is exactly what a fresh held stream reserves — so this arithmetic is in
-/// the same unit the node's floor accumulator counts in.
+/// never overridden. One window at [`RATE_PER_MB`] is the credit-window floor,
+/// `CHUNK_BYTES + VERIFY_LAG_BYTES` at ramp start, priced per MB, which is
+/// exactly what a fresh held stream reserves — so this arithmetic is in the
+/// same unit the node's floor accumulator counts in.
 fn deposit_micro_usdc() -> U256 {
     let m = U256::from(DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC);
-    let one_window = floor_micro(RATE_PER_MB);
+    let one_window = min_payment(
+        decdn_protocol::client::CHUNK_BYTES + decdn_client::VERIFY_LAG_BYTES,
+        RATE_PER_MB,
+    );
     m + one_window * U256::from(HELD_STREAMS)
 }
 

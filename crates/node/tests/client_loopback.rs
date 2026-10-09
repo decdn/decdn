@@ -53,8 +53,8 @@ use decdn_cache::{
 use decdn_client::{
     BlobTooLarge, Cumulative, HashMismatch, PoolContext, PoolLedger, PullDeadlines,
     RateAboveCeiling, UpstreamVoucherRejected, VoucherProgress, WarmConnection,
-    open_progressive_pull, sign_client_binding, stream_fetch, stream_fetch_on, stream_fetch_shared,
-    stream_fetch_tracked, stream_fetch_tracked_with_progress,
+    sign_client_binding, stream_fetch, stream_fetch_on, stream_fetch_shared, stream_fetch_tracked,
+    stream_fetch_tracked_with_progress,
 };
 use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore, Voucher,
@@ -927,11 +927,21 @@ fn assert_one_completed_inbound_stream(metrics: &Metrics, vouchers: u64) -> anyh
 /// One voucher accounting interval — [`decdn_protocol::client::CHUNK_BYTES`].
 const HARNESS_INTERVAL_BYTES: u64 = decdn_protocol::client::CHUNK_BYTES;
 
+/// The payer's verify lag ([`decdn_client::VERIFY_LAG_BYTES`]): the wire bytes
+/// past an interval boundary it must receive before it can verify, and so pay
+/// for, the interval.
+const HARNESS_LAG_BYTES: u64 = decdn_client::VERIFY_LAG_BYTES;
+
+/// The node's credit-window floor: one interval plus the payer's verify lag. An
+/// unpaid stream receives exactly this much and parks; each whole interval paid
+/// at the floor reopens exactly one more interval.
+const HARNESS_FLOOR_BYTES: u64 = HARNESS_INTERVAL_BYTES + HARNESS_LAG_BYTES;
+
 /// Spin up a serving `ClientHandler` with an explicit downstream credit-window
 /// ceiling and ramp divisor (ADR 003 §Credit window, #1669). The effective
 /// window at any point is `ramped_credit_window(credit_ramp_divisor,
-/// interval, credit_max, paid)`: at `paid = 0` a non-zero divisor floors the
-/// window to one interval (stop-and-wait), while `credit_ramp_divisor = 0`
+/// floor, credit_max, paid)`: at `paid = 0` a non-zero divisor floors the
+/// window to [`HARNESS_FLOOR_BYTES`] (stop-and-wait), while `credit_ramp_divisor = 0`
 /// opens the full `credit_max` immediately regardless of payment.
 async fn spawn_pipelined_server(
     cache: CacheEngine,
@@ -1197,7 +1207,8 @@ async fn expect_reject(recv: &mut RecvStream, expected: VoucherRejectReason) -> 
 
 /// A serve's first frame is small, so the first byte leaves after a few chunk
 /// groups rather than a whole interval. The frames after it still fill the
-/// interval exactly, and the node parks for its voucher at the same boundary.
+/// window floor exactly, and the node parks for its voucher at the same
+/// boundary.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_first_frame_is_small_and_the_interval_still_ends_on_its_boundary() -> anyhow::Result<()>
 {
@@ -1229,7 +1240,7 @@ async fn the_first_frame_is_small_and_the_interval_still_ends_on_its_boundary() 
         first_len <= FIRST_FRAME_MAX,
         "the first frame carries {first_len} bytes, over {FIRST_FRAME_MAX}"
     );
-    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES - first_len).await?;
+    read_exact_chunks(&mut recv, HARNESS_FLOOR_BYTES - first_len).await?;
     assert_parked_awaiting_voucher(&mut recv).await?;
 
     conn.close(0u32.into(), b"done");
@@ -1260,8 +1271,9 @@ async fn a_released_preimage_pays_for_a_chunk_and_resumes_delivery() -> anyhow::
     let ext = binding_ext(&signer, client_node_id)?;
     let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
 
-    // One chunk delivered against the ramp floor, then the node parks.
-    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+    // One chunk and the verify lag delivered against the ramp floor, then the
+    // node parks.
+    read_exact_chunks(&mut recv, HARNESS_FLOOR_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv).await?;
 
     // Anchor this stream to the chain, then pay the delivered chunk with a
@@ -1587,8 +1599,8 @@ async fn two_streams_on_one_lane_converge_on_the_deepest_index() -> anyhow::Resu
 
     let (mut send_a, mut recv_a) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
     let (mut send_b, mut recv_b) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
-    read_exact_chunks(&mut recv_a, HARNESS_INTERVAL_BYTES).await?;
-    read_exact_chunks(&mut recv_b, HARNESS_INTERVAL_BYTES).await?;
+    read_exact_chunks(&mut recv_a, HARNESS_FLOOR_BYTES).await?;
+    read_exact_chunks(&mut recv_b, HARNESS_FLOOR_BYTES).await?;
 
     // Each stream anchors ITSELF to the epoch — a sibling having done so is not
     // enough, because a bare reveal is placed against the stream it arrives on.
@@ -1620,9 +1632,18 @@ async fn two_streams_on_one_lane_converge_on_the_deepest_index() -> anyhow::Resu
     release(&mut send_b, 5).await?;
     read_exact_chunks(&mut recv_b, HARNESS_INTERVAL_BYTES).await?;
 
-    let lane = store
-        .get(lane_key(signer.address()))?
-        .ok_or_else(|| anyhow::anyhow!("lane row missing"))?;
+    // The node reads B's queued reveals one owed chunk at a time, so index 5
+    // lands a recoup phase after the chunk just read. Wait for it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let lane = loop {
+        let lane = store
+            .get(lane_key(signer.address()))?
+            .ok_or_else(|| anyhow::anyhow!("lane row missing"))?;
+        if lane.chain().verified_index >= 5 || Instant::now() >= deadline {
+            break lane;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     anyhow::ensure!(
         lane.chain().verified_index == 5,
         "the lane converges on the deepest index proved, got {}",
@@ -1677,8 +1698,8 @@ async fn a_below_frontier_reveal_is_credited_from_lane_headroom() -> anyhow::Res
 
     let (mut send_a, mut recv_a) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
     let (mut send_b, mut recv_b) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
-    read_exact_chunks(&mut recv_a, HARNESS_INTERVAL_BYTES).await?;
-    read_exact_chunks(&mut recv_b, HARNESS_INTERVAL_BYTES).await?;
+    read_exact_chunks(&mut recv_a, HARNESS_FLOOR_BYTES).await?;
+    read_exact_chunks(&mut recv_b, HARNESS_FLOOR_BYTES).await?;
 
     // The fast sibling anchors and pays its delivered chunk with a DEEP index,
     // advancing the lane frontier to 5. Reading its next chunk confirms the
@@ -1776,8 +1797,8 @@ async fn a_sibling_roll_does_not_take_a_retired_reveals_credit() -> anyhow::Resu
 
     let (mut send_x, mut recv_x) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
     let (mut send_y, mut recv_y) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
-    read_exact_chunks(&mut recv_x, HARNESS_INTERVAL_BYTES).await?;
-    read_exact_chunks(&mut recv_y, HARNESS_INTERVAL_BYTES).await?;
+    read_exact_chunks(&mut recv_x, HARNESS_FLOOR_BYTES).await?;
+    read_exact_chunks(&mut recv_y, HARNESS_FLOOR_BYTES).await?;
 
     // X anchors the first chain and pays its chunk with index 1.
     open_chain(
@@ -1867,8 +1888,8 @@ async fn a_sibling_roll_does_not_take_a_retired_reveals_credit() -> anyhow::Resu
 }
 
 /// #1669: with the ramp enabled (a non-zero `credit_ramp_divisor`), a stream that
-/// has paid nothing is served only the floor — one chunk — and then
-/// parks, exactly the pre-ramp stop-and-wait cadence. `credit_max` being large
+/// has paid nothing is served only the floor (one chunk plus the payer's verify
+/// lag) and then parks: the stop-and-wait cadence. `credit_max` being large
 /// makes no difference at `paid = 0`: the window is `ramped_credit_window`
 /// clamped to the floor until payment clears it.
 #[tokio::test(flavor = "multi_thread")]
@@ -1890,8 +1911,8 @@ async fn unpaid_stream_is_served_only_the_floor_then_pauses() -> anyhow::Result<
     let client_node_id = B256::from(*client_ep.id().as_bytes());
     let ext = binding_ext(&signer, client_node_id)?;
     let (_send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
-    // Exactly one interval — the ramp floor — then a park.
-    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+    // Exactly the ramp floor, then a park.
+    read_exact_chunks(&mut recv, HARNESS_FLOOR_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv).await?;
 
     conn.close(0u32.into(), b"done");
@@ -1901,11 +1922,12 @@ async fn unpaid_stream_is_served_only_the_floor_then_pauses() -> anyhow::Result<
 
 /// #1669: as cumulative `paid` advances, the window ramps past the floor once
 /// `paid` clears `credit_ramp_divisor * floor`. With `credit_ramp_divisor = 1`
-/// the window equals `paid`: after the first interval is paid the window is
-/// still pinned at the floor (`paid == floor`, not yet exceeding it), but after
-/// the SECOND interval is paid (`paid == 2 * floor`) the window doubles, and the
-/// server delivers two further intervals in one pass instead of one before it
-/// parks again — the observable widening this test asserts.
+/// the window is `max(paid, floor)`, where the floor is one interval plus the
+/// verify lag: after the first interval is paid the window is still pinned at
+/// the floor (`paid` is below it), so the server delivers one further interval.
+/// After the SECOND interval is paid the window is `paid`, two intervals, and
+/// the server delivers nearly two further intervals in one pass before it parks
+/// again: the observable widening this test asserts.
 #[tokio::test(flavor = "multi_thread")]
 async fn paying_grows_the_window_to_paid_over_divisor() -> anyhow::Result<()> {
     const CREDIT_MAX: u64 = 64 * 1024 * 1024;
@@ -1927,20 +1949,20 @@ async fn paying_grows_the_window_to_paid_over_divisor() -> anyhow::Result<()> {
     let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
 
     // Round 1: floor only (paid == 0 during this delivery pass).
-    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+    read_exact_chunks(&mut recv, HARNESS_FLOOR_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv).await?;
     pay_cumulative(&mut send, &signer, HARNESS_INTERVAL_BYTES).await?;
 
-    // Round 2: still floor-width — `paid == 1 * floor` does not yet exceed the
-    // floor at divisor 1.
+    // Round 2: still floor-width. `paid` is one interval, below the floor at
+    // divisor 1, so one more interval goes out.
     read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv).await?;
     pay_cumulative(&mut send, &signer, 2 * HARNESS_INTERVAL_BYTES).await?;
 
-    // Round 3: `paid == 2 * floor` now exceeds the floor, so the window is
-    // `paid / 1 == 2 * floor` — the server delivers TWO intervals in this pass
-    // before parking again, the widened window.
-    read_exact_chunks(&mut recv, 2 * HARNESS_INTERVAL_BYTES).await?;
+    // Round 3: `paid` is two intervals, past the floor, so the window is
+    // `paid / 1`. The server fills it from the floor's lag up to two intervals
+    // past `paid` in this pass before parking again: the widened window.
+    read_exact_chunks(&mut recv, 2 * HARNESS_INTERVAL_BYTES - HARNESS_LAG_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv).await?;
 
     conn.close(0u32.into(), b"done");
@@ -2011,11 +2033,11 @@ async fn read_unpaid_opening(
 
 /// #2168: a stream that ends fully paid returns its paid content to its lane's
 /// ramp-credit pool, so the payer's next request on the lane opens at the
-/// window the first one earned instead of at the one-interval floor (ADR 003
-/// §Credit window). Stream 1 pays for a 4 MiB range to its `StreamEnd`.
-/// Stream 2 then asks for the whole blob and pays nothing: at divisor 1 it
-/// still receives about 4 MiB before it parks, where a fresh lane receives one
-/// interval (`unpaid_stream_is_served_only_the_floor_then_pauses`).
+/// window the first one earned instead of at the floor (ADR 003 §Credit
+/// window). Stream 1 pays for a 4 MiB range to its `StreamEnd`. Stream 2 then
+/// asks for the whole blob and pays nothing: at divisor 1 it still receives
+/// about 4 MiB before it parks, where a fresh lane receives the floor
+/// (`unpaid_stream_is_served_only_the_floor_then_pauses`).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_back_to_back_stream_opens_at_the_lanes_banked_ramp() -> anyhow::Result<()> {
     const CREDIT_MAX: u64 = 64 * 1024 * 1024;
@@ -2058,7 +2080,7 @@ async fn a_back_to_back_stream_opens_at_the_lanes_banked_ramp() -> anyhow::Resul
 /// #2168: a stream that ends unpaid forfeits the ramp credit it carried, so a
 /// payer that paid once cannot open a wide window on stream after stream it
 /// abandons. Stream 2 opens at the banked window and walks away unpaid; stream 3
-/// then opens at the one-interval floor.
+/// then opens at the floor.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_abandoned_stream_forfeits_its_lanes_ramp() -> anyhow::Result<()> {
     const CREDIT_MAX: u64 = 64 * 1024 * 1024;
@@ -2102,8 +2124,8 @@ async fn an_abandoned_stream_forfeits_its_lanes_ramp() -> anyhow::Result<()> {
 
     let (unpaid, _send, _recv) = read_unpaid_opening(&conn, *hash.as_bytes(), &ext).await?;
     anyhow::ensure!(
-        unpaid == HARNESS_INTERVAL_BYTES,
-        "stream 3 received {unpaid} unpaid wire bytes; the forfeited lane opens at one interval"
+        unpaid == HARNESS_FLOOR_BYTES,
+        "stream 3 received {unpaid} unpaid wire bytes; the forfeited lane opens at the floor"
     );
 
     conn.close(0u32.into(), b"done");
@@ -4392,7 +4414,7 @@ async fn client_reused_channel_resumes() -> anyhow::Result<()> {
 /// The node must hand back its authoritative watermark (a `WatermarkBundle` on a
 /// gated rejection) so the client can reseed and resume; otherwise every proof
 /// is stale and credits nothing, the credit window stays pinned at its
-/// one-chunk floor, and the stream wedges after ~1 chunk.
+/// floor, and the stream wedges after ~1 chunk.
 ///
 /// The blob is 3 MiB — above the 1 MiB (`CHUNK_BYTES`) credit floor — so delivery
 /// must cross the window and demand a payment-advancing voucher the stale client
@@ -5401,10 +5423,10 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
 /// `RATE_PER_MB`.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()> {
-    // 6 MiB — larger than one credit window (the ramp floor, one chunk).
+    // 6 MiB: larger than one credit window (the ramp floor).
     let payload = vec![0xABu8; 6 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let window_cost = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
+    let window_cost = min_payment(HARNESS_FLOOR_BYTES, RATE_PER_MB);
     let deposit = window_cost.saturating_sub(U256::from(1u64));
 
     let signer = Arc::new(PrivateKeySigner::random());
@@ -5550,14 +5572,14 @@ async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Re
 }
 
 /// #1669: with the ramp enabled (a non-zero `credit_ramp_divisor`), the gate
-/// prices at `paid = 0` — the floor, one chunk — not the fully-ramped
+/// prices at `paid = 0` (the floor, [`HARNESS_FLOOR_BYTES`]), not the fully-ramped
 /// `credit_max` ceiling. A deposit that covers exactly the floor's cost clears
 /// the gate even though `credit_max` is configured far larger: unlike the
 /// flat window (a zero divisor), a big ceiling does not mean the node fronts that much
 /// before the first voucher.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_deposit_gate_reserves_only_the_floor_by_default() -> anyhow::Result<()> {
-    const CREDIT_MAX: u64 = 64 * 1024 * 1024; // far wider than the one-interval floor
+    const CREDIT_MAX: u64 = 64 * 1024 * 1024; // far wider than the floor
     let payload = vec![0x77u8; 8 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
@@ -5575,7 +5597,7 @@ async fn client_deposit_gate_reserves_only_the_floor_by_default() -> anyhow::Res
         decdn_incentive::LaneChain::NONE,
     ))?;
 
-    // Pool remaining exactly covers the one-chunk floor, not the 64 MiB ceiling.
+    // Pool remaining exactly covers the floor, not the 64 MiB ceiling.
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     let (target, _server_eth, server_ep, server_task, _metrics) = spawn_handler_server_with_pool(
         cache,
@@ -5834,10 +5856,10 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
 /// computed cost is exactly this case.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> {
-    // One voucher accounting interval's worth, well under the window.
+    // Larger than the floor window, so the floor binds.
     let payload = vec![0xB0u8; 1_572_864];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let window_cost = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
+    let window_cost = min_payment(HARNESS_FLOOR_BYTES, RATE_PER_MB);
 
     let signer = Arc::new(PrivateKeySigner::random());
     let store = Arc::new(MemoryPoolStateStore::new());
@@ -6434,15 +6456,13 @@ async fn a_closing_pool_is_unfunded_to_its_lane_and_not_found_to_anyone_else() -
     Ok(())
 }
 
-/// The harness's fixed one-chunk floor cost — `credit_window(chunk, paid = 0)`
-/// collapses to one [`decdn_protocol::client::CHUNK_BYTES`] (1 MiB) regardless
-/// of `credit_max` whenever `credit_ramp_divisor` is non-zero (ADR 003 §Credit
-/// window, #1669).
-///
-/// Because `CHUNK_BYTES == BYTES_PER_MB`, one chunk prices to exactly the
-/// quoted per-MB rate — so this is `RATE_PER_MB`, by the identity ADR 003
-/// §Chunk Cadence rests on, rather than a number to keep in step by hand.
-const HARNESS_FLOOR_COST: u64 = RATE_PER_MB;
+/// The harness's fixed floor cost: `credit_window(chunk, paid = 0)` collapses
+/// to [`HARNESS_FLOOR_BYTES`] (one chunk plus the verify lag) regardless of
+/// `credit_max` whenever `credit_ramp_divisor` is non-zero (ADR 003 §Credit
+/// window, #1669). Priced as `min_payment` prices it, rounding up, so it
+/// tracks the floor rather than a number kept in step by hand.
+const HARNESS_FLOOR_COST: u64 =
+    (HARNESS_FLOOR_BYTES * RATE_PER_MB).div_ceil(decdn_incentive::BYTES_PER_MB);
 
 /// `spawn_handler_server_with_metrics` with a fixed-`remaining` pool-view wired
 /// and an explicit credit-window ceiling/ramp divisor — the setup the floor-`M`
@@ -6637,14 +6657,14 @@ async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()>
     // for the pool's whole `committed` while the test runs, well inside the 10s
     // no-progress proof wait. `_send_a` is kept so the stream stays open.
     let (_send_a, mut recv_a) = open_paid_stream(&conn, *hash_a.as_bytes(), Some(&ext_a)).await?;
-    read_exact_chunks(&mut recv_a, HARNESS_INTERVAL_BYTES).await?;
+    read_exact_chunks(&mut recv_a, HARNESS_FLOOR_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv_a).await?;
 
     // B: admit (reserves a second floor — `high` covers both), deliver its first
-    // interval, park.
+    // interval and the verify lag, park.
     let (mut send_b, mut recv_b) =
         open_paid_stream(&conn, *hash_b.as_bytes(), Some(&ext_b)).await?;
-    read_exact_chunks(&mut recv_b, HARNESS_INTERVAL_BYTES).await?;
+    read_exact_chunks(&mut recv_b, HARNESS_FLOOR_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv_b).await?;
 
     // Drain the pool: `remaining` now reads `low` on every subsequent `status()`.
@@ -6776,12 +6796,12 @@ async fn setup_recheck_holder_and_driven(
     // A: admit (reserves one floor), deliver its first interval, then park reading a
     // voucher we never send — it holds its live floor reservation for the whole test.
     let (send_a, mut recv_a) = open_paid_stream(&conn, *hash_a.as_bytes(), Some(&ext_a)).await?;
-    read_exact_chunks(&mut recv_a, HARNESS_INTERVAL_BYTES).await?;
+    read_exact_chunks(&mut recv_a, HARNESS_FLOOR_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv_a).await?;
 
-    // B: admit (a second floor — `high` covers both), deliver its first interval, park.
+    // B: admit (a second floor, which `high` covers), deliver its floor, park.
     let (send_b, mut recv_b) = open_paid_stream(&conn, *hash_b.as_bytes(), Some(&ext_b)).await?;
-    read_exact_chunks(&mut recv_b, HARNESS_INTERVAL_BYTES).await?;
+    read_exact_chunks(&mut recv_b, HARNESS_FLOOR_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv_b).await?;
 
     Ok(RecheckFixture {
@@ -6812,11 +6832,11 @@ async fn pay_and_read_to_end(
     recv: &mut RecvStream,
     signer: &PrivateKeySigner,
 ) -> anyhow::Result<u64> {
-    // The fixture already delivered interval 1 and parked; pay it upfront so the
-    // first loop read is not spent waiting out a park.
-    let mut received = HARNESS_INTERVAL_BYTES;
-    pay_cumulative(send, signer, received).await?;
-    let mut paid = received;
+    // The fixture already delivered the floor and parked; pay its whole interval
+    // upfront so the first loop read is not spent waiting out a park.
+    let mut received = HARNESS_FLOOR_BYTES;
+    let mut paid = HARNESS_INTERVAL_BYTES;
+    pay_cumulative(send, signer, paid).await?;
     // The loop reads the stream again after a timeout, so the read must be cancel-safe.
     let mut reader = BufferedClientReader::default();
     loop {
@@ -6824,9 +6844,12 @@ async fn pay_and_read_to_end(
             Ok(msg) => match msg? {
                 ClientMessage::ChunkData(chunk) => {
                     received = received.saturating_add(chunk.bytes().len() as u64);
+                    // Pay up to the last whole interval received. Every span
+                    // between two whole intervals prices exactly, so the
+                    // rounded-up cumulative amount never underpays a span.
                     if received.saturating_sub(paid) >= HARNESS_INTERVAL_BYTES {
-                        pay_cumulative(send, signer, received).await?;
-                        paid = received;
+                        paid = received - received % HARNESS_INTERVAL_BYTES;
+                        pay_cumulative(send, signer, paid).await?;
                     }
                 }
                 ClientMessage::StreamEnd => return Ok(received),
@@ -6979,8 +7002,8 @@ fn store_with_distinct_lanes(
 /// M`. The bound is the per-pool live floor reservation — the hard money envelope
 /// no fan-out of fresh signer keys can escape.
 ///
-/// `remaining = 140`, `M = 0`, floor `40`: three lanes fit (`3 × 40 = 120 ≤ 140`),
-/// a fourth does not (`160 > 140`). Each lane is opened on its own bi-stream,
+/// `remaining` is three [`HARNESS_FLOOR_COST`]s plus a slack under one floor,
+/// `M = 0`: three lanes fit, a fourth does not. Each lane is opened on its own bi-stream,
 /// reads one floor, and PARKS holding its live reservation; the streams stay open
 /// (their send/recv halves are kept alive) so all three reservations are held
 /// concurrently. With three live floors held, a fourth distinct lane is refused
@@ -7020,13 +7043,13 @@ async fn concurrent_distinct_lanes_bounded_to_pool_deposit() -> anyhow::Result<(
     for (i, signer) in signers.iter().take(affordable_floors).enumerate() {
         let ext = binding_ext(signer, client_node_id)?;
         let (send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
-        read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+        read_exact_chunks(&mut recv, HARNESS_FLOOR_BYTES).await?;
         assert_parked_awaiting_voucher(&mut recv).await?;
         held.push((i, send, recv));
     }
 
-    // Fourth concurrent distinct lane: refused — `Σ live floors (120) + floor (40) >
-    // remaining − M (140)`.
+    // Fourth concurrent distinct lane: refused, as `Σ live floors + floor >
+    // remaining − M`.
     let fourth = signers
         .get(affordable_floors)
         .ok_or_else(|| anyhow::anyhow!("missing the fourth lane signer"))?;
@@ -7399,14 +7422,46 @@ async fn buyer_accepts_blob_at_exact_ceiling() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A pull stopped before its promised end (a steal's split) pays for every
-/// wire byte it received, the frames it reads past the split looking for a
-/// rejection included, and closes. The lane stays healthy: the next leg
-/// on the same ledger opens, pays on from there, and completes with no
-/// voucher rejection, whether or not the node read the closing voucher.
+/// Read a paid leg of `wire_len` wire bytes as a verifying decoder does, one
+/// bao chunk group at a time and never past the leg's end, until at least
+/// `until` wire bytes are read, the leg's wire is all read, or the stream
+/// faults. Returns the wire bytes read. The content is honest, so every byte
+/// read stands for a verified one: each read reports the bytes before it
+/// verified, and the pull pays for them as it would for a decoder's. A
+/// decoder asks for no byte past the leg's end, because the node sends its
+/// `StreamEnd` only once the closing voucher for the last bytes arrives.
+async fn read_groups(
+    reader: &mut decdn_client::sink::PullReader,
+    wire_len: u64,
+    until: u64,
+) -> anyhow::Result<u64> {
+    use iroh_io::AsyncStreamReader as _;
+    let mut read = 0u64;
+    while read < until.min(wire_len) {
+        let want = (wire_len - read).min(decdn_bao_range::CHUNK_GROUP_BYTES);
+        let bytes = reader.read_bytes(usize::try_from(want)?).await?;
+        if bytes.is_empty() {
+            break;
+        }
+        read = read.saturating_add(u64::try_from(bytes.len())?);
+    }
+    Ok(read)
+}
+
+/// A pull stopped before its promised end (a steal's split) pays for exactly
+/// the wire bytes its decoder verified, and closes. The frames the node queued
+/// past the split arrive but never verify, so they are not paid for. The lane
+/// stays healthy: the next leg on the same ledger opens, pays on from there,
+/// and completes with no voucher rejection, whether or not the node read the
+/// closing voucher.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_pull_stopped_at_a_split_pays_what_arrived_and_the_lane_pulls_on() -> anyhow::Result<()> {
+async fn a_pull_stopped_at_a_split_pays_what_it_verified_and_the_lane_pulls_on()
+-> anyhow::Result<()> {
+    use decdn_client::PeerSource;
+    use decdn_client::source::BlobSource as _;
+
     let payload = vec![0x3Au8; 8 * 1024 * 1024];
+    let total = u64::try_from(payload.len())?;
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth, server_ep, server_task) =
@@ -7415,60 +7470,51 @@ async fn a_pull_stopped_at_a_split_pays_what_arrived_and_the_lane_pulls_on() -> 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(&client_ep, signer, deposit);
     let ledger = Arc::new(ctx.new_ledger());
-    let deadlines = PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?;
     let slash = slash_domain();
-    let leg = |offset: u64, len: u64| {
-        open_progressive_pull(
-            &client_ep,
-            target.clone(),
-            &ctx,
-            Arc::clone(&ledger),
-            &slash,
-            server_eth.address(),
-            *hash.as_bytes(),
-            decdn_protocol::client::NO_NAMESPACE,
-            offset,
-            0x00c4,
-            0,
-            0,
-            deadlines,
-            len,
-            None,
-        )
-    };
+    let source = PeerSource::new(
+        &client_ep,
+        target,
+        Arc::new(std::sync::Mutex::new(ctx)),
+        Arc::clone(&ledger),
+        &slash,
+        server_eth.address(),
+        decdn_protocol::client::NO_NAMESPACE,
+        0,
+        u64::MAX,
+        PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
+        None,
+    );
 
-    // `[0, 4 MiB)`, stopped once about a third of its wire has arrived.
-    let (_header, mut pull) = leg(0, 4 * 1024 * 1024).await?;
-    let mut received = 0u64;
-    while received < 3 * 512 * 1024 {
-        let chunk = pull
-            .next_chunk()
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("the leg ended before the split"))?;
-        received = received.saturating_add(u64::try_from(chunk.len())?);
-    }
+    // `[0, 4 MiB)`, stopped once about a third of its wire has verified.
+    let range = decdn_bao_range::align_range(0, 4 * 1024 * 1024, total)?;
+    let (_header, mut reader) = source.open(*hash.as_bytes(), range).await?;
+    let wire_len = support::bao_wire_len(total, 0, 4 * 1024 * 1024);
+    let verified = read_groups(&mut reader, wire_len, 3 * 512 * 1024).await?;
+    anyhow::ensure!(verified >= 3 * 512 * 1024, "the leg ended before the split");
     // Let the node's credit window queue frames the leg has not read yet:
     // the stop reads them, without waiting, for a rejection behind them.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let promised = pull.expected_wire_bytes();
-    let stopped = pull.stop().await?;
+    let stopped = source.stop(reader).await?;
     let (stopped_bytes, _) = stopped
         .advanced()
         .ok_or_else(|| anyhow::anyhow!("the stopped leg must have paid"))?;
     anyhow::ensure!(
-        stopped_bytes > U256::from(received) && stopped_bytes <= U256::from(promised),
-        "the stopped leg pays for every frame it read, the queued ones too: \
-         {stopped_bytes} past the {received} read before the stop, at most {promised}"
+        stopped_bytes == U256::from(verified),
+        "the stopped leg pays for exactly the {verified} wire bytes it verified, none of the \
+         frames queued past the split: paid {stopped_bytes}"
     );
 
     // The next leg on the same ledger pays on from the stopped one's
     // watermark and completes.
-    let (_header, mut pull) = leg(4 * 1024 * 1024, 4 * 1024 * 1024).await?;
-    let mut next = 0u64;
-    while let Some(chunk) = pull.next_chunk().await? {
-        next = next.saturating_add(u64::try_from(chunk.len())?);
-    }
-    let finished = pull.finish().await?;
+    let range = decdn_bao_range::align_range(4 * 1024 * 1024, 4 * 1024 * 1024, total)?;
+    let (_header, mut reader) = source.open(*hash.as_bytes(), range).await?;
+    let wire_len = support::bao_wire_len(total, 4 * 1024 * 1024, 4 * 1024 * 1024);
+    let next = read_groups(&mut reader, wire_len, u64::MAX).await?;
+    anyhow::ensure!(
+        next == wire_len,
+        "the next leg delivers its whole wire ({next} of {wire_len})"
+    );
+    let finished = source.finish(reader).await?;
     let (finished_bytes, _) = finished
         .advanced()
         .ok_or_else(|| anyhow::anyhow!("the next leg must have paid"))?;
@@ -7477,6 +7523,7 @@ async fn a_pull_stopped_at_a_split_pays_what_arrived_and_the_lane_pulls_on() -> 
         "the next leg pays on from the stopped one: {finished_bytes} of {stopped_bytes} + {next}"
     );
 
+    drop(source);
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
@@ -7486,12 +7533,17 @@ async fn a_pull_stopped_at_a_split_pays_what_arrived_and_the_lane_pulls_on() -> 
 /// leg's own offset and measured against a ceiling-sized tree, so (a) a leg
 /// entirely under the ceiling completes even though the blob's signed
 /// `total_bytes` exceeds it — the claim never drives a refusal (#1895) — and (b)
-/// the leg that crosses the ceiling aborts with [`BlobTooLarge`] having paid no
-/// more than the ceiling's wire from its offset.
+/// the leg that crosses the ceiling aborts with [`BlobTooLarge`] having paid
+/// nothing: it verifies less than one metering interval before the abort.
 #[tokio::test(flavor = "multi_thread")]
 async fn gap_scoped_leg_enforces_the_received_byte_ceiling_from_its_own_offset()
 -> anyhow::Result<()> {
+    use decdn_client::PeerSource;
+    use decdn_client::sink::StashedFault as _;
+    use decdn_client::source::BlobSource as _;
+
     let payload = vec![0x5Cu8; 4 * 1024 * 1024];
+    let total = u64::try_from(payload.len())?;
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth, server_ep, server_task) =
@@ -7501,74 +7553,67 @@ async fn gap_scoped_leg_enforces_the_received_byte_ceiling_from_its_own_offset()
     let ctx = channel_context(&client_ep, signer, deposit);
     let ledger = Arc::new(ctx.new_ledger());
     let ceiling: u64 = 2_500_000;
-    let deadlines = PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?;
     let slash = slash_domain();
-    let leg = |offset: u64, len: u64, ledger: Arc<PoolLedger>| {
-        open_progressive_pull(
-            &client_ep,
-            target.clone(),
-            &ctx,
-            ledger,
-            &slash,
-            server_eth.address(),
-            *hash.as_bytes(),
-            decdn_protocol::client::NO_NAMESPACE,
-            offset,
-            0x00c4,
-            ceiling,
-            0,
-            deadlines,
-            len,
-            None,
-        )
-    };
+    let source = PeerSource::new(
+        &client_ep,
+        target,
+        Arc::new(std::sync::Mutex::new(ctx)),
+        Arc::clone(&ledger),
+        &slash,
+        server_eth.address(),
+        decdn_protocol::client::NO_NAMESPACE,
+        ceiling,
+        u64::MAX,
+        PullDeadlines::new(Duration::from_secs(10), Duration::from_secs(10), 0)?,
+        None,
+    );
 
     // (a) `[0, 2 MiB)` of a 4 MiB blob under a ~2.4 MiB ceiling: completes.
-    let (header, mut pull) = leg(0, 2 * 1024 * 1024, Arc::clone(&ledger)).await?;
+    let range = decdn_bao_range::align_range(0, 2 * 1024 * 1024, total)?;
+    let (header, mut reader) = source.open(*hash.as_bytes(), range).await?;
     anyhow::ensure!(
-        header.total_bytes == u64::try_from(payload.len())?,
+        header.total_bytes == total,
         "the signed claim exceeds the ceiling by design"
     );
-    let mut received = 0u64;
-    while let Some(chunk) = pull.next_chunk().await? {
-        received = received.saturating_add(u64::try_from(chunk.len())?);
-    }
+    let expected = support::bao_wire_len(total, 0, 2 * 1024 * 1024);
+    let received = read_groups(&mut reader, expected, u64::MAX).await?;
     anyhow::ensure!(
-        received == pull.expected_wire_bytes(),
-        "the under-ceiling leg must deliver its whole wire ({received} of {})",
-        pull.expected_wire_bytes()
+        received == expected,
+        "the under-ceiling leg must deliver its whole wire ({received} of {expected})"
     );
-    let paid_first = pull.finish().await?;
+    let paid_first = source.finish(reader).await?;
     let (paid_first, _) = paid_first
         .advanced()
         .ok_or_else(|| anyhow::anyhow!("the completed leg must have paid"))?;
 
-    // (b) `[2 MiB, 4 MiB)`: the ceiling's wire from this offset is ~0.4 MiB, so
-    // the leg aborts inside its first metering interval — before paying for it.
-    let (_header, mut pull) = leg(2 * 1024 * 1024, 2 * 1024 * 1024, Arc::clone(&ledger)).await?;
-    let err = loop {
-        match pull.next_chunk().await {
-            Ok(Some(_)) => {}
-            Ok(None) => anyhow::bail!("the crossing leg must not complete"),
-            Err(e) => break e,
-        }
-    };
+    // (b) `[2 MiB, 4 MiB)`: the ceiling's wire from this offset is ~0.4 MiB, under
+    // one metering interval, so the leg aborts before any payment comes due.
+    let ceiling_wire_from_offset = support::bao_wire_len(ceiling, 2 * 1024 * 1024, 0);
+    anyhow::ensure!(
+        ceiling_wire_from_offset < HARNESS_INTERVAL_BYTES,
+        "the ceiling's wire from the offset must sit under one interval"
+    );
+    let range = decdn_bao_range::align_range(2 * 1024 * 1024, 2 * 1024 * 1024, total)?;
+    let (_header, mut reader) = source.open(*hash.as_bytes(), range).await?;
+    let wire_len = support::bao_wire_len(total, 2 * 1024 * 1024, 2 * 1024 * 1024);
+    read_groups(&mut reader, wire_len, u64::MAX).await?;
+    let err = reader
+        .take_fault()
+        .ok_or_else(|| anyhow::anyhow!("the crossing leg must not complete"))?;
     anyhow::ensure!(
         err.downcast_ref::<BlobTooLarge>().is_some(),
         "the crossing leg must abort with BlobTooLarge, got: {err:#}"
     );
-    let paid_second = pull.abort();
-    let paid_total = paid_second
-        .advanced()
-        .map_or(paid_first, |(bytes, _)| bytes);
-    let ceiling_wire_from_offset = U256::from(support::bao_wire_len(ceiling, 2 * 1024 * 1024, 0));
+    drop(reader);
+    let paid_total = ledger.settlement().bytes;
     anyhow::ensure!(
-        paid_total <= paid_first + ceiling_wire_from_offset,
-        "the crossing leg paid {} past the first leg's {paid_first}, more than its \
-         ceiling wire {ceiling_wire_from_offset}",
+        paid_total == paid_first,
+        "the crossing leg paid {} past the first leg's {paid_first}; it verified less than \
+         one interval ({ceiling_wire_from_offset} wire bytes at most) and owes nothing",
         paid_total - paid_first
     );
 
+    drop(source);
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
@@ -9289,7 +9334,7 @@ async fn spawn_counting_pull_server(
 /// would bump `cache_miss` instead, and `hits == 0` alone cannot tell them apart.
 #[tokio::test(flavor = "multi_thread")]
 async fn underfunded_channel_never_reaches_the_paid_pull() -> anyhow::Result<()> {
-    let window_cost = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
+    let window_cost = min_payment(HARNESS_FLOOR_BYTES, RATE_PER_MB);
     let deposit = window_cost.saturating_sub(U256::from(1u64));
     let signer = Arc::new(PrivateKeySigner::random());
     let store = Arc::new(MemoryPoolStateStore::new());
@@ -9371,7 +9416,7 @@ async fn underfunded_channel_never_reaches_the_paid_pull() -> anyhow::Result<()>
 /// channels would turn a cold fetch into a permanent refusal on every node.
 #[tokio::test(flavor = "multi_thread")]
 async fn funded_channel_still_reaches_the_paid_pull() -> anyhow::Result<()> {
-    let window_cost = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
+    let window_cost = min_payment(HARNESS_FLOOR_BYTES, RATE_PER_MB);
     let signer = Arc::new(PrivateKeySigner::random());
     let store = Arc::new(MemoryPoolStateStore::new());
     store.record(&LaneState::hydrate(
@@ -11935,7 +11980,7 @@ async fn drive_to_second_interval_awaiting_voucher() -> anyhow::Result<MidStream
     std::mem::forget(cache_tmp); // keep the cache dir for the connection's life
     let (store, signer, _deposit) = seeded_store()?;
 
-    // Divisor 2 keeps the window pinned at the one-interval floor after the first
+    // Divisor 2 keeps the window pinned at the floor after the first
     // interval is paid (`paid / 2 < floor`), so the server parks after each
     // interval — a deterministic voucher rendezvous.
     let (target, _server_eth, server_ep, server_task, metrics) =
@@ -11950,14 +11995,16 @@ async fn drive_to_second_interval_awaiting_voucher() -> anyhow::Result<MidStream
     let ext = binding_ext(&signer, client_node_id)?;
     let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
 
-    // Interval 1: delivered on the floor window, then paid + accepted. The server
-    // only widens past the floor after crediting this voucher, so reading
-    // interval 2 below is itself the proof that interval 1 was accepted.
-    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+    // Interval 1 and the verify lag: delivered on the floor window, then
+    // interval 1 is paid + accepted. The server only sends past the floor after
+    // crediting this voucher, so reading interval 2 below is itself the proof
+    // that interval 1 was accepted.
+    read_exact_chunks(&mut recv, HARNESS_FLOOR_BYTES).await?;
     pay_cumulative(&mut send, &signer, HARNESS_INTERVAL_BYTES).await?;
 
-    // Interval 2 arrives; the server then parks awaiting its voucher, which is
-    // where the hostile proof is injected.
+    // The rest of interval 2 and the lag past it arrive; the server then parks
+    // awaiting interval 2's voucher, which is where the hostile proof is
+    // injected.
     read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
 
     Ok(MidStreamAfterAccept {
@@ -13057,8 +13104,8 @@ async fn client_spend_on_a_garbage_stream_is_bounded_by_one_frame() -> anyhow::R
 
 /// The exposure bound with a verified prefix (#1985): a provider that streams
 /// honest wire for the first ~2.5 MiB of a 4 MiB blob and garbage from there on
-/// (under an honest `total_bytes`) is paid for the verified prefix and at most
-/// one frame beyond it — never the rest of the blob. Pins the issue's bound in
+/// (under an honest `total_bytes`) is paid for the verified prefix and nothing
+/// beyond it — not the corrupt group, not the rest of the blob. Pins the bound in
 /// the shape that matters: payment for verified groups coexists with the
 /// cut-off at the first unverifiable one, and the two 1 MiB reveals the prefix
 /// earns prove the bound is about *where the decoder stops*, not "pay nothing".
@@ -13127,11 +13174,11 @@ async fn client_pays_for_an_honest_prefix_and_stops_at_the_first_bad_group() -> 
         paid >= U256::from(2u64 << 20),
         "paid {paid} wire bytes for a ~2.5 MiB verified prefix"
     );
-    // ...and nothing past the frame that carried the corrupt group.
-    let bound = U256::from(corrupt_from as u64 + LYING_FRAME as u64);
+    // ...and not one byte of the corrupt group: payment follows verification.
+    let bound = U256::from(corrupt_from as u64);
     anyhow::ensure!(
         paid <= bound,
-        "paid {paid} wire bytes, past the corrupt group plus one frame ({bound})"
+        "paid {paid} wire bytes, past the first corrupt byte at {bound}"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
@@ -13362,8 +13409,9 @@ enum StopPoint {
     /// Before any chunk data: the buyer's FIRST proof write fails. For a blob under
     /// one chunk that is the closing voucher.
     BeforeData,
-    /// After enough wire for one whole chunk has been served and the buyer's proofs
-    /// for it (the anchoring voucher and the reveal) have been read: only the
+    /// After enough wire for one whole chunk and the verify lag has been served and
+    /// the buyer's proofs for it (the anchoring voucher and the reveal) have been
+    /// read: only the
     /// closing voucher for the residual fails, the reveals stand.
     AfterFirstReveal,
 }
@@ -13424,13 +13472,15 @@ async fn serve_stop_send_then_signal(
     let mut frames = served_wire.chunks(LYING_FRAME);
 
     // A re-opened range too short to earn a reveal meets the stop before any data.
-    let chunk_bytes = usize::try_from(CHUNK_BYTES)?;
-    if matches!(stop, StopPoint::AfterFirstReveal) && served_wire.len() >= chunk_bytes {
-        // Serve one whole chunk's worth of wire, then take the buyer's proofs for it
-        // off the stream — the anchoring voucher, then the reveal — so those stand
-        // and only the closing voucher below meets the stop.
+    // The buyer pays for a chunk only once it has verified the leaf that holds the
+    // chunk's last byte, so a reveal needs the verify lag on the wire past it.
+    let floor_bytes = usize::try_from(HARNESS_FLOOR_BYTES)?;
+    if matches!(stop, StopPoint::AfterFirstReveal) && served_wire.len() >= floor_bytes {
+        // Serve one whole chunk's worth of wire and the verify lag, then take the
+        // buyer's proofs for it off the stream (the anchoring voucher, then the
+        // reveal), so those stand and only the closing voucher below meets the stop.
         let mut served = 0usize;
-        while served < chunk_bytes {
+        while served < floor_bytes {
             let chunk = frames
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("wire shorter than one chunk"))?;

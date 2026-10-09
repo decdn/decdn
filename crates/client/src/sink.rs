@@ -26,6 +26,12 @@ use crate::{HashMismatch, UpstreamPull};
 /// decoder can pull wire bytes on demand instead of being handed a complete
 /// buffer.
 ///
+/// A reader never asks past the leg's wire end. The node sends its
+/// `StreamEnd` only after the closing voucher, and that voucher goes out in
+/// [`UpstreamPull::finish`] once the decode is done, so a read past the end
+/// waits on a node that waits on the payer. The bao decoder reads exactly the
+/// leg's items and no further.
+///
 /// # Why the error is stashed rather than propagated
 ///
 /// The reader trait speaks `io::Error`, but `next_chunk` produces the typed
@@ -44,6 +50,11 @@ pub struct PullReader {
     pull: UpstreamPull,
     /// Wire bytes received but not yet consumed by the decoder.
     buf: BytesMut,
+    /// Wire bytes handed to the decoder so far. The decoder checks each item
+    /// it reads (a parent pair or a leaf) against the root before it reads
+    /// the next one, so every byte handed out before the current read has
+    /// verified. Each read reports that count to the pull, which pays for it.
+    consumed: u64,
     /// `StreamEnd` seen — no more chunks will arrive.
     ended: bool,
     /// The first `next_chunk` fault, preserved with its type. See the type docs.
@@ -55,6 +66,7 @@ impl PullReader {
         Self {
             pull,
             buf: BytesMut::new(),
+            consumed: 0,
             ended: false,
             fault: None,
         }
@@ -66,15 +78,21 @@ impl PullReader {
     /// voucher watermark.
     ///
     /// Any buffered-but-unconsumed wire bytes and a parked fault are dropped
-    /// silently: a caller only calls this after the decode loop reached its clean
-    /// `Done` state.
-    pub(crate) fn into_inner(self) -> UpstreamPull {
+    /// silently: a caller only calls this after the decode loop reached a clean
+    /// end (`Done`, or stopped at a steal's split). The decoder checked every
+    /// item it read on the way there, so every consumed byte is reported
+    /// verified, and `finish`/`stop` pay for it.
+    pub(crate) fn into_inner(mut self) -> UpstreamPull {
+        self.pull.mark_verified(self.consumed);
         self.pull
     }
 
     /// Pull chunks until `buf` holds `n` bytes, the stream ends, or a fault is
-    /// parked.
+    /// parked. The decoder asks for more only once it has checked the last item
+    /// it read, so everything consumed so far is reported verified first, and
+    /// the pull pays for it before it waits on the node for more.
     async fn fill_to(&mut self, n: usize) {
+        self.pull.mark_verified(self.consumed);
         while !self.ended && self.fault.is_none() && self.buf.len() < n {
             match self.pull.next_chunk().await {
                 Ok(Some(chunk)) => self.buf.extend_from_slice(&chunk),
@@ -89,6 +107,7 @@ impl PullReader {
     /// that to a truncation, not to corruption.
     fn take(&mut self, n: usize) -> Bytes {
         let take = self.buf.len().min(n);
+        self.consumed = self.consumed.saturating_add(take as u64);
         self.buf.split_to(take).freeze()
     }
 }

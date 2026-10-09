@@ -208,15 +208,13 @@ fn min_payment_clears_zero_tolerance_rate() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The floor is one chunk, and `CHUNK_BYTES == BYTES_PER_MB`, so it prices
-/// to exactly the advertised per-MB rate with no rounding at any rate —
-/// the identity ADR 003 §Chunk sizing and the payability floor rests on.
+/// One chunk prices to exactly the advertised per-MB rate with no rounding
+/// at any rate, because `CHUNK_BYTES == BYTES_PER_MB` — the identity ADR 003
+/// §Chunk sizing rests on.
 #[test]
-fn floor_micro_is_one_chunk_which_is_exactly_the_per_mb_rate() {
-    let f = floor_micro(100);
-    assert_eq!(f, min_payment(decdn_protocol::client::CHUNK_BYTES, 100));
+fn one_chunk_is_exactly_the_per_mb_rate() {
+    let f = min_payment(decdn_protocol::client::CHUNK_BYTES, 100);
     assert_eq!(f, U256::from(100u64));
-    assert!(f > U256::ZERO);
 }
 
 #[test]
