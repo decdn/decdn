@@ -984,7 +984,7 @@ single broadcast under the treasury sender. Source the funding from the
 initial-holder multisig — there is no other TOKEN source pre-TGE.
 
 **USDC is not in scope.** Circle operates the canonical Sepolia USDC
-faucet: <https://developers.circle.com/stablecoins/docs/usdc-on-testnet>.
+faucet: <https://faucet.circle.com>.
 The deCDN faucet only dispenses TOKEN.
 
 **Tuning at runtime.** `GOVERNANCE_ROLE` can adjust `claimAmount` and

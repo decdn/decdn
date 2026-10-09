@@ -29,7 +29,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///         `cooldown` at any time, pause claims via `Pausable`, and reclaim
 ///         any leftover balance via `withdraw`. USDC distribution is **not**
 ///         in scope: Circle operates the canonical Sepolia USDC faucet at
-///         developers.circle.com/stablecoins/docs/usdc-on-testnet.
+///         faucet.circle.com.
 ///
 /// @dev    Composition mirrors `CapacityBond`:
 ///           - `AccessControl`: three roles
