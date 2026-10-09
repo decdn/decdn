@@ -16,9 +16,10 @@ economics from day one ([ADR 016](adr/016-contract-interactions.md)).
 
 ## Status
 
-Pre-launch. The workspace version is `0.0.0`, there is no release tag, and nothing is
-published to crates.io or a container registry yet. To run deCDN today,
-[build it from source](#build-from-source).
+Public testnet on Arbitrum Sepolia. Signed release archives, crates and container images
+ship with each [release](https://github.com/decdn/decdn/releases/latest); see
+[Install](#install). The [operator guide](https://docs.decdn.org/run-a-node/overview)
+walks through running a node.
 
 Wire, ABI, config, and storage formats change without compatibility shims until the first
 public deployment. Many ADRs are still marked Draft, so the specification can change too.
@@ -77,11 +78,13 @@ What you need:
   [§ Minimum bond](adr/026-tokenomics.md#minimum-bond-is-non-retroactive)). The testnet
   deployed with `minBond` at 50,000 TOKEN ([manifest](crates/cli/deployments/421614.json)),
   which covers every tier up to about 1 Gbps. `decdn node bond --dry-run` prints the live
-  target. There is no public TOKEN source before TGE, so ask the maintainers in
-  [GitHub issues](https://github.com/decdn/decdn/issues).
+  target. The maintainers send testnet TOKEN: send your EVM operator address (`decdn
+  whoami` prints it) through any channel on the [contact page](https://decdn.org/#contact).
 - **USDC** for the node's own buyer pool, which pays for cache-miss pulls from peers
-  (10 USDC working deposit by default). Without it, every cache miss falls through to
-  origin ([runbook](docs/runbook.md#node-to-node-pulls-never-succeed-buyer-wallet-or-pool)).
+  (10 USDC working deposit by default). The node spends it only with
+  `cache.node_to_node_pull_through_enabled = true`, which is off by default. With it off,
+  a cache miss the node cannot serve from its own backend returns not-found
+  ([runbook](docs/runbook.md#node-to-node-pulls-never-succeed-buyer-wallet-or-pool)).
   Circle's [testnet faucet](https://developers.circle.com/stablecoins/docs/usdc-on-testnet)
   dispenses it.
 - **A keystore password source** for the headless daemon: `DECDN_KEYSTORE_PASSWORD` or
@@ -160,7 +163,7 @@ cargo nextest run -p decdn-e2e --features anvil-e2e
 
 ## Install
 
-These commands work from the first tagged release (see [Status](#status)):
+Install the latest release:
 
 ```bash
 cargo install --locked decdn-cli decdn-node

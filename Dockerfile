@@ -39,10 +39,10 @@ WORKDIR /home/decdn
 
 VOLUME ["/home/decdn/.decdn"]
 
-# QUIC transport, Prometheus metrics. Keep this comment on its own line —
+# QUIC transport (UDP), Prometheus metrics. Keep this comment on its own line —
 # Dockerfile `#` only starts a comment at the beginning of a line, so a trailing
 # one is parsed as arguments and fails with `invalid containerPort: #`.
-EXPOSE 4433 9090
+EXPOSE 4433/udp 9090
 
 # Container ships the daemon only. Operators wanting the user CLI
 # (`decdn fetch`, `decdn node …`, `decdn key-gen`) install it from the
