@@ -108,8 +108,9 @@ preview writes nothing and needs no cleanup. Do **not** follow it with
 Pushing `v*` starts [`.github/workflows/release.yml`](.github/workflows/release.yml).
 Steps 1–3 gate everything else. After them, the archive builds (step 6) run in
 parallel with the verification (steps 4–5). The asset upload waits for both, and
-the image push waits for the asset upload. Every job after step 3 builds the
-exact commit the tag pointed at when the run started. The workflow:
+the image push waits for the asset upload. Every job after step 3 works on the
+commit the tag push named; if the tag has since moved, the run fails rather
+than build another commit. The workflow:
 
 1. rejects the tag unless it is strict semver (the trigger glob is looser than
    it looks — `v0$(whoami)` matches it);
@@ -127,12 +128,12 @@ exact commit the tag pointed at when the run started. The workflow:
 5. creates the GitHub Release as a **draft**;
 6. builds eleven archives (`decdn-node` on five targets, `decdn` on six: the
    same five plus Windows ARM64) with `--locked`, one job per target, failing
-   a Linux target whose binaries need glibc newer than 2.36 (Debian 12). Once
-   verification passes it uploads them with a `SHA256SUMS` manifest, asserting
-   all eleven are present;
-7. once the archives are uploaded, assembles the multi-arch image from them —
-   it does not compile from source, so the binary in the image is
-   byte-identical to the archived one — and pushes the manifest **untagged**,
+   a Linux target whose binaries need glibc newer than the 2.31 floor
+   ([ADR 000](adr/000-language.md)). Once verification passes it uploads them
+   with a `SHA256SUMS` manifest, asserting all eleven are present;
+7. once the archives are uploaded, assembles the multi-arch image from the same
+   Linux archives — it does not compile from source, so the binary in the image
+   is byte-identical to the archived one — and pushes the manifest **untagged**,
    attaching the SBOM and `image-digest.txt`.
 
 Draft assets need authentication to download, and no image tag exists yet, so
@@ -296,7 +297,9 @@ release behind it is the one state this flow leaves lying around. Either run the
 signing script, or delete the tag as above.
 
 **Abandoned image manifests.** A run whose release is never signed leaves an
-untagged manifest in the GHCR package. It is not pullable by name and costs only
+untagged manifest in the GHCR package. So does re-running `upload-assets` or
+`docker` before signing: the image job pushes a fresh manifest and replaces
+`image-digest.txt`, and the earlier digest stays behind untagged. It is not pullable by name and costs only
 storage, so cleanup is optional. If you do delete one, take care: GHCR keys a
 package version by digest and treats tags as metadata on it, so deleting the
 wrong version removes the image behind every tag pointing at it, `latest`
