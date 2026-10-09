@@ -120,9 +120,9 @@ jobs:
             echo "::error::Cargo.lock pins no decdn commit"; exit 1; }
           echo "ref=$DECDN_REF" >> "$GITHUB_OUTPUT"
 
-      - uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
         with:
-          toolchain: 1.95.0
+          toolchain: 1.99.0
           components: rustfmt, clippy
 
       # A tag push cannot usefully save to the cache, so restore the clippy
@@ -264,9 +264,9 @@ jobs:
         with:
           ref: ${{ needs.release.outputs.tag }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
         with:
-          toolchain: 1.95.0
+          toolchain: 1.99.0
           targets: ${{ matrix.target }}
       # bash on every runner: Windows defaults to pwsh, where `$PACKAGE` is a
       # PowerShell variable rather than the environment variable.

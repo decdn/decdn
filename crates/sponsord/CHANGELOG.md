@@ -39,6 +39,7 @@ release.
 
 ### Changed
 
+- **MSRV is Rust 1.99.0** (was 1.95.0), matching decdn.
 - **decdn from GitHub.** The decdn crates are git dependencies on
   `github.com/decdn/decdn`, at the commit `Cargo.lock` pins
   (`a09720adcb055ef205cf0e0d83339c2e7673c498`); `decdn.ref` and the sibling

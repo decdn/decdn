@@ -264,6 +264,12 @@ fn check(source: &str) -> Vec<String> {
         .inline
 }
 
+/// Asserts the checker finds nothing in `source`, printing what it found if not.
+#[track_caller]
+fn assert_accepted(source: &str) {
+    assert_eq!(check(source), Vec::<String>::new());
+}
+
 #[test]
 fn flags_an_inline_tests_module() {
     let found = check("#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n");
@@ -276,7 +282,7 @@ fn flags_an_inline_tests_module() {
 
 #[test]
 fn accepts_an_out_of_line_tests_module() {
-    assert!(check("#[cfg(test)]\nmod tests;\n").is_empty());
+    assert_accepted("#[cfg(test)]\nmod tests;\n");
 }
 
 #[test]
@@ -340,10 +346,10 @@ fn places_children_of_a_directory_owner_beside_it() {
 
 #[test]
 fn ignores_modules_that_also_compile_outside_tests() {
-    assert!(check("#[cfg(any(test, feature = \"test-util\"))]\nmod doubles {}\n").is_empty());
-    assert!(check("#[cfg(not(test))]\nmod real {}\n").is_empty());
-    assert!(check("#[cfg(feature = \"x\")]\nmod gated {}\n").is_empty());
-    assert!(check("mod plain {}\n").is_empty());
+    assert_accepted("#[cfg(any(test, feature = \"test-util\"))]\nmod doubles {}\n");
+    assert_accepted("#[cfg(not(test))]\nmod real {}\n");
+    assert_accepted("#[cfg(feature = \"x\")]\nmod gated {}\n");
+    assert_accepted("mod plain {}\n");
 }
 
 #[test]
@@ -364,21 +370,21 @@ fn flags_a_module_gated_on_test_or_the_test_support_feature() {
 
 #[test]
 fn ignores_a_module_that_any_other_feature_compiles() {
-    assert!(check("#[cfg(any(test, feature = \"other\"))]\nmod doubles {}\n").is_empty());
-    assert!(check("#[cfg(any(feature = \"test-support\", unix))]\nmod doubles {}\n").is_empty());
-    assert!(check("#[cfg(any())]\nmod never {}\n").is_empty());
+    assert_accepted("#[cfg(any(test, feature = \"other\"))]\nmod doubles {}\n");
+    assert_accepted("#[cfg(any(feature = \"test-support\", unix))]\nmod doubles {}\n");
+    assert_accepted("#[cfg(any())]\nmod never {}\n");
 }
 
 #[test]
 fn ignores_test_gated_items_that_are_not_modules() {
     let source = "#[cfg(test)]\nuse std::fmt;\n#[cfg(test)]\nfn helper() {}\n\
                   #[cfg(test)]\nimpl Foo {}\n";
-    assert!(check(source).is_empty());
+    assert_accepted(source);
 }
 
 #[test]
 fn ignores_module_text_inside_string_literals() {
-    assert!(check("const S: &str = \"#[cfg(test)]\\nmod tests {}\";\n").is_empty());
+    assert_accepted("const S: &str = \"#[cfg(test)]\\nmod tests {}\";\n");
 }
 
 #[test]

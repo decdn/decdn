@@ -35,6 +35,7 @@ release.
 
 ### Changed
 
+- **MSRV is Rust 1.99.0** (was 1.95.0), matching decdn.
 - **One shared `decdn` data dir.** `decdn bundle pull` gets
   `--data-dir <data_dir>/decdn/`, kept across downloads, so its peer cache
   carries over. The voucher key stays per download under

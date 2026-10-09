@@ -59,6 +59,7 @@ release.
 
 ### Changed
 
+- **MSRV is Rust 1.99.0** (was 1.95.0), matching decdn.
 - **HTTPS through rustls.** reqwest 0.13 replaces OpenSSL (native-tls)
   with rustls and checks certificates with the platform verifier, so the
   binary no longer links `libssl` on Linux.

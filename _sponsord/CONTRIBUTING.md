@@ -2,13 +2,14 @@
 
 ## Toolchain
 
-`rust-toolchain.toml` pins Rust 1.95.0 with `rustfmt` and `clippy`; a
-rustup-managed `cargo` installs it on first use. The pin lives in three kinds
-of place, each read by a different tool: `rust-toolchain.toml`'s channel, the
-root `Cargo.toml`'s `rust-version`, and every `dtolnay/rust-toolchain@…` ref
-under `.github/`. Move them together in one change;
-`.github/scripts/check-toolchain-pin.sh` fails CI when they drift. The MSRV is
-the pinned toolchain.
+`rust-toolchain.toml` pins Rust 1.99.0 with `rustfmt` and `clippy`; a
+rustup-managed `cargo` installs it on first use. The version is written in
+five places: `rust-toolchain.toml`'s channel, the root `Cargo.toml`'s
+`rust-version`, every `dtolnay/rust-toolchain` step under `.github/`, the MSRV
+badge in `README.md`, and the `rust:` tag in `deploy/Dockerfile`. Move them
+together in one change. `.github/scripts/check-toolchain-pin.sh` fails CI when
+the first three drift; nothing checks the badge or the Dockerfile tag. The
+MSRV is the pinned toolchain.
 
 Also useful: [`cargo-nextest`](https://nexte.st) (the test runner CI uses),
 [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny),

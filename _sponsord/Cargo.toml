@@ -20,10 +20,11 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-# Three parts, not two: this string, `rust-toolchain.toml`'s channel and every
-# `dtolnay/rust-toolchain@…` ref under .github/ are compared byte-for-byte by
-# check_toolchain_pin.py, so they move together.
-rust-version = "1.95.0"
+# Three parts, not two: this string, `rust-toolchain.toml`'s channel and the
+# version of every `dtolnay/rust-toolchain` step under .github/ (its
+# `toolchain:` input, or its `@ref` without one) are compared byte-for-byte by
+# check_toolchain_pin.py, so they move together. A step's SHA pin is not checked.
+rust-version = "1.99.0"
 repository = "https://github.com/decdn/sponsord"
 homepage = "https://decdn.org"
 keywords = ["decdn", "cdn", "p2p", "sponsorship"]

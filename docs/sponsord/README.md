@@ -4,7 +4,7 @@
 [![Security](https://github.com/decdn/sponsord/actions/workflows/security.yml/badge.svg)](https://github.com/decdn/sponsord/actions/workflows/security.yml)
 [![CodeQL](https://github.com/decdn/sponsord/actions/workflows/codeql.yml/badge.svg)](https://github.com/decdn/sponsord/actions/workflows/codeql.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![MSRV](https://img.shields.io/badge/MSRV-1.95.0-orange.svg)](rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.99.0-orange.svg)](rust-toolchain.toml)
 
 Sponsored downloads for [deCDN](https://github.com/decdn/decdn): your users
 download content from deCDN, and you pay for it. They install one small CLI,

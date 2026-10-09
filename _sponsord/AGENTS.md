@@ -3,7 +3,7 @@
 This file provides guidance to coding agents working in this repository.
 
 sponsord lets a publisher pay for their users' deCDN downloads. It is a cargo
-workspace (Rust 2024, toolchain pinned to 1.95.0 in `rust-toolchain.toml`)
+workspace (Rust 2024, toolchain pinned to 1.99.0 in `rust-toolchain.toml`)
 that depends on [decdn/decdn](https://github.com/decdn/decdn) through git
 dependencies. Read `docs/architecture.md` first. It covers the flow and the
 trust boundaries, and this file does not repeat them.
@@ -120,10 +120,13 @@ rather than writing new ones.
   in a PR of its own. To build against a local `../decdn`, use an untracked
   `.cargo/config.toml` `[patch]` (see `CONTRIBUTING.md`), and do not commit
   the lockfile changes it causes.
-- **The toolchain version is written in four places**:
+- **The toolchain version is written in five places**:
   `rust-toolchain.toml`, `rust-version` in the root `Cargo.toml`, every
-  `dtolnay/rust-toolchain@…` ref under `.github/`, and the MSRV badge in
-  `README.md`. Change all four together. CI checks only the first three.
+  `dtolnay/rust-toolchain` step under `.github/` (its `toolchain:` input, and
+  the SHA pin of upstream's `X.Y.Z` branch with its `# X.Y.Z` comment), the
+  MSRV badge in `README.md`, and the `rust:X.Y` tag in `deploy/Dockerfile`.
+  Change all five together. CI checks only the first three, and of the
+  workflow steps only the `toolchain:` inputs.
 
 ## Pull requests
 

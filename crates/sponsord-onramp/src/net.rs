@@ -33,10 +33,10 @@ pub struct ClientIp(pub Option<IpAddr>);
 impl FromRequestParts<AppState> for ClientIp {
     type Rejection = std::convert::Infallible;
 
-    async fn from_request_parts(
+    fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         let peer = parts
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
@@ -53,7 +53,7 @@ impl FromRequestParts<AppState> for ClientIp {
                 .and_then(|v| v.trim().parse().ok())
                 .or(peer),
         };
-        Ok(Self(ip))
+        std::future::ready(Ok(Self(ip)))
     }
 }
 

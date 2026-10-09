@@ -7,7 +7,7 @@
 #
 #   docker build -f deploy/Dockerfile --build-arg BIN=sponsord -t sponsord .
 
-FROM rust:1.95-bookworm AS build
+FROM rust:1.99-bookworm AS build
 ARG BIN
 WORKDIR /src
 COPY . .

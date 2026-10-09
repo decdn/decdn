@@ -32,8 +32,10 @@ ref as that site's value; an expression there (`${{ … }}`) cannot be read and
 is refused rather than skipped. Out of scope: a `RUSTUP_TOOLCHAIN` env var,
 which no workflow here sets.
 
-There is no Dockerfile site. The image is a single Debian stage that copies
-prebuilt release binaries, so no `rust:` tag ever names a version.
+The release image (root `Dockerfile`) has no Rust stage: it copies prebuilt
+release binaries onto Debian. The from-source `deploy/Dockerfile` does name
+one, `FROM rust:X.Y-bookworm`, but is out of scope: the tag is major.minor
+only, and it is kept in step by hand (AGENTS.md).
 
 Run: .github/scripts/check-toolchain-pin.sh
 """

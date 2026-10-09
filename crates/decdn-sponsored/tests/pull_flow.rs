@@ -179,6 +179,7 @@ async fn failure_keeps_state_and_rerun_reuses_capability() {
         .unwrap_err();
     assert!(err.to_string().contains("Re-run the same command"));
     let key_before = std::fs::read(state_dir(&data).join("keystore.json")).unwrap();
+    assert!(!key_before.is_empty(), "the failed run left its key behind");
 
     // The mock allows exactly one GET /v1/capability, so this run must reuse
     // the saved capability and key rather than asking the onramp again.
@@ -189,7 +190,6 @@ async fn failure_keeps_state_and_rerun_reuses_capability() {
     let calls = std::fs::read_to_string(tmp.path().join("calls")).unwrap();
     assert_eq!(calls.lines().count(), 2);
     assert!(!state_dir(&data).exists());
-    assert!(!key_before.is_empty());
 }
 
 #[tokio::test]
