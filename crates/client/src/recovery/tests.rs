@@ -338,7 +338,9 @@ fn slot(wait: Duration) -> crate::CredentialSlot {
         &decdn_incentive::bind_node_id_domain(1, alloy::primitives::Address::ZERO),
     )
     .expect("sign");
-    crate::CredentialSlot::new(std::sync::Arc::new(signer), capability).with_swap_wait(wait)
+    crate::CredentialSlot::new(std::sync::Arc::new(signer), capability)
+        .unwrap()
+        .with_swap_wait(wait)
 }
 
 /// A swap that came before the step counts as a step under the progress rule:
@@ -350,7 +352,7 @@ async fn a_swap_that_came_before_the_step_counts_under_the_progress_rule() {
     let slot = slot(Duration::ZERO);
     let swap = |slot: &crate::CredentialSlot| {
         let next = self::slot(Duration::ZERO).current();
-        slot.swap(next.signer, next.capability);
+        slot.swap(next.signer, next.capability).unwrap();
     };
     swap(&slot);
     assert_eq!(gate.swap_step(&slot, 0).await, SwapStep::Swapped);
@@ -373,7 +375,7 @@ async fn concurrent_callers_share_one_swap() {
     });
     tokio::time::advance(Duration::from_secs(1)).await;
     let next = self::slot(Duration::ZERO).current();
-    slot.swap(next.signer, next.capability);
+    slot.swap(next.signer, next.capability).unwrap();
     for wait in waits {
         assert_eq!(wait.await.unwrap(), SwapStep::Swapped);
     }

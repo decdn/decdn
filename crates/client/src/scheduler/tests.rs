@@ -6560,6 +6560,7 @@ fn slot_for(credential: &crate::Credential, wait: Duration) -> crate::Credential
         Arc::clone(&credential.signer),
         credential.capability.clone(),
     )
+    .unwrap()
     .with_swap_wait(wait)
 }
 
@@ -6624,7 +6625,8 @@ async fn a_swap_mid_stream_retires_the_old_lane_paid_and_resumes_under_the_new_k
         while source.delivered_bytes() < 1024 * 1024 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        slot.swap(Arc::clone(&new.signer), new.capability.clone());
+        slot.swap(Arc::clone(&new.signer), new.capability.clone())
+            .unwrap();
     };
     let (fetched, ()) = tokio::join!(acquire_delegated(&store, &provider, root), swap);
     fetched?;
@@ -6691,7 +6693,8 @@ async fn a_swap_inside_the_wait_resumes_the_fetch() -> anyhow::Result<()> {
 
     let swap = async {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        slot.swap(Arc::clone(&new.signer), new.capability.clone());
+        slot.swap(Arc::clone(&new.signer), new.capability.clone())
+            .unwrap();
     };
     let (fetched, ()) = tokio::join!(acquire_delegated(&store, &provider, root), swap);
     fetched?;

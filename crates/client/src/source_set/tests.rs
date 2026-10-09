@@ -922,6 +922,40 @@ async fn a_decline_does_not_cool_the_node_for_a_sibling_entry() {
     );
 }
 
+/// A source that declined this blob and is also priced out (two lanes, two
+/// refusals) cannot serve at any deposit. With the other source absent, the
+/// set ends not-found, not "funding needed": no funding step can help.
+#[tokio::test(start_paused = true)]
+async fn a_declined_source_priced_out_too_takes_no_funding_step() -> anyhow::Result<()> {
+    use crate::UpstreamRefused;
+    use decdn_protocol::client::StreamError;
+    let p = provider(vec![]);
+    let mut set = SourceSet::new(
+        &p,
+        [0; 32],
+        Arc::default(),
+        vec![holder(A, 10.0), non_holder(B, 20.0)],
+    );
+    let now = Instant::now();
+    let unfunded = anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Unfunded));
+    set.record_fault(A, &unfunded, None, now, U256::ZERO);
+    let declined = anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Declined));
+    set.record_fault(A, &declined, None, now, U256::ZERO);
+    let absent = anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::NotFound));
+    for _ in 0..super::ABSENT_AFTER_NOT_FOUND {
+        set.record_fault(B, &absent, None, now, U256::ZERO);
+    }
+    set.discovery_done(Ok(vec![]), now, U256::ZERO);
+    let err = set
+        .exhausted(U256::ZERO, false)
+        .ok_or_else(|| anyhow::anyhow!("every source is out"))?;
+    assert!(
+        err.downcast_ref::<crate::NoAffordableSource>().is_none(),
+        "{err:#}"
+    );
+    Ok(())
+}
+
 fn too_large() -> anyhow::Error {
     anyhow::Error::new(crate::UpstreamRefused::mid_stream(
         decdn_protocol::client::StreamError::Declined,

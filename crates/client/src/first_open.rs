@@ -19,9 +19,7 @@ use std::sync::Arc;
 use alloy::primitives::{Address, U256};
 use tokio::time::Instant;
 
-use crate::credential::{
-    CapabilityCause, CredentialSlot, CredentialView, FundingNeeded, QuoteMax, unix_now,
-};
+use crate::credential::{CredentialSlot, CredentialView, FundingNeeded, QuoteMax, unix_now};
 use crate::fault::{Fault, classify};
 use crate::recovery::{RecoveryGate, SwapStep, after_step};
 use crate::scheduler::{Connecting, connect_future, key_spend, sleep_until_opt};
@@ -333,12 +331,7 @@ impl<'a> Delegate<'a> {
             unix_now(),
         );
         slot.report(view.event());
-        // No size is known yet, so no work is priced: a cap with nothing left
-        // is spent.
-        let cause = view
-            .cause()
-            .or(view.headroom.is_zero().then_some(CapabilityCause::CapSpent))
-            .or(self.capability_refused.then_some(CapabilityCause::Revoked));
+        let cause = view.funding_cause(self.capability_refused);
         let pool = slot.pool_id();
         let Some(cause) = cause else {
             return Err(exhausted.context(FundingNeeded::PublisherPool { pool }));

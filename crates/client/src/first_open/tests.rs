@@ -437,7 +437,9 @@ fn delegate_slot(spending_cap: u64) -> crate::CredentialSlot {
         &decdn_incentive::bind_node_id_domain(1, Address::ZERO),
     )
     .unwrap();
-    crate::CredentialSlot::new(Arc::new(signer), capability).with_swap_wait(Duration::ZERO)
+    crate::CredentialSlot::new(Arc::new(signer), capability)
+        .unwrap()
+        .with_swap_wait(Duration::ZERO)
 }
 
 /// A delegated first open (a pinned node, no size hint) ends with the same

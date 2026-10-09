@@ -132,9 +132,7 @@ use tokio::time::Instant;
 use crate::coverage_plan::{
     SourceCoverage, covered_part, covered_suffix_start, covers_byte_range, spread_segments,
 };
-use crate::credential::{
-    CapabilityCause, CredentialSlot, CredentialView, FundingNeeded, QuoteMax, unix_now,
-};
+use crate::credential::{CredentialSlot, CredentialView, FundingNeeded, QuoteMax, unix_now};
 use crate::driver::{
     DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PacingWait, SharedPool, UnitProgress, WaitReason,
     contiguous_byte_ranges, fill_gap, ranges_content_len,
@@ -3846,10 +3844,7 @@ where
                         .await?;
                         slot.report(view.event());
                         let pool = slot.pool_id();
-                        let Some(cause) = view
-                            .cause()
-                            .or(capability_refused.then_some(CapabilityCause::Revoked))
-                        else {
+                        let Some(cause) = view.funding_cause(capability_refused) else {
                             return Err(err.context(FundingNeeded::PublisherPool { pool }));
                         };
                         match env.recovery.swap_step(slot, generation_seen).await {

@@ -48,6 +48,45 @@ pub struct Credential {
     pub capability: SignedCapability,
 }
 
+/// A voucher key that is not the signer its capability names. Every voucher
+/// it signed would be refused, so a slot never holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialMismatch {
+    /// The voucher-signing key.
+    pub key: Address,
+    /// The signer the capability names.
+    pub capability_signer: Address,
+}
+
+impl std::fmt::Display for CredentialMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "voucher key {} is not the signer {} its capability names",
+            self.key, self.capability_signer
+        )
+    }
+}
+
+impl std::error::Error for CredentialMismatch {}
+
+impl Credential {
+    /// `signer` with `capability`, when the capability names `signer`.
+    fn checked(
+        signer: Arc<PrivateKeySigner>,
+        capability: SignedCapability,
+    ) -> Result<Self, CredentialMismatch> {
+        let (key, capability_signer) = (signer.address(), capability.capability.signer);
+        if key != capability_signer {
+            return Err(CredentialMismatch {
+                key,
+                capability_signer,
+            });
+        }
+        Ok(Self { signer, capability })
+    }
+}
+
 /// The current credential and how many swaps produced it.
 #[derive(Clone, Debug)]
 struct Current {
@@ -59,7 +98,7 @@ struct Current {
 struct SlotInner {
     current: tokio::sync::watch::Sender<Current>,
     events: tokio::sync::watch::Sender<Option<FundingEvent>>,
-    swap_wait: Duration,
+    swap_wait: std::sync::Mutex<Duration>,
     /// What earlier fetches signed under a key, from the application's local
     /// lane records ([`CredentialSlot::record_spend`]).
     recorded: std::sync::Mutex<Option<(Address, U256)>>,
@@ -82,34 +121,39 @@ pub struct CredentialSlot {
 impl CredentialSlot {
     /// A slot that holds `capability` for `signer`, with the
     /// [`CREDENTIAL_SWAP_WAIT`] wait.
-    #[must_use]
-    pub fn new(signer: Arc<PrivateKeySigner>, capability: SignedCapability) -> Self {
-        Self::build(Credential { signer, capability }, CREDENTIAL_SWAP_WAIT)
-    }
-
-    /// A new slot with this slot's credential that waits `wait` for a swap at
-    /// the exhausted candidate set. Clones of this slot stay on this slot.
-    #[must_use]
-    pub fn with_swap_wait(self, wait: Duration) -> Self {
-        let slot = Self::build(self.current(), wait);
-        *slot.recorded_lock() = *self.recorded_lock();
-        slot
-    }
-
-    fn build(credential: Credential, swap_wait: Duration) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`CredentialMismatch`] when the capability names another signer.
+    pub fn new(
+        signer: Arc<PrivateKeySigner>,
+        capability: SignedCapability,
+    ) -> Result<Self, CredentialMismatch> {
         let (current, _) = tokio::sync::watch::channel(Current {
             generation: 0,
-            credential,
+            credential: Credential::checked(signer, capability)?,
         });
         let (events, _) = tokio::sync::watch::channel(None);
-        Self {
+        Ok(Self {
             inner: Arc::new(SlotInner {
                 current,
                 events,
-                swap_wait,
+                swap_wait: std::sync::Mutex::new(CREDENTIAL_SWAP_WAIT),
                 recorded: std::sync::Mutex::new(None),
             }),
-        }
+        })
+    }
+
+    /// Wait `wait` for a swap at the exhausted candidate set. The slot and
+    /// every clone of it share the wait.
+    #[must_use]
+    pub fn with_swap_wait(self, wait: Duration) -> Self {
+        *self
+            .inner
+            .swap_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = wait;
+        self
     }
 
     fn recorded_lock(&self) -> std::sync::MutexGuard<'_, Option<(Address, U256)>> {
@@ -138,11 +182,22 @@ impl CredentialSlot {
 
     /// Put `capability` for `signer` in the slot. Every fetch that holds the
     /// slot retires its lanes on the old key and goes on under this one.
-    pub fn swap(&self, signer: Arc<PrivateKeySigner>, capability: SignedCapability) {
+    ///
+    /// # Errors
+    ///
+    /// [`CredentialMismatch`] when the capability names another signer. The
+    /// slot keeps its credential.
+    pub fn swap(
+        &self,
+        signer: Arc<PrivateKeySigner>,
+        capability: SignedCapability,
+    ) -> Result<(), CredentialMismatch> {
+        let credential = Credential::checked(signer, capability)?;
         self.inner.current.send_modify(|current| {
             current.generation = current.generation.saturating_add(1);
-            current.credential = Credential { signer, capability };
+            current.credential = credential;
         });
+        Ok(())
     }
 
     /// The credential a new lane signs under.
@@ -172,7 +227,11 @@ impl CredentialSlot {
     /// How long a fetch at the exhausted candidate set waits for a swap.
     #[must_use]
     pub fn swap_wait(&self) -> Duration {
-        self.inner.swap_wait
+        *self
+            .inner
+            .swap_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The fetch's funding signal: the latest [`FundingEvent`], or `None`
@@ -394,6 +453,18 @@ impl CredentialView {
         } else {
             None
         }
+    }
+
+    /// Why a delegated fetch needs a new capability at its exhausted set, or
+    /// `None` when the capability still covers the work and only the pool
+    /// owner can help. The local [`Self::cause`] comes first. A cap with
+    /// nothing left is spent even when no work is priced yet. A capability
+    /// nodes refused (`capability_refused`) while it still covers the work
+    /// reads as revoked.
+    pub(crate) fn funding_cause(&self, capability_refused: bool) -> Option<CapabilityCause> {
+        self.cause()
+            .or(self.headroom.is_zero().then_some(CapabilityCause::CapSpent))
+            .or(capability_refused.then_some(CapabilityCause::Revoked))
     }
 }
 

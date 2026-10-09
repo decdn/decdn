@@ -253,7 +253,8 @@ pub mod source_set;
 pub use config::PullConfig;
 pub use connection::Connections;
 pub use credential::{
-    CREDENTIAL_SWAP_WAIT, CapabilityCause, Credential, CredentialSlot, FundingEvent, FundingNeeded,
+    CREDENTIAL_SWAP_WAIT, CapabilityCause, Credential, CredentialMismatch, CredentialSlot,
+    FundingEvent, FundingNeeded,
 };
 pub use downloader::{DownloadTarget, Downloader};
 pub use driver::PoolExhausted;

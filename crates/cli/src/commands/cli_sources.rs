@@ -196,7 +196,10 @@ where
         // A grant that does not decode fails the lane build first, which
         // names the fault; without a slot the fetch still ends funding needed.
         let capability = grant.to_signed_capability().ok()?;
+        // The command checked the loaded key against the grant before any
+        // lane was built ([`super::fetch::ensure_delegate_signer`]).
         let slot = CredentialSlot::new(Arc::clone(self.signer), capability)
+            .ok()?
             .with_swap_wait(std::time::Duration::ZERO);
         // What earlier fetches signed under this key, at every provider the
         // buyer store holds a lane for: the capability's spend so far.

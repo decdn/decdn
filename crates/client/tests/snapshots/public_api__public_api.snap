@@ -88,15 +88,21 @@ pub fn decdn_client::credential::FundingNeeded::fmt(&self, &mut core::fmt::Forma
 pub struct decdn_client::credential::Credential
 pub decdn_client::credential::Credential::capability: decdn_incentive::capability::SignedCapability
 pub decdn_client::credential::Credential::signer: alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>
+pub struct decdn_client::credential::CredentialMismatch
+pub decdn_client::credential::CredentialMismatch::capability_signer: alloy_primitives::bits::address::Address
+pub decdn_client::credential::CredentialMismatch::key: alloy_primitives::bits::address::Address
+impl core::error::Error for decdn_client::credential::CredentialMismatch
+impl core::fmt::Display for decdn_client::credential::CredentialMismatch
+pub fn decdn_client::credential::CredentialMismatch::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::credential::CredentialSlot
 impl decdn_client::credential::CredentialSlot
 pub fn decdn_client::credential::CredentialSlot::current(&self) -> decdn_client::credential::Credential
 pub fn decdn_client::credential::CredentialSlot::funding_events(&self) -> tokio::sync::watch::Receiver<core::option::Option<decdn_client::credential::FundingEvent>>
 pub fn decdn_client::credential::CredentialSlot::generation(&self) -> u64
-pub fn decdn_client::credential::CredentialSlot::new(alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::capability::SignedCapability) -> Self
+pub fn decdn_client::credential::CredentialSlot::new(alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::capability::SignedCapability) -> core::result::Result<Self, decdn_client::credential::CredentialMismatch>
 pub fn decdn_client::credential::CredentialSlot::pool_id(&self) -> alloy_primitives::aliases::B256
 pub fn decdn_client::credential::CredentialSlot::record_spend(&self, alloy_primitives::bits::address::Address, alloy_primitives::aliases::U256)
-pub fn decdn_client::credential::CredentialSlot::swap(&self, alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::capability::SignedCapability)
+pub fn decdn_client::credential::CredentialSlot::swap(&self, alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::capability::SignedCapability) -> core::result::Result<(), decdn_client::credential::CredentialMismatch>
 pub fn decdn_client::credential::CredentialSlot::swap_wait(&self) -> core::time::Duration
 pub fn decdn_client::credential::CredentialSlot::with_swap_wait(self, core::time::Duration) -> Self
 pub const decdn_client::credential::CREDENTIAL_SWAP_WAIT: core::time::Duration
@@ -369,15 +375,21 @@ pub fn decdn_client::connection::Connections::new(iroh::endpoint::Endpoint) -> S
 pub struct decdn_client::Credential
 pub decdn_client::Credential::capability: decdn_incentive::capability::SignedCapability
 pub decdn_client::Credential::signer: alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>
+pub struct decdn_client::CredentialMismatch
+pub decdn_client::CredentialMismatch::capability_signer: alloy_primitives::bits::address::Address
+pub decdn_client::CredentialMismatch::key: alloy_primitives::bits::address::Address
+impl core::error::Error for decdn_client::credential::CredentialMismatch
+impl core::fmt::Display for decdn_client::credential::CredentialMismatch
+pub fn decdn_client::credential::CredentialMismatch::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::CredentialSlot
 impl decdn_client::credential::CredentialSlot
 pub fn decdn_client::credential::CredentialSlot::current(&self) -> decdn_client::credential::Credential
 pub fn decdn_client::credential::CredentialSlot::funding_events(&self) -> tokio::sync::watch::Receiver<core::option::Option<decdn_client::credential::FundingEvent>>
 pub fn decdn_client::credential::CredentialSlot::generation(&self) -> u64
-pub fn decdn_client::credential::CredentialSlot::new(alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::capability::SignedCapability) -> Self
+pub fn decdn_client::credential::CredentialSlot::new(alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::capability::SignedCapability) -> core::result::Result<Self, decdn_client::credential::CredentialMismatch>
 pub fn decdn_client::credential::CredentialSlot::pool_id(&self) -> alloy_primitives::aliases::B256
 pub fn decdn_client::credential::CredentialSlot::record_spend(&self, alloy_primitives::bits::address::Address, alloy_primitives::aliases::U256)
-pub fn decdn_client::credential::CredentialSlot::swap(&self, alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::capability::SignedCapability)
+pub fn decdn_client::credential::CredentialSlot::swap(&self, alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::capability::SignedCapability) -> core::result::Result<(), decdn_client::credential::CredentialMismatch>
 pub fn decdn_client::credential::CredentialSlot::swap_wait(&self) -> core::time::Duration
 pub fn decdn_client::credential::CredentialSlot::with_swap_wait(self, core::time::Duration) -> Self
 pub struct decdn_client::Cumulative

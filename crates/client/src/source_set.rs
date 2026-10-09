@@ -1230,16 +1230,18 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// Whether every known source is priced out at `deposit` or can serve
-    /// none of the work left, with at least one actually priced out. A set
+    /// none of the work left, with at least one priced out that could serve
+    /// the work at a higher deposit: a top-up cannot help a source that
+    /// declined this blob or holds none of the work left. A set
     /// that is unanimous only on the latter is handled by
     /// [`Self::all_item_marked`] instead, so this is the affordability verdict
     /// even when it is mixed with absence marks.
     fn all_excluded(&self, deposit: U256, only_uncovered_left: bool) -> bool {
         !self.holders.is_empty()
-            && self
-                .holders
-                .iter()
-                .any(|h| self.is_unaffordable(h.provider, deposit))
+            && self.holders.iter().any(|h| {
+                self.is_unaffordable(h.provider, deposit)
+                    && !self.cannot_serve(h.provider, only_uncovered_left)
+            })
             && self.holders.iter().all(|h| {
                 self.cannot_serve(h.provider, only_uncovered_left)
                     || self.is_unaffordable(h.provider, deposit)
