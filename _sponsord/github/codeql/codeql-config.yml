@@ -1,3 +1,22 @@
 name: sponsord CodeQL config
+
+# Test code holds fixture keys, nonces and tokens by design, and every alert
+# it raises is noise. Rust runs with `build-mode: none`, which honours
+# `paths-ignore`. The list skips integration-test targets, the `sponsord-e2e`
+# test crate, and the unit-test modules, which each live in their own file
+# under `src/`. `test_support.rs` is the fakes behind each crate's
+# `test-support` feature, which no release build enables.
+#
+# The `src/` patterns match by file name, so
+# `crates/e2e/tests/no_inline_test_modules.rs` fails the test run on any file
+# they match that is not declared as a test module. A production file never
+# drops out of the analysis because of its name. The coverage job in
+# `workflows/ci.yml` skips the same files; keep the two lists in sync.
 paths-ignore:
   - crates/*/tests/**
+  - crates/e2e/**
+  - crates/*/src/**/tests.rs
+  - crates/*/src/**/*_tests.rs
+  - crates/*/src/**/proptests.rs
+  - crates/*/src/**/test_support.rs
+  - crates/*/src/**/tests_support.rs

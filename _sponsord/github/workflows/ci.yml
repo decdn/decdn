@@ -208,10 +208,16 @@ jobs:
           tool: cargo-llvm-cov,cargo-nextest
       # The decdn sources (cargo's git checkout) and registry crates are
       # compiled into the same binaries; keep them out of sponsord's report.
+      #
+      # cargo-llvm-cov already skips `tests.rs` and `*_tests.rs` by default.
+      # The regex adds to that default and drops the other unit-test module
+      # names that `.github/codeql/codeql-config.yml` skips (`proptests.rs`,
+      # `test_support.rs`, `tests_support.rs`), so the report measures
+      # production code only. Keep the two lists in sync.
       - name: Run tests (with coverage instrumentation)
         run: >
           cargo llvm-cov nextest --workspace --no-tests=pass
-          --ignore-filename-regex '\.cargo/(git|registry)/'
+          --ignore-filename-regex '\.cargo/(git|registry)/|(^|/)(proptests|tests?_support)\.rs$'
           --cobertura --output-path cobertura.xml
       - name: Report disk usage
         if: always()

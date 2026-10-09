@@ -87,6 +87,15 @@ rather than writing new ones.
   `decdn-sponsored` CLI allows the print lints at its crate roots. Silence a
   lint at the site with `#[expect(…, reason = "…")]`. Every member must keep
   `[lints] workspace = true` (CI checks this).
+- **Unit tests live in their own file**: every test module is declared
+  `mod <name>;` with its body in `foo/<name>.rs` for `foo.rs`, or `<name>.rs`
+  beside a `lib.rs`/`main.rs`/`mod.rs`. Never inline, and never in
+  `crates/*/tests/` for tests that need private access. A test module is one
+  gated on `test` or `feature = "test-support"` only. CodeQL and coverage skip
+  these files by name (`tests.rs`, `*_tests.rs`, `proptests.rs`,
+  `test_support.rs`, `tests_support.rs`), so name a new one to match.
+  `crates/e2e/tests/no_inline_test_modules.rs` fails on an inline body, and on
+  a file with one of those names that is not a test module.
 - **Contracts with deployed software**: the release archive names, the
   `~/.decdn/sponsor.toml` schema and both HTTP APIs (`sponsord-api`) are read
   by installers and CLIs already in the field. A change to any of them must be

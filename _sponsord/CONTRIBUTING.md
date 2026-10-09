@@ -38,6 +38,34 @@ tests the release tooling.
 If you change a type in `sponsord-api`, regenerate the OpenAPI documents:
 `UPDATE_OPENAPI=1 cargo test -p sponsord-api --test openapi`.
 
+## Unit test placement
+
+Every unit-test module lives in its own file. Declare it in the source file and
+put the body in a child file: `foo/tests.rs` for `foo.rs`, or `tests.rs` beside
+a `lib.rs`, `main.rs` or `mod.rs`.
+
+```rust
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests;
+```
+
+The rule has no size threshold. It covers every module gated only on test code:
+`cfg(test)`, `cfg(all(test, …))`, and the `test_support` fakes gated on
+`cfg(any(test, feature = "test-support"))`. The tests stay child modules, so
+they keep access to private items. Do not move them to `crates/*/tests/`: an
+integration test reaches only `pub` items.
+`crates/e2e/tests/no_inline_test_modules.rs` parses every source file under
+`crates/` and fails on any test module with an inline body. It runs in the
+default `cargo nextest run`.
+
+CodeQL skips these files by name (`.github/codeql/codeql-config.yml`):
+`tests.rs`, `*_tests.rs`, `proptests.rs`, `test_support.rs` and
+`tests_support.rs` under `src/`. The coverage job skips the same names. Name a
+new test module to match, or its fixture keys raise alerts. The same test fails
+if a file with one of those names is not a test module, so a production file
+never drops out of the analysis.
+
 ## Building against a local deCDN checkout
 
 The deCDN crates are git dependencies on `github.com/decdn/decdn`, at the
