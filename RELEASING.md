@@ -255,13 +255,15 @@ signatures and the container images are all already published and stand on
 their own; crates.io is an additional distribution channel, so the recovery is
 to finish the remaining crates, not to re-cut the version.
 
-Last, the script starts the `bump-decdn` workflow in
-[decdn/sponsord](https://github.com/decdn/sponsord), which pins decdn at a
-release tag. That workflow opens the PR that moves the pin to this release,
-after crates.io serves it. Your `gh` login needs write access to
-decdn/sponsord. If the start fails, the script prints the command to run
-later; it never fails the publish. Set `DECDN_SKIP_SPONSORD_BUMP=1` to skip
-it; the workflow's schedule picks the release up within six hours.
+Last, the script opens the PR that pins
+[decdn/sponsord](https://github.com/decdn/sponsord) to this release: it clones
+sponsord into a temporary directory and runs its
+`.github/scripts/open-decdn-bump.sh <tag>`, which waits for crates.io to serve
+the release and opens the PR with your `gh` login and git identity. That
+needs write access to decdn/sponsord, and uses your cargo (rustup installs
+sponsord's pinned toolchain). If it fails, the script prints the command to
+run later from a sponsord checkout; it never fails the publish. Set
+`DECDN_SKIP_SPONSORD_BUMP=1` to skip it.
 
 ### Crate ownership
 

@@ -17,8 +17,8 @@
 #   DECDN_ALLOW_RATE_LIMIT set to 1 to publish more than 5 brand-new crates in
 #                          one run — only once crates.io has raised this repo's
 #                          publish-new limit (see the check below)
-#   DECDN_SKIP_SPONSORD_BUMP set to 1/true/yes to not start decdn/sponsord's bump-decdn
-#                          workflow after the upload
+#   DECDN_SKIP_SPONSORD_BUMP set to 1/true/yes to not open decdn/sponsord's
+#                          decdn bump PR after the upload
 #
 # Unlike sign-release.sh this is NOT freely re-runnable: a crates.io version is
 # immutable and can never be replaced or re-uploaded (only yanked, which does not
@@ -106,6 +106,7 @@ chmod 700 "$KEYS_HOME"
 cleanup() {
   local rc=$? err
   rm -rf "$KEYS_HOME"
+  if [[ -n "${SPONSORD_DIR:-}" ]]; then rm -rf "$SPONSORD_DIR"; fi
   # -d, not -n: WORKTREE is assigned before `git worktree add` runs, so on an
   # add failure the path does not exist and removing it would print a warning
   # on top of the real error.
@@ -415,11 +416,13 @@ fi
 
 # ---- downstream ------------------------------------------------------------
 
-# decdn/sponsord pins decdn at a release tag. Its bump-decdn workflow opens the
-# PR that moves the pin to this release; it waits out crates.io index lag by
-# itself, so it starts even when a crate above is not served yet. A fork or a
-# DECDN_REPO test run starts nothing.
-BUMP_CMD=(gh workflow run bump-decdn.yml -R decdn/sponsord --ref main)
+# decdn/sponsord pins decdn at a release tag. Its open-decdn-bump.sh opens the
+# PR that moves the pin to this release, with your gh login and git identity,
+# from a fresh clone; it waits out crates.io index lag by itself, so it runs
+# even when a crate above is not served yet. Its cargo is yours too: rustup
+# installs the toolchain sponsord's rust-toolchain.toml names. A fork or a
+# DECDN_REPO test run opens nothing.
+BUMP_HINT="(cd <a decdn/sponsord checkout> && .github/scripts/open-decdn-bump.sh $TAG)"
 if [[ -n "$SKIP_SPONSORD_BUMP" ]]; then
   echo
   echo "==> Skipping sponsord's decdn bump (DECDN_SKIP_SPONSORD_BUMP is set)"
@@ -428,12 +431,27 @@ elif [[ "$REPO" != "decdn/decdn" ]]; then
   echo "==> Skipping sponsord's decdn bump ($REPO is not decdn/decdn)"
 else
   echo
-  echo "==> Starting sponsord's decdn bump"
-  if "${BUMP_CMD[@]}"; then
-    echo "    https://github.com/decdn/sponsord/actions/workflows/bump-decdn.yml"
+  echo "==> Opening sponsord's decdn bump PR"
+  SPONSORD_DIR=$(mktemp -d)
+  rc=0
+  if ! gh repo clone decdn/sponsord "$SPONSORD_DIR" -- --quiet; then
+    echo "warning: could not clone decdn/sponsord. Open the bump PR with:" >&2
+    echo "  $BUMP_HINT" >&2
   else
-    echo "warning: could not start sponsord's bump-decdn workflow. Start it with:" >&2
-    echo "  ${BUMP_CMD[*]}" >&2
+    (cd "$SPONSORD_DIR" && .github/scripts/open-decdn-bump.sh "$TAG") || rc=$?
+    case "$rc" in
+      0) ;;
+      3)
+        echo "warning: crates.io does not serve $TAG yet, so sponsord's bump PR is not open." >&2
+        echo "Open it later with:" >&2
+        echo "  $BUMP_HINT" >&2
+        ;;
+      *)
+        echo "warning: sponsord's open-decdn-bump.sh exited $rc; its output above says" >&2
+        echo "whether the PR is open. To run it again:" >&2
+        echo "  $BUMP_HINT" >&2
+        ;;
+    esac
   fi
 fi
 
