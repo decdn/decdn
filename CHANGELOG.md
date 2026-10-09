@@ -2767,7 +2767,7 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
-- **Toolchain: Rust 1.99.0 is the pinned toolchain and the MSRV.**
+- **Toolchain: Rust 1.99.0 is the pinned toolchain and the MSRV (#2378).**
   `rust-toolchain.toml`, `rust-version` and every `dtolnay/rust-toolchain`
   step move from 1.95.0 together. Rust 1.97 makes v0 symbol mangling the
   default, so a profiler or debugger that reads `decdn-node` symbols needs a
@@ -2776,13 +2776,14 @@ since project inception and will roll into the first tagged release.
   `-- -D warnings` and `RUSTDOCFLAGS`. The setting is not part of the build
   fingerprint, so a plain local `cargo clippy` and the hook share one build.
   CI no longer sets `CARGO_INCREMENTAL`: cargo turns incremental compilation
-  off itself when `CI` is set. Tests assert on enum shapes with
-  `assert_matches!`, which prints the value it got when the match fails. The
-  two new pedantic lints `unused_async_trait_impl` and `assert_is_empty` are
-  allowed, because their rewrites read worse than the code they replace.
+  off itself when `CI` is set. Tests whose value is `Debug` assert on enum
+  shapes with `assert_matches!`, which prints the value it got when the match
+  fails. The two new pedantic lints `unused_async_trait_impl` and
+  `assert_is_empty` are allowed, because their rewrites read worse than the
+  code they replace.
   - Why: 1.96.1, 1.97.1 and 1.98.1 each fix a miscompilation, 1.96 fixes
     Cargo CVE-2026-5222 and CVE-2026-5223, and 1.99 moves to LLVM 23 with a
-    rustdoc that runs 20–40% faster on the `doc` gate. No dependency was held
+    rustdoc its release notes put at 20% faster on average (up to 40%). No dependency was held
     back by the 1.95 floor.
 - **Node: every cache-miss refusal logs one info line that names its path
   (#2282).** A node that refuses a paid request from a serve-miss exit

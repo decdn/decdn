@@ -236,7 +236,7 @@ pub mod streamer;
 // Docs live in `sink.rs` as `//!`. Deliberately NOT documented here as well:
 // rustdoc resolves intra-doc links on a `mod` item in THIS file's scope, so the
 // module's own links (`content_paid_frontier`, …) would go unresolved
-// and fail the `-D warnings` doc gate.
+// and fail the doc gate (`CARGO_BUILD_WARNINGS=deny`).
 pub mod sink;
 /// The sourcing and funding seams of a fetch (#1608): [`source::BlobSource`]
 /// (raw-bao byte source for a range) and [`source::Funder`] (the injected

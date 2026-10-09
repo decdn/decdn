@@ -557,7 +557,7 @@ impl Inner {
     /// this lock — no user code runs inside the critical section, at any of
     /// the six call sites — so a recovered guard cannot observe a torn
     /// `HashMap`. Having established that, [`Mutex::clear_poison`] (stable
-    /// since 1.77; MSRV is 1.99) returns the mutex to a healthy state. That
+    /// since 1.77) returns the mutex to a healthy state. That
     /// is what makes the counter below mean *"how many tasks panicked in
     /// here"* rather than *"how many times we locked since one did"* — the
     /// latter climbs at request rate forever and reads on a `rate()` panel

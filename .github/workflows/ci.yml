@@ -165,8 +165,8 @@ jobs:
       - run: cargo test --doc --workspace
 
   # NOTE: there is intentionally no separate "MSRV check" job. The workspace
-  # MSRV (`rust-version = "1.99.0"`) equals the toolchain pinned in
-  # rust-toolchain.toml (1.99.0), which every Rust job here installs — the
+  # MSRV (`rust-version`) equals the toolchain pinned in
+  # rust-toolchain.toml, which every Rust job here installs — the
   # `packaging` job's toolchain-pin check refuses the two to differ. A
   # `cargo check` on that same toolchain is a strict subset of the `clippy`
   # job's `cargo clippy --workspace --all-targets` (clippy is rustc + extra

@@ -50,7 +50,7 @@ const _: () = assert!(
 ///
 /// The enforcement is two links, not one: a ninth field hard-errors here
 /// (`E0027`, pattern does not mention field) until the pattern names it,
-/// and CI's `cargo clippy --workspace --all-targets -- -D warnings` then
+/// and CI's `CARGO_BUILD_WARNINGS=deny cargo clippy --workspace --all-targets` then
 /// rejects the named-but-unread binding as `unused_variables`. Note that
 /// two of the fixes rustc suggests for `E0027` — `field: _` and `..` —
 /// silence both links with no diagnostic at all; adding an `assert_eq!` is

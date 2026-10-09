@@ -24,10 +24,12 @@
 //! the unstable flag via `RUSTC_BOOTSTRAP=1` — passed only to the spawned
 //! `cargo rustdoc`, not to anything else. This is deterministic and *more*
 //! stable than tracking `nightly`: the rustdoc-JSON `format_version` is frozen
-//! to whatever our pinned stable emits (currently 61, which the
-//! `rustdoc-types` 0.59.x under `public-api` 0.52 parses). The coupling to watch: a
-//! deliberate workspace toolchain bump can bump `format_version`, which may
-//! require bumping `public-api` and regenerating this `.snap` in the same PR.
+//! to whatever our pinned stable emits (currently 61, ahead of the format 59
+//! that `rustdoc-types` 0.59 under `public-api` 0.52 targets). `public-api` does
+//! not check `format_version`, so a passing snapshot is the only compatibility
+//! check. The coupling to watch: a deliberate workspace toolchain bump can bump
+//! `format_version`, which may require bumping `public-api` and regenerating
+//! this `.snap` in the same PR.
 //!
 //! Written with `?` / `Result` rather than the upstream `.unwrap()` example so
 //! it complies with the workspace anti-panic clippy lints (`unwrap_used` et al.)

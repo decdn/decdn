@@ -274,3 +274,20 @@ fn import_report_human_directory_shows_bundle_not_file_map() {
         "file map must stay out of human line: {line}"
     );
 }
+
+#[test]
+fn is_cross_device_matches_only_the_cross_device_kind() {
+    assert!(is_cross_device(&std::io::Error::from(
+        std::io::ErrorKind::CrossesDevices
+    )));
+    assert!(!is_cross_device(&std::io::Error::from(
+        std::io::ErrorKind::NotFound
+    )));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn is_cross_device_matches_a_raw_exdev() {
+    // 18 == EXDEV on Linux and macOS: the error `rename` returns across mounts.
+    assert!(is_cross_device(&std::io::Error::from_raw_os_error(18)));
+}

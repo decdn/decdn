@@ -73,11 +73,10 @@ The pre-commit hook lints only the default-feature workspace. CI's `clippy` job 
 the configurations that unification hides, and they fail independently of the hook:
 
 ```bash
-export CARGO_BUILD_WARNINGS=deny                                  # any warning fails, as in CI
-cargo clippy --workspace --all-targets --all-features             # feature-gated targets
-cargo clippy -p decdn-incentive --no-default-features             # redb not linked
-cargo clippy -p decdn-incentive --no-default-features \
-  --features buyer-store-core                                     # the node's config
+CARGO_BUILD_WARNINGS=deny cargo clippy --workspace --all-targets --all-features  # feature-gated targets
+CARGO_BUILD_WARNINGS=deny cargo clippy -p decdn-incentive --no-default-features  # redb not linked
+CARGO_BUILD_WARNINGS=deny cargo clippy -p decdn-incentive --no-default-features \
+  --features buyer-store-core                                                    # the node's config
 ```
 
 The `--all-features` run is the only one that reaches anything behind an off-by-default feature —

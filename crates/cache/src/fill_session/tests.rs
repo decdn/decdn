@@ -158,3 +158,19 @@ async fn load_fails_when_pull_ends_err_before_capture() {
         .expect_err("a failed pull must fail the load");
     assert!(err.to_string().contains("upstream pull failed"));
 }
+
+#[test]
+fn chunk_span_sums_every_finite_piece() {
+    use bao_tree::{ChunkNum, ChunkRanges};
+    let two =
+        &ChunkRanges::from(ChunkNum(0)..ChunkNum(3)) | &ChunkRanges::from(ChunkNum(5)..ChunkNum(9));
+    assert_eq!(super::chunk_span(&two), 7);
+    assert_eq!(super::chunk_span(&ChunkRanges::empty()), 0);
+}
+
+#[test]
+fn chunk_span_ignores_an_open_ended_tail() {
+    use bao_tree::{ChunkNum, ChunkRanges};
+    let open = &ChunkRanges::from(ChunkNum(0)..ChunkNum(2)) | &ChunkRanges::from(ChunkNum(4)..);
+    assert_eq!(super::chunk_span(&open), 2);
+}

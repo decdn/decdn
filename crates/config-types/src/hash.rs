@@ -104,12 +104,11 @@ impl FromStr for Hash {
             return Err(HashParseError::BadLength { got: s.len() });
         }
         let mut out = [0u8; 32];
-        // `out.iter_mut()` yields exactly 32 slots; the `len == 64` check
-        // above means `as_chunks::<2>()` yields exactly 32 pairs with an
-        // empty remainder. `zip` pairs them 1:1 — every output byte is written
-        // exactly once, with no indexing, no `get_mut`, and no
-        // write-only-if-present branch that could silently leave a slot
-        // zeroed if the invariants ever drifted.
+        // `out.iter_mut()` yields exactly 32 slots, and the `len == 64` check
+        // above is what makes `as_chunks::<2>()` yield exactly 32 pairs with an
+        // empty remainder. `zip` stops at the shorter side, so that check is
+        // what keeps every output byte written exactly once — with no
+        // indexing, no `get_mut`, and no write-only-if-present branch.
         for (slot, [hi, lo]) in out.iter_mut().zip(s.as_bytes().as_chunks::<2>().0) {
             let (Some(hi), Some(lo)) = (hex_val(*hi), hex_val(*lo)) else {
                 return Err(HashParseError::NonHexChar);
