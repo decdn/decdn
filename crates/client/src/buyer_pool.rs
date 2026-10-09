@@ -647,9 +647,8 @@ impl std::error::Error for TopUpUnconfirmed {}
 
 /// Typed marker on a failed top-up whose funder found the buyer's wallet
 /// holding too little USDC for it. No retry fixes that, so the acquire loop
-/// classifies it [`crate::Fault::Unaffordable`]: the source waits for the
-/// deposit to rise, and the command stops with the top-up remedy once every
-/// source waits. Any other failed reactive top-up is transient.
+/// classifies it [`crate::Fault::Unaffordable`], and a funding recovery step
+/// that fails with it ends the fetch "funding needed".
 #[derive(Debug, Clone, Copy)]
 pub struct WalletShortfall;
 
@@ -660,6 +659,60 @@ impl std::fmt::Display for WalletShortfall {
 }
 
 impl std::error::Error for WalletShortfall {}
+
+/// Typed marker on a [`top_up`] error whose gas estimate reverted
+/// `PoolNotOpen`: the pool is `Closing` or `Closed`, so it accepts no funds and
+/// is never reopened. The funding recovery step opens a new pool instead (ADR
+/// 003 § Funding recovery).
+#[derive(Debug, Clone, Copy)]
+pub struct PoolNotOpen;
+
+impl std::fmt::Display for PoolNotOpen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("topUp reverted PoolNotOpen: the pool is closing or closed")
+    }
+}
+
+impl std::error::Error for PoolNotOpen {}
+
+/// Whether `pool_id` still accepts funds: the gas estimate of a one-unit
+/// `topUp` from `owner`, with no transaction sent. A `PoolNotOpen` revert says
+/// no. Any other estimate failure (an allowance or balance short of one unit,
+/// a transport fault, a revert the decoder cannot read) says nothing about the
+/// pool, so the pool's status is read instead: `Closing` or `Closed` says no.
+/// When that read fails too, the pool reads as open, and the warning names
+/// both failures.
+///
+/// The funding recovery step checks this when the pool already holds its
+/// working deposit and there is nothing to add: a full pool that is `Closing`
+/// or `Closed` still needs a replacement.
+pub async fn pool_accepts_funds<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    owner: Address,
+    pool_id: B256,
+) -> bool {
+    let estimate = match contract.topUp(pool_id, 1).from(owner).estimate_gas().await {
+        Ok(_) => return true,
+        Err(err) if decdn_incentive::is_pool_not_open(err.as_revert_data().as_ref()) => {
+            return false;
+        }
+        Err(err) => err,
+    };
+    match contract.getPool(pool_id).call().await {
+        Ok(pool) => !matches!(
+            pool.status,
+            PaymentPool::Status::Closing | PaymentPool::Status::Closed
+        ),
+        Err(read) => {
+            tracing::warn!(
+                %pool_id,
+                error = %format_args!("topUp estimate: {estimate}; getPool: {read}"),
+                "could not tell whether the buyer pool still accepts funds; treating it as open"
+            );
+            true
+        }
+    }
+}
 
 /// How many times [`top_up`] re-sends a submit rejected as a nonce collision.
 const TOPUP_NONCE_RETRIES: u32 = 3;
@@ -742,12 +795,17 @@ pub async fn top_up<P: Provider + Clone>(
         // A deterministic allowance shortfall is caught at gas estimation and
         // surfaces here with ABI revert data attached. Match it so the node can
         // re-`approve` and retry once; every other revert stays terminal (an
-        // `approve` cannot fix a balance shortfall or a paused pool).
-        let allowance_short =
-            decdn_incentive::is_erc20_allowance_shortfall(err.as_revert_data().as_ref());
+        // `approve` cannot fix a balance shortfall or a paused pool). A pool
+        // that is no longer open reverts `PoolNotOpen` the same way, which the
+        // funding recovery step answers with a new pool.
+        let revert_data = err.as_revert_data();
+        let allowance_short = decdn_incentive::is_erc20_allowance_shortfall(revert_data.as_ref());
+        let not_open = decdn_incentive::is_pool_not_open(revert_data.as_ref());
         let submit_err = anyhow::Error::new(err).context("submit topUp");
         return Err(if allowance_short {
             submit_err.context(AllowanceShortfall)
+        } else if not_open {
+            submit_err.context(PoolNotOpen)
         } else {
             submit_err
         });

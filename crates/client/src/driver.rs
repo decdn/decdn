@@ -4,14 +4,14 @@
 //! filling ONLY the gaps the store is missing, paying the minimum: held ranges
 //! are read locally, never pulled, never re-paid. It is the integration keystone
 //! of the #1621 ranged-store effort — the piece that turns the sourcing axis
-//! ([`BlobSource`]), the pacing axis ([`Pacer`]), and the funding axis
-//! ([`Funder`]) into a single fetch that pulls exactly the bytes a request needs.
+//! ([`BlobSource`]) and the pacing axis ([`Pacer`]) into a single fetch that
+//! pulls exactly the bytes a request needs.
 //!
 //! # The money-relevant branches
 //!
 //! A whole-tail pull streams one advancing `byte_offset` to the end of the blob;
-//! `drive` instead drives the same money-relevant branches per gap — it draws,
-//! funds, and resumes one missing range at a time. The acquire loop
+//! `drive` instead drives the same money-relevant branches per gap: it draws
+//! and resumes one missing range at a time. The acquire loop
 //! ([`crate::acquire`]) runs the same per-gap loop on each of its lanes. The
 //! branches are:
 //!
@@ -21,24 +21,21 @@
 //!   watermark. The store's checkpoints are what make a mid-gap fault re-enter
 //!   with a SMALLER gap: the store owns durability, so a resume never re-pulls a
 //!   checkpointed prefix.
-//! - **Reactive top-up**: a genuine mid-fetch exhaustion (confirmed against our
-//!   OWN ledger via [`genuine_exhaustion`]) is funded through [`Funder::top_up`],
-//!   then the gap is retried at its PAID frontier — NOT its checkpointed
-//!   (delivered) frontier. [`crate::ClientRangedStore::ingest_stream`] checkpoints
-//!   delivered+verified bytes payment-agnostically (the ADR 003 credit window
-//!   lets the node stream a full interval before the voucher that pays for it is
-//!   due), so a mid-leg exhaustion can leave the store's present-range frontier
-//!   AHEAD of the last PAID byte. Resuming from `missing_ranges` alone would then
-//!   skip billing the delivered-but-unpaid tail (an under-pay). So the per-leg
-//!   resume offset is [`sink::content_paid_frontier`] of the leg's paid wire
-//!   watermark — the tail is
-//!   re-delivered (`ingest_stream` re-writes it idempotently) and re-billed.
-//! - **Settle-wait**: after a top-up the driver retries the open immediately —
-//!   the pacer sees the healed deposit and draws right away. If the node's chain
-//!   watcher has not yet observed the new deposit, that retry is refused with the
-//!   ambiguous [`crate::resume_may_be_stale`] shape; ONLY THEN does the driver
-//!   sleep and retry, bounded by the settle-wait budget: back-off happens only on an
-//!   actual stale-resume refusal.
+//! - **Refuse**: a lane whose deposit cannot cover the next voucher, a node's
+//!   `Unfunded` refusal, and a mid-stream funding rejection all end the lane.
+//!   The acquire loop marks its source priced out at the current deposit, and
+//!   adds funds only through the funding recovery step at the exhausted
+//!   candidate set (ADR 003 § Funding recovery).
+//! - **Paid-frontier resume**: within a gap, each new leg opens at the gap's
+//!   PAID frontier, NOT its checkpointed (delivered) frontier.
+//!   [`crate::ClientRangedStore::ingest_stream`] checkpoints delivered+verified
+//!   bytes payment-agnostically (the ADR 003 credit window lets the node stream a
+//!   full interval before the voucher that pays for it is due), so a leg can
+//!   leave the store's present-range frontier AHEAD of the last PAID byte. The
+//!   per-leg resume offset is [`sink::content_paid_frontier`] of the leg's paid
+//!   wire watermark: the tail is re-delivered (`ingest_stream` re-writes it
+//!   idempotently) and re-billed. A lane that a funding refusal ends records
+//!   that tail on its ledger, and the lane's next drive bills it first.
 //! - **Reseed** (wallet-less resync, #1481): an authenticated
 //!   [`WatermarkBundle`](decdn_protocol::client::WatermarkBundle) that ADVANCES
 //!   our committed watermark is a healable desync — the driver reseeds the ledger
@@ -68,7 +65,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -77,28 +74,25 @@ use bao_tree::ChunkRanges;
 use decdn_bao_range::{
     AlignedRange, CHUNK_GROUP_BYTES, RangedStore, RangedStoreError, align_range,
 };
-use decdn_incentive::DepositOutcome;
 use decdn_protocol::VoucherRejectReason;
 
-use crate::buyer_pool::EscrowUntracked;
 use crate::fault::HealExhausted;
 use crate::pacer::{DownstreamFrontier, PaceDecision, PaceState};
-use crate::source::{BlobSource, Funder, IngestEnd, IngestStore, SourceFuture};
+use crate::source::{BlobSource, IngestEnd, IngestStore, SourceFuture};
 use crate::{
     MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger, UpstreamPullHeader,
-    UpstreamVoucherRejected, genuine_exhaustion, heal_watermark_desync, is_insufficient_deposit,
-    reject_empty_claim_for_nonempty_root, rejection_watermark, resume_may_be_stale,
+    UpstreamVoucherRejected, heal_watermark_desync, reject_empty_claim_for_nonempty_root,
+    rejection_watermark,
 };
 
 /// The shared pool cannot fund the next voucher: its remaining deposit is below
-/// the next voucher's cost and reactive top-up is disabled or exhausted (the
-/// pacer returned [`PaceDecision::Refuse`]).
+/// the next voucher's cost (the pacer returned [`PaceDecision::Refuse`]).
 ///
 /// Typed rather than a bare string so the fault classifier
 /// ([`crate::classify`]) can `downcast_ref` it and rule it
-/// [`crate::Fault::Unaffordable`]: the pool is the same deposit against every
-/// provider (ADR 003), so moving the range to another lane cannot fund it. The
-/// source waits for the deposit to rise instead of cooling.
+/// [`crate::Fault::Unaffordable`]: the source is priced out at the current
+/// deposit, and the acquire loop adds funds only through its funding recovery
+/// step (ADR 003 § Funding recovery).
 #[derive(Debug)]
 #[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct PoolExhausted {
@@ -113,68 +107,13 @@ impl std::fmt::Display for PoolExhausted {
         write!(
             f,
             "gap [{}, +{}) of blob cannot be funded: the remaining deposit cannot cover the \
-             next voucher and reactive top-up is disabled or exhausted",
+             next voucher",
             self.gap_start, self.gap_len
         )
     }
 }
 
 impl std::error::Error for PoolExhausted {}
-
-/// A source kept refusing a new stream as `InsufficientDeposit` while the pool's
-/// remaining deposit already sat within the low water of the working deposit,
-/// past the settle budget ([`DriveConfig::max_settle_waits`]).
-///
-/// No top-up the pacer would send moves such a deposit, so the source is not
-/// priced out by it: either its chain view has not seen a refill yet, or its
-/// refundable floor `M` exceeds what this working deposit can cover. The fault
-/// classifier ([`crate::classify`]) rules it [`crate::Fault::Source`], so the
-/// source cools and is asked again, instead of waiting for a deposit rise that
-/// never comes.
-#[derive(Debug)]
-pub(crate) struct StaleDepositView {
-    /// The remaining deposit by our own ledger.
-    pub(crate) remaining: U256,
-    /// The working deposit the pacer tops up toward.
-    pub(crate) working: U256,
-}
-
-impl std::fmt::Display for StaleDepositView {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the source refuses the pool as short of deposit while {} of the {} µUSDC working \
-             deposit remains: its chain view is stale, or its refundable floor exceeds the \
-             working deposit",
-            self.remaining, self.working
-        )
-    }
-}
-
-impl std::error::Error for StaleDepositView {}
-
-/// Marker on a reactive top-up that failed: [`Funder::top_up`] returned an
-/// error, so the deposit did not rise. The failure is the buyer's funding,
-/// never the serving source's delivery, so the fault classifier
-/// ([`crate::classify`]) rules it [`crate::Fault::Transient`]: the source keeps
-/// its health and the loop retries. A funder that found the wallet short of
-/// USDC ([`crate::buyer_pool::WalletShortfall`]) makes it
-/// [`crate::Fault::Unaffordable`], like [`PoolExhausted`], and an error that may
-/// have escrowed USDC
-/// ([`crate::buyer_pool::TopUpUnconfirmed`],
-/// [`crate::buyer_pool::EscrowUntracked`]) stays fatal, whatever marker it
-/// carries.
-#[derive(Debug)]
-#[doc(hidden)]
-pub struct TopUpFailed;
-
-impl std::fmt::Display for TopUpFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the reactive pool top-up failed")
-    }
-}
-
-impl std::error::Error for TopUpFailed {}
 
 /// A leg of a gap opened, streamed and finished cleanly, yet left both the gap's
 /// paid frontier and the store's delivered frontier where they were.
@@ -279,42 +218,28 @@ impl CleanLeg {
 /// one lane IS the pool and its own `DriveCounters` and [`PoolContext`] already
 /// hold every fact below.
 ///
-/// Three facts are properties of the POOL, not of a lane, so a per-lane copy of
-/// any of them lets N lanes each spend what only one pool holds:
-///
-/// - **Spend.** The deposit gate must subtract what EVERY lane committed, not
-///   what this one did.
-/// - **Top-up budget.** [`Funder::max_topups`] bounds the reactive top-ups ONE
-///   fetch may escrow. Counting them per-lane multiplies the bound by the lane
-///   count.
-/// - **Deposit.** A landed top-up raises the deposit every lane draws on. Written
-///   only through this lane's `ctx`, it is invisible to the others, whose gate
-///   still subtracts the aggregate spend from a stale deposit and walks to a
-///   false exhaustion.
+/// The pool's spend is a property of the POOL, not of a lane: the deposit gate
+/// must subtract what EVERY lane committed, not what this one did, or N lanes
+/// each spend what only one pool holds. The deposit every lane draws on rises
+/// through the funding recovery step, which credits every lane's
+/// `PoolContext` itself, or through a low-water refill a lane build makes,
+/// which raises every lane to it.
 #[doc(hidden)]
 pub struct SharedPool<'a> {
     /// Sum, across every lane, of the committed voucher amount — the pool's
     /// total spend so far.
     pub spent: &'a (dyn Fn() -> U256 + Send + Sync),
-    /// Reactive top-ups this FETCH has spent, across every lane.
-    pub topups_used: &'a AtomicU32,
-    /// Credit a landed top-up's new deposit to EVERY lane's `PoolContext`, so no
-    /// lane gates on a stale deposit.
-    pub credit: &'a (dyn Fn(U256) -> anyhow::Result<()> + Send + Sync),
-    /// Held across each lane's top-up. Two lanes that reach the pool's floor
-    /// together would each escrow the whole shortfall, and without
-    /// `--max-approve` the second `topUp` reverts on the allowance the first one
-    /// used. The lane that waits re-reads the deposit once it holds the lock,
-    /// and decides again if a sibling's top-up already raised it.
-    pub topup_lock: &'a tokio::sync::Mutex<()>,
+    /// Where each lane folds the rate and voucher interval its node quoted, so
+    /// the fetch can price the work left ([`crate::FundingEvent`]). `None`
+    /// records nothing.
+    pub quotes: Option<&'a crate::credential::QuoteMax>,
 }
 
 impl std::fmt::Debug for SharedPool<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedPool")
             .field("spent", &(self.spent)())
-            .field("topups_used", &self.topups_used.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
@@ -368,104 +293,9 @@ fn locked_deposit(ctx: &Mutex<PoolContext>) -> anyhow::Result<U256> {
         .deposit)
 }
 
-/// Whether `remaining` deposit pays for the next voucher and sits within the
-/// low water of `working_deposit`, so the reactive top-up the pacer could send
-/// is below [`crate::pacer::min_reactive_top_up`]. A peer that still refuses
-/// such a deposit as insufficient reads a balance older than ours.
-fn deposit_near_working(remaining: U256, next_voucher_cost: U256, working_deposit: U256) -> bool {
-    !working_deposit.is_zero()
-        && remaining >= next_voucher_cost
-        && working_deposit.saturating_sub(remaining)
-            < crate::pacer::min_reactive_top_up(working_deposit)
-}
-
-/// Decide the next step for a source that refuses a deposit near the working
-/// target ([`deposit_near_working`]) after `waits` settle waits: `None` to
-/// wait once more, or the [`StaleDepositView`] fault once the budget is spent.
-/// Logs the first wait at info, each later one at debug, and the fault at warn.
-fn stale_view_wait(remaining: U256, config: &DriveConfig, waits: u32) -> Option<StaleDepositView> {
-    let working = config.working_deposit;
-    if waits >= config.max_settle_waits {
-        tracing::warn!(
-            %remaining,
-            %working,
-            waits,
-            "a source keeps refusing a deposit near the working target; its chain view is \
-             stale or its refundable floor exceeds the working deposit"
-        );
-        return Some(StaleDepositView { remaining, working });
-    }
-    if waits == 0 {
-        tracing::info!(
-            %remaining,
-            %working,
-            "a source refuses a deposit near the working target; waiting for its chain view \
-             to catch up"
-        );
-    } else {
-        tracing::debug!(
-            %remaining,
-            waits,
-            "still waiting for a source's chain view of the deposit"
-        );
-    }
-    None
-}
-
 /// Bytes per [`bao_tree::ChunkNum`] — a 1 KiB bao chunk. A gap's byte span is its
 /// chunk-range boundaries scaled by this.
 const CHUNK_BYTES: u64 = 1024;
-
-/// Deployment knobs the pure gap/pay core needs from its caller (CLI: #1497's
-/// `MAX_TOPUP_SETTLE_WAITS` / `TOPUP_SETTLE_BACKOFF`; node: its own smaller
-/// budgets). Kept minimal — progress and deadlines stay with the caller.
-#[derive(Debug, Clone, Copy)]
-#[doc(hidden)]
-pub struct DriveConfig {
-    /// The reactive top-up target passed to the pacer as
-    /// [`PaceState::working_deposit`]. `U256::ZERO` disables reactive top-up.
-    pub working_deposit: U256,
-    /// The buyer's estimate of a serving peer's refundable floor `M`, passed to the
-    /// pacer as [`PaceState::seller_reserve`]. `U256::ZERO` tops up only once the
-    /// next voucher is unaffordable.
-    pub seller_reserve: U256,
-    /// How many settle-backoff steps the driver may spend, after a top-up,
-    /// retrying an open that keeps failing with [`crate::resume_may_be_stale`]
-    /// before giving up on the node's chain watcher.
-    pub max_settle_waits: u32,
-    /// How long each settle-backoff step sleeps.
-    pub settle_backoff: Duration,
-}
-
-impl DriveConfig {
-    /// The CLI's reactive-graduation defaults (#1497): 30 settle waits of 500 ms.
-    #[must_use]
-    pub const fn cli(working_deposit: U256) -> Self {
-        Self {
-            working_deposit,
-            seller_reserve: U256::ZERO,
-            max_settle_waits: MAX_TOPUP_SETTLE_WAITS,
-            settle_backoff: TOPUP_SETTLE_BACKOFF,
-        }
-    }
-}
-
-/// Reactive graduation (#1497): after an on-chain `topUp`, the node's settlement
-/// watcher can briefly lag the `ChannelToppedUp` event, so its pre-serve deposit
-/// gate (#1518) still sees the pre-top-up deposit and refuses the resumed open
-/// (collapsed to `NotFound`). The client that performed the top-up waits out that
-/// lag by retrying the open — money-safe, since an open sends no vouchers and does
-/// not move `byte_offset`. `MAX_TOPUP_SETTLE_WAITS * TOPUP_SETTLE_BACKOFF` bounds
-/// the total wait (15s), comfortably above the daemon's chain-event poll cadence
-/// yet well under a fetch's overall deadline.
-///
-/// The single source of truth for [`drive`]'s settle-wait budget (via
-/// [`DriveConfig::cli`]); the CLI `fetch` command and `bundle_pull` both run
-/// `drive`, so they share one settle-wait policy.
-pub(crate) const MAX_TOPUP_SETTLE_WAITS: u32 = 30;
-/// Backoff between resume-open retries while waiting for the node's chain watcher
-/// to observe a just-landed top-up (see [`MAX_TOPUP_SETTLE_WAITS`]).
-pub(crate) const TOPUP_SETTLE_BACKOFF: Duration = Duration::from_millis(500);
 
 /// How often a fetch's single flush owner persists the `.ranges` present record
 /// while sources are still delivering. The ranged store's ingest `checkpoint`
@@ -475,6 +305,57 @@ pub(crate) const TOPUP_SETTLE_BACKOFF: Duration = Duration::from_millis(500);
 /// refetching — and re-paying for — the whole in-flight download. 5 seconds
 /// mirrors the voucher-flush cadence.
 pub(crate) const PRESENT_RECORD_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The spans [`drive`] took from its lane's unpaid record
+/// ([`PoolLedger::take_unpaid`]). The lane owes them until a gap bills them,
+/// so whatever ends the drive first, an error or the caller dropping the
+/// drive, notes back every span that ends past the offset billing reached.
+/// A span the gap's own funding refusal also noted bills once:
+/// `take_unpaid` merges.
+struct OwedSpans<'l> {
+    ledger: &'l PoolLedger,
+    hash: [u8; 32],
+    /// The owed spans, as `(start, len)` in ascending order.
+    spans: Vec<(u64, u64)>,
+    /// The content offset billing reached: the start of the gap in flight,
+    /// its paid frontier once the gap failed, or `u64::MAX` once every gap
+    /// is filled.
+    unbilled_from: AtomicU64,
+}
+
+impl<'l> OwedSpans<'l> {
+    /// Take `hash`'s owed spans from `ledger`.
+    fn take(ledger: &'l PoolLedger, hash: [u8; 32]) -> Self {
+        Self {
+            ledger,
+            hash,
+            spans: ledger.take_unpaid(hash),
+            unbilled_from: AtomicU64::new(0),
+        }
+    }
+
+    /// Billing has reached `offset`.
+    fn unbilled_from(&self, offset: u64) {
+        self.unbilled_from.store(offset, Ordering::Relaxed);
+    }
+
+    /// Every gap is filled, so every owed span is billed.
+    fn billed(&self) {
+        self.unbilled_from(u64::MAX);
+    }
+}
+
+impl Drop for OwedSpans<'_> {
+    fn drop(&mut self) {
+        let from = self.unbilled_from.load(Ordering::Relaxed);
+        for &(start, len) in &self.spans {
+            let end = start.saturating_add(len);
+            if end > from {
+                self.ledger.note_unpaid(self.hash, start.max(from), end);
+            }
+        }
+    }
+}
 
 /// Drive `fut` (a fetch's whole gap/worker set) to completion while a single
 /// periodic tick flushes the store's `.ranges` present record every `interval`,
@@ -556,13 +437,11 @@ pub(crate) struct UnitProgress {
     pub(crate) first_byte: std::sync::OnceLock<tokio::time::Instant>,
 }
 
-/// Fetch-wide counters that persist ACROSS the request's gaps (a top-up budget is
+/// Counters that persist ACROSS the request's gaps (the reseed budget is
 /// per-fetch, not per-gap), plus the last upstream quote used to price the next
 /// voucher.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DriveCounters {
-    /// Reactive top-ups spent so far — bounded by [`Funder::max_topups`].
-    topups_used: u32,
     /// Desync-reseed retries spent so far — bounded by [`MAX_RESUME_ATTEMPTS`].
     resume_attempts: u32,
     /// `ceil(interval_bytes * rate_per_mb / MiB)` from the most recent successful
@@ -570,16 +449,21 @@ pub(crate) struct DriveCounters {
     /// gate open so the first draw always proceeds (an exhaustion can only follow
     /// an open).
     next_voucher_cost: U256,
+    /// The paid content frontier of the gap [`fill_gap`] ran last: each
+    /// pass's, then the one read after a leg that ended the gap with an error.
+    /// A caller whose gap failed re-notes the spans the lane owes from there.
+    /// `None` before the first pass.
+    pub(crate) gap_paid_frontier: Option<u64>,
 }
 
 impl DriveCounters {
     /// Fresh per-fetch (single-source) or per-worker (multi-source) counters:
-    /// no top-ups or reseeds spent, and no priced voucher yet.
+    /// no reseeds spent, and no priced voucher yet.
     pub(crate) const fn new() -> Self {
         Self {
-            topups_used: 0,
             resume_attempts: 0,
             next_voucher_cost: U256::ZERO,
+            gap_paid_frontier: None,
         }
     }
 }
@@ -627,7 +511,7 @@ fn scopes_to_source(err: &anyhow::Error) -> bool {
 }
 
 /// Price the next voucher from an upstream header, the exact formula
-/// [`PoolLedger`]'s own `next_voucher` and the CLI's reactive branch use.
+/// [`PoolLedger`]'s own `next_voucher` uses.
 fn voucher_cost(header: &UpstreamPullHeader) -> U256 {
     U256::from(header.interval_bytes)
         .saturating_mul(U256::from(header.rate_per_mb))
@@ -722,15 +606,14 @@ where
 /// `pool` is `None` for a single-source fetch — the one lane is the whole pool.
 /// A caller that drives several per-provider lanes over one shared deposit (the
 /// node's ranged assembly) passes a [`SharedPool`] so every lane's solvency gate
-/// subtracts the aggregate spend and the reactive-top-up budget spans the whole
-/// set (#1506).
+/// subtracts the aggregate spend (#1506).
 ///
 /// # What it does
 ///
 /// 1. Compute `store.missing_ranges(offset, len)` and split it into the ordered
 ///    contiguous gaps. If none are missing, skip straight to the completion check.
 /// 2. For each gap, run a per-gap resume/pay loop: assemble a [`PaceState`] from
-///    the ledger/ctx/store/header and let the [`Pacer`] choose `Draw` / `TopUp` /
+///    the ledger/ctx/store/header and let the [`Pacer`] choose `Draw` /
 ///    `Wait` / `Done` / `Refuse`. A `Draw` opens the gap's [`AlignedRange`] through the
 ///    [`BlobSource`], streams it into the store (which checkpoints durably), and
 ///    finishes the pull. A mid-gap fault re-enters with the checkpointed prefix
@@ -743,23 +626,21 @@ where
 ///
 /// # Errors
 ///
-/// A [`PaceDecision::Refuse`] (out of budget/attempts), a terminal source/store
-/// fault that is neither a healable desync nor a fundable exhaustion, a clean leg
-/// that moved neither frontier ([`LegNoProgress`]), an escrowed-but-untracked
-/// top-up outcome, or a `finalize` failure.
+/// A [`PaceDecision::Refuse`] ([`PoolExhausted`]), a terminal source/store
+/// fault that is not a healable desync (a funding refusal or rejection among
+/// them), a clean leg that moved neither frontier ([`LegNoProgress`]), or a
+/// `finalize` failure.
 #[allow(clippy::too_many_arguments)]
 #[doc(hidden)]
-pub async fn drive<St, S, P, F>(
+pub async fn drive<St, S, P>(
     store: &St,
     source: &S,
     pacer: &P,
-    funder: &F,
     ctx: &Arc<Mutex<PoolContext>>,
     ledger: &Arc<PoolLedger>,
     hash: [u8; 32],
     offset: u64,
     len: u64,
-    config: &DriveConfig,
     on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
     pacing_wait: Option<&dyn PacingWait>,
     downstream: Option<&(dyn Fn() -> DownstreamFrontier + Send + Sync)>,
@@ -769,7 +650,6 @@ where
     St: IngestStore,
     S: BlobSource,
     P: Pacer,
-    F: Funder,
 {
     let total_bytes = store.total_bytes();
     // A store sized from a `total_bytes == 0` claim has no gap to fill and is
@@ -799,7 +679,18 @@ where
         .missing_ranges(offset, len)
         .await
         .map_err(store_query_fault)?;
-    let gaps = contiguous_byte_ranges(&missing, total_bytes);
+    // The spans this lane delivered and did not pay for when a funding refusal
+    // ended its last drive join the gaps, even outside the request: the lane
+    // owes them, so the drive opens at their paid frontier and bills them again
+    // although the store holds the bytes.
+    let owed = OwedSpans::take(ledger, hash);
+    let gaps = crate::ledger::merge_spans(
+        contiguous_byte_ranges(&missing, total_bytes)
+            .into_iter()
+            .chain(owed.spans.iter().copied())
+            .map(|(start, len)| (start, start.saturating_add(len)))
+            .collect(),
+    );
 
     // Fill every gap while a single periodic tick flushes the `.ranges` present
     // record (the single-writer flush point). The ranged store's ingest
@@ -808,20 +699,20 @@ where
     // (and re-pay for) the whole in-flight range on resume; the interval bounds
     // that loss to one `PRESENT_RECORD_FLUSH_INTERVAL`. This loop is the
     // single-source path's sole periodic flush owner — `fill_gap` never flushes.
+    let owed = &owed;
     let outcome = drive_with_interval_flush(store, PRESENT_RECORD_FLUSH_INTERVAL, async move {
         let mut counters = DriveCounters::new();
         for (gap_start, gap_len) in gaps {
+            owed.unbilled_from(gap_start);
             fill_gap(
                 store,
                 source,
                 pacer,
-                funder,
                 ctx,
                 ledger,
                 hash,
                 gap_start,
                 gap_len,
-                config,
                 &mut counters,
                 on_progress,
                 // `None`: `drive` is the single-source path, whose one lane reports
@@ -833,17 +724,23 @@ where
                 pacing_wait,
                 downstream,
                 // `None` on the single-source path: this one lane IS the pool,
-                // so its own `counters` and `ctx` already hold the spend, the
-                // top-up budget, and the deposit. The node's ranged-drive loop
-                // injects a shared view of all three across its per-provider
-                // lanes here instead (#1506); the client's multi-source
-                // scheduler calls `fill_gap` directly with the same view.
+                // so its own ledger already holds the spend. The node's
+                // ranged-drive loop injects a shared spend view across its
+                // per-provider lanes here instead (#1506); the client's
+                // multi-source scheduler calls `fill_gap` directly with the
+                // same view.
                 pool,
                 // No steal on the single-source path.
                 None,
             )
-            .await?;
+            .await
+            .inspect_err(|_| {
+                // The failed gap's owed part stays owed from its paid
+                // frontier on.
+                owed.unbilled_from(counters.gap_paid_frontier.unwrap_or(gap_start));
+            })?;
         }
+        owed.billed();
         Ok(())
     })
     .await;
@@ -999,6 +896,32 @@ fn warn_on_new_hole(
     );
 }
 
+/// The paid and delivered frontiers of the gap `[gap_start, asked_end)`, read
+/// after its last leg ended: the leg's paid frontier, clamped to the store's
+/// contiguous delivered frontier, and that delivered frontier. `None` when the
+/// store cannot answer.
+async fn ended_frontiers<St: RangedStore + ?Sized>(
+    store: &St,
+    ledger: &PoolLedger,
+    gap_start: u64,
+    asked_end: u64,
+    leg_anchor: Option<(u64, U256)>,
+) -> Option<(u64, u64)> {
+    let (still_missing, total_bytes) =
+        missing_below_bound(store, gap_start, asked_end.saturating_sub(gap_start))
+            .await
+            .ok()?;
+    let gap_end = asked_end.min(total_bytes);
+    let delivered = contiguous_frontier(&still_missing, total_bytes, gap_start, gap_end);
+    let (leg_start, baseline) = leg_anchor.unwrap_or((gap_start, ledger.committed().bytes));
+    let paid_wire =
+        u64::try_from(ledger.committed().bytes.saturating_sub(baseline)).unwrap_or(u64::MAX);
+    let paid = crate::sink::content_paid_frontier(leg_start, total_bytes, paid_wire)
+        .min(gap_end)
+        .min(delivered);
+    Some((paid, delivered))
+}
+
 /// The per-gap resume/pay loop. Fills the contiguous content span
 /// `[gap_start, gap_start + gap_len)` — a single gap of `missing_ranges` — driving
 /// the [`Pacer`] until it is fully present. `counters` persist across gaps.
@@ -1007,23 +930,20 @@ fn warn_on_new_hole(
 /// clips the gap to it, so a gap past a size a leg has just proved ends at
 /// that size. Progress reports `(position, bound)`.
 #[allow(clippy::too_many_arguments)]
-// One sequential decide -> act -> classify loop. The five `PaceDecision` arms and
-// the four-way fault classification each justify a money-relevant decision inline
-// (which watermark heals a desync, when an exhaustion is fundable, why a stall is
-// terminal); splitting them out would separate those from the loop state they act
-// on.
+// One sequential decide -> act -> classify loop. The `PaceDecision` arms and the
+// fault classification each justify a money-relevant decision inline (which
+// watermark heals a desync, why a stall is terminal); splitting them out would
+// separate those from the loop state they act on.
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn fill_gap<St, S, P, F>(
+pub(crate) async fn fill_gap<St, S, P>(
     store: &St,
     source: &S,
     pacer: &P,
-    funder: &F,
     ctx: &Arc<Mutex<PoolContext>>,
     ledger: &Arc<PoolLedger>,
     hash: [u8; 32],
     gap_start: u64,
     gap_len: u64,
-    config: &DriveConfig,
     counters: &mut DriveCounters,
     on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
     // Multi-source only: the shared whole-blob delivered-byte counter every lane
@@ -1048,7 +968,6 @@ where
     St: IngestStore,
     S: BlobSource,
     P: Pacer,
-    F: Funder,
 {
     // Solvency basis for the deposit gate. On the single-source path (`None`) it
     // is THIS lane's own committed amount — `deposit - own_committed`, unchanged.
@@ -1060,35 +979,21 @@ where
     // amount subtracted for the deposit gate — the per-leg paid-frontier math below
     // still reads THIS lane's own `committed.bytes`.
     let spent = move |own_amount: U256| pool.map_or(own_amount, |p| (p.spent)());
-
-    // Post-top-up settle state. `awaiting_settle` is set only right after a top-up,
-    // and consulted ONLY in the error-classification path below: it gates the
-    // bounded settle-wait on an ACTUAL stale-resume refusal from a re-open, not
-    // proactively before the retry is even attempted (the pacer always retries the
-    // open immediately after a top-up). It stays armed across landed legs until a
-    // non-stale fault or the settle budget ends it; `exhaustion_confirmed` is
-    // per-open and resets the moment a leg lands.
-    let mut awaiting_settle = false;
-    let mut settle_waits = 0u32;
-    // Waits on a source's stale view of a deposit already near the working
-    // target (step 1b). Apart from `settle_waits`, which a top-up re-arms: this
-    // path never tops up, so a landed leg re-arms it instead.
-    let mut stale_view_waits = 0u32;
-    let mut exhaustion_confirmed = false;
+    counters.gap_paid_frontier = None;
 
     // Paid-frontier anchor (PER-LEG, not per-gap). A "leg" is one contiguous
     // delivery from one successful open. `leg_anchor` records `(content offset the
     // leg opened at, channel-cumulative committed WIRE bytes at that moment)`. It
     // is re-anchored on every successful open (to the previous paid frontier) and
-    // on a reseed (to the healed delivered frontier), and PERSISTS across a fault
-    // so a post-top-up resume prices the paid frontier against the faulted leg's
-    // own spend. Both the completion signal (`paid_cleared`) and the Draw resume
+    // on a reseed (to the healed delivered frontier), and PERSISTS across passes
+    // so a resumed leg prices the paid frontier against the previous leg's own
+    // spend. Both the completion signal (`paid_cleared`) and the Draw resume
     // start are derived from it; see the per-pass computation at the loop top.
     //
     // Why the PAID frontier and not the store's DELIVERED frontier: `ingest_stream`
     // checkpoints delivered+verified bytes payment-agnostically (ADR 003's credit
     // window lets the node stream up to a full interval before the voucher that
-    // pays for it is due), so a mid-leg exhaustion leaves the present-range
+    // pays for it is due), so a leg can leave the present-range
     // frontier AHEAD of the last PAID byte — and the whole blob can be delivered in
     // one leg while only part is paid. Gating on delivery would `Done` before the
     // tail is billed (under-pay). `content_paid_frontier` maps the wire an accepted
@@ -1198,6 +1103,7 @@ where
                 .min(gap_end)
                 .min(delivered_frontier);
         let paid_cleared = paid_frontier.saturating_sub(gap_start);
+        counters.gap_paid_frontier = Some(paid_frontier);
 
         // A clean leg's payment moves the paid frontier to the end of what it
         // delivered, and its bytes land in the store, so this pass sees one of the
@@ -1226,17 +1132,6 @@ where
             requested_bytes: gap_len,
             remaining_deposit,
             next_voucher_cost: counters.next_voucher_cost,
-            working_deposit: config.working_deposit,
-            seller_reserve: config.seller_reserve,
-            // The reactive-top-up budget is a property of the POOL, not of a
-            // lane: `Funder::max_topups` bounds what ONE fetch may escrow, and
-            // every lane escrows into the ONE deposit. Multi-source reads the
-            // count shared across lanes; single-source reads its own.
-            topups_used: pool.map_or(counters.topups_used, |p| {
-                p.topups_used.load(Ordering::Acquire)
-            }),
-            max_topups: funder.max_topups(),
-            exhaustion_confirmed,
             // `pulled_frontier` is this leg's own admitted/present frontier —
             // correct on BOTH the client and node pull legs, since it is always
             // THIS leg's delivery progress, never the downstream client's. No
@@ -1282,72 +1177,11 @@ where
                 );
             }
             PaceDecision::Refuse => {
+                // The lane keeps what it delivered and did not pay for, so
+                // its next drive, if it runs again, bills it.
+                ledger.note_unpaid(hash, paid_frontier, delivered_frontier);
+                counters.gap_paid_frontier = Some(paid_frontier);
                 return Err(anyhow::Error::new(PoolExhausted { gap_start, gap_len }));
-            }
-            PaceDecision::TopUp(additional) => {
-                // One top-up at a time across the pool's lanes. A sibling's
-                // top-up that landed while this lane waited has raised the
-                // deposit every lane reads, so decide again rather than escrow a
-                // second shortfall.
-                let _topping_up = match pool {
-                    Some(p) => Some(p.topup_lock.lock().await),
-                    None => None,
-                };
-                if pool.is_some() && locked_deposit(ctx)? > deposit {
-                    continue;
-                }
-                match funder
-                    .top_up(additional)
-                    .await
-                    .map_err(|err| err.context(TopUpFailed))?
-                {
-                    DepositOutcome::Added(new_deposit) => {
-                        // Credit the new deposit through the shared handle so the
-                        // source's next open (which clones the context) sees it.
-                        // The deposit backs the whole lane set, so multi-source
-                        // credits EVERY lane: a lane left on the pre-top-up value
-                        // subtracts the aggregate spend from a stale deposit and
-                        // walks to a false exhaustion the pool can already fund.
-                        match pool {
-                            Some(p) => (p.credit)(new_deposit)?,
-                            None => {
-                                ctx.lock()
-                                    .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
-                                    .deposit = new_deposit;
-                            }
-                        }
-                    }
-                    // Typed as an untracked escrow, so the acquire loop ends the
-                    // command rather than retrying into a second escrow.
-                    DepositOutcome::UnknownPool => {
-                        return Err(anyhow::Error::new(EscrowUntracked(format!(
-                            "mid-fetch top-up of {additional} landed on-chain but no local \
-                             record remains to credit it: the deposit is escrowed and \
-                             untracked. Reconcile against the chain before retrying"
-                        ))));
-                    }
-                    DepositOutcome::PoolMismatch => {
-                        return Err(anyhow::Error::new(EscrowUntracked(format!(
-                            "mid-fetch top-up of {additional} landed on-chain but the local \
-                             record now tracks a different pool: the deposit is escrowed \
-                             against the topped-up pool. Reconcile against the chain \
-                             before retrying"
-                        ))));
-                    }
-                }
-                // Spend one unit of the top-up budget — the shared one when lanes
-                // draw on one pool, so N lanes cannot each escrow `max_topups`.
-                match pool {
-                    Some(p) => {
-                        p.topups_used.fetch_add(1, Ordering::AcqRel);
-                    }
-                    None => counters.topups_used = counters.topups_used.saturating_add(1),
-                }
-                // The node's watcher may not observe this top-up before the next
-                // open; wait it out rather than misread the refusal.
-                awaiting_settle = true;
-                settle_waits = 0;
-                exhaustion_confirmed = false;
             }
             // Honors `up_to_bytes` (#1608):
             // `BudgetPacer` returns the full gap remainder, so clamping to it is a
@@ -1358,7 +1192,7 @@ where
                 // Draw the UNPAID tail `[paid_frontier, gap_end)`. This is the
                 // still-missing part when payment tracks delivery, and additionally
                 // the delivered-but-unpaid span `[paid_frontier, delivered_frontier)`
-                // after an exhaustion — `ingest_stream` re-writes the already-present
+                // a previous leg left: `ingest_stream` re-writes the already-present
                 // bytes idempotently and the pull re-bills them, so the credit-window
                 // tail the store checkpointed ahead of payment is finally paid. A
                 // hole the store left before present bytes caps the paid frontier
@@ -1410,20 +1244,28 @@ where
                             .fetch_max(leg_start.saturating_add(received), Ordering::SeqCst);
                     }
                     let Some(cb) = on_progress else { return };
+                    // Only bytes past the delivered frontier this pass read are
+                    // new. A leg that opens at the paid frontier re-delivers the
+                    // present bytes below it to bill them, and those add nothing
+                    // to the position, so the funding recovery gate never counts
+                    // them as verified progress.
+                    let end = leg_start.saturating_add(received);
+                    let prev_end = leg_start.saturating_add(received.saturating_sub(delta));
+                    let fresh = end.saturating_sub(prev_end.max(delivered_frontier));
                     let position = match progress_agg {
-                        // Multi-source: fold this leg's monotonic per-leg `received`
-                        // into the shared whole-blob total as deltas, so the bar
-                        // reads one non-decreasing position across concurrent lanes.
-                        // Clamp the readout to the blob size — a bounded, idempotent
-                        // tail re-fetch can re-deliver a few already-counted bytes,
-                        // and the bar must never exceed 100%.
+                        // Multi-source: fold this leg's new bytes into the shared
+                        // whole-blob total as deltas, so the bar reads one
+                        // non-decreasing position across concurrent lanes. The
+                        // readout clamps to the blob size.
                         Some(delivered) => delivered
-                            .fetch_add(delta, Ordering::Relaxed)
-                            .saturating_add(delta)
+                            .fetch_add(fresh, Ordering::Relaxed)
+                            .saturating_add(fresh)
                             .min(total_bytes),
-                        // Single-source: this one lane's present base plus its leg
-                        // progress is already the whole-blob position.
-                        None => base_present.saturating_add(received),
+                        // Single-source: this one lane's present base plus the
+                        // leg's new bytes is the whole-blob position.
+                        None => base_present
+                            .saturating_add(end.saturating_sub(delivered_frontier.max(leg_start)))
+                            .min(total_bytes),
                     };
                     cb(position, total_bytes);
                 };
@@ -1433,10 +1275,13 @@ where
                 let leg: anyhow::Result<()> = match source.open(hash, aligned.clone()).await {
                     Ok((header, reader)) => {
                         counters.next_voucher_cost = voucher_cost(&header);
+                        if let Some(quotes) = pool.and_then(|p| p.quotes) {
+                            quotes.observe(header.rate_per_mb, header.interval_bytes);
+                        }
                         // A new leg has opened: re-anchor the paid-frontier baseline
                         // to THIS open's start and the committed watermark BEFORE it
-                        // streams, so a later top-up on this leg prices its paid
-                        // frontier against this leg's own wire spend alone.
+                        // streams, so the next pass prices its paid frontier
+                        // against this leg's own wire spend alone.
                         leg_anchor = Some((resume_start, ledger.committed().bytes));
                         // The store is keyed by offset: the leg verifies under
                         // the size its own sender signs, whatever the bound.
@@ -1471,82 +1316,9 @@ where
                     Err(err) => Err(err),
                 };
 
-                if leg.is_ok() {
-                    stale_view_waits = 0;
-                }
                 if let Err(err) = leg {
-                    // --- fault classification (mirrors the CLI loop, REUSING the
-                    // shipped predicates) ---
-
-                    let committed = ledger.committed();
-
-                    // 1. A stale-resume refusal while we are waiting out a top-up:
-                    //    the node's watcher has not caught up yet. Sleep and retry
-                    //    the same sub-range, bounded by the settle budget. An
-                    //    `InsufficientDeposit` re-open (option 2 / #2013) qualifies for
-                    //    the same wait: right after a `topUp` the node's chain watcher
-                    //    may still read the pre-top-up `remaining − M` and refuse the
-                    //    authenticated owner with this code, exactly as an honest node's
-                    //    range gate refuses a stale offset with `NotFound`.
-                    if awaiting_settle
-                        && settle_waits < config.max_settle_waits
-                        && (resume_may_be_stale(&err) || is_insufficient_deposit(&err))
-                    {
-                        settle_waits = settle_waits.saturating_add(1);
-                        tokio::time::sleep(config.settle_backoff).await;
-                        continue;
-                    }
-                    awaiting_settle = false;
-
-                    // 1b. An open-time `InsufficientDeposit` refusal (option 2 / #2013):
-                    //     the serving node proved us the authenticated pool owner and
-                    //     told us its refundable floor `M` outruns our pool's remaining
-                    //     deposit. Our own ledger says we can still afford the next
-                    //     voucher — only the node's private `M` is higher than we
-                    //     estimated — so `genuine_exhaustion` below would reject it. Route
-                    //     it into the fund-and-retry loop directly: the pacer tops the
-                    //     deposit up toward our `working_deposit` ceiling and re-opens,
-                    //     clearing the node's `remaining − M ≥ window` gate. If the
-                    //     ceiling (or the top-up budget) is already spent the pacer
-                    //     refuses on the next pass, ending the fetch truthfully as
-                    //     `PoolExhausted` rather than on an ambiguous miss. The ceiling is
-                    //     the sole clamp on how much a lying node can make us escrow, so
-                    //     trusting this owner-only signal is money-safe.
-                    //
-                    //     A refusal while the deposit already sits within the low
-                    //     water of `working_deposit` is the node's stale view
-                    //     instead: a refill made elsewhere (another lane's build,
-                    //     a sibling's top-up) has not reached its chain watcher
-                    //     yet, and no top-up the pacer would send moves it (the
-                    //     pacer refuses a top-up below
-                    //     [`crate::pacer::min_reactive_top_up`]). Wait it out on
-                    //     its own budget. Past it, the source faults as
-                    //     [`StaleDepositView`]: it cools and is asked again,
-                    //     rather than read as priced out by a deposit that never
-                    //     rises.
-                    if is_insufficient_deposit(&err) {
-                        let remaining =
-                            locked_deposit(ctx)?.saturating_sub(spent(committed.amount));
-                        if deposit_near_working(
-                            remaining,
-                            counters.next_voucher_cost,
-                            config.working_deposit,
-                        ) {
-                            if let Some(stale) =
-                                stale_view_wait(remaining, config, stale_view_waits)
-                            {
-                                return Err(err.context(stale));
-                            }
-                            stale_view_waits = stale_view_waits.saturating_add(1);
-                            tokio::time::sleep(config.settle_backoff).await;
-                            continue;
-                        }
-                        exhaustion_confirmed = true;
-                        continue;
-                    }
-
-                    // 2 & 3 both read the shared context. The guard is held only
-                    // across synchronous reads, never across the heal's `.await`.
+                    // The heal reads the shared context. The guard is held only
+                    // across the synchronous read, never across the heal's `.await`.
                     let watermark = {
                         let guard = ctx
                             .lock()
@@ -1554,7 +1326,7 @@ where
                         rejection_watermark(&err, &guard)
                     };
 
-                    // 2. Desync heal (driver-owned, NOT a PaceDecision): an
+                    // 1. Desync heal (driver-owned, NOT a PaceDecision): an
                     //    authenticated bundle that ADVANCES our committed
                     //    watermark means the node holds a voucher we lost, an
                     //    `Underpaid` bundle BEHIND it means we hold vouchers the
@@ -1566,9 +1338,9 @@ where
                     //    rejecting after each heal: mark the rejection
                     //    `HealExhausted`, so the source cools rather than the
                     //    command ending. A rejection that no heal takes stays
-                    //    bare and falls through to step 4. Only a lane-watermark
+                    //    bare and falls through to step 2. Only a lane-watermark
                     //    reason is marked (`scopes_to_source`): a spending-cap
-                    //    rejection reaches step 3's check instead.
+                    //    rejection stays a funding rejection.
                     let healed = match watermark {
                         Some(watermark) => heal_watermark_desync(&err, watermark, ledger).await,
                         None => None,
@@ -1577,28 +1349,7 @@ where
                     if healed.is_some() && past_budget && scopes_to_source(&err) {
                         return Err(err.context(HealExhausted));
                     }
-                    let desync = healed.is_some() && !past_budget;
-
-                    // 3. Genuine exhaustion (corroborated against our OWN
-                    //    ledger): let the pacer fund it on the next pass. The
-                    //    store already checkpointed the paid prefix, so the
-                    //    retry re-opens only the un-checkpointed tail.
-                    let exhausted = !desync && {
-                        let guard = ctx
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?;
-                        let remaining = guard.deposit.saturating_sub(spent(committed.amount));
-                        genuine_exhaustion(
-                            &err,
-                            &guard,
-                            committed,
-                            remaining,
-                            counters.next_voucher_cost,
-                        )
-                    };
-                    let classify = (desync, exhausted);
-
-                    if classify.0 {
+                    if healed.is_some() && !past_budget {
                         counters.resume_attempts = counters.resume_attempts.saturating_add(1);
                         log_healed_retry(
                             hash,
@@ -1629,23 +1380,26 @@ where
                         leg_anchor = Some((delivered_frontier, ledger.committed().bytes));
                         continue;
                     }
-                    if classify.1 {
-                        exhaustion_confirmed = true;
-                        continue;
-                    }
 
-                    // 4. Anything else — a stall, reset, hash mismatch, local I/O
-                    //    fault, a voucher rejection no heal takes — is terminal.
+                    // 2. Anything else (a stall, reset, hash mismatch, local I/O
+                    //    fault, a funding refusal or rejection, a voucher
+                    //    rejection no heal takes) ends the lane. The acquire
+                    //    loop classifies it ([`crate::classify`]). A lane that
+                    //    a funding refusal ends keeps the span it delivered and
+                    //    did not pay for, so its next drive, if it runs again,
+                    //    bills it.
+                    if let Some((paid, delivered)) =
+                        ended_frontiers(store, ledger, gap_start, asked_end, leg_anchor).await
+                    {
+                        counters.gap_paid_frontier = Some(paid);
+                        if crate::classify(&err) == crate::Fault::Unaffordable {
+                            ledger.note_unpaid(hash, paid, delivered);
+                        }
+                    }
                     return Err(err);
                 }
 
-                // The leg landed: a fresh, healthy open resets the per-open state.
-                // The settle allowance stays armed, with whatever budget is left: a
-                // landed leg proves only that the upstream admitted ONE stream, maybe
-                // on headroom it computed before its watcher saw the top-up, so a
-                // later re-open can still meet the same stale refusal. The next
-                // top-up re-arms the budget; a stale refusal past it is terminal.
-                exhaustion_confirmed = false;
+                // The leg landed: the next pass must see a frontier move.
                 clean_leg = Some(CleanLeg {
                     offset: aligned.fetch_start(),
                     len: aligned.fetch_len(),

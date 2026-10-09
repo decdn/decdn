@@ -262,18 +262,16 @@ async fn every_source_unaffordable_stops_only_after_a_fresh_discovery() {
     };
     set.record_fault(A, &dry(), None, now, dep);
     set.record_fault(B, &dry(), None, now, dep);
-    assert!(set.exhausted(dep, true, false).is_none(), "top-ups left");
     assert!(
-        set.exhausted(dep, false, false).is_none(),
+        set.exhausted(dep, false).is_none(),
         "no discovery at this deposit yet"
     );
     assert!(set.wants_discovery(now, dep, 0, false));
     set.discovery_done(Ok(vec![]), now, dep);
-    let err = set.exhausted(dep, false, false);
+    let err = set.exhausted(dep, false);
     assert!(err.is_some_and(|e| e.downcast_ref::<NoAffordableSource>().is_some()));
     assert!(
-        set.exhausted(dep + U256::from(1u64), false, false)
-            .is_none(),
+        set.exhausted(dep + U256::from(1u64), false).is_none(),
         "a top-up revives"
     );
 }
@@ -308,12 +306,12 @@ async fn every_source_saying_not_found_ends_the_item() {
     let now = Instant::now();
     say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
     assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
+        set.exhausted(U256::ZERO, false).is_none(),
         "B has not answered"
     );
     say_not_found(&mut set, B, super::ABSENT_AFTER_NOT_FOUND, now);
     assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
+        set.exhausted(U256::ZERO, false).is_none(),
         "no discovery since the last mark"
     );
     assert!(
@@ -321,29 +319,27 @@ async fn every_source_saying_not_found_ends_the_item() {
         "unanimity skips the backoff"
     );
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
-    let err = set.exhausted(U256::ZERO, true, false);
+    let err = set.exhausted(U256::ZERO, false);
     assert!(err.is_some_and(|e| e.downcast_ref::<super::NoSourceHasBlob>().is_some()));
 }
 
-/// A refusal the chain explains as a drained capability signer at the
-/// refusing provider's rate.
-fn drained(provider: Address, remaining: u64, rate_per_mb: u64) -> anyhow::Error {
-    anyhow::Error::new(crate::SignerCapDrained {
-        pool_id: alloy::primitives::B256::ZERO,
-        signer: Address::ZERO,
-        provider,
-        remaining,
-        rate_per_mb,
-        expired: false,
+/// An unhealed voucher rejection with no funding reason.
+fn rejected(reason: decdn_protocol::client::VoucherRejectReason) -> anyhow::Error {
+    anyhow::Error::new(crate::UpstreamVoucherRejected {
+        reason,
+        bundle: None,
+        proof_generation: None,
     })
 }
 
-/// A probed holder that refuses the lane's signer as drained at its rate is
-/// barred for the blob, with no peer-store failure stamp, while a cheaper
-/// holder still starts. Once every holder is barred, the item ends with
-/// the drained cause in the chain (#2338).
+/// A holder that rejects this client's vouchers declines the fetch: it is
+/// barred for the blob with no peer-store failure stamp, while another
+/// holder still starts. Once every holder declined, the item ends at once,
+/// with no fresh discovery, naming the reasons collected (ADR 039 §Failure
+/// handling).
 #[tokio::test(start_paused = true)]
-async fn a_drained_signer_bars_each_refusing_holder_until_none_is_left() -> anyhow::Result<()> {
+async fn every_holder_declining_ends_the_item_with_its_reasons() -> anyhow::Result<()> {
+    use decdn_protocol::client::VoucherRejectReason;
     let p = provider(vec![]);
     let mut set = SourceSet::new(
         &p,
@@ -352,7 +348,13 @@ async fn a_drained_signer_bars_each_refusing_holder_until_none_is_left() -> anyh
         vec![holder(A, 10.0), holder(B, 20.0)],
     );
     let now = Instant::now();
-    let fault = set.record_fault(A, &drained(A, 5, 10), None, now, U256::ZERO);
+    let fault = set.record_fault(
+        A,
+        &rejected(VoucherRejectReason::BadSignature),
+        None,
+        now,
+        U256::ZERO,
+    );
     assert_eq!(fault, Fault::Source);
     assert!(
         p.faults.lock().is_ok_and(|f| f.is_empty()),
@@ -363,28 +365,65 @@ async fn a_drained_signer_bars_each_refusing_holder_until_none_is_left() -> anyh
         set.next_to_start(later, U256::ZERO, &HashSet::new())
             .map(|h| h.provider),
         Some(B),
-        "the barred holder never starts again"
+        "the declining holder never starts again"
     );
-    set.discovery_done(Ok(vec![holder(A, 10.0)]), now, U256::ZERO);
-    assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
-        "B is left"
-    );
+    assert!(set.exhausted(U256::ZERO, false).is_none(), "B is left");
 
-    set.record_fault(B, &drained(B, 5, 20), None, now, U256::ZERO);
-    set.discovery_done(Ok(vec![]), now, U256::ZERO);
+    set.record_fault(
+        B,
+        &rejected(VoucherRejectReason::BadSignature),
+        None,
+        now,
+        U256::ZERO,
+    );
     let err = set
-        .exhausted(U256::ZERO, true, false)
-        .ok_or_else(|| anyhow::anyhow!("every holder is barred"))?;
-    assert!(err.downcast_ref::<super::NoSourceServesSigner>().is_some());
+        .exhausted(U256::ZERO, false)
+        .ok_or_else(|| anyhow::anyhow!("every holder declined"))?;
+    let stop = err
+        .downcast_ref::<super::NoNodeWillServe>()
+        .ok_or_else(|| anyhow::anyhow!("expected NoNodeWillServe, got {err:#}"))?;
     assert_eq!(
-        err.downcast_ref::<crate::SignerCapDrained>()
-            .map(|d| d.provider),
-        Some(B),
-        "the last refusal is the cause"
+        stop.reasons,
+        vec![super::DeclineReason::Voucher(
+            VoucherRejectReason::BadSignature
+        )]
+    );
+    assert_eq!(
+        err.to_string(),
+        "no node will serve this: every node rejected this client's vouchers (BadSignature)"
     );
     assert_eq!(crate::classify(&err), Fault::Fatal(crate::FatalScope::Item));
     Ok(())
+}
+
+/// A `Declined` refusal from one holder and a funding refusal from the
+/// other: the set is not all-declined, so the funding rule decides.
+#[tokio::test(start_paused = true)]
+async fn a_funding_refusal_outranks_a_decline() {
+    use crate::UpstreamRefused;
+    use decdn_protocol::client::StreamError;
+    let p = provider(vec![]);
+    let mut set = SourceSet::new(
+        &p,
+        [0; 32],
+        Arc::default(),
+        vec![holder(A, 10.0), holder(B, 20.0)],
+    );
+    let now = Instant::now();
+    let declined = anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Declined));
+    set.record_fault(A, &declined, None, now, U256::ZERO);
+    let unfunded = anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Unfunded));
+    assert_eq!(
+        set.record_fault(B, &unfunded, None, now, U256::ZERO),
+        Fault::Unaffordable
+    );
+    assert!(
+        set.exhausted(U256::ZERO, false).is_none(),
+        "funding needs a fresh discovery first"
+    );
+    set.discovery_done(Ok(vec![]), now, U256::ZERO);
+    let err = set.exhausted(U256::ZERO, false);
+    assert!(err.is_some_and(|e| e.downcast_ref::<super::NoAffordableSource>().is_some()));
 }
 
 /// A probed holder's `NotFound` is a delivery fault only: it may mean load
@@ -396,7 +435,7 @@ async fn a_probed_holder_saying_not_found_is_never_absent() {
     let now = Instant::now();
     say_not_found(&mut set, A, 10, now);
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
-    assert!(set.exhausted(U256::ZERO, true, false).is_none());
+    assert!(set.exhausted(U256::ZERO, false).is_none());
     let cooled = set.health().cooling_until(A, now).is_some_and(|until| {
         set.next_to_start(until, U256::ZERO, &HashSet::new())
             .is_some()
@@ -804,12 +843,12 @@ async fn a_barred_holder_with_only_uncovered_work_left_ends_the_item() -> anyhow
         now,
     );
     assert!(
-        set.exhausted(U256::ZERO, true, true).is_none(),
+        set.exhausted(U256::ZERO, true).is_none(),
         "no discovery since the bar"
     );
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
     assert!(
-        set.exhausted(U256::ZERO, true, true).is_none(),
+        set.exhausted(U256::ZERO, true).is_none(),
         "a first bar may come from load shed: the holder gets its probe"
     );
     let later = now + super::PULL_THROUGH_BAR;
@@ -824,11 +863,11 @@ async fn a_barred_holder_with_only_uncovered_work_left_ends_the_item() -> anyhow
     );
     set.discovery_done(Ok(vec![]), later, U256::ZERO);
     assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
+        set.exhausted(U256::ZERO, false).is_none(),
         "work inside its coverage is left"
     );
     let err = set
-        .exhausted(U256::ZERO, true, true)
+        .exhausted(U256::ZERO, true)
         .ok_or_else(|| anyhow::anyhow!("only uncovered work is left"))?;
     assert!(
         err.downcast_ref::<super::NoSourceHasBlob>().is_some(),
@@ -841,16 +880,92 @@ async fn a_barred_holder_with_only_uncovered_work_left_ends_the_item() -> anyhow
     Ok(())
 }
 
+/// A decline scopes to its hash. Bundle entries share one health, so a node
+/// that declines one entry's blob must not cool for another's: entry two
+/// starts it at once. A delivery fault on the same node still cools it for
+/// every entry.
+#[tokio::test(start_paused = true)]
+async fn a_decline_does_not_cool_the_node_for_a_sibling_entry() {
+    use crate::UpstreamRefused;
+    use decdn_protocol::client::StreamError;
+    let p = provider(vec![]);
+    let health: Arc<crate::PeerHealth> = Arc::default();
+    let mut first = SourceSet::new(&p, [1; 32], Arc::clone(&health), vec![holder(A, 10.0)]);
+    let second = SourceSet::new(&p, [2; 32], Arc::clone(&health), vec![holder(A, 10.0)]);
+    let now = Instant::now();
+    let declined = anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Declined));
+    assert_eq!(
+        first.record_fault(A, &declined, None, now, U256::ZERO),
+        Fault::Source
+    );
+    assert!(
+        first
+            .next_to_start(now, U256::ZERO, &HashSet::new())
+            .is_none(),
+        "the node left the first entry's blob"
+    );
+    assert_eq!(
+        second
+            .next_to_start(now, U256::ZERO, &HashSet::new())
+            .map(|h| h.provider),
+        Some(A),
+        "the sibling entry starts it at once"
+    );
+
+    let stalled = anyhow::anyhow!("the lane stalled");
+    first.record_fault(A, &stalled, None, now, U256::ZERO);
+    assert!(
+        second
+            .next_to_start(now, U256::ZERO, &HashSet::new())
+            .is_none(),
+        "a delivery fault cools the node for every entry"
+    );
+}
+
+/// A source that declined this blob and is also priced out (two lanes, two
+/// refusals) cannot serve at any deposit. With the other source absent, the
+/// set ends not-found, not "funding needed": no funding step can help.
+#[tokio::test(start_paused = true)]
+async fn a_declined_source_priced_out_too_takes_no_funding_step() -> anyhow::Result<()> {
+    use crate::UpstreamRefused;
+    use decdn_protocol::client::StreamError;
+    let p = provider(vec![]);
+    let mut set = SourceSet::new(
+        &p,
+        [0; 32],
+        Arc::default(),
+        vec![holder(A, 10.0), non_holder(B, 20.0)],
+    );
+    let now = Instant::now();
+    let unfunded = anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Unfunded));
+    set.record_fault(A, &unfunded, None, now, U256::ZERO);
+    let declined = anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Declined));
+    set.record_fault(A, &declined, None, now, U256::ZERO);
+    let absent = anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::NotFound));
+    for _ in 0..super::ABSENT_AFTER_NOT_FOUND {
+        set.record_fault(B, &absent, None, now, U256::ZERO);
+    }
+    set.discovery_done(Ok(vec![]), now, U256::ZERO);
+    let err = set
+        .exhausted(U256::ZERO, false)
+        .ok_or_else(|| anyhow::anyhow!("every source is out"))?;
+    assert!(
+        err.downcast_ref::<crate::NoAffordableSource>().is_none(),
+        "{err:#}"
+    );
+    Ok(())
+}
+
 fn too_large() -> anyhow::Error {
     anyhow::Error::new(crate::UpstreamRefused::mid_stream(
-        decdn_protocol::client::StreamError::BlobTooLarge,
+        decdn_protocol::client::StreamError::Declined,
     ))
 }
 
-/// A proxy that refuses the blob as larger than its size ceiling never
-/// starts again for this blob, even once its cooldown ends and a
-/// discovery reports it again, while the holder still starts. A set where
-/// every source refused the blob as too large ends the item.
+/// A proxy that refuses `Declined` never starts again for this blob, even
+/// once its cooldown ends and a discovery reports it again, while the
+/// holder still starts. A set where every source declined ends the item
+/// with "no node will serve this".
 #[tokio::test(start_paused = true)]
 async fn a_proxy_refusing_the_blob_as_too_large_is_excluded() -> anyhow::Result<()> {
     let p = provider(vec![]);
@@ -880,26 +995,16 @@ async fn a_proxy_refusing_the_blob_as_too_large_is_excluded() -> anyhow::Result<
             .is_none(),
         "the proxy never starts again"
     );
-    assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
-        "B is left"
-    );
+    assert!(set.exhausted(U256::ZERO, false).is_none(), "B is left");
 
     set.record_fault(B, &too_large(), None, later, U256::ZERO);
-    set.discovery_done(Ok(vec![]), later, U256::ZERO);
     let err = set
-        .exhausted(U256::ZERO, true, false)
-        .ok_or_else(|| anyhow::anyhow!("every source refused the blob as too large"))?;
-    assert!(
-        err.downcast_ref::<super::NoSourceHasBlob>().is_some(),
-        "{err:#}"
-    );
-    assert!(
-        err.downcast_ref::<crate::UpstreamRefused>()
-            .is_some_and(|r| matches!(
-                r.error(),
-                decdn_protocol::client::StreamError::BlobTooLarge
-            )),
+        .exhausted(U256::ZERO, false)
+        .ok_or_else(|| anyhow::anyhow!("every source declined"))?;
+    assert_eq!(
+        err.downcast_ref::<super::NoNodeWillServe>()
+            .map(|stop| stop.reasons.clone()),
+        Some(vec![super::DeclineReason::Refused]),
         "{err:#}"
     );
     Ok(())
@@ -932,7 +1037,7 @@ async fn a_partial_holder_refusing_the_blob_as_too_large_loses_only_pull_through
     );
     set.discovery_done(Ok(vec![]), later, U256::ZERO);
     assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
+        set.exhausted(U256::ZERO, false).is_none(),
         "work inside its coverage is left"
     );
 
@@ -1031,7 +1136,7 @@ async fn overshoot_refusals_never_mark_a_non_holder_absent() {
     }
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
     assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
+        set.exhausted(U256::ZERO, false).is_none(),
         "overshoot refusals never mark the node absent"
     );
     assert!(
@@ -1050,13 +1155,13 @@ async fn a_non_holder_saying_not_found_three_times_ends_the_item() -> anyhow::Re
     say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND - 1, now);
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
     assert!(
-        set.exhausted(U256::ZERO, true, false).is_none(),
+        set.exhausted(U256::ZERO, false).is_none(),
         "two answers are not enough"
     );
     say_not_found(&mut set, A, 1, now);
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
     let err = set
-        .exhausted(U256::ZERO, true, false)
+        .exhausted(U256::ZERO, false)
         .ok_or_else(|| anyhow::anyhow!("three answers end the item"))?;
     assert!(
         err.downcast_ref::<super::NoSourceHasBlob>().is_some(),
@@ -1083,7 +1188,7 @@ async fn a_byte_between_not_found_answers_resets_the_count() {
     set.record_progress(A);
     say_not_found(&mut set, A, 2, now);
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
-    assert!(set.exhausted(U256::ZERO, true, false).is_none());
+    assert!(set.exhausted(U256::ZERO, false).is_none());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1093,7 +1198,7 @@ async fn a_new_holder_from_discovery_keeps_the_item_alive() {
     let now = Instant::now();
     say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
     set.discovery_done(Ok(vec![holder(B, 5.0)]), now, U256::ZERO);
-    assert!(set.exhausted(U256::ZERO, true, false).is_none());
+    assert!(set.exhausted(U256::ZERO, false).is_none());
 }
 
 /// A discovery whose probe now reports an absent provider as a holder
@@ -1105,7 +1210,7 @@ async fn a_probe_that_reports_the_blob_clears_an_absent_mark() {
     let now = Instant::now();
     say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
     set.discovery_done(Ok(vec![holder(A, 10.0)]), now, U256::ZERO);
-    assert!(set.exhausted(U256::ZERO, true, false).is_none());
+    assert!(set.exhausted(U256::ZERO, false).is_none());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1116,7 +1221,7 @@ async fn progress_clears_a_not_found_mark() {
     say_not_found(&mut set, A, super::ABSENT_AFTER_NOT_FOUND, now);
     set.record_progress(A);
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
-    assert!(set.exhausted(U256::ZERO, true, false).is_none());
+    assert!(set.exhausted(U256::ZERO, false).is_none());
 }
 
 /// A discovery that fails while the set is unanimous must still back off:
@@ -1169,13 +1274,13 @@ async fn a_unanimous_absent_set_still_wants_discovery_once_cooldowns_clear() {
     );
 }
 
-/// A mixed set — one source priced out, another saying it does not hold
-/// the blob — still ends the command once the top-up budget is spent: an
-/// absent source is excluded from the affordability verdict too, and at
-/// least one source being priced out is what makes it a command-ending
-/// `NoAffordableSource` rather than the pure "nobody has it" case.
+/// A mixed set (one source priced out, another saying it does not hold
+/// the blob) reaches the funding verdict: an absent source is excluded from
+/// the affordability verdict too, and at least one source being priced out
+/// is what makes it `NoAffordableSource` (the funding recovery point) rather
+/// than the pure "nobody has it" case.
 #[tokio::test(start_paused = true)]
-async fn a_mixed_unaffordable_and_absent_set_stops_once_topups_are_spent() {
+async fn a_mixed_unaffordable_and_absent_set_reaches_the_funding_verdict() {
     let p = provider(vec![]);
     let mut set = SourceSet::new(
         &p,
@@ -1194,8 +1299,7 @@ async fn a_mixed_unaffordable_and_absent_set_stops_once_topups_are_spent() {
         set.record_fault(B, &not_found(), None, now, dep);
     }
     set.discovery_done(Ok(vec![]), now, dep);
-    assert!(set.exhausted(dep, true, false).is_none(), "top-ups left");
-    let err = set.exhausted(dep, false, false);
+    let err = set.exhausted(dep, false);
     assert!(err.is_some_and(|e| e.downcast_ref::<NoAffordableSource>().is_some()));
 }
 

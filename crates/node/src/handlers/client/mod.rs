@@ -556,10 +556,9 @@ impl Drop for FloorReservation {
 /// Which floor gate refused an admission
 /// ([`ClientHandler::try_reserve_floor`]). They stay distinct here so the
 /// per-reason metric separates "this pool cannot pay" from the node-local
-/// per-signer live cap, and they part on the wire too: the pool arm speaks the
-/// owner-only [`StreamError::InsufficientDeposit`] (both floor gates run past the
-/// lane-ownership proof — option 2 / #2013), while the signer arm stays a plain
-/// `NotFound`.
+/// per-signer live cap, and they part on the wire too: the pool arm speaks
+/// [`StreamError::Unfunded`] to the proven requester (both floor gates run past
+/// the lane-ownership proof), while the signer arm stays a plain `NotFound`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FloorRefusal {
     /// The pool-wide ceiling: `remaining − M` cannot cover the live floor
@@ -606,26 +605,29 @@ impl From<FloorRefusal> for ServeRejectReason {
 }
 
 /// Server-side classification of a `serve_stream` refusal, used to pick the
-/// per-reason reject counter (#876). Finer-grained than the wire `StreamError`:
-/// `CacheMiss`, `UnknownChannel`, and `OwnerMismatch` all ship as `NotFound` on
-/// the wire (to avoid leaking channel existence), but are distinct here so an
-/// operator can, e.g., isolate an unknown-channel abuse campaign.
+/// per-reason reject counter (#876). Finer-grained than the wire `StreamError`,
+/// which carries only the three open-time refusal classes (ADR 005 §Open-time
+/// refusal classes): `CacheMiss`, `UnknownChannel`, and `OwnerMismatch` all
+/// ship as `NotFound` (to avoid leaking channel existence), but are distinct
+/// here so an operator can, e.g., isolate an unknown-channel abuse campaign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeRejectReason {
+    /// The node withdrew the blob after a probe: an operator evict or a
+    /// corruption quarantine with no blacklist entry behind it.
     EvictedSinceProbe,
     CacheMiss,
+    /// A fault in this node: a local store fault, or a fill that faulted on
+    /// this node's own side. Signed `Declined`, never a false absence.
     InternalError,
     UnknownChannel,
     OwnerMismatch,
     /// The pool's on-chain remaining deposit, minus the node's refundable floor
-    /// `M`, can no longer cover a credit window (ADR 003 §Pool solvency). UNLIKE
-    /// its siblings below, this one does NOT collapse to `NotFound`: it is
+    /// `M`, can no longer cover a credit window (ADR 003 §Pool solvency). It is
     /// reachable only past the lane-ownership proof (a known lane keyed to a
     /// verified signer holding an owner-signed capability), so its audience is the
-    /// proven pool owner — never an unauthenticated prober — and it ships the true
-    /// wire [`StreamError::InsufficientDeposit`] so that owner's reactive top-up
-    /// loop can fund past the node's `M` and re-open (option 2 / #2013, see
-    /// [`Self::wire_error`]).
+    /// proven requester — never an unauthenticated prober — and it ships the wire
+    /// [`StreamError::Unfunded`], which counts toward that requester's funding
+    /// recovery (see [`Self::wire_error`]).
     InsufficientDeposit,
     /// A wired `PoolView` could not confirm the request's pool on-chain: the pool
     /// has no on-chain record, is closed/reclaimed, or the admit-path `getPool`
@@ -633,20 +635,29 @@ enum ServeRejectReason {
     /// holds no cached registered read of. The node refuses rather than serve a
     /// pool it cannot confirm is live and solvent, or a signer it cannot confirm
     /// can pay (ADR 003 §Pool solvency). Collapses to `NotFound` on the wire
-    /// (see [`Self::wire_error`]) — unlike [`Self::InsufficientDeposit`], this
-    /// refusal can precede any lane-ownership proof, so it must stay a plain miss:
-    /// a client cannot tell an unconfirmed pool from a drained one, while an
-    /// operator can tell a chain/RPC problem from real deposit exhaustion.
+    /// (see [`Self::wire_error`]) — this refusal can precede any lane-ownership
+    /// proof, and an RPC fault is "not now", so it stays a plain miss: a client
+    /// cannot tell an unconfirmed pool from an absent blob, while an operator can
+    /// tell a chain/RPC problem from real deposit exhaustion.
     PoolUnconfirmed,
-    /// The request's voucher signer is registered on-chain with `cap − spent` below
-    /// a serve floor or with an expired registration. A signer's `cap`
-    /// is shared across every provider (ADR 003 §Pool solvency), so a "spent"
-    /// capability — one whose signer has already drawn its full `cap` at other nodes
-    /// — is uncashable here: the node would serve for vouchers it could never
-    /// redeem. Collapses to `NotFound` on the wire (see [`Self::wire_error`]) — it
-    /// keys on a per-signer quantity distinct from the pool floor
-    /// [`Self::InsufficientDeposit`] names, and stays a plain miss so no signer
-    /// state leaks.
+    /// The request's pool is `Closing` on-chain: it takes no top-up, and its
+    /// redemption ends at the dispute deadline (ADR 003 §Pool solvency).
+    /// `proven` says the requester holds a lane on the pool, so it passed the
+    /// lane-ownership proof: it hears `Unfunded` and its owner opens a new pool.
+    /// Anyone else hears `NotFound`, so pool state stays unmappable.
+    PoolClosing {
+        /// Whether the requester passed the lane-ownership proof.
+        proven: bool,
+    },
+    /// The request's voucher signer cannot pay: it is registered on-chain with
+    /// `cap − spent` below a serve floor or with an expired registration, or its
+    /// lane's capability is inside this node's expiry margin. A signer's `cap` is
+    /// shared across every provider (ADR 003 §Pool solvency), so a "spent"
+    /// capability — one whose signer has already drawn its full `cap` at other
+    /// nodes — is uncashable here: the node would serve for vouchers it could
+    /// never redeem. Ships [`StreamError::Unfunded`] (see [`Self::wire_error`]):
+    /// both gates key on a verified binding for a registered signer or a lane,
+    /// so the requester is proven.
     SignerCapExhausted,
     /// One capability signer's live un-vouchered reservation already fills its
     /// `k`-window concurrency cap (ADR 003 §Pool solvency, per-signer floor
@@ -654,7 +665,7 @@ enum ServeRejectReason {
     /// cap is signer-scoped and clears as that signer's in-flight streams pay.
     /// Collapses to `NotFound` on the wire (see [`Self::wire_error`]) — a node-local
     /// concurrency stop, cleared by waiting rather than by a top-up, so unlike
-    /// [`Self::InsufficientDeposit`] it names no owner-actionable pool state.
+    /// [`Self::InsufficientDeposit`] it names no funding state.
     SignerFloorAtCap,
     /// A whole-blob request from an active staker, refused while this node's own
     /// upstream open for the blob is in progress and no live fill exists to
@@ -674,12 +685,15 @@ enum ServeRejectReason {
     /// A cache-MISS serve shed under node overload — concurrency pressure,
     /// per-client fairness, or egress saturation. See [`Self::LoadShedHit`].
     LoadShedMiss,
+    /// The requested range starts at or past this node's size claim for the
+    /// blob. Ships [`StreamError::Declined`]: the size is this node's claim,
+    /// and another node can disagree (ADR 005 §Open-time refusal classes).
     RangeNotSatisfiable,
     /// A pull-through request whose start sits at or past this node's
-    /// buyer-side `max_blob_size` ceiling (ADR 005 §`BlobTooLarge` enforcement).
+    /// buyer-side `max_blob_size` ceiling (ADR 005 §`max_blob_size` enforcement).
     /// The gate reads only the requester's `byte_offset`, never the upstream's
     /// unverified `total_bytes` claim (#1895), and fires before the node commits
-    /// to the stream. Ships the true wire [`StreamError::BlobTooLarge`] (see
+    /// to the stream. Ships the wire [`StreamError::Declined`] (see
     /// [`Self::wire_error`]), so the requester drops this node for the blob.
     BlobTooLarge,
     /// The blob is on this operator's local denylist (ADR 011 §Local Denylist).
@@ -693,11 +707,10 @@ enum ServeRejectReason {
     /// local `denied_origins` or the on-chain one (ADR 011 §On Blacklist Event).
     OriginDenied,
     /// The origin-only policy (#1759, `cache.relay_foreign_namespaces = false`)
-    /// declined a hash this node's own backend genuinely does not hold. Distinct
-    /// from [`Self::CacheMiss`] for the operator's per-reason metric ONLY — both
-    /// collapse to `NotFound` on the wire (a declined foreign hash and a real
-    /// miss must look the same to a client, which re-routes either way), see
-    /// [`Self::wire_error`].
+    /// declined a hash this node's own backend genuinely does not hold. Ships
+    /// [`StreamError::Declined`] (see [`Self::wire_error`]): this node will not
+    /// relay the hash during this fetch, and another node may (ADR 002
+    /// §Retrieval by namespace).
     ForeignNamespaceDeclined,
     /// The node has been unable to reach the chain for longer than
     /// `blockchain.chain_staleness_grace_sec` (ADR 011 § Serving while
@@ -711,83 +724,54 @@ enum ServeRejectReason {
 }
 
 impl ServeRejectReason {
-    /// The wire `StreamError` a refusal for this reason signs to the client.
-    /// The reason is the single source of truth: `CacheMiss`, `UnknownChannel`,
-    /// and `OwnerMismatch` deliberately collapse to one `NotFound` here so the
-    /// three are wire-indistinguishable (no channel-existence leak), while the
-    /// finer split survives only in the per-reason metric (#876). Keeping the
-    /// mapping on the type makes an inconsistent error/reason pairing
-    /// unrepresentable at the call sites.
+    /// The wire class a refusal for this reason signs to the client (ADR 005
+    /// §Open-time refusal classes). The reason is the single source of truth;
+    /// keeping the mapping on the type makes an inconsistent class/reason
+    /// pairing unrepresentable at the call sites, and the finer split survives
+    /// only in the per-reason metric (#876).
     ///
     /// The requester side of this mapping is `decdn_client::UpstreamRefused`,
-    /// which recovers the wire code — and ONLY the wire code — from a refusal
-    /// (#1144). So the `NotFound` collapse is what a requester sees for the miss
-    /// reasons below, and the reputation consequences it draws must hold for the
-    /// weakest of them. They do: it scores `NotFound` as no fault at all, and only
-    /// `InternalError` as a degraded peer. `InsufficientDeposit` is the lone
-    /// non-collapsing floor refusal — reachable only past the lane-ownership proof,
-    /// so it is spoken to the proven owner (option 2 / #2013) and likewise scored
-    /// as no peer fault.
+    /// which recovers the class — and ONLY the class — from a refusal (#1144).
+    /// A requester never ends a fetch on one node's refusal, and no class scores
+    /// the node as degraded.
     const fn wire_error(self) -> StreamError {
         match self {
-            // `InsufficientDeposit` is the one floor-`M` refusal that does NOT
-            // collapse to `NotFound` (ADR 003 §Pool solvency, option 2 / #2013). It is
-            // reachable only past the lane-ownership proof — the floor gate fires behind
-            // a known lane keyed to a verified signer that holds an owner-signed
-            // capability — so its audience is never an unauthenticated prober but the
-            // proven pool owner, which already reads the pool's on-chain `remaining` and
-            // so learns no balance off the wire it could not compute. Speaking the true
-            // reason lets the owner's reactive top-up loop fund past the node's
-            // larger-than-estimated `M` and re-open, instead of dead-ending on an
-            // ambiguous `NotFound`. `SignerCapExhausted`, `SignerFloorAtCap`, and
-            // `PoolUnconfirmed` stay collapsed below: each keys on a different quantity
-            // than the pool floor this signal names.
-            Self::InsufficientDeposit => StreamError::InsufficientDeposit,
-            // `RangeNotSatisfiable` collapses to
-            // `NotFound` alongside the other "won't serve this" reasons: an
-            // out-of-bounds bounded range is a client error, but signalling it as
-            // `NotFound` (rather than `InternalError`) keeps it reputation-benign —
-            // a requester scores `InternalError` as a degraded peer (#1144), and a
-            // client's own malformed range must not penalise the node for it. The
-            // distinction survives in the per-reason metric.
+            // "No at the current funding". Spoken only to a proven requester: the
+            // floor and signer gates run past the lane-ownership proof or key on a
+            // verified binding for a registered signer, and a closing pool names
+            // its audience in `proven`. That requester already reads the pool's
+            // `remaining` and its signer's `{cap, expiry, spent}`, so the class
+            // leaks it nothing (ADR 003 §Pool solvency).
+            Self::InsufficientDeposit
+            | Self::SignerCapExhausted
+            | Self::PoolClosing { proven: true } => StreamError::Unfunded,
+            // "Not now": try other nodes, and this one may answer differently
+            // later. One code for a miss, a load shed, a stale chain, an
+            // unconfirmable pool, and every lane-existence refusal, so none of
+            // them can be told apart off the wire.
             Self::CacheMiss
             | Self::UnknownChannel
             | Self::OwnerMismatch
             | Self::PoolUnconfirmed
-            | Self::SignerCapExhausted
+            | Self::PoolClosing { proven: false }
             | Self::SignerFloorAtCap
             | Self::PullLoopGuard
             | Self::LoadShedHit
             | Self::LoadShedMiss
-            | Self::RangeNotSatisfiable
-            | Self::ForeignNamespaceDeclined
             | Self::ChainStale => StreamError::NotFound,
-            Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
-            Self::InternalError => StreamError::InternalError,
-            // `BlobTooLarge` does not collapse to `NotFound`. ADR 005 gives it its
-            // own retry rule: the ceiling is a stable node policy, so the requester
-            // must not ask this node for the same blob again. A `NotFound` would
-            // send the requester back here for each range. The code reveals only
-            // this node's own ceiling, which is no secret.
-            Self::BlobTooLarge => StreamError::BlobTooLarge,
-            // The two takedown refusals do NOT collapse to `NotFound`. ADR 011
-            // §`StreamRequest` Response names distinct codes because the retry
-            // advice differs and a miss-shaped answer would be actively
-            // misleading: a client told `NotFound` retries elsewhere and pays
-            // again, when for `OriginBlacklisted` every node will refuse it.
-            //
-            // They are still each other's privacy floor. `HashBlacklisted` does
-            // not say whether the entry is governance or local — that is the ADR's
-            // explicit requirement, since a client able to tell them apart could
-            // map an operator's private legal exposure by probing. It is why the
-            // two reasons below converge here and why the governance one is NOT
-            // allowed to fall through to `EvictedSinceProbe`: a hash refused
-            // under a code no on-chain entry explains is a hash this operator
-            // denied privately, which is that map. And neither says anything
-            // about a channel's balance, which is what the `NotFound` collapse
-            // above exists to protect.
-            Self::HashDenied | Self::ChainHashDenied => StreamError::HashBlacklisted,
-            Self::OriginDenied => StreamError::OriginBlacklisted,
+            // "This node will not serve this hash during this fetch". The
+            // requester drops this node for the hash and asks no further. One
+            // code for all of them means a client cannot tell a local denylist
+            // from a governance entry or a withdrawn blob, so it cannot map an
+            // operator's private legal exposure (ADR 011 §StreamRequest Response).
+            Self::EvictedSinceProbe
+            | Self::InternalError
+            | Self::RangeNotSatisfiable
+            | Self::BlobTooLarge
+            | Self::HashDenied
+            | Self::ChainHashDenied
+            | Self::OriginDenied
+            | Self::ForeignNamespaceDeclined => StreamError::Declined,
         }
     }
 }
@@ -804,18 +788,17 @@ impl ServeRejectReason {
 /// Why the reason code matters, stated precisely (the wire codes' own docs in
 /// `decdn_protocol::client` are the authority here):
 ///
-/// - `NotFound` = "node lacks the blob and cannot reach a provider, or declines
-///   to pull through". It is NODE-scoped, not blob-scoped, and it is the code a
-///   healthy-but-empty node returns.
-/// - `InternalError` = "unexpected failure; do not retry THIS node" — i.e. go
-///   elsewhere, this node is broken.
+/// - `CacheMiss` answers `NotFound` = "not now: try other nodes". It is the code
+///   a healthy-but-empty node returns, and this node can serve later.
+/// - `InternalError` answers `Declined` = "this node will not serve this hash
+///   during this fetch": the client drops this node for the hash, because this
+///   node is broken.
 ///
 /// Both steer a client to another node, so this is not the difference between
 /// "retry" and "give up". What it buys is (a) an honest signal that the node is
 /// degraded rather than merely empty, and (b) the per-reason reject metric — the
-/// ONLY server-side place the true cause is observable, since the distinct
-/// reject reasons collapse to the single `NotFound` wire code
-/// ([`ServeRejectReason::wire_error`]). An operator whose origin is 5xx-ing must
+/// ONLY server-side place the true cause is observable, since the wire carries
+/// only the reason's class ([`ServeRejectReason::wire_error`]). An operator whose origin is 5xx-ing must
 /// not see that reported as a cache miss.
 ///
 /// Note the reason code is NOT covered by the response's EIP-712 `slash_sig`,
@@ -838,7 +821,7 @@ enum FillOutcome {
     /// faulted): `NotFound`.
     CleanMiss,
     /// A backend/store fault, or a fault in this node's own buyer leg — the node is
-    /// degraded, not empty. Terminal: `InternalError` ("do not retry this node"), so a
+    /// degraded, not empty. Terminal: `InternalError`, which answers `Declined`, so a
     /// client routes around it and the operator's reject metric names the real cause.
     ///
     /// Two different lifetimes arrive here, and the variant deliberately does not
@@ -908,7 +891,10 @@ enum MissPath {
     /// The pull leg open ended without a target, for the reason the
     /// [`PullMiss`](crate::node_origin::PullMiss) names: no reachable provider
     /// or every candidate declined (`clean_miss`), every candidate quoted above
-    /// the buy ceiling (`below_margin`), or a fault in this node (`local_fault`).
+    /// the buy ceiling (`below_margin`), a fault in this node (`local_fault`),
+    /// this node's own wallet unable to fund a pool (`funding_needed`), or every
+    /// candidate refusing this node's funding with no recovery step left
+    /// (`unfunded`).
     PullLegMiss(crate::node_origin::PullMiss),
     /// The pull leg open ran past its deadline: the configured pull-through
     /// timeout, or [`WINDOW_PULL_FALLBACK_DEADLINE`] when none is set.
@@ -2101,11 +2087,9 @@ impl ClientHandler {
     /// Emit the observable side of an insufficient-deposit refusal (#1520).
     ///
     /// Unconditional `debug!` so a support ticket is answerable at all, plus a
-    /// throttled `warn!` ([`WarnThrottle`]). The wire code is
-    /// deliberately lossy — `InsufficientDeposit` collapses to `NotFound` with the
-    /// other miss reasons so a prober cannot map channel balances — so without these the
-    /// only trace of a refusal is a counter that, at the time this was written, no
-    /// alert, panel, or runbook entry referenced.
+    /// throttled `warn!` ([`WarnThrottle`]). The wire class is deliberately
+    /// lossy — it carries no reason and no amount — so without these the only
+    /// trace of a refusal's numbers is a counter.
     ///
     /// `headroom` and `ceiling` are both in payment-token base units.
     pub(super) fn log_deposit_refusal(
@@ -2483,7 +2467,7 @@ impl ClientHandler {
     /// fault by either party, and ADR 013 §Application Error Codes reserves
     /// `0x03` for peers that misbehaved; coding it as a fault would have the
     /// client penalise this node's reputation for discharging a takedown. A
-    /// client that re-requests the hash gets the signed `HashBlacklisted`
+    /// client that re-requests the hash gets the signed `Declined`
     /// refusal from the open-time gate, which is where the reason belongs. The
     /// caller returns `Stopped { Takedown }`, which the dispatch sink counts on
     /// `decdn_serve_stream_terminated_takedown_total`.

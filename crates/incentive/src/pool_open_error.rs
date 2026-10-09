@@ -70,6 +70,10 @@ sol! {
     /// amount. Surfaces when the one-time `approve` never ran (or was set too
     /// low) for the `PaymentPool` spender.
     error ERC20InsufficientAllowance(address spender, uint256 allowance, uint256 needed);
+
+    /// `PaymentPool.topUp` (and `assignCapability`) reverts this when the pool
+    /// is `Closing` or `Closed`. Declared here only for its 4-byte selector.
+    error PoolNotOpen();
 }
 
 /// Which class of failure aborted a buyer `openPool` attempt (#966). Carried
@@ -207,6 +211,15 @@ pub fn is_erc20_allowance_shortfall(revert_data: Option<&Bytes>) -> bool {
         let reason = r.reason.to_ascii_lowercase();
         reason.contains("exceeds allowance") || reason.contains("insufficient allowance")
     })
+}
+
+/// Whether a `topUp` revert is `PoolNotOpen`: the pool is `Closing` or
+/// `Closed` and accepts no funds. Pass alloy's `Error::as_revert_data()`.
+#[must_use]
+pub fn is_pool_not_open(revert_data: Option<&Bytes>) -> bool {
+    revert_data
+        .and_then(|data| data.get(..4))
+        .is_some_and(|selector| selector == PoolNotOpen::SELECTOR)
 }
 
 #[cfg(test)]

@@ -47,10 +47,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::metrics::Metrics;
 use decdn_client::buyer_pool::{
-    LOW_WATER_DIVISOR, ProgressWrite, ToppedUpPool, ensure_allowance, grade_deposit_credit,
-    open_pool, refill_amount, self_owned_lane_ctx, top_up as pool_top_up, topped_up_effect,
+    LOW_WATER_DIVISOR, PoolNotOpen, ProgressWrite, ToppedUpPool, ensure_allowance,
+    grade_deposit_credit, open_pool, pool_accepts_funds, refill_amount, self_owned_lane_ctx,
+    top_up as pool_top_up, topped_up_effect,
 };
-use decdn_client::{LocalPullFault, PoolContext};
+use decdn_client::{LocalPullFault, PoolContext, PoolReplaced, Recovery};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 
 /// How often the reclaim sweep scans the node's pool for a completed close.
@@ -169,12 +170,12 @@ impl std::error::Error for EscrowedUntracked {}
 /// Who starts a funding `topUp`. The two differ in who may rely on its headroom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TopUpFunder {
-    /// The proactive low-water refill. No pull waits on its amount, so a reactive
+    /// The proactive low-water refill. No pull waits on its amount, so a recovery
     /// top-up that joins it can claim that amount as its own.
     Refill,
-    /// A reactive mid-pull top-up. Its spawner relies on the whole amount, so no
-    /// joiner can claim any of it.
-    Reactive,
+    /// A funding recovery step's top-up. Its spawner relies on the whole amount,
+    /// so no joiner can claim any of it.
+    Recovery,
 }
 
 /// What a funding call gets from the `topUp` slot.
@@ -200,29 +201,32 @@ struct InFlightTopUp {
     /// The amount this `topUp` asks the chain for.
     requested: U256,
     /// Headroom this `topUp` adds that no pull relies on yet. A refill starts with
-    /// its full amount; a reactive top-up starts with zero.
+    /// its full amount; a recovery top-up starts with zero.
     unclaimed: U256,
+    /// Who started it.
+    funder: TopUpFunder,
 }
 
 impl InFlightTopUp {
     fn new(fut: SharedTopUp, requested: U256, funder: TopUpFunder) -> Self {
         let unclaimed = match funder {
             TopUpFunder::Refill => requested,
-            TopUpFunder::Reactive => U256::ZERO,
+            TopUpFunder::Recovery => U256::ZERO,
         };
         Self {
             fut,
             requested,
             unclaimed,
+            funder,
         }
     }
 
-    /// Join this `topUp`. A reactive joiner claims up to `want` of the unclaimed
+    /// Join this `topUp`. A recovery joiner claims up to `want` of the unclaimed
     /// amount. A refill joiner claims nothing, because no pull waits on it.
     fn join(&mut self, want: U256, funder: TopUpFunder) -> (SharedTopUp, TopUpClaim) {
         let claimed = match funder {
             TopUpFunder::Refill => U256::ZERO,
-            TopUpFunder::Reactive => self.unclaimed.min(want),
+            TopUpFunder::Recovery => self.unclaimed.min(want),
         };
         self.unclaimed = self.unclaimed.saturating_sub(claimed);
         let claim = TopUpClaim::Joined {
@@ -246,14 +250,14 @@ fn joined_headroom(claimed: U256, requested: U256, landed: U256) -> U256 {
     }
 }
 
-/// How many funding calls one reactive top-up makes before it gives up. A join that
+/// How many funding calls one recovery top-up makes before it gives up. A join that
 /// covers less than the request, or that fails, is followed by a call for the
 /// remainder. That call normally spawns, because the joined task frees the slot
 /// before its result reaches any waiter. This bound stops a caller that keeps losing
 /// the slot to other funders from looping without end.
 const MAX_TOPUP_CALLS: u32 = 3;
 
-/// Fund at least `additional` of new headroom for one reactive top-up on `pool_id`.
+/// Fund at least `additional` of new headroom for one recovery top-up on `pool_id`.
 ///
 /// `join_or_spawn(amount)` joins the in-flight `topUp` or spawns one for `amount`.
 ///
@@ -322,16 +326,24 @@ where
             warn_short_top_up(pool_id, additional, out, "funding calls ran out");
             Ok(out)
         }
-        (None, Some(err)) => Err(anyhow::anyhow!(
-            "reactive top-up failed: every joined topUp failed, last: {err:#}"
-        )),
+        (None, Some(err)) => {
+            let failed =
+                anyhow::anyhow!("recovery top-up failed: every joined topUp failed, last: {err:#}");
+            // The recovery step answers a pool that accepts no more funds
+            // with a new pool, so the marker rides out.
+            Err(if err.downcast_ref::<PoolNotOpen>().is_some() {
+                failed.context(PoolNotOpen)
+            } else {
+                failed
+            })
+        }
         (None, None) => Err(anyhow::anyhow!(
-            "reactive top-up made no funding call (MAX_TOPUP_CALLS is zero)"
+            "recovery top-up made no funding call (MAX_TOPUP_CALLS is zero)"
         )),
     }
 }
 
-/// Warn that a reactive top-up on `pool_id` has less than `requested` so far.
+/// Warn that a recovery top-up on `pool_id` has less than `requested` so far.
 fn warn_short_top_up(pool_id: PoolId, requested: U256, landed: TopUpLanded, why: &str) {
     warn!(
         %pool_id,
@@ -339,11 +351,11 @@ fn warn_short_top_up(pool_id: PoolId, requested: U256, landed: TopUpLanded, why:
         landed = %landed.added,
         new_deposit = %landed.new_deposit,
         why,
-        "reactive top-up is short of the requested amount"
+        "recovery top-up is short of the requested amount"
     );
 }
 
-/// Decide whether a failed `topUp` lets the reactive top-up try again. A joined
+/// Decide whether a failed `topUp` lets the recovery top-up try again. A joined
 /// `topUp` failure is another funder's, so the caller funds with its own `topUp`
 /// and gets the error back to report if every call fails.
 ///
@@ -360,13 +372,20 @@ fn retryable_join_error(
     claim: TopUpClaim,
 ) -> Result<Arc<anyhow::Error>> {
     if claim == TopUpClaim::Spawned || err.downcast_ref::<EscrowedUntracked>().is_some() {
-        return Err(anyhow::anyhow!("reactive top-up failed: {err:#}"));
+        let failed = anyhow::anyhow!("recovery top-up failed: {err:#}");
+        // A pool that accepts no more funds is what the recovery step answers
+        // with a new pool, so the marker rides out of the shared future.
+        return Err(if err.downcast_ref::<PoolNotOpen>().is_some() {
+            failed.context(PoolNotOpen)
+        } else {
+            failed
+        });
     }
     warn!(
         %pool_id,
         %requested,
         error = %sanitize_err_chain(&err),
-        "reactive top-up: the joined topUp failed; funding with our own topUp"
+        "recovery top-up: the joined topUp failed; funding with our own topUp"
     );
     Ok(err)
 }
@@ -462,7 +481,7 @@ where
 /// Add `additional` USDC to the buyer pool `pool_id` on-chain, then credit the
 /// returned amount into the persisted [`BuyerPoolState`] and return the new
 /// deposit. The shared funding kernel behind both the proactive low-water refill
-/// and the reactive mid-pull top-up (#1146/#1530), so the allowance posture, the
+/// and the funding recovery top-up (#1146/#1530), so the allowance posture, the
 /// deposit-credit grading, and the metering cannot drift apart.
 ///
 /// # Errors
@@ -611,10 +630,10 @@ pub struct BuyerPoolService<P: Provider + Clone + 'static> {
     /// escrowing a second deposit. `None` when no open is running.
     open_in_flight: Arc<Mutex<Option<SharedOpen>>>,
     /// The single in-flight funding `topUp`, if one is running (#1146/#1530). Both
-    /// the proactive low-water refill and the reactive mid-pull top-up dedup here,
+    /// the proactive low-water refill and the funding recovery top-up dedup here,
     /// so the two legs racing on the one pool cannot double-escrow one shortfall. The
     /// slot also tracks how much of the running `topUp` no pull has claimed, so two
-    /// reactive top-ups cannot both count one escrow as their own.
+    /// recovery top-ups cannot both count one escrow as their own.
     topup_in_flight: Arc<Mutex<Option<InFlightTopUp>>>,
     /// One [`SeedSlot`] per lane that a stream is seeding from chain
     /// ([`Self::reseed_lane_from_chain`]), so the streams that find one lane
@@ -792,7 +811,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             return pin_ctx(&state, &self.signer, &self.voucher_domain, provider_addr);
         }
 
-        let open = self.join_or_spawn_open();
+        let open = self.join_or_spawn_open(None);
 
         match tokio::time::timeout(budget, open).await {
             // Still running. The task owns the tx; hand the caller a typed "not
@@ -1122,7 +1141,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
              deposit (#1146)"
         );
         // Detached: the handle is DROPPED, not awaited — the task self-reports, and
-        // a reactive top-up arriving while it runs JOINS the same future and can
+        // a recovery top-up arriving while it runs JOINS the same future and can
         // claim its amount.
         drop(self.join_or_spawn_topup(state.pool_id, additional, TopUpFunder::Refill));
     }
@@ -1194,7 +1213,9 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
 
     /// Join the in-flight `openPool`, or spawn one. The one pool the node owns is
     /// opened at most once; concurrent misses join the single running open.
-    fn join_or_spawn_open(&self) -> SharedOpen {
+    /// `replacing` names a tracked pool that no longer accepts funds: the open
+    /// then runs although the store tracks it.
+    fn join_or_spawn_open(&self, replacing: Option<PoolId>) -> SharedOpen {
         // Recover on poison rather than treat one panic as node-fatal — see
         // [`Self::join_or_spawn_topup`] for why the slot is safe to recover.
         let mut slot = self
@@ -1222,7 +1243,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         let task = tokio::spawn(async move {
             let _guard = guard;
             run_open(
-                &contract, &store, signer, deployment, token, owner, deposit, &metrics,
+                &contract, &store, signer, deployment, token, owner, deposit, replacing, &metrics,
             )
             .await
             .map_err(Arc::new)
@@ -1331,21 +1352,166 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         }
     }
 
-    /// Fund `additional` of new headroom in the node's pool and return the pool's NEW
-    /// total deposit with the amount this call added (#1530). The reactive
-    /// counterpart of the proactive low-water refill:
-    /// the node-to-node pull loop calls this when an upstream's cap rejection is
-    /// backed by its own ledger, or when its deposit can no longer cover the next
-    /// voucher, then resumes on the larger deposit.
+    /// Run this node's funding recovery step (ADR 003 § Funding recovery): top the
+    /// current pool up toward the working deposit, or, when the pool is `Closing` or
+    /// `Closed` and its `topUp` reverts `PoolNotOpen`, open a new pool at the
+    /// working deposit and make it the current pool in the store. The closed pool
+    /// is not reclaimed here; the reclaim sweep recovers it once its dispute window
+    /// ends.
     ///
-    /// The caller sizes `additional` from its live pull ledger. This method does
-    /// not re-derive a shortfall from the persisted lane progress: that progress is
-    /// recorded when a pull ends, so mid-pull it omits the spend of the pull that
-    /// asks, and a shortfall computed from it tops up too little.
+    /// Concurrent fills share one pool, so one step funds them all.
+    /// `seen_deposit` is the deposit the calling fill saw. A row that already
+    /// holds more is a sibling's step that landed: the call returns the row's
+    /// deposit and escrows nothing. A recovery top-up still in flight is a
+    /// sibling's step too: the call waits for it and returns its deposit. When
+    /// that top-up reverts `PoolNotOpen`, the call joins the replacement open.
+    ///
+    /// The step sizes itself from the pool row: the deposit less the spend its
+    /// lanes recorded. A fill runs the step only once its own pulls ended, and
+    /// each pull records its progress as it ends, so the row holds that spend.
+    /// A pool that already holds the working deposit has nothing to add. A
+    /// `topUp` gas estimate (no transaction) then tells a closing or closed
+    /// pool, which a new pool replaces. An open pool is the upstreams' stale
+    /// view of a deposit they have not seen yet: the step settles and returns
+    /// the row's deposit, so the fill's settle window asks them again.
+    ///
+    /// # Errors
+    ///
+    /// No pool is tracked, the `topUp` or replacement `openPool` fails, a
+    /// joined top-up fails for any reason but `PoolNotOpen`, or a mined
+    /// transaction cannot be recorded
+    /// (escrowed and untracked).
+    pub async fn recover_pool(&self, seen_deposit: U256) -> Result<Recovery> {
+        let state = self
+            .reuse_or_report()?
+            .with_context(|| "no buyer pool tracked to recover")?;
+        if state.deposit > seen_deposit {
+            return Ok(Recovery::ToppedUp(state.deposit));
+        }
+        if let Some(in_flight) = self.recovery_in_flight() {
+            return match in_flight.await {
+                Ok(landed) => Ok(Recovery::ToppedUp(landed.new_deposit)),
+                // The sibling's step replaces the pool; this fill joins that
+                // open.
+                Err(err) if err.downcast_ref::<PoolNotOpen>().is_some() => {
+                    self.replace_pool(state.pool_id).await
+                }
+                Err(err) => Err(anyhow::anyhow!(
+                    "a sibling's recovery top-up failed: {err:#}"
+                )),
+            };
+        }
+        // A zero working deposit turns the node's funding off.
+        if self.working_deposit.is_zero() {
+            return Ok(Recovery::Unavailable);
+        }
+        let remaining = state.deposit.saturating_sub(state.pool_spend());
+        let additional = self.working_deposit.saturating_sub(remaining);
+        if additional.is_zero() {
+            return self.settle_or_replace(state.pool_id, state.deposit).await;
+        }
+        match self.top_up_pool_by(additional).await {
+            Ok(landed) if landed.added.is_zero() => Ok(Recovery::Unavailable),
+            Ok(landed) => Ok(Recovery::ToppedUp(landed.new_deposit)),
+            Err(err) if err.downcast_ref::<PoolNotOpen>().is_some() => {
+                self.replace_pool(state.pool_id).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The recovery step for pool `closed`, whose `topUp` reverted
+    /// `PoolNotOpen`: open a new pool in its place. Concurrent fills join one
+    /// open ([`Self::open_replacement`]).
+    ///
+    /// # Errors
+    ///
+    /// The replacement open fails.
+    async fn replace_pool(&self, closed: PoolId) -> Result<Recovery> {
+        info!(
+            pool_id = %closed,
+            "buyer pool no longer accepts funds; opening a new pool"
+        );
+        let opened = self.open_replacement(closed).await?;
+        Ok(Recovery::Replaced(PoolReplaced { closed, opened }))
+    }
+
+    /// The recovery step for pool `pool_id`, which already holds its working
+    /// deposit `deposit`: a `topUp` gas estimate (no transaction) tells a
+    /// closing or closed pool, which a new pool replaces. An open pool
+    /// settles at `deposit`.
+    ///
+    /// # Errors
+    ///
+    /// The replacement open fails.
+    async fn settle_or_replace(&self, pool_id: PoolId, deposit: U256) -> Result<Recovery> {
+        if pool_accepts_funds(&self.contract, self.owner, pool_id).await {
+            info!(
+                %pool_id,
+                %deposit,
+                "buyer pool already holds its working deposit; waiting for the upstreams to \
+                 see it"
+            );
+            return Ok(Recovery::ToppedUp(deposit));
+        }
+        info!(
+            %pool_id,
+            "buyer pool holds its working deposit but accepts no more funds; opening a new pool"
+        );
+        let opened = self.open_replacement(pool_id).await?;
+        Ok(Recovery::Replaced(PoolReplaced {
+            closed: pool_id,
+            opened,
+        }))
+    }
+
+    /// The recovery top-up in flight, if one is: a sibling fill's step, which
+    /// this fill waits for instead of funding its own.
+    fn recovery_in_flight(&self) -> Option<SharedTopUp> {
+        self.topup_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|in_flight| in_flight.funder == TopUpFunder::Recovery)
+            .map(|in_flight| in_flight.fut.clone())
+    }
+
+    /// The deposit the store's pool row records, or `None` with no pool
+    /// tracked: the deposit a fill sees.
+    pub fn pool_deposit(&self) -> Option<U256> {
+        self.store
+            .get_by_owner(self.owner)
+            .ok()
+            .flatten()
+            .map(|state| state.deposit)
+    }
+
+    /// Open a new pool in place of `closed`, the pool the store tracks now, and
+    /// return its id. The open runs on the shared open slot, like a first open.
+    ///
+    /// # Errors
+    ///
+    /// The open fails, or the store still tracks `closed` after it.
+    async fn open_replacement(&self, closed: PoolId) -> Result<PoolId> {
+        self.join_or_spawn_open(Some(closed))
+            .await
+            .map_err(|err| rehydrate_open_error(&err))?;
+        let state = self
+            .reuse_or_report()?
+            .with_context(|| "the replacement buyer pool is not in the store")?;
+        if state.pool_id == closed {
+            anyhow::bail!("no replacement opened for closed buyer pool {closed}");
+        }
+        Ok(state.pool_id)
+    }
+
+    /// Fund `additional` of new headroom in the node's pool and return the pool's NEW
+    /// total deposit with the amount this call added (#1530): the top-up behind
+    /// [`Self::recover_pool`].
     ///
     /// A `topUp` already in flight is JOINED, not duplicated. This call counts only
     /// the part of it that no other pull relies on: all of a refill's amount, none of
-    /// another reactive top-up's. When that part is less than `additional`, this
+    /// another recovery top-up's. When that part is less than `additional`, this
     /// method funds the remainder with a further `topUp` (see `top_up_at_least`).
     /// `added` is below `additional` only when the funding calls run out, or when the
     /// chain credits less than a `topUp` asked for. The caller compares the two.
@@ -1373,7 +1539,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             });
         }
         let landed = top_up_at_least(state.pool_id, additional, |amount| {
-            self.join_or_spawn_topup(state.pool_id, amount, TopUpFunder::Reactive)
+            self.join_or_spawn_topup(state.pool_id, amount, TopUpFunder::Recovery)
         })
         .await?;
         info!(
@@ -1381,7 +1547,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             %additional,
             added = %landed.added,
             new_deposit = %landed.new_deposit,
-            "reactive top-up: pool exhausted mid-pull; funded (#1530)"
+            "recovery top-up: funded the buyer pool (#1530)"
         );
         Ok(landed)
     }
@@ -1435,24 +1601,25 @@ pub trait PoolOpener: Send + Sync + std::fmt::Debug {
         write: ProgressWrite,
     ) -> Result<()>;
 
-    /// Fund `additional` of new headroom in the node's pool, returning its NEW total
-    /// deposit and the amount this call added. See [`BuyerPoolService::top_up_pool_by`].
-    /// An implementation reports what really landed in [`TopUpLanded::added`], which
-    /// can be less than `additional`.
+    /// Run the node's funding recovery step on its buyer pool, for a fill that
+    /// saw `seen_deposit`. See [`BuyerPoolService::recover_pool`].
     ///
-    /// Defaults to "funding not supported", so a read-only or test double need not
-    /// override it: nothing is added, and `new_deposit` is `U256::ZERO`. Callers
-    /// never lower their deposit view from a landing that added nothing.
+    /// Defaults to "funding not supported", so a read-only or test double need
+    /// not override it: [`Recovery::Unavailable`].
     ///
     /// # Errors
     ///
-    /// Implementations error when no pool is tracked, when the allowance or `topUp`
-    /// fails, or when the tx lands but the local row can no longer be credited.
-    async fn top_up_pool_by(&self, _additional: U256) -> Result<TopUpLanded> {
-        Ok(TopUpLanded {
-            new_deposit: U256::ZERO,
-            added: U256::ZERO,
-        })
+    /// Implementations error when no pool is tracked, when the allowance,
+    /// `topUp` or replacement `openPool` fails, or when a transaction lands but
+    /// the local row can no longer record it.
+    async fn recover_pool(&self, _seen_deposit: U256) -> Result<Recovery> {
+        Ok(Recovery::Unavailable)
+    }
+
+    /// The deposit the node's pool row records now, or `None` with no pool
+    /// tracked. See [`BuyerPoolService::pool_deposit`].
+    fn pool_deposit(&self) -> Option<U256> {
+        None
     }
 }
 
@@ -1475,8 +1642,12 @@ impl<P: Provider + Clone + 'static> PoolOpener for BuyerPoolService<P> {
         BuyerPoolService::record_progress(self, provider_addr, pool_id, write)
     }
 
-    async fn top_up_pool_by(&self, additional: U256) -> Result<TopUpLanded> {
-        BuyerPoolService::top_up_pool_by(self, additional).await
+    async fn recover_pool(&self, seen_deposit: U256) -> Result<Recovery> {
+        BuyerPoolService::recover_pool(self, seen_deposit).await
+    }
+
+    fn pool_deposit(&self) -> Option<U256> {
+        BuyerPoolService::pool_deposit(self)
     }
 }
 
@@ -1986,8 +2157,9 @@ impl OwnedPools {
 /// Open the node's buyer pool and persist it, unless a concurrent open already
 /// landed one for this owner (the fast-path miss that spawned this task read the
 /// store BEFORE the slot lock, so a previous open could have persisted in the
-/// gap). Detached, so every failure leg reports for itself — by the time it fails
-/// there may be nobody waiting to observe the `Err`.
+/// gap). A tracked pool named `replacing` no longer accepts funds, so it does not
+/// count as that landed pool. Detached, so every failure leg reports for itself:
+/// by the time it fails there may be nobody waiting to observe the `Err`.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::cognitive_complexity)]
 async fn run_open<P: Provider + Clone>(
@@ -1998,6 +2170,7 @@ async fn run_open<P: Provider + Clone>(
     token: Address,
     owner: Address,
     deposit: U256,
+    replacing: Option<PoolId>,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
     // Re-check under the slot: a previous open for this owner may have persisted
@@ -2006,7 +2179,7 @@ async fn run_open<P: Provider + Clone>(
     // invisible to the fast path too, so treating it as live would skip the open
     // on every pull.
     match store.get_by_owner(owner) {
-        Ok(Some(state)) if state.is_on(deployment) => {
+        Ok(Some(state)) if state.is_on(deployment) && Some(state.pool_id) != replacing => {
             debug!("a live buyer pool appeared while claiming the open slot; not opening a second");
             return Ok(());
         }
@@ -2032,9 +2205,11 @@ async fn run_open<P: Provider + Clone>(
     // names no provider: every candidate re-runs the identical call against the identical
     // contract through the identical RPC. A wallet that cannot fund a deposit cannot pay
     // anyone, and a chain lane that cannot carry the transaction cannot carry it for
-    // anyone — so walking the candidate list burns `MAX_PROVIDER_ATTEMPTS` futile opens
-    // and then answers the client `NotFound`, which is a lie about this node's state
-    // rather than a fact about the blob (#1560).
+    // anyone — so walking the candidate list burns `MAX_PROVIDER_ATTEMPTS` futile opens.
+    // The marker stops that walk at the first failure. What the client
+    // hears is the pool-open classifier's call, not the marker's: a wallet that cannot
+    // fund a deposit answers `NotFound`, because the funding problem is this node's, not
+    // the requester's (ADR 005 §Open-time refusal classes) (#1560).
     //
     // `ContractRevert` stays unmarked: it is deterministic on-chain state (a paused
     // contract, a future revert reason), it is metered by reason, and it does not say
@@ -2170,6 +2345,24 @@ async fn reclaim_once<P: Provider + Clone>(
             return;
         }
     };
+
+    // Reclaim is permissionless, so another caller may have reclaimed the pool
+    // first. Nothing is left to reclaim, and a row that survives sends every later
+    // fill to a pool that nodes answer `NotFound`, which no funding recovery step
+    // replaces. Drop the row, so the next fill opens a new pool.
+    if matches!(pool.status, PaymentPool::Status::Closed) {
+        match store.forget_if_pool(owner, state.pool_id) {
+            Ok(_) => info!(
+                pool_id = %state.pool_id,
+                "the buyer pool was already reclaimed; dropped the row"
+            ),
+            Err(err) => {
+                warn!(pool_id = %state.pool_id, error = %err, "reclaim sweep: forget of a reclaimed pool failed");
+                metrics.buyer_reclaim_failure();
+            }
+        }
+        return;
+    }
 
     // Not closed: nothing to reclaim yet.
     if pool.disputeDeadline == 0 {

@@ -5,82 +5,17 @@ use super::{
 use alloy::primitives::U256;
 
 /// A healthy mid-fetch snapshot: deposit covers the next voucher, range
-/// incomplete, no top-up pending. Each test tweaks one axis.
+/// incomplete. Each test tweaks one axis.
 fn healthy() -> PaceState {
     PaceState {
         cleared_bytes: 16 * 1024,
         requested_bytes: 1_000_000,
         remaining_deposit: U256::from(1_000u64),
         next_voucher_cost: U256::from(10u64),
-        working_deposit: U256::from(5_000u64),
-        seller_reserve: U256::ZERO,
-        topups_used: 0,
-        max_topups: 3,
-        exhaustion_confirmed: false,
         pulled_frontier: 0,
         gap_remaining: 1_000_000,
         downstream: DownstreamFrontier::default(),
     }
-}
-
-#[test]
-fn a_deposit_inside_the_seller_floor_band_tops_up_before_the_voucher_is_short() {
-    // The voucher (10) is affordable at 500, but 500 < 10 + a 1_000 floor: a
-    // serving peer would refuse the next open. Top up to the working deposit now.
-    let mut s = healthy();
-    s.remaining_deposit = U256::from(500u64);
-    s.seller_reserve = U256::from(1_000u64);
-    assert_eq!(
-        BudgetPacer::new().decide(&s),
-        PaceDecision::TopUp(U256::from(4_500u64))
-    );
-}
-
-#[test]
-fn a_deposit_above_the_seller_floor_band_draws() {
-    // 1_000 >= 10 + a 900 floor: the peer still admits new streams.
-    let mut s = healthy();
-    s.seller_reserve = U256::from(900u64);
-    assert!(matches!(
-        BudgetPacer::new().decide(&s),
-        PaceDecision::Draw { .. }
-    ));
-}
-
-#[test]
-fn the_seller_floor_never_refuses_on_its_own() {
-    // Inside the band with no top-up left (or none enabled), the voucher is still
-    // affordable: keep drawing and let the peer decide, never refuse.
-    let mut s = healthy();
-    s.remaining_deposit = U256::from(500u64);
-    s.seller_reserve = U256::from(1_000u64);
-    s.topups_used = s.max_topups;
-    assert!(matches!(
-        BudgetPacer::new().decide(&s),
-        PaceDecision::Draw { .. }
-    ));
-    let mut s = healthy();
-    s.remaining_deposit = U256::from(500u64);
-    s.seller_reserve = U256::from(1_000u64);
-    s.working_deposit = U256::ZERO;
-    assert!(matches!(
-        BudgetPacer::new().decide(&s),
-        PaceDecision::Draw { .. }
-    ));
-}
-
-#[test]
-fn a_working_deposit_inside_the_band_draws_after_its_top_up() {
-    // Topped up to a working deposit (600) that still sits inside the band
-    // (< 10 + 1_000): nothing more to add, so draw rather than loop on top-ups.
-    let mut s = healthy();
-    s.remaining_deposit = U256::from(600u64);
-    s.working_deposit = U256::from(600u64);
-    s.seller_reserve = U256::from(1_000u64);
-    assert!(matches!(
-        BudgetPacer::new().decide(&s),
-        PaceDecision::Draw { .. }
-    ));
 }
 
 #[test]
@@ -105,101 +40,38 @@ fn fully_cleared_range_is_done() {
     assert_eq!(BudgetPacer::new().decide(&s), PaceDecision::Done);
 }
 
+/// A lane never adds funds: a deposit short of the next voucher refuses, and
+/// the acquire loop's funding recovery step is the only place funds rise.
 #[test]
-fn exhausted_with_attempts_left_tops_up_the_shortfall() {
+fn a_deposit_short_of_the_next_voucher_refuses_instead_of_topping_up() {
     let mut s = healthy();
-    // Deposit can no longer cover the next voucher.
     s.remaining_deposit = U256::from(4u64);
     s.next_voucher_cost = U256::from(10u64);
-    assert_eq!(
-        BudgetPacer::new().decide(&s),
-        // additional = working_deposit - remaining = 5000 - 4.
-        PaceDecision::TopUp(U256::from(4_996u64))
-    );
-}
-
-#[test]
-fn a_confirmed_reactive_exhaustion_tops_up_even_if_numbers_look_affordable() {
-    let mut s = healthy();
-    // The driver corroborated a genuine ceiling hit against its own ledger.
-    s.exhaustion_confirmed = true;
-    match BudgetPacer::new().decide(&s) {
-        PaceDecision::TopUp(_) => {}
-        other => panic!("a confirmed exhaustion must top up, got {other:?}"),
-    }
-}
-
-/// #2296: right after a refill restored the deposit to the working target,
-/// a stale refusal confirmed an exhaustion whose top-up would add a few
-/// micro-USDC. That top-up costs two transactions and changes nothing.
-#[test]
-fn a_confirmed_exhaustion_below_the_low_water_shortfall_refuses() {
-    let mut s = healthy();
-    s.exhaustion_confirmed = true;
-    // additional = 5000 - 4998 = 2, far below the 1000 low water.
-    s.remaining_deposit = U256::from(4_998u64);
-    assert_eq!(BudgetPacer::new().decide(&s), PaceDecision::Refuse);
-    // At the low water exactly, the top-up is worth sending.
-    s.remaining_deposit = U256::from(4_000u64);
-    assert_eq!(
-        BudgetPacer::new().decide(&s),
-        PaceDecision::TopUp(U256::from(1_000u64))
-    );
-}
-
-/// The floor applies only while the deposit still covers the next voucher:
-/// a deposit that cannot pay for it tops up whatever the shortfall.
-#[test]
-fn an_unaffordable_voucher_tops_up_even_a_small_shortfall() {
-    let mut s = healthy();
-    s.next_voucher_cost = U256::from(4_999u64);
-    s.remaining_deposit = U256::from(4_998u64);
-    assert_eq!(
-        BudgetPacer::new().decide(&s),
-        PaceDecision::TopUp(U256::from(2u64))
-    );
-}
-
-#[test]
-fn exhausted_with_no_attempts_left_refuses() {
-    let mut s = healthy();
-    s.remaining_deposit = U256::from(4u64);
-    s.topups_used = s.max_topups;
     assert_eq!(BudgetPacer::new().decide(&s), PaceDecision::Refuse);
 }
 
 #[test]
-fn exhausted_with_topup_disabled_refuses() {
+fn a_deposit_that_exactly_covers_the_next_voucher_draws() {
     let mut s = healthy();
-    s.remaining_deposit = U256::from(4u64);
-    s.working_deposit = U256::ZERO; // reactive top-up disabled
-    assert_eq!(BudgetPacer::new().decide(&s), PaceDecision::Refuse);
-}
-
-#[test]
-fn exhausted_but_nothing_left_to_add_refuses() {
-    let mut s = healthy();
-    // Below the next voucher, but the deposit already sits at the working
-    // target, so there is no shortfall to fund.
-    s.remaining_deposit = U256::from(4u64);
+    s.remaining_deposit = U256::from(10u64);
     s.next_voucher_cost = U256::from(10u64);
-    s.working_deposit = U256::from(4u64);
-    assert_eq!(BudgetPacer::new().decide(&s), PaceDecision::Refuse);
+    assert!(matches!(
+        BudgetPacer::new().decide(&s),
+        PaceDecision::Draw { .. }
+    ));
 }
 
 #[test]
-fn a_top_up_healed_deposit_draws_immediately() {
-    // After a top-up lands, `remaining_deposit` covers the next voucher again
-    // and the range is incomplete: the pacer must retry the open right away —
-    // no proactive settle-wait. The bounded settle-wait only fires in the
-    // driver, and only on an ACTUAL stale-resume refusal (see driver.rs).
-    let s = healthy();
-    assert_eq!(
+fn the_first_draw_before_any_quote_always_proceeds() {
+    // No open yet prices the voucher at zero, so an empty deposit still draws:
+    // an exhaustion can only follow an open.
+    let mut s = healthy();
+    s.remaining_deposit = U256::ZERO;
+    s.next_voucher_cost = U256::ZERO;
+    assert!(matches!(
         BudgetPacer::new().decide(&s),
-        PaceDecision::Draw {
-            up_to_bytes: s.requested_bytes - s.cleared_bytes
-        }
-    );
+        PaceDecision::Draw { .. }
+    ));
 }
 
 #[test]
@@ -436,7 +308,7 @@ fn serve_demand_inside_a_wider_window_changes_nothing() {
 }
 
 #[test]
-fn window_pacer_passes_through_done_topup_refuse() {
+fn window_pacer_passes_through_done_and_refuse() {
     // Fully paid -> Done, identical to BudgetPacer, regardless of window state.
     let mut s = healthy();
     s.cleared_bytes = s.requested_bytes;
@@ -445,26 +317,11 @@ fn window_pacer_passes_through_done_topup_refuse() {
     assert_eq!(WindowPacer::new(10).decide(&s), PaceDecision::Done);
     assert_eq!(BudgetPacer::new().decide(&s), PaceDecision::Done);
 
-    // Exhausted with attempts left -> TopUp, exactly BudgetPacer's amount; the
+    // A deposit short of the next voucher -> Refuse, exactly BudgetPacer's; the
     // window never overrides the money decision.
     let mut s = healthy();
     s.remaining_deposit = U256::from(4u64);
     s.next_voucher_cost = U256::from(10u64);
-    s.pulled_frontier = 1_000_000;
-    s.downstream.served_paid = 0;
-    assert_eq!(
-        WindowPacer::new(10).decide(&s),
-        BudgetPacer::new().decide(&s)
-    );
-    match WindowPacer::new(10).decide(&s) {
-        PaceDecision::TopUp(_) => {}
-        other => panic!("expected TopUp, got {other:?}"),
-    }
-
-    // Exhausted with no attempts left -> Refuse, exactly BudgetPacer's.
-    let mut s = healthy();
-    s.remaining_deposit = U256::from(4u64);
-    s.topups_used = s.max_topups;
     s.pulled_frontier = 1_000_000;
     s.downstream.served_paid = 0;
     assert_eq!(WindowPacer::new(10).decide(&s), PaceDecision::Refuse);

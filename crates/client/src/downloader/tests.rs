@@ -1,18 +1,15 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use alloy::primitives::{Address, B256, U256};
-use alloy::signers::local::PrivateKeySigner;
-use decdn_incentive::DepositOutcome;
-
 use super::DownloadTarget;
 use super::Downloader;
-use crate::driver::DriveConfig;
-use crate::source::{BlobSource, FakeFunder, ScriptedSource};
+use crate::source::{BlobSource, FakeFunder, Recovery, ScriptedSource};
 use crate::{
     ClientRangedStore, Cumulative, GaveUp, PoolContext, PoolLedger, ProgressClock, StaticSources,
     StopPolicy, StreamCandidate,
 };
+use alloy::primitives::{Address, B256, U256};
+use alloy::signers::local::PrivateKeySigner;
 
 /// A buyer context with a huge deposit so funding never gates the fetch,
 /// paying `provider` (distinct bytes give the one-lane-per-provider set the
@@ -43,16 +40,7 @@ fn candidate<S>(source: S, ledger: Arc<PoolLedger>, provider: u8) -> StreamCandi
 }
 
 fn funder() -> FakeFunder {
-    FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX)))
-}
-
-fn drive_config() -> DriveConfig {
-    DriveConfig {
-        working_deposit: U256::from(u128::MAX),
-        seller_reserve: U256::ZERO,
-        max_settle_waits: 2,
-        settle_backoff: Duration::ZERO,
-    }
+    FakeFunder::new(Recovery::ToppedUp(U256::from(u128::MAX)))
 }
 
 /// A downloader over the static lanes `candidates`.
@@ -61,9 +49,7 @@ fn downloader<S: BlobSource>(
 ) -> anyhow::Result<Downloader<StaticSources<S>, FakeFunder>> {
     let sources = StaticSources::new(candidates)?;
     let holders = sources.holders();
-    Ok(Downloader::new(sources, funder())
-        .holders(holders)
-        .drive_config(drive_config()))
+    Ok(Downloader::new(sources, funder()).holders(holders))
 }
 
 /// The lane cap is the caller's, not the holder count: two holders under
@@ -85,7 +71,6 @@ async fn a_downloader_streams_at_most_max_lanes() -> anyhow::Result<()> {
     let holders = sources.holders();
     let downloader = Downloader::new(sources, funder())
         .holders(holders)
-        .drive_config(drive_config())
         .max_lanes(1);
     let dir = tempfile::tempdir()?;
     downloader

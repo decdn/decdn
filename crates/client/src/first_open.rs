@@ -19,10 +19,12 @@ use std::sync::Arc;
 use alloy::primitives::{Address, U256};
 use tokio::time::Instant;
 
+use crate::credential::{CredentialSlot, CredentialView, FundingNeeded, QuoteMax, unix_now};
 use crate::fault::{Fault, classify};
-use crate::scheduler::{Connecting, connect_future, sleep_until_opt};
-use crate::source::SourceFuture;
-use crate::source_set::{BUILD_RETRY_BASE, Holder, SourceProvider, SourceSet};
+use crate::recovery::{RecoveryGate, SwapStep, after_step};
+use crate::scheduler::{Connecting, connect_future, key_spend, sleep_until_opt};
+use crate::source::{Funder, SourceFuture};
+use crate::source_set::{BUILD_RETRY_BASE, Holder, NoAffordableSource, SourceProvider, SourceSet};
 use crate::stop::StopPolicy;
 use crate::streamer::StreamCandidate;
 
@@ -42,11 +44,15 @@ use crate::streamer::StreamCandidate;
 /// answer counts as progress: it clears the source's absent mark and ticks
 /// the stop policy's clock.
 ///
-/// The open runs no reactive top-up. A header-only open pays nothing, so a
-/// source refusing it for the deposit (`InsufficientDeposit`) is parked until
-/// the deposit rises. The pool is funded where the caller's `connect` builds
-/// the lane (the CLI's `open_or_reuse_pool` refills it below its low-water
-/// mark), and by the [`crate::acquire`] that follows.
+/// A source refusing the open for the deposit (`Unfunded`) is parked until
+/// the deposit rises. When every source is parked or cannot serve and a fresh
+/// discovery finds nothing new, the open reaches the fetch's one funding
+/// recovery point: it runs a step through `funder` under the fetch's `gate`,
+/// the same step [`crate::acquire`] runs, and asks the parked sources again
+/// at the raised deposit, or at the same deposit after a step that settles.
+/// A delegated fetch passes its `credentials`: the step is then the bounded
+/// wait for a swapped credential, and the open ends with a typed
+/// [`crate::FundingNeeded`], as [`crate::acquire`] does.
 ///
 /// # Errors
 ///
@@ -54,19 +60,24 @@ use crate::streamer::StreamCandidate;
 /// - a fatal lane build, wrapped in [`crate::LaneBuildFault`]: one that may
 ///   have escrowed USDC no record credits, which a retry would escrow again;
 /// - [`crate::NoAffordableSource`] or [`crate::NoSourceHasBlob`] on a
-///   unanimous verdict of the sources;
+///   unanimous verdict of the sources, or [`crate::PoolReplaced`] when the
+///   recovery step opened a new pool;
 /// - [`crate::GaveUp`] once the stop policy's limit passes without an answer.
-pub async fn first_open<P, T, O, Fut>(
+pub async fn first_open<P, F, T, O, Fut>(
     sources: &mut SourceSet<'_, P>,
     stop: &StopPolicy,
+    funder: &F,
+    gate: &RecoveryGate,
+    credentials: Option<&CredentialSlot>,
     open: O,
 ) -> anyhow::Result<(Address, T)>
 where
     P: SourceProvider,
+    F: Funder,
     O: Fn(Arc<StreamCandidate<P::Source>>) -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
-    let opened = open_loop(sources, &open);
+    let opened = open_loop(sources, funder, gate, credentials, &open);
     tokio::select! {
         biased;
         opened = opened => {
@@ -93,17 +104,25 @@ async fn poll_some<F: Future + Unpin>(fut: Option<&mut F>) -> F::Output {
 /// One attempt runs at a time: a lane build, then the `open` on that lane.
 /// Discovery runs beside it in the same `select!`, so a slow discovery never
 /// holds back a source whose cooldown ended.
-async fn open_loop<'p, P, T, O, Fut>(
+async fn open_loop<'p, P, F, T, O, Fut>(
     sources: &mut SourceSet<'p, P>,
+    funder: &F,
+    gate: &RecoveryGate,
+    credentials: Option<&CredentialSlot>,
     open: &O,
 ) -> anyhow::Result<(Address, T)>
 where
     P: SourceProvider,
+    F: Funder,
     O: Fn(Arc<StreamCandidate<P::Source>>) -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
     // The pool deposit the built lanes report, ZERO before any lane exists.
     let mut deposit = U256::ZERO;
+    // The recovery steps that topped up or settled, as this open last saw
+    // them ([`RecoveryGate::step`]).
+    let mut top_ups_seen = gate.top_ups();
+    let mut delegate = Delegate::new(credentials);
     // Sources a transient `open` error holds off, until the instant given.
     let mut held_off: HashMap<Address, Instant> = HashMap::new();
     let mut connecting: Option<Connecting<'p, P::Source>> = None;
@@ -124,12 +143,22 @@ where
                 }
             }
         }
+        delegate.follow_swap(sources);
         let attempting = connecting.is_some() || opening.is_some();
         if !attempting
             && discovering.is_none()
-            && let Some(err) = sources.exhausted(deposit, false, false)
+            && let Some(err) = sources.exhausted(deposit, false)
         {
-            return Err(err);
+            if err.downcast_ref::<NoAffordableSource>().is_none() {
+                return Err(err);
+            }
+            // A delegated fetch waits for a swapped credential, as
+            // [`crate::acquire`] does.
+            if let Some(err) = delegate.step(sources, gate, err).await? {
+                deposit =
+                    owner_step(sources, funder, gate, deposit, &mut top_ups_seen, err).await?;
+            }
+            continue;
         }
         if discovering.is_none()
             && sources.wants_discovery(now, deposit, usize::from(attempting), false)
@@ -171,13 +200,20 @@ where
                         sources.record_progress(provider);
                         return Ok((provider, answer));
                     }
-                    Err(err) => match sources.record_fault(provider, &err, None, Instant::now(), deposit) {
-                        Fault::Fatal(_) => return Err(err),
-                        Fault::Transient => {
-                            held_off.insert(provider, Instant::now() + BUILD_RETRY_BASE);
+                    Err(err) => {
+                        let at = Instant::now();
+                        delegate.saw(&err);
+                        if gate.settling(at) && sources.hold_while_settling(provider, &err, at) {
+                            continue;
                         }
-                        Fault::Source | Fault::Unaffordable => {}
-                    },
+                        match sources.record_fault(provider, &err, None, at, deposit) {
+                            Fault::Fatal(_) => return Err(err),
+                            Fault::Transient => {
+                                held_off.insert(provider, at + BUILD_RETRY_BASE);
+                            }
+                            Fault::Source | Fault::Unaffordable => {}
+                        }
+                    }
                 }
             }
             found = poll_some(discovering.as_mut()), if discovering.is_some() => {
@@ -185,6 +221,126 @@ where
                 sources.discovery_done(found, Instant::now(), deposit);
             }
             () = sleep_until_opt(wake) => {}
+        }
+    }
+}
+
+/// The first open's recovery step for a pool owner at the exhausted set
+/// `exhausted`: a top-up, a replacement, or a settle, through `funder` under
+/// `gate`. `top_ups_seen` is the open's count of the gate's top-ups, which
+/// the step brings up to date. Returns the deposit the open asks the sources
+/// again at.
+///
+/// # Errors
+///
+/// Every end [`after_step`] names.
+async fn owner_step<P, F>(
+    sources: &SourceSet<'_, P>,
+    funder: &F,
+    gate: &RecoveryGate,
+    deposit: U256,
+    top_ups_seen: &mut u64,
+    exhausted: anyhow::Error,
+) -> anyhow::Result<U256>
+where
+    P: SourceProvider,
+    F: Funder,
+{
+    let spent = sources
+        .lanes_spent()
+        .max(funder.pool_spent().unwrap_or(U256::ZERO));
+    // The deposit now, as the lane contexts hold it: a sibling bundle entry's
+    // step reaches them through the run's lane registry.
+    let current = || sources.lanes_deposit();
+    // A sibling entry may have priced a shared source out at a deposit above
+    // this open's view of it.
+    let seen = sources.priced_out_at(deposit);
+    let raised = after_step(
+        gate.step(funder, seen, top_ups_seen, current, spent).await,
+        exhausted,
+    )?;
+    if raised > deposit {
+        sources.credit_lanes(raised);
+    }
+    if raised <= seen {
+        // A settling step: ask the priced-out sources again.
+        sources.health().clear_unaffordable();
+    }
+    Ok(raised.max(deposit))
+}
+
+/// A first open's delegated credential: the slot, the generation its built
+/// lanes sign under, and whether a node refused the capability itself since.
+struct Delegate<'a> {
+    slot: Option<&'a CredentialSlot>,
+    generation_seen: u64,
+    capability_refused: bool,
+}
+
+impl<'a> Delegate<'a> {
+    fn new(slot: Option<&'a CredentialSlot>) -> Self {
+        Self {
+            slot,
+            generation_seen: slot.map_or(0, CredentialSlot::generation),
+            capability_refused: false,
+        }
+    }
+
+    /// Note a source's open error.
+    fn saw(&mut self, err: &anyhow::Error) {
+        if crate::fault::refuses_capability(err) {
+            self.capability_refused = true;
+        }
+    }
+
+    /// After a swap, drop the built lanes on the old key. What the sources
+    /// refused under it says nothing about the new one.
+    fn follow_swap<P: SourceProvider>(&mut self, sources: &mut SourceSet<'_, P>) {
+        let Some(slot) = self.slot else { return };
+        if slot.generation() == self.generation_seen {
+            return;
+        }
+        self.generation_seen = slot.generation();
+        sources.drop_lanes(|lane| slot.is_stale(&lane.ctx));
+        sources.health().clear_unaffordable();
+        self.capability_refused = false;
+    }
+
+    /// The recovery step at the exhausted set `exhausted` for a delegate: the
+    /// bounded wait for a swapped credential. `Ok(None)` after a swap. A
+    /// fetch with no slot gets `exhausted` back, for the owner's step.
+    ///
+    /// # Errors
+    ///
+    /// [`FundingNeeded::PublisherPool`] when the capability still covers the
+    /// work, and [`FundingNeeded::NewCapability`] when no swap comes.
+    async fn step<P: SourceProvider>(
+        &self,
+        sources: &SourceSet<'_, P>,
+        gate: &RecoveryGate,
+        exhausted: anyhow::Error,
+    ) -> anyhow::Result<Option<anyhow::Error>> {
+        let Some(slot) = self.slot else {
+            return Ok(Some(exhausted));
+        };
+        let view = CredentialView::of(
+            &slot.current(),
+            key_spend(slot, &sources.built_lanes(), None),
+            0,
+            &QuoteMax::default(),
+            unix_now(),
+        );
+        slot.report(view.event());
+        let cause = view.funding_cause(self.capability_refused);
+        let pool = slot.pool_id();
+        let Some(cause) = cause else {
+            return Err(exhausted.context(FundingNeeded::PublisherPool { pool }));
+        };
+        match gate.swap_step(slot, self.generation_seen).await {
+            SwapStep::Swapped => Ok(None),
+            SwapStep::NoProgress | SwapStep::TimedOut => {
+                Err(exhausted.context(FundingNeeded::NewCapability { pool, cause }))
+            }
         }
     }
 }

@@ -346,7 +346,7 @@ range of a partial blob reads back as zeros or ends early, and that is not
 corruption. So a partial blob is quarantined only when the mismatching leaf or
 node lies inside its present ranges, or when a short read occurs in an export
 whose whole range is present. The node stops serving, announcing, and
-re-acquiring the hash. A stream request for it answers `EvictedSinceProbe`.
+re-acquiring the hash. A stream request for it answers `Declined`.
 The engine drops the protecting tags, also for a pinned hash. The pin does not
 keep corrupt bytes from GC. The next GC sweep reclaims the entry. The next
 lookup or origin rescan that finds the store no longer holds the hash lifts

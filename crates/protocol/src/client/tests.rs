@@ -195,7 +195,7 @@ fn stream_response_error_roundtrip() -> Result<(), postcard::Error> {
         ..sample_response()
     };
     let ext = StreamResponseExt {
-        error: Some(StreamError::BlobTooLarge),
+        error: Some(StreamError::Declined),
     };
     let buf = encode_stream_response(&resp, Some(&ext))?;
     let (decoded, remainder) = postcard::take_from_bytes::<ClientMessage>(&buf)?;
@@ -340,17 +340,12 @@ fn client_message_discriminants_are_frozen() -> Result<(), Box<dyn std::error::E
 fn stream_error_variant_order_is_frozen() -> Result<(), postcard::Error> {
     for (i, e) in [
         StreamError::NotFound,
-        StreamError::Overloaded,
-        StreamError::BlobTooLarge,
-        StreamError::InternalError,
-        StreamError::EvictedSinceProbe,
+        StreamError::Declined,
+        StreamError::Unfunded,
         StreamError::VoucherRejected {
             reason: VoucherRejectReason::BadSignature,
             bundle: None,
         },
-        StreamError::OriginBlacklisted,
-        StreamError::HashBlacklisted,
-        StreamError::InsufficientDeposit,
     ]
     .into_iter()
     .enumerate()
@@ -1021,7 +1016,7 @@ fn stream_response_ext_validate_rejects_failure_without_error() {
 #[test]
 fn stream_response_ext_validate_accepts_failure_with_delivery_error() {
     let ext = StreamResponseExt {
-        error: Some(StreamError::Overloaded),
+        error: Some(StreamError::Unfunded),
     };
     assert_eq!(ext.validate(false), Ok(()));
 }
@@ -1086,7 +1081,7 @@ fn stream_response_two_phase_no_ext() -> Result<(), postcard::Error> {
 #[test]
 fn stream_response_ext_tolerates_future_trailing_bytes() -> Result<(), postcard::Error> {
     let ext = StreamResponseExt {
-        error: Some(StreamError::Overloaded),
+        error: Some(StreamError::Declined),
     };
     let mut bytes = postcard::to_allocvec(&ext)?;
     bytes.extend_from_slice(&[0xAAu8, 0xBB, 0xCC]);
@@ -1146,16 +1141,8 @@ fn client_message_validate_dispatches_to_payload() -> Result<(), MessageValidati
 fn stream_error_domain_split_matches_variants() {
     for e in [
         StreamError::NotFound,
-        StreamError::Overloaded,
-        StreamError::BlobTooLarge,
-        StreamError::InternalError,
-        StreamError::EvictedSinceProbe,
-        // Appended after `VoucherRejected` for wire-order reasons, but
-        // delivery-side all the same — this is the assertion that keeps the
-        // "everything except VoucherRejected" rule honest as the enum grows.
-        StreamError::OriginBlacklisted,
-        StreamError::HashBlacklisted,
-        StreamError::InsufficientDeposit,
+        StreamError::Declined,
+        StreamError::Unfunded,
     ] {
         assert!(e.is_delivery_side(), "{e:?} is delivery-side");
         assert!(!e.is_mid_stream(), "{e:?} is not mid-stream");

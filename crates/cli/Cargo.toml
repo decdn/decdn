@@ -123,6 +123,9 @@ decdn-client = { workspace = true, features = ["test-util"] }
 # None of this leaks into the `decdn` binary's release dep tree.
 decdn-node = { workspace = true }
 decdn-cache = { workspace = true }
+# A mocked chain answers a revert with a JSON-RPC `ErrorPayload`, which `alloy`
+# does not re-export.
+alloy-json-rpc = { workspace = true }
 
 # `tests/key_gen_prompt_pty.rs` drives the real `decdn` binary through the
 # interactive keystore-password prompt, which `rpassword` reads from

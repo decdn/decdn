@@ -283,7 +283,9 @@ as `decdn fetch`):
   An entry holds no lane permit while it waits on a sibling entry. All lanes of an entry write into
   one ranged store. The entry does not mark its donor ranges present in that
   store, so the store promotes the blob only when the loop fetched every
-  byte. Concurrent lanes top up the one deposit one at a time.
+  byte. A pull is one fetch, so all entries share one
+  [funding recovery](003-payments.md#funding-recovery) state. A verified
+  byte of any entry counts as progress for a further recovery step.
 - **Failover and retry.** All entries of a pull share one holder health
   table and one progress clock. The manifest fetch uses the same table and
   the same clock. When a holder faults, the holder cools, and the loop gives
@@ -294,10 +296,18 @@ as `decdn fetch`):
   that signs a different size stays a holder of the entry. An entry
   whose proven size differs from its manifest size succeeds with a warning
   line. A blob over the client's size cap fails only its entry.
-  A fault that only the user can fix stops all entries: a voucher rejection,
-  an origin blacklist, no affordable holder, or a local disk fault. The pull
-  then starts no new entry, stops the entries that run, and exits with
-  code 1. The clock measures the time since the last verified byte of any
+  A node's refusal never stops the pull. It removes, parks, or cools that
+  holder by the rules of
+  [ADR 039 § Failure handling](039-multi-source-parallel-fetch.md#failure-handling-reassign-only-tail).
+  A `Declined` refusal removes the holder for that entry's hash only. For the
+  other entries the holder only cools, as for any delivery fault, and stays
+  a candidate. An `Unfunded` refusal
+  parks the holder in the shared health table for every entry until a
+  funding recovery step.
+  A local fault that only the user can fix stops all entries: an escrow
+  that no local record credits, a local store or disk fault, or a keystore
+  failure. "Funding needed" also stops all entries. The pull then starts no new entry, stops the entries that run,
+  and exits with code 1. The clock measures the time since the last verified byte of any
   entry, so a stuck entry waits while other entries make progress. A pull in
   a terminal has no limit. A pull in a script stops after 10 minutes with no
   verified byte. `--give-up-after-secs` overrides both limits. When the limit

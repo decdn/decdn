@@ -1067,56 +1067,70 @@ fn delegated_spending_cap_exhausted_gets_the_owner_remedy_hint() {
     });
     let annotated = super::annotate_delegated_exhaustion(err);
     assert!(
-        annotated.to_string().contains("exhausted"),
-        "expected the exhaustion remedy, got: {annotated}"
+        annotated.to_string().contains("funding needed"),
+        "expected the funding remedy, got: {annotated}"
     );
 }
 
 /// A drained signer registration names the remedy a write-once
-/// registration leaves: a capability for a new signer key (#2338). Only a
-/// registration expired or with nothing left of its cap is named as
-/// shutting out every provider. A drain read at one provider's rate (alone,
-/// or under the stop once every known provider is barred) and a mid-stream
-/// `SignerCapExhausted` are measured against the refusing provider's rate,
-/// so the text says a cheaper provider may still serve.
+/// registration leaves: a capability for a new signer key (#2338), whether
+/// the fetch ended "funding needed" or on a mid-stream
+/// `SignerCapExhausted`.
 #[test]
 fn delegated_drained_signer_gets_the_new_key_remedy() {
-    let drained = |remaining, expired| decdn_client::SignerCapDrained {
-        pool_id: alloy::primitives::B256::ZERO,
-        signer: Address::repeat_byte(0xd1),
-        provider: Address::repeat_byte(0xa1),
-        remaining,
-        rate_per_mb: 10,
-        expired,
-    };
-    let at_rate = [
-        anyhow::Error::new(drained(5, false)),
-        anyhow::Error::new(drained(5, false)).context(decdn_client::NoSourceServesSigner),
+    for err in [
+        anyhow::Error::new(NoAffordableSource {
+            deposit: U256::from(5u32),
+        }),
         anyhow::Error::new(UpstreamVoucherRejected {
             reason: decdn_protocol::client::VoucherRejectReason::SignerCapExhausted,
             bundle: None,
             proof_generation: None,
         }),
-    ];
-    for err in at_rate {
-        let annotated = format!("{:#}", super::annotate_delegated_exhaustion(err));
-        assert!(
-            annotated.contains("new signer key")
-                && annotated.contains("lower rate may still serve")
-                && !annotated.contains("no node can be paid"),
-            "expected the rate-relative new-key remedy, got: {annotated}"
-        );
-    }
-    for err in [
-        anyhow::Error::new(drained(0, false)),
-        anyhow::Error::new(drained(5, true)),
     ] {
         let annotated = format!("{:#}", super::annotate_delegated_exhaustion(err));
         assert!(
-            annotated.contains("new signer key") && annotated.contains("no node can be paid"),
-            "expected the every-provider new-key remedy, got: {annotated}"
+            annotated.contains("funding needed") && annotated.contains("new signer key"),
+            "expected the new-key remedy, got: {annotated}"
         );
     }
+}
+
+/// The SDK's typed delegated stops render as the CLI's remedies: a capability
+/// that no longer pays names a new signer key, and a pool that cannot pay
+/// under a healthy capability names the owner's top-up.
+#[test]
+fn delegated_typed_funding_stops_render_their_remedies() {
+    let pool = alloy::primitives::B256::repeat_byte(0x11);
+    let exhausted = || {
+        anyhow::Error::new(NoAffordableSource {
+            deposit: U256::from(5u32),
+        })
+    };
+    let new_capability = format!(
+        "{:#}",
+        super::annotate_delegated_exhaustion(exhausted().context(
+            decdn_client::FundingNeeded::NewCapability {
+                pool,
+                cause: decdn_client::CapabilityCause::CapSpent,
+            }
+        ))
+    );
+    assert!(
+        new_capability.contains("new signer key") && new_capability.contains("spent its cap"),
+        "{new_capability}"
+    );
+    let publisher = format!(
+        "{:#}",
+        super::annotate_delegated_exhaustion(
+            exhausted().context(decdn_client::FundingNeeded::PublisherPool { pool })
+        )
+    );
+    assert!(
+        publisher.contains(&format!("ask the owner of pool {pool} to top it up"))
+            && publisher.contains("registered terms are spent"),
+        "{publisher}"
+    );
 }
 
 /// Any error the delegated-exhaustion annotator does not name passes
@@ -1138,8 +1152,8 @@ fn delegated_capability_expired_gets_the_owner_remedy_hint() {
     });
     let annotated = super::annotate_delegated_exhaustion(err);
     assert!(
-        annotated.to_string().contains("expired"),
-        "expected the expiry remedy, got: {annotated}"
+        annotated.to_string().contains("funding needed"),
+        "expected the funding remedy, got: {annotated}"
     );
 }
 
@@ -1154,8 +1168,8 @@ fn delegated_pool_exhausted_gets_the_owner_remedy_hint() {
     });
     let annotated = super::annotate_delegated_exhaustion(err);
     assert!(
-        annotated.to_string().contains("exhausted"),
-        "expected the exhaustion remedy, got: {annotated}"
+        annotated.to_string().contains("funding needed"),
+        "expected the funding remedy, got: {annotated}"
     );
 }
 
@@ -1219,10 +1233,10 @@ fn bound_notfound_refusal_is_untouched() {
 
 /// A refusal that is NOT `NotFound` gets no binding hint even when unbound: a
 /// client binding authorizes reactive pull-through, so it cannot fix a node
-/// that is degraded (`InternalError`) or a blob that is over the ceiling.
+/// that declines the blob or one the requester cannot fund.
 #[test]
 fn unbound_non_notfound_refusal_is_untouched() {
-    for error in [StreamError::InternalError, StreamError::BlobTooLarge] {
+    for error in [StreamError::Declined, StreamError::Unfunded] {
         let annotated = annotate_unbound_cache_miss(refusal(error.clone()), &ctx_with(None));
         assert!(
             !annotated.to_string().contains("capacity_bond_address"),
@@ -1815,4 +1829,68 @@ fn summary_is_none_before_any_delivery() {
         state: Arc::new(Mutex::new(SpeedState::default())),
     };
     assert!(meter.summary().is_none());
+}
+
+fn replacement(closed: u8, opened: u8) -> PoolReplaced {
+    PoolReplaced {
+        closed: B256::repeat_byte(closed),
+        opened: B256::repeat_byte(opened),
+    }
+}
+
+/// A pass that a funding recovery step ended by opening a new pool runs the
+/// remaining work again, once. A second replacement in the same command ends
+/// it "funding needed"; a pass that ends any other way ends the command.
+#[test]
+fn a_replaced_pool_runs_the_work_again_at_most_once() {
+    let mut replaced = None;
+    let first = replacement(1, 2);
+    assert!(
+        next_pass(Err(anyhow::Error::new(first)), &mut replaced, false).is_none(),
+        "the first replacement runs the work again"
+    );
+    assert_eq!(replaced, Some(first));
+
+    let err = next_pass(
+        Err(anyhow::Error::new(replacement(2, 3))),
+        &mut replaced,
+        false,
+    )
+    .expect("a second replacement ends the command")
+    .expect_err("it ends funding needed");
+    assert!(
+        format!("{err:#}").contains("accepts no more funds either"),
+        "{err:#}"
+    );
+
+    let mut replaced = Some(first);
+    assert!(
+        matches!(next_pass(Ok(()), &mut replaced, false), Some(Ok(()))),
+        "the second pass completes"
+    );
+    let mut replaced = None;
+    let err = next_pass(Err(anyhow::anyhow!("not found")), &mut replaced, false)
+        .expect("any other end ends the command")
+        .expect_err("with its own error");
+    assert_eq!(format!("{err}"), "not found");
+    assert_eq!(replaced, None);
+}
+
+/// A stream to stdout never runs again: the bytes it wrote cannot be taken
+/// back. Its replacement ends the command and names the new pool.
+#[test]
+fn a_stdout_stream_names_the_new_pool_and_does_not_run_again() {
+    let mut replaced = None;
+    let err = next_pass(
+        Err(anyhow::Error::new(replacement(1, 2))),
+        &mut replaced,
+        true,
+    )
+    .expect("a stdout stream ends the command")
+    .expect_err("with the replacement");
+    assert!(
+        format!("{err:#}").contains(&B256::repeat_byte(2).to_string()),
+        "{err:#}"
+    );
+    assert_eq!(replaced, None);
 }

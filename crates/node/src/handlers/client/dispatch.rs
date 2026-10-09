@@ -441,14 +441,11 @@ impl ClientHandler {
         // the store is asked.
         //
         // Governance entries are gated here too, on their own set — the
-        // blacklist watcher denies before it evicts. Two sets, ONE wire code:
-        // ADR 011 §StreamRequest Response requires that a client cannot tell a
-        // governance takedown from this operator's own denylist, and answering
-        // the governance case from the eviction arm below (`EvictedSinceProbe`)
-        // leaked exactly that — it made `HashBlacklisted` a unique fingerprint
-        // for "this operator privately denied it", which is the probe the ADR
-        // forecloses. The reasons stay distinct only so the operator's own
-        // metrics can tell them apart, which no client can read.
+        // blacklist watcher denies before it evicts. Two sets, ONE wire code,
+        // `Declined`, shared with the eviction arm below: ADR 011 §StreamRequest
+        // Response requires that a client cannot tell a governance takedown from
+        // this operator's own denylist. The reasons stay distinct only so the
+        // operator's own metrics can tell them apart, which no client can read.
         //
         // Governance is checked second because the local list is the cheaper and
         // far more common hit; both are one atomic load and a hash-set probe.
@@ -498,21 +495,23 @@ impl ClientHandler {
         // configured at all) is a real foreign-content answer, declined under
         // its own reason so the operator's metrics separate policy declines
         // from real cache misses. `Fault` (a transport error or a timed-out
-        // `HEAD`) is NOT an absence — signing an authoritative `NotFound` would
-        // tell a paying client this node's own content is gone and would hide
-        // the operator's backend outage — so it surfaces as `InternalError`
-        // instead, matching the store-fault handling on the `has()` path below.
+        // `HEAD`) is NOT an absence, so it refuses for `InternalError`,
+        // matching the store-fault handling on the `has()` path below. Both
+        // sign `Declined`: this node will not serve the hash during this fetch.
         if !self.relay_foreign_namespaces {
             match self.cache.origin_probe_presence(hash).await {
                 decdn_cache::OriginPresence::Present(_) => {}
                 decdn_cache::OriginPresence::Absent => {
+                    // The probe reads a withdrawn hash as absent. Keep the
+                    // operator's metric on the withdrawal: it is this node's own
+                    // content, not a foreign hash. Both reasons sign `Declined`.
+                    let reason = if self.cache.is_evicted(hash) || self.cache.is_quarantined(hash) {
+                        ServeRejectReason::EvictedSinceProbe
+                    } else {
+                        ServeRejectReason::ForeignNamespaceDeclined
+                    };
                     return self
-                        .respond_error(
-                            &mut send,
-                            &req,
-                            ServeRejectReason::ForeignNamespaceDeclined,
-                            rate_per_mb,
-                        )
+                        .respond_error(&mut send, &req, reason, rate_per_mb)
                         .await;
                 }
                 decdn_cache::OriginPresence::Fault => {
@@ -654,6 +653,42 @@ impl ClientHandler {
             self.clamp_lane_to_registration(lane, cap, expiry).await;
         }
 
+        // Funding gates that need the lane (ADR 003 §Pool solvency, ADR 005
+        // §Open-time refusal classes). A lane exists only behind a verified
+        // binding and an owner-signed capability, so a requester that holds one
+        // is proven and hears `Unfunded`; anyone else hears `NotFound`.
+        //
+        // A `Closing` pool takes no top-up, and its redemption ends at the
+        // dispute deadline, so this node does not serve on it. Its owner opens a
+        // new pool. A lane whose capability is inside the expiry margin cannot
+        // pay for a voucher, so admitting it would only stop at the first one.
+        if let Some(status) = pool_status
+            && matches!(
+                status.lifecycle,
+                crate::pool_view::Lifecycle::Closing { .. }
+            )
+        {
+            let reason = ServeRejectReason::PoolClosing {
+                proven: known_lane.is_some(),
+            };
+            return self
+                .respond_error(&mut send, &req, reason, rate_per_mb)
+                .await;
+        }
+        if let Some(lane) = known_lane.as_ref() {
+            let expiry = lane.lock().await.state.expiry;
+            if self.inside_expiry_margin(expiry) {
+                return self
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::SignerCapExhausted,
+                        rate_per_mb,
+                    )
+                    .await;
+            }
+        }
+
         // Per-pool cumulative floor-credit admission reservation (ADR 003 §Pool
         // solvency, stateful-B). It sums floor credit across ALL distinct lanes on
         // the pool and bounds it to `remaining − M`, closing the fan-out hole where
@@ -675,10 +710,9 @@ impl ClientHandler {
         // `live_reservation += reserved` increment run under ONE `pool_floor` lock, so
         // two concurrent admissions on a near-exhausted pool cannot both pass. A
         // pool-floor refusal reports `InsufficientDeposit` → wire
-        // `StreamError::InsufficientDeposit`: this gate runs past the lane-ownership
-        // proof, so its audience is the proven owner and it speaks the true reason
-        // for the owner's top-up loop (option 2 / #2013), not the ambiguous
-        // `NotFound` that unauthenticated misses collapse to.
+        // `StreamError::Unfunded`: this gate runs past the lane-ownership proof,
+        // so its audience is the proven requester, and the class counts toward
+        // its funding recovery.
         //
         // Held at fn scope so the reservation is released on EVERY exit via `Drop`.
         // Every serve path that reaches a serve loop MOVES it in and threads it through:
@@ -695,9 +729,8 @@ impl ClientHandler {
         // Blob availability gate. A store fault is NOT an absence: an
         // `Unavailable` audit means the node genuinely lacks the blob (NotFound
         // / EvictedSinceProbe), but `Err` is a transient local store failure
-        // that must not masquerade as a signed `NotFound` — a paying client
-        // would treat that as authoritative and stop asking. Surface it as
-        // `InternalError` and log. `serve_audit` also carries the complete
+        // that must not masquerade as a signed `NotFound`. Refuse it for
+        // `InternalError` (wire `Declined`) and log. `serve_audit` also carries the complete
         // blob's size in the same store contact, so the delivery size gate
         // below needn't `inspect` again on a cache hit (#1789 item 7 part B).
         let audit = match self.cache.serve_audit(hash).await {

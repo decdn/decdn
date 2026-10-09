@@ -492,6 +492,17 @@ pub struct PoolLedger {
     /// to another provider. A timed-out send is treated exactly like any other
     /// ambiguous send: the voucher stays armed and `settlement` settles high.
     send_deadline: Duration,
+    /// Content spans a lane delivered and did not pay for when it ended on a
+    /// funding refusal: `(hash, start, end)`. ADR 003's credit window lets the
+    /// node stream ahead of the voucher that pays for it, so the store can
+    /// hold these bytes while the lane owes them. When this lane runs again,
+    /// its next drive takes them and bills them again ([`Self::take_unpaid`]).
+    /// They live only on this lane. A fetch that completes without this lane
+    /// running again leaves them unpaid, and so does a replaced pool or a
+    /// rotated key, which builds a new lane. An unpaid span is the node's
+    /// credit-window loss, at most one credit window per lane, as for any
+    /// client that ends mid-stream.
+    unpaid: std::sync::Mutex<Vec<([u8; 32], u64, u64)>>,
 }
 
 /// Default ceiling on one voucher send (see [`PoolLedger::send_deadline`]). A
@@ -500,6 +511,24 @@ pub struct PoolLedger {
 /// transport level, not that it is merely slow. Generous enough never to fire on
 /// a healthy-but-loaded peer, short enough to bound the wedge into a failover.
 pub(crate) const VOUCHER_SEND_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Merge `(start, end)` spans into disjoint `(start, len)` ranges in ascending
+/// order. Overlapping or adjacent spans join; empty spans drop.
+pub(crate) fn merge_spans(mut spans: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    spans.retain(|&(start, end)| start < end);
+    spans.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(start, end)| (start, end - start))
+        .collect()
+}
 
 impl PoolLedger {
     /// Build a ledger seeded from the lane's persisted cumulative state (the
@@ -530,7 +559,38 @@ impl PoolLedger {
             epoch: std::sync::Mutex::new(None),
             retired: std::sync::Mutex::new(Displaced::Nothing),
             send_deadline: VOUCHER_SEND_DEADLINE,
+            unpaid: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Record that this lane delivered `[start, end)` of `hash` and did not pay
+    /// for it. An empty span records nothing.
+    pub(crate) fn note_unpaid(&self, hash: [u8; 32], start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        self.unpaid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((hash, start, end));
+    }
+
+    /// Take every span of `hash` this lane delivered and did not pay for, as
+    /// `(start, len)` in ascending order. Overlapping or adjacent spans merge.
+    pub(crate) fn take_unpaid(&self, hash: [u8; 32]) -> Vec<(u64, u64)> {
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        self.unpaid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|&(h, start, end)| {
+                if h == hash {
+                    spans.push((start, end));
+                    false
+                } else {
+                    true
+                }
+            });
+        merge_spans(spans)
     }
 
     #[cfg(test)]

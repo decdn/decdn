@@ -224,10 +224,10 @@ impl NodeFixture {
     /// the newly-configured value.
     ///
     /// This is the amount the node's node-to-node cache-miss buyer leg escrows
-    /// when it opens its upstream pool, and the target every reactive mid-pull
-    /// top-up (#1530) refills that pool back toward. Shrinking it below a blob's
+    /// when it opens its upstream pool, and the target every funding recovery
+    /// step (#1530) tops that pool back up toward. Shrinking it below a blob's
     /// wire cost is what forces the buyer leg to exhaust its deposit mid-pull and
-    /// exercise the reactive top-up — the loopback suite drives this with a
+    /// run the recovery step; the loopback suite drives this with a
     /// `FundingOpener` double; this drives the real daemon against a real
     /// on-chain `topUp`.
     ///

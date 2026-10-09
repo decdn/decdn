@@ -1,8 +1,7 @@
-use super::{BlobSource, Funder};
+use super::{BlobSource, Funder, Recovery};
 use crate::sink::StashedFault;
 use alloy::primitives::U256;
 use decdn_bao_range::{AlignedRange, align_range};
-use decdn_incentive::DepositOutcome;
 use iroh_io::AsyncStreamReader;
 
 fn blob(len: usize) -> Vec<u8> {
@@ -82,225 +81,29 @@ fn peer_source_is_a_blob_source() {
     assert_impl::<super::PeerSource<'static>>();
 }
 
-/// The fake funder records amounts and echoes its scripted outcome.
+/// The fake funder records the remaining deposits it was asked to recover
+/// from and answers its script in order, repeating the last outcome.
 #[tokio::test]
-async fn fake_funder_records_and_returns() -> anyhow::Result<()> {
-    let funder = super::FakeFunder::new(3, DepositOutcome::Added(U256::from(100u64)));
-    assert_eq!(funder.max_topups(), 3);
-    let out = funder.top_up(U256::from(40u64)).await?;
-    assert_eq!(out, DepositOutcome::Added(U256::from(100u64)));
-    assert_eq!(funder.calls(), vec![U256::from(40u64)]);
-    Ok(())
-}
-
-/// A signer registry that answers every read with the authorization it
-/// holds, or fails it when it holds `None`, and counts its reads.
-#[derive(Default)]
-struct FixedAuthorization {
-    auth: Option<decdn_incentive::payment_pool::SignerAuthorization>,
-    reads: std::sync::atomic::AtomicUsize,
-}
-
-impl super::SignerRegistry for FixedAuthorization {
-    fn read(
-        &self,
-        _pool_id: alloy::primitives::B256,
-        _signer: alloy::primitives::Address,
-    ) -> super::SourceFuture<'_, decdn_incentive::payment_pool::SignerAuthorization> {
-        self.reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let auth = self.auth;
-        Box::pin(async move { auth.ok_or_else(|| anyhow::anyhow!("rpc down")) })
-    }
-}
-
-/// A signer registry whose read never answers.
-struct SilentRegistry;
-
-impl super::SignerRegistry for SilentRegistry {
-    fn read(
-        &self,
-        _pool_id: alloy::primitives::B256,
-        _signer: alloy::primitives::Address,
-    ) -> super::SourceFuture<'_, decdn_incentive::payment_pool::SignerAuthorization> {
-        Box::pin(std::future::pending())
-    }
-}
-
-const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
-
-const NOW: u64 = 1_700_000_000;
-
-/// An open-stage refusal with `error`, signed at `rate_per_mb`.
-fn open_refusal(error: decdn_protocol::client::StreamError, rate_per_mb: u64) -> anyhow::Error {
-    use decdn_protocol::client::{StreamResponse, StreamResponseBody};
-    crate::UpstreamRefused::open(
-        StreamResponse {
-            body: StreamResponseBody {
-                hash: [0x5Au8; 32],
-                ok: false,
-                rate_per_mb,
-                total_bytes: 0,
-                pool_id: [0x77u8; 32],
-                timestamp_us: 0,
-            },
-            slash_sig: vec![0u8; decdn_protocol::message::SLASH_SIG_LEN],
-        },
-        &decdn_protocol::StreamResponseExt { error: Some(error) },
-    )
-}
-
-fn registered(cap: u64, spent: u64) -> decdn_incentive::payment_pool::SignerAuthorization {
-    decdn_incentive::payment_pool::SignerAuthorization::Registered {
-        cap,
-        expiry: NOW + 3_600,
-        spent,
-    }
-}
-
-/// Run `confirm_refusal` for `err` against a registry answering `auth`.
-/// Returns the result and how many reads it made.
-async fn confirm(
-    err: anyhow::Error,
-    auth: Option<decdn_incentive::payment_pool::SignerAuthorization>,
-) -> (anyhow::Error, usize) {
-    let ctx = super::ctx_with(0xa1, U256::from(1_000u64));
-    let check = FixedAuthorization {
-        auth,
-        ..FixedAuthorization::default()
-    };
-    let err = super::confirm_refusal(Some(&check), err, &ctx, NOW, DEADLINE).await;
-    (err, check.reads.load(std::sync::atomic::Ordering::Relaxed))
-}
-
-/// A signed `NotFound` to a signer whose `cap − spent` is one below a
-/// chunk at the signed rate ends as `SignerCapDrained`, with the numbers
-/// the node refused on (#2338).
-#[tokio::test]
-async fn a_not_found_to_a_drained_signer_becomes_signer_cap_drained() -> anyhow::Result<()> {
-    let (err, _) = confirm(
-        open_refusal(decdn_protocol::client::StreamError::NotFound, 10),
-        Some(registered(40, 31)),
-    )
-    .await;
-    let drained = err
-        .downcast_ref::<super::SignerCapDrained>()
-        .ok_or_else(|| anyhow::anyhow!("a drained signer is named: {err:#}"))?;
-    assert_eq!(drained.remaining, 9);
-    assert_eq!(drained.floor(), U256::from(10u64));
-    assert_eq!(drained.rate_per_mb, 10);
-    assert!(!drained.expired);
+async fn fake_funder_records_and_answers_its_script() -> anyhow::Result<()> {
+    let funder = super::FakeFunder::scripted(vec![
+        Recovery::ToppedUp(U256::from(100u64)),
+        Recovery::Unavailable,
+    ]);
     assert_eq!(
-        crate::classify(&err),
-        crate::Fault::Source,
-        "a cheaper provider can still serve 9 µUSDC of headroom"
+        funder.recover(U256::from(40u64)).await?,
+        Recovery::ToppedUp(U256::from(100u64))
+    );
+    assert_eq!(
+        funder.recover(U256::from(5u64)).await?,
+        Recovery::Unavailable
+    );
+    assert_eq!(
+        funder.recover(U256::from(5u64)).await?,
+        Recovery::Unavailable
+    );
+    assert_eq!(
+        funder.calls(),
+        vec![U256::from(40u64), U256::from(5u64), U256::from(5u64)]
     );
     Ok(())
-}
-
-/// A registration past its expiry is drained whatever its headroom.
-#[tokio::test]
-async fn a_not_found_to_an_expired_signer_becomes_signer_cap_drained() -> anyhow::Result<()> {
-    let expired = decdn_incentive::payment_pool::SignerAuthorization::Registered {
-        cap: 1_000,
-        expiry: NOW,
-        spent: 0,
-    };
-    let (err, _) = confirm(
-        open_refusal(decdn_protocol::client::StreamError::NotFound, 10),
-        Some(expired),
-    )
-    .await;
-    let drained = err
-        .downcast_ref::<super::SignerCapDrained>()
-        .ok_or_else(|| anyhow::anyhow!("an expired signer is named: {err:#}"))?;
-    assert!(drained.expired);
-    assert_eq!(
-        crate::classify(&err),
-        crate::Fault::Fatal(crate::FatalScope::Command)
-    );
-    Ok(())
-}
-
-/// Every refusal the chain does not explain comes back as it arrived: a
-/// signer that still covers one chunk, an unregistered signer, a failed
-/// read, a refusal other than `NotFound`, an unsigned mid-stream
-/// `NotFound`, and a refusal signed at a zero rate. Only an open-stage
-/// `NotFound` signed at a non-zero rate costs a read.
-#[tokio::test]
-async fn an_unexplained_refusal_stands() {
-    use decdn_protocol::client::StreamError;
-    let cases = [
-        (
-            open_refusal(StreamError::NotFound, 10),
-            Some(registered(40, 30)),
-            1,
-        ),
-        (
-            open_refusal(StreamError::NotFound, 10),
-            Some(decdn_incentive::payment_pool::SignerAuthorization::Unregistered),
-            1,
-        ),
-        (open_refusal(StreamError::NotFound, 10), None, 1),
-        (
-            open_refusal(StreamError::Overloaded, 10),
-            Some(registered(40, 40)),
-            0,
-        ),
-        (
-            anyhow::Error::new(crate::UpstreamRefused::mid_stream(StreamError::NotFound)),
-            Some(registered(40, 40)),
-            0,
-        ),
-        (
-            open_refusal(StreamError::NotFound, 0),
-            Some(registered(40, 40)),
-            0,
-        ),
-    ];
-    for (i, (err, auth, want_reads)) in cases.into_iter().enumerate() {
-        let (err, reads) = confirm(err, auth).await;
-        assert_eq!(reads, want_reads, "case {i} reads");
-        assert!(
-            err.downcast_ref::<super::SignerCapDrained>().is_none(),
-            "case {i}: {err:#}"
-        );
-        assert!(
-            err.downcast_ref::<crate::UpstreamRefused>().is_some(),
-            "case {i} keeps the refusal: {err:#}"
-        );
-    }
-}
-
-/// A source with no signer check keeps the refusal.
-#[tokio::test]
-async fn no_check_leaves_the_refusal() {
-    let ctx = super::ctx_with(0xa1, U256::from(1_000u64));
-    let err = super::confirm_refusal(
-        None,
-        open_refusal(decdn_protocol::client::StreamError::NotFound, 10),
-        &ctx,
-        NOW,
-        DEADLINE,
-    )
-    .await;
-    assert!(err.downcast_ref::<crate::UpstreamRefused>().is_some());
-}
-
-/// A read that never answers gives way at the deadline, and the refusal
-/// stands: a stalled RPC cannot hold the lane's open.
-#[tokio::test(start_paused = true)]
-async fn a_stalled_read_gives_way_at_the_deadline() {
-    let ctx = super::ctx_with(0xa1, U256::from(1_000u64));
-    let started = tokio::time::Instant::now();
-    let err = super::confirm_refusal(
-        Some(&SilentRegistry),
-        open_refusal(decdn_protocol::client::StreamError::NotFound, 10),
-        &ctx,
-        NOW,
-        DEADLINE,
-    )
-    .await;
-    assert_eq!(started.elapsed(), DEADLINE);
-    assert!(err.downcast_ref::<crate::UpstreamRefused>().is_some());
 }

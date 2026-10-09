@@ -147,7 +147,7 @@ async fn run() -> anyhow::Result<()> {
     chain.fund_eth(buyer_addr, 100).await?;
     // One pool fans out to every provider (ADR 003) — a single deposit backs
     // BOTH lanes this fetch opens, so it must cover the whole blob across the
-    // two of them, plus headroom for the reactive-topup ramp.
+    // two of them, plus headroom for recovery top-ups.
     chain
         .mint_usdc(
             buyer_addr,

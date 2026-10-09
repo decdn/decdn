@@ -25,12 +25,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use alloy::primitives::U256;
-
-use crate::driver::DriveConfig;
+use crate::credential::CredentialSlot;
 use crate::health::PeerHealth;
 use crate::ledgers::LaneLedgers;
 use crate::pacer::BudgetPacer;
+use crate::recovery::RecoveryGate;
 use crate::scheduler::{AcquireEnv, AcquireTarget, acquire};
 use crate::source::Funder;
 use crate::source_set::{Holder, SourceProvider, SourceSet};
@@ -106,10 +105,12 @@ pub struct Downloader<P, F> {
     holders: Vec<Holder>,
     /// The command-wide health every target's sources record into.
     health: Arc<PeerHealth>,
-    /// The top-up seam a mid-fetch cap exhaustion funds through.
+    /// The funding recovery seam an exhausted candidate set funds through.
     funder: F,
-    /// The driver's funding/settle policy.
-    drive_config: DriveConfig,
+    /// The fetch's funding recovery state, shared by every target.
+    recovery: Arc<RecoveryGate>,
+    /// A delegated fetch's swappable voucher credential ([`Self::credentials`]).
+    credentials: Option<CredentialSlot>,
     /// The most lanes that stream at once, for every target. Holders past it
     /// wait as reserves, and a holder discovery adds later can use a free
     /// lane.
@@ -126,7 +127,7 @@ impl<P, F> std::fmt::Debug for Downloader<P, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Downloader")
             .field("holders", &self.holders.len())
-            .field("drive_config", &self.drive_config)
+            .field("recovery", &self.recovery)
             .finish_non_exhaustive()
     }
 }
@@ -136,8 +137,8 @@ impl<P, F> Downloader<P, F> {
     /// funded through `funder`.
     ///
     /// Each target starts by discovering its holders, every holder streams at
-    /// once, and reactive top-up is off. The builder methods change each of
-    /// these.
+    /// once, and the downloader's targets share a fresh [`RecoveryGate`]. The
+    /// builder methods change each of these.
     #[must_use]
     pub fn new(provider: P, funder: F) -> Self {
         Self {
@@ -145,7 +146,8 @@ impl<P, F> Downloader<P, F> {
             holders: Vec::new(),
             health: Arc::default(),
             funder,
-            drive_config: DriveConfig::cli(U256::ZERO),
+            recovery: Arc::default(),
+            credentials: None,
             max_lanes: usize::MAX,
             max_blob_bytes: 0,
             refetched: AtomicU64::new(0),
@@ -169,13 +171,24 @@ impl<P, F> Downloader<P, F> {
         self
     }
 
-    /// Top the pool up through the funder, back to `working_deposit`, when a
-    /// fetch runs the deposit low. `U256::ZERO` turns reactive top-up off: a
-    /// fetch the deposit cannot cover then fails with
-    /// [`crate::NoAffordableSource`].
+    /// Run the funding recovery step under `recovery`, the fetch's gate. A
+    /// caller that runs its remaining work again after a
+    /// [`crate::PoolReplaced`] passes the gate the first pass used, so the
+    /// progress rule spans both passes.
     #[must_use]
-    pub const fn working_deposit(mut self, working_deposit: U256) -> Self {
-        self.drive_config.working_deposit = working_deposit;
+    pub fn recovery(mut self, recovery: Arc<RecoveryGate>) -> Self {
+        self.recovery = recovery;
+        self
+    }
+
+    /// Pay as a delegate under `slot`'s credential. The provider builds each
+    /// lane from [`CredentialSlot::current`]. After a swap, the lanes on the
+    /// old key end at a voucher boundary and new lanes resume under the new
+    /// key; at the exhausted candidate set the fetch waits for a swap instead
+    /// of topping up, and ends with a [`crate::FundingNeeded`].
+    #[must_use]
+    pub fn credentials(mut self, slot: CredentialSlot) -> Self {
+        self.credentials = Some(slot);
         self
     }
 
@@ -185,15 +198,6 @@ impl<P, F> Downloader<P, F> {
     #[must_use]
     pub fn health(mut self, health: Arc<PeerHealth>) -> Self {
         self.health = health;
-        self
-    }
-
-    /// Replace the whole funding and settle policy, the working deposit
-    /// included.
-    #[doc(hidden)]
-    #[must_use]
-    pub const fn drive_config(mut self, drive_config: DriveConfig) -> Self {
-        self.drive_config = drive_config;
         self
     }
 
@@ -386,7 +390,8 @@ where
             let env = AcquireEnv {
                 pacer: &pacer,
                 funder: &self.funder,
-                drive: &self.drive_config,
+                recovery: &self.recovery,
+                credentials: self.credentials.as_ref(),
                 max_lanes: self.max_lanes.max(1),
                 stop,
                 on_progress,

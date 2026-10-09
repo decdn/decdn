@@ -1079,7 +1079,7 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
 /// [`UpstreamRateLimited`] sentinel carrying the layer label, recoverable with
 /// `downcast_ref` through the stage context it adds. Without that the node's
 /// `probe_candidate` sees a bare `open_bi failed` string and scores the shedding
-/// peer `Unreachable`, the penalty the handler-level `Overloaded` refusal is
+/// peer `Unreachable`, the penalty a handler-level load-shed `NotFound` is
 /// exonerated from.
 ///
 /// Same strict per-source fixture as `probe_rate_limit_returns_rate_limited_close_code`,

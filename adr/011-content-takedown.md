@@ -445,20 +445,20 @@ On startup, nodes always fetch the full current blacklist (global + their region
 When a node receives a new blacklisted hash, it must, **in order**:
 
 1. **Stop publishing** — withdraw any DHT STORE records for the hash and stop re-publishing immediately ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale))
-2. **Stop serving** — reject any new `StreamRequest` for the hash immediately, returning `HashBlacklisted`
+2. **Stop serving** — reject any new `StreamRequest` for the hash immediately, returning `Declined` ([§ StreamRequest Response](#streamrequest-response))
 3. **Evict from cache** — delete the blob from local storage within the compliance window
 
 The publish-first ordering is critical: continuing to serve a blacklisted hash after the compliance window is a blacklist-violation slashing offense ([ADR 014 § SlashJudge Contract](014-on-chain-verification.md#slashjudge-contract)), and a signed response for that hash is dispositive evidence. Disk eviction can be async; DHT-record and probe-response suppression must be synchronous.
 
 When a node receives a blacklisted origin address, it additionally stops accepting any `StreamRequest` whose pool is owned by that operator address, and removes all of that origin's NodeIds from its local registry-derived node view.
 
-In-flight streams for a blacklisted hash — or on a channel funded by a newly blacklisted origin — are terminated at the next chunk boundary, after the preimage for the chunk already delivered is revealed. Termination is a stream reset with no `StreamEnd` sentinel, not an error frame: [ADR 005 § Stream errors](005-protocol.md#adr-005-wire-protocol) makes `VoucherRejected` the only `StreamError` that travels mid-stream, and the QUIC code is `NO_ERROR` so the client does not score the node as faulty for discharging a takedown ([ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes)). A client that re-requests the hash gets the signed `HashBlacklisted` refusal from the open-time gate, and can request a refund of the unused channel balance.
+In-flight streams for a blacklisted hash — or on a channel funded by a newly blacklisted origin — are terminated at the next chunk boundary, after the preimage for the chunk already delivered is revealed. Termination is a stream reset with no `StreamEnd` sentinel, not an error frame: [ADR 005 § `VoucherRejected` semantics](005-protocol.md#voucherrejected-semantics) makes `VoucherRejected` the only `StreamError` that travels mid-stream, and the QUIC code is `NO_ERROR` so the client does not score the node as faulty for discharging a takedown ([ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes)). A client that re-requests the hash gets the `Declined` refusal from the open-time gate and tries other nodes.
 
 ### Serving while chain-stale
 
 Every serve-path guard that enforces on-chain state reads a local projection. The deny-set, the pool-solvency check, and the per-signer capability cap all advance only while the chain watchers reach the RPC. During an RPC outage each guard passes on stale state. A takedown, a drained pool, or a spent capability that lands on-chain during the outage is invisible to the node. The node keeps signing serve and probe responses it can no longer vouch for. Serving a hash past its compliance window is slashable, and the offense is a signed `StreamResponse{ok:true}` or `ProbeResponse{has_blob:true}` — the node produces its own evidence.
 
-The node bounds this exposure with a grace window. It records the wall-clock time of the blacklist watcher's last successful poll tick. When the node has been unable to reach the chain for longer than `chain_staleness_grace_sec`, the serve path refuses new requests and the probe path answers `has_blob: false`. The serve refusal signs `NotFound`, which is reputation-benign, so a client re-routes to a peer whose chain reads are live. This is the runtime counterpart of the boot readiness gate: the boot gate keeps every listener shut until the first enumeration completes, and the staleness gate stops the same signed surfaces when the chain reads go stale after boot.
+The node bounds this exposure with a grace window. It records the wall-clock time of the blacklist watcher's last successful poll tick. When the node has been unable to reach the chain for longer than `chain_staleness_grace_sec`, the serve path refuses new requests and the probe path answers `has_blob: false`. The serve refusal is `NotFound`, which is reputation-benign, so a client re-routes to a peer whose chain reads are live. The node can answer differently once its chain reads recover, so the refusal does not remove it from the client's candidates. This is the runtime counterpart of the boot readiness gate: the boot gate keeps every listener shut until the first enumeration completes, and the staleness gate stops the same signed surfaces when the chain reads go stale after boot.
 
 The signal is the successful poll *tick*, not the last blacklist event. A quiet chain produces no blacklist events for long periods. Keying on events would take a node dark on any quiet period. A successful tick — including an idle tick with no logs — stamps the clock. The boot enumeration stamps it too, so a node that has just vetted its deny-set is never treated as stale.
 
@@ -496,17 +496,9 @@ The lists are hot-reloadable (`decdn node reload` / SIGHUP), which is load-beari
 
 ### StreamRequest Response
 
-```rust
-enum StreamError {
-    // ... existing errors ...
-    HashBlacklisted,      // hash is on the governance blacklist or local denylist
-    OriginBlacklisted,    // the pool owner's operator address is blacklisted
-}
-```
+A node refuses a blacklisted hash, and a request whose pool owner is a blacklisted origin, with `Declined` ([ADR 005 § Open-time refusal classes](005-protocol.md#open-time-refusal-classes)). The same code covers the governance blacklist, the local denylist, the on-chain origin blacklist, the local origin denylist, and a blob the operator withdrew with no blacklist entry behind it (a manual `decdn node evict`, or a stored-corruption quarantine, [ADR 040](040-cache-policy.md#pinning-durable-operator-evict-and-the-probe-hold-stay-engine-enforced)). A client able to tell these sources apart could map an operator's private legal exposure by probing. The distinction survives only in the operator's own metrics (`decdn_serve_stream_rejected_hash_denied_total` for the local list, `…_chain_hash_denied_total` for a governance entry), which no client can read.
 
-The response does not distinguish between governance and local denylist sources — a client able to tell them apart could map an operator's private legal exposure by probing. Both answer `HashBlacklisted`, which requires the governance half to be gated on its own deny-set rather than falling through to the eviction arm: a hash refused as `EvictedSinceProbe` while no on-chain entry explains it is a hash the operator denied privately, so leaving governance on the eviction code would have made the *local* code the fingerprint. `EvictedSinceProbe` therefore means a withdrawal with no blacklist entry behind it: a manual `decdn node evict`, or a stored-corruption quarantine ([ADR 040](040-cache-policy.md#pinning-durable-operator-evict-and-the-probe-hold-stay-engine-enforced)). The governance/local distinction survives only in the operator's own metrics (`decdn_serve_stream_rejected_hash_denied_total` for the local list, `…_chain_hash_denied_total` for a governance entry), which no client can read.
-
-Clients should retry on a different node for `HashBlacklisted`: a local entry binds only that node. `OriginBlacklisted` is not worth retrying anywhere — it is a statement about the requester's own funding address, so every node refuses identically until governance lifts the entry.
+A client removes the refusing node for this hash for the rest of the fetch, and tries other nodes. A local entry binds only that node. A client does not end the fetch on the refusal, even for an origin entry: a node's local origin denylist binds only that node, and the wire does not tell it apart from the on-chain list. When every candidate refuses `Declined`, the fetch ends early with "no node will serve this" ([ADR 039 § Failure handling](039-multi-source-parallel-fetch.md#failure-handling-reassign-only-tail)).
 
 ## Slashing
 

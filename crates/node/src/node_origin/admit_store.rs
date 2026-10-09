@@ -126,7 +126,7 @@ impl IngestStore for NodeAdmitStore {
     /// `UpstreamVoucherRejected`/buyer-side `LocalPullFault`) — the cache decoder
     /// only sees the resulting truncation as a generic `CacheError`. Surfacing
     /// the parked fault verbatim keeps `pull_verdict` fault classification,
-    /// reputation, channel remedies, and reactive top-up (`SpendingCapExhausted`) working.
+    /// reputation, channel remedies, and the funding recovery step working.
     /// No-op: unlike [`decdn_client::ClientRangedStore`]'s `.partial` +
     /// `.ranges` sidecar, this store's presence is derived live from
     /// [`CacheEngine`]'s own admitted-range bookkeeping — there is no

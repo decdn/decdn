@@ -67,7 +67,7 @@ const RATE_PER_MB: u64 = 1000;
 
 /// The SERVER's buyer working deposit. Sized generously relative to both blobs
 /// so neither pull exhausts it: this journey is about losing the record of the
-/// pool, not about running it down, and a reactive top-up would add a second
+/// pool, not about running it down, and a recovery top-up would add a second
 /// on-chain write to reason about.
 const SERVER_WORKING_DEPOSIT: u64 = 1_000_000;
 
