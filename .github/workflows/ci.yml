@@ -65,7 +65,7 @@ jobs:
       # fingerprint. It is set per step, not per job: rust-cache hashes every
       # `CARGO*`/`RUST*` variable it sees into the restore key, and release.yml
       # restores this `clippy` partition, so the env at the rust-cache step must
-      # match release.yml's `release` job.
+      # match release.yml's `verify` job.
       - run: cargo clippy --workspace --all-targets
         env:
           CARGO_BUILD_WARNINGS: deny
