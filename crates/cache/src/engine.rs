@@ -4391,7 +4391,7 @@ impl CacheEngine {
 
     /// Walk every blob in the local iroh-blobs store, complete or partial, and
     /// return its hash, excluding operator-evicted blobs
-    /// ([ADR 011](../../../adr/011-content-takedown.md)). Consumed by the DHT
+    /// ([ADR 011](https://github.com/decdn/decdn/blob/main/adr/011-content-takedown.md)). Consumed by the DHT
     /// republish scheduler at startup and by its lag sweep (ADR 022 §Bootstrap;
     /// AC 15 cold start, AC 20 lag re-seed): every held blob's first re-publish time is drawn from
     /// `uniform(0, 40 min)` per record, so the bootstrap `Store` rate matches
@@ -4689,7 +4689,7 @@ impl CacheEngine {
     }
 
     /// Read `[byte_offset, byte_offset + byte_len)` of `hash` from the local
-    /// store ([ADR 038 §Serve side](../../../adr/038-bao-verified-range-streaming.md)).
+    /// store ([ADR 038 §Serve side](https://github.com/decdn/decdn/blob/main/adr/038-bao-verified-range-streaming.md)).
     /// `byte_len == 0` reads to the blob end. Works against a **partial** blob
     /// admitted by [`Self::admit_bao`] — only the bytes covered by an
     /// admitted (and thus already-verified) range are readable; asking for
@@ -4802,7 +4802,7 @@ impl CacheEngine {
 
     /// Export `[byte_offset, byte_offset + byte_len)` of `hash` as the
     /// **header-less bao interleaved verified-stream encoding** that travels on
-    /// `cdn/client/v1` ([ADR 038 §Serve side](../../../adr/038-bao-verified-range-streaming.md)),
+    /// `cdn/client/v1` ([ADR 038 §Serve side](https://github.com/decdn/decdn/blob/main/adr/038-bao-verified-range-streaming.md)),
     /// yielded incrementally as the store produces it. `byte_len == 0` exports to
     /// the blob end. This is the *only* client-facing delivery path — there is no
     /// raw-byte fallback (ADR 038 AC#4) — so a whole-blob serve passes

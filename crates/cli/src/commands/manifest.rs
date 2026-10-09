@@ -11,7 +11,7 @@
 //!
 //! The on-disk schema, hash format (`b3:<hex>`), path-safety rules, and the
 //! determinism contract that makes single-hash bundle distribution viable are
-//! specified in [`appendix-bundles`](../../../../adr/appendix-bundles.md).
+//! specified in [`appendix-bundles`](https://github.com/decdn/decdn/blob/main/adr/appendix-bundles.md).
 
 use std::fs::File;
 use std::io::Write;

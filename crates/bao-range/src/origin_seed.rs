@@ -3,7 +3,7 @@
 //! A filesystem cache origin stores each blob as a sharded data object
 //! `{base}/{hex[0..2]}/{hex}` with a sibling pre-order bao outboard
 //! `{base}/{hex[0..2]}/{hex}.obao4`
-//! ([ADR 037 §Origin-tier pull-through](../../../adr/037-regional-proxy-warming.md)).
+//! ([ADR 037 §Origin-tier pull-through](https://github.com/decdn/decdn/blob/main/adr/037-regional-proxy-warming.md)).
 //! The reader side lives in `decdn-cache` (`origin::fs` / `origin::s3`); the
 //! writer side is `decdn origin import`. Both derive the sibling key and the
 //! outboard bytes from this module, so a blob written here is one the daemon
@@ -22,7 +22,7 @@ use bao_tree::io::sync::CreateOutboard;
 use crate::IROH_BLOCK_SIZE;
 
 /// Sibling-key suffix for the published pre-order bao outboard (`{H}.obao4`),
-/// per [ADR 037 §Origin-tier pull-through](../../../adr/037-regional-proxy-warming.md).
+/// per [ADR 037 §Origin-tier pull-through](https://github.com/decdn/decdn/blob/main/adr/037-regional-proxy-warming.md).
 /// Shared across the filesystem / S3 reader adapters and the `origin import`
 /// writer so an operator `aws s3 sync`-ing between backends keeps the same
 /// object names.

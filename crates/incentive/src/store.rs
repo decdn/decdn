@@ -4,7 +4,7 @@
 //! memory. Without a backing store, a node restart loses `last_amount` and a
 //! client can resubmit a previously-accepted voucher for a second byte
 //! delivery — see issue #527 and
-//! [ADR 003 §Off-chain voucher state persistence](../../../adr/003-payments.md).
+//! [ADR 003 §Off-chain voucher state persistence](https://github.com/decdn/decdn/blob/main/adr/003-payments.md).
 //!
 //! This module defines the [`PoolStateStore`] seam: a sync trait that takes each
 //! accepted lane state into a working set and makes it durable on an explicit

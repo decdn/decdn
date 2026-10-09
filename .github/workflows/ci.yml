@@ -1208,6 +1208,9 @@ jobs:
       - name: Deployment manifest mirror in sync
         run: .github/scripts/check-deployment-mirror.sh
 
+      - name: Doc comments link to repo files by absolute URL
+        run: .github/scripts/check-doc-links.sh
+
       # In a script, not inline: a `run:` block is templated by Actions before
       # bash sees it, so an inline grep for the literal `${{ github.repository }}`
       # would search for the expanded value and never match.
