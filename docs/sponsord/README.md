@@ -7,31 +7,31 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.99.0-orange.svg)](rust-toolchain.toml)
 
 Sponsored downloads for [deCDN](https://github.com/decdn/decdn): your users
-download content from deCDN, and you pay for it. They install one small CLI,
+download content from deCDN, and you pay for it. They run one command,
 pass a check in the browser (a captcha by default), and download. There's no
 wallet, key, or token for them to manage.
 
 You run two services next to a `PaymentPool` you fund:
 
-```
-  user's machine                       your servers                       chain
- ┌────────────────┐  /v1/capability  ┌──────────────────┐  POST /v1/    ┌──────────┐
- │ decdn-sponsored│ ───────────────▶ │ sponsord-onramp  │  capabilities │ sponsord │──▶ PaymentPool
- │  (throwaway    │ ◀─── installers  │  gate · hand-off │ ────────────▶ │ signs,   │    (your pool)
- │   key/download)│                  │  /v1/profile     │  bearer token │ tops up  │
- └──────┬─────────┘                  └────────▲─────────┘               └──────────┘
-        │ decdn bundle pull                   │ POST /v1/fund (gate passed)
-        ▼                                     │
-   deCDN nodes                           user's browser
+```text
+ user's machine                        ──────────────────── your servers ─────────────────────        chain
+┌─────────────────┐ GET /v1/capability ┌──────────────────┐ POST /v1/capabilities ┌──────────┐
+│ decdn-sponsored │ ─────────────────▶ │ sponsord-onramp  │ ────────────────────▶ │ sponsord │ ──▶ PaymentPool
+│ (throwaway key  │ ◀── installers ─── │ gate · hand-off  │    (bearer token)     │ signs,   │     (your pool)
+│  per download)  │                    │ /v1/profile      │                       │ tops up  │
+└────────┬────────┘                    └─────────▲────────┘                       └──────────┘
+         │ decdn bundle pull                     │ POST /v1/fund (gate passed)
+         ▼                                       │
+    deCDN nodes                           user's browser
 ```
 
-- **`sponsord`** holds the key that owns your pool. It signs capped, expiring
-  *capabilities* (`dcap1:` tokens) for callers holding its bearer token, and
-  keeps the pool topped up from that wallet. It has no opinion on who
-  deserves one; that's the gate's job.
+- **`sponsord`** holds your *treasury wallet*, the key that owns your pool.
+  It signs capped, expiring *capabilities* (`dcap1:` tokens) for callers
+  holding its bearer token, and keeps the pool topped up from that wallet. It
+  has no opinion on who deserves one; that's the gate's job.
 - **`sponsord-onramp`** is the public part: the installers, the gate page,
-  and the API the CLI polls. Turnstile is the built-in gate; you can plug in
-  your own.
+  and the API the CLI polls. Turnstile is the built-in gate; you can write
+  your own in Rust (see the [integrator guide](docs/integrator.md)).
 - **`decdn-sponsored`** is the end-user CLI. It gives each download a
   throwaway key, gets a capability for it through the onramp, and hands the
   pull to `decdn`, which verifies every byte against the content hash.
@@ -40,12 +40,15 @@ A capability lets one key spend up to its cap against your pool until it
 expires. Issuing one costs zero transactions and locks no deposit per user.
 Your loss is bounded by the gate, the per-capability cap, and the money
 behind the pool: its balance plus whatever the treasury wallet can still top
-it up with, since the daemon refills a drained pool automatically.
+it up with, since the daemon checks the pool periodically (hourly by
+default) and tops it up whenever it is below the low-water mark.
 
 ## Quickstart
 
-1. Open a pool once, from the treasury wallet: `decdn pool open`. Note its
-   id.
+1. Create the treasury wallet (for example with `decdn key-gen`), fund it
+   with gas and USDC, and open your pool from it once with `decdn pool open`.
+   Note the pool id it prints; you'll set it as `SPONSORD_POOL_ID`. The
+   [operator guide](docs/operator.md) has the details.
 2. Configure and start both services. With Docker:
 
    ```bash
@@ -58,7 +61,8 @@ it up with, since the daemon refills a drained pool automatically.
    That runs the released images (`ghcr.io/decdn/sponsord`,
    `ghcr.io/decdn/sponsord-onramp`). Or run the release binaries under
    systemd (`deploy/systemd/`).
-3. Put TLS in front of the onramp, then give users one line per download:
+3. Put TLS in front of the onramp (it listens on `127.0.0.1:8080` by
+   default), then give users one line per download:
 
    ```bash
    curl -fsSL https://downloads.example.org/decdn.sh | sh -s -- pull b3:<hash> --namespace <id>
@@ -67,6 +71,11 @@ it up with, since the daemon refills a drained pool automatically.
    ```powershell
    irm https://downloads.example.org/decdn.ps1 | iex; decdn-sponsored pull b3:<hash> --namespace <id>
    ```
+
+   `--namespace` is optional. It takes the numeric deCDN namespace the bundle
+   is published under, not your pool id, and lets a node that hasn't cached
+   the bundle fetch it from that namespace's origins. Without it, only nodes
+   that already cache the bundle can serve it.
 
 ## Documentation
 
