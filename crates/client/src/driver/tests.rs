@@ -2813,6 +2813,39 @@ async fn an_owed_span_behind_a_failed_missing_range_stays_owed() {
     );
 }
 
+/// A drive the caller drops mid-gap keeps the owed span it took: the node's
+/// pull leg races a drive against its cancel token, and the lane still owes
+/// those bytes.
+#[tokio::test(start_paused = true)]
+async fn a_dropped_drive_keeps_its_owed_span() {
+    let total = 6 * GROUP;
+    let (root, plaintext, outboard) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+    let (b, c) = (3 * GROUP, total);
+    let held = align_range(b, c - b, total).expect("align");
+    preadmit(&store, &plaintext, &outboard, &held).await;
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    ledger.note_unpaid(root, b, c);
+    // The gate never opens: the drive waits on its first read until dropped.
+    let (_gate, gated) = tokio::sync::watch::channel(false);
+    let source = ScriptedSource::new(plaintext)
+        .expect("source")
+        .paying(Arc::clone(&ledger))
+        .gated_on(gated);
+
+    tokio::select! {
+        ended = drive_whole(&store, &source, &ledger, root) => {
+            panic!("the gated drive ended: {ended:?}");
+        }
+        () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+    }
+    assert_eq!(
+        ledger.take_unpaid(root),
+        vec![(b, c - b)],
+        "the dropped drive noted its owed span back"
+    );
+}
+
 /// A leg that re-delivers present bytes to bill them reports no progress for
 /// them: the position counts only bytes past the delivered frontier, so the
 /// funding recovery gate never takes a re-billed byte for a new one.

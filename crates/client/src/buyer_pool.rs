@@ -676,10 +676,12 @@ impl std::fmt::Display for PoolNotOpen {
 impl std::error::Error for PoolNotOpen {}
 
 /// Whether `pool_id` still accepts funds: the gas estimate of a one-unit
-/// `topUp` from `owner`, with no transaction sent. Only a `PoolNotOpen` revert
-/// says no. Any other estimate failure (an allowance or balance short of one
-/// unit, a transport fault) says nothing about the pool's status, so it reads
-/// as open.
+/// `topUp` from `owner`, with no transaction sent. A `PoolNotOpen` revert says
+/// no. Any other estimate failure (an allowance or balance short of one unit,
+/// a transport fault, a revert the decoder cannot read) says nothing about the
+/// pool, so the pool's status is read instead: `Closing` or `Closed` says no.
+/// When that read fails too, the pool reads as open, and the warning names
+/// both failures.
 ///
 /// The funding recovery step checks this when the pool already holds its
 /// working deposit and there is nothing to add: a full pool that is `Closing`
@@ -689,9 +691,26 @@ pub async fn pool_accepts_funds<P: Provider + Clone>(
     owner: Address,
     pool_id: B256,
 ) -> bool {
-    match contract.topUp(pool_id, 1).from(owner).estimate_gas().await {
-        Ok(_) => true,
-        Err(err) => !decdn_incentive::is_pool_not_open(err.as_revert_data().as_ref()),
+    let estimate = match contract.topUp(pool_id, 1).from(owner).estimate_gas().await {
+        Ok(_) => return true,
+        Err(err) if decdn_incentive::is_pool_not_open(err.as_revert_data().as_ref()) => {
+            return false;
+        }
+        Err(err) => err,
+    };
+    match contract.getPool(pool_id).call().await {
+        Ok(pool) => !matches!(
+            pool.status,
+            PaymentPool::Status::Closing | PaymentPool::Status::Closed
+        ),
+        Err(read) => {
+            tracing::warn!(
+                %pool_id,
+                error = %format_args!("topUp estimate: {estimate}; getPool: {read}"),
+                "could not tell whether the buyer pool still accepts funds; treating it as open"
+            );
+            true
+        }
     }
 }
 

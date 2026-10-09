@@ -65,7 +65,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -305,6 +305,57 @@ const CHUNK_BYTES: u64 = 1024;
 /// refetching — and re-paying for — the whole in-flight download. 5 seconds
 /// mirrors the voucher-flush cadence.
 pub(crate) const PRESENT_RECORD_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The spans [`drive`] took from its lane's unpaid record
+/// ([`PoolLedger::take_unpaid`]). The lane owes them until a gap bills them,
+/// so whatever ends the drive first, an error or the caller dropping the
+/// drive, notes back every span that ends past the offset billing reached.
+/// A span the gap's own funding refusal also noted bills once:
+/// `take_unpaid` merges.
+struct OwedSpans<'l> {
+    ledger: &'l PoolLedger,
+    hash: [u8; 32],
+    /// The owed spans, as `(start, len)` in ascending order.
+    spans: Vec<(u64, u64)>,
+    /// The content offset billing reached: the start of the gap in flight,
+    /// its paid frontier once the gap failed, or `u64::MAX` once every gap
+    /// is filled.
+    unbilled_from: AtomicU64,
+}
+
+impl<'l> OwedSpans<'l> {
+    /// Take `hash`'s owed spans from `ledger`.
+    fn take(ledger: &'l PoolLedger, hash: [u8; 32]) -> Self {
+        Self {
+            ledger,
+            hash,
+            spans: ledger.take_unpaid(hash),
+            unbilled_from: AtomicU64::new(0),
+        }
+    }
+
+    /// Billing has reached `offset`.
+    fn unbilled_from(&self, offset: u64) {
+        self.unbilled_from.store(offset, Ordering::Relaxed);
+    }
+
+    /// Every gap is filled, so every owed span is billed.
+    fn billed(&self) {
+        self.unbilled_from(u64::MAX);
+    }
+}
+
+impl Drop for OwedSpans<'_> {
+    fn drop(&mut self) {
+        let from = self.unbilled_from.load(Ordering::Relaxed);
+        for &(start, len) in &self.spans {
+            let end = start.saturating_add(len);
+            if end > from {
+                self.ledger.note_unpaid(self.hash, start.max(from), end);
+            }
+        }
+    }
+}
 
 /// Drive `fut` (a fetch's whole gap/worker set) to completion while a single
 /// periodic tick flushes the store's `.ranges` present record every `interval`,
@@ -632,11 +683,11 @@ where
     // ended its last drive join the gaps, even outside the request: the lane
     // owes them, so the drive opens at their paid frontier and bills them again
     // although the store holds the bytes.
-    let owed = ledger.take_unpaid(hash);
+    let owed = OwedSpans::take(ledger, hash);
     let gaps = crate::ledger::merge_spans(
         contiguous_byte_ranges(&missing, total_bytes)
             .into_iter()
-            .chain(owed.iter().copied())
+            .chain(owed.spans.iter().copied())
             .map(|(start, len)| (start, start.saturating_add(len)))
             .collect(),
     );
@@ -648,9 +699,11 @@ where
     // (and re-pay for) the whole in-flight range on resume; the interval bounds
     // that loss to one `PRESENT_RECORD_FLUSH_INTERVAL`. This loop is the
     // single-source path's sole periodic flush owner — `fill_gap` never flushes.
+    let owed = &owed;
     let outcome = drive_with_interval_flush(store, PRESENT_RECORD_FLUSH_INTERVAL, async move {
         let mut counters = DriveCounters::new();
         for (gap_start, gap_len) in gaps {
+            owed.unbilled_from(gap_start);
             fill_gap(
                 store,
                 source,
@@ -682,18 +735,12 @@ where
             )
             .await
             .inspect_err(|_| {
-                // Every owed span that ends past the failed gap's start stays
-                // owed from the gap's paid frontier on. `take_unpaid` merges,
-                // so a span the gap's own failure also noted bills once.
-                let paid = counters.gap_paid_frontier.unwrap_or(gap_start);
-                for &(start, len) in &owed {
-                    let end = start.saturating_add(len);
-                    if end > gap_start {
-                        ledger.note_unpaid(hash, start.max(paid), end);
-                    }
-                }
+                // The failed gap's owed part stays owed from its paid
+                // frontier on.
+                owed.unbilled_from(counters.gap_paid_frontier.unwrap_or(gap_start));
             })?;
         }
+        owed.billed();
         Ok(())
     })
     .await;

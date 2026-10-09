@@ -637,18 +637,23 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 "a source faulted"
             );
         }
-        match fault {
+        let left_the_hash = match fault {
             // This client's voucher, not the node's delivery: the node declines
             // this fetch, and its peer-store record keeps no failure stamp.
             Fault::Source => match crate::fault::declining_rejection(err) {
                 Some(reason) => {
-                    self.record_declined(provider, DeclineReason::Voucher(reason), None);
+                    self.record_declined(provider, DeclineReason::Voucher(reason), None)
                 }
                 None => self.record_source_fault(provider, err, range.as_ref(), now),
             },
-            Fault::Fatal(_) | Fault::Unaffordable | Fault::Transient => {}
+            Fault::Fatal(_) | Fault::Unaffordable | Fault::Transient => false,
+        };
+        // A decline scopes to this hash (ADR 005 §Open-time refusal classes).
+        // The health is shared across a bundle's entries, so a node that left
+        // this hash does not cool for the others.
+        if !left_the_hash {
+            self.health.record(provider, fault, now, deposit);
         }
-        self.health.record(provider, fault, now, deposit);
         fault
     }
 
@@ -736,14 +741,16 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
 
     /// Record a delivery fault of `provider`'s: a `NotFound` toward marking it
     /// absent, a `Declined` refusal as a bar, and a failure stamp in its
-    /// peer-store record.
+    /// peer-store record. A `Declined` refusal that removes the provider from
+    /// this hash ([`Self::record_declined`]) is not a delivery fault: it
+    /// stamps nothing, and the call returns `true`.
     fn record_source_fault(
         &mut self,
         provider: Address,
         err: &anyhow::Error,
         range: Option<&LaneRange>,
         now: Instant,
-    ) {
+    ) -> bool {
         if crate::fault::says_absent(err)
             && !range.is_some_and(|r| r.past_end)
             && let Some(refused) = err.downcast_ref::<UpstreamRefused>()
@@ -752,12 +759,14 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         }
         if let Some(refused) = err.downcast_ref::<UpstreamRefused>()
             && matches!(refused.error(), StreamError::Declined)
+            && self.record_declined(provider, DeclineReason::Refused, Some(refused))
         {
-            self.record_declined(provider, DeclineReason::Refused, Some(refused));
+            return true;
         }
         if let Some(holder) = self.holder(provider) {
             self.provider.on_source_fault(holder);
         }
+        false
     }
 
     /// Count a `NotFound` from `provider` for a piece below the end the fetch
@@ -805,20 +814,23 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// node applies only when it pulls the blob through, so a partial holder
     /// is barred from pull-through only and keeps the blocks it covers. Any
     /// other source, and any source that rejected this client's voucher,
-    /// never starts again for this blob in this fetch.
+    /// never starts again for this blob in this fetch. Returns whether the
+    /// provider left this blob: `false` for a partial holder's pull-through
+    /// bar.
     fn record_declined(
         &mut self,
         provider: Address,
         reason: DeclineReason,
         refused: Option<&UpstreamRefused>,
-    ) {
+    ) -> bool {
         let partial = self
             .holder(provider)
             .is_some_and(|holder| holder.coverage.is_some());
-        let newly = if partial && reason == DeclineReason::Refused {
-            self.declined_pull_through.insert(provider)
-        } else {
+        let left = !(partial && reason == DeclineReason::Refused);
+        let newly = if left {
             self.declined.insert(provider)
+        } else {
+            self.declined_pull_through.insert(provider)
         };
         if !self.decline_reasons.contains(&reason) {
             self.decline_reasons.push(reason);
@@ -829,6 +841,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         if let Some(refused) = refused {
             self.last_absent = Some(refused.clone());
         }
+        left
     }
 
     /// Count a `NotFound` from probed partial holder `provider` for `range`,

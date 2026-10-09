@@ -880,6 +880,48 @@ async fn a_barred_holder_with_only_uncovered_work_left_ends_the_item() -> anyhow
     Ok(())
 }
 
+/// A decline scopes to its hash. Bundle entries share one health, so a node
+/// that declines one entry's blob must not cool for another's: entry two
+/// starts it at once. A delivery fault on the same node still cools it for
+/// every entry.
+#[tokio::test(start_paused = true)]
+async fn a_decline_does_not_cool_the_node_for_a_sibling_entry() {
+    use crate::UpstreamRefused;
+    use decdn_protocol::client::StreamError;
+    let p = provider(vec![]);
+    let health: Arc<crate::PeerHealth> = Arc::default();
+    let mut first = SourceSet::new(&p, [1; 32], Arc::clone(&health), vec![holder(A, 10.0)]);
+    let second = SourceSet::new(&p, [2; 32], Arc::clone(&health), vec![holder(A, 10.0)]);
+    let now = Instant::now();
+    let declined = anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Declined));
+    assert_eq!(
+        first.record_fault(A, &declined, None, now, U256::ZERO),
+        Fault::Source
+    );
+    assert!(
+        first
+            .next_to_start(now, U256::ZERO, &HashSet::new())
+            .is_none(),
+        "the node left the first entry's blob"
+    );
+    assert_eq!(
+        second
+            .next_to_start(now, U256::ZERO, &HashSet::new())
+            .map(|h| h.provider),
+        Some(A),
+        "the sibling entry starts it at once"
+    );
+
+    let stalled = anyhow::anyhow!("the lane stalled");
+    first.record_fault(A, &stalled, None, now, U256::ZERO);
+    assert!(
+        second
+            .next_to_start(now, U256::ZERO, &HashSet::new())
+            .is_none(),
+        "a delivery fault cools the node for every entry"
+    );
+}
+
 fn too_large() -> anyhow::Error {
     anyhow::Error::new(crate::UpstreamRefused::mid_stream(
         decdn_protocol::client::StreamError::Declined,
