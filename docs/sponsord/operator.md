@@ -54,7 +54,7 @@ on another host needs it.
 | `ONRAMP_TURNSTILE_SECRET` / `_FILE` | required (Turnstile gate) | Cloudflare Turnstile secret |
 | `ONRAMP_TURNSTILE_SITEKEY` | required (Turnstile gate) | Cloudflare Turnstile sitekey |
 | `ONRAMP_DECDN_RELEASE`, `ONRAMP_DECDN_SUMS_SHA256` | required | `decdn` release the installers install, and the SHA-256 of its `SHA256SUMS` |
-| `ONRAMP_CLI_RELEASE`, `ONRAMP_CLI_SUMS_SHA256` | required | `decdn-sponsored` release (`decdn-sponsored-vX.Y.Z`), likewise; both values are printed in its release notes |
+| `ONRAMP_CLI_RELEASE`, `ONRAMP_CLI_SUMS_SHA256` | required | sponsord release (`vX.Y.Z`) the installers take `decdn-sponsored` from, likewise; both values are printed in its release notes |
 | `ONRAMP_BIND` | `127.0.0.1:8080` | Listen address |
 | `ONRAMP_DAEMON_URL` | `http://127.0.0.1:8090` | The daemon |
 | `ONRAMP_SPENDING_CAP_MICRO_USDC` | daemon maximum | Cap requested per capability |
@@ -122,9 +122,8 @@ For a different kind of check, see [integrator.md](integrator.md).
   systemd versions load credentials at mode `0440`, which the daemon refuses
   for a keystore. So the daemon's unit copies the keystore to a `0600` file
   under `/run/sponsord` before start.
-- **Release binaries:** each `sponsord-vX.Y.Z` and `sponsord-onramp-vX.Y.Z`
-  GitHub Release has its binary for Linux x86_64 and aarch64, with a signed
-  `SHA256SUMS`.
+- **Release binaries:** each `vX.Y.Z` GitHub Release has both binaries for
+  Linux x86_64 and aarch64, with a signed `SHA256SUMS`.
 
 ## 5. Monitor
 

@@ -108,10 +108,11 @@ rather than writing new ones.
 - **`include_str!` must stay inside its crate**. A published `.crate`
   contains only its own directory, so an embed that reaches outside it builds
   in-tree but breaks `cargo install` (`check-package-embeds.sh`).
-- **Versions are per crate**. No crate inherits a workspace version, and each
-  internal alias in the root `[workspace.dependencies]` carries its member's
-  current version. Releases are cut with `cargo release -p <crate>`, which
-  produces signed `<crate>-vX.Y.Z` tags (see `RELEASING.md`).
+- **One version for the workspace**. Every member has
+  `version.workspace = true`, and each internal alias in the root
+  `[workspace.dependencies]` carries that version. `cargo release <level>`
+  releases every crate together under one signed `vX.Y.Z` tag (see
+  `RELEASING.md`). Changelogs stay per crate.
 - **The decdn pin**: `Cargo.lock` decides which decdn commit gets built. The
   `version` on each `decdn-*` git dependency must equal decdn's workspace
   version at that commit (`check-decdn-pin.sh`). To move it, run

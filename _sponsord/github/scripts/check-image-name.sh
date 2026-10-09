@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Fails if the container images are named inconsistently.
 #
-# The image list lives in release_plan.py (which crate's release carries which
-# image). These must agree with it:
+# The image list lives in release_plan.py (which crate builds which image). These must agree with it:
 #   * Dockerfile                — one final target per image (`FROM base AS <image>`)
-#   * release.yml's docker job  — pushes `ghcr.io/<owner>/<image>` and writes
-#                                 <image>-image-digest.txt
+#   * release.yml's docker job  — per image, pushes `ghcr.io/<owner>/<image>`
+#                                 and writes <image>-image-digest.txt
 #   * sign-release.sh           — validates that file against the same name,
 #                                 then tags from it
 #   * security.yml's scan matrix
@@ -29,10 +28,9 @@ mapfile -t IMAGES < <(python3 .github/scripts/release_plan.py --images)
   exit 1
 }
 
+# Both workflows run one job per image, from a matrix over the image names.
 # shellcheck disable=SC2016  # literal workflow-expression text, never expanded
-RELEASE_IMAGE='IMAGE: ghcr.io/${{ github.repository_owner }}/${{ needs.release.outputs.image }}'
-# shellcheck disable=SC2016  # literal workflow-expression text, never expanded
-SCAN_IMAGE='IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}'
+MATRIX_IMAGE='IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}'
 joined=$(printf '%s, ' "${IMAGES[@]}")
 MATRIX="image: [${joined%, }]"
 
@@ -46,8 +44,8 @@ expect() {
   }
 }
 
-expect .github/workflows/release.yml   "$RELEASE_IMAGE"
-expect .github/workflows/security.yml  "$SCAN_IMAGE"
+expect .github/workflows/release.yml   "$MATRIX_IMAGE"
+expect .github/workflows/security.yml  "$MATRIX_IMAGE"
 expect .github/workflows/security.yml  "$MATRIX"
 # shellcheck disable=SC2016  # ${OWNER} is literal text in the target file
 expect .github/scripts/sign-release.sh 'GHCR_NAMESPACE="ghcr.io/${OWNER}"'

@@ -1,7 +1,7 @@
 """Regression tests for the release plan.
 
 The plan decides what a tag builds, signs and publishes. A wrong entry ships a
-release missing its archives or image, or one the onramp's installers cannot
+release missing archives or an image, or one the onramp's installers cannot
 fetch — after the signed tag is already public.
 """
 
@@ -28,31 +28,32 @@ _spec.loader.exec_module(rp)
 
 
 @pytest.mark.parametrize(
-    ("tag", "crate", "version"),
+    ("tag", "version"),
     [
-        ("sponsord-core-v0.1.0", "sponsord-core", "0.1.0"),
-        ("sponsord-v1.2.3", "sponsord", "1.2.3"),
-        ("sponsord-onramp-v0.1.0-rc.1", "sponsord-onramp", "0.1.0-rc.1"),
-        ("decdn-sponsored-v10.20.30", "decdn-sponsored", "10.20.30"),
+        ("v0.1.0", "0.1.0"),
+        ("v1.2.3", "1.2.3"),
+        ("v0.1.0-rc.1", "0.1.0-rc.1"),
+        ("v10.20.30", "10.20.30"),
     ],
 )
-def test_tags_name_their_crate_and_version(tag, crate, version):
-    assert rp.parse_tag(tag) == (crate, version)
+def test_tags_name_their_version(tag, version):
+    assert rp.parse_tag(tag) == version
 
 
 @pytest.mark.parametrize(
     "tag",
     [
-        "v0.1.0",  # the old shared-version tag
-        "sponsord-v1",
-        "sponsord-v1.0",
-        "sponsord-1.0.0",
-        "foo-v1.0.0",
-        "sponsord-onramp-v",
-        "sponsord-v0.1.0-",
-        "sponsord-v0$(id)",
-        "sponsord-v0.1.0 ",
-        "refs/tags/sponsord-v0.1.0",
+        "sponsord-v0.1.0",  # the old per-crate tags
+        "decdn-sponsored-v0.1.0",
+        "v1",
+        "v1.0",
+        "1.0.0",
+        "V1.0.0",
+        "v",
+        "v0.1.0-",
+        "v0$(id)",
+        "v0.1.0 ",
+        "refs/tags/v0.1.0",
     ],
 )
 def test_anything_else_is_refused(tag):
@@ -60,30 +61,27 @@ def test_anything_else_is_refused(tag):
         rp.parse_tag(tag)
 
 
-def test_onramp_tag_is_not_read_as_the_daemon():
-    assert rp.plan("sponsord-onramp-v1.0.0")["crate"] == "sponsord-onramp"
-
-
-def test_archive_counts_and_images():
-    expect = {
-        "sponsord-api": ("0", ""),
-        "sponsord-core": ("0", ""),
-        "sponsord": ("2", "sponsord"),
-        "sponsord-onramp": ("2", "sponsord-onramp"),
-        "decdn-sponsored": ("6", ""),
+def test_every_release_carries_every_archive_and_image():
+    p = rp.plan("v0.1.0")
+    legs = json.loads(p["matrix"])["include"]
+    assert p["archives"] == str(len(legs)) == "10"
+    per_binary = {}
+    for leg in legs:
+        per_binary.setdefault(leg["binary"], set()).add(leg["target"])
+        assert leg["package"] == leg["binary"]
+    assert {b: len(t) for b, t in per_binary.items()} == {
+        "sponsord": 2,
+        "sponsord-onramp": 2,
+        "decdn-sponsored": 6,
     }
-    for crate, (archives, image) in expect.items():
-        p = rp.plan(f"{crate}-v0.1.0")
-        assert (p["archives"], p["image"]) == (archives, image), crate
-        legs = json.loads(p["matrix"])["include"]
-        assert len(legs) == int(archives)
-        assert all(leg["package"] == crate for leg in legs)
+    assert p["images"] == "sponsord sponsord-onramp"
+    assert json.loads(p["images_json"]) == ["sponsord", "sponsord-onramp"]
 
 
 def test_installer_contract_targets_for_the_wrapper():
     """decdn.sh / decdn.ps1 fetch these six; dropping one breaks an installer."""
-    legs = json.loads(rp.plan("decdn-sponsored-v0.1.0")["matrix"])["include"]
-    assert {leg["target"] for leg in legs} == {
+    legs = json.loads(rp.plan("v0.1.0")["matrix"])["include"]
+    assert {leg["target"] for leg in legs if leg["binary"] == "decdn-sponsored"} == {
         "x86_64-unknown-linux-gnu",
         "aarch64-unknown-linux-gnu",
         "x86_64-apple-darwin",
@@ -91,20 +89,55 @@ def test_installer_contract_targets_for_the_wrapper():
         "x86_64-pc-windows-msvc",
         "aarch64-pc-windows-msvc",
     }
-    assert {leg["binary"] for leg in legs} == {"decdn-sponsored"}
 
 
-def test_only_the_wrapper_carries_the_onramp_pin():
-    pins = {c for c in rp.CRATES if rp.plan(f"{c}-v0.1.0")["onramp_pin"] == "true"}
-    assert pins == {"decdn-sponsored"}
+def test_archive_names_are_unique():
+    """One SHA256SUMS covers every archive, so no two legs may share a name."""
+    legs = json.loads(rp.plan("v0.1.0")["matrix"])["include"]
+    names = [(leg["binary"], leg["target"]) for leg in legs]
+    assert len(names) == len(set(names))
 
 
-def test_tag_pattern_matches_every_crate_and_nothing_else():
+TAG_SAMPLES = [
+    "v0.1.0",
+    "v10.20.30",
+    "v1.0.0-rc.1",
+    "v1.0.0-beta-2",
+    "sponsord-v0.1.0",
+    "other-v0.1.0",
+    "v0-wip",
+    "v0.2.9.1",
+    "v1.0",
+    "v1.0.0-",
+    "v1.0.0 ",
+]
+
+
+def test_tag_pattern_accepts_exactly_what_parse_tag_does():
+    """A looser pattern would let a stray tag bound `git cliff --latest`."""
     pattern = re.compile(rp.tag_pattern())
-    for crate in rp.CRATES:
-        assert pattern.match(f"{crate}-v0.1.0"), crate
-    assert not pattern.match("v0.1.0")
-    assert not pattern.match("other-v0.1.0")
+    for tag in TAG_SAMPLES:
+        try:
+            rp.parse_tag(tag)
+            valid = True
+        except ValueError:
+            valid = False
+        assert bool(pattern.search(tag)) == valid, tag
+
+
+def test_tag_pattern_reads_the_same_as_an_ere():
+    """The same text is a bash ERE too; `(?:` would not be."""
+    tags = "\n".join(TAG_SAMPLES) + "\n"
+    out = subprocess.run(
+        ["grep", "-E", rp.tag_pattern()], input=tags, capture_output=True, text=True
+    ).stdout.splitlines()
+    assert out == [t for t in TAG_SAMPLES if rp.TAG.match(t)]
+
+
+def test_git_cliff_bounds_notes_at_the_same_tags():
+    """cliff.toml's tag_pattern decides where `git cliff --latest` stops."""
+    cliff = tomllib.loads((REPO_ROOT / "cliff.toml").read_text())
+    assert cliff["git"]["tag_pattern"] == rp.tag_pattern()
 
 
 def test_table_matches_the_workspace():
@@ -140,67 +173,81 @@ def test_cli_output_and_errors():
     run = lambda *a: subprocess.run(
         [sys.executable, str(MODULE_PATH), *a], capture_output=True, text=True
     )
-    ok = run("sponsord-v1.0.0")
+    ok = run("v1.0.0")
     assert ok.returncode == 0
-    assert "crate=sponsord\n" in ok.stdout and "archives=2\n" in ok.stdout
-    assert run("sponsord-v1.0.0", "--get", "image").stdout == "sponsord\n"
-    assert run("v1.0.0").returncode == 1
-    assert run("sponsord-v1.0.0", "--get", "nope").returncode == 2
+    assert "version=1.0.0\n" in ok.stdout and "archives=10\n" in ok.stdout
+    assert run("v1.0.0", "--get", "images").stdout == "sponsord sponsord-onramp\n"
+    assert run("sponsord-v1.0.0").returncode == 1
+    assert run("v1.0.0", "--get", "nope").returncode == 2
 
 
 @pytest.mark.parametrize(
-    ("tag", "prerelease", "latest"),
+    ("tag", "prerelease"),
+    [("v1.0.0", "false"), ("v1.0.0-rc.1", "true"), ("v0.2.0-alpha", "true")],
+)
+def test_prerelease_is_flagged(tag, prerelease):
+    assert rp.plan(tag)["prerelease"] == prerelease
+
+
+@pytest.mark.parametrize(
+    ("tag", "latest"),
     [
-        ("decdn-sponsored-v1.0.0", "false", "true"),
-        ("decdn-sponsored-v1.0.0-rc.1", "true", "false"),
-        ("sponsord-v1.0.0", "false", "false"),
-        ("sponsord-v1.0.0-rc.1", "true", "false"),
-        ("sponsord-core-v0.2.0-alpha", "true", "false"),
+        # The newest stable release, or a re-run of it.
+        ("v1.2.0", True),
+        ("v1.1.0", False),  # a re-run after 1.2.0 exists
+        # A maintenance release under a newer one never takes it.
+        ("v1.0.1", False),
+        ("v1.1.1", False),
+        ("v1.2.1", True),
+        # A prerelease never does, even above every stable release.
+        ("v1.3.0-rc.1", False),
+        # A candidate above the newest release does not hold it back.
+        ("v1.2.2", True),
     ],
 )
-def test_prerelease_is_flagged_and_never_latest(tag, prerelease, latest):
-    p = rp.plan(tag)
-    assert (p["prerelease"], p["latest"]) == (prerelease, latest)
+def test_latest_is_the_highest_stable_release(tag, latest):
+    tags = ["v1.0.0", "v1.1.0", "v1.2.0", "v1.3.0-rc.1", "v9.9.9.9", "sponsord-v9.0.0"]
+    assert rp.is_latest(tag, tags) is latest
 
 
 # The semver-checks baseline. Re-running a release's workflow is supported
 # (RELEASING.md), and so is a maintenance release under a newer one, so the
-# baseline is the crate's highest release *below* the tag, never merely the
+# baseline is the highest release *below* the tag, never merely the
 # newest tag: comparing against a newer release runs the check backwards.
-SPONSORD_TAGS = [
-    "sponsord-v0.1.0",
-    "sponsord-v0.2.0-rc.1",
-    "sponsord-v0.2.0",
-    "sponsord-v0.3.0",
-    "sponsord-v1.0.0",
-    "sponsord-v1.1.0",
-    # Other crates and odd tags are never a sponsord baseline.
-    "sponsord-core-v0.9.9",
-    "sponsord-onramp-v0.2.5",
-    "sponsord-v0-wip",
-    "sponsord-v0.2.9.1",
+RELEASE_TAGS = [
+    "v0.1.0",
+    "v0.2.0-rc.1",
+    "v0.2.0",
+    "v0.3.0",
+    "v1.0.0",
+    "v1.1.0",
+    # The old per-crate tags and odd tags are never a baseline.
+    "sponsord-v0.9.9",
+    "decdn-sponsored-v0.2.5",
+    "v0-wip",
+    "v0.2.9.1",
 ]
 
 
 @pytest.mark.parametrize(
     ("tag", "expected"),
     [
-        ("sponsord-v0.3.0", "sponsord-v0.2.0"),
+        ("v0.3.0", "v0.2.0"),
         # A rerun of 1.0.0 after 1.1.0 exists still checks against 0.3.0.
-        ("sponsord-v1.0.0", "sponsord-v0.3.0"),
+        ("v1.0.0", "v0.3.0"),
         # A maintenance release below a newer one.
-        ("sponsord-v1.0.1", "sponsord-v1.0.0"),
+        ("v1.0.1", "v1.0.0"),
         # A release candidate sorts below its release.
-        ("sponsord-v0.2.0", "sponsord-v0.2.0-rc.1"),
-        ("sponsord-v0.2.0-rc.1", "sponsord-v0.1.0"),
-        ("sponsord-v0.2.1", "sponsord-v0.2.0"),
-        # A first release has nothing to compare against.
-        ("sponsord-v0.1.0", None),
-        ("sponsord-v0.0.1", None),
+        ("v0.2.0", "v0.2.0-rc.1"),
+        ("v0.2.0-rc.1", "v0.1.0"),
+        ("v0.2.1", "v0.2.0"),
+        # The first release has nothing to compare against.
+        ("v0.1.0", None),
+        ("v0.0.1", None),
     ],
 )
 def test_baseline_is_the_highest_release_below_the_tag(tag, expected):
-    assert rp.baseline(tag, SPONSORD_TAGS) == expected
+    assert rp.baseline(tag, RELEASE_TAGS) == expected
 
 
 @pytest.mark.parametrize(
@@ -216,9 +263,9 @@ def test_baseline_is_the_highest_release_below_the_tag(tag, expected):
     ],
 )
 def test_baseline_follows_semver_precedence(lower, higher):
-    tags = [f"sponsord-v{lower}", f"sponsord-v{higher}"]
-    assert rp.baseline(f"sponsord-v{higher}", tags) == f"sponsord-v{lower}"
-    assert rp.baseline(f"sponsord-v{lower}", tags) is None
+    tags = [f"v{lower}", f"v{higher}"]
+    assert rp.baseline(f"v{higher}", tags) == f"v{lower}"
+    assert rp.baseline(f"v{lower}", tags) is None
 
 
 def test_baseline_cli_reads_the_repository_tags(tmp_path):
@@ -231,12 +278,14 @@ def test_baseline_cli_reads_the_repository_tags(tmp_path):
     )
     git("init", "-q")
     git("commit", "-q", "--allow-empty", "-m", "c")
-    for tag in ("sponsord-v0.1.0", "sponsord-v0.2.0", "sponsord-v0.3.0"):
+    for tag in ("v0.1.0", "v0.2.0", "v0.3.0"):
         git("tag", tag)
     run = lambda *a: subprocess.run(
         [sys.executable, str(MODULE_PATH), *a], capture_output=True, text=True, cwd=tmp_path
     )
-    assert run("sponsord-v0.2.0", "--baseline").stdout == "sponsord-v0.1.0\n"
-    none = run("sponsord-v0.1.0", "--baseline")
+    assert run("v0.2.0", "--baseline").stdout == "v0.1.0\n"
+    assert run("v0.3.0", "--latest").stdout == "true\n"
+    assert run("v0.2.1", "--latest").stdout == "false\n"
+    none = run("v0.1.0", "--baseline")
     assert (none.returncode, none.stdout) == (0, "")
-    assert run("v0.2.0", "--baseline").returncode == 1
+    assert run("sponsord-v0.2.0", "--baseline").returncode == 1

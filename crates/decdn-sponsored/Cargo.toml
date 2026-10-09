@@ -2,7 +2,7 @@
 name = "decdn-sponsored"
 description = "Sponsored decdn CLI: gets a capability through a sponsord onramp for each download and hands the pull to decdn"
 readme = "README.md"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

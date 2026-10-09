@@ -1,11 +1,13 @@
 # Changelog
 
-<!-- Maintained by hand, one entry per PR that changes this crate. `cargo
-     release` does NOT rewrite this file; git-cliff only generates the GitHub
-     release notes. Conventions: RELEASING.md § Changelogs. -->
+<!-- Maintained by hand, one entry per PR that changes this crate, under
+     [Unreleased]. `cargo release` only opens the version heading above those
+     entries; git-cliff generates the GitHub release notes. Conventions:
+     RELEASING.md § Changelogs. -->
 
-All notable changes to `decdn-sponsored` are documented in this file. It is
-versioned and released on its own, from `decdn-sponsored-vX.Y.Z` tags.
+All notable changes to `decdn-sponsored` are documented in this file. It shares
+one version with every sponsord crate, released together from `vX.Y.Z`
+tags; a release with no entry here changed nothing in this crate.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the crate follows [Semantic Versioning](https://semver.org/) from its first
@@ -25,8 +27,9 @@ release.
 
 - **`--version`**, and a refusal with an upgrade hint below the onramp's
   `min_cli_version`.
-- **Released on its own tags.** `decdn-sponsored-vX.Y.Z`; pin a release in the
-  onramp with that tag (`ONRAMP_CLI_RELEASE`). Archive names are unchanged:
+- **Released with every sponsord crate.** Its archives ship in each `vX.Y.Z`
+  release; pin one in the onramp with that tag (`ONRAMP_CLI_RELEASE`).
+  Archive names are unchanged:
   `decdn-sponsored-<version>-<target>.{tar.gz,zip}`. Also published to
   crates.io, dual-licensed MIT OR Apache-2.0.
 

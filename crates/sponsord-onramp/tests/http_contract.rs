@@ -264,7 +264,7 @@ async fn installer(path: &str) -> String {
 }
 
 /// Both installers name this onramp, download from the pinned GitHub
-/// Releases (`test_config`: decdn `v0.1.0`, `decdn-sponsored-v0.2.0`) by tag
+/// Releases (`test_config`: decdn `v0.1.0`, sponsord `v0.2.0`) by tag
 /// and SHA256SUMS digest, name the archives by the version the onramp parsed
 /// out of each tag, and write only the onramp URL and `decdn` path.
 fn assert_installer(body: &str) {
@@ -274,10 +274,7 @@ fn assert_installer(body: &str) {
     assert!(body.contains("https://github.com/decdn"));
     assert!(quoted("v0.1.0"), "decdn release tag");
     assert!(quoted("0.1.0"), "decdn version");
-    assert!(
-        quoted("decdn-sponsored-v0.2.0"),
-        "decdn-sponsored release tag"
-    );
+    assert!(quoted("v0.2.0"), "decdn-sponsored release tag");
     assert!(quoted("0.2.0"), "decdn-sponsored version");
     assert!(body.contains(&"ab".repeat(32)), "decdn SHA256SUMS digest");
     assert!(
@@ -297,6 +294,19 @@ async fn decdn_sh_is_rendered() {
     let body = installer("/decdn.sh").await;
     assert_installer(&body);
     assert!(body.starts_with("#!/bin/sh"));
+    // Both pins are `v` tags now, so only the slot tells them apart.
+    let ab = "ab".repeat(32);
+    let cd = "cd".repeat(32);
+    for line in [
+        "DECDN_RELEASE=\"v0.1.0\"",
+        "DECDN_VERSION=\"0.1.0\"",
+        &format!("DECDN_SUMS_SHA256=\"{ab}\""),
+        "CLI_RELEASE=\"v0.2.0\"",
+        "CLI_VERSION=\"0.2.0\"",
+        &format!("CLI_SUMS_SHA256=\"{cd}\""),
+    ] {
+        assert!(body.lines().any(|l| l == line), "{line}");
+    }
 }
 
 #[tokio::test]
@@ -304,6 +314,19 @@ async fn decdn_ps1_is_rendered() {
     let body = installer("/decdn.ps1").await;
     assert_installer(&body);
     assert!(body.contains("-pc-windows-msvc"));
+    // Both pins are `v` tags now, so only the slot tells them apart.
+    let ab = "ab".repeat(32);
+    let cd = "cd".repeat(32);
+    for line in [
+        "$DecdnRelease = 'v0.1.0'",
+        "$DecdnVersion = '0.1.0'",
+        &format!("$DecdnSumsSha256 = '{ab}'"),
+        "$CliRelease = 'v0.2.0'",
+        "$CliVersion = '0.2.0'",
+        &format!("$CliSumsSha256 = '{cd}'"),
+    ] {
+        assert!(body.lines().any(|l| l.trim() == line), "{line}");
+    }
 }
 
 fn from_peer(mut req: Request<Body>, ip: &str) -> Request<Body> {

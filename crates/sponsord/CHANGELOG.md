@@ -1,11 +1,13 @@
 # Changelog
 
-<!-- Maintained by hand, one entry per PR that changes this crate. `cargo
-     release` does NOT rewrite this file; git-cliff only generates the GitHub
-     release notes. Conventions: RELEASING.md § Changelogs. -->
+<!-- Maintained by hand, one entry per PR that changes this crate, under
+     [Unreleased]. `cargo release` only opens the version heading above those
+     entries; git-cliff generates the GitHub release notes. Conventions:
+     RELEASING.md § Changelogs. -->
 
-All notable changes to `sponsord` are documented in this file. It is
-versioned and released on its own, from `sponsord-vX.Y.Z` tags.
+All notable changes to `sponsord` are documented in this file. It shares
+one version with every sponsord crate, released together from `vX.Y.Z`
+tags; a release with no entry here changed nothing in this crate.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the crate follows [Semantic Versioning](https://semver.org/) from its first
@@ -32,8 +34,8 @@ release.
 - **Container image.** `ghcr.io/decdn/sponsord` (mirrored to
   `decdn/sponsord` on Docker Hub), amd64 and arm64, built from the release
   binaries; binds `0.0.0.0:8090`, runs as uid 1000.
-- **Release metadata.** Versioned and released on its own (`sponsord-vX.Y.Z`),
-  with crates.io metadata, dual-licensed MIT OR Apache-2.0.
+- **Release metadata.** Released with every sponsord crate under one version
+  (`vX.Y.Z`), with crates.io metadata, dual-licensed MIT OR Apache-2.0.
 
 ### Changed
 

@@ -1,7 +1,7 @@
 """Regression tests for the publish gate's dependency list.
 
-A dependency this misses is a publish that crates.io rejects — or worse, one
-that goes through and requires a sibling version that was never uploaded.
+A dependency this misses is a publish that crates.io rejects partway through
+the workspace, after the crates before it are already uploaded for good.
 """
 
 from __future__ import annotations
@@ -104,3 +104,80 @@ def test_the_real_workspace():
     siblings = lambda name: {n for n, o in needs[name] if o == "sibling"}  # noqa: E731
     assert siblings("sponsord") == {"sponsord-api", "sponsord-core"}
     assert siblings("sponsord-onramp") == {"sponsord-api"}
+
+
+def test_workspace_lists_each_decdn_dep_once_and_no_siblings():
+    members = {
+        "lib": tomllib.loads('[package]\nname = "lib"\n[dependencies]\ndecdn-client.workspace = true\n'),
+        "app": tomllib.loads(
+            '[package]\nname = "app"\n[dependencies]\nlib.workspace = true\n'
+            "decdn-client.workspace = true\n"
+        ),
+        # Never published, so its dependencies are not crates.io's business.
+        "tests": tomllib.loads(
+            '[package]\nname = "tests"\npublish = false\n'
+            "[dependencies]\ndecdn-e2e.workspace = true\n"
+        ),
+    }
+    got, errors = rd.workspace_decdn_deps(ROOT, members)
+    assert (got, errors) == ([("decdn-client", "0.1.0")], [])
+
+
+def test_workspace_errors_name_the_member():
+    members = {"app": tomllib.loads('[package]\nname = "app"\n[dependencies]\ndecdn-e2e.workspace = true\n')}
+    got, errors = rd.workspace_decdn_deps(ROOT, members)
+    assert got == []
+    assert len(errors) == 1 and errors[0].startswith("app: ")
+
+
+def test_cli_reads_the_tagged_tree():
+    import subprocess
+
+    out = subprocess.run(
+        [sys.executable, str(MODULE_PATH), "HEAD"],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        check=True,
+    ).stdout.split("\n")
+    lines = [line for line in out if line]
+    assert lines, "the workspace links decdn, so HEAD lists its crates"
+    assert all(line.startswith("decdn-") and len(line.split()) == 2 for line in lines), lines
+
+
+def test_conflicting_decdn_versions_are_both_listed():
+    """publish-crates.sh refuses a mismatch only if it sees both versions."""
+    root = tomllib.loads(
+        "[workspace.dependencies]\n"
+        'decdn-client = { git = "https://github.com/decdn/decdn", version = "0.1.0" }\n'
+    )
+    members = {
+        "a": tomllib.loads('[package]\nname = "a"\n[dependencies]\ndecdn-client.workspace = true\n'),
+        "b": tomllib.loads(
+            '[package]\nname = "b"\n[dependencies]\n'
+            'decdn-client = { git = "https://github.com/decdn/decdn", version = "0.2.0" }\n'
+        ),
+    }
+    got, errors = rd.workspace_decdn_deps(root, members)
+    assert errors == []
+    assert got == [("decdn-client", "0.1.0"), ("decdn-client", "0.2.0")]
+
+
+def test_the_real_workspace_needs_one_decdn_version():
+    """What publish-crates.sh requires of the tagged tree, checked at every PR."""
+    root = tomllib.loads((REPO_ROOT / "Cargo.toml").read_text())
+    members = {}
+    for rel in root["workspace"]["members"]:
+        m = tomllib.loads((REPO_ROOT / rel / "Cargo.toml").read_text())
+        members[m["package"]["name"]] = m
+    got, errors = rd.workspace_decdn_deps(root, members)
+    assert errors == []
+    assert {n for n, _ in got} == {"decdn-client", "decdn-common", "decdn-incentive"}
+    assert len({v for _, v in got}) == 1, got
+
+
+def test_cli_usage_error():
+    import subprocess
+
+    run = subprocess.run([sys.executable, str(MODULE_PATH)], capture_output=True, text=True)
+    assert run.returncode == 2 and "usage" in run.stderr

@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """Fail if a workspace member opts out of what the workspace decided.
 
-`[workspace.package]` holds one edition, one licence and one MSRV for every
-crate, and `[workspace.lints]` holds the lint table the anti-panic policy
-depends on. Both reach a member only when that member asks for them, and a
-member that does not ask gets no warning: a crate restating `edition` compiles
-green under its own value, and a crate without `[lints] workspace = true`
-compiles green under default lint levels.
-
-The version is the exception: each crate is versioned and released on its own
-(`cargo release -p <crate>`, tag `<crate>-v<version>`), so every member carries
-its own literal `version`, and the workspace has none to inherit.
+`[workspace.package]` holds one version, one edition, one licence and one MSRV
+for every crate, and `[workspace.lints]` holds the lint table the anti-panic
+policy depends on. Both reach a member only when that member asks for them,
+and a member that does not ask gets no warning: a crate restating
+`version = "0.1.0"` compiles green and is simply not the version that shipped
+(the workspace is released as a whole, from one `v<version>` tag), and a crate
+without `[lints] workspace = true` compiles green under default lint levels.
+release.yml's tag-vs-manifest check catches the first only after the tag
+exists; without this check nothing catches the second.
 
 Per member:
 
-* `version` is the member's own string, never `{ workspace = true }`.
-* `edition`, `license`, `rust-version` are `{ workspace = true }`.
+* `version`, `edition`, `license`, `rust-version` are `{ workspace = true }`.
 * `[lints] workspace = true` is present.
 * A publishable member (no `publish = false`) also inherits `repository`,
   `homepage`, `keywords`, `categories`, and carries its own `description` and
@@ -29,11 +27,11 @@ Per member:
 
 Across the workspace:
 
+* `[workspace.package]` has a `version` for the members to inherit.
 * Every internal `[workspace.dependencies]` alias (a `path` into a member)
-  resolves to a member and carries `version` equal to that member's own
-  version. `cargo release -p <member>` keeps them in step (`dependent-version =
+  resolves to a member and carries `version` equal to `[workspace.package]
+  version`. `cargo release` keeps them in step (`dependent-version =
   "upgrade"`); a hand edit does not.
-* `[workspace.package]` has no `version` for a member to inherit by mistake.
 * A member some other member depends on has an alias; a member nothing depends
   on has none — an unread alias is one more version to forget on release.
 * Every `crates/*/Cargo.toml` on disk is listed in `members`. The list is
@@ -54,7 +52,7 @@ if sys.version_info < (3, 11):  # tomllib, and the syntax used below
 
 import tomllib  # noqa: E402  (must follow the version guard)
 
-INHERITED_ALWAYS = ("edition", "license", "rust-version")
+INHERITED_ALWAYS = ("version", "edition", "license", "rust-version")
 INHERITED_IF_PUBLISHABLE = ("repository", "homepage", "keywords", "categories")
 LOCAL_IF_PUBLISHABLE = ("description", "readme")
 DEP_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
@@ -88,15 +86,14 @@ def check(repo_root: Path) -> list[str]:
 
     if not members:
         return ["Cargo.toml: [workspace] members is empty — this check inspected nothing"]
-    if ws_version is not None:
+    if not isinstance(ws_version, str):
         errors.append(
-            "Cargo.toml: [workspace.package] has a `version` — crates are versioned "
-            "independently, so each member carries its own and there is nothing to inherit"
+            "Cargo.toml: [workspace.package] has no `version` — the workspace is released "
+            "as a whole, and every member inherits its version from there"
         )
 
     # --- per-member shape --------------------------------------------------
     name_by_dir: dict[Path, str] = {}
-    version_by_dir: dict[Path, object] = {}
     depended_upon: set[str] = set()
     internal_deps: list[tuple[Path, str, object]] = []
     for crate_root in members:
@@ -109,13 +106,7 @@ def check(repo_root: Path) -> list[str]:
         package = manifest.get("package", {})
         name = package.get("name", str(rel))
         name_by_dir[crate_root.resolve()] = name
-        version_by_dir[crate_root.resolve()] = package.get("version")
 
-        if not isinstance(package.get("version"), str):
-            errors.append(
-                f"{rel}: `version` must be the crate's own string (`version = \"X.Y.Z\"`) — "
-                "each crate is versioned and released on its own"
-            )
         for key in INHERITED_ALWAYS:
             if not inherits(package, key):
                 errors.append(
@@ -157,13 +148,11 @@ def check(repo_root: Path) -> list[str]:
 
     # --- internal aliases --------------------------------------------------
     aliases: dict[str, dict] = {}
-    alias_member_version: dict[str, object] = {}
     for name, spec in workspace.get("dependencies", {}).items():
         if isinstance(spec, dict) and "path" in spec:
             target = (repo_root / spec["path"]).resolve()
             if target in name_by_dir:
                 aliases[name] = spec
-                alias_member_version[name] = version_by_dir[target]
             elif not target.is_relative_to(repo_root.resolve()):
                 # A sibling checkout (the decdn crates). Its version is decdn's
                 # to set, so only its presence is checked here; check_decdn_pin.py
@@ -182,12 +171,11 @@ def check(repo_root: Path) -> list[str]:
 
     for name, spec in sorted(aliases.items()):
         version = spec.get("version")
-        member_version = alias_member_version[name]
-        if version != member_version:
+        if version != ws_version:
             errors.append(
                 f"Cargo.toml: [workspace.dependencies] {name} says version = {version!r} "
-                f"but the crate is at {member_version!r} — `cargo release -p {name}` "
-                "moves both; a hand edit must too"
+                f"but the workspace is at {ws_version!r} — `cargo release` moves both; a "
+                "hand edit must too"
             )
         if name not in depended_upon:
             errors.append(
@@ -230,16 +218,16 @@ def main() -> int:
         for e in errors:
             print(f"  {e}", file=sys.stderr)
         print(
-            "\nEvery member carries its own version and inherits edition/license/\n"
-            "rust-version and the lint table from the root Cargo.toml; publishable\n"
-            "crates also inherit the registry metadata.\n"
+            "\nEvery member inherits version/edition/license/rust-version and the\n"
+            "lint table from the root Cargo.toml; publishable crates also inherit\n"
+            "the registry metadata.\n"
             "See .github/scripts/check_workspace_manifests.py.",
             file=sys.stderr,
         )
         return 1
     root = tomllib.loads((repo_root / "Cargo.toml").read_text())
     n = len(workspace_members(repo_root, root))
-    print(f"workspace manifests OK ({n} members, each with its own version)")
+    print(f"workspace manifests OK ({n} members)")
     return 0
 
 

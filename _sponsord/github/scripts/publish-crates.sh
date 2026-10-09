@@ -1,44 +1,54 @@
 #!/usr/bin/env bash
-# Publishes one crate to crates.io, after sign-release.sh has published its
-# GitHub Release. Each crate is versioned and released on its own, so the tag
-# (`<crate>-v<version>`) names the one crate this run uploads.
+# Publishes the workspace to crates.io, after sign-release.sh has published the
+# GitHub Release. Every crate shares the version the tag (`v<version>`) names,
+# and every publishable member goes up in one `cargo publish --workspace` run.
 #
 # Like signing, this is a human step with no counterpart in Actions: there is no
 # crates.io token in Actions secrets, and a `push`-triggered workflow runs the
 # workflow definition from the pushed ref, so a token reachable from release.yml
 # would be reachable from any tag anyone with push access could craft.
 #
-# Usage:  .github/scripts/publish-crates.sh sponsord-core-v0.1.2
+# Usage:  .github/scripts/publish-crates.sh v0.1.2
 #
-# The uploaded manifest resolves every path and git dependency by its
-# `version`, so crates.io must already serve each of them (registry_deps.py
-# lists them): a sibling crate's own release (publish sponsord-api and
-# sponsord-core before sponsord), and the decdn release whose tag is the
-# commit Cargo.lock pins. The readiness check below refuses until then.
+# The uploaded manifests resolve every path and git dependency by its
+# `version`. The siblings go up in this same run, in dependency order; the
+# decdn crates must already be on crates.io, from the decdn release whose tag
+# is the commit Cargo.lock pins (registry_deps.py lists them). The readiness
+# check below refuses until then.
 #
 # Environment:
 #   SPONSORD_REPO             override the owner/repo (default: decdn/sponsord)
 #   SPONSORD_SIGNING_KEY      key the tag is expected to be signed by (default:
 #                             any key published in KEYS)
 #   CARGO_REGISTRY_TOKEN      crates.io token, if not in the cargo credentials file
+#   SPONSORD_ALLOW_RATE_LIMIT set to 1 to publish more than 5 brand-new crates
+#                             in one run — only once crates.io has raised your
+#                             account's publish-new limit (see the check below)
 #
-# Unlike sign-release.sh this is NOT re-runnable once the upload succeeds: a
-# crates.io version is immutable and can never be replaced or re-uploaded (only
-# yanked, which does not free the version).
+# Unlike sign-release.sh this is NOT freely re-runnable: a crates.io version is
+# immutable and can never be replaced or re-uploaded (only yanked, which does
+# not free the version). If it fails partway, the crates already uploaded stay
+# uploaded — see the recovery note printed on failure.
 set -euo pipefail
 
 die() { echo "error: $*" >&2; exit 1; }
 
-TAG="${1:?tag required, e.g. sponsord-core-v0.1.2}"
+TAG="${1:?tag required, e.g. v0.1.2}"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 command -v python3 >/dev/null || die "python3 not found on PATH"
 PLAN=$(python3 "$SCRIPT_DIR/release_plan.py" "$TAG") ||
-  die "$TAG is not a release tag (<crate>-vMAJOR.MINOR.PATCH[-pre])"
-CRATE=$(sed -n 's/^crate=//p' <<<"$PLAN")
+  die "$TAG is not a release tag (vMAJOR.MINOR.PATCH[-pre])"
 VERSION=$(sed -n 's/^version=//p' <<<"$PLAN")
-ARCHIVES=$(sed -n 's/^archives=//p' <<<"$PLAN")
 REPO="${SPONSORD_REPO:-decdn/sponsord}"
 SIGNING_KEY="${SPONSORD_SIGNING_KEY:-}"
+# `1`/`true`/`yes` or `0`/`false`/`no`/empty, as sign-release.sh's switches;
+# anything else is a typo and stops the script.
+ALLOW_RATE_LIMIT=""
+case "${SPONSORD_ALLOW_RATE_LIMIT:-}" in
+  ''|0|false|no) ;;
+  1|true|yes) ALLOW_RATE_LIMIT=1 ;;
+  *) die "SPONSORD_ALLOW_RATE_LIMIT must be 1/true/yes or 0/false/no, got '${SPONSORD_ALLOW_RATE_LIMIT}'" ;;
+esac
 
 # ---- preconditions -------------------------------------------------------
 
@@ -201,29 +211,25 @@ esac
 # signature. A release can leave draft by other routes — `gh release edit
 # --draft=false` by hand, or an aborted sign-release.sh finished manually — so
 # check for the signature itself rather than inferring it from publication.
-# SHA256SUMS.asc is the one sign-release.sh always uploads for a crate with
-# archives. A crate without them (sponsord-core) carries no assets to sign: its
-# signed tag, verified above against KEYS, is the attestation.
-if (( ARCHIVES > 0 )); then
-  gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null |
-    grep -qx 'SHA256SUMS.asc' || die \
-    "release $TAG carries no SHA256SUMS.asc — it is published but was never signed.
+# SHA256SUMS.asc is the one signature sign-release.sh always uploads.
+gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null |
+  grep -qx 'SHA256SUMS.asc' || die \
+  "release $TAG carries no SHA256SUMS.asc — it is published but was never signed.
 Nothing goes to crates.io that no maintainer signature vouches for.
 Run .github/scripts/sign-release.sh $TAG."
-fi
 
-# ---- its path dependencies must be on crates.io first --------------------
+# ---- the decdn crates must be on crates.io first --------------------------
 
-# The uploaded manifest carries each path dependency's `version` and no path,
-# so crates.io must already serve exactly that version. Checked before anything
-# is packaged: the dry run below would also fail, but with a resolver error
-# that does not say what to do about it.
-echo "==> Checking $CRATE's path dependencies are on crates.io"
+# The uploaded manifests carry each decdn dependency's `version` and no git
+# source, so crates.io must already serve exactly that version. Checked before
+# anything is packaged: the dry run below would also fail, but with a resolver
+# error that does not say what to do about it.
+echo "==> Checking the decdn dependencies are on crates.io"
 # Captured to a variable first: neither `set -e` nor `pipefail` reaches into a
 # process substitution, so a failed listing would otherwise yield an empty list
 # and a vacuous pass.
-DEPS_RAW=$(cd "$REPO_ROOT" && python3 "$SCRIPT_DIR/registry_deps.py" "$TAG" "$CRATE") ||
-  die "could not list $CRATE's dependencies at $TAG"
+DEPS_RAW=$(cd "$REPO_ROOT" && python3 "$SCRIPT_DIR/registry_deps.py" "$TAG") ||
+  die "could not list the workspace's registry dependencies at $TAG"
 DEPS=()
 [[ -z "$DEPS_RAW" ]] || mapfile -t DEPS <<<"$DEPS_RAW"
 
@@ -235,12 +241,15 @@ DECDN_SHA=$(git show "${TAG}:Cargo.lock" |
   cut -d'#' -f2) || true
 DECDN_VERSION=""
 for entry in "${DEPS[@]}"; do
-  read -r _ ver origin <<<"$entry"
-  [[ "$origin" == "decdn" ]] || continue
+  read -r _ ver <<<"$entry"
   [[ -n "$DECDN_SHA" ]] || die "Cargo.lock at $TAG pins no decdn commit"
   DECDN_VERSION="$ver"
+  # The commit, not the tag object: ls-remote lists `refs/tags/vX` before its
+  # peeled `refs/tags/vX^{}`, and decdn's signed tags are annotated, so the
+  # first line would be the tag object. A lightweight tag has no `^{}` line.
   TAG_SHA=$(git ls-remote https://github.com/decdn/decdn \
-    "refs/tags/v${ver}^{}" "refs/tags/v${ver}" | awk 'NR==1 {print $1}') ||
+    "refs/tags/v${ver}^{}" "refs/tags/v${ver}" |
+    awk '$2 ~ /\^\{\}$/ {peeled = $1} {plain = $1} END {print (peeled != "" ? peeled : plain)}') ||
     die "cannot reach github.com/decdn/decdn to look up its v${ver} tag"
   [[ -n "$TAG_SHA" ]] || die \
     "decdn has no v${ver} tag, so ${ver} is not a decdn release.
@@ -256,8 +265,8 @@ against. Move the lock to decdn v${ver} (RELEASING.md) and cut a new release."
 done
 
 for entry in "${DEPS[@]}"; do
-  read -r name ver origin <<<"$entry"
-  if [[ "$origin" == "decdn" && "$ver" != "$DECDN_VERSION" ]]; then
+  read -r name ver <<<"$entry"
+  if [[ "$ver" != "$DECDN_VERSION" ]]; then
     die "$name requires '$ver' at $TAG, but the other decdn crates require $DECDN_VERSION"
   fi
   code=$(curl -s -o /dev/null -w '%{http_code}' -A "sponsord-publish-crates" \
@@ -265,15 +274,9 @@ for entry in "${DEPS[@]}"; do
     die "cannot reach crates.io to check $name $ver"
   case "$code" in
     200) echo "    ${name} ${ver} is on crates.io" ;;
-    404)
-      if [[ "$origin" == "decdn" ]]; then
-        die "${name} ${ver} is not on crates.io.
+    404) die "${name} ${ver} is not on crates.io.
 Publish decdn v${DECDN_VERSION} first (decdn's .github/scripts/publish-crates.sh),
-then re-run this script. Nothing has been uploaded."
-      fi
-      die "${name} ${ver} is not on crates.io.
-Release and publish ${name}-v${ver} first (RELEASING.md § Publishing to
-crates.io), then re-run this script. Nothing has been uploaded." ;;
+then re-run this script. Nothing has been uploaded." ;;
     *) die "crates.io returned HTTP $code for $name $ver; refusing to guess" ;;
   esac
 done
@@ -292,80 +295,190 @@ cd "$WORKTREE"
 
 # Belt and braces over release.yml's own check: the tree being uploaded carries
 # the tag's version, on the machine doing the uploading.
+#
+# Captured to a variable first, NOT piped straight into `mapfile < <(...)`:
+# neither `set -e` nor `pipefail` reaches into process substitution, so a
+# `cargo metadata` that dies after emitting some packages yields a silently
+# TRUNCATED list with rc=0. That matters because `cargo publish --workspace`
+# below publishes every crate regardless — a short list would narrow the version
+# assertion while leaving the unchecked crates to upload irreversibly.
 META=$(cargo metadata --no-deps --format-version 1) ||
-  die "cargo metadata failed; cannot read $CRATE's version"
-ACTUAL=$(printf '%s' "$META" | python3 -c '
+  die "cargo metadata failed; cannot enumerate the crates to publish"
+
+mapfile -t CRATES < <(printf '%s' "$META" | python3 -c '
 import json, sys
-for p in json.load(sys.stdin)["packages"]:
-    if p["name"] == sys.argv[1]:
-        print(p["version"])
-' "$CRATE") || die "could not parse cargo metadata"
-[[ "$ACTUAL" == "$VERSION" ]] ||
-  die "$CRATE is at '${ACTUAL}' in the tagged tree, but the tag says $VERSION"
-echo "==> $CRATE at $VERSION"
+for p in sorted(json.load(sys.stdin)["packages"], key=lambda p: p["name"]):
+    if p.get("publish") == []:          # publish = false
+        continue
+    print(p["name"], p["version"])
+') || die "could not parse cargo metadata"
+
+# Cross-check the count against the manifest set, so a partial parse is caught
+# rather than silently shrinking what gets asserted.
+EXPECTED=$(printf '%s' "$META" |
+  python3 -c 'import json,sys; print(sum(1 for p in json.load(sys.stdin)["packages"] if p.get("publish") != []))')
+(( ${#CRATES[@]} > 0 )) || die "no publishable crates found in the workspace"
+(( ${#CRATES[@]} == EXPECTED )) ||
+  die "crate list is truncated: parsed ${#CRATES[@]} of $EXPECTED publishable crates"
+
+for entry in "${CRATES[@]}"; do
+  read -r name ver <<<"$entry"
+  [[ "$ver" == "$VERSION" ]] ||
+    die "$name is at $ver in the tagged tree, but the tag says $VERSION"
+done
+echo "==> ${#CRATES[@]} crates at $VERSION"
+
+# crates.io rate-limits crate CREATION far harder than updates: the PublishNew
+# limiter allows a burst of 5 and then refills roughly one per 10 minutes, while
+# PublishUpdate is a burst of 30. Publishing more than 5 brand-new crates in one
+# `cargo publish --workspace` run therefore gets a 429 partway through — landing
+# in exactly the unrecoverable state described at the top of this file, with
+# some crates permanently uploaded and the version spent.
+#
+# The limit is per crates.io ACCOUNT, and this script cannot see what else the
+# account created lately: decdn's own first publish spends the same burst. So
+# within the burst it still asks, below, before any upload.
+#
+# Failing here is free; failing after the fifth upload is not.
+echo "==> Checking how many crates are new to crates.io"
+NEW_CRATES=()
+for entry in "${CRATES[@]}"; do
+  read -r name _ <<<"$entry"
+  code=$(curl -s -o /dev/null -w '%{http_code}' -A "sponsord-publish-crates" \
+    "https://crates.io/api/v1/crates/${name}") ||
+    die "cannot reach crates.io to check which crates already exist"
+  case "$code" in
+    200) ;;
+    404) NEW_CRATES+=("$name") ;;
+    *)   die "crates.io returned HTTP $code for $name; refusing to guess" ;;
+  esac
+done
+
+PUBLISH_NEW_BURST=5
+if (( ${#NEW_CRATES[@]} > PUBLISH_NEW_BURST )) && [[ -z "$ALLOW_RATE_LIMIT" ]]; then
+  die "${#NEW_CRATES[@]} crates do not exist on crates.io yet, over the burst of
+$PUBLISH_NEW_BURST that the PublishNew rate limit allows:
+
+$(printf '  %s\n' "${NEW_CRATES[@]}")
+
+A single run would be rate-limited (429) partway through, leaving some crates
+permanently published and the version spent. Do one of these first:
+
+  1. Ask the crates.io team to raise your account's publish-new limit, then re-run.
+  2. Publish the new crates by hand, in dependency order, spacing them out; the
+     tagged release then only performs PublishUpdate, which is not constrained.
+
+Set SPONSORD_ALLOW_RATE_LIMIT=1 to override if the limit has already been raised."
+fi
+if (( ${#NEW_CRATES[@]} > 0 )); then
+  if (( ${#NEW_CRATES[@]} > PUBLISH_NEW_BURST )); then
+    echo "    ${#NEW_CRATES[@]} new, ${#CRATES[@]} total (over the burst of $PUBLISH_NEW_BURST; SPONSORD_ALLOW_RATE_LIMIT set)"
+  else
+    echo "    ${#NEW_CRATES[@]} new, ${#CRATES[@]} total (within the burst of $PUBLISH_NEW_BURST)"
+  fi
+  cat <<NOTE
+
+  The burst is per crates.io account, and this run spends ${#NEW_CRATES[@]} of it. If this
+  account created any crate in the last hour (decdn's first publish creates
+  several), wait about 10 minutes per crate created before going on, or the
+  run is rate-limited partway with some crates uploaded for good.
+
+NOTE
+fi
 
 echo "==> Dry run"
 # On a re-run after a successful publish this is where cargo stops, because the
 # version already exists in the registry — so the message must not claim
 # nothing was uploaded. That claim is exactly the belief that leads someone to
 # retry a publish that already happened.
-cargo publish -p "$CRATE" --locked --dry-run || die \
+cargo publish --workspace --locked --dry-run || die \
   "the dry run failed.
 
-If it reports the version already exists, THE PUBLISH ALREADY SUCCEEDED — this
-is a re-run, and nothing further is needed. Confirm before doing anything else:
+If it reports a version already exists, AN EARLIER RUN ALREADY UPLOADED SOME OR
+ALL OF THESE CRATES — this is a re-run. Do not assume all of them made it;
+check each before doing anything else:
 
-  https://crates.io/crates/${CRATE}/${VERSION}
+$(printf '%s\n' "${CRATES[@]%% *}" | sed "s|^|  https://crates.io/crates/|; s|\$|/$VERSION|")
 
+and publish any that are missing as the failure message of that run says.
 Otherwise this is a genuine packaging failure and nothing has been uploaded."
 
-printf '\nAbout to publish %s %s to crates.io.\n\n' "$CRATE" "$VERSION"
-printf 'This CANNOT be undone. A published version is immutable; yanking hides it\n'
+printf '\nAbout to publish %s crates to crates.io as version %s:\n\n' "${#CRATES[@]}" "$VERSION"
+printf '  %s\n' "${CRATES[@]%% *}"
+printf '\nThis CANNOT be undone. A published version is immutable; yanking hides it\n'
 printf 'from new resolutions but never frees the version or removes the code.\n'
 read -r -p "Type the version ($VERSION) to continue: " confirm < /dev/tty
 [[ "$confirm" == "$VERSION" ]] || die "aborted"
 
 echo "==> Publishing"
-cargo publish -p "$CRATE" --locked || die \
-  "cargo publish failed. If it got as far as the upload, the version may be
-published already — check before doing anything else:
+# --workspace resolves the dependency order itself and waits for each crate to
+# appear in the index before publishing its dependents.
+cargo publish --workspace --locked || die \
+  "publishing failed partway. Crates uploaded before the failure ARE published
+and cannot be re-uploaded. Do NOT re-run this script — it would fail on the
+first already-published crate. Check which succeeded:
 
-  https://crates.io/crates/${CRATE}/${VERSION}
+$(printf '%s\n' "${CRATES[@]%% *}" | sed 's|^|  https://crates.io/crates/|')
 
-If it is not there, nothing was uploaded; fix the problem and re-run."
+then publish only the remainder, in dependency order (sponsord-api, then
+sponsord-core, then the rest), from a fresh worktree at the tag — the one
+this script used is removed on exit, and your own checkout may differ:
+
+  git worktree add --detach ../sponsord-$TAG $TAG
+  cd ../sponsord-$TAG && cargo publish -p <crate> --locked"
 
 # ---- confirm ---------------------------------------------------------------
 
-# cargo returning 0 means the upload was accepted, not that the index has
+# cargo returning 0 means the uploads were accepted, not that the index has
 # caught up. Ask crates.io what it actually serves.
 #
-# Nothing below exits non-zero. The publish already happened and is
-# irreversible, so a red exit here would misrepresent a successful release — and
-# send the operator looking for something to retry, which is the one thing they
-# must not do. Anything unresolved is reported as a warning.
+# Nothing below exits non-zero. The publish already happened and is irreversible,
+# so a red exit here would misrepresent a fully successful release — and send the
+# operator looking for something to retry, which is the one thing they must not
+# do. Anything unresolved is reported as a warning after the success banner.
 echo "==> Confirming on crates.io"
-found="" transport=""
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  # -f makes curl exit 22 on an HTTP >=400, which is the "not served yet"
-  # signal. Any other non-zero is a transport problem — DNS, proxy, TLS — and
-  # reporting that as index lag would send the operator to the wrong place.
-  rc=0
-  curl -sf -A "sponsord-publish-crates" \
-    "https://crates.io/api/v1/crates/${CRATE}/${VERSION}" >/dev/null 2>&1 || rc=$?
-  if (( rc == 0 )); then
-    found=1
-    break
+missing=() unreachable=()
+for entry in "${CRATES[@]}"; do
+  read -r name ver <<<"$entry"
+  found="" transport=""
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    # -f makes curl exit 22 on an HTTP >=400, which is the "not served yet"
+    # signal. Any other non-zero is a transport problem — DNS, proxy, TLS — and
+    # reporting that as index lag would send the operator to the wrong place.
+    rc=0
+    curl -sf -A "sponsord-publish-crates" \
+      "https://crates.io/api/v1/crates/${name}/${ver}" >/dev/null 2>&1 || rc=$?
+    if (( rc == 0 )); then
+      found=1
+      break
+    fi
+    (( rc == 22 )) || transport=1
+    sleep 3
+  done
+  if [[ -n "$found" ]]; then
+    echo "    https://crates.io/crates/${name}/${ver}"
+  elif [[ -n "$transport" ]]; then
+    unreachable+=("${name} ${ver}")
+  else
+    missing+=("${name} ${ver}")
   fi
-  (( rc == 22 )) || transport=1
-  sleep 3
 done
 
 echo
-echo "Published $CRATE $VERSION: https://crates.io/crates/${CRATE}/${VERSION}"
-if [[ -z "$found" && -n "$transport" ]]; then
-  echo "warning: could not reach crates.io to confirm it (network, not lag)." >&2
-  echo "Verify manually. Do NOT re-run this script." >&2
-elif [[ -z "$found" ]]; then
-  echo "warning: crates.io does not serve it yet. This is normally index lag;" >&2
-  echo "the upload itself succeeded. Re-check in a minute. Do NOT re-run." >&2
+echo "Published ${#CRATES[@]} crates at $VERSION."
+
+if (( ${#missing[@]} > 0 )); then
+  echo
+  echo "warning: crates.io does not serve these yet:" >&2
+  printf '  %s\n' "${missing[@]}" >&2
+  echo "This is normally index lag; the upload itself succeeded. Re-check in a" >&2
+  echo "minute. Do NOT re-run this script." >&2
+fi
+
+if (( ${#unreachable[@]} > 0 )); then
+  echo
+  echo "warning: could not reach crates.io to confirm these (network, not lag):" >&2
+  printf '  %s\n' "${unreachable[@]}" >&2
+  echo "Verify manually at https://crates.io/crates/<name>. Do NOT re-run this" >&2
+  echo "script — the publish above already succeeded." >&2
 fi

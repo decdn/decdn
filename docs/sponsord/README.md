@@ -83,8 +83,8 @@ it up with, since the daemon refills a drained pool automatically.
 
 ## Crates
 
-Each crate is versioned and released on its own, from a signed
-`<crate>-vX.Y.Z` tag:
+Every crate shares one version and is released together, from a signed
+`vX.Y.Z` tag:
 
 | Crate | What it is | Release archives | Image |
 |---|---|---|---|

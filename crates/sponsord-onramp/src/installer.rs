@@ -19,8 +19,8 @@ pub struct Installers {
 
 impl Installers {
     /// Render both templates from `cfg`. Each release's version is passed
-    /// alongside its tag rather than cut out of it by the scripts, because the
-    /// two repositories tag differently (`v0.1.0`, `decdn-sponsored-v0.1.0`).
+    /// alongside its tag rather than cut out of it by the scripts, so the
+    /// scripts hold no assumption about how either repository tags.
     /// Every substituted value was checked
     /// at startup to hold nothing a quoted shell or PowerShell string could
     /// misread (`config::script_safe_url`, `ReleasePin::new`).

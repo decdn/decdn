@@ -2,7 +2,7 @@
 name = "sponsord-api"
 description = "Wire types, error codes and HTTP clients for the sponsord daemon and onramp"
 readme = "README.md"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,17 @@ categories.workspace = true
 
 [lints]
 workspace = true
+
+# The OpenAPI documents carry this crate's version (`info.version`), and the
+# snapshot test compares them byte for byte, so the release rewrites them with
+# the version it cuts. This list replaces the root release.toml's rather than
+# adding to it, hence the CHANGELOG.md entry repeated from there.
+[package.metadata.release]
+pre-release-replacements = [
+  { file = "CHANGELOG.md", search = "## \\[Unreleased\\]", replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}", exactly = 1 },
+  { file = "../../docs/openapi/sponsord.json", search = '"version": "[^"]+"', replace = '"version": "{{version}}"', exactly = 1 },
+  { file = "../../docs/openapi/sponsord-onramp.json", search = '"version": "[^"]+"', replace = '"version": "{{version}}"', exactly = 1 },
+]
 
 [features]
 # Typed HTTP clients: `DaemonClient` (for gates in front of the daemon) and

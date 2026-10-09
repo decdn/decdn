@@ -14,13 +14,10 @@ use crate::net::ClientIpSource;
 use sponsord_api::MicroUsdc;
 use sponsord_api::daemon::Info;
 
-/// Tag prefix of a `decdn/decdn` release: the workspace shares one version,
-/// so its tags are `vMAJOR.MINOR.PATCH`.
-pub const DECDN_TAG_PREFIX: &str = "v";
-
-/// Tag prefix of a `decdn-sponsored` release: sponsord's crates are versioned
-/// on their own, so its tags name the crate.
-pub const CLI_TAG_PREFIX: &str = "decdn-sponsored-v";
+/// Tag prefix of a release of either repository the installers download
+/// from: `decdn/decdn` and `decdn/sponsord` each release their whole
+/// workspace under one version, so both tag `vMAJOR.MINOR.PATCH`.
+pub const RELEASE_TAG_PREFIX: &str = "v";
 
 /// A GitHub Release the installers download binaries from, pinned by its tag
 /// and by the SHA-256 of its `SHA256SUMS` file. The installer checks the
@@ -28,8 +25,8 @@ pub const CLI_TAG_PREFIX: &str = "decdn-sponsored-v";
 /// `SHA256SUMS`, so a release asset replaced after pinning is rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleasePin {
-    /// The release tag: a fixed prefix, then `MAJOR.MINOR.PATCH`, optionally
-    /// with a `-pre.release` suffix.
+    /// The release tag: `v`, then `MAJOR.MINOR.PATCH`, optionally with a
+    /// `-pre.release` suffix.
     pub tag: String,
     /// The version in `tag`, which names the release's archives
     /// (`<binary>-<version>-<target>`).
@@ -45,14 +42,16 @@ impl ReleasePin {
     ///
     /// # Errors
     ///
-    /// Returns an error if `tag` is not `prefix` followed by a semver version,
-    /// or `sums_sha256` is not 64 lowercase hex characters.
-    pub fn new(prefix: &str, tag: &str, sums_sha256: &str) -> anyhow::Result<Self> {
+    /// Returns an error if `tag` is not [`RELEASE_TAG_PREFIX`] followed by a
+    /// semver version, or `sums_sha256` is not 64 lowercase hex characters.
+    pub fn new(tag: &str, sums_sha256: &str) -> anyhow::Result<Self> {
         let version = tag
-            .strip_prefix(prefix)
+            .strip_prefix(RELEASE_TAG_PREFIX)
             .filter(|v| is_semver(v))
             .ok_or_else(|| {
-                anyhow::anyhow!("release tag {tag:?} is not {prefix}MAJOR.MINOR.PATCH[-pre]")
+                anyhow::anyhow!(
+                    "release tag {tag:?} is not {RELEASE_TAG_PREFIX}MAJOR.MINOR.PATCH[-pre]"
+                )
             })?;
         anyhow::ensure!(
             sums_sha256.len() == 64
@@ -192,7 +191,7 @@ pub struct Args {
     #[arg(long, env = "ONRAMP_DECDN_SUMS_SHA256")]
     pub decdn_sums_sha256: String,
     /// `decdn/sponsord` release tag the installers install `decdn-sponsored`
-    /// from (`decdn-sponsored-vMAJOR.MINOR.PATCH[-pre]`).
+    /// from (`vMAJOR.MINOR.PATCH[-pre]`).
     #[arg(long, env = "ONRAMP_CLI_RELEASE")]
     pub cli_release: String,
     /// SHA-256 of that release's `SHA256SUMS` file (printed in its release
@@ -353,13 +352,10 @@ impl OnrampConfig {
             fund_rate_per_min: args.fund_rate_per_min,
             poll_rate_per_min: args.poll_rate_per_min,
             releases_base,
-            decdn_release: ReleasePin::new(
-                DECDN_TAG_PREFIX,
-                &args.decdn_release,
-                &args.decdn_sums_sha256,
-            )
-            .map_err(|e| anyhow::anyhow!("ONRAMP_DECDN_RELEASE/ONRAMP_DECDN_SUMS_SHA256: {e}"))?,
-            cli_release: ReleasePin::new(CLI_TAG_PREFIX, &args.cli_release, &args.cli_sums_sha256)
+            decdn_release: ReleasePin::new(&args.decdn_release, &args.decdn_sums_sha256).map_err(
+                |e| anyhow::anyhow!("ONRAMP_DECDN_RELEASE/ONRAMP_DECDN_SUMS_SHA256: {e}"),
+            )?,
+            cli_release: ReleasePin::new(&args.cli_release, &args.cli_sums_sha256)
                 .map_err(|e| anyhow::anyhow!("ONRAMP_CLI_RELEASE/ONRAMP_CLI_SUMS_SHA256: {e}"))?,
         })
     }

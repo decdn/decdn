@@ -1,7 +1,6 @@
 # The images are assembled from the release binaries, not compiled from source.
 #
-# A server's release (`sponsord-v*` or `sponsord-onramp-v*`) builds its Linux
-# archives in `.github/workflows/release.yml`'s `build` job; the `docker` job
+# A release (`v*`) builds each server's Linux archives in `.github/workflows/release.yml`'s `build` job; the `docker` job
 # then unpacks the two into dist/<arch>/ and builds the matching target of this
 # file. The binary in an image is therefore byte-identical to the one in
 # <binary>-<version>-<target>.tar.gz, which the signed SHA256SUMS covers;

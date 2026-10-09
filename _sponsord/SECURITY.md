@@ -15,7 +15,7 @@ any of the following are especially welcome:
 - installer behaviour that runs or installs something other than the pinned,
   checksum-verified release binaries.
 
-Only the latest release of each crate receives fixes. The operator-facing
+Only the latest release receives fixes. The operator-facing
 security model (what each key can do, what bounds a loss) is in
 [docs/security.md](docs/security.md).
 
@@ -43,20 +43,18 @@ release pipeline enforces. CI does verify that a release tag is signed by a key
 published on `main`, but that check lives in the repository it is checking.
 Record the fingerprint above out of band the first time you verify a release.
 
-Each crate is released on its own, from a `<crate>-vX.Y.Z` tag
-(`decdn-sponsored-v0.1.0`, `sponsord-v0.1.0`, …). A release carries these
-signatures:
+Every crate is released together under one version, from a `vX.Y.Z` tag
+(`v0.1.0`, …). A release carries these signatures:
 
-- the tag, always;
-- the version-bump commit, for every release after a crate's first (which tags
-  the version the crate already carried);
-- the `SHA256SUMS` manifest covering every archive, for `decdn-sponsored`,
+- the tag;
+- the release commit (the version bump and changelog headings);
+- the `SHA256SUMS` manifest covering every archive of `decdn-sponsored`,
   `sponsord` and `sponsord-onramp`;
-- `<image>-image-digest.txt` and the SBOM, for the servers' images
+- `<image>-image-digest.txt` and the SBOM, for each server image
   (`sponsord`, `sponsord-onramp`).
 
-`sponsord-core` and `sponsord-api` ship no binaries; their signed tags are the
-whole attestation.
+`sponsord-core` and `sponsord-api` ship no binaries; the signed tag covers
+their source.
 Individual archives carry no `.asc` of their own — verify them through the
 signed manifest.
 
@@ -68,8 +66,8 @@ gpg --import KEYS
 
 # Fetch tags and verify the one you're installing
 git fetch --tags
-git verify-tag decdn-sponsored-v0.1.1
-git verify-commit decdn-sponsored-v0.1.1^{commit}   # not for a crate's first release
+git verify-tag v0.1.1
+git verify-commit v0.1.1^{commit}
 ```
 
 `git verify-tag` must report a **Good signature** from one of the keys above.
@@ -110,12 +108,12 @@ docker pull "ghcr.io/decdn/sponsord@${DIGEST}"
 docker pull "decdn/sponsord@${DIGEST}"        # identical bytes
 ```
 
-An image's version tags are its server crate's version (`sponsord-v0.2.1` is
+An image's version tags are the release's version (`v0.2.1` is
 `ghcr.io/decdn/sponsord:0.2.1`). Every tag you can pull — `latest`,
 `<version>` and `<major>.<minor>`, on either registry — is created only after
 that digest has been signed. Pulling by digest is still stronger: it pins the
 exact bytes you verified. A prerelease is published only as its exact version
-tag.
+tag, and a maintenance release below a newer one never moves `latest`.
 
 ### What a signature does and does not tell you
 
@@ -148,5 +146,5 @@ To tie a `.crate` back to the signed tag, read the commit out of the
 
 ```bash
 tar xzOf sponsord-<version>.crate sponsord-<version>/.cargo_vcs_info.json
-git rev-parse sponsord-v<version>^{commit}
+git rev-parse v<version>^{commit}
 ```

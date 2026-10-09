@@ -1,16 +1,22 @@
-# cargo-release configuration. Each crate is versioned and released on its
-# own: `cargo release -p <crate> <level> --execute` makes one signed commit and
-# one signed `<crate>-v<version>` tag. See RELEASING.md.
-shared-version = false
-tag-name = "{{crate_name}}-v{{version}}"
-# One commit per crate even when several are released in one run, so every
-# commit names the crate it releases.
-consolidate-commits = false
+# cargo-release configuration. The workspace is released as a whole:
+# `cargo release <level> --execute` bumps the one shared version, then makes one
+# signed commit and one signed `v<version>` tag. See RELEASING.md.
+shared-version = true
+tag-name = "v{{version}}"
+# One release commit for the whole workspace, not one per crate.
+consolidate-commits = true
 # No pre-release-hook: cargo-release runs hooks once per package with the cwd
-# set to that package's directory. Changelogs (crates/*/CHANGELOG.md) are
-# maintained per PR; git-cliff generates the GitHub release notes in
-# .github/workflows/release.yml instead.
-pre-release-commit-message = "chore(release): {{crate_name}} v{{version}}"
+# set to that package's directory. The GitHub release notes come from git-cliff
+# in .github/workflows/release.yml instead.
+pre-release-commit-message = "chore(release): v{{version}}"
+# Each crate keeps its own hand-maintained CHANGELOG.md (RELEASING.md
+# § Changelogs). The release opens a version heading under `[Unreleased]`, so
+# the entries gathered there since the last release become that version's. The
+# path is relative to each package; sponsord-e2e, which has no changelog, opts
+# out of the release in its own manifest.
+pre-release-replacements = [
+  { file = "CHANGELOG.md", search = "## \\[Unreleased\\]", replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}", exactly = 1 },
+]
 push = true
 push-remote = "origin"
 # Not a "we never publish" flag: crates go to crates.io via
@@ -20,6 +26,6 @@ push-remote = "origin"
 publish = false
 sign-commit = true
 sign-tag = true
-# Releasing sponsord-core rewrites the version on its [workspace.dependencies]
-# alias, so dependents require the release just cut. They are not re-released.
+# The version on each internal [workspace.dependencies] alias moves with the
+# workspace version, so the published manifests require this same release.
 dependent-version = "upgrade"

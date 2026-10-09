@@ -20,7 +20,7 @@ fn args(overrides: &[&str]) -> Result<Args, clap::Error> {
         ("--turnstile-sitekey", "0x4AAA-key_1"),
         ("--decdn-release", "v0.1.0"),
         ("--decdn-sums-sha256", &ab),
-        ("--cli-release", "decdn-sponsored-v0.2.0-rc.1"),
+        ("--cli-release", "v0.2.0-rc.1"),
         ("--cli-sums-sha256", &cd),
     ];
     for pair in overrides.chunks(2) {
@@ -45,7 +45,7 @@ fn reads_required_and_defaults() {
     assert_eq!(cfg.ttl_secs, None);
     assert_eq!(cfg.decdn_release.tag, "v0.1.0");
     assert_eq!(cfg.decdn_release.version, "0.1.0");
-    assert_eq!(cfg.cli_release.tag, "decdn-sponsored-v0.2.0-rc.1");
+    assert_eq!(cfg.cli_release.tag, "v0.2.0-rc.1");
     assert_eq!(cfg.cli_release.version, "0.2.0-rc.1");
     assert!(!format!("{cfg:?}").contains("\"tok\""));
 }
@@ -116,20 +116,17 @@ fn release_pin_accepts_semver_tags_and_hex_digests() {
         ("v1.0.0-rc.1", "1.0.0-rc.1"),
         ("v1.0.0-beta-2", "1.0.0-beta-2"),
     ] {
-        let pin = ReleasePin::new(DECDN_TAG_PREFIX, tag, &digest).unwrap();
+        let pin = ReleasePin::new(tag, &digest).unwrap();
         assert_eq!(pin.version, version, "{tag}");
     }
-    let pin = ReleasePin::new(CLI_TAG_PREFIX, "decdn-sponsored-v0.2.0-rc.1", &digest).unwrap();
-    assert_eq!(pin.version, "0.2.0-rc.1");
 }
 
 #[test]
-fn release_pin_requires_its_own_prefix() {
+fn release_pin_refuses_per_crate_tags() {
     let digest = "ab".repeat(32);
-    // A decdn tag is not a CLI release, and the reverse.
-    assert!(ReleasePin::new(CLI_TAG_PREFIX, "v0.2.0", &digest).is_err());
-    assert!(ReleasePin::new(CLI_TAG_PREFIX, "sponsord-v0.2.0", &digest).is_err());
-    assert!(ReleasePin::new(DECDN_TAG_PREFIX, "decdn-sponsored-v0.2.0", &digest).is_err());
+    // sponsord no longer tags per crate; such a pin names no release.
+    assert!(ReleasePin::new("decdn-sponsored-v0.2.0", &digest).is_err());
+    assert!(ReleasePin::new("sponsord-v0.2.0", &digest).is_err());
 }
 
 #[test]
@@ -146,20 +143,9 @@ fn release_pin_rejects_anything_a_script_could_misread() {
         "v0.1.0$(id)",
         "v0.1.0'",
     ] {
-        assert!(
-            ReleasePin::new(DECDN_TAG_PREFIX, tag, &digest).is_err(),
-            "{tag:?}"
-        );
-        let cli = tag.replacen('v', CLI_TAG_PREFIX, 1);
-        assert!(
-            ReleasePin::new(CLI_TAG_PREFIX, &cli, &digest).is_err(),
-            "{cli:?}"
-        );
+        assert!(ReleasePin::new(tag, &digest).is_err(), "{tag:?}");
     }
     for bad in [&"AB".repeat(32), &"ab".repeat(31), &"zz".repeat(32)] {
-        assert!(
-            ReleasePin::new(DECDN_TAG_PREFIX, "v0.1.0", bad).is_err(),
-            "{bad}"
-        );
+        assert!(ReleasePin::new("v0.1.0", bad).is_err(), "{bad}");
     }
 }

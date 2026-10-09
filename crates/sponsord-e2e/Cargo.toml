@@ -1,7 +1,7 @@
 [package]
 name = "sponsord-e2e"
 description = "Tests that run the sponsord daemon, onramp and CLI together"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,11 @@ publish = false
 
 [lints]
 workspace = true
+
+# Never released: it carries the workspace version only because every member
+# does, and has no changelog for the release to update.
+[package.metadata.release]
+release = false
 
 [dev-dependencies]
 decdn-sponsored.workspace = true

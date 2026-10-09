@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """What a release tag releases: the one table every release step reads.
 
-Each crate is versioned and released on its own, so a tag names one crate:
-`<crate>-v<MAJOR.MINOR.PATCH[-pre]>`, as `cargo release -p <crate>` pushes it.
-The tag decides everything downstream — which archives release.yml builds,
-whether it builds an image, what sign-release.sh signs and promotes, and what
-publish-crates.sh uploads. Keeping that in one table, rather than in a
-workflow matrix, a signing script and a publishing script separately, is what
-stops the three from disagreeing about a crate.
+The workspace is released as a whole under one version, so a tag is
+`v<MAJOR.MINOR.PATCH[-pre]>`, as `cargo release <level>` pushes it, and every
+release carries every crate: the archives of each binary, the images of both
+servers, and every library on crates.io. The table decides what release.yml
+builds, what sign-release.sh signs and promotes, and what publish-crates.sh
+uploads. Keeping it in one place, rather than in a workflow matrix, a signing
+script and a publishing script separately, is what stops the three from
+disagreeing about a crate.
 
 The archive names (`<binary>-<version>-<target>.{tar.gz,zip}`, binary at the
 archive root) are a contract with every installer the onramp has served:
@@ -15,16 +16,18 @@ archive root) are a contract with every installer the onramp has served:
 
 Usage:
   release_plan.py <tag>              key=value lines for $GITHUB_OUTPUT
-  release_plan.py <tag> --get KEY    one value (crate, version, dir, image,
-                                     archives, onramp_pin, prerelease,
-                                     latest, matrix)
+  release_plan.py <tag> --get KEY    one value (tag, version, archives, images,
+                                     images_json, prerelease, matrix)
   release_plan.py <tag> --baseline   the tag cargo semver-checks compares
                                      against, from this repository's tags
-                                     (nothing for a crate's first release)
+                                     (nothing for the first release)
+  release_plan.py <tag> --latest     `true` if the tag should be the
+                                     repository's "Latest release", from
+                                     this repository's tags
   release_plan.py --images           every image name, one per line
   release_plan.py --tag-pattern      an ERE matching every release tag
 
-A tag this table does not know is an error, never an empty plan.
+A tag that is not a release tag is an error, never an empty plan.
 """
 
 from __future__ import annotations
@@ -48,8 +51,8 @@ CLIENT = LINUX + [
 ]
 
 # crate -> where it lives, the binary its archives carry (if any), the targets
-# they are built for, the container image (if any), and whether its release is
-# the one the onramp's installers pin (ONRAMP_CLI_RELEASE).
+# they are built for, and the container image (if any). Every release carries
+# all of them.
 CRATES: dict[str, dict] = {
     "sponsord-api": {"dir": "crates/sponsord-api", "binary": None, "targets": [], "image": None},
     "sponsord-core": {"dir": "crates/sponsord-core", "binary": None, "targets": [], "image": None},
@@ -70,54 +73,41 @@ CRATES: dict[str, dict] = {
         "binary": "decdn-sponsored",
         "targets": CLIENT,
         "image": None,
-        "onramp_pin": True,
     },
 }
 
-SEMVER = r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?"
-# Longest names first, so the alternation never prefers `sponsord` over
-# `sponsord-onramp` (the `-v` anchor already rules that out; this is belt and
-# braces for a future name that would not).
-# Plain `[a-z-]` names, joined unescaped so the same pattern reads the same in
-# Python, git-cliff (Rust regex) and bash ERE.
-_NAMES = "|".join(sorted(CRATES, key=len, reverse=True))
-assert all(re.fullmatch(r"[a-z][a-z-]*", c) for c in CRATES)
-TAG = re.compile(rf"^({_NAMES})-v({SEMVER})$")
+# Plain groups, no `(?:`: tag_pattern() hands the same text to git-cliff (Rust
+# regex) and to bash (ERE), and ERE has no non-capturing group.
+SEMVER = r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?"
+TAG = re.compile(rf"^v({SEMVER})$")
 
 
-def parse_tag(tag: str) -> tuple[str, str]:
+def parse_tag(tag: str) -> str:
+    """The version a release tag names."""
     m = TAG.match(tag)
     if not m:
-        raise ValueError(
-            f"{tag!r} is not a release tag: expected <crate>-vMAJOR.MINOR.PATCH[-pre] "
-            f"for one of {', '.join(sorted(CRATES))}"
-        )
-    return m.group(1), m.group(2)
+        raise ValueError(f"{tag!r} is not a release tag: expected vMAJOR.MINOR.PATCH[-pre]")
+    return m.group(1)
 
 
 def plan(tag: str) -> dict[str, str]:
-    crate, version = parse_tag(tag)
-    spec = CRATES[crate]
+    version = parse_tag(tag)
     prerelease = "-" in version
     legs = [
         {"package": crate, "binary": spec["binary"], "target": target, "runner": runner}
+        for crate, spec in CRATES.items()
         for target, runner in spec["targets"]
     ]
     return {
         "tag": tag,
-        "crate": crate,
         "version": version,
-        "dir": spec["dir"],
-        "image": spec["image"] or "",
         "archives": str(len(legs)),
-        "onramp_pin": "true" if spec.get("onramp_pin") else "false",
+        # Space-separated for the scripts, JSON for the docker job's matrix.
+        "images": " ".join(images()),
+        "images_json": json.dumps(images(), separators=(",", ":")),
         # GitHub's prerelease flag, set on the draft.
         "prerelease": "true" if prerelease else "false",
-        # The repository's "Latest release": the CLI users install, and never a
-        # prerelease of it.
-        "latest": "true" if spec.get("onramp_pin") and not prerelease else "false",
-        # A GitHub Actions matrix; an empty `include` is never used, because
-        # release.yml skips the build when `archives` is 0.
+        # A GitHub Actions matrix: every archive of every binary crate.
         "matrix": json.dumps({"include": legs}, separators=(",", ":")),
     }
 
@@ -134,21 +124,34 @@ def _precedence(version: str) -> tuple:
 
 
 def baseline(tag: str, tags: Iterable[str]) -> str | None:
-    """The release `tag` is checked against by cargo semver-checks: its crate's
-    highest release tag below it, or None for a first release.
+    """The release `tag` is checked against by cargo semver-checks: the highest
+    release tag below it, or None for the first release.
 
     Below the tag, not merely the newest tag: re-running a release's workflow
     and cutting a maintenance release under a newer one are both supported, and
     a newer baseline would run the check backwards.
     """
-    crate, version = parse_tag(tag)
-    current = _precedence(version)
+    current = _precedence(parse_tag(tag))
     below = []
     for t in tags:
         m = TAG.match(t)
-        if m and m.group(1) == crate and _precedence(m.group(2)) < current:
-            below.append((_precedence(m.group(2)), t))
+        if m and _precedence(m.group(1)) < current:
+            below.append((_precedence(m.group(1)), t))
     return max(below)[1] if below else None
+
+
+def is_latest(tag: str, tags: Iterable[str]) -> bool:
+    """Whether `tag` should be the repository's "Latest release": stable, and
+    not below any other stable release tag. A maintenance release cut under a
+    newer release (supported, see baseline) never takes it."""
+    current = _precedence(parse_tag(tag))
+    if "-" in parse_tag(tag):
+        return False
+    for t in tags:
+        m = TAG.match(t)
+        if m and "-" not in m.group(1) and _precedence(m.group(1)) > current:
+            return False
+    return True
 
 
 def images() -> list[str]:
@@ -156,8 +159,14 @@ def images() -> list[str]:
 
 
 def tag_pattern() -> str:
-    """An ERE for every release tag, for git-cliff and the scripts' tag filters."""
-    return rf"^({_NAMES})-v[0-9]"
+    """An ERE matching exactly the tags parse_tag() accepts, for git-cliff.
+
+    As strict as parse_tag(), not just a `v<digit>` prefix: a stray tag the
+    release workflow refuses (`v0-wip`) stays in the repository, and a looser
+    pattern would let `git cliff --latest` stop at it and drop commits from
+    the next release's notes.
+    """
+    return rf"^v{SEMVER}$"
 
 
 def main(argv: list[str]) -> int:
@@ -167,11 +176,14 @@ def main(argv: list[str]) -> int:
     if argv == ["--tag-pattern"]:
         print(tag_pattern())
         return 0
-    if len(argv) == 2 and argv[1] == "--baseline":
+    if len(argv) == 2 and argv[1] in ("--baseline", "--latest"):
         tags = subprocess.run(
             ["git", "tag", "--list"], capture_output=True, text=True, check=True
         ).stdout.split()
         try:
+            if argv[1] == "--latest":
+                print("true" if is_latest(argv[0], tags) else "false")
+                return 0
             prev = baseline(argv[0], tags)
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)

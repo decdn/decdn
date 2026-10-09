@@ -1,28 +1,27 @@
 name: Release
 
-# Stages the release of ONE crate from the signed `<crate>-v<version>` tag that
-# `cargo release -p <crate>` pushed (RELEASING.md). Each crate is versioned and
-# released on its own; .github/scripts/release_plan.py says what a crate's tag
-# builds. Mirrors decdn's release.yml otherwise: this workflow builds, verifies
-# and stages, but signs and publishes nothing.
+# Stages the release of the whole workspace from the signed `v<version>` tag
+# that `cargo release <level>` pushed (RELEASING.md). Every crate shares that
+# version, and every release carries every crate;
+# .github/scripts/release_plan.py says what that is. Mirrors decdn's
+# release.yml otherwise: this workflow builds, verifies and stages, but signs
+# and publishes nothing.
 #
 #   release        parse the tag, verify its signature against KEYS on main,
-#                  check it against the crate's version and the decdn lock, run
-#                  the checks and cargo semver-checks against the crate's
-#                  previous release, and create a DRAFT GitHub Release with
-#                  git-cliff notes for that crate
-#   build          the crate's archives: decdn-sponsored for every platform the
-#                  installers support, sponsord / sponsord-onramp for Linux,
-#                  none for sponsord-api or sponsord-core
-#   upload-assets  those archives plus SHA256SUMS onto the draft, and for
-#                  decdn-sponsored the onramp pin values into its notes
-#   docker         for sponsord / sponsord-onramp, the multi-arch image, pushed
-#                  to GHCR by digest only (no tag), plus an SBOM and the digest
-#                  onto the draft
+#                  check it against the workspace version and the decdn lock,
+#                  run the checks and cargo semver-checks against the previous
+#                  release, and create a DRAFT GitHub Release with git-cliff
+#                  notes
+#   build          the archives: decdn-sponsored for every platform the
+#                  installers support, sponsord and sponsord-onramp for Linux
+#   upload-assets  those archives plus one SHA256SUMS onto the draft, and the
+#                  onramp pin values into its notes
+#   docker         per server, the multi-arch image, pushed to GHCR by digest
+#                  only (no tag), plus an SBOM and the digest onto the draft
 #
 # A maintainer then runs .github/scripts/sign-release.sh, which signs what the
-# release carries, tags the image on GHCR and Docker Hub, and takes the release
-# out of draft; then publish-crates.sh for crates.io.
+# release carries, tags the images on GHCR and Docker Hub, and takes the
+# release out of draft; then publish-crates.sh for crates.io.
 #
 # The onramp's installers pin a release by its tag and the SHA-256 of its
 # SHA256SUMS (`ONRAMP_CLI_RELEASE` / `ONRAMP_CLI_SUMS_SHA256`). Signing
@@ -41,17 +40,12 @@ name: Release
 on:
   push:
     tags:
-      - 'sponsord-api-v[0-9]*'
-      - 'sponsord-core-v[0-9]*'
-      - 'sponsord-v[0-9]*'
-      - 'sponsord-onramp-v[0-9]*'
-      - 'decdn-sponsored-v[0-9]*'
+      - 'v[0-9]*'
 
 permissions:
   contents: read
 
-# Per tag: two crates' releases can run side by side; a re-push of the same tag
-# queues behind the first run.
+# Per tag: a re-push of the same tag queues behind the first run.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -67,11 +61,9 @@ jobs:
       contents: write
     outputs:
       tag: ${{ steps.plan.outputs.tag }}
-      crate: ${{ steps.plan.outputs.crate }}
       version: ${{ steps.plan.outputs.version }}
-      image: ${{ steps.plan.outputs.image }}
+      images_json: ${{ steps.plan.outputs.images_json }}
       archives: ${{ steps.plan.outputs.archives }}
-      onramp_pin: ${{ steps.plan.outputs.onramp_pin }}
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
@@ -80,8 +72,8 @@ jobs:
           fetch-depth: 0
 
       # The tag flows into archive names, image tags and the release notes, and
-      # the trigger globs match things like `sponsord-v0$(id)`, so the plan
-      # holds it to `<crate>-vMAJOR.MINOR.PATCH[-pre]` before anything uses it.
+      # the trigger glob matches things like `v0$(id)`, so the plan holds it to
+      # `vMAJOR.MINOR.PATCH[-pre]` before anything uses it.
       # It runs from the tag's own checkout, like everything here.
       - name: Plan the release
         id: plan
@@ -140,21 +132,22 @@ jobs:
           shared-key: clippy
           save-if: false
 
-      - name: Check the tag matches the crate's version
+      # Every member, not just one: they share the version, and a member that
+      # restated its own would ship a number nobody released.
+      - name: Check the tag matches the workspace version
         shell: bash
         env:
-          CRATE: ${{ steps.plan.outputs.crate }}
           VERSION: ${{ steps.plan.outputs.version }}
         run: |
           set -euo pipefail
-          ACTUAL=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r --arg c "$CRATE" '.packages[] | select(.name == $c) | .version')
-          if [ "$ACTUAL" != "$VERSION" ]; then
-            echo "::error::tag says $CRATE $VERSION but the crate is at '${ACTUAL}'." \
-                 "Cut releases with \`cargo release -p $CRATE\`."
+          MISMATCH=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg v "$VERSION" '.packages[] | select(.version != $v) | "\(.name) \(.version)"')
+          if [ -n "$MISMATCH" ]; then
+            echo "::error::tag says $VERSION but these crates are not: ${MISMATCH//$'\n'/, }." \
+                 "Cut releases with \`cargo release <level>\`."
             exit 1
           fi
-          echo "$CRATE is at $VERSION."
+          echo "Every crate is at $VERSION."
 
       - name: decdn version requirements match the locked decdn
         run: .github/scripts/check-decdn-pin.sh
@@ -170,72 +163,63 @@ jobs:
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo nextest run --workspace --locked --no-tests=pass
 
-      # The whole workspace, not just the tagged crate: the crates depend on
-      # each other, and a release must not ship against a broken sibling.
-      #
       # Not here, unlike decdn: `cargo publish --dry-run` resolves the decdn
       # crates from crates.io, where they are not published yet.
       # publish-crates.sh runs the dry run at publish time.
 
-      # The tagged crate's public Rust API against its previous release, so a
-      # breaking change cannot ship under a non-breaking version. The tool
+      # Every published crate's public Rust API against the previous release, so
+      # a breaking change cannot ship under a non-breaking version. The tool
       # reads the version on each side from its manifest: a major bump, or a
       # minor bump while the major is 0, may break, and anything else may not.
       # Default features, as decdn checks, so the `test-support` fakes are not
-      # held to semver. The baseline is the crate's highest release below this
-      # tag; a first release has none and skips the check. Its signature is checked
-      # like this tag's, because building it runs its build scripts here.
+      # held to semver. `--workspace` skips `publish = false` members (the e2e
+      # tests). The baseline is the highest release below this tag; the first
+      # release has none and skips the check. Its signature is checked like
+      # this tag's, because building it runs its build scripts here.
       # Installed through install-action rather than a third-party action,
       # because this job holds `contents: write`.
       - name: cargo semver-checks against the previous release
         shell: bash
         env:
           TAG: ${{ steps.plan.outputs.tag }}
-          CRATE: ${{ steps.plan.outputs.crate }}
           # The keyring "Verify tag signature" built from KEYS on main.
           GNUPGHOME: ${{ runner.temp }}/keys-gnupg
         run: |
           set -euo pipefail
-          # The crate's highest release below this tag, in semver order, so a
+          # The highest release below this tag, in semver order, so a
           # re-run after a newer release, or a maintenance release under one,
           # never compares against a newer version (release_plan.py).
           PREV=$(python3 .github/scripts/release_plan.py "$TAG" --baseline)
           if [ -z "$PREV" ]; then
-            echo "No previous $CRATE release; skipping semver-checks."
+            echo "No previous release; skipping semver-checks."
             exit 0
           fi
           # Building the baseline runs its build scripts in this job, so it
           # must be a release a maintainer signed, as the tag being released is.
           if ! git verify-tag "$PREV"; then
             echo "::error::baseline $PREV is not signed by a key in KEYS on main;" \
-                 "delete the stray tag or sign it before releasing $CRATE."
+                 "delete the stray tag or sign it before releasing."
             exit 1
           fi
-          echo "Checking $CRATE against $PREV."
-          cargo semver-checks --package "$CRATE" --baseline-rev "$PREV" --default-features
+          echo "Checking the workspace against $PREV."
+          cargo semver-checks --workspace --baseline-rev "$PREV" --default-features
 
-      # Notes for this crate only: the conventional commits that touched its
-      # directory since its own previous tag.
+      # The conventional commits since the previous release tag.
       - name: Create draft GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.plan.outputs.tag }}
-          CRATE: ${{ steps.plan.outputs.crate }}
-          DIR: ${{ steps.plan.outputs.dir }}
           PRERELEASE: ${{ steps.plan.outputs.prerelease }}
           DECDN_REF: ${{ steps.decdn.outputs.ref }}
         run: |
           set -euo pipefail
           NOTES="$RUNNER_TEMP/release-notes.md"
-          git cliff --latest --strip header \
-            --tag-pattern "^${CRATE}-v[0-9]" \
-            --include-path "${DIR}/**" > "$NOTES"
-          # A release can carry no change of its own (a dependency or decdn pin
-          # bump), so empty notes say so rather than failing the release.
+          # cliff.toml's tag_pattern bounds `--latest` at the previous `v` tag.
+          git cliff --latest --strip header > "$NOTES"
+          # Empty notes say so rather than failing the release.
           if [ ! -s "$NOTES" ]; then
-            printf "No conventional commits under \`%s\` since the previous %s release.\n" \
-              "$DIR" "$CRATE" > "$NOTES"
+            echo "No conventional commits since the previous release." > "$NOTES"
           fi
           # GitHub caps a release body at 125000 characters; leave room for the
           # lines below and the pin block upload-assets appends.
@@ -271,7 +255,6 @@ jobs:
   build:
     name: Build ${{ matrix.binary }} ${{ matrix.target }}
     needs: release
-    if: needs.release.outputs.archives != '0'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -323,7 +306,6 @@ jobs:
   upload-assets:
     name: Upload release assets
     needs: [release, build]
-    if: needs.release.outputs.archives != '0'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -358,12 +340,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.release.outputs.tag }}
 
-      # decdn-sponsored only: its release is the one the onramp's installers
-      # pin. Everything below the marker is rewritten, so a re-run replaces the
-      # block instead of appending a second one. CRs are stripped first: notes
-      # edited in the web UI come back with CRLF line endings.
+      # The onramp's installers pin a release by its tag and this SHA256SUMS,
+      # from which they fetch decdn-sponsored. Everything below the marker is
+      # rewritten, so a re-run replaces the block instead of appending a second
+      # one. CRs are stripped first: notes edited in the web UI come back with
+      # CRLF line endings.
       - name: Add the onramp pin to the release notes
-        if: needs.release.outputs.onramp_pin == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -387,20 +369,23 @@ jobs:
           } >> notes.md
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
 
-  # The servers' releases carry an image, named after the binary and its
-  # Dockerfile target (release_plan.py; check-image-name.sh holds the
-  # Dockerfile, security.yml and sign-release.sh in step with it).
+  # One image per server, named after its binary and its Dockerfile target
+  # (release_plan.py; check-image-name.sh holds the Dockerfile, security.yml
+  # and sign-release.sh in step with it).
   docker:
-    name: Docker image (${{ needs.release.outputs.image }})
+    name: Docker image (${{ matrix.image }})
     needs: [release, build]
-    if: needs.release.outputs.image != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.release.outputs.images_json) }}
     env:
-      NAME: ${{ needs.release.outputs.image }}
-      IMAGE: ghcr.io/${{ github.repository_owner }}/${{ needs.release.outputs.image }}
+      NAME: ${{ matrix.image }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -410,18 +395,23 @@ jobs:
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - name: Download the Linux archives
+      # By exact name: a `sponsord-*` pattern would also match the onramp's.
+      - name: Download the x86_64 Linux archive
         uses: actions/download-artifact@v8
         with:
-          pattern: ${{ needs.release.outputs.image }}-*-unknown-linux-gnu
+          name: ${{ matrix.image }}-x86_64-unknown-linux-gnu
           path: archives
-          merge-multiple: true
+      - name: Download the aarch64 Linux archive
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.image }}-aarch64-unknown-linux-gnu
+          path: archives
 
       # The images copy the release binaries, so what runs in a container is
       # byte-for-byte what SHA256SUMS covers.
       - name: Unpack archives into dist/
         env:
-          BINARY: ${{ needs.release.outputs.image }}
+          BINARY: ${{ matrix.image }}
           VERSION: ${{ needs.release.outputs.version }}
         run: |
           set -euo pipefail

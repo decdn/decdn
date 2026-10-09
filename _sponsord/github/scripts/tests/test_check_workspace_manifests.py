@@ -1,10 +1,10 @@
 """Regression tests for the workspace-manifest checker.
 
-Each crate is versioned on its own, so a member that inherits a workspace
-`version` (or a stale alias version) ships the wrong number; a member without
-`[lints] workspace = true` compiles green under default lint levels. Neither has a warning, so the only
-thing standing between the mistake and a tag is this check — and a bug here is
-a quiet false pass.
+The workspace is released under one version, so a member that restates its
+own `version` (or a stale alias version) ships the wrong number; a member
+without `[lints] workspace = true` compiles green under default lint levels.
+Neither has a warning, so the only thing standing between the mistake and a
+tag is this check — and a bug here is a quiet false pass.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ _spec.loader.exec_module(cwm)
 PUBLISHABLE = """\
 [package]
 name = "{name}"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -50,7 +50,7 @@ workspace = true
 PRIVATE = """\
 [package]
 name = "{name}"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -101,6 +101,7 @@ def write_root(
         "[workspace]\n"
         f"members = [{members_toml}]\n\n"
         "[workspace.package]\n"
+        f'version = "{version}"\n'
         'edition = "2024"\n'
         'license = "MIT"\n'
         'rust-version = "1.95.0"\n'
@@ -190,7 +191,7 @@ def test_private_member_is_exempt_from_registry_metadata(tmp_path):
     assert cwm.check(repo) == []
 
 
-def test_internal_alias_version_must_match_the_member_version(tmp_path):
+def test_internal_alias_version_must_match_the_workspace_version(tmp_path):
     repo = build_repo(tmp_path)
     write_root(
         repo,
@@ -205,31 +206,18 @@ def test_internal_alias_version_must_match_the_member_version(tmp_path):
     assert "0.0.0" in errors[0]
 
 
-def test_members_may_carry_different_versions(tmp_path):
-    """Independent versioning: the alias follows its own member, not a sibling."""
-    repo = build_repo(tmp_path)
-    write_root(
-        repo,
-        version="0.0.0",
-        members=["crates/core", "crates/cli"],
-        internal={"demo-core": ("crates/core", "0.3.0")},
-    )
-    core = repo / "crates/core/Cargo.toml"
-    core.write_text(core.read_text().replace('version = "0.0.0"', 'version = "0.3.0"', 1))
-    assert cwm.check(repo) == []
-
-
 @pytest.mark.parametrize("private", [False, True], ids=["publishable", "private"])
-def test_member_inheriting_a_version_is_an_error(tmp_path, private):
+def test_member_restating_a_version_is_an_error(tmp_path, private):
+    """Even the workspace's own number: it would not move with the next release."""
     repo = build_repo(tmp_path)
     manifest = private_cli(repo) if private else repo / "crates/core/Cargo.toml"
     manifest.write_text(
-        manifest.read_text().replace('version = "0.0.0"', "version.workspace = true", 1)
+        manifest.read_text().replace("version.workspace = true", 'version = "0.0.0"', 1)
     )
     errors = cwm.check(repo)
-    assert any(
-        str(manifest.relative_to(repo)) in e and "own string" in e for e in errors
-    ), errors
+    assert len(errors) == 1, errors
+    assert str(manifest.relative_to(repo)) in errors[0]
+    assert "version.workspace = true" in errors[0]
 
 
 def test_depended_upon_member_without_an_alias_is_an_error(tmp_path):
@@ -372,14 +360,13 @@ def test_alias_path_that_is_not_a_member_is_an_error(tmp_path):
     assert any("crates/kore" in e and "not a workspace member" in e for e in errors), errors
 
 
-def test_workspace_package_version_is_an_error(tmp_path):
-    """Nothing to inherit: a workspace version would only invite `version.workspace`."""
+def test_workspace_without_a_version_is_an_error(tmp_path):
+    """Nothing for the members to inherit, so cargo would refuse the manifests."""
     repo = build_repo(tmp_path)
     root = repo / "Cargo.toml"
-    root.write_text(root.read_text().replace('edition = "2024"', 'version = "0.0.0"\nedition = "2024"', 1))
+    root.write_text(root.read_text().replace('version = "0.0.0"\nedition', "edition", 1))
     errors = cwm.check(repo)
-    assert len(errors) == 1, errors
-    assert "[workspace.package]" in errors[0] and "version" in errors[0]
+    assert any("[workspace.package]" in e and "no `version`" in e for e in errors), errors
 
 
 def test_member_without_a_manifest_is_an_error(tmp_path):

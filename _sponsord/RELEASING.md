@@ -1,9 +1,10 @@
 # Releasing sponsord
 
-Each crate is versioned and released on its own: `sponsord-api`,
-`sponsord-core`, `sponsord`, `sponsord-onramp` and `decdn-sponsored` each
-carry their own version and are released from their own `<crate>-vX.Y.Z` tags. Releasing one never bumps,
-rebuilds or republishes another.
+The workspace is released as a whole: `sponsord-api`, `sponsord-core`,
+`sponsord`, `sponsord-onramp` and `decdn-sponsored` share one version
+(`[workspace.package]` in the root `Cargo.toml`) and are released together,
+from one `vX.Y.Z` tag, as decdn's crates are. A release with no change to a
+crate still carries it at the new version.
 
 Releases are cut locally and signed with a maintainer's own GPG key, the same
 way decdn's are. CI builds the artifacts but signs nothing and publishes
@@ -13,30 +14,31 @@ secrets.
 A release is three commands with a CI build between the first two:
 
 ```bash
-cargo release -p decdn-sponsored patch --execute       # cut, sign and push the tag
+cargo release patch --execute                  # cut, sign and push the tag
 # ...wait for the tag-push run to finish...
-.github/scripts/sign-release.sh decdn-sponsored-v0.1.2  # verify, sign, tag images, publish
-.github/scripts/publish-crates.sh decdn-sponsored-v0.1.2  # publish the crate to crates.io
-# decdn-sponsored only: pin it in the onramp (ONRAMP_CLI_RELEASE / _SUMS_SHA256)
+.github/scripts/sign-release.sh v0.1.2         # verify, sign, tag images, publish
+.github/scripts/publish-crates.sh v0.1.2       # publish every crate to crates.io
+# then pin it in the onramp (ONRAMP_CLI_RELEASE / _SUMS_SHA256)
 ```
 
-## What each crate's release carries
+## What a release carries
 
 [`.github/scripts/release_plan.py`](.github/scripts/release_plan.py) is the one
-table the workflow and both scripts read:
+table the workflow and both scripts read. Every `vX.Y.Z` release carries all
+of it:
 
-| Tag | Archives (+ `SHA256SUMS`) | Image | crates.io |
+| Crate | Archives (one `SHA256SUMS` covers all 10) | Image | crates.io |
 |---|---|---|---|
-| `decdn-sponsored-vX.Y.Z` | `decdn-sponsored` for Linux, macOS and Windows, x86_64 and aarch64 each (6) | — | yes |
-| `sponsord-vX.Y.Z` | `sponsord` for Linux, x86_64 and aarch64 (2) | `sponsord` | yes |
-| `sponsord-onramp-vX.Y.Z` | `sponsord-onramp` for Linux, x86_64 and aarch64 (2) | `sponsord-onramp` | yes |
-| `sponsord-core-vX.Y.Z` | — (library; the release carries notes only) | — | yes |
-| `sponsord-api-vX.Y.Z` | — (library; the release carries notes only) | — | yes |
+| `decdn-sponsored` | Linux, macOS and Windows, x86_64 and aarch64 each (6) | — | yes |
+| `sponsord` | Linux, x86_64 and aarch64 (2) | `sponsord` | yes |
+| `sponsord-onramp` | Linux, x86_64 and aarch64 (2) | `sponsord-onramp` | yes |
+| `sponsord-core` | — (library) | — | yes |
+| `sponsord-api` | — (library) | — | yes |
 
 **The archive names are a contract.** The installers the onramp serves fetch
-`<binary>-<version>-<target>.tar.gz` (`.zip` on Windows) from a
-`decdn-sponsored` release and look it up in its `SHA256SUMS`, with the binary
-at the archive root. Renaming either breaks every installer already served.
+`<binary>-<version>-<target>.tar.gz` (`.zip` on Windows) from a release and
+look it up in its `SHA256SUMS`, with the binary at the archive root. Renaming
+either breaks every installer already served.
 
 ## One-time setup
 
@@ -69,12 +71,13 @@ at the archive root. Renaming either breaks every installer already served.
    only need GHCR.
 
 5. **A crates.io token.** `cargo login`, with a token scoped to publish-update
-   (and publish-new for a crate's first release).
+   (and publish-new for the first release).
 
-6. **Repository protection.** Protect the release tags (`sponsord-api-v*`,
-   `sponsord-core-v*`, `sponsord-v*`, `sponsord-onramp-v*`,
-   `decdn-sponsored-v*`) and the `main`
-   branch (a ruleset). Without tag protection, anyone with push access can
+6. **Repository protection.** Protect the release tags (`v*`) and the `main`
+   branch (a ruleset). `cargo release` pushes its release commit straight to
+   `main`, so whoever cuts a release must be able to bypass the `main`
+   ruleset's pull-request rule (an organization admin, today); otherwise the
+   push is refused after the tag is signed. Without tag protection, anyone with push access can
    create a release tag, and a `push`-triggered workflow runs the workflow
    definition *from the pushed ref*, so a tag can carry a `release.yml` with
    the signature gate deleted. The gate reads `KEYS` from `origin/main`
@@ -122,21 +125,28 @@ To lock a decdn release for crates.io, point the aliases at its tag for the
 update (`tag = "v0.1.0"` in place of `branch = "main"`), run the same
 commands, and keep the tag there while sponsord ships against that release.
 
-Land the move as its own PR before cutting releases against it, with a
+Land the move as its own PR before cutting a release against it, with a
 changelog entry naming the new decdn commit in every crate it reaches.
 
 ## Cutting a version
 
-`cargo release -p <crate> <patch|minor|major> --execute` does all of the
-following for that one crate, driven by [`release.toml`](release.toml):
+`cargo release <patch|minor|major> --execute` does all of the following for
+the whole workspace, driven by [`release.toml`](release.toml):
 
-- bumps the crate's own `version`, and if another crate depends on it, the
-  `version` on its `[workspace.dependencies]` alias
-  (`dependent-version = "upgrade"`) — the dependents themselves are not
-  re-released
-- commits as `chore(release): <crate> v<version>`, **signed**
-- tags `<crate>-v<version>`, **signed**
+- bumps `version` in `[workspace.package]`, which every crate inherits, and
+  the `version` on each internal `[workspace.dependencies]` alias
+  (`dependent-version = "upgrade"`)
+- opens a `## [<version>] - <date>` heading under `## [Unreleased]` in every
+  crate's `CHANGELOG.md`, so the entries gathered there become the release's
+- rewrites `info.version` in `docs/openapi/*.json`, which carry
+  `sponsord-api`'s version and are snapshot-tested against it
+  (`crates/sponsord-api/Cargo.toml`, `[package.metadata.release]`)
+- commits as `chore(release): v<version>`, **signed**
+- tags `v<version>`, **signed**
 - pushes both to `origin`
+
+`sponsord-e2e` inherits the version but is never released
+(`release = false` in its manifest).
 
 `release.toml` sets `publish = false`, so this step uploads nothing: it runs
 before CI has built anything and before anyone has verified anything, the
@@ -145,28 +155,15 @@ later `publish-crates.sh` step.
 
 Cut from `main`, with a clean tree and CI green on the commit you are tagging.
 
-**A crate's first release** is the version it already carries (every crate
-starts at `0.1.0`), so it takes no bump level:
-`cargo release -p <crate> --execute` tags the current version as-is, with no
-commit. Every later release names its level.
-
-**Order across crates.** When a change spans crates, release the dependency
-first, so its version is on crates.io when the dependent publishes:
-`sponsord-api` first (every other crate depends on it), then `sponsord-core`,
-then `sponsord`. `sponsord-onramp` and `decdn-sponsored` depend only on
-`sponsord-api`.
-
-**`sponsord-api` carries the OpenAPI documents' version.** Releasing it
-changes `docs/openapi/*.json`: regenerate them in the release PR with
-`UPDATE_OPENAPI=1 cargo test -p sponsord-api --test openapi`, or CI fails the
-snapshot test. `publish-crates.sh`
-refuses a crate whose sibling dependency is not on crates.io yet, and says
-which release to publish first.
+**The first release** is the version the workspace already carries (`0.1.0`),
+so it takes no bump level: `cargo release --execute` releases the current
+version without bumping it; its commit carries only the changelog headings.
+Every later release names its level.
 
 To preview without changing anything, drop `--execute`:
 
 ```bash
-cargo release -p sponsord patch --no-confirm
+cargo release patch --no-confirm
 ```
 
 Dry-run is cargo-release's default, so the preview writes nothing and needs no
@@ -175,12 +172,13 @@ cleanup.
 ## Changelogs
 
 Each crate keeps its own `crates/<dir>/CHANGELOG.md`, maintained by hand, one
-entry per PR that changes it ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/)).
-`cargo release` does **not** touch it — move the `[Unreleased]` entries under
-the new version as part of the PR before the cut. git-cliff only generates the
-GitHub release notes: the conventional commit subjects that touched the crate's
-directory since its previous tag (the `pr-title` check keeps squash-merge
-subjects conventional; others are left out).
+entry per PR that changes it, under `## [Unreleased]`
+([Keep a Changelog](https://keepachangelog.com/en/1.1.0/)). `cargo release`
+opens the version heading above those entries in every crate's file, so a
+crate with nothing new gets an empty heading: that version changed nothing in
+it. git-cliff only generates the GitHub release notes: the conventional commit
+subjects since the previous release tag (the `pr-title` check keeps
+squash-merge subjects conventional; others are left out).
 
 - Entries group under **Changed (BREAKING)**, **Added**, **Changed**,
   **Fixed**, **Removed**, **Security**, each a bullet that opens with a bold
@@ -199,29 +197,28 @@ Pushing a release tag starts
 [`.github/workflows/release.yml`](.github/workflows/release.yml), which:
 
 1. rejects the tag unless `release_plan.py` reads it as
-   `<crate>-vMAJOR.MINOR.PATCH[-pre]` for a known crate (the trigger globs are
-   looser than they look — `sponsord-v0$(whoami)` matches them);
+   `vMAJOR.MINOR.PATCH[-pre]` (the trigger glob is looser than it looks —
+   `v0$(whoami)` matches it);
 2. imports `KEYS` **from `origin/main`** and refuses the tag if it is not
    signed by a key published there;
-3. checks the crate's version matches the tag, and runs `check-decdn-pin`;
+3. checks every crate's version matches the tag, and runs `check-decdn-pin`;
 4. re-runs `cargo fmt`, clippy and the test suite on the whole workspace;
-5. runs `cargo semver-checks` on the crate's public API (default features)
-   against the crate's highest release below the tag, which must carry a
-   signature from `KEYS`, and fails if the change needs a bigger bump than the
-   version says (in 0.x, a breaking change needs a minor bump). "Below" is in
-   semver order, so a re-run after a newer release, or a maintenance release,
-   never compares against a newer version. A crate's first release has no
-   baseline and skips it. To run it before tagging, use
-   `cargo semver-checks -p <crate> --baseline-rev "$(.github/scripts/release_plan.py <tag> --baseline)" --default-features`;
-6. creates the GitHub Release as a **draft**, with git-cliff notes for that
-   crate and the locked decdn commit it was built against;
-7. builds the crate's archives and a `SHA256SUMS` manifest, asserting all of
-   them are present, and for `decdn-sponsored` appends the onramp pin values to
-   the notes;
-8. for a server, assembles its multi-arch image from those archives — it does
-   not compile from source, so the image's binary is byte-identical to the
-   archived one — and pushes the manifest **untagged**, attaching the SBOM and
-   `<image>-image-digest.txt`.
+5. runs `cargo semver-checks --workspace` on every published crate's public
+   API (default features) against the highest release below the tag, which
+   must carry a signature from `KEYS`, and fails if a change needs a bigger
+   bump than the version says (in 0.x, a breaking change needs a minor bump).
+   "Below" is in semver order, so a re-run after a newer release, or a
+   maintenance release, never compares against a newer version. The first
+   release has no baseline and skips it. To run it before tagging, use
+   `cargo semver-checks --workspace --baseline-rev "$(.github/scripts/release_plan.py <tag> --baseline)" --default-features`;
+6. creates the GitHub Release as a **draft**, with git-cliff notes and the
+   locked decdn commit it was built against;
+7. builds all 10 archives and one `SHA256SUMS` manifest, asserting all of them
+   are present, and appends the onramp pin values to the notes;
+8. for each server, assembles its multi-arch image from those archives — it
+   does not compile from source, so the image's binary is byte-identical to
+   the archived one — and pushes the manifest **untagged**, attaching the SBOM
+   and `<image>-image-digest.txt`.
 
 One check decdn's release run has is absent here: `cargo publish --dry-run`
 resolves the decdn crates from crates.io, where they may not be yet, so it
@@ -235,27 +232,27 @@ nothing resolves by name until the release is signed.
 Once the run is green:
 
 ```bash
-.github/scripts/sign-release.sh sponsord-v0.1.2
+.github/scripts/sign-release.sh v0.1.2
 ```
 
 It resolves your signing key to a fingerprint and confirms it is published in
 `KEYS`; force-fetches tags and checks your local tag matches `origin`'s;
-verifies the tag signature; then, for what the crate's release carries:
+verifies the tag signature; then:
 
 - **archives:** downloads them, checks `SHA256SUMS` strictly against them,
   that every published archive appears in it, **and** that the release carries
-  exactly the number of archives the crate ships, then signs `SHA256SUMS`;
-- **an image:** validates `<image>-image-digest.txt`, signs it and the SBOM,
-  promotes `:latest`, `:<version>` and `:<major>.<minor>` from the signed
-  digest on GHCR, and mirrors that digest to Docker Hub;
-- **nothing (`sponsord-core`):** the signed tag is the attestation.
+  exactly the 10 archives the plan lists, then signs `SHA256SUMS`;
+- **each image:** validates `<image>-image-digest.txt`, signs it and the SBOM,
+  promotes `:<version>` and `:<major>.<minor>` from the signed digest on
+  GHCR, and `:latest` too unless a higher release exists, then mirrors that
+  digest to Docker Hub.
 
 Every signature is verified against a keyring built only from `KEYS` before
-the `.asc` files are uploaded. Last, it takes the release out of draft; only
-stable `decdn-sponsored` releases become the repository's "Latest release", the
-CLI being what users install.
+the `.asc` files are uploaded. Last, it takes the release out of draft; a
+stable release with no higher stable release above it becomes the
+repository's "Latest release", so a maintenance release never takes it.
 
-The image's version tags are the server crate's own version. The mirror is a
+The images' version tags are the release's version. The mirror is a
 manifest copy, not a rebuild (`docker buildx imagetools create`), so
 `docker.io/decdn/<image>` and `ghcr.io/decdn/<image>` serve one identical
 digest and one signature covers both. The script re-reads every tag afterwards
@@ -272,29 +269,30 @@ and refuses to publish if any resolves to a different digest.
 The skip variables take `1`/`true`/`yes` or `0`/`false`/`no`; anything else is
 rejected rather than guessed.
 
-A prerelease (`sponsord-v1.2.0-rc.1`) is drafted as a GitHub prerelease, is
+A prerelease (`v1.2.0-rc.1`) is drafted as a GitHub prerelease, is
 never the repository's "Latest release", and gets only its exact version image
 tag: moving `latest` to a candidate would hand it to every unpinned pull.
 
 Re-running is safe at any point before the release is published. Once it is
 out of draft the script refuses to run again.
 
-## Pinning a `decdn-sponsored` release in the onramp
+## Pinning a release in the onramp
 
 Signing adds `SHA256SUMS.asc` beside `SHA256SUMS` and changes nothing else, so
 the values the workflow appended to the release notes stay valid. Set them on
 the onramp to make its installers serve the release:
 
 ```bash
-ONRAMP_CLI_RELEASE=decdn-sponsored-v0.1.2
+ONRAMP_CLI_RELEASE=v0.1.2
 ONRAMP_CLI_SUMS_SHA256=<from the release notes>
 ```
 
-The onramp refuses a CLI pin that is not `decdn-sponsored-vX.Y.Z`, and
-passes the installers the version alongside the tag, so they fetch
-`decdn-sponsored-0.1.2-<target>.*`. `decdn` releases are pinned the same way
-with decdn's own `vX.Y.Z` tags (`ONRAMP_DECDN_RELEASE`, and
-`ONRAMP_DECDN_SUMS_SHA256` = the SHA-256 of that release's `SHA256SUMS`).
+The onramp refuses a pin that is not `vX.Y.Z`, and passes the installers the
+version alongside the tag, so they fetch `decdn-sponsored-0.1.2-<target>.*`.
+`decdn` releases are pinned the same way with decdn's own `vX.Y.Z` tags
+(`ONRAMP_DECDN_RELEASE`, and `ONRAMP_DECDN_SUMS_SHA256` = the SHA-256 of that
+release's `SHA256SUMS`). Both pins share the form, so check which repository's
+release notes each value came from.
 
 Users who already installed keep their CLI until they re-run the installer.
 When a release changes what the onramp and the CLI exchange, set
@@ -306,31 +304,32 @@ tell their users to re-run it.
 Last, once the GitHub Release is out of draft:
 
 ```bash
-.github/scripts/publish-crates.sh sponsord-v0.1.2
+.github/scripts/publish-crates.sh v0.1.2
 ```
 
 It verifies the tag against `KEYS` and against `origin` the way
-`sign-release.sh` does, and requires the release to be published **and**, for a
-crate with archives, to carry `SHA256SUMS.asc`. It then lists the crate's path
-and git dependencies that survive into the uploaded manifest
-([`registry_deps.py`](.github/scripts/registry_deps.py)) and requires each on
-crates.io at the version it needs:
-
-- a **sibling** (`sponsord-api` for every other crate; `sponsord-core` for
-  `sponsord`) — publish its release first;
-- the **decdn** crates — the decdn commit `Cargo.lock` locks at the tag must
-  be decdn's `v<version>` tag, and that release must be on crates.io. Until it
-  is, the crates that link decdn (`sponsord-core`, `sponsord`,
-  `decdn-sponsored`) stop here, with nothing uploaded.
+`sign-release.sh` does, and requires the release to be published **and** to
+carry `SHA256SUMS.asc`. It then lists the decdn crates the uploaded manifests
+require ([`registry_deps.py`](.github/scripts/registry_deps.py)): the decdn
+commit `Cargo.lock` locks at the tag must be decdn's `v<version>` tag, and that
+release must be on crates.io. Until it is, the script stops there, with
+nothing uploaded. The sibling crates need no such check: they go up in the
+same run.
 
 It then makes a detached worktree of this repo at the tag and publishes from
-there — not from your working copy.
-After `cargo publish -p <crate> --dry-run` it asks you to type the version to
-confirm, publishes, and confirms crates.io serves it.
+there — not from your working copy. It checks every publishable crate is at
+the tag's version, and refuses if more than 5 of them are new to crates.io
+(the publish-new rate limit would stop the run partway; set
+`SPONSORD_ALLOW_RATE_LIMIT=1` once crates.io has raised it). After
+`cargo publish --workspace --dry-run` it asks you to type the version to
+confirm, publishes every crate in dependency order, and confirms crates.io
+serves each.
 
-**This step is not re-runnable once the upload succeeds.** A published version
-is immutable. A failure here does not invalidate the release: the GitHub
-Release, signatures and image stand on their own.
+**This step is not re-runnable once an upload succeeds.** A published version
+is immutable. If it fails partway, the crates already uploaded stay uploaded;
+the script prints which to check and how to publish the rest by hand. A
+failure here does not invalidate the release: the GitHub Release, signatures
+and images stand on their own.
 
 ### Crate ownership
 
@@ -350,9 +349,9 @@ the tag is on `origin` and an untagged image manifest may exist. Delete the
 draft and the tag, fix the problem, and cut again:
 
 ```bash
-gh release delete sponsord-v0.1.2 --yes
-git push --delete origin sponsord-v0.1.2
-git tag -d sponsord-v0.1.2
+gh release delete v0.1.2 --yes
+git push --delete origin v0.1.2
+git tag -d v0.1.2
 ```
 
 The version-bump commit is already on `origin/main` (`push = true`). Either
@@ -362,8 +361,8 @@ which you did.
 Re-running the workflow on the same tag is also fine: draft creation and the
 asset uploads are idempotent, and it refuses to touch a published release.
 
-**The crate is already on crates.io.** The version is spent. Do not delete the
-tag. `cargo yank` it and cut the crate's next patch version.
+**A crate is already on crates.io.** The version is spent. Do not delete the
+tag. `cargo yank` what was published and cut the next patch version.
 
 ## Verifying a release as a consumer would
 

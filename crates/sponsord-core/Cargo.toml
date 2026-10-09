@@ -2,7 +2,7 @@
 name = "sponsord-core"
 description = "Library core of sponsord, deCDN's sponsored on-ramp: capability signing and pool top-ups, for embedding"
 readme = "README.md"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

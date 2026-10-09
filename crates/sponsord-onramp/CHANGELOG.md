@@ -1,11 +1,13 @@
 # Changelog
 
-<!-- Maintained by hand, one entry per PR that changes this crate. `cargo
-     release` does NOT rewrite this file; git-cliff only generates the GitHub
-     release notes. Conventions: RELEASING.md § Changelogs. -->
+<!-- Maintained by hand, one entry per PR that changes this crate, under
+     [Unreleased]. `cargo release` only opens the version heading above those
+     entries; git-cliff generates the GitHub release notes. Conventions:
+     RELEASING.md § Changelogs. -->
 
-All notable changes to `sponsord-onramp` are documented in this file. It is
-versioned and released on its own, from `sponsord-onramp-vX.Y.Z` tags.
+All notable changes to `sponsord-onramp` are documented in this file. It shares
+one version with every sponsord crate, released together from `vX.Y.Z`
+tags; a release with no entry here changed nothing in this crate.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the crate follows [Semantic Versioning](https://semver.org/) from its first
@@ -18,11 +20,10 @@ release.
 - **API under `/v1`.** `POST /v1/fund` (body `{"client", "proof"}`; was
   `turnstile_token`) and `GET /v1/capability`. `captcha_failed` is now
   `gate_failed`.
-- **The CLI pin names the crate.** `ONRAMP_WRAPPER_RELEASE` /
-  `_SUMS_SHA256` are `ONRAMP_CLI_RELEASE` / `_SUMS_SHA256`, and the tag is
-  `decdn-sponsored-vX.Y.Z` (a bare `vX.Y.Z` is refused). `ONRAMP_DECDN_RELEASE`
-  keeps decdn's `vX.Y.Z`. The installers take each version from the onramp, so
-  archive names are unchanged.
+- **`ONRAMP_WRAPPER_RELEASE` is `ONRAMP_CLI_RELEASE`**, and
+  `ONRAMP_WRAPPER_SUMS_SHA256` is `ONRAMP_CLI_SUMS_SHA256`. The tag is a
+  sponsord release, `vX.Y.Z`, as `ONRAMP_DECDN_RELEASE` is decdn's. The installers take each version from the
+  onramp, so archive names are unchanged.
 - **`ONRAMP_PUBLIC_URL` is required.** It no longer defaults to decdn's own
   onramp. URLs baked into the installers and the Turnstile sitekey are
   validated at startup, and `ONRAMP_PUBLIC_URL` and `ONRAMP_RELEASES_BASE`
@@ -52,8 +53,8 @@ release.
 - **Container image.** `ghcr.io/decdn/sponsord-onramp` (mirrored to
   `decdn/sponsord-onramp` on Docker Hub), amd64 and arm64; binds
   `0.0.0.0:8080`, runs as uid 1000, keeps nothing on disk.
-- **Release metadata.** Versioned and released on its own
-  (`sponsord-onramp-vX.Y.Z`), with crates.io metadata, dual-licensed MIT OR
+- **Release metadata.** Released with every sponsord crate under one
+  version (`vX.Y.Z`), with crates.io metadata, dual-licensed MIT OR
   Apache-2.0.
 
 ### Changed

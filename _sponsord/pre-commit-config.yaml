@@ -72,11 +72,11 @@ repos:
         files: '^(rust-toolchain\.toml|Cargo\.toml|\.github/(workflows|actions)/.*\.ya?ml|\.github/scripts/check[-_]toolchain[-_]pin\.(py|sh))$'
         pass_filenames: false
 
-      # Each crate is versioned on its own: a member that inherits a version, or
-      # an alias that lags its member, ships the wrong number; one without
-      # `[lints] workspace = true` runs under default lint levels.
+      # Every crate shares the workspace version: a member that restates its
+      # own, or an alias that lags the workspace, ships the wrong number; one
+      # without `[lints] workspace = true` runs under default lint levels.
       - id: workspace-manifests
-        name: every member carries its own version and inherits the lints
+        name: every member inherits the version and the lints
         entry: .github/scripts/check-workspace-manifests.sh
         language: system
         files: '^(Cargo\.toml|crates/[^/]+/Cargo\.toml|\.github/scripts/check[-_]workspace[-_]manifests\.(py|sh))$'

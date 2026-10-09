@@ -2,7 +2,7 @@
 name = "sponsord"
 description = "deCDN sponsorship daemon: signs capped, expiring capabilities against a PaymentPool and keeps it topped up"
 readme = "README.md"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

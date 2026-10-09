@@ -89,7 +89,8 @@ jobs:
           # A gh failure fails the step; only an empty answer means "none yet".
           tags=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 \
             --exclude-drafts --exclude-pre-releases --json tagName --jq '.[].tagName')
-          if grep -qE "^${NAME}-v[0-9]" <<<"$tags"; then
+          # Every `vX.Y.Z` release carries both images.
+          if grep -qE "^v[0-9]" <<<"$tags"; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
