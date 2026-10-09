@@ -2288,8 +2288,8 @@ pub(crate) struct MultiLane<'a> {
 }
 
 /// Build a probe target for a discovered candidate: its `node_id`, an optional
-/// relay hint, and its registry multiaddrs as direct-address hints so a
-/// reachable node is probed relay-free (ADR 001 § Node Discovery).
+/// relay hint, and its registry multiaddrs as direct-address hints (ADR 001 §
+/// Node Discovery). See [`lane_target`] for why both ride the first packet.
 fn probe_target(cand: &NodeCandidate, relay: Option<RelayUrl>) -> EndpointAddr {
     let mut target = EndpointAddr::new(cand.node_id);
     if let Some(url) = relay {
@@ -2302,6 +2302,13 @@ fn probe_target(cand: &NodeCandidate, relay: Option<RelayUrl>) -> EndpointAddr {
 /// `addr` when the user gave one (`--addr`, which requires `--node-id`), the
 /// first configured relay hint, and its registry multiaddrs as direct-address
 /// hints (ADR 001 § Node Discovery).
+///
+/// iroh sends the first handshake packet to every path the target carries, so
+/// the relay hint and the direct addresses race from the start: a reachable
+/// node settles on the direct path, and a node behind NAT connects over the
+/// relay with no wait for the pkarr lookup. A hint that names a relay other
+/// than the node's home relay drops its packets, and the lookup supplies the
+/// right one.
 pub(crate) fn lane_target(
     candidate: &NodeCandidate,
     addr: Option<std::net::SocketAddr>,
