@@ -1745,7 +1745,7 @@ struct ChainPoolRow {
 
 /// Wire spelling of a `getPool` status, matching the lowercase vocabulary the
 /// rest of the `pool` output uses.
-const fn status_label(status: PaymentPool::Status) -> &'static str {
+pub(crate) const fn status_label(status: PaymentPool::Status) -> &'static str {
     match status {
         PaymentPool::Status::Open => "open",
         PaymentPool::Status::Closing => "closing",

@@ -79,6 +79,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_rejected_load_shed_miss_total",
     "decdn_serve_stream_rejected_origin_denied_total",
     "decdn_serve_stream_rejected_owner_mismatch_total",
+    "decdn_serve_stream_rejected_pool_closing_total",
     "decdn_serve_stream_rejected_pool_unconfirmed_total",
     "decdn_serve_stream_rejected_pull_loop_guard_total",
     "decdn_serve_stream_rejected_range_not_satisfiable_total",
@@ -1094,23 +1095,6 @@ pub struct DecdnMetrics {
     /// and that then probes origin-directory candidates, records two (#2195).
     #[default(Histogram::new(PROBE_COLLECTION_BUCKETS.to_vec()))]
     pub probe_collection_latency_seconds: Histogram,
-    /// `decdn_probe_post_eviction_failures_total` (ADR 001 §Probe cache,
-    /// ADR 005 §`EvictedSinceProbe` semantics; #1165): an upstream answered
-    /// `StreamError::EvictedSinceProbe` — it held the blob when it signed
-    /// `has_blob: true` and lost it to cache pressure before we opened the
-    /// stream.
-    ///
-    /// ADR 001 mandates tracking this rate; ADR 005 says why it matters more than
-    /// "a candidate failed": a node using probe-triggered eviction holds
-    /// correctly should *rarely* emit this, because a held blob is invisible to
-    /// the LRU driver. A sustained rate above ~1% therefore indicates a remote
-    /// hold-mechanism FAILURE — an implementation bug or resource exhaustion —
-    /// not a budget-configuration issue, which would surface as `has_blob: false`
-    /// at probe time and never reach a stream request.
-    ///
-    /// Narrower than the `RefusalVerdict::DurableMiss` arm that fires it, which
-    /// also covers `BlobTooLarge` — hence `DurableMissCause`.
-    pub probe_post_eviction_failures: Counter,
     /// `decdn_dht_lookup_round_ceiling_total` (#1145 review): a `find_providers` lookup was
     /// TRUNCATED at `MAX_LOOKUP_ROUNDS` while still finding closer nodes.
     ///
@@ -1287,32 +1271,27 @@ pub struct DecdnMetrics {
     pub node_pull_pool_wedged: Counter,
     /// `decdn_node_pull_refused_total` (#1144): a selected upstream refused
     /// delivery up front (a `StreamResponse` with `ok == false`). Counts every
-    /// wire code, including the `InternalError` that DOES tar the provider's
-    /// reputation — so this is a refusal counter, not an exoneration counter, and
-    /// it is deliberately not split by code (a labeled series would need a `Family`,
-    /// and a per-code counter set is not yet worth five more series). Most refusals
+    /// wire class, and none of them tars the provider's reputation. It is not
+    /// split by class (a labeled series would need a `Family`). Most refusals
     /// are honest and benign: a `NotFound` is simply a healthy-but-empty node, so
     /// a sustained rate here usually means content discovery is steering this node
     /// at upstreams that do not hold the blob — not that the upstreams are bad.
     pub node_pull_refused: Counter,
     /// `decdn_node_pull_refused_unattributable_total` (#1520): the subset of
     /// [`Self::node_pull_refused`] whose wire code this node cannot pin on the
-    /// upstream — `NotFound` and `Overloaded`, i.e. `RefusalVerdict::Transient`.
+    /// upstream — `NotFound` and `Unfunded`, i.e. `RefusalVerdict::Transient`.
     /// Those briefly suppress the `(peer, hash)` pair without touching reputation,
-    /// except an open-stage refusal on a node-origin leg, which is backpressure
+    /// except an open-stage `NotFound` on a node-origin leg, which is backpressure
     /// and suppresses nothing unless it outlasts the wait budget (#2178).
     ///
     /// Split out because it is the shape a *buyer-side* misconfiguration takes:
-    /// `NotFound` is what a seller signs when it refuses OUR channel for
-    /// insufficient deposit (the reject reasons collapse deliberately, see
-    /// [`Self::serve_stream_rejected_insufficient_deposit`]), so a node whose own
-    /// deposit is too small to buy anything sees 100% of its pulls refused with
-    /// nothing in its own telemetry saying so. Before this the arm bumped no
-    /// counter at all and logged at `debug`.
+    /// `Unfunded` is what a seller signs when it refuses OUR pool for its
+    /// deposit, and `NotFound` when our signer sits at its floor cap, so a node
+    /// whose own deposit is too small to buy anything sees 100% of its pulls
+    /// refused here.
     ///
-    /// Read it with one caveat: `Transient` is `NotFound | Overloaded`, and
-    /// `Overloaded` is the PEER's backpressure — not local, and the code's own
-    /// policy is to respect rather than punish it. So a network-wide load event
+    /// Read it with one caveat: `NotFound` also carries the PEER's load shed,
+    /// which the code respects rather than punishes. So a network-wide load event
     /// drives this ratio to ~1 for a reason no local change fixes. A rate
     /// approaching `node_pull_refused` therefore means "nobody is serving me",
     /// which is *usually* local (deposit, binding) but is worth confirming against
@@ -1323,7 +1302,7 @@ pub struct DecdnMetrics {
     /// candidate was shed at the transport with `APP_ERR_RATE_LIMITED` (`0x10`,
     /// ADR 013 §Application Error Codes) — the upstream's connection limiter,
     /// probe limiter, or per-connection stream cap refused the work before any
-    /// signed message existed. The transport-level twin of an `Overloaded`
+    /// signed message existed. The transport-level twin of a load-shed `NotFound`
     /// refusal, treated the same way: NO reputation outcome is recorded, and the
     /// `(peer, hash)` pair is suppressed for the short refusal TTL except on a
     /// node-origin leg, where the shed is backpressure (#2178). So this is the
@@ -1335,8 +1314,8 @@ pub struct DecdnMetrics {
     /// lands in the unreachable counter instead of here.
     pub node_upstream_rate_limited: Counter,
     /// `decdn_node_pull_backpressure_backoffs_total` (#2178): a ranged run's
-    /// upstream refused the stream open for backpressure (`NotFound`,
-    /// `Overloaded`, or a transport rate-limit), no other candidate covered the
+    /// upstream refused the stream open for backpressure (`NotFound` or a
+    /// transport rate-limit), no other candidate covered the
     /// still-missing gap, and the assembly waited to ask the same upstream again
     /// instead of dropping it. The common cause is this node's own other pulls
     /// filling the upstream's per-signer live cap: the refusal clears as those
@@ -1445,42 +1424,31 @@ pub struct DecdnMetrics {
     /// `node_pull_progress_persist_failures_total` (a real store-write failure that leaves the
     /// watermark lagging) so ordinary settle races do not drown out a genuine persist fault.
     pub node_pull_progress_superseded: Counter,
-    /// `decdn_node_pull_reactive_topup_total` (#1530): a node→node miss pull hit its
-    /// channel's deposit ceiling mid-stream, funded the shortfall on-chain, and
-    /// resumed at the paid frontier.
+    /// `decdn_node_pull_recovery_step_total` (#1530): a node→node miss fill ran a
+    /// funding recovery step (ADR 003 § Funding recovery) that funds the next
+    /// pass: every candidate refused this node's funding, so the step topped the
+    /// buyer pool up, opened a new pool in place of one that accepts no more
+    /// funds, or settled a pool that already holds its working deposit while the
+    /// upstreams catch up.
     ///
     /// Expected to be RARE once `buyer_working_deposit_micro_usdc` is sized for the
-    /// blobs this node pulls — the proactive low-water refill should refill a
-    /// channel long before a single pull outruns it. A sustained rate means the
-    /// working deposit is too small for the blob sizes in play, and every tick is a
+    /// blobs this node pulls: the low-water refill should refill a
+    /// pool long before a fill runs it dry. A sustained rate means the working
+    /// deposit is too small for the blob sizes in play, and every tick is a
     /// transaction plus a settlement wait a client sat through.
     ///
     /// Distinct from `decdn_buyer_topup_ok_total`, which counts on-chain top-ups from
-    /// BOTH legs: this one isolates the reactive leg, so the proactive refill's
+    /// BOTH legs: this one isolates the recovery step, so the low-water refill's
     /// routine traffic cannot hide it.
-    pub node_pull_reactive_topup: Counter,
-    /// `decdn_node_pull_reactive_topup_refused_total` (#1530): a mid-pull top-up was
-    /// NOT performed, or was performed and added less than the pull asked for.
+    pub node_pull_recovery_step: Counter,
+    /// `decdn_node_pull_recovery_step_refused_total` (#1530): a fill's funding
+    /// recovery step had no way to fund the next pass: the working deposit is
+    /// zero (funding off), the top-up landed nothing, or the funding
+    /// transaction failed (allowance, revert, RPC, or a mined `topUp` the local
+    /// pool row could not credit).
     ///
-    /// Three causes, one adversarial and two operational:
-    ///
-    /// - an upstream claiming `InsufficientDeposit` while our OWN ledger still covers
-    ///   the next voucher — a lying or buggy peer trying to make us escrow more USDC
-    ///   than we owe. `genuine_exhaustion` validates every claim against our own
-    ///   accounting and we decline to fund an uncorroborated one; this counter is the
-    ///   only place that becomes visible, so a sustained rate against one provider is
-    ///   worth alerting on;
-    /// - a funding transaction that failed (allowance, revert, RPC, or a mined
-    ///   `topUp` the local pool row could not credit);
-    /// - a top-up that landed less than the requested amount, or nothing (#2012).
-    ///
-    /// The three share a counter because the pull runs short of what it asked for,
-    /// but only the first says anything about the peer. A failed funding transaction
-    /// also ticks `decdn_buyer_topup_failure_total`. A short landing ticks neither
-    /// that nor this counter's success sibling, and logs a `warn!` with the requested
-    /// and landed amounts; the pull keeps what landed and continues until that
-    /// headroom runs out.
-    pub node_pull_reactive_topup_refused: Counter,
+    /// A failed funding transaction also ticks `decdn_buyer_topup_failure_total`.
+    pub node_pull_recovery_step_refused: Counter,
     /// `decdn_node_pull_through_timeouts_total` (#831): cache-miss pull-through
     /// attempts the delivery handler abandoned at its deadline. Distinguishes a
     /// slow/wedged upstream from a genuine miss (both otherwise return
@@ -1583,8 +1551,8 @@ pub struct DecdnMetrics {
     /// Sibling of `serve_cache_partial_hit` and `serve_cache_miss`. At most one
     /// of the three is bumped per request, and two requests that reach
     /// `serve_audit` bump none: a withdrawn hash (operator evict or corruption
-    /// quarantine) is refused `EvictedSinceProbe`, and a `serve_audit` store
-    /// fault is refused `InternalError`. Neither is an availability class — one
+    /// quarantine) is refused for `evicted_since_probe`, and a `serve_audit` store
+    /// fault is refused for `internal_error`. Neither is an availability class — one
     /// is a refusal, the other is the store failing to answer — so the ratio's
     /// denominator deliberately excludes both. Field has no `_total` suffix
     /// because the `OpenMetrics` encoder appends it.
@@ -1699,8 +1667,8 @@ pub struct DecdnMetrics {
     /// `decdn_serve_stream_rejected_cache_miss_total`.
     pub serve_stream_rejected_cache_miss: Counter,
     /// `serve_stream` requests refused by a local store fault (`has`/`inspect`
-    /// error, or a present blob reporting no size) — surfaced to the client as
-    /// `InternalError`, not a signed absence. Visible name:
+    /// error, or a present blob reporting no size) — signed to the client as
+    /// `Declined`, not a signed absence. Visible name:
     /// `decdn_serve_stream_rejected_internal_error_total`.
     pub serve_stream_rejected_internal_error: Counter,
     /// `serve_stream` requests refused on an unknown / never-opened lane
@@ -1744,28 +1712,36 @@ pub struct DecdnMetrics {
     /// which. Guards (1) and (3) also split by CAP: both run the two-level floor
     /// check, and its per-signer arm bumps `serve_stream_rejected_signer_floor_at_cap`
     /// instead, so this counter is the pool-ceiling half of them.
-    /// Wire-indistinguishable from `cache_miss` (signed as `NotFound`), so
-    /// this server-side counter is the only place the *reason* lives at all — now
-    /// more load-bearing, since a third refusal path routes through it.
+    /// Signed as `Unfunded`: every guard runs past the lane-ownership proof, so
+    /// its audience is the proven requester (ADR 005 §Open-time refusal classes).
     /// Visible name: `decdn_serve_stream_rejected_insufficient_deposit_total`.
     pub serve_stream_rejected_insufficient_deposit: Counter,
     /// Delivery refused at admission because a wired `PoolView` could not confirm
     /// the pool on-chain — the pool has no on-chain record, is closed/reclaimed, or
     /// the admit-path `getPool` faulted — or could not confirm the voucher signer:
     /// the admit-path `getAuthorization` faulted and the node holds no cached
-    /// registered read of the signer. Wire-indistinguishable from a cache miss
-    /// (signed as `NotFound`), so this counter is the only place the reason lives;
+    /// registered read of the signer. Signed as `NotFound`, like a cache miss,
+    /// so this counter is the only place the reason lives;
     /// kept distinct from `insufficient_deposit` so a real drained-pool refusal is
     /// not conflated with an unconfirmed or unreachable pool. Visible name:
     /// `decdn_serve_stream_rejected_pool_unconfirmed_total`.
     pub serve_stream_rejected_pool_unconfirmed: Counter,
-    /// Delivery refused at admission because the request's voucher signer is
-    /// registered on-chain with `cap − spent` below a serve floor or with an
-    /// expired registration — a "spent" capability the node could never cash. A
-    /// `getAuthorization` fault never counts here (see `pool_unconfirmed`). Wire-indistinguishable from a cache miss (signed as
-    /// `NotFound`), so this counter is the only place the reason lives; a rising
-    /// value flags capabilities presented whose signer has drained its shared `cap`
-    /// at other nodes. Visible name:
+    /// Delivery refused at admission because the request's pool is `Closing`
+    /// on-chain: it takes no top-up, and its redemption ends at the dispute
+    /// deadline (ADR 003 §Pool solvency). Signed as `Unfunded` to a requester
+    /// that holds a lane on the pool, so its owner opens a new pool, and as
+    /// `NotFound` to anyone else. Visible name:
+    /// `decdn_serve_stream_rejected_pool_closing_total`.
+    pub serve_stream_rejected_pool_closing: Counter,
+    /// Delivery refused at admission because the request's voucher signer
+    /// cannot pay: it is registered on-chain with `cap − spent` below a serve
+    /// floor or with an expired registration (a "spent" capability the node
+    /// could never cash), or its lane's capability is inside the node's expiry
+    /// margin. A `getAuthorization` fault never counts here (see
+    /// `pool_unconfirmed`). Signed as `Unfunded`: the requester holds a verified
+    /// binding for a registered signer or a lane, so it is proven (ADR 005
+    /// §Open-time refusal classes). A rising value flags capabilities presented
+    /// whose signer has drained its shared `cap` at other nodes. Visible name:
     /// `decdn_serve_stream_rejected_signer_cap_exhausted_total`.
     pub serve_stream_rejected_signer_cap_exhausted: Counter,
     /// A live serve was stopped MID-STREAM because the request's voucher signer
@@ -1776,16 +1752,16 @@ pub struct DecdnMetrics {
     /// (which is the admit-time refusal), kept distinct so a running value flags
     /// cross-node cap drain on long streams — the large-blob over-delivery this
     /// re-check bounds — rather than an open-time refusal. The stream stops in-band
-    /// with a `VoucherRejected { SignerCapExhausted }`, wire-`NotFound`-equivalent at
-    /// open time. Visible name:
+    /// with a `VoucherRejected { SignerCapExhausted }`, which the requester treats
+    /// as `Unfunded` from this node. Visible name:
     /// `decdn_serve_stream_midstream_signer_cap_exhausted_total`.
     pub serve_stream_midstream_signer_cap_exhausted: Counter,
     /// Delivery refused because ONE capability signer hit its per-signer live
     /// concurrency cap of un-vouchered reservation, while the pool itself can still
     /// pay (ADR 003 §Pool solvency, per-signer floor isolation).
-    /// Wire-indistinguishable from `insufficient_deposit` (both sign as `NotFound`,
-    /// so a prober cannot map a pool's floor consumption), so this counter is the
-    /// only place the distinction survives — a rising value means one signer runs
+    /// Signed as `NotFound`, because it clears by waiting rather than by funding
+    /// (ADR 005 §Open-time refusal classes), so this counter is the only place
+    /// the reason survives — a rising value means one signer runs
     /// more concurrent un-vouchered streams than its share covers while the pool as a
     /// whole is solvent. The two remedies differ: a pool shortfall clears with a
     /// top-up, a signer at its share does not. Visible name:
@@ -1799,24 +1775,22 @@ pub struct DecdnMetrics {
     /// the debug line `refusing a whole-blob request from a node` names the
     /// requester. Visible name: `decdn_serve_stream_rejected_pull_loop_guard_total`.
     pub serve_stream_rejected_pull_loop_guard: Counter,
-    /// Delivery refused because the requested bounded range
-    /// `[byte_offset, byte_offset + byte_len)` is out of bounds for the blob
-    /// (ADR 005 §Bounded byte ranges: the node MUST reject an overflowing or
-    /// past-EOF range). Wire-indistinguishable from `cache_miss` (signed as
-    /// `NotFound`), so this server-side counter is the only place the
-    /// distinction lives — a rising value flags clients issuing malformed
-    /// ranges. Visible name:
+    /// Delivery refused because the requested bounded range starts at or past
+    /// this node's size claim for the blob (ADR 005 §Bounded byte ranges).
+    /// Signed as `Declined`: the size is this node's claim, and another node
+    /// can disagree. A rising value flags clients issuing ranges past the end,
+    /// or nodes that disagree on a blob's size. Visible name:
     /// `decdn_serve_stream_rejected_range_not_satisfiable_total`.
     pub serve_stream_rejected_range_not_satisfiable: Counter,
     /// Delivery refused because a pull-through request starts at or past this
-    /// node's `max_blob_size` ceiling (ADR 005 §`BlobTooLarge` enforcement).
+    /// node's `max_blob_size` ceiling (ADR 005 §`max_blob_size` enforcement).
     /// The node refuses before it commits to the stream, so no byte is bought
-    /// upstream. Signed as `BlobTooLarge`. A rising value means clients ask
+    /// upstream. Signed as `Declined`. A rising value means clients ask
     /// this node for blobs above its ceiling. Visible name:
     /// `decdn_serve_stream_rejected_blob_too_large_total`.
     pub serve_stream_rejected_blob_too_large: Counter,
     /// Delivery refused because the blob is on this operator's local denylist
-    /// (ADR 011 §Local Denylist). Signed as `HashBlacklisted`. Deliberately
+    /// (ADR 011 §Local Denylist). Signed as `Declined`. Deliberately
     /// counts ONLY the local list; the governance blacklist has its own
     /// counter, [`Self::serve_stream_rejected_chain_hash_denied`]. Splitting
     /// them here is safe where the wire code must not: this is the operator's
@@ -1826,7 +1800,7 @@ pub struct DecdnMetrics {
     /// `decdn_serve_stream_rejected_hash_denied_total`.
     pub serve_stream_rejected_hash_denied: Counter,
     /// Delivery refused because the blob is on the *governance* blacklist (ADR
-    /// 011 §On Blacklist Event). Also signed as `HashBlacklisted` — identically
+    /// 011 §On Blacklist Event). Also signed as `Declined` — identically
     /// to the local list, which is the ADR's requirement — so this counter is
     /// the only place the two are distinguishable, and it is readable by the
     /// operator alone. Visible name:
@@ -1838,18 +1812,16 @@ pub struct DecdnMetrics {
     pub serve_stream_rejected_chain_hash_denied: Counter,
     /// Delivery refused because the channel's funding address is blacklisted as
     /// an origin — local `denied_origins` or the on-chain `ContentBlacklist`
-    /// (ADR 011 §On Blacklist Event). Signed as `OriginBlacklisted`. Visible
+    /// (ADR 011 §On Blacklist Event). Signed as `Declined`. Visible
     /// name: `decdn_serve_stream_rejected_origin_denied_total`.
     pub serve_stream_rejected_origin_denied: Counter,
     /// Delivery declined by the origin-only policy (#1759,
     /// `cache.relay_foreign_namespaces = false`): a memoized live probe of this
     /// node's own backend genuinely does not hold the hash. Signed as
-    /// `NotFound`, identically to [`Self::serve_stream_rejected_cache_miss`] —
-    /// a client cannot tell a policy decline from a real miss, which is the
-    /// point — so this counter is the only place an operator can separate the
-    /// two. Distinct from a backend FAULT during that same probe, which is
-    /// never counted here: a fault is not an absence and is signed
-    /// `InternalError`, landing in
+    /// `Declined`: this node will not relay the hash, and another node may
+    /// (ADR 005 §Open-time refusal classes). Distinct from a backend FAULT
+    /// during that same probe, which is never counted here: a fault is not an
+    /// absence and lands in
     /// [`Self::serve_stream_rejected_internal_error`] instead. Visible name:
     /// `decdn_serve_stream_rejected_foreign_declined_total`.
     pub serve_stream_rejected_foreign_declined: Counter,
@@ -3132,10 +3104,6 @@ recorders! {
     node_pull_first_byte(elapsed: Duration) =>
         node_pull_first_byte_seconds.observe(elapsed.as_secs_f64());
 
-    /// An upstream refused a stream with `EvictedSinceProbe` after answering
-    /// `has_blob: true` at probe (ADR 001 §Probe cache; #1165).
-    probe_post_eviction_failure => probe_post_eviction_failures.inc();
-
     /// A DHT lookup was truncated at `MAX_LOOKUP_ROUNDS` while still finding closer nodes
     /// (#1145 review). A sustained rate means the ceiling is too low for the network size.
     dht_lookup_round_ceiling => dht_lookup_round_ceiling.inc();
@@ -3172,7 +3140,7 @@ recorders! {
     serve_stream_rejected_cache_miss => serve_stream_rejected_cache_miss.inc();
 
     /// Record a `serve_stream` request refused by a local store fault,
-    /// surfaced as `InternalError` (#876).
+    /// signed as `Declined` (#876).
     serve_stream_rejected_internal_error => serve_stream_rejected_internal_error.inc();
 
     /// Record a `serve_stream` request refused on an unknown lane (#876).
@@ -3196,6 +3164,9 @@ recorders! {
     /// faulted), or a `getAuthorization` fault left the signer with no cached
     /// registered read — kept distinct from a real deposit-exhaustion refusal.
     serve_stream_rejected_pool_unconfirmed => serve_stream_rejected_pool_unconfirmed.inc();
+
+    /// Record a `serve_stream` admission refused because its pool is `Closing`.
+    serve_stream_rejected_pool_closing => serve_stream_rejected_pool_closing.inc();
 
     /// Record an admit signer confirm the signer-auth cache answered.
     serve_signer_auth_cached => serve_signer_auth_cached.inc();
@@ -3233,7 +3204,7 @@ recorders! {
 
     /// Record a `serve_stream` pull-through refused because the requested range
     /// starts at or past the node's `max_blob_size` ceiling (ADR 005
-    /// §`BlobTooLarge` enforcement).
+    /// §`max_blob_size` enforcement).
     serve_stream_rejected_blob_too_large => serve_stream_rejected_blob_too_large.inc();
 
     /// Record a `serve_stream` delivery refused because the blob is on the
@@ -3371,11 +3342,11 @@ recorders! {
     node_pull_pool_wedged => node_pull_pool_wedged.inc();
 
     /// A selected upstream refused delivery up front (#1144). Counts every wire
-    /// code; only `InternalError` also scores the provider's reputation.
+    /// class; none scores the provider's reputation.
     node_pull_refused => node_pull_refused.inc();
 
     /// A refusal this node cannot attribute to the upstream (#1520) — `NotFound`
-    /// or `Overloaded`. A rate approaching `node_pull_refused` means nobody will
+    /// or `Unfunded`. A rate approaching `node_pull_refused` means nobody will
     /// serve us, which is usually our own deposit or binding, not their fault.
     node_pull_refused_unattributable => node_pull_refused_unattributable.inc();
 
@@ -3421,14 +3392,12 @@ recorders! {
     /// this write was superseded (benign under `BuyerLedgers`; #1145 review).
     node_pull_progress_superseded => node_pull_progress_superseded.inc();
 
-    /// A miss pull funded its exhausted channel mid-stream and resumed at the paid
-    /// frontier (#1530).
-    node_pull_reactive_topup => node_pull_reactive_topup.inc();
+    /// A miss fill's funding recovery step funded the next pass (#1530).
+    node_pull_recovery_step => node_pull_recovery_step.inc();
 
-    /// A mid-pull top-up was declined or added less than requested: an upstream
-    /// claiming exhaustion our own ledger contradicts, a failed funding tx, or a
-    /// top-up that landed short (#1530, #2012).
-    node_pull_reactive_topup_refused => node_pull_reactive_topup_refused.inc();
+    /// A miss fill's funding recovery step had no way to fund the next pass,
+    /// or its funding tx failed (#1530).
+    node_pull_recovery_step_refused => node_pull_recovery_step_refused.inc();
 
     /// The delivery handler abandoned a pull-through at its deadline (#831).
     node_pull_through_timeout => node_pull_through_timeouts.inc();

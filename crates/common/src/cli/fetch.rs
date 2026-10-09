@@ -248,8 +248,9 @@ pub struct ClientFetchArgs {
     /// it names the pool and authorizes THIS client's loaded key to spend against
     /// it up to the owner-set cap. The loaded keystore MUST be the delegate signer
     /// the token authorizes (a mismatch aborts). The delegate does not own the
-    /// pool, so reactive top-up is disabled on this path — an exhausted cap or
-    /// drained pool needs the owner to top up or re-issue a higher-cap capability.
+    /// pool, so its funding recovery step cannot top up: an exhausted cap or a
+    /// drained pool needs the owner to top up or issue a capability for a new
+    /// signer key.
     /// Mutually exclusive with `--capability-file`.
     #[arg(long, value_name = "TOKEN", conflicts_with = "capability_file")]
     pub capability: Option<String>,

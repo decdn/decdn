@@ -15,65 +15,58 @@ fn rejected(reason: VoucherRejectReason) -> anyhow::Error {
     })
 }
 
+/// Only a local fault ends the command; no node's refusal does.
 #[test]
-fn payment_and_blacklist_faults_end_the_command() {
-    for reason in [
-        VoucherRejectReason::SpendingCapExhausted,
-        VoucherRejectReason::CapabilityExpired,
-        VoucherRejectReason::BadSignature,
-        VoucherRejectReason::WrongSigner,
-    ] {
-        assert_eq!(
-            classify(&rejected(reason)),
-            Fault::Fatal(FatalScope::Command),
-            "{reason:?}"
-        );
-    }
-    assert_eq!(
-        classify(&refusal(StreamError::OriginBlacklisted)),
-        Fault::Fatal(FatalScope::Command)
-    );
+fn a_local_fault_ends_the_command() {
     let local = anyhow::anyhow!("store write").context(LocalPullFault);
     assert_eq!(classify(&local), Fault::Fatal(FatalScope::Command));
 }
 
-fn drained(remaining: u64, expired: bool) -> crate::SignerCapDrained {
-    crate::SignerCapDrained {
-        pool_id: alloy::primitives::B256::ZERO,
-        signer: alloy::primitives::Address::ZERO,
-        provider: alloy::primitives::Address::ZERO,
-        remaining,
-        rate_per_mb: 10,
-        expired,
-    }
-}
-
-/// A drained signer ends the command only when no provider at any rate
-/// can serve it: its registration expired, or nothing is left of its cap.
-/// With some headroom left, a cheaper provider still can, so only the
-/// refusing source is barred, and the stop once every source is ends the
-/// item (#2338).
+/// An unhealed funding rejection acts as `Unfunded` from its source; every
+/// other unhealed rejection acts as `Declined` (ADR 005 §`VoucherRejected`
+/// semantics). Neither ends the fetch on its own.
 #[test]
-fn a_drained_signer_ends_the_command_only_at_every_rate() {
-    for (remaining, expired) in [(0, false), (5, true)] {
+fn an_unhealed_rejection_scopes_to_its_source() {
+    for reason in [
+        VoucherRejectReason::SpendingCapExhausted,
+        VoucherRejectReason::CapabilityExpired,
+        VoucherRejectReason::PoolExhausted,
+        VoucherRejectReason::SignerCapExhausted,
+    ] {
         assert_eq!(
-            classify(&anyhow::Error::new(drained(remaining, expired))),
-            Fault::Fatal(FatalScope::Command),
-            "remaining {remaining}, expired {expired}"
+            classify(&rejected(reason)),
+            Fault::Unaffordable,
+            "{reason:?}"
         );
+        assert_eq!(super::declining_rejection(&rejected(reason)), None);
     }
-    assert_eq!(
-        classify(&anyhow::Error::new(drained(5, false))),
-        Fault::Source
-    );
-    let stop =
-        anyhow::Error::new(drained(5, false)).context(crate::source_set::NoSourceServesSigner);
+    for reason in [
+        VoucherRejectReason::BadSignature,
+        VoucherRejectReason::WrongSigner,
+        VoucherRejectReason::BytesRegression,
+        VoucherRejectReason::Underpaid,
+        VoucherRejectReason::UnderFold,
+        VoucherRejectReason::AmountRegression,
+    ] {
+        assert_eq!(classify(&rejected(reason)), Fault::Source, "{reason:?}");
+        assert_eq!(
+            super::declining_rejection(&rejected(reason)),
+            Some(reason),
+            "{reason:?}"
+        );
+        let mid_stream = refusal(StreamError::VoucherRejected {
+            reason,
+            bundle: None,
+        });
+        assert_eq!(super::declining_rejection(&mid_stream), Some(reason));
+    }
+    let stop = anyhow::Error::new(crate::source_set::NoNodeWillServe { reasons: vec![] });
     assert_eq!(classify(&stop), Fault::Fatal(FatalScope::Item));
 }
 
 /// A watermark rejection that healed the lane ledger after the lane spent
-/// its resume budget (#2257) is this source's, so the range moves on and
-/// the rest of the bundle continues.
+/// its resume budget (#2257) only cools its source: the range moves on,
+/// and the source does not decline the fetch.
 #[test]
 fn a_rejection_healed_past_the_resume_budget_is_the_sources() {
     for reason in [
@@ -83,29 +76,10 @@ fn a_rejection_healed_past_the_resume_budget_is_the_sources() {
     ] {
         let err = rejected(reason).context(HealExhausted);
         assert_eq!(classify(&err), Fault::Source, "{reason:?}");
+        assert_eq!(super::declining_rejection(&err), None, "{reason:?}");
         assert!(
             err.downcast_ref::<UpstreamVoucherRejected>().is_some(),
             "the marker keeps the rejection in the chain"
-        );
-    }
-}
-
-/// A watermark rejection that no heal took ends the command, as ADR 005
-/// says: a `BytesRegression` with no bundle is a single-signer fault, and
-/// an `Underpaid` or a trailing proof that no bundle heals has nothing to
-/// retry from.
-#[test]
-fn a_rejection_no_heal_took_ends_the_command() {
-    for reason in [
-        VoucherRejectReason::BytesRegression,
-        VoucherRejectReason::Underpaid,
-        VoucherRejectReason::UnderFold,
-        VoucherRejectReason::AmountRegression,
-    ] {
-        assert_eq!(
-            classify(&rejected(reason)),
-            Fault::Fatal(FatalScope::Command),
-            "{reason:?}"
         );
     }
 }
@@ -134,7 +108,7 @@ fn a_dry_pool_marks_the_source_unaffordable() {
     });
     assert_eq!(classify(&dry), Fault::Unaffordable);
     assert_eq!(
-        classify(&refusal(StreamError::InsufficientDeposit)),
+        classify(&refusal(StreamError::Unfunded)),
         Fault::Unaffordable
     );
 }
@@ -145,17 +119,37 @@ fn a_lane_build_error_is_transient() {
     assert_eq!(classify(&err), Fault::Transient);
 }
 
-/// A failed reactive top-up is the buyer's funding, never the source's
-/// delivery: it is transient, so the source keeps its health and the loop
-/// retries. A wallet short of USDC is not fixed by a retry, so the source
-/// waits for the deposit like a dry pool.
+/// A wallet short of USDC is not fixed by a retry, so it reads like a dry
+/// pool: the funding recovery step that meets it ends "funding needed".
 #[test]
-fn a_failed_reactive_top_up_is_transient_unless_the_wallet_is_short() {
-    let failed =
-        || anyhow::anyhow!("submit topUp: rpc timed out").context(crate::driver::TopUpFailed);
-    assert_eq!(classify(&failed()), Fault::Transient);
-    let short = failed().context(crate::buyer_pool::WalletShortfall);
+fn a_wallet_shortfall_is_unaffordable() {
+    let short = anyhow::anyhow!("submit topUp: transfer amount exceeds balance")
+        .context(crate::buyer_pool::WalletShortfall);
     assert_eq!(classify(&short), Fault::Unaffordable);
+}
+
+/// A recovery step that opened a new pool ends this pass of the command: no
+/// lane can pay from the new pool, and the caller runs the remaining work
+/// again against it.
+#[test]
+fn a_replaced_pool_ends_the_command_pass() {
+    let replaced = anyhow::Error::new(crate::PoolReplaced {
+        closed: alloy::primitives::B256::repeat_byte(1),
+        opened: alloy::primitives::B256::repeat_byte(2),
+    });
+    assert_eq!(classify(&replaced), Fault::Fatal(FatalScope::Command));
+}
+
+/// The pacer's refusal of a lane whose deposit cannot cover the next voucher
+/// prices the source out at the current deposit, like a node's `Unfunded`
+/// refusal: it never cools the source as a delivery fault.
+#[test]
+fn a_dry_lane_is_unaffordable() {
+    let dry = anyhow::Error::new(crate::PoolExhausted {
+        gap_start: 0,
+        gap_len: 1,
+    });
+    assert_eq!(classify(&dry), Fault::Unaffordable);
 }
 
 /// A lane build never blames its source and retries, unless what failed
@@ -179,8 +173,7 @@ fn a_lane_build_takes_its_cause_only_when_fatal() {
 
 /// A `topUp` that may have escrowed USDC no record credits ends the
 /// command, whether it surfaces from a lane build (which otherwise retries)
-/// or from a reactive top-up (which is otherwise unaffordable): a retry
-/// escrows again.
+/// or from a funding recovery step: a retry escrows again.
 #[test]
 fn a_possibly_escrowed_top_up_ends_the_command() {
     let tx = alloy::primitives::TxHash::repeat_byte(0xab);
@@ -206,14 +199,6 @@ fn a_possibly_escrowed_top_up_ends_the_command() {
             "unconfirmed lane build",
             anyhow::Error::new(LaneBuildFault(unconfirmed())),
         ),
-        (
-            "untracked reactive",
-            untracked().context(crate::driver::TopUpFailed),
-        ),
-        (
-            "unconfirmed reactive",
-            unconfirmed().context(crate::driver::TopUpFailed),
-        ),
     ] {
         assert_eq!(
             classify(&err),
@@ -225,14 +210,7 @@ fn a_possibly_escrowed_top_up_ends_the_command() {
 
 #[test]
 fn delivery_faults_are_the_sources() {
-    for error in [
-        StreamError::NotFound,
-        StreamError::Overloaded,
-        StreamError::BlobTooLarge,
-        StreamError::InternalError,
-        StreamError::EvictedSinceProbe,
-        StreamError::HashBlacklisted,
-    ] {
+    for error in [StreamError::NotFound, StreamError::Declined] {
         assert_eq!(
             classify(&refusal(error.clone())),
             Fault::Source,
@@ -250,7 +228,7 @@ fn not_found_is_a_source_fault_that_says_absent() {
     let err = refusal(StreamError::NotFound);
     assert_eq!(classify(&err), Fault::Source);
     assert!(super::says_absent(&err));
-    assert!(!super::says_absent(&refusal(StreamError::Overloaded)));
+    assert!(!super::says_absent(&refusal(StreamError::Unfunded)));
 }
 
 #[test]
@@ -262,6 +240,24 @@ fn unanimous_stops_are_fatal_with_their_scope() {
     assert_eq!(classify(&dry), Fault::Fatal(FatalScope::Command));
     let absent = anyhow::Error::new(crate::source_set::NoSourceHasBlob);
     assert_eq!(classify(&absent), Fault::Fatal(FatalScope::Item));
+}
+
+/// `classify` reads the markers in a fixed order, and the order is the
+/// meaning when an error carries more than one: a local fault outranks any
+/// node's refusal, a heal past the resume budget outranks the funding reason
+/// of the rejection it carries, and a voucher rejection's reason outranks the
+/// refusal class around it.
+#[test]
+fn stacked_markers_classify_in_a_fixed_order() {
+    let local = refusal(StreamError::Unfunded).context(LocalPullFault);
+    assert_eq!(classify(&local), Fault::Fatal(FatalScope::Command));
+
+    let healed = rejected(VoucherRejectReason::SpendingCapExhausted).context(HealExhausted);
+    assert_eq!(classify(&healed), Fault::Source);
+
+    let funding_inside_a_decline = rejected(VoucherRejectReason::SignerCapExhausted)
+        .context(UpstreamRefused::mid_stream(StreamError::Declined));
+    assert_eq!(classify(&funding_inside_a_decline), Fault::Unaffordable);
 }
 
 /// A source failing or a stop only the human can fix `warns()`; a deposit wait

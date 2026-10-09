@@ -30,14 +30,14 @@ use decdn_cache::origin::{FilesystemOrigin, Origin, OriginFetch};
 use decdn_cache::{
     CacheEngine, CacheMetrics, CircuitBreakerPolicy, Hash, PinnedHashes, RetryPolicy,
 };
-use decdn_client::PoolContext;
 use decdn_client::probe::probe_once;
+use decdn_client::{PoolContext, Recovery};
 use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore,
     ProbeSlashData, StreamSlashData, Voucher, bind_node_id_domain, binding_signing_hash,
     min_payment, signed_to_wire_voucher, slash_judge_domain, voucher_domain,
 };
-use decdn_node::buyer_channel::{PoolOpenPending, PoolOpener, TopUpLanded};
+use decdn_node::buyer_channel::{PoolOpenPending, PoolOpener};
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use decdn_node::dht::{
     ConfigStakerSet, NegativeProbeCache, NodeAddressResolver, OriginDirectory, PositiveProbeCache,
@@ -768,8 +768,6 @@ async fn build_origin_with_negative_cache(
         // Buffered/generic path: the directory is keyed under `NO_NAMESPACE`,
         // matching the hash-only `Origin::fetch` lookup (node_origin.rs discover).
         U256::ZERO,
-        // Reactive mid-pull top-up off; only the #1530 tests turn it on.
-        U256::ZERO,
     )
     .await
 }
@@ -802,10 +800,6 @@ async fn build_origin_with_probe_caches(
     // so a lookup under `NO_NAMESPACE` resolves nothing (proving the request's
     // namespace actually threads through `discover`).
     directory_namespace: U256,
-    // The reactive mid-pull top-up target (#1530). `U256::ZERO` — what every caller
-    // but the reactive-top-up tests passes — DISABLES the leg, so a fixture whose
-    // channel runs dry still fails the way its test asserts.
-    working_deposit: U256,
 ) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     build_origin_with_discovery(
         ep_b,
@@ -820,7 +814,6 @@ async fn build_origin_with_probe_caches(
         max_blob_size_bytes,
         negative_cache,
         probe_cache,
-        working_deposit,
     )
     .await
 }
@@ -873,7 +866,6 @@ async fn build_origin_with_discovery(
     max_blob_size_bytes: u64,
     negative_cache: NegativeProbeCache,
     probe_cache: PositiveProbeCache,
-    working_deposit: U256,
 ) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     let FixtureDiscovery {
         stakers,
@@ -929,13 +921,9 @@ async fn build_origin_with_discovery(
             min_throughput_bps: 0,
             max_blob_size_bytes,
             max_rate_per_mb: 0,
-            working_deposit,
-            seller_reserve: U256::ZERO,
-            // A day's margin; the fixtures use never-expiring channels, so the
-            // near-expiry guard (#1603) is inert unless a test sets an expiry.
-            // Short, so a post-top-up settle wait cannot dominate a test's wall clock.
-            // The fixtures accept the resumed open immediately, so the budget is only
-            // ever spent when a test deliberately withholds settlement.
+            // Short, so a post-recovery settle wait cannot dominate a test's wall
+            // clock. The fixtures accept the re-open immediately, so the window is
+            // only ever spent when a test deliberately withholds settlement.
             event_poll_interval: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
@@ -1029,8 +1017,6 @@ async fn build_origin_seeded_ranking(
         NegativeProbeCache::new(),
         probe_cache,
         U256::ZERO,
-        // Reactive mid-pull top-up off; only the #1530 tests turn it on.
-        U256::ZERO,
     )
     .await
 }
@@ -1088,13 +1074,9 @@ async fn build_origin_multi_hash(
             min_throughput_bps: 0,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
-            // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
-            // does when its channel runs dry, which a self-funding one would hide.
-            working_deposit: U256::ZERO,
-            seller_reserve: U256::ZERO,
-            // Short, so a post-top-up settle wait cannot dominate a test's wall clock.
-            // The fixtures accept the resumed open immediately, so the budget is only
-            // ever spent when a test deliberately withholds settlement.
+            // Short, so a post-recovery settle wait cannot dominate a test's wall
+            // clock. The fixtures accept the re-open immediately, so the window is
+            // only ever spent when a test deliberately withholds settlement.
             event_poll_interval: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
@@ -1698,8 +1680,6 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
             min_throughput_bps: 0,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
-            working_deposit: U256::ZERO,
-            seller_reserve: U256::ZERO,
             event_poll_interval: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
@@ -2149,8 +2129,8 @@ async fn serve_then_reject_voucher(
 /// Serve the whole payload, read the closing voucher, then reply with an ARBITRARY
 /// `StreamError` (not a `VoucherRejected`) — the shape the receive loop's voucher-slot
 /// handler (`resolve_voucher_slot`) folds into `UpstreamRefused` (#1145 review, #1484).
-/// Modelled on [`serve_then_reject_voucher`], differing only in the final frame: an
-/// `Overloaded`/`NotFound` in reply to a voucher must be metered as a refusal, not
+/// Modelled on [`serve_then_reject_voucher`], differing only in the final frame: a
+/// `NotFound` (a load shed) in reply to a voucher must be metered as a refusal, not
 /// stringified into the `Unreachable` catch-all.
 async fn serve_then_error_on_voucher(
     conn: Connection,
@@ -4990,12 +4970,12 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
 /// #1145 — a non-`VoucherRejected` `StreamError` arriving in reply to the CLOSING VOUCHER
 /// lands in the receive loop's voucher-slot handler (`resolve_voucher_slot`, the optimistic
 /// loop of #1484). That handler must keep the typed wire code like the three mid-stream
-/// receive sites do: stringifying it lets an honest `Overloaded`/`NotFound` fall through
+/// receive sites do: stringifying it lets an honest `NotFound` load shed fall through
 /// every downcast to the `Unreachable` catch-all — scoring a reachable, honestly-answering
 /// peer as a dead node.
 ///
 /// Driven through the REAL path (the server delivers the whole payload, reads the closing
-/// voucher, then replies `Overloaded`), because — as the mid-stream sibling spells out — an
+/// voucher, then replies `NotFound`), because, as the mid-stream sibling spells out, an
 /// assertion against `classify_pull_failure`'s ladder would pass with the `bail!("{e:?}")`
 /// restored: the classifier is not where the fault lies. `node_pull_refused_total` is
 /// reachable only if the voucher-slot handler kept the wire code as `UpstreamRefused`.
@@ -5015,7 +4995,7 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
     let a_eth = Arc::new(PrivateKeySigner::random());
     let (ep_a, addr_a) =
         local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    // `Overloaded` in reply to the voucher: backpressure from a reachable peer, the code a
+    // `NotFound` in reply to the voucher: a load shed from a reachable peer, the code a
     // stringifying ack-wait catch-all would misread as `Unreachable`.
     let task_a = spawn_a_voucher_erroring_server(
         ep_a.clone(),
@@ -5024,7 +5004,7 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
         payload.clone(),
         total_bytes,
         RATE,
-        StreamError::Overloaded,
+        StreamError::NotFound,
     );
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
@@ -5244,7 +5224,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
     let a_eth = Arc::new(PrivateKeySigner::random());
     let (ep_a, addr_a) =
         local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    // `InsufficientDeposit` OUTSIDE a voucher round trip: the same code the drained-channel
+    // `Unfunded` OUTSIDE a voucher round trip: the same code the drained-channel
     // test drives through the ack wait, arriving on the other road.
     let task_a = spawn_a_mid_stream_error_server(
         ep_a.clone(),
@@ -5326,7 +5306,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
             .lock()
             .map_err(|_| anyhow::anyhow!("retired lock poisoned"))?
             .is_empty(),
-        "an `InsufficientDeposit` channel must keep its row so the deposit can be reclaimed"
+        "an `Unfunded` channel must keep its row so the deposit can be reclaimed"
     );
 
     // Our payment fault, not the peer's: it is not scored.
@@ -6040,7 +6020,7 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
 /// even attributable to the peer (`ServeRejectReason::wire_error` collapses seven reasons
 /// onto it, three of them ours), so it gets `REFUSAL_SUPPRESSION_TTL` — 30 s, long enough to
 /// stop a retry burst re-probing a peer that just said no, short enough not to blackhole it.
-/// An `EvictedSinceProbe` is a durable, honest fact about this (peer, hash), so it earns the
+/// A `Declined` is a durable, honest fact about this (peer, hash), so it earns the
 /// full cache TTL.
 ///
 /// Nothing guarded the mapping. `only_a_durable_refusal_earns_the_full_suppression_ttL`
@@ -6064,12 +6044,12 @@ async fn a_transient_refusal_is_suppressed_briefly_and_a_durable_one_for_the_ful
          upstream for five minutes over one dry deposit"
     );
 
-    // 2. `EvictedSinceProbe` — a durable, honest fact about this (peer, hash). It must be
+    // 2. `Declined` — a durable, honest fact about this (peer, hash). It must be
     //    suppressed AT ALL. Without this, deleting the durable arm's `suppress(None)`
     //    outright is invisible: with a tiny cache TTL, "never suppressed" and "suppression
     //    already expired" look identical after any wait.
     anyhow::ensure!(
-        refusal_suppression_after(StreamError::EvictedSinceProbe, Duration::ZERO).await?,
+        refusal_suppression_after(StreamError::Declined, Duration::ZERO).await?,
         "a durable refusal must suppress the (peer, hash) pair — otherwise a peer that \
          advertises everything and serves nothing keeps winning the ranker and burns a \
          MAX_PROVIDER_ATTEMPTS slot on every miss, forever"
@@ -6079,119 +6059,15 @@ async fn a_transient_refusal_is_suppressed_briefly_and_a_durable_one_for_the_ful
     //    budget. Together with (1) this pins the two arms to different calls: no single
     //    implementation satisfies both.
     anyhow::ensure!(
-        !refusal_suppression_after(StreamError::EvictedSinceProbe, PAST_THE_TINY_TTL).await?,
+        !refusal_suppression_after(StreamError::Declined, PAST_THE_TINY_TTL).await?,
         "a durable refusal must ride the cache-wide TTL; outliving one this long means it is \
          being given the transient budget instead"
     );
     Ok(())
 }
 
-/// Refuse one pull with `error` and report what `decdn_probe_post_eviction_failures_total`
-/// reads afterwards. Modelled on [`refusal_suppression_after`], but the instrument is the
-/// metric, not the suppression; asserts the refusal actually happened
-/// (`node_pull_refused_total == 1`) so a returned `0` can never mean "the pull never
-/// reached the classifier".
-async fn post_eviction_failures_after_a_refusal(error: StreamError) -> Result<u64> {
-    let payload = vec![0x4Eu8; 4096];
-    let hash = Hash::new(&payload);
-    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-
-    let a_sk = fresh_key();
-    let a_id = a_sk.public();
-    let a_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_a, addr_a) =
-        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_a = spawn_a_refusing_server(
-        ep_a.clone(),
-        Arc::clone(&a_eth),
-        slash_domain(),
-        total_bytes,
-        RATE,
-        error,
-    );
-
-    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let b_id = fresh_key().public();
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
-
-    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let b_metrics = Arc::new(Metrics::new());
-    let b_buyer = Arc::new(PrivateKeySigner::random());
-    let (providers, addr_map) =
-        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let buyer = Arc::new(StubOpener {
-        pool_id: B256::repeat_byte(0x4E),
-        deposit: U256::from(DEPOSIT_MICRO_USDC),
-        signer: Arc::clone(&b_buyer),
-        voucher_domain: voucher_dom(),
-        recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
-    }) as Arc<dyn PoolOpener>;
-    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
-        &ep_b,
-        DhtNodeId::from_bytes(*b_id.as_bytes()),
-        hash,
-        buyer,
-        &local_rep,
-        &b_metrics,
-        providers,
-        addr_map,
-        Duration::from_secs(20),
-        Duration::from_secs(20),
-        0,
-    )
-    .await;
-
-    let got = Origin::fetch(&origin, hash, u64::MAX)
-        .await
-        .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
-    anyhow::ensure!(
-        matches!(got, OriginFetch::NotFound),
-        "a refused pull must not surface bytes"
-    );
-    assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
-    let count = counter_value(&b_metrics, "probe_post_eviction_failures_total")?;
-
-    shutdown([task_a], [&ep_b, &ep_a]).await?;
-    Ok(count)
-}
-
-/// `decdn_probe_post_eviction_failures_total` must fire for an `EvictedSinceProbe` refusal
-/// and ONLY for it — the whole point of `DurableMissCause` (#1165, #1223 review).
-///
-/// The unit test on `pull_verdict` (`only_an_eviction_carries_the_post_eviction_cause`)
-/// pins the *classification*, not the emission: rerouting the metric call, or firing it for
-/// both `DurableMiss` causes, passes that test while the metric silently counts blob-ceiling
-/// rejections as hold-mechanism failures. This drives both causes through the real wire +
-/// classification path and reads the counter itself. `BlobTooLarge` is the load-bearing
-/// zero: it takes the SAME `DurableMiss` arm, so it is the one code that can tell "metric
-/// keyed on the cause" from "metric keyed on the verdict".
 #[tokio::test(flavor = "multi_thread")]
-async fn only_an_eviction_refusal_fires_the_post_eviction_metric() -> Result<()> {
-    anyhow::ensure!(
-        post_eviction_failures_after_a_refusal(StreamError::EvictedSinceProbe).await? == 1,
-        "an EvictedSinceProbe refusal must increment \
-         decdn_probe_post_eviction_failures_total — ADR 001 §Probe cache mandates tracking \
-         this rate"
-    );
-    anyhow::ensure!(
-        post_eviction_failures_after_a_refusal(StreamError::BlobTooLarge).await? == 0,
-        "a BlobTooLarge refusal is a static fact about the blob, not a hold-mechanism \
-         failure — counting it as one is exactly the conflation DurableMissCause exists to \
-         prevent"
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
+async fn node_origin_declined_refusal_is_not_scored() -> Result<()> {
     let payload = vec![0x1Eu8; 4096];
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
@@ -6207,7 +6083,7 @@ async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
         slash_domain(),
         total_bytes,
         RATE,
-        StreamError::InternalError,
+        StreamError::Declined,
     );
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
@@ -6247,12 +6123,13 @@ async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
         "a refused delivery must not surface bytes (NotFound)"
     );
 
-    // Metered as a refusal (it IS one) AND scored (this one is the peer's fault).
+    // Metered as a refusal (it IS one) and never scored: a refusal proves the
+    // peer answered, whatever its class.
     assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
-    assert_counter(&b_metrics, "node_pull_unreachable_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
     anyhow::ensure!(
-        local_rep.score(a_id) < 0.5,
-        "an InternalError refusal must drop the local score below neutral, got {}",
+        (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
+        "a Declined refusal must leave the local score neutral, got {}",
         local_rep.score(a_id)
     );
 
@@ -8074,7 +7951,7 @@ async fn window_pull_through_funder_blacklisted_mid_stream_cuts_off_a_delegated_
 }
 
 /// #1560 END TO END, over the wire the client actually reads: when B cannot open its
-/// upstream pull because of a fault in B, the leaf must be refused `InternalError` — not the
+/// upstream pull because of a fault in B, the leaf must be refused `Declined` — not the
 /// signed `NotFound` that says the content does not exist.
 ///
 /// This is the claim the issue makes, and the only test that can settle it. Everything
@@ -8146,8 +8023,8 @@ async fn window_pull_through_local_fault_refuses_internal_error_not_not_found() 
     .ok_or_else(|| anyhow::anyhow!("B cannot pay for the upstream pull, so it cannot serve"))?;
     let refusal = refusal.to_string();
     anyhow::ensure!(
-        refusal.contains("InternalError"),
-        "B's own broken deadline config must be reported as B being broken, got: {refusal}"
+        refusal.contains("Declined"),
+        "B's own broken deadline config must be reported as B declining, got: {refusal}"
     );
     anyhow::ensure!(
         !refusal.contains("NotFound"),
@@ -8173,7 +8050,7 @@ async fn window_pull_through_local_fault_refuses_internal_error_not_not_found() 
 /// Without this the fix is only pinned in one direction. `window.rs`'s
 /// `miss_reason(fault_seen || miss.is_local_fault())` is the line #1560 changed, and
 /// mutating it to a flat `miss_reason(true)` passes every other test in this file — the node
-/// would answer `InternalError` for every ordinary cache miss on the network, permanently
+/// would answer `Declined` for every ordinary cache miss on the network, permanently
 /// steering clients off healthy nodes. That is a worse failure than the bug being fixed,
 /// because it fires constantly rather than only when a node is broken.
 ///
@@ -8250,9 +8127,9 @@ async fn window_pull_through_honest_upstream_miss_still_refuses_not_found() -> R
         "an honest network-wide miss is exactly what a wire `NotFound` is for, got: {refusal}"
     );
     anyhow::ensure!(
-        !refusal.contains("InternalError"),
-        "B is healthy — reporting itself broken for an ordinary miss would steer clients \
-         off a working node on every cache miss, got: {refusal}"
+        !refusal.contains("Declined"),
+        "B is healthy — declining an ordinary miss would steer clients off a working \
+         node on every cache miss, got: {refusal}"
     );
 
     assert_counter(&b_metrics, "serve_stream_rejected_cache_miss_total", 1)?;
@@ -8529,8 +8406,8 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
 
 /// The per-pool floor ceiling covers the window pull-through MISS path, not only
 /// the cache-hit path: a same-lane stream already in flight makes a concurrent
-/// same-lane MISS refuse — with the owner-facing `InsufficientDeposit` wire code
-/// (option 2 / #2013), since the bound leaf is a proven lane owner — before it
+/// same-lane MISS refuse — with the `Unfunded` wire code, since the bound leaf
+/// is a proven lane owner — before it
 /// ever opens a second upstream pull.
 ///
 /// Both leaves share ONE lane — same `pool_id` (the gated upstream's channel id
@@ -8629,8 +8506,8 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
 
     // Leaf 2: same lane, concurrent with leaf 1 still in flight. Drive the
     // request by hand (rather than `leaf_paced_pull`, which bails on a refusal)
-    // so the refusal itself — the owner-facing `InsufficientDeposit` wire code
-    // (option 2 / #2013), spoken because this bound leaf is a proven lane owner —
+    // so the refusal itself — the `Unfunded` wire code, spoken because this
+    // bound leaf is a proven lane owner —
     // is asserted.
     let leaf2_sk = fresh_key();
     let leaf2_node_id = B256::from(*leaf2_sk.public().as_bytes());
@@ -8680,8 +8557,8 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
         "concurrent same-lane MISS must be refused while budget covers only one floor"
     );
     anyhow::ensure!(
-        matches!(resp2_ext.error, Some(StreamError::InsufficientDeposit)),
-        "expected the owner-facing InsufficientDeposit wire code for the pool-ceiling refusal, \
+        matches!(resp2_ext.error, Some(StreamError::Unfunded)),
+        "expected the Unfunded wire code for the pool-ceiling refusal, \
          got {:?}",
         resp2_ext.error
     );
@@ -10953,7 +10830,7 @@ async fn ranged_pull_under_ceiling(
     })
 }
 
-/// Assert `run` is a `BlobTooLarge` refusal the leaf read before any byte, metered
+/// Assert `run` is a `Declined` size-ceiling refusal the leaf read before any byte, metered
 /// once on its own reason and never on the received-byte abort.
 async fn assert_refused_too_large(run: &CeilingRun) -> Result<()> {
     let err = match &run.leaf {
@@ -10964,8 +10841,8 @@ async fn assert_refused_too_large(run: &CeilingRun) -> Result<()> {
         Err(e) => format!("{e:#}"),
     };
     anyhow::ensure!(
-        err.contains("delivery refused: Some(BlobTooLarge)"),
-        "the leaf must read a signed BlobTooLarge refusal, got: {err}"
+        err.contains("delivery refused: Some(Declined)"),
+        "the leaf must read a signed Declined refusal, got: {err}"
     );
     assert_counter(
         &run.b_metrics,
@@ -10982,8 +10859,8 @@ async fn assert_refused_too_large(run: &CeilingRun) -> Result<()> {
     Ok(())
 }
 
-/// A request that starts at B's size ceiling is refused with `BlobTooLarge`
-/// before B commits (#2256). The gate reads the request's own offset, so B skips
+/// A request that starts at B's size ceiling is refused `Declined` for its
+/// size ceiling before B commits (#2256). The gate reads the request's own offset, so B skips
 /// discovery and the upstream handshake: A serves no stream and B pays nothing.
 /// A start exactly AT the ceiling is already past it, as the client's resume
 /// guard draws the line.
@@ -11215,13 +11092,9 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
             min_throughput_bps: 0,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
-            // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
-            // does when its channel runs dry, which a self-funding one would hide.
-            working_deposit: U256::ZERO,
-            seller_reserve: U256::ZERO,
-            // Short, so a post-top-up settle wait cannot dominate a test's wall clock.
-            // The fixtures accept the resumed open immediately, so the budget is only
-            // ever spent when a test deliberately withholds settlement.
+            // Short, so a post-recovery settle wait cannot dominate a test's wall
+            // clock. The fixtures accept the re-open immediately, so the window is
+            // only ever spent when a test deliberately withholds settlement.
             event_poll_interval: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
@@ -11587,8 +11460,6 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         PositiveProbeCache::with_capacity_and_ttl(16, Duration::from_millis(300)),
         // Buffered `Origin::fetch` path — directory keyed under `NO_NAMESPACE`.
         U256::ZERO,
-        // Reactive mid-pull top-up off; only the #1530 tests turn it on.
-        U256::ZERO,
     )
     .await;
 
@@ -11651,9 +11522,10 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
     let streams = Arc::new(AtomicUsize::new(0));
 
     // --- Three providers: reachable, honest at probe, refuse the pull with
-    //     `InternalError` — reported node-fault, so NOT negative-cached and NOT
-    //     wedged, which is exactly what lets all three remain in the cache for
-    //     the second fetch to spend its budget on. -----------------------------
+    //     `Declined`. B's negative cache runs a zero cache-wide TTL, so the
+    //     durable suppression a `Declined` earns lapses at once and all three
+    //     remain in the probe cache for the second fetch to spend its budget on.
+    //     -----------------------------------------------------------------------
     let n0_sk = fresh_key();
     let n0_id = n0_sk.public();
     let n0_eth = Arc::new(PrivateKeySigner::random());
@@ -11665,7 +11537,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         slash_domain(),
         total_bytes,
         RATE,
-        StreamError::InternalError,
+        StreamError::Declined,
         Arc::clone(&probes),
         Arc::clone(&streams),
     );
@@ -11681,7 +11553,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         slash_domain(),
         total_bytes,
         RATE,
-        StreamError::InternalError,
+        StreamError::Declined,
         Arc::clone(&probes),
         Arc::clone(&streams),
     );
@@ -11697,7 +11569,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         slash_domain(),
         total_bytes,
         RATE,
-        StreamError::InternalError,
+        StreamError::Declined,
         Arc::clone(&probes),
         Arc::clone(&streams),
     );
@@ -11741,7 +11613,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
-    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_negative_cache(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -11753,6 +11625,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
+        NegativeProbeCache::with_capacity_and_ttl(64, Duration::ZERO),
     )
     .await;
 
@@ -11774,7 +11647,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
     assert_counter(&b_metrics, "node_pull_refused_total", 3)?;
 
     // Fetch #2: the probe-cache hit walks the SAME three cached candidates (none
-    // negative-cached or wedged by an `InternalError` refusal). It must spend
+    // still negative-cached, none wedged). It must spend
     // exactly the fetch-wide budget of 3 — not hand a fresh lookup three MORE —
     // and must not re-probe anyone.
     let second = Origin::fetch(&origin, hash, u64::MAX)
@@ -11798,7 +11671,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
 
     // Fetch #3: fetch #2 disproved the cached entry by spending the whole budget
     // on it, so it must have been INVALIDATED — none of the three refusers is
-    // negative-cached or wedged (`InternalError`), so only the invalidate stands
+    // still negative-cached or wedged, so only the invalidate stands
     // between this fetch and a second hit on the same dead list. It must go COLD:
     // a fresh lookup that re-probes all three at the wire.
     let third = Origin::fetch(&origin, hash, u64::MAX)
@@ -11852,8 +11725,8 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     // --- Provider N: reachable, honest at probe, refuses the pull with
-    //     `InternalError` — reported node-fault, so NOT negative-cached and NOT
-    //     wedged, exactly like the shared-budget test's three refusers. -----------
+    //     `Declined`. As in the shared-budget test, B's negative cache runs a
+    //     zero cache-wide TTL, so N stays a cached candidate. ---------------------
     let probes_n = Arc::new(AtomicUsize::new(0));
     let streams_n = Arc::new(AtomicUsize::new(0));
     let n_sk = fresh_key();
@@ -11867,7 +11740,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         slash_domain(),
         total_bytes,
         RANK_LAST_RATE,
-        StreamError::InternalError,
+        StreamError::Declined,
         Arc::clone(&probes_n),
         Arc::clone(&streams_n),
     );
@@ -11918,7 +11791,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
-    let (origin, engine, _engine_tmp) = build_origin_with_timeout(
+    let (origin, engine, _engine_tmp) = build_origin_with_negative_cache(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -11930,6 +11803,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
+        NegativeProbeCache::with_capacity_and_ttl(64, Duration::ZERO),
     )
     .await;
 
@@ -11955,12 +11829,9 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
     );
     assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
     assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
-    // 2, not 1: H's failed probe scores Unreachable, AND N's `InternalError` refusal is
-    // classified `RefusalVerdict::NodeFault`, which — per `classify_pull_failure` — ALSO
-    // scores `Outcome::Unreachable` on top of incrementing `node_pull_refused_total` (a
-    // refusal proves reachability at the wire but is still reputation-scored as
-    // unreachable). This is why the shared-budget test above never asserts this counter.
-    assert_counter(&b_metrics, "node_pull_unreachable_total", 2)?;
+    // H's failed probe scores Unreachable; N's refusal proves it reachable and
+    // scores nothing.
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 1)?;
     assert_counter(&b_metrics, "node_pull_attempts_total", 1)?;
 
     // --- Bring H online between the two fetches: a real, healthy upstream
@@ -12057,10 +11928,9 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
     assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
     assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
     assert_counter(&b_metrics, "node_pull_refused_total", 2)?;
-    // 3, not 2: the 2 from fetch #1 (H unreachable + N's NodeFault refusal) plus one more
-    // from N's second (cached-phase) refusal. H's successful cold-path probe and delivery
-    // add none.
-    assert_counter(&b_metrics, "node_pull_unreachable_total", 3)?;
+    // Still only fetch #1's unreachable H: N's second refusal and H's successful
+    // cold-path probe and delivery add none.
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 1)?;
     // THE property under test: one orchestration per fetch, however many
     // candidate lists it walks THIS TIME — 2, not 3. A regressed
     // `if !attempt_metered` guard that always fires would double-count fetch
@@ -12269,7 +12139,8 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
 /// above cannot see this: its entry keeps a second, unsuppressed provider, so the filtered
 /// list is never empty.
 ///
-/// Sole provider N refuses with `EvictedSinceProbe` — durable, so fetch #1 negative-caches
+/// Sole provider N refuses `Declined` (a blob withdrawn after its probe), which is
+/// durable, so fetch #1 negative-caches
 /// the (peer, hash) for the full cache-wide TTL while the positive entry (written at
 /// `probe_and_rank`'s tail regardless) survives. Fetch #2 finds the entry, filters N out,
 /// and must take the MISS path end to end: no hit metered, and no re-probe or re-stream of
@@ -12282,7 +12153,7 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
-    // --- Node N: honest at probe, refuses every pull with `EvictedSinceProbe` —
+    // --- Node N: honest at probe, refuses every pull `Declined`, which is
     //     durable, so the refusal suppresses this (peer, hash) for the FULL
     //     cache-wide TTL (5 min at defaults), comfortably covering fetch #2. ------
     let probes_n = Arc::new(AtomicUsize::new(0));
@@ -12298,7 +12169,7 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
         slash_domain(),
         total_bytes,
         RATE,
-        StreamError::EvictedSinceProbe,
+        StreamError::Declined,
         Arc::clone(&probes_n),
         Arc::clone(&streams_n),
     );
@@ -12934,13 +12805,9 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
             min_throughput_bps: 0,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
-            // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
-            // does when its channel runs dry, which a self-funding one would hide.
-            working_deposit: U256::ZERO,
-            seller_reserve: U256::ZERO,
-            // Short, so a post-top-up settle wait cannot dominate a test's wall clock.
-            // The fixtures accept the resumed open immediately, so the budget is only
-            // ever spent when a test deliberately withholds settlement.
+            // Short, so a post-recovery settle wait cannot dominate a test's wall
+            // clock. The fixtures accept the re-open immediately, so the window is
+            // only ever spent when a test deliberately withholds settlement.
             event_poll_interval: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
@@ -13028,14 +12895,12 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// #1530: reactive mid-pull deposit top-up on the node-to-node buyer leg.
+// #1530: the funding recovery step on the node-to-node buyer leg.
 //
-// The daemon's miss pull opens a channel at the small INITIAL deposit and, until
-// #1530, could only spend it: `stream_fetch_shared` at a fixed `byte_offset == 0`
-// has no resume point, so a blob larger than that deposit simply failed. The pull
-// now resumes at the PAID FRONTIER after funding the shortfall, which is what these
-// tests pin — the completion, and, more importantly, that resuming costs the buyer
-// nothing it had already bought.
+// The daemon's miss pull opens its pool at a small INITIAL deposit. When no
+// upstream serves at that deposit, the fill's recovery step funds the shortfall
+// and the pull resumes at the PAID FRONTIER. These tests pin the completion and,
+// more importantly, that resuming costs the buyer nothing it had already bought.
 // ---------------------------------------------------------------------------
 
 /// [`support::honest_bao_wire_range`], visible under this suite's name.
@@ -13053,8 +12918,8 @@ fn honest_bao_wire_from(payload: &[u8], byte_offset: u64) -> Result<Vec<u8>> {
 /// signer's capability cap (`VoucherRejectReason::SpendingCapExhausted`), and a real
 /// `topUp` raises the pool's escrowed deposit backing that cap. Modelling it
 /// as one shared cell is what makes the round trip real here:
-/// `FundingOpener`'s `top_up_pool_by` raises the same
-/// number the server enforces, so the resumed leg succeeds for the RIGHT reason
+/// `FundingOpener`'s `recover_pool` raises the same
+/// number the server enforces, so the next pass succeeds for the RIGHT reason
 /// rather than because the fixture stopped objecting.
 type SharedDeposit = Arc<Mutex<U256>>;
 
@@ -13068,12 +12933,14 @@ fn read_deposit(cell: &SharedDeposit) -> Result<U256> {
         .map_err(|_| anyhow::anyhow!("deposit lock poisoned"))?)
 }
 
-/// A buyer-channel opener that FUNDS, so the reactive leg has something to spend.
+/// A buyer-pool opener that FUNDS, so the funding recovery step has something to
+/// spend.
 ///
 /// [`StubOpener`] with two differences that matter: its deposit is a live cell an
-/// upstream fixture reads (see [`SharedDeposit`]), and `top_up_pool_by` adds to that
-/// cell and logs the call. `funds` is what a test flips to model a top-up that
-/// lands but adds no headroom.
+/// upstream fixture reads (see [`SharedDeposit`]), and `recover_pool` adds to that
+/// cell and logs the call, sizing the top-up as the real service does: the working
+/// deposit less what the pool still holds by its recorded spend. `funds` is what a
+/// test flips to model a top-up that lands but adds no headroom.
 #[derive(Debug)]
 struct FundingOpener {
     pool_id: B256,
@@ -13081,15 +12948,19 @@ struct FundingOpener {
     /// headroom arithmetic reads.
     deposit: SharedDeposit,
     /// What the UPSTREAM enforces. Normally the same number, raised in lockstep by a
-    /// top-up. A test drives them APART to model an upstream lying about our deposit,
-    /// which is the case `genuine_exhaustion` exists to refuse.
+    /// top-up. A pinned ceiling (`ceiling_follows == false`) models an upstream that
+    /// refuses our funding whatever we hold.
     ceiling: SharedDeposit,
+    /// Whether a top-up raises `ceiling` with `deposit` (an honest upstream).
+    ceiling_follows: bool,
     signer: Arc<PrivateKeySigner>,
     voucher_domain: Eip712Domain,
     recorded: Arc<Mutex<Vec<ProgressEntry>>>,
-    /// Every `top_up_pool_by(additional)` in order — the test's view of what the pull
-    /// tried to fund.
+    /// Every recovery step's requested top-up, in order: the test's view of what
+    /// the fill tried to fund.
     topups: Arc<Mutex<Vec<(Address, U256)>>>,
+    /// The deposit a recovery step tops the pool up toward. Zero: nothing to add.
+    working: U256,
     /// Whether a top-up actually adds headroom. `false` models a refusal.
     funds: bool,
     /// The most one top-up lands. `None` lands the full request; `Some` models a
@@ -13147,44 +13018,74 @@ impl PoolOpener for FundingOpener {
         Ok(())
     }
 
-    async fn top_up_pool_by(&self, additional: U256) -> Result<TopUpLanded> {
-        self.topups
-            .lock()
-            .map_err(|_| anyhow::anyhow!("topups lock poisoned"))?
-            .push((Address::ZERO, additional));
+    fn pool_deposit(&self) -> Option<U256> {
+        read_deposit(&self.deposit).ok()
+    }
+
+    async fn recover_pool(&self, seen_deposit: U256) -> Result<Recovery> {
+        // A deposit above what the fill saw is a sibling fill's step.
+        let now = read_deposit(&self.deposit)?;
+        if now > seen_deposit {
+            return Ok(Recovery::ToppedUp(now));
+        }
+        if self.working.is_zero() {
+            return Ok(Recovery::Unavailable);
+        }
+        // The pool's spend as its row records it: the latest amount per provider.
+        let spent = {
+            let recorded = self
+                .recorded
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recorded lock poisoned"))?;
+            let mut latest: HashMap<Address, U256> = HashMap::new();
+            for (provider, _, amount) in recorded.iter() {
+                latest.insert(*provider, *amount);
+            }
+            latest
+                .values()
+                .fold(U256::ZERO, |a, b| a.saturating_add(*b))
+        };
         let mut deposit = self
             .deposit
             .lock()
             .map_err(|_| anyhow::anyhow!("deposit lock poisoned"))?;
-        // Add `additional`, capped at `landing_cap`, and report what landed, as the
-        // real `BuyerPoolService::top_up_pool_by` does.
+        let additional = self.working.saturating_sub(deposit.saturating_sub(spent));
+        // A full open pool settles: the upstream has not seen it yet.
+        if additional.is_zero() {
+            return Ok(Recovery::ToppedUp(*deposit));
+        }
+        self.topups
+            .lock()
+            .map_err(|_| anyhow::anyhow!("topups lock poisoned"))?
+            .push((Address::ZERO, additional));
+        // Add `additional`, capped at `landing_cap`, as the real service does.
         let added = if self.funds {
             self.landing_cap
                 .map_or(additional, |cap| additional.min(cap))
         } else {
             U256::ZERO
         };
-        if !added.is_zero() {
-            *deposit = deposit.saturating_add(added);
-            // The escrow the upstream can see rises with it — a real `topUp` raises one
-            // number, and the buyer's belief and the seller's gate are both views of it.
+        if added.is_zero() {
+            return Ok(Recovery::Unavailable);
+        }
+        *deposit = deposit.saturating_add(added);
+        // The escrow an honest upstream sees rises with it: a real `topUp` raises one
+        // number, and the buyer's belief and the seller's gate are both views of it.
+        if self.ceiling_follows {
             *self
                 .ceiling
                 .lock()
                 .map_err(|_| anyhow::anyhow!("ceiling lock poisoned"))? = *deposit;
         }
-        Ok(TopUpLanded {
-            new_deposit: *deposit,
-            added,
-        })
+        Ok(Recovery::ToppedUp(*deposit))
     }
 }
 
 /// Serve `payload` with real per-interval voucher pacing, honouring the request's
 /// `byte_offset`, and REFUSE any voucher the shared deposit cannot cover.
 ///
-/// The upstream half of the reactive-top-up round trip, and the only fixture in this
-/// file that can produce a mid-blob `InsufficientDeposit`: `serve_then_reject_voucher`
+/// The upstream half of the recovery-top-up round trip, and the only fixture in this
+/// file that can produce a mid-blob `Unfunded`: `serve_then_reject_voucher`
 /// refuses the CLOSING voucher over a raw payload, so nothing is ever delivered and
 /// resumed. Here the buyer is paid for what it received, told it cannot afford the
 /// next interval, and — once the deposit rises — served the remainder from wherever
@@ -13298,9 +13199,9 @@ async fn serve_with_deposit_ceiling(
 /// deposit has to cover. Returns whether it was accepted.
 ///
 /// `bundle: None`, which is what a real node attaches when it holds no prior accepted
-/// voucher to echo — and, critically, what keeps `genuine_exhaustion`'s desync
-/// carve-out out of the way. A bundle that ADVANCED our watermark would (correctly)
-/// route to the reseed path instead of to funding.
+/// voucher to echo, which keeps the watermark heal out of the way. A bundle that
+/// ADVANCED our watermark would (correctly) route to the reseed path instead of
+/// to funding.
 ///
 /// Acceptance is implicit (continued delivery is the ack, ADR 005), so on accept no
 /// reply is written; only a rejection sends a message.
@@ -13470,7 +13371,7 @@ fn spawn_deposit_capped_server(
     })
 }
 
-/// Everything a reactive-top-up test needs to drive one fetch and then inspect what
+/// Everything a recovery-top-up test needs to drive one fetch and then inspect what
 /// it paid.
 struct TopUpFixture {
     origin: NodeOrigin,
@@ -13497,12 +13398,12 @@ impl TopUpFixture {
     }
 }
 
-/// How one reactive-top-up scenario is wired.
+/// How one recovery-top-up scenario is wired.
 #[derive(Debug, Clone, Copy)]
 struct TopUpSetup {
     /// What the buyer's channel starts with.
     initial_micro_usdc: u64,
-    /// The graduation target; `0` disables the reactive leg.
+    /// The working deposit a recovery step tops up toward; `0` turns funding off.
     working_micro_usdc: u64,
     /// Whether a top-up adds headroom.
     funds: bool,
@@ -13598,10 +13499,12 @@ async fn top_up_fixture_multi_rep(
         pool_id: B256::repeat_byte(0x15),
         deposit,
         ceiling,
+        ceiling_follows: setup.ceiling_micro_usdc.is_none(),
         signer: Arc::new(PrivateKeySigner::random()),
         voucher_domain: voucher_dom(),
         recorded: Arc::clone(&recorded),
         topups: Arc::new(Mutex::new(Vec::new())),
+        working: U256::from(setup.working_micro_usdc),
         funds: setup.funds,
         landing_cap: setup.landing_cap_micro_usdc.map(U256::from),
     });
@@ -13622,7 +13525,6 @@ async fn top_up_fixture_multi_rep(
         NegativeProbeCache::new(),
         PositiveProbeCache::new(),
         U256::ZERO,
-        U256::from(setup.working_micro_usdc),
     )
     .await;
 
@@ -13685,7 +13587,7 @@ async fn a_pull_larger_than_the_working_deposit_tops_up_once_and_completes() -> 
         Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("the reactive top-up pull never finished"))?
+    .map_err(|_| anyhow::anyhow!("the recovery top-up pull never finished"))?
     .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
 
     anyhow::ensure!(
@@ -13703,7 +13605,7 @@ async fn a_pull_larger_than_the_working_deposit_tops_up_once_and_completes() -> 
     let log = topup_log(&fixture.opener)?;
     anyhow::ensure!(
         log.len() == 1,
-        "exactly one reactive top-up should have funded this pull, got {log:?}"
+        "exactly one recovery top-up should have funded this pull, got {log:?}"
     );
     // The top-up restores spendable headroom to the WORKING deposit: it adds the
     // working deposit less what the pool still had, and the pool never had more
@@ -13715,12 +13617,8 @@ async fn a_pull_larger_than_the_working_deposit_tops_up_once_and_completes() -> 
         }),
         "the top-up must raise spendable to the WORKING deposit, got {log:?}"
     );
-    assert_counter(&fixture.metrics, "node_pull_reactive_topup_total", 1)?;
-    assert_counter(
-        &fixture.metrics,
-        "node_pull_reactive_topup_refused_total",
-        0,
-    )?;
+    assert_counter(&fixture.metrics, "node_pull_recovery_step_total", 1)?;
+    assert_counter(&fixture.metrics, "node_pull_recovery_step_refused_total", 0)?;
     // The upstream did nothing wrong — it served every byte it was paid for.
     assert_counter(&fixture.metrics, "node_pull_unreachable_total", 0)?;
     assert_counter(&fixture.metrics, "node_pull_corruption_total", 0)?;
@@ -13795,7 +13693,7 @@ async fn a_slow_post_topup_delivery_scores_slow_not_instant() -> Result<()> {
         Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("the reactive top-up pull never finished"))?
+    .map_err(|_| anyhow::anyhow!("the recovery top-up pull never finished"))?
     .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
     anyhow::ensure!(
         matches!(got, OriginFetch::AlreadyAdmitted),
@@ -13810,7 +13708,7 @@ async fn a_slow_post_topup_delivery_scores_slow_not_instant() -> Result<()> {
     );
 
     // The pull DID top up and complete — the same path the headline test drives.
-    assert_counter(&fixture.metrics, "node_pull_reactive_topup_total", 1)?;
+    assert_counter(&fixture.metrics, "node_pull_recovery_step_total", 1)?;
     assert_counter(&fixture.metrics, "node_pull_corruption_total", 0)?;
     assert_counter(&fixture.metrics, "node_pull_unreachable_total", 0)?;
 
@@ -13840,8 +13738,8 @@ async fn a_slow_post_topup_delivery_scores_slow_not_instant() -> Result<()> {
 ///
 /// The persisted watermark is channel-cumulative WIRE bytes, so the whole pull's
 /// spend is directly comparable to what ONE bao encoding of the blob costs. A naive
-/// `byte_offset = 0` restart — the thing that made the reactive leg impossible on
-/// this path — bills roughly twice that, and fails the upper bound loudly.
+/// `byte_offset = 0` restart bills roughly twice that, and fails the upper bound
+/// loudly.
 ///
 /// The bounds are asymmetric on purpose:
 ///
@@ -13869,7 +13767,7 @@ async fn the_resumed_leg_does_not_re_pay_for_delivered_bytes() -> Result<()> {
         Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("the reactive top-up pull never finished"))?
+    .map_err(|_| anyhow::anyhow!("the recovery top-up pull never finished"))?
     .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
     anyhow::ensure!(
         matches!(got, OriginFetch::AlreadyAdmitted),
@@ -13908,20 +13806,19 @@ async fn the_resumed_leg_does_not_re_pay_for_delivered_bytes() -> Result<()> {
     Ok(())
 }
 
-/// An upstream claiming `InsufficientDeposit` while OUR ledger still covers the next
-/// voucher is lying or broken, and must not be funded.
+/// An upstream that refuses every voucher while OUR ledger still covers it buys
+/// at most one funding recovery step, never a stream of them.
 ///
-/// This is the whole reason `genuine_exhaustion` validates the claim against the
-/// buyer's own accounting rather than taking the wire word for it: without it, any
-/// upstream could make a node escrow more USDC on demand, repeatedly, by refusing
-/// vouchers it could perfectly well accept.
+/// The progress rule bounds the step count (ADR 003 § Funding recovery): the
+/// first step is free, and each further step needs a byte verified since the
+/// last one. An upstream that verifies nothing gets one step, then the fill
+/// ends funding needed, so it cannot make a node escrow USDC on demand.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_node_crying_poverty_while_our_ledger_has_headroom_is_not_funded() -> Result<()> {
+async fn a_node_crying_poverty_gets_one_recovery_step_and_no_more() -> Result<()> {
     let payload = multi_interval_payload();
     // The buyer's channel is funded far beyond the whole blob, so nothing the upstream
-    // can say about our deposit is true — but its ceiling is set to refuse the very
-    // first voucher anyway. That divergence IS the attack: an upstream that can make a
-    // node escrow more USDC just by refusing vouchers it could accept.
+    // can say about our deposit is true, but its ceiling is set to refuse the very
+    // first voucher anyway.
     let fixture = top_up_fixture(
         Arc::clone(&payload),
         TopUpSetup {
@@ -13947,18 +13844,15 @@ async fn a_node_crying_poverty_while_our_ledger_has_headroom_is_not_funded() -> 
         "a refused pull must not surface bytes"
     );
 
+    let log = topup_log(&fixture.opener)?;
     anyhow::ensure!(
-        topup_log(&fixture.opener)?.is_empty(),
-        "we must NOT escrow USDC on an upstream's unsupported word"
+        log.len() <= 1,
+        "an upstream that verifies no byte must buy at most one recovery step, got {log:?}"
     );
-    assert_counter(&fixture.metrics, "node_pull_reactive_topup_total", 0)?;
-    // ...and the refusal is VISIBLE. This is the counter's whole reason to exist —
-    // it is the only signal that distinguishes a peer extorting escrow from an
-    // ordinary failed pull, and until #1600 the case could never reach it.
     assert_counter(
         &fixture.metrics,
-        "node_pull_reactive_topup_refused_total",
-        1,
+        "node_pull_recovery_step_total",
+        u64::try_from(log.len())?,
     )?;
 
     fixture.shutdown().await?;
@@ -13995,25 +13889,25 @@ async fn a_topup_that_adds_no_headroom_ends_the_pull() -> Result<()> {
         log.len() == 1,
         "the funding attempt must be made exactly once, then abandoned — got {log:?}"
     );
-    assert_counter(&fixture.metrics, "node_pull_reactive_topup_total", 0)?;
-    assert_counter(
-        &fixture.metrics,
-        "node_pull_reactive_topup_refused_total",
-        1,
-    )?;
+    assert_counter(&fixture.metrics, "node_pull_recovery_step_total", 0)?;
+    assert_counter(&fixture.metrics, "node_pull_recovery_step_refused_total", 1)?;
 
     fixture.shutdown().await?;
     Ok(())
 }
 
-/// A top-up that lands SHORT of its request (#2012): the pull keeps the headroom that
-/// landed and spends it, uses its single reactive top-up, and is metered once as
-/// refused — not as a success, and not a second time as an extortion refusal.
+/// The lane that a funding refusal ends keeps the span it delivered and did not
+/// pay for, and its next leg after the recovery step bills that span first,
+/// although the store holds the bytes (ADR 003 § Funding recovery).
 ///
-/// The initial deposit covers two MiB at `RATE` and the capped landing one more,
-/// short of the 3 MiB + 777 byte blob, so the pull ends without the blob.
+/// The initial deposit covers two MiB at `RATE`, and the credit window lets the
+/// upstream deliver the third MiB unpaid before it refuses. Each landing covers
+/// one MiB. The first one pays the owed third MiB, and the credit window lets
+/// the leg verify the last 777 bytes unpaid; those new bytes allow a second
+/// step, which pays for them. The lane pays for every byte it received, so the
+/// last voucher is the whole blob's price.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_topup_that_lands_short_keeps_what_landed_and_is_metered_once() -> Result<()> {
+async fn the_owed_tail_is_billed_on_the_same_lane_after_the_step() -> Result<()> {
     let payload = multi_interval_payload();
     let initial = 2 * RATE;
     let cap = RATE;
@@ -14034,18 +13928,65 @@ async fn a_topup_that_lands_short_keeps_what_landed_and_is_metered_once() -> Res
     .map_err(|_| anyhow::anyhow!("an underfunded pull must not hang"))?
     .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
     anyhow::ensure!(
-        matches!(got, OriginFetch::NotFound),
-        "a pull the short landing cannot finish must not surface bytes"
+        matches!(got, OriginFetch::AlreadyAdmitted),
+        "two short landings carry the pull to the end"
+    );
+    let log = topup_log(&fixture.opener)?;
+    anyhow::ensure!(log.len() == 2, "two steps, got {log:?}");
+    let paid = progress_log(&fixture.recorded)?
+        .iter()
+        .map(|(_, _, amount)| *amount)
+        .max()
+        .unwrap_or(U256::ZERO);
+    // Three MiB at `RATE` plus one more unit for the last 777 bytes.
+    let whole = 3 * RATE + 1;
+    anyhow::ensure!(
+        paid == U256::from(whole),
+        "the lane must bill the owed third MiB and the tail: paid {paid}, expected {whole}"
+    );
+
+    fixture.shutdown().await?;
+    Ok(())
+}
+
+/// A top-up that lands SHORT of its request (#2012): the pull keeps the headroom that
+/// landed and spends it, first on the owed tail and then on new bytes, and the
+/// pull completes.
+///
+/// The initial deposit covers two MiB at `RATE`. Each capped landing covers two
+/// more: the owed third MiB and the last 777 bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_short_landing_keeps_what_landed_and_completes_the_pull() -> Result<()> {
+    let payload = multi_interval_payload();
+    let initial = 2 * RATE;
+    let cap = 2 * RATE;
+    let fixture = top_up_fixture(
+        Arc::clone(&payload),
+        TopUpSetup {
+            landing_cap_micro_usdc: Some(cap),
+            ..TopUpSetup::honest(initial, 200 * RATE, true)
+        },
+    )
+    .await?;
+
+    let got = tokio::time::timeout(
+        Duration::from_mins(1),
+        Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("an underfunded pull must not hang"))?
+    .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::AlreadyAdmitted),
+        "the short landing must carry the pull to the end"
     );
 
     let log = topup_log(&fixture.opener)?;
+    anyhow::ensure!(!log.is_empty(), "the pull needs a landing, got none");
+    let steps = u64::try_from(log.len())?;
     anyhow::ensure!(
-        log.len() == 1,
-        "the single reactive top-up must be spent exactly once — got {log:?}"
-    );
-    anyhow::ensure!(
-        read_deposit(&fixture.opener.deposit)? == U256::from(initial + cap),
-        "the short landing must raise the deposit by exactly what landed"
+        read_deposit(&fixture.opener.deposit)? == U256::from(initial + cap * steps),
+        "each short landing must raise the deposit by exactly what landed"
     );
     let paid = progress_log(&fixture.recorded)?
         .iter()
@@ -14054,21 +13995,68 @@ async fn a_topup_that_lands_short_keeps_what_landed_and_is_metered_once() -> Res
         .unwrap_or(U256::ZERO);
     anyhow::ensure!(
         paid > U256::from(initial),
-        "the pull must spend the headroom that landed: paid {paid}, initial deposit {initial}"
+        "the pull must spend the headroom the landing added: paid {paid}"
     );
-    assert_counter(&fixture.metrics, "node_pull_reactive_topup_total", 0)?;
-    assert_counter(
-        &fixture.metrics,
-        "node_pull_reactive_topup_refused_total",
-        1,
-    )?;
+    assert_counter(&fixture.metrics, "node_pull_recovery_step_total", steps)?;
 
     fixture.shutdown().await?;
     Ok(())
 }
 
-/// `buyer_working_deposit_micro_usdc = 0` disables the reactive leg outright, the
-/// same sentinel the proactive low-water refill honours. An operator who turns
+/// A pool that already holds its working deposit, refused by an upstream whose
+/// chain watcher has not seen that deposit yet, settles instead of ending
+/// "funding needed": the step escrows nothing, the settle window asks the
+/// upstream again, and the pull completes once the upstream catches up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_pool_refused_by_a_stale_upstream_settles_then_is_served() -> Result<()> {
+    let payload = multi_interval_payload();
+    let fixture = top_up_fixture(
+        Arc::clone(&payload),
+        TopUpSetup {
+            // The upstream enforces two MiB of the 200 the pool holds.
+            ceiling_micro_usdc: Some(2 * RATE),
+            ..TopUpSetup::honest(200 * RATE, 100 * RATE, true)
+        },
+    )
+    .await?;
+    // The upstream catches up once the refused leg has recorded its progress.
+    let ceiling = Arc::clone(&fixture.opener.ceiling);
+    let recorded = Arc::clone(&fixture.recorded);
+    let catch_up = tokio::spawn(async move {
+        while recorded.lock().map_or(true, |log| log.is_empty()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(mut ceiling) = ceiling.lock() {
+            *ceiling = U256::from(200 * RATE);
+        }
+    });
+
+    let got = tokio::time::timeout(
+        Duration::from_mins(1),
+        Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("a settling pull must not hang"))?
+    .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    catch_up.await?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::AlreadyAdmitted),
+        "the upstream serves once it sees the deposit"
+    );
+    anyhow::ensure!(
+        topup_log(&fixture.opener)?.is_empty(),
+        "a full pool escrows nothing"
+    );
+    // The one step was the settle.
+    assert_counter(&fixture.metrics, "node_pull_recovery_step_total", 1)?;
+
+    fixture.shutdown().await?;
+    Ok(())
+}
+
+/// `buyer_working_deposit_micro_usdc = 0` turns the funding recovery step's
+/// top-up off, the same sentinel the low-water refill honours. An operator who turns
 /// top-ups off must not have one performed on their behalf.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_zero_working_deposit_never_funds_a_pull() -> Result<()> {
@@ -14206,22 +14194,15 @@ async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Res
     Ok(())
 }
 
-/// The reactive top-up is bounded at ONE per pull, over the wire (#1600 review).
-///
-/// The pure policy — refusing once `topups_used == max_topups` — is pinned in
-/// `decdn_client::pacer`'s own unit tests; this pins the WIRING — the
-/// `topups_used` increment [`decdn_client::driver::drive`] performs after a
-/// landed top-up. Removing that increment is currently invisible to every other
-/// test, because the funding double is idempotent against its target (a second call
-/// at the same target adds nothing, so the funder reports no headroom and the loop
-/// stops anyway).
-/// Here the working deposit is deliberately still too small for the blob, so a loop
-/// that did not count would keep funding-and-failing rather than ending after one.
+/// A working deposit too small for the whole blob funds it over several
+/// recovery steps (ADR 003 § Funding recovery): each step restores three MiB of
+/// headroom, the pull verifies new bytes with it, and the progress rule allows
+/// the next step. The buffered fill counts the bytes its store gained, so a
+/// re-billed byte counts nothing.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_working_deposit_that_still_cannot_cover_the_blob_funds_exactly_once() -> Result<()> {
+async fn a_long_pull_recovers_again_after_verified_progress() -> Result<()> {
     // ~10 chunks of wire, so the whole blob costs ~10x RATE. The initial
-    // deposit funds two, and the top-up restores headroom to three more — enough for
-    // real progress on the resumed leg, and still far short of the blob.
+    // deposit funds two, and each step restores headroom to three more.
     let len = usize::try_from(MB_BYTES).unwrap_or(usize::MAX) * 9 + 777;
     let payload: Arc<Vec<u8>> = Arc::new(
         (0..len)
@@ -14239,21 +14220,23 @@ async fn a_working_deposit_that_still_cannot_cover_the_blob_funds_exactly_once()
         Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("a still-underfunded pull must not loop forever"))?
+    .map_err(|_| anyhow::anyhow!("a pull funded step by step must not loop forever"))?
     .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
     anyhow::ensure!(
-        matches!(got, OriginFetch::NotFound),
-        "a pull the working deposit cannot cover must end as a miss"
+        matches!(got, OriginFetch::AlreadyAdmitted),
+        "each step paid for new bytes, so the steps carry the pull to the end"
     );
 
     let log = topup_log(&fixture.opener)?;
     anyhow::ensure!(
-        log.len() == 1,
-        "exactly one reactive top-up per pull, then give up — an upstream whose rate \
-         outruns the working deposit is a pricing problem, and each extra attempt is a \
-         transaction a waiting client pays for. Got {log:?}"
+        log.len() >= 2,
+        "a blob past one working deposit needs more than one step, got {log:?}"
     );
-    assert_counter(&fixture.metrics, "node_pull_reactive_topup_total", 1)?;
+    assert_counter(
+        &fixture.metrics,
+        "node_pull_recovery_step_total",
+        u64::try_from(log.len())?,
+    )?;
 
     fixture.shutdown().await?;
     Ok(())
@@ -14319,8 +14302,6 @@ async fn build_origin_economics(
             min_throughput_bps: 0,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
-            working_deposit: U256::ZERO,
-            seller_reserve: U256::ZERO,
             event_poll_interval: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
@@ -15323,7 +15304,6 @@ async fn build_serving_node(
         0, // max_blob_size_bytes: 0 = unlimited; these tests do not exercise the size ceiling
         NegativeProbeCache::new(),
         probe_cache,
-        U256::ZERO,
     )
     .await;
     let origin_s = Arc::new(origin);

@@ -50,9 +50,7 @@
 //!    cache serves an unbound lane nothing. Create its ledger with
 //!    [`PoolContext::new_ledger`], and wrap both in a [`PeerSource`] inside a
 //!    [`StreamCandidate::new`]. Cap the lane's rate at the rate the node signed
-//!    in its probe answer ([`effective_rate_ceiling`]). A lane that pays under a
-//!    delegated capability also checks its signer
-//!    ([`PeerSource::with_signer_check`]).
+//!    in its probe answer ([`effective_rate_ceiling`]).
 //! 6. **Fetch** with [`Downloader::fetch_to_paths`] or [`Streamer::open`], over
 //!    a [`StaticSources`] of the lanes. Every lane streams at once unless
 //!    [`Downloader::max_lanes`] caps it.
@@ -83,14 +81,21 @@
 //! - **Persistence.** The faces never write the buyer store. Record every
 //!   lane's payment after each fetch (step 7). A lane you do not record resumes
 //!   from a stale watermark next time, and its provider rejects the vouchers.
-//! - **Funding policy.** Reactive top-up is off until you give a face a
-//!   working deposit ([`Downloader::working_deposit`],
-//!   [`Streamer::working_deposit`]). A [`Funder`] then decides whether a fetch
-//!   that runs the pool low tops it up. One whose
-//!   [`max_topups`](Funder::max_topups) is `0` never does. A source whose next
-//!   voucher the deposit cannot cover then waits for the deposit to rise, and
-//!   once every known source waits the fetch fails with a
-//!   [`NoAffordableSource`].
+//! - **Funding policy.** A source whose next voucher the deposit cannot cover,
+//!   or that refuses the pool as `Unfunded`, waits for the deposit to rise.
+//!   Once no other source serves and a fresh discovery finds nothing new, the
+//!   fetch runs one funding recovery step through your [`Funder`]
+//!   ([`Funder::recover`]): it may top the pool up, open a new pool
+//!   ([`PoolReplaced`]), or report that it has no way to add funds. A further
+//!   step needs a newly verified byte since the last one. When no step is
+//!   allowed or possible, the fetch fails with a [`NoAffordableSource`],
+//!   "funding needed".
+//! - **Delegated credentials.** A delegate that pays under someone else's
+//!   pool hands the face a [`CredentialSlot`] and watches its
+//!   [`FundingEvent`]s. Swap a new key and capability into the slot when the
+//!   capability runs low: the fetch retires the old lanes at a voucher
+//!   boundary and goes on under the new key. Without a swap, a delegated
+//!   fetch ends with a typed [`FundingNeeded`].
 //! - **Which holders to use.** Discovery gives candidates; ordering and
 //!   admission ([`discovery::admit_sources`]) are the caller's choice.
 //!
@@ -154,6 +159,9 @@ pub mod connection;
 /// (node — concentrate + sticky) and `coverage_plan::spread_segments` (client —
 /// spread for parallelism). Pure, no I/O.
 pub(crate) mod coverage_plan;
+/// A delegated fetch's voucher credential, which the application swaps when
+/// the capability runs low, and the funding signal that says when.
+pub mod credential;
 /// Client-side node discovery (#936): read + select the active node set from
 /// `CapacityBond.getRegisteredNodes`, then rank probed blob-holders.
 pub mod discovery;
@@ -164,8 +172,8 @@ pub mod discovery;
 pub mod downloader;
 /// The #1608 gap-driven fetch driver: [`driver::drive`] fills only the
 /// [`missing_ranges`](decdn_bao_range::RangedStore::missing_ranges) of a request,
-/// paying the minimum, by folding the resume / top-up / settle-wait / reseed loop
-/// behind the [`pacer::Pacer`] + [`source::Funder`] axes.
+/// paying the minimum, by folding the resume / reseed loop behind the
+/// [`pacer::Pacer`] axis.
 pub mod driver;
 /// One-shot client `Endpoint` construction: relay + discovery resolution for
 /// the `cdn/client/v1` and `cdn/probe/v1` dial paths (#935/#936).
@@ -188,7 +196,7 @@ mod ledger;
 #[doc(hidden)]
 pub mod ledgers;
 /// The pure pacing axis (#1608): [`pacer::Pacer`] / [`pacer::BudgetPacer`] decide
-/// draw / top-up / wait / done / refuse for the gap-driven driver, with no I/O.
+/// draw / wait / done / refuse for the gap-driven driver, with no I/O.
 #[doc(hidden)]
 pub mod pacer;
 /// Persisted per-peer knowledge base: registry-fed identity plus interaction-fed
@@ -210,6 +218,9 @@ pub mod ranged_store;
 /// The `APP_ERR_RATE_LIMITED` (`0x10`) transport shed, typed for the pull
 /// orchestrator (ADR 013 §Application Error Codes).
 pub(crate) mod rate_limited;
+/// The funding recovery step at the exhausted candidate set (ADR 003 § Funding
+/// recovery): the per-fetch [`recovery::RecoveryGate`] and its progress rule.
+pub mod recovery;
 mod scheduler;
 /// Pure segmentation and tail-steal helpers for the multi-source scheduler
 /// (ADR 039 § Dynamic segmentation and tail-stealing): no I/O, no async.
@@ -227,9 +238,9 @@ pub mod streamer;
 // module's own links (`content_paid_frontier`, …) would go unresolved
 // and fail the `-D warnings` doc gate.
 pub mod sink;
-/// The two sourcing axes of the gap-driven driver (#1608): [`source::BlobSource`]
-/// (raw-bao byte source for a range) and [`source::Funder`] (injected top-up
-/// seam), plus scripted test doubles.
+/// The sourcing and funding seams of a fetch (#1608): [`source::BlobSource`]
+/// (raw-bao byte source for a range) and [`source::Funder`] (the injected
+/// funding recovery seam), plus scripted test doubles.
 pub mod source;
 /// The sources of one blob (ADR 039 § Source set and selection):
 /// [`source_set::SourceSet`] tracks
@@ -241,14 +252,17 @@ pub mod source_set;
 // through, and every type their signatures name.
 pub use config::PullConfig;
 pub use connection::Connections;
+pub use credential::{
+    CREDENTIAL_SWAP_WAIT, CapabilityCause, Credential, CredentialMismatch, CredentialSlot,
+    FundingEvent, FundingNeeded,
+};
 pub use downloader::{DownloadTarget, Downloader};
 pub use driver::PoolExhausted;
 pub use ledger::{Cumulative, PoolLedger};
+pub use recovery::RecoveryGate;
 pub use sink::{BlobCache, NoCache, SinkFuture};
-pub use source::{Funder, PeerSource, SignerCapDrained, SignerRegistry, SourceFuture};
-pub use source_set::{
-    Holder, NoAffordableSource, NoSourceHasBlob, NoSourceServesSigner, StaticSources,
-};
+pub use source::{Funder, PeerSource, PoolReplaced, Recovery, SourceFuture};
+pub use source_set::{Holder, NoAffordableSource, NoNodeWillServe, NoSourceHasBlob, StaticSources};
 pub use stop::{ClockHold, GaveUp, ProgressClock, StopPolicy};
 pub use streamer::{LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedReader};
 
@@ -260,11 +274,11 @@ pub use connection::WarmConnection;
 #[doc(hidden)]
 pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
 #[doc(hidden)]
+pub use credential::QuoteMax;
+#[doc(hidden)]
 pub use decdn_bao_range::RangedStore;
 #[doc(hidden)]
-pub use driver::{
-    DriveConfig, LegNoProgress, PacingWait, SharedPool, WaitReason, drive, first_leg,
-};
+pub use driver::{LegNoProgress, PacingWait, SharedPool, WaitReason, drive, first_leg};
 #[doc(hidden)]
 pub use fault::{FatalScope, Fault, HealExhausted, LaneBuildFault, classify};
 #[doc(hidden)]
@@ -286,6 +300,8 @@ pub use peer_store::{PeerRecord, PeerStore, StoreConfig};
 pub use ranged_store::ClientRangedStore;
 #[doc(hidden)]
 pub use rate_limited::UpstreamRateLimited;
+#[doc(hidden)]
+pub use recovery::{RECOVERY_SETTLE, Stepped};
 #[doc(hidden)]
 pub use scheduler::{
     AcquireEnv, AcquireTarget, ConsumptionPacing, GROWTH_RETRY, GrowFor, LANE_WATCHDOG, LaneLease,
@@ -1038,27 +1054,25 @@ impl std::error::Error for UpstreamVoucherRejected {}
 /// folding every one into "unreachable".
 ///
 /// That distinction is the whole point. A refusal is proof the peer is *reachable
-/// and answering*, so most codes are no evidence at all that it is degraded:
+/// and answering*, so no class is evidence that it is degraded (ADR 005 §Open-time
+/// refusal classes):
 ///
-/// - `NotFound` — the honest, empty-provider answer, and it is NODE-scoped, not
-///   blob-scoped (`ServeRejectReason::wire_error` deliberately collapses seven
-///   reasons onto it so channel existence cannot be probed). Scoring it as
-///   `Unreachable` punished a node for truthfully saying it lacks a blob.
-/// - `EvictedSinceProbe` / `BlobTooLarge` — likewise honest, and DURABLE for this
-///   (peer, hash): asking again soon gets the same answer, so the consumer suppresses
-///   the pair for the full negative-cache TTL rather than burning a candidate slot on it.
-/// - `Overloaded` — honest but transient. Backpressure is to be respected, not punished,
-///   so it earns only the short `REFUSAL_SUPPRESSION_TTL`.
-/// - `VoucherRejected` — OUR payment fault, not the peer's. Listed because it genuinely
+/// - `NotFound` — "not now". It is NODE-scoped, not blob-scoped
+///   (`ServeRejectReason::wire_error` collapses a miss, a load shed, and several
+///   pool and signer states onto it), so it earns only a short suppression.
+/// - `Declined` — "not this hash during this fetch", DURABLE for this (peer, hash):
+///   asking again soon gets the same answer, so the consumer drops the peer for the
+///   hash rather than burning a candidate slot on it.
+/// - `Unfunded` — "not at the requester's current funding". It says nothing about
+///   the peer; it counts toward the requester's funding recovery.
+/// - `VoucherRejected` — a payment fault on this lane. Listed because it genuinely
 ///   arrives here: it is the code designated for MID-stream, and the mid-stream receive
 ///   arms wrap any `StreamError` into this sentinel (#1145 review).
-/// - `InternalError` — the one code that IS evidence of a degraded peer; it means
-///   "unexpected failure, do not retry THIS node" (#1129).
 ///
 /// `node_origin::classify_refusal` is the consumer and matches this exhaustively, so a new
 /// wire code breaks that build rather than silently inheriting a verdict.
 ///
-/// Only the wire code is recoverable here, never the finer server-side
+/// Only the wire class is recoverable here, never the finer server-side
 /// `ServeRejectReason` — that collapse is intentional and must not be reversed.
 /// `Display` keeps the stable `delivery refused: {code}` text that logs, the CLI's
 /// cache-miss annotation, and the loopback tests match on.
@@ -1302,8 +1316,10 @@ impl std::error::Error for PullStalled {}
 /// Reputation is not the only consequence. A second consumer — the node crate's
 /// `record_pool_open_failure` — reads this marker to choose between answering a
 /// downstream client `StreamError::NotFound` ("we could not obtain this blob") and
-/// `InternalError` ("unexpected failure; do not retry this node"). That path involves no
-/// peer and no reputation at all.
+/// `Declined` ("this node will not serve this hash during this fetch"). That path
+/// involves no peer and no reputation at all. One marked failure still answers
+/// `NotFound`: a wallet that cannot fund a deposit, because the funding problem is
+/// this node's, not the requester's.
 ///
 /// So attaching this marker at a NEW site changes serve-path refusals, not just scoring.
 /// Attach it when the failure means *this node* cannot serve anyone — a broken signer, an
@@ -2006,19 +2022,6 @@ async fn open_stream(
 #[doc(hidden)]
 pub const MAX_RESUME_ATTEMPTS: u32 = 3;
 
-/// Reactive graduation (#1497): the maximum number of times the STREAMING fetch
-/// (`crates/cli/src/commands/fetch.rs`) will `topUp` a channel toward its
-/// `working_deposit` after a genuine mid-fetch `SpendingCapExhausted` (validated
-/// against the buyer's own ledger via [`genuine_exhaustion`]) and resume at the
-/// PAID FRONTIER ([`sink::content_paid_frontier`]) — not at the failed leg's own
-/// offset, which would re-pay for the credited-but-unpaid tail. Separate from [`MAX_RESUME_ATTEMPTS`]: a top-up is a funding
-/// action with its own on-chain cost and failure mode (a delegate key that
-/// cannot fund, an allowance that fails to land), not a wallet-less resume, so
-/// it is bounded on its own budget rather than sharing/competing with the resume
-/// attempts.
-#[doc(hidden)]
-pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
-
 /// In-memory fetch with wallet-less resume (issue #1481 §5): if a mid-stream
 /// voucher rejection carries a signer-verified [`WatermarkBundle`] for one of
 /// the four regression/exhaustion reasons, reseed `ledger` from it and reopen
@@ -2055,10 +2058,7 @@ pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
 /// exhausted or the reason/bundle isn't eligible).
 ///
 /// The production callers do not use this wrapper: the gap-driven
-/// [`driver::drive`] reaches the same reseed loop around [`open_progressive_pull`],
-/// and additionally answers a genuine `SpendingCapExhausted` with an on-chain
-/// top-up through its [`Funder`] — the thing a from-zero retry could never do
-/// without re-paying for the delivered prefix.
+/// [`driver::drive`] reaches the same reseed loop around [`open_progressive_pull`].
 ///
 /// A bundle-less rejection, a non-gated reason, or a bundle that fails
 /// [`WatermarkBundle::validate`] (malformed `last_signature` length) is
@@ -2722,142 +2722,23 @@ fn frontier_is_proved(bundle: &WatermarkBundle) -> bool {
         )
 }
 
-/// True iff `err` is a `SpendingCapExhausted` voucher rejection that the buyer's OWN ledger
-/// corroborates as genuine exhaustion, AND the buyer's remaining spendable deposit is below the
-/// cost of the next voucher. A node claiming `SpendingCapExhausted` while the buyer's ledger
-/// still shows headroom is NOT corroborated (returns `false`) — the caller must refuse to fund
-/// it.
-///
-/// `committed` is the caller's OWN `ledger.committed()` at the moment of the rejection — the
-/// watermark this genuinely-exhausted-or-not decision is judged against.
-///
-/// The healable-desync carve-out is watermark-ADVANCEMENT-based, not bundle-PRESENCE-based.
-/// The node attaches an authenticated [`WatermarkBundle`] to EVERY watermark-gated rejection for
-/// which it has a prior accepted voucher to echo (`watermark_bundle_for_reject` in
-/// `crates/node/src/handlers/client/voucher.rs`) — including a rejection caused by perfectly
-/// ordinary, real exhaustion on a lane that has already had some vouchers accepted. Treating
-/// bundle PRESENCE alone as "this is a desync" would misroute every such real exhaustion into
-/// the resync path (which cannot fix it — the deposit is actually short — and eventually fails
-/// after burning `MAX_RESUME_ATTEMPTS`) instead of the top-up path that could. The bundle is only
-/// evidence of desync when it reports a watermark AHEAD of what we already hold — i.e. the node
-/// knows about a voucher we do not, which reseeding can heal. A bundle that merely echoes back
-/// our OWN already-committed watermark (at or behind `committed`) proves nothing about desync;
-/// it is the node correctly reporting the state we already agree on, and the exhaustion is real.
-#[doc(hidden)]
-pub fn genuine_exhaustion(
-    err: &anyhow::Error,
-    ctx: &PoolContext,
-    committed: Cumulative,
-    remaining_spendable: U256,
-    next_voucher_cost: U256,
-) -> bool {
-    let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() else {
-        return false;
-    };
-    if rejected.reason != VoucherRejectReason::SpendingCapExhausted {
-        return false;
-    }
-    // An authenticated bundle that ADVANCES our committed amount is a healable desync — let the
-    // resume loop reseed instead of adding funds. A bundle that is absent, or present but at or
-    // behind `committed`, proves no desync (see the doc comment above), so exhaustion can still
-    // be genuine.
-    if let Some(bundle) = resumable_watermark(err, ctx)
-        && Cumulative::from(bundle).amount > committed.amount
-    {
-        return false;
-    }
-    // Validate the node's claim against our OWN accounting: only genuine if we truly cannot
-    // cover the next voucher. Otherwise the node is lying/buggy and we refuse to fund it.
-    remaining_spendable < next_voucher_cost
-}
-
-/// Whether a failed open/resume is consistent with the resume offset being wrong
-/// — i.e. the upstream refused it as a range past the end, or with the ambiguous
-/// `NotFound` its range gate collapses `byte_offset >= total_bytes` into.
-///
-/// This is the shared predicate the CLI's streaming fetch loop and the #1608
-/// gap-driven [`driver::drive`] both key their post-top-up settle-wait on: right
-/// after an on-chain `topUp`, the serving node's chain watcher may not yet have
-/// observed the new deposit, so its pre-serve deposit gate (#1518) refuses the
-/// resumed open with exactly this shape. Retrying the OPEN is money-safe (no
-/// vouchers are sent and the offset is unchanged), so the caller waits briefly
-/// for the watcher rather than treating it as terminal.
-///
-/// Two signals qualify, and the second is unavoidably ambiguous:
-///
-/// - [`ResumeOffsetPastEnd`] — the node signed a response whose `total_bytes` is
-///   at or below our offset. Unambiguous, but only reachable against a
-///   non-conforming server.
-/// - `NotFound` — what an honest node actually sends. Its range gate refuses
-///   `byte_offset >= total_bytes` *before* signing, and that deliberately
-///   collapses to `NotFound` on the wire alongside a cache miss and an unknown
-///   channel (`ServeRejectReason::wire_error`), so the client cannot separate
-///   "your offset is past the end" from "I don't have this blob".
-///
-/// Everything else — stalls, resets, hash mismatches, local flush failures — must
-/// NOT qualify. Those say nothing about the offset.
-#[must_use]
-#[doc(hidden)]
-pub fn resume_may_be_stale(err: &anyhow::Error) -> bool {
-    if err.downcast_ref::<ResumeOffsetPastEnd>().is_some() {
-        return true;
-    }
-    err.downcast_ref::<UpstreamRefused>()
-        .is_some_and(|refused| matches!(refused.error(), StreamError::NotFound))
-}
-
-/// Whether `err` is an **open-time** [`StreamError::InsufficientDeposit`] refusal
-/// (ADR 003 §Pool solvency, option 2 / #2013): the serving node proved us the
-/// authenticated pool owner and told us its refundable floor `M` outruns our
-/// pool's remaining deposit, so the pool cannot cover a credit window here.
-///
-/// `InsufficientDeposit` is a delivery-side code — a legitimate one rides ONLY in
-/// the signed open-stage `StreamResponse { ok: false }`, never mid-stream. So this
-/// gates on open-stage evidence ([`UpstreamRefused::evidence`] present): a
-/// protocol-violating peer that emits a bare mid-stream `StreamError::InsufficientDeposit`
-/// (no signed response) is NOT honored as a floor refusal and never drives the
-/// top-up loop.
-///
-/// The driver routes an open-stage refusal into its fund-and-retry loop the same
-/// way it routes a ledger-corroborated exhaustion: it tops the deposit up toward
-/// the buyer's own `working_deposit` ceiling and re-opens, so a node's
-/// larger-than-estimated `M` does not dead-end a fetch on an ambiguous
-/// `NotFound`. Unlike [`genuine_exhaustion`], this needs no ledger corroboration —
-/// our own numbers say we CAN afford the next voucher; only the node's private `M`
-/// (which we cannot compute) is higher. The buyer's ceiling is the sole clamp on
-/// how much a (possibly lying) node can make us escrow, so trusting the owner-only
-/// refusal is money-safe.
-#[must_use]
-pub(crate) fn is_insufficient_deposit(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<UpstreamRefused>()
-        .is_some_and(|refused| {
-            matches!(refused.error(), StreamError::InsufficientDeposit)
-                && refused.evidence().is_some()
-        })
-}
-
 /// Whether a failed open of a bounded range could mean only that the range's
 /// START is past the blob's end: the size it was cut from was wrong. An end
 /// past the blob clamps and serves rather than failing, so this fires only on
 /// a start with no bytes to serve.
 ///
 /// A holder refuses such a range before it signs (`RangeNotSatisfiable`, which
-/// reaches the wire as [`StreamError::NotFound`]). A relay signs its own size
-/// instead, and the range then fails to align against it here
-/// ([`decdn_bao_range::RangeVerifyError::RangeOutOfBounds`] or
+/// reaches the wire as [`StreamError::Declined`]). That refusal names only the
+/// class, so it removes the holder for this fetch and does not qualify here. A
+/// relay signs its own size instead, and the range then fails to align against
+/// it here ([`decdn_bao_range::RangeVerifyError::RangeOutOfBounds`] or
 /// [`ResumeOffsetPastEnd`]). A caller that cut the range from an unsigned size
 /// asks for the whole blob on these, and treats every other failure as the
 /// open's own outcome (#2063).
 #[must_use]
 #[doc(hidden)]
 pub fn is_range_past_end(err: &anyhow::Error) -> bool {
-    let refused_not_found = err
-        .downcast_ref::<UpstreamRefused>()
-        .is_some_and(|refused| {
-            matches!(refused.error(), StreamError::NotFound) && refused.evidence().is_some()
-        });
-    refused_not_found
-        || err.downcast_ref::<ResumeOffsetPastEnd>().is_some()
+    err.downcast_ref::<ResumeOffsetPastEnd>().is_some()
         || err.chain().any(|cause| {
             matches!(
                 cause.downcast_ref::<decdn_bao_range::RangeVerifyError>(),
@@ -3668,7 +3549,7 @@ impl UpstreamPull {
     /// receive loop, so a raw voucher-write failure — the end-of-stream
     /// `STOP_SENDING(0)` a node emits when it finishes and drops `recv` — would
     /// otherwise mask that terminal signal and abort a complete, paid fetch (or
-    /// swallow a typed rejection the reactive top-up path keys on). Read the terminal
+    /// swallow a typed rejection the fault classification keys on). Read the terminal
     /// signal, briefly, and prefer it.
     ///
     /// A `StreamEnd` marks the stream ended: the chunk that triggered the write is
@@ -4308,8 +4189,8 @@ impl StreamMeter {
 /// `test-util` `fetch_inner`) can self-heal from an authenticated watermark
 /// instead of treating the rejection as terminal. Any
 /// OTHER `StreamError` is the upstream refusing mid-stream; carry the typed wire
-/// code as [`UpstreamRefused`] so an honest `Overloaded`/`NotFound` peer is scored
-/// on its real code rather than the `Unreachable` catch-all (#1145 review).
+/// class as [`UpstreamRefused`] so a refusing peer is scored on its real class
+/// rather than the `Unreachable` catch-all (#1145 review).
 fn voucher_rejection(
     ledger: &PoolLedger,
     meter: &StreamMeter,

@@ -707,6 +707,7 @@ fn serve_stream_rejected_counters_start_at_zero_and_increment_per_reason() {
         "decdn_serve_stream_rejected_owner_mismatch_total",
         "decdn_serve_stream_rejected_insufficient_deposit_total",
         "decdn_serve_stream_rejected_pool_unconfirmed_total",
+        "decdn_serve_stream_rejected_pool_closing_total",
         "decdn_serve_stream_rejected_signer_cap_exhausted_total",
         "decdn_serve_stream_midstream_signer_cap_exhausted_total",
         "decdn_serve_stream_rejected_signer_floor_at_cap_total",
@@ -738,6 +739,7 @@ fn serve_stream_rejected_counters_start_at_zero_and_increment_per_reason() {
     metrics.serve_stream_rejected_owner_mismatch();
     metrics.serve_stream_rejected_insufficient_deposit();
     metrics.serve_stream_rejected_pool_unconfirmed();
+    metrics.serve_stream_rejected_pool_closing();
     metrics.serve_stream_rejected_signer_cap_exhausted();
     metrics.serve_stream_midstream_signer_cap_exhausted();
     metrics.serve_stream_rejected_signer_floor_at_cap();

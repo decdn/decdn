@@ -157,7 +157,8 @@ const fn refusal_is_listed(reason: ServeRejectReason) {
         | ServeRejectReason::ChainHashDenied
         | ServeRejectReason::OriginDenied
         | ServeRejectReason::ForeignNamespaceDeclined
-        | ServeRejectReason::ChainStale => {}
+        | ServeRejectReason::ChainStale
+        | ServeRejectReason::PoolClosing { .. } => {}
     }
 }
 
@@ -187,6 +188,7 @@ fn every_failed_end_counts_on_exactly_one_listed_reason() {
         ServeRejectReason::OriginDenied,
         ServeRejectReason::ForeignNamespaceDeclined,
         ServeRejectReason::ChainStale,
+        ServeRejectReason::PoolClosing { proven: true },
     ];
     let stops = [
         ServeStop::VoucherRejected,

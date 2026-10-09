@@ -5,17 +5,15 @@ use alloy::signers::local::PrivateKeySigner;
 use bao_tree::io::outboard::PreOrderMemOutboard;
 use bytes::Bytes;
 use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, IROH_BLOCK_SIZE, RangedStore, align_range};
-use decdn_incentive::DepositOutcome;
 
 use super::{
-    DriveConfig, LegNoProgress, SharedPool, contiguous_byte_ranges, drive, first_leg,
+    LegNoProgress, PoolExhausted, SharedPool, contiguous_byte_ranges, drive, first_leg,
     ranges_content_len,
 };
 use crate::ProgressCallback;
 use crate::pacer::{BudgetPacer, PaceDecision, PaceState};
-use crate::source::Funder;
 use crate::source::PrimedSource;
-use crate::source::{BlobSource, FakeFunder, FlushCountingStore, ScriptedSource, SourceFuture};
+use crate::source::{BlobSource, FlushCountingStore, ScriptedSource, SourceFuture};
 use crate::{
     ClientRangedStore, Cumulative, PoolContext, PoolLedger, UpstreamPullHeader, UpstreamRefused,
     UpstreamVoucherRejected, VoucherProgress,
@@ -88,8 +86,8 @@ fn fresh_store(root: [u8; 32], total: u64) -> ClientRangedStore {
     store
 }
 
-/// A healthy buyer context: a huge deposit so the pacer never has to top up
-/// (the money assertions exercise the gap logic, not funding).
+/// A healthy buyer context: a huge deposit so the pacer never refuses (the
+/// money assertions exercise the gap logic, not funding).
 fn healthy_ctx() -> PoolContext {
     let signer = PrivateKeySigner::random();
     PoolContext {
@@ -105,19 +103,6 @@ fn healthy_ctx() -> PoolContext {
         prior_amount: U256::ZERO,
         client_binding: None,
         capability: None,
-    }
-}
-
-fn healthy_funder() -> FakeFunder {
-    FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX)))
-}
-
-fn config() -> DriveConfig {
-    DriveConfig {
-        working_deposit: U256::from(u128::MAX),
-        seller_reserve: U256::ZERO,
-        max_settle_waits: 2,
-        settle_backoff: std::time::Duration::from_millis(0),
     }
 }
 
@@ -162,24 +147,10 @@ async fn assert_drives_only_gaps(total: u64, held: &[(u64, u64)], expected_gaps:
         .paying(Arc::clone(&ledger));
     assert_eq!(source.root(), root);
     let pacer = BudgetPacer::new();
-    let funder = healthy_funder();
     let ctx = Arc::new(Mutex::new(healthy_ctx()));
 
     drive(
-        &store,
-        &source,
-        &pacer,
-        &funder,
-        &ctx,
-        &ledger,
-        root,
-        0,
-        0,
-        &config(),
-        None,
-        None,
-        None,
-        None,
+        &store, &source, &pacer, &ctx, &ledger, root, 0, 0, None, None, None, None,
     )
     .await
     .expect("drive whole blob");
@@ -200,11 +171,6 @@ async fn assert_drives_only_gaps(total: u64, held: &[(u64, u64)], expected_gaps:
         source.opened_bytes() < total || held.is_empty(),
         "with a held range, fewer than the whole blob's bytes must be pulled"
     );
-    assert_eq!(
-        funder.calls(),
-        Vec::<U256>::new(),
-        "healthy deposit: no top-ups"
-    );
 
     // The blob is complete, finalized, and byte-exact.
     assert!(store.is_complete().await.expect("is_complete"));
@@ -216,93 +182,49 @@ async fn assert_drives_only_gaps(total: u64, held: &[(u64, u64)], expected_gaps:
     );
 }
 
-/// Two gaps that reach the pool's floor together top up once: the second
-/// waits on the lock, sees the deposit the first one raised, and decides
-/// again instead of escrowing a second shortfall.
+/// A lane on a shared pool gates on the pool's spend across every lane, not
+/// on its own: with the deposit spent elsewhere in the pool, the lane refuses
+/// its next leg even though its own ledger has spent almost nothing.
 #[tokio::test(start_paused = true)]
-async fn concurrent_gaps_on_one_pool_top_up_once() {
-    /// Tops up only while the deposit is below 1 000, else draws.
-    struct TopUpUntilFunded;
-    impl crate::Pacer for TopUpUntilFunded {
-        fn decide(&self, s: &PaceState) -> PaceDecision {
-            if s.cleared_bytes >= s.requested_bytes {
-                PaceDecision::Done
-            } else if s.remaining_deposit < U256::from(1_000u64) {
-                PaceDecision::TopUp(U256::from(1_000_000u64))
-            } else {
-                PaceDecision::Draw {
-                    up_to_bytes: s.requested_bytes - s.cleared_bytes,
-                }
-            }
-        }
-    }
-    /// A funder whose `topUp` takes a second to land and counts its calls.
-    struct SlowFunder(std::sync::atomic::AtomicU32);
-    impl Funder for SlowFunder {
-        fn max_topups(&self) -> u32 {
-            10
-        }
-        fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Box::pin(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                Ok(DepositOutcome::Added(additional))
-            })
-        }
-    }
-
-    let total = 8 * GROUP;
+async fn a_lane_gates_on_the_pools_shared_spend() {
+    let total = 3 * GROUP;
     let (root, plaintext, _) = synth_blob(total as usize);
-    // Two concurrent drives on one pool, one gap each: sibling fetches
-    // that share a lane.
-    let (store_a, store_b) = (fresh_store(root, total), fresh_store(root, total));
+    let store = fresh_store(root, total);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let source = ScriptedSource::new(plaintext)
         .expect("source")
         .paying(Arc::clone(&ledger));
-    let mut starved = healthy_ctx();
-    starved.deposit = U256::ZERO;
-    let ctx = Arc::new(Mutex::new(starved));
-    let spent_ledger = Arc::clone(&ledger);
-    let spent = move || spent_ledger.committed().amount;
-    let credit_ctx = Arc::clone(&ctx);
-    let credit = move |deposit: U256| {
-        credit_ctx.lock().expect("ctx").deposit = deposit;
-        Ok(())
-    };
-    let topups = std::sync::atomic::AtomicU32::new(0);
-    let topup_lock = tokio::sync::Mutex::new(());
+    let ctx = Arc::new(Mutex::new(healthy_ctx()));
+    // Every lane of the pool together spent the whole deposit.
+    let spent = || U256::from(u128::MAX);
     let pool = SharedPool {
         spent: &spent,
-        topups_used: &topups,
-        credit: &credit,
-        topup_lock: &topup_lock,
+        quotes: None,
     };
-    let funder = SlowFunder(std::sync::atomic::AtomicU32::new(0));
-    let drive_config = config();
-    let gap = |store, offset| {
-        drive(
-            store,
-            &source,
-            &TopUpUntilFunded,
-            &funder,
-            &ctx,
-            &ledger,
-            root,
-            offset,
-            GROUP,
-            &drive_config,
-            None,
-            None,
-            None,
-            Some(&pool),
-        )
+    let pacer = crate::pacer::WindowPacer::new(GROUP);
+    let downstream = || super::DownstreamFrontier {
+        served_paid: u64::MAX,
+        serve_demand: 0,
     };
-    let (a, b) = tokio::join!(gap(&store_a, 0), gap(&store_b, 4 * GROUP));
-    a.expect("drive a");
-    b.expect("drive b");
-    assert_eq!(funder.0.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(source.opened_ranges().len(), 2);
+    let err = drive(
+        &store,
+        &source,
+        &pacer,
+        &ctx,
+        &ledger,
+        root,
+        0,
+        0,
+        None,
+        None,
+        Some(&downstream),
+        Some(&pool),
+    )
+    .await
+    .expect_err("the shared spend refuses the next leg");
+    assert!(err.downcast_ref::<PoolExhausted>().is_some(), "{err:#}");
+    // The first open is free (no quote yet); the next pass refuses.
+    assert_eq!(source.opened_ranges().len(), 1);
 }
 
 /// A leg whose signed size differs from the store's bound verifies under its
@@ -323,13 +245,11 @@ async fn a_leg_whose_claim_differs_from_the_bound_is_ingested_under_its_claim() 
         &store,
         &source,
         &BudgetPacer::new(),
-        &healthy_funder(),
         &ctx,
         &ledger,
         root,
         4 * GROUP,
         2 * GROUP,
-        &config(),
         None,
         None,
         None,
@@ -391,13 +311,11 @@ async fn first_leg_is_the_range_the_drive_opens_first() {
         &resumed,
         &source,
         &BudgetPacer::new(),
-        &healthy_funder(),
         &Arc::new(Mutex::new(healthy_ctx())),
         &ledger,
         root,
         0,
         0,
-        &config(),
         None,
         None,
         None,
@@ -458,13 +376,11 @@ async fn a_windowed_first_leg_is_the_range_the_drive_opens_first() {
         &windowed,
         &source,
         &crate::pacer::WindowPacer::new(2 * GROUP),
-        &healthy_funder(),
         &Arc::new(Mutex::new(healthy_ctx())),
         &ledger,
         root,
         0,
         0,
-        &config(),
         None,
         None,
         Some(&downstream),
@@ -503,13 +419,11 @@ async fn a_primed_first_leg_is_adopted_not_reopened() {
         &store,
         &primed,
         &BudgetPacer::new(),
-        &healthy_funder(),
         &Arc::new(Mutex::new(healthy_ctx())),
         &ledger,
         root,
         0,
         0,
-        &config(),
         None,
         None,
         None,
@@ -647,20 +561,17 @@ async fn resume_base_is_reported_before_the_first_chunk() {
         .expect("source")
         .paying(Arc::clone(&ledger));
     let pacer = BudgetPacer::new();
-    let funder = healthy_funder();
     let ctx = Arc::new(Mutex::new(healthy_ctx()));
 
     drive(
         &store,
         &source,
         &pacer,
-        &funder,
         &ctx,
         &ledger,
         root,
         0,
         0,
-        &config(),
         Some(&on_progress),
         None,
         None,
@@ -700,25 +611,11 @@ async fn fully_held_blob_opens_nothing() {
 
     let source = ScriptedSource::new(plaintext.clone()).expect("source");
     let pacer = BudgetPacer::new();
-    let funder = healthy_funder();
     let ctx = Arc::new(Mutex::new(healthy_ctx()));
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
 
     drive(
-        &store,
-        &source,
-        &pacer,
-        &funder,
-        &ctx,
-        &ledger,
-        root,
-        0,
-        0,
-        &config(),
-        None,
-        None,
-        None,
-        None,
+        &store, &source, &pacer, &ctx, &ledger, root, 0, 0, None, None, None, None,
     )
     .await
     .expect("drive fully-held blob");
@@ -778,26 +675,12 @@ async fn mid_gap_fault_resumes_at_the_checkpoint_not_the_whole_gap() {
     let store = fresh_store(root, total);
 
     let pacer = BudgetPacer::new();
-    let funder = healthy_funder();
     let ctx = Arc::new(Mutex::new(healthy_ctx()));
 
     // Drive #1: faults mid-gap and returns the terminal stall, but checkpoints
     // a durable prefix into the store first.
     let err = drive(
-        &store,
-        &source,
-        &pacer,
-        &funder,
-        &ctx,
-        &ledger,
-        root,
-        0,
-        0,
-        &config(),
-        None,
-        None,
-        None,
-        None,
+        &store, &source, &pacer, &ctx, &ledger, root, 0, 0, None, None, None, None,
     )
     .await
     .expect_err("the mid-gap stall surfaces as a terminal error");
@@ -812,20 +695,7 @@ async fn mid_gap_fault_resumes_at_the_checkpoint_not_the_whole_gap() {
 
     // Drive #2: resume. Only the un-checkpointed tail is still missing.
     drive(
-        &store,
-        &source,
-        &pacer,
-        &funder,
-        &ctx,
-        &ledger,
-        root,
-        0,
-        0,
-        &config(),
-        None,
-        None,
-        None,
-        None,
+        &store, &source, &pacer, &ctx, &ledger, root, 0, 0, None, None, None, None,
     )
     .await
     .expect("resume completes the blob");
@@ -879,24 +749,10 @@ async fn partial_request_pulls_only_its_gap_and_leaves_partial() {
         .expect("source")
         .paying(Arc::clone(&ledger));
     let pacer = BudgetPacer::new();
-    let funder = healthy_funder();
     let ctx = Arc::new(Mutex::new(healthy_ctx()));
 
     drive(
-        &store,
-        &source,
-        &pacer,
-        &funder,
-        &ctx,
-        &ledger,
-        root,
-        GROUP,
-        GROUP,
-        &config(),
-        None,
-        None,
-        None,
-        None,
+        &store, &source, &pacer, &ctx, &ledger, root, GROUP, GROUP, None, None, None, None,
     )
     .await
     .expect("drive interior range");
@@ -956,11 +812,9 @@ impl crate::sink::StashedFault for MaybeFaultReader {
 }
 
 /// A [`BlobSource`] wrapper that fails its FIRST open with a scripted
-/// upstream `SpendingCapExhausted` voucher rejection — the shape a genuine
-/// mid-fetch exhaustion refusal takes — and delegates every later open to
-/// the inner [`ScriptedSource`]. Regression coverage for the pacer bug where
-/// `BudgetPacer` proactively returned `Wait` after every top-up, forcing the
-/// driver to sleep the full settle budget before even retrying the open.
+/// upstream `SpendingCapExhausted` voucher rejection (the shape a mid-fetch
+/// funding rejection takes) and delegates every later open to the inner
+/// [`ScriptedSource`].
 struct FailFirstOpen {
     inner: ScriptedSource,
     opens: std::sync::atomic::AtomicUsize,
@@ -1140,13 +994,11 @@ async fn drive_through_faults(
         &store,
         &source,
         &BudgetPacer::new(),
-        &healthy_funder(),
         &Arc::new(Mutex::new(ctx)),
         ledger,
         root,
         0,
         0,
-        &config(),
         None,
         None,
         None,
@@ -1304,9 +1156,9 @@ async fn repeated_bytes_regression_rejections_are_bounded_and_scoped() {
 }
 
 /// A spending-cap rejection whose bundle keeps reseeding the ledger is
-/// healed within the resume budget, and past it ends the command bare: it
-/// is not a lane-watermark fault, so it never carries the marker that
-/// scopes a fault to one source.
+/// healed within the resume budget, and past it ends the drive bare: it is
+/// not a lane-watermark fault, so it never carries the heal marker, and it
+/// acts as `Unfunded` from its source.
 #[tokio::test]
 async fn a_non_lane_rejection_past_the_budget_is_never_scoped_to_the_source() {
     let reason = VoucherRejectReason::SpendingCapExhausted;
@@ -1335,7 +1187,7 @@ async fn a_non_lane_rejection_past_the_budget_is_never_scoped_to_the_source() {
     );
     assert_eq!(
         crate::classify(&err),
-        crate::Fault::Fatal(crate::FatalScope::Command),
+        crate::Fault::Unaffordable,
         "{reason:?}"
     );
     let budget = usize::try_from(crate::MAX_RESUME_ATTEMPTS).unwrap_or(usize::MAX);
@@ -1347,12 +1199,12 @@ async fn a_non_lane_rejection_past_the_budget_is_never_scoped_to_the_source() {
 }
 
 /// A voucher rejection that no heal takes ends the drive on the first open
-/// and stays fatal for the command (ADR 005): an `Underpaid` with no bundle
-/// has no watermark to rebase to, a `BytesRegression` with no bundle is a
-/// single-signer fault, and a trailing proof whose bundle the ledger covers on amount but
-/// not on bytes cannot heal.
+/// and acts as `Declined` from its source (ADR 005): an `Underpaid` with no
+/// bundle has no watermark to rebase to, a `BytesRegression` with no bundle
+/// is a single-signer fault, and a trailing proof whose bundle the ledger
+/// covers on amount but not on bytes cannot heal.
 #[tokio::test]
-async fn a_rejection_no_heal_takes_ends_the_command() {
+async fn a_rejection_no_heal_takes_declines_its_source() {
     fn bare(reason: VoucherRejectReason) -> anyhow::Error {
         anyhow::Error::new(UpstreamVoucherRejected {
             reason,
@@ -1391,31 +1243,28 @@ async fn a_rejection_no_heal_takes_ends_the_command() {
         );
         assert_eq!(
             crate::classify(&err),
-            crate::Fault::Fatal(crate::FatalScope::Command),
-            "{name}"
+            crate::Fault::Source,
+            "{name}: the source declines this fetch"
+        );
+        assert!(
+            crate::fault::declining_rejection(&err).is_some(),
+            "{name}: acts as Declined"
         );
         assert_eq!(opens, 1, "{name}: no retry");
     }
 }
 
+/// A lane never adds funds: a mid-stream `SpendingCapExhausted` on an
+/// under-deposited lane ends the lane with the rejection, which the acquire
+/// loop prices out at the current deposit. No re-open, no top-up.
 #[tokio::test(start_paused = true)]
-async fn a_top_up_is_followed_by_an_immediate_reopen_not_a_settle_wait() {
-    // The buyer starts under-deposited, so the first open's genuine
-    // `SpendingCapExhausted` refusal is corroborated by the buyer's OWN
-    // ledger (0 remaining < any nonzero voucher cost) and the pacer tops
-    // up. Before the fix, `BudgetPacer::decide` proactively returned `Wait`
-    // right after that top-up, and the driver slept the WHOLE settle
-    // budget (`max_settle_waits * settle_backoff`) before even retrying the
-    // open. The clock is paused, so only a real `tokio::time::sleep`
-    // advances it: the settle-wait costs a full `settle_backoff` of virtual
-    // time, while the CPU cost of the fetch itself costs none. That makes
-    // the elapsed-time assertion below exact instead of machine-dependent.
+async fn a_mid_stream_funding_rejection_ends_the_lane_without_a_top_up() {
     let total = 2 * GROUP;
     let (root, plaintext, _outboard) = synth_blob(total as usize);
     let store = fresh_store(root, total);
 
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let inner = ScriptedSource::new(plaintext.clone())
+    let inner = ScriptedSource::new(plaintext)
         .expect("source")
         .paying(Arc::clone(&ledger));
     let root = inner.root();
@@ -1424,71 +1273,87 @@ async fn a_top_up_is_followed_by_an_immediate_reopen_not_a_settle_wait() {
         opens: std::sync::atomic::AtomicUsize::new(0),
     };
 
-    let pacer = BudgetPacer::new();
-    let funder = FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX)));
-
     let mut ctx = healthy_ctx();
-    ctx.deposit = U256::ZERO; // under-deposited: the first refusal is genuine
+    ctx.deposit = U256::ZERO;
     let ctx = Arc::new(Mutex::new(ctx));
 
-    let drive_config = DriveConfig {
-        working_deposit: U256::from(10_000u64),
-        seller_reserve: U256::ZERO,
-        max_settle_waits: 2,
-        settle_backoff: std::time::Duration::from_secs(2),
-    };
-
-    let started = tokio::time::Instant::now();
-    drive(
+    let err = drive(
         &store,
         &source,
-        &pacer,
-        &funder,
+        &BudgetPacer::new(),
         &ctx,
         &ledger,
         root,
         0,
         0,
-        &drive_config,
         None,
         None,
         None,
         None,
     )
     .await
-    .expect("drive completes after one reactive top-up");
-    let elapsed = started.elapsed();
+    .expect_err("a funding rejection ends the lane");
 
+    assert_eq!(crate::classify(&err), crate::Fault::Unaffordable, "{err:#}");
     assert_eq!(
         source.opens.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "one faulting open + one immediate re-open"
-    );
-    assert_eq!(
-        source.inner.opened_ranges().len(),
         1,
-        "only the SECOND (successful) open reaches the inner scripted source"
+        "no re-open inside the lane"
     );
-    assert_eq!(
-        funder.calls().len(),
-        1,
-        "exactly one reactive top-up funded the genuine exhaustion"
-    );
-    assert!(
-        elapsed < drive_config.settle_backoff,
-        "the re-open must follow the top-up immediately, not after a settle-wait \
-         sleep (settle_backoff was {:?} per step): elapsed {elapsed:?}",
-        drive_config.settle_backoff
-    );
+    assert!(!store.is_complete().await.expect("is_complete"));
+}
 
-    assert!(store.is_complete().await.expect("is_complete"));
-    let got = store.read(0, 0).await.expect("read whole blob");
-    assert_eq!(got.as_ref(), plaintext.as_slice());
+/// A deposit that cannot cover the next voucher refuses the next leg with
+/// [`PoolExhausted`] instead of funding it: one leg lands, the next pass
+/// finds the deposit spent, and the lane ends priced out.
+#[tokio::test(start_paused = true)]
+async fn a_lane_short_of_the_next_voucher_refuses_with_pool_exhausted() {
+    let total = 3 * GROUP;
+    let (root, plaintext, _outboard) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let source = ScriptedSource::new(plaintext)
+        .expect("source")
+        .paying(Arc::clone(&ledger));
+    let root = source.root();
+
+    // One group per leg: a window pacer with the downstream always paid up.
+    let pacer = crate::pacer::WindowPacer::new(GROUP);
+    let downstream = || super::DownstreamFrontier {
+        served_paid: u64::MAX,
+        serve_demand: 0,
+    };
+    let mut ctx = healthy_ctx();
+    ctx.deposit = U256::from(1u64);
+    let ctx = Arc::new(Mutex::new(ctx));
+
+    let err = drive(
+        &store,
+        &source,
+        &pacer,
+        &ctx,
+        &ledger,
+        root,
+        0,
+        0,
+        None,
+        None,
+        Some(&downstream),
+        None,
+    )
+    .await
+    .expect_err("a spent deposit refuses the next leg");
+
+    assert!(err.downcast_ref::<PoolExhausted>().is_some(), "{err:#}");
+    assert_eq!(crate::classify(&err), crate::Fault::Unaffordable);
+    assert_eq!(source.opened_ranges().len(), 1, "one leg, then the refusal");
+    assert!(!store.is_complete().await.expect("is_complete"));
 }
 
 /// A [`BlobSource`] that refuses its FIRST open with an owner-only
-/// [`StreamError::InsufficientDeposit`] (ADR 003 §Pool solvency, option 2 /
-/// #2013) — the serving node's floor `M` beyond the buyer's estimate — and
+/// [`StreamError::Unfunded`] (ADR 003 §Pool solvency): the serving node's
+/// floor `M` beyond the buyer's estimate, and
 /// serves every later open from the inner [`ScriptedSource`]. The refusal
 /// arrives at the open (the node signed `ok: false`, so there is no header and
 /// no reader), exactly as a real one does.
@@ -1511,11 +1376,11 @@ impl BlobSource for RefuseFirstOpenShortDeposit {
         Box::pin(async move {
             if n < self.refusals {
                 // A real open-stage refusal: the node signs `StreamResponse
-                // { ok: false }` with the delivery-side `InsufficientDeposit` in
+                // { ok: false }` with the delivery-side `Unfunded` in
                 // the trailing ext, exactly the shape `open_progressive_pull`
                 // builds via the crate-private `UpstreamRefused::open`. Built here
                 // (rather than `mid_stream`) so the refusal carries open-stage
-                // evidence — which is what `is_insufficient_deposit` now requires.
+                // evidence, as a real one does.
                 let body = StreamResponseBody {
                     hash,
                     ok: false,
@@ -1526,14 +1391,14 @@ impl BlobSource for RefuseFirstOpenShortDeposit {
                 };
                 // `open` retains the response as-is without re-validating the
                 // signature, so an EOA-length (65-byte) placeholder slash-sig is
-                // enough — this test exercises the top-up routing, not slash
+                // enough: this test exercises the refusal's routing, not slash
                 // evidence.
                 let resp = StreamResponse {
                     body,
                     slash_sig: vec![0u8; 65],
                 };
                 let ext = StreamResponseExt {
-                    error: Some(StreamError::InsufficientDeposit),
+                    error: Some(StreamError::Unfunded),
                 };
                 return Err(UpstreamRefused::open(resp, &ext));
             }
@@ -1550,158 +1415,12 @@ impl BlobSource for RefuseFirstOpenShortDeposit {
     }
 }
 
+/// An open-stage `Unfunded` refusal on an affordable deposit (the node's
+/// private floor `M` above what the buyer holds) ends the lane as
+/// unaffordable at once: the refusal scopes to that node, and only the
+/// acquire loop's funding recovery step may add funds.
 #[tokio::test(start_paused = true)]
-async fn an_insufficient_deposit_open_refusal_tops_up_and_reopens() {
-    // Option 2 / #2013: the buyer's ledger CAN afford the next voucher — its
-    // deposit sits well above the voucher cost — so `genuine_exhaustion` rejects
-    // the refusal. Only the node's private floor `M` is higher than the buyer
-    // estimated, and the buyer cannot compute it. The driver must trust the
-    // owner-only `InsufficientDeposit` signal, top the deposit up toward its own
-    // `working_deposit` ceiling, and re-open — rather than dead-end as it would
-    // on an ambiguous `NotFound`.
-    let total = 2 * GROUP;
-    let (root, plaintext, _outboard) = synth_blob(total as usize);
-    let store = fresh_store(root, total);
-
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let inner = ScriptedSource::new(plaintext.clone())
-        .expect("source")
-        .paying(Arc::clone(&ledger));
-    let root = inner.root();
-    let source = RefuseFirstOpenShortDeposit {
-        inner,
-        opens: std::sync::atomic::AtomicUsize::new(0),
-        refusals: 1,
-    };
-
-    let pacer = BudgetPacer::new();
-    let funder = FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX)));
-
-    let mut ctx = healthy_ctx();
-    // Affordable next voucher (deposit ≫ cost), so the refusal is NOT a
-    // ledger-corroborated exhaustion; the recovery is driven purely by the
-    // dedicated `InsufficientDeposit` route.
-    ctx.deposit = U256::from(1_000u64);
-    let ctx = Arc::new(Mutex::new(ctx));
-
-    let drive_config = DriveConfig {
-        // Headroom above the current deposit so the pacer has something to add.
-        working_deposit: U256::from(10_000u64),
-        seller_reserve: U256::ZERO,
-        max_settle_waits: 2,
-        settle_backoff: std::time::Duration::from_secs(2),
-    };
-
-    drive(
-        &store,
-        &source,
-        &pacer,
-        &funder,
-        &ctx,
-        &ledger,
-        root,
-        0,
-        0,
-        &drive_config,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .expect("drive recovers an InsufficientDeposit refusal via one top-up");
-
-    assert_eq!(
-        source.opens.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "one refused open + one re-open after the top-up"
-    );
-    assert_eq!(
-        funder.calls().len(),
-        1,
-        "exactly one top-up funded past the node's larger-than-estimated M"
-    );
-    assert!(store.is_complete().await.expect("is_complete"));
-    let got = store.read(0, 0).await.expect("read whole blob");
-    assert_eq!(got.as_ref(), plaintext.as_slice());
-}
-
-/// #2296: a refill made elsewhere already restored the deposit to the
-/// working target, and the node refuses on the balance it read before. A
-/// top-up would add nothing worth two transactions, so the driver waits the
-/// node's watcher out on the settle budget and re-opens.
-#[tokio::test(start_paused = true)]
-async fn an_insufficient_deposit_refusal_at_the_working_deposit_settle_waits() {
-    let total = 2 * GROUP;
-    let (root, plaintext, _outboard) = synth_blob(total as usize);
-    let store = fresh_store(root, total);
-
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let inner = ScriptedSource::new(plaintext.clone())
-        .expect("source")
-        .paying(Arc::clone(&ledger));
-    let root = inner.root();
-    let source = RefuseFirstOpenShortDeposit {
-        inner,
-        opens: std::sync::atomic::AtomicUsize::new(0),
-        refusals: 1,
-    };
-
-    let pacer = BudgetPacer::new();
-    let funder = FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX)));
-
-    let mut ctx = healthy_ctx();
-    ctx.deposit = U256::from(10_000u64);
-    let ctx = Arc::new(Mutex::new(ctx));
-
-    let settle_backoff = std::time::Duration::from_secs(2);
-    let drive_config = DriveConfig {
-        working_deposit: U256::from(10_000u64),
-        seller_reserve: U256::ZERO,
-        max_settle_waits: 2,
-        settle_backoff,
-    };
-
-    let started = tokio::time::Instant::now();
-    drive(
-        &store,
-        &source,
-        &pacer,
-        &funder,
-        &ctx,
-        &ledger,
-        root,
-        0,
-        0,
-        &drive_config,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .expect("drive re-opens once the node's watcher catches up");
-
-    assert!(
-        funder.calls().is_empty(),
-        "no top-up for a deposit already at the working target"
-    );
-    assert_eq!(
-        source.opens.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "one refused open + one re-open after the settle wait"
-    );
-    assert!(started.elapsed() >= settle_backoff, "the re-open waited");
-    assert!(store.is_complete().await.expect("is_complete"));
-}
-
-/// A source that keeps refusing a deposit at the working target exhausts
-/// the stale-view budget and faults as [`StaleDepositView`]: a source
-/// fault, so it cools and is asked again. Never a sub-floor top-up, and
-/// never `PoolExhausted`, which would price the source out until a deposit
-/// rise that no top-up brings.
-#[tokio::test(start_paused = true)]
-async fn a_source_that_keeps_refusing_a_full_deposit_faults_as_a_stale_view() {
+async fn an_unfunded_open_refusal_ends_the_lane_as_unaffordable() {
     let total = 2 * GROUP;
     let (root, plaintext, _outboard) = synth_blob(total as usize);
     let store = fresh_store(root, total);
@@ -1714,237 +1433,36 @@ async fn a_source_that_keeps_refusing_a_full_deposit_faults_as_a_stale_view() {
     let source = RefuseFirstOpenShortDeposit {
         inner,
         opens: std::sync::atomic::AtomicUsize::new(0),
-        refusals: usize::MAX,
+        refusals: 1,
     };
 
-    let pacer = BudgetPacer::new();
-    let funder = FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX)));
     let mut ctx = healthy_ctx();
-    ctx.deposit = U256::from(10_000u64);
+    ctx.deposit = U256::from(1_000u64);
     let ctx = Arc::new(Mutex::new(ctx));
-    let settle_backoff = std::time::Duration::from_secs(2);
-    let drive_config = DriveConfig {
-        working_deposit: U256::from(10_000u64),
-        seller_reserve: U256::ZERO,
-        max_settle_waits: 2,
-        settle_backoff,
-    };
 
-    let started = tokio::time::Instant::now();
     let err = drive(
         &store,
         &source,
-        &pacer,
-        &funder,
+        &BudgetPacer::new(),
         &ctx,
         &ledger,
         root,
         0,
         0,
-        &drive_config,
         None,
         None,
         None,
         None,
     )
     .await
-    .expect_err("a source that never catches up faults");
+    .expect_err("an Unfunded refusal ends the lane");
 
-    assert!(
-        err.downcast_ref::<super::StaleDepositView>().is_some(),
-        "{err:#}"
-    );
-    assert_eq!(crate::classify(&err), crate::Fault::Source);
-    assert!(funder.calls().is_empty(), "no sub-floor top-up");
+    assert_eq!(crate::classify(&err), crate::Fault::Unaffordable, "{err:#}");
     assert_eq!(
         source.opens.load(std::sync::atomic::Ordering::SeqCst),
-        3,
-        "the first refusal and one re-open per settle wait"
+        1,
+        "no re-open inside the lane"
     );
-    assert!(started.elapsed() >= 2 * settle_backoff);
-}
-
-/// A [`BlobSource`] that fails its first open with a genuine exhaustion (like
-/// [`FailFirstOpen`]), serves the next open, refuses the THIRD open as a stale
-/// resume ([`ResumeOffsetPastEnd`]), and serves every open after that. It
-/// models an upstream that admits one stream on headroom it computed before its
-/// watcher saw the top-up, then refuses the next.
-struct StaleRefusalAfterOneLeg {
-    inner: FailFirstOpen,
-}
-
-impl BlobSource for StaleRefusalAfterOneLeg {
-    type Reader = MaybeFaultReader;
-
-    fn open(
-        &self,
-        hash: [u8; 32],
-        range: AlignedRange,
-    ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
-        let n = self.inner.opens.load(std::sync::atomic::Ordering::SeqCst);
-        Box::pin(async move {
-            if n == 2 {
-                self.inner
-                    .opens
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                return Err(anyhow::Error::new(crate::ResumeOffsetPastEnd {
-                    total_bytes: self.inner.inner.total_bytes(),
-                    byte_offset: range.fetch_start(),
-                }));
-            }
-            self.inner.open(hash, range).await
-        })
-    }
-
-    fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
-        self.inner.finish(reader)
-    }
-
-    fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
-        self.inner.stop(reader)
-    }
-}
-
-/// The settle allowance a top-up arms outlives the first landed leg: a stale
-/// refusal on a LATER re-open still settle-waits and retries instead of ending
-/// the fetch. One group per leg (a [`WindowPacer`] with a one-group window and
-/// the downstream always paid up) forces several opens after the top-up.
-#[tokio::test(start_paused = true)]
-async fn a_stale_refusal_after_a_landed_post_top_up_leg_still_settle_waits() {
-    let total = 3 * GROUP;
-    let (root, plaintext, _outboard) = synth_blob(total as usize);
-    let store = fresh_store(root, total);
-
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let inner = ScriptedSource::new(plaintext.clone())
-        .expect("source")
-        .paying(Arc::clone(&ledger));
-    let root = inner.root();
-    let source = StaleRefusalAfterOneLeg {
-        inner: FailFirstOpen {
-            inner,
-            opens: std::sync::atomic::AtomicUsize::new(0),
-        },
-    };
-
-    let pacer = crate::pacer::WindowPacer::new(GROUP);
-    let funder = FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX)));
-    let mut ctx = healthy_ctx();
-    ctx.deposit = U256::ZERO; // under-deposited: the first refusal is genuine
-    let ctx = Arc::new(Mutex::new(ctx));
-    let drive_config = DriveConfig {
-        working_deposit: U256::from(10_000u64),
-        seller_reserve: U256::ZERO,
-        max_settle_waits: 2,
-        settle_backoff: std::time::Duration::from_secs(2),
-    };
-    let downstream = || super::DownstreamFrontier {
-        served_paid: u64::MAX,
-        serve_demand: 0,
-    };
-
-    drive(
-        &store,
-        &source,
-        &pacer,
-        &funder,
-        &ctx,
-        &ledger,
-        root,
-        0,
-        0,
-        &drive_config,
-        None,
-        None,
-        Some(&downstream),
-        None,
-    )
-    .await
-    .expect("a stale refusal inside the settle budget must retry, not end the fetch");
-
-    assert_eq!(funder.calls().len(), 1, "one top-up funded the fetch");
-    assert!(
-        source.inner.opens.load(std::sync::atomic::Ordering::SeqCst) >= 5,
-        "fault + leg + stale refusal + retried legs"
-    );
-    assert!(store.is_complete().await.expect("is_complete"));
-    let got = store.read(0, 0).await.expect("read whole blob");
-    assert_eq!(got.as_ref(), plaintext.as_slice());
-}
-
-/// A mid-fetch `topUp` that mines but cannot be credited locally is
-/// terminal: the USDC is escrowed against a row that will not account for
-/// it, so continuing would spend against a deposit the driver cannot track.
-/// This is the disposition the proactive and manual legs are written to
-/// match, so it has to be pinned rather than assumed.
-#[tokio::test(start_paused = true)]
-async fn an_uncreditable_reactive_top_up_is_terminal() {
-    for (outcome, expected) in [
-        (DepositOutcome::UnknownPool, "no local record remains"),
-        (DepositOutcome::PoolMismatch, "tracks a different pool"),
-    ] {
-        let total = 2 * GROUP;
-        let (root, plaintext, _outboard) = synth_blob(total as usize);
-        let store = fresh_store(root, total);
-
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-        let inner = ScriptedSource::new(plaintext.clone())
-            .expect("source")
-            .paying(Arc::clone(&ledger));
-        let root = inner.root();
-        let source = FailFirstOpen {
-            inner,
-            opens: std::sync::atomic::AtomicUsize::new(0),
-        };
-
-        let pacer = BudgetPacer::new();
-        let funder = FakeFunder::new(3, outcome);
-
-        let mut ctx = healthy_ctx();
-        ctx.deposit = U256::ZERO; // under-deposited: the refusal is genuine
-        let ctx = Arc::new(Mutex::new(ctx));
-
-        let drive_config = DriveConfig {
-            working_deposit: U256::from(10_000u64),
-            seller_reserve: U256::ZERO,
-            max_settle_waits: 2,
-            settle_backoff: std::time::Duration::from_secs(2),
-        };
-
-        let err = drive(
-            &store,
-            &source,
-            &pacer,
-            &funder,
-            &ctx,
-            &ledger,
-            root,
-            0,
-            0,
-            &drive_config,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect_err("an untrackable escrow must not read as a completed fetch");
-        let msg = format!("{err:#}");
-        assert!(msg.contains(expected), "{outcome:?}: {msg}");
-        assert!(
-            msg.contains("escrowed"),
-            "the operator must learn the money moved: {msg}"
-        );
-        assert_eq!(
-            crate::classify(&err),
-            crate::Fault::Fatal(crate::FatalScope::Command),
-            "{outcome:?}: a retry escrows again, so the acquire loop must end: {msg}"
-        );
-        assert!(
-            !store.is_complete().await.expect("is_complete"),
-            "{outcome:?}: the fetch must not be reported complete"
-        );
-    }
 }
 
 /// A [`Pacer`] stub for the `up_to_bytes` clamp test: `Draw { up_to_bytes }`
@@ -1986,24 +1504,10 @@ async fn draw_clamps_the_open_to_up_to_bytes() {
         up_to_bytes: GROUP,
         drawn: std::sync::atomic::AtomicBool::new(false),
     };
-    let funder = healthy_funder();
     let ctx = Arc::new(Mutex::new(healthy_ctx()));
 
     drive(
-        &store,
-        &source,
-        &pacer,
-        &funder,
-        &ctx,
-        &ledger,
-        root,
-        0,
-        0,
-        &config(),
-        None,
-        None,
-        None,
-        None,
+        &store, &source, &pacer, &ctx, &ledger, root, 0, 0, None, None, None, None,
     )
     .await
     .expect("drive stops cleanly once the stub pacer says Done");
@@ -2066,7 +1570,6 @@ async fn wait_decision_awaits_the_pacing_hook_once_then_completes() {
     let pacer = WaitOnceThenBudget {
         waited: std::sync::atomic::AtomicBool::new(false),
     };
-    let funder = healthy_funder();
     let ctx = Arc::new(Mutex::new(healthy_ctx()));
     let wait_hook = CountingWait {
         calls: std::sync::atomic::AtomicUsize::new(0),
@@ -2076,13 +1579,11 @@ async fn wait_decision_awaits_the_pacing_hook_once_then_completes() {
         &store,
         &source,
         &pacer,
-        &funder,
         &ctx,
         &ledger,
         root,
         0,
         0,
-        &config(),
         None,
         Some(&wait_hook),
         None,
@@ -2143,7 +1644,6 @@ async fn window_pacer_gates_on_injected_served_paid() {
         .expect("source")
         .paying(Arc::clone(&ledger));
     let pacer = crate::pacer::WindowPacer::new(GROUP);
-    let funder = healthy_funder();
     let ctx = Arc::new(Mutex::new(healthy_ctx()));
 
     let served_paid_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2163,13 +1663,11 @@ async fn window_pacer_gates_on_injected_served_paid() {
         &store,
         &source,
         &pacer,
-        &funder,
         &ctx,
         &ledger,
         root,
         0,
         0,
-        &config(),
         None,
         Some(&wait_hook),
         Some(&served_paid_reader),
@@ -2284,7 +1782,6 @@ async fn a_large_window_draws_at_least_half_per_open_and_completes() {
                 serve_demand: dem.load(std::sync::atomic::Ordering::SeqCst),
             }
         };
-        let funder = healthy_funder();
         let ctx = Arc::new(Mutex::new(healthy_ctx()));
 
         tokio::time::timeout(
@@ -2293,13 +1790,11 @@ async fn a_large_window_draws_at_least_half_per_open_and_completes() {
                 &store,
                 &source,
                 &pacer,
-                &funder,
                 &ctx,
                 &ledger,
                 root,
                 0,
                 0,
-                &config(),
                 None,
                 Some(&wait_hook),
                 Some(&reader),
@@ -2462,7 +1957,6 @@ async fn in_band_demand_converges_when_upstream_payment_lags_delivery() {
     let wait_hook = ParkingWait {
         calls: std::sync::atomic::AtomicUsize::new(0),
     };
-    let funder = healthy_funder();
     let ctx = Arc::new(Mutex::new(healthy_ctx()));
 
     let outcome = tokio::time::timeout(
@@ -2471,13 +1965,11 @@ async fn in_band_demand_converges_when_upstream_payment_lags_delivery() {
             &store,
             &source,
             &pacer,
-            &funder,
             &ctx,
             &ledger,
             root,
             0,
             0,
-            &config(),
             None,
             Some(&wait_hook),
             Some(&downstream),
@@ -2524,7 +2016,6 @@ async fn in_band_demand_converges_when_upstream_payment_lags_delivery() {
             .is_empty(),
         "the demanded byte is in the store"
     );
-    assert!(funder.calls().is_empty(), "no top-up was needed");
 }
 
 /// The interval flush persists resume progress MID-fetch, not only at
@@ -2664,22 +2155,19 @@ async fn fill_gap_stops_its_leg_at_a_lowered_end() {
         .expect("source")
         .gated_on(held)
         .paying(Arc::clone(&ledger));
-    let (pacer, funder) = (BudgetPacer::new(), healthy_funder());
+    let pacer = BudgetPacer::new();
     let ctx = Arc::new(Mutex::new(healthy_ctx()));
     let mut counters = super::DriveCounters::new();
-    let config = config();
     let stop_at = std::sync::atomic::AtomicU64::new(u64::MAX);
     let fill = super::fill_gap(
         &store,
         &source,
         &pacer,
-        &funder,
         &ctx,
         &ledger,
         root,
         0,
         total,
-        &config,
         &mut counters,
         None,
         None,
@@ -2736,24 +2224,10 @@ async fn drive_rejects_an_empty_claim_for_a_non_empty_root() {
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let source = ScriptedSource::new(Vec::new()).expect("source");
     let pacer = BudgetPacer::new();
-    let funder = healthy_funder();
     let ctx = Arc::new(Mutex::new(healthy_ctx()));
 
     let err = drive(
-        &store,
-        &source,
-        &pacer,
-        &funder,
-        &ctx,
-        &ledger,
-        wanted,
-        0,
-        0,
-        &config(),
-        None,
-        None,
-        None,
-        None,
+        &store, &source, &pacer, &ctx, &ledger, wanted, 0, 0, None, None, None, None,
     )
     .await
     .expect_err("an empty claim for a non-empty root must fail");
@@ -2777,24 +2251,10 @@ async fn drive_accepts_the_empty_blob_under_the_empty_root() {
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let source = ScriptedSource::new(Vec::new()).expect("source");
     let pacer = BudgetPacer::new();
-    let funder = healthy_funder();
     let ctx = Arc::new(Mutex::new(healthy_ctx()));
 
     drive(
-        &store,
-        &source,
-        &pacer,
-        &funder,
-        &ctx,
-        &ledger,
-        root,
-        0,
-        0,
-        &config(),
-        None,
-        None,
-        None,
-        None,
+        &store, &source, &pacer, &ctx, &ledger, root, 0, 0, None, None, None, None,
     )
     .await
     .expect("the empty blob under the empty root completes");
@@ -2877,7 +2337,6 @@ async fn drive_bounded<St: crate::source::IngestStore>(
     ledger: &Arc<PoolLedger>,
 ) -> anyhow::Result<()> {
     let pacer = BudgetPacer::new();
-    let funder = healthy_funder();
     let ctx = Arc::new(Mutex::new(healthy_ctx()));
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -2885,13 +2344,11 @@ async fn drive_bounded<St: crate::source::IngestStore>(
             store,
             source,
             &pacer,
-            &funder,
             &ctx,
             ledger,
             source.root(),
             0,
             0,
-            &config(),
             None,
             None,
             None,
@@ -3205,4 +2662,246 @@ async fn an_unpaid_clean_leg_is_reopened_at_most_once() {
         "the store kept the bytes; the ledger paid nothing"
     );
     assert_eq!(source.opened_ranges(), vec![(0, total), (0, total)]);
+}
+
+/// A source that delivers part of a range unpaid, then raises a funding
+/// rejection: the credit window let it stream ahead of the voucher.
+fn delivers_then_rejects_funding(plaintext: Vec<u8>, ledger: &Arc<PoolLedger>) -> ScriptedSource {
+    ScriptedSource::new(plaintext)
+        .expect("source")
+        .paying(Arc::clone(ledger))
+        .fault_once_after(3 * GROUP as usize, || {
+            anyhow::Error::new(UpstreamVoucherRejected {
+                reason: VoucherRejectReason::PoolExhausted,
+                bundle: None,
+                proof_generation: None,
+            })
+        })
+}
+
+/// Drive the whole blob once on `ledger`, with the lane's deposit raised.
+async fn drive_whole(
+    store: &ClientRangedStore,
+    source: &ScriptedSource,
+    ledger: &Arc<PoolLedger>,
+    root: [u8; 32],
+) -> anyhow::Result<()> {
+    let ctx = Arc::new(Mutex::new(healthy_ctx()));
+    drive(
+        store,
+        source,
+        &BudgetPacer::new(),
+        &ctx,
+        ledger,
+        root,
+        0,
+        0,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+/// A lane that a funding refusal ends keeps the span it delivered and did not
+/// pay for. The next drive on the SAME lane opens at the paid frontier and
+/// bills that span again, although the store holds the bytes, so the node is
+/// paid for every byte it delivered.
+#[tokio::test(start_paused = true)]
+async fn the_same_lane_bills_its_owed_tail_after_a_funding_refusal() {
+    let total = 6 * GROUP;
+    let (root, plaintext, _outboard) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let source = delivers_then_rejects_funding(plaintext, &ledger);
+
+    let err = drive_whole(&store, &source, &ledger, root)
+        .await
+        .expect_err("the funding rejection ends the lane");
+    assert_eq!(crate::classify(&err), crate::Fault::Unaffordable, "{err:#}");
+    let present = ranges_content_len(&store.present_ranges().await.expect("present"), total);
+    assert!(present > 0, "the credit window delivered bytes unpaid");
+    assert_eq!(
+        ledger.committed().amount,
+        U256::ZERO,
+        "the lane paid nothing"
+    );
+
+    drive_whole(&store, &source, &ledger, root)
+        .await
+        .expect("the same lane resumes after the deposit rises");
+    assert!(store.is_complete().await.expect("is_complete"));
+    let opened = source.opened_ranges();
+    assert_eq!(
+        opened.get(1).map(|&(start, _)| start),
+        Some(0),
+        "the next leg opens at the paid frontier, not the delivered one: {opened:?}"
+    );
+    assert!(
+        ledger.committed().bytes >= U256::from(total),
+        "the lane paid for every byte it delivered"
+    );
+}
+
+/// After a pool replacement or a key rotation the old lane is gone. A new
+/// lane carries no owed span, so it resumes at the delivered frontier: the old
+/// lane's unpaid span is the node's bounded credit-window loss.
+#[tokio::test(start_paused = true)]
+async fn a_new_lane_resumes_at_the_delivered_frontier_and_owes_nothing() {
+    let total = 6 * GROUP;
+    let (root, plaintext, _outboard) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+    let old = Arc::new(PoolLedger::new(Cumulative::default()));
+    let source = delivers_then_rejects_funding(plaintext.clone(), &old);
+    drive_whole(&store, &source, &old, root)
+        .await
+        .expect_err("the funding rejection ends the old lane");
+    let missing = store.missing_ranges(0, 0).await.expect("missing");
+    let delivered = contiguous_byte_ranges(&missing, total)
+        .first()
+        .map_or(total, |&(start, _)| start);
+    assert!(delivered > 0, "the credit window delivered bytes unpaid");
+
+    let new = Arc::new(PoolLedger::new(Cumulative::default()));
+    let fresh = ScriptedSource::new(plaintext)
+        .expect("source")
+        .paying(Arc::clone(&new));
+    drive_whole(&store, &fresh, &new, root)
+        .await
+        .expect("the new lane completes");
+    assert_eq!(
+        fresh.opened_ranges().first().map(|&(start, _)| start),
+        Some(delivered),
+        "the new lane opens at the delivered frontier"
+    );
+    assert!(
+        old.take_unpaid(root)
+            .first()
+            .is_some_and(|&(start, _)| start == 0),
+        "the old lane still records what it owes"
+    );
+}
+
+/// A missing range `[a, b)` and an owed span `[b, c)` merge into one gap. A
+/// drive whose gap fails before it reaches `b` keeps the whole owed span: the
+/// gap's paid frontier never passed `a`.
+#[tokio::test(start_paused = true)]
+async fn an_owed_span_behind_a_failed_missing_range_stays_owed() {
+    let total = 6 * GROUP;
+    let (root, plaintext, outboard) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+    let (b, c) = (3 * GROUP, total);
+    let held = align_range(b, c - b, total).expect("align");
+    preadmit(&store, &plaintext, &outboard, &held).await;
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    ledger.note_unpaid(root, b, c);
+    let source = ScriptedSource::new(plaintext)
+        .expect("source")
+        .paying(Arc::clone(&ledger))
+        .refusing_open(0, || {
+            anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Unfunded))
+        });
+
+    drive_whole(&store, &source, &ledger, root)
+        .await
+        .expect_err("the open is refused");
+    assert_eq!(
+        ledger.take_unpaid(root),
+        vec![(b, c - b)],
+        "the owed span survives the failed gap"
+    );
+}
+
+/// A drive the caller drops mid-gap keeps the owed span it took: the node's
+/// pull leg races a drive against its cancel token, and the lane still owes
+/// those bytes.
+#[tokio::test(start_paused = true)]
+async fn a_dropped_drive_keeps_its_owed_span() {
+    let total = 6 * GROUP;
+    let (root, plaintext, outboard) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+    let (b, c) = (3 * GROUP, total);
+    let held = align_range(b, c - b, total).expect("align");
+    preadmit(&store, &plaintext, &outboard, &held).await;
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    ledger.note_unpaid(root, b, c);
+    // The gate never opens: the drive waits on its first read until dropped.
+    let (_gate, gated) = tokio::sync::watch::channel(false);
+    let source = ScriptedSource::new(plaintext)
+        .expect("source")
+        .paying(Arc::clone(&ledger))
+        .gated_on(gated);
+
+    tokio::select! {
+        ended = drive_whole(&store, &source, &ledger, root) => {
+            panic!("the gated drive ended: {ended:?}");
+        }
+        () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+    }
+    assert_eq!(
+        ledger.take_unpaid(root),
+        vec![(b, c - b)],
+        "the dropped drive noted its owed span back"
+    );
+}
+
+/// A leg that re-delivers present bytes to bill them reports no progress for
+/// them: the position counts only bytes past the delivered frontier, so the
+/// funding recovery gate never takes a re-billed byte for a new one.
+#[tokio::test(start_paused = true)]
+async fn re_delivered_bytes_report_no_progress() {
+    let total = 6 * GROUP;
+    let (root, plaintext, outboard) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+    let owed_end = 3 * GROUP;
+    let held = align_range(0, owed_end, total).expect("align");
+    preadmit(&store, &plaintext, &outboard, &held).await;
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    ledger.note_unpaid(root, 0, owed_end);
+    // The leg re-delivers most of the owed span, then resets.
+    let source = ScriptedSource::new(plaintext)
+        .expect("source")
+        .paying(Arc::clone(&ledger))
+        .fault_once_after(2 * GROUP as usize, || anyhow::anyhow!("connection reset"));
+    let highest = std::sync::atomic::AtomicU64::new(0);
+    let on_progress = |position: u64, _total: u64| {
+        highest.fetch_max(position, std::sync::atomic::Ordering::Relaxed);
+    };
+    let ctx = Arc::new(Mutex::new(healthy_ctx()));
+    drive(
+        &store,
+        &source,
+        &BudgetPacer::new(),
+        &ctx,
+        &ledger,
+        root,
+        0,
+        0,
+        Some(&on_progress),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect_err("the leg resets");
+    assert_eq!(
+        highest.load(std::sync::atomic::Ordering::Relaxed),
+        owed_end,
+        "the re-delivered bytes moved the position past the present base"
+    );
+}
+
+/// Owed spans merge into disjoint ascending ranges.
+#[test]
+fn owed_spans_merge_and_are_taken_once() {
+    let ledger = PoolLedger::new(Cumulative::default());
+    let hash = [7u8; 32];
+    ledger.note_unpaid(hash, 10, 20);
+    ledger.note_unpaid(hash, 15, 30);
+    ledger.note_unpaid(hash, 40, 40);
+    ledger.note_unpaid([8u8; 32], 0, 5);
+    assert_eq!(ledger.take_unpaid(hash), vec![(10, 20)]);
+    assert!(ledger.take_unpaid(hash).is_empty(), "taken once");
+    assert_eq!(ledger.take_unpaid([8u8; 32]), vec![(0, 5)]);
 }

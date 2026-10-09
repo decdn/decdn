@@ -10,6 +10,16 @@ fn no_revert_data_is_rpc_error() {
 }
 
 #[test]
+fn pool_not_open_revert_is_recognised_and_nothing_else_is() {
+    let data = Bytes::from(PoolNotOpen {}.abi_encode());
+    assert!(is_pool_not_open(Some(&data)));
+    let other = Bytes::from(ZeroAmount {}.abi_encode());
+    assert!(!is_pool_not_open(Some(&other)));
+    assert!(!is_pool_not_open(None));
+    assert!(!is_pool_not_open(Some(&Bytes::from(vec![0u8; 2]))));
+}
+
+#[test]
 fn zero_amount_is_insufficient_deposit() {
     let data = Bytes::from(ZeroAmount {}.abi_encode());
     assert_eq!(

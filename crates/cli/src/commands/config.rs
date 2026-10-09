@@ -1100,8 +1100,8 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # only this node. This is the fastest removal path the protocol offers and the
 # one sized to a sub-day statutory deadline (e.g. the EU TCO one-hour clock),
 # because it is entirely within the order recipient's control. Refused
-# requests are signed as HashBlacklisted / OriginBlacklisted, which do not
-# reveal whether the entry is local or on-chain.
+# requests are signed as Declined, which does not reveal whether the entry is
+# local or on-chain.
 #
 # Hashes are bare 64-char lowercase hex — the same spelling as
 # cache.pinned_hashes. An invalid entry FAILS startup rather than being skipped:

@@ -96,8 +96,8 @@ impl ClientHandler {
             // Everything else (`BlobTooLarge`, `HashMismatch`, `VerifyFailed`,
             // `EvictionLimitExceeded`) is DETERMINISTIC: it will recur on every
             // request for this hash, so it is not evidence the node is degraded.
-            // Reporting it as `InternalError` ("do not retry this node") would
-            // steer clients off a healthy node permanently over one bad blob.
+            // Reporting it as `InternalError` (wire `Declined`) would drop this
+            // node for the hash over one bad upstream copy.
             // Meter it (the operator still needs to see it) but let it fall
             // through as a plain miss.
             Ok(Err(e)) => {
@@ -248,8 +248,8 @@ impl ClientHandler {
     /// A deadline expiry itself is a [`FillOutcome::CleanMiss`], NOT a
     /// [`FillOutcome::HardFault`] (#1129): we do not KNOW that anything is broken.
     /// The blob may well exist upstream and we simply ran out of patience. Reporting
-    /// a slow upstream as `InternalError` ("do not retry this node") would steer
-    /// clients off a perfectly healthy node because someone ELSE was slow. Only a
+    /// a slow upstream as `InternalError` (wire `Declined`) would drop a healthy
+    /// node for the hash because someone ELSE was slow. Only a
     /// genuine store/origin *error* is a fault, including the `has`-lookup error
     /// below.
     pub(super) async fn on_pull_through_timeout(

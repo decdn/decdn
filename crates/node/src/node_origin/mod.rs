@@ -50,7 +50,7 @@ mod timed_source;
 pub(crate) use admit_store::NodeAdmitStore;
 pub(crate) use backend_source::BackendSource;
 pub(crate) use funder::NodeFunder;
-use funder::{SETTLE_POLL_STEP, settle_wait_budget};
+use funder::{SETTLE_POLL_STEP, settle_window};
 pub(crate) use pull_leg::{PrimeLeg, PullLegTarget, run_local_pull_leg, run_pull_leg};
 
 use std::collections::HashMap;
@@ -65,14 +65,15 @@ use alloy::primitives::{Address, B256, U256};
 use decdn_bao_range::align_range;
 use decdn_cache::origin::{Origin, OriginFetch};
 use decdn_cache::{Hash, OriginKind, OriginPullError};
-use decdn_client::driver::DriveConfig;
-use decdn_client::{BudgetPacer, PeerSource, PrimedSource, drive, first_leg};
+use decdn_client::{
+    BudgetPacer, PeerSource, PrimedSource, RecoveryGate, Stepped, drive, first_leg,
+};
 use decdn_common::redact::sanitize_err_chain;
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use timed_source::{TimedSource, timed_open};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument as _, debug, warn};
+use tracing::{Instrument as _, debug, info, warn};
 
 use decdn_reputation::{LocalReputation, Outcome};
 
@@ -185,6 +186,10 @@ enum PoolOpenArm {
     /// [`PoolOpenPending`]: the open outlived the caller's budget and continues
     /// in the background. Not a failure.
     Pending,
+    /// `PoolOpenFailureReason::InsufficientDeposit`: this node's wallet cannot
+    /// fund a deposit, so it can pay no provider and the fill ends "funding
+    /// needed".
+    FundingNeeded,
     /// [`LocalPullFault`]: node-wide — this node can pay no provider.
     LocalFault,
     /// [`OpenReported`] without [`LocalPullFault`]: the open task already logged
@@ -198,10 +203,17 @@ enum PoolOpenArm {
 ///
 /// Order is load-bearing: [`LocalPullFault`] is checked before [`OpenReported`]
 /// because the node-wide faults carry both, and letting `OpenReported` win would
-/// answer a client `NotFound` from a node that cannot pay anyone (#1560).
+/// answer a client `NotFound` from a node that cannot pay anyone (#1560). An
+/// unfundable wallet carries [`LocalPullFault`] too, and is checked first: its
+/// fill ends "funding needed", which the client hears as `NotFound` (ADR 005
+/// §Open-time refusal classes).
 fn classify_pool_open_arm(err: &anyhow::Error) -> PoolOpenArm {
     if err.downcast_ref::<PoolOpenPending>().is_some() {
         PoolOpenArm::Pending
+    } else if err.downcast_ref::<PoolOpenFailureReason>()
+        == Some(&PoolOpenFailureReason::InsufficientDeposit)
+    {
+        PoolOpenArm::FundingNeeded
     } else if err.downcast_ref::<LocalPullFault>().is_some() {
         PoolOpenArm::LocalFault
     } else if err.downcast_ref::<OpenReported>().is_some() {
@@ -255,12 +267,13 @@ fn classify_pool_open_arm(err: &anyhow::Error) -> PoolOpenArm {
 /// which is also where the full error chain is still intact to log.
 ///
 /// Consequently the `LocalPullFault`-marked legs are the node-wide ones: the store and
-/// lock faults, and an `InsufficientDeposit` — a wallet that cannot fund a deposit
-/// cannot pay any provider, so walking to the next candidate is futile and a `NotFound`
-/// would misdescribe this node. The unmarked legs are the deliberate `Clean` ones: a
+/// lock faults, and an `InsufficientDeposit`. The store and lock faults answer the
+/// client `Declined`. A wallet that cannot fund a deposit cannot pay any provider
+/// either, but its fill ends "funding needed", a funding problem of this node and
+/// not of the requester, so it answers `NotFound`. The unmarked legs are the deliberate `Clean` ones: a
 /// pending open and a `ContractRevert` — deterministic on-chain state that says
 /// nothing about this node's ability to pay, so another candidate may still deliver.
-/// Refusing `InternalError` for that would steer clients off a node that is fine.
+/// Refusing `Declined` for that would steer clients off a node that is fine.
 /// An `RpcError` is NOT among them: `openPool` names no provider, so a chain lane
 /// that cannot carry the transaction cannot carry it for any candidate.
 // The arms are a flat sentinel ladder; splitting it would scatter one decision.
@@ -300,6 +313,15 @@ fn record_pool_open_failure(
     // It also logs despite `OpenReported`, which normally means "already reported, stay
     // quiet". Deliberate: the raising site's line says what broke, and this one says what it
     // COST — that a client was refused rather than told the blob is missing.
+    if arm == PoolOpenArm::FundingNeeded {
+        deps.metrics.node_pull_local_fault();
+        warn!(
+            %provider_addr, error = %sanitize_err_chain(err),
+            "node-origin: this node's wallet cannot fund a buyer pool — it cannot pay \
+             any provider; exonerating the upstream and answering a miss"
+        );
+        return PullMiss::FundingNeeded;
+    }
     if arm == PoolOpenArm::LocalFault {
         deps.metrics.node_pull_local_fault();
         warn!(
@@ -409,28 +431,9 @@ pub struct NodeOriginConfig {
     /// refuses a stream quote that exceeds the lower of the two before paying — and
     /// retains the signed over-quote as rate-manipulation evidence.
     pub max_rate_per_mb: u64,
-    /// The deposit a freshly-opened buyer channel escrows, and the target a
-    /// mid-pull reactive top-up raises an exhausted channel toward
-    /// (`blockchain.buyer_working_deposit_micro_usdc`, #1530). The proactive
-    /// low-water refill (`crate::buyer_channel::refill_decision`) targets the
-    /// same deposit; the two legs differ only in what triggers them.
-    ///
-    /// `U256::ZERO` disables the reactive top-up entirely. Config never resolves
-    /// to zero (the resolver rejects it), but the value flows into the paid leg's
-    /// [`decdn_client::driver::DriveConfig`], where zero switches the
-    /// pacer's reactive arm off.
-    pub working_deposit: U256,
-    /// This node's estimate of an upstream's refundable floor `M` (ADR 003 § Pool
-    /// solvency): its own `blockchain.pool_min_remaining_deposit_micro_usdc`, the
-    /// floor it keeps on the pools it serves. An upstream refuses a new stream once
-    /// the pool's remaining deposit, less its `M`, cannot cover a window, and the
-    /// refusal reads as a plain miss. The pull leg's pacer therefore tops up while
-    /// the deposit still covers this floor plus the next voucher, so a mid-pull
-    /// re-open is not refused. It only triggers a top-up; it never refuses a draw.
-    pub seller_reserve: U256,
     /// How often this node's chain watcher polls for events
-    /// (`blockchain.event_poll_interval_ms`), used to size the post-top-up settle
-    /// wait (#1530).
+    /// (`blockchain.event_poll_interval_ms`), used to size the settle window
+    /// after a funding recovery step's top-up (#1530).
     ///
     /// The wait is for the UPSTREAM's watcher, not ours, but every node in the
     /// network runs the same default cadence and this is the only local reading of
@@ -865,6 +868,16 @@ impl Origin for NodeOrigin {
                 // Latched across BOTH walks, like `attempt_metered` — see
                 // `miss_answer` for what it buys.
                 let mut miss = PullMiss::Clean;
+                // The fill's funding recovery state (ADR 003 § Funding recovery),
+                // and the candidates of both walks that refused this node's
+                // funding: the ones the step asks again.
+                let gate = Arc::new(RecoveryGate::with_settle(settle_window(
+                    deps.config.event_poll_interval,
+                )));
+                // The deposit this fill starts at. A sibling fill's step that
+                // lands above it serves this fill too.
+                let seen = deps.buyer.pool_deposit().unwrap_or(U256::ZERO);
+                let mut unfunded: Vec<Candidate> = Vec::new();
 
                 // ADR 001 §Probe cache: "On a cache miss the requester checks the probe
                 // cache first; if a valid entry exists, it skips DHT lookup and goes
@@ -873,11 +886,13 @@ impl Origin for NodeOrigin {
                     deps.metrics.probe_cache_hit();
                     deps.metrics.node_pull_attempt();
                     attempt_metered = true;
-                    let outcome = try_pull(&deps_lock, deps, &cached, hash_bytes, budget).await;
+                    let outcome =
+                        try_pull(&deps_lock, deps, &cached, hash_bytes, budget, &gate).await;
                     match outcome.payload {
                         Ok(()) => return Ok(OriginFetch::AlreadyAdmitted),
                         Err(failed) => miss = miss.or(failed),
                     }
+                    unfunded.extend(outcome.unfunded);
                     budget = budget.saturating_sub(outcome.attempts);
                     // Every cached provider we had budget to try failed to deliver.
                     // The entry has been disproved by the only evidence that outranks
@@ -897,7 +912,10 @@ impl Origin for NodeOrigin {
                         // so an exhausted budget spent on OUR faults is not signed to a
                         // client as an absent blob (#1560).
                         debug!(%hash, "node-origin: probe-cache candidates exhausted the attempt budget");
-                        return miss_answer(miss);
+                        return recover_unfunded(
+                            &deps_lock, deps, hash_bytes, unfunded, miss, &gate, seen,
+                        )
+                        .await;
                     }
                 } else {
                     deps.metrics.probe_cache_miss();
@@ -920,7 +938,10 @@ impl Origin for NodeOrigin {
                         deps.metrics.node_pull_no_providers();
                     }
                     debug!(%hash, "node-origin: no providers discovered for cache-miss pull");
-                    return miss_answer(miss);
+                    return recover_unfunded(
+                        &deps_lock, deps, hash_bytes, unfunded, miss, &gate, seen,
+                    )
+                    .await;
                 }
                 if !attempt_metered {
                     deps.metrics.node_pull_attempt();
@@ -935,12 +956,25 @@ impl Origin for NodeOrigin {
                     U256::ZERO,
                 )
                 .await;
-                match try_pull(&deps_lock, deps, &ranked, hash_bytes, budget)
-                    .await
-                    .payload
-                {
+                let outcome = try_pull(&deps_lock, deps, &ranked, hash_bytes, budget, &gate).await;
+                match outcome.payload {
                     Ok(()) => Ok(OriginFetch::AlreadyAdmitted),
-                    Err(failed) => miss_answer(miss.or(failed)),
+                    Err(failed) => {
+                        // The exhausted candidate set: both walks and a fresh
+                        // discovery delivered nothing. Funding recovery for the
+                        // candidates that refused this node's funding.
+                        unfunded.extend(outcome.unfunded);
+                        recover_unfunded(
+                            &deps_lock,
+                            deps,
+                            hash_bytes,
+                            unfunded,
+                            miss.or(failed),
+                            &gate,
+                            seen,
+                        )
+                        .await
+                    }
                 }
             }
             .instrument(span.clone())
@@ -972,12 +1006,10 @@ impl Origin for NodeOrigin {
 /// asked; what failed is US — a buyer key that cannot sign, a deadline config that
 /// cannot run, a signature the upstream cannot verify, a cache store that cannot
 /// take the bytes. Reported as a miss it
-/// becomes a signed wire `NotFound`, which is exactly the false claim about content
-/// that `StreamError::InternalError` ("unexpected failure; do not retry this node")
-/// exists to keep a broken node from making. So it surfaces as an origin error
-/// instead, and the serve path's existing `CacheError::OriginError` →
-/// `FillOutcome::HardFault` → `ServeRejectReason::InternalError` chain does the
-/// rest.
+/// becomes a signed wire `NotFound`, a false claim about content that a broken
+/// node must not make. So it surfaces as an origin error instead, and the serve
+/// path's `CacheError::OriginError` → `FillOutcome::HardFault` →
+/// `ServeRejectReason::InternalError` chain answers the client `Declined`.
 ///
 /// [`OriginPullError::Permanent`] rather than `Transient`, on three counts: the
 /// retry loop must not re-run a pull whose signer or store is broken; `Permanent` records
@@ -989,10 +1021,14 @@ impl Origin for NodeOrigin {
 /// A [`PullMiss::BelowMargin`] answers the same `NotFound` as [`PullMiss::Clean`]:
 /// this node's serve-economics buy ceiling is a local policy decision, not a fact
 /// about the content, and it must never reach the wire as a distinct code — that
-/// would let a client fingerprint this node's pricing floor by probing for it.
+/// would let a client fingerprint this node's pricing floor by probing for it. A
+/// [`PullMiss::FundingNeeded`] and [`PullMiss::Unfunded`] answer it too: this
+/// node's own funding gap is not the requester's to recover.
 fn miss_answer(miss: PullMiss) -> Result<OriginFetch, OriginPullError> {
     match miss {
-        PullMiss::Clean | PullMiss::BelowMargin => Ok(OriginFetch::NotFound),
+        PullMiss::Clean | PullMiss::BelowMargin | PullMiss::FundingNeeded | PullMiss::Unfunded => {
+            Ok(OriginFetch::NotFound)
+        }
         PullMiss::LocalFault => Err(OriginPullError::Permanent(anyhow::anyhow!(
             "node-origin: a LOCAL fault hit at least one attempted candidate and none \
              delivered; this node cannot complete the pull, so it refuses rather than \
@@ -1326,7 +1362,7 @@ async fn probe_candidate(
         Ok(ok) => ok,
         Err(err) => {
             // A `0x10` shed is the peer ANSWERING — "not now" — not the peer being
-            // unreachable (#1986). It gets what the handler-level `Overloaded` refusal
+            // unreachable (#1986). It gets what a handler-level `NotFound` refusal
             // gets in `classify_refusal`: the pair is suppressed for the short TTL so
             // a retry burst stops re-spending a probe slot on it, and no reputation
             // outcome is recorded. A `global-full` shed skips the node's close ack-wait
@@ -1548,6 +1584,9 @@ struct PullOutcome<T> {
     /// Candidates actually TRIED — i.e. per-candidate attempts, whether or
     /// not they delivered. Never exceeds the `budget` passed in.
     attempts: usize,
+    /// The tried candidates that refused this node's funding
+    /// ([`PullMiss::Unfunded`]): the ones a funding recovery step asks again.
+    unfunded: Vec<Candidate>,
 }
 
 /// Why an attempt — one candidate, or a whole walk of them — produced no payload
@@ -1558,9 +1597,8 @@ struct PullOutcome<T> {
 /// every non-hit onto a clean `NotFound` — no providers, all refused, all stalled,
 /// and a LOCAL fault alike — makes a false statement about the content in the last
 /// case: the blob may well exist and be perfectly reachable; it is
-/// this node that cannot sign a voucher for it — and `StreamError::InternalError`
-/// ("unexpected failure; do not retry this node") exists precisely to keep a
-/// broken node from laundering its own defect into a signed claim about content.
+/// this node that cannot sign a voucher for it. A broken node answers `Declined`
+/// rather than launder its own defect into a signed claim about content.
 ///
 /// Deliberately NOT a per-verdict taxonomy. The crate-private `PullVerdict`
 /// already carries the full one, and it answers a different question ("what does
@@ -1590,6 +1628,17 @@ pub enum PullMiss {
     /// ceiling; the node declined an unprofitable relay. Wire-identical to
     /// [`Self::Clean`].
     BelowMargin,
+    /// This node's own wallet cannot fund a buyer pool, so it can pay no
+    /// provider and the fill ends "funding needed". The funding problem is this
+    /// node's, not the requester's, so it is wire-identical to [`Self::Clean`]
+    /// (ADR 005 §Open-time refusal classes).
+    FundingNeeded,
+    /// The candidate refused this node's funding: an `Unfunded` refusal, a
+    /// funding voucher rejection, or this node's pool short of the next
+    /// voucher. The refusal scopes to that candidate; a walk that delivers
+    /// nothing runs its funding recovery step for such candidates (ADR 003
+    /// § Funding recovery). Wire-identical to [`Self::Clean`].
+    Unfunded,
 }
 
 impl PullMiss {
@@ -1600,6 +1649,8 @@ impl PullMiss {
             Self::Clean => "clean_miss",
             Self::LocalFault => "local_fault",
             Self::BelowMargin => "below_margin",
+            Self::FundingNeeded => "funding_needed",
+            Self::Unfunded => "unfunded",
         }
     }
 
@@ -1622,7 +1673,7 @@ impl PullMiss {
             // configuration of what we will accept from it (`Oversize`, `RateCeiling`,
             // `OurDeadline`), or about one lane to one provider (the two voucher arms).
             // None of them is evidence that THIS node is broken for every client and
-            // every blob, so none earns an `InternalError`: a node with one wedged lane
+            // every blob, so none earns a `Declined`: a node with one wedged lane
             // is still a healthy node that simply cannot serve this blob right now.
             PullVerdict::Oversize
             | PullVerdict::RateCeiling
@@ -1631,31 +1682,13 @@ impl PullMiss {
             | PullVerdict::RateLimited
             | PullVerdict::OurDeadLane(_)
             | PullVerdict::OurVoucherRetryable(_)
-            | PullVerdict::Refused(
-                RefusalVerdict::NodeFault
-                | RefusalVerdict::DurableMiss(_)
-                | RefusalVerdict::Transient,
-            )
+            | PullVerdict::Refused(RefusalVerdict::DurableMiss | RefusalVerdict::Transient)
             | PullVerdict::Corruption
             | PullVerdict::LegNoProgress
             | PullVerdict::Unreachable => Self::Clean,
-            // Spelled out rather than folded into `Refused(_)` above, because it is the
-            // one refusal `classify_refusal` calls "everything about us": our operator
-            // address is on the ADR 011 blacklist, so every peer refuses identically and
-            // the condition is node-wide, not per-provider.
-            //
-            // Reachable ONLY for `OriginBlacklisted`, though `classify_refusal` maps two
-            // variants here: `pull_verdict` unwraps a `VoucherRejected` to `voucher_verdict`
-            // first, and its own comment calls that a defensive backstop. If that unwrap
-            // ever stops happening, the reasoning below does not transfer — a rejected
-            // voucher is a statement about one channel, not about a governance list.
-            //
-            // It stays `Clean` anyway, on two counts. `InternalError` means "UNEXPECTED
-            // failure" — a governance blacklist is a deterministic policy state, not a
-            // defect. And "do not retry this node" is the wrong advice: a blacklisted node
-            // still serves everything already in its cache perfectly well, so steering
-            // clients off it wholesale costs them the hits it CAN serve. `NotFound` — "not
-            // here, try elsewhere" — is both true of this blob and the better instruction.
+            // A defensive backstop: `pull_verdict` unwraps a `VoucherRejected` to
+            // `voucher_verdict` first, so this arm is not reached in practice. A
+            // rejected voucher is about one lane, not this node.
             PullVerdict::Refused(RefusalVerdict::OurFault) => Self::Clean,
         }
     }
@@ -1676,10 +1709,16 @@ impl PullMiss {
     /// economics refusal happened somewhere in this walk" signal so the buy loop
     /// can tell a below-margin miss apart from a genuinely empty one, rather than
     /// letting a later candidate's honest miss erase the fact that an earlier one
-    /// quoted above this node's buy ceiling.
+    /// quoted above this node's buy ceiling. A [`Self::FundingNeeded`] sits
+    /// between the two: every attempt hits the same wallet, so it names the walk
+    /// whatever an attempt's quote was. An [`Self::Unfunded`] candidate ranks
+    /// just below it: the walk's funding recovery step decides whether it
+    /// becomes funding needed.
     const fn or(self, other: Self) -> Self {
         match (self, other) {
             (Self::LocalFault, _) | (_, Self::LocalFault) => Self::LocalFault,
+            (Self::FundingNeeded, _) | (_, Self::FundingNeeded) => Self::FundingNeeded,
+            (Self::Unfunded, _) | (_, Self::Unfunded) => Self::Unfunded,
             (Self::BelowMargin, _) | (_, Self::BelowMargin) => Self::BelowMargin,
             (Self::Clean, Self::Clean) => Self::Clean,
         }
@@ -1823,31 +1862,158 @@ fn heat_of(deps: &NodeOriginDeps, hash_bytes: [u8; 32]) -> u32 {
 /// candidates skipped earlier for an unresolvable operator address or a local
 /// channel-open failure are intentionally not scored (neither is the provider's
 /// fault). `budget` is the fetch-wide [`MAX_PROVIDER_ATTEMPTS`] remainder rather
-/// than the constant itself — see [`PullOutcome`].
+/// than the constant itself (see [`PullOutcome`]). Every verified byte counts
+/// toward the fill's funding recovery `gate`.
 async fn try_pull(
     deps_lock: &Arc<OnceLock<NodeOriginDeps>>,
     deps: &NodeOriginDeps,
     ranked: &[Candidate],
     hash_bytes: [u8; 32],
     budget: usize,
+    gate: &Arc<RecoveryGate>,
 ) -> PullOutcome<()> {
     let mut attempts = 0;
     let mut miss = PullMiss::Clean;
+    let mut unfunded = Vec::new();
     for candidate in ranked.iter().take(budget) {
         attempts += 1;
-        match pull_from_candidate(deps_lock, deps, candidate, hash_bytes).await {
+        match pull_from_candidate(deps_lock, deps, candidate, hash_bytes, gate).await {
             Ok(()) => {
                 return PullOutcome {
                     payload: Ok(()),
                     attempts,
+                    unfunded,
                 };
             }
-            Err(failed) => miss = miss.or(failed),
+            Err(failed) => {
+                if failed == PullMiss::Unfunded {
+                    unfunded.push(candidate.clone());
+                }
+                miss = miss.or(failed);
+            }
         }
     }
     PullOutcome {
         payload: Err(miss),
         attempts,
+        unfunded,
+    }
+}
+
+/// The end of a fill whose walks delivered nothing: when some candidates
+/// refused this node's funding, run the fill's funding recovery step (ADR 003
+/// § Funding recovery) and ask those candidates once more, else answer `miss`.
+///
+/// The first step of a fill is always allowed; a further step only after a
+/// byte verified since the last one. A step that tops the pool up opens the
+/// gate's settle window: a candidate that still refuses inside it is the
+/// upstream's chain watcher lagging the new deposit, so the fill waits a
+/// [`SETTLE_POLL_STEP`] and asks again instead of taking another step. A fill
+/// that can take no step ends "funding needed" ([`PullMiss::FundingNeeded`]),
+/// which still answers the client `NotFound`.
+async fn recover_unfunded(
+    deps_lock: &Arc<OnceLock<NodeOriginDeps>>,
+    deps: &NodeOriginDeps,
+    hash_bytes: [u8; 32],
+    mut unfunded: Vec<Candidate>,
+    mut miss: PullMiss,
+    gate: &Arc<RecoveryGate>,
+    mut seen: U256,
+) -> Result<OriginFetch, OriginPullError> {
+    while !unfunded.is_empty() {
+        if gate.settling(tokio::time::Instant::now()) {
+            tokio::time::sleep(SETTLE_POLL_STEP).await;
+        } else {
+            match node_step(gate, deps, seen, unfunded.len()).await {
+                Ok(deposit) => seen = deposit,
+                Err(end) => return miss_answer(miss.or(end)),
+            }
+        }
+        let outcome = try_pull(deps_lock, deps, &unfunded, hash_bytes, unfunded.len(), gate).await;
+        match outcome.payload {
+            Ok(()) => return Ok(OriginFetch::AlreadyAdmitted),
+            Err(failed) => miss = miss.or(failed),
+        }
+        unfunded = outcome.unfunded;
+    }
+    miss_answer(miss)
+}
+
+/// The content bytes `store` holds of its `total_bytes` blob, or `None` when
+/// the store cannot answer.
+async fn held_bytes(store: &NodeAdmitStore, total_bytes: u64) -> Option<u64> {
+    use decdn_client::RangedStore as _;
+    let missing = store.missing_ranges(0, total_bytes).await.ok()?;
+    let chunk = |n: bao_tree::ChunkNum| n.0.saturating_mul(1024).min(total_bytes);
+    let mut bounds = missing.boundaries().iter().copied();
+    let mut missing_bytes = 0u64;
+    while let Some(start) = bounds.next() {
+        let end = bounds.next().map_or(total_bytes, chunk);
+        missing_bytes = missing_bytes.saturating_add(end.saturating_sub(chunk(start)));
+    }
+    Some(total_bytes.saturating_sub(missing_bytes))
+}
+
+/// Run one funding recovery step of a fill under `gate`, for `candidates`
+/// candidates that refused this node's funding. `seen` is the deposit the fill
+/// last saw. A pool row above it is a sibling fill's step: the gate takes it as
+/// raised and runs no step of its own. `Ok` is the deposit the fill sees next;
+/// `Err` names the fill's end: no step allowed or possible, or a step that
+/// failed.
+pub(super) async fn node_step(
+    gate: &RecoveryGate,
+    deps: &NodeOriginDeps,
+    seen: U256,
+    candidates: usize,
+) -> Result<U256, PullMiss> {
+    let funder = NodeFunder::new(Arc::clone(&deps.buyer), Arc::clone(&deps.metrics), seen);
+    // The node's step sizes itself from its pool row, so the spend it is
+    // handed is not read.
+    let current = || deps.buyer.pool_deposit().unwrap_or(seen);
+    // One fill runs its steps one after another, so it has seen every top-up
+    // its gate took; a sibling fill's step reaches it through the pool row.
+    let mut top_ups = gate.top_ups();
+    match gate
+        .step(&funder, seen, &mut top_ups, current, U256::ZERO)
+        .await
+    {
+        Stepped::Raised(deposit) => Ok(deposit),
+        Stepped::Replaced(replaced) => {
+            info!(
+                closed = %replaced.closed,
+                opened = %replaced.opened,
+                "node-origin: the buyer pool accepts no more funds; a new pool replaces it"
+            );
+            gate.start_next_pass();
+            Ok(deps.buyer.pool_deposit().unwrap_or(seen))
+        }
+        end @ (Stepped::NoProgress | Stepped::Unavailable) => {
+            info!(
+                candidates,
+                why = no_step_why(&end),
+                "node-origin: no candidate serves at this node's funding; the fill ends funding \
+                 needed"
+            );
+            Err(PullMiss::FundingNeeded)
+        }
+        Stepped::Failed(err) => {
+            warn!(
+                error = %sanitize_err_chain(&err),
+                "node-origin: the funding recovery step failed"
+            );
+            Err(PullMiss::LocalFault)
+        }
+    }
+}
+
+/// Why a fill's funding recovery step let no candidate be asked again: the
+/// progress rule allowed no step, or the step could not add funds (which the
+/// funder counted as `node_pull_recovery_step_refused`).
+const fn no_step_why(stepped: &Stepped) -> &'static str {
+    if matches!(stepped, Stepped::NoProgress) {
+        "no byte was verified since the last recovery step"
+    } else {
+        "the recovery step could not add funds"
     }
 }
 
@@ -1920,6 +2086,7 @@ async fn pull_from_candidate(
     deps: &NodeOriginDeps,
     candidate: &Candidate,
     hash_bytes: [u8; 32],
+    gate: &Arc<RecoveryGate>,
 ) -> Result<(), PullMiss> {
     let span = tracing::info_span!(
         "upstream_stream",
@@ -1932,7 +2099,7 @@ async fn pull_from_candidate(
         outcome = tracing::field::Empty,
     );
     let opened = AtomicBool::new(false);
-    let result = pull_from_candidate_in_span(deps_lock, deps, candidate, hash_bytes, &opened)
+    let result = pull_from_candidate_in_span(deps_lock, deps, candidate, hash_bytes, &opened, gate)
         .instrument(span.clone())
         .await;
     // Only a candidate the pull opened a stream to has a stream outcome; one
@@ -1963,6 +2130,7 @@ async fn pull_from_candidate_in_span(
     candidate: &Candidate,
     hash_bytes: [u8; 32],
     opened: &AtomicBool,
+    gate: &Arc<RecoveryGate>,
 ) -> Result<(), PullMiss> {
     let Ok(pk) = PublicKey::from_bytes(&candidate.node_id) else {
         return Err(PullMiss::Clean);
@@ -2098,9 +2266,14 @@ async fn pull_from_candidate_in_span(
         Ok(pair) => pair,
         Err(err) => {
             // No bytes pulled, no voucher paid — nothing to settle.
-            let verdict =
-                classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(ctx.pool_id), &err);
-            return Err(PullMiss::for_verdict(verdict));
+            return Err(candidate_miss(
+                deps,
+                pk,
+                provider_addr,
+                hash_bytes,
+                ctx.pool_id,
+                &err,
+            ));
         }
     };
     // The drive adopts the pull only while it is fresh, measured from here: the
@@ -2143,29 +2316,18 @@ async fn pull_from_candidate_in_span(
     let dial_runtime = deps.dial_runtime.clone();
     let slash_domain = deps.slash_domain.clone();
     let engine = deps.engine.clone();
-    let buyer = Arc::clone(&deps.buyer);
     let metrics = Arc::clone(&deps.metrics);
     let ledger_for_drive = Arc::clone(&ledger);
     let deps_for_thread = Arc::clone(deps_lock);
     let max_blob_size_bytes = deps.config.max_blob_size_bytes;
-    let drive_config = DriveConfig {
-        working_deposit: deps.config.working_deposit,
-        seller_reserve: deps.config.seller_reserve,
-        max_settle_waits: settle_wait_budget(deps.config.event_poll_interval),
-        settle_backoff: SETTLE_POLL_STEP,
-    };
+    // Every newly verified byte counts toward the fill's funding recovery gate.
+    let gate_for_thread = Arc::clone(gate);
     // The outer `fetch`-side future owns the drop guard: dropping this future (deadline
     // expiry / disconnect / shutdown) cancels the token, which the pull thread selects
     // on to stop the drive.
     let cancel = CancellationToken::new();
     let cancel_for_thread = cancel.clone();
     let _cancel_guard = cancel.drop_guard();
-    // Set on the drive thread the first time a reactive top-up escrows any headroom, so
-    // the refuse-metering below can tell a pull that never funded itself (an extortion
-    // `SpendingCapExhausted` to meter) from one that did (already metered by `NodeFunder`,
-    // as a success or as a short landing).
-    let reactive_funded = Arc::new(AtomicBool::new(false));
-    let reactive_funded_for_thread = Arc::clone(&reactive_funded);
     // The pull runs on its own thread and runtime, which starts with no span.
     // Carry the caller's span across so the pull's events stay in its trace.
     let pull_span = tracing::Span::current();
@@ -2222,17 +2384,16 @@ async fn pull_from_candidate_in_span(
                 _ => drop((header, whole)),
             }
             let pacer = BudgetPacer::new();
-            let funder = NodeFunder::new(
-                buyer,
-                Arc::clone(&ctx),
-                Arc::clone(&metrics),
-                reactive_funded_for_thread,
-            );
+            // The bytes the store holds before the drive: what it holds after,
+            // less these, is the newly verified bytes the fill's funding
+            // recovery gate counts. Bytes a leg re-delivers to bill them are
+            // already held, so they count nothing.
+            let held_before = held_bytes(&store, total_bytes).await;
             // Whole blob: offset 0, len `total_bytes`. `drive` derives missing ranges
-            // from the ranged store, so a mid-pull top-up resumes by re-deriving gaps
-            // — no truncate, no rewind buffer. `drive` finalizes the store when the
-            // whole blob is present, so the caller holds no whole-blob buffer of its
-            // own on success.
+            // from the ranged store, so a later pull of the same blob resumes by
+            // re-deriving gaps: no truncate, no rewind buffer. `drive` finalizes the
+            // store when the whole blob is present, so the caller holds no whole-blob
+            // buffer of its own on success.
             let cancelled;
             let result = tokio::select! {
                 biased;
@@ -2240,13 +2401,11 @@ async fn pull_from_candidate_in_span(
                     &store,
                     &source,
                     &pacer,
-                    &funder,
                     &ctx,
                     &ledger_for_drive,
                     hash_bytes,
                     0,
                     total_bytes,
-                    &drive_config,
                     None,
                     None,
                     None,
@@ -2261,6 +2420,12 @@ async fn pull_from_candidate_in_span(
                     Ok(())
                 }
             };
+            if let (Some(before), Some(after)) =
+                (held_before, held_bytes(&store, total_bytes).await)
+                && after > before
+            {
+                gate_for_thread.record_verified(after - before);
+            }
             // A primed pull the drive never opened closes now.
             source.clear();
             (result, pool_id, cancelled)
@@ -2316,32 +2481,37 @@ async fn pull_from_candidate_in_span(
             );
             Ok(())
         }
-        Err(err) => {
-            // Meter a refused reactive top-up (#1600): the upstream ended the pull with
-            // `SpendingCapExhausted` while OUR ledger still had headroom — an attempt to make us
-            // escrow more USDC on its unsupported word. The driver's `genuine_exhaustion`
-            // saw the contradiction and never issued a `TopUp`, so `NodeFunder` was never
-            // called and nothing else meters this; without it, a lying peer is invisible.
-            // Guarded on `working_deposit != 0` (reactive top-up enabled) and on this pull
-            // NOT having funded itself — a pull that escrowed any headroom was already
-            // metered by `NodeFunder` (`node_pull_reactive_topup`, or
-            // `node_pull_reactive_topup_refused` for a short landing) and is not being
-            // extorted. A pull whose every top-up failed or added nothing stays unfunded;
-            // its refusal here counts the upstream's claim, a separate event from the
-            // funding outcome `NodeFunder` metered. No escrow, no bytes: the fetch still
-            // misses.
-            if !deps.config.working_deposit.is_zero()
-                && !reactive_funded.load(Ordering::Relaxed)
-                && err
-                    .downcast_ref::<UpstreamVoucherRejected>()
-                    .is_some_and(|r| r.reason == VoucherRejectReason::SpendingCapExhausted)
-            {
-                deps.metrics.node_pull_reactive_topup_refused();
-            }
-            let verdict =
-                classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(pool_id), &err);
-            Err(PullMiss::for_verdict(verdict))
+        Err(err) => Err(candidate_miss(
+            deps,
+            pk,
+            provider_addr,
+            hash_bytes,
+            pool_id,
+            &err,
+        )),
+    }
+}
+
+/// The miss one candidate's failed pull is, after [`classify_pull_failure`]
+/// scored and metered it. A failure that names no fault of this node and that
+/// refused this node's funding ([`decdn_client::Fault::Unaffordable`]: an
+/// `Unfunded` refusal, a funding voucher rejection, or this node's pool short
+/// of the next voucher) is [`PullMiss::Unfunded`], so the walk's funding
+/// recovery step can ask the candidate again (ADR 003 § Funding recovery).
+fn candidate_miss(
+    deps: &NodeOriginDeps,
+    pk: PublicKey,
+    provider_addr: Address,
+    hash_bytes: [u8; 32],
+    pool_id: B256,
+    err: &anyhow::Error,
+) -> PullMiss {
+    let verdict = classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(pool_id), err);
+    match PullMiss::for_verdict(verdict) {
+        PullMiss::Clean if decdn_client::classify(err) == decdn_client::Fault::Unaffordable => {
+            PullMiss::Unfunded
         }
+        miss => miss,
     }
 }
 
@@ -2440,11 +2610,10 @@ fn persist_buyer_progress(
 /// condition would suppress a healthy peer for minutes). It has to be a decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RefusalVerdict {
-    /// The peer reports its OWN degradation. Score its reputation.
-    NodeFault,
-    /// A true, lasting fact about this (peer, hash) pair. Suppress the pair for the full
-    /// [`NegativeProbeCache`] TTL — asking again soon would get the same answer.
-    DurableMiss(DurableMissCause),
+    /// A true, lasting fact about this (peer, hash) pair: the peer answered
+    /// `Declined`. Suppress the pair for the full [`NegativeProbeCache`] TTL,
+    /// because asking again soon gets the same answer.
+    DurableMiss,
     /// Transient, or not attributable to the peer at all. Suppress the pair only briefly
     /// ([`REFUSAL_SUPPRESSION_TTL`]) — long enough that a peer serving nothing stops
     /// burning a candidate slot on every miss in a retry burst, short enough that we do
@@ -2452,32 +2621,6 @@ enum RefusalVerdict {
     Transient,
     /// OUR fault. Score nothing, suppress nothing.
     OurFault,
-}
-
-/// Why a [`RefusalVerdict::DurableMiss`] is durable.
-///
-/// The verdict itself answers "what does this refusal say about the peer?", and
-/// both causes give the same answer: asking this peer for this hash again inside
-/// the TTL gets the same reply, so suppress it and don't spend a candidate slot
-/// finding out. They are NOT the same thing to an operator, though —
-/// `EvictedSinceProbe` is a peer contradicting its own signed `has_blob: true`
-/// and is the ADR 001-mandated `decdn_probe_post_eviction_failures_total`
-/// signal, while `BlobTooLarge` is a static fact about the blob that says
-/// nothing about anyone's hold mechanism. A payload rather than a fourth
-/// `RefusalVerdict` variant, because a variant would claim the two mean
-/// different things about the peer, and they do not (#1165).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DurableMissCause {
-    /// The peer held the blob at probe time and lost it to cache pressure
-    /// before we opened the stream — a hold-mechanism failure (ADR 005).
-    EvictedSinceProbe,
-    /// The blob is over the peer's ceiling — deterministic for this blob.
-    BlobTooLarge,
-    /// The peer will not serve this hash: it is on the governance blacklist or
-    /// on that operator's local denylist (ADR 011). The peer does not say which,
-    /// and must not — but either way it is a policy decision, not a cache state,
-    /// so it will not change inside the TTL.
-    HashBlacklisted,
 }
 
 /// How long a (peer, hash) pair is suppressed after a refusal we cannot attribute to the
@@ -2488,9 +2631,9 @@ enum DurableMissCause {
 /// peer just checked. A `NotFound` *refusal* is not: `ServeRejectReason::wire_error`
 /// deliberately collapses several reject reasons onto the wire `NotFound` so that a probing
 /// client cannot map out other clients' remaining pool balances — and some of them are ours
-/// or transient: `InsufficientDeposit`, `UnknownChannel` (while the upstream's chain watcher
-/// catches up), and `RangeNotSatisfiable` (our own bad range computation). We cannot tell
-/// them apart, and we must not: the collapse is a privacy property, not an oversight.
+/// or transient: our signer's live floor at its cap on that peer, an `UnknownChannel` or an
+/// unconfirmed pool (while the upstream's chain watcher catches up), and a load shed. We
+/// cannot tell them apart, and we must not: the collapse is a privacy property.
 ///
 /// So the refusal is suppressed on the assumption it may be *us*. At the full TTL, a
 /// pool that ran dry for one pull — or the pre-observation window right after we open
@@ -2505,40 +2648,22 @@ enum DurableMissCause {
 /// ([`record_backpressure_exhausted`]).
 const REFUSAL_SUPPRESSION_TTL: Duration = Duration::from_secs(30);
 
-// `match_same_arms`: `VoucherRejected` and `OriginBlacklisted` both map to
-// `OurFault`, and `EvictedSinceProbe`/`BlobTooLarge`/`HashBlacklisted` all map to
-// `DurableMiss`, but merging them would erase why each reaches that verdict —
-// which is the only thing that makes a future variant's arm decidable. Each arm
-// carries its own reasoning; keep them apart.
+// `match_same_arms`: `NotFound` and `Unfunded` both map to `Transient`, but for
+// different reasons; each arm carries its own reasoning, so keep them apart.
 #[allow(clippy::match_same_arms)]
 const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
     match error {
-        // The one code by which a node reports its OWN degradation: "unexpected
-        // failure; do not retry THIS node" (#1129).
-        StreamError::InternalError => RefusalVerdict::NodeFault,
-        // Honest and durable: `EvictedSinceProbe` is a race the peer is being truthful
-        // about, and `BlobTooLarge` is deterministic for this blob. Asking this peer for
-        // this hash again inside the TTL gets the same answer, so don't spend a candidate
-        // slot finding out.
-        StreamError::EvictedSinceProbe => {
-            RefusalVerdict::DurableMiss(DurableMissCause::EvictedSinceProbe)
-        }
-        StreamError::BlobTooLarge => RefusalVerdict::DurableMiss(DurableMissCause::BlobTooLarge),
-        // Honest but NOT durable, and — for `NotFound` — not even attributable: see
-        // `REFUSAL_SUPPRESSION_TTL`. `Overloaded` is backpressure, which the code's own
-        // policy says to respect rather than punish; suppressing the peer for five
-        // minutes over a load spike lasting seconds is punishing it.
-        // `InsufficientDeposit` (ADR 003 §Pool solvency, option 2 / #2013) is our
-        // OWN upstream buyer pool falling short of this peer's floor `M` — the peer
-        // spoke it because we proved lane ownership on that pool. It says nothing
-        // about the peer and clears when our pull driver tops the pool up, so it is
-        // `Transient` like `NotFound`: the driver's own top-up loop is the real
-        // remedy; a verdict is reached here only once that loop gave up, and then
-        // re-routing (or a later retry) is right.
-        StreamError::NotFound | StreamError::Overloaded | StreamError::InsufficientDeposit => {
-            RefusalVerdict::Transient
-        }
-        // `VoucherRejected` never reaches here any more: `pull_verdict` unwraps it out of
+        // "No, and stop asking" (ADR 005 §Open-time refusal classes). Asking this
+        // peer for this hash again inside the TTL gets the same answer, so don't
+        // spend a candidate slot finding out.
+        StreamError::Declined => RefusalVerdict::DurableMiss,
+        // "Not now", and not attributable: see `REFUSAL_SUPPRESSION_TTL`.
+        StreamError::NotFound => RefusalVerdict::Transient,
+        // Our OWN upstream buyer pool or capability falls short at this peer
+        // (ADR 003 §Funding recovery). It says nothing about the peer, so it is
+        // `Transient`: the remedy is our own funding recovery.
+        StreamError::Unfunded => RefusalVerdict::Transient,
+        // `VoucherRejected` does not reach here: `pull_verdict` unwraps it out of
         // `UpstreamRefused` and routes it to `voucher_verdict`, which is the only place that
         // decides what a rejected voucher costs the channel (#1145 review).
         //
@@ -2549,21 +2674,6 @@ const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
         // give it. Routing a mid-stream rejection through here alone is what let a wedged
         // channel skip its remedy entirely and be handed back on every subsequent miss.
         StreamError::VoucherRejected { .. } => RefusalVerdict::OurFault,
-        // Policy, not cache state, and it will not lapse inside the TTL. Note we
-        // cannot tell a governance entry from the peer's own local denylist —
-        // the wire code deliberately does not distinguish them (ADR 011
-        // §StreamRequest Response) — but both are durable for this pair, which
-        // is the only question this function asks.
-        StreamError::HashBlacklisted => {
-            RefusalVerdict::DurableMiss(DurableMissCause::HashBlacklisted)
-        }
-        // Says nothing about the peer and everything about us: OUR operator
-        // address is blacklisted, so every peer will refuse identically.
-        // `OurFault` — scoring the peer would punish it for reporting our own
-        // status, and suppressing the pair would waste the entry, since the next
-        // peer refuses too. There is no remedy at this layer; lifting the entry
-        // is a governance action.
-        StreamError::OriginBlacklisted => RefusalVerdict::OurFault,
     }
 }
 
@@ -2604,7 +2714,7 @@ enum PullVerdict {
     /// The peer shed the connection or stream at the transport with
     /// `APP_ERR_RATE_LIMITED` (ADR 013 §Application Error Codes) before any signed
     /// message existed (#1986). The transport-level twin of
-    /// `Refused(Transient)` for `StreamError::Overloaded`, and it gets the same
+    /// `Refused(Transient)` for a load-shed `StreamError::NotFound`, and it gets the same
     /// treatment: backpressure is respected, not punished. Metered and suppressed for
     /// [`REFUSAL_SUPPRESSION_TTL`], never scored — the peer answered, it just declined
     /// the work, and the `global-full` layer is not about this caller at all.
@@ -2730,16 +2840,15 @@ const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 ///   bounded window and the pool row is KEPT rather than deleted.
 /// - **Try again.** `PoolExhausted` — the pool WE fund the upstream from can no longer
 ///   cover further credit (ADR 003 §Pool solvency). Every upstream returns it, so it is a
-///   statement about us, not the peer. Top up our pool (see `genuine_exhaustion`) and
-///   retry rather than suppress a healthy peer.
+///   statement about us, not the peer. The fill's funding recovery step tops our pool up
+///   (ADR 003 § Funding recovery) and asks again, rather than suppress a healthy peer.
 ///
 /// Wallet-less resume: this classifier does NOT special-case a bundled
 /// `SpendingCapExhausted`/`AmountRegression`/`BytesRegression`/`UnderFold`/`Underpaid`, and it does
 /// not need to. The gap-driven `decdn_client::drive` loop (this node's own cache-miss buyer leg)
 /// already retries a resumable rejection in its own loop before it can ever surface here: it
 /// reseeds the pool's ledger and reopens the pull, transparently, and this classifier sees only the
-/// FINAL outcome. The loop also answers a genuine `SpendingCapExhausted` with an on-chain top-up
-/// (via [`NodeFunder`]) rather than a terminal error. So by the time `pull_verdict` downcasts an
+/// FINAL outcome. So by the time `pull_verdict` downcasts an
 /// error to `UpstreamVoucherRejected` and reaches this function, the rejection is genuinely
 /// terminal: either the reason was never gated, it carried no bundle, the bundle failed shape
 /// validation or authentication, the bundle did not advance our ledger (an echo, or a bytes-only
@@ -2771,8 +2880,8 @@ const fn voucher_verdict(reason: VoucherRejectReason, has_bundle: bool) -> PullV
         // `PoolExhausted` says the pool WE fund the upstream from can no longer cover
         // further credit; it is a statement about us, so every upstream returns it and
         // routing it to `OurDeadLane` would walk the candidate list suppressing each
-        // healthy peer for an hour, outliving any top-up. The remedy is a top-up of our
-        // pool (see `genuine_exhaustion`) and a retry, so keep the peer and try again.
+        // healthy peer for an hour, outliving any top-up. The remedy is the fill's
+        // funding recovery step on our pool and one more ask, so keep the peer.
         // Not fatal, and not the peer's fault: this stream had not carried the
         // current epoch's `chain_root` voucher before its first reveal. The fix
         // is to re-anchor and resend, which is what a retry does — and the
@@ -2835,14 +2944,20 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
     }
     // Ahead of the catch-all, deliberately: a `0x10` close is the ONE transport failure
     // that is a statement by the peer rather than an absence of one (#1986). Left to the
-    // residual it scores `Unreachable` for exactly the condition the handler-level
-    // `Overloaded` refusal is exonerated for, and a `global-full` shed scores every
+    // residual it scores `Unreachable` for exactly the condition a handler-level
+    // load-shed `NotFound` is exonerated for, and a `global-full` shed scores every
     // concurrent prober at once.
     if err.downcast_ref::<UpstreamRateLimited>().is_some() {
         return PullVerdict::RateLimited;
     }
     if let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() {
         return voucher_verdict(rejected.reason, rejected.bundle.is_some());
+    }
+    // This node's own pool cannot cover the next voucher (the pacer refused the
+    // leg): a statement about us, never the peer, exactly like an upstream's
+    // `PoolExhausted`. Ahead of the catch-all, which would score the peer.
+    if err.downcast_ref::<decdn_client::PoolExhausted>().is_some() {
+        return PullVerdict::OurVoucherRetryable(VoucherRejectReason::PoolExhausted);
     }
     // Ahead of `UpstreamRefused` and the catch-all, deliberately: a local signing or encode
     // fault surfaces while we are talking to a peer, and every arm below this one blames
@@ -2907,19 +3022,19 @@ fn is_local_store_fault(err: &anyhow::Error) -> bool {
 /// not backpressure (#2178).
 ///
 /// Backpressure is an open-stage refusal that usually clears with time: a
-/// transport rate-limit ([`PullVerdict::RateLimited`]), or a signed `NotFound` or
-/// `Overloaded` answer to the stream open. The leg goes only to a source whose
+/// transport rate-limit ([`PullVerdict::RateLimited`]), or a signed `NotFound`
+/// answer to the stream open. The leg goes only to a source whose
 /// probe advertised the blob, so a `NotFound` from it is rarely an honest miss. It
 /// is one of the refusals the seller's `ServeRejectReason::wire_error` collapses
 /// onto `NotFound`, and the common one is the per-signer live cap: this node pays
 /// every upstream leg from one buyer signer, so its other concurrent pulls on the
 /// same hash can fill that cap. The collapse also carries refusals that do not
-/// clear by waiting (a spent capability, an unconfirmed pool, a chain-stale
-/// seller); the assembly's wait budget bounds what those cost.
+/// clear by waiting (an unconfirmed pool, a chain-stale seller); the assembly's
+/// wait budget bounds what those cost.
 ///
-/// Two refusals stay out. `InsufficientDeposit`: another provider may reserve a
-/// smaller floor and admit the pool, so the caller moves on. A mid-stream
-/// `NotFound` or `Overloaded`: the per-signer cap refuses only at admission, and a
+/// Two refusals stay out. `Unfunded`: another provider may reserve a smaller
+/// floor and admit the pool, so the caller moves on. A mid-stream `NotFound`:
+/// the per-signer cap refuses only at admission, and a
 /// source that serves some bytes and then refuses must not reset the wait budget
 /// on every round.
 ///
@@ -2950,7 +3065,7 @@ fn backpressure_verdict(err: &anyhow::Error) -> Option<PullVerdict> {
         PullVerdict::RateLimited => Some(verdict),
         PullVerdict::Refused(RefusalVerdict::Transient) => {
             let at_open = err.downcast_ref::<UpstreamRefused>().is_some_and(|r| {
-                r.evidence().is_some() && !matches!(r.error(), StreamError::InsufficientDeposit)
+                r.evidence().is_some() && !matches!(r.error(), StreamError::Unfunded)
             });
             at_open.then_some(verdict)
         }
@@ -2990,9 +3105,8 @@ fn record_backpressure_exhausted(
 
 /// Classify a failed pull and fold the appropriate (or no) reputation outcome,
 /// shared by the buffered and window-paced paths (#856). Buyer-side faults are
-/// exonerated (don't tar the provider); an honest refusal is exonerated too
-/// (#1144 — a peer that answers is reachable, whatever it answers), except
-/// `InternalError`, by which a peer reports its own degradation; a transport-level
+/// exonerated (don't tar the provider); a refusal is exonerated too (#1144 — a
+/// peer that answers is reachable, whatever it answers); a transport-level
 /// rate-limit shed is exonerated the same way (#1986); a hash mismatch is
 /// `Corruption`; everything else is `Unreachable`.
 ///
@@ -3098,7 +3212,7 @@ fn classify_pull_failure(
             debug!(%provider_addr, error = %err, "node-origin: upstream fell below the throughput floor; suppressing briefly, not tarring upstream reputation");
         }
         // The peer shed us at the transport with `APP_ERR_RATE_LIMITED` (#1986): the same
-        // event as a handler-level `Overloaded` refusal, one layer down, and it earns the
+        // event as a handler-level load-shed `NotFound`, one layer down, and it earns the
         // same remedy. Suppressing the `(peer, hash)` pair briefly stops a shedding peer
         // from burning a candidate slot on every retry of this miss; scoring it would tar
         // a peer for honestly saying "not now" — and, for the node-wide `global-full`
@@ -3144,50 +3258,22 @@ fn classify_pull_failure(
         // miss, forever. The negative cache is the right instrument — scoped to (peer, hash),
         // TTL'd, reputation-neutral — and `RefusalVerdict` decides what the suppression is
         // worth: five minutes for a peer that truthfully says the blob is gone, far less for
-        // a `NotFound` that may well have been our own empty deposit.
+        // a `NotFound`, which can be a load shed, a stale chain, or a pool the peer has not
+        // confirmed yet.
         PullVerdict::Refused(verdict) => {
             deps.metrics.node_pull_refused();
             match verdict {
-                RefusalVerdict::NodeFault => {
-                    debug!(peer = %pk, %provider_addr, error = %err, "node-origin: upstream reports itself degraded; scoring unreachable");
-                    record_outcome(deps, pk, &Outcome::Unreachable);
-                }
-                RefusalVerdict::DurableMiss(cause) => {
-                    // Exhaustive on the cause, not an `if ==` — a new cause added
-                    // tomorrow must DECIDE its telemetry here, the same discipline
-                    // `RefusalVerdict`'s own doc demands of new `StreamError`s.
-                    // Two causes emit nothing, for unrelated reasons; merging them
-                    // would lose both rationales (`clippy::match_same_arms`).
-                    #[allow(clippy::match_same_arms)]
-                    match cause {
-                        // ADR 001 §Probe cache mandates tracking this rate; ADR
-                        // 005 says a correct hold mechanism should make it rare,
-                        // so a sustained rate is a remote implementation bug, not
-                        // a tuning knob.
-                        DurableMissCause::EvictedSinceProbe => {
-                            deps.metrics.probe_post_eviction_failure();
-                        }
-                        // A static fact about the blob vs. the peer's ceiling —
-                        // says nothing about any hold mechanism; no telemetry.
-                        DurableMissCause::BlobTooLarge => {}
-                        // A takedown the peer is complying with. Expected
-                        // behaviour, not a fault, and deliberately ambiguous
-                        // between governance and the peer's local denylist —
-                        // there is nothing here an operator could action, and a
-                        // metric would only invite reading peers' local policy
-                        // off the aggregate. No telemetry.
-                        DurableMissCause::HashBlacklisted => {}
-                    }
+                RefusalVerdict::DurableMiss => {
                     suppress(None);
-                    debug!(%provider_addr, ?cause, error = %err, "node-origin: upstream does not have this blob; negative-caching this (peer, hash) for the full TTL without tarring reputation");
+                    debug!(%provider_addr, error = %err, "node-origin: upstream declined this blob; negative-caching this (peer, hash) for the full TTL without tarring reputation");
                 }
                 RefusalVerdict::Transient => {
                     // Metered (#1520). This arm is where a *buyer-side* problem
-                    // lands: a seller refusing our channel for insufficient
-                    // deposit signs `NotFound`, deliberately indistinguishable
-                    // from an honest miss, so without a counter here a node whose
-                    // own deposit cannot buy anything sees every pull refused with
-                    // nothing in its telemetry saying why.
+                    // lands: a seller refusing our pool or signer answers
+                    // `Unfunded`, or `NotFound` when the state is one it collapses,
+                    // so without a counter here a node whose own deposit cannot
+                    // buy anything sees every pull refused with nothing in its
+                    // telemetry saying why.
                     deps.metrics.node_pull_refused_unattributable();
                     suppress(Some(REFUSAL_SUPPRESSION_TTL));
                     debug!(%provider_addr, error = %err, ttl = ?REFUSAL_SUPPRESSION_TTL, "node-origin: upstream refused for a reason we cannot attribute to it; briefly suppressing this (peer, hash) without tarring reputation");

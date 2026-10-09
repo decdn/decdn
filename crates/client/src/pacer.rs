@@ -2,24 +2,16 @@
 //!
 //! A [`Pacer`] answers one question at each gap boundary: given a snapshot of the
 //! fetch's budget state ([`PaceState`]), may the driver draw the next paid
-//! segment, must it top up, wait, stop, or refuse? It is a total function of the
-//! snapshot — **no I/O, no async** — so the policy is unit-testable in isolation,
-//! independent of any network or chain fixture.
+//! segment, wait, stop, or refuse? It is a total function of the snapshot (**no
+//! I/O, no async**), so the policy is unit-testable in isolation, independent of
+//! any network or chain fixture.
 //!
 //! [`BudgetPacer`] is the client policy: it gates on the buyer's OWN deposit
-//! (order-free — it never waits on the counterparty's state) and folds in the
-//! reactive top-up / resume-at-paid-frontier logic. The node's window pacer
-//! (ADR 037) is a separate impl handed to the same driver.
-//!
-//! # Where the error classification lives
-//!
-//! The reactive exhaustion predicates that need the typed pull error —
-//! [`crate::genuine_exhaustion`] and `resumable_watermark` — stay at the
-//! DRIVER boundary, not inside `decide`: the driver runs
-//! [`crate::genuine_exhaustion`] against the error and feeds its boolean result in
-//! as [`PaceState::exhaustion_confirmed`], and owns the reseed (desync) path
-//! itself. That keeps the pacer a pure function of numbers while still REUSING the
-//! shipped predicates rather than reimplementing them.
+//! (order-free: it never waits on the counterparty's state). A lane whose
+//! deposit cannot cover the next voucher refuses; the buyer adds funds only
+//! through the funding recovery step at the exhausted candidate set (ADR 003
+//! § Funding recovery), never inside a lane. The node's window pacer (ADR 037)
+//! is a separate impl handed to the same driver.
 
 use alloy::primitives::U256;
 use decdn_bao_range::CHUNK_GROUP_BYTES;
@@ -99,29 +91,6 @@ pub struct PaceState {
     /// (`ceil(interval_bytes * rate_per_mb / MiB)`), priced by the driver from the
     /// [`crate::UpstreamPullHeader`] of the last open.
     pub next_voucher_cost: U256,
-    /// The reactive top-up target. `U256::ZERO` disables reactive top-up (the
-    /// pacer then refuses on exhaustion rather than funding).
-    pub working_deposit: U256,
-    /// The buyer's estimate of the serving peer's refundable floor `M` (ADR 003
-    /// § Pool solvency). A serving node refuses a NEW stream once the pool's
-    /// remaining deposit, less `M`, cannot cover a window, and reports that refusal
-    /// as a plain miss. So a buyer that re-opens mid-fetch must top up while
-    /// `remaining_deposit` still covers `M` plus the next voucher, not only once it
-    /// cannot cover the voucher. It triggers a top-up only; it never refuses a
-    /// draw on its own, because a peer with a smaller `M` still serves. `U256::ZERO`
-    /// keeps the voucher-only trigger.
-    pub seller_reserve: U256,
-    /// Reactive top-ups already spent on this fetch.
-    pub topups_used: u32,
-    /// Reactive top-ups allowed in total, from
-    /// [`crate::source::Funder::max_topups`] (CLI 3, node 1).
-    pub max_topups: u32,
-    /// Whether the last draw failed with an exhaustion the DRIVER confirmed as
-    /// genuine via [`crate::genuine_exhaustion`] — a real ceiling hit corroborated
-    /// by our own ledger, not a healable desync or a lying peer. `false` on the
-    /// proactive (happy-path) query; a non-genuine reactive fault is handled by
-    /// the driver's own reseed/terminal path, not here.
-    pub exhaustion_confirmed: bool,
     /// Content bytes the node's upstream pull leg has drawn so far (the pull-side
     /// frontier). [`BudgetPacer`] never reads this field — it exists for
     /// [`WindowPacer`] (ADR 037), which bounds `pulled_frontier -
@@ -150,14 +119,11 @@ pub enum PaceDecision {
         /// Upper bound on content bytes to draw before the next pacing decision.
         up_to_bytes: u64,
     },
-    /// A genuine, corroborated exhaustion with budget remaining: add this many
-    /// micro-USDC via [`crate::source::Funder::top_up`], then resume at the paid
-    /// frontier.
-    TopUp(U256),
     /// The requested range is fully present: finalize and stop.
     Done,
-    /// Out of budget or attempts (deposit cannot cover the next voucher and either
-    /// top-up is disabled/exhausted, or there is nothing left to add). Terminal.
+    /// The remaining deposit cannot cover the next voucher. Terminal for the
+    /// lane: the driver ends it with [`crate::PoolExhausted`], which marks its
+    /// source priced out at the current deposit.
     Refuse,
     /// The pull leg has run its full window ahead of the downstream paid frontier
     /// ([`WindowPacer`], ADR 037) and no serve leg is parked at its frontier: pause
@@ -180,16 +146,8 @@ pub trait Pacer: Send + Sync {
     fn decide(&self, state: &PaceState) -> PaceDecision;
 }
 
-/// The smallest reactive top-up worth sending for a confirmed exhaustion the
-/// deposit can still afford: the low water the proactive refill uses
-/// ([`crate::buyer_pool::LOW_WATER_DIVISOR`]).
-#[must_use]
-pub(crate) fn min_reactive_top_up(working_deposit: U256) -> U256 {
-    working_deposit / U256::from(crate::buyer_pool::LOW_WATER_DIVISOR)
-}
-
-/// The client pacing policy: gate on the buyer's own deposit, top up reactively
-/// on a genuine mid-fetch ceiling hit, and stop when the range is satisfied.
+/// The client pacing policy: gate on the buyer's own deposit, refuse once it
+/// cannot cover the next voucher, and stop when the range is satisfied.
 /// Carries no configuration — every input arrives in the [`PaceState`] — so it is
 /// a zero-sized, order-free decision function.
 #[derive(Debug, Clone, Copy, Default)]
@@ -208,47 +166,16 @@ impl Pacer for BudgetPacer {
         // 1. The range is fully PAID — nothing left to pull or pay for. Gating on
         //    paid (not delivered) progress is what bills the credit-window tail the
         //    store checkpointed ahead of payment: an exhaustion leaves paid < the
-        //    delivered frontier, so this stays below `requested` and the fund/draw
+        //    delivered frontier, so this stays below `requested` and the draw
         //    branch below re-opens the unpaid tail until payment catches up.
         if s.cleared_bytes >= s.requested_bytes {
             return PaceDecision::Done;
         }
-        // 2. Exhaustion. Two ways to reach it, both order-free: the driver
-        //    confirmed a genuine reactive ceiling hit (`genuine_exhaustion`), or —
-        //    gating on our OWN deposit — the remaining balance cannot even cover
-        //    the next voucher. Either way, fund it if a top-up is enabled, budget
-        //    remains, and there is something to add; otherwise refuse.
-        //
-        //    A confirmed exhaustion our own numbers can still afford also needs
-        //    the top-up to add at least the low water: the deposit already sits
-        //    near the working target, so a top-up of a few micro-USDC moves
-        //    nothing a peer decides on, and costs an approve and a topUp tx.
-        let unaffordable = s.remaining_deposit < s.next_voucher_cost;
-        let additional = s.working_deposit.saturating_sub(s.remaining_deposit);
-        let can_topup =
-            s.topups_used < s.max_topups && !s.working_deposit.is_zero() && !additional.is_zero();
-        if unaffordable {
-            return if can_topup {
-                PaceDecision::TopUp(additional)
-            } else {
-                PaceDecision::Refuse
-            };
-        }
-        if s.exhaustion_confirmed {
-            return if can_topup && additional >= min_reactive_top_up(s.working_deposit) {
-                PaceDecision::TopUp(additional)
-            } else {
-                PaceDecision::Refuse
-            };
-        }
-        // 2b. The voucher is affordable, but the deposit has fallen into the band a
-        //     serving peer refuses new streams in (`remaining − M` below a window).
-        //     Top up now if a top-up is available; otherwise keep drawing and let the
-        //     peer decide — a peer with a smaller floor still serves.
-        let below_seller_floor =
-            s.remaining_deposit < s.next_voucher_cost.saturating_add(s.seller_reserve);
-        if below_seller_floor && can_topup {
-            return PaceDecision::TopUp(additional);
+        // 2. Gating on our OWN deposit: the remaining balance cannot cover the
+        //    next voucher. The lane refuses; the funding recovery step at the
+        //    exhausted candidate set is the only place the buyer adds funds.
+        if s.remaining_deposit < s.next_voucher_cost {
+            return PaceDecision::Refuse;
         }
         // 3. The deposit covers the next voucher and the range is not fully paid:
         //    keep drawing the UNPAID remainder (the driver re-opens it at the paid
@@ -282,9 +209,9 @@ impl Pacer for BudgetPacer {
 /// the exposure bound is the same.
 ///
 /// Composition, not reimplementation: `WindowPacer::decide` calls
-/// `BudgetPacer::decide` and only touches the `Draw` arm. `Done` / `TopUp` /
-/// `Refuse` pass through unchanged, so the two pacers can never disagree about
-/// whether/how to pay — only about how much to pull in one pass.
+/// `BudgetPacer::decide` and only touches the `Draw` arm. `Done` and `Refuse`
+/// pass through unchanged, so the two pacers can never disagree about whether
+/// to pay, only about how much to pull in one pass.
 #[derive(Debug, Clone, Copy)]
 pub struct WindowPacer {
     /// Maximum content bytes the pull frontier may run ahead of the served-paid

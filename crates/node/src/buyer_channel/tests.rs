@@ -1091,6 +1091,7 @@ async fn the_open_recheck_ignores_a_row_from_another_deployment() {
             Address::repeat_byte(2),
             owner,
             U256::from(10_000_000u64),
+            None,
             &Arc::new(Metrics::new()),
         )
         .await;
@@ -1105,6 +1106,44 @@ async fn the_open_recheck_ignores_a_row_from_another_deployment() {
             assert_eq!(asserter.read_q().len(), 1, "no open was attempted");
         }
     }
+}
+
+/// A tracked pool that no longer accepts funds does not suppress the open of
+/// its replacement (ADR 003 § Funding recovery): the funding recovery step
+/// names it, and the open goes ahead although the store still tracks it.
+#[tokio::test]
+async fn a_replacement_open_runs_past_the_closed_pool_it_replaces() {
+    let owner = Address::repeat_byte(1);
+    let closed = PoolId::from([0xAA; 32]);
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    store
+        .record(&BuyerPoolState::new(
+            closed,
+            DEPLOYMENT,
+            owner,
+            Address::repeat_byte(2),
+            U256::from(10_000_000u64),
+        ))
+        .expect("seed the row");
+    // One faulting call: an open that goes ahead spends it and fails.
+    let (contract, asserter) = mocked_pool_contract_with(vec![MockCall::Err]);
+    let result = run_open(
+        &contract,
+        &store,
+        Arc::new(PrivateKeySigner::random()),
+        DEPLOYMENT,
+        Address::repeat_byte(2),
+        owner,
+        U256::from(10_000_000u64),
+        Some(closed),
+        &Arc::new(Metrics::new()),
+    )
+    .await;
+    assert!(result.is_err(), "the replacement open reached the chain");
+    assert!(
+        asserter.read_q().is_empty(),
+        "the open spent the scripted call"
+    );
 }
 
 /// A lane this node has been paid on, but has no local record of, resumes
@@ -1982,7 +2021,7 @@ async fn top_up_at_least_short_join_funds_the_remainder() {
     assert_eq!(*asked.borrow(), vec![u(100), u(60)]);
 }
 
-/// Two concurrent reactive top-ups: the joiner claims none of the spawner's
+/// Two concurrent recovery top-ups: the joiner claims none of the spawner's
 /// escrow, so it funds its whole request itself instead of counting the
 /// spawner's deposit growth as its own.
 #[tokio::test]
@@ -2141,18 +2180,18 @@ fn in_flight(amount: u64, funder: TopUpFunder) -> InFlightTopUp {
 fn in_flight_refill_is_claimed_at_most_once() {
     let mut slot = in_flight(100, TopUpFunder::Refill);
 
-    assert_eq!(slot.join(u(60), TopUpFunder::Reactive).1, joined(60, 100));
-    assert_eq!(slot.join(u(60), TopUpFunder::Reactive).1, joined(40, 100));
-    assert_eq!(slot.join(u(60), TopUpFunder::Reactive).1, joined(0, 100));
+    assert_eq!(slot.join(u(60), TopUpFunder::Recovery).1, joined(60, 100));
+    assert_eq!(slot.join(u(60), TopUpFunder::Recovery).1, joined(40, 100));
+    assert_eq!(slot.join(u(60), TopUpFunder::Recovery).1, joined(0, 100));
 }
 
-/// A reactive top-up's amount is its spawner's: a second reactive top-up that
+/// A recovery top-up's amount is its spawner's: a second recovery top-up that
 /// joins it claims nothing (#2012).
 #[test]
-fn in_flight_reactive_topup_leaves_nothing_to_claim() {
-    let mut slot = in_flight(100, TopUpFunder::Reactive);
+fn in_flight_recovery_topup_leaves_nothing_to_claim() {
+    let mut slot = in_flight(100, TopUpFunder::Recovery);
 
-    assert_eq!(slot.join(u(100), TopUpFunder::Reactive).1, joined(0, 100));
+    assert_eq!(slot.join(u(100), TopUpFunder::Recovery).1, joined(0, 100));
 }
 
 /// A refill that joins claims nothing, so it cannot take headroom a reactive
@@ -2162,7 +2201,7 @@ fn in_flight_refill_joiner_claims_nothing() {
     let mut slot = in_flight(100, TopUpFunder::Refill);
 
     assert_eq!(slot.join(u(100), TopUpFunder::Refill).1, joined(0, 100));
-    assert_eq!(slot.join(u(100), TopUpFunder::Reactive).1, joined(100, 100));
+    assert_eq!(slot.join(u(100), TopUpFunder::Recovery).1, joined(100, 100));
 }
 
 #[test]
@@ -2345,4 +2384,229 @@ async fn retry_still_shortfall_stops_after_one_retry() {
         2,
         "one retry only, then give up"
     );
+}
+
+/// A service whose chain calls answer from `asserter`, over a pool row of
+/// `deposit` with no spend, at a working deposit of 10 USDC.
+fn recovery_service(
+    asserter: &alloy::providers::mock::Asserter,
+    deposit: u64,
+) -> BuyerPoolService<impl Provider + Clone + 'static> {
+    use alloy::providers::ProviderBuilder;
+
+    let owner = Address::repeat_byte(1);
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    store
+        .record(&BuyerPoolState::new(
+            PoolId::from([0x5A; 32]),
+            DEPLOYMENT,
+            owner,
+            Address::repeat_byte(2),
+            U256::from(deposit),
+        ))
+        .expect("seed the row");
+    BuyerPoolService {
+        contract: PaymentPool::new(
+            Address::ZERO,
+            ProviderBuilder::new().connect_mocked_client(asserter.clone()),
+        ),
+        store,
+        signer: signer(),
+        deployment: DEPLOYMENT,
+        voucher_domain: Eip712Domain::default(),
+        token: Address::repeat_byte(2),
+        owner,
+        working_deposit: U256::from(10_000_000u64),
+        open_in_flight: Arc::new(Mutex::new(None)),
+        topup_in_flight: Arc::new(Mutex::new(None)),
+        seed_slots: Mutex::new(HashMap::new()),
+        metrics: Arc::new(Metrics::new()),
+        _reclaimer: AbortOnDropHandle::new(tokio::spawn(std::future::pending())),
+    }
+}
+
+/// A row above the deposit the fill saw is a sibling fill's step that landed:
+/// the step shares it and makes no chain call.
+#[tokio::test]
+async fn a_recovery_step_shares_a_siblings_landed_top_up() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    let svc = recovery_service(&asserter, 10_000_000);
+    let stepped = svc
+        .recover_pool(U256::from(4_000_000u64))
+        .await
+        .expect("no chain call");
+    assert_eq!(stepped, Recovery::ToppedUp(U256::from(10_000_000u64)));
+}
+
+/// Concurrent fills that reach the step while one recovery top-up is in
+/// flight all wait for it: the pool escrows once, and every fill proceeds at
+/// the deposit it landed.
+#[tokio::test]
+async fn concurrent_steps_share_one_recovery_top_up() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    let svc = recovery_service(&asserter, 4_000_000);
+    let landed: BoxFuture<'static, TopUpOutcome> = Box::pin(async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Ok(TopUpLanded {
+            new_deposit: U256::from(10_000_000u64),
+            added: U256::from(6_000_000u64),
+        })
+    });
+    *svc.topup_in_flight.lock().unwrap() = Some(InFlightTopUp::new(
+        landed.shared(),
+        U256::from(6_000_000u64),
+        TopUpFunder::Recovery,
+    ));
+    let steps =
+        futures_util::future::join_all((0..4).map(|_| svc.recover_pool(U256::from(4_000_000u64))))
+            .await;
+    for stepped in steps {
+        assert_eq!(
+            stepped.expect("no chain call"),
+            Recovery::ToppedUp(U256::from(10_000_000u64))
+        );
+    }
+}
+
+/// Concurrent fills that wait on a recovery top-up that reverts `PoolNotOpen`
+/// join the replacement open: every fill reports the new pool, none a local
+/// fault.
+#[tokio::test]
+async fn fills_waiting_on_a_top_up_into_a_closing_pool_join_its_replacement() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    let svc = recovery_service(&asserter, 4_000_000);
+    let closed = PoolId::from([0x5A; 32]);
+    let opened = PoolId::from([0x6B; 32]);
+    let reverted: BoxFuture<'static, TopUpOutcome> = Box::pin(async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Err(Arc::new(
+            anyhow::anyhow!("topUp reverted").context(PoolNotOpen),
+        ))
+    });
+    *svc.topup_in_flight.lock().unwrap() = Some(InFlightTopUp::new(
+        reverted.shared(),
+        U256::from(6_000_000u64),
+        TopUpFunder::Recovery,
+    ));
+    // The replacement open in flight records the new pool as the current one.
+    let store = Arc::clone(&svc.store);
+    let replacement: BoxFuture<'static, OpenOutcome> = Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        store
+            .record(&BuyerPoolState::new(
+                opened,
+                DEPLOYMENT,
+                Address::repeat_byte(1),
+                Address::repeat_byte(2),
+                U256::from(10_000_000u64),
+            ))
+            .map_err(|err| Arc::new(anyhow::Error::new(err)))
+    });
+    *svc.open_in_flight.lock().unwrap() = Some(replacement.shared());
+    let steps =
+        futures_util::future::join_all((0..3).map(|_| svc.recover_pool(U256::from(4_000_000u64))))
+            .await;
+    for stepped in steps {
+        assert_eq!(
+            stepped.expect("every fill joins the replacement"),
+            Recovery::Replaced(PoolReplaced { closed, opened })
+        );
+    }
+}
+
+/// The reclaim sweep drops the row of a pool another caller already
+/// reclaimed: nothing is left to reclaim, and a surviving row would send every
+/// later fill to a pool that nodes answer `NotFound`. An open pool keeps its
+/// row.
+#[tokio::test]
+async fn the_reclaim_sweep_drops_a_pool_someone_else_reclaimed() {
+    use alloy::sol_types::SolValue;
+
+    for (status, deadline, kept) in [
+        (PaymentPool::Status::Closed, 1_000, false),
+        (PaymentPool::Status::Open, 0, true),
+    ] {
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(
+            &PaymentPool::Pool {
+                owner: Address::repeat_byte(1),
+                status,
+                disputeDeadline: deadline,
+                deposit: 10_000_000,
+                totalRedeemed: 0,
+            }
+            .abi_encode(),
+        );
+        let svc = recovery_service(&asserter, 10_000_000);
+        svc.sweep_reclaimable_once().await;
+        assert_eq!(
+            svc.store.get_by_owner(svc.owner).unwrap().is_some(),
+            kept,
+            "a pool read {}",
+            if kept { "open" } else { "closed" }
+        );
+        assert!(asserter.read_q().is_empty(), "the sweep read the pool");
+    }
+}
+
+/// A pool that already holds its working deposit and still accepts funds
+/// settles: the upstreams have not seen the deposit yet, so the step returns
+/// it and the fill's settle window asks them again. Only a gas estimate runs.
+#[tokio::test]
+async fn a_full_open_pool_settles_without_a_top_up() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&alloy::primitives::U64::from(50_000u64));
+    let svc = recovery_service(&asserter, 10_000_000);
+    let stepped = svc
+        .recover_pool(U256::from(10_000_000u64))
+        .await
+        .expect("the estimate answers");
+    assert_eq!(stepped, Recovery::ToppedUp(U256::from(10_000_000u64)));
+    assert!(asserter.read_q().is_empty(), "the estimate ran");
+}
+
+/// A pool that already holds its working deposit but is closing or closed
+/// still needs a replacement: the `topUp` estimate reverts `PoolNotOpen`, and
+/// the step goes on to open a new pool.
+#[tokio::test]
+async fn a_full_closing_pool_is_replaced() {
+    let selector = alloy::primitives::keccak256("PoolNotOpen()");
+    let revert = format!("0x{}", alloy::primitives::hex::encode(&selector[..4]));
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_failure(
+        serde_json::from_value::<alloy_json_rpc::ErrorPayload>(serde_json::json!({
+            "code": 3,
+            "message": "execution reverted",
+            "data": revert,
+        }))
+        .unwrap(),
+    );
+    let svc = recovery_service(&asserter, 10_000_000);
+    // The replacement open the step joins records the new pool as current.
+    let opened = PoolId::from([0x6B; 32]);
+    let store = Arc::clone(&svc.store);
+    let replacement: BoxFuture<'static, OpenOutcome> = Box::pin(async move {
+        store
+            .record(&BuyerPoolState::new(
+                opened,
+                DEPLOYMENT,
+                Address::repeat_byte(1),
+                Address::repeat_byte(2),
+                U256::from(10_000_000u64),
+            ))
+            .map_err(|err| Arc::new(anyhow::Error::new(err)))
+    });
+    *svc.open_in_flight.lock().unwrap() = Some(replacement.shared());
+    let stepped = svc
+        .recover_pool(U256::from(10_000_000u64))
+        .await
+        .expect("the step joins the replacement open");
+    assert_eq!(
+        stepped,
+        Recovery::Replaced(PoolReplaced {
+            closed: PoolId::from([0x5A; 32]),
+            opened,
+        })
+    );
+    assert!(asserter.read_q().is_empty(), "the estimate ran");
 }

@@ -5,7 +5,7 @@
 //! voucher cumulatives advance through one monotonic issuer instead of colliding
 //! across per-fetch instances. `total_committed` is the pool-wide deposit-spend
 //! view every lane's solvency gate subtracts from; `credit_all` propagates a
-//! landed reactive top-up's new deposit to every live lane.
+//! funding recovery step's new deposit to every live lane.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -22,8 +22,8 @@ use crate::ledger::PoolLedger;
 pub struct LaneHandle {
     /// The lane's shared, concurrency-safe voucher issuer.
     pub ledger: Arc<PoolLedger>,
-    /// The lane's shared pool context (deposit, binding), written by reactive
-    /// top-ups via [`LaneLedgers::credit_all`].
+    /// The lane's shared pool context (deposit, binding), written by the
+    /// funding recovery step via [`LaneLedgers::credit_all`].
     pub ctx: Arc<Mutex<PoolContext>>,
 }
 
@@ -31,10 +31,6 @@ pub struct LaneHandle {
 #[derive(Default, Debug)]
 pub struct LaneLedgers {
     map: Mutex<HashMap<LaneKey, LaneHandle>>,
-    /// Serializes the run's reactive top-ups: every lane draws on one deposit,
-    /// so two concurrent top-ups would each escrow the whole shortfall (see
-    /// [`crate::SharedPool::topup_lock`]).
-    topup_lock: tokio::sync::Mutex<()>,
 }
 
 impl LaneLedgers {
@@ -68,15 +64,31 @@ impl LaneLedgers {
             .fold(U256::ZERO, U256::saturating_add)
     }
 
-    /// The lock every lane of the run takes around a reactive top-up, for the
-    /// run's [`crate::SharedPool::topup_lock`].
+    /// Σ over every registered lane `signer` signs of what it committed past
+    /// its recorded prior: what the run signed under `signer`'s capability
+    /// beyond the application's local records. The handles are cloned out
+    /// under the map lock, which is released before any `ctx` lock is taken
+    /// (the lock order [`Self::credit_all`] keeps).
     #[must_use]
-    pub const fn topup_lock(&self) -> &tokio::sync::Mutex<()> {
-        &self.topup_lock
+    pub(crate) fn signed_by(&self, signer: alloy::primitives::Address) -> U256 {
+        let handles: Vec<LaneHandle> = {
+            let map = self
+                .map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.iter()
+                .filter(|(lane, _)| lane.signer == signer)
+                .map(|(_, h)| h.clone())
+                .collect()
+        };
+        handles
+            .iter()
+            .map(|h| crate::credential::signed_past_prior(&h.ctx, &h.ledger))
+            .fold(U256::ZERO, U256::saturating_add)
     }
 
     /// Write `new_deposit` onto every registered lane's pool context so no lane
-    /// gates on a stale deposit after a reactive top-up lands.
+    /// gates on a stale deposit after a funding recovery step lands.
     ///
     /// The lane contexts are cloned out under the map lock, which is then
     /// released BEFORE any `ctx` lock is taken: the driver holds a lane `ctx`
@@ -84,7 +96,7 @@ impl LaneLedgers {
     /// locking a `ctx` while still holding the map lock would invert that order
     /// and could deadlock. A poisoned `ctx` is recovered with
     /// [`std::sync::PoisonError::into_inner`], the same as the other methods —
-    /// a stale deposit never fails a top-up.
+    /// a stale deposit never fails a recovery step.
     pub fn credit_all(&self, new_deposit: U256) {
         let ctxs: Vec<Arc<Mutex<PoolContext>>> = {
             let map = self
@@ -102,7 +114,7 @@ impl LaneLedgers {
 
     /// Raise every registered lane's pool context to at least `deposit`: a
     /// refill a lane build made reaches lanes built before it. Never lowers a
-    /// deposit a concurrent top-up raised further. Same lock order as
+    /// deposit a concurrent recovery step raised further. Same lock order as
     /// [`Self::credit_all`].
     pub(crate) fn raise_all(&self, deposit: U256) {
         let ctxs: Vec<Arc<Mutex<PoolContext>>> = {

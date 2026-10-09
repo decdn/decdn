@@ -252,11 +252,11 @@ fn billed_bytes(data_dir: &std::path::Path, provider: Address) -> anyhow::Result
     Ok(u64::try_from(billed).unwrap_or(u64::MAX))
 }
 
-/// The `decdn fetch` argv (after the `fetch` subcommand) for a reactive top-up
+/// The `decdn fetch` argv (after the `fetch` subcommand) for a recovery top-up
 /// journey, with the pool's single `--working-deposit-micro-usdc` as a parameter.
-/// The pool opens at this deposit and every reactive top-up restores it back
+/// The pool opens at this deposit and every recovery top-up restores it back
 /// toward it, so a blob whose cost exceeds it exhausts the deposit mid-stream and
-/// the reactive leg tops up. `--capacity-bond-address` is required: it is the
+/// the funding recovery step tops up. `--capacity-bond-address` is required: it is the
 /// EIP-712 `verifyingContract` the buyer signs its ADR 005 client identity
 /// binding against, and the node refuses to serve a paid request that carries no
 /// verified binding — even for a blob it already holds.
@@ -299,25 +299,21 @@ fn topup_fetch_argv_with_deposits(
     ]
 }
 
-// ---- Multi-interval reactive top-up: no double-pay, no under-pay ----
+// ---- Multi-interval recovery top-up: no double-pay, no under-pay ----
 //
-// The test above bakes the pool's very FIRST voucher into `InsufficientDeposit`
+// The test above bakes the pool's very FIRST voucher into an `Unfunded` refusal
 // on a fresh pool — no prior accepted voucher exists, so this is the shallowest
-// possible exercise of the reactive branch. This test drives the deeper case:
-// several whole chunks get delivered AND ACCEPTED first, and only the
+// possible exercise of the funding recovery step. This test drives the deeper
+// case: several whole chunks get delivered AND ACCEPTED first, and only the
 // NEXT one exhausts the deposit.
 //
-// Reaching the top-up path here depends on `genuine_exhaustion` (`decdn-client`'s
-// advancement-based bundle check): once any voucher has been accepted, the node
-// attaches a `WatermarkBundle` to every subsequent watermark-gated rejection it
-// can (`watermark_bundle_for_reject`), including a perfectly ordinary exhaustion.
-// `genuine_exhaustion` distinguishes "bundle reports something AHEAD of what we
-// already hold" (desync — reseed) from "bundle just echoes our own
-// already-committed watermark" (not a desync — the exhaustion is real), by
-// comparing the bundle's cumulative amount against `ledger.committed()`. That
-// keeps real exhaustion on the top-up path instead of the resync path, which
-// cannot fix a genuinely short deposit and would fail the fetch after burning
-// `MAX_RESUME_ATTEMPTS`.
+// Once any voucher has been accepted, the node attaches a `WatermarkBundle` to
+// every subsequent watermark-gated rejection it can
+// (`watermark_bundle_for_reject`), including an ordinary exhaustion. The driver
+// heals the lane ledger only from a bundle that moves it; a bundle that echoes
+// the already-committed watermark heals nothing, so the rejection stays a
+// funding refusal and reaches the recovery step instead of the resync path,
+// which cannot fix a short deposit.
 //
 // This also exercises the resume offset: the resume lands at the CONTENT paid
 // frontier — `content_paid_frontier(fetch_start_offset, total_bytes,
@@ -349,7 +345,7 @@ fn topup_fetch_argv_with_deposits(
 //     deposit must clear 1000 + M = 1500 µUSDC just to open. 9000 µUSDC clears
 //     this with room to spare.
 //   * Yet it must stay below the whole ~9 MiB blob's cost (~9500 µUSDC) so a later
-//     voucher exhausts it mid-stream and the reactive top-up fires.
+//     voucher exhausts it mid-stream and the recovery top-up fires.
 //
 // 9000 µUSDC threads both: the stream opens (9000 − 500 = 8500 ≥ 1000), nine whole
 // chunks are delivered and metered (cumulative 9000 µUSDC), and the partial tail —
@@ -358,7 +354,7 @@ fn topup_fetch_argv_with_deposits(
 // low-water auto-refill (#1103): this test pre-opens and pre-records the pool,
 // and on the CLI's one invocation the pool's full 9000 µUSDC remaining sits above
 // the low-water trigger (working / LOW_WATER_DIVISOR = 1800 µUSDC), so no
-// proactive refill pre-empts the REACTIVE (mid-stream) top-up under test.
+// low-water refill pre-empts the recovery top-up under test.
 //
 // The rate, the refundable floor `M`, and the working deposit are sized together
 // under `MAX_RATE_PER_MB` (1000) so the open-gate and exhaust-mid-blob
@@ -378,7 +374,7 @@ const MULTI_RATE_PER_MB: u64 = 1000; // 0.001 USDC/MB — at the wire cap MAX_RA
 /// 9000 − 500 = 8500 ≥ 1000.
 const MULTI_POOL_MIN_REMAINING_MICRO_USDC: u64 = 500;
 
-// A single-invocation reactive MID-STREAM top-up extends a fetch past its
+// A single-invocation recovery top-up extends a fetch past its
 // opening deposit: `cli/src/commands/fetch.rs::open_or_reuse_pool` signs the
 // self-capability with `spending_cap = SELF_CAPABILITY_CAP` (`u64::MAX`), so the on-chain cap
 // `PaymentPool._registerCapability` fixes at first redemption never binds. The
@@ -391,7 +387,7 @@ const MULTI_POOL_MIN_REMAINING_MICRO_USDC: u64 = 500;
 async fn fetch_topup_after_several_delivered_intervals_does_not_double_pay() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_multi_interval_topup()))
         .await
-        .context("multi-interval reactive top-up e2e exceeded the overall timeout")??;
+        .context("multi-interval recovery top-up e2e exceeded the overall timeout")??;
     Ok(())
 }
 
@@ -470,7 +466,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     // function-ENTRY `resume_offset(existing_partial_len(...))` path (unrelated
     // to this fix, and pre-existing), which would corrupt the very cost
     // measurement this test exists to take. Pre-clearing the race keeps this
-    // test to exactly ONE `decdn fetch` invocation, so the reactive top-up
+    // test to exactly ONE `decdn fetch` invocation, so the recovery top-up
     // branch is the only thing that can move the byte offset.
     let deployment = Deployment {
         chain_id: chain.chain_id(),
@@ -542,7 +538,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     // to wait on). A
     // pure readiness `NotFound` delivers no byte and writes no partial, so
     // re-invoking is safe and cannot double-pay; the moment any byte lands we stop
-    // retrying, so the reactive top-up branch remains the only thing that can move
+    // retrying, so the recovery top-up branch remains the only thing that can move
     // the byte offset within the one delivering run.
     let partial = client_dir.path().join("blob.bin.partial");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -574,7 +570,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     let got = std::fs::read(&out).context("read output")?;
     anyhow::ensure!(
         got == blob,
-        "the fetch must still complete successfully after the reactive top-up: got {} bytes, \
+        "the fetch must still complete successfully after the recovery top-up: got {} bytes, \
          expected {}",
         got.len(),
         blob.len()
@@ -684,7 +680,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
 // delivers before `remaining` folds below the refundable floor `M`, so the gate
 // never trips: the node delivers the full blob in one leg, and the on-chain
 // `redeem` (`min(desired, remaining)`) caps its recovery at the deposit while the
-// buyer still records the full wire cost. Because a mid-stream reactive top-up
+// buyer still records the full wire cost. Because a mid-stream recovery top-up
 // cannot be forced deterministically here, this test asserts no top-up count. The
 // per-leg `content_paid_frontier` re-anchoring invariant — that a second delivery
 // leg prices its paid frontier against its own leg's wire spend, not the fetch's
@@ -768,7 +764,7 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
         eth_identity::load_signer(&keystore, TOPUP_KEYSTORE_PASSWORD).context("load buyer")?;
     let buyer_addr = buyer.address();
     chain.fund_eth(buyer_addr, 100).await?;
-    // Well above the opening deposit: covers the open and any reactive top-up a
+    // Well above the opening deposit: covers the open and any recovery top-up a
     // slower host might drive, with headroom. The test does not depend on a count.
     chain
         .mint_usdc(buyer_addr, U256::from(5 * DEPOSIT_SHORT_WORKING_MICRO_USDC))
@@ -777,7 +773,7 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
 
     // Pre-open and pre-record the pool, and never restart the daemon — same
     // reasoning as the multi-interval test above: this keeps the journey to
-    // exactly ONE `decdn fetch` invocation, so the reactive top-up branch is the
+    // exactly ONE `decdn fetch` invocation, so the recovery top-up branch is the
     // only thing that can move the byte offset, and the settle measurement below
     // is not corrupted by a cross-invocation resume.
     let deployment = Deployment {
@@ -933,7 +929,7 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
     );
 
     // The buyer's local record mirrors the chain: whatever the escrow ended at —
-    // the opening deposit if no reactive top-up fired, or a raised deposit if a
+    // the opening deposit if no recovery top-up fired, or a raised deposit if a
     // slower host let one land — the persisted deposit equals the on-chain deposit.
     let onchain = pool
         .getPool(opened.state.pool_id)

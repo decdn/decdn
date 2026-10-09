@@ -422,9 +422,8 @@ pub struct StreamResponse {
 /// reordering are Tier-3.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StreamResponseExt {
-    /// Delivery-side failure code when `body.ok == false` (`NotFound`,
-    /// `Overloaded`, `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`,
-    /// `OriginBlacklisted`, `HashBlacklisted`, `InsufficientDeposit`).
+    /// Open-time refusal class when `body.ok == false` (`NotFound`,
+    /// `Declined`, `Unfunded`).
     /// Unsigned and informational. `VoucherRejected` never rides here — it is
     /// delivered mid-stream via [`ClientMessage::StreamError`].
     ///
@@ -518,7 +517,7 @@ pub struct StreamResponseBody {
     pub rate_per_mb: u64,
     /// Total blob size in bytes, as the signing node claims it. A pulling node
     /// does not enforce its `max_blob_size` against this claim: it enforces the
-    /// ceiling on the bytes it receives (ADR 005 §`BlobTooLarge` enforcement).
+    /// ceiling on the bytes it receives (ADR 005 §`max_blob_size` enforcement).
     pub total_bytes: u64,
     /// `pool_id` echoed from the [`StreamRequest`] (signed, so a node cannot
     /// silently re-bind the response to a different pool).
@@ -1063,47 +1062,41 @@ impl WatermarkBundle {
     }
 }
 
-/// A stream failure code (ADR 005 §Stream errors). Variant order is frozen.
+/// A stream failure code (ADR 005 §Open-time refusal classes).
 ///
-/// Every variant except `VoucherRejected` is delivery-side and rides in
-/// [`StreamResponseExt::error`] alongside `ok: false`; `VoucherRejected` is the
-/// only variant delivered mid-stream, inside a [`ClientMessage::StreamError`].
-/// All codes are unsigned and informational — never on-chain evidence.
+/// `NotFound`, `Declined`, and `Unfunded` are the open-time refusal classes and
+/// ride in [`StreamResponseExt::error`] alongside `ok: false`.
+/// `VoucherRejected` is the only variant delivered mid-stream, inside a
+/// [`ClientMessage::StreamError`]. All codes are unsigned and informational,
+/// never on-chain evidence. A node keeps its finer refusal reason in its own
+/// per-reason metrics. The wire carries only the class, because a requester
+/// acts on the class alone.
 ///
-/// New variants are appended at the end, never inserted: the postcard
-/// discriminant is the declaration index, so `OriginBlacklisted`,
-/// `HashBlacklisted`, and `InsufficientDeposit` sit after `VoucherRejected` even
-/// though they read as delivery-side neighbours of `EvictedSinceProbe`. Moving
-/// them would silently renumber `VoucherRejected` on the wire — an ADR 013
-/// Tier-3 break. Use [`StreamError::is_delivery_side`], not variant position, to
-/// reason about the domain split.
+/// Every refusal scopes to the node that sent it, for the current fetch. A
+/// requester never ends a fetch on the word of one node.
 ///
-/// The same append-only discipline applies WITHIN a struct-variant's fields:
-/// postcard encodes a struct variant's payload positionally, in declaration
+/// Postcard encodes a struct variant's payload positionally, in declaration
 /// order, so `VoucherRejected`'s `bundle` field sits after `reason` and any
-/// future field must append after `bundle`, never insert before it.
+/// further field appends after `bundle`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamError {
-    /// Node lacks the blob and cannot reach a provider, or declines to pull
-    /// through (ADR 037 ramped credit window).
+    /// "No": this node cannot serve the request now. The requester tries
+    /// other nodes. This node can answer differently later.
     NotFound,
-    /// Node is at capacity; try another node.
-    Overloaded,
-    /// Blob exceeds this node's configured `max_blob_size`; try another node,
-    /// but do not retry this one for the same blob.
-    BlobTooLarge,
-    /// Unexpected failure; do not retry this node.
-    InternalError,
-    /// The node withdrew the blob between probe and stream request. WARNING: still
-    /// slashable after a signed `has_blob: true` probe (ADR 005).
+    /// "No, and stop asking": this node will not serve this hash or request
+    /// during this fetch. The requester removes it from the candidates for the
+    /// hash for the rest of the fetch.
+    Declined,
+    /// "No at the current funding": this node will not serve this request at
+    /// the requester's current pool deposit or signer capability (ADR 003
+    /// §Funding recovery). The requester parks it at the current funding for
+    /// this fetch, and asks it again only after a funding recovery step.
     ///
-    /// A withdrawal with no blacklist entry behind it — a manual
-    /// `decdn node evict`, or a quarantine after a serve found the stored copy
-    /// corrupt. A takedown answers [`Self::HashBlacklisted`]
-    /// whichever list it came from; routing governance takedowns here instead
-    /// would leave `HashBlacklisted` uniquely identifying an operator's *private*
-    /// denylist (ADR 011 §`StreamRequest` Response).
-    EvictedSinceProbe,
+    /// Spoken ONLY to a requester that passed the lane-ownership proof or holds
+    /// a verified signer binding. Any other requester gets [`Self::NotFound`]
+    /// for the same state, so pool and signer state stay unmappable off the
+    /// wire.
+    Unfunded,
     /// Mid-stream payment-voucher rejection carried in a
     /// [`ClientMessage::StreamError`] message (never in the initial
     /// [`StreamResponse`]).
@@ -1125,41 +1118,6 @@ pub enum StreamError {
         /// whenever the signer does not recover to `voucher_signer`.
         bundle: Option<WatermarkBundle>,
     },
-    /// The pool funding this request is owned by a blacklisted origin
-    /// operator (ADR 011 §`StreamRequest` Response). Permanent for this pool:
-    /// opening a new one under the same address will be refused identically, so
-    /// a requester should not retry here or elsewhere with this funder.
-    OriginBlacklisted,
-    /// The blob is on the governance blacklist or this operator's local
-    /// denylist (ADR 011 §`StreamRequest` Response). Deliberately does not
-    /// distinguish the two — a local denylist entry is nobody else's business,
-    /// and a client that could tell them apart could map an operator's private
-    /// legal exposure. Retry on a different node: a local entry binds only this
-    /// one, and a governance entry will be refused everywhere.
-    HashBlacklisted,
-    /// The pool funding this stream cannot cover a credit window: its on-chain
-    /// remaining deposit, minus the node's refundable floor `M`, is short (ADR
-    /// 003 §Pool solvency). A delivery-side, open-time refusal — the node signs
-    /// `ok: false` before committing to serve.
-    ///
-    /// Spoken ONLY to a requester that has proven lane authorization on this pool
-    /// (a verified client binding whose signer holds an owner-signed capability
-    /// for the pool, or a registered on-chain signer). An unauthenticated prober
-    /// never reaches the floor gate — it is refused earlier as a plain
-    /// [`Self::NotFound`], which is what keeps a pool's balance unmappable off the
-    /// wire (#1520). The proven owner already reads the pool's on-chain
-    /// `remaining`, so this leaks it no balance it could not compute; it learns
-    /// only the inequality `remaining − M < window`, an owner-only, self-funded
-    /// bound on the node's private `M`.
-    ///
-    /// Recovery: the pool **owner tops up the deposit** and re-opens. The buyer's
-    /// reactive top-up loop routes this into a fund-and-retry against its own
-    /// `working_deposit` ceiling, so a node's larger-than-estimated `M` does not
-    /// dead-end the fetch. Terminal only once the buyer's ceiling or top-up
-    /// budget is spent. Distinct from the mid-stream
-    /// [`VoucherRejectReason::PoolExhausted`], which fires after the node has
-    /// already committed to serving; this is the open-time equivalent.
-    InsufficientDeposit,
 }
 
 impl StreamError {
@@ -1239,8 +1197,8 @@ pub enum VoucherRejectReason {
     /// further credit for this stream (ADR 003 §Pool solvency). A pool-wide
     /// condition, not this signer's. Recovery: the pool **owner tops up the
     /// deposit**. Emitted mid-stream by the serve loop after the client has proved
-    /// capability ownership; the open-time equivalent stays wire-`NotFound`
-    /// (anti-enumeration). Not watermark-gated.
+    /// capability ownership; the open-time equivalent is [`StreamError::Unfunded`],
+    /// spoken only to a proven requester. Not watermark-gated.
     PoolExhausted,
     /// The signer's shared on-chain `cap − spent` headroom, tracked across every
     /// provider, can no longer cover a serve floor — the signer has drained its
@@ -1252,7 +1210,8 @@ pub enum VoucherRejectReason {
     /// **owner** raises this signer's cap or delegates a fresh capability. Emitted
     /// mid-stream after the client has proved capability ownership, so naming the
     /// condition is post-auth and leaks nothing an open-time refusal must hide (the
-    /// admit-time equivalent stays wire-`NotFound`). Not watermark-gated.
+    /// admit-time equivalent is [`StreamError::Unfunded`], spoken only to a proven
+    /// requester). Not watermark-gated.
     SignerCapExhausted,
     /// A released [`ChunkPreimage`] does not hash to the stream's deepest
     /// verified preimage in `index − verified` steps (ADR 003 §Concurrent

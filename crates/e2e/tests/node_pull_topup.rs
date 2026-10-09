@@ -3,7 +3,7 @@
 //!
 //! The loopback suite (`crates/node/tests/node_origin_pull.rs`,
 //! `a_pull_larger_than_the_working_deposit_tops_up_once_and_completes` and
-//! siblings) drives the reactive top-up through a `FundingOpener` double whose
+//! siblings) drives the recovery top-up through a `FundingOpener` double whose
 //! `top_up_pool_by` just adds to an in-memory cell. That proves the DECISION —
 //! detect exhaustion, resume at the paid frontier, do not re-pay delivered
 //! bytes — but by construction it cannot exercise three things that only exist
@@ -88,8 +88,8 @@ const RATE_PER_MB: u64 = 1000;
 
 /// The SERVER's node-to-node buyer working deposit, shrunk to 8000 `µUSDC` — far
 /// below the blob's ~9040 `µUSDC` wire cost, so the upstream pull exhausts it
-/// mid-stream and the reactive top-up fires exactly once (the node's
-/// `MAX_REACTIVE_TOPUPS` is 1). Sized above the seeder's pre-serve floor with room
+/// mid-stream and one funding recovery step tops it up: the top-up restores the
+/// working deposit, which covers the rest of the blob. Sized above the seeder's pre-serve floor with room
 /// to spare: the seeder admits the SERVER's pool only while `remaining − M` covers
 /// the reserved credit window (#1518), and this journey sets `M` to
 /// [`POOL_MIN_REMAINING`] (2000 `µUSDC`), so the 6000 `µUSDC` of headroom
@@ -105,18 +105,16 @@ const SERVER_WORKING_DEPOSIT: u64 = 8_000;
 ///   * On the SEEDER it is the seller-side pre-serve floor: the seeder admits the
 ///     SERVER's buyer pool only while `remaining − M` covers the reserved credit
 ///     window (#1518).
-///   * On the SERVER it is the buyer-side `seller_reserve` estimate: the SERVER's
-///     pull pacer holds back its estimate of the upstream's `M` (taken from its
-///     own `pool_min_remaining_deposit`, since an upstream running this software
-///     keeps the same floor) before funding a voucher.
+///   * On the SERVER it is its own seller-side floor, which this journey never
+///     reaches. Its buyer pull holds no reserve for the upstream's `M`: the
+///     upstream refuses `Unfunded` at its floor, and the pull's funding recovery
+///     step tops the pool up.
 ///
-/// At the default `M` (1 USDC) the SERVER's pacer would reserve `1_000_000` `µUSDC`
-/// out of the scaled 8000 `µUSDC` deposit and could never fund the first voucher, so both
-/// nodes are scaled together.
+/// Both nodes run the same scaled value, so the two configurations agree.
 const POOL_MIN_REMAINING: u64 = 2_000;
 
 /// USDC (base units) minted to the SERVER operator so its buyer pool to the
-/// seeder can open at [`SERVER_WORKING_DEPOSIT`] and fund a full reactive top-up
+/// seeder can open at [`SERVER_WORKING_DEPOSIT`] and fund a full recovery top-up
 /// with headroom to spare. Mirrors `node_to_node_coalesce.rs`.
 const SERVER_BUYER_USDC: u64 = 1_000_000_000;
 
@@ -169,7 +167,7 @@ async fn server_upstream_pool_id(
 }
 
 /// A client fetch whose node-to-node pull costs more than the SERVER's working
-/// deposit completes byte-exact, after exactly one on-chain reactive top-up.
+/// deposit completes byte-exact, after exactly one on-chain recovery top-up.
 ///
 /// The blob is large enough that the fused serve-miss runs well past the ramped
 /// credit window's floor, so the journey also rides the serve-demand path: the
@@ -182,7 +180,7 @@ async fn server_upstream_pool_id(
 async fn node_pull_larger_than_working_deposit_tops_up_once_and_completes() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))
         .await
-        .context("node-to-node reactive top-up e2e exceeded the overall timeout")??;
+        .context("node-to-node recovery top-up e2e exceeded the overall timeout")??;
     Ok(())
 }
 
@@ -241,7 +239,7 @@ async fn run() -> anyhow::Result<()> {
     // pull-through. It is given the seeder as an iroh discovery peer, priced at
     // the same rate as the seeder (so its buy clears the ADR 041 margin gate),
     // and its buyer working deposit is shrunk below the blob's wire cost so the
-    // upstream pull must reactively top up. Finally it is funded as a buyer so
+    // upstream pull must top up through its funding recovery step. Finally it is funded as a buyer so
     // that top-up can actually escrow USDC.
     let server = NodeFixture::launch_pull_through_cache(&chain, "US", &[&seeder]).await?;
     server.set_rate_per_mb(RATE_PER_MB).await?;
@@ -267,7 +265,7 @@ async fn run() -> anyhow::Result<()> {
     // own upstream pull from the seeder to succeed — so on return, the server's
     // buyer pool is open AND the seeder has served it at least once (its pool-view
     // is warm). The warm blob is tiny relative to the working deposit, so this
-    // costs a rounding error and never itself trips the reactive top-up.
+    // costs a rounding error and never itself trips the recovery top-up.
     let (mut session, warm_got) = client
         .open_session_in_namespace(&chain, &server, warm_hash, namespace)
         .await
@@ -280,10 +278,10 @@ async fn run() -> anyhow::Result<()> {
     // deposit), so this reads 0 — but assert on the DELTA regardless, per the
     // `scrape_metric` contract.
     let topup_before = server
-        .scrape_metric("decdn_node_pull_reactive_topup_total")
+        .scrape_metric("decdn_node_pull_recovery_step_total")
         .await?;
     let refused_before = server
-        .scrape_metric("decdn_node_pull_reactive_topup_refused_total")
+        .scrape_metric("decdn_node_pull_recovery_step_refused_total")
         .await?;
 
     // The proof: fetch the blob whose wire cost exceeds the server's working
@@ -301,26 +299,26 @@ async fn run() -> anyhow::Result<()> {
     // delivered every byte across the top-up.
     anyhow::ensure!(
         got == blob,
-        "the fetch must complete byte-exact after the reactive top-up: got {} bytes, expected {}",
+        "the fetch must complete byte-exact after the recovery top-up: got {} bytes, expected {}",
         got.len(),
         blob.len()
     );
 
-    // (2) EXACTLY ONE reactive top-up funded the pull, and none was refused. A
+    // (2) EXACTLY ONE recovery top-up funded the pull, and none was refused. A
     // delta of 0 would mean the deposit was never exhausted (mis-sized blob); a
-    // delta of 2 would mean the node's `MAX_REACTIVE_TOPUPS` bound broke.
+    // delta of 2 would mean a step funded less than the rest of the blob.
     let topup_after = server
-        .scrape_metric("decdn_node_pull_reactive_topup_total")
+        .scrape_metric("decdn_node_pull_recovery_step_total")
         .await?;
     anyhow::ensure!(
         topup_after == topup_before + 1,
-        "the deposit-exhausting pull must reactively top up exactly once \
+        "the deposit-exhausting pull must top up exactly once \
          (expected {} -> {}, got {topup_after})",
         topup_before,
         topup_before + 1
     );
     let refused_after = server
-        .scrape_metric("decdn_node_pull_reactive_topup_refused_total")
+        .scrape_metric("decdn_node_pull_recovery_step_refused_total")
         .await?;
     anyhow::ensure!(
         refused_after == refused_before,
@@ -358,7 +356,7 @@ async fn run() -> anyhow::Result<()> {
         .deposit;
     anyhow::ensure!(
         U256::from(onchain_deposit) > U256::from(SERVER_WORKING_DEPOSIT),
-        "the reactive top-up must have raised the server's upstream pool escrow on-chain above \
+        "the recovery top-up must have raised the server's upstream pool escrow on-chain above \
          its opening working deposit ({SERVER_WORKING_DEPOSIT} µUSDC), got {onchain_deposit}"
     );
 

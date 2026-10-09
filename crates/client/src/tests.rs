@@ -6,8 +6,7 @@ use bytes::Bytes;
 use super::{
     Cumulative, HashMismatch, Healed, LocalPullFault, PoolContext, PoolLedger, U256,
     UpstreamVoucherRejected, Voucher, VoucherRejectReason, WatermarkBundle, aligned_wire_len,
-    decode_to_vec, genuine_exhaustion, heal_watermark_desync, rejection_watermark,
-    resumable_watermark,
+    decode_to_vec, heal_watermark_desync, rejection_watermark, resumable_watermark,
 };
 
 /// The `LocalPullFault` marker must ride out on the errors the range helpers ACTUALLY
@@ -1001,202 +1000,6 @@ async fn heal_refuses_a_rebase_bundle_we_did_not_sign() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// True twin: `SpendingCapExhausted` with no bundle (nothing for `resumable_watermark` to
-/// reseed from) and our own ledger confirming we truly cannot cover the next voucher.
-#[test]
-fn genuine_exhaustion_true_when_insufficient_and_ledger_drained() {
-    use alloy::primitives::{Address, B256};
-    use alloy::signers::local::PrivateKeySigner;
-
-    let channel_id = B256::repeat_byte(0x11);
-    let token = Address::repeat_byte(0x22);
-    let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
-    let signer = std::sync::Arc::new(PrivateKeySigner::random());
-    let ctx = resume_test_ctx(channel_id, token, &signer, &domain);
-
-    let err = anyhow::Error::new(UpstreamVoucherRejected {
-        reason: VoucherRejectReason::SpendingCapExhausted,
-        bundle: None,
-        proof_generation: None,
-    });
-    // remaining 10 µUSDC, next voucher needs 1000 -> truly out.
-    assert!(genuine_exhaustion(
-        &err,
-        &ctx,
-        Cumulative::default(),
-        U256::from(10u64),
-        U256::from(1000u64)
-    ));
-}
-
-/// A node crying `SpendingCapExhausted` while our OWN ledger still shows headroom is NOT
-/// corroborated — the caller must refuse to fund it (a lying or buggy node must not be
-/// able to solicit an unnecessary top-up).
-#[test]
-fn genuine_exhaustion_false_when_ledger_still_has_headroom() {
-    use alloy::primitives::{Address, B256};
-    use alloy::signers::local::PrivateKeySigner;
-
-    let channel_id = B256::repeat_byte(0x11);
-    let token = Address::repeat_byte(0x22);
-    let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
-    let signer = std::sync::Arc::new(PrivateKeySigner::random());
-    let ctx = resume_test_ctx(channel_id, token, &signer, &domain);
-
-    let err = anyhow::Error::new(UpstreamVoucherRejected {
-        reason: VoucherRejectReason::SpendingCapExhausted,
-        bundle: None,
-        proof_generation: None,
-    });
-    assert!(!genuine_exhaustion(
-        &err,
-        &ctx,
-        Cumulative::default(),
-        U256::from(5000u64),
-        U256::from(1000u64)
-    ));
-}
-
-/// Any rejection reason other than `SpendingCapExhausted` is never exhaustion, regardless
-/// of what the ledger shows.
-#[test]
-fn genuine_exhaustion_false_for_non_insufficient_reason() {
-    use alloy::primitives::{Address, B256};
-    use alloy::signers::local::PrivateKeySigner;
-
-    let channel_id = B256::repeat_byte(0x11);
-    let token = Address::repeat_byte(0x22);
-    let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
-    let signer = std::sync::Arc::new(PrivateKeySigner::random());
-    let ctx = resume_test_ctx(channel_id, token, &signer, &domain);
-
-    let err = anyhow::Error::new(UpstreamVoucherRejected {
-        reason: VoucherRejectReason::AmountRegression,
-        bundle: None,
-        proof_generation: None,
-    });
-    assert!(!genuine_exhaustion(
-        &err,
-        &ctx,
-        Cumulative::default(),
-        U256::ZERO,
-        U256::from(1000u64)
-    ));
-}
-
-/// A healable watermark desync — an authenticated bundle that ADVANCES our committed
-/// watermark (the node knows about a voucher nonce we do not) — is NOT genuine exhaustion,
-/// even if it rides on an `SpendingCapExhausted` rejection and even if the ledger looks
-/// drained: the caller should reseed and resume, not fund a top-up.
-#[test]
-fn genuine_exhaustion_false_when_healable_desync_bundle_advances_committed() -> anyhow::Result<()> {
-    use alloy::primitives::{Address, B256};
-    use alloy::signers::local::PrivateKeySigner;
-
-    let channel_id = B256::repeat_byte(0x11);
-    let token = Address::repeat_byte(0x22);
-    let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
-    let signer = std::sync::Arc::new(PrivateKeySigner::random());
-    let ctx = resume_test_ctx(channel_id, token, &signer, &domain);
-    // Our own ledger is still at amount 300; the bundle reports amount 500 — the node
-    // holds a later voucher than we do, exactly the healable desync #1481 §5 exists to
-    // catch.
-    let committed = Cumulative {
-        bytes: U256::from(2048u64),
-        amount: U256::from(300u64),
-    };
-
-    let bundle = signed_bundle(
-        channel_id,
-        token,
-        &signer,
-        &domain,
-        U256::from(500u64),
-        U256::from(4096u64),
-    )?;
-    let err = anyhow::Error::new(UpstreamVoucherRejected {
-        reason: VoucherRejectReason::SpendingCapExhausted,
-        bundle: Some(bundle),
-        proof_generation: None,
-    });
-
-    // Sanity: this bundle IS the healable-desync case `resumable_watermark` resolves, and
-    // it genuinely advances past `committed`.
-    let resolved = resumable_watermark(&err, &ctx).ok_or_else(|| {
-        anyhow::anyhow!("test bundle must be a healable desync resumable_watermark accepts")
-    })?;
-    anyhow::ensure!(
-        Cumulative::from(resolved).amount > committed.amount,
-        "test bundle must advance past `committed` to exercise the desync branch"
-    );
-    assert!(!genuine_exhaustion(
-        &err,
-        &ctx,
-        committed,
-        U256::from(10u64),
-        U256::from(1000u64)
-    ));
-    Ok(())
-}
-
-/// The case this whole redesign exists for: a bundle that is PRESENT and authenticated, but
-/// does NOT advance past `committed` — the node echoing back exactly the watermark we
-/// already hold, because there is nothing later for it to report. This is NOT a desync (there
-/// is nothing to reseed to), so a genuinely drained ledger IS genuine exhaustion — the top-up
-/// path must fire, not the resync path. Every watermark-gated rejection on a channel that has
-/// ever had a voucher accepted carries a bundle (`watermark_bundle_for_reject`), so bundle
-/// PRESENCE alone (the pre-redesign check) would have misrouted this into an unproductive
-/// resync loop that eventually fails outright.
-#[test]
-fn genuine_exhaustion_true_when_bundle_present_but_does_not_advance_committed() -> anyhow::Result<()>
-{
-    use alloy::primitives::{Address, B256};
-    use alloy::signers::local::PrivateKeySigner;
-
-    let channel_id = B256::repeat_byte(0x11);
-    let token = Address::repeat_byte(0x22);
-    let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
-    let signer = std::sync::Arc::new(PrivateKeySigner::random());
-    let ctx = resume_test_ctx(channel_id, token, &signer, &domain);
-    // Our ledger and the echoed bundle agree EXACTLY: amount 500 both sides.
-    let committed = Cumulative {
-        bytes: U256::from(4096u64),
-        amount: U256::from(500u64),
-    };
-
-    let bundle = signed_bundle(
-        channel_id,
-        token,
-        &signer,
-        &domain,
-        U256::from(500u64),
-        U256::from(4096u64),
-    )?;
-    let err = anyhow::Error::new(UpstreamVoucherRejected {
-        reason: VoucherRejectReason::SpendingCapExhausted,
-        bundle: Some(bundle),
-        proof_generation: None,
-    });
-
-    // Sanity: the bundle is still authenticated (resumable_watermark resolves it) — the
-    // fix is NOT "stop trusting the bundle", it's "stop treating its mere presence as proof
-    // of desync".
-    anyhow::ensure!(
-        resumable_watermark(&err, &ctx).is_some(),
-        "test bundle must be authenticated for this to be a meaningful test"
-    );
-    // remaining 10 µUSDC, next voucher needs 1000 -> truly out, and the bundle does not
-    // move us anywhere new.
-    assert!(genuine_exhaustion(
-        &err,
-        &ctx,
-        committed,
-        U256::from(10u64),
-        U256::from(1000u64)
-    ));
-    Ok(())
-}
-
 /// Deterministic pseudo-random blob spanning several 16 KiB chunk groups.
 fn make_blob(len: usize) -> Vec<u8> {
     let mut v = vec![0u8; len];
@@ -1432,7 +1235,7 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
         slash_sig: sig.as_bytes().to_vec(),
     };
     let response_ext = decdn_protocol::StreamResponseExt {
-        error: Some(StreamError::EvictedSinceProbe),
+        error: Some(StreamError::Declined),
     };
     // Preconditions the real open stage enforces before ever calling `open`.
     response.validate()?;
@@ -1443,7 +1246,7 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
         .downcast_ref::<UpstreamRefused>()
         .ok_or_else(|| anyhow::anyhow!("open() must stay a typed UpstreamRefused: {err:#}"))?;
     anyhow::ensure!(
-        *refused.error() == StreamError::EvictedSinceProbe,
+        *refused.error() == StreamError::Declined,
         "the wire code must survive unchanged, got {:?}",
         refused.error()
     );
@@ -1470,71 +1273,6 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
         operator.address(),
         &domain,
     )?;
-    Ok(())
-}
-
-/// Option 2 / #2013: `is_insufficient_deposit` recognises an open-stage
-/// `InsufficientDeposit` (the node signed `ok: false` with the code in the ext),
-/// which is the only shape a legitimate floor refusal takes, and REJECTS a bare
-/// mid-stream `StreamError::InsufficientDeposit` — a protocol violation that must
-/// not drive the top-up loop.
-#[test]
-fn is_insufficient_deposit_matches_only_the_open_stage_refusal() -> anyhow::Result<()> {
-    use decdn_protocol::client::{StreamError, StreamResponse, StreamResponseBody};
-
-    use super::{UpstreamRefused, is_insufficient_deposit};
-
-    let body = StreamResponseBody {
-        hash: [0x5Au8; 32],
-        ok: false,
-        rate_per_mb: 10,
-        total_bytes: 0,
-        pool_id: [0x77u8; 32],
-        timestamp_us: 1_700_000_000_000_000,
-    };
-    let response = StreamResponse {
-        body,
-        slash_sig: vec![0u8; decdn_protocol::message::SLASH_SIG_LEN],
-    };
-    let ext = decdn_protocol::StreamResponseExt {
-        error: Some(StreamError::InsufficientDeposit),
-    };
-    let open = UpstreamRefused::open(response, &ext);
-    anyhow::ensure!(
-        is_insufficient_deposit(&open),
-        "an open-stage InsufficientDeposit must be recognised"
-    );
-
-    let mid = anyhow::Error::new(UpstreamRefused::mid_stream(
-        StreamError::InsufficientDeposit,
-    ));
-    anyhow::ensure!(
-        !is_insufficient_deposit(&mid),
-        "a mid-stream InsufficientDeposit is protocol-violating and must NOT be honored"
-    );
-
-    // A different open-stage code is not a floor refusal either.
-    let other_body = StreamResponseBody {
-        hash: [0x5Au8; 32],
-        ok: false,
-        rate_per_mb: 10,
-        total_bytes: 0,
-        pool_id: [0x77u8; 32],
-        timestamp_us: 0,
-    };
-    let other = UpstreamRefused::open(
-        StreamResponse {
-            body: other_body,
-            slash_sig: vec![0u8; decdn_protocol::message::SLASH_SIG_LEN],
-        },
-        &decdn_protocol::StreamResponseExt {
-            error: Some(StreamError::NotFound),
-        },
-    );
-    anyhow::ensure!(
-        !is_insufficient_deposit(&other),
-        "an open-stage NotFound is not a floor refusal"
-    );
     Ok(())
 }
 
@@ -1604,14 +1342,14 @@ fn a_mid_stream_refusal_never_carries_a_response() {
 
     use super::UpstreamRefused;
 
-    let refused = UpstreamRefused::mid_stream(StreamError::Overloaded);
+    let refused = UpstreamRefused::mid_stream(StreamError::Declined);
     assert!(
         refused.evidence().is_none(),
         "a mid-stream refusal has no signed response to carry"
     );
     assert_eq!(
         *refused.error(),
-        StreamError::Overloaded,
+        StreamError::Declined,
         "the mid-stream wire code must survive unchanged"
     );
 }

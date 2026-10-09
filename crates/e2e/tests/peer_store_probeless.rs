@@ -199,8 +199,7 @@ async fn run() -> anyhow::Result<()> {
     let buyer_addr = buyer.address();
     chain.fund_eth(buyer_addr, 100).await?;
     // One shared pool backs every lane this test's two sequential
-    // single-source fetches may open, plus headroom for the reactive-topup
-    // ramp.
+    // single-source fetches may open, plus headroom for recovery top-ups.
     chain
         .mint_usdc(
             buyer_addr,

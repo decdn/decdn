@@ -6,7 +6,8 @@ use alloy::primitives::{Address, U256};
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 
 use super::first_open;
-use crate::source::{ScriptedSource, ctx_with};
+use crate::recovery::RecoveryGate;
+use crate::source::{FakeFunder, Recovery, ScriptedSource, ctx_with};
 use crate::source_set::{SourceSet, StaticSources};
 use crate::stop::{ProgressClock, StopPolicy};
 use crate::streamer::StreamCandidate;
@@ -27,6 +28,21 @@ fn lane(provider: u8) -> StreamCandidate<ScriptedSource> {
         lease: LaneLease::new(()),
         widen: None,
     }
+}
+
+/// [`first_open`] with a funder that has no way to add funds.
+async fn open_first<P, T, O, Fut>(
+    sources: &mut SourceSet<'_, P>,
+    stop: &StopPolicy,
+    open: O,
+) -> anyhow::Result<(Address, T)>
+where
+    P: crate::SourceProvider,
+    O: Fn(Arc<StreamCandidate<P::Source>>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let funder = FakeFunder::new(Recovery::Unavailable);
+    first_open(sources, stop, &funder, &RecoveryGate::new(), None, open).await
 }
 
 fn provider_of(lane: &StreamCandidate<ScriptedSource>) -> Address {
@@ -83,7 +99,7 @@ async fn an_empty_set_discovers_until_a_holder_appears() -> anyhow::Result<()> {
         discoveries: AtomicU32::new(0),
     };
     let mut set = SourceSet::new(&provider, [0; 32], Arc::default(), Vec::new());
-    let (answered, ()) = first_open(
+    let (answered, ()) = open_first(
         &mut set,
         &policy(Some(Duration::from_mins(10))),
         |_| async { Ok(()) },
@@ -107,7 +123,7 @@ async fn a_cooled_source_answers_while_discovery_hangs() -> anyhow::Result<()> {
     };
     let mut set = SourceSet::new(&provider, [0; 32], Arc::default(), holders);
     let calls = AtomicU32::new(0);
-    let (answered, ()) = first_open(&mut set, &policy(Some(Duration::from_mins(1))), |_| {
+    let (answered, ()) = open_first(&mut set, &policy(Some(Duration::from_mins(1))), |_| {
         let call = calls.fetch_add(1, Ordering::SeqCst);
         async move {
             if call == 0 {
@@ -127,7 +143,7 @@ async fn a_source_that_faults_once_answers_after_it_cools() -> anyhow::Result<()
     let sources = StaticSources::new(vec![lane(0xA1)])?;
     let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
     let calls = AtomicU32::new(0);
-    let (provider, size) = first_open(&mut set, &policy(None), |_lane| {
+    let (provider, size) = open_first(&mut set, &policy(None), |_lane| {
         let call = calls.fetch_add(1, Ordering::SeqCst);
         async move {
             if call == 0 {
@@ -147,7 +163,7 @@ async fn a_source_that_faults_once_answers_after_it_cools() -> anyhow::Result<()
 async fn a_faulting_source_moves_the_open_to_the_next_one() -> anyhow::Result<()> {
     let sources = StaticSources::new(vec![lane(0xA1), lane(0xB2)])?;
     let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
-    let (provider, ()) = first_open(&mut set, &policy(None), |lane| async move {
+    let (provider, ()) = open_first(&mut set, &policy(None), |lane| async move {
         if provider_of(&lane) == A {
             anyhow::bail!("connection reset");
         }
@@ -166,24 +182,27 @@ fn rejected(reason: VoucherRejectReason) -> anyhow::Error {
     })
 }
 
-/// A capability rejection, and a watermark rejection that no heal took,
-/// end the open.
+/// A rejection that no heal took declines its source only. Once every
+/// source declined, the open ends with "no node will serve this", naming
+/// the reason (ADR 039 §Failure handling).
 #[tokio::test(start_paused = true)]
-async fn a_fatal_fault_ends_the_open() -> anyhow::Result<()> {
-    for reason in [
-        VoucherRejectReason::CapabilityExpired,
-        VoucherRejectReason::AmountRegression,
-    ] {
-        let sources = StaticSources::new(vec![lane(0xA1), lane(0xB2)])?;
-        let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
-        let err = first_open(&mut set, &policy(None), |_lane| async move {
-            Err::<(), _>(rejected(reason))
-        })
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("{reason:?} must end the open"))?;
-        assert!(err.downcast_ref::<UpstreamVoucherRejected>().is_some());
-    }
+async fn every_source_declining_ends_the_open() -> anyhow::Result<()> {
+    let reason = VoucherRejectReason::AmountRegression;
+    let sources = StaticSources::new(vec![lane(0xA1), lane(0xB2)])?;
+    let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
+    let err = open_first(&mut set, &policy(None), |_lane| async move {
+        Err::<(), _>(rejected(reason))
+    })
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("{reason:?} from every source must end the open"))?;
+    let stop = err
+        .downcast_ref::<crate::NoNodeWillServe>()
+        .ok_or_else(|| anyhow::anyhow!("expected NoNodeWillServe, got {err:#}"))?;
+    assert_eq!(
+        stop.reasons,
+        vec![crate::source_set::DeclineReason::Voucher(reason)]
+    );
     Ok(())
 }
 
@@ -193,7 +212,7 @@ async fn a_fatal_fault_ends_the_open() -> anyhow::Result<()> {
 async fn a_rejection_healed_past_the_budget_moves_the_open() -> anyhow::Result<()> {
     let sources = StaticSources::new(vec![lane(0xA1), lane(0xB2)])?;
     let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
-    let (provider, ()) = first_open(&mut set, &policy(None), |lane| async move {
+    let (provider, ()) = open_first(&mut set, &policy(None), |lane| async move {
         if provider_of(&lane) == A {
             return Err(rejected(VoucherRejectReason::UnderFold).context(HealExhausted));
         }
@@ -210,7 +229,7 @@ async fn a_rejection_healed_past_the_budget_moves_the_open() -> anyhow::Result<(
 async fn every_source_saying_not_found_ends_with_no_source_has_blob() -> anyhow::Result<()> {
     let sources = StaticSources::new(vec![lane(0xA1), lane(0xB2)])?.not_probed();
     let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
-    let err = first_open(&mut set, &policy(None), |_lane| async {
+    let err = open_first(&mut set, &policy(None), |_lane| async {
         Err::<(), _>(not_found())
     })
     .await
@@ -227,7 +246,7 @@ async fn a_probed_holder_saying_not_found_twice_then_answers() -> anyhow::Result
     let sources = StaticSources::new(vec![lane(0xA1)])?;
     let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
     let calls = AtomicU32::new(0);
-    let (provider, ()) = first_open(&mut set, &policy(None), |_lane| {
+    let (provider, ()) = open_first(&mut set, &policy(None), |_lane| {
         let call = calls.fetch_add(1, Ordering::SeqCst);
         async move {
             if call < 2 {
@@ -248,7 +267,7 @@ async fn it_gives_up_after_the_limit_without_an_answer() -> anyhow::Result<()> {
     let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
     let limit = Duration::from_mins(3);
     let start = tokio::time::Instant::now();
-    let err = first_open(&mut set, &policy(Some(limit)), |_lane| async {
+    let err = open_first(&mut set, &policy(Some(limit)), |_lane| async {
         Err::<(), _>(anyhow::anyhow!("connection reset"))
     })
     .await
@@ -256,5 +275,217 @@ async fn it_gives_up_after_the_limit_without_an_answer() -> anyhow::Result<()> {
     .ok_or_else(|| anyhow::anyhow!("a source that never answers must give up"))?;
     assert_eq!(err.downcast_ref::<GaveUp>(), Some(&GaveUp { idle: limit }));
     assert_eq!(tokio::time::Instant::now() - start, limit);
+    Ok(())
+}
+
+fn unfunded() -> anyhow::Error {
+    anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Unfunded))
+}
+
+/// A sole source that refuses the deposit `Unfunded` brings the open to the
+/// fetch's one funding recovery point: the step tops the pool up, the raised
+/// deposit reaches the lane, and the source answers at it.
+#[tokio::test(start_paused = true)]
+async fn an_unfunded_sole_source_answers_after_a_recovery_step() -> anyhow::Result<()> {
+    let sources = StaticSources::new(vec![lane(0xA1)])?;
+    let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
+    let funder = FakeFunder::new(Recovery::ToppedUp(U256::from(2_000u32)));
+    let gate = RecoveryGate::new();
+    let (provider, ()) = first_open(
+        &mut set,
+        &policy(None),
+        &funder,
+        &gate,
+        None,
+        |lane| async move {
+            if lane.ctx.lock().unwrap().deposit < U256::from(2_000u32) {
+                return Err(unfunded());
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    assert_eq!(provider, A);
+    assert_eq!(funder.calls(), vec![U256::from(1_000u32)]);
+    Ok(())
+}
+
+/// A funder with no way to add funds (a delegated signer with no funder)
+/// ends the open "funding needed" once the sole source refuses `Unfunded`.
+#[tokio::test(start_paused = true)]
+async fn an_unfunded_source_with_no_funding_path_ends_funding_needed() -> anyhow::Result<()> {
+    let sources = StaticSources::new(vec![lane(0xA1)])?;
+    let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
+    let err = open_first(&mut set, &policy(None), |_lane| async {
+        Err::<(), _>(unfunded())
+    })
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("an unfunded sole source must end the open"))?;
+    assert!(
+        err.downcast_ref::<crate::NoAffordableSource>().is_some(),
+        "{err:#}"
+    );
+    Ok(())
+}
+
+/// A bundle entry's first open sees a sibling entry's step: the sibling
+/// raised the deposit on the lane context the run's registry shares, so the
+/// open takes no step of its own and asks the source again at the new
+/// deposit.
+#[tokio::test(start_paused = true)]
+async fn a_first_open_sees_a_sibling_entrys_step() -> anyhow::Result<()> {
+    let sources = StaticSources::new(vec![lane(0xA1)])?;
+    let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
+    let funder = FakeFunder::new(Recovery::Unavailable);
+    let gate = RecoveryGate::new();
+    let (provider, ()) = first_open(&mut set, &policy(None), &funder, &gate, None, |lane| {
+        async move {
+            let mut ctx = lane.ctx.lock().unwrap();
+            if ctx.deposit < U256::from(2_000u32) {
+                // The sibling's step lands while this open is refused.
+                ctx.deposit = U256::from(2_000u32);
+                return Err(unfunded());
+            }
+            Ok(())
+        }
+    })
+    .await?;
+    assert_eq!(provider, A);
+    assert!(funder.calls().is_empty(), "no step of its own");
+    Ok(())
+}
+
+/// A sibling bundle entry's lane priced source A out at `1_000`. This entry has
+/// built no lane, so its own view of the deposit is zero.
+fn priced_out_by_a_sibling() -> Arc<crate::PeerHealth> {
+    let health = Arc::new(crate::PeerHealth::default());
+    health.record(
+        A,
+        crate::Fault::Unaffordable,
+        tokio::time::Instant::now(),
+        U256::from(1_000u32),
+    );
+    health
+}
+
+/// A bundle entry that has built no lane finds its only source priced out by
+/// a sibling entry, whose step already topped the pool up. The entry takes
+/// that step as its own pass, and runs no step: the run's step is spent.
+#[tokio::test(start_paused = true)]
+async fn an_entry_with_no_lane_takes_a_siblings_top_up() -> anyhow::Result<()> {
+    let gate = RecoveryGate::new();
+    let sibling = FakeFunder::new(Recovery::ToppedUp(U256::from(2_000u32)));
+    let mut top_ups = gate.top_ups();
+    let seen = U256::from(1_000u32);
+    let _ = gate
+        .step(&sibling, seen, &mut top_ups, || seen, U256::ZERO)
+        .await;
+
+    let sources = StaticSources::new(vec![lane(0xA1)])?;
+    let mut set = SourceSet::new(
+        &sources,
+        [0; 32],
+        priced_out_by_a_sibling(),
+        sources.holders(),
+    );
+    let funder = FakeFunder::new(Recovery::Unavailable);
+    let (provider, ()) = first_open(&mut set, &policy(None), &funder, &gate, None, |_| async {
+        Ok(())
+    })
+    .await?;
+    assert_eq!(provider, A);
+    assert!(funder.calls().is_empty(), "no step of its own");
+    Ok(())
+}
+
+/// A bundle entry that has built no lane runs the run's first step at the
+/// deposit a sibling priced its source out at, not at its own zero view: the
+/// step tops up against that deposit's remainder.
+#[tokio::test(start_paused = true)]
+async fn an_entry_with_no_lane_steps_at_the_siblings_deposit() -> anyhow::Result<()> {
+    let sources = StaticSources::new(vec![lane(0xA1)])?;
+    let mut set = SourceSet::new(
+        &sources,
+        [0; 32],
+        priced_out_by_a_sibling(),
+        sources.holders(),
+    );
+    let funder = FakeFunder::new(Recovery::ToppedUp(U256::from(2_000u32)));
+    let gate = RecoveryGate::new();
+    let (provider, ()) = first_open(&mut set, &policy(None), &funder, &gate, None, |_| async {
+        Ok(())
+    })
+    .await?;
+    assert_eq!(provider, A);
+    assert_eq!(funder.calls(), vec![U256::from(1_000u32)]);
+    Ok(())
+}
+
+/// A slot holding a fresh key's capability, capped at `spending_cap`, a day
+/// from expiry, with no wait for a swap.
+fn delegate_slot(spending_cap: u64) -> crate::CredentialSlot {
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let capability = decdn_incentive::Capability {
+        signer: signer.address(),
+        spending_cap,
+        pool_id: alloy::primitives::B256::repeat_byte(0x11),
+        expiry: crate::credential::unix_now() + 24 * 60 * 60,
+    }
+    .sign(
+        &signer,
+        &decdn_incentive::bind_node_id_domain(1, Address::ZERO),
+    )
+    .unwrap();
+    crate::CredentialSlot::new(Arc::new(signer), capability)
+        .unwrap()
+        .with_swap_wait(Duration::ZERO)
+}
+
+/// A delegated first open (a pinned node, no size hint) ends with the same
+/// typed outcome as the acquire loop: a refused capability needs a new one,
+/// and a refused pool under a healthy capability names the publisher's pool.
+#[tokio::test(start_paused = true)]
+async fn a_delegated_first_open_ends_with_a_typed_funding_needed() -> anyhow::Result<()> {
+    let pool = alloy::primitives::B256::repeat_byte(0x11);
+    let cases: [(fn() -> anyhow::Error, crate::FundingNeeded); 2] = [
+        (
+            || {
+                anyhow::Error::new(UpstreamVoucherRejected {
+                    reason: VoucherRejectReason::SpendingCapExhausted,
+                    bundle: None,
+                    proof_generation: None,
+                })
+            },
+            crate::FundingNeeded::NewCapability {
+                pool,
+                cause: crate::CapabilityCause::Revoked,
+            },
+        ),
+        (unfunded, crate::FundingNeeded::PublisherPool { pool }),
+    ];
+    for (refusal, expected) in cases {
+        let sources = StaticSources::new(vec![lane(0xA1)])?;
+        let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
+        let funder = FakeFunder::new(Recovery::Unavailable);
+        let slot = delegate_slot(1_000);
+        let err = first_open(
+            &mut set,
+            &policy(None),
+            &funder,
+            &RecoveryGate::new(),
+            Some(&slot),
+            |_lane| async move { Err::<(), _>(refusal()) },
+        )
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a refused delegate must end the open"))?;
+        assert_eq!(
+            err.downcast_ref::<crate::FundingNeeded>(),
+            Some(&expected),
+            "{err:#}"
+        );
+        assert!(funder.calls().is_empty(), "a delegate tops nothing up");
+    }
     Ok(())
 }

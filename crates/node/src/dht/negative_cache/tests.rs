@@ -27,8 +27,9 @@ fn record_then_contains_returns_true() {
 
 /// Entries carry their own expiry, so a caller with weaker evidence can suppress a
 /// (peer, hash) for less time than the cache's default (#1145 review). This is what
-/// lets an unattributable delivery refusal — a wire `NotFound`, onto which seven
-/// reject reasons deliberately collapse, three of them ours or transient — cost a peer
+/// lets an unattributable delivery refusal — a wire `NotFound`, onto which every
+/// not-now reject reason deliberately collapses, a load shed and a stale chain among
+/// them — cost a peer
 /// seconds of suppression rather than the five minutes an authoritative probe answer
 /// earns.
 #[test]

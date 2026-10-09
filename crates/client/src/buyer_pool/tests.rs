@@ -1,7 +1,7 @@
 use super::{
     AllowanceShortfall, LOW_WATER_DIVISOR, PaymentPool, TopUpUnconfirmed, approval_floor,
     approve_decision, escrowed_but_untracked, grade_deposit_credit, issue_self_capability,
-    open_pool, refill_amount, top_up,
+    open_pool, pool_accepts_funds, refill_amount, top_up,
 };
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, TxHash, U256};
@@ -389,4 +389,50 @@ fn progress_write_rebases_a_pending_anchor_without_an_advance() {
             totals: lane_progress(500, 50),
         })
     );
+}
+
+/// A `topUp` estimate that fails for a reason other than `PoolNotOpen` says
+/// nothing about the pool, so the pool's status decides: `Closing` and
+/// `Closed` accept no funds, `Open` does. When the status read fails too,
+/// the pool reads as open.
+#[tokio::test]
+async fn an_unreadable_estimate_falls_back_to_the_pools_status() {
+    use alloy::providers::ProviderBuilder;
+    use alloy::sol_types::SolValue;
+
+    let owner = Address::repeat_byte(1);
+    let status = |status: PaymentPool::Status| -> Vec<u8> {
+        PaymentPool::Pool {
+            owner,
+            status,
+            disputeDeadline: 0,
+            deposit: 10,
+            totalRedeemed: 0,
+        }
+        .abi_encode()
+    };
+    let cases = [
+        ("open", Some(status(PaymentPool::Status::Open)), true),
+        ("closing", Some(status(PaymentPool::Status::Closing)), false),
+        ("closed", Some(status(PaymentPool::Status::Closed)), false),
+        ("unreadable", None, true),
+    ];
+    for (case, read, accepts) in cases {
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_failure_msg("transient rpc fault");
+        match read {
+            Some(answer) => asserter.push_success(&alloy::primitives::Bytes::from(answer)),
+            None => asserter.push_failure_msg("transient rpc fault"),
+        }
+        let contract = PaymentPool::new(
+            Address::ZERO,
+            ProviderBuilder::new().connect_mocked_client(asserter.clone()),
+        );
+        assert_eq!(
+            pool_accepts_funds(&contract, owner, B256::repeat_byte(2)).await,
+            accepts,
+            "{case}"
+        );
+        assert!(asserter.read_q().is_empty(), "{case}: both reads ran");
+    }
 }

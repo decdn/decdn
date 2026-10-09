@@ -24,6 +24,12 @@ fn pool(owner: Address, deposit: u64, redeemed: u64) -> PaymentPool::Pool {
     }
 }
 
+/// The `getPool` answer for `owner`'s tracked pool, still open: the read the
+/// first lane build of a run makes before it reuses the row.
+fn still_open(owner: Address) -> Bytes {
+    pool(owner, WORKING, 0).abi_encode().into()
+}
+
 fn lane(amount: u64, bytes: u64) -> Bytes {
     PaymentPool::Lane {
         amount,
@@ -182,7 +188,7 @@ async fn a_tracked_pool_resumes_a_new_lane_from_the_chain_watermark() {
         &store,
         &signer,
         ChainAdoption::Allowed,
-        vec![Some(lane(500, 500_000))],
+        vec![Some(still_open(signer.address())), Some(lane(500, 500_000))],
     )
     .await
     .expect("a tracked pool reuses without touching getPools");
@@ -235,6 +241,7 @@ async fn a_row_from_another_deployment_is_not_reused() {
         let tracked = pool_to_reuse(
             &store,
             &contract,
+            &RunFunding::default(),
             signer.address(),
             DEPLOYMENT,
             ChainAdoption::Refused,
@@ -248,6 +255,79 @@ async fn a_row_from_another_deployment_is_not_reused() {
             "row on {foreign:?}, buying on {DEPLOYMENT:?}"
         );
         assert!(tracked.is_none_or(|state| state.redeemed_elsewhere().is_zero()));
+    }
+}
+
+/// A tracked pool is reused only while the chain shows it open. A pool its
+/// owner closed (`Closing`) or that anyone reclaimed (`Closed`) is treated as
+/// no row, so the run opens another. A failed read, a pool the chain holds no
+/// record of yet, and a pool another owner holds keep the row: none of them
+/// shows this owner's pool closed.
+#[tokio::test]
+async fn a_tracked_pool_is_reused_only_while_the_chain_shows_it_open() {
+    let signer = Arc::new(PrivateKeySigner::random());
+    let owner = signer.address();
+    let id = B256::repeat_byte(0xCC);
+    let read = |owner: Address, status: PaymentPool::Status| -> Option<Bytes> {
+        let mut answer = pool(owner, WORKING, 0);
+        answer.status = status;
+        Some(answer.abi_encode().into())
+    };
+    let cases = [
+        ("open", read(owner, PaymentPool::Status::Open), true),
+        ("closing", read(owner, PaymentPool::Status::Closing), false),
+        ("closed", read(owner, PaymentPool::Status::Closed), false),
+        ("read fault", None, true),
+        (
+            "no record",
+            read(Address::ZERO, PaymentPool::Status::Open),
+            true,
+        ),
+        (
+            "another owner",
+            read(Address::repeat_byte(0x99), PaymentPool::Status::Closed),
+            true,
+        ),
+    ];
+    for (case, answer, reused) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        store
+            .record(&BuyerPoolState::new(
+                id,
+                DEPLOYMENT,
+                owner,
+                TOKEN,
+                U256::from(WORKING),
+            ))
+            .unwrap();
+        let asserter = Asserter::new();
+        match answer {
+            Some(response) => asserter.push_success(&response),
+            None => asserter.push_failure_msg("transient rpc fault"),
+        }
+        let contract = PaymentPool::new(
+            PP,
+            ProviderBuilder::new().connect_mocked_client(asserter.clone()),
+        );
+        let funding = RunFunding::default();
+        let tracked = pool_to_reuse(
+            &store,
+            &contract,
+            &funding,
+            owner,
+            DEPLOYMENT,
+            ChainAdoption::Refused,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tracked.map(|state| state.pool_id),
+            reused.then_some(id),
+            "{case}"
+        );
+        assert_eq!(funding.pool_id(), reused.then_some(id), "{case}");
+        assert!(asserter.read_q().is_empty(), "{case}: the status was read");
     }
 }
 
@@ -428,11 +508,13 @@ async fn a_pool_spent_across_lanes_refills_and_fails_when_nothing_is_left() {
         .record(&tracked_row(id, signer.address(), WORKING, &[2_000_000; 5]))
         .unwrap();
 
+    let mut calls = vec![Some(still_open(signer.address()))];
+    calls.extend(refill_fails_with_wallet(0));
     let (result, drained) = run_in(
         &store,
         &signer,
         ChainAdoption::Allowed,
-        refill_fails_with_wallet(0),
+        calls,
         &RunFunding::default(),
     )
     .await;
@@ -478,7 +560,10 @@ async fn an_untracked_lanes_chain_watermark_counts_toward_the_pool_spend() {
         ))
         .unwrap();
 
-    let mut calls = vec![Some(lane(1_000_000, 1_000_000_000))];
+    let mut calls = vec![
+        Some(still_open(signer.address())),
+        Some(lane(1_000_000, 1_000_000_000)),
+    ];
     calls.extend(refill_fails_with_wallet(0));
     let (result, drained) = run_in(
         &store,
@@ -516,7 +601,11 @@ async fn a_wallet_short_of_usdc_keeps_the_lane_while_the_pool_can_still_pay() {
         &store,
         &signer,
         ChainAdoption::Allowed,
-        refill_fails_with_wallet(0),
+        [
+            vec![Some(still_open(signer.address()))],
+            refill_fails_with_wallet(0),
+        ]
+        .concat(),
         &funding,
     )
     .await;
@@ -554,7 +643,11 @@ async fn a_later_lane_build_skips_the_refill_after_a_wallet_shortfall() {
         &store,
         &signer,
         ChainAdoption::Allowed,
-        refill_fails_with_wallet(0),
+        [
+            vec![Some(still_open(signer.address()))],
+            refill_fails_with_wallet(0),
+        ]
+        .concat(),
         &funding,
     )
     .await;
@@ -582,7 +675,11 @@ async fn a_refill_failure_with_a_funded_wallet_fails_the_lane_build() {
         &store,
         &signer,
         ChainAdoption::Allowed,
-        refill_fails_with_wallet(WORKING),
+        [
+            vec![Some(still_open(signer.address()))],
+            refill_fails_with_wallet(WORKING),
+        ]
+        .concat(),
         &funding,
     )
     .await;
@@ -848,12 +945,14 @@ async fn a_lane_build_reports_the_pools_other_spend() {
     );
 }
 
-/// The run's funder reports the pool's spend to the deposit gate. A
-/// reactive top-up that fails for another reason is not a shortfall; after
-/// a wallet shortfall, a reactive top-up fails without a chain call and
-/// says so ([`WalletShortfall`]).
+/// The run's funder reports the pool's spend to the deposit gate. A funding
+/// recovery step that fails for another reason is not a shortfall; after a
+/// wallet shortfall, a step fails without a chain call and says so
+/// ([`WalletShortfall`]). A delegated signer's zero working deposit leaves
+/// the step no funding path.
 #[tokio::test]
 async fn the_cli_funder_reads_the_run_funding() {
+    let signer = Arc::new(PrivateKeySigner::random());
     let dir = tempfile::tempdir().unwrap();
     let store = client_store(&dir);
     let rpc = ProviderBuilder::new().connect_mocked_client(Asserter::new());
@@ -868,31 +967,113 @@ async fn the_cli_funder_reads_the_run_funding() {
         spend(700, 0, false, false),
         &ledger_at(0),
     );
-    let pool_id = std::sync::OnceLock::new();
-    pool_id.set(B256::repeat_byte(0xEE)).unwrap();
+    funding.note_pool(B256::repeat_byte(0xEE));
     let funder = CliFunder {
         contract: &contract,
         rpc: &rpc,
         store: &store,
         owner: Address::repeat_byte(0x01),
-        pool_id: &pool_id,
+        signer: &signer,
+        deployment: DEPLOYMENT,
         token: TOKEN,
         payment_pool_addr: PP,
+        working_deposit: U256::from(WORKING),
         max_approve: false,
         funding: &funding,
     };
     assert_eq!(funder.pool_spent(), Some(U256::from(700u64)));
 
-    // No answers are queued, so the wallet read faults: not a shortfall.
-    let err = funder.top_up(U256::from(5u64)).await.unwrap_err();
+    // No answers are queued, so the allowance read faults: not a shortfall.
+    let err = funder.recover(U256::from(5u64)).await.unwrap_err();
     assert!(funding.shortfall().is_none(), "{err:#}");
     assert!(err.downcast_ref::<WalletShortfall>().is_none(), "{err:#}");
 
     *funding.shortfall.lock().unwrap() = Some("wallet 0x01 holds 0 µUSDC".to_owned());
-    let err = funder.top_up(U256::from(5u64)).await.unwrap_err();
+    let err = funder.recover(U256::from(5u64)).await.unwrap_err();
     assert!(
         format!("{err:#}").contains("the wallet cannot fund a top-up: wallet 0x01 holds 0"),
         "{err:#}"
     );
     assert!(err.downcast_ref::<WalletShortfall>().is_some(), "{err:#}");
+
+    let delegated = CliFunder {
+        working_deposit: U256::ZERO,
+        ..funder
+    };
+    assert!(matches!(
+        delegated.recover(U256::ZERO).await,
+        Ok(Recovery::Unavailable)
+    ));
+}
+
+/// Run a recovery step for a self-funded pool that already holds its working
+/// deposit, with the chain's `topUp` estimate answered by `estimate`.
+async fn step_on_a_full_pool(asserter: Asserter) -> anyhow::Result<Recovery> {
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    let id = B256::repeat_byte(0xEE);
+    store
+        .record(&tracked_row(id, signer.address(), WORKING, &[]))
+        .unwrap();
+    let rpc = ProviderBuilder::new().connect_mocked_client(asserter);
+    let contract = PaymentPool::new(PP, rpc.clone());
+    let funding = RunFunding::default();
+    funding.note_pool(id);
+    let funder = CliFunder {
+        contract: &contract,
+        rpc: &rpc,
+        store: &store,
+        owner: signer.address(),
+        signer: &signer,
+        deployment: DEPLOYMENT,
+        token: TOKEN,
+        payment_pool_addr: PP,
+        working_deposit: U256::from(WORKING),
+        max_approve: false,
+        funding: &funding,
+    };
+    funder.recover(U256::from(WORKING)).await
+}
+
+/// A full pool that still accepts funds settles: the step escrows nothing and
+/// reports the deposit the nodes have yet to see, so the settle window asks
+/// them again.
+#[tokio::test]
+async fn a_full_open_pool_settles_without_a_top_up() {
+    let asserter = Asserter::new();
+    asserter.push_success(&alloy::primitives::U64::from(50_000u64));
+    let stepped = step_on_a_full_pool(asserter.clone()).await.unwrap();
+    assert!(matches!(stepped, Recovery::ToppedUp(d) if d == U256::from(WORKING)));
+    assert!(asserter.read_q().is_empty(), "only the estimate ran");
+}
+
+/// A full pool that is closing or closed still needs a replacement: its
+/// `topUp` estimate reverts `PoolNotOpen`, and the step goes on to open a new
+/// pool (whose chain calls this mock leaves unanswered).
+#[tokio::test]
+async fn a_full_closing_pool_is_replaced() {
+    let selector = alloy::primitives::keccak256("PoolNotOpen()");
+    let asserter = Asserter::new();
+    asserter.push_failure(
+        serde_json::from_value::<alloy_json_rpc::ErrorPayload>(serde_json::json!({
+            "code": 3,
+            "message": "execution reverted",
+            "data": format!("0x{}", alloy::primitives::hex::encode(&selector[..4])),
+        }))
+        .unwrap(),
+    );
+    // The open's allowance read finds enough, so the open goes on to submit.
+    asserter.push_success(&U256::MAX.abi_encode());
+    let err = step_on_a_full_pool(asserter.clone())
+        .await
+        .expect_err("the replacement open reaches the chain");
+    assert!(
+        format!("{err:#}").contains("submit openPool"),
+        "the step submitted an openPool, not a topUp: {err:#}"
+    );
+    assert!(
+        asserter.read_q().is_empty(),
+        "the estimate and the allowance ran"
+    );
 }

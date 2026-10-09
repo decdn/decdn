@@ -200,20 +200,6 @@ fn a_reported_open_failure_is_not_metered_a_second_time() {
     }
 }
 
-/// A wallet that cannot fund the deposit is node-wide: it can pay no provider,
-/// so the open task marks it [`LocalPullFault`] as well and the classifier
-/// refuses rather than signing the client a clean `NotFound`. An unmarked leg
-/// would fall to the residual arm instead, which both double-counts it and
-/// blames the local store for a chain fault (#2072).
-#[test]
-fn an_insufficient_deposit_is_a_local_fault() {
-    let err = anyhow::anyhow!("submit openPool: ERC20: transfer amount exceeds balance")
-        .context(PoolOpenFailureReason::InsufficientDeposit)
-        .context(OpenReported)
-        .context(LocalPullFault);
-    assert_eq!(classify_pool_open_arm(&err), PoolOpenArm::LocalFault);
-}
-
 /// The node-wide faults carry both markers, and `LocalPullFault` must win: an
 /// `OpenReported` verdict here would answer `NotFound` from a node that cannot
 /// pay anyone (#1560).
@@ -230,6 +216,31 @@ fn local_fault_outranks_open_reported() {
         .context(LocalPullFault)
         .context(OpenReported);
     assert_eq!(classify_pool_open_arm(&err), PoolOpenArm::LocalFault);
+}
+
+/// An unfundable wallet carries `LocalPullFault` and `OpenReported` like the
+/// other node-wide faults, but its fill ends "funding needed": the arm is its
+/// own, and its miss answers the client `NotFound`, not `Declined`.
+#[test]
+fn an_unfundable_wallet_is_funding_needed_and_answers_not_found() {
+    let err = anyhow::anyhow!("openPool would revert: balance too low")
+        .context(PoolOpenFailureReason::InsufficientDeposit)
+        .context(OpenReported)
+        .context(LocalPullFault);
+    assert_eq!(classify_pool_open_arm(&err), PoolOpenArm::FundingNeeded);
+    assert!(matches!(
+        miss_answer(PullMiss::FundingNeeded),
+        Ok(OriginFetch::NotFound)
+    ));
+    assert_eq!(
+        PullMiss::Clean.or(PullMiss::FundingNeeded),
+        PullMiss::FundingNeeded
+    );
+    assert_eq!(
+        PullMiss::FundingNeeded.or(PullMiss::LocalFault),
+        PullMiss::LocalFault
+    );
+    assert!(!PullMiss::FundingNeeded.is_local_fault());
 }
 
 /// A pending open outranks everything: it is not a failure at all, so it must
@@ -325,8 +336,8 @@ fn buyer_side_sentinels_survive_anyhow_downcast() {
     );
 
     // The refusal sentinel (#1144) carries the wire code through the same
-    // channel, so `classify_pull_failure` can split an honest `NotFound` from
-    // a self-reported `InternalError` instead of folding both to Unreachable.
+    // channel, so `classify_pull_failure` can read the refusal class instead
+    // of folding every refusal to Unreachable.
     let refused: anyhow::Error =
         anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::NotFound));
     let recovered = refused
@@ -337,44 +348,34 @@ fn buyer_side_sentinels_survive_anyhow_downcast() {
 }
 
 /// Asserted on the real predicate `classify_pull_failure` consults: a refusal is
-/// proof the peer ANSWERED, so only the one code by
-/// which a peer reports its own degradation may score it. The
-/// `NotFound` case is the heart of the issue: a healthy-but-empty node must not take
-/// an `Unreachable` hit (local EWMA; ADR 008 has no cross-node propagation) for
-/// honestly saying so.
+/// proof the peer ANSWERED, so no refusal class scores it. A healthy-but-empty
+/// node must not take an `Unreachable` hit (local EWMA; ADR 008 has no
+/// cross-node propagation) for honestly saying so.
 #[test]
-fn only_internal_error_refusals_are_scored() {
-    // The exonerated codes: every one is an honest answer from a reachable
-    // node. `NotFound` is NODE-scoped, not blob-scoped (seven
-    // `ServeRejectReason`s collapse onto it), so it cannot even be read as
-    // "this peer lacks this blob" with confidence — only as "this peer won't
-    // serve it", which is no evidence of a fault.
-    for error in [
-        StreamError::NotFound,
-        StreamError::EvictedSinceProbe,
-        StreamError::Overloaded,
-        StreamError::BlobTooLarge,
-        StreamError::VoucherRejected {
+fn each_refusal_class_has_its_verdict() {
+    assert_eq!(
+        classify_refusal(&StreamError::NotFound),
+        RefusalVerdict::Transient
+    );
+    assert_eq!(
+        classify_refusal(&StreamError::Unfunded),
+        RefusalVerdict::Transient
+    );
+    assert_eq!(
+        classify_refusal(&StreamError::Declined),
+        RefusalVerdict::DurableMiss
+    );
+    assert_eq!(
+        classify_refusal(&StreamError::VoucherRejected {
             reason: VoucherRejectReason::PoolExhausted,
             bundle: None,
-        },
-    ] {
-        assert_ne!(
-            classify_refusal(&error),
-            RefusalVerdict::NodeFault,
-            "{error:?} is an honest refusal and must not tar the provider"
-        );
-    }
-    // The one code that IS evidence of a degraded peer (#1129): "unexpected
-    // failure; do not retry THIS node".
-    assert_eq!(
-        classify_refusal(&StreamError::InternalError),
-        RefusalVerdict::NodeFault
+        }),
+        RefusalVerdict::OurFault
     );
 }
 
 /// #2178: backpressure is a transport shed or an OPEN-stage refusal. A bare
-/// mid-stream `NotFound` or `Overloaded` is not: the per-signer cap refuses
+/// mid-stream `NotFound` is not: the per-signer cap refuses
 /// only at admission, and a source that serves some bytes and then refuses
 /// must not reset the wait budget on every round. The open-stage `NotFound`
 /// case needs a signed refusal, which only the client crate can build; the
@@ -388,13 +389,8 @@ fn backpressure_is_a_transport_shed_or_an_open_stage_refusal() {
     );
     for error in [
         StreamError::NotFound,
-        StreamError::Overloaded,
-        StreamError::InsufficientDeposit,
-        StreamError::InternalError,
-        StreamError::EvictedSinceProbe,
-        StreamError::BlobTooLarge,
-        StreamError::HashBlacklisted,
-        StreamError::OriginBlacklisted,
+        StreamError::Unfunded,
+        StreamError::Declined,
     ] {
         let mid_stream = anyhow::Error::new(UpstreamRefused::mid_stream(error.clone()));
         assert_eq!(
@@ -459,34 +455,20 @@ fn a_pool_exhaustion_is_a_retryable_topup_not_a_dead_channel() {
 /// proves — and for the codes below it proves rather little.
 #[test]
 fn only_a_durable_refusal_earns_the_full_suppression_ttl() {
-    // A peer that truthfully says the blob is gone, or is over its ceiling, will say
-    // the same thing in a minute. Worth the full TTL.
-    for (error, cause) in [
-        (
-            StreamError::EvictedSinceProbe,
-            DurableMissCause::EvictedSinceProbe,
-        ),
-        (StreamError::BlobTooLarge, DurableMissCause::BlobTooLarge),
-    ] {
-        assert_eq!(
-            classify_refusal(&error),
-            RefusalVerdict::DurableMiss(cause),
-            "{error:?} is a lasting fact about this (peer, hash)"
-        );
-    }
+    // A peer that declines the blob will say the same thing in a minute. Worth
+    // the full TTL.
+    assert_eq!(
+        classify_refusal(&StreamError::Declined),
+        RefusalVerdict::DurableMiss,
+        "Declined is a lasting fact about this (peer, hash)"
+    );
     // `NotFound` is the one that matters. `wire_error` collapses `UnknownChannel`
-    // — the window where the upstream's chain watcher has not yet seen the channel
-    // WE just opened — onto it, deliberately, so channel existence cannot be probed.
-    // At the full TTL that blackholed a healthy peer for five minutes over a
-    // condition that had already passed. `InsufficientDeposit` is our own upstream
-    // pool short of the peer's floor `M` (option 2 / #2013), likewise transient and
-    // no fault of the peer. `Overloaded` is a load spike, which the policy says to
-    // respect.
-    for error in [
-        StreamError::NotFound,
-        StreamError::Overloaded,
-        StreamError::InsufficientDeposit,
-    ] {
+    // (the window where the upstream's chain watcher has not yet seen the pool
+    // WE just opened) onto it, so pool existence cannot be probed. At the full
+    // TTL that blackholes a healthy peer for five minutes over a condition that
+    // has already passed. `Unfunded` is our own upstream funding short at the
+    // peer, likewise transient and no fault of the peer.
+    for error in [StreamError::NotFound, StreamError::Unfunded] {
         assert_eq!(
             classify_refusal(&error),
             RefusalVerdict::Transient,
@@ -604,9 +586,8 @@ fn a_no_progress_leg_is_not_scored_unreachable() {
 /// so a new `VoucherRejectReason` inherits `Clean` without a build break — acceptable,
 /// because `voucher_verdict` IS exhaustive over all ten and already routes the node-wide
 /// reasons (`BadSignature`, `WrongSigner`) to `OurLocalFault` before this function sees
-/// them. `RefusalVerdict`'s four discriminants are spelled out so a FIFTH does break the
-/// build; its `DurableMiss(_)` payload is not, so a new `DurableMissCause` still inherits
-/// `Clean`.
+/// them. `RefusalVerdict`'s three discriminants are spelled out so a fourth does break
+/// the build.
 #[test]
 fn only_our_own_fault_may_withhold_a_not_found() {
     let reason = VoucherRejectReason::SpendingCapExhausted;
@@ -617,10 +598,9 @@ fn only_our_own_fault_may_withhold_a_not_found() {
         PullVerdict::Stalled,
         PullVerdict::OurDeadLane(reason),
         PullVerdict::OurVoucherRetryable(reason),
-        PullVerdict::Refused(RefusalVerdict::NodeFault),
         PullVerdict::Refused(RefusalVerdict::Transient),
         PullVerdict::Refused(RefusalVerdict::OurFault),
-        PullVerdict::Refused(RefusalVerdict::DurableMiss(DurableMissCause::BlobTooLarge)),
+        PullVerdict::Refused(RefusalVerdict::DurableMiss),
         PullVerdict::Corruption,
         PullVerdict::LegNoProgress,
         PullVerdict::Unreachable,
@@ -732,12 +712,8 @@ fn a_local_fault_survives_the_rest_of_the_walk() {
 fn a_mid_stream_refusal_is_judged_by_its_wire_code_not_the_catch_all() {
     for (error, want) in [
         (StreamError::NotFound, RefusalVerdict::Transient),
-        (StreamError::Overloaded, RefusalVerdict::Transient),
-        (
-            StreamError::EvictedSinceProbe,
-            RefusalVerdict::DurableMiss(DurableMissCause::EvictedSinceProbe),
-        ),
-        (StreamError::InternalError, RefusalVerdict::NodeFault),
+        (StreamError::Unfunded, RefusalVerdict::Transient),
+        (StreamError::Declined, RefusalVerdict::DurableMiss),
     ] {
         // Exactly what the receive loops now raise — wrapped, because a real one comes
         // up through the pull path's `.context` layers and `downcast_ref` must still
@@ -751,23 +727,6 @@ fn a_mid_stream_refusal_is_judged_by_its_wire_code_not_the_catch_all() {
             "a mid-stream {error:?} must be judged as a refusal, not fall to the catch-all"
         );
     }
-}
-
-/// ADR 001 §Probe cache mandates tracking the `EvictedSinceProbe` rate, and
-/// ADR 005 explains why it is not just "a candidate failed": it is a peer
-/// contradicting its own recent availability answer. Both causes
-/// are `DurableMiss` — they say the same thing about the peer — but only one
-/// is that signal, and a shared unpayloaded variant cannot tell them apart.
-#[test]
-fn only_an_eviction_carries_the_post_eviction_cause() {
-    assert_eq!(
-        classify_refusal(&StreamError::EvictedSinceProbe),
-        RefusalVerdict::DurableMiss(DurableMissCause::EvictedSinceProbe)
-    );
-    assert_eq!(
-        classify_refusal(&StreamError::BlobTooLarge),
-        RefusalVerdict::DurableMiss(DurableMissCause::BlobTooLarge)
-    );
 }
 
 /// The residual arm has to stay reachable — it is how a genuinely dead node gets
@@ -857,10 +816,10 @@ fn our_deadline_and_their_silence_get_opposite_verdicts() {
 }
 
 /// A transport-level `APP_ERR_RATE_LIMITED` shed (#1986) is the same event as
-/// the handler-level `Overloaded` refusal, and must get the same verdict: brief
-/// suppression, no reputation. Before this arm the sentinel fell through the
-/// ladder to `Unreachable` — a 0.0 EWMA sample for a peer that answered, and
-/// one every prober in a `GlobalFull` window recorded at once.
+/// a handler-level load-shed `NotFound`, and must get the same verdict: brief
+/// suppression, no reputation. Scoring it `Unreachable` would record a 0.0 EWMA
+/// sample for a peer that answered, and every prober in a `GlobalFull` window
+/// would record one at once.
 #[test]
 fn a_rate_limit_shed_is_suppressed_not_scored() {
     let shed = anyhow::Error::new(UpstreamRateLimited {

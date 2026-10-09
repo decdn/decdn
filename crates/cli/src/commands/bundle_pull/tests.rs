@@ -123,41 +123,34 @@ fn a_blob_no_holder_has_fails_only_its_entry() {
     assert!(!ends_the_pull(&err));
 }
 
-/// A voucher rejection is the one pool's, so every entry would meet it.
+/// A voucher rejection scopes to its node: on its own it ends no entry's
+/// pull beyond its own. "Funding needed" is the one pool's, so every entry
+/// would meet it, and it ends the whole pull (ADR 039 §Failure handling).
 #[test]
-fn a_voucher_rejection_ends_the_whole_pull() {
-    let err = anyhow::Error::new(decdn_client::UpstreamVoucherRejected {
+fn only_funding_needed_ends_the_whole_pull() {
+    let rejected = anyhow::Error::new(decdn_client::UpstreamVoucherRejected {
         reason: decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted,
         bundle: None,
         proof_generation: None,
     })
     .context("entry");
-    assert_eq!(entry_scope(&err), decdn_client::FatalScope::Command);
-    assert!(ends_the_pull(&err));
+    assert!(!ends_the_pull(&rejected));
+    let funding = anyhow::Error::new(decdn_client::NoAffordableSource {
+        deposit: alloy::primitives::U256::ZERO,
+    })
+    .context("entry");
+    assert_eq!(entry_scope(&funding), decdn_client::FatalScope::Command);
+    assert!(ends_the_pull(&funding));
 }
 
-/// A capability signer every provider refuses, whatever its rate, ends
-/// the whole pull: every entry would meet it. One that only the providers
-/// of an entry refuse at their rates fails that entry alone, since a
-/// cheaper provider of another entry can still serve it (#2338).
+/// Every node declining one entry fails that entry alone: another
+/// entry's nodes can still serve it.
 #[test]
-fn a_drained_signer_ends_the_pull_only_at_every_rate() {
-    let drained = |remaining| decdn_client::SignerCapDrained {
-        pool_id: alloy::primitives::B256::ZERO,
-        signer: Address::ZERO,
-        provider: Address::ZERO,
-        remaining,
-        rate_per_mb: 10,
-        expired: false,
-    };
-    let everywhere = anyhow::Error::new(drained(0)).context("entry");
-    assert_eq!(entry_scope(&everywhere), decdn_client::FatalScope::Command);
-    assert!(ends_the_pull(&everywhere));
-    let here = anyhow::Error::new(drained(5))
-        .context(decdn_client::NoSourceServesSigner)
-        .context("entry");
-    assert_eq!(entry_scope(&here), decdn_client::FatalScope::Item);
-    assert!(!ends_the_pull(&here));
+fn every_node_declining_fails_only_its_entry() {
+    let err =
+        anyhow::Error::new(decdn_client::NoNodeWillServe { reasons: vec![] }).context("entry");
+    assert_eq!(entry_scope(&err), decdn_client::FatalScope::Item);
+    assert!(!ends_the_pull(&err));
 }
 
 /// A blob over the client's cap fails only its own entry.
@@ -210,10 +203,8 @@ async fn a_command_fault_stops_every_later_entry() {
             started.lock().unwrap().push(i);
             async move {
                 if i == 1 {
-                    Err(anyhow::Error::new(decdn_client::UpstreamVoucherRejected {
-                        reason: decdn_protocol::client::VoucherRejectReason::PoolExhausted,
-                        bundle: None,
-                        proof_generation: None,
+                    Err(anyhow::Error::new(decdn_client::NoAffordableSource {
+                        deposit: alloy::primitives::U256::ZERO,
                     }))
                 } else {
                     Ok(())
@@ -228,7 +219,7 @@ async fn a_command_fault_stops_every_later_entry() {
     .await;
     let err = stopped.expect("the pull stops");
     assert!(
-        err.downcast_ref::<decdn_client::UpstreamVoucherRejected>()
+        err.downcast_ref::<decdn_client::NoAffordableSource>()
             .is_some()
     );
     assert_eq!(*started.lock().unwrap(), vec![0, 1]);
@@ -334,10 +325,8 @@ async fn a_command_fault_settles_the_items_it_drops() {
             let settled = &settled;
             async move {
                 if i == 1 {
-                    return Err(anyhow::Error::new(decdn_client::UpstreamVoucherRejected {
-                        reason: decdn_protocol::client::VoucherRejectReason::PoolExhausted,
-                        bundle: None,
-                        proof_generation: None,
+                    return Err(anyhow::Error::new(decdn_client::NoAffordableSource {
+                        deposit: alloy::primitives::U256::ZERO,
                     }));
                 }
                 // In flight when its sibling fails: it never finishes.
@@ -4696,20 +4685,7 @@ fn two_scripted_holders(
 
 /// A funder that is never asked: every scripted deposit is huge.
 fn no_topups() -> decdn_client::source::FakeFunder {
-    decdn_client::source::FakeFunder::new(
-        0,
-        decdn_incentive::DepositOutcome::Added(alloy::primitives::U256::ZERO),
-    )
-}
-
-/// A drive config whose working deposit never gates a scripted fetch.
-fn drive_config() -> decdn_client::DriveConfig {
-    decdn_client::DriveConfig {
-        working_deposit: alloy::primitives::U256::from(u128::MAX),
-        seller_reserve: alloy::primitives::U256::ZERO,
-        max_settle_waits: 2,
-        settle_backoff: std::time::Duration::ZERO,
-    }
+    decdn_client::source::FakeFunder::new(decdn_client::Recovery::Unavailable)
 }
 
 /// `blob`'s BLAKE3 root, the hash a scripted holder serves it under.
@@ -4741,7 +4717,6 @@ async fn a_range_entry_survives_a_holder_blip() -> anyhow::Result<()> {
     let dest = staging.path().join("entry");
     let downloader = Downloader::new(&provider, no_topups())
         .holders(holders)
-        .drive_config(drive_config())
         .max_lanes(2);
     let stop = StopPolicy::new(
         false,
