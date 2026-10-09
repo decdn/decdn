@@ -1089,8 +1089,8 @@ pub enum StreamError {
     Declined,
     /// "No at the current funding": this node will not serve this request at
     /// the requester's current pool deposit or signer capability (ADR 003
-    /// §Funding recovery). The requester removes it for this fetch, and the
-    /// refusal counts toward funding recovery.
+    /// §Funding recovery). The requester parks it at the current funding for
+    /// this fetch, and asks it again only after a funding recovery step.
     ///
     /// Spoken ONLY to a requester that passed the lane-ownership proof or holds
     /// a verified signer binding. Any other requester gets [`Self::NotFound`]
@@ -1197,8 +1197,8 @@ pub enum VoucherRejectReason {
     /// further credit for this stream (ADR 003 §Pool solvency). A pool-wide
     /// condition, not this signer's. Recovery: the pool **owner tops up the
     /// deposit**. Emitted mid-stream by the serve loop after the client has proved
-    /// capability ownership; the open-time equivalent stays wire-`NotFound`
-    /// (anti-enumeration). Not watermark-gated.
+    /// capability ownership; the open-time equivalent is [`StreamError::Unfunded`],
+    /// spoken only to a proven requester. Not watermark-gated.
     PoolExhausted,
     /// The signer's shared on-chain `cap − spent` headroom, tracked across every
     /// provider, can no longer cover a serve floor — the signer has drained its
@@ -1210,7 +1210,8 @@ pub enum VoucherRejectReason {
     /// **owner** raises this signer's cap or delegates a fresh capability. Emitted
     /// mid-stream after the client has proved capability ownership, so naming the
     /// condition is post-auth and leaks nothing an open-time refusal must hide (the
-    /// admit-time equivalent stays wire-`NotFound`). Not watermark-gated.
+    /// admit-time equivalent is [`StreamError::Unfunded`], spoken only to a proven
+    /// requester). Not watermark-gated.
     SignerCapExhausted,
     /// A released [`ChunkPreimage`] does not hash to the stream's deepest
     /// verified preimage in `index − verified` steps (ADR 003 §Concurrent

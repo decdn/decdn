@@ -1316,7 +1316,9 @@ impl std::error::Error for PullStalled {}
 /// `record_pool_open_failure` — reads this marker to choose between answering a
 /// downstream client `StreamError::NotFound` ("we could not obtain this blob") and
 /// `Declined` ("this node will not serve this hash during this fetch"). That path
-/// involves no peer and no reputation at all.
+/// involves no peer and no reputation at all. One marked failure still answers
+/// `NotFound`: a wallet that cannot fund a deposit, because the funding problem is
+/// this node's, not the requester's.
 ///
 /// So attaching this marker at a NEW site changes serve-path refusals, not just scoring.
 /// Attach it when the failure means *this node* cannot serve anyone — a broken signer, an

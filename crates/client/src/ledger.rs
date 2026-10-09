@@ -500,7 +500,7 @@ pub struct PoolLedger {
     /// They live only on this lane. A fetch that completes without this lane
     /// running again leaves them unpaid, and so does a replaced pool or a
     /// rotated key, which builds a new lane. An unpaid span is the node's
-    /// credit-window loss, at most one voucher interval per lane, as for any
+    /// credit-window loss, at most one credit window per lane, as for any
     /// client that ends mid-stream.
     unpaid: std::sync::Mutex<Vec<([u8; 32], u64, u64)>>,
 }

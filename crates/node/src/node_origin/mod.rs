@@ -3246,7 +3246,8 @@ fn classify_pull_failure(
         // miss, forever. The negative cache is the right instrument — scoped to (peer, hash),
         // TTL'd, reputation-neutral — and `RefusalVerdict` decides what the suppression is
         // worth: five minutes for a peer that truthfully says the blob is gone, far less for
-        // a `NotFound` that may well have been our own empty deposit.
+        // a `NotFound`, which can be a load shed, a stale chain, or a pool the peer has not
+        // confirmed yet.
         PullVerdict::Refused(verdict) => {
             deps.metrics.node_pull_refused();
             match verdict {

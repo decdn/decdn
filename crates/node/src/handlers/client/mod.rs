@@ -788,18 +788,17 @@ impl ServeRejectReason {
 /// Why the reason code matters, stated precisely (the wire codes' own docs in
 /// `decdn_protocol::client` are the authority here):
 ///
-/// - `NotFound` = "node lacks the blob and cannot reach a provider, or declines
-///   to pull through". It is NODE-scoped, not blob-scoped, and it is the code a
-///   healthy-but-empty node returns.
-/// - `InternalError` = "unexpected failure; do not retry THIS node" — i.e. go
-///   elsewhere, this node is broken.
+/// - `CacheMiss` answers `NotFound` = "not now: try other nodes". It is the code
+///   a healthy-but-empty node returns, and this node can serve later.
+/// - `InternalError` answers `Declined` = "this node will not serve this hash
+///   during this fetch": the client drops this node for the hash, because this
+///   node is broken.
 ///
 /// Both steer a client to another node, so this is not the difference between
 /// "retry" and "give up". What it buys is (a) an honest signal that the node is
 /// degraded rather than merely empty, and (b) the per-reason reject metric — the
-/// ONLY server-side place the true cause is observable, since the distinct
-/// reject reasons collapse to the single `NotFound` wire code
-/// ([`ServeRejectReason::wire_error`]). An operator whose origin is 5xx-ing must
+/// ONLY server-side place the true cause is observable, since the wire carries
+/// only the reason's class ([`ServeRejectReason::wire_error`]). An operator whose origin is 5xx-ing must
 /// not see that reported as a cache miss.
 ///
 /// Note the reason code is NOT covered by the response's EIP-712 `slash_sig`,
@@ -822,7 +821,7 @@ enum FillOutcome {
     /// faulted): `NotFound`.
     CleanMiss,
     /// A backend/store fault, or a fault in this node's own buyer leg — the node is
-    /// degraded, not empty. Terminal: `InternalError` ("do not retry this node"), so a
+    /// degraded, not empty. Terminal: `InternalError`, which answers `Declined`, so a
     /// client routes around it and the operator's reject metric names the real cause.
     ///
     /// Two different lifetimes arrive here, and the variant deliberately does not
@@ -892,7 +891,10 @@ enum MissPath {
     /// The pull leg open ended without a target, for the reason the
     /// [`PullMiss`](crate::node_origin::PullMiss) names: no reachable provider
     /// or every candidate declined (`clean_miss`), every candidate quoted above
-    /// the buy ceiling (`below_margin`), or a fault in this node (`local_fault`).
+    /// the buy ceiling (`below_margin`), a fault in this node (`local_fault`),
+    /// this node's own wallet unable to fund a pool (`funding_needed`), or every
+    /// candidate refusing this node's funding with no recovery step left
+    /// (`unfunded`).
     PullLegMiss(crate::node_origin::PullMiss),
     /// The pull leg open ran past its deadline: the configured pull-through
     /// timeout, or [`WINDOW_PULL_FALLBACK_DEADLINE`] when none is set.

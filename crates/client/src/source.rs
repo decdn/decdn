@@ -275,13 +275,15 @@ impl std::error::Error for PoolReplaced {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Recovery {
-    /// The current pool's deposit rose to this total, in micro-USDC.
+    /// The current pool's deposit is this total, in micro-USDC: the step
+    /// topped it up, or it already held its sized deposit and still accepts
+    /// funds, so the step settles at it while the nodes' views catch up.
     ToppedUp(U256),
     /// The current pool no longer accepts funds, and a new pool replaces it.
     Replaced(PoolReplaced),
-    /// The buyer has no way to add funds: the pool already holds its sized
-    /// deposit, or the buyer is a delegated signer with no funder to ask. The
-    /// fetch ends "funding needed".
+    /// The buyer has no way to add funds: it is a delegated signer with no
+    /// funder to ask, its funding is turned off, or its top-up added nothing.
+    /// The fetch ends "funding needed".
     Unavailable,
 }
 
@@ -302,8 +304,10 @@ pub trait Funder: Send + Sync {
     /// A self-funded owner tops its current pool up toward its sized deposit.
     /// A pool that is `Closing` or `Closed` refuses the top-up, and the owner
     /// opens a new pool at its normal deposit and makes it current instead
-    /// ([`Recovery::Replaced`]). A buyer with no way to add funds returns
-    /// [`Recovery::Unavailable`].
+    /// ([`Recovery::Replaced`]). A pool that already holds its sized deposit and
+    /// still accepts funds needs no top-up: the step settles at its deposit
+    /// ([`Recovery::ToppedUp`]), so the caller asks the nodes again. A buyer with
+    /// no way to add funds returns [`Recovery::Unavailable`].
     ///
     /// # Errors
     ///

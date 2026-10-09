@@ -915,7 +915,7 @@ fn signed_to_wire_capability(signed: &SignedCapability) -> WireCapability {
 /// The loop exists to ride out the node's readiness window, during which it
 /// refuses delivery up front — its `getPool` view has not resolved the pool yet,
 /// which reaches us as the wire `NotFound` that `ServeRejectReason::wire_error`
-/// collapses seven reject reasons onto. That, transport errors, a per-attempt
+/// collapses every not-now reject reason onto. That, transport errors, a per-attempt
 /// `PullTimeout`, and a `PullStalled` (#1134 — an upstream that went silent
 /// mid-stream; retryable here because in a loopback fixture the node is coming
 /// up, not dying) are all retryable. A node-side persist fault also lands here:

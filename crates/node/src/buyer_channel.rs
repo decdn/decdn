@@ -2205,9 +2205,11 @@ async fn run_open<P: Provider + Clone>(
     // names no provider: every candidate re-runs the identical call against the identical
     // contract through the identical RPC. A wallet that cannot fund a deposit cannot pay
     // anyone, and a chain lane that cannot carry the transaction cannot carry it for
-    // anyone — so walking the candidate list burns `MAX_PROVIDER_ATTEMPTS` futile opens
-    // and then answers the client `NotFound`, which is a lie about this node's state
-    // rather than a fact about the blob (#1560).
+    // anyone — so walking the candidate list burns `MAX_PROVIDER_ATTEMPTS` futile opens.
+    // The marker stops that walk at the first failure. What the client
+    // hears is the pool-open classifier's call, not the marker's: a wallet that cannot
+    // fund a deposit answers `NotFound`, because the funding problem is this node's, not
+    // the requester's (ADR 005 §Open-time refusal classes) (#1560).
     //
     // `ContractRevert` stays unmarked: it is deterministic on-chain state (a paused
     // contract, a future revert reason), it is metered by reason, and it does not say
