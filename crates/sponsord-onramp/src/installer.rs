@@ -11,7 +11,9 @@ const DECDN_PS1_TEMPLATE: &str = include_str!("../assets/decdn.ps1");
 /// Both installers, rendered.
 #[derive(Clone, Debug)]
 pub struct Installers {
+    /// The POSIX shell installer, served at `GET /decdn.sh`.
     pub sh: String,
+    /// The PowerShell installer, served at `GET /decdn.ps1`.
     pub ps1: String,
 }
 

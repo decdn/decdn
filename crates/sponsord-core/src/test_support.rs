@@ -24,8 +24,11 @@ use crate::issuer::{Issuer, Limits};
 use crate::pool::{Authorization, PoolChain, TxState};
 use crate::sponsor::Sponsor;
 
+/// The chain id [`fake_sponsor`] signs for (Arbitrum Sepolia's).
 pub const TEST_CHAIN_ID: u64 = 421_614;
+/// The `PaymentPool` address [`fake_sponsor`] signs for.
 pub const TEST_PAYMENT_POOL: Address = Address::repeat_byte(0x22);
+/// The pool id [`fake_sponsor`] signs for.
 pub const TEST_POOL_ID: B256 = B256::repeat_byte(0x11);
 /// The RPC URL `FakePool` failures name, with an API key in its path, so
 /// tests can assert it never reaches a log line.
@@ -38,6 +41,7 @@ pub const FAKE_TOPUP_TX: TxHash = TxHash::repeat_byte(0xAB);
 /// nonce, and switches to fail reads or top-ups. A failure reads like a raw
 /// reqwest transport error naming [`FAKE_RPC_URL`]: unlike `ChainPool`, it
 /// does not redact, so tests exercise the log sites' own redaction.
+#[derive(Debug)]
 pub struct FakePool {
     owner: Address,
     remaining: Mutex<MicroUsdc>,
@@ -54,6 +58,8 @@ pub struct FakePool {
 }
 
 impl FakePool {
+    /// A pool owned by `owner` holding `remaining` micro-USDC, with no
+    /// registrations and every failure switch off.
     #[must_use]
     pub fn new(owner: Address, remaining: u64) -> Self {
         Self {
@@ -120,7 +126,7 @@ impl FakePool {
     }
 
     /// What `confirmed_nonce` reports. Starts at 0. Named for the RPC's
-    /// transaction count: CodeQL takes a literal passed to a `*nonce*`
+    /// transaction count: `CodeQL` takes a literal passed to a `*nonce*`
     /// function for a hard-coded cryptographic nonce.
     pub fn set_confirmed_tx_count(&self, count: u64) {
         self.confirmed_nonce.store(count, Ordering::SeqCst);
@@ -238,7 +244,7 @@ pub async fn fake_sponsor(max_spending_cap: u64, max_ttl_secs: u64) -> (Sponsor,
 
 /// `tracing` output captured from the current thread, for asserting what a
 /// test logged and what it must not (an RPC URL).
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CapturedLog(Arc<Mutex<Vec<u8>>>);
 
 impl CapturedLog {

@@ -28,8 +28,12 @@ pub struct IssueRequest {
     /// The delegate key the capability authorizes to sign vouchers.
     #[cfg_attr(feature = "openapi", schema(value_type = String, example = "0x00000000000000000000000000000000000000aa"))]
     pub signer: Address,
+    /// Most the signer may spend, in micro-USDC. Omitted: the daemon's
+    /// maximum. 0 is refused (`zero`), above the maximum `exceeds_max`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spending_cap: Option<MicroUsdc>,
+    /// Seconds from now until the capability expires. Omitted: the daemon's
+    /// maximum. 0 is refused (`zero`), above the maximum `exceeds_max`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_secs: Option<u64>,
 }
@@ -37,7 +41,7 @@ pub struct IssueRequest {
 impl IssueRequest {
     /// A request for `signer` at the daemon's maximum terms.
     #[must_use]
-    pub fn new(signer: Address) -> Self {
+    pub const fn new(signer: Address) -> Self {
         Self {
             signer,
             spending_cap: None,
@@ -52,6 +56,7 @@ impl IssueRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct IssueResponse {
+    /// The token and its terms, flattened into this object.
     #[serde(flatten)]
     pub capability: IssuedCapability,
     /// Whether the terms come from an existing on-chain registration.
@@ -63,11 +68,16 @@ pub struct IssueResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Info {
+    /// EIP-155 id of the chain the pool is on.
     pub chain_id: u64,
     /// The `PaymentPool` contract.
     #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub payment_pool: Address,
+    /// Largest `spending_cap` the daemon grants, in micro-USDC; also the
+    /// default when a request omits it.
     pub max_spending_cap: MicroUsdc,
+    /// Largest `ttl_secs` the daemon grants; also the default when a request
+    /// omits it.
     pub max_ttl_secs: u64,
 }
 
@@ -75,6 +85,7 @@ pub struct Info {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Health {
+    /// Always `true`: the server is up and answering.
     pub ok: bool,
 }
 

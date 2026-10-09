@@ -54,7 +54,7 @@ fn get(uri: &str) -> Request<Body> {
     Request::get(uri).body(Body::empty()).unwrap()
 }
 
-fn fund_req(body: Value) -> Request<Body> {
+fn fund_req(body: &Value) -> Request<Body> {
     Request::post("/v1/fund")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
@@ -62,7 +62,7 @@ fn fund_req(body: Value) -> Request<Body> {
 }
 
 fn fund() -> Request<Body> {
-    fund_req(json!({ "client": CLIENT, "proof": "ok" }))
+    fund_req(&json!({ "client": CLIENT, "proof": "ok" }))
 }
 
 fn poll() -> Request<Body> {
@@ -125,8 +125,8 @@ async fn a_refused_gate_is_403_gate_failed() {
 async fn malformed_requests_are_400_bad_request() {
     let app = sponsord_onramp::http::router(app_state_with_fakes().await);
     for req in [
-        fund_req(json!({ "client": "0xnope", "proof": "ok" })),
-        fund_req(json!({ "client": CLIENT })),
+        fund_req(&json!({ "client": "0xnope", "proof": "ok" })),
+        fund_req(&json!({ "client": CLIENT })),
         get("/v1/capability?client=%3Cscript%3E"),
         get("/v1/capability"),
         get("/fund?client=%3Cscript%3E"),

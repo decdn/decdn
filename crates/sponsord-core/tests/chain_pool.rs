@@ -1,7 +1,7 @@
 //! Anvil integration test for `sponsord_core::pool::ChainPool`.
 //!
 //! Launches the deploy fixture, funds a hot wallet with gas + mock USDC,
-//! opens a PaymentPool as that wallet, then drives the pool `PoolChain`
+//! opens a `PaymentPool` as that wallet, then drives the pool `PoolChain`
 //! exactly as the sponsor would: confirm `pool_owner` is the wallet, read
 //! `remaining`, `top_up`, and confirm `remaining` grew by the credited amount.
 //!
@@ -33,6 +33,10 @@ const OPEN_DEPOSIT_MICRO_USDC: u64 = 50_000_000;
 const TOPUP_MICRO_USDC: u64 = 5_000_000;
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one end-to-end journey, read top to bottom"
+)]
 async fn remaining_grows_after_topup() {
     let chain = ChainFixture::launch().await.expect("launch");
 

@@ -24,10 +24,22 @@ struct Entry {
     evict_at: u64,
 }
 
+/// Capabilities issued by `POST /v1/fund`, keyed by client signer, until
+/// the CLI polls them or they expire.
 pub struct GrantCache {
     entries: Mutex<HashMap<Address, Entry>>,
     handoff_secs: u64,
     max_entries: usize,
+}
+
+// By hand: the entries are live capability tokens.
+impl std::fmt::Debug for GrantCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrantCache")
+            .field("handoff_secs", &self.handoff_secs)
+            .field("max_entries", &self.max_entries)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for GrantCache {
@@ -37,6 +49,8 @@ impl Default for GrantCache {
 }
 
 impl GrantCache {
+    /// An empty cache holding each capability for at most `handoff_secs` and
+    /// at most `max_entries` (at least 1) at once.
     #[must_use]
     pub fn new(handoff_secs: u64, max_entries: usize) -> Self {
         Self {
@@ -85,11 +99,13 @@ impl GrantCache {
         self.lock().retain(|_, e| now < e.evict_at);
     }
 
+    /// Entries held, including any past their time not yet swept.
     #[must_use]
     pub fn len(&self) -> usize {
         self.lock().len()
     }
 
+    /// Whether no entry is held.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0

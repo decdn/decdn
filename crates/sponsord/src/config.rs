@@ -15,7 +15,7 @@ use sponsord_core::{ChainConfig, KeeperConfig, Limits, MicroUsdc};
 const MIN_API_TOKEN_LEN: usize = 32;
 
 /// sponsord: signs capped, expiring capabilities against the sponsor's
-/// PaymentPool for callers holding its bearer token, and keeps the pool
+/// `PaymentPool` for callers holding its bearer token, and keeps the pool
 /// funded from the treasury.
 #[derive(Debug, Parser)]
 #[command(name = "sponsord", version)]
@@ -86,14 +86,20 @@ pub struct Args {
 /// Resolved configuration.
 #[derive(Debug)]
 pub struct DaemonConfig {
+    /// Address the HTTP API listens on.
     pub bind: SocketAddr,
+    /// Bearer token callers present, at least 32 bytes.
     pub api_token: Secret,
     /// The treasury wallet's keystore: the pool owner, which signs
     /// capabilities and pays for top-ups.
     pub treasury_keystore: PathBuf,
+    /// Password of the treasury keystore.
     pub treasury_password: Secret,
+    /// The chain, `PaymentPool` and pool capabilities are signed for.
     pub chain: ChainConfig,
+    /// The largest terms callers may request.
     pub limits: Limits,
+    /// When and by how much the keeper tops the pool up.
     pub keeper: KeeperConfig,
 }
 
@@ -202,7 +208,7 @@ mod tests {
         assert_eq!(cfg.limits.max_spending_cap, MicroUsdc(5_000_000));
         assert_eq!(cfg.limits.max_ttl_secs, 172_800);
         assert_eq!(cfg.keeper.low_water, MicroUsdc(20_000_000));
-        assert_eq!(cfg.keeper.interval, Duration::from_secs(3600));
+        assert_eq!(cfg.keeper.interval, Duration::from_hours(1));
     }
 
     #[test]

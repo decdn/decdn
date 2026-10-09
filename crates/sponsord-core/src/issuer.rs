@@ -13,35 +13,49 @@ use sponsord_api::{IssuedCapability, MicroUsdc};
 /// The largest terms the issuer grants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
+    /// Largest spending cap per capability, in micro-USDC.
     pub max_spending_cap: MicroUsdc,
+    /// Longest time to expiry, in seconds from issue.
     pub max_ttl_secs: u64,
 }
 
 /// Requested terms; an omitted value means the maximum.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TermsRequest {
+    /// Spending cap in micro-USDC; `None` means [`Limits::max_spending_cap`].
     pub spending_cap: Option<MicroUsdc>,
+    /// Seconds until expiry; `None` means [`Limits::max_ttl_secs`].
     pub ttl_secs: Option<u64>,
 }
 
 /// Resolved terms, within the issuer's [`Limits`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Terms {
+    /// Spending cap, in micro-USDC.
     pub spending_cap: MicroUsdc,
+    /// Seconds from issue until the capability expires.
     pub ttl_secs: u64,
 }
 
 /// Requested capability terms outside the issuer's bounds.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TermsError {
+    /// A requested value is above its maximum in [`Limits`].
     #[error("requested {field} {requested} exceeds the maximum {max}")]
     ExceedsMax {
+        /// The offending term: `spending_cap` or `ttl_secs`.
         field: &'static str,
+        /// The value asked for.
         requested: u64,
+        /// The issuer's maximum for that term.
         max: u64,
     },
+    /// A requested value is 0, which would register a dead signer.
     #[error("requested {field} is zero")]
-    Zero { field: &'static str },
+    Zero {
+        /// The offending term: `spending_cap` or `ttl_secs`.
+        field: &'static str,
+    },
 }
 
 /// Signs capped, expiring capabilities against one pool, as the pool owner,
@@ -59,7 +73,20 @@ pub struct Issuer {
     limits: Limits,
 }
 
+// By hand: the signer may hold a key, so only its address is shown.
+impl std::fmt::Debug for Issuer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Issuer")
+            .field("signer", &self.signer.address())
+            .field("pool_id", &self.pool_id)
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Issuer {
+    /// An issuer signing as `signer` for `pool_id`, under the `PaymentPool`'s
+    /// EIP-712 `domain`. `signer` must be the pool's on-chain owner.
     #[must_use]
     pub fn new(
         signer: impl Signer + Send + Sync + 'static,
@@ -81,13 +108,15 @@ impl Issuer {
         self.signer.address()
     }
 
+    /// The pool these capabilities spend from.
     #[must_use]
-    pub fn pool_id(&self) -> B256 {
+    pub const fn pool_id(&self) -> B256 {
         self.pool_id
     }
 
+    /// The largest terms this issuer grants.
     #[must_use]
-    pub fn limits(&self) -> Limits {
+    pub const fn limits(&self) -> Limits {
         self.limits
     }
 
@@ -146,7 +175,7 @@ impl Issuer {
     }
 }
 
-fn bounded(field: &'static str, requested: Option<u64>, max: u64) -> Result<u64, TermsError> {
+const fn bounded(field: &'static str, requested: Option<u64>, max: u64) -> Result<u64, TermsError> {
     match requested {
         None => Ok(max),
         Some(0) => Err(TermsError::Zero { field }),

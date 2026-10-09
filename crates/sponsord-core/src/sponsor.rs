@@ -25,7 +25,9 @@ use crate::pool::{ChainPool, PoolChain};
 /// URL's length, not the URL: it often carries an API key (#38).
 #[derive(Clone, PartialEq, Eq)]
 pub struct ChainConfig {
+    /// JSON-RPC endpoint of the chain the pool is on.
     pub rpc_url: String,
+    /// EIP-155 chain id, part of the capability's EIP-712 domain.
     pub chain_id: u64,
     /// The `PaymentPool` contract.
     pub payment_pool: Address,
@@ -33,14 +35,22 @@ pub struct ChainConfig {
     pub pool_id: B256,
 }
 
+/// Why [`Sponsor::issue`] gave no capability.
 #[derive(Debug, thiserror::Error)]
 pub enum SponsorError {
+    /// The requested terms are zero or above the maximum.
     #[error(transparent)]
     Terms(#[from] TermsError),
+    /// The signer is registered on-chain and its registration has expired.
     #[error("signer registration expired at {expiry}")]
-    SignerExpired { expiry: u64 },
+    SignerExpired {
+        /// Unix time, in seconds, the registration expired at.
+        expiry: u64,
+    },
+    /// Reading the signer's registration from the chain failed.
     #[error("read signer authorization: {0:#}")]
     Chain(anyhow::Error),
+    /// The signer failed to sign the capability.
     #[error("{0:#}")]
     Sign(anyhow::Error),
 }
@@ -59,12 +69,24 @@ impl std::fmt::Debug for ChainConfig {
     }
 }
 
+/// Issues capabilities against one pool and runs its keeper. Built with
+/// [`Sponsor::connect`], or [`Sponsor::new`] from parts.
 pub struct Sponsor {
     issuer: Issuer,
     pool: Arc<dyn PoolChain>,
     chain_id: u64,
     payment_pool: Address,
     keeper: Arc<KeeperStatus>,
+}
+
+impl std::fmt::Debug for Sponsor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sponsor")
+            .field("issuer", &self.issuer)
+            .field("chain_id", &self.chain_id)
+            .field("payment_pool", &self.payment_pool)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Sponsor {
@@ -123,8 +145,10 @@ impl Sponsor {
         })
     }
 
+    /// The chain, `PaymentPool` and maximum terms, as `GET /v1/info` reports
+    /// them.
     #[must_use]
-    pub fn info(&self) -> Info {
+    pub const fn info(&self) -> Info {
         let limits = self.issuer.limits();
         Info {
             chain_id: self.chain_id,

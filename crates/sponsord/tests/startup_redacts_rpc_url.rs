@@ -48,7 +48,7 @@ fn boot_against_a_closed_port(rust_log: Option<&str>) -> (u16, String, String) {
     }
     let mut child = cmd.spawn().unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     while child.try_wait().unwrap().is_none() {
         if Instant::now() > deadline {
             let _ = child.kill();

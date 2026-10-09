@@ -21,13 +21,26 @@ use subtle::ConstantTimeEq;
 
 use crate::metrics::Metrics;
 
+/// What the HTTP handlers share.
 #[derive(Clone)]
 pub struct ApiState {
+    /// Issues the capabilities and reports the keeper's status.
     pub sponsor: Arc<Sponsor>,
     /// Compared in constant time; held as a [`Secret`] so it is wiped on drop.
     pub api_token: Arc<Secret>,
+    /// The time capabilities are issued at and registrations checked against.
     pub clock: Arc<dyn Clock>,
+    /// Issue and error counters for `GET /metrics`.
     pub metrics: Arc<Metrics>,
+}
+
+// By hand: the clock is a trait object, and the token stays out.
+impl std::fmt::Debug for ApiState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiState")
+            .field("sponsor", &self.sponsor)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ApiState {
@@ -43,6 +56,7 @@ impl ApiState {
     }
 }
 
+/// The daemon's routes, with the bearer-token check on every `/v1` route.
 pub fn router(state: ApiState) -> Router {
     let api = Router::new()
         .route(routes::CAPABILITIES, post(issue))

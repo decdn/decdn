@@ -13,6 +13,8 @@ use sponsord_api::onramp::{CapabilityResponse, ClientQuery};
 use crate::net::ClientIp;
 use crate::state::AppState;
 
+/// `GET /v1/capability`: the token held for `client`, `204` if none is, or
+/// `400` without a valid `client` query.
 pub async fn get(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,

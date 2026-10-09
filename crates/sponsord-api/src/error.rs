@@ -42,7 +42,7 @@ pub enum ErrorCode {
 impl ErrorCode {
     /// The HTTP status this code is sent with.
     #[must_use]
-    pub fn http_status(self) -> u16 {
+    pub const fn http_status(self) -> u16 {
         match self {
             Self::BadRequest | Self::ExceedsMax | Self::Zero => 400,
             Self::Unauthorized => 401,
@@ -57,7 +57,7 @@ impl ErrorCode {
 
     /// The wire spelling, e.g. `"signer_expired"`.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::BadRequest => "bad_request",
             Self::ExceedsMax => "exceeds_max",
@@ -84,6 +84,7 @@ impl std::fmt::Display for ErrorCode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ErrorBody {
+    /// What went wrong, e.g. `"signer_expired"`.
     pub error: ErrorCode,
     /// With `exceeds_max`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -97,8 +98,9 @@ pub struct ErrorBody {
 }
 
 impl ErrorBody {
+    /// A body with `error` and none of the optional fields.
     #[must_use]
-    pub fn new(error: ErrorCode) -> Self {
+    pub const fn new(error: ErrorCode) -> Self {
         Self {
             error,
             max_spending_cap: None,

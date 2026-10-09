@@ -20,7 +20,9 @@ use sponsord_api::MicroUsdc;
 /// capability redeemed for it (`PaymentPool.authorized[poolId][signer]`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Authorization {
+    /// The most the signer may spend from the pool, in micro-USDC.
     pub spending_cap: MicroUsdc,
+    /// Unix time, in seconds, at which the registration expires.
     pub expiry: u64,
 }
 
@@ -80,7 +82,10 @@ pub enum TxState {
     /// It mined and reverted, so it moved nothing.
     Reverted,
     /// The node knows the transaction but has no receipt for it yet.
-    Pending { nonce: u64 },
+    Pending {
+        /// The nonce it was sent with.
+        nonce: u64,
+    },
     /// The node has neither the transaction nor a receipt: it was dropped,
     /// replaced, or never reached this node.
     Unknown,
@@ -114,6 +119,8 @@ fn registration(cap: u64, expiry: u64) -> Option<Authorization> {
     })
 }
 
+/// The `PaymentPool` reads and writes the sponsor and keeper make, as the
+/// treasury. [`ChainPool`] is the on-chain implementation.
 #[async_trait]
 pub trait PoolChain: Send + Sync {
     /// The treasury wallet address, which must be the pool's on-chain owner.
@@ -154,6 +161,17 @@ pub struct ChainPool {
     owner: Address,
     token: Address,
     payment_pool: Address,
+}
+
+// By hand: the provider holds the RPC URL, which can carry an API key.
+impl std::fmt::Debug for ChainPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainPool")
+            .field("owner", &self.owner)
+            .field("token", &self.token)
+            .field("payment_pool", &self.payment_pool)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ChainPool {
@@ -393,10 +411,7 @@ mod tests {
         assert!(!shown.contains("KEY"), "{shown}");
         assert_eq!(
             shown,
-            format!(
-                "top up 0x11: {}: await topUp receipt: error sending request: timed out",
-                marker
-            )
+            format!("top up 0x11: {marker}: await topUp receipt: error sending request: timed out")
         );
 
         let short = anyhow::Error::new(chain(&[REQWEST]))

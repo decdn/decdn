@@ -78,9 +78,15 @@ rather than writing new ones.
 
 ## Constraints that aren't obvious from the code
 
-- **Lints**: the workspace denies `unwrap`, `expect`, `panic!` and slice
-  indexing outside tests. Every member must keep `[lints] workspace = true`
-  (CI checks this).
+- **Lints**: the workspace runs decdn's lint set (root `Cargo.toml`
+  `[workspace.lints]`): clippy `pedantic`, `deny` on `unwrap`, `expect`,
+  `panic!`, slice indexing, truncating casts and `print!`/`eprintln!`
+  outside tests, `unsafe_code` forbidden, and a doc comment on every public
+  item (on `sponsord-api` types those comments are the OpenAPI
+  descriptions, so regenerate the snapshots after editing them). The
+  `decdn-sponsored` CLI allows the print lints at its crate roots. Silence a
+  lint at the site with `#[expect(…, reason = "…")]`. Every member must keep
+  `[lints] workspace = true` (CI checks this).
 - **Contracts with deployed software**: the release archive names, the
   `~/.decdn/sponsor.toml` schema and both HTTP APIs (`sponsord-api`) are read
   by installers and CLIs already in the field. A change to any of them must be

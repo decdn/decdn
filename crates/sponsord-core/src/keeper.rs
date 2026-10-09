@@ -65,6 +65,8 @@ pub struct KeeperSnapshot {
 }
 
 impl KeeperStatus {
+    /// Copy the current values. Each is read on its own, so a snapshot taken
+    /// mid-tick may mix values from before and after it.
     #[must_use]
     pub fn snapshot(&self) -> KeeperSnapshot {
         KeeperSnapshot {
@@ -141,6 +143,10 @@ fn set_hold(slot: &mut Option<Unconfirmed>, status: &KeeperStatus, hold: Option<
         .store(hold.map_or(0, |h| h.since_unix), Ordering::Relaxed);
 }
 
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "one branch per pool state, each with its own log event; the tracing macros' expansion is most of the score"
+)]
 async fn sweep(
     pool: &dyn PoolChain,
     pool_id: B256,
@@ -221,6 +227,10 @@ async fn sweep(
 }
 
 /// Check the held top-up; returns whether it may still mine.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "one branch per pool state, each with its own log event; the tracing macros' expansion is most of the score"
+)]
 async fn settle(
     pool: &dyn PoolChain,
     pool_id: B256,
@@ -339,7 +349,7 @@ mod tests {
     const CFG: KeeperConfig = KeeperConfig {
         low_water: MicroUsdc(20_000_000),
         refill: MicroUsdc(100_000_000),
-        interval: Duration::from_secs(3600),
+        interval: Duration::from_hours(1),
     };
 
     #[test]

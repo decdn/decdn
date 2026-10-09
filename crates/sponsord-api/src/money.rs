@@ -12,15 +12,18 @@ use serde::{Deserialize, Serialize};
 pub struct MicroUsdc(pub u64);
 
 impl MicroUsdc {
+    /// No USDC.
     pub const ZERO: MicroUsdc = MicroUsdc(0);
 
+    /// `self + other`, capped at `u64::MAX`.
     #[must_use]
-    pub fn saturating_add(self, other: MicroUsdc) -> MicroUsdc {
+    pub const fn saturating_add(self, other: MicroUsdc) -> MicroUsdc {
         MicroUsdc(self.0.saturating_add(other.0))
     }
 
+    /// `self - other`, floored at zero.
     #[must_use]
-    pub fn saturating_sub(self, other: MicroUsdc) -> MicroUsdc {
+    pub const fn saturating_sub(self, other: MicroUsdc) -> MicroUsdc {
         MicroUsdc(self.0.saturating_sub(other.0))
     }
 }

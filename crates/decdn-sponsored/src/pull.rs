@@ -18,7 +18,7 @@ use sponsord_api::client::OnrampClient;
 use sponsord_api::onramp::Profile;
 
 /// How long to wait for the browser gate flow to produce a capability.
-const CAPABILITY_POLL_TIMEOUT: Duration = Duration::from_secs(600);
+const CAPABILITY_POLL_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// How often to ask the onramp whether the capability is there yet.
 const CAPABILITY_POLL_EVERY: Duration = Duration::from_secs(2);
@@ -62,15 +62,14 @@ pub async fn pull(
 
     let client = session.ensure_key()?;
     if session.capability()?.is_none() {
-        let token = match api.capability(client).await? {
-            Some(token) => token,
-            None => {
-                let url = api.fund_url(client);
-                println!("Open this link to start the download:\n  {url}");
-                open_in_browser(&url);
-                api.poll_capability(client, CAPABILITY_POLL_EVERY, CAPABILITY_POLL_TIMEOUT)
-                    .await?
-            }
+        let token = if let Some(token) = api.capability(client).await? {
+            token
+        } else {
+            let url = api.fund_url(client);
+            println!("Open this link to start the download:\n  {url}");
+            open_in_browser(&url);
+            api.poll_capability(client, CAPABILITY_POLL_EVERY, CAPABILITY_POLL_TIMEOUT)
+                .await?
         };
         session.save_capability(&token)?;
     }

@@ -17,11 +17,20 @@ pub enum DaemonError {
     /// The signer's on-chain registration expired at `expiry`; only a new
     /// signer can get a usable capability.
     #[error("signer registration expired at {expiry}")]
-    SignerExpired { expiry: u64 },
+    SignerExpired {
+        /// Unix time (seconds) the registration expired at; 0 if the daemon
+        /// left it out.
+        expiry: u64,
+    },
     /// The daemon rejected the request itself (`4xx`): a wrong token, or
     /// terms outside its maximums. Retrying will not help.
     #[error("daemon rejected the request: {status} {code}")]
-    Rejected { status: u16, code: ErrorCode },
+    Rejected {
+        /// The HTTP status, `400`–`499`.
+        status: u16,
+        /// The body's error code, or [`ErrorCode::Unknown`] if it had none.
+        code: ErrorCode,
+    },
     /// The daemon could not be reached, timed out, or failed on its side.
     #[error("daemon unavailable: {0}")]
     Unavailable(String),
@@ -127,15 +136,20 @@ async fn parse<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Resul
 /// Why an onramp call failed.
 #[derive(Debug, thiserror::Error)]
 pub enum OnrampError {
+    /// The request could not be sent, or a `200` body did not parse.
     #[error("{0}")]
     Http(#[from] reqwest::Error),
     /// The onramp answered with an unexpected status.
     #[error("{route} failed: {status} {code}")]
     Status {
+        /// The route path called, e.g. `/v1/profile`.
         route: &'static str,
+        /// The HTTP status the onramp answered with.
         status: u16,
+        /// The body's error code, or [`ErrorCode::Unknown`] if it had none.
         code: ErrorCode,
     },
+    /// [`OnrampClient::poll_capability`] saw no capability within its timeout.
     #[error("timed out after {0:?} waiting for a capability")]
     Timeout(Duration),
 }

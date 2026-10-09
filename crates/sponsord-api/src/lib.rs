@@ -8,7 +8,7 @@
 //!   ([`client::OnrampClient`]).
 //! - [`error`]: the `{"error": "<code>"}` body both servers answer with.
 //!
-//! The `openapi` feature adds the OpenAPI documents (`openapi::daemon()`,
+//! The `openapi` feature adds the `OpenAPI` documents (`openapi::daemon()`,
 //! `openapi::onramp()`), committed under `docs/openapi/`.
 
 pub mod daemon;

@@ -30,11 +30,58 @@ categories = ["network-programming"]
 # `readme` and `description` are per crate: each is its own crates.io landing
 # page. check_workspace_manifests.py requires both on every publishable member.
 
+# decdn's lint set (decdn's root Cargo.toml, `[workspace.lints]`). Keep the two
+# in step: a lint added there belongs here too, unless sponsord has no code it
+# could fire on.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+elided_lifetimes_in_paths = "warn"
+# A `pub` item inside a private module is not part of any crate's API.
+unreachable_pub = "warn"
+# Every public item carries a doc comment. On the sponsord-api wire types the
+# comments are also the OpenAPI descriptions.
+missing_docs = "warn"
+
 [workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Anti-panic: the daemon and the onramp are long-running servers.
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 indexing_slicing = "deny"
+
+# Numeric safety (USDC amounts, expiries). `deny`, not `warn`, so a bare local
+# `cargo clippy` agrees with CI's `-D warnings`. Widening casts stay legal.
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_precision_loss = "deny"
+
+# No stray output or scaffolding. The print lints keep stdio out of the
+# libraries and the servers; the decdn-sponsored CLI is a terminal UI and
+# allows both at its crate roots.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+# Code quality
+cognitive_complexity = "warn"
+needless_pass_by_value = "warn"
+missing_const_for_fn = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+trivially_copy_pass_by_ref = "warn"
+unused_self = "warn"
+
+# Pedantic relaxations
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
 
 [workspace.dependencies]
 # Internal crates. The `version` is what makes them publishable: a published

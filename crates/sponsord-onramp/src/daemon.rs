@@ -5,10 +5,14 @@ use async_trait::async_trait;
 use sponsord_api::client::{DaemonClient, DaemonError};
 use sponsord_api::daemon::{Info, IssueRequest, IssueResponse};
 
+/// Something that issues capabilities: [`DaemonClient`] in production, a
+/// fake in tests.
 #[async_trait]
 pub trait CapabilitySource: Send + Sync {
+    /// A capability for `req.signer`: the daemon's `POST /v1/capabilities`.
     async fn issue(&self, req: &IssueRequest) -> Result<IssueResponse, DaemonError>;
 
+    /// The daemon's chain, pool and maximum terms, read once at startup.
     async fn info(&self) -> Result<Info, DaemonError>;
 }
 

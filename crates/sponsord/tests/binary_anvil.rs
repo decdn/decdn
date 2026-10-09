@@ -52,6 +52,10 @@ async fn metrics(base: &str) -> String {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one end-to-end journey, read top to bottom"
+)]
 async fn daemon_binary_serves_tops_up_and_shuts_down() {
     let chain = ChainFixture::launch().await.expect("launch");
 

@@ -18,6 +18,8 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// Count a capability handed out; `registered` if its signer was already
+    /// registered on-chain.
     pub fn issued(&self, registered: bool) {
         let counter = if registered {
             &self.issued_registered
@@ -27,6 +29,7 @@ impl Metrics {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count a request answered with the error `code`.
     pub fn error(&self, code: ErrorCode) {
         let mut errors = self
             .errors

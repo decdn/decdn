@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Unix time in seconds.
 pub trait Clock: Send + Sync {
+    /// The current time, in unix seconds.
     fn now_unix(&self) -> u64;
 }
 
@@ -15,8 +16,7 @@ impl Clock for SystemClock {
     fn now_unix(&self) -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_secs())
     }
 }
 
@@ -25,15 +25,18 @@ impl Clock for SystemClock {
 pub struct FixedClock(AtomicU64);
 
 impl FixedClock {
+    /// A clock reading `now_unix` (unix seconds) until it is moved.
     #[must_use]
-    pub fn new(now_unix: u64) -> Self {
+    pub const fn new(now_unix: u64) -> Self {
         Self(AtomicU64::new(now_unix))
     }
 
+    /// Make the clock read `now_unix` (unix seconds).
     pub fn set(&self, now_unix: u64) {
         self.0.store(now_unix, Ordering::SeqCst);
     }
 
+    /// Move the clock forward by `secs` seconds.
     pub fn advance(&self, secs: u64) {
         self.0.fetch_add(secs, Ordering::SeqCst);
     }

@@ -27,7 +27,8 @@ use crate::gate::{Gate, html_escape};
 use crate::net::ClientIpSource;
 use crate::state::{self, AppState};
 
-pub fn test_info() -> Info {
+/// The [`Info`] every fake daemon reports.
+pub const fn test_info() -> Info {
     Info {
         chain_id: 421_614,
         payment_pool: Address::repeat_byte(0x22),
@@ -36,6 +37,7 @@ pub fn test_info() -> Info {
     }
 }
 
+/// A valid [`OnrampConfig`] with the Turnstile gate and no rate limits.
 pub fn test_config() -> OnrampConfig {
     OnrampConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
@@ -72,16 +74,22 @@ pub fn test_config() -> OnrampConfig {
     }
 }
 
+/// How a [`FakeCapabilitySource`] answers `issue`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceBehavior {
+    /// Issue a fresh `dcap1:FAKE<n>` token.
     Issue,
+    /// Fail with [`DaemonError::SignerExpired`].
     SignerExpired,
+    /// Fail with [`DaemonError::Unavailable`].
     Unavailable,
+    /// Fail with [`DaemonError::Rejected`] (a `401`).
     Rejected,
 }
 
 /// In-memory daemon: hands out `dcap1:FAKE<n>` tokens with the requested
 /// terms (omitted = `test_info()` maximums), or fails as configured.
+#[derive(Debug)]
 pub struct FakeCapabilitySource {
     behavior: SourceBehavior,
     issued: AtomicUsize,
@@ -89,16 +97,19 @@ pub struct FakeCapabilitySource {
 }
 
 impl FakeCapabilitySource {
-    pub fn new(behavior: SourceBehavior) -> Self {
+    /// A fake that answers every `issue` as `behavior` says.
+    pub const fn new(behavior: SourceBehavior) -> Self {
         Self {
             behavior,
             issued: AtomicUsize::new(0),
             last_request: Mutex::new(None),
         }
     }
+    /// Tokens issued so far.
     pub fn issued_count(&self) -> usize {
         self.issued.load(Ordering::SeqCst)
     }
+    /// The last request passed to `issue`, if any.
     pub fn last_request(&self) -> Option<IssueRequest> {
         self.last_request.lock().unwrap().clone()
     }
@@ -137,20 +148,23 @@ impl CapabilitySource for FakeCapabilitySource {
 
 /// A gate that passes or refuses every proof, and records the last client
 /// address it was shown.
+#[derive(Debug)]
 pub struct FakeGate {
     pass: AtomicBool,
     last_ip: Mutex<Option<IpAddr>>,
 }
 
 impl FakeGate {
+    /// A gate that passes every proof if `pass`, else refuses every one.
     #[must_use]
-    pub fn new(pass: bool) -> Self {
+    pub const fn new(pass: bool) -> Self {
         Self {
             pass: AtomicBool::new(pass),
             last_ip: Mutex::new(None),
         }
     }
 
+    /// The client address passed to the last `verify`, if any.
     pub fn last_ip(&self) -> Option<IpAddr> {
         *self.last_ip.lock().unwrap()
     }
@@ -174,9 +188,14 @@ impl Gate for FakeGate {
     }
 }
 
+/// How [`app_state_with_options`] sets up its fakes.
+#[derive(Debug)]
 pub struct FakeOptions {
+    /// Whether the [`FakeGate`] passes every proof.
     pub gate_passes: bool,
+    /// How the [`FakeCapabilitySource`] answers `issue`.
     pub source: SourceBehavior,
+    /// The configuration the state is built from.
     pub config: OnrampConfig,
 }
 
@@ -191,8 +210,11 @@ impl Default for FakeOptions {
 }
 
 /// The fakes behind an [`AppState`], for tests to inspect.
+#[derive(Debug)]
 pub struct Fakes {
+    /// The fake daemon.
     pub source: Arc<FakeCapabilitySource>,
+    /// The fake gate.
     pub gate: Arc<FakeGate>,
 }
 
@@ -211,6 +233,7 @@ pub async fn app_state_with_options(opts: FakeOptions) -> (AppState, Fakes) {
     (state, Fakes { source, gate })
 }
 
+/// An [`AppState`] over the default [`FakeOptions`].
 pub async fn app_state_with_fakes() -> AppState {
     app_state_with_options(FakeOptions::default()).await.0
 }

@@ -15,6 +15,8 @@ use async_trait::async_trait;
 
 pub use turnstile::TurnstileGate;
 
+/// A check a person passes in the browser before the onramp asks the daemon
+/// for a capability.
 #[async_trait]
 pub trait Gate: Send + Sync {
     /// The HTML page for `client`. It must, once its check passes, `POST`

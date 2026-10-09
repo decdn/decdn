@@ -1,3 +1,5 @@
+//! The daemon's HTTP API against a `FakePool`: bearer auth, `/v1/info`,
+//! issuing and its error codes, and `/metrics`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -45,7 +47,7 @@ async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, v)
 }
 
-fn issue_req(auth: Option<&str>, body: Value) -> Request<Body> {
+fn issue_req(auth: Option<&str>, body: &Value) -> Request<Body> {
     let mut b = Request::post("/v1/capabilities").header("content-type", "application/json");
     if let Some(a) = auth {
         b = b.header("authorization", a);
@@ -80,10 +82,10 @@ async fn missing_or_wrong_token_is_401() {
     assert_eq!(v["error"], "unauthorized");
 
     let wrong = format!("Bearer {}", "f".repeat(32));
-    let (s, _) = send(&app, issue_req(Some(&wrong), json!({"signer": SIGNER}))).await;
+    let (s, _) = send(&app, issue_req(Some(&wrong), &json!({"signer": SIGNER}))).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 
-    let (s, _) = send(&app, issue_req(Some(TOKEN), json!({"signer": SIGNER}))).await;
+    let (s, _) = send(&app, issue_req(Some(TOKEN), &json!({"signer": SIGNER}))).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "token without a scheme");
 }
 
@@ -91,7 +93,7 @@ async fn missing_or_wrong_token_is_401() {
 async fn bearer_scheme_is_case_insensitive() {
     let (app, _) = app().await;
     let lower = format!("bearer {TOKEN}");
-    let (s, _) = send(&app, issue_req(Some(&lower), json!({"signer": SIGNER}))).await;
+    let (s, _) = send(&app, issue_req(Some(&lower), &json!({"signer": SIGNER}))).await;
     assert_eq!(s, StatusCode::OK);
 }
 
@@ -124,7 +126,7 @@ async fn info_reports_chain_and_maximums() {
 async fn issue_defaults_to_the_maximum_and_signs_for_the_signer() {
     let (app, pool) = app().await;
     let before = now();
-    let (s, v) = send(&app, issue_req(Some(&bearer()), json!({"signer": SIGNER}))).await;
+    let (s, v) = send(&app, issue_req(Some(&bearer()), &json!({"signer": SIGNER}))).await;
     assert_eq!(s, StatusCode::OK);
     let typed: IssueResponse = serde_json::from_value(v.clone()).unwrap();
     assert!(!typed.registered);
@@ -153,7 +155,7 @@ async fn issue_honours_lower_terms() {
         &app,
         issue_req(
             Some(&bearer()),
-            json!({"signer": SIGNER, "spending_cap": 1_000_000, "ttl_secs": 3_600}),
+            &json!({"signer": SIGNER, "spending_cap": 1_000_000, "ttl_secs": 3_600}),
         ),
     )
     .await;
@@ -170,7 +172,7 @@ async fn above_maximum_is_400_exceeds_max_with_the_maximums() {
         &app,
         issue_req(
             Some(&bearer()),
-            json!({"signer": SIGNER, "spending_cap": 5_000_001}),
+            &json!({"signer": SIGNER, "spending_cap": 5_000_001}),
         ),
     )
     .await;
@@ -186,7 +188,7 @@ async fn zero_terms_are_400_zero() {
     let (app, _) = app().await;
     let (s, v) = send(
         &app,
-        issue_req(Some(&bearer()), json!({"signer": SIGNER, "ttl_secs": 0})),
+        issue_req(Some(&bearer()), &json!({"signer": SIGNER, "ttl_secs": 0})),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
@@ -198,13 +200,17 @@ async fn malformed_requests_are_400_bad_request() {
     let (app, _) = app().await;
     let (s, v) = send(
         &app,
-        issue_req(Some(&bearer()), json!({"signer": "0xnope"})),
+        issue_req(Some(&bearer()), &json!({"signer": "0xnope"})),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert_eq!(v["error"], "bad_request");
 
-    let (s, v) = send(&app, issue_req(Some(&bearer()), json!({"spending_cap": 1}))).await;
+    let (s, v) = send(
+        &app,
+        issue_req(Some(&bearer()), &json!({"spending_cap": 1})),
+    )
+    .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert_eq!(v["error"], "bad_request");
 
@@ -226,7 +232,7 @@ async fn lowercase_and_checksummed_signers_are_both_accepted() {
     let checksummed = Address::repeat_byte(0xab).to_string();
     let lower = checksummed.to_lowercase();
     for signer in [checksummed, lower] {
-        let (s, _) = send(&app, issue_req(Some(&bearer()), json!({"signer": signer}))).await;
+        let (s, _) = send(&app, issue_req(Some(&bearer()), &json!({"signer": signer}))).await;
         assert_eq!(s, StatusCode::OK);
     }
 }
@@ -234,7 +240,7 @@ async fn lowercase_and_checksummed_signers_are_both_accepted() {
 #[tokio::test]
 async fn registered_signer_gets_the_same_token_back() {
     let (app, pool) = app().await;
-    let (_, first) = send(&app, issue_req(Some(&bearer()), json!({"signer": SIGNER}))).await;
+    let (_, first) = send(&app, issue_req(Some(&bearer()), &json!({"signer": SIGNER}))).await;
     pool.register(
         SIGNER.parse().unwrap(),
         Authorization {
@@ -246,7 +252,7 @@ async fn registered_signer_gets_the_same_token_back() {
         &app,
         issue_req(
             Some(&bearer()),
-            json!({"signer": SIGNER, "spending_cap": 1}),
+            &json!({"signer": SIGNER, "spending_cap": 1}),
         ),
     )
     .await;
@@ -266,7 +272,7 @@ async fn expired_registration_is_409_signer_expired() {
             expiry: 1_000,
         },
     );
-    let (s, v) = send(&app, issue_req(Some(&bearer()), json!({"signer": SIGNER}))).await;
+    let (s, v) = send(&app, issue_req(Some(&bearer()), &json!({"signer": SIGNER}))).await;
     assert_eq!(s, StatusCode::CONFLICT);
     assert_eq!(v, json!({"error": "signer_expired", "expiry": 1_000}));
     let typed: ErrorBody = serde_json::from_value(v).unwrap();
@@ -280,7 +286,7 @@ async fn failed_chain_read_is_503() {
     let log = CapturedLog::default();
     let (s, v) = {
         let _guard = log.install();
-        send(&app, issue_req(Some(&bearer()), json!({"signer": SIGNER}))).await
+        send(&app, issue_req(Some(&bearer()), &json!({"signer": SIGNER}))).await
     };
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(v["error"], "chain_unavailable");
@@ -302,18 +308,18 @@ async fn metrics_need_no_token_and_count_issues_errors_and_the_pool() {
         sponsord_core::KeeperConfig {
             low_water: MicroUsdc(20_000_000),
             refill: MicroUsdc(100_000_000),
-            interval: std::time::Duration::from_secs(3600),
+            interval: std::time::Duration::from_hours(1),
         },
         shutdown.clone(),
     ));
     let app = router(ApiState::new(sponsor.clone(), TOKEN.into()));
-    send(&app, issue_req(Some(&bearer()), json!({"signer": SIGNER}))).await;
+    send(&app, issue_req(Some(&bearer()), &json!({"signer": SIGNER}))).await;
     send(
         &app,
-        issue_req(Some(&bearer()), json!({"signer": SIGNER, "ttl_secs": 0})),
+        issue_req(Some(&bearer()), &json!({"signer": SIGNER, "ttl_secs": 0})),
     )
     .await;
-    send(&app, issue_req(None, json!({"signer": SIGNER}))).await;
+    send(&app, issue_req(None, &json!({"signer": SIGNER}))).await;
     // The keeper checks the pool once right away; wait for that check rather
     // than for a fixed time, so a slow machine can't race it.
     tokio::time::timeout(std::time::Duration::from_secs(10), async {

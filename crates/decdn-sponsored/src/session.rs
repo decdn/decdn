@@ -52,6 +52,7 @@ pub struct DecdnDataDir {
 }
 
 impl DecdnDataDir {
+    /// The directory to pass to `decdn --data-dir`.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -59,7 +60,7 @@ impl DecdnDataDir {
 
     /// Whether this is the shared dir rather than the download's own.
     #[must_use]
-    pub fn is_shared(&self) -> bool {
+    pub const fn is_shared(&self) -> bool {
         self.lock.is_some()
     }
 }
@@ -110,16 +111,21 @@ impl Session {
         }
     }
 
+    /// This download's encrypted key (`keystore.json`), for `decdn --keystore`.
     #[must_use]
     pub fn keystore_path(&self) -> PathBuf {
         eth_identity::keystore_path(&self.dir)
     }
 
+    /// The file holding the key's random password, for
+    /// `decdn --keystore-password-file`.
     #[must_use]
     pub fn password_path(&self) -> PathBuf {
         self.dir.join(PASSWORD_FILE)
     }
 
+    /// The file holding the `dcap1:` token issued to this download's key,
+    /// for `decdn --capability-file`.
     #[must_use]
     pub fn capability_path(&self) -> PathBuf {
         self.dir.join(CAPABILITY_FILE)

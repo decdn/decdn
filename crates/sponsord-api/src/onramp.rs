@@ -40,8 +40,10 @@ pub struct ClientQuery {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct FundRequest {
+    /// The download key's address, as in the gate page's `?client=`.
     #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub client: Address,
+    /// The gate's proof; for Turnstile, the widget's response token.
     pub proof: String,
 }
 
@@ -59,6 +61,7 @@ pub struct CapabilityResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Profile {
+    /// EIP-155 id of the chain the contracts are on.
     pub chain_id: u64,
     /// JSON-RPC endpoint `decdn` reads the chain through.
     pub rpc_url: String,

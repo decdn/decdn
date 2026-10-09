@@ -1,3 +1,6 @@
+//! The `sponsord-onramp` binary: loads the `ONRAMP_*` configuration,
+//! connects to the daemon, and serves the onramp with the Turnstile gate.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often expired hand-offs are dropped from memory.
-const SWEEP_EVERY: Duration = Duration::from_secs(300);
+const SWEEP_EVERY: Duration = Duration::from_mins(5);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

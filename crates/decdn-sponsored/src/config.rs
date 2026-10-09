@@ -30,6 +30,7 @@ struct File {
 pub struct Config {
     /// The onramp's public base URL.
     pub onramp_url: String,
+    /// The `decdn` binary to run: a path, or a name looked up on `PATH`.
     pub decdn_bin: String,
     /// Root for per-download state (`<data_dir>/downloads/<hash>/`).
     pub data_dir: PathBuf,

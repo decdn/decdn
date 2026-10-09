@@ -15,6 +15,8 @@ pub const DEFAULT_TEMPLATE: &str = include_str!("../../assets/turnstile.html");
 
 const SITEVERIFY: &str = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 
+/// A [`Gate`] that serves a Cloudflare Turnstile widget and checks its token
+/// with Cloudflare's siteverify API.
 pub struct TurnstileGate {
     secret: Secret,
     sitekey: String,
@@ -22,6 +24,17 @@ pub struct TurnstileGate {
     template: String,
     http: reqwest::Client,
     endpoint: String,
+}
+
+// By hand: the secret stays out, and the template is a whole HTML page.
+impl std::fmt::Debug for TurnstileGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnstileGate")
+            .field("sitekey", &self.sitekey)
+            .field("brand_name", &self.brand_name)
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Deserialize)]

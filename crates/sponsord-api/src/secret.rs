@@ -10,6 +10,7 @@ use zeroize::Zeroizing;
 pub struct Secret(Zeroizing<String>);
 
 impl Secret {
+    /// Wrap `value`; it is wiped from memory when the secret is dropped.
     #[must_use]
     pub fn new(value: String) -> Self {
         Self(Zeroizing::new(value))

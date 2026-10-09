@@ -1,4 +1,4 @@
-//! OpenAPI 3.1 documents for both servers, built from the types in this
+//! `OpenAPI` 3.1 documents for both servers, built from the types in this
 //! crate. The committed copies under `docs/openapi/` are checked against
 //! these by `tests/openapi.rs`; regenerate them with
 //! `UPDATE_OPENAPI=1 cargo test -p sponsord-api --test openapi`.
@@ -6,6 +6,10 @@
 //! The functions below exist only to carry each route's documentation.
 
 #![allow(dead_code)]
+#![expect(
+    clippy::missing_const_for_fn,
+    reason = "the route functions are empty; only `#[utoipa::path]` reads them"
+)]
 
 use utoipa::OpenApi;
 
@@ -61,13 +65,13 @@ struct DaemonDoc;
 )]
 struct OnrampDoc;
 
-/// The daemon's OpenAPI document.
+/// The daemon's `OpenAPI` document.
 #[must_use]
 pub fn daemon() -> utoipa::openapi::OpenApi {
     DaemonDoc::openapi()
 }
 
-/// The onramp's OpenAPI document.
+/// The onramp's `OpenAPI` document.
 #[must_use]
 pub fn onramp() -> utoipa::openapi::OpenApi {
     OnrampDoc::openapi()

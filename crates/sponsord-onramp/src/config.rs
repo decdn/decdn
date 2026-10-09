@@ -1,3 +1,6 @@
+//! Configuration: [`Args`], the `ONRAMP_*` environment variables and flags,
+//! checked and resolved into [`OnrampConfig`] at startup.
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -212,6 +215,8 @@ pub enum GateKind {
 /// The Turnstile gate's settings.
 #[derive(Debug, Clone)]
 pub struct TurnstileConfig {
+    /// Server-side secret for Cloudflare's siteverify call, from
+    /// `ONRAMP_TURNSTILE_SECRET` or `ONRAMP_TURNSTILE_SECRET_FILE`.
     pub secret: Secret,
     /// Letters, digits, `_` and `-` only: it is interpolated into the page.
     pub sitekey: String,
@@ -220,28 +225,46 @@ pub struct TurnstileConfig {
 /// Resolved configuration.
 #[derive(Debug)]
 pub struct OnrampConfig {
+    /// Address the HTTP server listens on (`ONRAMP_BIND`).
     pub bind: SocketAddr,
     /// This onramp's own public base URL, baked into the installers.
     pub public_url: String,
+    /// Base URL of the sponsord daemon (`ONRAMP_DAEMON_URL`).
     pub daemon_url: String,
+    /// Bearer token for the daemon's API, from `ONRAMP_DAEMON_TOKEN` or
+    /// `ONRAMP_DAEMON_TOKEN_FILE`.
     pub daemon_token: Secret,
     /// Public RPC URL handed to end users.
     pub rpc_url: String,
+    /// `CapacityBond` contract address handed to end users for node
+    /// discovery (`ONRAMP_CAPACITY_BOND_ADDR`).
     pub capacity_bond: Address,
+    /// `SlashJudge` contract address handed to `decdn`; `None` leaves it out
+    /// of the profile (`ONRAMP_SLASH_JUDGE_ADDR`).
     pub slash_judge: Option<Address>,
+    /// Oldest `decdn-sponsored` this onramp works with; older CLIs are told
+    /// to re-run the installer. `None` accepts any (`ONRAMP_MIN_CLI_VERSION`).
     pub min_cli_version: Option<semver::Version>,
     /// Cap requested for each capability; `None` takes the daemon maximum.
     pub spending_cap: Option<MicroUsdc>,
     /// TTL requested for each capability; `None` takes the daemon maximum.
     pub ttl_secs: Option<u64>,
+    /// What a person must pass to get a capability (`ONRAMP_GATE`).
     pub gate: GateKind,
+    /// Name shown on the gate page (`ONRAMP_BRAND_NAME`).
     pub brand_name: String,
     /// The gate page template, read at startup; `None` is the built-in one.
     pub gate_template: Option<String>,
     /// Set exactly when `gate` is [`GateKind::Turnstile`].
     pub turnstile: Option<TurnstileConfig>,
+    /// Where the requester's address comes from: the TCP peer, or the
+    /// `ONRAMP_CLIENT_IP_HEADER` a trusted proxy sets.
     pub client_ip: ClientIpSource,
+    /// `POST /v1/fund` requests allowed per client address per minute; 0
+    /// disables the limit (`ONRAMP_FUND_RATE_PER_MIN`).
     pub fund_rate_per_min: u32,
+    /// `GET /v1/capability` polls allowed per client address per minute; 0
+    /// disables the limit (`ONRAMP_POLL_RATE_PER_MIN`).
     pub poll_rate_per_min: u32,
     /// Base URL of the release downloads, without a trailing `/`.
     pub releases_base: String,

@@ -14,6 +14,8 @@ use sponsord_api::{ErrorBody, ErrorCode};
 use crate::net::ClientIp;
 use crate::state::AppState;
 
+/// `GET /fund`: the gate page for `client`, or `400` without a valid
+/// `client` query.
 pub async fn page(
     State(state): State<AppState>,
     query: Result<Query<ClientQuery>, QueryRejection>,
@@ -24,6 +26,9 @@ pub async fn page(
     Html(state.gate.page(client)).into_response()
 }
 
+/// `POST /v1/fund`: check the gate's proof, then hand back the capability
+/// held for the client or one newly issued by the daemon, and hold it for
+/// the polling CLI.
 pub async fn submit(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,

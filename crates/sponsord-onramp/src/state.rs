@@ -1,3 +1,6 @@
+//! [`AppState`], the state every HTTP handler shares, and [`build`], which
+//! assembles it at startup.
+
 use std::sync::Arc;
 
 use sponsord_api::MicroUsdc;
@@ -14,7 +17,9 @@ use crate::net::{ClientIpSource, RateLimiter};
 /// The terms the onramp asks the daemon for; `None` takes its maximum.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RequestedTerms {
+    /// Spending cap per capability (`ONRAMP_SPENDING_CAP_MICRO_USDC`).
     pub spending_cap: Option<MicroUsdc>,
+    /// Lifetime per capability, in seconds (`ONRAMP_TTL_SECS`).
     pub ttl_secs: Option<u64>,
 }
 
@@ -22,18 +27,38 @@ pub struct RequestedTerms {
 /// stay inside the gate and the daemon client.
 #[derive(Clone)]
 pub struct AppState {
+    /// What a person must pass before `POST /v1/fund` issues anything.
     pub gate: Arc<dyn Gate>,
+    /// Where capabilities come from: the sponsord daemon.
     pub daemon: Arc<dyn CapabilitySource>,
+    /// Capabilities issued and waiting for the polling CLI.
     pub grants: Arc<GrantCache>,
+    /// The terms asked of the daemon for every capability.
     pub terms: RequestedTerms,
     /// Served at `GET /v1/profile`; its chain id and `PaymentPool` come from
     /// the daemon's `/v1/info`, read once at startup.
     pub profile: Arc<Profile>,
+    /// The installer scripts, rendered once at startup.
     pub installers: Arc<Installers>,
+    /// The time source for rate limits and hand-off expiry.
     pub clock: Arc<dyn Clock>,
+    /// Where the requester's address comes from.
     pub client_ip: ClientIpSource,
+    /// Per-address limit on `POST /v1/fund`.
     pub fund_limit: Arc<RateLimiter>,
+    /// Per-address limit on `GET /v1/capability`.
     pub poll_limit: Arc<RateLimiter>,
+}
+
+// By hand: the gate, the daemon client and the clock are trait objects.
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("terms", &self.terms)
+            .field("profile", &self.profile)
+            .field("client_ip", &self.client_ip)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Assemble `AppState`: read the daemon's `/v1/info`, refuse configured

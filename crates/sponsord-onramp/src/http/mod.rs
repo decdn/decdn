@@ -15,6 +15,7 @@ use sponsord_api::onramp::{Profile, routes};
 
 use crate::state::AppState;
 
+/// The onramp's routes over `state`.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route(routes::HEALTHZ, get(healthz))

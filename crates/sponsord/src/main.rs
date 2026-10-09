@@ -1,3 +1,6 @@
+//! The `sponsord` daemon: loads the treasury key, checks it owns the pool,
+//! then serves the HTTP API and runs the pool keeper until Ctrl-C or SIGTERM.
+
 use std::sync::Arc;
 
 use sponsord::config::DaemonConfig;
@@ -11,6 +14,10 @@ use tokio_util::sync::CancellationToken;
 /// path or query often holds an API key, from its errors; this is the
 /// backstop for any other error that names it (#38).
 #[tokio::main]
+#[expect(
+    clippy::print_stderr,
+    reason = "process exit boundary: the final error line, before or after tracing"
+)]
 async fn main() -> std::process::ExitCode {
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,

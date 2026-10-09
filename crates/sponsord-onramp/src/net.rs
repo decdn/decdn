@@ -59,12 +59,13 @@ impl FromRequestParts<AppState> for ClientIp {
 
 /// A fixed-window limit of `per_minute` requests per IP address. A limit of
 /// 0 disables it; a request with no known address is never limited.
+#[derive(Debug)]
 pub struct RateLimiter {
     per_minute: u32,
     windows: Mutex<Windows>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Windows {
     /// Per address: the minute counted, and the requests in it.
     counts: HashMap<IpAddr, (u64, u32)>,
@@ -77,6 +78,7 @@ struct Windows {
 const SWEEP_AT: usize = 10_000;
 
 impl RateLimiter {
+    /// A limiter allowing `per_minute` requests per address; 0 allows all.
     #[must_use]
     pub fn new(per_minute: u32) -> Self {
         Self {
@@ -131,14 +133,15 @@ mod tests {
     fn a_full_map_is_swept_once_per_minute() {
         let limiter = RateLimiter::new(5);
         let ip = |n: u32| Some(IpAddr::from(n.to_be_bytes()));
-        for n in 0..SWEEP_AT as u32 {
+        let sweep_at = u32::try_from(SWEEP_AT).unwrap();
+        for n in 0..sweep_at {
             assert!(limiter.allow(ip(n), 60));
         }
         // A new minute: the first request sweeps the stale windows...
         assert!(limiter.allow(ip(u32::MAX), 120));
         assert_eq!(limiter.windows.lock().unwrap().counts.len(), 1);
         // ...and refilling the map within that minute sweeps nothing more.
-        for n in 0..SWEEP_AT as u32 {
+        for n in 0..sweep_at {
             assert!(limiter.allow(ip(n), 121));
         }
         assert_eq!(limiter.windows.lock().unwrap().swept, 2);

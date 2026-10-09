@@ -1,6 +1,9 @@
 //! `decdn-sponsored`: download a content-addressed bundle through the
 //! sponsord onramp, with no wallet. See `pull::pull`.
 
+// Terminal UI, like the library: errors go to stderr.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::process::ExitCode;

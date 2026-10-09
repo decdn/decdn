@@ -1,3 +1,6 @@
+//! `state::build` at startup: daemon info, term bounds, and an unreachable
+//! daemon.
+
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
