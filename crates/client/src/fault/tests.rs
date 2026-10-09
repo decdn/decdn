@@ -241,3 +241,21 @@ fn unanimous_stops_are_fatal_with_their_scope() {
     let absent = anyhow::Error::new(crate::source_set::NoSourceHasBlob);
     assert_eq!(classify(&absent), Fault::Fatal(FatalScope::Item));
 }
+
+/// `classify` reads the markers in a fixed order, and the order is the
+/// meaning when an error carries more than one: a local fault outranks any
+/// node's refusal, a heal past the resume budget outranks the funding reason
+/// of the rejection it carries, and a voucher rejection's reason outranks the
+/// refusal class around it.
+#[test]
+fn stacked_markers_classify_in_a_fixed_order() {
+    let local = refusal(StreamError::Unfunded).context(LocalPullFault);
+    assert_eq!(classify(&local), Fault::Fatal(FatalScope::Command));
+
+    let healed = rejected(VoucherRejectReason::SpendingCapExhausted).context(HealExhausted);
+    assert_eq!(classify(&healed), Fault::Source);
+
+    let funding_inside_a_decline = rejected(VoucherRejectReason::SignerCapExhausted)
+        .context(UpstreamRefused::mid_stream(StreamError::Declined));
+    assert_eq!(classify(&funding_inside_a_decline), Fault::Unaffordable);
+}
