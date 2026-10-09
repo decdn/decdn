@@ -540,9 +540,12 @@ normally, so nothing else alerts. `DecdnNodePullNeverSucceeds` fires after 6h.
 The node pulls from peers only with `cache.node_to_node_pull_through_enabled =
 true`, which is off by default. With it off, the node never opens a buyer pool
 or spends USDC on pulls, and the symptoms above do not apply. The buyer service
-still starts: it sends its startup USDC `approve`
-(`blockchain.buyer_max_approve`), publishes `decdn_buyer_wallet_usdc`, and runs
-the reclaim sweep for any pool it already owns. A paid miss fills from the
+still starts. With `blockchain.buyer_max_approve = true` (the default), it gives
+the `PaymentPool` an unlimited USDC allowance at startup, sending the `approve`
+only when the current allowance is lower; that standing authorization stays in
+place with pull-through off. Set it to `false` to manage the allowance yourself.
+The service also publishes `decdn_buyer_wallet_usdc` and runs the reclaim sweep
+for any pool it already owns. A paid miss fills from the
 node's own origin backend; a node without one returns not-found.
 
 The node's buyer leg is the one part of it that *spends*. It opens one
