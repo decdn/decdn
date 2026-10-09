@@ -2,13 +2,13 @@
 //! Discovery), mirrored into an iroh [`MemoryLookup`] that the runtime registers
 //! on the node's endpoint.
 //!
-//! A node publishes only its relay URL through pkarr, so a dial by bare
-//! `NodeId` learns no IP address from pkarr and opens over the relay. The
-//! `CapacityBond` registry watcher keeps this directory in step with each
+//! The `CapacityBond` registry watcher keeps this directory in step with each
 //! node's on-chain `multiaddrs`. With its lookup on the endpoint, every
 //! `EndpointAddr::new(node_id)` dial (DHT RPCs, upstream probes and pulls,
-//! waiver requests) resolves the registry addresses and connects directly when
-//! the node is reachable.
+//! waiver requests) resolves the registry addresses at once, alongside the
+//! pkarr lookup that supplies the peer's home relay URL and the public IPs it
+//! publishes (`node_publish_filter`). iroh sends the handshake to every known
+//! path and keeps the direct path when the node is reachable.
 //!
 //! The addresses are self-attested and additive. A stale or wrong address
 //! loses the path race to the relay, and the QUIC handshake authenticates the
