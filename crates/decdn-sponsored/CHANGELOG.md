@@ -15,6 +15,8 @@ release.
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-10-09
+
 ### Changed
 
 - **decdn v0.0.1.** The decdn crates are locked at decdn's `v0.0.1` release
