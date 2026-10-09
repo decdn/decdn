@@ -179,7 +179,7 @@ blake3 = "1"
 
 # Source parsing for the workspace guard that keeps every unit-test module in
 # its own file (`crates/e2e/tests/no_inline_test_modules.rs`, #2352).
-syn = { version = "2", default-features = false, features = ["full", "parsing", "visit"] }
+syn = { version = "3", default-features = false, features = ["full", "parsing", "visit"] }
 
 # Content-defined chunking (`decdn origin import --optimize`): fastcdc's
 # v2020 module implements the rolling-hash chunk-boundary algorithm and
