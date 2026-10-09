@@ -24,7 +24,7 @@ use super::{Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeReques
 use crate::error::OriginPullError;
 
 /// Sibling-key suffix for the published pre-order bao outboard (`{H}.obao4`),
-/// per [ADR 037 §Origin-tier pull-through](../../../adr/037-regional-proxy-warming.md).
+/// per [ADR 037 §Origin-tier pull-through](https://github.com/decdn/decdn/blob/main/adr/037-regional-proxy-warming.md).
 /// Re-exported from [`decdn_bao_range`] — the shared layout contract every
 /// origin reader (filesystem / S3) and the `decdn origin import` writer derive
 /// the sibling key from, so an operator `aws s3 sync`-ing between backends keeps
@@ -87,7 +87,7 @@ impl FilesystemOrigin {
     }
 
     /// Build the sibling outboard path: `{base}/{hex[0..2]}/{hex}.obao4`
-    /// ([ADR 037 §Origin-tier pull-through](../../../adr/037-regional-proxy-warming.md)).
+    /// ([ADR 037 §Origin-tier pull-through](https://github.com/decdn/decdn/blob/main/adr/037-regional-proxy-warming.md)).
     /// Sits next to the data object so a pre-seed `cp`/`sync` carries both.
     fn obao4_path_for(&self, hash: Hash) -> PathBuf {
         let hex = hash.to_hex();

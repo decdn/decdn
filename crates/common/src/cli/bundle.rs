@@ -4,7 +4,7 @@
 //! BLAKE3-content-addressed blobs into a single JSON manifest file. The
 //! manifest itself is also a blob (BLAKE3-hashed), so origins can publish
 //! a single bundle hash and clients fetch the bundle then everything it
-//! references. See [`appendix-bundles`](../../../adr/appendix-bundles.md)
+//! references. See [`appendix-bundles`](https://github.com/decdn/decdn/blob/main/adr/appendix-bundles.md)
 //! for the on-disk schema, hash format (`b3:<hex>`), path-safety rules,
 //! and the determinism requirement that makes bundle-as-blob distribution
 //! viable.

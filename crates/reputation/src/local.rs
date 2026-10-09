@@ -118,7 +118,7 @@ pub enum Outcome {
     /// Peer self-attested *this node's own* region yet the observed probe
     /// latency exceeded the ADR 030 ceiling — the canonical region-spoofing
     /// signal
-    /// ([ADR 030 §Soft mitigation](../../../adr/030-node-region-self-attestation.md)).
+    /// ([ADR 030 §Soft mitigation](https://github.com/decdn/decdn/blob/main/adr/030-node-region-self-attestation.md)).
     /// Scored as a fully negative sample (like [`Outcome::Unreachable`]); it is a
     /// local-only observation.
     RegionLatencyMismatch,

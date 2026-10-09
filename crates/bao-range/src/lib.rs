@@ -3,8 +3,8 @@
 //! (client receive). Depends only on `bao-tree`, so linking it from the CLI's
 //! pull path keeps the iroh-blobs-free invariant (#578).
 //!
-//! [ADR 037 §Origin-tier pull-through](../../../adr/037-regional-proxy-warming.md),
-//! [ADR 038 §Wire format](../../../adr/038-bao-verified-range-streaming.md).
+//! [ADR 037 §Origin-tier pull-through](https://github.com/decdn/decdn/blob/main/adr/037-regional-proxy-warming.md),
+//! [ADR 038 §Wire format](https://github.com/decdn/decdn/blob/main/adr/038-bao-verified-range-streaming.md).
 //!
 //! An opaque origin backend (S3/R2/B2/HTTP/fs) serves raw bytes by hash with no
 //! bao tree, so a node that wants only a byte range `[a, b)` of a large blob
@@ -59,7 +59,7 @@ pub const CHUNK_GROUP_BYTES: u64 = 1u64 << (IROH_BLOCK_SIZE.chunk_log() + 10);
 /// Exact byte length of the **header-less** bao interleaved encoding a serving
 /// node emits for `chunk_ranges` of a `total_bytes`-byte blob — the sum of every
 /// proof node (64 bytes each) and data leaf (≤ chunk-group bytes) in response
-/// (pre-order) order ([ADR 038 §Wire format](../../../adr/038-bao-verified-range-streaming.md)).
+/// (pre-order) order ([ADR 038 §Wire format](https://github.com/decdn/decdn/blob/main/adr/038-bao-verified-range-streaming.md)).
 ///
 /// This is the byte count that travels on `cdn/client/v1`: the wire carries the
 /// response-format stream (no 8-byte size header — `total_bytes` is already the

@@ -13,7 +13,7 @@
 //! [`PoolStateStore`] and records the post-acceptance state to it before
 //! advancing in-memory fields or returning `Ok`; the store makes that record
 //! durable on its own flush cadence — see
-//! [ADR 003 §Off-chain voucher state persistence](../../../adr/003-payments.md)
+//! [ADR 003 §Off-chain voucher state persistence](https://github.com/decdn/decdn/blob/main/adr/003-payments.md)
 //! and [`crate::store`].
 
 use alloy::dyn_abi::Eip712Domain;

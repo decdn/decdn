@@ -1763,7 +1763,7 @@ impl ChainFixture {
     ///
     /// Returns the minted `slashId`. An `Err` here is the *whole point* for the
     /// negative cases: a challenge that fails verification reverts, and per
-    /// [ADR 014 § Bond Handling](../../../adr/014-on-chain-verification.md) the
+    /// [ADR 014 § Bond Handling](https://github.com/decdn/decdn/blob/main/adr/014-on-chain-verification.md) the
     /// bond is never transferred on a failed verification — assert the
     /// challenger's TOKEN balance directly.
     ///

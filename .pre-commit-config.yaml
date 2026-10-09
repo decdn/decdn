@@ -125,6 +125,16 @@ repos:
         language: pygrep
         types: [rust]
 
+      # Rustdoc resolves a relative link against the rendered page, so a link
+      # to a repo file breaks on docs.rs. Doc links to repo files are absolute
+      # GitHub URLs. The `packaging` CI job is authoritative.
+      - id: doc-links
+        name: crate doc comments link to repo files by absolute URL
+        entry: .github/scripts/check-doc-links.sh
+        language: system
+        files: '^(crates/.*\.rs|\.github/scripts/check-doc-links\.sh)$'
+        pass_filenames: false
+
       # Cargo enforces acyclicity only. The dependency flow in CLAUDE.md
       # § Crate Structure (three leaves, cli/e2e as sinks, an iroh-blobs-free
       # CLI and client SDK) is held by the table in check_crate_edges.py. Needs cargo. The

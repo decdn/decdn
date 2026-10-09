@@ -217,7 +217,7 @@ impl OriginFetch {
 }
 
 /// Result of an [`Origin::fetch_range_data`] call ([ADR 037 §Origin-tier
-/// pull-through](../../../adr/037-regional-proxy-warming.md), #823).
+/// pull-through](https://github.com/decdn/decdn/blob/main/adr/037-regional-proxy-warming.md), #823).
 ///
 /// A range-scoped origin pull fetches the small sibling `{H}.obao4` outboard
 /// once ([`Origin::fetch_outboard`]), then fetches the requested byte span in
@@ -361,7 +361,7 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
 
     /// Fetch the chunk-group-aligned byte span `req` of the blob `hash`, for a
     /// range-scoped pull
-    /// ([ADR 037 §Origin-tier pull-through](../../../adr/037-regional-proxy-warming.md),
+    /// ([ADR 037 §Origin-tier pull-through](https://github.com/decdn/decdn/blob/main/adr/037-regional-proxy-warming.md),
     /// #823). Each call covers at most [`crate::RANGE_PULL_WINDOW_BYTES`]; a
     /// longer span takes several calls, in order. The engine fetches the
     /// sibling `{H}.obao4` outboard separately through [`Self::fetch_outboard`].
