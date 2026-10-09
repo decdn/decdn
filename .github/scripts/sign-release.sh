@@ -11,8 +11,11 @@
 #
 # Environment:
 #   DECDN_REPO            override the owner/repo (default: decdn/decdn)
-#   DECDN_SIGNING_KEY     key to sign with (default: gpg's default secret key).
-#                         Whatever it resolves to must be published in KEYS.
+#   DECDN_SIGNING_KEY     key to sign with. Unset, the script uses the one
+#                         secret key with an @decdn.org uid that is published
+#                         in KEYS, else the first secret key gpg lists; two
+#                         such @decdn.org keys stop the script. Whatever it
+#                         resolves to must be published in KEYS.
 #   DECDN_SKIP_IMAGE_TAGS set to 1 to publish without creating ANY pullable
 #                         image tag — the release then ships with only the
 #                         signed digest in image-digest.txt
@@ -108,37 +111,13 @@ if [[ -z "$SKIP_IMAGE_TAGS" ]]; then
   fi
 fi
 
-# Resolve the signing key to a full fingerprint. `gpg --list-secret-keys` with
-# NO argument exits 0 even on a completely empty keyring, so testing its exit
-# status proves nothing — extracting a fingerprint is the real check.
-#
-# Only the `fpr` following a `sec` record is taken: gpg emits one per subkey
-# too, and a signing subkey would otherwise be mistaken for a second key.
-mapfile -t SECRET_FPRS < <(
-  gpg --list-secret-keys --with-colons ${SIGNING_KEY:+"$SIGNING_KEY"} 2>/dev/null |
-    awk -F: '/^sec:/ {want = 1} /^fpr:/ && want {print $10; want = 0}'
-)
-# shellcheck disable=SC2016  # the quotes are inside a double-quoted ${:+}, so it does expand
-(( ${#SECRET_FPRS[@]} > 0 )) ||
-  die "no usable gpg secret key${SIGNING_KEY:+ matching '$SIGNING_KEY'}"
-
-# gpg substring-matches uids, so a loose DECDN_SIGNING_KEY can select more than
-# one key. Taking the first silently signs the release with a key the operator
-# did not name — which the KEYS check below would not catch, since it only
-# asks whether the key is *a* published maintainer key.
-if [[ -n "$SIGNING_KEY" ]] && (( ${#SECRET_FPRS[@]} > 1 )); then
-  die "DECDN_SIGNING_KEY '$SIGNING_KEY' is ambiguous — it matches ${#SECRET_FPRS[@]} secret keys:
-$(printf '  %s\n' "${SECRET_FPRS[@]}")
-Use a full fingerprint."
-fi
-FPR="${SECRET_FPRS[0]}"
-
-# A gpg home containing ONLY the published maintainer keys. Both the tag
-# signature and the signatures produced below are verified against this rather
-# than the personal keyring: verifying against your own keyring only proves you
-# can read a signature you already trust, which was never in doubt. This is the
-# question consumers will actually ask. It is a full home rather than a bare
-# keyring file so `git verify-tag` can use it via GNUPGHOME.
+# A gpg home containing ONLY the published maintainer keys. Key selection reads
+# it, and both the tag signature and the signatures produced below are verified
+# against it rather than the personal keyring: verifying against your own
+# keyring only proves you can read a signature you already trust, which was
+# never in doubt. This is the question consumers will actually ask. It is a full
+# home rather than a bare keyring file so `git verify-tag` can use it via
+# GNUPGHOME.
 KEYS_HOME=$(mktemp -d)
 chmod 700 "$KEYS_HOME"
 # Single EXIT trap for the whole script — a second `trap ... EXIT` later would
@@ -162,13 +141,104 @@ trap cleanup EXIT
 gpg --homedir "$KEYS_HOME" --import "$KEYS_FILE" >/dev/null 2>&1 ||
   die "KEYS is not a valid OpenPGP keyring"
 
+# Reads a `gpg --with-colons` key listing on stdin and prints the primary-key
+# fingerprint of each key. Only the `fpr` following a `sec`/`pub` record is
+# taken: gpg emits one per subkey too, and a signing subkey would otherwise be
+# mistaken for a second key.
+primary_fprs() {
+  awk -F: '/^(sec|pub):/ {want = 1} /^fpr:/ && want {print $10; want = 0}'
+}
+
+# Like primary_fprs, but prints only keys that carry a live uid whose email is
+# exactly `…@decdn.org`. The email is the text inside the uid's last `<…>`, or
+# the whole uid when it is a bare address, and the domain match is anchored, so
+# `decdn.org.example` and `notdecdn.org` do not qualify. A revoked or expired
+# key (field 2 `r`/`e` on `sec`) or uid (the same on `uid`) does not count.
+decdn_org_fprs() {
+  awk -F: '
+    function flush() { if (fpr != "" && hit) print fpr }
+    /^sec:/ {
+      flush(); fpr = ""; hit = 0; want = 1
+      live = ($2 != "r" && $2 != "e")
+      next
+    }
+    /^fpr:/ && want { fpr = $10; want = 0; next }
+    /^uid:/ && live && $2 != "r" && $2 != "e" {
+      email = tolower($10)
+      if (match(email, /<[^<>]*>$/)) email = substr(email, RSTART + 1, RLENGTH - 2)
+      if (email ~ /^[^@]+@decdn\.org$/) hit = 1
+    }
+    END { flush() }
+  '
+}
+
+# Resolve the signing key to a full fingerprint, in this order:
+#   1. DECDN_SIGNING_KEY, when set.
+#   2. The one secret key with a live @decdn.org uid that is published in KEYS.
+#      A maintainer keyring usually holds a personal key as well, and that key
+#      can sort first, so the published project key wins over keyring order.
+#   3. The first secret key gpg lists — what gpg itself signs with when gpg.conf
+#      names no default-key. The KEYS check below still rejects it if it is not
+#      published.
+#
+# `gpg --list-secret-keys` with NO argument exits 0 even on a completely empty
+# keyring, so testing its exit status proves nothing — extracting a fingerprint
+# is the real check.
+if [[ -n "$SIGNING_KEY" ]]; then
+  mapfile -t SECRET_FPRS < <(
+    gpg --list-secret-keys --with-colons "$SIGNING_KEY" 2>/dev/null | primary_fprs
+  )
+  (( ${#SECRET_FPRS[@]} > 0 )) ||
+    die "no usable gpg secret key matching '$SIGNING_KEY'"
+
+  # gpg substring-matches uids, so a loose DECDN_SIGNING_KEY can select more
+  # than one key. Taking the first silently signs the release with a key the
+  # operator did not name — which the KEYS check below would not catch, since
+  # it only asks whether the key is *a* published maintainer key.
+  (( ${#SECRET_FPRS[@]} == 1 )) ||
+    die "DECDN_SIGNING_KEY '$SIGNING_KEY' is ambiguous — it matches ${#SECRET_FPRS[@]} secret keys:
+$(printf '  %s\n' "${SECRET_FPRS[@]}")
+Use a full fingerprint."
+  FPR="${SECRET_FPRS[0]}"
+  KEY_SOURCE="DECDN_SIGNING_KEY"
+else
+  declare -A PUBLISHED=()
+  while read -r f; do
+    PUBLISHED[$f]=1
+  done < <(gpg --homedir "$KEYS_HOME" --list-keys --with-colons 2>/dev/null | primary_fprs)
+
+  DECDN_FPRS=()
+  while read -r f; do
+    if [[ -n "${PUBLISHED[$f]:-}" ]]; then
+      DECDN_FPRS+=("$f")
+    fi
+  done < <(gpg --list-secret-keys --with-colons 2>/dev/null | decdn_org_fprs)
+
+  # Taking the first of several would be a guess about which maintainer is
+  # signing, decided by keyring order.
+  (( ${#DECDN_FPRS[@]} <= 1 )) ||
+    die "found ${#DECDN_FPRS[@]} @decdn.org secret keys published in KEYS:
+$(printf '  %s\n' "${DECDN_FPRS[@]}")
+Set DECDN_SIGNING_KEY to the full fingerprint of the one to sign with."
+
+  if (( ${#DECDN_FPRS[@]} == 1 )); then
+    FPR="${DECDN_FPRS[0]}"
+    KEY_SOURCE="decdn.org key from KEYS"
+  else
+    mapfile -t SECRET_FPRS < <(gpg --list-secret-keys --with-colons 2>/dev/null | primary_fprs)
+    (( ${#SECRET_FPRS[@]} > 0 )) || die "no usable gpg secret key"
+    FPR="${SECRET_FPRS[0]}"
+    KEY_SOURCE="first secret key in the keyring"
+  fi
+fi
+
 gpg --homedir "$KEYS_HOME" --list-keys "$FPR" >/dev/null 2>&1 || die \
   "signing key $FPR is not published in KEYS.
 Consumers follow SECURITY.md and would reject this signature. Add your public
 key to KEYS first (RELEASING.md § One-time setup), or point DECDN_SIGNING_KEY
 at a key that is already there."
 
-echo "==> Signing as $FPR"
+echo "==> Signing as $FPR ($KEY_SOURCE)"
 
 # The local tag must match origin's. `git fetch --tags` does NOT update a tag
 # that already exists locally, so without --force a stale or re-cut local tag

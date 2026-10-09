@@ -2767,6 +2767,16 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **Release: `sign-release.sh` signs with your `@decdn.org` key from `KEYS`
+  by default (#2391).** With `DECDN_SIGNING_KEY` unset, the script picks the
+  one secret key that has a live `@decdn.org` uid and is published in `KEYS`.
+  Two such keys stop the script with both fingerprints listed. With none, it
+  falls back to the first secret key gpg lists, as before, and the KEYS check
+  still rejects an unpublished key. `DECDN_SIGNING_KEY` keeps priority, and
+  `==> Signing as` names the rule that chose the key.
+  - Why: a maintainer keyring usually holds a personal key too. When that key
+    sorted first, the script picked it and died at the KEYS check, so every
+    run needed `DECDN_SIGNING_KEY` set by hand.
 - **Toolchain: Rust 1.99.0 is the pinned toolchain and the MSRV (#2378).**
   `rust-toolchain.toml`, `rust-version` and every `dtolnay/rust-toolchain`
   step move from 1.95.0 together. Rust 1.97 makes v0 symbol mangling the
