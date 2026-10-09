@@ -12,9 +12,10 @@
 # Environment:
 #   DECDN_REPO            override the owner/repo (default: decdn/decdn)
 #   DECDN_SIGNING_KEY     key to sign with. Unset, the script uses the one
-#                         secret key with an @decdn.org uid that is published
-#                         in KEYS, else the first secret key gpg lists; two
-#                         such @decdn.org keys stop the script. Whatever it
+#                         secret key with a live @decdn.org uid that is
+#                         published in KEYS, else the one secret key published
+#                         in KEYS; two or more candidates stop the script.
+#                         gpg.conf's default-key is not read. Whatever it
 #                         resolves to must be published in KEYS.
 #   DECDN_SKIP_IMAGE_TAGS set to 1 to publish without creating ANY pullable
 #                         image tag — the release then ships with only the
@@ -112,12 +113,12 @@ if [[ -z "$SKIP_IMAGE_TAGS" ]]; then
 fi
 
 # A gpg home containing ONLY the published maintainer keys. Key selection reads
-# it, and both the tag signature and the signatures produced below are verified
-# against it rather than the personal keyring: verifying against your own
-# keyring only proves you can read a signature you already trust, which was
-# never in doubt. This is the question consumers will actually ask. It is a full
-# home rather than a bare keyring file so `git verify-tag` can use it via
-# GNUPGHOME.
+# it to learn which keys are published, and both the tag signature and the
+# signatures produced below are verified against it rather than the personal
+# keyring: verifying against your own keyring only proves you can read a
+# signature you already trust, which was never in doubt. This is the question
+# consumers will actually ask. It is a full home rather than a bare keyring file
+# so `git verify-tag` can use it via GNUPGHOME.
 KEYS_HOME=$(mktemp -d)
 chmod 700 "$KEYS_HOME"
 # Single EXIT trap for the whole script — a second `trap ... EXIT` later would
@@ -141,55 +142,86 @@ trap cleanup EXIT
 gpg --homedir "$KEYS_HOME" --import "$KEYS_FILE" >/dev/null 2>&1 ||
   die "KEYS is not a valid OpenPGP keyring"
 
+# gpg's stderr from the key listings below, shown when one fails. It lives in
+# KEYS_HOME so the EXIT trap removes it.
+GPG_ERR="$KEYS_HOME/list.err"
+
 # Reads a `gpg --with-colons` key listing on stdin and prints the primary-key
-# fingerprint of each key. Only the `fpr` following a `sec`/`pub` record is
-# taken: gpg emits one per subkey too, and a signing subkey would otherwise be
-# mistaken for a second key.
+# fingerprint of each key. Only the `fpr` right after a `sec`/`pub` record is
+# taken: gpg emits one per subkey too, and a subkey would otherwise be mistaken
+# for a second key.
 primary_fprs() {
-  awk -F: '/^(sec|pub):/ {want = 1} /^fpr:/ && want {print $10; want = 0}'
+  awk -F: '/^(sec|pub):/ {want = 1} /^fpr:/ && want {if ($10 != "") print $10; want = 0}'
 }
 
-# Like primary_fprs, but prints only keys that carry a live uid whose email is
-# exactly `…@decdn.org`. The email is the text inside the uid's last `<…>`, or
-# the whole uid when it is a bare address, and the domain match is anchored, so
-# `decdn.org.example` and `notdecdn.org` do not qualify. A revoked or expired
-# key (field 2 `r`/`e` on `sec`) or uid (the same on `uid`) does not count.
-decdn_org_fprs() {
-  awk -F: '
-    function flush() { if (fpr != "" && hit) print fpr }
-    /^sec:/ {
+# Like primary_fprs, but prints only keys that can sign today: field 2 is not
+# `r`/`e`/`i`/`d` (revoked, expired, invalid, disabled) and field 12 holds `S`,
+# which gpg sets only while some part of the key is able to sign.
+#
+# With the argument `decdn`, a key must also carry a uid that is not revoked or
+# expired and whose email is a @decdn.org address. When the uid ends in `<…>`,
+# the email is the text inside it; otherwise the whole uid is the email. Either
+# way it must be one address with nothing around it, matched case-insensitively
+# and anchored at both ends, so `decdn.org.example`, `notdecdn.org`,
+# `eu.decdn.org` and `Name me@decdn.org` do not qualify.
+signing_fprs() {
+  awk -F: -v decdn="${1:-}" '
+    function flush() { if (fpr != "" && (hit || !decdn)) print fpr }
+    /^(sec|pub):/ {
       flush(); fpr = ""; hit = 0; want = 1
-      live = ($2 != "r" && $2 != "e")
+      usable = ($2 !~ /^[reid]$/ && $12 ~ /S/)
       next
     }
-    /^fpr:/ && want { fpr = $10; want = 0; next }
-    /^uid:/ && live && $2 != "r" && $2 != "e" {
+    /^fpr:/ && want { if (usable) fpr = $10; want = 0; next }
+    /^uid:/ && $2 !~ /^[re]$/ {
       email = tolower($10)
       if (match(email, /<[^<>]*>$/)) email = substr(email, RSTART + 1, RLENGTH - 2)
-      if (email ~ /^[^@]+@decdn\.org$/) hit = 1
+      if (email ~ /^[^@<> \t]+@decdn\.org$/) hit = 1
     }
     END { flush() }
   '
 }
 
+# Every key KEYS publishes that can sign today. A key that KEYS marks revoked or
+# expired is left out even when the local copy still looks live: consumers
+# import KEYS, so its view of the key is the one that counts.
+KEYS_LISTING=$(gpg --homedir "$KEYS_HOME" --list-keys --with-colons 2>"$GPG_ERR") ||
+  die "gpg could not list the keys in KEYS:
+$(<"$GPG_ERR")"
+declare -A PUBLISHED=()
+while read -r f; do
+  PUBLISHED[$f]=1
+done < <(signing_fprs <<<"$KEYS_LISTING")
+
+# Reads fingerprints on stdin and prints those that are in PUBLISHED.
+published_only() {
+  local f
+  while read -r f; do
+    if [[ -n "${PUBLISHED[$f]:-}" ]]; then
+      printf '%s\n' "$f"
+    fi
+  done
+}
+
 # Resolve the signing key to a full fingerprint, in this order:
 #   1. DECDN_SIGNING_KEY, when set.
-#   2. The one secret key with a live @decdn.org uid that is published in KEYS.
-#      A maintainer keyring usually holds a personal key as well, and that key
-#      can sort first, so the published project key wins over keyring order.
-#   3. The first secret key gpg lists — what gpg itself signs with when gpg.conf
-#      names no default-key. The KEYS check below still rejects it if it is not
-#      published.
-#
-# `gpg --list-secret-keys` with NO argument exits 0 even on a completely empty
-# keyring, so testing its exit status proves nothing — extracting a fingerprint
-# is the real check.
+#   2. The one secret key that can sign, has a live @decdn.org uid and is
+#      published in KEYS. A maintainer keyring usually holds a personal key as
+#      well, so this rule keeps keyring order out of the choice.
+#   3. The one secret key that can sign and is published in KEYS, whatever its
+#      uids.
+# Two or more candidates at step 2 or 3 stop the script. Taking the first would
+# guess which published key to sign with, by keyring order. gpg.conf's
+# default-key is not read: DECDN_SIGNING_KEY is how to name a key.
 if [[ -n "$SIGNING_KEY" ]]; then
-  mapfile -t SECRET_FPRS < <(
-    gpg --list-secret-keys --with-colons "$SIGNING_KEY" 2>/dev/null | primary_fprs
-  )
+  SECRET_LISTING=$(gpg --list-secret-keys --with-colons "$SIGNING_KEY" 2>"$GPG_ERR") ||
+    die "no gpg secret key matches DECDN_SIGNING_KEY '$SIGNING_KEY':
+$(<"$GPG_ERR")"
+  # Every match counts here, usable or not: the question is which key the
+  # operator named, and an unusable one fails the KEYS check below instead.
+  mapfile -t SECRET_FPRS < <(primary_fprs <<<"$SECRET_LISTING")
   (( ${#SECRET_FPRS[@]} > 0 )) ||
-    die "no usable gpg secret key matching '$SIGNING_KEY'"
+    die "no gpg secret key matches DECDN_SIGNING_KEY '$SIGNING_KEY'"
 
   # gpg substring-matches uids, so a loose DECDN_SIGNING_KEY can select more
   # than one key. Taking the first silently signs the release with a key the
@@ -202,20 +234,16 @@ Use a full fingerprint."
   FPR="${SECRET_FPRS[0]}"
   KEY_SOURCE="DECDN_SIGNING_KEY"
 else
-  declare -A PUBLISHED=()
-  while read -r f; do
-    PUBLISHED[$f]=1
-  done < <(gpg --homedir "$KEYS_HOME" --list-keys --with-colons 2>/dev/null | primary_fprs)
+  # With no argument, gpg exits 0 and prints nothing on an empty keyring, and
+  # also when gpg-agent is not running. The exit status only catches gpg itself
+  # failing, so an empty listing is checked on its own.
+  SECRET_LISTING=$(gpg --list-secret-keys --with-colons 2>"$GPG_ERR") ||
+    die "gpg could not list your secret keys:
+$(<"$GPG_ERR")"
+  [[ -n "$SECRET_LISTING" ]] ||
+    die "gpg lists no secret keys (is gpg-agent running, and is GNUPGHOME right?)"
 
-  DECDN_FPRS=()
-  while read -r f; do
-    if [[ -n "${PUBLISHED[$f]:-}" ]]; then
-      DECDN_FPRS+=("$f")
-    fi
-  done < <(gpg --list-secret-keys --with-colons 2>/dev/null | decdn_org_fprs)
-
-  # Taking the first of several would be a guess about which maintainer is
-  # signing, decided by keyring order.
+  mapfile -t DECDN_FPRS < <(signing_fprs decdn <<<"$SECRET_LISTING" | published_only)
   (( ${#DECDN_FPRS[@]} <= 1 )) ||
     die "found ${#DECDN_FPRS[@]} @decdn.org secret keys published in KEYS:
 $(printf '  %s\n' "${DECDN_FPRS[@]}")
@@ -225,15 +253,32 @@ Set DECDN_SIGNING_KEY to the full fingerprint of the one to sign with."
     FPR="${DECDN_FPRS[0]}"
     KEY_SOURCE="decdn.org key from KEYS"
   else
-    mapfile -t SECRET_FPRS < <(gpg --list-secret-keys --with-colons 2>/dev/null | primary_fprs)
-    (( ${#SECRET_FPRS[@]} > 0 )) || die "no usable gpg secret key"
-    FPR="${SECRET_FPRS[0]}"
-    KEY_SOURCE="first secret key in the keyring"
+    mapfile -t CANDIDATES < <(signing_fprs <<<"$SECRET_LISTING" | published_only)
+    case ${#CANDIDATES[@]} in
+      1)
+        FPR="${CANDIDATES[0]}"
+        KEY_SOURCE="only secret key in KEYS"
+        ;;
+      0)
+        mapfile -t SECRET_FPRS < <(primary_fprs <<<"$SECRET_LISTING")
+        die "none of your secret keys is published in KEYS and able to sign:
+$(printf '  %s\n' "${SECRET_FPRS[@]}")
+Consumers follow SECURITY.md and would reject a signature from any of them. Add
+your public key to KEYS first (RELEASING.md § One-time setup)."
+        ;;
+      *)
+        die "found ${#CANDIDATES[@]} secret keys published in KEYS:
+$(printf '  %s\n' "${CANDIDATES[@]}")
+Set DECDN_SIGNING_KEY to the full fingerprint of the one to sign with."
+        ;;
+    esac
   fi
 fi
 
-gpg --homedir "$KEYS_HOME" --list-keys "$FPR" >/dev/null 2>&1 || die \
-  "signing key $FPR is not published in KEYS.
+# Steps 2 and 3 only ever pick a published key; this is the check that holds
+# DECDN_SIGNING_KEY to the same rule.
+[[ -n "${PUBLISHED[$FPR]:-}" ]] || die \
+  "signing key $FPR is not published in KEYS, or KEYS marks it revoked or expired.
 Consumers follow SECURITY.md and would reject this signature. Add your public
 key to KEYS first (RELEASING.md § One-time setup), or point DECDN_SIGNING_KEY
 at a key that is already there."

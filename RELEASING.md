@@ -146,9 +146,10 @@ Once the run is green:
 ```
 
 It resolves your signing key to a fingerprint — `DECDN_SIGNING_KEY` if set,
-else your one `@decdn.org` key that is in `KEYS` (two such keys are refused,
-not guessed between), else the first secret key gpg lists — and confirms it is
-published in `KEYS`; force-fetches tags and checks your local tag matches `origin`'s;
+else your one secret key with a live `@decdn.org` uid that is in `KEYS`, else
+your one secret key that is in `KEYS` at all; two or more candidates are
+refused, not guessed between — and confirms `KEYS` publishes it and does not
+mark it revoked or expired; force-fetches tags and checks your local tag matches `origin`'s;
 verifies the tag signature; downloads the draft's assets; checks `SHA256SUMS`
 strictly against them **and** that every published archive appears in the
 manifest; signs `SHA256SUMS`, `image-digest.txt` and the SBOM; verifies each
@@ -168,7 +169,7 @@ Useful environment overrides:
 
 | Variable | Effect |
 |----------|--------|
-| `DECDN_SIGNING_KEY` | key to sign with. Unset, the script uses your one secret key with an `@decdn.org` uid that is in `KEYS`, else the first secret key gpg lists. Set it when you hold two such `@decdn.org` keys |
+| `DECDN_SIGNING_KEY` | key to sign with. Unset, the script uses your one secret key with a live `@decdn.org` uid that is in `KEYS`, else your one secret key that is in `KEYS`. Set it when you hold two or more such keys (for example during a key rotation). gpg.conf's `default-key` is not read |
 | `DECDN_SKIP_IMAGE_TAGS` | set to `1` to publish with **no** pullable image tag at all — the release then ships only the signed digest |
 | `DECDN_SKIP_DOCKERHUB` | set to `1` to tag on GHCR only (implied by `DECDN_SKIP_IMAGE_TAGS`) |
 | `DECDN_DOCKERHUB_REPO` | override the Docker Hub repository (defaults to `<DECDN_REPO>-node`) |
