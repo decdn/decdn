@@ -404,8 +404,12 @@ jobs:
           PACKAGE: ${{ matrix.package }}
           TARGET: ${{ matrix.target }}
 
+      # `shell: bash` is required on the Windows runners, whose default shell
+      # is pwsh: there `"$PACKAGE"` and `"$TARGET"` name unset PowerShell
+      # variables, not the env vars below, and expand to empty strings.
       - name: Build (native)
         if: ${{ !matrix.cross }}
+        shell: bash
         run: cargo build --release --package "$PACKAGE" --target "$TARGET"
         env:
           PACKAGE: ${{ matrix.package }}
