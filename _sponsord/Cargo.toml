@@ -17,7 +17,7 @@ members = [
 # signed `v<version>` tag (`cargo release <level>`; see RELEASING.md). Every
 # member inherits it, and each internal alias below carries it too;
 # check_workspace_manifests.py requires both.
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 # Three parts, not two: this string, `rust-toolchain.toml`'s channel and the
@@ -90,11 +90,11 @@ missing_panics_doc = "allow"
 # manifest has no path to follow, so cargo rejects a path dependency without
 # one. Locally the `path` wins. It equals the workspace version above;
 # `cargo release` rewrites it (`dependent-version = "upgrade"`).
-decdn-sponsored = { path = "crates/decdn-sponsored", version = "0.1.0" }
-sponsord = { path = "crates/sponsord", version = "0.1.0" }
-sponsord-api = { path = "crates/sponsord-api", version = "0.1.0" }
-sponsord-core = { path = "crates/sponsord-core", version = "0.1.0" }
-sponsord-onramp = { path = "crates/sponsord-onramp", version = "0.1.0" }
+decdn-sponsored = { path = "crates/decdn-sponsored", version = "0.0.0" }
+sponsord = { path = "crates/sponsord", version = "0.0.0" }
+sponsord-api = { path = "crates/sponsord-api", version = "0.0.0" }
+sponsord-core = { path = "crates/sponsord-core", version = "0.0.0" }
+sponsord-onramp = { path = "crates/sponsord-onramp", version = "0.0.0" }
 
 # deCDN, from its public repository. `Cargo.lock` pins the commit every build
 # uses; `cargo update -p decdn-incentive` moves it (RELEASING.md). The

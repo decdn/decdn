@@ -155,12 +155,12 @@ later `publish-crates.sh` step.
 
 Cut from `main`, with a clean tree and CI green on the commit you are tagging.
 
-**The first release** is the version the workspace already carries (`0.1.0`),
-so it takes no bump level: `cargo release --execute` releases the current
-version without bumping it; its commit carries only the changelog headings.
-Every later release names its level.
+**The first release** bumps from the `0.0.0` placeholder the workspace carries
+until then, so it names its level like every other: `cargo release minor
+--execute` cuts `v0.1.0`.
 
-To preview without changing anything, drop `--execute`:
+To preview without changing anything, drop `--execute` (with the level you
+will cut, `minor` for the first release):
 
 ```bash
 cargo release patch --no-confirm
