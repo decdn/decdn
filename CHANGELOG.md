@@ -3239,7 +3239,7 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
-- **Release: `publish-crates.sh` starts sponsord's decdn bump.** After the
+- **Release: `publish-crates.sh` starts sponsord's decdn bump (#2399).** After the
   upload, the script runs `gh workflow run bump-decdn.yml -R decdn/sponsord`,
   and that workflow opens the PR that pins sponsord to the new release once
   crates.io serves it. A failed start prints the command and never fails the
