@@ -2732,8 +2732,8 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
 name = "decdn-bao-range"
-version = "0.0.1"
-source = "git+https://github.com/decdn/decdn?tag=v0.0.1#454e5137ecb1bd5a57be2888dfcbfb7323719329"
+version = "0.0.2"
+source = "git+https://github.com/decdn/decdn?tag=v0.0.2#a9f8af9c655666f3a03efe073035139e6f4bdbfa"
 dependencies = [
  "bao-tree",
  "bytes",
@@ -2743,8 +2743,8 @@ dependencies = [
 
 [[package]]
 name = "decdn-cache"
-version = "0.0.1"
-source = "git+https://github.com/decdn/decdn?tag=v0.0.1#454e5137ecb1bd5a57be2888dfcbfb7323719329"
+version = "0.0.2"
+source = "git+https://github.com/decdn/decdn?tag=v0.0.2#a9f8af9c655666f3a03efe073035139e6f4bdbfa"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2779,8 +2779,8 @@ dependencies = [
 
 [[package]]
 name = "decdn-client"
-version = "0.0.1"
-source = "git+https://github.com/decdn/decdn?tag=v0.0.1#454e5137ecb1bd5a57be2888dfcbfb7323719329"
+version = "0.0.2"
+source = "git+https://github.com/decdn/decdn?tag=v0.0.2#a9f8af9c655666f3a03efe073035139e6f4bdbfa"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2805,8 +2805,8 @@ dependencies = [
 
 [[package]]
 name = "decdn-common"
-version = "0.0.1"
-source = "git+https://github.com/decdn/decdn?tag=v0.0.1#454e5137ecb1bd5a57be2888dfcbfb7323719329"
+version = "0.0.2"
+source = "git+https://github.com/decdn/decdn?tag=v0.0.2#a9f8af9c655666f3a03efe073035139e6f4bdbfa"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2827,8 +2827,8 @@ dependencies = [
 
 [[package]]
 name = "decdn-config-types"
-version = "0.0.1"
-source = "git+https://github.com/decdn/decdn?tag=v0.0.1#454e5137ecb1bd5a57be2888dfcbfb7323719329"
+version = "0.0.2"
+source = "git+https://github.com/decdn/decdn?tag=v0.0.2#a9f8af9c655666f3a03efe073035139e6f4bdbfa"
 dependencies = [
  "anyhow",
  "serde",
@@ -2837,8 +2837,8 @@ dependencies = [
 
 [[package]]
 name = "decdn-e2e"
-version = "0.0.1"
-source = "git+https://github.com/decdn/decdn?tag=v0.0.1#454e5137ecb1bd5a57be2888dfcbfb7323719329"
+version = "0.0.2"
+source = "git+https://github.com/decdn/decdn?tag=v0.0.2#a9f8af9c655666f3a03efe073035139e6f4bdbfa"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2864,8 +2864,8 @@ dependencies = [
 
 [[package]]
 name = "decdn-incentive"
-version = "0.0.1"
-source = "git+https://github.com/decdn/decdn?tag=v0.0.1#454e5137ecb1bd5a57be2888dfcbfb7323719329"
+version = "0.0.2"
+source = "git+https://github.com/decdn/decdn?tag=v0.0.2#a9f8af9c655666f3a03efe073035139e6f4bdbfa"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2887,8 +2887,8 @@ dependencies = [
 
 [[package]]
 name = "decdn-node"
-version = "0.0.1"
-source = "git+https://github.com/decdn/decdn?tag=v0.0.1#454e5137ecb1bd5a57be2888dfcbfb7323719329"
+version = "0.0.2"
+source = "git+https://github.com/decdn/decdn?tag=v0.0.2#a9f8af9c655666f3a03efe073035139e6f4bdbfa"
 dependencies = [
  "alloy",
  "alloy-json-rpc",
@@ -2942,8 +2942,8 @@ dependencies = [
 
 [[package]]
 name = "decdn-protocol"
-version = "0.0.1"
-source = "git+https://github.com/decdn/decdn?tag=v0.0.1#454e5137ecb1bd5a57be2888dfcbfb7323719329"
+version = "0.0.2"
+source = "git+https://github.com/decdn/decdn?tag=v0.0.2#a9f8af9c655666f3a03efe073035139e6f4bdbfa"
 dependencies = [
  "postcard",
  "serde",
@@ -2953,8 +2953,8 @@ dependencies = [
 
 [[package]]
 name = "decdn-reputation"
-version = "0.0.1"
-source = "git+https://github.com/decdn/decdn?tag=v0.0.1#454e5137ecb1bd5a57be2888dfcbfb7323719329"
+version = "0.0.2"
+source = "git+https://github.com/decdn/decdn?tag=v0.0.2#a9f8af9c655666f3a03efe073035139e6f4bdbfa"
 dependencies = [
  "anyhow",
  "decdn-protocol",

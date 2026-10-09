@@ -31,6 +31,12 @@ release.
   value that is not UTF-8 is an error. Nothing changes when the URL is
   unset.
 
+### Changed
+
+- **decdn v0.0.2.** The decdn crates are locked at decdn's `v0.0.2` release tag
+  (`a9f8af9c655666f3a03efe073035139e6f4bdbfa`) and require `0.0.2`, which is on
+  crates.io.
+
 ## [0.0.2] - 2026-10-09
 
 ### Changed

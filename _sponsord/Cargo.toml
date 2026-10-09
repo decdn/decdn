@@ -104,12 +104,12 @@ sponsord-onramp = { path = "crates/sponsord-onramp", version = "0.0.2" }
 # resolves on crates.io, where `git` is dropped. check_decdn_pin.py enforces
 # both; publish-crates.sh refuses until that version is on crates.io. To build
 # against a local checkout, see CONTRIBUTING.md.
-decdn-client = { git = "https://github.com/decdn/decdn", tag = "v0.0.1", version = "0.0.1" }
-decdn-common = { git = "https://github.com/decdn/decdn", tag = "v0.0.1", version = "0.0.1" }
-decdn-incentive = { git = "https://github.com/decdn/decdn", tag = "v0.0.1", version = "0.0.1" }
+decdn-client = { git = "https://github.com/decdn/decdn", tag = "v0.0.2", version = "0.0.2" }
+decdn-common = { git = "https://github.com/decdn/decdn", tag = "v0.0.2", version = "0.0.2" }
+decdn-incentive = { git = "https://github.com/decdn/decdn", tag = "v0.0.2", version = "0.0.2" }
 # Dev-only (the anvil fixtures). A dev-dependency without a `version` is
 # stripped from the published manifest, so this one needs none.
-decdn-e2e = { git = "https://github.com/decdn/decdn", tag = "v0.0.1" }
+decdn-e2e = { git = "https://github.com/decdn/decdn", tag = "v0.0.2" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
