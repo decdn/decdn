@@ -12,7 +12,10 @@ set -euo pipefail
 REPO_ROOT=$(git rev-parse --show-toplevel)
 cd "$REPO_ROOT"
 
-if git grep -nE '\]\((\./|\.\./)' -- 'crates/*.rs'; then
+# Matches a target that starts with `./` or `../`, or a scheme-less `.md`
+# target such as `](adr/038-….md)`. URLs carry a `:` and intra-doc paths
+# carry no `.md`, so neither matches.
+if git grep -nE '\]\((\./|\.\./|[^):#[:space:]]*\.md(#[^)]*)?\))' -- 'crates/*.rs'; then
   cat >&2 <<'EOF'
 
 error: relative link in a doc comment. It breaks on docs.rs.
