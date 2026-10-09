@@ -40,6 +40,12 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
+    # Mirrors ci.yml's workflow-level env. rust-cache hashes every
+    # `CARGO*`/`RUST*` variable into its restore key, so the `clippy` partition
+    # restored below only hits when this env matches the env at ci.yml's clippy
+    # rust-cache step. Change the two together.
+    env:
+      RUST_BACKTRACE: 1
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
