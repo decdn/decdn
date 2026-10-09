@@ -12,6 +12,9 @@ cargo install decdn-cli
 decdn config init --chain arbitrum-sepolia
 ```
 
+Container images are published as `ghcr.io/decdn/decdn` and `decdn/decdn`, with `decdn` as
+the entrypoint.
+
 Deliberately links no blob store and no AWS SDK: the range verification the publish path
 needs lives in the `iroh-blobs`-free `decdn-bao-range`, reached through
 `decdn-client`.

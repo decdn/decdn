@@ -40,16 +40,25 @@ cargo release patch --execute              # cut, sign and push the tag
 3. **Tools.** `cargo install cargo-release git-cliff`, plus `gh auth login`.
 
 4. **Registry logins.** `docker login ghcr.io` with a token carrying
-   `write:packages`, and `docker login docker.io` — the image is published to
-   both. Skip the second with `DECDN_SKIP_DOCKERHUB=1` if you only need GHCR.
+   `write:packages`, and `docker login docker.io` — both images go to both
+   registries. The Docker Hub repositories `decdn/decdn-node` and
+   `decdn/decdn` must exist first. Skip the Docker Hub login with
+   `DECDN_SKIP_DOCKERHUB=1` if you only need GHCR.
 
-5. **A crates.io token.** `cargo login`, with a token scoped to
+5. **Public GHCR packages.** The first push of an image creates its GHCR
+   package as **private**, and a private package denies every anonymous
+   `docker pull`. After the first release run, set `decdn-node` and `decdn`
+   to public (package settings, *Change visibility*). `sign-release.sh`
+   checks every promoted repository without credentials and refuses to
+   publish while one is private.
+
+6. **A crates.io token.** `cargo login`, with a token scoped to
    publish-update (and publish-new for the first release). Membership of the
    `decdn` crates.io owner set is what makes it work; the token itself is
    personal and never leaves your machine. That owner set does not exist until
    the first publish creates it — see [Crate ownership](#crate-ownership).
 
-6. **Before the *first* release only — clear the new-crate rate limit.**
+7. **Before the *first* release only — clear the new-crate rate limit.**
    crates.io limits crate *creation* far harder than updates: `PublishNew`
    allows a burst of 5, then roughly one per 10 minutes. The first release
    creates **ten** crates at once, so a single run would be rate-limited
@@ -108,7 +117,7 @@ preview writes nothing and needs no cleanup. Do **not** follow it with
 Pushing `v*` starts [`.github/workflows/release.yml`](.github/workflows/release.yml).
 Steps 1–3 gate everything else. After them, the archive builds (step 6) run in
 parallel with the verification (steps 4–5). The asset upload waits for both, and
-the image push waits for the asset upload. Every job after step 3 works on the
+the image pushes wait for the asset upload. Every job after step 3 works on the
 commit the tag push named; if the tag has since moved, the run fails rather
 than build another commit. The workflow:
 
@@ -131,13 +140,16 @@ than build another commit. The workflow:
    a Linux target whose binaries need glibc newer than the 2.31 floor
    ([ADR 000](adr/000-language.md)). Once verification passes it uploads them
    with a `SHA256SUMS` manifest, asserting all eleven are present;
-7. once the archives are uploaded, assembles the multi-arch image from the same
-   Linux archives — it does not compile from source, so the binary in the image
-   is byte-identical to the archived one — and pushes the manifest **untagged**,
-   attaching the SBOM and `image-digest.txt`.
+7. once the archives are uploaded, assembles two multi-arch images from the
+   same Linux archives — `decdn-node` (the daemon, with the `decdn` CLI beside
+   it) and `decdn` (the CLI only). It does not compile from source, so every
+   binary in an image is byte-identical to the archived one. It pushes each
+   manifest **untagged** and attaches each image's SBOM
+   (`<stage>-<version>-sbom.spdx.json`) and digest
+   (`<stage>-image-digest.txt`), named after the image's Dockerfile stage.
 
 Draft assets need authentication to download, and no image tag exists yet, so
-nothing resolves by name until the release is signed. The image manifest is
+nothing resolves by name until the release is signed. Each image manifest is
 fetchable by digest in that window — untagged is not unreachable — but the
 digest is not advertised anywhere a user would look, and no tag ever points at
 unsigned bytes.
@@ -157,16 +169,18 @@ refused, not guessed between — and confirms `KEYS` publishes it and does not
 mark it revoked or expired; force-fetches tags and checks your local tag matches `origin`'s;
 verifies the tag signature; downloads the draft's assets; checks `SHA256SUMS`
 strictly against them **and** that every published archive appears in the
-manifest; signs `SHA256SUMS`, `image-digest.txt` and the SBOM; verifies each
-signature against a keyring built only from `KEYS`; uploads the three `.asc`
-files; promotes `:latest`, `:<version>` and `:<major>.<minor>` from the signed
-digest on GHCR; mirrors that same digest to Docker Hub; and flips the release
-out of draft.
+manifest; signs `SHA256SUMS` and each image's digest file and SBOM; verifies
+each signature against a keyring built only from `KEYS`; uploads the five
+`.asc` files; promotes `:latest`, `:<version>` and `:<major>.<minor>` from each
+signed digest on GHCR; mirrors those same digests to Docker Hub; checks that
+every promoted repository is pullable without credentials; and flips the
+release out of draft.
 
 The mirror is a manifest copy, not a rebuild: `docker buildx imagetools create`
 copies the manifest bytes verbatim, so `docker.io/decdn/decdn-node` and
-`ghcr.io/decdn/decdn-node` serve one identical digest and the single signature
-over `image-digest.txt` vouches for both. The script re-reads every tag on both
+`ghcr.io/decdn/decdn-node` serve one identical digest, and the single signature
+over `decdn-node-image-digest.txt` vouches for both. The same holds for
+`decdn/decdn` and `decdn-image-digest.txt`. The script re-reads every tag on both
 registries afterwards and refuses to publish if any resolves to a different
 digest, so this is checked rather than assumed.
 
@@ -175,9 +189,9 @@ Useful environment overrides:
 | Variable | Effect |
 |----------|--------|
 | `DECDN_SIGNING_KEY` | key to sign with. Unset, the script uses your one secret key with a live `@decdn.org` uid that is in `KEYS`, else your one secret key that is in `KEYS`. Set it when you hold two or more such keys (for example during a key rotation). gpg.conf's `default-key` is not read |
-| `DECDN_SKIP_IMAGE_TAGS` | set to `1` to publish with **no** pullable image tag at all — the release then ships only the signed digest |
+| `DECDN_SKIP_IMAGE_TAGS` | set to `1` to publish with **no** pullable image tag at all — the release then ships only the signed digests |
 | `DECDN_SKIP_DOCKERHUB` | set to `1` to tag on GHCR only (implied by `DECDN_SKIP_IMAGE_TAGS`) |
-| `DECDN_DOCKERHUB_REPO` | override the Docker Hub repository (defaults to `<DECDN_REPO>-node`) |
+| `DECDN_DOCKERHUB_REPO` | the Docker Hub counterpart of `DECDN_REPO` (defaults to it); the images are `<it>-node` and `<it>` |
 | `DECDN_REPO` | target a fork instead of `decdn/decdn` — both registries follow it |
 
 The skip variables take `1`/`true`/`yes` or `0`/`false`/`no`; anything else is
@@ -270,7 +284,7 @@ individual owner does that, so do not remove yourself once the team is added —
 that would leave nobody able to grant or revoke access again.
 
 This runs once. Later releases publish updates to names that already exist and
-add no crates, which is also why step 5's owner-set membership only starts
+add no crates, which is also why step 6's owner-set membership only starts
 meaning something after the first release. `cargo owner --list <crate>`
 confirms the result.
 
@@ -300,13 +314,14 @@ release behind it is the one state this flow leaves lying around. Either run the
 signing script, or delete the tag as above.
 
 **Abandoned image manifests.** A run whose release is never signed leaves an
-untagged manifest in the GHCR package. So does re-running `upload-assets` or
-`docker` before signing: the image job pushes a fresh manifest and replaces
-`image-digest.txt`, and the earlier digest stays behind untagged. It is not pullable by name and costs only
+untagged manifest in each GHCR package. So does re-running `upload-assets` or
+`docker` before signing: the image job pushes fresh manifests and replaces
+the `<stage>-image-digest.txt` files, and the earlier digests stay behind
+untagged. They are not pullable by name and cost only
 storage, so cleanup is optional. If you do delete one, take care: GHCR keys a
 package version by digest and treats tags as metadata on it, so deleting the
 wrong version removes the image behind every tag pointing at it, `latest`
-included. Match the digest against `image-digest.txt` before deleting anything.
+included. Match the digest against that image's digest file before deleting anything.
 
 **Crates are already on crates.io.** Then the version is spent: it cannot be
 re-cut, because `cargo publish` will refuse to replace it and no amount of

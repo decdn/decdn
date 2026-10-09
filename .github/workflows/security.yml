@@ -46,12 +46,18 @@ jobs:
           exit-code: "1"
 
   trivy-image:
-    name: Trivy image scan
+    name: Trivy image scan (${{ matrix.image }})
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ghcr.io/${{ github.repository }}-node
+          - ghcr.io/${{ github.repository }}
     steps:
       - uses: actions/checkout@v7
 
@@ -62,30 +68,36 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # GHCR only, deliberately. sign-release.sh mirrors the same manifest to
-      # Docker Hub with `imagetools create`, which copies it verbatim, so both
+      # GHCR only, deliberately. sign-release.sh mirrors the same manifests to
+      # Docker Hub with `imagetools create`, which copies them verbatim, so both
       # registries serve byte-identical bytes under one digest — scanning the
       # mirror would re-scan the image already covered here.
       #
       # Skip gracefully if no :latest image has been published yet
-      # (pre-first-release, or tags cleaned up).
+      # (pre-first-release, or tags cleaned up). Only a registry "not found"
+      # counts as that: an auth failure or a registry outage fails the job,
+      # rather than skipping the scan every week without anyone noticing.
       - name: Check image exists
         id: image
         env:
-          IMAGE: ghcr.io/${{ github.repository }}-node:latest
+          IMAGE: ${{ matrix.image }}:latest
         run: |
-          if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+          set -uo pipefail
+          if err=$(docker manifest inspect "$IMAGE" 2>&1 >/dev/null); then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
+          elif grep -qiE 'manifest unknown|not found' <<< "$err"; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
             echo "::notice::Image $IMAGE not found; skipping scan."
+          else
+            echo "::error::cannot inspect $IMAGE: $err"
+            exit 1
           fi
 
       - name: Run Trivy image scan
         if: steps.image.outputs.exists == 'true'
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ghcr.io/${{ github.repository }}-node:latest
+          image-ref: ${{ matrix.image }}:latest
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true

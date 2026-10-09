@@ -12,7 +12,8 @@ cargo install decdn-node
 decdn-node run
 ```
 
-Container images are published as `ghcr.io/decdn/decdn-node` and `decdn/decdn-node`.
+Container images are published as `ghcr.io/decdn/decdn-node` and `decdn/decdn-node`. The
+image also carries the `decdn` CLI, so `docker exec <container> decdn node status` works.
 Configure the daemon with `decdn config init` from the `decdn-cli` crate.
 
 ## License

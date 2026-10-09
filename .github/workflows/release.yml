@@ -7,9 +7,9 @@ name: Release
 # below only to generate the GitHub release notes.
 #
 # This workflow builds and stages; it does not sign and it does not publish.
-# The GitHub Release is created as a *draft* and the container image manifest is
-# pushed untagged, so no NAME a user would pull resolves to anything before a
-# maintainer has signed it with .github/scripts/sign-release.sh. (The manifest
+# The GitHub Release is created as a *draft* and both container image manifests
+# are pushed untagged, so no NAME a user would pull resolves to anything before a
+# maintainer has signed it with .github/scripts/sign-release.sh. (A manifest
 # is still fetchable by its digest — untagged is not unreachable — but no tag
 # points at unsigned bytes, and the digest is not advertised anywhere a user
 # would look.) There is no signing key in Actions secrets.
@@ -35,10 +35,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
-  # `-node`, because the image carries the daemon only — the `decdn` CLI is
-  # deliberately not in it (see Dockerfile). Same repository path on Docker Hub,
-  # which sign-release.sh mirrors the signed digest to.
-  IMAGE_NAME: ${{ github.repository }}-node
 
 jobs:
   # The fast gate. Everything else needs it; nothing in it compiles.
@@ -343,8 +339,9 @@ jobs:
     strategy:
       fail-fast: false
       # Two binaries: the `decdn-node` daemon and the `decdn` user CLI. Each
-      # ships as its own archive so users grab only what they need; the
-      # container image is daemon-only.
+      # ships as its own archive so users grab only what they need. The
+      # container images reuse the Linux archives: `decdn` carries the CLI,
+      # `decdn-node` the daemon plus the CLI.
       #
       # One job per target, not per binary: the two packages share most of
       # their dependency graph, and building both in one `target/` compiles
@@ -445,9 +442,9 @@ jobs:
       # matrix, so the condition keys on the target, not on `cross`. A
       # natively-built binary can reference symbols up to GLIBC_2.39 (the
       # runner's) and fails at exec on any older distribution with
-      # "version `GLIBC_2.3x' not found" — debian:bookworm-slim (2.36), our own
-      # image's base, included. Checked here, before the archive exists, so a
-      # binary above the floor never reaches upload-assets or the image.
+      # "version `GLIBC_2.3x' not found" — debian:bookworm-slim (2.36), our
+      # images' base, included. Checked here, before the archive exists, so a
+      # binary above the floor never reaches upload-assets or either image.
       - name: Check glibc floor
         if: contains(matrix.target, '-linux-gnu')
         shell: bash
@@ -587,23 +584,41 @@ jobs:
           TAG: ${{ needs.tag.outputs.tag }}
 
   docker:
-    name: Docker image
-    # Needs build-binaries: the image is assembled from the Linux archives that
-    # job produces, so the binary inside the image is byte-identical to the one
-    # the signed SHA256SUMS covers. Needs verify: that job creates the draft
-    # this one uploads to, and no image is pushed, not even untagged, for a
-    # release that failed verification. Needs upload-assets: no image is
-    # pushed and nothing is attached to the draft unless all eleven archives
-    # and SHA256SUMS reached it first, so a failed run never leaves a draft
-    # holding an SBOM and digest for archives it does not have.
+    name: Docker image (${{ matrix.target }})
+    # Needs build-binaries: each image is assembled from the Linux archives that
+    # job produces, so every binary inside it is byte-identical to the one the
+    # signed SHA256SUMS covers. Needs verify: that job creates the draft this
+    # one uploads to, and no image is pushed, not even untagged, for a release
+    # that failed verification. Needs upload-assets: no image is pushed and
+    # nothing is attached to the draft unless all eleven archives and
+    # SHA256SUMS reached it first, so a failed run never leaves a draft holding
+    # an SBOM and digest for archives it does not have.
     needs: [tag, verify, build-binaries, upload-assets]
     runs-on: ubuntu-latest
     permissions:
-      # `write`, not `read`: this job uploads the SBOM and image-digest.txt to
+      # `write`, not `read`: this job uploads the SBOM and the image digest to
       # the draft release, and a job-level permissions block fully overrides
       # the workflow-level grant rather than adding to it.
       contents: write
       packages: write
+    strategy:
+      # One leg per image, each a stage of the one Dockerfile. A failed leg
+      # does not cancel the other; sign-release.sh refuses a draft that lacks
+      # either image's digest, so a half-built release cannot be signed.
+      # Each image has the same repository path on Docker Hub, which
+      # sign-release.sh mirrors its signed digest to.
+      fail-fast: false
+      matrix:
+        include:
+          # `-node` because this image's entrypoint is the daemon. It also
+          # carries the `decdn` CLI, for `docker exec` admin.
+          - target: decdn-node
+            binaries: decdn-node decdn
+            image: ${{ github.repository }}-node
+          # The CLI image takes the repository's own name, as the binary does.
+          - target: decdn
+            binaries: decdn
+            image: ${{ github.repository }}
     steps:
       # `github.sha`, not the tag name — see build-binaries.
       - uses: actions/checkout@v7
@@ -619,8 +634,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      # Each Linux artifact carries the CLI archive too; the unpack step below
-      # names the daemon archives explicitly and ignores the rest.
+      # Each Linux artifact carries both archives; the unpack step below names
+      # the ones this image needs and ignores the rest.
       - name: Download Linux archives
         uses: actions/download-artifact@v8
         with:
@@ -633,18 +648,26 @@ jobs:
       - name: Unpack archives into dist/
         env:
           VERSION: ${{ needs.tag.outputs.version }}
+          BINARIES: ${{ matrix.binaries }}
         run: |
           set -euo pipefail
           mkdir -p dist/amd64 dist/arm64
-          tar xzf "archives/decdn-node-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-            -C dist/amd64
-          tar xzf "archives/decdn-node-${VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
-            -C dist/arm64
-          for a in amd64 arm64; do
-            [ -x "dist/$a/decdn-node" ] || {
-              echo "::error::dist/$a/decdn-node missing or not executable"; exit 1; }
+          read -ra bins <<< "$BINARIES"
+          # A misspelt matrix key leaves this empty, and the loop below, with
+          # its executable check, would then run zero times.
+          (( ${#bins[@]} > 0 )) || {
+            echo "::error::matrix.binaries is empty"; exit 1; }
+          for b in "${bins[@]}"; do
+            tar xzf "archives/${b}-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+              -C dist/amd64
+            tar xzf "archives/${b}-${VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+              -C dist/arm64
+            for a in amd64 arm64; do
+              [ -x "dist/$a/$b" ] || {
+                echo "::error::dist/$a/$b missing or not executable"; exit 1; }
+              sha256sum "dist/$a/$b"
+            done
           done
-          sha256sum dist/*/decdn-node
 
       - name: Log in to GHCR
         uses: docker/login-action@v4.6.0
@@ -660,7 +683,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ matrix.image }}
           tags: |
             type=raw,value=unused
 
@@ -675,45 +698,55 @@ jobs:
       # tags as metadata on it, so a staging tag would end up on the same
       # version as `latest` after promotion and deleting it to tidy up would
       # delete the released image.
+      #
+      # The cache scope is per image: both legs write the gha cache at once,
+      # and a shared scope would let one leg's export overwrite the other's.
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
+          target: ${{ matrix.target }}
           platforms: linux/amd64,linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
 
       # Scanned by digest in the release package — the untagged manifest is
       # already there, it just has no tag pointing at it yet.
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
         with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          image: ${{ env.REGISTRY }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}
           format: spdx-json
-          output-file: decdn-${{ needs.tag.outputs.version }}-sbom.spdx.json
+          output-file: ${{ matrix.target }}-${{ needs.tag.outputs.version }}-sbom.spdx.json
           upload-release-assets: false
           upload-artifact: false
 
       # GPG has no native OCI-image signature format, so the image is attested
-      # out of band: image-digest.txt records the exact
+      # out of band: <stage>-image-digest.txt records the exact
       # ghcr.io/...@sha256:... reference, and sign-release.sh signs that file
-      # locally.
+      # locally. An empty build output fails here rather than at signing time.
       - name: Record image digest
         env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: echo "${IMAGE}@${DIGEST}" > image-digest.txt
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "::error::build produced no image digest (got '$DIGEST')"; exit 1; }
+          echo "${IMAGE}@${DIGEST}" > "${TARGET}-image-digest.txt"
 
       - name: Upload SBOM and digest to draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.tag.outputs.tag }}
           VERSION: ${{ needs.tag.outputs.version }}
+          TARGET: ${{ matrix.target }}
         run: |
           gh release upload "$TAG" --clobber \
-            "decdn-${VERSION}-sbom.spdx.json" \
-            image-digest.txt
+            "${TARGET}-${VERSION}-sbom.spdx.json" \
+            "${TARGET}-image-digest.txt"

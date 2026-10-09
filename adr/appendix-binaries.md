@@ -84,12 +84,17 @@ and would silently miss data on a prefix rename.
 
 ## Distribution
 
-- **Container image** ships `decdn-node` only — daemon-only is the
-  dominant container use case; a publisher wanting the CLI in a
-  container rebuilds from the release archive. The image copies the
-  `decdn-node` binary out of the Linux release archives. It does not
-  compile from source. The binary in the image is therefore identical
-  to the archived one, and one signed `SHA256SUMS` covers both.
+- **Container images.** Two stages of one Dockerfile build the
+  container images:
+  - `decdn-node` runs the daemon. It also contains the `decdn` CLI.
+    An operator uses `docker exec <container> decdn node …` to reach
+    the loopback admin port.
+  - `decdn` runs the CLI only. Publishers and clients use it.
+
+  Each image copies its binaries out of the Linux release archives.
+  It does not compile from source. Each binary in an image is
+  identical to the archived binary. The signed `SHA256SUMS` covers
+  the archive. It therefore also covers the binary in the image.
 - **Release archives** ship both binaries as separate tarballs per
   target (Linux x86_64 + aarch64, macOS x86_64 + aarch64, Windows
   x86_64): `decdn-node-${VERSION}-${TARGET}.tar.gz` (operators) and
