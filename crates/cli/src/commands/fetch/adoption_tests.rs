@@ -24,6 +24,12 @@ fn pool(owner: Address, deposit: u64, redeemed: u64) -> PaymentPool::Pool {
     }
 }
 
+/// The `getPool` answer for `owner`'s tracked pool, still open: the read the
+/// first lane build of a run makes before it reuses the row.
+fn still_open(owner: Address) -> Bytes {
+    pool(owner, WORKING, 0).abi_encode().into()
+}
+
 fn lane(amount: u64, bytes: u64) -> Bytes {
     PaymentPool::Lane {
         amount,
@@ -182,7 +188,7 @@ async fn a_tracked_pool_resumes_a_new_lane_from_the_chain_watermark() {
         &store,
         &signer,
         ChainAdoption::Allowed,
-        vec![Some(lane(500, 500_000))],
+        vec![Some(still_open(signer.address())), Some(lane(500, 500_000))],
     )
     .await
     .expect("a tracked pool reuses without touching getPools");
@@ -235,6 +241,7 @@ async fn a_row_from_another_deployment_is_not_reused() {
         let tracked = pool_to_reuse(
             &store,
             &contract,
+            &RunFunding::default(),
             signer.address(),
             DEPLOYMENT,
             ChainAdoption::Refused,
@@ -248,6 +255,79 @@ async fn a_row_from_another_deployment_is_not_reused() {
             "row on {foreign:?}, buying on {DEPLOYMENT:?}"
         );
         assert!(tracked.is_none_or(|state| state.redeemed_elsewhere().is_zero()));
+    }
+}
+
+/// A tracked pool is reused only while the chain shows it open. A pool its
+/// owner closed (`Closing`) or that anyone reclaimed (`Closed`) is treated as
+/// no row, so the run opens another. A failed read, a pool the chain holds no
+/// record of yet, and a pool another owner holds keep the row: none of them
+/// shows this owner's pool closed.
+#[tokio::test]
+async fn a_tracked_pool_is_reused_only_while_the_chain_shows_it_open() {
+    let signer = Arc::new(PrivateKeySigner::random());
+    let owner = signer.address();
+    let id = B256::repeat_byte(0xCC);
+    let read = |owner: Address, status: PaymentPool::Status| -> Option<Bytes> {
+        let mut answer = pool(owner, WORKING, 0);
+        answer.status = status;
+        Some(answer.abi_encode().into())
+    };
+    let cases = [
+        ("open", read(owner, PaymentPool::Status::Open), true),
+        ("closing", read(owner, PaymentPool::Status::Closing), false),
+        ("closed", read(owner, PaymentPool::Status::Closed), false),
+        ("read fault", None, true),
+        (
+            "no record",
+            read(Address::ZERO, PaymentPool::Status::Open),
+            true,
+        ),
+        (
+            "another owner",
+            read(Address::repeat_byte(0x99), PaymentPool::Status::Closed),
+            true,
+        ),
+    ];
+    for (case, answer, reused) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let store = client_store(&dir);
+        store
+            .record(&BuyerPoolState::new(
+                id,
+                DEPLOYMENT,
+                owner,
+                TOKEN,
+                U256::from(WORKING),
+            ))
+            .unwrap();
+        let asserter = Asserter::new();
+        match answer {
+            Some(response) => asserter.push_success(&response),
+            None => asserter.push_failure_msg("transient rpc fault"),
+        }
+        let contract = PaymentPool::new(
+            PP,
+            ProviderBuilder::new().connect_mocked_client(asserter.clone()),
+        );
+        let funding = RunFunding::default();
+        let tracked = pool_to_reuse(
+            &store,
+            &contract,
+            &funding,
+            owner,
+            DEPLOYMENT,
+            ChainAdoption::Refused,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tracked.map(|state| state.pool_id),
+            reused.then_some(id),
+            "{case}"
+        );
+        assert_eq!(funding.pool_id(), reused.then_some(id), "{case}");
+        assert!(asserter.read_q().is_empty(), "{case}: the status was read");
     }
 }
 
@@ -428,11 +508,13 @@ async fn a_pool_spent_across_lanes_refills_and_fails_when_nothing_is_left() {
         .record(&tracked_row(id, signer.address(), WORKING, &[2_000_000; 5]))
         .unwrap();
 
+    let mut calls = vec![Some(still_open(signer.address()))];
+    calls.extend(refill_fails_with_wallet(0));
     let (result, drained) = run_in(
         &store,
         &signer,
         ChainAdoption::Allowed,
-        refill_fails_with_wallet(0),
+        calls,
         &RunFunding::default(),
     )
     .await;
@@ -478,7 +560,10 @@ async fn an_untracked_lanes_chain_watermark_counts_toward_the_pool_spend() {
         ))
         .unwrap();
 
-    let mut calls = vec![Some(lane(1_000_000, 1_000_000_000))];
+    let mut calls = vec![
+        Some(still_open(signer.address())),
+        Some(lane(1_000_000, 1_000_000_000)),
+    ];
     calls.extend(refill_fails_with_wallet(0));
     let (result, drained) = run_in(
         &store,
@@ -516,7 +601,11 @@ async fn a_wallet_short_of_usdc_keeps_the_lane_while_the_pool_can_still_pay() {
         &store,
         &signer,
         ChainAdoption::Allowed,
-        refill_fails_with_wallet(0),
+        [
+            vec![Some(still_open(signer.address()))],
+            refill_fails_with_wallet(0),
+        ]
+        .concat(),
         &funding,
     )
     .await;
@@ -554,7 +643,11 @@ async fn a_later_lane_build_skips_the_refill_after_a_wallet_shortfall() {
         &store,
         &signer,
         ChainAdoption::Allowed,
-        refill_fails_with_wallet(0),
+        [
+            vec![Some(still_open(signer.address()))],
+            refill_fails_with_wallet(0),
+        ]
+        .concat(),
         &funding,
     )
     .await;
@@ -582,7 +675,11 @@ async fn a_refill_failure_with_a_funded_wallet_fails_the_lane_build() {
         &store,
         &signer,
         ChainAdoption::Allowed,
-        refill_fails_with_wallet(WORKING),
+        [
+            vec![Some(still_open(signer.address()))],
+            refill_fails_with_wallet(WORKING),
+        ]
+        .concat(),
         &funding,
     )
     .await;

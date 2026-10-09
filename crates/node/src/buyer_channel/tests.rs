@@ -2514,6 +2514,41 @@ async fn fills_waiting_on_a_top_up_into_a_closing_pool_join_its_replacement() {
     }
 }
 
+/// The reclaim sweep drops the row of a pool another caller already
+/// reclaimed: nothing is left to reclaim, and a surviving row would send every
+/// later fill to a pool that nodes answer `NotFound`. An open pool keeps its
+/// row.
+#[tokio::test]
+async fn the_reclaim_sweep_drops_a_pool_someone_else_reclaimed() {
+    use alloy::sol_types::SolValue;
+
+    for (status, deadline, kept) in [
+        (PaymentPool::Status::Closed, 1_000, false),
+        (PaymentPool::Status::Open, 0, true),
+    ] {
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(
+            &PaymentPool::Pool {
+                owner: Address::repeat_byte(1),
+                status,
+                disputeDeadline: deadline,
+                deposit: 10_000_000,
+                totalRedeemed: 0,
+            }
+            .abi_encode(),
+        );
+        let svc = recovery_service(&asserter, 10_000_000);
+        svc.sweep_reclaimable_once().await;
+        assert_eq!(
+            svc.store.get_by_owner(svc.owner).unwrap().is_some(),
+            kept,
+            "a pool read {}",
+            if kept { "open" } else { "closed" }
+        );
+        assert!(asserter.read_q().is_empty(), "the sweep read the pool");
+    }
+}
+
 /// A pool that already holds its working deposit and still accepts funds
 /// settles: the upstreams have not seen the deposit yet, so the step returns
 /// it and the fill's settle window asks them again. Only a gas estimate runs.

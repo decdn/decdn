@@ -221,8 +221,9 @@ impl CleanLeg {
 /// The pool's spend is a property of the POOL, not of a lane: the deposit gate
 /// must subtract what EVERY lane committed, not what this one did, or N lanes
 /// each spend what only one pool holds. The deposit every lane draws on rises
-/// only through the funding recovery step, which credits every lane's
-/// `PoolContext` itself.
+/// through the funding recovery step, which credits every lane's
+/// `PoolContext` itself, or through a low-water refill a lane build makes,
+/// which raises every lane to it.
 #[doc(hidden)]
 pub struct SharedPool<'a> {
     /// Sum, across every lane, of the committed voucher amount — the pool's

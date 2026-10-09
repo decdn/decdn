@@ -1,9 +1,10 @@
 //! The funding recovery step at the exhausted candidate set (ADR 003 § Funding
 //! recovery, ADR 039 § Failure handling).
 //!
-//! A buyer adds funds only here. The acquire loop and the first open reach the
-//! step when the candidate set is exhausted, a fresh discovery found nothing
-//! new, and at least one candidate refused `Unfunded` or is priced out at the
+//! On a node's refusal, a buyer adds funds only here: the low-water refill at a
+//! lane build reads only the buyer's own pool. The acquire loop and the first
+//! open reach the step when the candidate set is exhausted, a fresh discovery
+//! found nothing new, and at least one candidate refused `Unfunded` or is priced out at the
 //! current deposit. The step runs through the caller's [`Funder`], under the
 //! fetch's [`RecoveryGate`]: the first step of a fetch is always allowed, and a
 //! further step only after at least one new BLAKE3-verified byte. A caller that

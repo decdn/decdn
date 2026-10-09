@@ -3764,6 +3764,14 @@ where
 /// progress would seed the first voucher at a cumulative this pool has never
 /// redeemed against. It is treated as no row.
 ///
+/// A tracked row is reused only while its pool is open. Only the owner closes a
+/// pool, but the owner key can close it from another machine, and anyone can
+/// reclaim it once its dispute window ends. Nodes answer a request on a closed
+/// pool `NotFound`, the same as a missing blob, so a fetch on it never reaches
+/// a funding recovery step. So the first lane build of a run reads the pool
+/// once ([`still_open`]), and a pool the chain shows `Closing` or `Closed` is
+/// treated as no row: the run adopts or opens another.
+///
 /// No row is not the same as no pool. The store loses rows — a reset data dir, a
 /// new machine, a store-format change — while the pool they named is still open
 /// on chain with deposit in it. Where `adoption` allows, the chain is asked
@@ -3781,6 +3789,7 @@ where
 async fn pool_to_reuse<P>(
     store: &RedbBuyerPoolStore,
     contract: &PaymentPool::PaymentPoolInstance<P>,
+    funding: &RunFunding,
     self_address: Address,
     deployment: Deployment,
     adoption: ChainAdoption,
@@ -3804,6 +3813,17 @@ where
         }
         None => None,
     };
+    // A lane of this run already pays from the pool, so its first build read it.
+    let tracked = match tracked {
+        Some(state) if funding.pool_id() != Some(state.pool_id) => {
+            let kept = still_open(contract, self_address, state).await;
+            if let Some(state) = &kept {
+                funding.note_pool(state.pool_id);
+            }
+            kept
+        }
+        other => other,
+    };
     Ok(match (tracked, adoption) {
         (Some(state), _) => Some(state),
         (None, ChainAdoption::Refused) => None,
@@ -3811,6 +3831,41 @@ where
             adopt_owned_pool(store, contract, self_address, deployment).await?
         }
     })
+}
+
+/// `state` while the chain shows its pool open, or `None` once the chain shows
+/// this owner's pool `Closing` or `Closed`. A failed read, or a pool the chain
+/// holds no record of yet, keeps `state`: a lagging RPC can miss a pool opened
+/// moments ago, and replacing it on that read would escrow a second deposit.
+async fn still_open<P>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    self_address: Address,
+    state: BuyerPoolState,
+) -> Option<BuyerPoolState>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    match contract.getPool(state.pool_id).call().await {
+        Ok(pool)
+            if pool.owner == self_address && !matches!(pool.status, PaymentPool::Status::Open) =>
+        {
+            tracing::info!(
+                pool_id = %state.pool_id,
+                status = super::pool::status_label(pool.status),
+                "the tracked buyer pool no longer accepts work; a new pool replaces it"
+            );
+            None
+        }
+        Ok(_) => Some(state),
+        Err(error) => {
+            tracing::warn!(
+                pool_id = %state.pool_id,
+                error = %error,
+                "could not read the tracked buyer pool's status; reusing it"
+            );
+            Some(state)
+        }
+    }
 }
 
 /// Record `lane`'s on-chain watermark `(bytes, amount)` in the row before the
@@ -4045,7 +4100,8 @@ where
     P: alloy::providers::Provider + Clone,
 {
     let payment_pool_addr = deployment.payment_pool;
-    let tracked = pool_to_reuse(store, contract, self_address, deployment, adoption).await?;
+    let tracked =
+        pool_to_reuse(store, contract, funding, self_address, deployment, adoption).await?;
     if let Some(state) = tracked {
         let lane = LaneKey {
             pool_id: state.pool_id,

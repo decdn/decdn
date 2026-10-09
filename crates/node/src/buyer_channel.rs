@@ -2346,6 +2346,24 @@ async fn reclaim_once<P: Provider + Clone>(
         }
     };
 
+    // Reclaim is permissionless, so another caller may have reclaimed the pool
+    // first. Nothing is left to reclaim, and a row that survives sends every later
+    // fill to a pool that nodes answer `NotFound`, which no funding recovery step
+    // replaces. Drop the row, so the next fill opens a new pool.
+    if matches!(pool.status, PaymentPool::Status::Closed) {
+        match store.forget_if_pool(owner, state.pool_id) {
+            Ok(_) => info!(
+                pool_id = %state.pool_id,
+                "the buyer pool was already reclaimed; dropped the row"
+            ),
+            Err(err) => {
+                warn!(pool_id = %state.pool_id, error = %err, "reclaim sweep: forget of a reclaimed pool failed");
+                metrics.buyer_reclaim_failure();
+            }
+        }
+        return;
+    }
+
     // Not closed: nothing to reclaim yet.
     if pool.disputeDeadline == 0 {
         return;
