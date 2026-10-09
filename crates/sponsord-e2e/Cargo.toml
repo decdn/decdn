@@ -33,5 +33,5 @@ tower = { version = "0.5", features = ["util"] }
 # `tests/no_inline_test_modules.rs` parses every source file under `crates/`
 # and matches them against the CodeQL `paths-ignore` globs.
 globset = "0.4"
-syn = { version = "2", default-features = false, features = ["full", "parsing", "visit"] }
+syn = { version = "3", default-features = false, features = ["full", "parsing", "visit"] }
 walkdir = "2"
