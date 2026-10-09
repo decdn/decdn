@@ -14,3 +14,9 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = '(package(sponsord-core) & binary(chain_pool)) | (package(sponsord) & binary(binary_anvil))'
 slow-timeout = { period = "120s", terminate-after = 5 }
+# Each boots its own anvil and shells out to `forge`, which can lose a
+# scheduling race on a loaded runner, as decdn's anvil suites do. Scoped here,
+# never global: everything else is deterministic and fails on the first
+# attempt. A retry reports a FLAKY line rather than hiding the failure; treat
+# one as a defect to triage, not noise.
+retries = 2
