@@ -16,7 +16,11 @@
 #
 # Environment:
 #   SPONSORD_REPO            override the owner/repo (default: decdn/sponsord)
-#   SPONSORD_SIGNING_KEY     key to sign with (default: gpg's default secret key).
+#   SPONSORD_SIGNING_KEY     key to sign with. Unset, the script uses the one
+#                            secret key with a live @decdn.org uid that is
+#                            published in KEYS, else the one secret key
+#                            published in KEYS; two or more candidates stop
+#                            the script. gpg.conf's default-key is not read.
 #                            Whatever it resolves to must be published in KEYS.
 #   SPONSORD_SKIP_IMAGE_TAGS set to 1 to publish without creating ANY pullable
 #                            image tag — the release then ships with only the
@@ -125,37 +129,13 @@ if [[ -z "$SKIP_IMAGE_TAGS" ]] && (( ${#IMAGES[@]} > 0 )); then
   fi
 fi
 
-# Resolve the signing key to a full fingerprint. `gpg --list-secret-keys` with
-# NO argument exits 0 even on a completely empty keyring, so testing its exit
-# status proves nothing — extracting a fingerprint is the real check.
-#
-# Only the `fpr` following a `sec` record is taken: gpg emits one per subkey
-# too, and a signing subkey would otherwise be mistaken for a second key.
-mapfile -t SECRET_FPRS < <(
-  gpg --list-secret-keys --with-colons ${SIGNING_KEY:+"$SIGNING_KEY"} 2>/dev/null |
-    awk -F: '/^sec:/ {want = 1} /^fpr:/ && want {print $10; want = 0}'
-)
-# shellcheck disable=SC2016  # the quotes are inside a double-quoted ${:+}, so it does expand
-(( ${#SECRET_FPRS[@]} > 0 )) ||
-  die "no usable gpg secret key${SIGNING_KEY:+ matching '$SIGNING_KEY'}"
-
-# gpg substring-matches uids, so a loose SPONSORD_SIGNING_KEY can select more than
-# one key. Taking the first silently signs the release with a key the operator
-# did not name — which the KEYS check below would not catch, since it only
-# asks whether the key is *a* published maintainer key.
-if [[ -n "$SIGNING_KEY" ]] && (( ${#SECRET_FPRS[@]} > 1 )); then
-  die "SPONSORD_SIGNING_KEY '$SIGNING_KEY' is ambiguous — it matches ${#SECRET_FPRS[@]} secret keys:
-$(printf '  %s\n' "${SECRET_FPRS[@]}")
-Use a full fingerprint."
-fi
-FPR="${SECRET_FPRS[0]}"
-
-# A gpg home containing ONLY the published maintainer keys. Both the tag
-# signature and the signatures produced below are verified against this rather
-# than the personal keyring: verifying against your own keyring only proves you
-# can read a signature you already trust, which was never in doubt. This is the
-# question consumers will actually ask. It is a full home rather than a bare
-# keyring file so `git verify-tag` can use it via GNUPGHOME.
+# A gpg home containing ONLY the published maintainer keys. Key selection reads
+# it to learn which keys are published, and both the tag signature and the
+# signatures produced below are verified against it rather than the personal
+# keyring: verifying against your own keyring only proves you can read a
+# signature you already trust, which was never in doubt. This is the question
+# consumers will actually ask. It is a full home rather than a bare keyring file
+# so `git verify-tag` can use it via GNUPGHOME.
 KEYS_HOME=$(mktemp -d)
 chmod 700 "$KEYS_HOME"
 # Single EXIT trap for the whole script — a second `trap ... EXIT` later would
@@ -179,13 +159,149 @@ trap cleanup EXIT
 gpg --homedir "$KEYS_HOME" --import "$KEYS_FILE" >/dev/null 2>&1 ||
   die "KEYS is not a valid OpenPGP keyring"
 
-gpg --homedir "$KEYS_HOME" --list-keys "$FPR" >/dev/null 2>&1 || die \
-  "signing key $FPR is not published in KEYS.
+# gpg's stderr from the key listings below, shown when one fails. It lives in
+# KEYS_HOME so the EXIT trap removes it.
+GPG_ERR="$KEYS_HOME/list.err"
+
+# Reads a `gpg --with-colons` key listing on stdin and prints the primary-key
+# fingerprint of each key. Only the `fpr` right after a `sec`/`pub` record is
+# taken: gpg emits one per subkey too, and a subkey would otherwise be mistaken
+# for a second key.
+primary_fprs() {
+  awk -F: '/^(sec|pub):/ {want = 1} /^fpr:/ && want {if ($10 != "") print $10; want = 0}'
+}
+
+# Like primary_fprs, but prints only keys that can sign today: field 2 is not
+# `r`/`e`/`i`/`d` (revoked, expired, invalid, disabled) and field 12 holds `S`,
+# which gpg sets only while some part of the key is able to sign.
+#
+# With the argument `decdn`, a key must also carry a uid that is not revoked or
+# expired and whose email is a @decdn.org address. The email is the one gpg's
+# own `<address>` lookup uses: the text inside the uid's first `<…>`, whatever
+# follows it, or the whole uid when it has no `<…>`. It must be one address
+# with nothing around it, matched case-insensitively and anchored at both ends,
+# so `decdn.org.example`, `notdecdn.org`, `eu.decdn.org`, `Name me@decdn.org`
+# and `Name <me@example.com> <me@decdn.org>` do not qualify.
+signing_fprs() {
+  awk -F: -v decdn="${1:-}" '
+    function flush() { if (fpr != "" && (hit || !decdn)) print fpr }
+    /^(sec|pub):/ {
+      flush(); fpr = ""; hit = 0; want = 1
+      usable = ($2 !~ /^[reid]$/ && $12 ~ /S/)
+      next
+    }
+    /^fpr:/ && want { if (usable) fpr = $10; want = 0; next }
+    /^uid:/ && $2 !~ /^[re]$/ {
+      email = tolower($10)
+      if (match(email, /<[^<>]*>/)) email = substr(email, RSTART + 1, RLENGTH - 2)
+      if (email ~ /^[^@<> \t]+@decdn\.org$/) hit = 1
+    }
+    END { flush() }
+  '
+}
+
+# Every key KEYS publishes that can sign today. A key that KEYS marks revoked or
+# expired is left out even when the local copy still looks live: consumers
+# import KEYS, so its view of the key is the one that counts.
+KEYS_LISTING=$(gpg --homedir "$KEYS_HOME" --list-keys --with-colons 2>"$GPG_ERR") ||
+  die "gpg could not list the keys in KEYS:
+$(<"$GPG_ERR")"
+declare -A PUBLISHED=()
+while read -r f; do
+  PUBLISHED[$f]=1
+done < <(signing_fprs <<<"$KEYS_LISTING")
+
+# Reads fingerprints on stdin and prints those that are in PUBLISHED.
+published_only() {
+  local f
+  while read -r f; do
+    if [[ -n "${PUBLISHED[$f]:-}" ]]; then
+      printf '%s\n' "$f"
+    fi
+  done
+}
+
+# Resolve the signing key to a full fingerprint, in this order:
+#   1. SPONSORD_SIGNING_KEY, when set.
+#   2. The one secret key that can sign, has a live @decdn.org uid and is
+#      published in KEYS. A maintainer keyring usually holds a personal key as
+#      well, so this rule keeps keyring order out of the choice.
+#   3. The one secret key that can sign and is published in KEYS, whatever its
+#      uids.
+# Two or more candidates at step 2 or 3 stop the script. Taking the first would
+# guess which published key to sign with, by keyring order. gpg.conf's
+# default-key is not read: SPONSORD_SIGNING_KEY is how to name a key.
+if [[ -n "$SIGNING_KEY" ]]; then
+  SECRET_LISTING=$(gpg --list-secret-keys --with-colons "$SIGNING_KEY" 2>"$GPG_ERR") ||
+    die "no gpg secret key matches SPONSORD_SIGNING_KEY '$SIGNING_KEY':
+$(<"$GPG_ERR")"
+  # Every match counts here, usable or not: the question is which key the
+  # operator named, and an unusable one fails the KEYS check below instead.
+  mapfile -t SECRET_FPRS < <(primary_fprs <<<"$SECRET_LISTING")
+  (( ${#SECRET_FPRS[@]} > 0 )) ||
+    die "no gpg secret key matches SPONSORD_SIGNING_KEY '$SIGNING_KEY'"
+
+  # gpg substring-matches uids, so a loose SPONSORD_SIGNING_KEY can select more
+  # than one key. Taking the first silently signs the release with a key the
+  # operator did not name — which the KEYS check below would not catch, since
+  # it only asks whether the key is *a* published maintainer key.
+  (( ${#SECRET_FPRS[@]} == 1 )) ||
+    die "SPONSORD_SIGNING_KEY '$SIGNING_KEY' is ambiguous — it matches ${#SECRET_FPRS[@]} secret keys:
+$(printf '  %s\n' "${SECRET_FPRS[@]}")
+Use a full fingerprint."
+  FPR="${SECRET_FPRS[0]}"
+  KEY_SOURCE="SPONSORD_SIGNING_KEY"
+else
+  # With no argument, gpg exits 0 and prints nothing on an empty keyring, and
+  # also when gpg-agent is not running. The exit status only catches gpg itself
+  # failing, so an empty listing is checked on its own.
+  SECRET_LISTING=$(gpg --list-secret-keys --with-colons 2>"$GPG_ERR") ||
+    die "gpg could not list your secret keys:
+$(<"$GPG_ERR")"
+  [[ -n "$SECRET_LISTING" ]] ||
+    die "gpg lists no secret keys (is gpg-agent running, and is GNUPGHOME right?)"
+
+  mapfile -t DECDN_FPRS < <(signing_fprs decdn <<<"$SECRET_LISTING" | published_only)
+  (( ${#DECDN_FPRS[@]} <= 1 )) ||
+    die "found ${#DECDN_FPRS[@]} @decdn.org secret keys published in KEYS:
+$(printf '  %s\n' "${DECDN_FPRS[@]}")
+Set SPONSORD_SIGNING_KEY to the full fingerprint of the one to sign with."
+
+  if (( ${#DECDN_FPRS[@]} == 1 )); then
+    FPR="${DECDN_FPRS[0]}"
+    KEY_SOURCE="decdn.org key from KEYS"
+  else
+    mapfile -t CANDIDATES < <(signing_fprs <<<"$SECRET_LISTING" | published_only)
+    case ${#CANDIDATES[@]} in
+      1)
+        FPR="${CANDIDATES[0]}"
+        KEY_SOURCE="only secret key in KEYS"
+        ;;
+      0)
+        mapfile -t SECRET_FPRS < <(primary_fprs <<<"$SECRET_LISTING")
+        die "none of your secret keys is published in KEYS and able to sign:
+$(printf '  %s\n' "${SECRET_FPRS[@]}")
+Consumers follow SECURITY.md and would reject a signature from any of them. Add
+your public key to KEYS first (RELEASING.md § One-time setup)."
+        ;;
+      *)
+        die "found ${#CANDIDATES[@]} secret keys published in KEYS:
+$(printf '  %s\n' "${CANDIDATES[@]}")
+Set SPONSORD_SIGNING_KEY to the full fingerprint of the one to sign with."
+        ;;
+    esac
+  fi
+fi
+
+# Steps 2 and 3 only ever pick a published key; this is the check that holds
+# SPONSORD_SIGNING_KEY to the same rule.
+[[ -n "${PUBLISHED[$FPR]:-}" ]] || die \
+  "signing key $FPR is not published in KEYS, or KEYS marks it revoked or expired.
 Consumers follow SECURITY.md and would reject this signature. Add your public
 key to KEYS first (RELEASING.md § One-time setup), or point SPONSORD_SIGNING_KEY
 at a key that is already there."
 
-echo "==> Signing as $FPR"
+echo "==> Signing as $FPR ($KEY_SOURCE)"
 
 # The local tag must match origin's. `git fetch --tags` does NOT update a tag
 # that already exists locally, so without --force a stale or re-cut local tag

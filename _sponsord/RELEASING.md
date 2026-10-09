@@ -253,8 +253,11 @@ Once the run is green:
 .github/scripts/sign-release.sh v0.1.2
 ```
 
-It resolves your signing key to a fingerprint and confirms it is published in
-`KEYS`; force-fetches tags and checks your local tag matches `origin`'s;
+It resolves your signing key to a fingerprint — `SPONSORD_SIGNING_KEY` if set,
+else your one secret key with a live `@decdn.org` uid that is in `KEYS`, else
+your one secret key that is in `KEYS` at all; two or more candidates are
+refused, not guessed between — and confirms `KEYS` publishes it and does not
+mark it revoked or expired; force-fetches tags and checks your local tag matches `origin`'s;
 verifies the tag signature; then:
 
 - **archives:** downloads them, checks `SHA256SUMS` strictly against them,
@@ -278,7 +281,7 @@ and refuses to publish if any resolves to a different digest.
 
 | Variable | Effect |
 |----------|--------|
-| `SPONSORD_SIGNING_KEY` | key to sign with, when your default key is not the one in `KEYS` |
+| `SPONSORD_SIGNING_KEY` | key to sign with. Unset, the script uses your one secret key with a live `@decdn.org` uid that is in `KEYS`, else your one secret key that is in `KEYS`. Set it when you hold two or more such keys (for example during a key rotation). gpg.conf's `default-key` is not read |
 | `SPONSORD_SKIP_IMAGE_TAGS` | `1` publishes with **no** pullable image tag — the release then ships only the signed digest |
 | `SPONSORD_SKIP_DOCKERHUB` | `1` tags on GHCR only (implied by `SPONSORD_SKIP_IMAGE_TAGS`) |
 | `SPONSORD_DOCKERHUB_NAMESPACE` | override the Docker Hub namespace (defaults to the repo owner) |
