@@ -20,7 +20,7 @@ name: CI
 # the canary). An input would let a manual run on main execute an arbitrary
 # ref in jobs that write the cache main builds restore (CodeQL's
 # cache-poisoning finding); to build against another decdn, open a PR that
-# moves the lock (`cargo update -p decdn-incentive`).
+# moves the lock (RELEASING.md § Pinning decdn).
 
 on:
   push:
@@ -370,8 +370,9 @@ jobs:
 
   # Early warning, not a gate: the next decdn sponsord will move its lock to.
   # Cargo checks each `decdn-*` version requirement against the git crate, so
-  # the requirements are first rewritten to decdn main's workspace version,
-  # then the lock moves to decdn main's head. A failure here means the next
+  # each alias is first pointed at `branch = "main"` and its requirement
+  # rewritten to decdn main's workspace version, then the lock moves to decdn
+  # main's head. A failure here means the next
   # bump needs work; ci-success lets it fail.
   decdn-main:
     name: decdn main canary
@@ -407,7 +408,7 @@ jobs:
           set -euo pipefail
           version=$(curl -fsSL https://raw.githubusercontent.com/decdn/decdn/main/Cargo.toml \
             | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])')
-          sed -i -E "/^decdn-[a-z-]+ = \{ git = /s/version = \"[^\"]+\"/version = \"${version}\"/" Cargo.toml
+          sed -i -E "/^decdn-[a-z0-9-]+ = \{ git = /{s/(tag|rev) = \"[^\"]+\"/branch = \"main\"/;s/version = \"[^\"]+\"/version = \"${version}\"/}" Cargo.toml
           grep -E '^decdn-' Cargo.toml
           cargo update -p decdn-client -p decdn-common -p decdn-incentive -p decdn-e2e
       - run: cargo clippy --workspace --all-targets -- -D warnings

@@ -115,9 +115,12 @@ rather than writing new ones.
   `RELEASING.md`). Changelogs stay per crate.
 - **The decdn pin**: `Cargo.lock` decides which decdn commit gets built. The
   `version` on each `decdn-*` git dependency must equal decdn's workspace
-  version at that commit (`check-decdn-pin.sh`). To move it, run
+  version at that commit (`check-decdn-pin.sh`). The aliases name a decdn
+  release `tag`. To move it, change the `tag` on every `decdn-*` alias (and
+  the `version`, where one is set), then run
   `cargo update -p decdn-client -p decdn-common -p decdn-incentive -p decdn-e2e`
-  in a PR of its own. To build against a local `../decdn`, use an untracked
+  in a PR of its own (`RELEASING.md` § Pinning decdn). To build against a
+  local `../decdn`, use an untracked
   `.cargo/config.toml` `[patch]` (see `CONTRIBUTING.md`), and do not commit
   the lockfile changes it causes.
 - **The toolchain version is written in five places**:

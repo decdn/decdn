@@ -96,19 +96,20 @@ sponsord-api = { path = "crates/sponsord-api", version = "0.0.1" }
 sponsord-core = { path = "crates/sponsord-core", version = "0.0.1" }
 sponsord-onramp = { path = "crates/sponsord-onramp", version = "0.0.1" }
 
-# deCDN, from its public repository. `Cargo.lock` pins the commit every build
-# uses; `cargo update -p decdn-incentive` moves it (RELEASING.md). The
+# deCDN, from its public repository, at a release tag. `Cargo.lock` pins the
+# commit every build uses; to move it, change the `tag` on every decdn alias
+# and run `cargo update -p decdn-incentive` (RELEASING.md). The
 # `version` must equal decdn's workspace version at that commit: cargo checks
 # the requirement against the git crate, and it is what a published manifest
 # resolves on crates.io, where `git` is dropped. check_decdn_pin.py enforces
 # both; publish-crates.sh refuses until that version is on crates.io. To build
 # against a local checkout, see CONTRIBUTING.md.
-decdn-client = { git = "https://github.com/decdn/decdn", branch = "main", version = "0.0.0" }
-decdn-common = { git = "https://github.com/decdn/decdn", branch = "main", version = "0.0.0" }
-decdn-incentive = { git = "https://github.com/decdn/decdn", branch = "main", version = "0.0.0" }
+decdn-client = { git = "https://github.com/decdn/decdn", tag = "v0.0.1", version = "0.0.1" }
+decdn-common = { git = "https://github.com/decdn/decdn", tag = "v0.0.1", version = "0.0.1" }
+decdn-incentive = { git = "https://github.com/decdn/decdn", tag = "v0.0.1", version = "0.0.1" }
 # Dev-only (the anvil fixtures). A dev-dependency without a `version` is
 # stripped from the published manifest, so this one needs none.
-decdn-e2e = { git = "https://github.com/decdn/decdn", branch = "main" }
+decdn-e2e = { git = "https://github.com/decdn/decdn", tag = "v0.0.1" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"

@@ -15,7 +15,7 @@ resolves the version instead. So:
 Checked here:
 
 * There is at least one decdn alias, every one names the same git source
-  (repository and branch), and none is a leftover path into a sibling
+  (repository and ref), and none is a leftover path into a sibling
   checkout.
 * Every alias with a `version` carries an exact `X.Y.Z[-pre]`, and all carry
   the same one. An alias without one is used only as a dev-dependency (cargo

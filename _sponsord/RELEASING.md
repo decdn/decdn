@@ -89,8 +89,8 @@ either breaks every installer already served.
 ## Pinning decdn
 
 The decdn crates are git dependencies on
-[decdn/decdn](https://github.com/decdn/decdn) (`branch = "main"` in the root
-`Cargo.toml`), and two places say which decdn a release builds against. They
+[decdn/decdn](https://github.com/decdn/decdn), at a release `tag` in the root
+`Cargo.toml`, and two places say which decdn a release builds against. They
 must agree:
 
 - `Cargo.lock`: the one decdn commit every build compiles. Every CI job and
@@ -111,19 +111,19 @@ must be the commit of decdn's `v<version>` tag, and that version must be on
 crates.io. `publish-crates.sh` checks both and refuses until then. Any other
 commit still releases binaries and images; it just cannot go to crates.io.
 
-To move the lock to decdn's current `main`:
+To move the lock to another decdn release, set `tag = "v<version>"` on every
+`decdn-*` entry in the root `Cargo.toml`, and `version = "<version>"` on each
+entry that has one, then:
 
 ```bash
 cargo update -p decdn-client -p decdn-common -p decdn-incentive -p decdn-e2e
-# if decdn's workspace version moved, set version = "<it>" on each decdn-*
-# entry in Cargo.toml, then:
 cargo metadata --locked --format-version 1 > /dev/null
 .github/scripts/check-decdn-pin.sh
 ```
 
-To lock a decdn release for crates.io, point the aliases at its tag for the
-update (`tag = "v0.1.0"` in place of `branch = "main"`), run the same
-commands, and keep the tag there while sponsord ships against that release.
+To build against decdn's current `main` instead, set `branch = "main"` in
+place of the `tag`, and `version` to decdn main's workspace version, and run
+the same commands. That lock can ship binaries and images, not crates.
 
 Land the move as its own PR before cutting a release against it, with a
 changelog entry naming the new decdn commit in every crate it reaches.

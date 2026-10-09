@@ -15,6 +15,12 @@ release.
 
 ## [Unreleased]
 
+### Changed
+
+- **decdn v0.0.1.** The decdn crates are locked at decdn's `v0.0.1` release
+  tag (`454e5137ecb1bd5a57be2888dfcbfb7323719329`) and require `0.0.1`, which
+  is on crates.io, so this crate can be published there.
+
 ## [0.0.1] - 2026-10-09
 
 ### Changed (BREAKING)
