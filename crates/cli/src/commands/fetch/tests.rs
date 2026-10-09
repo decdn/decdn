@@ -1056,7 +1056,8 @@ fn ensure_delegate_signer_matches_or_rejects() {
 }
 
 /// A delegated `SpendingCapExhausted` is reconnected to the owner-side remedy; the
-/// delegate holds no wallet on the pool, so "top up / re-issue" is the fix.
+/// delegate holds no wallet on the pool, so "top up / issue a capability for a new
+/// signer key" is the fix.
 #[test]
 fn delegated_spending_cap_exhausted_gets_the_owner_remedy_hint() {
     let err = anyhow::Error::new(UpstreamVoucherRejected {
