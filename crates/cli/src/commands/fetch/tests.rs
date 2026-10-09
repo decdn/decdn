@@ -1,5 +1,6 @@
 use super::*;
 use decdn_incentive::buyer_pool::BuyerLaneProgress;
+use std::assert_matches;
 
 /// A node that sheds this client's probes is named as rate-limited, apart
 /// from the silent ones; with none, the message keeps its two counts.
@@ -1864,8 +1865,9 @@ fn a_replaced_pool_runs_the_work_again_at_most_once() {
     );
 
     let mut replaced = Some(first);
-    assert!(
-        matches!(next_pass(Ok(()), &mut replaced, false), Some(Ok(()))),
+    assert_matches!(
+        next_pass(Ok(()), &mut replaced, false),
+        Some(Ok(())),
         "the second pass completes"
     );
     let mut replaced = None;

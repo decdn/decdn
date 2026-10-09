@@ -2,6 +2,7 @@ use alloy::primitives::{B256, U256};
 
 use super::*;
 use crate::source::FakeFunder;
+use std::assert_matches;
 
 const DEPOSIT: U256 = U256::from_limbs([1_000, 0, 0, 0]);
 
@@ -26,7 +27,7 @@ async fn the_first_step_of_a_fetch_is_always_allowed() {
             U256::from(900u64),
         )
         .await;
-    assert!(matches!(stepped, Stepped::Raised(d) if d == U256::from(2_000u64)));
+    assert_matches!(stepped, Stepped::Raised(d) if d == U256::from(2_000u64));
     // The funder tops up against the remaining deposit, deposit less spend.
     assert_eq!(funder.calls(), vec![U256::from(100u64)]);
 }
@@ -43,7 +44,7 @@ async fn a_second_step_without_a_verified_byte_is_refused() {
     let stepped = gate
         .step(&funder, raised, &mut top_ups, || raised, U256::ZERO)
         .await;
-    assert!(matches!(stepped, Stepped::NoProgress), "{stepped:?}");
+    assert_matches!(stepped, Stepped::NoProgress, "{stepped:?}");
     assert_eq!(funder.calls().len(), 1, "no funding call without progress");
 }
 
@@ -63,7 +64,7 @@ async fn a_verified_byte_since_the_last_step_allows_another() {
     let stepped = gate
         .step(&funder, raised, &mut top_ups, || raised, U256::ZERO)
         .await;
-    assert!(matches!(stepped, Stepped::Raised(d) if d == U256::from(3_000u64)));
+    assert_matches!(stepped, Stepped::Raised(d) if d == U256::from(3_000u64));
     assert_eq!(funder.calls().len(), 2);
 }
 
@@ -76,7 +77,7 @@ async fn a_deposit_a_sibling_already_raised_takes_no_step() {
     let stepped = gate
         .step(&funder, DEPOSIT, &mut top_ups, || now, U256::ZERO)
         .await;
-    assert!(matches!(stepped, Stepped::Raised(d) if d == now));
+    assert_matches!(stepped, Stepped::Raised(d) if d == now);
     assert!(
         funder.calls().is_empty(),
         "the sibling's step covers this one"
@@ -85,7 +86,7 @@ async fn a_deposit_a_sibling_already_raised_takes_no_step() {
     let stepped = gate
         .step(&funder, now, &mut top_ups, || now, U256::ZERO)
         .await;
-    assert!(matches!(stepped, Stepped::Raised(_)));
+    assert_matches!(stepped, Stepped::Raised(_));
 }
 
 #[tokio::test]
@@ -96,12 +97,12 @@ async fn a_replaced_pool_stays_replaced_for_every_later_step() {
     let stepped = gate
         .step(&funder, DEPOSIT, &mut top_ups, || DEPOSIT, U256::ZERO)
         .await;
-    assert!(matches!(stepped, Stepped::Replaced(r) if r == replaced()));
+    assert_matches!(stepped, Stepped::Replaced(r) if r == replaced());
     gate.record_verified(10);
     let stepped = gate
         .step(&funder, DEPOSIT, &mut top_ups, || DEPOSIT, U256::ZERO)
         .await;
-    assert!(matches!(stepped, Stepped::Replaced(r) if r == replaced()));
+    assert_matches!(stepped, Stepped::Replaced(r) if r == replaced());
     assert_eq!(funder.calls().len(), 1);
 }
 
@@ -122,12 +123,12 @@ async fn the_next_pass_steps_on_the_new_pool_under_the_same_progress_rule() {
     let stepped = gate
         .step(&funder, DEPOSIT, &mut top_ups, || DEPOSIT, U256::ZERO)
         .await;
-    assert!(matches!(stepped, Stepped::NoProgress), "{stepped:?}");
+    assert_matches!(stepped, Stepped::NoProgress, "{stepped:?}");
     gate.record_verified(1);
     let stepped = gate
         .step(&funder, DEPOSIT, &mut top_ups, || DEPOSIT, U256::ZERO)
         .await;
-    assert!(matches!(stepped, Stepped::Raised(d) if d == U256::from(2_000u64)));
+    assert_matches!(stepped, Stepped::Raised(d) if d == U256::from(2_000u64));
 }
 
 #[tokio::test]
@@ -177,17 +178,11 @@ async fn a_siblings_settle_step_answers_a_caller_that_has_not_seen_it() {
     let stepped = gate
         .step(&funder, DEPOSIT, &mut first, || DEPOSIT, U256::ZERO)
         .await;
-    assert!(
-        matches!(stepped, Stepped::Raised(d) if d == DEPOSIT),
-        "{stepped:?}"
-    );
+    assert_matches!(stepped, Stepped::Raised(d) if d == DEPOSIT, "{stepped:?}");
     let stepped = gate
         .step(&funder, DEPOSIT, &mut second, || DEPOSIT, U256::ZERO)
         .await;
-    assert!(
-        matches!(stepped, Stepped::Raised(d) if d == DEPOSIT),
-        "{stepped:?}"
-    );
+    assert_matches!(stepped, Stepped::Raised(d) if d == DEPOSIT, "{stepped:?}");
     assert_eq!(
         funder.calls().len(),
         1,
@@ -196,7 +191,7 @@ async fn a_siblings_settle_step_answers_a_caller_that_has_not_seen_it() {
     let stepped = gate
         .step(&funder, DEPOSIT, &mut second, || DEPOSIT, U256::ZERO)
         .await;
-    assert!(matches!(stepped, Stepped::NoProgress), "{stepped:?}");
+    assert_matches!(stepped, Stepped::NoProgress, "{stepped:?}");
 }
 
 /// Two callers exhausted at the same deposit step at once: one tops up, and
@@ -216,8 +211,9 @@ async fn concurrent_callers_share_one_top_up() {
     let a = call(std::sync::Arc::clone(&gate), std::sync::Arc::clone(&funder));
     let b = call(std::sync::Arc::clone(&gate), std::sync::Arc::clone(&funder));
     for stepped in [a.await.unwrap(), b.await.unwrap()] {
-        assert!(
-            matches!(stepped, Stepped::Raised(d) if d == U256::from(2_000u64)),
+        assert_matches!(
+            stepped,
+            Stepped::Raised(d) if d == U256::from(2_000u64),
             "{stepped:?}"
         );
     }
@@ -238,8 +234,9 @@ async fn a_caller_behind_a_siblings_top_up_takes_the_raised_deposit() {
     let stepped = gate
         .step(&funder, DEPOSIT, &mut late, || U256::ZERO, U256::ZERO)
         .await;
-    assert!(
-        matches!(stepped, Stepped::Raised(d) if d == U256::from(2_000u64)),
+    assert_matches!(
+        stepped,
+        Stepped::Raised(d) if d == U256::from(2_000u64),
         "{stepped:?}"
     );
     assert_eq!(funder.calls().len(), 1);
@@ -267,7 +264,7 @@ async fn the_next_pass_forgets_the_old_pools_deposit() {
     let stepped = gate
         .step(&funder, DEPOSIT, &mut top_ups, || DEPOSIT, U256::ZERO)
         .await;
-    assert!(matches!(stepped, Stepped::NoProgress), "{stepped:?}");
+    assert_matches!(stepped, Stepped::NoProgress, "{stepped:?}");
 }
 
 #[test]
@@ -275,10 +272,10 @@ fn a_replacement_ends_the_pass_with_the_new_pool() {
     let exhausted = anyhow::Error::new(crate::NoAffordableSource { deposit: DEPOSIT });
     let end = after_step(Stepped::Replaced(replaced()), exhausted).unwrap_err();
     assert_eq!(end.downcast_ref::<PoolReplaced>(), Some(&replaced()));
-    assert!(matches!(
+    assert_matches!(
         crate::classify(&end),
         crate::Fault::Fatal(crate::FatalScope::Command)
-    ));
+    );
 }
 
 #[test]

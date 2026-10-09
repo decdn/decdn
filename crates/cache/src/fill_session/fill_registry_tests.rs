@@ -7,6 +7,7 @@ use decdn_bao_range::{IROH_BLOCK_SIZE, align_range};
 
 use super::{FillClaim, FillError, FillRegistry, FillSession};
 use crate::{CHUNK_GROUP_BYTES, Hash};
+use std::assert_matches;
 
 /// One chunk group of bytes, the alignment granularity `claim` snaps to.
 const G: u64 = CHUNK_GROUP_BYTES;
@@ -547,14 +548,11 @@ fn claim_make_session_not_called_on_attach() {
     let hash = store_hash(0x34);
 
     let owner = reg.claim(hash, 0, 0, total, || FillSession::new(root(0x34), total));
-    assert!(matches!(owner, FillClaim::Owner { .. }), "first claim owns");
+    assert_matches!(owner, FillClaim::Owner { .. }, "first claim owns");
     let attach = reg.claim(hash, 0, 0, total, || {
         panic!("make_session must not be called on the attach branch")
     });
-    assert!(
-        matches!(attach, FillClaim::Attach { .. }),
-        "second attaches"
-    );
+    assert_matches!(attach, FillClaim::Attach { .. }, "second attaches");
 }
 
 /// (d) Lease teardown: the last observer leaving before the pull ends cancels

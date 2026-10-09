@@ -22,6 +22,7 @@
 use bytes::Bytes;
 use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, IROH_BLOCK_SIZE, RangedStore};
 use decdn_client::ClientRangedStore;
+use std::assert_matches;
 
 const GROUP: u64 = CHUNK_GROUP_BYTES;
 
@@ -126,8 +127,9 @@ async fn resume_trusts_record_without_rehashing() {
         .finalize()
         .await
         .expect_err("finalize's whole-file hash must catch the corrupted prefix");
-    assert!(
-        matches!(err, decdn_bao_range::RangedStoreError::Backend(_)),
+    assert_matches!(
+        err,
+        decdn_bao_range::RangedStoreError::Backend(_),
         "{err:?}"
     );
     assert!(partial_path.exists(), "a failed finalize keeps the partial");

@@ -1288,7 +1288,7 @@ mod doubles {
                 if let Some((after, make)) = &self.fault
                     && *after < wire.len()
                     && self.faults_left.as_ref().is_none_or(|left| {
-                        left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        left.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                             .is_ok()
                     })
                 {

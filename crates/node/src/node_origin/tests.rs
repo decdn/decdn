@@ -1,5 +1,6 @@
 use super::*;
 use decdn_protocol::{Coverage, VoucherRejectReason};
+use std::assert_matches;
 
 /// A hash stays pending while any open for it is in flight, and clears when
 /// the last guard drops. Another hash is never pending (#2224).
@@ -228,10 +229,10 @@ fn an_unfundable_wallet_is_funding_needed_and_answers_not_found() {
         .context(OpenReported)
         .context(LocalPullFault);
     assert_eq!(classify_pool_open_arm(&err), PoolOpenArm::FundingNeeded);
-    assert!(matches!(
+    assert_matches!(
         miss_answer(PullMiss::FundingNeeded),
         Ok(OriginFetch::NotFound)
-    ));
+    );
     assert_eq!(
         PullMiss::Clean.or(PullMiss::FundingNeeded),
         PullMiss::FundingNeeded
@@ -271,7 +272,7 @@ fn an_unmarked_failure_is_the_residual() {
 async fn unprovisioned_fetch_is_not_found() {
     let origin = NodeOrigin::new();
     let got = origin.fetch(Hash::new(b"anything"), 1 << 20).await.unwrap();
-    assert!(matches!(got, OriginFetch::NotFound));
+    assert_matches!(got, OriginFetch::NotFound);
     assert_eq!(origin.kind(), OriginKind::Peer);
 }
 
@@ -628,14 +629,11 @@ fn only_our_own_fault_may_withhold_a_not_found() {
 /// ceiling by probing for the wire difference).
 #[test]
 fn below_margin_is_wire_identical_to_clean() {
-    assert!(matches!(
-        miss_answer(PullMiss::Clean),
-        Ok(OriginFetch::NotFound)
-    ));
-    assert!(matches!(
+    assert_matches!(miss_answer(PullMiss::Clean), Ok(OriginFetch::NotFound));
+    assert_matches!(
         miss_answer(PullMiss::BelowMargin),
         Ok(OriginFetch::NotFound)
-    ));
+    );
 }
 
 /// A [`PullMiss::BelowMargin`] never masks, and is never masked by, a

@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -593,8 +594,9 @@ async fn spawn_periodic_exits_promptly_on_shutdown() {
     stop_tx.send(()).expect("receiver still alive");
 
     let joined = tokio::time::timeout(Duration::from_millis(500), tasks.join_next()).await;
-    assert!(
-        matches!(joined, Ok(Some(Ok(())))),
+    assert_matches!(
+        joined,
+        Ok(Some(Ok(()))),
         "spawn_periodic must exit within 500ms of shutdown signal; a 60s hang \
          here means the stop arm of the select was lost"
     );
@@ -887,7 +889,7 @@ async fn shutdown_streams_recv_resolves_on_sigterm() {
     let signal = tokio::time::timeout(Duration::from_millis(500), streams.recv())
         .await
         .expect("ShutdownStreams::recv did not resolve within 500ms of SIGTERM");
-    assert!(matches!(signal, ShutdownSignal::Sigterm));
+    assert_matches!(signal, ShutdownSignal::Sigterm);
 }
 
 /// Guard test for ADR 005 transport defaults. Catches accidental edits to

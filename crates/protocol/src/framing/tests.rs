@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 
 #[tokio::test]
 async fn parse_frame_incomplete_header_and_body_return_none() -> Result<(), FrameError> {
@@ -29,10 +30,10 @@ async fn parse_frame_incomplete_header_and_body_return_none() -> Result<(), Fram
 async fn parse_frame_rejects_oversized_length() -> Result<(), FrameError> {
     let mut hdr = Vec::new();
     write_varint_u32(&mut hdr, MAX_MESSAGE_SIZE + 1).await?;
-    assert!(matches!(
+    assert_matches!(
         parse_frame(&hdr),
         Err(FrameError::TooLarge(n)) if n == MAX_MESSAGE_SIZE + 1
-    ));
+    );
     Ok(())
 }
 
@@ -69,7 +70,7 @@ async fn varint_rejects_oversize_continuation() {
     let bytes = [0xFFu8, 0xFF, 0xFF, 0xFF, 0xFF];
     let mut cursor = std::io::Cursor::new(bytes);
     let r = read_varint_u32(&mut cursor).await;
-    assert!(matches!(r, Err(FrameError::Varint)));
+    assert_matches!(r, Err(FrameError::Varint));
 }
 
 #[tokio::test]
@@ -78,7 +79,7 @@ async fn varint_rejects_5th_byte_overflow_bits() {
     let bytes = [0x80u8, 0x80, 0x80, 0x80, 0x10];
     let mut cursor = std::io::Cursor::new(bytes);
     let r = read_varint_u32(&mut cursor).await;
-    assert!(matches!(r, Err(FrameError::Varint)));
+    assert_matches!(r, Err(FrameError::Varint));
 }
 
 #[tokio::test]
@@ -100,7 +101,7 @@ async fn frame_rejects_too_large_without_reading_payload() -> Result<(), FrameEr
     let header_len = header.len();
     let mut cursor = std::io::Cursor::new(header);
     let r = read_frame(&mut cursor).await;
-    assert!(matches!(r, Err(FrameError::TooLarge(n)) if n == MAX_MESSAGE_SIZE + 1));
+    assert_matches!(r, Err(FrameError::TooLarge(n)) if n == MAX_MESSAGE_SIZE + 1);
     // No payload bytes were read.
     assert_eq!(usize::try_from(cursor.position()).ok(), Some(header_len));
     Ok(())
@@ -114,7 +115,7 @@ async fn frame_short_read_errors() -> Result<(), FrameError> {
     buf.extend_from_slice(b"abc");
     let mut cursor = std::io::Cursor::new(buf);
     let r = read_frame(&mut cursor).await;
-    assert!(matches!(r, Err(FrameError::Io(_))));
+    assert_matches!(r, Err(FrameError::Io(_)));
     Ok(())
 }
 
@@ -161,10 +162,7 @@ async fn decode_message_rejects_garbage() {
     // Discriminant 99 has no matching `ProbeMessage` variant → Decode error.
     let garbage = [99u8, 0, 0, 0];
     let r = decode_message::<ProbeMessage>(&garbage);
-    assert!(
-        matches!(r, Err(FrameError::Decode(_))),
-        "expected FrameError::Decode"
-    );
+    assert_matches!(r, Err(FrameError::Decode(_)), "expected FrameError::Decode");
 }
 
 #[tokio::test]
@@ -175,8 +173,9 @@ async fn varint_eof_mid_stream() {
     let bytes = [0x80u8];
     let mut cursor = std::io::Cursor::new(bytes);
     let r = read_varint_u32(&mut cursor).await;
-    assert!(
-        matches!(&r, Err(FrameError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+    assert_matches!(
+        &r,
+        Err(FrameError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof,
         "expected Io(UnexpectedEof), got {r:?}"
     );
 }

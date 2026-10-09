@@ -3,9 +3,9 @@
 # identical to resolver 2's; the only difference is that
 # `resolver.incompatible-rust-versions` defaults to `fallback` instead of
 # `allow`, so cargo prefers dependency versions whose declared `rust-version`
-# is <= ours. Paired with `rust-version = "1.95.0"` below, that stops a future
+# is <= ours. Paired with `rust-version = "1.99.0"` below, that stops a future
 # `cargo update` from silently pulling a dependency that raised its MSRV past
-# the pinned toolchain. Nothing is excluded at 1.95.0 today.
+# the pinned toolchain. `cargo update --dry-run --verbose` names any version it holds back.
 resolver = "3"
 members = [
     "crates/node",
@@ -40,7 +40,7 @@ license = "MIT OR Apache-2.0"
 # `dtolnay/rust-toolchain@…` ref in the workflows are compared byte-for-byte by
 # check_toolchain_pin.py, so they move together or the `packaging` job says
 # which one did not.
-rust-version = "1.95.0"
+rust-version = "1.99.0"
 repository = "https://github.com/decdn/decdn"
 homepage = "https://decdn.org"
 keywords = ["cdn", "p2p", "content-delivery", "iroh", "blake3"]
@@ -283,8 +283,9 @@ alloy-json-rpc = "2"
 # test sets `RUSTC_BOOTSTRAP=1` to unlock the rustdoc-JSON flag; see
 # crates/protocol/tests/public_api.rs); `insta` snapshots the rendered surface.
 # Used only by the feature-gated `public_api` test target, which stays out of
-# the default workspace run. The `public-api` minor (0.52 → rustdoc-types 0.57)
-# must match the rustdoc-JSON `format_version` our stable toolchain emits.
+# the default workspace run. The `public-api` minor (0.52 → rustdoc-types 0.59,
+# format 59) must parse the rustdoc-JSON our stable toolchain emits (format 61).
+# It does not check `format_version`; the passing snapshot is the only check.
 public-api = "0.52"
 rustdoc-json = "0.9"
 insta = "1"
@@ -350,8 +351,8 @@ panic = "deny"
 indexing_slicing = "deny"
 
 # Numeric safety (payment amounts, byte offsets). `deny`, not `warn`: CI clippy
-# and the pre-commit hook both pass `-D warnings`, so these were already fatal
-# there — `deny` makes a bare local `cargo clippy` agree, and stops a call site
+# and the pre-commit hook set `CARGO_BUILD_WARNINGS=deny`, so any warning is
+# fatal there — `deny` makes a bare local `cargo clippy` agree, and stops a call site
 # relaxing one back to `warn`. Widening casts stay legal; `as_conversions` is
 # deliberately NOT enabled — it fires on every `as` cast, safe ones included:
 # it counts casts, it does not judge them.
@@ -384,6 +385,12 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+# An `async fn` trait impl that never awaits reads better than the lint's
+# rewrite to `-> impl Future` + `std::future::ready(..)`.
+unused_async_trait_impl = "allow"
+# Its `assert_eq!` rewrite needs `[] as [T; 0]` for a `Vec`, and for
+# `!is_empty()` the failure prints only the empty value, so it adds nothing.
+assert_is_empty = "allow"
 
 [profile.dev]
 opt-level = 0

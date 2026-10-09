@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 
 const ROOT: &str = "cause-root-7f3a";
 const OUTER: &str = "ctx-outer-7f3a";
@@ -89,14 +90,12 @@ fn logged_decompression_failure_names_the_decoder_error_once() {
 #[test]
 fn origin_error_kind_finds_the_typed_cause_under_context() {
     let e = decompression_fault();
-    assert!(
-        matches!(
-            e.origin_error_kind(),
-            Some(OriginError::DecompressionFailed {
-                encoding: SupportedEncoding::Gzip,
-                ..
-            })
-        ),
+    assert_matches!(
+        e.origin_error_kind(),
+        Some(OriginError::DecompressionFailed {
+            encoding: SupportedEncoding::Gzip,
+            ..
+        }),
         "{e:?}"
     );
 }

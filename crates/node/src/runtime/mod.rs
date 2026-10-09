@@ -2466,8 +2466,8 @@ pub async fn run(
 /// stop signal, watcher handle, or task handle that the graceful-shutdown
 /// sequence consumes exactly once; the exhaustive destructure at the top of
 /// [`shutdown`] (no `..` rest) is a deliberate safety net — a field left
-/// unconsumed becomes an unused-variable error under `-D warnings`, proving no
-/// stop signal was dropped on the floor.
+/// unconsumed raises an `unused_variables` warning, which CI and the pre-commit
+/// hook make fatal, proving no stop signal was dropped on the floor.
 struct ShutdownHandles<P: Provider + Clone + 'static> {
     metrics_stop_tx: oneshot::Sender<()>,
     dispatch_gc_stop_tx: oneshot::Sender<()>,

@@ -3,6 +3,7 @@ use super::{
     PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, RampPacer, WindowPacer,
 };
 use alloy::primitives::U256;
+use std::assert_matches;
 
 /// A healthy mid-fetch snapshot: deposit covers the next voucher, range
 /// incomplete. Each test tweaks one axis.
@@ -55,10 +56,7 @@ fn a_deposit_that_exactly_covers_the_next_voucher_draws() {
     let mut s = healthy();
     s.remaining_deposit = U256::from(10u64);
     s.next_voucher_cost = U256::from(10u64);
-    assert!(matches!(
-        BudgetPacer::new().decide(&s),
-        PaceDecision::Draw { .. }
-    ));
+    assert_matches!(BudgetPacer::new().decide(&s), PaceDecision::Draw { .. });
 }
 
 #[test]
@@ -68,10 +66,7 @@ fn the_first_draw_before_any_quote_always_proceeds() {
     let mut s = healthy();
     s.remaining_deposit = U256::ZERO;
     s.next_voucher_cost = U256::ZERO;
-    assert!(matches!(
-        BudgetPacer::new().decide(&s),
-        PaceDecision::Draw { .. }
-    ));
+    assert_matches!(BudgetPacer::new().decide(&s), PaceDecision::Draw { .. });
 }
 
 #[test]
@@ -156,7 +151,7 @@ fn min_draw_is_clamped_to_the_gap_remainder() {
     // minimum shrinks to the (group-rounded) remainder, so the tail draws.
     let (pacer, mut s) = big_window_state(64 * 1024 * 1024 - 3 * CHUNK_GROUP_BYTES);
     s.gap_remaining = 2 * CHUNK_GROUP_BYTES + 100;
-    assert!(matches!(pacer.decide(&s), PaceDecision::Draw { .. }));
+    assert_matches!(pacer.decide(&s), PaceDecision::Draw { .. });
     // Two groups of room for the same remainder is below it: wait.
     let (pacer, mut s) = big_window_state(64 * 1024 * 1024 - 2 * CHUNK_GROUP_BYTES);
     s.gap_remaining = 2 * CHUNK_GROUP_BYTES + 100;
@@ -214,11 +209,9 @@ fn half_the_window_always_opens_once_the_client_catches_up() {
         s.gap_remaining = 1 << 40;
         s.pulled_frontier = 100 * CHUNK_BYTES + lag;
         s.downstream.served_paid = 100 * CHUNK_BYTES;
-        assert!(
-            matches!(
-                WindowPacer::new(window).decide(&s),
-                PaceDecision::Draw { .. }
-            ),
+        assert_matches!(
+            WindowPacer::new(window).decide(&s),
+            PaceDecision::Draw { .. },
             "window {window} must draw with a caught-up client"
         );
         window += CHUNK_GROUP_BYTES;
@@ -361,7 +354,7 @@ fn ramp_pacer_widens_the_pull_window_as_served_paid_advances() {
     let mut s = healthy();
     s.downstream.served_paid = 32 * CHUNK_GROUP_BYTES;
     s.pulled_frontier = floor;
-    assert!(matches!(pacer.decide(&s), PaceDecision::Draw { .. }));
+    assert_matches!(pacer.decide(&s), PaceDecision::Draw { .. });
 }
 
 #[test]
@@ -386,7 +379,7 @@ fn ramp_pacer_measures_paid_from_the_session_start() {
     // Once the stream has paid 32 groups PAST its start, the window is 16
     // groups (> floor), so the same pull may Draw again.
     s.downstream.served_paid = start + 32 * CHUNK_GROUP_BYTES;
-    assert!(matches!(pacer.decide(&s), PaceDecision::Draw { .. }));
+    assert_matches!(pacer.decide(&s), PaceDecision::Draw { .. });
 }
 
 #[test]
@@ -406,7 +399,7 @@ fn ramp_pacer_adds_the_carried_credit_to_the_streams_own_payment() {
     let mut s = healthy();
     s.downstream.served_paid = start;
     s.pulled_frontier = start + floor;
-    assert!(matches!(pacer.decide(&s), PaceDecision::Draw { .. }));
+    assert_matches!(pacer.decide(&s), PaceDecision::Draw { .. });
     s.pulled_frontier = start + 16 * CHUNK_GROUP_BYTES;
     assert_eq!(pacer.decide(&s), PaceDecision::Wait);
 
@@ -416,7 +409,7 @@ fn ramp_pacer_adds_the_carried_credit_to_the_streams_own_payment() {
     s.pulled_frontier = start + 16 * CHUNK_GROUP_BYTES + 24 * CHUNK_GROUP_BYTES;
     assert_eq!(pacer.decide(&s), PaceDecision::Wait);
     s.pulled_frontier -= CHUNK_GROUP_BYTES;
-    assert!(matches!(pacer.decide(&s), PaceDecision::Draw { .. }));
+    assert_matches!(pacer.decide(&s), PaceDecision::Draw { .. });
 }
 
 /// The liveness invariant `PULL_WINDOW_FLOOR` exists to hold: a pull window
@@ -470,8 +463,9 @@ fn at_the_floor_a_pull_one_chunk_ahead_may_still_draw() {
     // position by up to one group (`content_paid_frontier` floors to one).
     s.downstream.served_paid = 0;
     s.pulled_frontier = CHUNK_BYTES;
-    assert!(
-        matches!(pacer.decide(&s), PaceDecision::Draw { .. }),
+    assert_matches!(
+        pacer.decide(&s),
+        PaceDecision::Draw { .. },
         "the pull must be able to feed the client past the chunk boundary it \
          pays at, or neither side can move"
     );

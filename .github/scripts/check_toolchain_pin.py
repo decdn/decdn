@@ -19,7 +19,7 @@ to prevent. This check turns that PR red until the two TOML sites move in the
 same change.
 
 All sites must carry the identical `X.Y.Z` string. A two-part `rust-version`
-("1.95") satisfies cargo but is not the string the other sites carry, and
+("X.Y") satisfies cargo but is not the string the other sites carry, and
 `stable` is the floating spelling the pin exists to refuse, so both fail here
 rather than being normalised. Zero action refs is a failure too: a regex that
 matches nothing must not report agreement.

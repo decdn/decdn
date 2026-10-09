@@ -17,7 +17,7 @@ Closes #
 <!-- The commands you ran and their result. -->
 
 - [ ] `cargo fmt -- --check`
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- [ ] `CARGO_BUILD_WARNINGS=deny cargo clippy --workspace --all-targets --all-features`
 - [ ] `cargo nextest run`
 - [ ] `contracts/` changed: `(cd contracts && forge fmt --check && FOUNDRY_PROFILE=ci forge build --sizes --deny warnings && forge test)`, and `.gas-snapshot` regenerated with `(cd contracts && FOUNDRY_PROFILE=ci forge snapshot --snap .gas-snapshot)`
 - [ ] User-visible change: `CHANGELOG.md` entry added

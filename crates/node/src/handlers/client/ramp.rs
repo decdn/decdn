@@ -39,10 +39,9 @@ impl RampPool {
     fn take(&self, cap: u64) -> u64 {
         let prev = self
             .credit
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-                Some(c.saturating_sub(cap))
-            })
-            .unwrap_or_else(|c| c);
+            .update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                c.saturating_sub(cap)
+            });
         prev.min(cap)
     }
 
@@ -51,10 +50,9 @@ impl RampPool {
         if bytes == 0 || cap == 0 {
             return;
         }
-        let _ = self
-            .credit
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-                Some(c.saturating_add(bytes).min(cap))
+        self.credit
+            .update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                c.saturating_add(bytes).min(cap)
             });
     }
 

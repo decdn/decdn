@@ -67,7 +67,7 @@ const GUARD: Duration = DEFAULT_RPC_CALL_TIMEOUT.saturating_mul(6);
 pub(crate) async fn bounded<T>(what: &str, fut: impl Future<Output = T>) -> T {
     // `unwrap_or_else` rather than a `match` with an `Err(_)` arm: the only
     // error here is `Elapsed`, and matching it as a wildcard trips
-    // `clippy::match_wild_err_arm` (fatal under CI's `-D warnings`), whose
+    // `clippy::match_wild_err_arm` (fatal under CI's `CARGO_BUILD_WARNINGS=deny`), whose
     // suggested `.expect(msg)` is itself denied by the anti-panic policy.
     tokio::time::timeout(GUARD, fut)
         .await

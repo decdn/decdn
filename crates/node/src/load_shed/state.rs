@@ -75,16 +75,14 @@ pub struct ShedSlot {
 
 impl Drop for ShedSlot {
     fn drop(&mut self) {
-        let _ = self
-            .state
+        self.state
             .node_active
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(1))
+            .update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                n.saturating_sub(1)
             });
-        let _ = self
-            .counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(1))
+        self.counter
+            .update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                n.saturating_sub(1)
             });
         // Best-effort prune: only removes if whatever is currently mapped for
         // this key is zero; a concurrently-recreated live entry is left intact

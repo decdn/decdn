@@ -175,7 +175,7 @@ fn intersecting_parents(n: u64, base: u64, a: u64, b: u64) -> u64 {
     }
     // Largest power of two strictly below `n` (`n >= 2` here): the left child's
     // group count.
-    let left = 1u64 << (n - 1).ilog2();
+    let left = (n - 1).isolate_highest_one();
     1u64.saturating_add(intersecting_parents(left, base, a, b))
         .saturating_add(intersecting_parents(
             n - left,

@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 
 fn make_cfg() -> S3OriginConfig {
     S3OriginConfig {
@@ -74,11 +75,9 @@ fn body_stream_error_preserves_retry_classification() {
     // stays Transient after prefixing.
     let raw = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated body");
     let wrapped = prefix_body_stream_error("s3://decdn-blobs/ab/abcdef", raw);
-    assert!(
-        matches!(
-            crate::retry::classify_io_error(wrapped),
-            OriginPullError::Transient(_)
-        ),
+    assert_matches!(
+        crate::retry::classify_io_error(wrapped),
+        OriginPullError::Transient(_),
         "prefixing broke transient classification of a mid-body EOF"
     );
 }
@@ -97,11 +96,9 @@ fn body_stream_error_passes_typed_marker_through() {
         "typed marker was wrapped and lost its downcast identity"
     );
     // … and the downcast-driven classification still lands on Permanent.
-    assert!(
-        matches!(
-            crate::retry::classify_io_error(out),
-            OriginPullError::Permanent(_)
-        ),
+    assert_matches!(
+        crate::retry::classify_io_error(out),
+        OriginPullError::Permanent(_),
         "typed marker no longer classifies Permanent after prefixing"
     );
 }

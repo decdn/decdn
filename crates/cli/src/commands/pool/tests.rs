@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 
 #[test]
 fn resolve_expiry_absolute_and_relative_agree() {
@@ -578,14 +579,8 @@ fn a_faulted_clear_fails_and_keeps_the_reclaim_instruction() {
 #[test]
 fn close_plan_acts_only_on_open() {
     assert_eq!(plan_close(PaymentPool::Status::Open), ClosePlan::Close);
-    assert!(matches!(
-        plan_close(PaymentPool::Status::Closing),
-        ClosePlan::Skip(_)
-    ));
-    assert!(matches!(
-        plan_close(PaymentPool::Status::Closed),
-        ClosePlan::Skip(_)
-    ));
+    assert_matches!(plan_close(PaymentPool::Status::Closing), ClosePlan::Skip(_));
+    assert_matches!(plan_close(PaymentPool::Status::Closed), ClosePlan::Skip(_));
 }
 
 #[test]

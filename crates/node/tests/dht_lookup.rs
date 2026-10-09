@@ -47,6 +47,7 @@ use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets};
 // Teardown is routed through the shared bounded helper rather than a bare
 // `Endpoint::close().await`, which has no deadline of its own.
 mod support;
+use std::assert_matches;
 use support::shutdown;
 
 fn fresh_key() -> SecretKey {
@@ -228,8 +229,9 @@ fn insert_record(records: &Mutex<RecordStore>, hash: [u8; 32], holder: [u8; 32])
         Coverage::full(1),
         receive_us,
     );
-    assert!(
-        matches!(outcome, InsertOutcome::Inserted | InsertOutcome::Refreshed),
+    assert_matches!(
+        outcome,
+        InsertOutcome::Inserted | InsertOutcome::Refreshed,
         "test record insert must succeed: {outcome:?}"
     );
 }

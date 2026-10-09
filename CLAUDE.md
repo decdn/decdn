@@ -41,7 +41,7 @@ Full Solidity workflow, CI gotchas, static analysis, coverage, and gas snapshots
 
 ## Architecture
 
-**Language:** Rust (edition 2024, MSRV 1.95). **Networking:** iroh (QUIC transport, NAT traversal, content-addressed blobs).
+**Language:** Rust (edition 2024, MSRV 1.99). **Networking:** iroh (QUIC transport, NAT traversal, content-addressed blobs).
 
 **Code style:** `rustfmt.toml` sets `max_width = 100`.
 
@@ -53,7 +53,7 @@ Full Solidity workflow, CI gotchas, static analysis, coverage, and gas snapshots
 
 **Say what you mean:** `elided_lifetimes_in_paths` and `unreachable_pub` are `warn`. Write `Foo<'_>` when the type borrows, and give an item inside a private module the visibility it actually has (`pub(crate)` / `pub(super)`) rather than a bare `pub`. Both are machine-fixable — `cargo clippy --fix --workspace --all-targets` applies them.
 
-**`missing_docs` is `warn`:** every public item — including struct fields and enum variants — carries a doc comment. The `alloy::sol!` bindings are the exception: each generated block opts out where it is declared, so a new binding needs the same `#[allow(missing_docs)]` on its wrapper. New docs are link-checked too: the `doc` gate runs `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items`, so a broken `[`Type`]` link fails the build.
+**`missing_docs` is `warn`:** every public item — including struct fields and enum variants — carries a doc comment. The `alloy::sol!` bindings are the exception: each generated block opts out where it is declared, so a new binding needs the same `#[allow(missing_docs)]` on its wrapper. New docs are link-checked too: the `doc` gate runs `CARGO_BUILD_WARNINGS=deny cargo doc --workspace --no-deps --document-private-items`, so a broken `[`Type`]` link fails the build.
 
 **Unit tests live in their own file:** every `#[cfg(test)]` module, whatever its name or size, is declared `mod <name>;` with its body in `foo/<name>.rs` for `foo.rs`, or `<name>.rs` beside a `lib.rs`/`main.rs`/`mod.rs`. Never inline, and never in `crates/*/tests/` for tests that need private access. `crates/e2e/tests/no_inline_test_modules.rs` fails the test run on an inline body. See [CONTRIBUTING.md § Unit test placement](CONTRIBUTING.md#unit-test-placement).
 

@@ -3,7 +3,7 @@
 [![CI](https://github.com/decdn/decdn/actions/workflows/ci.yml/badge.svg)](https://github.com/decdn/decdn/actions/workflows/ci.yml)
 [![Security](https://github.com/decdn/decdn/actions/workflows/security.yml/badge.svg)](https://github.com/decdn/decdn/actions/workflows/security.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![MSRV](https://img.shields.io/badge/MSRV-1.95.0-orange.svg)](rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.99.0-orange.svg)](rust-toolchain.toml)
 
 A decentralized CDN. Bonded operators cache and serve BLAKE3-addressed blobs over
 [iroh](https://iroh.computer/) QUIC, and clients pay for every megabyte in USDC through

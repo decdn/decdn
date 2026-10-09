@@ -22,6 +22,7 @@ use crate::{
     UpstreamVoucherRejected,
 };
 use decdn_bao_range::RangedStore;
+use std::assert_matches;
 
 /// A deterministic blob of `len` bytes: the same synth as the `source` unit
 /// tests, so a `ScriptedSource` over it yields verifiable wire.
@@ -2292,11 +2293,9 @@ async fn pool_wide_spent_gates_on_other_run_lanes() -> anyhow::Result<()> {
     .await
     .expect_err("the pool-wide spend must refuse the second leg");
     assert!(err.downcast_ref::<GaveUp>().is_some(), "{err:#}");
-    assert!(
-        matches!(
-            health.health(Address::repeat_byte(0xA1)),
-            Health::Unaffordable { .. }
-        ),
+    assert_matches!(
+        health.health(Address::repeat_byte(0xA1)),
+        Health::Unaffordable { .. },
         "the pool-wide view priced A out: {:?}",
         health.health(Address::repeat_byte(0xA1))
     );
@@ -2697,7 +2696,7 @@ async fn watchdog_trips(
             return std::future::pending().await;
         }
         tokio::time::sleep(deadline / 2).await;
-        for k in 0u64.. {
+        for k in 0u64..=u64::MAX {
             counter.store(verified(k), std::sync::atomic::Ordering::Relaxed);
             tokio::time::sleep(deadline).await;
         }
@@ -2768,7 +2767,7 @@ async fn watchdog_gives_the_first_byte_its_grace() {
     let start = tokio::time::Instant::now();
     let feed = async {
         tokio::time::sleep(Duration::from_secs(20)).await;
-        for k in 1u64.. {
+        for k in 1u64..=u64::MAX {
             counter.store(k * 1024, std::sync::atomic::Ordering::Relaxed);
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
@@ -5610,7 +5609,7 @@ fn shared_widen(
                 super::GrowFor::Extra => keep,
             };
             let taken = take
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                     (n > keep).then(|| n.saturating_sub(1))
                 })
                 .is_ok();
@@ -6739,11 +6738,9 @@ async fn no_swap_inside_the_wait_ends_needing_a_new_capability() -> anyhow::Resu
         "{err:#}"
     );
     assert_eq!(classify(&err), Fault::Fatal(FatalScope::Command));
-    assert!(
-        matches!(
-            *events.borrow_and_update(),
-            Some(crate::FundingEvent::RunningLow { .. })
-        ),
+    assert_matches!(
+        *events.borrow_and_update(),
+        Some(crate::FundingEvent::RunningLow { .. }),
         "the fetch signalled the capability running low"
     );
     Ok(())

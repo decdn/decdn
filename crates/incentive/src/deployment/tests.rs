@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 
 const DEPLOYMENT: Deployment = Deployment {
     chain_id: 0x0102_0304_0506_0708,
@@ -20,11 +21,9 @@ fn bytes_round_trip() -> anyhow::Result<()> {
 #[test]
 fn a_wrong_width_is_corrupt() {
     for len in [0, 20, 27, 29] {
-        assert!(
-            matches!(
-                Deployment::from_bytes(&vec![0u8; len]),
-                Err(StoreError::Corrupt { .. })
-            ),
+        assert_matches!(
+            Deployment::from_bytes(&vec![0u8; len]),
+            Err(StoreError::Corrupt { .. }),
             "{len} bytes must not decode"
         );
     }

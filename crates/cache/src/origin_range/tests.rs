@@ -5,6 +5,7 @@ use super::*;
 use crate::error::OriginPullError;
 use crate::origin::{OriginFetch, OutboardFetch};
 use crate::range_pull::align_range;
+use std::assert_matches;
 
 #[test]
 fn window_spans_tile_the_range_in_bounded_steps() {
@@ -114,8 +115,9 @@ async fn window_reader_reads_across_windows_and_fetches_each_once() {
     );
 
     assert!(reader.read_at(0, 1).await.is_err(), "a backward read fails");
-    assert!(
-        matches!(*fault.lock().unwrap(), Some(CacheError::Internal(_))),
-        "a backward read is a local fault, not an origin fault",
+    assert_matches!(
+        *fault.lock().unwrap(),
+        Some(CacheError::Internal(_)),
+        "a backward read is a local fault, not an origin fault"
     );
 }

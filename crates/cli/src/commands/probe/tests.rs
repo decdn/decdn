@@ -1,6 +1,7 @@
 use super::*;
 use decdn_protocol::SLASH_SIG_LEN;
 use decdn_protocol::message::{ProbeResponse, ProbeResponseBody};
+use std::assert_matches;
 
 fn fixture(
     rate_per_mb: u64,
@@ -37,8 +38,9 @@ fn fixture(
 fn validate_rejects_zero_rate_response() {
     let (resp, _resp_ext) = fixture(0, true, Some(4096));
     let err = resp.validate().expect_err("zero rate must be rejected");
-    assert!(
-        matches!(err, decdn_protocol::MessageValidationError::RateIsZero),
+    assert_matches!(
+        err,
+        decdn_protocol::MessageValidationError::RateIsZero,
         "expected RateIsZero, got {err:?}"
     );
 }

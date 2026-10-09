@@ -15,6 +15,7 @@ use iroh_io::AsyncStreamReader;
 
 use super::{BackendReader, BackendSource, WireChunks};
 use crate::node_origin::NodeAdmitStore;
+use std::assert_matches;
 
 /// A minimal own-origin double: serves one blob's aligned ranges plus its
 /// `{H}.obao4` outboard. `data` is held separately from `hash` so a test can
@@ -200,8 +201,9 @@ async fn backend_source_mismatch_is_local_verify_fault() -> anyhow::Result<()> {
     let cache_err = err
         .downcast_ref::<decdn_cache::CacheError>()
         .ok_or_else(|| anyhow::anyhow!("expected a CacheError, got {err:?}"))?;
-    assert!(
-        matches!(cache_err, decdn_cache::CacheError::VerifyFailed { expected } if *expected == hash),
+    assert_matches!(
+        cache_err,
+        decdn_cache::CacheError::VerifyFailed { expected } if *expected == hash,
         "a corrupt own origin must surface as a local VerifyFailed, got {cache_err:?}"
     );
     Ok(())
@@ -339,9 +341,9 @@ async fn backend_reader_keeps_the_terminal_fault() {
         "and every read after it"
     );
     let fault = reader.take_fault().expect("the fault is kept");
-    assert!(matches!(
+    assert_matches!(
         fault.downcast_ref::<decdn_cache::CacheError>(),
         Some(decdn_cache::CacheError::VerifyFailed { .. })
-    ));
+    );
     assert!(reader.take_fault().is_none(), "taken once");
 }

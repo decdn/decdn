@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -172,7 +173,7 @@ async fn missing_ranges_oob_is_alignment_error() {
         .missing_ranges(total, 1)
         .await
         .expect_err("oob must error");
-    assert!(matches!(err, RangedStoreError::Alignment(_)));
+    assert_matches!(err, RangedStoreError::Alignment(_));
 }
 
 /// An end past the bound clamps to it, as on the node's store: the bound
@@ -201,7 +202,7 @@ async fn read_oob_is_alignment_error() {
     let total = GROUP;
     let store = store_with_present(total, ChunkRanges::empty());
     let err = store.read(total, 1).await.expect_err("oob must error");
-    assert!(matches!(err, RangedStoreError::Alignment(_)));
+    assert_matches!(err, RangedStoreError::Alignment(_));
 }
 
 #[tokio::test]
@@ -212,7 +213,7 @@ async fn read_absent_span_is_backend_error() {
     let store = store_with_present(total, present);
 
     let err = store.read(0, 1024).await.expect_err("absent must error");
-    assert!(matches!(err, RangedStoreError::Backend(_)));
+    assert_matches!(err, RangedStoreError::Backend(_));
 }
 
 // --- admit / finalize ---
@@ -306,7 +307,7 @@ async fn admit_corrupt_payload_is_backend_error_and_presence_unchanged() {
         .admit(aligned, Bytes::from(bao_bytes))
         .await
         .expect_err("corrupt payload must fail");
-    assert!(matches!(err, RangedStoreError::Backend(_)));
+    assert_matches!(err, RangedStoreError::Backend(_));
 
     let present = store.present_ranges().await.expect("present_ranges");
     assert!(present.is_empty());
@@ -343,7 +344,7 @@ async fn finalize_on_incomplete_store_is_incomplete_error() {
     let store = fresh_store(root, total);
 
     let err = store.finalize().await.expect_err("incomplete must error");
-    assert!(matches!(err, RangedStoreError::Incomplete));
+    assert_matches!(err, RangedStoreError::Incomplete);
 }
 
 #[tokio::test]
@@ -1268,7 +1269,7 @@ async fn finalize_requires_a_proven_size() -> anyhow::Result<()> {
         .finalize()
         .await
         .expect_err("an unproven size must not finalize");
-    assert!(matches!(err, RangedStoreError::Incomplete), "{err:?}");
+    assert_matches!(err, RangedStoreError::Incomplete, "{err:?}");
     let data_path = store.data_path.lock().expect("lock").clone();
     assert!(data_path.to_string_lossy().ends_with(".partial"));
     assert!(data_path.exists());
@@ -1299,7 +1300,7 @@ async fn finalize_hashes_the_whole_file() -> anyhow::Result<()> {
         .finalize()
         .await
         .expect_err("a whole-file hash mismatch must fail");
-    assert!(matches!(err, RangedStoreError::Backend(_)), "{err:?}");
+    assert_matches!(err, RangedStoreError::Backend(_), "{err:?}");
     assert!(partial.exists(), "a failed finalize keeps the partial");
     assert_eq!(store.bound(), total, "a failed finalize keeps the bound");
     assert_eq!(store.proven(), None);
@@ -1339,10 +1340,7 @@ async fn an_empty_blob_is_proven_only_against_the_empty_root() -> anyhow::Result
         "an empty claim must not verify against a non-empty root"
     );
     assert_eq!(bad.proven(), None);
-    assert!(matches!(
-        bad.finalize().await,
-        Err(RangedStoreError::Incomplete)
-    ));
+    assert_matches!(bad.finalize().await, Err(RangedStoreError::Incomplete));
     Ok(())
 }
 

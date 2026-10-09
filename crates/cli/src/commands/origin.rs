@@ -784,12 +784,11 @@ fn move_into_place(source: &Path, base: &Path, data_path: &Path) -> anyhow::Resu
     }
 }
 
-/// Whether an `io::Error` is `EXDEV` (cross-device link), the one `rename`
-/// failure that a copy-then-unlink can recover. `raw_os_error` is checked
-/// directly because `ErrorKind` has no stable `CrossesDevices` on the MSRV.
+/// Whether an `io::Error` is a cross-device link (`EXDEV`, or
+/// `ERROR_NOT_SAME_DEVICE` on Windows), the one `rename` failure that a
+/// copy-then-unlink can recover.
 fn is_cross_device(err: &std::io::Error) -> bool {
-    // 18 == EXDEV on Linux and macOS.
-    err.raw_os_error() == Some(18)
+    err.kind() == std::io::ErrorKind::CrossesDevices
 }
 
 /// A `Read` wrapper that copies every byte it yields into `sink` — used to

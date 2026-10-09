@@ -46,7 +46,7 @@ fn accept_budget_reached_trips_at_each_bound() {
 #[test]
 fn budget_bounds_are_sane() {
     // Bind to locals so the comparisons aren't const-folded (clippy's
-    // `assertions_on_constants` is fatal under `-D warnings`).
+    // `assertions_on_constants` is fatal under CI's `CARGO_BUILD_WARNINGS=deny`).
     let count_cap = MAX_DHT_REQUESTS_PER_CONN;
     let age = MAX_DHT_CONN_AGE;
     assert!(count_cap > 0, "a zero count cap serves nothing");

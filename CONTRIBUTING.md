@@ -8,7 +8,7 @@ deCDN builds with a native toolchain and works with any editor. Install the prer
 
 | Tool | Why | Install |
 |---|---|---|
-| [rustup](https://rustup.rs) | `rust-toolchain.toml` pins Rust `1.95.0` with `rustfmt` and `clippy`; a rustup-managed `cargo` installs and selects that pin on first invocation | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| [rustup](https://rustup.rs) | `rust-toolchain.toml` pins Rust `1.99.0` with `rustfmt` and `clippy`; a rustup-managed `cargo` installs and selects that pin on first invocation | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
 | `cargo-nextest` | the test runner this repo and CI use instead of `cargo test` | `cargo install --locked cargo-nextest` |
 | `cargo-deny` | license + advisory audit; both a pre-commit hook and a CI check; findings warn and never block, but a run that checked nothing fails | `cargo install --locked cargo-deny` |
 | [pre-commit](https://pre-commit.com/) | runs the commit- and push-stage hooks | `pipx install pre-commit` |
@@ -38,7 +38,7 @@ The first build downloads the pinned toolchain and compiles the full dependency 
 ### Verify
 
 ```bash
-rustc --version            # 1.95.0
+rustc --version            # 1.99.0
 cargo nextest --version
 cargo deny --version
 pre-commit --version
@@ -73,10 +73,10 @@ The pre-commit hook lints only the default-feature workspace. CI's `clippy` job 
 the configurations that unification hides, and they fail independently of the hook:
 
 ```bash
-cargo clippy --workspace --all-targets --all-features -- -D warnings   # feature-gated targets
-cargo clippy -p decdn-incentive --no-default-features -- -D warnings   # redb not linked
-cargo clippy -p decdn-incentive --no-default-features \
-  --features buyer-store-core -- -D warnings                           # the node's config
+CARGO_BUILD_WARNINGS=deny cargo clippy --workspace --all-targets --all-features  # feature-gated targets
+CARGO_BUILD_WARNINGS=deny cargo clippy -p decdn-incentive --no-default-features  # redb not linked
+CARGO_BUILD_WARNINGS=deny cargo clippy -p decdn-incentive --no-default-features \
+  --features buyer-store-core                                                    # the node's config
 ```
 
 The `--all-features` run is the only one that reaches anything behind an off-by-default feature —
@@ -263,17 +263,17 @@ Notes and common snags:
 
 ## Rust Toolchain
 
-`rust-toolchain.toml` pins an exact stable release (currently `1.95.0`); CI uses the same pin via `dtolnay/rust-toolchain@1.95.0` so pre-commit's `cargo clippy` runs the identical lint *rules* as CI. Identical rules, not identical coverage: the hook runs one invocation over the default-feature workspace, while the `clippy` job runs four (see [Build and Test](#build-and-test)). Under a rustup-managed `cargo`, the pinned toolchain auto-installs and is selected on first `cargo` invocation; other setups need to install `1.95.0` manually.
+`rust-toolchain.toml` pins an exact stable release (currently `1.99.0`); CI uses the same pin via `dtolnay/rust-toolchain@1.99.0` so pre-commit's `cargo clippy` runs the identical lint *rules* as CI. Identical rules, not identical coverage: the hook runs one invocation over the default-feature workspace, while the `clippy` job runs four (see [Build and Test](#build-and-test)). Under a rustup-managed `cargo`, the pinned toolchain auto-installs and is selected on first `cargo` invocation; other setups need to install `1.99.0` manually.
 
 Dependabot auto-bumps the GitHub Actions refs only — it does **not** touch `rust-toolchain.toml` or `Cargo.toml`'s `rust-version`. A toolchain bump therefore touches three kinds of site: `.github/scripts/check-toolchain-pin.sh` (the `toolchain-pin` hook and the `packaging` CI job) refuses them to differ, so a Dependabot bump stays red until `rust-toolchain.toml` and `Cargo.toml` move in the same PR. All carry the same `X.Y.Z`; a two-part `rust-version` is refused for that reason, and a `with: toolchain:` input on a `dtolnay/rust-toolchain` step counts as that step's version.
 
-MSRV (`rust-version.workspace = true` → 1.95.0) is the lower bound the workspace must compile under. It equals the stable lint pin, so there is no separate MSRV job: every Rust job compiles on that toolchain, and the pin check keeps the two from drifting apart. If MSRV is ever lowered below the pinned toolchain, add a dedicated `cargo check` job on the older floor and relax the pin check to a floor comparison.
+MSRV (`rust-version.workspace = true` → 1.99.0) is the lower bound the workspace must compile under. It equals the stable lint pin, so there is no separate MSRV job: every Rust job compiles on that toolchain, and the pin check keeps the two from drifting apart. If MSRV is ever lowered below the pinned toolchain, add a dedicated `cargo check` job on the older floor and relax the pin check to a floor comparison.
 
 The workspace is on `resolver = "3"`, which reads that `rust-version`: it defaults `resolver.incompatible-rust-versions` to `fallback`, so `cargo update` prefers dependency versions whose own declared MSRV is at or below ours instead of silently pulling one that raised it past the pinned toolchain. Resolver 3's feature-unification rules are identical to resolver 2's. If a dependency you need resolves to an older version than expected, that is this fallback at work — raise the workspace MSRV and the toolchain pin together rather than reaching for `--ignore-rust-version`.
 
 ## Code Style
 
-**Language:** Rust (edition 2024, MSRV 1.95).
+**Language:** Rust (edition 2024, MSRV 1.99).
 
 `rustfmt.toml` sets `max_width = 100`.
 
@@ -285,7 +285,7 @@ The workspace is on `resolver = "3"`, which reads that `rust-version`: it defaul
 
 **Say what you mean:** `elided_lifetimes_in_paths` and `unreachable_pub` are `warn`. Write `Foo<'_>` when the type borrows, and give an item inside a private module the visibility it actually has (`pub(crate)` / `pub(super)`) rather than a bare `pub`. Both are machine-fixable — `cargo clippy --fix --workspace --all-targets` applies them.
 
-**`missing_docs` is `warn`:** every public item — including struct fields and enum variants — carries a doc comment. The `alloy::sol!` bindings are the exception: each generated block opts out where it is declared, so a new binding needs the same `#[allow(missing_docs)]` on its wrapper. New docs are link-checked too: the `doc` gate runs `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items`, so a broken `[`Type`]` link fails the build.
+**`missing_docs` is `warn`:** every public item — including struct fields and enum variants — carries a doc comment. The `alloy::sol!` bindings are the exception: each generated block opts out where it is declared, so a new binding needs the same `#[allow(missing_docs)]` on its wrapper. New docs are link-checked too: the `doc` gate runs `CARGO_BUILD_WARNINGS=deny cargo doc --workspace --no-deps --document-private-items`, so a broken `[`Type`]` link fails the build.
 
 ## Working with ADRs
 
