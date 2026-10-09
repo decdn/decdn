@@ -250,9 +250,11 @@ fn lane_key_parts(bytes: &[u8; LANE_KEY_LEN]) -> (B256, Address, Address) {
 /// capability expiry for this lane's signer. Adding it is a breaking on-disk
 /// change — a record written before it fails to decode here (the trailing `u64`
 /// is absent, so `take_from_bytes` hits `DeserializeUnexpectedEnd`), it is not
-/// silently defaulted. That break is deliberate and unversioned: deCDN is
-/// pre-launch with no deployed store to stay compatible with, so
-/// [`SUPPORTED_SCHEMA_VERSION`] does not bump.
+/// silently defaulted. That break is deliberate and unversioned: before mainnet
+/// no store carries a compatibility promise, so [`SUPPORTED_SCHEMA_VERSION`]
+/// does not bump. A node that holds a record in the older layout fails `open`
+/// with [`StoreError::Corrupt`]; recovery moves `lanes.redb` aside, which
+/// forfeits that lane's unredeemed claim.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredLaneState {
     schema_version: u32,
@@ -285,8 +287,7 @@ struct StoredLaneState {
     /// `registered_until`: adding it is a breaking on-disk change — a record
     /// written before it fails to decode (the trailing length-prefix is absent,
     /// so `take_from_bytes` hits `DeserializeUnexpectedEnd`), it is not silently
-    /// defaulted. That break is deliberate and unversioned: deCDN is pre-launch
-    /// with no deployed store to stay compatible with.
+    /// defaulted. That break is deliberate and unversioned; see [`StoredLaneState`].
     owner_sig: Vec<u8>,
     /// The lane's paid cumulative — the on-chain `newPaidCumulative` of the most
     /// recent `PoolRedeemed` this node observed for it — as a fixed-width
@@ -297,7 +298,7 @@ struct StoredLaneState {
     /// and re-submitting already-redeemed lanes for silent on-chain no-ops
     /// (#2052). A required field like `registered_until`/`owner_sig`: adding it is
     /// a breaking on-disk change (a record written before it fails to decode), not
-    /// silently defaulted — deliberate and unversioned, as deCDN is pre-launch.
+    /// silently defaulted — deliberate and unversioned; see [`StoredLaneState`].
     paid_cumulative: [u8; 32],
 }
 

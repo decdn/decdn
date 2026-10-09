@@ -490,9 +490,9 @@ async fn build_infra(
     )
     .await?;
     // Keep the concrete store `Arc` so it can back the seller
-    // `ChannelStateStore` (channel_state_v1 table), the pending-settle store
+    // `PoolStateStore` (lane_state_v1 table), the pending-settle store
     // (pending_settle_v1 table, PR #743 review), and the buyer
-    // `BuyerChannelStore` (buyer_channel_state_v2 table, #744) — redb forbids a
+    // `BuyerPoolStore` (buyer_pool_state_v1 table, #744) — redb forbids a
     // second `Database` handle to the same file, so one shared store owns all.
     let concrete_channel_store: Arc<PersistentPoolStateStore> = Arc::new(
         tokio::task::spawn_blocking(move || {
@@ -1629,10 +1629,10 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // On-chain buyer-side service (#744). When this node pulls content from an
     // upstream provider on a cache miss it pays via the same channel mechanism,
     // acting as the client: a separate wallet-filled provider signs `approve` /
-    // `openChannel` / `reclaimExpired`. It shares the persistent store (a
-    // distinct `buyer_channel_state_v2` table) and re-derives the voucher domain
-    // the handler consumed above. The cache-miss hook that *calls*
-    // `open_or_reuse_channel` is the `NodeOrigin` provisioned below (#831), gated
+    // `openPool` / `topUp` / `closePool` / `reclaim`. It shares the persistent
+    // store (a distinct `buyer_pool_state_v1` table in `buyer.redb`) and re-derives
+    // the voucher domain the handler consumed above. The cache-miss hook that
+    // *calls* `open_or_reuse_pool` is the `NodeOrigin` provisioned below (#831), gated
     // on `cache.node_to_node_pull_through_enabled`; the service is also held for
     // the process lifetime so its reclaim sweep keeps running even when
     // pull-through is off. The backgrounded bootstrap task (#1109, below) owns

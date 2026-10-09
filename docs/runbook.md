@@ -537,6 +537,14 @@ action is required.
 against content the fleet already holds; the node serves inbound requests
 normally, so nothing else alerts. `DecdnNodePullNeverSucceeds` fires after 6h.
 
+The node pulls from peers only with `cache.node_to_node_pull_through_enabled =
+true`, which is off by default. With it off, the node never opens a buyer pool
+or spends USDC on pulls, and the symptoms above do not apply. The buyer service
+still starts: it sends its startup USDC `approve`
+(`blockchain.buyer_max_approve`), publishes `decdn_buyer_wallet_usdc`, and runs
+the reclaim sweep for any pool it already owns. A paid miss fills from the
+node's own origin backend; a node without one returns not-found.
+
 The node's buyer leg is the one part of it that *spends*. It opens one
 `PaymentPool` deposit of `blockchain.buyer_working_deposit_micro_usdc` (10 USDC
 by default) and reuses it for every upstream pull. Two things break it.

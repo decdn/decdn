@@ -878,7 +878,7 @@ async fn cli_drain_wait_treats_econnrefused_as_complete() -> anyhow::Result<()> 
                 "uptime_s": 1,
                 "in_flight_streams": 1,
                 // `binding` and `registry_active` carry no `serde(default)`
-                // (pre-deployment, so no compatibility shims — see CLAUDE.md),
+                // (pre-mainnet, so no compatibility shims — see CLAUDE.md),
                 // which makes this stub a real check that the DTO and its
                 // producers stay in step.
                 "binding": "unknown",

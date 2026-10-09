@@ -55,7 +55,7 @@ VOLUME ["/home/decdn/.decdn"]
 
 # The CLI only dials out, so it exposes no port. `CMD ["--help"]` makes a bare
 # `docker run <image>` print usage and exit 0; any arguments replace it
-# (`docker run <image> fetch <hash>`).
+# (`docker run <image> fetch --hash <hash> -o <path>`).
 ENTRYPOINT ["decdn"]
 CMD ["--help"]
 

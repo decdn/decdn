@@ -92,7 +92,7 @@ enum ClientMessage {
 
 #### Variant ordering rule
 
-Discriminants are assigned in declaration order (postcard default). New variants MUST be appended at the end. Reordering or removing variants is a major (breaking) change requiring an ALPN version bump. `ChunkPreimage` sits at 4, beside the `Voucher` it extends, rather than after `StreamEnd`: inserting it renumbers the tail, which is a straight in-place cut while `cdn/client/v1` is pre-deployment and there are no live peers. After the first deployment the same insertion would be a major change.
+Discriminants are assigned in declaration order (postcard default). New variants MUST be appended at the end. Reordering or removing variants is a major (breaking) change requiring an ALPN version bump. `ChunkPreimage` sits at 4, beside the `Voucher` it extends, rather than after `StreamEnd`: inserting it renumbers the tail, which is a straight in-place cut before mainnet. After the mainnet deployment the same insertion is a major change.
 
 #### Unknown variant handling
 

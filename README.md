@@ -21,8 +21,8 @@ ship with each [release](https://github.com/decdn/decdn/releases/latest); see
 [Install](#install). The [operator guide](https://docs.decdn.org/run-a-node/overview)
 walks through running a node.
 
-Wire, ABI, config, and storage formats change without compatibility shims until the first
-public deployment. Many ADRs are still marked Draft, so the specification can change too.
+Wire, ABI, config, and storage formats change without compatibility shims until the
+mainnet deployment. Many ADRs are still marked Draft, so the specification can change too.
 
 ## How it works
 
@@ -31,10 +31,11 @@ public deployment. Many ADRs are still marked Draft, so the specification can ch
 │  CapacityBond   bonded TOKEN · registry of active nodes    │
 │  PaymentPool    USDC deposits · voucher redemption         │
 └─────▲──────────────────▲──────────────────────────▲────────┘
-      │ deposit          │ bond · deposit · redeem  │ bond · redeem
-┌─────┴──────┐    ┌──────┴───────┐    ┌─────────────┴─┐    ┌───────────────┐
-│   Client   │◄──►│  Cache node  │◄──►│  Origin node  │◄───┤ S3/R2/B2/HTTP │
-└────────────┘    └──────────────┘    └───────────────┘    └───────────────┘
+      │ deposit ·        │ bond · deposit · redeem  │ bond · redeem
+      │ close · reclaim  │                          │
+┌─────┴──────┐    ┌──────┴───────┐    ┌─────────────┴─┐    ┌──────────────────┐
+│   Client   │◄──►│  Cache node  │◄──►│  Origin node  │◄───┤ S3/R2/B2/HTTP/fs │
+└────────────┘    └──────────────┘    └───────────────┘    └──────────────────┘
     ◄─► bytes one way, USDC vouchers the other (cdn/client/v1)
 ```
 
@@ -44,13 +45,42 @@ public deployment. Many ADRs are still marked Draft, so the specification can ch
 - **Clients** pick nodes from their peer store or the on-chain registry by measured RTT,
   stream content, and pay each node with signed vouchers drawn against one pool deposit
   ([ADR 012](adr/012-client.md), [ADR 003](adr/003-payments.md)).
-- **On a cache miss**, a node pulls from a peer and streams to the client at the same
-  time. The node pays for that upstream pull from its own pool, like any other client:
-  every byte transfer is paid.
+- **On a cache miss**, a node fills from its own origin backend if it has one. With node-to-node
+  pull-through enabled (off by default), it can also pull from a peer and stream to the
+  client at the same time. The node pays for that upstream pull from its own pool, like
+  any other client: every byte transfer is paid.
 - **Origin backends** (S3, R2, B2, HTTP, filesystem) are private per-node config. No
   origin URL is ever exposed ([ADR 002](adr/002-content-addressing.md)).
 
-## Try it
+## Install
+
+Install the latest release:
+
+```bash
+cargo install --locked decdn-cli decdn-node
+docker pull ghcr.io/decdn/decdn-node     # daemon + CLI; mirrored to docker.io/decdn/decdn-node
+docker pull ghcr.io/decdn/decdn          # CLI only; mirrored to docker.io/decdn/decdn
+```
+
+The `decdn-node` image runs the daemon and also carries the CLI, so
+`docker exec <container> decdn node status` reaches the daemon's local admin
+port. The `decdn` image runs the CLI. Mount your key directory and a working
+directory:
+
+```bash
+docker run --rm -it -v ~/.decdn:/home/decdn/.decdn -v "$PWD":/work -w /work \
+  ghcr.io/decdn/decdn fetch --hash <hash> -o blob.bin
+```
+
+Both images run as uid 1000. If your user has another uid, add
+`--user "$(id -u):$(id -g)" -e HOME=/home/decdn`. Without a TTY, mount a file
+that holds the keystore password and point `DECDN_KEYSTORE_PASSWORD_FILE` at it.
+
+Each [GitHub release](https://github.com/decdn/decdn/releases) also carries
+`decdn-${VERSION}-${TARGET}` and `decdn-node-${VERSION}-${TARGET}` archives (`.tar.gz`,
+or `.zip` on Windows). A maintainer signs the `SHA256SUMS` manifest that covers the
+archives, and each container image's digest file and SBOM. crates.io artifacts carry no
+maintainer signature. [SECURITY.md](SECURITY.md) explains how to verify each channel.
 
 ### Build from source
 
@@ -67,18 +97,22 @@ cargo build --release -p decdn-cli -p decdn-node
 [CONTRIBUTING.md](CONTRIBUTING.md#development-environment) lists the full development
 prerequisites, including Foundry for the contracts.
 
+## Try it
+
 ### Run a node on Arbitrum Sepolia
 
 What you need:
 
 - **Arbitrum Sepolia ETH** for gas.
 - **TOKEN** for the bond. The bond is `max(minBond, bondRequired(mbps))`, where
-  `bondRequired` is a super-linear curve over declared bandwidth
+  `bondRequired` is a curve over declared bandwidth, super-linear at the default exponent
   ([ADR 026 § Capacity-bond curve](adr/026-tokenomics.md#capacity-bond-curve),
   [§ Minimum bond](adr/026-tokenomics.md#minimum-bond-is-non-retroactive)). The testnet
   deployed with `minBond` at 50,000 TOKEN ([manifest](crates/cli/deployments/421614.json)),
-  which covers every tier up to about 1 Gbps. `decdn node bond --dry-run` prints the live
-  target. The maintainers send testnet TOKEN: send your EVM operator address (`decdn
+  which at the default curve (k = 12.6, α = 1.2) covers declarations up to about
+  997 Mbps; 1,000 Mbps needs about 50,162 TOKEN.
+  `decdn node bond --mbps <n> --dry-run` prints the live target (it unlocks the keystore
+  first). The maintainers send testnet TOKEN: send your EVM operator address (`decdn
   whoami` prints it) through any channel on the [contact page](https://decdn.org/#contact).
 - **USDC** for the node's own buyer pool, which pays for cache-miss pulls from peers
   (10 USDC working deposit by default). The node spends it only with
@@ -120,9 +154,10 @@ decdn key-gen --output-dir ~/.decdn/client
 decdn --config ~/.decdn/client.toml fetch --hash <blake3-hash> -o ./blob.bin
 ```
 
-`fetch` probes bonded nodes and picks one that holds the blob. When none does, it picks a
-bonded node that pulls the blob through from a peer or its origin, so a cache miss still
-succeeds. It pays the chosen node from a pool you own.
+`fetch` probes bonded nodes and picks one that holds the blob. When none does, it tries
+bonded non-holders nearest first. Each fills the miss from its own origin, or from a peer
+if it enables pull-through. A node with neither answers not-found, and `fetch` moves to
+the next. `fetch` pays each node it uses from a pool you own.
 
 `fetch` reuses your existing pool or opens one with a 10 USDC working deposit, and it tops
 the pool up on-chain without prompting when the balance runs low. Fund the wallet with
@@ -160,42 +195,14 @@ cargo build -p decdn-cli -p decdn-node
 cargo nextest run -p decdn-e2e --features anvil-e2e
 ```
 
-## Install
-
-Install the latest release:
-
-```bash
-cargo install --locked decdn-cli decdn-node
-docker pull ghcr.io/decdn/decdn-node     # daemon + CLI; mirrored to docker.io/decdn/decdn-node
-docker pull ghcr.io/decdn/decdn          # CLI only; mirrored to docker.io/decdn/decdn
-```
-
-The `decdn-node` image runs the daemon and also carries the CLI, so
-`docker exec <container> decdn node status` reaches the daemon's local admin
-port. The `decdn` image runs the CLI. Mount your key directory and a working
-directory:
-
-```bash
-docker run --rm -it -v ~/.decdn:/home/decdn/.decdn -v "$PWD":/work -w /work \
-  ghcr.io/decdn/decdn fetch <hash>
-```
-
-Both images run as uid 1000. If your user has another uid, add
-`--user "$(id -u):$(id -g)" -e HOME=/home/decdn`. Without a TTY, mount a file
-that holds the keystore password and point `DECDN_KEYSTORE_PASSWORD_FILE` at it.
-
-Each [GitHub release](https://github.com/decdn/decdn/releases) also carries
-`decdn-${VERSION}-${TARGET}` and `decdn-node-${VERSION}-${TARGET}` archives (`.tar.gz`,
-or `.zip` on Windows). A maintainer signs the `SHA256SUMS` manifest that covers the
-archives, and each container image's digest file and SBOM. crates.io artifacts carry no
-maintainer signature. [SECURITY.md](SECURITY.md) explains how to verify each channel.
-
 ## Commands
 
 deCDN ships two binaries, split like `dockerd` and `docker`
 ([appendix](adr/appendix-binaries.md)):
 
-- **`decdn-node`**: the daemon. It has one subcommand, `decdn-node run [--config <path>]`.
+- **`decdn-node`**: the daemon. It has one subcommand, `run`. The global `--config <path>`
+  selects the config file, and every `run` flag also reads a `DECDN_*` environment
+  variable (`decdn-node run --help`).
 - **`decdn`**: every command a human types.
 
 | `decdn` command | Purpose |
@@ -207,7 +214,7 @@ deCDN ships two binaries, split like `dockerd` and `docker`
 | `probe`, `fetch` | Probe a node over `cdn/probe/v1`; paid single-blob fetch over `cdn/client/v1` |
 | `bundle {pull}` | Fetch a directory bundle by manifest ([appendix](adr/appendix-bundles.md)) |
 | `pool {…}` | Client payment-pool lifecycle: `list`, `open`, `top-up`, `close`, `reclaim`, `assign` |
-| `publish {…}` | Publisher control plane: create namespaces; seat and unseat authorized origins |
+| `publish {…}` | Publisher control plane: `namespace create`; seat and unseat authorized origins with `assign` and `revoke` |
 | `origin {import}` | Write local content into a local filesystem origin store, offline and config-free |
 | `appeal {slash}` | File a slash appeal and post the appeal bond ([ADR 028](adr/028-slashing-appeals.md)) |
 
@@ -232,7 +239,7 @@ from the config file, and each command also accepts it as a flag (`--rpc-url`,
 crates/
   node/         — daemon binary `decdn-node`: runtime bring-up, handlers, admin RPC server, dispatch limiter
   cli/          — user CLI binary `decdn`
-  common/       — config schema + resolver, identity loading, AdminRpc trait + DTOs, clap definitions for both binaries
+  common/       — config schema + resolver, identity loading, AdminRpc trait + DTOs, the `decdn` clap tree and the daemon's `run` flags
   protocol/     — wire format and ALPN message definitions (leaf crate)
   config-types/ — config-vocabulary value types shared by cache + common (leaf crate)
   bao-range/    — bao verified-range helpers and the origin-store layout (leaf crate, ADR 038)
@@ -262,9 +269,9 @@ how they interact.
 | Discovery | Clients never query the DHT: they pick bonded nodes from their peer store or the `CapacityBond` registry by measured RTT. Nodes find holders for a cache miss through the `cdn/dht/v1` Kademlia DHT; for a namespaced request, the on-chain origin set is the directory of last resort. Latency-driven proxy warming creates regional copies where demand is. | [012](adr/012-client.md), [022](adr/022-content-discovery.md), [037](adr/037-regional-proxy-warming.md) |
 | Delivery | A large fetch spreads disjoint byte ranges across several holders, at most one per operator, and reassigns ranges as sources finish or stall. Cache admission and eviction are node-local. A node refuses a cache miss whose upstream price leaves no margin after the fee split. | [039](adr/039-multi-source-parallel-fetch.md), [040](adr/040-cache-policy.md), [041](adr/041-refuse-to-serve.md) |
 | Payments | A client funds one shared `PaymentPool` and pays each provider with cumulative off-chain vouchers. Only the provider redeems its own vouchers, so a pool owner's close cannot understate what a node earned. A close starts a grace window in which nodes keep redeeming, and each node's periodic sweep redeems well inside it. | [003](adr/003-payments.md) |
-| Tokenomics | USDC pays for bytes. Operators bond TOKEN on a super-linear curve over declared bandwidth, with a flat `minBond` floor. Fee-split buckets are governance-tunable. Protocol-owned liquidity is a Uniswap V3 50/50 TOKEN/USDC pool that governance seeds after launch. | [026](adr/026-tokenomics.md), [016](adr/016-contract-interactions.md), [018](adr/018-liquidity-strategy.md) |
-| Enforcement | Every `ProbeResponse` and `StreamResponse` carries a secp256k1 EIP-712 `slash_sig`, so a node's quotes and deliveries are on-chain evidence; the Ed25519 NodeId is connection identity only. A challenge is a commit–reveal that resolves on-chain at reveal time. Slashed TOKEN sits in escrow for a 30-day appeal window. Governance blacklists content hashes. Reputation is a local per-peer EWMA. | [014](adr/014-on-chain-verification.md), [028](adr/028-slashing-appeals.md), [011](adr/011-content-takedown.md), [008](adr/008-reputation.md) |
-| Governance | `DecdnGovernor` with a `TimelockController`. No TOKEN balance carries a vote; a bond only makes an operator eligible. Vote weight is trailing-window served bytes, capped per epoch by declared capacity and overall by a per-operator share, ramped by tenure since first bond, and zeroed by a standing slash. The process moves from admin key to bootstrap multisig to DAO; the contract set stays the same. | [009](adr/009-governance.md), [036](adr/036-served-bytes-voting-weight.md) |
+| Tokenomics | USDC pays for bytes. Operators bond TOKEN on a governance-tunable curve over declared bandwidth (super-linear at the default exponent), with a flat `minBond` floor. Fee-split buckets are governance-tunable. Protocol-owned liquidity is a Uniswap V3 50/50 TOKEN/USDC pool that governance seeds after launch. | [026](adr/026-tokenomics.md), [016](adr/016-contract-interactions.md), [018](adr/018-liquidity-strategy.md) |
+| Enforcement | Every `ProbeResponse` and `StreamResponse` carries a secp256k1 EIP-712 `slash_sig`, so a node's quotes and deliveries are on-chain evidence; the Ed25519 NodeId authenticates connections and the registration proof, never slash evidence. A challenge is a commit–reveal that resolves on-chain at reveal time. Slashed TOKEN sits in escrow for a 30-day appeal window. Governance blacklists content hashes. Reputation is a local per-peer EWMA. | [014](adr/014-on-chain-verification.md), [028](adr/028-slashing-appeals.md), [011](adr/011-content-takedown.md), [008](adr/008-reputation.md) |
+| Governance | `DecdnGovernor` with a `TimelockController`. No TOKEN balance carries a vote. Vote weight is trailing-window served bytes, capped per epoch by declared capacity and overall by a per-operator share, ramped by tenure since first bond, and zeroed by a standing slash inside the trailing window. The process moves from admin key to bootstrap multisig to DAO; the contract set stays the same. | [009](adr/009-governance.md), [036](adr/036-served-bytes-voting-weight.md) |
 | Evolution | Varint-length framing, protocol enums, and a three-tier schema-evolution model. Production targets Arbitrum One. | [013](adr/013-schema-evolution.md), [L2 appendix](adr/appendix-l2-deployment.md) |
 
 For the full design, start at [`adr/README.md`](adr/README.md). It gives the reading order,
