@@ -64,9 +64,13 @@ decdn before it runs the tests (see the `anvil-e2e` job in `ci.yml`).
   and the pinned release tags and `SHA256SUMS` digests baked in. Config comes
   from `ONRAMP_*` env vars.
 - **`decdn-sponsored`** is the end-user CLI (Linux, macOS and Windows). It
-  creates a throwaway key per download under `~/.decdn/sponsored/`, polls the
-  onramp, then spawns `decdn bundle pull` with the capability. The spawned
-  `decdn` handles discovery, payment and verification.
+  creates a throwaway key per download under its data dir
+  (`~/.decdn/sponsored/` by default), polls the onramp, then spawns
+  `decdn bundle pull` with the capability. The spawned `decdn` handles
+  discovery, payment and verification. Config comes from
+  `~/.decdn/sponsor.toml`, or from `DECDN_SPONSOR_*` env vars when
+  `DECDN_SPONSOR_ONRAMP_URL` is set. Its image ships decdn's own `decdn`
+  release binary beside it (`.github/scripts/fetch-decdn.sh`).
 - **`crates/e2e`** (`sponsord-e2e`, never released) runs the real daemon
   router behind the real onramp, driven by the CLI's pull flow, against
   `FakePool`.
@@ -97,8 +101,9 @@ rather than writing new ones.
   `crates/e2e/tests/no_inline_test_modules.rs` fails on an inline body, and on
   a file with one of those names that is not a test module.
 - **Contracts with deployed software**: the release archive names, the
-  `~/.decdn/sponsor.toml` schema and both HTTP APIs (`sponsord-api`) are read
-  by installers and CLIs already in the field. A change to any of them must be
+  `~/.decdn/sponsor.toml` schema, the CLI's `DECDN_SPONSOR_*` variable names
+  and both HTTP APIs (`sponsord-api`) are read by installers, CLIs and
+  scripts already in the field. A change to any of them must be
   called out as contract-breaking in the changelog. If the onramp and the CLI
   exchange something new, `ONRAMP_MIN_CLI_VERSION` controls when older CLIs
   are told to upgrade.

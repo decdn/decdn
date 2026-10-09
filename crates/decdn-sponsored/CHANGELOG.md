@@ -15,6 +15,22 @@ release.
 
 ## [Unreleased]
 
+### Added
+
+- **Container image.** Each release publishes `ghcr.io/decdn/decdn-sponsored`
+  (mirrored to `decdn/decdn-sponsored` on Docker Hub; amd64 and arm64), with
+  the CLI and the `decdn` binary from decdn's release at the pinned tag,
+  verified against decdn's signed `SHA256SUMS` and anchored to the decdn
+  commit `Cargo.lock` locks.
+- **Configuration from the environment.** When `DECDN_SPONSOR_ONRAMP_URL` is
+  set, the CLI does not read `~/.decdn/sponsor.toml`. It takes the onramp
+  from that variable, the `decdn` binary from `DECDN_SPONSOR_DECDN_BIN`
+  (default `decdn` on `PATH`) and the state root from
+  `DECDN_SPONSOR_DATA_DIR` (default `~/.decdn/sponsored`). The variable names
+  are now part of the CLI's contract. An empty value counts as unset, and a
+  value that is not UTF-8 is an error. Nothing changes when the URL is
+  unset.
+
 ## [0.0.2] - 2026-10-09
 
 ### Changed

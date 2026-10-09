@@ -3,8 +3,8 @@
 
 The workspace is released as a whole under one version, so a tag is
 `v<MAJOR.MINOR.PATCH[-pre]>`, as `cargo release <level>` pushes it, and every
-release carries every crate: the archives of each binary, the images of both
-servers, and every library on crates.io. The table decides what release.yml
+release carries every crate: the archives of each binary, its container
+image, and every library on crates.io. The table decides what release.yml
 builds, what sign-release.sh signs and promotes, and what publish-crates.sh
 uploads. Keeping it in one place, rather than in a workflow matrix, a signing
 script and a publishing script separately, is what stops the three from
@@ -73,7 +73,9 @@ CRATES: dict[str, dict] = {
         "dir": "crates/decdn-sponsored",
         "binary": "decdn-sponsored",
         "targets": CLIENT,
-        "image": None,
+        # Also carries decdn's `decdn`, which release.yml's docker job fetches
+        # from decdn's release (fetch-decdn.sh), not from this one's archives.
+        "image": "decdn-sponsored",
     },
 }
 

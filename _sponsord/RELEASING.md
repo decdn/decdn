@@ -29,7 +29,7 @@ of it:
 
 | Crate | Archives (one `SHA256SUMS` covers all 10) | Image | crates.io |
 |---|---|---|---|
-| `decdn-sponsored` | Linux, macOS and Windows, x86_64 and aarch64 each (6) | — | yes |
+| `decdn-sponsored` | Linux, macOS and Windows, x86_64 and aarch64 each (6) | `decdn-sponsored` | yes |
 | `sponsord` | Linux, x86_64 and aarch64 (2) | `sponsord` | yes |
 | `sponsord-onramp` | Linux, x86_64 and aarch64 (2) | `sponsord-onramp` | yes |
 | `sponsord-core` | — (library) | — | yes |
@@ -66,9 +66,11 @@ either breaks every installer already served.
 3. **Tools.** `cargo install cargo-release git-cliff`, plus `gh auth login`.
 
 4. **Registry logins.** `docker login ghcr.io` with a token carrying
-   `write:packages`, and `docker login docker.io` — the server images are
+   `write:packages`, and `docker login docker.io` — the images are
    published to both. Skip the second with `SPONSORD_SKIP_DOCKERHUB=1` if you
-   only need GHCR.
+   only need GHCR. Each image needs its `decdn/<image>` repository on Docker
+   Hub before the first release that carries it, and its GHCR package made
+   public after its first push.
 
 5. **A crates.io token.** `cargo login`, with a token scoped to publish-update
    (and publish-new for the first release).
@@ -219,10 +221,11 @@ squash-merge subjects conventional; others are left out).
   **Fixed**, **Removed**, **Security**, each a bullet that opens with a bold
   one-line summary.
 - **Contract-breaking** changes are called out explicitly: the release archive
-  names, the `~/.decdn/sponsor.toml` schema, and both servers' HTTP APIs
-  (`sponsord-api`) are read by installers and clients already deployed.
-- **Config-breaking** changes name the `SPONSORD_*` or `ONRAMP_*` variable
-  (rename, new required variable, default shift).
+  names, the `~/.decdn/sponsor.toml` schema, the CLI's `DECDN_SPONSOR_*`
+  variables, and both servers' HTTP APIs (`sponsord-api`) are read by
+  installers and clients already deployed.
+- **Config-breaking** changes name the `SPONSORD_*`, `ONRAMP_*` or
+  `DECDN_SPONSOR_*` variable (rename, new required variable, default shift).
 - A move of the locked decdn names the new commit in every crate it reaches.
 - Security advisories cite the `RUSTSEC-YYYY-NNNN` id.
 
@@ -269,10 +272,12 @@ Only once both pass:
 1. `upload-assets` attaches all 10 archives and one `SHA256SUMS` manifest,
    asserting all of them are present, and appends the onramp pin values to
    the notes;
-2. after it, for each server, `docker` assembles the multi-arch image from
+2. after it, for each image, `docker` assembles the multi-arch image from
    those archives — it does not compile from source, so the image's binary is
    byte-identical to the archived one — and pushes the manifest **untagged**,
-   attaching the SBOM and `<image>-image-digest.txt`.
+   attaching the SBOM and `<image>-image-digest.txt`. The `decdn-sponsored`
+   image also gets the `decdn` binary from decdn's release at the pinned tag,
+   checked against decdn's signed `SHA256SUMS` (`fetch-decdn.sh`).
 
 A release that fails verification therefore leaves no asset on the draft and
 pushes no image.

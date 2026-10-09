@@ -1,7 +1,7 @@
 name: Security
 
 # Mirrors decdn's security.yml: a Trivy scan of the dependency tree on every
-# manifest change and weekly, and of both published images weekly.
+# manifest change and weekly, and of every published image weekly.
 #
 # Third-party actions are pinned to full commit SHAs (version in the trailing
 # comment; Dependabot bumps both), as in release.yml: the image scan hands
@@ -49,8 +49,8 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
 
-  # `latest` exists once sign-release.sh has published a stable release of the
-  # image's crate, so the scan is skipped only while no such release exists.
+  # `latest` exists once sign-release.sh has published a stable release
+  # carrying the image, so the scan is skipped only while no such release exists.
   # Whether the image exists is read from the releases, not by probing the
   # registry: GHCR answers a missing package and an auth or network failure
   # alike (`denied`), and treating every failure as "missing" would leave the
@@ -68,7 +68,7 @@ jobs:
       matrix:
         # The images release_plan.py lists; check-image-name.sh holds them in
         # step.
-        image: [sponsord, sponsord-onramp]
+        image: [decdn-sponsored, sponsord, sponsord-onramp]
     env:
       IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
     steps:
@@ -89,13 +89,22 @@ jobs:
           # A gh failure fails the step; only an empty answer means "none yet".
           tags=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 \
             --exclude-drafts --exclude-pre-releases --json tagName --jq '.[].tagName')
-          # Every `vX.Y.Z` release carries both images.
+          # Releases from before an image was added do not carry it, so look
+          # for its digest file on the "Latest release", the one `latest`
+          # points at. Captured before grepping it, so a gh failure fails the
+          # step here too instead of reading as "not released".
+          exists=false
           if grep -qE "^v[0-9]" <<<"$tags"; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
+            assets=$(gh release view --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            if grep -qxF "${NAME}-image-digest.txt" <<<"$assets"; then
+              exists=true
+            else
+              echo "::notice::The latest release does not carry ${NAME} yet, so ${IMAGE}:latest does not exist; skipping scan."
+            fi
           else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::No published ${NAME} release yet, so ${IMAGE}:latest does not exist; skipping scan."
+            echo "::notice::No published release yet, so ${IMAGE}:latest does not exist; skipping scan."
           fi
+          echo "exists=${exists}" >> "$GITHUB_OUTPUT"
 
       - name: Run Trivy image scan
         if: steps.image.outputs.exists == 'true'

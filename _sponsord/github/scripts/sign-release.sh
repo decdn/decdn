@@ -4,7 +4,7 @@
 # The workspace is released as a whole, from a `v<version>` tag, and
 # release_plan.py says what every release carries: the archives of sponsord,
 # sponsord-onramp and decdn-sponsored under one SHA256SUMS, and a container
-# image per server with its SBOM and digest file.
+# image per binary with its SBOM and digest file.
 #
 # The workflow builds all of that but signs nothing and publishes nothing — the
 # GitHub Release is left as a draft and the image manifest is pushed untagged.
@@ -50,7 +50,7 @@ ARCHIVES=$(plan_get archives)
 
 REPO="${SPONSORD_REPO:-decdn/sponsord}"
 OWNER="${REPO%%/*}"
-# One image per server, named after its binary. release.yml pushed each as
+# One image per binary, named after it. release.yml pushed each as
 # `ghcr.io/<owner>/<image>` and wrote that into its digest file
 # (check-image-name.sh keeps the names in step).
 read -r -a IMAGES <<<"$(plan_get images)"
@@ -468,9 +468,9 @@ else
   fi
 
   # Every repository whose tags already point at this release, so a later
-  # failure can say which. With two images, a failure on the second leaves the
-  # first's `:latest` serving a release that is still a draft — an operator who
-  # stops for the day must be told that, not just "re-run".
+  # failure can say which. With several images, a failure on a later one
+  # leaves an earlier one's `:latest` serving a release that is still a draft —
+  # an operator who stops for the day must be told that, not just "re-run".
   PROMOTED=()
 
   # Points every tag in PROMOTE_TAGS of image $1 at the signed digest of $2.

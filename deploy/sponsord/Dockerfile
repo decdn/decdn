@@ -1,6 +1,6 @@
 # A server image built from source, for a fork or an unreleased commit. The
-# images each release publishes (ghcr.io/decdn/sponsord, -onramp) come from the
-# root Dockerfile instead, which packages the signed release binaries. Same
+# server images each release publishes (ghcr.io/decdn/sponsord, -onramp) come
+# from the root Dockerfile instead, which packages the signed release binaries. Same
 # runtime user (uid 1000) and layout, so either works with deploy/compose.yaml.
 #
 # From the repository root, `--build-arg BIN=sponsord` or `BIN=sponsord-onramp`:

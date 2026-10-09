@@ -99,7 +99,7 @@ Every crate shares one version and is released together, from a signed
 |---|---|---|---|
 | [`sponsord`](crates/sponsord) | The signing and top-up daemon | Linux (x86_64, aarch64) | `ghcr.io/decdn/sponsord` |
 | [`sponsord-onramp`](crates/sponsord-onramp) | The public onramp: gate, installers, hand-off | Linux (x86_64, aarch64) | `ghcr.io/decdn/sponsord-onramp` |
-| [`decdn-sponsored`](crates/decdn-sponsored) | The end-user CLI | Linux, macOS, Windows (x86_64, aarch64 each) | — |
+| [`decdn-sponsored`](crates/decdn-sponsored) | The end-user CLI | Linux, macOS, Windows (x86_64, aarch64 each) | `ghcr.io/decdn/decdn-sponsored` |
 | [`sponsord-core`](crates/sponsord-core) | The daemon's logic as a library, to embed instead of running the daemon | — | — |
 | [`sponsord-api`](crates/sponsord-api) | Wire types, error codes and typed clients for both servers | — | — |
 | [`sponsord-e2e`](crates/e2e) | Tests that run all three together (not released) | — | — |

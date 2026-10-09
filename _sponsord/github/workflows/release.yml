@@ -20,7 +20,7 @@ name: Release
 #                  support, sponsord and sponsord-onramp for Linux
 #   upload-assets  after verify and build: the archives plus one SHA256SUMS
 #                  onto the draft, and the onramp pin values into its notes
-#   docker         after upload-assets: per server, the multi-arch image,
+#   docker         after upload-assets: per image, the multi-arch image,
 #                  pushed to GHCR by digest only (no tag), plus an SBOM and
 #                  the digest onto the draft
 #
@@ -528,14 +528,14 @@ jobs:
           } >> notes.md
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
 
-  # One image per server, named after its binary and its Dockerfile target
+  # One image per binary that has one, named after it and its Dockerfile target
   # (release_plan.py; check-image-name.sh holds the Dockerfile, security.yml
   # and sign-release.sh in step with it).
   docker:
     name: Docker image (${{ matrix.image }})
     # Needs build: the image is assembled from the Linux archives that job
-    # produces, so the binary inside the image is byte-identical to the one
-    # the signed SHA256SUMS covers. Needs verify: that job creates the draft
+    # produces, so this release's binary inside the image is byte-identical
+    # to the one the signed SHA256SUMS covers. Needs verify: that job creates the draft
     # this one uploads to, and no image is pushed, not even untagged, for a
     # release that failed verification. Needs upload-assets: no image is
     # pushed and nothing is attached to the draft unless every archive and
@@ -578,7 +578,9 @@ jobs:
 
       # The images copy the release binaries, so what runs in a container is
       # byte-for-byte what SHA256SUMS covers. Their glibc floor was checked in
-      # the build leg, below the base image's.
+      # the build leg, below the base image's. The one exception is the
+      # `decdn` in the decdn-sponsored image, fetched below from decdn's
+      # release and run on both platforms once the image is built.
       - name: Unpack archives into dist/
         env:
           BINARY: ${{ matrix.image }}
@@ -593,6 +595,16 @@ jobs:
               echo "::error::dist/$a/$BINARY missing or not executable"; exit 1; }
           done
           sha256sum dist/*/"$BINARY"
+
+      # The CLI image also carries the `decdn` it spawns. That binary is
+      # decdn's, not this release's: fetched from decdn's release at the tag
+      # Cargo.toml pins, verified against decdn's signed SHA256SUMS. Without
+      # it the Dockerfile's COPY fails the build.
+      - name: Fetch decdn into dist/
+        if: matrix.image == 'decdn-sponsored'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: .github/scripts/fetch-decdn.sh dist
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -623,6 +635,20 @@ jobs:
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ env.NAME }}
           cache-to: type=gha,mode=max,scope=${{ env.NAME }}
+
+      # The fetched decdn is the one binary the build leg never checked: run
+      # it from the pushed image on each platform before anything records
+      # the digest, so a wrong-arch or too-new-glibc binary stops here.
+      - name: Check decdn runs in the image
+        if: matrix.image == 'decdn-sponsored'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for platform in linux/amd64 linux/arm64; do
+            docker run --rm --platform "$platform" --entrypoint decdn \
+              "${IMAGE}@${DIGEST}" --version
+          done
 
       - name: Generate SBOM
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3

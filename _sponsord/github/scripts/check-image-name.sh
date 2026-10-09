@@ -8,6 +8,8 @@
 #   * sign-release.sh           — validates that file against the same name,
 #                                 then tags from it
 #   * security.yml's scan matrix
+#   * ci.yml's docker-build matrix, so a new image is built on every PR
+#     rather than first at release
 #
 # A mismatch is otherwise caught only when sign-release.sh rejects a digest
 # file — after a full release build, with the tag already pushed.
@@ -47,6 +49,7 @@ expect() {
 expect .github/workflows/release.yml   "$MATRIX_IMAGE"
 expect .github/workflows/security.yml  "$MATRIX_IMAGE"
 expect .github/workflows/security.yml  "$MATRIX"
+expect .github/workflows/ci.yml        "$MATRIX"
 # shellcheck disable=SC2016  # ${OWNER} is literal text in the target file
 expect .github/scripts/sign-release.sh 'GHCR_NAMESPACE="ghcr.io/${OWNER}"'
 for image in "${IMAGES[@]}"; do
@@ -60,11 +63,11 @@ if (( fail )); then
   cat >&2 <<EOF
 
 The images (${IMAGES[*]}) must be named the same in release_plan.py, the
-Dockerfile, release.yml, security.yml and sign-release.sh, or sign-release.sh
+Dockerfile, release.yml, security.yml, ci.yml and sign-release.sh, or sign-release.sh
 will reject the digest file release.yml wrote — after a full release build,
 with the tag already pushed.
 EOF
   exit 1
 fi
 
-echo "image names consistent across release_plan.py, Dockerfile, release.yml, security.yml and sign-release.sh"
+echo "image names consistent across release_plan.py, Dockerfile, release.yml, security.yml, ci.yml and sign-release.sh"

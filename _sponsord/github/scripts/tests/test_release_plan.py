@@ -84,8 +84,8 @@ def test_every_release_carries_every_archive_and_image():
         "sponsord-onramp": 2,
         "decdn-sponsored": 6,
     }
-    assert p["images"] == "sponsord sponsord-onramp"
-    assert json.loads(p["images_json"]) == ["sponsord", "sponsord-onramp"]
+    assert p["images"] == "decdn-sponsored sponsord sponsord-onramp"
+    assert json.loads(p["images_json"]) == ["decdn-sponsored", "sponsord", "sponsord-onramp"]
 
 
 def test_installer_contract_targets_for_the_wrapper():
@@ -197,6 +197,18 @@ def test_table_matches_the_workspace():
             assert spec["binary"] in bins, crate
 
 
+def test_each_image_is_named_after_its_linux_binary():
+    """release.yml's docker job unpacks `<image>-<version>-<linux triple>`
+    archives, so an image must carry its crate's binary name and that binary
+    must be built for both Linux targets, or the job fails after tagging."""
+    linux = {target for target, _ in rp.LINUX}
+    for crate, spec in rp.CRATES.items():
+        if spec["image"] is None:
+            continue
+        assert spec["image"] == spec["binary"], crate
+        assert linux <= {target for target, _ in spec["targets"]}, crate
+
+
 def test_images_have_dockerfile_targets():
     dockerfile = (REPO_ROOT / "Dockerfile").read_text()
     for image in rp.images():
@@ -210,7 +222,7 @@ def test_cli_output_and_errors():
     ok = run("v1.0.0")
     assert ok.returncode == 0
     assert "version=1.0.0\n" in ok.stdout and "archives=10\n" in ok.stdout
-    assert run("v1.0.0", "--get", "images").stdout == "sponsord sponsord-onramp\n"
+    assert run("v1.0.0", "--get", "images").stdout == "decdn-sponsored sponsord sponsord-onramp\n"
     assert run("sponsord-v1.0.0").returncode == 1
     assert run("v1.0.0", "--get", "nope").returncode == 2
 

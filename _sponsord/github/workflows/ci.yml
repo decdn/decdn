@@ -77,6 +77,13 @@ jobs:
             docker:
               - 'Dockerfile'
               - '.dockerignore'
+              # The decdn pin decides which decdn release the CLI image
+              # fetches, so a bump PR proves that release still verifies.
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/scripts/fetch-decdn.sh'
+              - '.github/scripts/bump-decdn.sh'
+              - '.github/scripts/bump_decdn.py'
               - '.github/workflows/ci.yml'
             markdown:
               - '**/*.md'
@@ -422,7 +429,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [sponsord, sponsord-onramp]
+        image: [decdn-sponsored, sponsord, sponsord-onramp]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -432,7 +439,7 @@ jobs:
         env:
           IMAGE: ${{ matrix.image }}
       # The real images copy release binaries; a placeholder proves the COPY
-      # path, the entrypoint and the runtime user without a release build.
+      # path and the entrypoint without a release build.
       - name: Build (single platform, placeholder binary)
         env:
           IMAGE: ${{ matrix.image }}
@@ -441,7 +448,18 @@ jobs:
           mkdir -p dist/amd64
           printf '#!/bin/sh\necho "%s placeholder"\n' "$IMAGE" > "dist/amd64/$IMAGE"
           chmod +x "dist/amd64/$IMAGE"
-          docker build --platform linux/amd64 --target "$IMAGE" -t "$IMAGE:ci" .
+      # The decdn the CLI image ships is a release that already exists, so
+      # CI fetches the real one: this runs the same verification the release
+      # does, and catches a decdn pin whose release no longer verifies.
+      - name: Fetch decdn into dist/
+        if: matrix.image == 'decdn-sponsored'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/fetch-decdn.sh dist
+      - name: Build the image
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: docker build --platform linux/amd64 --target "$IMAGE" -t "$IMAGE:ci" .
       - name: Check the entrypoint resolves
         env:
           IMAGE: ${{ matrix.image }}
@@ -450,8 +468,16 @@ jobs:
           out=$(docker run --rm "$IMAGE:ci")
           [ "$out" = "$IMAGE placeholder" ] || {
             echo "::error::entrypoint did not run the copied binary (got: $out)"; exit 1; }
-      # The onramp keeps nothing on disk; an image that declares a volume
-      # would make operators provision one for nothing.
+      # The CLI spawns `decdn` by name, so it must resolve on PATH, and must
+      # run on the base image's glibc: decdn's release sets its own floor.
+      - name: Check decdn runs from PATH
+        if: matrix.image == 'decdn-sponsored'
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: docker run --rm --entrypoint decdn "$IMAGE:ci" --version
+      # No image needs a volume: the servers keep nothing on disk, and the
+      # CLI's state is the user's to mount if they want it. A declared volume
+      # would make every `docker run` provision one for nothing.
       - name: Check the image declares no volume
         env:
           IMAGE: ${{ matrix.image }}
