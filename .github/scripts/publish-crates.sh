@@ -203,6 +203,15 @@ git -C "$REPO_ROOT" worktree add --detach "$WORKTREE" "$TAG" >/dev/null 2>&1 ||
   die "could not create a worktree at $TAG"
 cd "$WORKTREE"
 
+# A new worktree leaves the contracts/lib submodules as empty directories, but
+# their repositories live in the shared .git/modules. When the parent checkout
+# has them initialized, cargo's git status check (libgit2) opens those
+# repositories, descends into a nested submodule whose directory does not
+# exist, and aborts the dry run with a bare "No such file or directory".
+# Checking the submodules out makes the worktree match what libgit2 expects.
+git submodule update --init --recursive >/dev/null 2>&1 ||
+  die "could not check out the submodules in the worktree at $TAG"
+
 # Belt and braces over release.yml's own check: this asserts the tree being
 # uploaded carries the tag's version, on the machine doing the uploading.
 #
@@ -276,8 +285,12 @@ permanently published and the version spent. Do one of these first:
 
 Set DECDN_ALLOW_RATE_LIMIT=1 to override if the limit has already been raised."
 fi
-[[ ${#NEW_CRATES[@]} -eq 0 ]] ||
+if (( ${#NEW_CRATES[@]} > PUBLISH_NEW_BURST )); then
+  echo "    ${#NEW_CRATES[@]} new, ${#CRATES[@]} total — OVER the burst of" \
+       "$PUBLISH_NEW_BURST; publishing anyway because DECDN_ALLOW_RATE_LIMIT is set"
+elif (( ${#NEW_CRATES[@]} > 0 )); then
   echo "    ${#NEW_CRATES[@]} new, ${#CRATES[@]} total (within the burst of $PUBLISH_NEW_BURST)"
+fi
 
 echo "==> Dry run"
 # On a re-run after a successful publish this is where cargo stops, because the
