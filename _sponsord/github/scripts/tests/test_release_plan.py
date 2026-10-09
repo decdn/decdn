@@ -61,14 +61,24 @@ def test_anything_else_is_refused(tag):
         rp.parse_tag(tag)
 
 
+def archives(p: dict[str, str]) -> list[tuple[str, str, str]]:
+    """(package, binary, target) for every archive the matrix builds."""
+    out = []
+    for leg in json.loads(p["matrix"])["include"]:
+        for build in leg["builds"].split(" "):
+            package, binary = build.split(":")
+            out.append((package, binary, leg["target"]))
+    return out
+
+
 def test_every_release_carries_every_archive_and_image():
     p = rp.plan("v0.1.0")
-    legs = json.loads(p["matrix"])["include"]
-    assert p["archives"] == str(len(legs)) == "10"
+    built = archives(p)
+    assert p["archives"] == str(len(built)) == "10"
     per_binary = {}
-    for leg in legs:
-        per_binary.setdefault(leg["binary"], set()).add(leg["target"])
-        assert leg["package"] == leg["binary"]
+    for package, binary, target in built:
+        per_binary.setdefault(binary, set()).add(target)
+        assert package == binary
     assert {b: len(t) for b, t in per_binary.items()} == {
         "sponsord": 2,
         "sponsord-onramp": 2,
@@ -80,8 +90,8 @@ def test_every_release_carries_every_archive_and_image():
 
 def test_installer_contract_targets_for_the_wrapper():
     """decdn.sh / decdn.ps1 fetch these six; dropping one breaks an installer."""
-    legs = json.loads(rp.plan("v0.1.0")["matrix"])["include"]
-    assert {leg["target"] for leg in legs if leg["binary"] == "decdn-sponsored"} == {
+    built = archives(rp.plan("v0.1.0"))
+    assert {t for _, b, t in built if b == "decdn-sponsored"} == {
         "x86_64-unknown-linux-gnu",
         "aarch64-unknown-linux-gnu",
         "x86_64-apple-darwin",
@@ -93,9 +103,33 @@ def test_installer_contract_targets_for_the_wrapper():
 
 def test_archive_names_are_unique():
     """One SHA256SUMS covers every archive, so no two legs may share a name."""
-    legs = json.loads(rp.plan("v0.1.0")["matrix"])["include"]
-    names = [(leg["binary"], leg["target"]) for leg in legs]
+    names = [(b, t) for _, b, t in archives(rp.plan("v0.1.0"))]
     assert len(names) == len(set(names))
+
+
+def test_one_build_job_per_target():
+    """Each target compiles the shared dependency graph once, in one job."""
+    legs = json.loads(rp.plan("v0.1.0")["matrix"])["include"]
+    targets = [leg["target"] for leg in legs]
+    assert len(targets) == len(set(targets)) == 6
+    for leg in legs:
+        if leg["target"].endswith("-linux-gnu"):
+            assert leg["builds"] == (
+                "sponsord:sponsord sponsord-onramp:sponsord-onramp "
+                "decdn-sponsored:decdn-sponsored"
+            )
+        else:
+            assert leg["builds"] == "decdn-sponsored:decdn-sponsored"
+
+
+def test_a_target_with_two_runners_is_refused(monkeypatch):
+    crates = {
+        "a": {"dir": "a", "binary": "a", "targets": [("t", "r1")], "image": None},
+        "b": {"dir": "b", "binary": "b", "targets": [("t", "r2")], "image": None},
+    }
+    monkeypatch.setattr(rp, "CRATES", crates)
+    with pytest.raises(ValueError, match="built on both"):
+        rp.plan("v0.1.0")
 
 
 TAG_SAMPLES = [

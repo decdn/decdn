@@ -194,31 +194,49 @@ squash-merge subjects conventional; others are left out).
 ## What CI does with the tag
 
 Pushing a release tag starts
-[`.github/workflows/release.yml`](.github/workflows/release.yml), which:
+[`.github/workflows/release.yml`](.github/workflows/release.yml). Its `tag`
+job, which compiles nothing, gates everything else:
 
 1. rejects the tag unless `release_plan.py` reads it as
    `vMAJOR.MINOR.PATCH[-pre]` (the trigger glob is looser than it looks —
    `v0$(whoami)` matches it);
 2. imports `KEYS` **from `origin/main`** and refuses the tag if it is not
-   signed by a key published there;
+   signed by a key published there, or if it no longer points at the commit
+   the run was triggered for (every later job builds that commit, never the
+   tag name, so a tag re-pushed mid-run cannot get one commit checked and
+   another built);
 3. checks every crate's version matches the tag, and runs `check-decdn-pin`;
-4. re-runs `cargo fmt`, clippy and the test suite on the whole workspace;
-5. runs `cargo semver-checks --workspace` on every published crate's public
-   API (default features) against the highest release below the tag, which
-   must carry a signature from `KEYS`, and fails if a change needs a bigger
-   bump than the version says (in 0.x, a breaking change needs a minor bump).
-   "Below" is in semver order, so a re-run after a newer release, or a
-   maintenance release, never compares against a newer version. The first
-   release has no baseline and skips it. To run it before tagging, use
-   `cargo semver-checks --workspace --baseline-rev "$(.github/scripts/release_plan.py <tag> --baseline)" --default-features`;
-6. creates the GitHub Release as a **draft**, with git-cliff notes and the
-   locked decdn commit it was built against;
-7. builds all 10 archives and one `SHA256SUMS` manifest, asserting all of them
-   are present, and appends the onramp pin values to the notes;
-8. for each server, assembles its multi-arch image from those archives — it
-   does not compile from source, so the image's binary is byte-identical to
-   the archived one — and pushes the manifest **untagged**, attaching the SBOM
-   and `<image>-image-digest.txt`.
+4. picks the semver baseline, the highest release below the tag, and refuses
+   it unless it too carries a signature from `KEYS`. "Below" is in semver
+   order, so a re-run after a newer release, or a maintenance release, never
+   compares against a newer version. The first release has none.
+
+Then two jobs run side by side:
+
+1. **`verify`** re-runs `cargo fmt`, clippy and the test suite on the whole
+   workspace; runs `cargo semver-checks --workspace` on every published
+   crate's public API (default features) against the baseline, failing if a
+   change needs a bigger bump than the version says (in 0.x, a breaking change
+   needs a minor bump; to run it before tagging, use
+   `cargo semver-checks --workspace --baseline-rev "$(.github/scripts/release_plan.py <tag> --baseline)" --default-features`);
+   then creates the GitHub Release as a **draft**, with git-cliff notes and
+   the locked decdn commit it was built against.
+2. **`build`** runs one job per target, each building every binary released
+   for it, and fails a Linux leg whose binaries need a glibc above 2.35
+   (Ubuntu 22.04).
+
+Only once both pass:
+
+1. `upload-assets` attaches all 10 archives and one `SHA256SUMS` manifest,
+   asserting all of them are present, and appends the onramp pin values to
+   the notes;
+2. after it, for each server, `docker` assembles the multi-arch image from
+   those archives — it does not compile from source, so the image's binary is
+   byte-identical to the archived one — and pushes the manifest **untagged**,
+   attaching the SBOM and `<image>-image-digest.txt`.
+
+A release that fails verification therefore leaves no asset on the draft and
+pushes no image.
 
 One check decdn's release run has is absent here: `cargo publish --dry-run`
 resolves the decdn crates from crates.io, where they may not be yet, so it

@@ -90,25 +90,42 @@ def parse_tag(tag: str) -> str:
     return m.group(1)
 
 
+def legs() -> list[dict[str, str]]:
+    """One build job per target, each building every binary released for it.
+
+    Per target, not per binary: the binaries share most of their dependency
+    graph, so one `target/` per target compiles the shared part once. `builds`
+    lists `package:binary` pairs, space-separated for the workflow's bash loop.
+    """
+    by_target: dict[str, dict[str, str]] = {}
+    for crate, spec in CRATES.items():
+        for target, runner in spec["targets"]:
+            leg = by_target.setdefault(target, {"target": target, "runner": runner, "builds": ""})
+            if leg["runner"] != runner:
+                raise ValueError(f"{target} is built on both {leg['runner']} and {runner}")
+            leg["builds"] = f"{leg['builds']} {crate}:{spec['binary']}".lstrip()
+    return list(by_target.values())
+
+
+def archive_count() -> int:
+    """Every (binary, target) pair is one archive."""
+    return sum(len(spec["targets"]) for spec in CRATES.values())
+
+
 def plan(tag: str) -> dict[str, str]:
     version = parse_tag(tag)
     prerelease = "-" in version
-    legs = [
-        {"package": crate, "binary": spec["binary"], "target": target, "runner": runner}
-        for crate, spec in CRATES.items()
-        for target, runner in spec["targets"]
-    ]
     return {
         "tag": tag,
         "version": version,
-        "archives": str(len(legs)),
+        "archives": str(archive_count()),
         # Space-separated for the scripts, JSON for the docker job's matrix.
         "images": " ".join(images()),
         "images_json": json.dumps(images(), separators=(",", ":")),
         # GitHub's prerelease flag, set on the draft.
         "prerelease": "true" if prerelease else "false",
-        # A GitHub Actions matrix: every archive of every binary crate.
-        "matrix": json.dumps({"include": legs}, separators=(",", ":")),
+        # A GitHub Actions matrix: one leg per target (legs()).
+        "matrix": json.dumps({"include": legs()}, separators=(",", ":")),
     }
 
 
