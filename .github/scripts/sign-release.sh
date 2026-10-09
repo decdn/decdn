@@ -159,11 +159,12 @@ primary_fprs() {
 # which gpg sets only while some part of the key is able to sign.
 #
 # With the argument `decdn`, a key must also carry a uid that is not revoked or
-# expired and whose email is a @decdn.org address. When the uid ends in `<…>`,
-# the email is the text inside it; otherwise the whole uid is the email. Either
-# way it must be one address with nothing around it, matched case-insensitively
-# and anchored at both ends, so `decdn.org.example`, `notdecdn.org`,
-# `eu.decdn.org` and `Name me@decdn.org` do not qualify.
+# expired and whose email is a @decdn.org address. The email is the one gpg's
+# own `<address>` lookup uses: the text inside the uid's first `<…>`, whatever
+# follows it, or the whole uid when it has no `<…>`. It must be one address
+# with nothing around it, matched case-insensitively and anchored at both ends,
+# so `decdn.org.example`, `notdecdn.org`, `eu.decdn.org`, `Name me@decdn.org`
+# and `Name <me@example.com> <me@decdn.org>` do not qualify.
 signing_fprs() {
   awk -F: -v decdn="${1:-}" '
     function flush() { if (fpr != "" && (hit || !decdn)) print fpr }
@@ -175,7 +176,7 @@ signing_fprs() {
     /^fpr:/ && want { if (usable) fpr = $10; want = 0; next }
     /^uid:/ && $2 !~ /^[re]$/ {
       email = tolower($10)
-      if (match(email, /<[^<>]*>$/)) email = substr(email, RSTART + 1, RLENGTH - 2)
+      if (match(email, /<[^<>]*>/)) email = substr(email, RSTART + 1, RLENGTH - 2)
       if (email ~ /^[^@<> \t]+@decdn\.org$/) hit = 1
     }
     END { flush() }

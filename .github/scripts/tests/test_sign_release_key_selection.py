@@ -252,7 +252,8 @@ def test_unpublished_decdn_key_is_not_chosen(keyring):
         "Lookalike <me@eu.decdn.org>",
         "Mentions me@decdn.org <me@example.com>",
         "Name me@decdn.org",
-        "Foo <me@decdn.org> trailing",
+        # gpg's mailbox is the FIRST <…>, so a trailing one is not the email.
+        "Two <me@example.com> <me@decdn.org>",
     ],
 )
 def test_lookalike_uids_do_not_match(keyring, uid):
@@ -269,6 +270,16 @@ def test_lookalike_uids_do_not_match(keyring, uid):
 def test_bare_address_uid_matches_case_insensitively(keyring):
     keyring.gen_key("Personal <me@example.com>", publish=True)
     decdn = keyring.gen_key("me@DECDN.org", publish=True)
+
+    result = keyring.run()
+
+    assert signed_as(result, decdn, DECDN_RULE), output(result)
+
+
+def test_text_after_the_address_still_matches(keyring):
+    # gpg's own `<me@decdn.org>` lookup finds this uid, so the script agrees.
+    keyring.gen_key("Personal <me@example.com>", publish=True)
+    decdn = keyring.gen_key("Maintainer <me@decdn.org> (release key)", publish=True)
 
     result = keyring.run()
 
