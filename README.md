@@ -1,9 +1,15 @@
 # deCDN
 
-[![CI](https://github.com/decdn/decdn/actions/workflows/ci.yml/badge.svg)](https://github.com/decdn/decdn/actions/workflows/ci.yml)
-[![Security](https://github.com/decdn/decdn/actions/workflows/security.yml/badge.svg)](https://github.com/decdn/decdn/actions/workflows/security.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![MSRV](https://img.shields.io/badge/MSRV-1.99.0-orange.svg)](rust-toolchain.toml)
+[![CI](https://img.shields.io/github/actions/workflow/status/decdn/decdn/ci.yml?branch=main&label=CI&logo=github)](https://github.com/decdn/decdn/actions/workflows/ci.yml?query=branch%3Amain)
+[![Security](https://img.shields.io/github/actions/workflow/status/decdn/decdn/security.yml?branch=main&label=security&logo=github)](https://github.com/decdn/decdn/actions/workflows/security.yml?query=branch%3Amain)
+[![CodeQL](https://img.shields.io/github/actions/workflow/status/decdn/decdn/codeql.yml?branch=main&label=CodeQL&logo=github)](https://github.com/decdn/decdn/actions/workflows/codeql.yml?query=branch%3Amain)
+[![Release](https://img.shields.io/github/v/release/decdn/decdn?sort=semver&logo=github)](https://github.com/decdn/decdn/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/decdn-cli?logo=rust&label=crates.io)](https://crates.io/crates/decdn-cli)
+[![docs.rs](https://img.shields.io/docsrs/decdn-client?logo=docs.rs&label=docs.rs)](https://docs.rs/decdn-client)
+[![Docker](https://img.shields.io/docker/v/decdn/decdn-node?sort=semver&logo=docker&label=docker)](https://hub.docker.com/r/decdn/decdn-node)
+[![MSRV](https://img.shields.io/crates/msrv/decdn-client?logo=rust&label=MSRV)](Cargo.toml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![Docs](https://img.shields.io/badge/docs-docs.decdn.org-informational)](https://docs.decdn.org)
 
 A decentralized CDN. Bonded operators cache and serve BLAKE3-addressed blobs over
 [iroh](https://iroh.computer/) QUIC, and clients pay for every megabyte in USDC through
