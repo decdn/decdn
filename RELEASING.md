@@ -105,8 +105,10 @@ preview writes nothing and needs no cleanup. Do **not** follow it with
 
 ## What CI does with the tag
 
-Pushing `v*` starts [`.github/workflows/release.yml`](.github/workflows/release.yml),
-which:
+Pushing `v*` starts [`.github/workflows/release.yml`](.github/workflows/release.yml).
+Steps 1–3 gate everything else. After them, the archive builds (step 6) run in
+parallel with the verification (steps 4–5). The asset upload and the image push
+wait for both. The workflow:
 
 1. rejects the tag unless it is strict semver (the trigger glob is looser than
    it looks — `v0$(whoami)` matches it);
@@ -121,12 +123,13 @@ which:
    error found during the real publish has no clean recovery;
 5. creates the GitHub Release as a **draft**;
 6. builds eleven archives (`decdn-node` on five targets, `decdn` on six: the
-   same five plus Windows ARM64) and a
-   `SHA256SUMS` manifest, asserting all eleven are present;
-7. assembles the multi-arch image from those archives — it does not compile
-   from source, so the binary in the image is byte-identical to the archived
-   one — and pushes the manifest **untagged**, attaching the SBOM and
-   `image-digest.txt`.
+   same five plus Windows ARM64), one job per target, and once verification
+   passes uploads them with a `SHA256SUMS` manifest, asserting all eleven are
+   present;
+7. once verification passes, assembles the multi-arch image from those archives
+   — it does not compile from source, so the binary in the image is
+   byte-identical to the archived one — and pushes the manifest **untagged**,
+   attaching the SBOM and `image-digest.txt`.
 
 Draft assets need authentication to download, and no image tag exists yet, so
 nothing resolves by name until the release is signed. The image manifest is
