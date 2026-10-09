@@ -46,10 +46,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: changes
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
-    env:
-      # Any warning fails the run (cargo's `build.warnings`). Unlike
-      # `-- -D warnings` it is not part of the build fingerprint.
-      CARGO_BUILD_WARNINGS: deny
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -64,7 +60,15 @@ jobs:
           # warm baseline once GitHub's per-repo cache store (currently 10 GiB)
           # saturates.
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # `CARGO_BUILD_WARNINGS=deny` (cargo's `build.warnings`) fails the run on
+      # any warning. Unlike `-- -D warnings` it is not part of the build
+      # fingerprint. It is set per step, not per job: rust-cache hashes every
+      # `CARGO*`/`RUST*` variable it sees into the restore key, and release.yml
+      # restores this `clippy` partition, so the env at the rust-cache step must
+      # match release.yml's `release` job.
       - run: cargo clippy --workspace --all-targets
+        env:
+          CARGO_BUILD_WARNINGS: deny
       # `--workspace` unifies features, so `decdn-cli` turns on
       # `decdn-incentive/redb` for everyone and the two configurations the
       # feature split exists to create are never actually compiled: the node's
@@ -73,9 +77,13 @@ jobs:
       # `cargo build -p decdn-node`, or any downstream taking `decdn-incentive`
       # alone — and both break silently under unification. Check them directly.
       - run: cargo clippy -p decdn-incentive --no-default-features
+        env:
+          CARGO_BUILD_WARNINGS: deny
       - run: >
           cargo clippy -p decdn-incentive --no-default-features
           --features buyer-store-core
+        env:
+          CARGO_BUILD_WARNINGS: deny
       # A feature that no dev-dependency turns on is invisible to the
       # `--workspace --all-targets` run above: `anvil-e2e` (all 15
       # `crates/e2e/tests/*` + the two gated `decdn-node` tests),
@@ -98,6 +106,8 @@ jobs:
       # all-features configuration, which is not the per-job feature set either
       # anvil job builds.
       - run: cargo clippy --workspace --all-targets --all-features
+        env:
+          CARGO_BUILD_WARNINGS: deny
 
   deny:
     name: cargo deny
