@@ -17,6 +17,8 @@
 #   DECDN_ALLOW_RATE_LIMIT set to 1 to publish more than 5 brand-new crates in
 #                          one run — only once crates.io has raised this repo's
 #                          publish-new limit (see the check below)
+#   DECDN_SKIP_SPONSORD_BUMP set to 1 to not start decdn/sponsord's bump-decdn
+#                          workflow after the upload
 #
 # Unlike sign-release.sh this is NOT freely re-runnable: a crates.io version is
 # immutable and can never be replaced or re-uploaded (only yanked, which does not
@@ -29,6 +31,7 @@ VERSION="${TAG#v}"
 REPO="${DECDN_REPO:-decdn/decdn}"
 SIGNING_KEY="${DECDN_SIGNING_KEY:-}"
 ALLOW_RATE_LIMIT="${DECDN_ALLOW_RATE_LIMIT:-}"
+SKIP_SPONSORD_BUMP="${DECDN_SKIP_SPONSORD_BUMP:-}"
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -390,6 +393,30 @@ if (( ${#unreachable[@]} > 0 )); then
   printf '  %s\n' "${unreachable[@]}" >&2
   echo "Verify manually at https://crates.io/crates/<name>. Do NOT re-run this" >&2
   echo "script — the publish above already succeeded." >&2
+fi
+
+# ---- downstream ------------------------------------------------------------
+
+# decdn/sponsord pins decdn at a release tag. Its bump-decdn workflow opens the
+# PR that moves the pin to this release; it waits out crates.io index lag by
+# itself, so it starts even when a crate above is not served yet. A fork or a
+# DECDN_REPO test run starts nothing.
+BUMP_CMD=(gh workflow run bump-decdn.yml -R decdn/sponsord --ref main)
+if [[ -n "$SKIP_SPONSORD_BUMP" ]]; then
+  echo
+  echo "==> Skipping sponsord's decdn bump (DECDN_SKIP_SPONSORD_BUMP is set)"
+elif [[ "$REPO" != "decdn/decdn" ]]; then
+  echo
+  echo "==> Skipping sponsord's decdn bump ($REPO is not decdn/decdn)"
+else
+  echo
+  echo "==> Starting sponsord's decdn bump"
+  if "${BUMP_CMD[@]}"; then
+    echo "    https://github.com/decdn/sponsord/actions/workflows/bump-decdn.yml"
+  else
+    echo "warning: could not start sponsord's bump-decdn workflow. Start it with:" >&2
+    echo "  ${BUMP_CMD[*]}" >&2
+  fi
 fi
 
 echo

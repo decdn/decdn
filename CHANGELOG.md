@@ -3239,6 +3239,14 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Release: `publish-crates.sh` starts sponsord's decdn bump.** After the
+  upload, the script runs `gh workflow run bump-decdn.yml -R decdn/sponsord`,
+  and that workflow opens the PR that pins sponsord to the new release once
+  crates.io serves it. A failed start prints the command and never fails the
+  publish; a `DECDN_REPO` other than `decdn/decdn` starts nothing, and
+  `DECDN_SKIP_SPONSORD_BUMP=1` skips it.
+  - Why: sponsord pins decdn at a release tag, and each move was a PR opened
+    by hand after the release.
 - **`serve_stream` spans time their serve loop's waits by cause (#2348).** A
   serve loop records `store_wait_ns`, `send_wait_ns` and `proof_wait_ns` as
   it ends, with the QUIC path's state: `path_kind`, `path_rtt_us`,
