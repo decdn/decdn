@@ -16,7 +16,7 @@ This ADR is the canonical economic-model umbrella. It implements a **work-token 
 
 ### Inputs assumed by this ADR
 
-Pre-launch design with no holder-compensation or contract-migration concerns. ~$1M+ pre-seed USDC capital secured (planning target $3M); program structure is operational and tracked separately. 2026 unmetered-bandwidth provider economics (1 Gbps VPS, 10 Gbps dedicated, 100 Gbps edge tiers); dedicated-bandwidth nodes are realistic at every scale band the protocol is sized for.
+Pre-mainnet design with no holder-compensation or contract-migration concerns. ~$1M+ pre-seed USDC capital secured (planning target $3M); program structure is operational and tracked separately. 2026 unmetered-bandwidth provider economics (1 Gbps VPS, 10 Gbps dedicated, 100 Gbps edge tiers); dedicated-bandwidth nodes are realistic at every scale band the protocol is sized for.
 
 ## Decision
 
@@ -218,9 +218,9 @@ S1 and S2 leave essentially all TOKEN liquid; operators bond TOKEN purchased on 
 - **Capacity-growth lock demand.** Every new operator or tier upgrade is a new buyer of TOKEN to bond. The demand is mechanically tied to network capacity growth, not to a promise of yield.
 - **Deflationary burn.** 30% of routed USDC is swapped to TOKEN and burned per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol).
 
-### Recognizing pre-launch testnet operators
+### Recognizing testnet operators
 
-There is **no dedicated on-chain credit and no earmarked allocation** for pre-launch testnet operators. The former on-chain "Genesis Bond Credit" (a Treasury-funded `CapacityBond` grant with a 24-month vest) is removed; its 5pp folds back into the operational DAO Treasury (group 2, now a flat 15% — 30% at TGE, then 48-month linear). Any retroactive recognition of verified testnet contribution is a **discretionary off-chain Treasury TGE-unlock distribution** — liquid TOKEN on a cliff/linear schedule the foundation/Treasury sets — with **no protocol contract surface**. This keeps the contract set smaller and sidesteps on-chain grant/vest/slash interactions; early-operator unit economics are carried by the off-chain USDC infrastructure subsidies in [§ Bootstrap mechanism — pre-seed USDC](#bootstrap-mechanism--pre-seed-usdc).
+There is **no dedicated on-chain credit and no earmarked allocation** for testnet operators. The protocol has no on-chain operator grant. The operational DAO Treasury (group 2) is a flat 15%: 30% at TGE, then 48-month linear. Any retroactive recognition of verified testnet contribution is a **discretionary off-chain Treasury TGE-unlock distribution** — liquid TOKEN on a cliff/linear schedule the foundation/Treasury sets — with **no protocol contract surface**. This keeps the contract set smaller and sidesteps on-chain grant/vest/slash interactions; early-operator unit economics are carried by the off-chain USDC infrastructure subsidies in [§ Bootstrap mechanism — pre-seed USDC](#bootstrap-mechanism--pre-seed-usdc).
 
 **Howey framing.** A discretionary off-chain distribution for prior verifiable work (testnet) is structurally distinct from ongoing service emission: the work that earned it is complete at TGE, and recipients receive liquid TOKEN, not a protocol-mediated yield. Shape matches a founding-contributor grant, not yield to passive bonders.
 

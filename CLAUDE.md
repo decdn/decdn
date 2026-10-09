@@ -6,7 +6,7 @@ Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over
 
 **Status: Early implementation.** Cargo workspace with 11 crates and two binaries (#421): the `node` crate builds the `decdn-node` daemon (runtime bring-up, admin RPC server, dispatch limiter, probe handler); the `cli` crate builds the user-facing `decdn` binary (`key-gen`, `whoami`, `config {…}`, `probe`, `fetch`, `setup`, `node {…}`, `bundle {pull}`, `origin {import}`, `pool {…}`, `publish {…}`, `appeal {slash}`). See the [Crate Structure](#crate-structure) section for what each crate owns. No crate is a stub.
 
-**Pre-launch: wire-breaking changes are fine.** Nothing is deployed and there are no live peers. Do not add backward-compatibility shims, version negotiation, dual-format readers, or migration paths for wire, postcard, ABI, config, or storage changes. Change the format, update every side in the same PR, and delete the old shape. Compatibility work only becomes real after the first public deployment.
+**Pre-mainnet: wire-breaking changes are fine.** The only deployment is the Arbitrum Sepolia testnet, which is redeployed, never migrated. Do not add backward-compatibility shims, version negotiation, dual-format readers, or migration paths for wire, postcard, ABI, config, or storage changes. Change the format, update every side in the same PR, and delete the old shape. Compatibility work only becomes real after the mainnet deployment.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-commit hooks, and development environment setup.
 

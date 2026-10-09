@@ -68,7 +68,7 @@ Every reason here traces to a real PR/issue/ADR. Quotes are from the commit/PR/A
 - **Off-chain ERC-1271 + Safe-as-wallet** (#1431). The node-side ERC-1271 check "was never built"; a
   1-of-1 Safe is "the same trust posture as today's eth_keystore — zero security gain, added setup burden."
 - **Dead `StreamResponse.redirect` field** (#1838 / #1842). "no node ever populates it, no client ever
-  follows it, yet it is carried on the wire and folded into the EIP-712 signed set." Must go pre-launch:
+  follows it, yet it is carried on the wire and folded into the EIP-712 signed set." Must go pre-mainnet:
   "post-launch it becomes a frozen signed field."
 - **Mechanism-inventory sweep** (#1850). Net −3,900 lines of code "with no production caller, along with
   the tests that existed only to exercise it": client rtt_map, fused progressive pull, `Percent` type,

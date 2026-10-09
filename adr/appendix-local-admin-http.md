@@ -15,7 +15,7 @@ Neither fits when a same-host operator must **read live internal state** (readin
 
 A running deCDN node exposes a **loopback-only JSON-RPC 2.0 server** on a configurable port (`observability.admin_port`, default `9191`), dispatched over HTTP `POST /`, framed per <https://www.jsonrpc.org/specification>.
 
-The surface version lives in the namespace prefix (`admin_v1_...`), not a URL path segment, since JSON-RPC dispatches on the envelope's `method` field. Within `v1`, routes accrete fields backwards-compatibly; a breaking change cuts over to `admin_v2_...`. This rule applies from the first public deployment. Before that, a breaking change edits the `v1` method in place.
+The surface version lives in the namespace prefix (`admin_v1_...`), not a URL path segment, since JSON-RPC dispatches on the envelope's `method` field. Within `v1`, routes accrete fields backwards-compatibly; a breaking change cuts over to `admin_v2_...`. This rule applies from the mainnet deployment. Before mainnet, a breaking change edits the `v1` method in place.
 
 Method set (the `AdminRpc` trait in `decdn-common` is the canonical surface):
 

@@ -2,7 +2,7 @@
 
 Part of [deCDN](https://github.com/decdn/decdn) — a decentralized CDN where nodes cache and serve BLAKE3-addressed blobs over [iroh](https://iroh.computer) QUIC, and clients pay per megabyte in USDC over off-chain payment channels.
 
-> **Status: early implementation.** deCDN is pre-launch — no network is deployed. Wire formats, APIs and on-chain interfaces change without compatibility shims.
+> **Status: early implementation.** deCDN runs a public testnet on Arbitrum Sepolia and is pre-mainnet. Wire formats, APIs and on-chain interfaces change without compatibility shims until mainnet.
 
 The deCDN client SDK: fetch BLAKE3-addressed blobs from deCDN nodes, pay for them per megabyte
 from a USDC payment pool, and verify every byte as it arrives. Two entry points cover most uses:

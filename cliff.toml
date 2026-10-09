@@ -59,7 +59,7 @@ conventional_commits = true
 filter_unconventional = true
 split_commits = false
 # A commit marked breaking (`!` or a `BREAKING CHANGE:` footer) is kept even
-# when a `skip = true` parser below matches it. Pre-launch, wire- and
+# when a `skip = true` parser below matches it. Pre-mainnet, wire- and
 # config-breaking changes are the commits an operator most needs to see, and a
 # `chore(deps)!:` must not vanish with the routine bumps.
 protect_breaking_commits = true
