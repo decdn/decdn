@@ -326,9 +326,17 @@ where
             warn_short_top_up(pool_id, additional, out, "funding calls ran out");
             Ok(out)
         }
-        (None, Some(err)) => Err(anyhow::anyhow!(
-            "recovery top-up failed: every joined topUp failed, last: {err:#}"
-        )),
+        (None, Some(err)) => {
+            let failed =
+                anyhow::anyhow!("recovery top-up failed: every joined topUp failed, last: {err:#}");
+            // The recovery step answers a pool that accepts no more funds
+            // with a new pool, so the marker rides out.
+            Err(if err.downcast_ref::<PoolNotOpen>().is_some() {
+                failed.context(PoolNotOpen)
+            } else {
+                failed
+            })
+        }
         (None, None) => Err(anyhow::anyhow!(
             "recovery top-up made no funding call (MAX_TOPUP_CALLS is zero)"
         )),
@@ -1355,7 +1363,8 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// `seen_deposit` is the deposit the calling fill saw. A row that already
     /// holds more is a sibling's step that landed: the call returns the row's
     /// deposit and escrows nothing. A recovery top-up still in flight is a
-    /// sibling's step too: the call waits for it and returns its deposit.
+    /// sibling's step too: the call waits for it and returns its deposit. When
+    /// that top-up reverts `PoolNotOpen`, the call joins the replacement open.
     ///
     /// The step sizes itself from the pool row: the deposit less the spend its
     /// lanes recorded. A fill runs the step only once its own pulls ended, and
@@ -1369,7 +1378,8 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// # Errors
     ///
     /// No pool is tracked, the `topUp` or replacement `openPool` fails, a
-    /// joined top-up fails, or a mined transaction cannot be recorded
+    /// joined top-up fails for any reason but `PoolNotOpen`, or a mined
+    /// transaction cannot be recorded
     /// (escrowed and untracked).
     pub async fn recover_pool(&self, seen_deposit: U256) -> Result<Recovery> {
         let state = self
@@ -1379,10 +1389,17 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             return Ok(Recovery::ToppedUp(state.deposit));
         }
         if let Some(in_flight) = self.recovery_in_flight() {
-            let landed = in_flight
-                .await
-                .map_err(|err| anyhow::anyhow!("a sibling's recovery top-up failed: {err:#}"))?;
-            return Ok(Recovery::ToppedUp(landed.new_deposit));
+            return match in_flight.await {
+                Ok(landed) => Ok(Recovery::ToppedUp(landed.new_deposit)),
+                // The sibling's step replaces the pool; this fill joins that
+                // open.
+                Err(err) if err.downcast_ref::<PoolNotOpen>().is_some() => {
+                    self.replace_pool(state.pool_id).await
+                }
+                Err(err) => Err(anyhow::anyhow!(
+                    "a sibling's recovery top-up failed: {err:#}"
+                )),
+            };
         }
         // A zero working deposit turns the node's funding off.
         if self.working_deposit.is_zero() {
@@ -1397,18 +1414,26 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             Ok(landed) if landed.added.is_zero() => Ok(Recovery::Unavailable),
             Ok(landed) => Ok(Recovery::ToppedUp(landed.new_deposit)),
             Err(err) if err.downcast_ref::<PoolNotOpen>().is_some() => {
-                info!(
-                    pool_id = %state.pool_id,
-                    "buyer pool no longer accepts funds; opening a new pool"
-                );
-                let opened = self.open_replacement(state.pool_id).await?;
-                Ok(Recovery::Replaced(PoolReplaced {
-                    closed: state.pool_id,
-                    opened,
-                }))
+                self.replace_pool(state.pool_id).await
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// The recovery step for pool `closed`, whose `topUp` reverted
+    /// `PoolNotOpen`: open a new pool in its place. Concurrent fills join one
+    /// open ([`Self::open_replacement`]).
+    ///
+    /// # Errors
+    ///
+    /// The replacement open fails.
+    async fn replace_pool(&self, closed: PoolId) -> Result<Recovery> {
+        info!(
+            pool_id = %closed,
+            "buyer pool no longer accepts funds; opening a new pool"
+        );
+        let opened = self.open_replacement(closed).await?;
+        Ok(Recovery::Replaced(PoolReplaced { closed, opened }))
     }
 
     /// The recovery step for pool `pool_id`, which already holds its working

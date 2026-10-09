@@ -2468,6 +2468,52 @@ async fn concurrent_steps_share_one_recovery_top_up() {
     }
 }
 
+/// Concurrent fills that wait on a recovery top-up that reverts `PoolNotOpen`
+/// join the replacement open: every fill reports the new pool, none a local
+/// fault.
+#[tokio::test]
+async fn fills_waiting_on_a_top_up_into_a_closing_pool_join_its_replacement() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    let svc = recovery_service(&asserter, 4_000_000);
+    let closed = PoolId::from([0x5A; 32]);
+    let opened = PoolId::from([0x6B; 32]);
+    let reverted: BoxFuture<'static, TopUpOutcome> = Box::pin(async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Err(Arc::new(
+            anyhow::anyhow!("topUp reverted").context(PoolNotOpen),
+        ))
+    });
+    *svc.topup_in_flight.lock().unwrap() = Some(InFlightTopUp::new(
+        reverted.shared(),
+        U256::from(6_000_000u64),
+        TopUpFunder::Recovery,
+    ));
+    // The replacement open in flight records the new pool as the current one.
+    let store = Arc::clone(&svc.store);
+    let replacement: BoxFuture<'static, OpenOutcome> = Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        store
+            .record(&BuyerPoolState::new(
+                opened,
+                DEPLOYMENT,
+                Address::repeat_byte(1),
+                Address::repeat_byte(2),
+                U256::from(10_000_000u64),
+            ))
+            .map_err(|err| Arc::new(anyhow::Error::new(err)))
+    });
+    *svc.open_in_flight.lock().unwrap() = Some(replacement.shared());
+    let steps =
+        futures_util::future::join_all((0..3).map(|_| svc.recover_pool(U256::from(4_000_000u64))))
+            .await;
+    for stepped in steps {
+        assert_eq!(
+            stepped.expect("every fill joins the replacement"),
+            Recovery::Replaced(PoolReplaced { closed, opened })
+        );
+    }
+}
+
 /// A pool that already holds its working deposit and still accepts funds
 /// settles: the upstreams have not seen the deposit yet, so the step returns
 /// it and the fill's settle window asks them again. Only a gas estimate runs.
