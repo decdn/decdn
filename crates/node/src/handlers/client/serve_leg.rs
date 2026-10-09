@@ -60,7 +60,7 @@ use super::outcome::{ServeEnd, ServeStop};
 use super::proof_wait::{ChunkProofs, ProofWaitFault};
 use super::ramp::RampCarry;
 use super::serve_waits::{ServeWaits, Wait};
-use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked};
+use super::voucher::{OwedChunk, StreamAnchor, ensure_unpaid_bytes_tracked, pop_payable};
 use super::wire::chunk_frame_bufs;
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, CHUNK_GROUP_BYTES, ClientHandler, ClientMessage,
@@ -411,8 +411,11 @@ impl ClientHandler {
             // remainder stays owed. `MAX_PROOFS_PER_CHUNK` bounds how many proofs
             // may leave a chunk unsettled — see the twin loop in `deliver` for the
             // full reasoning.
-            let collected_any = !pending.is_empty();
-            'chunk: while let Some(mut owed) = pending.pop_front() {
+            let mut collected_any = false;
+            'chunk: while let Some(mut owed) =
+                pop_payable(&mut pending, unvouchered, done_delivering)
+            {
+                collected_any = true;
                 // One proof budget and one proof-wait ceiling for every proof
                 // this chunk takes.
                 let mut proofs = ChunkProofs::start();
@@ -543,7 +546,7 @@ impl ClientHandler {
                     }
                 }
             }
-            ensure_unpaid_bytes_tracked(delivered, *paid, unvouchered)?;
+            ensure_unpaid_bytes_tracked(delivered, *paid, unvouchered, &pending)?;
 
             // Reconcile the floor reservation against this stream's live balance now
             // that `paid` has advanced (mirrors `deliver`). `paid`/`delivered` are BYTE

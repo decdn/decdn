@@ -539,7 +539,8 @@ pub struct ResolvedPayment {
     pub rate_per_mb: u64,
     /// Credit-window ceiling in bytes (ADR 003 §Credit window). The per-stream
     /// window ramps toward this cap as the stream pays; floored at one chunk
-    /// ([`decdn_protocol::client::CHUNK_BYTES`], the payment quantum).
+    /// ([`decdn_protocol::client::CHUNK_BYTES`], the payment quantum) plus one
+    /// 16 KiB chunk group, the leaf the payer verifies before it pays.
     /// See [`crate::config::DEFAULT_CREDIT_MAX`].
     pub credit_max: u64,
     /// Ramp divisor for the credit window; `0` opens the full ceiling immediately.

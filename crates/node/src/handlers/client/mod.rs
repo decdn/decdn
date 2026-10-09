@@ -2201,15 +2201,17 @@ impl ClientHandler {
     /// interval is `interval_bytes` and whose ramp input is `paid` (ADR 003
     /// §Credit window): the stream's own confirmed payment plus the credit it
     /// carries from its lane ([`RampCarry::ramp_paid`](ramp::RampCarry::ramp_paid)).
-    /// The window ramps from one interval toward `credit_max` as `paid` grows:
-    /// `paid / credit_ramp_divisor` once that clears the one-interval floor, the
-    /// floor itself below that point (including at `paid == 0`), and the full
-    /// `credit_max` when `credit_ramp_divisor` is `0`. Floored at one interval so
-    /// the loop always makes progress.
+    /// The window ramps from its floor toward `credit_max` as `paid` grows:
+    /// `paid / credit_ramp_divisor` once that clears the floor, the floor itself
+    /// below that point (including at `paid == 0`), and the full `credit_max`
+    /// when `credit_ramp_divisor` is `0`. The floor is one interval plus
+    /// [`decdn_client::VERIFY_LAG_BYTES`]: the payer pays only for bytes it has
+    /// verified, so it must receive the leaf that straddles an interval boundary
+    /// before it can pay for that interval, and the loop always makes progress.
     pub(super) fn credit_window(&self, interval_bytes: u64, paid: u64) -> u64 {
         decdn_incentive::ramped_credit_window(
             self.credit_ramp_divisor,
-            interval_bytes,
+            interval_bytes.saturating_add(decdn_client::VERIFY_LAG_BYTES),
             self.credit_max,
             paid,
         )

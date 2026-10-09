@@ -837,7 +837,11 @@ async fn run_clamp() -> anyhow::Result<()> {
     // key too.
     let headroom = after.cap.saturating_sub(after.spent);
     anyhow::ensure!(
-        U256::from(headroom) < decdn_incentive::floor_micro(NODE_RATE_PER_MB),
+        U256::from(headroom)
+            < decdn_incentive::min_payment(
+                decdn_protocol::client::CHUNK_BYTES + decdn_client::VERIFY_LAG_BYTES,
+                NODE_RATE_PER_MB
+            ),
         "precondition: the signer must be spent below one chunk, but {headroom} µUSDC of its \
          registered cap is left"
     );

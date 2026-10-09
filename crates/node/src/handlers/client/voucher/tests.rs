@@ -247,18 +247,54 @@ fn an_over_credit_is_refused() {
 }
 
 /// The post-recoup accounting check passes only when the unpaid bytes are
-/// exactly the ones not yet cut into a chunk.
+/// exactly the held owed chunks plus the ones not yet cut into a chunk.
 #[test]
 fn unpaid_bytes_must_all_be_tracked() {
-    assert!(super::ensure_unpaid_bytes_tracked(1000, 900, 100).is_ok());
+    let none = std::collections::VecDeque::new();
+    assert!(super::ensure_unpaid_bytes_tracked(1000, 900, 100, &none).is_ok());
+    let held = std::collections::VecDeque::from([super::OwedChunk::new(100)]);
     assert!(
-        super::ensure_unpaid_bytes_tracked(1000, 800, 100).is_err(),
+        super::ensure_unpaid_bytes_tracked(1000, 800, 100, &held).is_ok(),
+        "a held owed chunk counts as tracked"
+    );
+    assert!(
+        super::ensure_unpaid_bytes_tracked(1000, 800, 100, &none).is_err(),
         "a shortfall nothing tracks is refused"
     );
     assert!(
-        super::ensure_unpaid_bytes_tracked(1000, 1001, 0).is_err(),
+        super::ensure_unpaid_bytes_tracked(1000, 1001, 0, &none).is_err(),
         "paid running ahead of delivered is refused"
     );
+}
+
+/// The newest owed chunk waits until the leaf that verifies its last byte is
+/// on the wire; every older chunk, and any chunk once the range is all sent,
+/// is payable at once.
+#[test]
+fn the_newest_chunk_is_payable_only_past_the_verify_lag() {
+    let lag = decdn_client::VERIFY_LAG_BYTES;
+    let mut pending = std::collections::VecDeque::from([super::OwedChunk::new(1 << 20)]);
+    assert!(
+        super::pop_payable(&mut pending, lag - 1, false).is_none(),
+        "the payer cannot verify the chunk's last byte yet"
+    );
+    assert!(super::pop_payable(&mut pending, lag, false).is_some());
+
+    let mut pending = std::collections::VecDeque::from([super::OwedChunk::new(1 << 20)]);
+    assert!(
+        super::pop_payable(&mut pending, 0, true).is_some(),
+        "a fully sent range is payable to its end"
+    );
+
+    let mut pending = std::collections::VecDeque::from([
+        super::OwedChunk::new(1 << 20),
+        super::OwedChunk::new(1 << 20),
+    ]);
+    assert!(
+        super::pop_payable(&mut pending, 0, false).is_some(),
+        "an older chunk has a whole chunk after it"
+    );
+    assert!(super::pop_payable(&mut pending, 0, false).is_none());
 }
 
 /// A whole chunk that a proof paid in part is still a whole chunk: a metering

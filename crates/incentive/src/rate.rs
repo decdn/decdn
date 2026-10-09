@@ -18,7 +18,6 @@
 //! client does when computing `amount = ceil(bytes / 1_048_576) * rate`.
 
 use alloy::primitives::U256;
-use decdn_protocol::client::CHUNK_BYTES;
 
 /// 1 `MB` in bytes per ADR 005 §Probe-Triggered Eviction Hold's `MB`
 /// definition.
@@ -106,18 +105,6 @@ pub fn min_payment(bytes: u64, rate_per_mb: u64) -> U256 {
     U256::from(bytes)
         .saturating_mul(U256::from(rate_per_mb))
         .div_ceil(U256::from(BYTES_PER_MB))
-}
-
-/// One-chunk floor priced in `µUSDC` — the un-self-funded credit a fresh lane
-/// draws before its first proof (ADR 003 §Credit window / §Pool solvency).
-///
-/// The credit window is floored at one chunk so a stream can always make
-/// progress: deliver a full chunk, then recoup it. Because `CHUNK_BYTES ==
-/// BYTES_PER_MB`, this is exactly `rate_per_mb` — one chunk costs one MB of
-/// price, by identity (ADR 003 §Chunk Cadence).
-#[must_use]
-pub fn floor_micro(rate_per_mb: u64) -> U256 {
-    min_payment(CHUNK_BYTES, rate_per_mb)
 }
 
 /// Stateful-B pool solvency: the pool's remaining deposit minus the refundable

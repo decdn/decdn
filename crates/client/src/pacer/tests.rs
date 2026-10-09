@@ -1,6 +1,6 @@
 use super::{
     BudgetPacer, CHUNK_BYTES, CHUNK_GROUP_BYTES, DownstreamFrontier, MIN_DRAW_WINDOW,
-    PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, RampPacer, WindowPacer,
+    PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, RampPacer, VERIFY_LAG_BYTES, WindowPacer,
 };
 use alloy::primitives::U256;
 use std::assert_matches;
@@ -415,7 +415,8 @@ fn ramp_pacer_adds_the_carried_credit_to_the_streams_own_payment() {
 /// The liveness invariant `PULL_WINDOW_FLOOR` exists to hold: a pull window
 /// must clear one payment chunk by BOTH group roundings that separate paid
 /// wire from drawable content — `content_paid_frontier`'s floor to a group
-/// boundary, and `WindowPacer`'s floor of its own room to whole groups — AND
+/// boundary, and `WindowPacer`'s floor of its own room to whole groups — plus
+/// the leaf the client verifies past the chunk boundary before it pays, AND
 /// still leave a group for the serving node's one-frame prefetch.
 ///
 /// Modelled at the worst case for each: the served-paid frontier lags the
@@ -433,12 +434,13 @@ fn ramp_pacer_adds_the_carried_credit_to_the_streams_own_payment() {
 #[test]
 fn the_pull_window_floor_clears_one_chunk_and_a_prefetch_after_both_roundings() {
     let survives = PULL_WINDOW_FLOOR - 2 * CHUNK_GROUP_BYTES;
-    let needed = CHUNK_BYTES + CHUNK_GROUP_BYTES;
+    let needed = CHUNK_BYTES + VERIFY_LAG_BYTES + CHUNK_GROUP_BYTES;
     assert!(
         survives >= needed,
         "a {PULL_WINDOW_FLOOR}-byte floor leaves only {survives} bytes after both \
          roundings, short of the {needed} bytes the client must draw — one \
-         {CHUNK_BYTES}-byte chunk to complete a payment, plus the \
+         {CHUNK_BYTES}-byte chunk plus the {VERIFY_LAG_BYTES}-byte leaf that \
+         verifies its boundary to complete a payment, plus the \
          {CHUNK_GROUP_BYTES}-byte group the serve leg prefetches past a shut \
          window. One side or the other would park forever"
     );

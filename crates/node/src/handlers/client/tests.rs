@@ -1,5 +1,11 @@
 use super::*;
 
+/// The credit-window floor (one chunk plus the verify lag) priced in `µUSDC` at
+/// `rate_per_mb`: the credit a fresh stream reserves before its first proof.
+fn floor_micro(rate_per_mb: u64) -> U256 {
+    decdn_incentive::min_payment(CHUNK_BYTES + decdn_client::VERIFY_LAG_BYTES, rate_per_mb)
+}
+
 /// #2171: a lane loaded from the store counts its whole claim — the signed
 /// bytes AND the chunks its chain proved — as already credited. Crediting
 /// only the signed half would reopen the proved frontier as headroom for any
@@ -1116,7 +1122,7 @@ fn floor_reservation_refused_unspent_releases_the_live_floor() -> anyhow::Result
     let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let pool = B256::repeat_byte(0x5C);
-    let floor = decdn_incentive::floor_micro(1000);
+    let floor = floor_micro(1000);
     {
         let res = FloorReservation::reserve(map.clone(), pool, TEST_SIGNER, floor);
         let live = lock_floor(&map)?.get(&pool).map(|s| s.live_reservation);
@@ -1144,7 +1150,7 @@ async fn pool_budget_covers_reserve_accounts_committed_floor() -> anyhow::Result
     let metrics = Arc::new(Metrics::new());
     let (handler, _dir) = handler_for_tests(&metrics).await; // M = 0
     let pool = B256::repeat_byte(0x11);
-    let floor = decdn_incentive::floor_micro(1_000_000);
+    let floor = floor_micro(1_000_000);
     // Empty pool, M = 0: remaining must cover the new reserve exactly.
     anyhow::ensure!(
         handler.pool_budget_covers_reserve(pool, floor, floor),
@@ -1181,7 +1187,7 @@ async fn try_reserve_floor_charges_only_when_budget_covers() -> anyhow::Result<(
     let metrics = Arc::new(Metrics::new());
     let (handler, _dir) = handler_for_tests(&metrics).await; // M = 0
     let pool = B256::repeat_byte(0x22);
-    let floor = decdn_incentive::floor_micro(1_000_000);
+    let floor = floor_micro(1_000_000);
     // Budget covers exactly one floor: the first reserve succeeds.
     let first = handler.try_reserve_floor(pool, TEST_SIGNER, floor, TEST_RATE, floor);
     anyhow::ensure!(first.is_ok(), "a floor within remaining − M is reserved");
@@ -1354,7 +1360,7 @@ fn a_stale_guard_does_not_reconcile_against_a_re_entered_pool() -> anyhow::Resul
     let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let pool = B256::repeat_byte(0x39);
-    let floor = decdn_incentive::floor_micro(1000);
+    let floor = floor_micro(1000);
 
     let stale = FloorReservation::reserve(Arc::clone(&map), pool, TEST_SIGNER, floor);
     // The pool is reclaimed on-chain: its whole entry goes, signer rows and all.
@@ -1458,7 +1464,7 @@ async fn a_paid_out_signer_leaves_no_row_behind() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
     let (handler, _dir) = handler_for_tests(&metrics).await; // M = 0
     let pool = B256::repeat_byte(0x37);
-    let floor = decdn_incentive::floor_micro(1_000_000);
+    let floor = floor_micro(1_000_000);
     let guard = handler
         .try_reserve_floor(pool, TEST_SIGNER, floor, TEST_RATE, floor)
         .map_err(|e| anyhow::anyhow!("refused: {e:?}"))?;
@@ -1728,7 +1734,7 @@ async fn wide_live_cap_reproduces_the_pool_only_bound() -> anyhow::Result<()> {
     let (handler, _dir) =
         handler_for_tests_with_signer_policy(&metrics, U256::ZERO, u64::MAX).await;
     let pool = B256::repeat_byte(0x35);
-    let floor = decdn_incentive::floor_micro(1_000_000);
+    let floor = floor_micro(1_000_000);
     let remaining = floor.saturating_mul(U256::from(3u64));
     // ONE signer draws the pool's entire headroom, three floors, unrefused.
     let mut held = Vec::new();
@@ -1760,7 +1766,7 @@ fn repaid_release_after_forget_does_not_resurrect_entry() -> anyhow::Result<()> 
     let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let pool = B256::repeat_byte(0x5F);
-    let floor = decdn_incentive::floor_micro(1000);
+    let floor = floor_micro(1000);
     let res = FloorReservation::reserve(map.clone(), pool, TEST_SIGNER, floor);
     // The pool closes mid-stream: the same in-memory remove
     // `forget_pool_floor` performs.
@@ -1803,7 +1809,8 @@ async fn a_loaded_lane_starts_empty_and_banks_for_the_next_stream() {
     assert_eq!(first.carried(), 0, "a loaded lane carries no credit");
     assert_eq!(
         handler.credit_window(CHUNK_BYTES, first.ramp_paid(0)),
-        CHUNK_BYTES
+        CHUNK_BYTES + decdn_client::VERIFY_LAG_BYTES,
+        "a lane with no credit opens at the floor: one chunk plus the verify lag"
     );
     first.return_paid(8 << 20);
 
