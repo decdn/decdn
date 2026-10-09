@@ -119,9 +119,10 @@ rather than writing new ones.
   release `tag`. To move it, change the `tag` on every `decdn-*` alias (and
   the `version`, where one is set), then run
   `cargo update -p decdn-client -p decdn-common -p decdn-incentive -p decdn-e2e`
-  in a PR of its own (`RELEASING.md` § Pinning decdn). To build against a
-  local `../decdn`, use an untracked
-  `.cargo/config.toml` `[patch]` (see `CONTRIBUTING.md`), and do not commit
+  in a PR of its own (`RELEASING.md` § Pinning decdn).
+  `.github/scripts/open-decdn-bump.sh` opens that PR, and decdn's
+  `publish-crates.sh` runs it for each release. To build against a local
+  `../decdn`, use an untracked `.cargo/config.toml` `[patch]` (see `CONTRIBUTING.md`), and do not commit
   the lockfile changes it causes.
 - **The toolchain version is written in five places**:
   `rust-toolchain.toml`, `rust-version` in the root `Cargo.toml`, every

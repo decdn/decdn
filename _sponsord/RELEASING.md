@@ -111,6 +111,41 @@ must be the commit of decdn's `v<version>` tag, and that version must be on
 crates.io. `publish-crates.sh` checks both and refuses until then. Any other
 commit still releases binaries and images; it just cannot go to crates.io.
 
+### The bump PR
+
+[`open-decdn-bump.sh`](.github/scripts/open-decdn-bump.sh) opens the PR that
+moves the lock to a decdn release. decdn's `publish-crates.sh` runs it with
+the tag it just published. To run it by hand you need git, cargo, Python 3.11+
+and `gh` logged in to github.com, in a clone whose `origin` is decdn/sponsord
+and which you can push to:
+
+```bash
+.github/scripts/open-decdn-bump.sh            # decdn's latest release
+.github/scripts/open-decdn-bump.sh v0.1.2     # one release
+.github/scripts/open-decdn-bump.sh --dry-run  # print the diff, push nothing
+```
+
+It works in a temporary worktree at `origin/main`, so your checkout and
+branch stay as they are. It checks crates.io up to 10 times, a minute apart,
+until it serves every versioned `decdn-*` crate, then pushes
+`bump/decdn-v<version>` and opens `build: pin decdn to v<version>`. The
+commit adds a changelog entry to every crate the move reaches, replacing an
+unreleased one from an earlier bump
+([`bump_decdn.py`](.github/scripts/bump_decdn.py)). It commits as your git
+identity without the pre-commit hooks, pushes with your `origin` credentials
+and opens the PR with your `gh` login; CI checks the PR.
+
+It does nothing when `main` already pins that release or a later one (by
+SemVer precedence), or when a PR from that branch exists in any state: a
+closed bump PR is never reopened, so close one to skip that release. When
+`cargo metadata --locked` or `check-decdn-pin.sh` fails on the new lock, it
+still opens the PR, says so in the body, and exits 1. Any other exit 1 opened
+no PR, and the last line says which step failed. Exit 3 means crates.io does
+not serve the release yet; run it again later. A red CI on the PR means the
+new decdn needs code changes; push them to its branch.
+
+### Moving the lock by hand
+
 To move the lock to another decdn release, set `tag = "v<version>"` on every
 `decdn-*` entry in the root `Cargo.toml`, and `version = "<version>"` on each
 entry that has one, then:
