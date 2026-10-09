@@ -255,6 +255,23 @@ signatures and the container images are all already published and stand on
 their own; crates.io is an additional distribution channel, so the recovery is
 to finish the remaining crates, not to re-cut the version.
 
+Last, the script opens the PR that pins
+[decdn/sponsord](https://github.com/decdn/sponsord) to this release: it clones
+sponsord into a temporary directory and runs its
+`.github/scripts/open-decdn-bump.sh <tag>`. That script waits up to about ten
+minutes for crates.io to serve the release, commits as your git identity,
+pushes with your git credentials for github.com, and opens the PR with your
+`gh` login. It needs push access to decdn/sponsord, Python 3.11+, and, over
+https, a git credential helper such as `gh auth setup-git`; it uses your cargo,
+so rustup selects sponsord's pinned toolchain.
+
+When it fails, or you press Ctrl-C while it waits, the script prints the
+command to run later from a sponsord checkout; it never fails the publish. It
+runs sponsord's `main` as you, without the cargo registry tokens in the
+environment. sponsord's ruleset requires a reviewed PR for a change to `main`,
+but org admins can bypass it. To run the script and its helpers from a
+checkout you have reviewed instead, set `DECDN_SKIP_SPONSORD_BUMP=1`.
+
 ### Crate ownership
 
 crates.io gives a new crate to whoever publishes the name first, and

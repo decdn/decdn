@@ -3239,6 +3239,15 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Release: `publish-crates.sh` opens sponsord's decdn bump PR (#2399).**
+  After the upload, the script clones decdn/sponsord into a temporary
+  directory and runs its `open-decdn-bump.sh <tag>`, which opens the PR that
+  pins sponsord to the new release with the maintainer's `gh` login. A
+  failure prints the command to run later and never fails the publish; a
+  `DECDN_REPO` other than `decdn/decdn` opens nothing, and
+  `DECDN_SKIP_SPONSORD_BUMP=1` (or `true`/`yes`) skips it.
+  - Why: sponsord pins decdn at a release tag, and each move was a PR opened
+    by hand after the release.
 - **`serve_stream` spans time their serve loop's waits by cause (#2348).** A
   serve loop records `store_wait_ns`, `send_wait_ns` and `proof_wait_ns` as
   it ends, with the QUIC path's state: `path_kind`, `path_rtt_us`,
