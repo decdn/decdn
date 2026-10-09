@@ -2,11 +2,12 @@
 //! is below the low-water mark, top it up from the treasury by the refill
 //! amount. Its progress is published in [`KeeperStatus`] for metrics.
 //!
-//! A top-up whose `topUp` was broadcast but not confirmed may still mine, and
-//! a second one would escrow the refill twice. The keeper holds further
-//! top-ups until that transaction has a receipt, or the RPC node no longer
-//! knows it and the treasury's confirmed nonce has passed every nonce it could
-//! have (#40). The hold is kept in memory, so a restart clears it.
+//! A `topUp` that may have been broadcast without the keeper seeing it mine
+//! can still mine, and a second one would escrow the refill twice. The keeper
+//! holds further top-ups until that transaction has a receipt, or the
+//! treasury's confirmed nonce has passed the nonce it was sent with (#40). A
+//! `topUp` whose submit failed in transport has no hash, so only its nonce can
+//! settle it. The hold is kept in memory, so a restart clears it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -118,22 +119,17 @@ pub async fn run(
     }
 }
 
-/// How many nonces past the treasury's pending nonce a top-up's `topUp` can
-/// land: an `approve` may take the pending nonce first, and decdn's `top_up`
-/// re-sends a `topUp` that lost its nonce to a concurrent transaction up to
-/// three times (its private `TOPUP_NONCE_RETRIES`; decdn/decdn#2319 asks for
-/// the nonce on `TopUpUnconfirmed`, which would replace this bound).
-const TOPUP_NONCE_SPAN: u64 = 4;
-
-/// A top-up whose `topUp` was broadcast but whose receipt was not read. It
-/// may still mine, so no other top-up is sent until it is settled (#40).
+/// A top-up whose `topUp` may have been broadcast but whose receipt was not
+/// read. It may still mine, so no other top-up is sent until it is settled
+/// (#40).
 #[derive(Clone, Copy, Debug)]
 struct Unconfirmed {
-    tx: TxHash,
-    /// The highest nonce the `topUp` can have: its own once the RPC node has
-    /// returned it, until then the treasury's pending nonce before the top-up
-    /// plus [`TOPUP_NONCE_SPAN`].
-    max_nonce: u64,
+    /// The `topUp` transaction; `None` when its submit failed in transport,
+    /// so the RPC node may have broadcast it without returning its hash.
+    tx: Option<TxHash>,
+    /// The nonce the `topUp` was sent with. Once the treasury's confirmed
+    /// nonce passes it, the `topUp` has mined or can never mine.
+    nonce: u64,
     since_unix: u64,
 }
 
@@ -159,7 +155,7 @@ async fn sweep(
     // the balance read makes the `remaining` recorded here include a held
     // top-up that has mined.
     let mut may_top_up = true;
-    if let Some(held) = unconfirmed.as_mut() {
+    if let Some(held) = unconfirmed.as_ref() {
         may_top_up = false;
         if !settle(pool, pool_id, held, status, clock).await {
             set_hold(unconfirmed, status, None);
@@ -184,20 +180,6 @@ async fn sweep(
     if !may_top_up || !needs_refill(remaining, cfg.low_water) {
         return;
     }
-    // Bound the nonces this top-up can take, so that if it comes back
-    // unconfirmed it can be settled even if the RPC node never returns it.
-    let pending = match pool.pending_nonce().await {
-        Ok(n) => n,
-        Err(e) => {
-            status.failures.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                pool = %pool_id,
-                "treasury nonce read failed, so the top-up waits for the next check: {}",
-                sanitize_err_chain(&e)
-            );
-            return;
-        }
-    };
     match pool.top_up(pool_id, cfg.refill).await {
         Ok(credited) => {
             status.topups.fetch_add(1, Ordering::Relaxed);
@@ -217,14 +199,14 @@ async fn sweep(
             if let Some(m) = e.downcast_ref::<TopUpUnconfirmed>() {
                 let hold = Unconfirmed {
                     tx: m.tx,
-                    max_nonce: pending.saturating_add(TOPUP_NONCE_SPAN),
+                    nonce: m.nonce,
                     since_unix: clock.now_unix(),
                 };
                 set_hold(unconfirmed, status, Some(hold));
                 tracing::error!(
-                    pool = %pool_id, tx = %m.tx, max_nonce = hold.max_nonce,
+                    pool = %pool_id, tx = ?m.tx, nonce = m.nonce,
                     "pool top-up unconfirmed; holding further top-ups until it has a \
-                     receipt or every nonce it could have is used: {}",
+                     receipt or its nonce is used: {}",
                     sanitize_err_chain(&e)
                 );
             } else {
@@ -242,20 +224,28 @@ async fn sweep(
 async fn settle(
     pool: &dyn PoolChain,
     pool_id: B256,
-    held: &mut Unconfirmed,
+    held: &Unconfirmed,
     status: &KeeperStatus,
     clock: &dyn Clock,
 ) -> bool {
-    let tx = held.tx;
+    let nonce = held.nonce;
     // The nonce is read first: a transaction that mines between the two
-    // reads then shows as mined, never as replaced.
-    let read = async { anyhow::Ok((pool.confirmed_nonce().await?, pool.transaction(tx).await?)) };
+    // reads then shows as mined, never as replaced. Without a hash there is
+    // only the nonce to read.
+    let read = async {
+        let confirmed = pool.confirmed_nonce().await?;
+        let state = match held.tx {
+            Some(tx) => Some((tx, pool.transaction(tx).await?)),
+            None => None,
+        };
+        anyhow::Ok((confirmed, state))
+    };
     let (confirmed, state) = match read.await {
         Ok(r) => r,
         Err(e) => {
             status.failures.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
-                pool = %pool_id, %tx,
+                pool = %pool_id, tx = ?held.tx, nonce,
                 "unconfirmed pool top-up check failed; still holding top-ups: {}",
                 sanitize_err_chain(&e)
             );
@@ -263,8 +253,10 @@ async fn settle(
         }
     };
     let held_secs = clock.now_unix().saturating_sub(held.since_unix);
+    // How many 0-value self-transfers clear a hold on a dropped `topUp`.
+    let self_transfers = nonce.saturating_add(1).saturating_sub(confirmed);
     match state {
-        TxState::Mined => {
+        Some((tx, TxState::Mined)) => {
             status.topups.fetch_add(1, Ordering::Relaxed);
             status
                 .last_topup_unix
@@ -272,38 +264,61 @@ async fn settle(
             tracing::info!(pool = %pool_id, %tx, "unconfirmed pool top-up mined");
             false
         }
-        TxState::Reverted => {
+        Some((tx, TxState::Reverted)) => {
             tracing::warn!(
                 pool = %pool_id, %tx,
                 "unconfirmed pool top-up reverted, so nothing was escrowed; resuming top-ups"
             );
             false
         }
-        TxState::Pending { nonce } => {
-            held.max_nonce = nonce;
+        // A used nonce settles it whatever the node says of the hash: a
+        // stale or load-balanced node can still report a replaced `topUp` as
+        // pending, or not yet have the receipt of one that mined. It is not
+        // counted as a top-up; the next sweep reads the balance either way.
+        Some((tx, TxState::Pending { .. } | TxState::Unknown)) if confirmed > nonce => {
+            tracing::warn!(
+                pool = %pool_id, %tx, nonce, confirmed,
+                "the RPC node has no receipt for pool top-up {tx}, but its nonce {nonce} \
+                 is used, so it has mined or never will; resuming top-ups"
+            );
+            false
+        }
+        Some((tx, TxState::Pending { .. })) => {
             tracing::warn!(
                 pool = %pool_id, %tx, nonce, held_secs,
                 "pool top-up still pending; holding further top-ups"
             );
             true
         }
-        TxState::Unknown if confirmed > held.max_nonce => {
-            tracing::warn!(
-                pool = %pool_id, %tx, max_nonce = held.max_nonce, confirmed,
-                "the RPC node does not know pool top-up {tx} and every nonce it could \
-                 have is used, so it can never mine; resuming top-ups"
-            );
-            false
-        }
-        TxState::Unknown => {
-            let max_nonce = held.max_nonce;
+        Some((tx, TxState::Unknown)) => {
             tracing::error!(
-                pool = %pool_id, %tx, max_nonce, confirmed, held_secs,
+                pool = %pool_id, %tx, nonce, confirmed, held_secs,
                 "the RPC node does not know pool top-up {tx}, which may still be pending \
                  elsewhere; holding further top-ups. If it was dropped, send 0-value \
                  transactions from the treasury to itself until its confirmed nonce \
-                 passes {max_nonce} ({} at most); the hold then clears",
-                max_nonce.saturating_add(1).saturating_sub(confirmed)
+                 passes {nonce} ({self_transfers} at most); the hold then clears"
+            );
+            true
+        }
+        // With no hash, the `topUp` may be the transaction that used its
+        // nonce, so it may have refilled the pool. It is not counted as a
+        // top-up; the next sweep reads the balance either way.
+        None if confirmed > nonce => {
+            tracing::warn!(
+                pool = %pool_id, nonce, confirmed,
+                "nonce {nonce} of the pool top-up whose submit failed in transport is \
+                 used, so it has mined or never will; resuming top-ups"
+            );
+            false
+        }
+        None => {
+            tracing::error!(
+                pool = %pool_id, nonce, confirmed, held_secs,
+                "a pool top-up whose submit failed in transport may still mine at nonce \
+                 {nonce}; holding further top-ups. If it was not broadcast or was \
+                 dropped, send 0-value transactions from the treasury to itself until \
+                 its confirmed nonce passes {nonce} ({self_transfers} at most); the hold \
+                 then clears"
             );
             true
         }
@@ -417,11 +432,10 @@ mod tests {
         assert!(!text.contains("rpc.example"), "{text}");
     }
 
-    /// A pool below low water whose top-up, sent at pending nonce 10, came
-    /// back unconfirmed at t=1000; later top-ups would succeed.
+    /// A pool below low water whose top-up, sent at nonce 10, came back
+    /// unconfirmed at t=1000; later top-ups would succeed.
     async fn held_pool() -> (FakePool, KeeperStatus, Option<Unconfirmed>) {
         let pool = FakePool::new(Address::repeat_byte(1), 0);
-        pool.set_pending_tx_count(10);
         pool.set_confirmed_tx_count(10);
         pool.unconfirm_top_ups(true);
         let status = KeeperStatus::default();
@@ -443,19 +457,19 @@ mod tests {
             (0, 1, 1_000)
         );
         let h = held.unwrap();
-        assert_eq!((h.tx, h.max_nonce), (FAKE_TOPUP_TX, 10 + TOPUP_NONCE_SPAN));
+        assert_eq!((h.tx, h.nonce), (Some(FAKE_TOPUP_TX), 10));
         let text = log.text();
         assert!(text.contains("pool top-up unconfirmed"), "{text}");
         assert!(text.contains(&FAKE_TOPUP_TX.to_string()), "{text}");
         assert!(!text.contains("rpc.example"), "{text}");
 
         // Still pending an hour later, and the pool still below low water:
-        // no second top-up, and the bound tightens to the tx's own nonce.
-        pool.set_tx_state(TxState::Pending { nonce: 11 });
+        // no second top-up.
+        pool.set_tx_state(TxState::Pending { nonce: 10 });
         let clock = FixedClock::new(4_600);
         sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
         assert_eq!(pool.top_up_calls(), 1);
-        assert_eq!(held.unwrap().max_nonce, 11);
+        assert!(held.is_some());
         let s = status.snapshot();
         assert_eq!(
             (
@@ -510,18 +524,17 @@ mod tests {
     async fn a_top_up_whose_nonce_was_used_by_another_tx_clears_the_hold() {
         let (pool, status, mut held) = held_pool().await;
         let clock = FixedClock::new(2_000);
-        pool.set_tx_state(TxState::Pending { nonce: 11 });
+        pool.set_tx_state(TxState::Pending { nonce: 10 });
         sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
 
-        // Gone from the node, but nonce 11 is not used yet: it may come back.
+        // Gone from the node, but nonce 10 is not used yet: it may come back.
         pool.set_tx_state(TxState::Unknown);
-        pool.set_confirmed_tx_count(11);
         sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
         assert!(held.is_some());
 
-        // Nonce 11 mined with another transaction: this one never can. The
+        // Nonce 10 mined with another transaction: this one never can. The
         // sweep that learns it still sends nothing; the next one tops up.
-        pool.set_confirmed_tx_count(12);
+        pool.set_confirmed_tx_count(11);
         sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
         assert!(held.is_none());
         assert_eq!(pool.top_up_calls(), 1);
@@ -531,34 +544,93 @@ mod tests {
         assert_eq!(pool.top_up_calls(), 2);
     }
 
+    /// A stale or load-balanced node can keep reporting a replaced `topUp`
+    /// as pending. Its used nonce still clears the hold, or the documented
+    /// self-transfers could never clear it.
     #[tokio::test]
-    async fn a_top_up_the_node_never_returned_clears_once_its_bound_is_passed() {
+    async fn a_top_up_still_reported_pending_clears_once_its_nonce_is_used() {
         let log = CapturedLog::default();
         let _guard = log.install();
         let (pool, status, mut held) = held_pool().await;
-        let max = 10 + TOPUP_NONCE_SPAN;
         let clock = FixedClock::new(2_000);
-        // Unknown from the start, so only the bound is known. The log says
+        pool.set_tx_state(TxState::Pending { nonce: 10 });
+        pool.set_confirmed_tx_count(11);
+        sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+        assert!(held.is_none());
+        let s = status.snapshot();
+        assert_eq!((s.topups, s.topup_unconfirmed_since_unix), (0, 0));
+        assert_eq!(pool.top_up_calls(), 1);
+        let text = log.text();
+        assert!(text.contains("nonce 10 is used"), "{text}");
+
+        sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+        assert_eq!(pool.top_up_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_top_up_the_node_never_returned_clears_once_its_nonce_is_used() {
+        let log = CapturedLog::default();
+        let _guard = log.install();
+        let (pool, status, mut held) = held_pool().await;
+        let clock = FixedClock::new(2_000);
+        // Unknown from the start, so only its nonce settles it. The log says
         // how many self-transfers would clear it.
         sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
         assert!(held.is_some());
         let text = log.text();
         assert!(text.contains("send 0-value transactions"), "{text}");
-        assert!(
-            text.contains(&format!("passes {max} (5 at most)")),
-            "{text}"
-        );
+        assert!(text.contains("passes 10 (1 at most)"), "{text}");
 
-        pool.set_confirmed_tx_count(max);
-        sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
-        assert!(held.is_some(), "nonce {max} may still be the top-up's");
-        assert_eq!(pool.top_up_calls(), 1);
-
-        pool.set_confirmed_tx_count(max + 1);
+        pool.set_confirmed_tx_count(11);
         sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
         assert!(held.is_none());
         assert_eq!(status.snapshot().topup_unconfirmed_since_unix, 0);
         assert_eq!(pool.top_up_calls(), 1);
+    }
+
+    /// The RPC node may have broadcast a `topUp` whose submit failed in
+    /// transport, so it is held too, with no hash to check.
+    #[tokio::test]
+    async fn a_top_up_lost_in_transport_is_held_until_its_nonce_is_used() {
+        let log = CapturedLog::default();
+        let _guard = log.install();
+        let pool = FakePool::new(Address::repeat_byte(1), 0);
+        pool.set_confirmed_tx_count(10);
+        pool.lose_top_up_submits(true);
+        let status = KeeperStatus::default();
+        let mut held = None;
+        let clock = FixedClock::new(1_000);
+        sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+        pool.lose_top_up_submits(false);
+        let h = held.unwrap();
+        assert_eq!((h.tx, h.nonce), (None, 10));
+        assert_eq!(status.snapshot().topup_unconfirmed_since_unix, 1_000);
+        let text = log.text();
+        assert!(text.contains("pool top-up unconfirmed"), "{text}");
+        assert!(!text.contains("rpc.example"), "{text}");
+
+        // With no hash, a receipt cannot settle it: only the nonce does.
+        pool.set_tx_state(TxState::Mined);
+        sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+        assert!(held.is_some());
+        assert_eq!(pool.top_up_calls(), 1);
+        assert!(
+            log.text().contains("passes 10 (1 at most)"),
+            "{}",
+            log.text()
+        );
+
+        // Nonce 10 is used: it mined or never will. Unknown which, so it is
+        // not counted; the sweep that learns it sends nothing, the next tops
+        // up on a fresh balance.
+        pool.set_confirmed_tx_count(11);
+        sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+        assert!(held.is_none());
+        let s = status.snapshot();
+        assert_eq!((s.topups, s.topup_unconfirmed_since_unix), (0, 0));
+        assert_eq!(pool.top_up_calls(), 1);
+        sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+        assert_eq!(pool.top_up_calls(), 2);
     }
 
     #[tokio::test]
@@ -575,26 +647,6 @@ mod tests {
         let text = log.text();
         assert!(text.contains("check failed"), "{text}");
         assert!(!text.contains("rpc.example"), "{text}");
-    }
-
-    #[tokio::test]
-    async fn a_failed_pending_nonce_read_sends_no_top_up() {
-        let pool = FakePool::new(Address::repeat_byte(1), 0);
-        pool.fail_tx_reads(true);
-        let status = KeeperStatus::default();
-        let mut held = None;
-        sweep(
-            &pool,
-            TEST_POOL_ID,
-            &CFG,
-            &status,
-            &FixedClock::new(1),
-            &mut held,
-        )
-        .await;
-        assert_eq!(pool.top_up_calls(), 0);
-        assert!(held.is_none());
-        assert_eq!(status.snapshot().failures, 1);
     }
 
     /// A pool whose held top-up mines right after the first of the keeper's
@@ -645,9 +697,6 @@ mod tests {
             self.mine_once();
             nonce
         }
-        async fn pending_nonce(&self) -> anyhow::Result<u64> {
-            self.inner.pending_nonce().await
-        }
     }
 
     /// Read in the other order, a top-up that mines between the reads would
@@ -655,7 +704,6 @@ mod tests {
     #[tokio::test]
     async fn a_top_up_that_mines_between_the_reads_counts_as_mined() {
         let (inner, status, mut held) = held_pool().await;
-        held.as_mut().unwrap().max_nonce = 10;
         let pool = MinesBetweenReads {
             inner,
             mined: AtomicBool::new(false),

@@ -46,10 +46,10 @@ pub struct FakePool {
     fail_authorization: AtomicBool,
     fail_top_up: AtomicBool,
     unconfirm_top_up: AtomicBool,
+    lose_top_up_submit: AtomicBool,
     fail_tx_reads: AtomicBool,
     tx_state: Mutex<TxState>,
     pub(crate) confirmed_nonce: AtomicU64,
-    pending_nonce: AtomicU64,
     top_up_calls: AtomicU64,
 }
 
@@ -64,10 +64,10 @@ impl FakePool {
             fail_authorization: AtomicBool::new(false),
             fail_top_up: AtomicBool::new(false),
             unconfirm_top_up: AtomicBool::new(false),
+            lose_top_up_submit: AtomicBool::new(false),
             fail_tx_reads: AtomicBool::new(false),
             tx_state: Mutex::new(TxState::Unknown),
             confirmed_nonce: AtomicU64::new(0),
-            pending_nonce: AtomicU64::new(0),
             top_up_calls: AtomicU64::new(0),
         }
     }
@@ -94,13 +94,22 @@ impl FakePool {
 
     /// Make every `top_up` broadcast [`FAKE_TOPUP_TX`] but fail to read its
     /// receipt: the error carries decdn's `TopUpUnconfirmed`, and nothing is
-    /// credited.
+    /// credited. Its nonce is the one `confirmed_nonce` reports, the
+    /// treasury's next while nothing else is pending.
     pub fn unconfirm_top_ups(&self, unconfirm: bool) {
         self.unconfirm_top_up.store(unconfirm, Ordering::SeqCst);
     }
 
-    /// Make every `transaction`, `confirmed_nonce` and `pending_nonce` read
-    /// fail (an RPC outage).
+    /// Make every `top_up` submit fail in transport, as if the RPC node may
+    /// have broadcast it without returning its hash: the error carries
+    /// decdn's `TopUpUnconfirmed` with no transaction, at the nonce
+    /// [`FakePool::unconfirm_top_ups`] uses, and nothing is credited.
+    pub fn lose_top_up_submits(&self, lose: bool) {
+        self.lose_top_up_submit.store(lose, Ordering::SeqCst);
+    }
+
+    /// Make every `transaction` and `confirmed_nonce` read fail (an RPC
+    /// outage).
     pub fn fail_tx_reads(&self, fail: bool) {
         self.fail_tx_reads.store(fail, Ordering::SeqCst);
     }
@@ -115,11 +124,6 @@ impl FakePool {
     /// function for a hard-coded cryptographic nonce.
     pub fn set_confirmed_tx_count(&self, count: u64) {
         self.confirmed_nonce.store(count, Ordering::SeqCst);
-    }
-
-    /// What `pending_nonce` reports. Starts at 0.
-    pub fn set_pending_tx_count(&self, count: u64) {
-        self.pending_nonce.store(count, Ordering::SeqCst);
     }
 
     /// How many times `top_up` has been called, failed or not.
@@ -149,12 +153,23 @@ impl PoolChain for FakePool {
     }
     async fn top_up(&self, _pool_id: B256, additional: MicroUsdc) -> anyhow::Result<MicroUsdc> {
         self.top_up_calls.fetch_add(1, Ordering::SeqCst);
+        let nonce = self.confirmed_nonce.load(Ordering::SeqCst);
+        // Each shaped like the matching decdn `top_up` error.
+        if self.lose_top_up_submit.load(Ordering::SeqCst) {
+            return Err(
+                anyhow::anyhow!("error sending request for url ({FAKE_RPC_URL})")
+                    .context("submit topUp")
+                    .context(TopUpUnconfirmed { tx: None, nonce }),
+            );
+        }
         if self.unconfirm_top_up.load(Ordering::SeqCst) {
-            // Shaped like decdn's `top_up` error after the broadcast.
             return Err(
                 anyhow::anyhow!("error sending request for url ({FAKE_RPC_URL})")
                     .context("await topUp receipt")
-                    .context(TopUpUnconfirmed { tx: FAKE_TOPUP_TX }),
+                    .context(TopUpUnconfirmed {
+                        tx: Some(FAKE_TOPUP_TX),
+                        nonce,
+                    }),
             );
         }
         anyhow::ensure!(
@@ -192,13 +207,6 @@ impl PoolChain for FakePool {
             "nonce read failed: error sending request for url ({FAKE_RPC_URL})"
         );
         Ok(self.confirmed_nonce.load(Ordering::SeqCst))
-    }
-    async fn pending_nonce(&self) -> anyhow::Result<u64> {
-        anyhow::ensure!(
-            !self.fail_tx_reads.load(Ordering::SeqCst),
-            "pending nonce read failed: error sending request for url ({FAKE_RPC_URL})"
-        );
-        Ok(self.pending_nonce.load(Ordering::SeqCst))
     }
 }
 

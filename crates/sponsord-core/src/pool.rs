@@ -144,10 +144,6 @@ pub trait PoolChain: Send + Sync {
     /// The treasury's confirmed transaction count (its nonce at the latest
     /// block): every nonce below it has been used by a mined transaction.
     async fn confirmed_nonce(&self) -> anyhow::Result<u64>;
-
-    /// The treasury's transaction count including the RPC node's pending
-    /// pool: the nonce its next transaction gets.
-    async fn pending_nonce(&self) -> anyhow::Result<u64>;
 }
 
 /// The `PaymentPool` contract, read through and paid into by the treasury
@@ -226,7 +222,7 @@ impl PoolChain for ChainPool {
         )
         .await
         .map_err(|e| redacted_top_up("approve the top-up".to_owned(), &e))?;
-        let topped = top_up(&self.contract, pool_id, amount)
+        let topped = top_up(&self.contract, self.owner, pool_id, amount)
             .await
             .map_err(|e| redacted_top_up(format!("top up {pool_id}"), &e))?;
         Ok(MicroUsdc(
@@ -289,14 +285,6 @@ impl PoolChain for ChainPool {
             .latest()
             .await
             .map_err(|e| anyhow::anyhow!("read the treasury's nonce: {}", redacted(&e)))
-    }
-
-    async fn pending_nonce(&self) -> anyhow::Result<u64> {
-        self.provider
-            .get_transaction_count(self.owner)
-            .pending()
-            .await
-            .map_err(|e| anyhow::anyhow!("read the treasury's pending nonce: {}", redacted(&e)))
     }
 }
 
@@ -390,12 +378,16 @@ mod tests {
     #[test]
     fn a_top_up_error_keeps_its_markers_but_not_the_url() {
         const REQWEST: &str = "error sending request for url (http://rpc.example/v3/KEY)";
-        let tx = alloy::primitives::TxHash::repeat_byte(0xAB);
+        let marker = TopUpUnconfirmed {
+            tx: Some(alloy::primitives::TxHash::repeat_byte(0xAB)),
+            nonce: 7,
+        };
         let unconfirmed = anyhow::Error::new(chain(&[REQWEST, "timed out"]))
             .context("await topUp receipt")
-            .context(TopUpUnconfirmed { tx });
+            .context(marker);
         let err = redacted_top_up("top up 0x11".to_owned(), &unconfirmed);
-        assert_eq!(err.downcast_ref::<TopUpUnconfirmed>().unwrap().tx, tx);
+        let kept = err.downcast_ref::<TopUpUnconfirmed>().unwrap();
+        assert_eq!((kept.tx, kept.nonce), (marker.tx, marker.nonce));
         let shown = format!("{err:#}");
         assert!(!shown.contains("rpc.example"), "{shown}");
         assert!(!shown.contains("KEY"), "{shown}");
@@ -403,7 +395,7 @@ mod tests {
             shown,
             format!(
                 "top up 0x11: {}: await topUp receipt: error sending request: timed out",
-                TopUpUnconfirmed { tx }
+                marker
             )
         );
 
@@ -448,7 +440,6 @@ mod tests {
             pool.authorization(id, owner).await.err().unwrap(),
             pool.transaction(TxHash::ZERO).await.err().unwrap(),
             pool.confirmed_nonce().await.err().unwrap(),
-            pool.pending_nonce().await.err().unwrap(),
         ];
         for err in errors {
             let err = format!("{err:#}");

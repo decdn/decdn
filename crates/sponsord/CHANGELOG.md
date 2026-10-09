@@ -39,7 +39,7 @@ release.
 
 - **decdn from GitHub.** The decdn crates are git dependencies on
   `github.com/decdn/decdn`, at the commit `Cargo.lock` pins
-  (`7f938e6b8437eba614e54375dcbc504de108379d`); `decdn.ref` and the sibling
+  (`a09720adcb055ef205cf0e0d83339c2e7673c498`); `decdn.ref` and the sibling
   checkout are gone.
 - **HTTPS through rustls.** reqwest 0.13 replaces OpenSSL (native-tls)
   with rustls and checks certificates with the platform verifier, so the
@@ -48,9 +48,9 @@ release.
 ### Fixed
 
 - **No second top-up while one may still mine.** A pool top-up whose receipt
-  could not be read now holds further top-ups until it mines or can no
-  longer mine, instead of being retried at the next tick, which could refill
-  the pool twice. A dropped one is cleared with self-transfers from the
+  could not be read, or whose submit failed in transport, now holds further
+  top-ups until it mines or can no longer mine, instead of being retried at
+  the next tick, which could refill the pool twice. A dropped one is cleared with self-transfers from the
   treasury, not a restart. See `docs/operator.md` §5
   ([#40](https://github.com/decdn/sponsord/issues/40)).
 - **Top-ups after a dropped or outside transaction.** The treasury's nonce

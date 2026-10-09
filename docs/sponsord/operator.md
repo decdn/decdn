@@ -147,11 +147,13 @@ may be out of USDC or gas), on `sponsord_pool_last_check_unix` going stale,
 and on the treasury wallet's own balance.
 
 Also alert on `sponsord_pool_topup_unconfirmed_since_unix` staying non-zero.
-It means the keeper broadcast a `topUp` but could not read its receipt. A
-second top-up could refill the pool twice, so the keeper sends none until
-that transaction has a receipt, or until the RPC node no longer knows it and
-the treasury's confirmed nonce has passed every nonce it could have. The
-`error` log line names the transaction and that highest nonce.
+It means the keeper may have broadcast a `topUp` but does not know that it
+mined: it could not read the receipt, or the submission failed in transport
+after the RPC node may have accepted it. A second top-up could refill the
+pool twice, so the keeper sends none until that transaction has a receipt,
+or until the treasury's confirmed nonce has passed the nonce it was sent
+with. The `error` log line names the nonce, and the transaction when the
+node returned its hash.
 
 The hold clears by itself once the transaction mines. If it was dropped
 instead, nothing else uses its nonce, so send 0-value transactions from the
@@ -160,10 +162,6 @@ most. Each one takes the next nonce, so a transaction still pending
 elsewhere either mines first or can never mine. Do not restart `sponsord`
 to clear the hold: a restart forgets it, and if the transaction is still
 pending somewhere the pool can be refilled twice.
-
-A top-up whose submission fails after the RPC node accepted it (the
-response is lost) carries no transaction hash, so it is not held. Tracked in
-[decdn/decdn#2319](https://github.com/decdn/decdn/issues/2319).
 
 ## 6. Upgrades
 

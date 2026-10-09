@@ -42,7 +42,7 @@ release.
 - **Requests carry a timeout and a `User-Agent`** (`decdn-sponsored/<version>`).
 - **decdn from GitHub.** The decdn crates are git dependencies on
   `github.com/decdn/decdn`, at the commit `Cargo.lock` pins
-  (`7f938e6b8437eba614e54375dcbc504de108379d`); `decdn.ref` and the sibling
+  (`a09720adcb055ef205cf0e0d83339c2e7673c498`); `decdn.ref` and the sibling
   checkout are gone.
 - **HTTPS through rustls.** reqwest 0.13 replaces OpenSSL (native-tls)
   with rustls and checks certificates with the platform verifier, so the

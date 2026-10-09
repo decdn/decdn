@@ -102,14 +102,13 @@ async fn remaining_grows_after_topup() {
     // has sent three transactions: the approve, openPool and topUp (the
     // top-up's own approve was skipped, as step 1's allowance covered it).
     assert_eq!(pool.confirmed_nonce().await.unwrap(), 3);
-    assert_eq!(pool.pending_nonce().await.unwrap(), 3);
     assert_eq!(
         pool.transaction(TxHash::repeat_byte(0x99)).await.unwrap(),
         TxState::Unknown
     );
 
     // With automining off, a sent transaction waits in the pool at nonce 3:
-    // pending, counted by the pending nonce but not the confirmed one.
+    // pending, and not counted by the confirmed nonce.
     let raw = chain.provider_for(&signer);
     raw.raw_request::<_, ()>("evm_setAutomine".into(), (false,))
         .await
@@ -125,7 +124,6 @@ async fn remaining_grows_after_topup() {
         TxState::Pending { nonce: 3 }
     );
     assert_eq!(pool.confirmed_nonce().await.unwrap(), 3);
-    assert_eq!(pool.pending_nonce().await.unwrap(), 4);
 
     raw.raw_request::<_, String>("evm_mine".into(), ())
         .await
