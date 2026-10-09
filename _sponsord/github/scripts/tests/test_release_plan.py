@@ -284,6 +284,18 @@ def test_baseline_is_the_highest_release_below_the_tag(tag, expected):
     assert rp.baseline(tag, RELEASE_TAGS) == expected
 
 
+@pytest.mark.parametrize("tag", ["v0.0.2", "v0.0.3-rc.1", "v0.0.9"])
+def test_a_0_0_z_tag_has_no_baseline(tag):
+    # Every 0.0.z bump is breaking, so there is nothing to check; building
+    # v0.0.1 as a baseline failed once decdn's main moved past 0.0.0.
+    tags = ["v0.0.1", "v0.0.2", "v0.0.3-rc.1"]
+    assert rp.baseline(tag, tags) is None
+
+
+def test_the_first_0_1_release_still_checks_against_0_0_z():
+    assert rp.baseline("v0.1.0", ["v0.0.1", "v0.0.2"]) == "v0.0.2"
+
+
 @pytest.mark.parametrize(
     ("lower", "higher"),
     [

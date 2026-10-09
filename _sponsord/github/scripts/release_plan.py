@@ -20,7 +20,8 @@ Usage:
                                      images_json, prerelease, matrix)
   release_plan.py <tag> --baseline   the tag cargo semver-checks compares
                                      against, from this repository's tags
-                                     (nothing for the first release)
+                                     (nothing for the first release or a
+                                     0.0.z tag)
   release_plan.py <tag> --latest     `true` if the tag should be the
                                      repository's "Latest release", from
                                      this repository's tags
@@ -147,8 +148,17 @@ def baseline(tag: str, tags: Iterable[str]) -> str | None:
     Below the tag, not merely the newest tag: re-running a release's workflow
     and cutting a maintenance release under a newer one are both supported, and
     a newer baseline would run the check backwards.
+
+    None for a 0.0.z tag as well. Cargo treats every 0.0.z bump as breaking,
+    so cargo semver-checks accepts any API change there and has nothing to
+    find, while building the baseline can still fail: v0.0.1 required decdn
+    `0.0.0` from decdn's `main`, which stopped resolving once decdn's `main`
+    moved to 0.0.1, and cargo semver-checks builds the baseline without its
+    Cargo.lock.
     """
     current = _precedence(parse_tag(tag))
+    if current[0][:2] == (0, 0):
+        return None
     below = []
     for t in tags:
         m = TAG.match(t)

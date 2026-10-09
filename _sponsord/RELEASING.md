@@ -209,17 +209,21 @@ job, which compiles nothing, gates everything else:
 4. picks the semver baseline, the highest release below the tag, and refuses
    it unless it too carries a signature from `KEYS`. "Below" is in semver
    order, so a re-run after a newer release, or a maintenance release, never
-   compares against a newer version. The first release has none.
+   compares against a newer version. The first release has none, and nor
+   does a `0.0.z` tag: Cargo treats every `0.0.z` bump as breaking, so the
+   check has nothing to find.
 
 Then two jobs run side by side:
 
 1. **`verify`** re-runs `cargo fmt`, clippy and the test suite on the whole
-   workspace; runs `cargo semver-checks --workspace` on every published
-   crate's public API (default features) against the baseline, failing if a
-   change needs a bigger bump than the version says (in 0.x, a breaking change
-   needs a minor bump; to run it before tagging, use
-   `cargo semver-checks --workspace --baseline-rev "$(.github/scripts/release_plan.py <tag> --baseline)" --default-features`);
-   then creates the GitHub Release as a **draft**, with git-cliff notes and
+   workspace; when there is a baseline, runs `cargo semver-checks
+   --workspace` on every published crate's public API (default features)
+   against it, failing if a change needs a bigger bump than the version says
+   (in `0.y.z` with `y` above 0, a breaking change needs a minor bump; every
+   `0.0.z` bump may break, hence no baseline there). To run it before tagging,
+   when `release_plan.py <tag> --baseline` prints a tag, use
+   `cargo semver-checks --workspace --baseline-rev <that tag> --default-features`.
+   It then creates the GitHub Release as a **draft**, with git-cliff notes and
    the locked decdn commit it was built against.
 2. **`build`** runs one job per target, each building every binary released
    for it, and fails a Linux leg whose binaries need a glibc above 2.35

@@ -177,8 +177,9 @@ jobs:
       # The release verify runs cargo semver-checks against: the highest
       # release below this tag, in semver order, so a re-run after a newer
       # release, or a maintenance release under one, never compares against a
-      # newer version (release_plan.py). Empty for the first release. Picked
-      # here rather than in verify because this job holds the KEYS keyring:
+      # newer version (release_plan.py). Empty for the first release, and for
+      # a 0.0.z tag, where every bump may break and there is nothing to check.
+      # Picked here rather than in verify because this job holds the KEYS keyring:
       # building the baseline runs its build scripts, so it must be a release
       # a maintainer signed, as the tag being released is.
       - name: Pick the semver baseline
@@ -192,7 +193,7 @@ jobs:
           set -euo pipefail
           PREV=$(python3 .github/scripts/release_plan.py "$TAG" --baseline)
           if [ -z "$PREV" ]; then
-            echo "No previous release; verify skips semver-checks."
+            echo "No baseline (first release, or a 0.0.z tag); verify skips semver-checks."
             exit 0
           fi
           if ! git verify-tag "$PREV"; then
