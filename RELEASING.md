@@ -107,27 +107,31 @@ preview writes nothing and needs no cleanup. Do **not** follow it with
 
 Pushing `v*` starts [`.github/workflows/release.yml`](.github/workflows/release.yml).
 Steps 1–3 gate everything else. After them, the archive builds (step 6) run in
-parallel with the verification (steps 4–5). The asset upload and the image push
-wait for both. The workflow:
+parallel with the verification (steps 4–5). The asset upload waits for both, and
+the image push waits for the asset upload. Every job after step 3 builds the
+exact commit the tag pointed at when the run started. The workflow:
 
 1. rejects the tag unless it is strict semver (the trigger glob is looser than
    it looks — `v0$(whoami)` matches it);
 2. imports `KEYS` **from `origin/main`** and refuses the tag if it is not signed
-   by a key published there;
+   by a key published there, or if it no longer points at the commit that
+   triggered the run;
 3. checks all eleven crate versions match the tag;
-4. re-runs `cargo fmt`, `clippy` and the test suite, plus `cargo semver-checks`
-   against the previous tag — skipped for major bumps, for minor bumps while the
-   major is `0`, and for the first release (no prior tag to diff against);
-   then `cargo publish --workspace --dry-run`, which packages and verify-builds
+4. re-runs `cargo fmt`, `clippy` and the test suite; then
+   `cargo publish --workspace --dry-run`, which packages and verify-builds
    every crate. That runs here, before the draft exists, because a packaging
-   error found during the real publish has no clean recovery;
+   error found during the real publish has no clean recovery. Then
+   `cargo semver-checks` against the previous tag — skipped for major bumps,
+   for minor bumps while the major is `0`, and for the first release (no prior
+   tag to diff against);
 5. creates the GitHub Release as a **draft**;
 6. builds eleven archives (`decdn-node` on five targets, `decdn` on six: the
-   same five plus Windows ARM64), one job per target, and once verification
-   passes uploads them with a `SHA256SUMS` manifest, asserting all eleven are
-   present;
-7. once verification passes, assembles the multi-arch image from those archives
-   — it does not compile from source, so the binary in the image is
+   same five plus Windows ARM64) with `--locked`, one job per target, failing
+   a Linux target whose binaries need glibc newer than 2.36 (Debian 12). Once
+   verification passes it uploads them with a `SHA256SUMS` manifest, asserting
+   all eleven are present;
+7. once the archives are uploaded, assembles the multi-arch image from them —
+   it does not compile from source, so the binary in the image is
    byte-identical to the archived one — and pushes the manifest **untagged**,
    attaching the SBOM and `image-digest.txt`.
 
