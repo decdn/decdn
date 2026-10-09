@@ -43,7 +43,7 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.99.0"
 repository = "https://github.com/decdn/decdn"
 homepage = "https://decdn.org"
-keywords = ["cdn", "p2p", "content-delivery", "iroh", "blake3"]
+keywords = ["decdn", "cdn", "p2p", "iroh", "blake3"]
 categories = ["network-programming", "web-programming"]
 # `readme` and `description` are deliberately NOT here — not because
 # inheritance would break packaging (cargo copies a workspace-root readme into
