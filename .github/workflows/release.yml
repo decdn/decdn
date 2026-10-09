@@ -24,8 +24,12 @@ permissions:
 
 concurrency:
   group: release
-  # cancel-in-progress: false — docker push / release-asset upload are not
-  # idempotent; cancelling mid-flight can leave the draft half-built.
+  # The run in progress is never cancelled: every tag shares this group, so
+  # cancelling would let a second tag push abandon a release half-staged.
+  # GitHub still keeps at most one pending run per group, so a third push
+  # drops the run waiting behind the first before it starts. Re-run that
+  # workflow once the group is free; the draft step and both asset uploads
+  # are idempotent, so a run cancelled by hand mid-flight recovers the same way.
   cancel-in-progress: false
 
 env:
@@ -113,6 +117,23 @@ jobs:
           if ! git verify-tag "$GITHUB_REF_NAME"; then
             echo "::error::$GITHUB_REF_NAME is not signed by a key in KEYS on main." \
                  "Releases must be cut locally with a signed tag — see RELEASING.md."
+            exit 1
+          fi
+
+      # `git verify-tag` above checks the tag as this job fetched it, and every
+      # later job builds `github.sha`, the commit the push event named. A tag
+      # deleted and re-pushed while this run is queued must fail the release
+      # rather than have one commit signature-checked and another built.
+      # `actions/checkout` already refuses a tag that no longer matches
+      # `github.sha`; asserting it here keeps the guarantee in this workflow
+      # rather than in the action's internals.
+      - name: Check tag points at the triggering commit
+        shell: bash
+        run: |
+          TAG_SHA=$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")
+          if [ "$TAG_SHA" != "$GITHUB_SHA" ]; then
+            echo "::error::$GITHUB_REF_NAME now points at $TAG_SHA, but this run" \
+                 "was triggered for $GITHUB_SHA. Was the tag re-pushed?"
             exit 1
           fi
 
@@ -214,13 +235,18 @@ jobs:
         env:
           VERSION: ${{ needs.tag.outputs.version }}
         run: |
-          # Highest v* tag that does NOT point at HEAD. The release tag always
-          # points at HEAD now that cutting is local, so skipping tags on HEAD
-          # is what makes this resolve to the *previous* release rather than
-          # comparing the revision against itself.
+          # Highest v* tag that does NOT point at HEAD. The checkout is the
+          # tagged commit, so the release tag itself always points at HEAD;
+          # skipping tags on HEAD is what makes this resolve to the *previous*
+          # release rather than comparing the revision against itself.
           HEAD_SHA=$(git rev-parse HEAD)
           PREV=""
-          for t in $(git tag --list 'v[0-9]*' --sort=-v:refname); do
+          # A separate assignment, not `for t in $(...)`: `-e` aborts on a
+          # failed assignment but ignores a failed substitution in a `for`
+          # list, which would leave PREV empty and skip semver-checks exactly
+          # as if this were the first release.
+          TAGS=$(git tag --list 'v[0-9]*' --sort=-v:refname)
+          for t in $TAGS; do
             # The glob is far looser than the version format below assumes, so
             # apply the same strict semver filter used on the triggering tag.
             # An odd tag like `v1.2` or `v0-wip` would otherwise become the
@@ -270,8 +296,10 @@ jobs:
 
       # Created as a draft. Draft assets require authentication to download, so
       # the archives are not publicly reachable until sign-release.sh publishes
-      # them. Idempotent, so "Re-run failed jobs" works after a flake in a
-      # later job — but it refuses to touch an already-published release.
+      # them. Idempotent, so "Re-run all jobs" refreshes the existing draft
+      # rather than failing — but it refuses to touch an already-published
+      # release. "Re-run failed jobs" reaches this step only when this job, or
+      # `tag` before it, failed or was cancelled.
       - name: Create draft GitHub Release
         shell: bash
         run: |
@@ -328,8 +356,9 @@ jobs:
           # native build links against the runner's glibc — ubuntu-latest is
           # 24.04, glibc 2.39 — which is NEWER than debian:bookworm-slim (2.36),
           # so the binary would not run in our own container, nor on Debian 12
-          # or RHEL 9. `cross` images pin an old glibc (~2.31), which fixes the
-          # floor independently of whatever ubuntu-latest points at next.
+          # or RHEL 9. `cross` images pin an old glibc, at or below the 2.31
+          # floor ADR 000 sets, independently of whatever ubuntu-latest points
+          # at next.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             builds: decdn-node:decdn-node decdn-cli:decdn
@@ -360,9 +389,11 @@ jobs:
             builds: decdn-cli:decdn
             archive: zip
     steps:
+      # `github.sha`, not the tag name: the `tag` job proved this commit is the
+      # one the tag pointed at, and the tag can move after that check.
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.tag.outputs.tag }}
+          ref: ${{ github.sha }}
 
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
@@ -387,7 +418,7 @@ jobs:
         shell: bash
         run: |
           for build in $BUILDS; do
-            cross build --release --package "${build%%:*}" --target "$TARGET"
+            cross build --release --locked --package "${build%%:*}" --target "$TARGET"
           done
         env:
           BUILDS: ${{ matrix.builds }}
@@ -401,12 +432,47 @@ jobs:
         shell: bash
         run: |
           for build in $BUILDS; do
-            cargo build --release --package "${build%%:*}" --target "$TARGET"
+            cargo build --release --locked --package "${build%%:*}" --target "$TARGET"
           done
         env:
           BUILDS: ${{ matrix.builds }}
           RUSTC_WRAPPER: sccache
           SCCACHE_GHA_ENABLED: "true"
+          TARGET: ${{ matrix.target }}
+
+      # Enforce the glibc 2.31 floor (Debian 11, Ubuntu 20.04, RHEL 8) that
+      # ADR 000 sets, rather than trusting `cross: true` to stay in the
+      # matrix, so the condition keys on the target, not on `cross`. A
+      # natively-built binary can reference symbols up to GLIBC_2.39 (the
+      # runner's) and fails at exec on any older distribution with
+      # "version `GLIBC_2.3x' not found" — debian:bookworm-slim (2.36), our own
+      # image's base, included. Checked here, before the archive exists, so a
+      # binary above the floor never reaches upload-assets or the image.
+      - name: Check glibc floor
+        if: contains(matrix.target, '-linux-gnu')
+        shell: bash
+        run: |
+          MAX_ALLOWED=2.31
+          for build in $BUILDS; do
+            f="target/$TARGET/release/${build#*:}"
+            [ -f "$f" ] || { echo "::error::$f was not built"; exit 1; }
+            # `|| true` on the grep alone: under pipefail a no-match would
+            # abort before the empty check below can name the file, while an
+            # objdump failure still fails the step.
+            need=$(objdump -T "$f" \
+              | { grep -o 'GLIBC_[0-9.]*' || true; } \
+              | sed 's/GLIBC_//' | sort -V | tail -1)
+            [ -n "$need" ] || { echo "::error::$f has no GLIBC symbol versions"; exit 1; }
+            echo "$f requires glibc >= $need"
+            if [ "$(printf '%s\n%s\n' "$need" "$MAX_ALLOWED" | sort -V | tail -1)" \
+                 != "$MAX_ALLOWED" ]; then
+              echo "::error::$f needs glibc $need, above the $MAX_ALLOWED floor." \
+                   "Is this target still built with \`cross\`?"
+              exit 1
+            fi
+          done
+        env:
+          BUILDS: ${{ matrix.builds }}
           TARGET: ${{ matrix.target }}
 
       - name: Archive (tar.gz)
@@ -488,9 +554,9 @@ jobs:
       #
       # The count assertion is load-bearing. `sha256sum` with zero file
       # arguments reads STDIN rather than failing, so a `shopt -s nullglob`
-      # glob that matched nothing produced a valid-looking manifest with a
-      # single line naming the file `-` (the hash of empty stdin). That
-      # manifest then passes `sha256sum --check` with `-: OK`, and a
+      # glob that matched nothing would produce a valid-looking manifest with
+      # a single line naming the file `-` (the hash of empty stdin). That
+      # manifest would pass `sha256sum --check` with `-: OK`, and a
       # maintainer would sign a release containing no binaries at all.
       - name: Generate checksum manifest
         working-directory: artifacts
@@ -526,8 +592,11 @@ jobs:
     # job produces, so the binary inside the image is byte-identical to the one
     # the signed SHA256SUMS covers. Needs verify: that job creates the draft
     # this one uploads to, and no image is pushed, not even untagged, for a
-    # release that failed verification.
-    needs: [tag, verify, build-binaries]
+    # release that failed verification. Needs upload-assets: no image is
+    # pushed and nothing is attached to the draft unless all eleven archives
+    # and SHA256SUMS reached it first, so a failed run never leaves a draft
+    # holding an SBOM and digest for archives it does not have.
+    needs: [tag, verify, build-binaries, upload-assets]
     runs-on: ubuntu-latest
     permissions:
       # `write`, not `read`: this job uploads the SBOM and image-digest.txt to
@@ -536,12 +605,14 @@ jobs:
       contents: write
       packages: write
     steps:
+      # `github.sha`, not the tag name — see build-binaries.
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.tag.outputs.tag }}
+          ref: ${{ github.sha }}
 
-      # Still needed: the apt-get layer runs under emulation for arm64. That is
-      # seconds, not the multi-minute cargo build it replaces.
+      # The arm64 platform runs the Dockerfile's apt-get layer under
+      # emulation. The binaries arrive prebuilt, so that is seconds of package
+      # installs, not a compile.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
@@ -574,24 +645,6 @@ jobs:
               echo "::error::dist/$a/decdn-node missing or not executable"; exit 1; }
           done
           sha256sum dist/*/decdn-node
-
-          # Enforce the glibc floor rather than trusting `cross: true` to stay
-          # in the matrix. A natively-built binary needs GLIBC_2.39 (the
-          # runner's), which does not exist in debian:bookworm-slim (2.36) — it
-          # would fail at exec with "version `GLIBC_2.38' not found", and the
-          # published archive would be unrunnable on Debian 12 / RHEL 9 too.
-          MAX_ALLOWED=2.36
-          for a in amd64 arm64; do
-            need=$(objdump -T "dist/$a/decdn-node" \
-              | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)
-            echo "dist/$a/decdn-node requires glibc <= $need"
-            if [ "$(printf '%s\n%s\n' "$need" "$MAX_ALLOWED" | sort -V | tail -1)" \
-                 != "$MAX_ALLOWED" ]; then
-              echo "::error::dist/$a/decdn-node needs glibc $need, above the" \
-                   "$MAX_ALLOWED floor. Is this target still built with \`cross\`?"
-              exit 1
-            fi
-          done
 
       - name: Log in to GHCR
         uses: docker/login-action@v4.6.0
@@ -648,7 +701,7 @@ jobs:
       # GPG has no native OCI-image signature format, so the image is attested
       # out of band: image-digest.txt records the exact
       # ghcr.io/...@sha256:... reference, and sign-release.sh signs that file
-      # locally. cosign will later replace this with an in-registry signature.
+      # locally.
       - name: Record image digest
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
