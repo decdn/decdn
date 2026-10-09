@@ -37,15 +37,10 @@ env:
   IMAGE_NAME: ${{ github.repository }}-node
 
 jobs:
-  release:
-    name: Release
+  # The fast gate. Everything else needs it; nothing in it compiles.
+  tag:
+    name: Verify tag
     runs-on: ubuntu-latest
-    # Mirrors ci.yml's workflow-level env. rust-cache hashes every
-    # `CARGO*`/`RUST*` variable into its restore key, so the `clippy` partition
-    # restored below only hits when this env matches the env at ci.yml's clippy
-    # rust-cache step. Change the two together.
-    env:
-      RUST_BACKTRACE: 1
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -105,8 +100,7 @@ jobs:
         run: |
           set -o pipefail
           # No --depth: this repo is checked out at fetch-depth 0, and a shallow
-          # fetch would impose a shallow boundary that the semver baseline and
-          # cargo-semver-checks below both need the history behind.
+          # fetch would impose a shallow boundary on that full history.
           git fetch --no-tags origin main
           mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
           git show origin/main:KEYS > "$RUNNER_TEMP/KEYS" || {
@@ -120,19 +114,6 @@ jobs:
           fi
 
       - uses: dtolnay/rust-toolchain@1.99.0
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # Reuse the `clippy` partition rather than a `release` one: the
-          # pre-release verification below runs the same
-          # `cargo clippy --workspace --all-targets` as ci.yml's clippy job, so
-          # the artifacts match. A `release` partition would never be populated
-          # — tag pushes are not on a branch, so this job cannot save, and no
-          # job in ci.yml writes that key.
-          shared-key: clippy
-          save-if: false
 
       # The version bump happens locally and is unpoliced by CI, so confirm the
       # tag matches the manifests it claims to describe. Catches a hand-typed
@@ -157,6 +138,41 @@ jobs:
             exit 1
           fi
           echo "All crates are at $VERSION."
+
+  # Runs in parallel with build-binaries, which needs only the version and the
+  # tag. The jobs that publish anything — the draft below, upload-assets and
+  # docker — all need this one, so no byte leaves the run unverified.
+  verify:
+    name: Verify release
+    needs: tag
+    runs-on: ubuntu-latest
+    # Mirrors ci.yml's workflow-level env. rust-cache hashes every
+    # `CARGO*`/`RUST*` variable into its restore key, so the `clippy` partition
+    # restored below only hits when this env matches the env at ci.yml's clippy
+    # rust-cache step. Change the two together.
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      # Full history: the semver baseline below walks the prior release tags,
+      # and cargo-semver-checks builds that baseline from the history behind it.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Reuse the `clippy` partition rather than a `release` one: the
+          # pre-release verification below runs the same
+          # `cargo clippy --workspace --all-targets` as ci.yml's clippy job, so
+          # the artifacts match. A `release` partition would never be populated
+          # — tag pushes are not on a branch, so this job cannot save, and no
+          # job in ci.yml writes that key.
+          shared-key: clippy
+          save-if: false
 
       - name: Install tools
         uses: taiki-e/install-action@v2.87.26
@@ -190,7 +206,7 @@ jobs:
       - name: Determine semver baseline
         id: baseline
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.tag.outputs.version }}
         run: |
           # Highest v* tag that does NOT point at HEAD. The release tag always
           # points at HEAD now that cutting is local, so skipping tags on HEAD
@@ -284,22 +300,24 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.version.outputs.tag }}
+          TAG: ${{ needs.tag.outputs.tag }}
 
   build-binaries:
-    name: Build ${{ matrix.archive_name }} ${{ matrix.target }}
-    needs: release
+    name: Build ${{ matrix.target }}
+    needs: tag
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       # Two binaries per target post-#421 split: the `decdn-node` daemon
-      # and the `decdn` user CLI. Both ship as separate tarballs so
-      # users grab only what they need; the container image is daemon-
-      # only.
+      # and the `decdn` user CLI. Both ship as separate archives so users
+      # grab only what they need; the container image is daemon-only.
+      #
+      # One job per target, not per binary: the two packages share most of
+      # their dependency graph, and building both in one `target/` compiles
+      # that graph once. `builds` lists `package:binary` pairs; each binary
+      # ships as `<binary>-<version>-<target>.<archive>`.
       matrix:
         include:
-          # decdn-node (daemon) — five targets.
-          #
           # Both Linux targets go through `cross`, never a native build. A
           # native build links against the runner's glibc — ubuntu-latest is
           # 24.04, glibc 2.39 — which is NEWER than debian:bookworm-slim (2.36),
@@ -308,81 +326,37 @@ jobs:
           # floor independently of whatever ubuntu-latest points at next.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            package: decdn-node
-            binary: decdn-node
-            archive_name: decdn-node
+            builds: decdn-node:decdn-node decdn-cli:decdn
             archive: tar.gz
             cross: true
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
-            package: decdn-node
-            binary: decdn-node
-            archive_name: decdn-node
+            builds: decdn-node:decdn-node decdn-cli:decdn
             archive: tar.gz
             cross: true
           - target: x86_64-apple-darwin
             runner: macos-latest
-            package: decdn-node
-            binary: decdn-node
-            archive_name: decdn-node
+            builds: decdn-node:decdn-node decdn-cli:decdn
             archive: tar.gz
           - target: aarch64-apple-darwin
             runner: macos-latest
-            package: decdn-node
-            binary: decdn-node
-            archive_name: decdn-node
+            builds: decdn-node:decdn-node decdn-cli:decdn
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
-            package: decdn-node
-            binary: decdn-node.exe
-            archive_name: decdn-node
+            builds: decdn-node:decdn-node decdn-cli:decdn
             archive: zip
-          # decdn (user CLI) — the same five targets, same glibc reasoning,
-          # plus Windows on ARM64, which the walletless on-ramp installs.
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            package: decdn-cli
-            binary: decdn
-            archive_name: decdn
-            archive: tar.gz
-            cross: true
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-            package: decdn-cli
-            binary: decdn
-            archive_name: decdn
-            archive: tar.gz
-            cross: true
-          - target: x86_64-apple-darwin
-            runner: macos-latest
-            package: decdn-cli
-            binary: decdn
-            archive_name: decdn
-            archive: tar.gz
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-            package: decdn-cli
-            binary: decdn
-            archive_name: decdn
-            archive: tar.gz
-          - target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            package: decdn-cli
-            binary: decdn.exe
-            archive_name: decdn
-            archive: zip
-          # Cross-compiled on the x64 runner with the MSVC ARM64 toolchain.
+          # The CLI only: Windows on ARM64 is for the walletless on-ramp, which
+          # installs `decdn`. Cross-compiled on the x64 runner with the MSVC
+          # ARM64 toolchain.
           - target: aarch64-pc-windows-msvc
             runner: windows-latest
-            package: decdn-cli
-            binary: decdn.exe
-            archive_name: decdn
+            builds: decdn-cli:decdn
             archive: zip
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.release.outputs.tag }}
+          ref: ${{ needs.tag.outputs.tag }}
 
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
@@ -397,54 +371,70 @@ jobs:
         with:
           tool: cross
 
+      # One `build` per package, not a single `--package a --package b`: one
+      # invocation unifies features across every package it selects, so the
+      # daemon could link features only the CLI enables. Separate invocations
+      # build each package exactly as a standalone build would, and still reuse
+      # every dependency whose feature set matches.
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --package "$PACKAGE" --target "$TARGET"
+        shell: bash
+        run: |
+          for build in $BUILDS; do
+            cross build --release --package "${build%%:*}" --target "$TARGET"
+          done
         env:
-          PACKAGE: ${{ matrix.package }}
+          BUILDS: ${{ matrix.builds }}
           TARGET: ${{ matrix.target }}
 
       # `shell: bash` is required on the Windows runners, whose default shell
-      # is pwsh: there `"$PACKAGE"` and `"$TARGET"` name unset PowerShell
+      # is pwsh: there `$BUILDS` and `"$TARGET"` name unset PowerShell
       # variables, not the env vars below, and expand to empty strings.
       - name: Build (native)
         if: ${{ !matrix.cross }}
         shell: bash
-        run: cargo build --release --package "$PACKAGE" --target "$TARGET"
+        run: |
+          for build in $BUILDS; do
+            cargo build --release --package "${build%%:*}" --target "$TARGET"
+          done
         env:
-          PACKAGE: ${{ matrix.package }}
+          BUILDS: ${{ matrix.builds }}
           RUSTC_WRAPPER: sccache
           SCCACHE_GHA_ENABLED: "true"
           TARGET: ${{ matrix.target }}
 
       - name: Archive (tar.gz)
         if: matrix.archive == 'tar.gz'
+        shell: bash
         run: |
-          cd "target/$TARGET/release"
-          tar czf "../../../${ARCHIVE_NAME}-${VERSION}-${TARGET}.tar.gz" "$BINARY"
+          for build in $BUILDS; do
+            bin="${build#*:}"
+            tar czf "${bin}-${VERSION}-${TARGET}.tar.gz" -C "target/$TARGET/release" "$bin"
+          done
         env:
-          ARCHIVE_NAME: ${{ matrix.archive_name }}
+          BUILDS: ${{ matrix.builds }}
           TARGET: ${{ matrix.target }}
-          VERSION: ${{ needs.release.outputs.version }}
-          BINARY: ${{ matrix.binary }}
+          VERSION: ${{ needs.tag.outputs.version }}
 
       - name: Archive (zip)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          Compress-Archive -Path "target/$env:TARGET/release/$env:BINARY" `
-            -DestinationPath "$env:ARCHIVE_NAME-$env:VERSION-$env:TARGET.zip"
+          foreach ($build in $env:BUILDS -split ' ') {
+            $bin = ($build -split ':')[1]
+            Compress-Archive -Path "target/$env:TARGET/release/$bin.exe" `
+              -DestinationPath "$bin-$env:VERSION-$env:TARGET.zip"
+          }
         env:
-          ARCHIVE_NAME: ${{ matrix.archive_name }}
+          BUILDS: ${{ matrix.builds }}
           TARGET: ${{ matrix.target }}
-          VERSION: ${{ needs.release.outputs.version }}
-          BINARY: ${{ matrix.binary }}
+          VERSION: ${{ needs.tag.outputs.version }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.archive_name }}-${{ matrix.target }}
-          path: ${{ matrix.archive_name }}-${{ needs.release.outputs.version }}-${{ matrix.target }}.*
+          name: binaries-${{ matrix.target }}
+          path: '*-${{ needs.tag.outputs.version }}-${{ matrix.target }}.*'
           # Default is `warn`, which leaves a leg green when it produced
           # nothing — the manifest job downstream would then hash a short set
           # and a maintainer would sign an incomplete release.
@@ -452,7 +442,7 @@ jobs:
 
   upload-assets:
     name: Upload release assets
-    needs: [release, build-binaries]
+    needs: [tag, verify, build-binaries]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -499,14 +489,15 @@ jobs:
         run: gh release upload "$TAG" --clobber artifacts/*
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.release.outputs.tag }}
+          TAG: ${{ needs.tag.outputs.tag }}
 
   docker:
     name: Docker image
     # Needs build-binaries: the image is assembled from the Linux archives that
     # job produces, so the binary inside the image is byte-identical to the one
-    # the signed SHA256SUMS covers.
-    needs: [release, build-binaries]
+    # the signed SHA256SUMS covers. Needs verify: no image is pushed, not even
+    # untagged, for a release that failed verification.
+    needs: [tag, verify, build-binaries]
     runs-on: ubuntu-latest
     permissions:
       # `write`, not `read`: this job uploads the SBOM and image-digest.txt to
@@ -517,7 +508,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.release.outputs.tag }}
+          ref: ${{ needs.tag.outputs.tag }}
 
       # Still needed: the apt-get layer runs under emulation for arm64. That is
       # seconds, not the multi-minute cargo build it replaces.
@@ -527,10 +518,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Download Linux daemon archives
+      # Each Linux artifact carries the CLI archive too; the unpack step below
+      # names the daemon archives explicitly and ignores the rest.
+      - name: Download Linux archives
         uses: actions/download-artifact@v8
         with:
-          pattern: decdn-node-*-unknown-linux-gnu
+          pattern: binaries-*-unknown-linux-gnu
           path: archives
           merge-multiple: true
 
@@ -538,7 +531,7 @@ jobs:
       # the Rust target triple, so the Dockerfile's COPY needs no branching.
       - name: Unpack archives into dist/
         env:
-          VERSION: ${{ needs.release.outputs.version }}
+          VERSION: ${{ needs.tag.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p dist/amd64 dist/arm64
@@ -618,7 +611,7 @@ jobs:
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
           format: spdx-json
-          output-file: decdn-${{ needs.release.outputs.version }}-sbom.spdx.json
+          output-file: decdn-${{ needs.tag.outputs.version }}-sbom.spdx.json
           upload-release-assets: false
           upload-artifact: false
 
@@ -635,8 +628,8 @@ jobs:
       - name: Upload SBOM and digest to draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.release.outputs.tag }}
-          VERSION: ${{ needs.release.outputs.version }}
+          TAG: ${{ needs.tag.outputs.tag }}
+          VERSION: ${{ needs.tag.outputs.version }}
         run: |
           gh release upload "$TAG" --clobber \
             "decdn-${VERSION}-sbom.spdx.json" \
