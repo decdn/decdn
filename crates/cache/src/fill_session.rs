@@ -1234,13 +1234,10 @@ pub enum FillClaim {
 /// contributes nothing, which is fine for the finite `covered ∩ R` overlaps this
 /// measures.
 fn chunk_span(ranges: &ChunkRanges) -> u64 {
-    ranges
-        .boundaries()
-        .chunks_exact(2)
-        .map(|pair| match pair {
-            [start, end] => end.0.saturating_sub(start.0),
-            _ => 0,
-        })
+    let (pairs, _open_end) = ranges.boundaries().as_chunks::<2>();
+    pairs
+        .iter()
+        .map(|[start, end]| end.0.saturating_sub(start.0))
         .sum()
 }
 

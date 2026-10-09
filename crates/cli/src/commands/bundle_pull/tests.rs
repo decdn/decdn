@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 
 /// Every entry draws its own sample of the registry, so a node that one
 /// draw leaves out still reaches other entries.
@@ -101,8 +102,9 @@ async fn discover_candidates_skips_the_registry_read_on_fresh_identities() -> an
     let (common, chain) = chain_against(&rpc, dir.path(), &[])?;
     let found = discover_candidates(&chain, &common).await?;
     assert_eq!(found.len(), usize::from(min));
-    assert!(
-        matches!(rpc.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+    assert_matches!(
+        rpc.accept(),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock,
         "a cached run must not reach the RPC endpoint"
     );
 
@@ -304,8 +306,9 @@ async fn a_retaken_slot_waits_behind_at_most_one_new_group() {
     };
     assert!(poll!(d.as_mut()).is_pending());
     drop(c_slot);
-    assert!(
-        matches!(poll!(retake.as_mut()), Poll::Ready(Ok(()))),
+    assert_matches!(
+        poll!(retake.as_mut()),
+        Poll::Ready(Ok(())),
         "the retake comes before d"
     );
     assert!(poll!(d.as_mut()).is_pending());

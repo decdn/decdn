@@ -19,6 +19,7 @@ use bytes::Bytes;
 
 use crate::AlignedRange;
 use crate::ranged_store::RangedStore;
+use std::assert_matches;
 
 /// Produces a FRESH, EMPTY `RangedStore` for one blob `(root, total_bytes)`.
 /// Async because backends open files / stores. Each call must return a new
@@ -313,8 +314,9 @@ async fn case_incomplete_finalize<F: ConformanceFactory>(fx: &Fixture, factory: 
         .finalize()
         .await
         .expect_err("finalize on partial store must error");
-    assert!(
-        matches!(err, crate::RangedStoreError::Incomplete),
+    assert_matches!(
+        err,
+        crate::RangedStoreError::Incomplete,
         "finalize on partial store must be Incomplete, got {err:?}"
     );
 }
@@ -328,8 +330,9 @@ async fn case_out_of_bounds_is_alignment<F: ConformanceFactory>(fx: &Fixture, fa
         .missing_ranges(fx.total, 1)
         .await
         .expect_err("missing_ranges out of bounds must error");
-    assert!(
-        matches!(m_err, crate::RangedStoreError::Alignment(_)),
+    assert_matches!(
+        m_err,
+        crate::RangedStoreError::Alignment(_),
         "missing_ranges OOB should be Alignment, got {m_err:?}"
     );
 
@@ -337,8 +340,9 @@ async fn case_out_of_bounds_is_alignment<F: ConformanceFactory>(fx: &Fixture, fa
         .read(fx.total, 1)
         .await
         .expect_err("read out of bounds must error");
-    assert!(
-        matches!(r_err, crate::RangedStoreError::Alignment(_)),
+    assert_matches!(
+        r_err,
+        crate::RangedStoreError::Alignment(_),
         "read OOB should be Alignment, got {r_err:?}"
     );
 }

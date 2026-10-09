@@ -38,6 +38,7 @@ use decdn_cache::{
     CacheEngine, CacheError, CacheMetrics, CircuitBreakerPolicy, Hash, ManualClock, Origin,
     OriginFetch, OriginKind, OriginPullError, PinnedHashes, RetryPolicy,
 };
+use std::assert_matches;
 
 /// A programmable origin whose behaviour for the target hash is flipped
 /// at runtime via an atomic flag, and which counts every `fetch` call.
@@ -217,8 +218,9 @@ async fn opens_on_repeated_transient_then_fast_fails_with_no_backoff() -> anyhow
     // Two consecutive transient failures trip the breaker (threshold = 2).
     for _ in 0..2 {
         let err = engine.get(hash).await.unwrap_err();
-        assert!(
-            matches!(err, CacheError::OriginError { .. }),
+        assert_matches!(
+            err,
+            CacheError::OriginError { .. },
             "transient-exhausted should surface as OriginError, got {err:?}"
         );
     }
@@ -239,8 +241,9 @@ async fn opens_on_repeated_transient_then_fast_fails_with_no_backoff() -> anyhow
         .await
         .expect("OPEN breaker miss must return immediately, not block on backoff");
     let err = res.unwrap_err();
-    assert!(
-        matches!(err, CacheError::OriginError { .. }),
+    assert_matches!(
+        err,
+        CacheError::OriginError { .. },
         "open-breaker miss should surface OriginError, got {err:?}"
     );
     assert_eq!(
@@ -435,8 +438,9 @@ async fn permanent_not_found_never_trips_breaker() -> anyhow::Result<()> {
     let hash = Hash::new(b"never-exists");
     for _ in 0..20 {
         let err = engine.get(hash).await.unwrap_err();
-        assert!(
-            matches!(err, CacheError::NotFound { .. }),
+        assert_matches!(
+            err,
+            CacheError::NotFound { .. },
             "404 should surface NotFound, got {err:?}"
         );
     }

@@ -161,10 +161,11 @@ mod sol_types {
             function getSlashRecord(uint256 slashId) external view returns (SlashRecord memory);
 
             /// Global cumulative appeal-window pause offset, in seconds. Every
-            /// slash's enforced deadline is `getSlashRecord(id).appealWindowClose
-            /// + pausedTotal`; the offset only ever grows (`_unpause` credits each
-            /// ended pause interval), so it uniformly extends every open window
-            /// and preserves base-close ordering.
+            /// slash's enforced deadline is
+            /// `getSlashRecord(id).appealWindowClose + pausedTotal`; the offset
+            /// only ever grows (`_unpause` credits each ended pause interval), so
+            /// it uniformly extends every open window and preserves base-close
+            /// ordering.
             function pausedTotal() external view returns (uint64);
 
             /// The operator's raw registration record. `active` here is

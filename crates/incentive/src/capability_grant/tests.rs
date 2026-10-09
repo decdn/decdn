@@ -1,6 +1,7 @@
 use super::*;
 use alloy::primitives::{address, b256};
 use alloy::signers::local::PrivateKeySigner;
+use std::assert_matches;
 
 fn sample_domain() -> Eip712Domain {
     crate::capability::voucher_domain(
@@ -92,8 +93,9 @@ fn truncated_body_is_rejected_without_panicking() {
     let truncated = &token[..cut];
     let err = CapabilityGrant::from_token(truncated)
         .expect_err("a truncated token must be rejected, not panic");
-    assert!(
-        matches!(err, GrantError::BadPayload | GrantError::BadBase64),
+    assert_matches!(
+        err,
+        GrantError::BadPayload | GrantError::BadBase64,
         "unexpected error for truncated token: {err:?}"
     );
 }
@@ -112,8 +114,8 @@ fn malformed_signature_bytes_fail_reconstruction() {
     let (_, mut grant, _) = signed_grant();
     grant.owner_signature = vec![0u8; 10]; // not 65 bytes
     assert_eq!(grant.to_signed_capability(), Err(GrantError::BadSignature));
-    assert!(matches!(
+    assert_matches!(
         grant.owner(&sample_domain()),
         Err(GrantOwnerError::Decode(GrantError::BadSignature))
-    ));
+    );
 }

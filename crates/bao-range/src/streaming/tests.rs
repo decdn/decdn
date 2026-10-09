@@ -1,5 +1,6 @@
 use super::*;
 use crate::{CHUNK_GROUP_BYTES, align_range, encode_verified_range};
+use std::assert_matches;
 
 // A blob spanning several chunk groups plus a partial final group, so the
 // tree has real interior nodes (matches the crate-root tests' rationale).
@@ -44,7 +45,7 @@ fn corrupt_outboard_fails() {
     let mut buf = Vec::new();
     let err = encode_whole_blob_headerless(root, BLOB_SIZE, outboard, &data[..], &mut buf)
         .expect_err("corrupt outboard must fail verification");
-    assert!(matches!(err, RangeVerifyError::Verification { .. }));
+    assert_matches!(err, RangeVerifyError::Verification { .. });
 }
 
 #[test]
@@ -57,5 +58,5 @@ fn wrong_root_fails() {
     let mut buf = Vec::new();
     let err = encode_whole_blob_headerless(wrong_root, BLOB_SIZE, outboard, &data[..], &mut buf)
         .expect_err("wrong root must fail verification");
-    assert!(matches!(err, RangeVerifyError::Verification { .. }));
+    assert_matches!(err, RangeVerifyError::Verification { .. });
 }

@@ -50,6 +50,7 @@ use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::rpc_params;
 use jsonrpsee::server::{Server, ServerConfig};
+use std::assert_matches;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
@@ -706,8 +707,9 @@ async fn admin_v1_drain_without_params_is_rejected() -> anyhow::Result<()> {
     let err = res
         .err()
         .ok_or_else(|| anyhow::anyhow!("a no-params drain must be refused"))?;
-    assert!(
-        matches!(&err, ClientError::Call(obj) if obj.code() == -32602),
+    assert_matches!(
+        &err,
+        ClientError::Call(obj) if obj.code() == -32602,
         "expected -32602 Invalid params, got {err:?}"
     );
     let waited =

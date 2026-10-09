@@ -78,6 +78,7 @@ use decdn_node::metrics::Metrics;
 use decdn_protocol::{ALPN_DHT, ContentHash, Coverage, NodeId};
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets};
+use std::assert_matches;
 
 // Teardown is routed through the shared bounded helper rather than a bare
 // `Endpoint::close().await`, which has no deadline of its own. Called fully
@@ -325,8 +326,9 @@ fn insert_record(records: &Mutex<RecordStore>, hash: [u8; 32], holder: [u8; 32])
         Coverage::full(1),
         receive_us,
     );
-    assert!(
-        matches!(outcome, InsertOutcome::Inserted | InsertOutcome::Refreshed),
+    assert_matches!(
+        outcome,
+        InsertOutcome::Inserted | InsertOutcome::Refreshed,
         "test record insert must succeed: {outcome:?}"
     );
 }

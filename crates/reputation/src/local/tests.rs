@@ -1,6 +1,7 @@
 use super::*;
 use anyhow::{Context, ensure};
 use iroh::SecretKey;
+use std::assert_matches;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -100,40 +101,40 @@ fn invalid_config_rejected() {
         alpha: f64::NAN,
         ..LocalReputationConfig::default()
     };
-    assert!(matches!(
+    assert_matches!(
         LocalReputation::new(bad),
         Err(ConfigError::OutOfUnitInterval { field: "alpha", .. })
-    ));
+    );
 
     let bad = LocalReputationConfig {
         reference_bps: 0,
         ..LocalReputationConfig::default()
     };
-    assert!(matches!(
+    assert_matches!(
         LocalReputation::new(bad),
         Err(ConfigError::ZeroReferenceBps)
-    ));
+    );
 
     let bad = LocalReputationConfig {
         speed_weight: 0.5, // 0.5 + 0.4 + 0.2 = 1.1
         ..LocalReputationConfig::default()
     };
-    assert!(matches!(
+    assert_matches!(
         LocalReputation::new(bad),
         Err(ConfigError::WeightsDoNotSumToOne { .. })
-    ));
+    );
 
     let bad = LocalReputationConfig {
         initial_score: 1.5,
         ..LocalReputationConfig::default()
     };
-    assert!(matches!(
+    assert_matches!(
         LocalReputation::new(bad),
         Err(ConfigError::OutOfUnitInterval {
             field: "initial_score",
             ..
         })
-    ));
+    );
 }
 
 #[test]

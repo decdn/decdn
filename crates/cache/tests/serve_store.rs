@@ -22,6 +22,7 @@ use decdn_bao_range::{CHUNK_GROUP_BYTES, IROH_BLOCK_SIZE, RangedStore, RangedSto
 use decdn_cache::{NodeRangedStore, ServeStore};
 use futures_util::StreamExt;
 use iroh_blobs::Hash;
+use std::assert_matches;
 
 mod util;
 
@@ -188,8 +189,9 @@ async fn observe_on_never_admitted_hash_is_backend_error() -> anyhow::Result<()>
 
     match ServeStore::observe(&store).await {
         Ok(_) => anyhow::bail!("observe on a never-admitted hash must error, got Ok"),
-        Err(err) => assert!(
-            matches!(err, RangedStoreError::Backend(_)),
+        Err(err) => assert_matches!(
+            err,
+            RangedStoreError::Backend(_),
             "observe on a never-admitted hash must be Backend(_), got {err:?}"
         ),
     }

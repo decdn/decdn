@@ -1,6 +1,7 @@
 use super::*;
 use crate::{PullStalled, UpstreamVoucherRejected};
 use decdn_protocol::client::VoucherRejectReason;
+use std::assert_matches;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -435,8 +436,9 @@ async fn a_reveal_under_a_moved_root_is_not_released() -> anyhow::Result<()> {
     let live = ledger
         .meter(ledger.chain_root(), |_r| async { Ok(()) })
         .await?;
-    assert!(
-        matches!(live, Metered::Released(_)),
+    assert_matches!(
+        live,
+        Metered::Released(_),
         "the re-anchored stream meters the live chain: {live:?}"
     );
     Ok(())
@@ -928,10 +930,7 @@ async fn rebase_skips_stale_rejections_and_heals_fresh_ones() -> anyhow::Result<
         bytes: U256::from(5_000u64),
         amount: U256::from(60u64),
     };
-    assert!(matches!(
-        ledger.rebase(node, Some(0)).await,
-        Rebase::Rebased { .. }
-    ));
+    assert_matches!(ledger.rebase(node, Some(0)).await, Rebase::Rebased { .. });
     let healed = ledger
         .issue(1_000, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
         .await?;
@@ -950,10 +949,7 @@ async fn rebase_skips_stale_rejections_and_heals_fresh_ones() -> anyhow::Result<
 
     // A voucher signed under generation 1 that still underpays is a fresh
     // divergence, and heals again.
-    assert!(matches!(
-        ledger.rebase(stale, Some(1)).await,
-        Rebase::Rebased { .. }
-    ));
+    assert_matches!(ledger.rebase(stale, Some(1)).await, Rebase::Rebased { .. });
     assert_eq!(ledger.committed(), stale);
     assert_eq!(ledger.generation(), 2);
     Ok(())
@@ -973,10 +969,7 @@ async fn rebase_heals_a_watermark_behind_only_on_bytes() -> anyhow::Result<()> {
         bytes: U256::from(5_000u64),
         amount: U256::from(90u64),
     };
-    assert!(matches!(
-        ledger.rebase(node, None).await,
-        Rebase::Rebased { .. }
-    ));
+    assert_matches!(ledger.rebase(node, None).await, Rebase::Rebased { .. });
     assert_eq!(ledger.committed(), node);
     let next = ledger
         .issue(1_000, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
@@ -1022,7 +1015,7 @@ async fn rebase_waits_for_an_in_flight_voucher() -> anyhow::Result<()> {
 
     let _ = release.send(());
     let stale = sender.await??;
-    assert!(matches!(rebase.await?, Rebase::Rebased { .. }));
+    assert_matches!(rebase.await?, Rebase::Rebased { .. });
     assert!(stale.amount > node.amount);
     assert_eq!(
         ledger.committed(),
@@ -1045,10 +1038,7 @@ async fn the_unsaved_rebase_is_taken_once() {
         bytes: U256::from(5_000u64),
         amount: U256::from(60u64),
     };
-    assert!(matches!(
-        ledger.rebase(node, None).await,
-        Rebase::Rebased { .. }
-    ));
+    assert_matches!(ledger.rebase(node, None).await, Rebase::Rebased { .. });
     assert_eq!(ledger.take_unsaved_rebase(), Some(node));
     assert_eq!(ledger.take_unsaved_rebase(), None);
 }

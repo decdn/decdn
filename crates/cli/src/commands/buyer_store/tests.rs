@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 
 /// `buyer.redb` is one of the daemon markers, and the client's own store
 /// is not a marker at all. The rest of the set is covered by
@@ -86,8 +87,9 @@ fn a_node_data_dir_whose_buyer_store_was_deleted_is_still_a_node_s() {
     assert!(!dir.path().join("buyer.redb").exists());
 
     let owner = classify_buyer_store(dir.path()).unwrap();
-    assert!(
-        matches!(owner, BuyerStoreOwner::Node { .. }),
+    assert_matches!(
+        owner,
+        BuyerStoreOwner::Node { .. },
         "a data dir with daemon stores but no buyer.redb must not be a client's"
     );
     // And the guards still bite, which is the point.

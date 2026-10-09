@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 
 #[test]
 fn redact_userinfo_redacts_all_credential_shapes() {
@@ -22,14 +23,11 @@ fn redact_userinfo_redacts_all_credential_shapes() {
         "https://***@[::1]:443"
     );
     // No userinfo => unchanged (borrowed, not copied).
-    assert!(matches!(
+    assert_matches!(
         redact_userinfo("https://relay.example:7842"),
         Cow::Borrowed("https://relay.example:7842")
-    ));
-    assert!(matches!(
-        redact_userinfo("not a url"),
-        Cow::Borrowed("not a url")
-    ));
+    );
+    assert_matches!(redact_userinfo("not a url"), Cow::Borrowed("not a url"));
     // An `@` in the path (after the host) is not userinfo — leave it.
     assert_eq!(
         redact_userinfo("https://host/path@x"),
@@ -72,10 +70,10 @@ fn strip_urls_handles_both_shapes_and_trailing_delimiters() {
 #[test]
 fn strip_urls_passes_clean_text_through_borrowed() {
     // No URL scheme => no copy, value verbatim.
-    assert!(matches!(
+    assert_matches!(
         strip_urls("connection refused (os error 111)"),
         Cow::Borrowed("connection refused (os error 111)")
-    ));
+    );
 }
 
 #[test]

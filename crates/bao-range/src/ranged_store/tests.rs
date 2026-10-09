@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 
 #[test]
 fn error_from_range_verify() {
@@ -14,7 +15,7 @@ fn error_from_range_verify() {
         len: 0,
         blob_size: 0,
     });
-    assert!(matches!(err, RangedStoreError::Alignment(_)));
+    assert_matches!(err, RangedStoreError::Alignment(_));
 }
 
 /// A wrapping variant names only itself and hands its cause to `source()`,

@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 
 /// The closed-form [`aligned_wire_size`] must equal the encoder walk
 /// byte-for-byte for every group-aligned contiguous range: it is what the
@@ -146,14 +147,14 @@ fn rejects_overlong_range_data() {
     let range_data = vec![0u8; too_long];
     let err = encode_verified_range([0u8; 32], &aligned, &range_data, Bytes::new())
         .expect_err("overlong range_data must be rejected");
-    assert!(matches!(
+    assert_matches!(
         err,
         RangeVerifyError::RangeDataSize {
             expected,
             got,
             blob_size,
         } if expected == fetch_len && got == too_long && blob_size == BLOB_SIZE
-    ));
+    );
 }
 
 // The mirror case: a truncated 206 body is a typed error, not an opaque
@@ -166,11 +167,11 @@ fn rejects_too_short_range_data() {
     let range_data = vec![0u8; too_short];
     let err = encode_verified_range([0u8; 32], &aligned, &range_data, Bytes::new())
         .expect_err("short range_data must be rejected");
-    assert!(matches!(
+    assert_matches!(
         err,
         RangeVerifyError::RangeDataSize { expected, got, .. }
             if expected == fetch_len && got == too_short
-    ));
+    );
 }
 
 /// A request whose end runs past the blob clamps to the blob's end instead
@@ -195,14 +196,14 @@ fn align_range_clamped_clamps_an_end_past_the_blob() {
 #[test]
 fn align_range_clamped_refuses_an_offset_at_or_past_the_end() {
     let total = 5 * CHUNK_GROUP_BYTES;
-    assert!(matches!(
+    assert_matches!(
         align_range_clamped(total, 0, total),
         Err(RangeVerifyError::RangeOutOfBounds { .. })
-    ));
-    assert!(matches!(
+    );
+    assert_matches!(
         align_range_clamped(total + 1, 1, total),
         Err(RangeVerifyError::RangeOutOfBounds { .. })
-    ));
+    );
 }
 
 /// `(0, 0)` stays the whole blob under the clamped rule, same as
@@ -222,14 +223,14 @@ fn align_range_clamped_whole_blob_request_is_unchanged() {
 #[test]
 fn align_range_clamped_empty_blob_is_whole_blob_only() {
     assert!(align_range_clamped(0, 0, 0).is_ok());
-    assert!(matches!(
+    assert_matches!(
         align_range_clamped(1, 0, 0),
         Err(RangeVerifyError::RangeOutOfBounds { .. })
-    ));
-    assert!(matches!(
+    );
+    assert_matches!(
         align_range_clamped(0, 1, 0),
         Err(RangeVerifyError::RangeOutOfBounds { .. })
-    ));
+    );
 }
 
 /// Edges [`align_range_clamped`] must get right beyond the group-scale cases

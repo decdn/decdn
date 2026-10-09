@@ -77,7 +77,7 @@ impl TabProgress {
             .unwrap_or(100);
         let advanced = self
             .last
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 (cur != Self::CLEARED && pct > cur).then_some(pct)
             })
             .is_ok();

@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 
 use super::super::{LaneDeliveryState, handler_over_store};
 use crate::metrics::Metrics;
+use std::assert_matches;
 
 /// A well-formed voucher verifies against a fresh lane and advances the
 /// candidate state to the voucher's cumulative amount/bytes — the pure,
@@ -752,8 +753,9 @@ fn wrong_signer_is_rejected_without_the_lane_lock() {
     let err = forged
         .verify_signer(pinned_signer, &domain)
         .expect_err("a wrong-key voucher must fail signature recovery");
-    assert!(
-        matches!(err, decdn_incentive::VoucherError::WrongSigner { .. }),
+    assert_matches!(
+        err,
+        decdn_incentive::VoucherError::WrongSigner { .. },
         "wrong-key voucher recovers to a different signer: {err:?}"
     );
 
@@ -835,8 +837,9 @@ fn concurrent_advances_recheck_the_live_watermark_no_lost_update() {
     let err = after_hi
         .advance_presigned(&voucher_lo)
         .expect_err("a straggler below the live watermark must not advance");
-    assert!(
-        matches!(err, decdn_incentive::PoolError::AmountRegression { .. }),
+    assert_matches!(
+        err,
+        decdn_incentive::PoolError::AmountRegression { .. },
         "straggler is a benign amount regression against the live watermark: {err:?}"
     );
 

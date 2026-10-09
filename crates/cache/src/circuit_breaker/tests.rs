@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 
 fn breaker(policy: CircuitBreakerPolicy) -> (OriginBreaker, ManualClock) {
     let clock = ManualClock::new();
@@ -28,8 +29,9 @@ fn admit(b: &OriginBreaker) -> TrialGuard<'_> {
 
 /// Assert the breaker short-circuits right now.
 fn assert_short_circuit(b: &OriginBreaker) {
-    assert!(
-        matches!(b.acquire(), Admission::ShortCircuit),
+    assert_matches!(
+        b.acquire(),
+        Admission::ShortCircuit,
         "expected short-circuit"
     );
 }
@@ -45,10 +47,7 @@ fn drive(b: &OriginBreaker, outcome: OriginOutcome) {
 fn starts_closed_and_proceeds() {
     let (b, _clk) = breaker(policy());
     assert_eq!(b.state(), BreakerState::Closed);
-    assert!(matches!(
-        b.acquire(),
-        Admission::Proceed(BreakerState::Closed, _)
-    ));
+    assert_matches!(b.acquire(), Admission::Proceed(BreakerState::Closed, _));
 }
 
 #[test]
@@ -92,10 +91,7 @@ fn open_short_circuits_until_cooldown() {
     assert_short_circuit(&b);
     // Once cooldown elapses, the next acquire goes half-open.
     clk.advance(Duration::from_millis(1));
-    assert!(matches!(
-        b.acquire(),
-        Admission::Proceed(BreakerState::HalfOpen, _)
-    ));
+    assert_matches!(b.acquire(), Admission::Proceed(BreakerState::HalfOpen, _));
     assert_eq!(b.state(), BreakerState::HalfOpen);
 }
 

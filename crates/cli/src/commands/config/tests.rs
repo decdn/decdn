@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 
 // The shipped template must parse under `deny_unknown_fields` (every
 // uncommented line is a real section header, so a typo'd header fails
@@ -412,8 +413,9 @@ fn render_origin_config_without_chain_parses() {
 fn render_fs_origin_config_carries_the_path() {
     // %20 decodes to a space; the quote exercises `toml_basic_string`.
     let spec = parse_origin_spec("file:///var/lib/decdn%20blobs/ori%22gin").expect("valid URL");
-    assert!(
-        matches!(&spec, OriginSpec::Fs(p) if p.to_str() == Some("/var/lib/decdn blobs/ori\"gin"))
+    assert_matches!(
+        &spec,
+        OriginSpec::Fs(p) if p.to_str() == Some("/var/lib/decdn blobs/ori\"gin")
     );
     let rendered = render_config(None, &Role::Origin(spec)).expect("render");
     let cfg: config::FileConfig = toml::from_str(&rendered).expect("must parse as FileConfig");
@@ -544,18 +546,18 @@ fn resolve_role_maps_flags() {
         origin: origin.map(str::to_string),
         client,
     };
-    assert!(matches!(
+    assert_matches!(
         resolve_role(&args(None, false)).expect("relay"),
         Role::Relay
-    ));
-    assert!(matches!(
+    );
+    assert_matches!(
         resolve_role(&args(None, true)).expect("client"),
         Role::Client
-    ));
-    assert!(matches!(
+    );
+    assert_matches!(
         resolve_role(&args(Some("https://origin.example/"), false)).expect("origin"),
         Role::Origin(_)
-    ));
+    );
     // ftp:// fails the scheme classification in `parse_origin_spec`.
     assert!(resolve_role(&args(Some("ftp://origin.example/"), false)).is_err());
 }

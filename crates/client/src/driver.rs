@@ -15,7 +15,7 @@
 //! ([`crate::acquire`]) runs the same per-gap loop on each of its lanes. The
 //! branches are:
 //!
-//! - **Draw** (the happy path): open the gap's [`AlignedRange`](decdn_bao_range::AlignedRange), stream it through
+//! - **Draw** (the happy path): open the gap's [`AlignedRange`], stream it through
 //!   [`crate::ClientRangedStore::ingest_stream`] (which durably checkpoints as it goes),
 //!   then [`BlobSource::finish`] to drain the pull and recover the acked voucher
 //!   watermark. The store's checkpoints are what make a mid-gap fault re-enter
@@ -37,7 +37,7 @@
 //!   idempotently) and re-billed. A lane that a funding refusal ends records
 //!   that tail on its ledger, and the lane's next drive bills it first.
 //! - **Reseed** (wallet-less resync, #1481): an authenticated
-//!   [`WatermarkBundle`](decdn_protocol::client::WatermarkBundle) that ADVANCES
+//!   [`WatermarkBundle`] that ADVANCES
 //!   our committed watermark is a healable desync — the driver reseeds the ledger
 //!   ([`PoolLedger::reseed`]) and retries. This is driver-owned, NOT a
 //!   [`PaceDecision`] — the reseed check runs ahead of pacing, the same ordering

@@ -105,16 +105,13 @@ impl FromStr for Hash {
         }
         let mut out = [0u8; 32];
         // `out.iter_mut()` yields exactly 32 slots; the `len == 64` check
-        // above means `chunks_exact(2)` yields exactly 32 pairs with no
-        // remainder. `zip` pairs them 1:1 — every output byte is written
+        // above means `as_chunks::<2>()` yields exactly 32 pairs with an
+        // empty remainder. `zip` pairs them 1:1 — every output byte is written
         // exactly once, with no indexing, no `get_mut`, and no
         // write-only-if-present branch that could silently leave a slot
         // zeroed if the invariants ever drifted.
-        for (slot, pair) in out.iter_mut().zip(s.as_bytes().chunks_exact(2)) {
-            let (Some(hi), Some(lo)) = (
-                pair.first().copied().and_then(hex_val),
-                pair.get(1).copied().and_then(hex_val),
-            ) else {
+        for (slot, [hi, lo]) in out.iter_mut().zip(s.as_bytes().as_chunks::<2>().0) {
+            let (Some(hi), Some(lo)) = (hex_val(*hi), hex_val(*lo)) else {
                 return Err(HashParseError::NonHexChar);
             };
             *slot = (hi << 4) | lo;

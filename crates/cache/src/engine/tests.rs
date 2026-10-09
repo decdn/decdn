@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::origin::{Origin, OriginFetch, OriginKind};
+use std::assert_matches;
 
 /// A trivial in-memory origin for tests. Stores exactly one blob.
 #[derive(Debug)]
@@ -5336,10 +5337,7 @@ async fn admit_bao_stream_handles_zero_total_bytes() {
         )
         .await
         .expect_err("zero size under a non-empty hash is rejected");
-    assert!(
-        matches!(err, CacheError::Feed(_)),
-        "expected Feed, got {err:?}"
-    );
+    assert_matches!(err, CacheError::Feed(_), "expected Feed, got {err:?}");
 }
 
 #[tokio::test]
@@ -5359,8 +5357,9 @@ async fn admit_bao_stream_rejects_corrupt_bao() {
         .admit_bao_stream(hash, ranges, total, Bytes::from(corrupt), None)
         .await
         .unwrap_err();
-    assert!(
-        matches!(err, CacheError::VerifyFailed { expected } if expected == hash),
+    assert_matches!(
+        err,
+        CacheError::VerifyFailed { expected } if expected == hash,
         "expected VerifyFailed, got {err:?}"
     );
     assert!(
@@ -5477,11 +5476,9 @@ async fn spike_bitfield_size_known_before_status_size_on_front_partial() {
         .unwrap();
 
     let status = engine.inner.store.blobs().status(hash).await.unwrap();
-    assert!(
-        matches!(
-            status,
-            iroh_blobs::api::blobs::BlobStatus::Partial { size: None }
-        ),
+    assert_matches!(
+        status,
+        iroh_blobs::api::blobs::BlobStatus::Partial { size: None },
         "front-only partial must NOT have a status()-known size yet, got {status:?}"
     );
 
@@ -5519,11 +5516,9 @@ async fn coverage_of_front_partial_covers_block_zero_before_status_knows_size() 
         .unwrap();
 
     let status = engine.inner.store.blobs().status(hash).await.unwrap();
-    assert!(
-        matches!(
-            status,
-            iroh_blobs::api::blobs::BlobStatus::Partial { size: None }
-        ),
+    assert_matches!(
+        status,
+        iroh_blobs::api::blobs::BlobStatus::Partial { size: None },
         "front-only partial must NOT have a status()-known size yet, got {status:?}"
     );
 
@@ -5728,7 +5723,7 @@ async fn admit_bao_stream_announces_a_block_it_completed_before_failing() {
         panic!("a truncated feed must fail the admit");
     };
     // The sender's short delivery, not this node's store.
-    assert!(matches!(err, CacheError::Feed(_)), "{err:?}");
+    assert_matches!(err, CacheError::Feed(_), "{err:?}");
     assert!(
         engine.coverage(hash).await.unwrap().covers(0),
         "fixture precondition: block 0 landed before the feed ended"
@@ -5978,11 +5973,9 @@ async fn partial_hit_size_source_agrees_with_coverage_on_front_partial() {
         .unwrap();
 
     let status = engine.inner.store.blobs().status(hash).await.unwrap();
-    assert!(
-        matches!(
-            status,
-            iroh_blobs::api::blobs::BlobStatus::Partial { size: None }
-        ),
+    assert_matches!(
+        status,
+        iroh_blobs::api::blobs::BlobStatus::Partial { size: None },
         "front-only partial must NOT have a status()-known size yet, got {status:?}"
     );
 
@@ -6164,14 +6157,14 @@ async fn tagged_partial_survives_gc_untagged_is_reclaimed() {
         .await
         .unwrap();
 
-    assert!(matches!(
+    assert_matches!(
         engine.inner.store.blobs().status(ha).await.unwrap(),
         BlobStatus::Partial { .. }
-    ));
-    assert!(matches!(
+    );
+    assert_matches!(
         engine.inner.store.blobs().status(hb).await.unwrap(),
         BlobStatus::Partial { .. }
-    ));
+    );
 
     // Poll for the control's reclaim rather than sleeping a fixed span:
     // fails fast once GC sweeps (typically the first 200ms interval), and
@@ -6199,11 +6192,9 @@ async fn tagged_partial_survives_gc_untagged_is_reclaimed() {
 
     // The tagged partial must STILL be present after the control was swept —
     // proving the tag (not timing) is what protected it.
-    assert!(
-        matches!(
-            engine.inner.store.blobs().status(ha).await.unwrap(),
-            BlobStatus::Partial { .. }
-        ),
+    assert_matches!(
+        engine.inner.store.blobs().status(ha).await.unwrap(),
+        BlobStatus::Partial { .. },
         "tagged partial survives GC"
     );
 }

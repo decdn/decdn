@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 use std::io::Write;
 
 fn write_config(body: &str) -> tempfile::NamedTempFile {
@@ -64,7 +65,7 @@ fn malformed_relay_error_redacts_userinfo() {
 
 #[test]
 fn empty_relays_disable_relay_mode() {
-    assert!(matches!(relay_mode(&[]), RelayMode::Disabled));
+    assert_matches!(relay_mode(&[]), RelayMode::Disabled);
     let one = vec![RelayUrl::from_str("https://relay.example.com").unwrap()];
-    assert!(matches!(relay_mode(&one), RelayMode::Custom(_)));
+    assert_matches!(relay_mode(&one), RelayMode::Custom(_));
 }

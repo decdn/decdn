@@ -1,6 +1,7 @@
 use alloy::primitives::address;
 
 use super::*;
+use std::assert_matches;
 
 // Distinct valid 20-byte addresses standing in for the placeholder
 // strings ("0xFLAG"/"0xCONFIG"/…). `resolve*` parse their address fields,
@@ -27,18 +28,16 @@ const OA_ADDR: Address = address!("0x000000000000000000000000000000000000000A");
 fn password_sources_expands_tilde_and_delegates() {
     let sources = password_sources(Some(Path::new("~/pw.txt")), PasswordUse::Unlock);
     let want = std::env::var_os("HOME").map(|home| PathBuf::from(home).join("pw.txt"));
-    assert!(
-        matches!(
-            sources.as_slice(),
-            [
-                PasswordSource::Env(name),
-                PasswordSource::File(p),
-                PasswordSource::Prompt {
-                    usage: PasswordUse::Unlock
-                },
-            ] if *name == eth_identity::KEYSTORE_PASSWORD_ENV
-                && want.as_ref().is_none_or(|want| p == want)
-        ),
+    assert_matches!(
+        sources.as_slice(),
+        [
+            PasswordSource::Env(name),
+            PasswordSource::File(p),
+            PasswordSource::Prompt {
+                usage: PasswordUse::Unlock
+            },
+        ] if *name == eth_identity::KEYSTORE_PASSWORD_ENV
+            && want.as_ref().is_none_or(|want| p == want),
         "got: {sources:?}, wanted file {want:?}"
     );
 
@@ -46,25 +45,21 @@ fn password_sources_expands_tilde_and_delegates() {
     // the wrapper a path their own `resolve_chain` expanded, and a second
     // pass must not rewrite it.
     let absolute = password_sources(Some(Path::new("/abs/pw.txt")), PasswordUse::Unlock);
-    assert!(
-        matches!(
-            absolute.as_slice(),
-            [_, PasswordSource::File(p), _] if p == Path::new("/abs/pw.txt")
-        ),
+    assert_matches!(
+        absolute.as_slice(),
+        [_, PasswordSource::File(p), _] if p == Path::new("/abs/pw.txt"),
         "got: {absolute:?}"
     );
 
     let without = password_sources(None, PasswordUse::Create);
-    assert!(
-        matches!(
-            without.as_slice(),
-            [
-                PasswordSource::Env(_),
-                PasswordSource::Prompt {
-                    usage: PasswordUse::Create
-                },
-            ]
-        ),
+    assert_matches!(
+        without.as_slice(),
+        [
+            PasswordSource::Env(_),
+            PasswordSource::Prompt {
+                usage: PasswordUse::Create
+            },
+        ],
         "got: {without:?}"
     );
 }

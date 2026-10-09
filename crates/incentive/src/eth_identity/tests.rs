@@ -3,6 +3,7 @@ use alloy::primitives::{B256, keccak256};
 use alloy::signers::{Signer, SignerSync};
 use alloy::sol;
 use alloy::sol_types::{SolStruct, eip712_domain};
+use std::assert_matches;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
@@ -26,34 +27,30 @@ fn make_data_dir() -> TempDir {
 #[test]
 fn password_sources_orders_env_then_file_then_prompt() {
     let with_file = standard_sources(Some(PathBuf::from("/abs/pw.txt")), PasswordUse::Unlock);
-    assert!(
-        matches!(
-            with_file.as_slice(),
-            [
-                PasswordSource::Env(name),
-                PasswordSource::File(p),
-                PasswordSource::Prompt {
-                    usage: PasswordUse::Unlock
-                },
-            ] if *name == KEYSTORE_PASSWORD_ENV
-                && p == Path::new("/abs/pw.txt")
-        ),
+    assert_matches!(
+        with_file.as_slice(),
+        [
+            PasswordSource::Env(name),
+            PasswordSource::File(p),
+            PasswordSource::Prompt {
+                usage: PasswordUse::Unlock
+            },
+        ] if *name == KEYSTORE_PASSWORD_ENV
+            && p == Path::new("/abs/pw.txt"),
         "got: {with_file:?}"
     );
 
     // No path => no `File` entry at all, so an operator who passed no flag
     // never sees a missing-file skip reason.
     let without = standard_sources(None, PasswordUse::Create);
-    assert!(
-        matches!(
-            without.as_slice(),
-            [
-                PasswordSource::Env(_),
-                PasswordSource::Prompt {
-                    usage: PasswordUse::Create
-                },
-            ]
-        ),
+    assert_matches!(
+        without.as_slice(),
+        [
+            PasswordSource::Env(_),
+            PasswordSource::Prompt {
+                usage: PasswordUse::Create
+            },
+        ],
         "got: {without:?}"
     );
 }

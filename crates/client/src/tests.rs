@@ -8,6 +8,7 @@ use super::{
     UpstreamVoucherRejected, Voucher, VoucherRejectReason, WatermarkBundle, aligned_wire_len,
     decode_to_vec, heal_watermark_desync, rejection_watermark, resumable_watermark,
 };
+use std::assert_matches;
 
 /// The `LocalPullFault` marker must ride out on the errors the range helpers ACTUALLY
 /// raise — not on one a test hand-built (#1145 review).
@@ -51,11 +52,9 @@ fn a_cap_that_cannot_outlast_its_stages_is_refused() {
     // At and below `open + window` the cap always wins the race, so the throughput floor
     // — the signal that a healthy stream is still making progress — could never fire.
     for cap in [Duration::from_secs(1), window, open + window] {
-        assert!(
-            matches!(
-                PullDeadlines::capped(open, window, floor, cap),
-                Err(DeadlineError::CapCannotOutlastItsStages { .. })
-            ),
+        assert_matches!(
+            PullDeadlines::capped(open, window, floor, cap),
+            Err(DeadlineError::CapCannotOutlastItsStages { .. }),
             "a cap of {cap:?} against open {open:?} + window {window:?} leaves the floor \
              unable to fire, and must not be constructible"
         );
@@ -74,14 +73,14 @@ fn a_cap_that_cannot_outlast_its_stages_is_refused() {
     );
 
     // A zero budget elapses on its first poll: the stage it bounds can never run.
-    assert!(matches!(
+    assert_matches!(
         PullDeadlines::capped(Duration::ZERO, window, floor, Duration::from_mins(1)),
         Err(DeadlineError::ZeroBudget)
-    ));
-    assert!(matches!(
+    );
+    assert_matches!(
         PullDeadlines::capped(open, Duration::ZERO, floor, Duration::from_mins(1)),
         Err(DeadlineError::ZeroBudget)
-    ));
+    );
 }
 
 /// `new` must refuse a zero budget too — and it is the constructor that MATTERS, because
@@ -99,18 +98,14 @@ fn new_refuses_a_zero_budget_on_the_path_every_production_pull_takes() {
     use super::{DeadlineError, PullDeadlines};
     use std::time::Duration;
 
-    assert!(
-        matches!(
-            PullDeadlines::new(Duration::ZERO, Duration::from_secs(20), 4096),
-            Err(DeadlineError::ZeroBudget)
-        ),
+    assert_matches!(
+        PullDeadlines::new(Duration::ZERO, Duration::from_secs(20), 4096),
+        Err(DeadlineError::ZeroBudget),
         "a zero open bound means the open stage can never complete"
     );
-    assert!(
-        matches!(
-            PullDeadlines::new(Duration::from_secs(20), Duration::ZERO, 4096),
-            Err(DeadlineError::ZeroBudget)
-        ),
+    assert_matches!(
+        PullDeadlines::new(Duration::from_secs(20), Duration::ZERO, 4096),
+        Err(DeadlineError::ZeroBudget),
         "a zero window makes the throughput floor unsatisfiable on every read"
     );
     assert!(PullDeadlines::new(Duration::from_secs(20), Duration::from_secs(20), 4096).is_ok());

@@ -1,5 +1,6 @@
 use super::*;
 use alloy::primitives::{Bytes, FixedBytes};
+use std::assert_matches;
 
 fn node_info(node_id: [u8; 32], active: bool) -> CapacityBond::NodeInfo {
     CapacityBond::NodeInfo {
@@ -805,7 +806,7 @@ fn registry_failure_falls_back_to_the_store() {
         warning.contains("identity up to"),
         "the warning names the staleness of the fallback identities: {warning}"
     );
-    assert!(matches!(&out, Bootstrap::Cached { .. }));
+    assert_matches!(&out, Bootstrap::Cached { .. });
     let mut got = out.into_peers();
     let mut want = peers;
     got.sort_by_key(|c| c.node_id);

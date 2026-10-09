@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 use std::collections::HashMap;
 
 const US: B256 = B256::repeat_byte(0x01);
@@ -920,7 +921,7 @@ async fn enforcement_denies_and_evicts() -> Result<()> {
     )
     .await;
 
-    assert!(matches!(outcome, Recheck::Evicted), "{outcome:?}");
+    assert_matches!(outcome, Recheck::Evicted, "{outcome:?}");
     assert!(
         sink.cache.is_chain_denied(h),
         "the live deny-set the delivery path reads must carry the reason"
@@ -963,7 +964,7 @@ async fn takedown_forgets_the_warming_tag() -> Result<()> {
         h,
     )
     .await;
-    assert!(matches!(outcome, Recheck::Evicted), "{outcome:?}");
+    assert_matches!(outcome, Recheck::Evicted, "{outcome:?}");
 
     // If the tag survived the takedown, this credit would refill `source`.
     // With the tag forgotten, `credit_serve` is a documented no-op.
@@ -997,8 +998,9 @@ async fn an_already_evicted_hash_is_back_filled_into_the_deny_set() -> Result<()
     )
     .await;
 
-    assert!(
-        matches!(outcome, Recheck::NoAction),
+    assert_matches!(
+        outcome,
+        Recheck::NoAction,
         "already evicted, nothing to evict"
     );
     assert!(
@@ -1029,7 +1031,7 @@ async fn back_fill_does_not_repeat_once_recorded() -> Result<()> {
             h,
         )
         .await;
-        assert!(matches!(outcome, Recheck::NoAction), "{outcome:?}");
+        assert_matches!(outcome, Recheck::NoAction, "{outcome:?}");
     }
     Ok(())
 }

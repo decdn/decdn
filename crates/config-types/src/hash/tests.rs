@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 
 #[test]
 fn hex_round_trips() {
@@ -70,10 +71,10 @@ fn from_str_rejects_bad_length() {
         "abcd".parse::<Hash>().unwrap_err(),
         HashParseError::BadLength { got: 4 }
     );
-    assert!(matches!(
+    assert_matches!(
         "".parse::<Hash>(),
         Err(HashParseError::BadLength { got: 0 })
-    ));
+    );
 }
 
 #[test]

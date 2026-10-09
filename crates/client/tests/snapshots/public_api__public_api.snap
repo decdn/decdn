@@ -283,7 +283,7 @@ pub decdn_client::streamer::VerifiedReader::Live(decdn_client::streamer::LiveRea
 impl core::fmt::Debug for decdn_client::streamer::VerifiedReader
 pub fn decdn_client::streamer::VerifiedReader::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl tokio::io::async_read::AsyncRead for decdn_client::streamer::VerifiedReader
-pub fn decdn_client::streamer::VerifiedReader::poll_read(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>, &mut tokio::io::read_buf::ReadBuf<'_>) -> core::task::poll::Poll<std::io::error::Result<()>>
+pub fn decdn_client::streamer::VerifiedReader::poll_read(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>, &mut tokio::io::read_buf::ReadBuf<'_>) -> core::task::poll::Poll<core::io::error::Result<()>>
 pub struct decdn_client::streamer::LiveReader
 impl core::fmt::Debug for decdn_client::streamer::LiveReader
 pub fn decdn_client::streamer::LiveReader::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -359,7 +359,7 @@ pub decdn_client::VerifiedReader::Live(decdn_client::streamer::LiveReader)
 impl core::fmt::Debug for decdn_client::streamer::VerifiedReader
 pub fn decdn_client::streamer::VerifiedReader::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl tokio::io::async_read::AsyncRead for decdn_client::streamer::VerifiedReader
-pub fn decdn_client::streamer::VerifiedReader::poll_read(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>, &mut tokio::io::read_buf::ReadBuf<'_>) -> core::task::poll::Poll<std::io::error::Result<()>>
+pub fn decdn_client::streamer::VerifiedReader::poll_read(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>, &mut tokio::io::read_buf::ReadBuf<'_>) -> core::task::poll::Poll<core::io::error::Result<()>>
 #[non_exhaustive] pub struct decdn_client::BlobTooLarge
 pub decdn_client::BlobTooLarge::ceiling: u64
 pub decdn_client::BlobTooLarge::reached: u64

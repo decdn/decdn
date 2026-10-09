@@ -211,7 +211,7 @@ pub fn decdn_protocol::dht::parse_store_request_ext(&[u8]) -> core::result::Resu
 pub mod decdn_protocol::framing
 pub enum decdn_protocol::framing::FrameError
 pub decdn_protocol::framing::FrameError::Decode(postcard::error::Error)
-pub decdn_protocol::framing::FrameError::Io(std::io::error::Error)
+pub decdn_protocol::framing::FrameError::Io(core::io::error::Error)
 pub decdn_protocol::framing::FrameError::TooLarge(u32)
 pub decdn_protocol::framing::FrameError::Varint
 pub const decdn_protocol::framing::MAX_MESSAGE_SIZE: u32
@@ -346,7 +346,7 @@ impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::dht::DhtMessage
 pub const decdn_protocol::dht::DhtMessage::VARIANT_COUNT: u32
 pub enum decdn_protocol::FrameError
 pub decdn_protocol::FrameError::Decode(postcard::error::Error)
-pub decdn_protocol::FrameError::Io(std::io::error::Error)
+pub decdn_protocol::FrameError::Io(core::io::error::Error)
 pub decdn_protocol::FrameError::TooLarge(u32)
 pub decdn_protocol::FrameError::Varint
 pub enum decdn_protocol::MessageValidationError

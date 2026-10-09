@@ -2,6 +2,7 @@ use super::*;
 use alloy::providers::ProviderBuilder;
 use alloy::providers::mock::Asserter;
 use alloy::sol_types::SolValue;
+use std::assert_matches;
 
 const PP: Address = Address::repeat_byte(0x9c);
 /// The deployment every test buys on: chain 1, contract [`PP`].
@@ -806,7 +807,7 @@ async fn a_reused_adopted_row_keeps_the_pools_redeemed_spend() {
             U256::from(1_500_000u64),
         )
         .unwrap();
-    assert!(matches!(outcome, AdvanceOutcome::Advanced));
+    assert_matches!(outcome, AdvanceOutcome::Advanced);
     assert_eq!(
         store.get_by_owner(owner).unwrap().unwrap().pool_spend(),
         U256::from(3_500_000u64)
@@ -1000,10 +1001,10 @@ async fn the_cli_funder_reads_the_run_funding() {
         working_deposit: U256::ZERO,
         ..funder
     };
-    assert!(matches!(
+    assert_matches!(
         delegated.recover(U256::ZERO).await,
         Ok(Recovery::Unavailable)
-    ));
+    );
 }
 
 /// Run a recovery step for a self-funded pool that already holds its working
@@ -1044,7 +1045,7 @@ async fn a_full_open_pool_settles_without_a_top_up() {
     let asserter = Asserter::new();
     asserter.push_success(&alloy::primitives::U64::from(50_000u64));
     let stepped = step_on_a_full_pool(asserter.clone()).await.unwrap();
-    assert!(matches!(stepped, Recovery::ToppedUp(d) if d == U256::from(WORKING)));
+    assert_matches!(stepped, Recovery::ToppedUp(d) if d == U256::from(WORKING));
     assert!(asserter.read_q().is_empty(), "only the estimate ran");
 }
 

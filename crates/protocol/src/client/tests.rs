@@ -1,5 +1,6 @@
 use super::*;
 use crate::framing::{decode_message, encode_message, read_frame, write_frame};
+use std::assert_matches;
 
 fn sample_body() -> StreamResponseBody {
     StreamResponseBody {
@@ -787,10 +788,10 @@ fn encode_chunk_frame_rejects_a_frame_past_max_message_size() {
     assert_eq!(chunk_frame_postcard_len(largest), max);
 
     let over = vec![0u8; largest + 1];
-    assert!(matches!(
+    assert_matches!(
         crate::client::encode_chunk_frame(&over),
         Err(MessageValidationError::ChunkTooLarge { frame_len }) if frame_len == max + 1
-    ));
+    );
 }
 
 #[tokio::test]
@@ -866,14 +867,14 @@ fn the_hot_path_encoders_reject_empty_and_oversized_frames() {
     let mut data_hdr = [0u8; CHUNK_DATA_HEADER_MAX];
     let mut frame_hdr = [0u8; CHUNK_FRAME_HEADERS_MAX];
 
-    assert!(matches!(
+    assert_matches!(
         encode_chunk_data_header(0, &mut data_hdr),
         Err(MessageValidationError::EmptyChunk)
-    ));
-    assert!(matches!(
+    );
+    assert_matches!(
         encode_chunk_frame_headers(0, &mut frame_hdr),
         Err(MessageValidationError::EmptyChunk)
-    ));
+    );
 
     // `MAX_MESSAGE_SIZE` is 2^24, whose payload varint is 4 bytes, so the header
     // is 5 and the largest frame that fits carries 5 fewer payload bytes.
@@ -885,14 +886,14 @@ fn the_hot_path_encoders_reject_empty_and_oversized_frames() {
 
     // One byte past it, both doors report the FRAME length they refused.
     let over = largest + 1;
-    assert!(matches!(
+    assert_matches!(
         encode_chunk_data_header(over, &mut data_hdr),
         Err(MessageValidationError::ChunkTooLarge { frame_len }) if frame_len == max + 1
-    ));
-    assert!(matches!(
+    );
+    assert_matches!(
         encode_chunk_frame_headers(over, &mut frame_hdr),
         Err(MessageValidationError::ChunkTooLarge { frame_len }) if frame_len == max + 1
-    ));
+    );
 }
 
 /// `chunk_frame_postcard_len` is the size gate `encode_chunk_frame` and
