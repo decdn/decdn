@@ -14,11 +14,11 @@ use std::num::NonZeroU64;
 
 /// How many blocks the persisted scan checkpoint is rewound before the
 /// resume backfill (#751), absorbing a shallow reorg between the last scanned
-/// block and the next boot: a `ChannelOpened` re-mined at a slightly different
+/// block and the next boot: a `PoolOpened` re-mined at a slightly different
 /// height after a reorg is still inside the rescanned window.
-/// `register_open_channel` is idempotent, so the only cost of the margin is a
-/// few extra blocks of `eth_getLogs`. Sized for the shallow reorgs of an
-/// Arbitrum-Sepolia-class L2.
+/// `PoolProjection::record_opened` is absolute and so idempotent, so the only
+/// cost of the margin is a few extra blocks of `eth_getLogs`. Sized for the
+/// shallow reorgs of an Arbitrum-Sepolia-class L2.
 ///
 /// The rewind applies only where a *durable* cursor is resumed — a
 /// `HeadMinusWindow` start re-derives its floor from head on every boot, so

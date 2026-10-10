@@ -877,14 +877,13 @@ pub struct DecdnMetrics {
     /// batch size. Operator-visible name:
     /// `decdn_redemption_reconcile_failures_total`.
     pub redemption_reconcile_failures: Counter,
-    /// Buyer-side reclaim-sweep attempts (`try_reclaim`) that failed — a failed
-    /// `getChannel`/`reclaimExpired` RPC, a receipt wait, an on-chain revert, or
-    /// a failed store write when clearing the local record after a reclaim/drop
-    /// (#906). Each is otherwise only a single `warn!` per hourly sweep; a
-    /// sustained rate means an expired channel's refundable deposit is not being
-    /// recovered (check the gas wallet / RPC). Pairs with the `error!`
-    /// escalation once the same channel fails `RECLAIM_ESCALATION_THRESHOLD`
-    /// consecutive sweeps. Operator-visible name:
+    /// Buyer-side reclaim-sweep passes (`reclaim_once`) that failed — a failed
+    /// buyer store read, a failed `getPool`/`reclaim` RPC, a receipt wait, an
+    /// on-chain revert, or a failed store write when clearing the local record
+    /// after a reclaim (#906). Each is otherwise only a single `warn!` per hourly
+    /// sweep; a sustained rate means a closed pool's residual is not being
+    /// recovered past its dispute deadline (check the gas wallet / RPC).
+    /// Operator-visible name:
     /// `decdn_buyer_reclaim_failures_total`.
     pub buyer_reclaim_failures: Counter,
     /// Buyer-pool rows omitted from a successful store hydration because
@@ -1130,14 +1129,14 @@ pub struct DecdnMetrics {
     pub node_region_latency_penalty: Counter,
     /// `decdn_node_pull_pool_open_failures_total` (#831): a buyer
     /// `open_or_reuse_pool` failed before a pull could start. This is the
-    /// node's own payment-side fault (gas, RPC, expired pool), NOT the
+    /// node's own payment-side fault (gas, RPC, buyer store), NOT the
     /// provider's — a sustained rate means node→node buying is wedged. This is
     /// the *unlabeled total* across all causes; the
     /// `pool_open_failures_*_total` family below (#966) breaks the
     /// `openPool`-tx failures out by cause so an operator can tell a
     /// misconfiguration (`insufficient_deposit`) from infrastructure
-    /// (`rpc_error`). It also covers store/expired-reclaim causes the by-reason
-    /// family does not, so the two are not expected to sum equal.
+    /// (`rpc_error`). It also covers store, watermark-read and capability-signing
+    /// causes the by-reason family does not, so the two are not expected to sum equal.
     ///
     /// **One failure moves this counter once.** A site increments it if and only
     /// if it marks the error `OpenReported`, which is what stops the classifier
@@ -2564,13 +2563,13 @@ impl Metrics {
         Ok(())
     }
 
-    /// Record a buyer `openChannel`-tx failure broken out by cause (#966): bumps
+    /// Record a buyer `openPool`-tx failure broken out by cause (#966): bumps
     /// the `decdn_pool_open_failures_{reason}_total` sibling counter for
     /// `reason`. Pairs with the structured `reason` field on the `warn!`/`debug!`
     /// in [`crate::node_origin`]. Distinct from
     /// [`Self::node_pull_pool_open_failure`], the unlabeled total (which also
-    /// counts store/expired-reclaim causes that never reach the `openChannel`
-    /// tx).
+    /// counts store, watermark-read and capability-signing causes that never reach
+    /// the `openPool` tx).
     pub fn pool_open_failure_by_reason(&self, reason: PoolOpenFailureReason) {
         match reason {
             PoolOpenFailureReason::InsufficientDeposit => {
@@ -3008,10 +3007,10 @@ recorders! {
     /// are submitted unchanged.
     redemption_reconcile_failure => redemption_reconcile_failures.inc();
 
-    /// A buyer-side reclaim-sweep attempt (`try_reclaim`) failed — an RPC/receipt
-    /// error, an on-chain revert, or a failed store write when clearing the local
-    /// record (#906). Pairs with the per-attempt `warn!` in `try_reclaim` and the
-    /// threshold `error!` in `reclaim_once`.
+    /// A buyer-side reclaim-sweep pass (`reclaim_once`) failed — a store read, an
+    /// RPC/receipt error, an on-chain revert, or a failed store write when
+    /// clearing the local record (#906). Pairs with the per-pass `warn!` in
+    /// `reclaim_once`.
     buyer_reclaim_failure => buyer_reclaim_failures.inc();
 
     /// Buyer-pool rows skipped as undecodable during one successful store

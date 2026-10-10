@@ -891,12 +891,12 @@ impl ClientHandler {
                 }
                 // Node-to-node cache-miss pull-through (#831). Fronting upstream
                 // USDC egress is privileged: gate it on the request PROVING
-                // ownership of the named channel — a verified client binding
-                // (`verified_client`) whose address is the channel's authorized
-                // client. Channel *existence* cannot gate spend (channel ids are
-                // public on-chain via `ChannelOpened`, so any leech could name
+                // ownership of the named pool — a verified client binding
+                // (`verified_client`) whose address is the pool's authorized
+                // signer. Pool *existence* cannot gate spend (pool ids are
+                // public on-chain via `PoolOpened`, so any leech could name
                 // one); only proven ownership can. An unbound request, or one
-                // for a channel it does not own, gets a plain `NotFound` and
+                // for a pool it does not own, gets a plain `NotFound` and
                 // cannot make this node spend — closing the proxy-abuse /
                 // griefing vector where an unpaid client drains the buyer
                 // deposit. (Multi-hop node→node pulls therefore require the

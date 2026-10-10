@@ -511,7 +511,7 @@ async fn build_infra(
     // the buyer handle built further below.
     let channel_state_store: Arc<dyn PoolStateStore> = concrete_channel_store.clone();
     // Debounce the scan-checkpoint writes (#784, keyed in #1092): each persisted
-    // watcher (settlement `ChannelOpened`, origin `Origin`) advances its cursor
+    // watcher (settlement `PoolOpened`, origin `Origin`) advances its cursor
     // once per completed `eth_getLogs` window — on the live tail, once per poll
     // tick with new confirmed blocks — and the directly-durable store fsyncs on
     // each. The persisted value is only a *floor* for the resume backfill
@@ -1431,7 +1431,7 @@ async fn build_chain_and_handlers(
     // this wallet carries a gapped nonce, sits unmined, and wedges the lane
     // until restart. `SimpleNonceManager` stores nothing — each send re-reads
     // the pending nonce — so a failed send can't gap the lane. The buyer
-    // provider below relies on this same property for the retried `reclaimExpired`.
+    // provider below relies on this same property for the retried `reclaim`.
     // `wallet_provider` was built above (the handler's admit-path pool-view shares
     // it); it moves into the service here.
     let (payment_service, settlement_route) = PoolSettlementService::bootstrap(
@@ -1644,14 +1644,15 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // insufficient gas) must not block the node's core seller function. Log and
     // continue with the buyer path disabled (and thus pull-through disabled).
     // Simple nonce management, for the reason given on the seller
-    // `wallet_provider` above (#904). It matters most here: `reclaimExpired` is
-    // *expected* to revert under host-clock-vs-chain skew and be retried, so a
-    // reverting send must not leak a cached nonce and wedge the buyer lane. This
-    // provider is shared across `approve`/`openChannel`/`topUp`/`reclaimExpired`
-    // and the reclaim sweep runs concurrently with opens, so correctness relies
-    // on `SimpleNonceManager` re-reading the pending nonce each send (a transient
-    // racing collision just gets a fresh nonce on the next attempt), not on the
-    // sends being strictly serialized.
+    // `wallet_provider` above (#904). It matters most here: `reclaim` can revert
+    // when its chain-head deadline pre-check races the deadline or the head read
+    // fails, and the next sweep retries it, so a reverting send must not leak a
+    // cached nonce and wedge the buyer lane. This provider is shared across
+    // `approve`/`openPool`/`topUp`/`reclaim` and the reclaim sweep runs
+    // concurrently with opens, so correctness relies on `SimpleNonceManager`
+    // re-reading the pending nonce each send (a transient racing collision just
+    // gets a fresh nonce on the next attempt), not on the sends being strictly
+    // serialized.
     let buyer_wallet_provider = ch
         .providers
         .buyer_wallet((*infra.eth_signer).clone(), ch.event_poll_interval);

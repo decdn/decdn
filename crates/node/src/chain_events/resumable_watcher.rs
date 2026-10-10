@@ -59,8 +59,8 @@ pub(crate) struct Checkpoint {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ColdStart {
     /// Start at **head**: nothing predates this node, so there is no history
-    /// worth replaying. Settlement `ChannelOpened` — a channel opened before the
-    /// node's keypair existed cannot be one of ours.
+    /// worth replaying. The settlement watcher — no `PoolRedeemed` toward this
+    /// node can predate the node itself.
     Head,
 }
 
@@ -73,7 +73,7 @@ pub(crate) enum CursorStart {
     Seeded { at: u64 },
     /// Resume from a durable checkpoint, rewound by `reorg_margin`, persisting
     /// forward each window. This is the only start that reads a checkpoint to
-    /// derive its floor (settlement `ChannelOpened`).
+    /// derive its floor (the settlement watcher's `PoolOpened` checkpoint).
     ///
     /// What a first-ever (cold-store) boot does is the caller's choice — see
     /// [`ColdStart`]. Getting that wrong is a correctness bug, not a tuning

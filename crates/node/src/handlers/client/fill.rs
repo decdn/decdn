@@ -11,9 +11,9 @@ impl ClientHandler {
     /// populate, window and buffered pull-through, #831) and the pre-spend floor
     /// reservation are gated on it. Authority needs a verified client
     /// binding whose recovered address is the lane's pinned `voucher_signer`.
-    /// Channel *existence* is public (on-chain `ChannelOpened`), so it cannot
+    /// Pool *existence* is public (on-chain `PoolOpened`), so it cannot
     /// authorize spend — only proof of *voucher authority* can, since only the
-    /// pinned signer can produce a voucher this channel will accept. An unbound
+    /// pinned signer can produce a voucher this pool will accept. An unbound
     /// request, or a binding that does not match that signer, must not make this
     /// node front upstream USDC or its own origin's egress.
     ///

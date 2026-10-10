@@ -8961,10 +8961,11 @@ async fn client_not_found_is_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **#327 / #527 idempotency guard.** A re-observed `ChannelOpened` (which the
-/// settlement watcher *will* replay after any RPC-error resubscription) must
-/// NOT reset an already-advanced voucher watermark via `register_lane` — doing
-/// so would reopen the replay window. Here the lane is already known with an
+/// **#327 / #527 idempotency guard.** A re-observed lane registration (the
+/// on-chain capability-registration consumer and the first-voucher capability
+/// intake both register the same lane) must NOT reset an already-advanced
+/// voucher watermark via `register_lane` — doing so would reopen the replay
+/// window. Here the lane is already known with an
 /// advanced watermark (hydrated from the store at construction); a fresh
 /// `register_lane` for the same [`LaneKey`] must be a no-op.
 #[tokio::test]

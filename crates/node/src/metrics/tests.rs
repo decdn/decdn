@@ -1588,7 +1588,7 @@ fn cache_metrics_handle_shares_atomic_with_registered_group() {
 
 #[test]
 fn pool_open_failures_by_reason_label_distinct_counters() {
-    // The three buyer `openChannel` failure classes (#966) must each land
+    // The three buyer `openPool` failure classes (#966) must each land
     // in their own `decdn_pool_open_failures_{reason}_total` sibling
     // counter — that label split is the whole point of the issue, so a
     // bump on one reason must NOT leak into another.

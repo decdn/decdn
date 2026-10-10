@@ -170,7 +170,7 @@ pub struct ClientFetchArgs {
     pub chain_id: Option<u64>,
 
     /// Path to the buyer's Ethereum keystore that signs vouchers and the
-    /// `openChannel` tx. Overrides `blockchain.eth_keystore`; when unset defaults
+    /// `openPool` tx. Overrides `blockchain.eth_keystore`; when unset defaults
     /// to `keystore.json` under the (client-scoped) data dir. Password from
     /// `$DECDN_KEYSTORE_PASSWORD`, else `--keystore-password-file`, else a TTY
     /// prompt.

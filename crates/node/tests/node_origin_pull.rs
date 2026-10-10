@@ -129,7 +129,7 @@ impl decdn_node::pool_view::PoolView for StubPoolView {
 }
 
 /// A buyer-channel opener that stands in for the chain-backed
-/// `BuyerChannelService`, so the test exercises the pull without a chain.
+/// `BuyerPoolService`, so the test exercises the pull without a chain.
 ///
 /// It also models the #852 persistence loop: [`PoolOpener::record_progress`]
 /// appends to `recorded`, and `open_or_reuse_pool` seeds the returned
@@ -236,13 +236,13 @@ struct FailingRecordOpener {
 }
 
 /// A [`PoolOpener`] whose open for `wedged` never completes within the caller's
-/// budget — the on-chain hazard #1143 exists for (an unresponsive RPC, a
-/// `ChannelOpened` tx that never mines). Every other provider opens instantly.
+/// budget — the on-chain hazard #1143 exists for (an unresponsive RPC, an
+/// `openPool` tx that never mines). Every other provider opens instantly.
 ///
 /// It ASSUMES the budget contract rather than testing it: it sleeps for `budget`
 /// and hands back the typed [`PoolOpenPending`], which is what the real service
 /// does — but because this body *re-implements* that behaviour, nothing here would
-/// notice if `BuyerChannelService::open_or_reuse_pool` stopped doing it. Scope
+/// notice if `BuyerPoolService::open_or_reuse_pool` stopped doing it. Scope
 /// this fixture to what it genuinely covers: `node_origin`'s candidate loop, i.e.
 /// that a pending open is metered, scores no reputation, and falls through to the
 /// next candidate. Returning the real sentinel (rather than a bare string) is what
@@ -2612,7 +2612,7 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
 /// This is the stage #1141/#1142 did *not* bound. Those fixed the stall once a
 /// candidate accepts a QUIC connection; `open_or_reuse_pool` runs BEFORE that,
 /// and was unbounded on both the buffered and window paths — so a candidate whose
-/// on-chain open wedges (an unresponsive RPC endpoint, an `openChannel` tx that
+/// on-chain open wedges (an unresponsive RPC endpoint, an `openPool` tx that
 /// never mines) consumed the caller's entire outer deadline, candidates #2..N were
 /// never reached, and the serve path refused a blob the honest fallback held. The
 /// old `PULL_THROUGH_OUTER_SLACK` doc conceded exactly this.
@@ -7212,9 +7212,10 @@ async fn build_node_b(
 /// default `64`.
 ///
 /// Each leaf is `(pool_id, funder, voucher_signer, deposit)`. The two address
-/// legs are distinct on purpose: an on-chain `openChannel` may pin a delegate
-/// `voucher_signer` that is not the funder, and the ADR 011 compliance gates key
-/// on the FUNDER. Passing the same address twice is the undelegated default.
+/// legs are distinct on purpose: the pool owner may authorize a delegate
+/// `voucher_signer` (ADR 003 § Capability delegation) that is not the funder,
+/// and the ADR 011 compliance gates key on the FUNDER. Passing the same address
+/// twice is the undelegated default.
 ///
 /// `content_deny` wires B's ADR 011 deny-set. `None` means "deny nothing" (the
 /// steady state for every other caller); a shared `Arc` lets a test flip an entry

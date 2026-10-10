@@ -87,15 +87,15 @@ pub const PROBE_EARLY_EXIT_CANDIDATES: usize = MAX_PROVIDER_ATTEMPTS;
 pub const PULL_THROUGH_OUTER_SLACK: Duration =
     PROBE_TIMEOUT.saturating_add(DEFAULT_ROUND_TIMEOUT.saturating_mul(MAX_LOOKUP_ROUNDS));
 
-/// How long a pull is willing to WAIT on a buyer-channel open before giving up on
+/// How long a pull is willing to WAIT on a buyer-pool open before giving up on
 /// that candidate — not how long the open itself is allowed to take (#1143).
 ///
-/// The `openChannel` runs in a detached task that owns the tx, so a
-/// caller that stops waiting costs nothing: the open continues, the channel lands,
+/// The `openPool` runs in a detached task that owns the tx, so a
+/// caller that stops waiting costs nothing: the open continues, the pool lands,
 /// and the next pull to that provider reuses it. What the caller buys by waiting is
-/// only the chance to use the channel on *this* pull. That makes a short budget the
+/// only the chance to use the pool on *this* pull. That makes a short budget the
 /// right trade — a cache miss must fall through to another candidate in seconds,
-/// while an `openChannel` may legitimately need minutes to mine on a slow L2.
+/// while an `openPool` may legitimately need minutes to mine on a slow L2.
 ///
 /// Deliberately much smaller than `cache.node_pull_timeout_sec`: the channel open, the
 /// stream open, and the streaming stage are SEQUENTIAL stages of one candidate attempt,

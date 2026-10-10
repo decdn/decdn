@@ -32,14 +32,16 @@
 //! Arbitrum-Sepolia-class L2 and is the single place that claim lives), and
 //! because the sinks holding an authoritative on-chain enumeration source
 //! re-read it and self-heal. The one without one is where an orphan sticks:
-//! settlement's `register_open_channel` (durable — an fsynced phantom channel,
-//! reclaimed only by the expiry sweep). It predates #1227 and is unchanged by
-//! it — deleting an always-zero field cannot alter what a lag never did.
+//! settlement's pool projection (`PoolProjection::record_opened`) — an orphaned
+//! `PoolOpened` leaves a phantom pool in memory until the next restart, and the
+//! on-chain `redeem` is the backstop for anything served against it. It predates
+//! #1227 and is unchanged by it — deleting an always-zero field cannot alter what
+//! a lag never did.
 //!
 //! For the settlement watcher specifically, a lag also carries a concrete cost,
 //! which is what makes zero an active choice there rather than an inherited one:
-//! it would delay channel registration, so a client's first request on a
-//! freshly-opened channel would be rejected as unknown.
+//! it would delay the pool projection, so a client's first request on a
+//! freshly-opened pool would miss it and pay a `getPool` read on admission.
 //!
 //! If a future chain needs a lag, reintroduce it as a config knob with a
 //! **non-zero default and a test asserting a live production config engages
@@ -95,17 +97,16 @@ pub(crate) const DEFAULT_RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// **Every** chain read on a watcher's path routes through here: the loop's own
 /// `get_logs`, `shared_head`'s `get_block_number`, and each follow-up RPC a
 /// [`resumable_watcher::LogSink`] issues from `apply` / `on_tick_complete`
-/// (`getChannel`, `getOrigins`, `nodeIdOf`, `get_block`,
-/// `isHashBlacklistedForOperator`). This is not automatic — the loop cannot see
-/// a sink's own reads, so a *new* sink read that does not wrap itself here
-/// reintroduces the wedge this exists to prevent: the alloy HTTP provider has no
-/// request timeout, so a provider that holds the connection open and never
-/// responds stalls the tick forever, with no backoff, no metric, and no
-/// graceful-shutdown path.
+/// (`getOrigins`, `nodeIdOf`, `get_block`, `isHashBlacklistedForOperator`).
+/// This is not automatic — the loop cannot see a sink's own reads, so a *new*
+/// sink read that does not wrap itself here reintroduces the wedge this exists
+/// to prevent: the alloy HTTP provider has no request timeout, so a provider
+/// that holds the connection open and never responds stalls the tick forever,
+/// with no backoff, no metric, and no graceful-shutdown path.
 ///
 /// This helper guarantees only that a call is *bounded*. What a timeout **means**
 /// is the call site's decision, and each documents its own — the two watcher shapes
-/// being fail-the-tick-and-back-off (`getChannel`, origin's `getOrigins`) and
+/// being fail-the-tick-and-back-off (origin's `getOrigins`) and
 /// degrade-and-continue (`slash`'s `get_block`, the registry's `nodeIdOf`,
 /// origin's `nodeIdOf`). The serve-admission reads in `ResolvingPoolView`
 /// (`getPool`, `getAuthorization`) refuse the request.

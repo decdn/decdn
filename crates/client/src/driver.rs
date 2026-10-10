@@ -51,7 +51,7 @@
 //!   file belongs to another blob": there is no foreign-partial ambiguity to
 //!   resolve, and resume is always driven by the verified present set.
 //! - No **progress reporting, deadlines, or durable watermark persistence** to a
-//!   `BuyerChannelStore` — these are the caller's job. The acked watermark lives
+//!   `BuyerPoolStore` — these are the caller's job. The acked watermark lives
 //!   in the [`PoolLedger`] the caller owns; persisting it across process restarts,
 //!   and drawing a progress bar, are CLI concerns.
 //!

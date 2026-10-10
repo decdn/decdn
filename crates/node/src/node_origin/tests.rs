@@ -157,13 +157,13 @@ fn failure_reason_survives_context_wrapping() {
         // Approximate the real chain: a base error, the kernel's typed
         // reason, then the caller's wrapping `.context` layers. The exact
         // ordering differs from the submit path — there the kernel attaches
-        // the reason *after* its own `.context("submit openChannel")` — but
+        // the reason *after* its own `.context("submit openPool")` — but
         // `downcast_ref` walks the whole chain irrespective of layer order,
         // which is exactly what this test pins down.
-        let err = anyhow::anyhow!("openChannel send failed: transport down")
+        let err = anyhow::anyhow!("openPool send failed: transport down")
             .context(reason)
-            .context("submit openChannel")
-            .context("persist newly-opened buyer channel");
+            .context("submit openPool")
+            .context("persist newly-opened buyer pool");
         let recovered = err.downcast_ref::<PoolOpenFailureReason>().copied();
         assert_eq!(
             recovered,
