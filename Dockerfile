@@ -29,7 +29,13 @@
 # digest, so linux/amd64 and linux/arm64 both resolve from it.
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS base
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# `upgrade` applies the security fixes the pinned base predates. Debian
+# publishes them to bookworm-security well before it rebuilds `bookworm-slim`,
+# so the digest alone ships known-fixed CVEs that the weekly Trivy image scan
+# fails on. The release build runs this layer uncached, so every release takes
+# the security updates current at build time.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
       ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
