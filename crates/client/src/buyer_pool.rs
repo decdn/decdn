@@ -442,7 +442,8 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 ///
 /// # Errors
 ///
-/// Fails on `openPool` submit/receipt, a reverted tx, a missing `PoolOpened`
+/// Fails on the pending-nonce read (nothing sent, so no [`OpenUnconfirmed`]),
+/// `openPool` submit/receipt, a reverted tx, a missing `PoolOpened`
 /// event in the receipt logs, or a capability-signing error. The classified
 /// failure legs attach a [`PoolOpenFailureReason`] into the `anyhow` error chain
 /// (recover it with `err.downcast_ref::<PoolOpenFailureReason>()`) so a caller
@@ -461,14 +462,26 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// flight would escrow a second deposit against a pool the first tx is still
 /// going to mine. So while an `openPool` is outstanding, the only safe thing is
 /// to keep waiting; the node calls this inside a detached task that holds the
-/// owner's open slot for exactly as long as this future runs (#1143).
+/// owner's open slot while this future runs, and after it while the open is
+/// unconfirmed (#1143, #2415).
 ///
 /// The wait ends early only when the receipt read itself fails. That error
 /// names the broadcast tx, which may still mine and escrow the deposit. The
-/// error is classified [`PoolOpenFailureReason::RpcError`]. Reconciling the tx
-/// before another open is the caller's responsibility. The broadcast is also
-/// logged at `info` before the wait, so a caller that drops this future still
-/// leaves the hash in the log.
+/// error is classified [`PoolOpenFailureReason::RpcError`] and carries an
+/// [`OpenUnconfirmed`] with the hash and nonce. A submit that fails in
+/// transport ([`decdn_incentive::tx::send_broadcast_unknown`]) carries one too,
+/// with the nonce and no hash. The caller must resolve that transaction before
+/// it sends another `openPool`, and hands a receipt it reads later to
+/// [`opened_from_receipt`]. The broadcast is also logged at `info` before the
+/// wait, so a caller that drops this future still leaves the hash in the log.
+///
+/// # The nonce is explicit
+///
+/// `open_pool` reads `owner`'s pending nonce and sends the `openPool` with it,
+/// so an unconfirmed open names the nonce it holds. The provider's own nonce
+/// manager does not see that nonce, so `contract`'s provider must read the
+/// pending nonce on every send (alloy's `with_simple_nonce_management`), as for
+/// [`top_up`].
 pub async fn open_pool<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     signer: Arc<PrivateKeySigner>,
@@ -483,9 +496,18 @@ pub async fn open_pool<P: Provider + Clone>(
         contract.address(),
         deployment.payment_pool
     );
-    let voucher_domain = deployment.voucher_domain();
+    let amount = to_pool_u64(deposit, "deposit")?;
+    let nonce = contract
+        .provider()
+        .get_transaction_count(owner)
+        .pending()
+        .await
+        .context("read the pending nonce for openPool")
+        .context(PoolOpenFailureReason::RpcError)?;
     let pending = match contract
-        .openPool(to_pool_u64(deposit, "deposit")?)
+        .openPool(amount)
+        .from(owner)
+        .nonce(nonce)
         .send()
         .await
     {
@@ -496,9 +518,14 @@ pub async fn open_pool<P: Provider + Clone>(
             // revert data attached; a send error *without* revert data is a
             // transport/RPC fault.
             let reason = PoolOpenFailureReason::classify_revert_data(err.as_revert_data().as_ref());
-            return Err(anyhow::Error::new(err))
-                .context("submit openPool")
-                .context(reason);
+            // A transport failure may have reached the node and broadcast the
+            // `openPool` before the response was lost.
+            let broadcast_unknown = decdn_incentive::tx::send_broadcast_unknown(&err);
+            let mut err = anyhow::Error::new(err).context("submit openPool");
+            if broadcast_unknown {
+                err = err.context(OpenUnconfirmed { tx: None, nonce });
+            }
+            return Err(err.context(reason));
         }
     };
     // Capture the hash before `get_receipt` consumes `pending`: past this point
@@ -513,8 +540,38 @@ pub async fn open_pool<P: Provider + Clone>(
             .context(format!(
                 "await openPool receipt (tx {tx:#x}; it may still mine and escrow the deposit)"
             ))
+            .context(OpenUnconfirmed {
+                tx: Some(tx),
+                nonce,
+            })
             .context(PoolOpenFailureReason::RpcError)
     })?;
+    opened_from_receipt(&receipt, tx, signer, deployment, token, owner, deposit)
+}
+
+/// Build the [`OpenedPool`] an `openPool` tx bought, from its mined `receipt`.
+///
+/// [`open_pool`] calls this once its receipt arrives. A caller that holds an
+/// [`OpenUnconfirmed`] calls it with the receipt it read later, so a pool
+/// whose first receipt read failed is tracked like any other. `deposit` is the
+/// amount the open requested; the returned state records what the contract
+/// credited.
+///
+/// # Errors
+///
+/// The tx reverted ([`PoolOpenFailureReason::ContractRevert`]), the receipt
+/// holds no `PoolOpened` event for `owner` (the deposit is escrowed but
+/// untracked; logged here), or the self capability could not be signed.
+pub fn opened_from_receipt(
+    receipt: &alloy::rpc::types::TransactionReceipt,
+    tx: TxHash,
+    signer: Arc<PrivateKeySigner>,
+    deployment: Deployment,
+    token: Address,
+    owner: Address,
+    deposit: U256,
+) -> Result<OpenedPool> {
+    let voucher_domain = deployment.voucher_domain();
     if !receipt.status() {
         // A mined revert: the reason is not recoverable from the receipt (no
         // trace), so it folds into `ContractRevert`.
@@ -599,6 +656,85 @@ const SELF_CAPABILITY_EXPIRY: u64 = u64::MAX;
 #[doc(hidden)]
 pub const SELF_CAPABILITY_CAP: u64 = u64::MAX;
 
+/// Typed marker on an [`open_pool`] error raised when the `openPool` may have
+/// been broadcast but is not known to have mined: its submit failed in
+/// transport, or it was broadcast and its receipt could not be read. The
+/// transaction may still mine and escrow the deposit, so a caller must resolve
+/// it before it sends another `openPool`. Recover it with
+/// `err.downcast_ref::<OpenUnconfirmed>()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenUnconfirmed {
+    /// The broadcast `openPool` transaction. `None` when the submit failed in
+    /// transport: the RPC node may have broadcast the transaction without
+    /// returning its hash.
+    pub tx: Option<TxHash>,
+    /// The nonce the `openPool` was sent with. Once the account's confirmed
+    /// nonce passes it, the `openPool` has either mined or can never mine.
+    pub nonce: u64,
+}
+
+impl std::fmt::Display for OpenUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.tx {
+            Some(tx) => write!(
+                f,
+                "openPool tx {tx} (nonce {n}) was broadcast but its receipt was not read, so it \
+                 may have mined and escrowed the deposit. An open sent before the tx confirms \
+                 or the account's nonce passes {n} escrows a second deposit; `decdn pool list` \
+                 shows the pools this account holds",
+                n = self.nonce
+            ),
+            None => write!(
+                f,
+                "openPool submit (nonce {n}) failed in transport, so the RPC node may have \
+                 broadcast it and it may mine. An open sent before the account's nonce passes \
+                 {n} escrows a second deposit; `decdn pool list` shows the pools this account \
+                 holds",
+                n = self.nonce
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OpenUnconfirmed {}
+
+/// Send `openPool(deposit)` from `owner` at exactly `nonce`, and return its
+/// hash without waiting for a receipt.
+///
+/// A caller resolving an [`OpenUnconfirmed`] whose nonce no transaction holds
+/// re-sends with that same nonce. Two transactions at one nonce cannot both
+/// mine, so the re-send and a first open that resurfaces escrow at most one
+/// deposit between them. A receipt wait here would never end if the other
+/// transaction took the nonce, so the caller reads receipts itself.
+///
+/// # Errors
+///
+/// The deposit overflows `uint64`, or the send fails. A send failure carries a
+/// [`PoolOpenFailureReason`] classified from its revert data.
+pub async fn send_open_pool<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    owner: Address,
+    deposit: U256,
+    nonce: u64,
+) -> Result<TxHash> {
+    let amount = to_pool_u64(deposit, "deposit")?;
+    match contract
+        .openPool(amount)
+        .from(owner)
+        .nonce(nonce)
+        .send()
+        .await
+    {
+        Ok(pending) => Ok(*pending.tx_hash()),
+        Err(err) => {
+            let reason = PoolOpenFailureReason::classify_revert_data(err.as_revert_data().as_ref());
+            Err(anyhow::Error::new(err)
+                .context(format!("re-send openPool at nonce {nonce}"))
+                .context(reason))
+        }
+    }
+}
+
 /// Typed marker attached to a `top_up` submit error whose revert is an
 /// `ERC20InsufficientAllowance` shortfall: the `PaymentPool`'s standing USDC
 /// allowance is below the transfer amount. The node's `fund_pool` downcasts
@@ -625,7 +761,7 @@ impl std::error::Error for AllowanceShortfall {}
 /// moved while no local record credits it. A caller must not treat it as
 /// "nothing escrowed"; the acquire loop classifies it as fatal to the command
 /// ([`crate::Fault::Fatal`]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TopUpUnconfirmed {
     /// The broadcast `topUp` transaction, which an operator reconciles
     /// against. `None` when the submit failed in transport: the RPC node may

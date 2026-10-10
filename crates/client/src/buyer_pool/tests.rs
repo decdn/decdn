@@ -1,7 +1,7 @@
 use super::{
-    AllowanceShortfall, LOW_WATER_DIVISOR, PaymentPool, TopUpUnconfirmed, approval_floor,
-    approve_decision, escrowed_but_untracked, grade_deposit_credit, issue_self_capability,
-    open_pool, pool_accepts_funds, refill_amount, top_up,
+    AllowanceShortfall, LOW_WATER_DIVISOR, OpenUnconfirmed, PaymentPool, TopUpUnconfirmed,
+    approval_floor, approve_decision, escrowed_but_untracked, grade_deposit_credit,
+    issue_self_capability, open_pool, pool_accepts_funds, refill_amount, send_open_pool, top_up,
 };
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, TxHash, U256};
@@ -67,19 +67,14 @@ async fn a_transport_failed_top_up_submit_is_unconfirmed_with_its_nonce() {
     assert!(format!("{err:#}").contains("nonce 5"), "{err:#}");
 }
 
-/// An `openPool` whose receipt cannot be read may still escrow its deposit, so
-/// the error names its tx hash and is classified as an RPC fault (#2413).
-#[tokio::test]
-async fn an_unreadable_open_pool_receipt_names_the_tx() {
-    let hash = B256::repeat_byte(0xab);
-    let asserter = alloy::providers::mock::Asserter::new();
-    asserter.push_success(&hash);
+/// Run [`open_pool`] against a mocked pool whose RPC calls `asserter` answers.
+async fn open_on(asserter: alloy::providers::mock::Asserter) -> anyhow::Error {
     let contract = mocked_pool(asserter);
     let deployment = decdn_incentive::Deployment {
         chain_id: CHAIN_ID,
         payment_pool: *contract.address(),
     };
-    let err = open_pool(
+    open_pool(
         &contract,
         std::sync::Arc::new(PrivateKeySigner::random()),
         deployment,
@@ -88,15 +83,89 @@ async fn an_unreadable_open_pool_receipt_names_the_tx() {
         U256::from(1_000u64),
     )
     .await
-    .unwrap_err();
+    .unwrap_err()
+}
+
+/// An `openPool` whose receipt cannot be read may still escrow its deposit, so
+/// the error names its tx hash and nonce and is classified as an RPC fault
+/// (#2413, #2415).
+#[tokio::test]
+async fn an_unreadable_open_pool_receipt_names_the_tx() {
+    let hash = B256::repeat_byte(0xab);
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&U256::from(5u64));
+    asserter.push_success(&hash);
+    let err = open_on(asserter).await;
     assert!(
         format!("{err:#}").contains(&format!("{hash:#x}")),
         "{err:#}"
     );
     assert_eq!(
+        err.downcast_ref::<OpenUnconfirmed>(),
+        Some(&OpenUnconfirmed {
+            tx: Some(hash),
+            nonce: 5
+        })
+    );
+    assert_eq!(
         err.downcast_ref::<decdn_incentive::PoolOpenFailureReason>(),
         Some(&decdn_incentive::PoolOpenFailureReason::RpcError)
     );
+}
+
+/// An `openPool` submit that fails in transport may have been broadcast, so it
+/// carries [`OpenUnconfirmed`] with no hash and the nonce it was sent with.
+#[tokio::test]
+async fn a_transport_failed_open_pool_submit_is_unconfirmed_with_its_nonce() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&U256::from(5u64));
+    let err = open_on(asserter).await;
+    assert_eq!(
+        err.downcast_ref::<OpenUnconfirmed>(),
+        Some(&OpenUnconfirmed { tx: None, nonce: 5 })
+    );
+    assert_eq!(
+        err.downcast_ref::<decdn_incentive::PoolOpenFailureReason>(),
+        Some(&decdn_incentive::PoolOpenFailureReason::RpcError)
+    );
+}
+
+/// A re-sent `openPool` returns its hash without waiting for a receipt, and
+/// a rejected one carries no [`OpenUnconfirmed`]: the caller already holds the
+/// nonce it re-sent at.
+#[tokio::test]
+async fn send_open_pool_returns_the_hash_without_a_receipt_wait() {
+    let hash = B256::repeat_byte(0xcd);
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&hash);
+    asserter.push_failure_msg("nonce too low");
+    let contract = mocked_pool(asserter.clone());
+    let owner = Address::repeat_byte(0x22);
+    let deposit = U256::from(1_000u64);
+    assert_eq!(
+        send_open_pool(&contract, owner, deposit, 5).await.unwrap(),
+        hash
+    );
+    let err = send_open_pool(&contract, owner, deposit, 5)
+        .await
+        .unwrap_err();
+    assert!(err.downcast_ref::<OpenUnconfirmed>().is_none(), "{err:#}");
+    assert!(format!("{err:#}").contains("nonce 5"), "{err:#}");
+    assert!(
+        asserter.read_q().is_empty(),
+        "one send each, no receipt read"
+    );
+}
+
+/// An `openPool` submit the RPC node rejects broadcast nothing, so it carries
+/// no [`OpenUnconfirmed`] and the next open may go ahead.
+#[tokio::test]
+async fn a_rejected_open_pool_submit_is_not_unconfirmed() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&U256::from(5u64));
+    asserter.push_failure_msg("insufficient funds for gas");
+    let err = open_on(asserter).await;
+    assert!(err.downcast_ref::<OpenUnconfirmed>().is_none(), "{err:#}");
 }
 
 /// A `topUp` submit the RPC node rejects broadcast nothing, so it carries

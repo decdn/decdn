@@ -405,6 +405,25 @@ pub async fn enumerate_owned_pools<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
+    enumerate_owned_pools_at(contract, owner, alloy::eips::BlockId::latest()).await
+}
+
+/// [`enumerate_owned_pools`] as of block `at`. Every page reads the same
+/// block, so the list is one chain state even when a load-balanced RPC routes
+/// each page to a different backend. A backend that has not reached `at`
+/// fails the read rather than answering from an older state.
+///
+/// # Errors
+///
+/// Errors if any page read fails, naming the offset that failed.
+pub async fn enumerate_owned_pools_at<P>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    owner: alloy::primitives::Address,
+    at: alloy::eips::BlockId,
+) -> anyhow::Result<Vec<crate::lane::PoolId>>
+where
+    P: alloy::providers::Provider + Clone,
+{
     use alloy::primitives::U256;
 
     let mut ids = Vec::new();
@@ -413,6 +432,7 @@ where
         let page = contract
             .getPools(owner, U256::from(offset), U256::from(OWNED_POOLS_PAGE))
             .call()
+            .block(at)
             .await
             .map_err(|e| {
                 anyhow::Error::new(e).context(format!("getPools(offset={offset}) failed"))

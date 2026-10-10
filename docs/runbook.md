@@ -596,6 +596,23 @@ It is read-only, so it is not refused on a node's data dir the way `close --all`
 is. When the two views disagree, believe the chain: the disagreement is the
 diagnostic.
 
+**`decdn_buyer_pool_open_unresolved` at 1 means the node holds its pool open for
+an `openPool` it could not confirm.** The submit failed in transport, or the
+receipt read failed, so the transaction may still mine. The node opens no second
+pool until the chain resolves it, and every cache miss that needs a pool is
+refused as a local fault meanwhile. The node re-reads the chain every 5 s: a
+receipt, or the account's nonce passing the open's, ends the wait. A nonce that
+no transaction holds gets a fresh `openPool` at that same nonce, so at most one
+of them escrows. `still holding the open slot for an unconfirmed openPool`
+repeats every minute with the elapsed time and the last thing the chain said. A
+gauge that stays at 1 means the RPC cannot answer, a pending transaction from
+this key holds the open's nonce or an earlier one, or every re-send at that
+nonce fails because the wallet cannot fund the deposit or the gas, or the
+contract refuses the open. Read `last` in the repeating warning, then fix the
+RPC, let that transaction mine, or fund the wallet. Do not restart to clear it:
+a restart forgets the wait, and a transaction that mines after the restart is a
+deposit the node does not track until the next restart adopts or reports it.
+
 1. Run `decdn node pools`, and `decdn pool list --all` beside it. The first
    reports every pool the daemon tracks, its deposit, and the per-lane amounts
    already signed away; the second reports every pool the wallet owns on chain.

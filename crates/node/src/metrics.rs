@@ -457,6 +457,18 @@ pub struct DecdnMetrics {
     /// `decdn_buyer_wallet_usdc`: the two together are what distinguishes "no
     /// pool to adopt" from "could not look".
     pub buyer_pool_adoption_failures: Counter,
+    /// `decdn_buyer_pool_open_unresolved`: 1 while this node holds its buyer
+    /// pool open for an `openPool` whose outcome the chain has not resolved.
+    ///
+    /// The submit or the receipt read of that `openPool` failed, and the
+    /// transaction may still mine, so the node opens no second pool until the
+    /// chain shows the outcome. Every cache miss that needs a pool meanwhile is
+    /// refused as a local fault. A value that stays at 1 means the chain lane
+    /// cannot answer, a pending transaction holds the open's nonce or an
+    /// earlier one, or every
+    /// re-send at that nonce fails: the wallet cannot fund the deposit or the
+    /// gas, or the contract refuses the open.
+    pub buyer_pool_open_unresolved: Gauge,
     /// Total raw USDC this node holds in accepted vouchers that it has not yet
     /// redeemed on-chain — the sum of `owed − paid` across every inbound lane
     /// the redeemer plans to collect. Refreshed once per redeemer self-tick
@@ -2527,6 +2539,12 @@ impl Metrics {
     /// a payment pool.
     pub(crate) fn buyer_pool_adoption_failure(&self) {
         self.decdn.buyer_pool_adoption_failures.inc();
+    }
+
+    /// Publish whether the buyer pool open is held for an unconfirmed
+    /// `openPool`.
+    pub(crate) fn set_buyer_pool_open_unresolved(&self, held: bool) {
+        self.decdn.buyer_pool_open_unresolved.set(i64::from(held));
     }
 
     /// Register iroh's transport metrics under the `decdn_iroh_` prefix so
