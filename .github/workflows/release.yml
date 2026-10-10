@@ -699,8 +699,10 @@ jobs:
       # version as `latest` after promotion and deleting it to tidy up would
       # delete the released image.
       #
-      # The cache scope is per image: both legs write the gha cache at once,
-      # and a shared scope would let one leg's export overwrite the other's.
+      # No layer cache. The base stage's `apt-get upgrade` must run on every
+      # release to pick up current security fixes, and a cached layer would
+      # replay a stale one for as long as the base digest is unchanged. The
+      # other layers copy this release's fresh binaries and never hit a cache.
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v7
@@ -711,8 +713,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.target }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+          no-cache: true
 
       # Scanned by digest in the release package — the untagged manifest is
       # already there, it just has no tag pointing at it yet.
