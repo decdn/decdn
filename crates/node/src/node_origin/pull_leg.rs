@@ -76,7 +76,7 @@ use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::NodeId as DhtNodeId;
 use crate::handlers::client::PROOF_WAIT_CEILING;
 use crate::runtime::QUIC_MAX_IDLE_TIMEOUT;
-use crate::selection::{CHANNEL_OPEN_CALLER_BUDGET, Candidate, MAX_PROVIDER_ATTEMPTS};
+use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, POOL_OPEN_CALLER_BUDGET};
 use decdn_client::{
     PoolContext, PullDeadlines, open_progressive_pull as open_progressive_upstream,
 };
@@ -558,7 +558,7 @@ async fn spanning_cached_candidates(
 }
 
 impl NodeOrigin {
-    /// Discover, probe, rank, and open a channel to the best available provider for
+    /// Discover, probe, rank, and open a lane to the best available provider for
     /// `hash`, returning the bound [`PullLegTarget`] (with the upstream `total_bytes`)
     /// the orchestration hands to [`run_pull_leg`].
     ///
@@ -734,7 +734,7 @@ impl NodeOrigin {
         }
     }
 
-    /// Resolve, open/reuse a channel, bind (#1117), and run the header handshake
+    /// Resolve, open/reuse a lane, bind (#1117), and run the header handshake
     /// against one candidate, the `candidate_ix`-th ranked; return the committed
     /// `total_bytes` and, when the handshake opened the pull leg's first leg, that
     /// live pull. Any holder — partial or whole — signs the same whole-blob
@@ -781,7 +781,7 @@ impl NodeOrigin {
             };
         let ctx = match deps
             .buyer
-            .open_or_reuse_pool(provider_addr, CHANNEL_OPEN_CALLER_BUDGET)
+            .open_or_reuse_pool(provider_addr, POOL_OPEN_CALLER_BUDGET)
             .await
         {
             Ok(ctx) => ctx,
@@ -894,7 +894,7 @@ impl NodeOrigin {
         // The header handshake: open a range to read the committed `total_bytes`,
         // then abort: no `next_chunk`, so no bytes are pulled and no voucher is
         // paid, and the ledger watermark is unchanged. The actual range-minimized
-        // pull re-opens per gap via `PeerSource` on this same (now cached) channel.
+        // pull re-opens per gap via `PeerSource` on this same (now cached) lane.
         // The range lies in a block the candidate advertised, so a partial holder
         // answers from what it holds; asked for bytes it lacks, a holder that pulls
         // through starts its own pull for them, and partial holders asking each
@@ -1187,7 +1187,7 @@ fn assembly_result(
 
 /// The real [`RunSink`]: opens one buyer lane per planned run, drives it with
 /// [`drive`], scores the provider, and persists the lane watermark. All the
-/// per-run buyer state (channel context, voucher ledger, funder, source) is built
+/// per-run buyer state (pool context, voucher ledger, funder, source) is built
 /// INSIDE `drive_run` — one lane per run — while the store, pacer, and demand
 /// window it borrows from the fields are SHARED across every run.
 struct PeerRunSink<'a> {
@@ -1458,7 +1458,7 @@ impl PeerRunSink<'_> {
         let ctx = match self
             .deps
             .buyer
-            .open_or_reuse_pool(provider_addr, CHANNEL_OPEN_CALLER_BUDGET)
+            .open_or_reuse_pool(provider_addr, POOL_OPEN_CALLER_BUDGET)
             .await
         {
             Ok(ctx) => ctx,
@@ -1511,7 +1511,7 @@ impl PeerRunSink<'_> {
             Err(_) => run.len,
         };
 
-        // Per-lane #852 settle: persist THIS channel's watermark on every exit —
+        // Per-lane #852 settle: persist THIS lane's watermark on every exit —
         // clean run, terminal drive error, or a cooperative cancel — after `drive`
         // below stops advancing the shared ledger.
         let _settle = SettleOnDrop {
@@ -1760,7 +1760,7 @@ fn local_bookkeeping_ctx() -> PoolContext {
 /// drained wire (at amount 0). We hand `drive` that SAME ledger ([`BackendSource::ledger`])
 /// plus a benign [`local_bookkeeping_ctx`], so the completion
 /// counter the source moves is the one the gap loop reads. This is NOT payment — no
-/// channel, no voucher, no chain, no counterparty; see the [`BackendSource`] module
+/// lane, no voucher, no chain, no counterparty; see the [`BackendSource`] module
 /// docs.
 ///
 /// The downstream [`RampPacer`] is KEPT (bound on `served_paid`): the pull still

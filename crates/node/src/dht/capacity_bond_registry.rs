@@ -38,7 +38,7 @@
 //!   false` but is still payable, so its binding must survive.
 //! - `regions`, the reverse map, and the dial-address directory are likewise
 //!   unfiltered: liveness is applied separately at read time via the shared
-//!   `StakerSet`, and an inactive node stays dialable for channel settlement.
+//!   `StakerSet`, and an inactive node stays dialable for lane settlement.
 //!
 //! # Fatality
 //!
@@ -456,7 +456,7 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
                 match CapacityBond::NodeAutoEjected::decode_log_data(&log.inner.data) {
                     // Deactivates WITHOUT clearing the binding: ejection flips
                     // `isActive` only, and the operator may still be owed payment
-                    // on an open channel.
+                    // on an open lane.
                     Ok(event) => {
                         let node_id = NodeId::from(event.nodeId.0);
                         apply_change(&self.active, &self.metrics, StakerChange::Inactive(node_id));

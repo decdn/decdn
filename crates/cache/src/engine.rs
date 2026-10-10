@@ -3659,7 +3659,7 @@ impl CacheEngine {
     /// Like [`Self::populate`], but restricted to the node's OWN configured
     /// origins (fs/http/s3): the `Peer` node→node origin is never consulted, so
     /// this fronts no upstream USDC (#1116). The serve path uses it to
-    /// reactively fill from a local origin a blob a paying, channel-owning
+    /// reactively fill from a local origin a blob a paying, lane-authorized
     /// client asked for — independent of `node_to_node_pull_through_enabled` —
     /// and to prefer a local origin over the paid peer window path. A hit is a
     /// no-op; absence from every local origin surfaces `NotFound`, and a chain

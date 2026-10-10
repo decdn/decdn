@@ -32,7 +32,7 @@ fn an_unprovisioned_origin_refuses_no_whole_blob_request() {
 }
 
 /// The wedge is a FIXED [`WEDGED_PROVIDER_SUPPRESSION_SECS`] window measured from the
-/// rejection, not a channel deadline — the buyer pool is shared across every provider and
+/// rejection, not a lane deadline — the buyer pool is shared across every provider and
 /// carries no per-provider expiry to key one on. Round-trips the write and the read halves
 /// so the horizon's DERIVATION is pinned, not just its comparison: nothing else in the
 /// workspace distinguishes 3600s from any other future instant, because both integration
@@ -443,7 +443,7 @@ fn an_under_fold_rejection_is_a_dead_lane() {
 /// an `OurLocalFault` (which would tar the peer for our own funding gap). A top-up
 /// and retry is the fix, which is exactly what `OurVoucherRetryable` drives.
 #[test]
-fn a_pool_exhaustion_is_a_retryable_topup_not_a_dead_channel() {
+fn a_pool_exhaustion_is_a_retryable_topup_not_a_dead_lane() {
     assert_eq!(
         voucher_verdict(VoucherRejectReason::PoolExhausted, false),
         PullVerdict::OurVoucherRetryable(VoucherRejectReason::PoolExhausted),
@@ -463,7 +463,7 @@ fn only_a_durable_refusal_earns_the_full_suppression_ttl() {
         RefusalVerdict::DurableMiss,
         "Declined is a lasting fact about this (peer, hash)"
     );
-    // `NotFound` is the one that matters. `wire_error` collapses `UnknownChannel`
+    // `NotFound` is the one that matters. `wire_error` collapses `UnknownLane`
     // (the window where the upstream's chain watcher has not yet seen the pool
     // WE just opened) onto it, so pool existence cannot be probed. At the full
     // TTL that blackholes a healthy peer for five minutes over a condition that

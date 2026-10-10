@@ -9,7 +9,7 @@
 //! one no longer accepts funds.
 //!
 //! The node's own low-water refill of its buyer pool is a separate, proactive
-//! node policy ([`crate::buyer_channel`]); it reacts to no upstream.
+//! node policy ([`crate::buyer_pool`]); it reacts to no upstream.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +18,7 @@ use alloy::primitives::U256;
 use decdn_client::source::SourceFuture;
 use decdn_client::{Funder, LocalPullFault, Recovery};
 
-use crate::buyer_channel::PoolOpener;
+use crate::buyer_pool::PoolOpener;
 
 /// One step of the settle wait after a funding recovery step's top-up. Small
 /// enough that the common case (the upstream's watcher was already close to

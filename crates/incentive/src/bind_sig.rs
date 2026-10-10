@@ -130,7 +130,7 @@ pub fn register_node_signing_hash(
 /// `node_id` is the client's 32-byte iroh `NodeId` (the connection's
 /// authenticated remote id); `nonce` is [`EPHEMERAL_BINDING_NONCE`] for
 /// off-chain bindings. The recovered address is what the node uses for voucher
-/// attribution; the caller MUST further check it equals the channel's `client`
+/// attribution; the caller MUST further check it equals the lane's `signer`
 /// before accepting vouchers.
 ///
 /// # Errors

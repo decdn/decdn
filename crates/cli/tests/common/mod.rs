@@ -24,9 +24,9 @@ use std::process::Command;
 ///   above any config file. An exported `DECDN_DATA_DIR` displaces the
 ///   `--data-dir` these tests pass.
 ///
-/// Neither is a live defect in this crate's tests today: `channel list`
+/// Neither is a live defect in this crate's tests today: `pool list`
 /// short-circuits config loading when `--data-dir` is given
-/// (`commands::channel::list`), and `origin import` is never handed a
+/// (`commands::pool::list`), and `origin import` is never handed a
 /// `config_path` at all (`commands::origin::origin_dispatch`). That safety is a
 /// property of those two subcommands, though, not of the tests — it evaporates
 /// if a subcommand changes or a new test drops the flag. `decdn-e2e` had the

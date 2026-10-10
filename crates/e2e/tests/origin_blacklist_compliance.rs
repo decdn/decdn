@@ -92,7 +92,7 @@ async fn origin_deny_set_survives_a_restart() -> anyhow::Result<()> {
 /// Poll until a fetch by `client` is refused specifically for `expected`.
 ///
 /// Asserts on the TYPED refusal rather than a formatted string: a
-/// channel/connect/payment regression that also fails the fetch must not green
+/// pool/connect/payment regression that also fails the fetch must not green
 /// the check. Before the watcher catches up the fetch may still succeed — that
 /// is "not yet projected", so retry.
 async fn poll_until_refused(
@@ -214,7 +214,7 @@ async fn run() -> anyhow::Result<()> {
     let (node, hash) = NodeFixture::launch(&chain, "US", &payload).await?;
 
     // A single buyer reused across the whole journey: the origin deny-set is
-    // keyed by the channel FUNDER, so the same signer must fund the baseline
+    // keyed by the pool FUNDER, so the same signer must fund the baseline
     // (allowed) fetch and the post-blacklist (refused) one.
     let client = ClientFixture::new(&chain).await?;
     let funder = client.address();
@@ -234,7 +234,7 @@ async fn run() -> anyhow::Result<()> {
 
     // The watcher projects `OriginBlacklistUpdated` into the delivery gate; a
     // fresh fetch from the SAME funder is then refused for the origin-blacklist
-    // class specifically (`Declined`), not a bare channel/connect/
+    // class specifically (`Declined`), not a bare pool/connect/
     // payment failure that a regression could also produce. During the brief
     // window before the watcher catches up the fetch may still succeed — treat
     // that as "not yet projected" and retry.
@@ -246,7 +246,7 @@ async fn run() -> anyhow::Result<()> {
             Ok(_) => Ok(None),
             Err(err) => {
                 // Assert on the TYPED refusal, not a formatted-string match: a
-                // channel/connect/payment regression that also fails the fetch
+                // pool/connect/payment regression that also fails the fetch
                 // must not green this check. `client.fetch` wraps the error in
                 // `.context(..)`, but anyhow preserves `downcast_ref` to the inner
                 // `UpstreamRefused` (same shape g_node_08_namespace_scope uses).

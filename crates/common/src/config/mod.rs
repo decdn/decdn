@@ -430,7 +430,7 @@ pub const DEFAULT_NODE_PULL_PROBE_FANOUT: usize = 5;
 /// for the next ranked candidate at this deadline.
 ///
 /// It does NOT cover the buyer pool open, which precedes it on its own 5 s budget
-/// (`CHANNEL_OPEN_CALLER_BUDGET`), nor the streaming that follows it, which is bounded by
+/// (`POOL_OPEN_CALLER_BUDGET`), nor the streaming that follows it, which is bounded by
 /// the throughput floor ([`DEFAULT_NODE_PULL_STALL_WINDOW_SEC`]). All three are sequential
 /// stages of ONE candidate attempt, and the node derives the overall pull-through deadline
 /// as `MAX_PROVIDER_ATTEMPTS × (pool open + this + window) + a fixed discovery allowance`,

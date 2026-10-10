@@ -176,7 +176,7 @@ async fn run_global() -> anyhow::Result<()> {
     );
 
     // ...the paid client path now refuses delivery for the blacklist reason
-    // specifically (not some unrelated channel/connect/payment failure).
+    // specifically (not some unrelated pool/connect/payment failure).
     assert_refused_as_blacklisted(&chain, &node, hash).await?;
 
     // ...and the probe handler stops signing `has_blob: true` (the
@@ -207,7 +207,7 @@ async fn run_global() -> anyhow::Result<()> {
 
 /// Assert a paid fetch of `hash` from `node` is refused `Declined` *for the
 /// blacklist reason*. The node's `chain_hash_denied` counter pins the cause, so
-/// a channel/connect/payment regression that also fails the fetch cannot green
+/// a pool/connect/payment regression that also fails the fetch cannot green
 /// this check.
 async fn assert_refused_as_blacklisted(
     chain: &ChainFixture,

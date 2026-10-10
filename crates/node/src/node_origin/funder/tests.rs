@@ -8,7 +8,7 @@ use decdn_client::{PoolContext, PoolReplaced};
 use decdn_incentive::PoolId;
 
 use super::*;
-use crate::buyer_channel::PoolOpener;
+use crate::buyer_pool::PoolOpener;
 
 /// A [`PoolOpener`] double whose `recover_pool` counts its calls and answers a
 /// fixed outcome. Only `recover_pool` is exercised by `NodeFunder`; the rest of

@@ -10,7 +10,7 @@
 //!
 //! The loop half here is deliberately pure — a [`RunSink`] abstracts the store
 //! query and the per-run drive, so the plan / sequence / repair decisions are
-//! testable without a live channel or a 64 MiB transfer. The buyer wiring that
+//! testable without a live lane or a 64 MiB transfer. The buyer wiring that
 //! opens a lane, pays vouchers, scores the provider, and persists the watermark
 //! lives in the real [`super::pull_leg`] sink.
 //!

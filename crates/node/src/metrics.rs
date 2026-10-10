@@ -763,7 +763,7 @@ pub struct DecdnMetrics {
     /// per dropped hint (#751). A hint is advisory — the next voucher re-hints
     /// and the redeemer self-tick / shutdown close still redeem — so a few drops
     /// are benign, but a sustained non-zero rate means the redeemer is not
-    /// keeping up with channel fan-out and threshold redemption is leaning on
+    /// keeping up with lane fan-out and threshold redemption is leaning on
     /// the slow self-tick. Operator-visible name:
     /// `decdn_redeem_hints_dropped_total`.
     pub redeem_hints_dropped: Counter,
@@ -1337,7 +1337,7 @@ pub struct DecdnMetrics {
     /// delivered frontier. The drive ends the gap rather than re-open and re-pay the
     /// same range. An upstream leg is not scored: its `(peer, hash)` pair is
     /// suppressed briefly and the run re-plans onto another source. A `warn!` names
-    /// the range, both frontiers and the channel's paid wire since the leg opened.
+    /// the range, both frontiers and the lane's paid wire since the leg opened.
     ///
     /// Zero is the expected value. A tick means this node's store did not keep a
     /// leg's bytes, its ledger did not record the leg's payment, or the upstream
@@ -1384,7 +1384,7 @@ pub struct DecdnMetrics {
     /// # Two distinct causes, one counter
     ///
     /// 1. the node's own chain lane (a slow L2, a stuck nonce) is slower than
-    ///    `CHANNEL_OPEN_CALLER_BUDGET` — the interesting one; and
+    ///    `POOL_OPEN_CALLER_BUDGET` — the interesting one; and
     /// 2. a boot or idle **reconcile** holds the provider's open slot.
     ///
     /// The verdict is the same for both — try the next candidate, score nothing — which
@@ -1674,8 +1674,9 @@ pub struct DecdnMetrics {
     /// value isolates an unknown-lane abuse campaign. Visible name:
     /// `decdn_serve_stream_rejected_unknown_lane_total`.
     pub serve_stream_rejected_unknown_lane: Counter,
-    /// `serve_stream` requests refused because a verified client binding does
-    /// not authorize the named channel (#327). Visible name:
+    /// `serve_stream` requests refused because they carry no verified client
+    /// binding, so they cannot name a lane (#327). A binding for a signer with no
+    /// lane counts as `unknown_lane`. Visible name:
     /// `decdn_serve_stream_rejected_owner_mismatch_total`.
     pub serve_stream_rejected_owner_mismatch: Counter,
     /// `serve_stream` requests reset because the client binding failed to
@@ -1689,7 +1690,7 @@ pub struct DecdnMetrics {
     /// Visible name: `decdn_probe_read_faults_total`.
     pub probe_read_faults: Counter,
     /// `serve_stream` requests refused before any bytes are served because the
-    /// requesting channel's remaining deposit could not cover what the node
+    /// requesting pool's remaining deposit could not cover what the node
     /// would front at its rate. (The refusal itself is signed — as an `ok: false`
     /// response; what is never signed is an `ok: true`.) **Three** guards bump
     /// this. Not a sequence any one request walks: a cache HIT reaches only (3),
@@ -1697,7 +1698,7 @@ pub struct DecdnMetrics {
     /// mutually exclusive. A miss passes (1) and then at most one of (2)/(3):
     /// 1. the cache-miss **floor** (#1519) — one credit window, applied above
     ///    every fill tier so none of them fronts origin egress or upstream USDC
-    ///    for a channel that cannot pay for a single interval;
+    ///    for a pool that cannot pay for a single interval;
     /// 2. the **window** tier's speculative ceiling (#856) — the whole-blob cost
     ///    when `max_blob_size_bytes` is finite, else the window cost;
     /// 3. the **direct-serve** ceiling (#1516) —
@@ -1806,7 +1807,7 @@ pub struct DecdnMetrics {
     /// which sees only evictions with no blacklist entry behind them (corruption
     /// recovery, a manual `decdn node evict`).
     pub serve_stream_rejected_chain_hash_denied: Counter,
-    /// Delivery refused because the channel's funding address is blacklisted as
+    /// Delivery refused because the pool's funding address is blacklisted as
     /// an origin — local `denied_origins` or the on-chain `ContentBlacklist`
     /// (ADR 011 §On Blacklist Event). Signed as `Declined`. Visible
     /// name: `decdn_serve_stream_rejected_origin_denied_total`.
@@ -3137,8 +3138,8 @@ recorders! {
     /// Record a `serve_stream` request refused on an unknown lane (#876).
     serve_stream_rejected_unknown_lane => serve_stream_rejected_unknown_lane.inc();
 
-    /// Record a `serve_stream` request refused because the client binding did
-    /// not authorize the named channel (#876).
+    /// Record a `serve_stream` request refused because it carries no verified
+    /// client binding, so it cannot name a lane (#876).
     serve_stream_rejected_owner_mismatch => serve_stream_rejected_owner_mismatch.inc();
     /// A client binding failed to verify and the stream was reset.
     serve_stream_rejected_bad_binding => serve_stream_rejected_bad_binding.inc();
@@ -3146,7 +3147,7 @@ recorders! {
     probe_read_fault => probe_read_faults.inc();
 
     /// Record a `serve_stream` cache-miss refused by the pre-flight deposit guard
-    /// (#856): the requesting channel could not cover the worst-case blob cost,
+    /// (#856): the requesting pool could not cover the worst-case blob cost,
     /// so no upstream pull was started.
     serve_stream_rejected_insufficient_deposit => serve_stream_rejected_insufficient_deposit.inc();
 
@@ -3206,7 +3207,7 @@ recorders! {
     /// governance blacklist (ADR 011 §On Blacklist Event).
     serve_stream_rejected_chain_hash_denied => serve_stream_rejected_chain_hash_denied.inc();
 
-    /// Record a `serve_stream` delivery refused because the channel's funding
+    /// Record a `serve_stream` delivery refused because the pool's funding
     /// address is a blacklisted origin (ADR 011 §On Blacklist Event).
     serve_stream_rejected_origin_denied => serve_stream_rejected_origin_denied.inc();
 

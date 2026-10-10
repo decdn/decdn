@@ -484,7 +484,7 @@ impl ReceiptLog for VecReceiptLog {
 
 /// A [`ReceiptLog`] whose `append` always errors. Proves the voucher-accept
 /// path treats a receipt-log write failure as non-fatal (issue #248): the
-/// payment already committed to the channel store, so delivery must still
+/// payment already committed to the pool-state store, so delivery must still
 /// succeed.
 #[derive(Debug, Default)]
 pub(crate) struct FailingReceiptLog;
@@ -1100,7 +1100,7 @@ pub(crate) fn capture_spans() -> SpanCapture {
         .clone()
 }
 
-/// A `PoolStateStore` that hydrates its seeded channels (so vouchers reach
+/// A `PoolStateStore` that hydrates its seeded lanes (so vouchers reach
 /// the apply path) but fails every `record` — exercises the store-record
 /// failure path in `ClientHandler::commit_one_proof`.
 #[derive(Debug)]

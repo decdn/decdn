@@ -44,9 +44,9 @@ pub enum BundleCommand {
 /// `--hash <b3>` (fetch the manifest blob first, then its entries). Both then
 /// run the same per-entry fetch loop. The network/chain/target flags come from
 /// the flattened [`ClientFetchArgs`] — `--node-id` pins every entry to one node,
-/// `--channel-id` (#1481) adopts one publisher-opened channel and pins the whole
-/// bundle to its provider, otherwise each entry is discovered independently
-/// (#936/#391). `--namespace` (ADR 002) routes every cache-miss origin pull to a
+/// otherwise each entry is discovered independently (#936/#391); `--capability` /
+/// `--capability-file` adopts one publisher-delegated pool and pays every entry
+/// from it. `--namespace` (ADR 002) routes every cache-miss origin pull to a
 /// namespace's authorized origins.
 #[derive(Args, Debug)]
 #[command(group(ArgGroup::new("bundle_source").required(true).args(["input", "hash"])))]

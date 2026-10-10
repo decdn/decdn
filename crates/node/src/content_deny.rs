@@ -69,7 +69,7 @@ impl ContentDenylist {
         Self::new(&ResolvedContent::default())
     }
 
-    /// Is this address denied as a channel funder, by either source?
+    /// Is this address denied as a pool funder, by either source?
     #[must_use]
     pub fn is_origin_denied(&self, addr: &Address) -> bool {
         self.local_origins.load().contains(addr) || self.chain_origins.load().contains(addr)

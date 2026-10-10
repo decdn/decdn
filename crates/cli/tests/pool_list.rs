@@ -198,11 +198,11 @@ async fn list_with_data_dir_ignores_broken_config_env_expansion() {
 /// A daemon's `buyer.redb`, written by the real daemon store and then closed.
 /// Returns the pool id recorded into it.
 fn seed_stopped_daemon_store(data_dir: &std::path::Path) -> B256 {
-    use decdn_node::channel_store::{BuyerPoolStoreHandle, PersistentPoolStateStore};
+    use decdn_node::pool_store::{BuyerPoolStoreHandle, PersistentPoolStateStore};
 
     // The buyer table ignores the seller-side deployment stamp: each buyer row
     // carries its own tag. The row below reuses this deployment for both.
-    let deployment = decdn_node::channel_store::Deployment {
+    let deployment = decdn_node::pool_store::Deployment {
         chain_id: 31_337,
         payment_pool: Address::repeat_byte(0x9c),
     };
@@ -295,14 +295,14 @@ fn a_stopped_daemons_store_is_read_from_disk_and_labelled() {
 /// is down", and the two send an operator opposite ways.
 #[test]
 fn a_locked_store_says_the_admin_url_is_wrong_not_that_the_node_is_down() {
-    use decdn_node::channel_store::PersistentPoolStateStore;
+    use decdn_node::pool_store::PersistentPoolStateStore;
 
     let dir = data_dir();
     // Held for the duration of the command: the daemon is up, the admin port
     // in the flag is simply not its.
     let _daemon = PersistentPoolStateStore::open(
         dir.path(),
-        decdn_node::channel_store::Deployment {
+        decdn_node::pool_store::Deployment {
             chain_id: 31_337,
             payment_pool: Address::repeat_byte(0x9c),
         },

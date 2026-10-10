@@ -78,7 +78,7 @@ impl ClientHandler {
     /// in-flight takedown boundary, and client-disconnect handling all read from
     /// the cache: a coherent whole-range bao encoder reads the cache the pull leg
     /// fills. The caller (orchestration) has
-    /// already proven channel ownership, run the pre-flight gates, and signed +
+    /// already proven lane authority, run the pre-flight gates, and signed +
     /// sent the `StreamResponse`; the pull leg fills the store beside this call.
     /// Consumes neither stream — the caller does.
     ///

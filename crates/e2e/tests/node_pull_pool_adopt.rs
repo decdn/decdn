@@ -10,7 +10,7 @@
 //! on-chain — against ADR 003 §node→node, which says a pool is opened once and
 //! reused and that owner funds are never stranded.
 //!
-//! The unit tests in `crates/node/src/buyer_channel.rs` cover the adoption
+//! The unit tests in `crates/node/src/buyer_pool.rs` cover the adoption
 //! DECISION (newest `Open` wins, a `Closing` pool is skipped, an unreachable
 //! chain adopts nothing) against a mocked transport. Three things only exist
 //! against a real chain and a real upstream daemon, and this is what pins them:

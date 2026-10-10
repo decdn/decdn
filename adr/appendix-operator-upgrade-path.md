@@ -61,7 +61,7 @@ Payment pools and stake state are unaffected.
 
 ## Tier 3 — major break (ALPN bump)
 
-Tier 3 is a classification boundary, not a standing rollout procedure. The ALPN string changes (`cdn/client/v1` → `cdn/client/v2`). The accompanying ADR MUST define the supported-version set, deployment order, client behavior, channel or signature migration, rollback conditions, observability, and retirement criteria that the actual break requires.
+Tier 3 is a classification boundary, not a standing rollout procedure. The ALPN string changes (`cdn/client/v1` → `cdn/client/v2`). The accompanying ADR MUST define the supported-version set, deployment order, client behavior, pool or signature migration, rollback conditions, observability, and retirement criteria that the actual break requires.
 
 The current runtime supports the `…/v1` identifiers documented by the protocol ADRs. No transition guarantee exists until a concrete Tier 3 ADR defines and implements it.
 

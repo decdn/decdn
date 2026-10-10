@@ -82,7 +82,7 @@ impl ClientHandler {
             //
             // This arm names neither lifetime: the node-origin also surfaces its own
             // buyer-side faults here (a broken signer, an unusable deadline config, an
-            // unreadable channel store) as `OriginPullError::Permanent`, and those recur
+            // unreadable pool store) as `OriginPullError::Permanent`, and those recur
             // for every hash until an operator acts. Telling an operator to wait for a
             // permanent defect to pass is worse than saying nothing.
             Ok(Err(

@@ -2,10 +2,10 @@
 //! own configured origin (fs/http/s3), for the own-origin serve-miss.
 //!
 //! The peer serve-miss path pulls a cold blob from another node over a paid
-//! `cdn/client/v1` channel ([`decdn_client::PeerSource`]). The own-origin
+//! `cdn/client/v1` lane ([`decdn_client::PeerSource`]). The own-origin
 //! serve-miss flow is the LOCAL twin: the bytes are already reachable through this
 //! node's own origin, so
-//! there is no counterparty, no channel, and no payment — but the driver, sink,
+//! there is no counterparty, no lane, and no payment — but the driver, sink,
 //! and serve leg are reused verbatim. This source is what lets that happen: it
 //! streams the header-less interleaved bao wire for one [`AlignedRange`] straight
 //! out of [`CacheEngine::origin_range_wire`], so the existing `NodeAdmitStore`
@@ -35,7 +35,7 @@
 //! advances it by exactly the leg's drained WIRE bytes at rate 0 — `committed.bytes`
 //! moves so the frontier reaches the gap end, while `committed.amount` stays 0 so
 //! nothing resembling a payment or a deposit-exhaustion is ever computed. This is
-//! NOT payment: no channel, no voucher, no chain, no counterparty — only the
+//! NOT payment: no lane, no voucher, no chain, no counterparty — only the
 //! driver's internal completion counter, exactly the `ScriptedSource::paying`
 //! precedent with a zero rate.
 
@@ -60,7 +60,7 @@ pub(crate) struct BackendSource {
     engine: CacheEngine,
     root: [u8; 32],
     total_bytes: u64,
-    /// Local completion bookkeeping ONLY — no channel, no chain, no counterparty.
+    /// Local completion bookkeeping ONLY — no lane, no chain, no counterparty.
     self_pay: Arc<PoolLedger>,
 }
 

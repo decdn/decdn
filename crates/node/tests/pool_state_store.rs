@@ -21,7 +21,7 @@ use decdn_incentive::{
     LaneKey, LaneState, PoolError, PoolStateStore, SignedVoucher, StoreError, Voucher,
     voucher_domain,
 };
-use decdn_node::channel_store::{Deployment, PersistentPoolStateStore};
+use decdn_node::pool_store::{Deployment, PersistentPoolStateStore};
 use tempfile::TempDir;
 
 const CHAIN_ID: u64 = 421_614; // Arbitrum Sepolia
@@ -375,7 +375,7 @@ fn set_paid_cumulative_survives_restart_and_resists_regression() -> anyhow::Resu
 /// this test only exercises the cross-lane independence the store itself must
 /// provide.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_vouchers_across_distinct_channels() -> anyhow::Result<()> {
+async fn concurrent_vouchers_across_distinct_lanes() -> anyhow::Result<()> {
     let dir = data_dir()?;
     let store = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
     let domain = voucher_domain(CHAIN_ID, VERIFYING);
@@ -597,7 +597,7 @@ fn bad_permissions_rejected() -> anyhow::Result<()> {
 
 /// Sanity check: the parent of the redb file is `data_dir`, not a sibling.
 #[test]
-fn channels_db_lives_in_data_dir() -> anyhow::Result<()> {
+fn lane_store_lives_in_data_dir() -> anyhow::Result<()> {
     let dir = data_dir()?;
     let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
     let parent = store
@@ -622,7 +622,7 @@ fn channels_db_lives_in_data_dir() -> anyhow::Result<()> {
 #[test]
 fn buyer_and_seller_pending_settle_sets_are_isolated() -> anyhow::Result<()> {
     use decdn_incentive::{PendingSettle, PendingSettleStore};
-    use decdn_node::channel_store::BuyerPendingSettleStoreHandle;
+    use decdn_node::pool_store::BuyerPendingSettleStoreHandle;
 
     let dir = data_dir()?;
     let seller_pool = b256!("aa00000000000000000000000000000000000000000000000000000000000000");

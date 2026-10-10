@@ -63,7 +63,7 @@ new content cannot be admitted.
 
 **Symptoms:** startup fails fast with the existing `check_rpc_reachability`
 error in `crates/node/src/runtime/mod.rs`; running nodes stop receiving
-blacklist updates and stop being able to settle channels. Once
+blacklist updates and stop being able to redeem lanes. Once
 [#283](https://github.com/decdn/decdn/issues/283) lands, the
 `decdn_rpc_healthy` gauge drops to 0.
 
@@ -422,7 +422,7 @@ nodeId-indexed `NodeAutoEjected`. The node's staker-set watcher follows
 `NodeAutoEjected` already carries the nodeId (see
 `crates/node/src/dht/chain_staker_set.rs`). Separately, the blacklist watcher
 folds the blacklisted-address union into the node's origin deny-set, so a
-`StreamRequest` on a channel funded by a blacklisted operator is refused at the
+`StreamRequest` on a pool funded by a blacklisted operator is refused at the
 delivery gate with `OriginDenied` and any in-flight stream is cut at the next MB
 boundary (`crates/node/src/content_deny.rs`). Both are automatic — no operator
 action is required.

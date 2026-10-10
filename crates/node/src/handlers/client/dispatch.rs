@@ -309,7 +309,7 @@ impl ClientHandler {
     /// progress ([`proof_wait`](super::proof_wait)).
     ///
     /// Kept as one linear, ADR-ordered sequence (read → bind → blob gate →
-    /// channel → sign → deliver); splitting it would scatter the ADR-005
+    /// lane → sign → deliver); splitting it would scatter the ADR-005
     /// ordering invariants across helpers — same rationale as the probe
     /// handler's `serve`.
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
@@ -703,7 +703,7 @@ impl ClientHandler {
         // The guard is opened at the point the billed span is knowable, NOT here: an
         // open-ended tail (`byte_len == 0`, `byte_offset > 0`) only knows its span
         // once `total_bytes` is resolved, so reserving a full floor here would refuse
-        // a tail resume the channel funded for its tail. The miss legs open it at the
+        // a tail resume the pool funded for its tail. The miss legs open it at the
         // pre-spend gate below (before any USDC fronting, so fan-out stays gated); the
         // direct-serve leg opens it at the floor-`M` gate, where `total_bytes` gives
         // the exact aligned span. Both use `try_reserve_floor`, whose budget check and
@@ -944,7 +944,7 @@ impl ClientHandler {
                 // this guard prices at `paid = 0`, i.e. the ramp floor — one
                 // chunk (`CHUNK_BYTES`, a fixed 1 MiB) — not the fully-ramped
                 // `credit_max` ceiling (64 MiB by default),
-                // since a cold request has confirmed no payment yet. A channel
+                // since a cold request has confirmed no payment yet. A pool
                 // funded for the blob but not for a floor chunk is refused
                 // cold and served warm. Closing that needs the origin size probe
                 // to run before the floor, which is a larger change than this one.
@@ -1049,7 +1049,7 @@ impl ClientHandler {
                 // outboard — serve the request by running the local pull leg (fill
                 // the cache from origin) beside the serve leg (stream the filling
                 // cache to the paying client), exactly like the node→node window path
-                // but with NO upstream, NO channel, and NO payment on the ingest side.
+                // but with NO upstream, NO lane, and NO payment on the ingest side.
                 // Time-to-first-byte does not wait for the whole blob to land.
                 //
                 // Any request shape routes here: the serve leg clamps to
@@ -1158,7 +1158,7 @@ impl ClientHandler {
                 // (`InternalError`) rather than an empty one (`NotFound`). Every
                 // terminal MISS below therefore takes its reason from
                 // `FillOutcome::miss_reason` (via `MissRefusal::new`) and is sent
-                // through `respond_miss`. (The channel-class refusals — `UnknownChannel`,
+                // through `respond_miss`. (The lane- and pool-class refusals — `UnknownLane`,
                 // `InsufficientDeposit` — keep their own reasons: they are
                 // client-attributable and would refuse regardless of origin
                 // health.)
@@ -1348,12 +1348,7 @@ impl ClientHandler {
                 );
             }
             return self
-                .respond_error(
-                    &mut send,
-                    &req,
-                    ServeRejectReason::UnknownChannel,
-                    rate_per_mb,
-                )
+                .respond_error(&mut send, &req, ServeRejectReason::UnknownLane, rate_per_mb)
                 .await;
         };
 

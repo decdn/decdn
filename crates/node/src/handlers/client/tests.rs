@@ -650,7 +650,7 @@ fn takedown_reject_reasons_are_declined() {
     }
     for reason in [
         ServeRejectReason::CacheMiss,
-        ServeRejectReason::UnknownChannel,
+        ServeRejectReason::UnknownLane,
         ServeRejectReason::OwnerMismatch,
         ServeRejectReason::PoolUnconfirmed,
         ServeRejectReason::PoolClosing { proven: false },
@@ -1571,7 +1571,7 @@ async fn clamp_lane_to_registration_narrows_the_live_lane_and_persists() -> anyh
     assert_eq!(held.expiry, 1_900_000_000);
     assert_eq!(held.registered_until, 1_900_000_000);
     let stored = handler
-        .channel_state_store
+        .pool_state_store
         .get(key)?
         .ok_or_else(|| anyhow::anyhow!("the lane row exists"))?;
     assert_eq!((stored.cap, stored.expiry), (held.cap, held.expiry));

@@ -2,7 +2,7 @@
 //!
 //! The node-to-node cache-miss pull path discovers upstream providers by iroh
 //! [`NodeId`] (DHT `FIND_VALUE` / origin directory), but paying one requires
-//! its bonded operator address: [`crate::buyer_channel::BuyerPoolService`]
+//! its bonded operator address: [`crate::buyer_pool::BuyerPoolService`]
 //! opens the USDC pool *to* that address, and the pull's open stage
 //! (`open_progressive_pull`) verifies the delivery `slash_sig`
 //! recovers *to* it. This module resolves that binding from the same

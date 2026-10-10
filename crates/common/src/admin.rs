@@ -464,7 +464,7 @@ pub struct BuyerLaneSnapshot {
     pub provider: String,
     /// Cumulative amount of the last voucher this node signed on the lane, in
     /// micro-USDC. This is the node's own spend watermark: re-signing a lower
-    /// total is what strands a channel, so it is the figure to compare against
+    /// total is what strands a lane, so it is the figure to compare against
     /// a provider's complaint.
     pub last_amount_micro_usdc: u64,
     /// Bytes delivered as of that same voucher.

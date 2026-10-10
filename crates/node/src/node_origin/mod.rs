@@ -3,7 +3,7 @@
 //!
 //! A whole-blob cache miss reaches the network through the engine's origin
 //! chain, so the production shape of "on a miss, discover a provider, open a
-//! paid channel, pull, and populate the cache" is an [`Origin`] implementation
+//! paid lane, pull, and populate the cache" is an [`Origin`] implementation
 //! injected into that chain (appended last, so configured HTTP/FS/S3 origins
 //! are tried first and the paid network pull is the final fallback). On
 //! [`Origin::fetch`] this:
@@ -80,8 +80,8 @@ use decdn_reputation::{LocalReputation, Outcome};
 use decdn_incentive::PoolOpenFailureReason;
 use decdn_protocol::client::NO_NAMESPACE;
 
-use crate::buyer_channel::{OpenReported, PoolOpenPending, PoolOpener};
 use crate::buyer_ledgers::BuyerLedgers;
+use crate::buyer_pool::{OpenReported, PoolOpenPending, PoolOpener};
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use crate::dht::{
@@ -286,7 +286,7 @@ fn record_pool_open_failure(
 ) -> PullMiss {
     // Not a failure at all: the open ran past our per-candidate budget and is still
     // going in the background (#1143). Meter it apart from real failures — a sustained rate
-    // means this node's chain lane is too slow for `CHANNEL_OPEN_CALLER_BUDGET`, which is a
+    // means this node's chain lane is too slow for `POOL_OPEN_CALLER_BUDGET`, which is a
     // very different diagnosis from a reverting or under-funded open.
     //
     // NOT `node_pull_timeout_sec`. The pool open has its OWN budget;
@@ -404,7 +404,7 @@ pub struct NodeOriginConfig {
     /// handshake, and the signed `StreamResponse`. Bounded work, so a slow one is a stall.
     ///
     /// It does NOT bound the buyer pool open, which is a separate, earlier stage on its
-    /// own budget (`selection::CHANNEL_OPEN_CALLER_BUDGET`, 5 s) — raising this to give a
+    /// own budget (`selection::POOL_OPEN_CALLER_BUDGET`, 5 s) — raising this to give a
     /// slow L2 more room does nothing. That the two are sequential stages is exactly why
     /// `outer_pull_deadline` budgets both, plus the stall window, for every candidate.
     pub pull_timeout: Duration,
@@ -561,7 +561,7 @@ pub struct NodeOriginDeps {
     /// `CapacityBond` EIP-712 bind domain (ADR 005). Used to sign the client
     /// identity binding this node attaches — over its OWN iroh `NodeId` with
     /// the buyer key — to every node→node pull, so an upstream node can prove
-    /// this node owns the named channel and, on its own cache miss, chain a
+    /// this node signs for a known lane on the named pool and, on its own cache miss, chain a
     /// further reactive origin pull (`pull_authorized`, #1117). Built from
     /// `chain_id` + the `CapacityBond` address, identical to the domain the
     /// serving side verifies against.
@@ -586,7 +586,7 @@ pub struct NodeOriginDeps {
     pub registry_regions: Arc<std::sync::RwLock<HashMap<DhtNodeId, String>>>,
     /// Resolved pull tuning.
     pub config: NodeOriginConfig,
-    /// The live voucher ledger of each provider's current channel, shared by every
+    /// The live voucher ledger of each provider's current lane, shared by every
     /// concurrent pull on it (#1145 review). Not a cache — see [`BuyerLedgers`] for
     /// why a per-pull ledger collides on the same cumulative amount and what that
     /// costs.
@@ -594,7 +594,7 @@ pub struct NodeOriginDeps {
     /// Providers suppressed from ranking because one rejected our voucher on a reason this
     /// lane cannot recover from — mapped to the first Unix second at which the provider is
     /// rankable again (#1145 review). The horizon is a fixed
-    /// `WEDGED_PROVIDER_SUPPRESSION_SECS` window, not a channel deadline: the buyer pool is
+    /// `WEDGED_PROVIDER_SUPPRESSION_SECS` window, not a lane deadline: the buyer pool is
     /// shared across every provider, so it carries no per-provider expiry to key one on.
     /// Keyed by the peer's [`DhtNodeId`], so `probe_and_rank` can skip a wedged provider for
     /// ALL hashes, not just the one that wedged it. In-memory: on restart the first miss
@@ -2018,8 +2018,8 @@ const fn no_step_why(stepped: &Stepped) -> &'static str {
 
 /// Attach this node's ADR 005 client identity binding to an upstream pull's
 /// `PoolContext` (#1117). Signs over our OWN endpoint `NodeId` with the
-/// channel's buyer key (`ctx.client_signer`) under the `CapacityBond` bind
-/// domain, so the upstream can prove we own the named channel and, on its own
+/// lane's buyer key (`ctx.client_signer`) under the `CapacityBond` bind
+/// domain, so the upstream can prove we sign for a known lane on the named pool and, on its own
 /// cache miss, chain a further reactive origin pull (`pull_authorized`). A
 /// signing failure drops the candidate rather than sending an unbound request
 /// the upstream would refuse to chain — try the next provider instead.
@@ -2138,7 +2138,7 @@ async fn pull_from_candidate_in_span(
         .addr_resolver
         .address_of(&DhtNodeId::from_bytes(candidate.node_id))
     else {
-        // No bonded address → we cannot safely open a channel to, or verify the
+        // No bonded address → we cannot safely open a lane to, or verify the
         // `slash_sig` of, this provider. Skip rather than guess.
         debug!("node-origin: candidate has no resolvable operator address; skipping");
         return Err(PullMiss::Clean);
@@ -2157,7 +2157,7 @@ async fn pull_from_candidate_in_span(
     let ctx = match deps
         .buyer
         // Same pool-open bound as the window path (#1143) — see there.
-        .open_or_reuse_pool(provider_addr, crate::selection::CHANNEL_OPEN_CALLER_BUDGET)
+        .open_or_reuse_pool(provider_addr, crate::selection::POOL_OPEN_CALLER_BUDGET)
         .await
     {
         Ok(ctx) => ctx,
@@ -2174,7 +2174,7 @@ async fn pull_from_candidate_in_span(
         Ok(ctx) => ctx,
         Err(err) => {
             // As on the window path: our signing fault, metered as ours, peer unscored.
-            // No channel: the bind failed before we could present a voucher on one.
+            // No pool id: the bind failed before we could present a voucher on a lane.
             let verdict = classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
             return Err(PullMiss::for_verdict(verdict));
         }
@@ -2521,7 +2521,7 @@ fn candidate_miss(
 /// (#1145 review). See the comment at its construction in [`pull_from_candidate`]
 /// for which cancellations are reachable and why each one is by design.
 ///
-/// It settles the voucher watermark, so the next reuse of this channel signs the
+/// It settles the voucher watermark, so the next reuse of this lane signs the
 /// nonce the upstream actually committed to (#852) — just as real on a cancelled
 /// pull as on a returned one, since the bytes were bought either way.
 ///
@@ -2580,7 +2580,7 @@ impl Drop for SettleOnDrop {
 /// Persist whatever the upstream acked, regardless of Ok/Err (#852): a
 /// mid-stream failure or a paid-but-corrupt (hash-mismatch) delivery can still
 /// have advanced the upstream's accepted-voucher watermark. Skipping this lets
-/// the channel re-sign a stale voucher on its next reuse and be rejected. The
+/// the lane re-sign a stale voucher on its next reuse and be rejected. The
 /// bytes are already paid for, so a persist failure must not fail the pull;
 /// surface it loudly instead (it breaks the next reuse). Both the buffered
 /// [`pull_from_candidate`] and the window-paced pull leg reach it via
@@ -2630,7 +2630,7 @@ enum RefusalVerdict {
 /// peer just checked. A `NotFound` *refusal* is not: `ServeRejectReason::wire_error`
 /// deliberately collapses several reject reasons onto the wire `NotFound` so that a probing
 /// client cannot map out other clients' remaining pool balances — and some of them are ours
-/// or transient: our signer's live floor at its cap on that peer, an `UnknownChannel` or an
+/// or transient: our signer's live floor at its cap on that peer, an `UnknownLane` or an
 /// unconfirmed pool (while the upstream's chain watcher catches up), and a load shed. We
 /// cannot tell them apart, and we must not: the collapse is a privacy property.
 ///
@@ -2664,14 +2664,14 @@ const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
         StreamError::Unfunded => RefusalVerdict::Transient,
         // `VoucherRejected` does not reach here: `pull_verdict` unwraps it out of
         // `UpstreamRefused` and routes it to `voucher_verdict`, which is the only place that
-        // decides what a rejected voucher costs the channel (#1145 review).
+        // decides what a rejected voucher costs the lane (#1145 review).
         //
         // The arm stays because the match is exhaustive on purpose — a new `StreamError` must
         // break this build — and because `RefusalVerdict::OurFault` is still the right answer
         // to the question THIS function asks ("what does this refusal say about the peer?"):
         // nothing. It just is not the whole answer, and this function is not the one that can
         // give it. Routing a mid-stream rejection through here alone is what let a wedged
-        // channel skip its remedy entirely and be handed back on every subsequent miss.
+        // lane skip its remedy entirely and be handed back on every subsequent miss.
         StreamError::VoucherRejected { .. } => RefusalVerdict::OurFault,
     }
 }
@@ -2782,13 +2782,13 @@ enum PullVerdict {
 ///
 /// The cost is this provider for the suppression window; the pool's deposit is untouched and
 /// stays available to every other lane.
-fn wedged_channel(
+fn wedged_lane(
     deps: &NodeOriginDeps,
     pk: PublicKey,
     provider_addr: Address,
     hash_bytes: [u8; 32],
     reason: VoucherRejectReason,
-    channel: Option<B256>,
+    pool_id: Option<B256>,
 ) {
     deps.metrics.node_pull_pool_wedged();
     // Immediate cover: suppress this (peer, hash) for the short refusal TTL so a retry for the
@@ -2804,7 +2804,7 @@ fn wedged_channel(
     // out across every provider), so there is nothing for this call site to choose.
     deps.record_wedged(&pk);
     warn!(
-        %provider_addr, pool_id = ?channel, ?reason,
+        %provider_addr, ?pool_id, ?reason,
         "node-origin: upstream rejected our voucher on terms this lane cannot recover from; \
          suppressing the provider for a bounded window while the pool's own deposit is \
          unaffected (#1122)"
@@ -2975,12 +2975,12 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
         // `UpstreamVoucherRejected` wherever it lands, so this unwrap is a defensive backstop
         // for any `VoucherRejected` that still reaches here inside `UpstreamRefused`: were it
         // left folded into the refusal ladder it would be ruled `OurFault` — score nothing,
-        // suppress nothing, do nothing — and skip the whole channel remedy above, leaving a
-        // wedged or settled channel in the store to be handed straight back on the next miss,
+        // suppress nothing, do nothing — and skip the whole lane remedy above, leaving a
+        // wedged or settled lane in the store to be handed straight back on the next miss,
         // forever, on a `debug!` line invisible at the project's default `RUST_LOG=info`.
         //
         // Unwrap it here rather than in `classify_refusal`, because the answer is not a
-        // refusal verdict at all: it is a statement about our CHANNEL, and `voucher_verdict`
+        // refusal verdict at all: it is a statement about our LANE, and `voucher_verdict`
         // is the one place that decides what a rejected voucher costs.
         if let StreamError::VoucherRejected { reason, bundle } = refused.error() {
             return voucher_verdict(*reason, bundle.is_some());
@@ -3112,7 +3112,7 @@ fn record_backpressure_exhausted(
 /// [`pull_verdict`] makes the decision; this acts on it, and RETURNS it so the
 /// caller can act on it too (#1560). The two consumers want different halves of the
 /// same answer: this function asks "what does this failure say about the PEER?" and
-/// spends the reputation/suppression/channel remedies accordingly, while the caller
+/// spends the reputation/suppression/lane remedies accordingly, while the caller
 /// asks "what may we tell our own client?" and folds the verdict into a
 /// [`PullMiss`]. Returning it is what stops the second question being answered by
 /// silence: without it every non-hit looks identical to the serve path, and a fault in
@@ -3124,7 +3124,7 @@ fn record_backpressure_exhausted(
 /// owes the verdict a [`PullMiss`]; dropping it there signs this node's own fault to a
 /// client as an absent blob (#1560).
 ///
-/// `channel` is the buyer pool the pull was paying from, or `None` for the failures that
+/// `pool_id` names the buyer pool the pull was paying from, or `None` for the failures that
 /// happen before there is one to pay from (a pool open that never completed, a local
 /// binding-signature fault). It is `Option` rather than plumbed unconditionally because the
 /// distinction is real: only a pull that presented a voucher can have one rejected, so only
@@ -3136,7 +3136,7 @@ fn classify_pull_failure(
     pk: PublicKey,
     provider_addr: Address,
     hash_bytes: [u8; 32],
-    channel: Option<B256>,
+    pool_id: Option<B256>,
     err: &anyhow::Error,
 ) -> PullVerdict {
     let suppress = |ttl: Option<Duration>| {
@@ -3232,7 +3232,7 @@ fn classify_pull_failure(
         // is invisible, and money is at stake.
         PullVerdict::OurDeadLane(reason) => {
             deps.metrics.node_pull_voucher_rejected();
-            wedged_channel(deps, pk, provider_addr, hash_bytes, reason, channel);
+            wedged_lane(deps, pk, provider_addr, hash_bytes, reason, pool_id);
         }
         // The peer is fine, the fault is our buyer pool: `PoolExhausted` means the deposit we
         // fund the upstream from can no longer cover further credit, cleared by a top-up and a
@@ -3242,7 +3242,7 @@ fn classify_pull_failure(
             deps.metrics.node_pull_voucher_rejected();
             debug!(
                 %provider_addr, ?reason, error = %err,
-                "node-origin: upstream rejected the voucher but the channel is healthy; \
+                "node-origin: upstream rejected the voucher but the lane is healthy; \
                  left intact for a retry"
             );
         }
@@ -3317,7 +3317,7 @@ fn classify_pull_failure(
 /// Meter and log a [`LegNoProgress`] (#2194): a leg that finished cleanly but moved
 /// neither frontier. `provider` is the upstream's key and operator address, or
 /// `None` for an own-origin leg. The log carries the range, both frontiers and the
-/// channel's paid wire, which tell a store fault from a ledger fault.
+/// lane's paid wire, which tell a store fault from a ledger fault.
 pub(super) fn warn_leg_no_progress(
     metrics: &crate::metrics::Metrics,
     hash_bytes: [u8; 32],

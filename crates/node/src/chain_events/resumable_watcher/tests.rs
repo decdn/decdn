@@ -12,7 +12,7 @@ fn persisted_none_starts_at_head() {
 #[test]
 fn persisted_none_starts_at_head_ignoring_from_block() {
     // The cold-store floor is head, not the deploy block — a persisted-cursor
-    // watcher has no history to replay before its own first channel.
+    // watcher has no history to replay before its own first lane.
     assert_eq!(resolve_persisted_start(None, 1_000, 200, MARGIN), 1_000);
 }
 

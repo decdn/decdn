@@ -1059,7 +1059,7 @@ since project inception and will roll into the first tagged release.
   a false "just-filled blob" warning and refused `InternalError`, so the
   requester routed around a healthy node. The local-origin populate tier
   (#1116) instead filled the blob from the operator's origin and then refused
-  `UnknownChannel`. Every fill tier now takes its answer from the request's one
+  `UnknownLane`. Every fill tier now takes its answer from the request's one
   lane resolution. A request whose lane was unknown when it resolved refuses on
   the `no_lane` path (`NotFound`, counted as `cache_miss`) and runs no fill
   tier.
@@ -2028,7 +2028,7 @@ since project inception and will roll into the first tagged release.
   a fifth daemon store would have been checked by nothing. The list now comes
   from `decdn_common::data_dir::DAEMON_STORE_FILES` plus `CLIENT_BUYER_DB_FILE`,
   the same names the daemon's own store and the client store use. A new
-  `channel_store` test asserts that opening `PersistentPoolStateStore` creates
+  `pool_store` test asserts that opening `PersistentPoolStateStore` creates
   every file in that set and no `.redb` outside it, which turns the premise
   `daemon_marker` — and with it the node-vs-client classification from #2078 —
   rests on into a checked fact.
@@ -2640,7 +2640,7 @@ since project inception and will roll into the first tagged release.
   *ours* — a buyer key that cannot sign the ADR 005 client binding, a voucher
   signature the upstream cannot verify (`BadSignature` / `WrongSigner`), an
   unusable `cache.node_pull_timeout_sec` / `cache.node_pull_stall_timeout_sec`
-  budget, or a buyer-channel store this node cannot read — the serve path
+  budget, or a buyer pool store this node cannot read — the serve path
   collapsed it onto the same clean `NotFound` as "no provider had it". The
   failure was metered honestly all along
   (`decdn_node_pull_local_fault_total`, "any sustained rate is an emergency"),
@@ -2653,14 +2653,14 @@ since project inception and will roll into the first tagged release.
   already maps through `CacheError::OriginError` → `FillOutcome::HardFault` →
   `ServeRejectReason::InternalError`, and the window-paced path folds it into
   the same `fault_seen` latch the reactive local-origin tier has used since
-  #1129. Buyer channel-open failures are attributed at the site that raises them
+  #1129. Buyer pool-open failures are attributed at the site that raises them
   rather than guessed at by the caller: a poisoned open lock, an unreadable
-  channel store, a store write that leaves a deposit untracked, a panicked open
+  pool store, a store write that leaves a deposit untracked, a panicked open
   task, and a wallet that cannot fund a deposit all refuse, while a pending open,
-  a reconcile-held slot, an unreclaimable expired channel, a per-provider on-chain
+  a reconcile-held slot, a per-provider on-chain
   revert, and a transient RPC fault stay clean misses.
   - Scope is deliberately narrow: only a local fault changes the wire code. A
-    wedged or settled *channel* to one provider still answers `NotFound` — it is
+    wedged or settled *lane* to one provider still answers `NotFound` — it is
     not evidence this node is broken for every client and every blob, and it
     already has its own remedy. So does an `OriginBlacklisted` refusal, which is
     node-wide but is a governance policy state rather than an unexpected failure,
@@ -2920,7 +2920,7 @@ since project inception and will roll into the first tagged release.
   gate denies rustdoc warnings.
 
 - **`elided_lifetimes_in_paths` and `unreachable_pub` are on.** A type path that
-  borrows now says so — `TableDefinition<'_, …>` across `channel_store`'s eleven
+  borrows now says so — `TableDefinition<'_, …>` across `pool_store`'s eleven
   redb table definitions, `EvictionContext<'_>` in the cache's admission and
   eviction policy traits — so a reader sees the borrow at the call site instead of
   having to look the type up. `unreachable_pub` narrows 46 items that were `pub`
@@ -3054,7 +3054,7 @@ since project inception and will roll into the first tagged release.
   documented as the deliberate exception (its values share one aggregate and one
   budget axis; they pointedly do not share an alert, which is why the alert
   filters to `reason="exhausted"`); `dispatch_rejected_*`,
-  `probe_rate_limit_rejected_*`, `channel_open_failures_*` and the gossip
+  `probe_rate_limit_rejected_*`, `pool_open_failures_*` and the gossip
   rejection counters stay siblings. **No metric is renamed.** The
   observability appendix is corrected accordingly: it documented
   `decdn_gossip_messages_rejected_total{reason="clock_skew"}`, a labeled name
@@ -3168,7 +3168,7 @@ since project inception and will roll into the first tagged release.
   dashboards querying the old names go blank. Note this makes
   `probe_hold_unavailable` the one labeled counter in `decdn-node`; the other
   reason-style splits (`dispatch_rejected_*`, `probe_rate_limit_rejected_*`,
-  `channel_open_failures_*`) remain sibling counters for now.
+  `pool_open_failures_*`) remain sibling counters for now.
 
 - **The `decdn_node_address_watcher_*` metrics are removed (#1231).** Gone:
   `decdn_node_address_watcher_restarts_total` and
