@@ -710,7 +710,7 @@ impl ClientHandler {
         // `live_reservation += reserved` increment run under ONE `pool_floor` lock, so
         // two concurrent admissions on a near-exhausted pool cannot both pass. A
         // pool-floor refusal reports `InsufficientDeposit` → wire
-        // `StreamError::Unfunded`: this gate runs past the lane-ownership proof,
+        // `StreamError::Unfunded`: this gate runs past the lane-authority proof,
         // so its audience is the proven requester, and the class counts toward
         // its funding recovery.
         //
@@ -849,13 +849,13 @@ impl ClientHandler {
                 }
                 hit_size = Some(size);
             } else {
-                // The shed gate runs before the channel-ownership refusal below,
+                // The shed gate runs before the lane-authority refusal below,
                 // so an unbound / unknown-lane request can transiently hold a
                 // `ShedSlot` until that refusal returns it. This is bounded by
                 // the `ConnectionLimiter` global + per-source caps and is
                 // self-limiting: once the node is pressured, further such
                 // requests shed right here without acquiring a slot at all.
-                // Keeping the gate here — ahead of channel-ownership and any
+                // Keeping the gate here — ahead of lane authority and any
                 // fill — preserves "shed before committing serve resources /
                 // before any origin spend".
                 //
@@ -897,10 +897,9 @@ impl ClientHandler {
                 // spend (pool ids are public on-chain via `PoolOpened`, so any
                 // leech could name one); only proven lane authority can. An
                 // unbound request, or one with no lane in that pool, gets a
-                // plain `NotFound` and
-                // cannot make this node spend — closing the proxy-abuse /
-                // griefing vector where an unpaid client drains the buyer
-                // deposit. (Multi-hop node→node pulls therefore require the
+                // plain `NotFound` and cannot make this node spend — closing
+                // the proxy-abuse / griefing vector where an unpaid client
+                // drains the buyer deposit. (Multi-hop node→node pulls therefore require the
                 // downstream requester to send a binding; both the direct-client
                 // `decdn fetch` (#1115) and the node→node requester
                 // (`node_origin`, #1117) now do, so chained pull-through works.)
