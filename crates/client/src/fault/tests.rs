@@ -171,11 +171,11 @@ fn a_lane_build_takes_its_cause_only_when_fatal() {
     );
 }
 
-/// A `topUp` that may have escrowed USDC no record credits ends the
-/// command, whether it surfaces from a lane build (which otherwise retries)
-/// or from a funding recovery step: a retry escrows again.
+/// A `topUp` or `openPool` that may have escrowed USDC no record credits
+/// ends the command, whether it surfaces from a lane build (which otherwise
+/// retries) or from a funding recovery step: a retry escrows again.
 #[test]
-fn a_possibly_escrowed_top_up_ends_the_command() {
+fn a_possibly_escrowed_deposit_ends_the_command() {
     let tx = alloy::primitives::TxHash::repeat_byte(0xab);
     let untracked =
         || crate::buyer_pool::escrowed_but_untracked("pool 0x01 topped up by 5 µUSDC", tx, "disk");
@@ -187,10 +187,16 @@ fn a_possibly_escrowed_top_up_ends_the_command() {
     };
     let maybe_broadcast = anyhow::anyhow!("submit topUp: connection reset")
         .context(crate::buyer_pool::TopUpUnconfirmed { tx: None, nonce: 7 });
+    let open_unconfirmed =
+        anyhow::anyhow!("await openPool receipt").context(crate::buyer_pool::OpenUnconfirmed {
+            tx: Some(tx),
+            nonce: 7,
+        });
     for (name, err) in [
         ("untracked", untracked()),
         ("unconfirmed", unconfirmed()),
         ("maybe broadcast", maybe_broadcast),
+        ("open unconfirmed", open_unconfirmed),
         (
             "untracked lane build",
             anyhow::Error::new(LaneBuildFault(untracked())),

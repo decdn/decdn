@@ -996,6 +996,17 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **The daemon no longer escrows a second pool deposit after an `openPool`
+  whose outcome it did not see (#2415).** When the `openPool` receipt read
+  failed, or its submit failed in transport, the open task freed the open
+  slot and the next cache miss sent a second `openPool` while the first could
+  still mine. The open task now keeps the slot until the chain resolves the
+  transaction: a receipt yields the pool, a spent nonce asks `getPools` and
+  adopts the pool that appeared, and a nonce no transaction holds lets the
+  next open go ahead on that same nonce. `openPool` is now sent with an
+  explicit pending nonce, and its unconfirmed error carries the hash and
+  nonce (`OpenUnconfirmed`). `decdn fetch` and `bundle pull` treat that
+  error as fatal to the command, as for an unconfirmed `topUp`.
 - **`decdn fetch` / `bundle pull` steal a slow leg's tail by pull-through
   (#2348).** A lane could steal only inside a range's covered suffix, so a
   range whose last block only one lane covered ran on that lane to the end,

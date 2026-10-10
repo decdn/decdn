@@ -1064,8 +1064,10 @@ async fn a_full_closing_pool_is_replaced() {
         }))
         .unwrap(),
     );
-    // The open's allowance read finds enough, so the open goes on to submit.
+    // The open's allowance read finds enough, and its pending-nonce read
+    // answers, so the open goes on to submit.
     asserter.push_success(&U256::MAX.abi_encode());
+    asserter.push_success(&U256::ZERO);
     let err = step_on_a_full_pool(asserter.clone())
         .await
         .expect_err("the replacement open reaches the chain");

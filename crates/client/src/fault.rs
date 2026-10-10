@@ -8,7 +8,7 @@
 
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 
-use crate::buyer_pool::{EscrowUntracked, TopUpUnconfirmed, WalletShortfall};
+use crate::buyer_pool::{EscrowUntracked, OpenUnconfirmed, TopUpUnconfirmed, WalletShortfall};
 use crate::driver::PoolExhausted;
 use crate::source::PoolReplaced;
 use crate::{BlobTooLarge, LocalPullFault, UpstreamRefused, UpstreamVoucherRejected};
@@ -98,12 +98,13 @@ impl std::fmt::Display for HealExhausted {
 
 impl std::error::Error for HealExhausted {}
 
-/// Whether `err` reports a `topUp` that may have escrowed USDC no local record
-/// credits ([`EscrowUntracked`], [`TopUpUnconfirmed`]). A retry escrows again,
-/// so it is fatal to the command.
+/// Whether `err` reports a `topUp` or `openPool` that may have escrowed USDC
+/// no local record credits ([`EscrowUntracked`], [`TopUpUnconfirmed`],
+/// [`OpenUnconfirmed`]). A retry escrows again, so it is fatal to the command.
 fn escrow_untracked(err: &anyhow::Error) -> bool {
     err.downcast_ref::<EscrowUntracked>().is_some()
         || err.downcast_ref::<TopUpUnconfirmed>().is_some()
+        || err.downcast_ref::<OpenUnconfirmed>().is_some()
 }
 
 /// Whether a mid-stream voucher rejection for `reason` acts as `Unfunded`

@@ -877,8 +877,18 @@ fn mocked_service(
     signer: Arc<PrivateKeySigner>,
     owner: Address,
 ) -> BuyerPoolService<impl Provider + Clone + 'static> {
+    mocked_service_on(mocked_pool_contract(responses), store, signer, owner)
+}
+
+/// [`mocked_service`] on a caller-built `contract`.
+fn mocked_service_on<P: Provider + Clone + 'static>(
+    contract: PaymentPool::PaymentPoolInstance<P>,
+    store: Arc<dyn BuyerPoolStore>,
+    signer: Arc<PrivateKeySigner>,
+    owner: Address,
+) -> BuyerPoolService<P> {
     BuyerPoolService {
-        contract: mocked_pool_contract(responses),
+        contract,
         store,
         signer,
         deployment: DEPLOYMENT,
@@ -2838,4 +2848,359 @@ async fn an_unreadable_sweep_reclaim_receipt_logs_the_tx() -> anyhow::Result<()>
     // The reclaim may still mine, so the row stays for the next sweep.
     assert!(store.get_by_owner(owner)?.is_some(), "the row survives");
     Ok(())
+}
+
+// ---- unconfirmed `openPool` (#2415) ------------------------------------
+
+/// A filler-free `PaymentPool` at [`DEPLOYMENT`]'s address whose RPC calls
+/// `asserter` answers in order, so an `openPool` send is one
+/// `eth_sendTransaction`.
+fn bare_pool_contract(
+    asserter: alloy::providers::mock::Asserter,
+) -> PaymentPool::PaymentPoolInstance<impl Provider + Clone + 'static> {
+    PaymentPool::new(
+        Address::ZERO,
+        alloy::providers::ProviderBuilder::default().connect_mocked_client(asserter),
+    )
+}
+
+/// One scripted RPC answer.
+enum Reply {
+    /// `eth_getTransactionReceipt` finds nothing.
+    NoReceipt,
+    /// `eth_getTransactionReceipt` finds this receipt.
+    Receipt(Box<alloy::rpc::types::TransactionReceipt>),
+    /// `eth_getTransactionCount` answers this nonce.
+    Nonce(u64),
+    /// An `eth_call` answers this payload.
+    Call(alloy::primitives::Bytes),
+    /// The call faults, as a transient RPC error does.
+    Fault,
+}
+
+/// An [`Asserter`](alloy::providers::mock::Asserter) that answers `replies` in
+/// order.
+fn script(replies: Vec<Reply>) -> alloy::providers::mock::Asserter {
+    let asserter = alloy::providers::mock::Asserter::new();
+    for reply in replies {
+        match reply {
+            Reply::NoReceipt => asserter.push_success(&serde_json::Value::Null),
+            Reply::Receipt(receipt) => asserter.push_success(&receipt),
+            Reply::Nonce(nonce) => asserter.push_success(&U256::from(nonce)),
+            Reply::Call(bytes) => asserter.push_success(&bytes),
+            Reply::Fault => asserter.push_failure_msg("transient rpc fault"),
+        }
+    }
+    asserter
+}
+
+/// The hash of the `openPool` whose outcome the open task did not observe.
+fn open_tx() -> alloy::primitives::TxHash {
+    alloy::primitives::TxHash::repeat_byte(0xAB)
+}
+
+/// A mined `openPool` receipt whose `PoolOpened` log credits `deposit` to
+/// `pool_id`.
+fn opened_receipt(
+    pool_id: PoolId,
+    owner: Address,
+    deposit: u64,
+) -> Box<alloy::rpc::types::TransactionReceipt> {
+    use alloy::sol_types::SolEvent;
+
+    let event = PaymentPool::PoolOpened {
+        poolId: pool_id,
+        owner,
+        deposit: U256::from(deposit),
+    };
+    let log = alloy::rpc::types::Log {
+        inner: alloy::primitives::Log {
+            address: Address::ZERO,
+            data: event.encode_log_data(),
+        },
+        block_hash: None,
+        block_number: None,
+        block_timestamp: None,
+        transaction_hash: None,
+        transaction_index: None,
+        log_index: None,
+        removed: false,
+    };
+    Box::new(alloy::rpc::types::TransactionReceipt {
+        inner: alloy::consensus::ReceiptEnvelope::Eip1559(alloy::consensus::ReceiptWithBloom {
+            receipt: alloy::consensus::Receipt {
+                status: alloy::consensus::Eip658Value::Eip658(true),
+                cumulative_gas_used: 0,
+                logs: vec![log],
+            },
+            logs_bloom: alloy::primitives::Bloom::ZERO,
+        }),
+        transaction_hash: open_tx(),
+        transaction_index: Some(0),
+        block_hash: None,
+        block_number: None,
+        gas_used: 0,
+        effective_gas_price: 0,
+        blob_gas_used: None,
+        blob_gas_price: None,
+        from: owner,
+        to: None,
+        contract_address: None,
+    })
+}
+
+/// The open an unconfirmed-open test sent.
+fn open_request(owner: Address) -> OpenRequest {
+    OpenRequest {
+        signer: signer(),
+        deployment: DEPLOYMENT,
+        token: Address::repeat_byte(2),
+        owner,
+        deposit: U256::from(10_000_000u64),
+    }
+}
+
+/// The error `open_pool` returns for `unconfirmed`.
+fn unconfirmed_error(unconfirmed: OpenUnconfirmed) -> anyhow::Error {
+    anyhow::anyhow!("await openPool receipt")
+        .context(unconfirmed)
+        .context(PoolOpenFailureReason::RpcError)
+}
+
+/// The hashed open sent with nonce 5.
+const HASHED: fn() -> OpenUnconfirmed = || OpenUnconfirmed {
+    tx: Some(open_tx()),
+    nonce: 5,
+};
+
+/// Settle `unconfirmed` against `replies`, asserting every reply was read.
+async fn settle(
+    replies: Vec<Reply>,
+    unconfirmed: OpenUnconfirmed,
+    store: &Arc<dyn BuyerPoolStore>,
+    owner: Address,
+) -> Result<Option<OpenedPool>> {
+    let asserter = script(replies);
+    let contract = bare_pool_contract(asserter.clone());
+    let settled = settle_unconfirmed_open(
+        &contract,
+        store,
+        &open_request(owner),
+        unconfirmed,
+        unconfirmed_error(unconfirmed),
+        &metrics(),
+    )
+    .await;
+    assert!(asserter.read_q().is_empty(), "every scripted read was made");
+    settled
+}
+
+/// One chain read classifies an unconfirmed open by its receipt, then the
+/// account's confirmed nonce, then its pending nonce.
+#[tokio::test]
+async fn an_unconfirmed_open_resolves_by_receipt_then_nonce() {
+    let owner = Address::repeat_byte(1);
+    let hashless = OpenUnconfirmed { tx: None, nonce: 5 };
+    let receipt = || Reply::Receipt(opened_receipt(PoolId::from([0xBB; 32]), owner, 1));
+    let cases = vec![
+        ("mined", HASHED(), vec![receipt()], Some("mined")),
+        (
+            "in flight",
+            HASHED(),
+            vec![Reply::NoReceipt, Reply::Nonce(5), Reply::Nonce(6)],
+            None,
+        ),
+        (
+            "nonce spent",
+            HASHED(),
+            vec![Reply::NoReceipt, Reply::Nonce(6), Reply::NoReceipt],
+            Some("spent"),
+        ),
+        (
+            "mined between the reads",
+            HASHED(),
+            vec![Reply::NoReceipt, Reply::Nonce(6), receipt()],
+            Some("mined"),
+        ),
+        (
+            "vacant",
+            HASHED(),
+            vec![Reply::NoReceipt, Reply::Nonce(5), Reply::Nonce(5)],
+            Some("vacant"),
+        ),
+        (
+            "hashless, nonce spent",
+            hashless,
+            vec![Reply::Nonce(6)],
+            Some("spent"),
+        ),
+        (
+            "hashless, in flight",
+            hashless,
+            vec![Reply::Nonce(5), Reply::Nonce(6)],
+            None,
+        ),
+    ];
+    for (name, unconfirmed, replies, want) in cases {
+        let asserter = script(replies);
+        let contract = bare_pool_contract(asserter.clone());
+        let got = resolve_unconfirmed_open(&contract, owner, unconfirmed)
+            .await
+            .expect(name)
+            .map(|resolution| match resolution {
+                OpenResolution::Mined(_) => "mined",
+                OpenResolution::NonceSpent => "spent",
+                OpenResolution::Vacant => "vacant",
+            });
+        assert_eq!(got, want, "{name}");
+        assert!(asserter.read_q().is_empty(), "{name}: every read was made");
+    }
+}
+
+/// The issue's check: an open whose receipt read failed holds until its
+/// transaction mines, then yields the pool that transaction bought.
+#[tokio::test(start_paused = true)]
+async fn an_unconfirmed_open_waits_out_its_pending_tx_and_takes_the_mined_pool() {
+    let owner = Address::repeat_byte(1);
+    let pool_id = PoolId::from([0xBB; 32]);
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    let opened = settle(
+        vec![
+            // First tick: still pending.
+            Reply::NoReceipt,
+            Reply::Nonce(5),
+            Reply::Nonce(6),
+            // Second tick: a read faults, which is no evidence either way.
+            Reply::Fault,
+            // Third tick: mined.
+            Reply::Receipt(opened_receipt(pool_id, owner, 9_000_000)),
+        ],
+        HASHED(),
+        &store,
+        owner,
+    )
+    .await
+    .expect("the mined open settles")
+    .expect("the receipt names the pool");
+    assert_eq!(opened.state.pool_id, pool_id);
+    assert_eq!(
+        opened.state.deposit,
+        U256::from(9_000_000u64),
+        "the row records the credited deposit"
+    );
+    assert_eq!(opened.tx, open_tx());
+}
+
+/// A spent nonce with no receipt in hand asks `getPools`, and adopts the pool
+/// the open bought.
+#[tokio::test(start_paused = true)]
+async fn a_spent_nonce_adopts_the_pool_the_open_bought() {
+    use alloy::sol_types::SolValue;
+
+    let owner = Address::repeat_byte(1);
+    let pool_id = PoolId::from([0xBB; 32]);
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    let settled = settle(
+        vec![
+            Reply::NoReceipt,
+            Reply::Nonce(6),
+            Reply::NoReceipt,
+            // `getPools` faults: no answer, so wait for the next tick.
+            Reply::Fault,
+            Reply::NoReceipt,
+            Reply::Nonce(6),
+            Reply::NoReceipt,
+            Reply::Call(vec![pool_id].abi_encode().into()),
+            Reply::Call(
+                onchain_pool(owner, PaymentPool::Status::Open, 10_000_000)
+                    .abi_encode()
+                    .into(),
+            ),
+        ],
+        HASHED(),
+        &store,
+        owner,
+    )
+    .await
+    .expect("the adoption settles the open");
+    assert!(settled.is_none(), "reconciliation recorded the pool itself");
+    assert_eq!(
+        store.get_by_owner(owner).unwrap().map(|row| row.pool_id),
+        Some(pool_id)
+    );
+}
+
+/// A spent nonce with no new pool on chain, and a nonce nothing holds, both
+/// mean the open escrowed nothing: the error stays an RPC fault, so the
+/// caller's classification is unchanged and the next miss opens afresh.
+#[tokio::test(start_paused = true)]
+async fn an_open_that_escrowed_nothing_fails_as_an_rpc_fault() {
+    use alloy::sol_types::SolValue;
+
+    let owner = Address::repeat_byte(1);
+    for (name, replies) in [
+        (
+            "nonce spent, no pool",
+            vec![
+                Reply::NoReceipt,
+                Reply::Nonce(6),
+                Reply::NoReceipt,
+                Reply::Call(Vec::<PoolId>::new().abi_encode().into()),
+            ],
+        ),
+        (
+            "vacant",
+            vec![Reply::NoReceipt, Reply::Nonce(5), Reply::Nonce(5)],
+        ),
+    ] {
+        let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+        let err = settle(replies, HASHED(), &store, owner)
+            .await
+            .expect_err(name);
+        assert_eq!(
+            err.downcast_ref::<PoolOpenFailureReason>(),
+            Some(&PoolOpenFailureReason::RpcError),
+            "{name}: {err:#}"
+        );
+        assert!(store.get_by_owner(owner).unwrap().is_none(), "{name}");
+    }
+}
+
+/// While the open's outcome is unknown the open slot stays held, so a later
+/// miss joins the running open instead of sending a second `openPool`
+/// (#2415). Every read past the send faults, so the outcome never resolves.
+#[tokio::test(start_paused = true)]
+async fn an_unconfirmed_open_holds_the_open_slot() {
+    let owner = Address::repeat_byte(1);
+    let asserter = script(vec![Reply::Nonce(5)]);
+    asserter.push_success(&open_tx());
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    let svc = mocked_service_on(bare_pool_contract(asserter.clone()), store, signer(), owner);
+    let provider = Address::repeat_byte(3);
+
+    let first = svc
+        .open_or_reuse_pool(provider, Duration::from_secs(1))
+        .await
+        .expect_err("the open cannot resolve");
+    assert!(
+        first.downcast_ref::<PoolOpenPending>().is_some(),
+        "{first:#}"
+    );
+    assert!(asserter.read_q().is_empty(), "the open was sent");
+
+    tokio::time::sleep(Duration::from_mins(10)).await;
+    assert!(
+        svc.open_in_flight.lock().unwrap().is_some(),
+        "the open task still holds the slot"
+    );
+    // A second open would fail at once on its nonce read; joining the held
+    // open runs out the budget instead.
+    let second = svc
+        .open_or_reuse_pool(provider, Duration::from_secs(1))
+        .await
+        .expect_err("the open cannot resolve");
+    assert!(
+        second.downcast_ref::<PoolOpenPending>().is_some(),
+        "{second:#}"
+    );
 }
