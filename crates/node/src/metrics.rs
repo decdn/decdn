@@ -464,7 +464,9 @@ pub struct DecdnMetrics {
     /// transaction may still mine, so the node opens no second pool until the
     /// chain shows the outcome. Every cache miss that needs a pool meanwhile is
     /// refused as a local fault. A value that stays at 1 means the chain lane
-    /// cannot answer, or a pending transaction holds the open's nonce.
+    /// cannot answer, a pending transaction holds the open's nonce, or every
+    /// re-send at that nonce fails: the wallet cannot fund the deposit or the
+    /// gas, or the contract refuses the open.
     pub buyer_pool_open_unresolved: Gauge,
     /// Total raw USDC this node holds in accepted vouchers that it has not yet
     /// redeemed on-chain — the sum of `owed − paid` across every inbound lane

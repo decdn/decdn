@@ -605,9 +605,11 @@ a receipt, or the account's nonce passing the open's, ends the wait. A nonce
 that no transaction holds gets a fresh `openPool` at that same nonce, so at
 most one of them escrows. `still holding the open slot for an unconfirmed
 openPool` repeats every minute with the elapsed time and the last thing the
-chain said. A gauge that stays at 1 means the RPC cannot answer, or a pending
-transaction from this key holds the open's nonce; fix the RPC or let that
-transaction mine. Do not restart to clear it: a restart forgets the wait, and a
+chain said. A gauge that stays at 1 means the RPC cannot answer, a pending
+transaction from this key holds the open's nonce, or every re-send at that
+nonce fails because the wallet cannot fund the deposit or the gas, or the
+contract refuses the open. Read `last` in the repeating warning, then fix the
+RPC, let that transaction mine, or fund the wallet. Do not restart to clear it: a restart forgets the wait, and a
 transaction that mines after the restart is a deposit the node does not track
 until the next restart adopts or reports it.
 
