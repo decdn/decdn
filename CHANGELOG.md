@@ -2657,7 +2657,7 @@ since project inception and will roll into the first tagged release.
   rather than guessed at by the caller: a poisoned open lock, an unreadable
   pool store, a store write that leaves a deposit untracked, a panicked open
   task, and a wallet that cannot fund a deposit all refuse, while a pending open,
-  a reconcile-held slot, an unreclaimable expired pool, a per-provider on-chain
+  a reconcile-held slot, a per-provider on-chain
   revert, and a transient RPC fault stay clean misses.
   - Scope is deliberately narrow: only a local fault changes the wire code. A
     wedged or settled *lane* to one provider still answers `NotFound` — it is

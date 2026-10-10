@@ -15,7 +15,7 @@
 //!
 //! **Boundary (deliberately not covered here).** The runtime orchestration is
 //! out of scope for this file. The cache-engine hook that, on a miss, discovers
-//! a provider, opens the upstream pool, pulls, and populates the cache is
+//! a provider, opens or reuses the node's pool, pulls, and populates the cache is
 //! `decdn_node::node_origin::NodeOrigin`, which `runtime/mod.rs` constructs
 //! and provisions when `cache.node_to_node_pull_through_enabled` is set;
 //! `node_origin_pull.rs` is the suite that covers it. This file instead drives

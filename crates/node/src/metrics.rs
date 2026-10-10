@@ -1674,8 +1674,9 @@ pub struct DecdnMetrics {
     /// value isolates an unknown-lane abuse campaign. Visible name:
     /// `decdn_serve_stream_rejected_unknown_lane_total`.
     pub serve_stream_rejected_unknown_lane: Counter,
-    /// `serve_stream` requests refused because a verified client binding does
-    /// not authorize the named lane (#327). Visible name:
+    /// `serve_stream` requests refused because they carry no verified client
+    /// binding, so they cannot name a lane (#327). A binding for a signer with no
+    /// lane counts as `unknown_lane`. Visible name:
     /// `decdn_serve_stream_rejected_owner_mismatch_total`.
     pub serve_stream_rejected_owner_mismatch: Counter,
     /// `serve_stream` requests reset because the client binding failed to
@@ -3137,8 +3138,8 @@ recorders! {
     /// Record a `serve_stream` request refused on an unknown lane (#876).
     serve_stream_rejected_unknown_lane => serve_stream_rejected_unknown_lane.inc();
 
-    /// Record a `serve_stream` request refused because the client binding did
-    /// not authorize the named lane (#876).
+    /// Record a `serve_stream` request refused because it carries no verified
+    /// client binding, so it cannot name a lane (#876).
     serve_stream_rejected_owner_mismatch => serve_stream_rejected_owner_mismatch.inc();
     /// A client binding failed to verify and the stream was reset.
     serve_stream_rejected_bad_binding => serve_stream_rejected_bad_binding.inc();

@@ -3712,11 +3712,12 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
 /// still hold the last acked watermark so the caller can persist what it paid —
 /// it must NOT reset to `None`.
 ///
-/// Induced deterministically by deposit exhaustion (no mock server): a blob one
-/// chunk plus a remainder needs two vouchers — a cumulative amount
+/// Induced deterministically by capability-cap exhaustion (no mock server): a
+/// blob one chunk plus a remainder needs two vouchers — a cumulative amount
 /// for the interval, then a larger cumulative amount for the close — but the
-/// pool deposit only clears the first. The node acks voucher 1 and rejects
-/// voucher 2 as over-deposit, so the fetch errors after one acked voucher.
+/// signer's cap only clears the first. The node acks voucher 1 and rejects
+/// voucher 2 as over-cap (`SpendingCapExhausted`), so the fetch errors after one
+/// acked voucher.
 /// `progress.advanced()` must then report voucher 1 (nonce 1), proving the
 /// copy-back in `stream_fetch_tracked` runs on the error path.
 ///
@@ -3817,7 +3818,7 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
             rejected.reason,
             decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted
         ),
-        "the exhausted pool must surface its own rejection reason; got {:?}",
+        "the exhausted cap must surface its own rejection reason; got {:?}",
         rejected.reason
     );
     // The bundle IS attached — this is the case that made bundle presence alone
@@ -3850,7 +3851,7 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
             &metrics.encode()?,
             "decdn_serve_stream_rejected_insufficient_deposit_total 0"
         ),
-        "an exhausted pool must not retry at all, so nothing should reach the \
+        "an exhausted cap must not retry at all, so nothing should reach the \
          pre-serve deposit gate"
     );
 
@@ -8168,8 +8169,8 @@ async fn client_binding_address_mismatch_resets() -> anyhow::Result<()> {
 }
 
 /// Binding authorization gate: a correctly-signed binding for an address that
-/// does NOT own the requested pool is refused with `NotFound` (the leech
-/// closure for bound clients). Covers `serve_stream`'s `client != owner` arm.
+/// signs for no lane on the requested pool is refused as an unknown lane (wire
+/// `NotFound`). This is the leech closure for bound clients.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
     let payload = b"valid binding, wrong pool owner".to_vec();
@@ -8324,7 +8325,7 @@ async fn binding_matching_the_delegate_signer_is_authorized() -> anyhow::Result<
 }
 
 /// The mirror of the above: a connection bound as the *funder* behind a delegated
-/// lane is refused with `OwnerMismatch` (wire `NotFound`). The funder holds
+/// lane is refused as an unknown lane (wire `NotFound`). The funder holds
 /// no voucher authority on this lane, so its vouchers would fail
 /// `WrongSigner` mid-stream after free bytes had already shipped.
 #[tokio::test(flavor = "multi_thread")]
@@ -9021,7 +9022,7 @@ async fn register_lane_is_idempotent_and_preserves_watermark() -> anyhow::Result
 // Node-to-node cache-miss pull-through authorization gate (#831)
 //
 // The miss-hook that triggers a *paid* upstream pull must fire only for a
-// request that PROVES ownership of the named pool — pool ids are public
+// request that PROVES it signs for a known lane on the named pool — pool ids are public
 // on-chain, so existence cannot authorize spend. A `CountingOrigin` (returns
 // NotFound but counts every fetch) stands in for the paid `NodeOrigin`, so a
 // test can distinguish "the gate blocked the pull" (0 fetches) from "the pull
@@ -9060,14 +9061,14 @@ impl decdn_cache::Origin for CountingOrigin {
     }
 }
 
-/// The pull-through gate authorizes ONLY a request proving ownership of the
-/// named pool: an unbound request and a validly-bound-but-wrong-owner request
-/// must NOT reach the paid pull (the counting origin stays at 0), while the
-/// pool owner's bound request does. All three return `NotFound` to the
+/// The pull-through gate authorizes ONLY a request whose bound signer holds a
+/// known lane on the named pool: an unbound request and a validly-bound request
+/// from another signer must NOT reach the paid pull (the counting origin stays
+/// at 0), while the lane signer's bound request does. All three return `NotFound` to the
 /// client (the stand-in origin has nothing); the security property is whether
 /// the paid pull was attempted at all.
 #[tokio::test(flavor = "multi_thread")]
-async fn pull_through_gate_authorizes_only_pool_owner() -> anyhow::Result<()> {
+async fn pull_through_gate_authorizes_only_lane_signer() -> anyhow::Result<()> {
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cache_tmp = tempfile::tempdir()?;
     let cache = CacheEngine::open(
@@ -9322,7 +9323,7 @@ async fn spawn_counting_pull_server(
 
 /// #1519, the headline case: an underfunded pool must not make the node spend.
 ///
-/// Every cache-miss fill tier is gated on pool OWNERSHIP (`pull_authorized`)
+/// Every cache-miss fill tier is gated on LANE AUTHORITY (`pull_authorized`)
 /// and none was gated on solvency, so before the pre-spend floor a dust-deposit
 /// pool could name absent hashes, make the node pay its paid upstream for each,
 /// and be refused afterwards by the serve-path gate. The attacker gained nothing —

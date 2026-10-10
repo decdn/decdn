@@ -545,7 +545,7 @@ impl PoolContext {
 /// Sign an ADR 005 ephemeral client identity binding: an EIP-712
 /// `BindNodeId(nodeId, nonce = 0)` attestation over the requester's OWN iroh
 /// `NodeId`, signed with the buyer key. The serving node recovers the signer via
-/// `ecrecover` (`verify_binding`) and checks it owns the named lane before
+/// `ecrecover` (`verify_binding`) and checks it signs for a known lane on the named pool before
 /// honoring a cache-miss origin pull (`pull_authorized`, ADR 003 §Off-Chain
 /// Ephemeral Binding). Used by the CLI client fetch (#1115) and by node-to-node
 /// pulls, where `node_origin` binds its upstream requests so an upstream can

@@ -6520,7 +6520,7 @@ async fn node_origin_reused_lane_resumes_voucher_progress() -> Result<()> {
     )
     .await;
 
-    // First pull (hash1): opens the pool against A, pays for its wire bytes, and
+    // First pull (hash1): opens the node's pool and the B→A lane, pays for its wire bytes, and
     // persists the watermark.
     let first_fetch = Origin::fetch(&origin, hash1, u64::MAX)
         .await

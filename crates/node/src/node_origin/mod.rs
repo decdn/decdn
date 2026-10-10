@@ -561,7 +561,7 @@ pub struct NodeOriginDeps {
     /// `CapacityBond` EIP-712 bind domain (ADR 005). Used to sign the client
     /// identity binding this node attaches — over its OWN iroh `NodeId` with
     /// the buyer key — to every node→node pull, so an upstream node can prove
-    /// this node owns the named lane and, on its own cache miss, chain a
+    /// this node signs for a known lane on the named pool and, on its own cache miss, chain a
     /// further reactive origin pull (`pull_authorized`, #1117). Built from
     /// `chain_id` + the `CapacityBond` address, identical to the domain the
     /// serving side verifies against.
@@ -2019,7 +2019,7 @@ const fn no_step_why(stepped: &Stepped) -> &'static str {
 /// Attach this node's ADR 005 client identity binding to an upstream pull's
 /// `PoolContext` (#1117). Signs over our OWN endpoint `NodeId` with the
 /// lane's buyer key (`ctx.client_signer`) under the `CapacityBond` bind
-/// domain, so the upstream can prove we own the named lane and, on its own
+/// domain, so the upstream can prove we sign for a known lane on the named pool and, on its own
 /// cache miss, chain a further reactive origin pull (`pull_authorized`). A
 /// signing failure drops the candidate rather than sending an unbound request
 /// the upstream would refuse to chain — try the next provider instead.

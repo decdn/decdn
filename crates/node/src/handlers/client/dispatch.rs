@@ -1158,7 +1158,7 @@ impl ClientHandler {
                 // (`InternalError`) rather than an empty one (`NotFound`). Every
                 // terminal MISS below therefore takes its reason from
                 // `FillOutcome::miss_reason` (via `MissRefusal::new`) and is sent
-                // through `respond_miss`. (The lane-class refusals — `UnknownLane`,
+                // through `respond_miss`. (The lane- and pool-class refusals — `UnknownLane`,
                 // `InsufficientDeposit` — keep their own reasons: they are
                 // client-attributable and would refuse regardless of origin
                 // health.)

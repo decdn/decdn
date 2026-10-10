@@ -319,7 +319,7 @@ jsonrpsee = { version = "0.26", features = ["server", "http-client", "macros"] }
 # Embedded persistent KV (used by `node` to fence voucher replay across
 # restarts — issue #527 / ADR 003 §Off-chain voucher state persistence).
 # Pure-Rust, ACID, single-file, fsync on commit via `Durability::Immediate`.
-# 4.2 floor: `channel_store::flush` commits its batch in ascending key order, and
+# 4.2 floor: `pool_store::flush` commits its batch in ascending key order, and
 # the append fast path that makes that pay off arrives in 4.2. Below it the same
 # sort is a pessimization — measured at 1.31x MORE leaf pages on 4.1 — so the
 # floor is what keeps the sort a win rather than a regression.
@@ -431,7 +431,7 @@ codegen-units = 1
 # NOT `panic = "abort"`: production code recovers from panics via unwinding —
 # `chain_events::resumable_watcher` wraps hook dispatch in `catch_unwind` so a
 # panicking hook cannot kill the daemon, `dht::chain_projection` does the same
-# for lock poisoning, and the runtime / admin / buyer-channel layers branch on
+# for lock poisoning, and the runtime / admin / buyer-pool layers branch on
 # `JoinError::is_panic`. `abort` turns every one of those into a dead process.
 #
 # `strip = "debuginfo"`, not `"symbols"`: the symbol table stays in the shipped

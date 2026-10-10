@@ -1390,7 +1390,7 @@ pub struct ClientHandler {
     /// Node-to-node cache-miss pull-through deadline (#831), set at construction
     /// via [`ClientHandlerDeps`]. `None` (the default — feature off, and in
     /// tests) disables pull-through: a cache miss returns `NotFound`. When
-    /// `Some`, a miss *from a request that proves authority over the named lane*
+    /// `Some`, a miss *from a request that proves it signs for a known lane on the named pool*
     /// (see [`Self::pull_authorized`]) triggers `cache.populate` (the engine's
     /// `NodeOrigin` discovers, pays, pulls, and fills the store), bounded by this
     /// deadline so a slow upstream can't pin the delivery path. Proven lane

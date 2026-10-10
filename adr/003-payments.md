@@ -530,7 +530,7 @@ A signer reuses one `chain_root` across two providers. Every preimage it release
 
 Node serves bytes that don't match the advertised BLAKE3 hash.
 
-Absorbed at the wire by progressive BLAKE3 verification at the client (mandatory in `cdn/client/v1` per [ADR 002](002-content-addressing.md#adr-002-content-addressing) and [ADR 005](005-protocol.md#adr-005-wire-protocol)). Vouchers are signed and sent only after the corresponding chunks have been verified — a corrupt window therefore yields no voucher. The client drops the connection, requests the blob from a different node, and recovers any unspent channel funds via channel-close. **Client monetary loss in the corruption case is zero**; the only cost is downstream bandwidth (sunk regardless of outcome).
+Absorbed at the wire by progressive BLAKE3 verification at the client (mandatory in `cdn/client/v1` per [ADR 002](002-content-addressing.md#adr-002-content-addressing) and [ADR 005](005-protocol.md#adr-005-wire-protocol)). Vouchers are signed and sent only after the corresponding chunks have been verified — a corrupt window therefore yields no voucher. The client drops the connection, requests the blob from a different node, and recovers the unspent deposit when the owner closes and reclaims the pool. **Client monetary loss in the corruption case is zero**; the only cost is downstream bandwidth (sunk regardless of outcome).
 
 No on-chain slash machinery is needed for content corruption. The threat is bounded in framing parallel to [§ Voucher withholding](#voucher-withholding) above: per-encounter wasted bandwidth is capped by the ramped credit window on each side, and at the floor by one chunk plus one chunk group (the client's wasted download for a corrupt chunk, which it never pays for; the node's upstream cost when a correctly-withheld proof leaves the chunk unpaid). Both bounds are mechanical — the same self-enforcing credit-window pause applies, per stream, with credit keyed to the lane rather than the counterparty. Clients prefer nodes whose probe and delivery history they trust; the protocol coordinates neither side.
 
@@ -1121,7 +1121,7 @@ Node admission and queueing policy — how a node decides which requests to serv
 
 ## NodeId-to-Ethereum Binding
 
-The protocol requires a verifiable mapping between iroh NodeIds (ed25519 public keys) and Ethereum addresses (secp256k1-derived). This binding is used for payment channel association and slash evidence attribution. Two orthogonal signature mechanisms protect this mapping: the EIP-712 `bindingSignature` (secp256k1) proves the Ethereum key holder consents to the association — preventing un-slashable registration; the `ed25519Signature` ([§ NodeId Ownership Verification](#nodeid-ownership-verification)) proves the NodeId's private key holder authorized the registration — preventing NodeId squatting.
+The protocol requires a verifiable mapping between iroh NodeIds (ed25519 public keys) and Ethereum addresses (secp256k1-derived). This binding is used for pool and lane association and for slash evidence attribution. Two orthogonal signature mechanisms protect this mapping: the EIP-712 `bindingSignature` (secp256k1) proves the Ethereum key holder consents to the association — preventing un-slashable registration; the `ed25519Signature` ([§ NodeId Ownership Verification](#nodeid-ownership-verification)) proves the NodeId's private key holder authorized the registration — preventing NodeId squatting.
 
 ### Binding Message Format
 

@@ -12,11 +12,10 @@
 //! this crate shares one send/receipt path.
 //!
 //! `cli::commands::pool`'s `close_and_forget` / `reclaim_and_forget` hand-roll
-//! the pair instead: they fold an estimation-time revert and a reverted receipt
-//! into one pool-specific error (`TxOutcome::Reverted`), because a pool that
-//! someone else already closed is a normal race. Their receipt-read error names
-//! no transaction, so a receipt timeout there loses the hash too. Any other
-//! hand-rolled send/receipt pair is a bug for the same reason.
+//! the pair so they can word a revert as a likely race: a concurrent close by
+//! the same owner, or a concurrent permissionless reclaim. Their receipt-read
+//! error names no transaction, so a receipt timeout there loses the hash
+//! (#2413). Any other hand-rolled send/receipt pair is a bug for that reason.
 
 use alloy::contract::{CallBuilder, CallDecoder, Error as ContractError};
 use alloy::primitives::B256;
