@@ -520,13 +520,11 @@ pub async fn open_pool<P: Provider + Clone>(
             let reason = PoolOpenFailureReason::classify_revert_data(err.as_revert_data().as_ref());
             // A transport failure may have reached the node and broadcast the
             // `openPool` before the response was lost.
-            let unconfirmed = decdn_incentive::tx::send_broadcast_unknown(&err)
-                .then_some(OpenUnconfirmed { tx: None, nonce });
-            let err = anyhow::Error::new(err).context("submit openPool");
-            let err = match unconfirmed {
-                Some(unconfirmed) => err.context(unconfirmed),
-                None => err,
-            };
+            let broadcast_unknown = decdn_incentive::tx::send_broadcast_unknown(&err);
+            let mut err = anyhow::Error::new(err).context("submit openPool");
+            if broadcast_unknown {
+                err = err.context(OpenUnconfirmed { tx: None, nonce });
+            }
             return Err(err.context(reason));
         }
     };

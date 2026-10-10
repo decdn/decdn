@@ -851,16 +851,9 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             return pin_ctx(&state, &self.signer, &self.voucher_domain, provider_addr);
         }
 
-        let open = self.join_or_spawn_open(None);
-        let joined = async {
-            tokio::select! {
-                biased;
-                outcome = open => Some(outcome),
-                () = self.open_hold.wait_held() => None,
-            }
-        };
+        let open = self.unless_held(self.join_or_spawn_open(None));
 
-        match tokio::time::timeout(budget, joined).await {
+        match tokio::time::timeout(budget, open).await {
             // Still running. The task owns the tx; hand the caller a typed "not
             // yet" so it can move to the next candidate.
             Err(_) => Err(anyhow::Error::new(PoolOpenPending { waited: budget })),
@@ -1303,6 +1296,17 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             .context(LocalPullFault)
     }
 
+    /// `open`'s outcome, or `None` once the open slot is held for an
+    /// unconfirmed `openPool` ([`OpenHold`]); the caller then fails with
+    /// [`Self::held_open_error`].
+    async fn unless_held(&self, open: SharedOpen) -> Option<OpenOutcome> {
+        tokio::select! {
+            biased;
+            outcome = open => Some(outcome),
+            () = self.open_hold.wait_held() => None,
+        }
+    }
+
     /// Join the in-flight `openPool`, or spawn one. The one pool the node owns is
     /// opened at most once; concurrent misses join the single running open.
     /// `replacing` names a tracked pool that no longer accepts funds: the open
@@ -1587,13 +1591,13 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// The open fails, the open slot is held for an unconfirmed `openPool`
     /// ([`Self::held_open_error`]), or the store still tracks `closed` after it.
     async fn open_replacement(&self, closed: PoolId) -> Result<PoolId> {
-        tokio::select! {
-            biased;
-            outcome = self.join_or_spawn_open(Some(closed)) => {
-                outcome.map_err(|err| rehydrate_open_error(&err))?;
-            }
-            () = self.open_hold.wait_held() => return Err(self.held_open_error()),
-        }
+        let Some(outcome) = self
+            .unless_held(self.join_or_spawn_open(Some(closed)))
+            .await
+        else {
+            return Err(self.held_open_error());
+        };
+        outcome.map_err(|err| rehydrate_open_error(&err))?;
         let state = self
             .reuse_or_report()?
             .with_context(|| "the replacement buyer pool is not in the store")?;

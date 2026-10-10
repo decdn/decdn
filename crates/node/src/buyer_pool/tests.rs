@@ -529,7 +529,7 @@ async fn reconcile_adopts_nothing_when_the_owner_holds_no_pool() {
 /// The queue holds exactly the `getPools` + `getPool` pair that sweep
 /// consumes; an empty one would not prove the same thing, because the
 /// mocked transport errors an unexpected call and the error path also
-/// returns `false`.
+/// leaves the row alone (returning [`Reconciled::Unknown`]).
 #[tokio::test]
 async fn reconcile_is_a_no_op_when_the_store_already_tracks_a_pool() {
     use alloy::sol_types::SolValue;
@@ -2092,8 +2092,9 @@ fn adoption_failures(metrics: &Arc<Metrics>) -> u64 {
 }
 
 /// A pool that is only unreachable — an RPC blip on `getPools` — leaves the
-/// store untouched and returns `false`, so the first miss falls through to
-/// the ordinary lazy open instead of buying being disabled for the process.
+/// store untouched and returns [`Reconciled::Unknown`], so the first miss
+/// falls through to the ordinary lazy open instead of buying being disabled
+/// for the process.
 #[tokio::test]
 async fn reconcile_leaves_the_store_untouched_when_the_chain_is_unreachable() {
     let owner = Address::repeat_byte(1);
@@ -2964,6 +2965,20 @@ fn script(replies: Vec<Reply>) -> alloy::providers::mock::Asserter {
     asserter
 }
 
+/// A `getPools` answer listing `ids`.
+fn ids_reply(ids: &[PoolId]) -> Reply {
+    use alloy::sol_types::SolValue;
+
+    Reply::Call(ids.to_vec().abi_encode().into())
+}
+
+/// A `getPool` answer: `owner`'s pool in `status` holding 10 USDC.
+fn pool_reply(owner: Address, status: PaymentPool::Status) -> Reply {
+    use alloy::sol_types::SolValue;
+
+    Reply::Call(onchain_pool(owner, status, 10_000_000).abi_encode().into())
+}
+
 /// The hash of the `openPool` whose outcome the open task did not see.
 fn open_tx() -> TxHash {
     TxHash::repeat_byte(0xAB)
@@ -3281,17 +3296,8 @@ async fn a_vacant_nonce_is_re_sent_at_that_nonce_until_one_open_mines() {
 /// run never counts as an adoption failure.
 #[tokio::test(start_paused = true)]
 async fn a_spent_nonce_adopts_the_pool_the_open_bought() {
-    use alloy::sol_types::SolValue;
-
     let owner = Address::repeat_byte(1);
     let pool_id = PoolId::from([0xBB; 32]);
-    let pool = || {
-        Reply::Call(
-            onchain_pool(owner, PaymentPool::Status::Open, 10_000_000)
-                .abi_encode()
-                .into(),
-        )
-    };
     let spent = || {
         vec![
             Reply::NoReceipt,
@@ -3305,11 +3311,11 @@ async fn a_spent_nonce_adopts_the_pool_the_open_bought() {
     replies.push(Reply::Fault);
     replies.extend(spent());
     // `getPools` lists the pool, and its read faults.
-    replies.push(Reply::Call(vec![pool_id].abi_encode().into()));
+    replies.push(ids_reply(&[pool_id]));
     replies.push(Reply::Fault);
     replies.extend(spent());
-    replies.push(Reply::Call(vec![pool_id].abi_encode().into()));
-    replies.push(pool());
+    replies.push(ids_reply(&[pool_id]));
+    replies.push(pool_reply(owner, PaymentPool::Status::Open));
 
     let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
     let metrics = metrics();
@@ -3330,8 +3336,6 @@ async fn a_spent_nonce_adopts_the_pool_the_open_bought() {
 /// pool this node owns must not be dropped on one failed read.
 #[tokio::test(start_paused = true)]
 async fn a_replacement_open_settles_onto_the_new_pool() {
-    use alloy::sol_types::SolValue;
-
     let owner = Address::repeat_byte(1);
     let closed = PoolId::from([0xAA; 32]);
     let opened = PoolId::from([0xBB; 32]);
@@ -3345,19 +3349,6 @@ async fn a_replacement_open_settles_onto_the_new_pool() {
             U256::from(10_000_000u64),
         ))
         .expect("seed the closed pool's row");
-    let ids = || Reply::Call(vec![closed, opened].abi_encode().into());
-    let new_pool = || {
-        Reply::Call(
-            onchain_pool(owner, PaymentPool::Status::Open, 10_000_000)
-                .abi_encode()
-                .into(),
-        )
-    };
-    let closing = Reply::Call(
-        onchain_pool(owner, PaymentPool::Status::Closing, 10_000_000)
-            .abi_encode()
-            .into(),
-    );
     let landed = settle(
         vec![
             // First tick: the walk reads the new pool, and the closed one faults.
@@ -3365,17 +3356,17 @@ async fn a_replacement_open_settles_onto_the_new_pool() {
             Reply::Block(100),
             Reply::Nonce(6),
             Reply::NoReceipt,
-            ids(),
-            new_pool(),
+            ids_reply(&[closed, opened]),
+            pool_reply(owner, PaymentPool::Status::Open),
             Reply::Fault,
             // Second tick: the closed pool reads `Closing`.
             Reply::NoReceipt,
             Reply::Block(100),
             Reply::Nonce(6),
             Reply::NoReceipt,
-            ids(),
-            new_pool(),
-            closing,
+            ids_reply(&[closed, opened]),
+            pool_reply(owner, PaymentPool::Status::Open),
+            pool_reply(owner, PaymentPool::Status::Closing),
         ],
         hashed(),
         &store,
@@ -3396,8 +3387,6 @@ async fn a_replacement_open_settles_onto_the_new_pool() {
 /// and it no longer carries [`OpenUnconfirmed`], because the outcome is known.
 #[tokio::test(start_paused = true)]
 async fn an_open_that_escrowed_nothing_fails_as_a_resolved_rpc_fault() {
-    use alloy::sol_types::SolValue;
-
     let owner = Address::repeat_byte(1);
     let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
     let err = settle(
@@ -3406,7 +3395,7 @@ async fn an_open_that_escrowed_nothing_fails_as_a_resolved_rpc_fault() {
             Reply::Block(100),
             Reply::Nonce(6),
             Reply::NoReceipt,
-            Reply::Call(Vec::<PoolId>::new().abi_encode().into()),
+            ids_reply(&[]),
         ],
         hashed(),
         &store,
@@ -3458,8 +3447,6 @@ async fn a_reverted_unconfirmed_open_fails_as_a_contract_revert() {
 /// it cannot write.
 #[tokio::test(start_paused = true)]
 async fn an_unrecordable_adopted_pool_fails_as_escrowed_but_untracked() {
-    use alloy::sol_types::SolValue;
-
     let owner = Address::repeat_byte(1);
     let store: Arc<dyn BuyerPoolStore> = Arc::new(WriteOnlyFault(
         MemoryBuyerPoolStore::new(),
@@ -3471,12 +3458,8 @@ async fn an_unrecordable_adopted_pool_fails_as_escrowed_but_untracked() {
             Reply::Block(100),
             Reply::Nonce(6),
             Reply::NoReceipt,
-            Reply::Call(vec![PoolId::from([0xBB; 32])].abi_encode().into()),
-            Reply::Call(
-                onchain_pool(owner, PaymentPool::Status::Open, 10_000_000)
-                    .abi_encode()
-                    .into(),
-            ),
+            ids_reply(&[PoolId::from([0xBB; 32])]),
+            pool_reply(owner, PaymentPool::Status::Open),
         ],
         hashed(),
         &store,
@@ -3581,8 +3564,6 @@ async fn an_unconfirmed_open_holds_the_open_slot_and_misses_fail_fast() {
 /// background block poller competes for the scripted replies.
 #[tokio::test(start_paused = true)]
 async fn a_transport_failed_open_adopts_its_pool_once_the_nonce_is_spent() {
-    use alloy::sol_types::SolValue;
-
     let owner = Address::repeat_byte(1);
     let pool_id = PoolId::from([0xBB; 32]);
     // The nonce read answers; the send then over-calls the queue and fails in
@@ -3608,12 +3589,8 @@ async fn a_transport_failed_open_adopts_its_pool_once_the_nonce_is_spent() {
         vec![
             Reply::Block(100),
             Reply::Nonce(6),
-            Reply::Call(vec![pool_id].abi_encode().into()),
-            Reply::Call(
-                onchain_pool(owner, PaymentPool::Status::Open, 10_000_000)
-                    .abi_encode()
-                    .into(),
-            ),
+            ids_reply(&[pool_id]),
+            pool_reply(owner, PaymentPool::Status::Open),
         ],
     );
     tokio::time::sleep(OPEN_RESOLVE_INTERVAL * 2).await;
