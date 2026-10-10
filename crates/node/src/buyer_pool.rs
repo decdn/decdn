@@ -2415,30 +2415,33 @@ async fn reclaim_once<P: Provider + Clone>(
     }
 
     match contract.reclaim(state.pool_id).send().await {
-        Ok(pending) => match pending.get_receipt().await {
-            Ok(receipt) if receipt.status() => {
-                // Only the `Err` leaves the row's fate unknown — `Ok(false)`
-                // means the compare-and-delete found no row for this pool, so
-                // nothing maps the owner to it. A surviving row would send a
-                // later reuse back to a `Closed` pool whose `deposit` field
-                // still reads healthy, so meter it like the sibling arms
-                // instead of dropping out of the sweep silently.
-                if let Err(err) = store.forget_if_pool(owner, state.pool_id) {
-                    warn!(pool_id = %state.pool_id, error = %err, "reclaim sweep: forget after reclaim failed");
-                    metrics.buyer_reclaim_failure();
-                    return;
+        Ok(pending) => {
+            let tx = *pending.tx_hash();
+            match pending.get_receipt().await {
+                Ok(receipt) if receipt.status() => {
+                    // Only the `Err` leaves the row's fate unknown — `Ok(false)`
+                    // means the compare-and-delete found no row for this pool, so
+                    // nothing maps the owner to it. A surviving row would send a
+                    // later reuse back to a `Closed` pool whose `deposit` field
+                    // still reads healthy, so meter it like the sibling arms
+                    // instead of dropping out of the sweep silently.
+                    if let Err(err) = store.forget_if_pool(owner, state.pool_id) {
+                        warn!(pool_id = %state.pool_id, error = %err, "reclaim sweep: forget after reclaim failed");
+                        metrics.buyer_reclaim_failure();
+                        return;
+                    }
+                    info!(pool_id = %state.pool_id, "reclaimed the buyer pool residual and dropped the row");
                 }
-                info!(pool_id = %state.pool_id, "reclaimed the buyer pool residual and dropped the row");
+                Ok(_) => {
+                    warn!(pool_id = %state.pool_id, %tx, "reclaim sweep: reclaim reverted");
+                    metrics.buyer_reclaim_failure();
+                }
+                Err(err) => {
+                    warn!(pool_id = %state.pool_id, %tx, error = %sanitize_error_sources(&err), "reclaim sweep: reclaim receipt failed");
+                    metrics.buyer_reclaim_failure();
+                }
             }
-            Ok(_) => {
-                warn!(pool_id = %state.pool_id, "reclaim sweep: reclaim reverted");
-                metrics.buyer_reclaim_failure();
-            }
-            Err(err) => {
-                warn!(pool_id = %state.pool_id, error = %sanitize_error_sources(&err), "reclaim sweep: reclaim receipt failed");
-                metrics.buyer_reclaim_failure();
-            }
-        },
+        }
         Err(err) => {
             warn!(pool_id = %state.pool_id, error = %sanitize_error_sources(&err), "reclaim sweep: reclaim submit failed");
             metrics.buyer_reclaim_failure();

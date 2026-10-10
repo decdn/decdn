@@ -494,11 +494,17 @@ pub async fn open_pool<P: Provider + Clone>(
                 .context(reason);
         }
     };
+    // Capture the hash before `get_receipt` consumes `pending`: past this point
+    // the deposit may escrow, so a receipt failure names the tx to reconcile.
     // Unbounded by design — see the `# The receipt wait is deliberately UNBOUNDED`
     // section above.
+    let tx = *pending.tx_hash();
     let receipt = pending.get_receipt().await.map_err(|err| {
         anyhow::Error::new(err)
-            .context("await openPool receipt")
+            .context(format!(
+                "await openPool receipt (tx {tx:#x}; may still mine — do not open another pool \
+                 until it resolves)"
+            ))
             .context(PoolOpenFailureReason::RpcError)
     })?;
     if !receipt.status() {

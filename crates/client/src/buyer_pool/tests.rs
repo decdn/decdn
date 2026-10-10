@@ -67,6 +67,38 @@ async fn a_transport_failed_top_up_submit_is_unconfirmed_with_its_nonce() {
     assert!(format!("{err:#}").contains("nonce 5"), "{err:#}");
 }
 
+/// An `openPool` whose receipt cannot be read may still escrow its deposit, so
+/// the error names its tx hash and stays classified as an RPC fault (#2413).
+#[tokio::test]
+async fn an_unreadable_open_pool_receipt_names_the_tx() {
+    let hash = B256::repeat_byte(0xab);
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&hash);
+    let contract = mocked_pool(asserter);
+    let deployment = decdn_incentive::Deployment {
+        chain_id: CHAIN_ID,
+        payment_pool: *contract.address(),
+    };
+    let err = open_pool(
+        &contract,
+        std::sync::Arc::new(PrivateKeySigner::random()),
+        deployment,
+        Address::repeat_byte(0x44),
+        Address::repeat_byte(0x22),
+        U256::from(1_000u64),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains(&format!("{hash:#x}")),
+        "{err:#}"
+    );
+    assert_eq!(
+        err.downcast_ref::<decdn_incentive::PoolOpenFailureReason>(),
+        Some(&decdn_incentive::PoolOpenFailureReason::RpcError)
+    );
+}
+
 /// A `topUp` submit the RPC node rejects broadcast nothing, so it carries
 /// no [`TopUpUnconfirmed`] and a caller may retry it.
 #[tokio::test]

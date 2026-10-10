@@ -575,10 +575,15 @@ where
         }
         Err(e) => return Err(anyhow::Error::new(e).context("closePool send failed")),
     };
-    let receipt = pending
-        .get_receipt()
-        .await
-        .map_err(|e| anyhow::Error::new(e).context("closePool receipt failed"))?;
+    // Read before the wait: an unreadable receipt leaves the tx in flight, and
+    // the hash is the operator's only handle on it.
+    let tx = *pending.tx_hash();
+    let receipt = pending.get_receipt().await.map_err(|e| {
+        anyhow::Error::new(e).context(format!(
+            "closePool sent (tx {tx:#x}) but the receipt could not be fetched; it may still \
+             mine — check the tx before re-running"
+        ))
+    })?;
 
     match receipt_outcome(receipt.status()) {
         TxOutcome::Landed => {
@@ -633,10 +638,15 @@ where
         Err(e) if e.as_revert_data().is_some() => anyhow::bail!(reclaim_reverted(pool_id)),
         Err(e) => return Err(anyhow::Error::new(e).context("reclaim send failed")),
     };
-    let receipt = pending
-        .get_receipt()
-        .await
-        .map_err(|e| anyhow::Error::new(e).context("reclaim receipt failed"))?;
+    // Read before the wait: an unreadable receipt leaves the tx in flight, and
+    // the hash is the operator's only handle on it.
+    let tx = *pending.tx_hash();
+    let receipt = pending.get_receipt().await.map_err(|e| {
+        anyhow::Error::new(e).context(format!(
+            "reclaim sent (tx {tx:#x}) but the receipt could not be fetched; it may still \
+             mine — check the tx before re-running"
+        ))
+    })?;
 
     match receipt_outcome(receipt.status()) {
         TxOutcome::Landed => {
