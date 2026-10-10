@@ -27,13 +27,7 @@
 # it can bump a digest, but it cannot derive a version from `bookworm-slim`, so
 # without this pin it would open no PRs at all. This is the multi-arch index
 # digest, so linux/amd64 and linux/arm64 both resolve from it.
-#
-# Pulled from ECR Public's mirror of the Docker Official Images, not Docker Hub.
-# The mirror serves the same index under the same digest. The release builds on
-# GitHub-hosted runners, whose shared egress IPs exhaust Docker Hub's per-IP
-# anonymous pull limit and fail the build with 429 Too Many Requests. Buildx
-# resolves the base manifest on every build, even with a warm layer cache.
-FROM public.ecr.aws/docker/library/debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS base
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
